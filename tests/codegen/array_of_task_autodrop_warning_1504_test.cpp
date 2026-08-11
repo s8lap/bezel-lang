@@ -79,12 +79,31 @@ CompileCheck check(const std::string& prog) {
 // sound program).
 BEZEL_TEST(codegen_array_of_task_autodrop_1504,
            plain_var_array_of_task_lints_not_errors) {
+    // ⚠ SCAFFOLDING REPAIRED (#2999, 2026-08-07). This case used to append via
+    // `a.Add(new Task<int>());`. Today's #2966 made "a member call on a built-in
+    // receiver that no dispatch arm lowered" a located compile error, and that
+    // turned the `Add` into a hard reject — CORRECTLY: `Array<Task>.Add` is a
+    // SILENT NO-OP, measured on the parent commit as `Count` == 0 where 1 is
+    // right, with no diagnostic at any severity. Filed as #2999.
+    //
+    // This case is about the §28.3 AUTO-DROP LINT, not about `Add`; the append
+    // was scaffolding, and the scaffolding was broken. The lint does not depend
+    // on it — measured: `var a := new Array<Task>();` alone still emits exactly
+    // the §28.3 warning and still builds and runs (exit 0). So the append is
+    // dropped rather than the case.
+    //
+    // ⚠ Note what this means about the ASSERTIONS below: they check only that a
+    // binary was produced, that there is no hard error, and that the exit code
+    // is 0 — which a silently-dropped `Add` satisfied for as long as the drop
+    // stayed silent. That is why the defect survived here. Do NOT re-add an
+    // append to this case as a way of "making it more realistic" unless the
+    // assertions also check the element actually landed; put that coverage in a
+    // test that pins #2999 instead.
     auto r = check(
         "module M; "
         "class App "
         "  public static method Main(): int "
         "    var a := new Array<Task>(); "
-        "    a.Add(new Task<int>()); "
         "    return 0; "
         "  end Main; "
         "end App;");

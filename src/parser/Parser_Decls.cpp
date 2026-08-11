@@ -2414,6 +2414,19 @@ std::vector<ast::Param> Parser::parseParamList() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ':' after parameter name");
         }
+        // fix issue 3027 (§15.4.1, v0.240): admit `Identifier ":" "owned"?
+        // Type`. The owning-form `FromCollectionLiteral` spec example puts
+        // `owned` AFTER the colon (`elements: owned OwningArray<T>`), but
+        // A.4 ParamModifiers is only declared before the identifier. The
+        // post-colon form is semantically identical to the modifier-before
+        // form (`owned elements: OwningArray<T>`): both mark the parameter
+        // as `owned` for the existing modifier=="owned" sema path.
+        // Mirrors the `owned?` already admitted on return types
+        // (MethodDecl / OperatorDecl / IfaceMethod, A.4 grammar lines
+        // ~1042/1037/10299).
+        if (p.modifier.empty() && consumeKeyword("owned")) {
+            p.modifier = "owned";
+        }
         p.type = parseType();
         if (consumePunctuator(":=")) {
             p.defaultValue = parseExpression();

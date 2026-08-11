@@ -44,6 +44,7 @@ namespace bezel::ast {
 struct Expr;
 struct Stmt;
 struct CallExpr;
+struct IndexExpr;
 struct MethodDecl;
 struct BindExpr;
 struct LocalDecl;
@@ -174,6 +175,196 @@ bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
 // on the alias fact.
 bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
                                       const sema::SemaContext& ctx);
+
+// §21.1 (v0.201) / stdlib §5, §4.4, §9.6 (fix #2709): a BUILTIN COLLECTION
+// MATERIALIZER call — `recv.ToArray()`, `.ToSet()`, `.ToDictionary(…)`,
+// `.Slice(r)`, `Encoding.GetBytes(s)`,
+// `.Sorted(…)`, `.Reversed()`, `s.Split(…)`. Every one is declared
+// `owned`-returning by the stdlib ("`ToArray()` returns a fresh `Array<T>` …
+// The return is `owned` — the caller is responsible for disposing it", stdlib
+// §5; likewise §4.4 for `Sorted`/`Reversed` and §9.6 for `Split`), so §21.1's
+// const rejection names them: "Rejected […]: a fresh `new`, an
+// `owned`-returning call […]".
+//
+// WHY THIS IS NOT `producerState`. These are compiler-known members with no
+// user `MethodDecl`, so `producerState`'s `returnOwned` authority never sees
+// them and they fall through to `Borrowed`. That verdict is deliberate and
+// LOAD-BEARING — `producerState` is the free-deciding input at
+// `handleLocalDecl` (Ownership.cpp), and codegen already reclaims these values
+// on its own recognition for both bindable spellings (a plain `var` via
+// `isFreshBorrowingArrayMaterializerLocal`, a `using var` via
+// `registerUsingDisposal`). Reclassifying them `Owned` would register a SECOND
+// free on top of codegen's — the double-free direction. This predicate is
+// therefore a pure DIAGNOSTIC-side second opinion, consulted only where §21.1
+// asks "is this initializer an owned production?"; it changes no disposal.
+//
+// The gap it closes: a `const` local is neither a `LocalDecl` (so codegen's
+// plain-`var` materializer reclaim never sees it) nor a `using var`, so NOTHING
+// frees it — measured at 100-of-100 leaked objects per materializer under LSan.
+// §21.1 requires the rejection; the rejection removes the leak by removing the
+// program.
+//
+// BOTH INSTANCE-CALL SPELLINGS (fix #2749 item 3). The callee may be a
+// `MemberAccessExpr` (`recv.M(..)`) or a `NullCondMemberExpr` (`recv?.M(..)`) —
+// sibling `Expr` kinds with identical `target`/`member` fields, so the original
+// `dynamic_cast<MemberAccessExpr*>`-only gate missed every `?.` spelling and
+// `const b := s?.Split(",");` was accepted. This is sema's own #2581 precedent
+// (`ExprTC::builtinInstanceCallee`), applied here. `?.` does not change the
+// classification: §21.1 rejects "an `owned`-returning call", `Split` is declared
+// `owned`-returning, and the null path merely adds §28.3's `null` row, which
+// "has no value to own, so it is compatible with either an owned target or a
+// borrowed target" — it cannot demote the non-null path's owned production.
+// The `?(` invocation form (`ast::NullCondCallExpr`) is deliberately NOT
+// covered: it invokes a FUNCTION VALUE, which §28.3 classifies as Borrowed and
+// §21.1 admits.
+//
+// ⚠⚠ THIS WIDENING IS INERT TODAY, AND THAT IS THE POINT — do not delete it as
+// dead code. MEASURED on 6cd9b70 with temporary instrumentation in the body
+// below: with the widening in place the predicate IS now reached for
+// `a?.Sorted()`, `a?.Reversed()`, `a?.Slice(0..1)` and `t?.Split(",")`, with no
+// symbol on the callee (so the narrowness gate passes them) — but every one of
+// them arrives with `ctx.exprType(call) == nullptr`, because SEMA NEVER TYPES A
+// BUILTIN INSTANCE CALL REACHED THROUGH `?.` at all. That is the same defect
+// behind their #2434 codegen degradation, and it is filed separately as #2756.
+// The result-head gate below then fails OPEN, so no rejection is emitted and no
+// program's diagnostics change.
+//
+// It is shipped anyway, deliberately, for a soundness reason rather than a
+// stylistic one: today `const b := s?.Split(",");` is not a leak (the value
+// never lowers — the local degrades to zero-initialized), but the moment #2756
+// lands the lowering, it becomes a REAL accept-and-leak of exactly #2709's
+// shape. A lane whose scope is "make `?.` builtin calls lower" would have no
+// reason to also add the §21.1 rejection. Pre-placing the guard means that fix
+// arrives already covered instead of re-opening the defect. The tripwire test
+// `const_nullcond_materializer_2749.residual_*_pending_2756` pins the current
+// state and is MEANT to go red when #2756 lands; the correct response is to flip
+// it into a rejection assertion.
+//
+// NARROWNESS (a false reject here breaks working code). Recognized only when
+// sema attached NO SYMBOL AT ALL to the callee — `ctx.exprSymbol(callee) ==
+// nullptr`. The result type must additionally be a declaration-less builtin
+// `Array` / `Set` / `Dictionary` head. A USER method named `ToArray` keeps the
+// ordinary user-call rules; a borrow-returning one stays admissible as a
+// `const` initializer, which §21.1 explicitly permits.
+//
+// ⚠ That narrowness had to be RE-ESTABLISHED for `?.`, not assumed, because the
+// null-conditional form is typed by a separate function with its own resolution
+// mirror. `ExprTC::resolveNullCondMember` calls `setExprSymbol(&nm, member)`
+// unconditionally once `lookupMember`/`lookupExtensionMember` resolved one, and
+// returns early attaching NOTHING when neither did — the builtin case. So a user
+// method reached as `obj?.Sorted()` attaches a MethodSymbol and a function-typed
+// field reached as `cfg?.Split(line)` attaches a FieldSymbol, and the single
+// `exprSymbol == nullptr` line excludes both, exactly as it does for their `.`
+// spellings.
+//
+// ⚠ DO NOT "restore consistency" with `isOwningCollectionDrainAliasCall`'s
+// `dynamic_cast<sema::MethodSymbol*>` gate. That is what this predicate shipped
+// first, and it FALSELY REJECTED a legal program: a call through a
+// FUNCTION-TYPED FIELD named one of these (e.g. `public Split: (string) ->
+// Array<string>;`) attaches a FieldSymbol, not a MethodSymbol, so the
+// MethodSymbol-only cast let it through — and §28.3 classifies a function-value
+// invocation with a non-`owned` concrete return as BORROWED, which §21.1
+// admits. `isOwningCollectionDrainAliasCall` has the same hole latently; it is
+// unfixed there only because `Drain` is a less plausible field name.
+//
+// The `exprSymbol == nullptr` form is sound because sema's builtin member-call
+// typing path lives entirely inside `if (!calleeSym)`
+// (sema/ExprTypecheck_Calls.cpp:2873, block extent 2873-8103), and every site
+// that attaches a symbol to a MemberAccessExpr requires a RESOLVED declaration.
+// ⚠ That is also what keeps the CROSS-MODULE case safe by one line:
+// ModuleLoader reconstructs a real MethodSymbol into the imported type's
+// members, so an imported `Sorted(): Array<int>` — whose importer-side TypeRef
+// is byte-identical to the builtin shape this predicate accepts — is excluded
+// by the symbol check alone. There is no test pinning that; add one if you
+// touch this.
+//
+// Deliberately NOT unified with codegen's same-named recognizers
+// (`isFreshBorrowingArrayMaterializerLocal` / `isFreshOwnerlessDictMaterializer
+// Expr`, LlvmBackend_Setup.cpp): those answer "must codegen free this
+// temporary?" and exclude `ToSet` on purpose (its temporary is reclaimed on
+// another path — a second free would double-free). This answers the different
+// question "does the stdlib declare this return `owned`?", for which `ToSet`
+// belongs. Sharing one list would fuse two questions with different answers.
+bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
+                                    const sema::SemaContext& ctx);
+
+// §28.3 producers table, "Range slice" row (v0.240) / §15.6 (fix #2749 item 2):
+// the RANGE-SLICE INDEXER form `arr[r]` on a builtin `Array<T>`. The spec row is
+// verbatim:
+//
+//   | Range slice `arr[r]` on `Array<T>` (§15.6) | Owned — a fresh `Array<T>`,
+//   | the compiler-recognized `Slice(r: Range<int>): owned Array<T>` form
+//   | (stdlib §4.4); **not** the indexer row above. |
+//
+// So the spec treats `arr[0..2]` and `arr.Slice(0..2)` as ONE operation, and
+// §21.1's "Rejected […]: a fresh `new`, an `owned`-returning call" therefore
+// covers both spellings identically.
+//
+// WHY IT NEEDS ITS OWN PREDICATE. #2709's `isBuiltinOwnedMaterializerCall` is
+// keyed on an `ast::CallExpr`; `arr[0..2]` is an `ast::IndexExpr` and cannot
+// reach it, and `producerState` has no `IndexExpr` arm either. The consequence
+// was a LIVE REMEDY LOOP, measured on 0b9693e: `using var s := arr[0..2];` drew
+// the #2073 vacuous lint ("use `const x := …;`") and `const s := arr[0..2];` was
+// then ACCEPTED — #2709's exact defect, reachable through the more idiomatic
+// spelling, and an inconsistency #2709 itself introduced by fixing only
+// `.Slice(r)`.
+//
+// WHAT IT RECOGNIZES, and why that cannot over-fire. It mirrors the ONE sema arm
+// that produces this classification (`ExprTypecheck_Exprs.cpp`, the
+// `if (isRangeIdx && cn == "Array") ctx_.setExprType(&e, tt);` line) on all
+// three of its conditions, AND cross-checks sema's own verdict by pointer:
+//   (a) the RECEIVER types as a declaration-less builtin `Array` head with a
+//       non-empty generic-argument list — which excludes `OwningArray<T>` (where
+//       §15.6 slicing is rejected outright), the span families (`Span`,
+//       `ReadOnlySpan`, `ArraySpan`, `ReadOnlyArraySpan` — sema types a range
+//       index on those as the ELEMENT, and their stdlib `Slice` overloads return
+//       span heads, not owned arrays), `string`, inline arrays `[N]T`, the
+//       dictionaries, and every USER type (whose TypeRef carries a
+//       `declaration`, including a user class that shadows the name `Array`);
+//   (b) the first index is a range — a syntactic `RangeExpr` (`arr[0..2]`) or a
+//       `Range`-typed value (`var r := 0..2; arr[r]`, #1079), the same two forms
+//       sema accepts — which leaves the single-element read `arr[i]` alone; it
+//       is §28.3's *indexer* row, a Borrow, which §21.1 admits verbatim;
+//   (c) sema in fact typed the whole index expression as the receiver's OWN
+//       TypeRef object. ⚠ NARROWLY: within the receiver family (a) selects —
+//       Named, declaration-less, head `Array` — that arm is the only one storing
+//       `tt` itself; every other arm there stores `tt->genericArgs[0]` or `[1]`,
+//       which cannot alias `tt`. It is NOT unique across ALL IndexExpr arms: an
+//       earlier draft claimed that, and it is FALSE, because
+//       `SemaContext::primitiveTypeRef` is an INTERN TABLE (SemaContext.hpp
+//       :655-666, primitiveCache_ at :569) — so the STRING range-slice arm
+//       (ExprTypecheck_Exprs.cpp:1491-1494) also stores a pointer frequently
+//       identical to its receiver's exprType. That collision is harmless only
+//       because (a) rejects a `string` receiver as Kind::Primitive before this
+//       check runs, and it is DATA-DEPENDENT (an explicitly annotated
+//       `var s: string` mints a fresh TypeRef and does NOT collide). Anyone
+//       relaxing (a) — to cover `string` slices, or to widen the head test —
+//       must not inherit the false invariant.
+//
+// All three are AND-ed and every one of them FAILS OPEN: a shape this cannot
+// type, or one sema types differently than the mirror expects, is ACCEPTED, not
+// rejected. That is the deliberate polarity #2709 chose for its own null-
+// `exprType` gate — a missing rejection is a leak already filed, while a false
+// reject breaks a legal program.
+//
+// DIAGNOSTIC-ONLY, exactly like `isBuiltinOwnedMaterializerCall`: it is reached
+// only through `MethodOwnership::constInitializerRejected`, changes no disposal,
+// retain, or dataflow state, and the code generated for every program that still
+// compiles is what it was.
+//
+// ⚠ THE `arr[r]` SLICE ALSO LEAKS UNDER THE REMEDIES, and that is a SEPARATE,
+// larger defect this predicate does not touch — filed as #2753. Measured on
+// 0b9693e (64-iteration amplified probe, LSan, values pinned through exit
+// codes): `const`, `using var` AND plain `var` bindings of `arr[0..2]` each
+// leaked 64 of 64 `bz_array_slice` allocations, while the equivalent
+// `arr.Slice(0..2)` under `using var` ran clean. So codegen reclaims the CALL
+// spelling and reclaims nothing for the INDEX spelling. This predicate is the
+// §21.1 half only: it removes the `const` binding (which has no free path at
+// all, by construction) and stops the lint from advertising it. It does NOT make
+// `using var arr[r]` reclaim — do not "finish the job" here by reclassifying,
+// which is the double-free direction #2709 declined for enumerated reasons.
+bool isBuiltinArrayRangeSliceIndex(const ast::IndexExpr& ix,
+                                   const sema::SemaContext& ctx);
 
 // §28.3 "Factory methods and sourceless returns" / Appendix C.3 (fix #1499): a
 // STATIC method returning a plain class/interface type with NO `owned`

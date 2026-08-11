@@ -39,6 +39,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 using bezel::test::runAotChecked;
 
@@ -321,4 +322,7 @@ BEZEL_TEST(using_var_drain_alias_2146,
         "  end Main; "
         "end P;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "`const` initializer") ||
+        hasErrorMessage(r, "§21.1"));
 }

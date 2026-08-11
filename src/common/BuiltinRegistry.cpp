@@ -109,6 +109,13 @@ constexpr std::array<std::string_view, 2> kLinkedListNames = {
     "LinkedList", "OwningLinkedList",
 };
 
+// #2809 / §32.5 / stdlib §10.1–§10.3: the FFI-boundary BUFFER classes. See the
+// header for why the set exists and who consults it. `IntPtr`/`UIntPtr` are
+// §32.7 pointer-sized integer VALUE types, not buffers, and stay out.
+constexpr std::array<std::string_view, 3> kFfiBufferBuiltins = {
+    "CString", "WString", "RawBytes",
+};
+
 // The heap-pointer reference builtins shared by BOTH codegen rep paths in
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
@@ -154,6 +161,60 @@ constexpr std::array<std::string_view, 65> kHeapPointerReferenceBuiltins = {
     "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
     "BinarySerializer", "BinaryDeserializer", "JsonSerializer",
     "JsonDeserializer",
+};
+
+// #2757: the RESERVED builtin type names that lowerTypeRef's Named case
+// recognizes but that are NOT heap-pointer references — the complement that,
+// together with kHeapPointerReferenceBuiltins above, makes up the complete
+// reserved-name set (`isReservedBuiltinTypeName`, see the header for why the
+// set exists and who consults it). Derived by grepping every name compared in
+// that Named case (src/codegen/LlvmBackend_Layout.cpp) and subtracting the
+// heap table; each entry names the branch it comes from.
+//
+// `DictionaryEntry` and `DrainedEntry` are compared there too and are
+// deliberately ABSENT: their arm is reached only by a synthetic TypeRef
+// (no astNode, importedName-keyed, genericArgs.size() >= 2), and neither name
+// resolves as a written type annotation at all (`bezelc` reports "unresolved
+// type name" — measured, not inferred), so no declaration-less single-part
+// Named ref can ever carry them. Adding them would only change the
+// generic-argument inference binding, with nothing to gain.
+constexpr std::array<std::string_view, 19> kNonHeapReservedBuiltins = {
+    // §32.5 / §32.7 / stdlib §10: FFI-boundary types (i64 / opaque ptr).
+    "IntPtr", "UIntPtr", "CString", "WString", "RawBytes",
+    // §2.5: the temporal/identity value builtins (i64 / i32 / {i64,i64}).
+    "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid",
+    // §9.8 (#499): Range<T> — the intrinsic value-type record.
+    "Range",
+    // §4.14 / §4.15 (#549/#779) / §3.3 (#883): the {ptr,i32,i32} span shapes.
+    "ArraySpan", "ReadOnlyArraySpan", "Span", "ReadOnlySpan",
+    "ReadOnlyStringSpan",
+    // §2.15 (#687): JsonOptions — a compiler-known value record.
+    "JsonOptions",
+    // §4.14: OwningBuffer<T> — a heap ptr, but only on the astNode rep path,
+    // so it is not a member of the shared heap table above.
+    "OwningBuffer",
+    // §31.4: ExceptionInfo — the {ptr,ptr,ptr} Exception.CauseChain element.
+    "ExceptionInfo",
+};
+
+// #2921 / #2923: the reserved built-in INTERFACE heads — the subset of
+// `isReservedBuiltinTypeName` whose runtime value may be a USER class (a user
+// type may declare `class MyList: IEnumerable<int>`, and an
+// `IEnumerable<int>`-typed slot then holds a real vtable-bearing object).
+// They are therefore the exact complement of `isVtableLessBuiltinClassName`:
+// every OTHER reserved name denotes a concrete built-in whose runtime value is
+// a header-less C struct. See the header for why the derivation runs in this
+// direction (a forgotten entry here costs a leak, never a wild jump).
+constexpr std::array<std::string_view, 21> kBuiltinInterfaceHeads = {
+    // §29 iteration / collection interfaces
+    "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
+    "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
+    "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
+    "ICollection", "IList", "IOwningCollection", "IOwningList",
+    // §24.3 / §6.5 event faces; §5 groupings
+    "IEvent", "IAsyncEvent", "IGrouping",
+    // §2.14–§2.15 serialization vocabulary
+    "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
 };
 
 // §31.4 / #1621: the built-in exception hierarchy (child name -> parent
@@ -250,9 +311,147 @@ bool isLinkedListName(std::string_view n) {
     return contains(kLinkedListNames, n);
 }  // per §4.6 / §4.7 — bz_llist_t*-backed linked-list names
 
+bool isFfiBufferBuiltinName(std::string_view n) {
+    return contains(kFfiBufferBuiltins, n);
+}  // per §32.5 / stdlib §10.1–§10.3 (#2809) — the raw-buffer FFI classes
+
 bool isHeapPointerReferenceBuiltin(std::string_view n) {
     return contains(kHeapPointerReferenceBuiltins, n);
 }  // per §4 / §6 / §29 / §30 / §2.14–§2.15 — heap-pointer reference builtins shared by the two codegen rep paths
+
+// #2757 / §7.1 / §14.1: the COMPLETE reserved builtin type-name set — the heap
+// table plus the non-heap Named-case names. See the header for the contract.
+bool isReservedBuiltinTypeName(std::string_view n) {
+    return contains(kHeapPointerReferenceBuiltins, n) ||
+           contains(kNonHeapReservedBuiltins, n);
+}
+
+// #2921 / #2923 / §8.1 / §8.5 / §28.2 / §28.9: the reserved built-in CLASSES —
+// every reserved name that is not an interface head. Their runtime values are
+// plain C structs with no Bezel vtable at word 0, so neither the slot-2 Dispose
+// dispatch nor `bz_obj_is_string`'s negative "not-a-vtable ⇒ a string" test may
+// be applied to them. See the header for the full contract.
+bool isVtableLessBuiltinClassName(std::string_view n) {
+    return isReservedBuiltinTypeName(n) &&
+           !contains(kBuiltinInterfaceHeads, n);
+}
+
+// fix #2969 (§8.5 / §8.1 / §18.5 / §28.9, v0.240): the reserved built-in
+// INTERFACE heads — exposed as its own predicate so the §2969 codegen routing
+// does not have to re-list the `kBuiltinInterfaceHeads` names. See the header
+// for the contract — split off from `isVtableLessBuiltinClassName` because a
+// user class may legitimately declare `class MyE: IEnumerable<int>`, so the
+// dynamic dispatch on these names must remain reachable even though they are
+// the one reserved-name population that §2923's fix declined to route away
+// from it.
+bool isBuiltinInterfaceHead(std::string_view n) {
+    return contains(kBuiltinInterfaceHeads, n);
+}
+
+// fix #2992 (§28.3 / §28.9 / §28.10, v0.240): the built-in type heads whose
+// `using var` carries a REAL §28.10 disposal obligation — the set the §28.10
+// vacuity lint (rhsIsDisposableClassType Path 2) uses to decide a `using var`
+// is NOT vacuous, and that the codegen auto-drop chain
+// (registerUsingDisposal) consults at its end-of-chain guard to make a silent
+// fallthrough loud. See the header for why this is the shared authority.
+//
+// This is the EXACT population that lived inline in rhsIsDisposableClassType's
+// Path 2 (Ownership.cpp ~5046) pre-#2992 — lifted verbatim, not reconciled
+// with codegen's broader chain-claimed set. The two DISAGREE on 13 names (the
+// borrowing collections Array/Stack/Queue/Set/SortedSet/Dictionary/
+// SortedDictionary/LinkedList, plus Stopwatch, Random, Atomic, AtomicInteger,
+// Buffer): every one is claimed by the chain but absent here, so a factory-
+// call `using var x := MakeArr()` over `Array<T>` fires a false-positive
+// vacuity warning (measured 2026-08-09 on d2a3d3e). Reconciling them requires
+// a design decision about whether borrowing collections belong in the LINT's
+// disposable set — #2695 deliberately excluded them so the lint fires on a
+// bound-then-pinned alias whose `const` remedy compiles (the lint's coherence
+// invariant). That decision is filed separately; the table here matches the
+// lint's current table so the lift is behaviour-preserving.
+// per §28.3 / §28.9 / §28.10, fix #2992
+constexpr std::array<std::string_view, 41> kDisposableBuiltinHeadNames = {
+    // stdlib §3.1 / spec §28.9 (#2190): StringBuilder owns its heap parts array.
+    "StringBuilder",
+    // §2.15 concrete serializers/deserializers (#2073 rework 3b).
+    "BinarySerializer", "BinaryDeserializer",
+    "JsonSerializer", "JsonDeserializer",
+    // §32.6 / stdlib §10: CString/WString/RawBytes carry a free() obligation.
+    "CString", "WString", "RawBytes",
+    // stdlib §7.2 (#645): FileStream — flush + close on dispose.
+    "FileStream",
+    // §29.1/§29.2: the iteration-protocol sentinel family (#2385/#2451).
+    "IEnumerable", "IEnumerator",
+    "IOwningEnumerable", "IOwningEnumerator",
+    "IAsyncEnumerable", "IAsyncEnumerator",
+    "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+    // §30.15 channels; §24.3 events; §2.11 subscription.
+    "Channel", "ChannelSender",
+    "EventSource", "AsyncEventSource",
+    "Subscription",
+    // §6.10 nursery; §6.1 cancellation.
+    "TaskScope", "CancellationTokenSource",
+    // §6.2/§6.3 sync primitives.
+    "Mutex", "Lock", "Semaphore", "SemaphoreToken",
+    // §30 tasks; §28.13 Shared/Weak.
+    "OwningTask", "Task", "Shared", "Weak",
+    // §28.11 owning collections (the borrowing variants are intentionally
+    // absent — see the header comment and #2695).
+    "OwningArray", "OwningDictionary", "OwningSet", "OwningStack",
+    "OwningQueue", "OwningLinkedList", "OwningBuffer",
+    // §6.6 task-completion sources.
+    "TaskCompletionSource", "OwningTaskCompletionSource",
+};
+
+bool isDisposableBuiltinHeadName(std::string_view head) {
+    return contains(kDisposableBuiltinHeadNames, head);
+}  // per §28.3 / §28.9 / §28.10, fix #2992
+
+// fix #3017 (§28.3 / §28.9 / §28.10, v0.240): the 13 built-in class heads
+// the codegen auto-drop chain (registerUsingDisposal) claims disposal for but
+// that are DELIBERATELY ABSENT from `kDisposableBuiltinHeadNames` above —
+// the §28.10 vacuity-lint's table. Each name carries a real disposal
+// obligation (§28.9 trivial-dispose reclaim for the borrowing collections;
+// specific runtime frees for the vtable-less builtins), so a factory-call
+// `using var x := C.Make()` over one is the CORRECT canonical pattern, not
+// vacuous. The alias form (`var src := new T(); using var p := src;`) is NOT
+// affected by this table: the lint's `rhsIsDisposableClassType` Path 2 still
+// returns false for these heads, and the IdentifierExpr RHS bypasses every
+// CallExpr disjunct in `constInitializerRejected`.
+//
+// Population measured 2026-08-09 on d2a3d3e (#2992's authority-differential
+// analysis): every name here has a dedicated disposal arm in
+// `registerUsingDisposal` and is absent from `kDisposableBuiltinHeadNames`.
+//
+// **Borrowing collections** (§4, §28.11 trivial-dispose):
+//   - Array, Stack, Queue, Set, SortedSet, Dictionary, SortedDictionary,
+//     LinkedList — each reclaimed by the chain's collection-family arms
+//     (array-backed, dictionary-backed, linked-list). #2695 deliberately
+//     excluded the borrowing collections from `kDisposableBuiltinHeadNames`
+//     so the lint fires on a bound-then-pinned alias — that decision is
+//     preserved (see `kDisposableBuiltinHeadNames`'s own header comment).
+//
+// **Vtable-less builtins** (§6.4 / §3 / §8.1 / §10.1):
+//   - Random — fix #2921; `bz_random_free` (stdlib §3 trivial-dispose).
+//   - Atomic, AtomicInteger — fix #2973; `bz_atomic_dispose`.
+//   - Stopwatch — §8.1 (#2025); `bz_stopwatch_free`.
+//   - Buffer — #545; element-buffer free.
+//
+// Adding a new name here is a soundness-adjacent change: the chain must
+// have an arm that reclaims it, or it stays a leak (the end-of-chain guard
+// in `registerUsingDisposal` catches future omissions of any vtable-less
+// builtin, #2992). The lint's two predicates (`isDisposableBuiltinHeadName`
+// and `isChainClaimedBuiltinHeadName`) are EXPLICITLY disjoint — the former
+// is the lint's narrow table, the latter is the factory-call-form closure
+// for the gap #2695 created.  // per §28.3 / §28.9 / §28.10, fix #3017
+constexpr std::array<std::string_view, 13> kChainClaimedBuiltinHeadNames = {
+    "Array", "Stack", "Queue", "Set", "SortedSet",
+    "Dictionary", "SortedDictionary", "LinkedList",
+    "Random", "Atomic", "AtomicInteger", "Stopwatch", "Buffer",
+};
+
+bool isChainClaimedBuiltinHeadName(std::string_view head) {
+    return contains(kChainClaimedBuiltinHeadNames, head);
+}  // per §28.3 / §28.9 / §28.10, fix #3017
 
 std::string_view builtinExceptionParentOf(std::string_view name) {
     for (const auto& edge : kBuiltinExceptionHierarchy)

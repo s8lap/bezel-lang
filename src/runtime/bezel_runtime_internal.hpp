@@ -124,6 +124,28 @@ static inline void bz_string_init_rc(void* s) {
 }
 
 // ---- shared runtime types (used across >1 domain TU) ----
+
+// fix #3026 (spec §28.2 / §28.9 / §8.1, stdlib §4.1 / §4.6-§4.9, v0.240):
+// the runtime-struct kind tag. The three heap collection structs
+// (bz_array_t / bz_llist_t / bz_dict_t) share no header, so a polymorphic
+// collection-interface receiver (IReadOnlyCollection<T> / ICollection<T> /
+// IOwningCollection<T>) whose concrete backing is unknown at the call site
+// cannot pick the matching bz_*_free statically — see
+// LlvmBackend_Calls2.cpp's `isCollectionInterfaceName` arm. The kind field
+// (int64, appended at the END of each struct so existing offsets data@0/
+// count@8/capacity@16 stay put) records which struct the pointer holds, so
+// the runtime helper bz_runtime_dispose can dispatch on it. Set in each
+// struct's alloc fn (calloc leaves it 0; we overwrite to the explicit tag);
+// 0 is reserved as "untagged" and an untagged pointer is treated as
+// unsound by bz_runtime_dispose (returns without doing anything — same
+// trade #2967/#2970 record for diagnostic-untagged positions). Codegen does
+// NOT read this field directly: it always emits `bz_runtime_dispose(p,
+// dispose_elem)` which reads the kind internally.
+constexpr int64_t BZ_RUNTIME_KIND_NONE  = 0;
+constexpr int64_t BZ_RUNTIME_KIND_ARRAY = -1;  // fix #3026 — sentinel: see comment
+constexpr int64_t BZ_RUNTIME_KIND_LLIST = -2;  //   on bz_runtime_dispose in
+constexpr int64_t BZ_RUNTIME_KIND_DICT  = -3;  //   bezel_runtime_collections.cpp
+
 struct bz_array_t {
     void*   data;       // heap buffer holding count*elem_size bytes
     int64_t count;
@@ -153,6 +175,11 @@ struct bz_array_t {
     // over-disposed by the dynamic path. APPENDED last: data@0/count@8/capacity@16
     // are read at fixed offsets by codegen and must not move.
     void (*elem_disposer)(void*);
+    // fix #3026: kind tag, see comment on the BZ_RUNTIME_KIND_* constants
+    // above. APPENDED last so every prior field's offset is preserved
+    // (existing codegen reads data@0 / count@8 / capacity@16 at fixed
+    // offsets; this field lives at the new end-of-struct offset).
+    int64_t kind;
 };
 typedef struct { char* data; int64_t len; uint8_t width; int64_t rc; } bz_string_hdr;
 struct bz_string_struct {

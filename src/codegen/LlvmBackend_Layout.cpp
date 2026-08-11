@@ -81,12 +81,19 @@ bool Emitter::isCharTargetExpr(const ast::Expr& e) {
     // §6.6/§5.2 (#1961): the compound/increment write-back applies the §5.2
     // code-point narrowing only for a `char` target. Resolve a T-typed target
     // through the active substitution first (a generic body specialized on
-    // T = char), mirroring isUnsignedTargetExpr. A `char?` target does not
-    // reach the built-in emitCompoundOp path (it is a nullable-value struct),
-    // so only the non-nullable primitive is treated as char here.
+    // T = char), mirroring isUnsignedTargetExpr.
+    //
+    // §7.11 (#2888): `char?` is included. The pre-#2888 `!rt->nullable` clause
+    // was correct only while a `char?` LHS never reached emitCompoundOp — the
+    // open-coded #1964 lifting in lowerStmt computed its own `isCharU` from the
+    // target TypeRef and passed it down. emitCompoundOp now owns the lifting,
+    // unwraps the `{i8, i32}` payload BEFORE its char arm and passes this flag
+    // through, so excluding `char?` here would drop §5.2's code-point check on
+    // the both-present branch — a silently invalid `char`, which is the
+    // type-invariant violation #1961 exists to prevent. This predicate's ONLY
+    // consumers are emitCompoundOp's `charTarget` argument.
     const sema::TypeRef* rt = resolveTypeParamRef(ctx_.exprType(e));
-    return rt && !rt->nullable &&
-           rt->kind == sema::TypeRef::Kind::Primitive &&
+    return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
            rt->primitive == sema::PrimitiveType::Char;
 }
 
@@ -144,9 +151,250 @@ llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
 }
 
 
+llvm::Value* Emitter::emitImplicitOne(llvm::Type* t) {
+    if (!t) return nullptr;
+    if (t->isFloatingPointTy()) return llvm::ConstantFP::get(t, 1.0);
+    // §6.4: `decimal` is a STRUCT-typed primitive — `ConstantInt::get` does not
+    // build a constant of that type at all.
+    if (t == decimalStructType()) return emitDecimalOne();
+    if (t->isIntegerTy()) return llvm::ConstantInt::get(t, 1);
+    // §7.11 (#2888): for a nullable value LHS the implicit `1` is the BARE
+    // payload `1`, not a wrapped `T?`. §7.11, verbatim: "A mixed expression in
+    // which one operand is `T?` and the other is the non-nullable `T` lifts as
+    // well — the non-nullable operand is treated as present (never `null`)" —
+    // which is exactly how emitCompoundOp's lifting arm reads a non-tagged
+    // right operand. (`n++` on a `null` `int?` therefore stays `null`, per
+    // §17.6's identification of `x++` with `x := x + 1`.)
+    if (llvm::Type* pay = nullableValuePayloadTy(t)) return emitImplicitOne(pay);
+    return nullptr;
+}
+
+
+// fix #2904 / §25.1 / §25.2 / §6.6: see the declaration comment in
+// LlvmBackend_impl.hpp. §25.2 "Resolution", verbatim: "For `a <op> b` on
+// non-primitive operands, the candidate set is the union of the `operator <op>`
+// overloads declared on the **static types of both operands, including
+// declarations inherited from their base classes** … Parameters match operands
+// **in order** — there is no automatic commutation". So the target's type is
+// searched first (the common LHS-declared case) and then the value's (#2156's
+// RHS-declared shape, e.g. `operator *(int, Scale)` living on `Scale`), each
+// through its own base chain.
+sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
+        const std::string& binOp, const sema::TypeRef* leftTy,
+        const sema::TypeRef* rightTy) {
+    if (binOp.empty()) return nullptr;
+    // fix #2932 (§25.2, v0.240): the CLASS base chain of a type symbol, walked
+    // by `classBaseOf`. `baseTypes` carries interfaces too; only a CLASS base
+    // participates here (§11.8's static interface members are the
+    // type-parameter path, resolved at instantiation, not this one).
+    auto classBaseOf = [](const sema::TypeSymbol* t) -> const sema::TypeSymbol* {
+        if (!t) return nullptr;
+        for (const sema::TypeSymbol* b : t->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) return b;
+        return nullptr;
+    };
+    // §25.2: match the operator's parameter types against the operand types IN
+    // ORDER (left→param0, right→param1). Sema has already validated that the
+    // compound is well-typed, so this only DISAMBIGUATES when one type declares
+    // several overloads of the same token. A Primitive parameter matches a
+    // Primitive operand by kind (numeric widening is downstream, as for the
+    // binary form).
+    //
+    // fix #2932 (§25.2, v0.240): a Named parameter matches a Named operand by
+    // declaration OR by the operand's CLASS BASE CHAIN — §25.2, verbatim: "A
+    // derived-typed operand satisfies a base-typed parameter by the ordinary
+    // argument rules." The exact-declaration test this had was half of why
+    // `n += d` with `operator +(int, Base)` and `d: Derived` aborted the
+    // compile: even reaching the declaration on `Base`, `Derived` did not match
+    // its `Base`-typed parameter. (Interface conformance is deliberately NOT
+    // admitted here: the measured defect is the class chain, and widening to
+    // interfaces would newly SELECT operators for shapes nothing has measured.)
+    auto paramMatches = [&](sema::Symbol* paramSym,
+                            const sema::TypeRef* operandTy) -> bool {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(paramSym);
+        if (!ps) return false;
+        sema::TypeRef* pt = ps->declType ? ctx_.resolvedType(*ps->declType)
+                                         : ps->resolvedDeclType;
+        if (!pt || !operandTy) return false;
+        if (pt->kind == sema::TypeRef::Kind::Named) {
+            if (operandTy->kind != sema::TypeRef::Kind::Named ||
+                !pt->declaration || !operandTy->declaration)
+                return false;
+            std::unordered_set<const sema::TypeSymbol*> seen;
+            for (const sema::TypeSymbol* t = operandTy->declaration;
+                 t && seen.insert(t).second; t = classBaseOf(t))
+                if (t == pt->declaration) return true;
+            return false;
+        }
+        if (pt->kind == sema::TypeRef::Kind::Primitive)
+            return operandTy->kind == sema::TypeRef::Kind::Primitive;
+        return false;
+    };
+    // fix #2932 (§25.2, v0.240): "including declarations inherited from their
+    // base classes (a derived-typed operand reaches its base's operators …)".
+    // The scan this function was extracted from (`#610`/`#2156`) looked at a
+    // type's OWN members only, so a DERIVED-typed operand contributed no
+    // candidates at all: measured on 20cc955, `n += d` with
+    // `operator +(int, Base)` declared on `d`'s base ABORTED the compile
+    // ("Call parameter type does not match function signature! … call
+    // { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %56, ptr %55)") while the
+    // plain binary `n + d` one line above was correct — `lowerBinary` walks the
+    // chain and this did not. §12.2's no-hiding rule "prevents a derived class
+    // from redeclaring an operator token its base declares, so one chain
+    // contributes no duplicate candidates" — so the FIRST match up the chain is
+    // THE match and there is no ambiguity to resolve. The visited set guards a
+    // malformed cyclic chain.
+    auto findOnType = [&](const sema::TypeSymbol* ts) -> sema::MethodSymbol* {
+        std::unordered_set<const sema::TypeSymbol*> seen;
+        for (const sema::TypeSymbol* t = ts; t && seen.insert(t).second;
+             t = classBaseOf(t)) {
+            for (sema::Symbol* m : t->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (ms && ms->isOperator && ms->operatorToken == binOp &&
+                    ms->params.size() == 2 &&
+                    paramMatches(ms->params[0], leftTy) &&
+                    paramMatches(ms->params[1], rightTy))
+                    return ms;
+            }
+        }
+        return nullptr;
+    };
+    if (leftTy && leftTy->kind == sema::TypeRef::Kind::Named &&
+        leftTy->declaration)
+        if (sema::MethodSymbol* m = findOnType(leftTy->declaration)) return m;
+    if (rightTy && rightTy->kind == sema::TypeRef::Kind::Named &&
+        rightTy->declaration)
+        return findOnType(rightTy->declaration);
+    return nullptr;
+}
+
+
+// fix #2904 / §25.1 / §25.2 / §6.6: `emitCompoundOp` with the §25 overload arm
+// in front of it — see the declaration comment in LlvmBackend_impl.hpp. The
+// lookup must run BEFORE emitCompoundOp, not after it: emitCompoundOp's integer
+// tail hands a record struct to `llvm.sadd.with.overflow`, which the IR verifier
+// rejects, so the compile ABORTS rather than falling through to anything.
+llvm::Value* Emitter::emitCompoundOpTyped(const std::string& op, llvm::Value* l,
+                                          llvm::Value* r,
+                                          const sema::TypeRef* leftTy,
+                                          const sema::TypeRef* rightTy, bool fp,
+                                          bool uns, bool charTarget,
+                                          bool rUns) {
+    if (sema::MethodSymbol* om =
+            findCompoundOperatorOverload(op, leftTy, rightTy)) {
+        // §25.1 / §25.2: dispatch to the user-defined binary operator with the
+        // arguments in SOURCE order {target, value} — the §25.2 in-order match.
+        // A failed call DECLINES (returns null) so the caller reports its own
+        // diagnostic; falling through to emitCompoundOp would abort the compile
+        // on malformed IR, which is the very defect this arm exists to remove.
+        std::vector<llvm::Value*> args{l, r};
+        return emitMethodCall(om, args, /*baseQualified=*/false);
+    }
+    return emitCompoundOp(op, l, r, fp, uns, charTarget, rUns);
+}
+
+
 llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
                             llvm::Value* r, bool fp, bool uns, bool charTarget,
                             bool rUns) {
+    // §7.11 (#2888): a nullable VALUE left operand. It must be tested FIRST —
+    // ahead of the char arm, which would otherwise hand the whole tagged struct
+    // to emitCharRangeCheck, and ahead of the integer tail, which handed it to
+    // `llvm.sadd.with.overflow` (an IR-verifier abort:
+    // "Call parameter type does not match function signature! … { i8, i32 }").
+    //
+    // §7.11, verbatim (the document's inline section links rendered as bare
+    // `§N`): "A lifted binary operator produces `null` if *either* operand is
+    // `null`", and "The runtime checks each operator already performs —
+    // `OverflowException` on integer overflow (§6.1), `DivideByZeroException`
+    // on integer or `decimal` division/`mod` by zero (§6.1) — apply only when
+    // both operands are present (non-null); when the lifted result is `null` by
+    // reason of a null operand, no underlying operation runs and no check
+    // fires." That is a CONTROL-FLOW construct: a
+    // hasValue-guarded branch whose present arm runs the ordinary checked
+    // operation on the unwrapped payloads and rewraps, joined by a PHI with a
+    // `null` incoming from the guard.
+    //
+    // THE ARM LIVES HERE, in the one function every compound/increment lowering
+    // funnels through, rather than at the callers (#2888). It was open-coded in
+    // exactly ONE of them — lowerStmt's `#1964` AssignmentStmt block — so every
+    // ACCESSOR-mediated and COLLECTION spelling was a live defect: `b.NP += 3`
+    // (lowerPropertyCompound), `b[0] += 4` (lowerIndexerCompoundCore),
+    // `iface.P += 5.0` (the #481 arm of lowerStmt), the imported-property path
+    // (lowerImportedPropertyCompoundCore) and `arr[0] += 3` / `dict[k] += 4`
+    // (lowerCollectionIndexerCompound) all aborted the compile on malformed IR.
+    // Putting it in the callers would have made SIX copies of one rule; #2883
+    // had just made the same call for the `decimal` arm below.
+    //
+    // §7.11's "A mixed expression in which one operand is `T?` and the other is
+    // the non-nullable `T` lifts as well — the non-nullable operand is treated
+    // as present (never `null`)": a right operand that is not itself tagged
+    // contributes a constant-true tag. For a `decimal?` LHS "is the RHS tagged"
+    // cannot be "is it a struct", because the bare `decimal` payload is ALSO a
+    // struct — it is "a struct that is not the bare `%bz.decimal`" (#2149),
+    // which covers both a `decimal?` RHS and a nullable-INT RHS.
+    if (llvm::Type* payTy = nullableValuePayloadTy(l->getType())) {
+        llvm::Type* nty = l->getType();
+        const bool decimalPayload = (payTy == decimalStructType());
+        llvm::Value* lTag = nullablePrimHasValue(l);   // i1
+        llvm::Value* lPay = nullablePrimValue(l);      // payTy
+        const bool rNullable =
+            decimalPayload ? (r->getType()->isStructTy() &&
+                              r->getType() != decimalStructType())
+                           : r->getType()->isStructTy();
+        llvm::Value* rTag = rNullable ? nullablePrimHasValue(r)
+                                      : builder_.getTrue();
+        llvm::Value* rPay = rNullable ? nullablePrimValue(r) : r;
+        llvm::Value* both = builder_.CreateAnd(lTag, rTag, "ncmp.both");
+        auto* entryBB = builder_.GetInsertBlock();
+        auto* opBB = llvm::BasicBlock::Create(llvm_, "ncmp.op", currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "ncmp.end", currentFn_);
+        builder_.CreateCondBr(both, opBB, endBB);
+        // --- opBB: BOTH present → the ordinary checked operation on payloads.
+        builder_.SetInsertPoint(opBB);
+        llvm::Value* pay = nullptr;
+        if (decimalPayload) {
+            // §6.4/§5.1 (#2141): an integer RHS (`d += 5`, or the unwrapped
+            // payload of an `int?` RHS — #2149) §5.1-converts to `decimal`; a
+            // decimal RHS is used as-is. §6.2 admits no decimal/binary-float
+            // mixing, so sema has already rejected anything else.
+            rPay = coerceNumericToType(rPay, decimalStructType(), rUns);
+            if (rPay->getType() == decimalStructType())
+                pay = emitDecimalArith(op, lPay, rPay);
+        } else {
+            // §5.1 widening of the RHS payload to the LHS payload width
+            // (int→i64, int→double, float→double). Integer same-width and
+            // narrowing cases are handled by the recursion itself, exactly as
+            // on the non-nullable path.
+            rPay = coerceNumericToType(rPay, payTy, rUns);
+            pay = emitCompoundOp(op, lPay, rPay, payTy->isFloatingPointTy(),
+                                 uns, charTarget, rUns);
+        }
+        // The payload op may have spun off guard-throw blocks (§6.1 overflow,
+        // §5.2 char range, §6.1 divide-by-zero), so the PHI's predecessor is
+        // the CURRENT block, not opBB.
+        llvm::Value* wrapped = nullptr;
+        if (pay) {
+            wrapped = builder_.CreateInsertValue(
+                llvm::UndefValue::get(nty),
+                llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+            wrapped = builder_.CreateInsertValue(wrapped, pay, {1u});
+        }
+        auto* opEndBB = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        // A payload the underlying op cannot lower DECLINES (the caller reports
+        // its own "could not lower the RHS/operator" diagnostic). Returning a
+        // PHI whose present arm is `null` would be a SILENT wrong value — the
+        // program would store `null` where §7.11 defines a value.
+        if (!pay) return nullptr;
+        llvm::PHINode* res = builder_.CreatePHI(nty, 2, "ncmp.res");
+        res->addIncoming(wrapped, opEndBB);
+        // Null-by-null-operand: the lifted result is `null`, and no underlying
+        // operation ran on this edge.
+        res->addIncoming(llvm::ConstantAggregateZero::get(nty), entryBB);
+        return res;
+    }
     // §6.6/§5.2 (#1961): a `char` LHS compound assignment/increment desugars to
     // `c := char(c OP e)` — the arithmetic runs at int width with the §6.1/§6.2
     // checked posture (as for any integer), and the result is narrowed back to
@@ -193,6 +441,37 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
         llvm::Value* res = emitCompoundOp(op, lw, r, /*fp=*/false, /*uns=*/false);
         if (!res) return nullptr;
         return emitCharRangeCheck(res);
+    }
+    // §6.4/§5.1 (#2883): `decimal` is a STRUCT-typed primitive (`%bz.decimal`),
+    // not a scalar — every arm below assumes a scalar, and the integer tail
+    // hands the struct straight to `llvm.sadd.with.overflow`, which the IR
+    // verifier rejects ("Intrinsic has incorrect return type!") so the compile
+    // ABORTS on a legal program. Route it to the §6.4 decimal helper, which
+    // carries §6.4's "raises `OverflowException` on overflow and
+    // `DivideByZeroException` on division by zero" — exactly what the LOCAL
+    // `d += x` / `d++` statement paths already do (LlvmBackend_Stmts.cpp).
+    //
+    // The arm lives HERE rather than at each caller because the hole was one
+    // missing arm reached from FOUR call sites, each a separate live ICE:
+    // `d.P += 1m` on a block-form property (lowerPropertyCompound),
+    // `d[0] += 1m` / `d[0]++` on an indexer (lowerIndexerCompoundCore, whose
+    // own `lowerRhs` already synthesized `emitDecimalOne()` one line earlier),
+    // `i.P += 1m` through a virtual/interface property (the #481 arm of
+    // lowerStmt), and the imported-property path #2862 had to open-code a
+    // caller-side check to dodge — that check is deleted with this fix.
+    //
+    // §5.1/§6.2: an integer RHS widens to `decimal` (`d.P += 5`). The local
+    // path pre-coerces the RHS to the slot type before it reaches this function
+    // (`coerceNumericToType(rhs, elemTy, …)`), but the property/indexer callers
+    // pass the RHS at its own natural width, so the widening is applied here —
+    // without it `emitDecimalArith` would store an i32 into a `%bz.decimal`
+    // slot. If the RHS is still not a decimal afterwards, DECLINE (a diagnostic
+    // beats malformed IR); §6.2 admits no decimal/binary-float mixing, so sema
+    // has already rejected any program that could reach that.
+    if (l->getType() == decimalStructType()) {
+        r = coerceNumericToType(r, decimalStructType(), rUns);
+        if (r->getType() != decimalStructType()) return nullptr;
+        return emitDecimalArith(op, l, r);
     }
     // §4.6 (#857): string compound concatenation when BOTH operands are string
     // pointers (e.g. an indexer/property `s[i] += t`). A string is a pointer, not
@@ -516,6 +795,23 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             sema::TypeRef nv;
             if (nullableTypeParamConcrete(rt, nv)) {
                 if (isNullableValueTy(&nv)) return nullableValueStructTy(&nv);
+                // fix #2743 / §14.1: the substitution may map this parameter onto
+                // ANOTHER, still-unbound type parameter (`T → U`). That happens
+                // when a specialization of an inner generic is built lazily from
+                // inside an OUTER generic's unspecialized TEMPLATE body — e.g.
+                // `Outer<U>.Head(): U?` forwarding `return g.Head();` to
+                // `Inner<T>.Head(): T?` builds `Inner$Head$spec` under {T → U}.
+                // `nv` is then not a value type, but it is NOT a reference type
+                // either: T's concrete form is still unknown, so the TEMPLATE rule
+                // applies exactly as in the no-binding branch below. Falling
+                // through instead resolved `T` to U's PLACEHOLDER LLVM type (i32)
+                // and DROPPED the nullability — the pseudo-specialization was
+                // typed `i32` while its body's `return null` emitted `ret ptr null`
+                // (IR-verify failure, `bezelc -c` exit 1). The same placeholder
+                // struct the template `bz$M.Inner$Head` already uses keeps the
+                // signature and every return in that body consistent.
+                if (isBareTypeParamRef(&nv))
+                    return nullablePrimStructTy(sema::PrimitiveType::Int);
                 // resolved to a reference type → plain ptr `?` lowering.
             } else {
                 // a type param with no active binding — fall to template rule.
@@ -958,10 +1254,18 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // type recurses.
             if (!rt->arrayElement || !rt->arraySize) return i32();
             llvm::Type* elem = lowerTypeRef(rt->arrayElement);
+            // fix #2936: decode the lexeme with the ONE literal parser. This
+            // was `std::stoull(text)` — base 10 — so `[0x5]int` became a
+            // 0-element array and `[5_0]int` a 5-element one, SILENTLY. Note
+            // this arm is tried BEFORE the folded `arraySizeValue` below, so a
+            // bare literal never reached sema's (correct) fold: `[0x3 + 2]int`
+            // was right while `[0x5]int` was wrong, which is what made the
+            // split visible.
             if (auto* lit =
                     dynamic_cast<const ast::IntLiteralExpr*>(rt->arraySize))
                 return llvm::ArrayType::get(
-                    elem, std::stoull(std::string(lit->text)));
+                    elem,
+                    static_cast<std::uint64_t>(parseIntLiteral(lit->text)));
             if (rt->arraySizeValue >= 0)  // #734: folded member-const size
                 return llvm::ArrayType::get(
                     elem, static_cast<uint64_t>(rt->arraySizeValue));
@@ -1039,10 +1343,232 @@ llvm::Type* Emitter::storageType(const sema::Symbol* m) {
 }
 
 
+// fix #2889 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
+// §22.8 "Field initializers", v0.240). See the declaration comment in
+// LlvmBackend_impl.hpp.
+//
+// The layout/substitution machinery keys type-parameter bindings by PARAMETER
+// NAME in one flat map. When `t` is a GENERIC class, every site that installs a
+// substitution for it binds `t`'s OWN parameter names only (`lowerNew` from the
+// `new` site's type arguments, method emission from the receiver's). Storage
+// INHERITED from a generic ancestor is declared in terms of the ANCESTOR's
+// parameter names, so unless `t` happens to spell the base's argument with the
+// same name (`class D<T> : B<T>` — the one shape that worked), no binding named
+// it and `storageType` fell to its i32 placeholder for every inherited
+// parameter-typed field.
+//
+// This composes the missing half: for each generic ancestor on `t`'s class base
+// chain, ask `computeAncestorGenericSubst` (the shared #2840 helper #2860/#2873/
+// #2882 already use, which resolves each level's base arguments through the
+// level below and refuses rather than guessing) for that ancestor's own
+// parameter bindings, and report the ones the active substitution does not
+// already carry.
+//
+// MOST-DERIVED WINS. The chain is walked outward-in and a name already bound —
+// by the active substitution, or by a nearer ancestor — is never overwritten.
+// That keeps `t`'s own parameters meaning `t`'s own type arguments for `t`'s own
+// fields. It also means a base that REUSES a derived parameter's spelling for a
+// different argument (`class D<T> : B<string>` where `B`'s parameter is also
+// named `T`) keeps today's behaviour: one flat name-keyed map cannot represent
+// two bindings of `T` at once. That is a pre-existing limitation of the
+// substitution representation, not of this composition — filed separately rather
+// than papered over here.
+bool Emitter::ancestorGenericSubstAdditions(
+        const sema::TypeSymbol* t,
+        std::unordered_map<std::string_view, llvm::Type*>& addSubst,
+        std::unordered_map<std::string_view, const sema::TypeRef*>& addSema) {
+    if (!t || t->genericParams.empty() || genericSubst_.empty()) return false;
+    sema::TypeRef synth;
+    synth.kind = sema::TypeRef::Kind::Named;
+    synth.declaration = const_cast<sema::TypeSymbol*>(t);
+    for (const sema::TypeSymbol* anc = baseClassOf(t); anc;
+         anc = baseClassOf(anc)) {
+        if (anc->genericParams.empty()) continue;
+        std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+        if (!computeAncestorGenericSubst(&synth, anc, ancSubst, ancSema))
+            continue;
+        for (const auto& [nm, ty] : ancSubst) {
+            if (genericSubst_.count(nm) || addSubst.count(nm)) continue;
+            addSubst[nm] = ty;
+            auto sit = ancSema.find(nm);
+            if (sit != ancSema.end()) addSema[nm] = sit->second;
+        }
+    }
+    return !addSubst.empty();
+}
+
+
+// fix #2897 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
+// §22.8 "Field initializers", v0.240). See the declaration comment in
+// LlvmBackend_impl.hpp.
+std::vector<const sema::TypeSymbol*> Emitter::instanceStorageOwners(
+        const sema::TypeSymbol* t, std::size_t n) {
+    // Default every slot to `t` itself, so a slot no level claims (which the
+    // prefix accounting below cannot produce, but a future change might) is
+    // resolved exactly as today rather than under some ancestor's map.
+    std::vector<const sema::TypeSymbol*> owners(n, t);
+    std::vector<const sema::TypeSymbol*> chain;
+    for (const sema::TypeSymbol* c = t; c; c = baseClassOf(c))
+        chain.push_back(c);
+    // Root-first: `collectInstanceStorage(L)` is L's ancestors' storage followed
+    // by L's own (§ prefix layout), so the slots it adds beyond the level above
+    // are exactly the ones L declares.
+    std::size_t prev = 0;
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        std::vector<const sema::Symbol*> s;
+        collectInstanceStorage(*it, s);
+        for (std::size_t i = prev; i < s.size() && i < n; ++i) owners[i] = *it;
+        prev = s.size();
+    }
+    return owners;
+}
+
+
+// fix #2897 (§14.1 / §12 / §22.8, v0.240). See the declaration comment in
+// LlvmBackend_impl.hpp.
+std::vector<llvm::Type*> Emitter::instanceStorageTypes(
+        const sema::TypeSymbol* t) {
+    std::vector<const sema::Symbol*> storage;
+    collectInstanceStorage(t, storage);
+    std::vector<llvm::Type*> tys(storage.size(), nullptr);
+    if (storage.empty()) return tys;
+    if (genericSubst_.empty()) {
+        for (std::size_t i = 0; i < storage.size(); ++i)
+            tys[i] = storageType(storage[i]);
+        return tys;
+    }
+    const std::vector<const sema::TypeSymbol*> owners =
+        instanceStorageOwners(t, storage.size());
+
+    // Phase 1: each generic ANCESTOR's OWN parameter bindings, resolved while the
+    // ACTIVE substitution is still installed — `computeAncestorGenericSubst`
+    // seeds a bare synthesized receiver out of it (#2889) and re-derives every
+    // level POSITIONALLY from the base clause, which is why a shared parameter
+    // spelling cannot confuse it. An ancestor it cannot resolve is left out and
+    // keeps the flat map, exactly as today.
+    std::vector<const sema::TypeSymbol*> ancs;
+    std::vector<std::unordered_map<std::string_view, llvm::Type*>> ancSubsts;
+    std::vector<std::unordered_map<std::string_view, const sema::TypeRef*>>
+        ancSemas;
+    sema::TypeRef synth;
+    synth.kind = sema::TypeRef::Kind::Named;
+    synth.declaration = const_cast<sema::TypeSymbol*>(t);
+    for (const sema::TypeSymbol* o : owners) {
+        if (!o || o == t || o->genericParams.empty()) continue;
+        bool seen = false;
+        for (const sema::TypeSymbol* a : ancs) if (a == o) { seen = true; break; }
+        if (seen) continue;
+        std::unordered_map<std::string_view, llvm::Type*> s;
+        std::unordered_map<std::string_view, const sema::TypeRef*> sm;
+        if (!computeAncestorGenericSubst(&synth, o, s, sm)) continue;
+        ancs.push_back(o);
+        ancSubsts.push_back(std::move(s));
+        ancSemas.push_back(std::move(sm));
+    }
+    if (ancs.empty()) {
+        for (std::size_t i = 0; i < storage.size(); ++i)
+            tys[i] = storageType(storage[i]);
+        return tys;
+    }
+
+    // Phase 2: each member under its declaring class's substitution. `installed`
+    // tracks which map is currently in place (ancs.size() == the caller's own),
+    // so the maps are copied only when the declaring class actually changes —
+    // storage is grouped by level, so that is once per level.
+    auto savedSubst = genericSubst_;
+    auto savedSema = genericSubstSemaTy_;
+    std::size_t installed = ancs.size();
+    for (std::size_t i = 0; i < storage.size(); ++i) {
+        std::size_t ai = ancs.size();
+        for (std::size_t k = 0; k < ancs.size(); ++k)
+            if (ancs[k] == owners[i]) { ai = k; break; }
+        if (ai != installed) {
+            if (ai == ancs.size()) {
+                genericSubst_ = savedSubst;
+                genericSubstSemaTy_ = savedSema;
+            } else {
+                genericSubst_ = ancSubsts[ai];
+                genericSubstSemaTy_ = ancSemas[ai];
+            }
+            installed = ai;
+        }
+        tys[i] = storageType(storage[i]);
+    }
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSema);
+    return tys;
+}
+
+
+// fix #2896 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
+// §22.8 "Field initializers", v0.240). See the declaration comment in
+// LlvmBackend_impl.hpp.
+//
+// The active substitution is composed with whatever `t` inherits from a generic
+// ancestor before the comparison (`mergeAncestorGenericSubst`, #2889) for the
+// same reason `emitBaseDisposeChain` does it: without that, a generic derived
+// class over a generic base measures the SAME erased placeholder on both sides
+// for the inherited slots and the test wrongly concludes "identical".
+bool Emitter::instanceLayoutDiffersFromErasedTemplate(const sema::TypeSymbol* t) {
+    if (!t || t->genericParams.empty() || genericSubst_.empty()) return false;
+    auto savedSubst = genericSubst_;
+    auto savedSema = genericSubstSemaTy_;
+    mergeAncestorGenericSubst(t);
+    std::vector<llvm::Type*> specLayout = instanceStorageTypes(t);
+    genericSubst_.clear();
+    genericSubstSemaTy_.clear();
+    std::vector<llvm::Type*> tmplLayout = instanceStorageTypes(t);
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSema);
+    return tmplLayout != specLayout;
+}
+
+
 llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
     // CG29: a record has no vtable header; route to recordStruct so every
     // classStruct caller (field access, etc.) gets the right layout.
     if (t->kind == ast::TypeDeclKind::Record) return recordStruct(t);
+
+    // fix #2889 (§14.1 "Generic declarations" / §12 "Inheritance and
+    // Dispatch" / §22.8 "Field initializers", v0.240) — the ALLOCATION face of
+    // the placeholder-layout family (#2840 access, #2860 imported field init,
+    // #2873 disposer + local field init, #2882 implicit base ctor). See
+    // `ancestorGenericSubstAdditions` for the full rationale.
+    //
+    // The specialized path below substitutes field types by PARAMETER NAME, and
+    // the active substitution binds only `t`'s OWN parameter names. For a
+    // GENERIC derived class over a generic base (`class D<U> : B<U>`, or
+    // `class D<U> : B<string>`) the inherited storage is declared in terms of
+    // `B`'s parameter `T`, which no active binding names — so `storageType` fell
+    // to its i32 placeholder and `class.D$specN` was built at the ERASED size.
+    // `lowerNew` sizes its calloc from exactly this struct, so `new D<string>()`
+    // allocated the T→i32 object while every reader (correct since #2840) GEP'd
+    // the T→ptr offsets: a heap-buffer-overflow on every inherited field past
+    // the first widened one, on ordinary single-module code (#2889).
+    //
+    // The non-generic-derived walk further down already composes exactly these
+    // bindings, but it is gated on `t->genericParams.empty()` and so never ran
+    // for a generic derived class.
+    //
+    // Bounded re-entry: the merged map is installed and `classStruct(t)` is
+    // re-entered ONCE. On the re-entry the same helper proves the same bindings,
+    // all of which are now present, so nothing new is added and control falls
+    // through to the specialized path.
+    if (!genericSubst_.empty() && !t->genericParams.empty()) {
+        std::unordered_map<std::string_view, llvm::Type*> addSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> addSema;
+        if (ancestorGenericSubstAdditions(t, addSubst, addSema)) {
+            auto savedSubst = genericSubst_;
+            auto savedSemaTy = genericSubstSemaTy_;
+            for (const auto& [nm, ty] : addSubst) genericSubst_[nm] = ty;
+            for (const auto& [nm, tr] : addSema) genericSubstSemaTy_[nm] = tr;
+            llvm::StructType* result = classStruct(t);
+            genericSubst_ = std::move(savedSubst);
+            genericSubstSemaTy_ = std::move(savedSemaTy);
+            return result;
+        }
+    }
 
     // CG-generic: if we have an active substitution, compute the concrete
     // field types first and look them up in the specialization cache.
@@ -1063,8 +1589,16 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
             specFieldTys.push_back(ptrTy());        // [4] ParamName
         }
         specFieldTys.push_back(disposedFlagTy());   // [1 or 5] disposed run-once flag
-        for (const sema::Symbol* m : storage)
-            specFieldTys.push_back(storageType(m));
+        // fix #2897 (§14.1 / §12 / §22.8, v0.240): resolve each slot under the
+        // substitution of the class that DECLARES it. The flat name-keyed map
+        // cannot hold two bindings of one spelling at once, so a base that reuses
+        // a derived parameter's name for a DIFFERENT argument
+        // (`class Coll<T> : Base<string>`, `Base`'s parameter also `T`) laid the
+        // inherited slot out at the DERIVED argument's width while `fieldAddr`'s
+        // inherited branch (correct since #2840) GEP'd the base's — an 8-byte
+        // store into a 4-byte slot, corrupting the field after it.
+        for (llvm::Type* fty : instanceStorageTypes(t))
+            specFieldTys.push_back(fty);
         // Cache lookup: specializedStructs_[t][specFieldTys] → existing
         auto& specMap = specializedStructs_[t];
         auto sit = specMap.find(specFieldTys);
@@ -1120,10 +1654,39 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
             std::unordered_map<std::string_view, const sema::TypeRef*> nextArgs;
             if (!base->genericParams.empty()) {
                 auto* btd = dynamic_cast<const ast::TypeDecl*>(base->decl);
-                if (!baseRef || !btd ||
-                    btd->genericParams.size() != baseRef->genericArgs.size())
+                // fix #2840 (§14.1 / §2.5, v0.240): an IMPORTED generic base has
+                // NO ast::TypeDecl — ModuleLoader::reconstructTypeSymbol builds a
+                // sema::TypeSymbol from the metadata and never sets `decl` (there
+                // is no AST node in the importer) — but it DOES populate
+                // `genericParams` positionally from the metadata
+                // (ModuleLoader.cpp:339). Reading the parameter NAMES off
+                // `base->decl` therefore made this walk `break` for every
+                // cross-module base, dropping `D : Base<string>` to the
+                // UNSPECIALIZED (placeholder) layout in which the inherited
+                // `v: T` is the i32 fallback rather than ptr — malformed IR on any
+                // read of the inherited field, and a silently truncating store on
+                // any write. Take the names from the AST decl when present, else
+                // from the imported TypeSymbol — the same `td ? td->genericParams
+                // : ts->genericParams` fallback already written for the call path
+                // (LlvmBackend_Calls2.cpp, §14.1/#783) and the static-access path
+                // (§22.12/#684), and the reason `computeAncestorGenericSubst`
+                // (which binds T→ptr for exactly this receiver) did not have the
+                // gap. Both sequences are positional against
+                // `baseRef->genericArgs`, so the arity check below is unchanged.
+                std::vector<std::string_view> gpNames;
+                if (btd) {
+                    gpNames.reserve(btd->genericParams.size());
+                    for (const auto& gp : btd->genericParams)
+                        gpNames.push_back(gp.name);
+                } else {
+                    gpNames.reserve(base->genericParams.size());
+                    for (const sema::Symbol* gp : base->genericParams)
+                        if (gp) gpNames.push_back(gp->name);
+                }
+                if (!baseRef || gpNames.empty() ||
+                    gpNames.size() != baseRef->genericArgs.size())
                     break;  // unresolvable — fall through to unspecialized layout
-                for (std::size_t gi = 0; gi < btd->genericParams.size(); ++gi) {
+                for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
                     const sema::TypeRef* arg = baseRef->genericArgs[gi];
                     // Resolve a bare generic-param ref (`T`, no declaration)
                     // through the lower level's bindings; concrete args pass
@@ -1134,7 +1697,7 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
                         auto it = curArgs.find(arg->headName());
                         if (it != curArgs.end()) arg = it->second;
                     }
-                    std::string_view pname = btd->genericParams[gi].name;
+                    std::string_view pname = gpNames[gi];
                     nextArgs[pname] = arg;
                     // Record the layout binding (keep the lowest/most-derived
                     // binding on a param-name collision — it is the concrete one).
@@ -1622,11 +2185,83 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
 }
 
 
+// fix #2903 / §5.1 / §7.2 / §23.1 / §9.2: see the declaration comment in
+// LlvmBackend_impl.hpp for why this exists and what it is the one definition of.
+// fix #2903 / §7.2 (factored out by #2925): the width a value must arrive at to
+// reach `slotTy`. A nullable VALUE slot is the tagged `{i8 hasValue; T}` struct
+// and the value is the bare payload `T`, so the width to match is T's. The
+// shape test is the EXACT one #2888 established — a nullable value type is a
+// LITERAL two-element struct whose element 0 is the i8 tag, while every class,
+// record and choice is a NAMED struct — but with the payload left unrestricted,
+// unlike `nullableValuePayloadTy`, which narrows to the scalars `emitCompoundOp`
+// can operate on: a nullable RECORD / Guid payload is an aggregate this must
+// still recognize (so it does not target the whole tagged struct) and then pass
+// through untouched.
+llvm::Type* Emitter::slotPayloadTy(llvm::Type* slotTy) {
+    if (auto* st = llvm::dyn_cast<llvm::StructType>(slotTy))
+        if (st->isLiteral() && st->getNumElements() == 2 &&
+            st->getElementType(0) == nullablePrimHasValTy())
+            return st->getElementType(1);
+    return slotTy;
+}
+
+llvm::Value* Emitter::coerceInitializerToSlot(llvm::Value* v,
+                                              llvm::Type* slotTy,
+                                              bool srcUnsigned) {
+    if (!v || !slotTy) return v;
+    llvm::Type* want = slotPayloadTy(slotTy);
+    if (v->getType() == want) return v;
+    // §5.1's WIDENING direction (int→long, int→double, float→double, int→decimal).
+    llvm::Value* w = coerceNumericToType(v, want, srcUnsigned);
+    if (w->getType() == want) return w;
+    // §5.1's "Constant narrowing" direction: an integer strictly WIDER than the
+    // integer slot. `i1` (`bool`) is excluded on both sides — §5.1's "Between
+    // integers and `bool`" row makes that conversion never implicit, so a
+    // mismatch there is a shape this function must not touch.
+    if (v->getType()->isIntegerTy() && !v->getType()->isIntegerTy(1) &&
+        want->isIntegerTy() && !want->isIntegerTy(1) &&
+        v->getType()->getIntegerBitWidth() > want->getIntegerBitWidth())
+        return builder_.CreateTrunc(v, want, "init.narrow");
+    return v;  // no §5.1 conversion applies — leave the value as is.
+}
+
+// fix #2925 (§5.1 "Constant narrowing" at a CALL ARGUMENT / `return`, v0.240) —
+// see the declaration comment in LlvmBackend_impl.hpp for why this is NOT
+// `coerceInitializerToSlot` and what the placeholder truncation was.
+llvm::Value* Emitter::coerceExprValueToSlot(llvm::Value* v, llvm::Type* slotTy,
+                                            const ast::Expr* e,
+                                            bool srcUnsigned) {
+    if (!v || !slotTy) return v;
+    llvm::Type* want = slotPayloadTy(slotTy);
+    if (v->getType() == want) return v;
+    // §5.1's WIDENING direction is unconditional and unchanged — the target
+    // type is only ever a widening's *destination*, never its authority over
+    // what the value IS (issues #408 / #421 / #410 / #746 / #1778).
+    llvm::Value* w = coerceNumericToType(v, want, srcUnsigned);
+    if (w->getType() == want) return w;
+    // §5.1's "Constant narrowing" direction. THE GATE: only when sema already
+    // types the producing expression AT this width, so codegen is repairing a
+    // width its own lowering failed to honour (a re-typed `const K := 3` still
+    // loads its declared i32 slot; `1 + 2` still folds at i32) rather than
+    // performing a conversion of its own. Without the gate, an IMPORTED GENERIC
+    // METHOD's i32 PLACEHOLDER parameter (#1943 / #428) looked like a narrower
+    // slot and `Count<long>(y)` had its i64 silently truncated to fit it —
+    // MEASURED compiling, linking and running (returning 7) instead of raising
+    // #1943's fail-closed diagnostic.
+    if (!e) return w;
+    const sema::TypeRef* st = ctx_.exprType(*e);
+    if (!st || st->kind != sema::TypeRef::Kind::Primitive) return w;
+    if (lowerPrimitive(st->primitive) != want) return w;
+    return coerceInitializerToSlot(v, want, srcUnsigned);
+}
+
+
 // fix #568 / §14.1 / §7.1: see the declaration comment in LlvmBackend_impl.hpp.
 llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
                                                   const sema::TypeRef* declRet,
                                                   bool srcUnsigned,
-                                                  bool sourceIsNullableRef) {
+                                                  bool sourceIsNullableRef,
+                                                  const ast::Expr* srcExpr) {
     if (!v || !declRet) return v;
     // Resolve the EFFECTIVE nullable value type. A bare nullable type-parameter
     // (`T?`) resolves through the active monomorphization to its concrete value
@@ -1673,9 +2308,21 @@ llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
     // needs SIToFP. Without this the bare narrower value fell through unwrapped
     // and emitReturn then `ret`'d it against the `{i8, T}` struct return type
     // (IR-verify failure). Mirrors the local-decl fix (#842).
+    // fix #2925 (§5.1 "Constant narrowing" composed with "Nullable
+    // conversions", v0.240): `coerceExprValueToSlot` rather than
+    // `coerceNumericToType`, which is the WIDENING direction only. §5.1: "The
+    // two rules compose through at most one `?` on each side ([§7.10]: `?` is
+    // idempotent): `S` converts to `T?` via `S → T → T?`" — so `return K;`
+    // from a `byte?`-returning method (a `const` identifier that loads its i32
+    // slot) must reach the tagged payload as an i8 before the wrap. `slotTy`
+    // is already the unwrapped payload, so no further tagged retarget occurs.
+    // The narrowing carries the same sema-types-it-at-the-slot GATE as every
+    // other value-reaching-a-slot site (see coerceExprValueToSlot): a caller
+    // that passes no `srcExpr` keeps the widening-only, pre-#2925 behaviour.
     if ((v->getType()->isIntegerTy() || v->getType()->isFloatingPointTy()) &&
         v->getType() != slotTy) {
-        llvm::Value* inner = coerceNumericToType(v, slotTy, srcUnsigned);
+        llvm::Value* inner =
+            coerceExprValueToSlot(v, slotTy, srcExpr, srcUnsigned);
         if (inner->getType() == slotTy) return wrapNullableValue(nv, inner);
     }
     // A bare value matching the value slot — or a layout-equal but differently-
@@ -1692,10 +2339,95 @@ llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
 
 llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (!te.operand || !te.testType) return nullptr;
+    // fix #2865 (§8.6 "Boxing" / §28.9 / §28.3, v0.240): an UNBOUND +1 box
+    // temporary. §8.6 mints a fresh heap wrapper whenever a value type reaches
+    // an `Object`/interface location, and §28.9 makes it runtime-managed —
+    // "exempt from MANUAL disposal", which removes the obligation from the USER,
+    // not from codegen. When the box is BOUND to a local, `collectBoxRelease
+    // Eligible` already arms a scope-end `bz_box_release`; when it is a bare
+    // temporary — `if m.M() is int then`, `if e[i] is int then` — nothing ever
+    // held it and nothing ever freed it: one 24-byte box per evaluation, growing
+    // without bound in a loop (#2865 shapes 1 and 2, 480 B / 20 iterations).
+    //
+    // `is` / `is not` / `as <value type>` are precisely the positions
+    // BoxEscapeWalker already classifies as NON-CONSUMING reads: `is` walks the
+    // descriptor chain and keeps nothing, and a value-target `as` COPIES the
+    // payload bytes out of the wrapper. So once the operand is proven to be a
+    // fresh, solely-owned box, releasing it here is exactly-once.
+    //
+    // TWO independent proofs, either of which suffices:
+    //   * the mint-identity check below (`lastBoxMint_`), which covers every
+    //     box minted IN THIS FRAME while lowering the operand — the inline
+    //     indexer/property read paths (shape 2);
+    //   * `isUserMethodBoxReturnCall`, the SAME predicate `isPlusOneBoxProducer`
+    //     case (b) uses to arm the bound-local release, which covers a box
+    //     minted by a locally-compiled `boxReturnMethods_` callee at its return
+    //     edge and transferred to us (shape 1).
+    // Anything else keeps leaking — the safe direction (a bounded leak over a
+    // double free), and what the filed residuals track.
+    llvm::Value* savedBoxMint = lastBoxMint_;
+    lastBoxMint_ = nullptr;
     llvm::Value* obj = lowerExpr(*te.operand);
+    const bool freshBoxTemp =
+        obj && obj->getType()->isPointerTy() &&
+        ((lastBoxMint_ && obj == lastBoxMint_) ||
+         isUserMethodBoxReturnCall(te.operand.get()));
+    lastBoxMint_ = savedBoxMint;
+    // Release the operand's wrapper. Call ONLY where `obj` is provably dead:
+    // never on an `as` whose target is a REFERENCE type, because that arm
+    // RETURNS `obj` itself (`o as Object`, and `o as IShape` on a boxed record
+    // whose descriptor matches) — releasing there would hand the caller a
+    // dangling box.
+    auto releaseFreshBoxTemp = [&] {
+        if (freshBoxTemp) emitBoxRelease(obj);
+    };
     if (!obj) return nullptr;
     sema::TypeRef* rt = ctx_.resolvedType(*te.testType);
     if (!rt) return nullptr;
+
+    // fix #2775 (§8.6/§12.7/§19.3, v0.240): SILENCE AMPLIFIER. Every
+    // `return nullptr` below is not "an error we recover from" — lowerIf turns
+    // a null condition into an unconditional branch PAST the body (see the note
+    // there), so a dropped type test reads as a constant `false` in a program
+    // that compiled clean. Two shipped defects (#2703's collection-literal arm
+    // and #2761) each had "no diagnostic at all" as their worst failure mode.
+    //
+    // ONE definition, called from every bail, rather than a guard copied per
+    // site: the copies are how a predicate acquires the missing case (the
+    // #2787 lesson). Follows the #2491 precedent — Warning, suppressed once the
+    // compile already has errors so a cascade never buries the real diagnostic.
+    //
+    // The `dropped` classification deliberately EXCLUDES the shapes where a
+    // non-answer is legitimate: a declaration-less Named target is the bare
+    // type-PARAMETER shape, whose descriptor does not resolve inside the
+    // UNSPECIALIZED generic template body (issue #490 — that stub is never
+    // executed; the specialization path compiles the concrete version), and an
+    // operand whose sema type is not Object/an interface is erased there for
+    // the same reason. Warning on either would fire on dead code.
+    auto reportDroppedTest = [&](const char* why) {
+        if (ctx_.diagnostics().hasErrors()) return;
+        // A TypeTestExpr synthesized inside a chain can carry an empty span
+        // (line 0), which rendered as a useless `file:0:0` — the #2737 shape.
+        // Fall back to the operand, then to the tested type, so the report
+        // always names a real position. (`line` is 1-based, so 0 means unset.)
+        SourceLocation at = te.span.begin;
+        if (at.line == 0 && te.operand) at = te.operand->span.begin;
+        if (at.line == 0 && te.testType) at = te.testType->span.begin;
+        ctx_.diagnostics().report(
+            Severity::Warning, at,
+            std::string("internal: this type test was DROPPED and reads as "
+                        "false — ") + why +
+                " (a value type reaching an Object/interface location must be "
+                "boxed, §8.6) — #2775");
+    };
+    // True when the OPERAND is statically a reference location (Object or an
+    // interface): sema has already promised a pointer, so a non-pointer lowered
+    // value is by construction a producer that failed to establish the §8.6
+    // boxed representation.
+    auto operandIsReferenceLocation = [&]() {
+        const sema::TypeRef* opTy = ctx_.exprType(*te.operand);
+        return opTy && isObjectOrInterfaceTarget(opTy);
+    };
     // §8.6 / §12.7 (#417): `is string` / `as string`. A string stored in an
     // Object is a bare `bz_string*` with NO leading vtable/descriptor word, so
     // emitIsA's descriptor walk cannot run on it. Recognize it via
@@ -1707,15 +2439,21 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // (already the bz_string*) or null.
     if (rt->kind == sema::TypeRef::Kind::Primitive &&
         rt->primitive == sema::PrimitiveType::String) {
-        if (!obj->getType()->isPointerTy()) return nullptr;
+        if (!obj->getType()->isPointerTy()) {
+            if (operandIsReferenceLocation())
+                reportDroppedTest("the operand did not lower to a reference");
+            return nullptr;
+        }
         auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
         llvm::Value* isStr = builder_.CreateCall(
             isStrFn, {obj, vtableTablePtr()}, "is.string");
         llvm::Value* isStrBit =
             builder_.CreateICmpNE(isStr, builder_.getInt32(0));
-        if (te.op == "is") return isStrBit;
-        if (te.op == "is not")
+        if (te.op == "is") { releaseFreshBoxTemp(); return isStrBit; }
+        if (te.op == "is not") {
+            releaseFreshBoxTemp();
             return builder_.CreateXor(isStrBit, builder_.getInt1(true));
+        }
         if (te.op == "as")
             // §17.4: `o as string` → the bz_string* on success, null otherwise.
             return builder_.CreateSelect(
@@ -1727,12 +2465,19 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // non-null operand; `o as Object` is the operand itself (no downcast).
     if (rt->kind == sema::TypeRef::Kind::Primitive &&
         rt->primitive == sema::PrimitiveType::Object) {
-        if (!obj->getType()->isPointerTy()) return nullptr;
+        if (!obj->getType()->isPointerTy()) {
+            if (operandIsReferenceLocation())
+                reportDroppedTest("the operand did not lower to a reference");
+            return nullptr;
+        }
         llvm::Value* nonNull = builder_.CreateICmpNE(
             obj, llvm::ConstantPointerNull::get(ptrTy()), "is.object");
-        if (te.op == "is") return nonNull;
-        if (te.op == "is not")
+        if (te.op == "is") { releaseFreshBoxTemp(); return nonNull; }
+        if (te.op == "is not") {
+            releaseFreshBoxTemp();
             return builder_.CreateXor(nonNull, builder_.getInt1(true));
+        }
+        // `as Object` RETURNS the operand — no release (see releaseFreshBoxTemp).
         if (te.op == "as")
             return builder_.CreateSelect(
                 nonNull, obj, llvm::ConstantPointerNull::get(ptrTy()));
@@ -1781,7 +2526,23 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         auto bit = builtinDesc_.find(tn);
         if (bit != builtinDesc_.end()) targetDesc = bit->second;
     }
-    if (!targetDesc) return nullptr;
+    if (!targetDesc) {
+        // #2775: a CONCRETE target with no runtime descriptor means the
+        // compiler has no runtime tag for it — an internal limitation, not a
+        // program error. Measured live when this guard landed: `var o: Object
+        // := 12.5m; o is decimal` and `var o: Object := ia; o is [3]int` both
+        // compiled clean and answered false, because neither `decimal` nor an
+        // inline array is boxed although §8.6 requires both.
+        const bool concreteTarget =
+            rt->kind == sema::TypeRef::Kind::Primitive ||
+            rt->kind == sema::TypeRef::Kind::Unit ||
+            rt->kind == sema::TypeRef::Kind::InlineArray ||
+            (rt->kind == sema::TypeRef::Kind::Named && rt->declaration);
+        if (concreteTarget)
+            reportDroppedTest("no runtime descriptor resolved for the target "
+                              "type");
+        return nullptr;
+    }
     // §12.7 / §7 / issues #447 + #448: a nullable VALUE type operand is a
     // tagged {i8 hasValue; T value} struct, NOT a pointer. emitIsA walks a
     // vtable descriptor chain and requires a pointer operand; calling it on a
@@ -1799,6 +2560,12 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             if (te.op == "is") return hasVal;
             if (te.op == "is not") return builder_.CreateNot(hasVal);
         }
+        // #2775: sema already typed this operand as `Object` or an interface —
+        // both REFERENCE locations — so a non-pointer lowered value here is by
+        // construction a codegen invariant violation: some producer failed to
+        // establish the §8.6 boxed representation.
+        if (operandIsReferenceLocation())
+            reportDroppedTest("the operand did not lower to a reference");
         return nullptr;
     }
     // #1071 / §8.6 / §12.7: an Object/interface operand may hold a bare
@@ -1842,9 +2609,11 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     } else {
         isA = emitIsA(obj, targetDesc);
     }
-    if (te.op == "is") return isA;
-    if (te.op == "is not")
+    if (te.op == "is") { releaseFreshBoxTemp(); return isA; }
+    if (te.op == "is not") {
+        releaseFreshBoxTemp();
         return builder_.CreateXor(isA, builder_.getInt1(true));
+    }
     if (te.op == "as") {
         // §17.4: `x as T` for a VALUE-type target unboxes — load the value
         // bytes out of the box `{ vtable*, rc, value-bytes }` (payload at two
@@ -1855,7 +2624,17 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         // target keeps the #399 behavior (the pointer IS the value). The payload
         // load is guarded by `isA` so a failed cast (or a null operand) never
         // dereferences the box.
-        if (isBoxableValueType(rt)) {
+        // fix #2915: `rt->kind == Unit` is excluded EXPLICITLY rather than by
+        // isBoxableValueType (which now admits it, so the boxed `()` has a
+        // runtime identity — §4.7/§8.6). This arm loads the payload as
+        // `lowerTypeRef(rt)`, and the unit type lowers to LLVM `void`: a
+        // `load void` is not constructible and would abort the compiler. The
+        // unboxing direction `o as ()` therefore keeps EXACTLY its pre-fix
+        // lowering (it falls through to the reference-target arm below) — this
+        // change makes the boxing and type-TEST directions correct and leaves
+        // the unbox untouched, rather than inventing a `()?` representation.
+        // Filed separately; it is the unit twin of #2911's `x as [N]T`.
+        if (isBoxableValueType(rt) && rt->kind != sema::TypeRef::Kind::Unit) {
             // §17.4: the result of `as` is ALWAYS nullable, so the target may be
             // written either bare (`o as int`) or already-nullable (`o as int?`).
             // The box stores the BARE value bytes, and the result struct built
@@ -1884,6 +2663,18 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             builder_.CreateBr(contBB);
 
             builder_.SetInsertPoint(contBB);
+            // fix #2865: the payload has been LOADED out of the wrapper (a
+            // by-value copy of the scalar/struct bytes — `loaded` above), so on
+            // this arm, and only on this arm, `obj` is dead and a fresh temporary
+            // wrapper can be reclaimed. Both PHI predecessors join here, so the
+            // release runs exactly once on the matched and the unmatched path
+            // alike (bz_box_release is null-safe for the null-operand case).
+            // The reference-target `as` below deliberately does NOT release.
+            //
+            // ⚠ The call is emitted AFTER this block's PHI nodes, never before:
+            // an emitBoxRelease at the top of contBB put a `call` ahead of them
+            // and the verifier rejected the module ("PHI nodes not grouped at
+            // top of basic block!") — caught by this fix's own `as int` probe.
             if (rt->kind == sema::TypeRef::Kind::Primitive ||
                 isNullableRecordTy(rt) ||
                 valueBuiltinName(rt) != nullptr ||
@@ -1914,6 +2705,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                     llvm::ConstantInt::get(nullablePrimHasValTy(), 1), loadBB);
                 hvPhi->addIncoming(
                     llvm::ConstantInt::get(nullablePrimHasValTy(), 0), preBB);
+                releaseFreshBoxTemp();  // fix #2865 — after the PHIs
                 llvm::Value* res = builder_.CreateInsertValue(
                     llvm::UndefValue::get(nst), hvPhi, {0u});
                 return builder_.CreateInsertValue(res, valPhi, {1u});
@@ -1924,6 +2716,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             auto* recPhi = builder_.CreatePHI(valTy, 2);
             recPhi->addIncoming(loaded, loadBB);
             recPhi->addIncoming(llvm::Constant::getNullValue(valTy), preBB);
+            releaseFreshBoxTemp();  // fix #2865 — after the PHI
             return recPhi;
         }
         return builder_.CreateSelect(
@@ -2038,7 +2831,14 @@ llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
         return box;
     };
 
-    if (!nullableValue) return emitBox();
+    if (!nullableValue) {
+        // fix #2865 (§8.6/§28.9/§28.3, v0.240): record the mint so a consumer
+        // that provably DISCARDS it can reclaim it — see `lastBoxMint_`'s note
+        // in LlvmBackend_impl.hpp and its one reader, lowerTypeTest.
+        llvm::Value* b = emitBox();
+        lastBoxMint_ = b;
+        return b;
+    }
 
     // Nullable source: branch on hasValue — box only when present, else null.
     auto* boxBB = llvm::BasicBlock::Create(llvm_, "box.some", currentFn_);
@@ -2053,6 +2853,9 @@ llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
     auto* phi = builder_.CreatePHI(ptrTy(), 2);
     phi->addIncoming(boxed, boxEndBB);
     phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), preBB);
+    // fix #2865: the nullable arm's mint is the PHI (null when the source was
+    // absent — bz_box_release is null-safe, so the reader needs no extra guard).
+    lastBoxMint_ = phi;
     return phi;
 }
 
@@ -2064,10 +2867,65 @@ llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
 // pointer) is preserved by only boxing boxable VALUE sources.
 llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
                                    const ast::Expr* init) {
-    if (!v || !declTy || !init) return v;
-    if (!isObjectOrInterfaceTarget(declTy)) return v;
+    // ⚠ MERGE NOTE (#2901 + #2915): the opening guard deliberately does NOT
+    // test `!v`. #2915 needs a null `v` to reach the unit rescue below (unit
+    // lowers to LLVM `void`, so `lowerExpr` returns nullptr for `()`), and that
+    // rescue is placed BEFORE this function's own `!v` bail for exactly that
+    // reason. #2901's type-parameter resolution below is null-`v`-safe: it
+    // reads only `declTy`.
+    if (!declTy || !init) return v;
+    // fix #2901 (§8.6 / §14.1, v0.240): resolve a bare TYPE-PARAMETER target
+    // through the active monomorphization before classifying it. §8.6 states,
+    // verbatim: "When a value type is used where `Object` (or an interface
+    // implemented by the value type) is expected, the value is **boxed**: a
+    // heap-allocated wrapper holds the value. Boxed values are runtime-managed
+    // ([§28.9])." Under `Nm<IArea>(rb)` the formal `v: T` IS "an interface
+    // implemented by the value type" — but only after substitution. Before it,
+    // `declTy` is the bare `T` ref (Named, `declaration == nullptr`), which
+    // `isObjectOrInterfaceTarget` cannot classify, so it answered "not an
+    // Object/interface target" and the box was skipped for EVERY generic
+    // parameter at EVERY call site.
+    //
+    // This is the exact mirror of what #1279 already did on the SOURCE side a
+    // few lines below (a `T` bound to a value type, returned where `Object` is
+    // expected, must be boxed as its concrete type). The two halves were never
+    // symmetric: the source got its substitution, the target never did.
+    //
+    // The gate stays a PROPERTY, not a list: after resolution the same
+    // `isObjectOrInterfaceTarget` decides, so nothing is admitted that a
+    // written-out `Object`/interface target would not admit. A bare `T` bound
+    // to a value type, a class, or nothing at all resolves to something that
+    // predicate still rejects, leaving those paths byte-identical.
+    if (!isObjectOrInterfaceTarget(declTy)) {
+        const sema::TypeRef* concreteTarget = resolveTypeParamRef(declTy);
+        if (concreteTarget == declTy ||
+            !isObjectOrInterfaceTarget(concreteTarget))
+            return v;
+        declTy = concreteTarget;
+    }
     const sema::TypeRef* srcTy = ctx_.exprType(*init);
     if (!srcTy) return v;
+    // fix #2915 (§4.7 / §8.6 "Boxing of the unit value", v0.240): the unit
+    // source is the one boxable kind with NO lowered value — `()` lowers to
+    // LLVM `void`, so `lowerExpr` returns nullptr for it and every caller's
+    // `if (v)` guard skipped the box, leaving the `Object` slot zero — the NULL
+    // reference. §4.7 is explicit that `var o: Object := ();` "produces a boxed
+    // `()`", and §8.1 lists the unit type among the kinds that derive from
+    // Object via boxing; neither reading §8.6 permits (interned or fresh) is
+    // satisfiable by null. Handled BEFORE the `!v` bail below for exactly that
+    // reason. Callers that already had a value are untouched.
+    //
+    // ⚠ The `!v` in this condition is load-bearing, not defensive. Several
+    // positions call boxForTarget TWICE on the same argument (the arm that
+    // rescues the null value, then the shared boxing site downstream); without
+    // it the second call minted a SECOND wrapper and the first leaked —
+    // measured under LSan as 48 bytes in 2 allocations for `p := ();` and for
+    // `Take(())`, against 24/1 and 0/0 for the same shapes with an `int`. With
+    // it, the second call reaches the "already a pointer" bail below and the
+    // count matches the int baseline exactly.
+    if (!v && srcTy->kind == sema::TypeRef::Kind::Unit && !srcTy->nullable)
+        return boxUnitValue();
+    if (!v) return v;
     // #1279 / §8.6 / §14.1: a generic value-type parameter `T` / `T?` (declared
     // `where T: value`) returned where `Object`/`Object?` is expected must be
     // boxed like its CONCRETE monomorphized type. Under an active
@@ -2663,7 +3521,8 @@ bool Emitter::forVarCapturedInBody(const ast::ForStmt& fs) {
 
 
 llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
-                             llvm::Value* receiverVal) {
+                             llvm::Value* receiverVal,
+                             const sema::TypeRef* recvStaticTy) {
     llvm::Function* origFn = nullptr;
     auto it = methodFns_.find(ms);
     if (it != methodFns_.end()) origFn = it->second;
@@ -2689,6 +3548,84 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     llvm::FunctionType* methTy =
         origFn ? origFn->getFunctionType() : methodFnType(ms);
     if (!methTy) return nullptr;
+    // fix #2766 / §27.6 / §14.1: an INTERFACE-dispatch thunk (no concrete
+    // origFn) must use the INSTANTIATED parameter types of the receiver's static
+    // interface type, not methodFnType(ms)'s erased ones. methodFnType lowers
+    // the interface's DECLARED parameter types, and for a generic interface
+    // (`IEquatable<T>.Equals(other: T)`) the unbound `T` lowers to a placeholder
+    // `i32` for EVERY instantiation. That is the ABI the emitted thunk then
+    // advertises, while both the call site (which types the call from the
+    // reference's static `(string) -> bool`) and the itable target
+    // (`bz$M.SC$Equals(ptr, ptr)`) use the real one.
+    //
+    // The consequence is not cosmetic — it was measured on the generated code:
+    // the thunk compiled to `mov %esi,%ebx` / `mov %ebx,%esi`, i.e. it TRUNCATED
+    // the reference argument to 32 bits before forwarding it. A string argument
+    // whose address happens to be below 4 GiB (a literal in a small, non-PIE
+    // executable) survives the round trip, which is why this went unnoticed; a
+    // HEAP string does not. A probe passing a runtime-concatenated string to a
+    // `IEquatable<string>` method group over a user class SEGVs inside the
+    // callee at the truncated address under ASan (whose allocator returns high
+    // addresses), and only "works" on the plain oracle by allocator luck.
+    //
+    // It is also what makes #2766's string-receiver guard below possible at all:
+    // with the erased signature, ONE cached thunk serves `IEquatable<string>`
+    // and `IEquatable<int>` alike, so the argument cannot be tested as a pointer
+    // (for `IEquatable<int>` it is a raw `i32` value, and calling
+    // bz_obj_is_string on it would dereference the integer as an address).
+    // Taking the instantiated types separates those instantiations into distinct
+    // thunks — see the widened methodThunks_ key — after which the
+    // reference-shaped ones carry real pointers and the value-shaped ones are
+    // excluded by the `isPointerTy()` gate.
+    //
+    // Deliberately narrow: only when there is NO concrete origFn (a virtual
+    // method's thunk already takes its signature from the real function), only
+    // for a bound instance reference whose static receiver type IS this
+    // interface with resolved generic arguments, only for a parameter whose
+    // DECLARED type is a bare type-parameter name of that interface, and never
+    // for a by-ref parameter (§22.3 — methodFnType passes those as a
+    // pointer-to-slot, which is already correct). A parameter with a concrete
+    // declared type keeps the type it already had, so a non-generic interface
+    // (`IFoo.Do(n: int): int`) is bit-for-bit unaffected. The RETURN type is
+    // left alone here: a generic-returning interface method has the same latent
+    // defect, but fixing it is a separate change and is filed rather than
+    // bundled.
+    if (!origFn && dynamicDispatch && instMethod && !extRef && recvStaticTy &&
+        ms->parent && recvStaticTy->kind == sema::TypeRef::Kind::Named &&
+        recvStaticTy->declaration == ms->parent &&
+        recvStaticTy->genericArgs.size() == 1 &&
+        ms->parent->genericParams.size() == 1 && ms->params.size() == 1 &&
+        methTy->getNumParams() == 2 &&
+        ((ms->parent->name == "IEquatable"  && ms->name == "Equals") ||
+         (ms->parent->name == "IComparable" && ms->name == "CompareTo"))) {
+        // These two, and ONLY these two, are substituted — because the STDLIB
+        // states their signatures, so the mapping "the single parameter is the
+        // interface's single type argument" is read off the document rather than
+        // guessed. stdlib §9.4 declares `IComparable<T>` with
+        //   `public method CompareTo(other: T): int;`
+        // and §9.6's `String` satisfies `IEquatable<string>` with
+        //   `public method Equals(other: string?): bool;`
+        //
+        // Every OTHER generic interface method is deliberately left alone. The
+        // reason is not caution for its own sake: a SYNTHETIC builtin interface
+        // records NO resolved declared type for its parameters at all
+        // (ParameterSymbol::resolvedDeclType is null — which is precisely why
+        // methodFnType fell back to the `i32` placeholder), so for an arbitrary
+        // method there is no evidence in the symbol table for WHICH type
+        // parameter a given parameter position corresponds to. Inventing a
+        // positional mapping (`IDictionary<K,V>.Add(k: K, v: V)`…) would be
+        // exactly the silent interpretation this project forbids. The remaining
+        // methods keep today's erased ABI — unchanged, still latently wrong —
+        // and that residue is FILED rather than guessed at here.
+        if (sema::TypeRef* arg = recvStaticTy->genericArgs[0]) {
+            if (llvm::Type* t = lowerTypeRef(arg)) {
+                if (t != methTy->getParamType(1))
+                    methTy = llvm::FunctionType::get(
+                        methTy->getReturnType(),
+                        {methTy->getParamType(0), t}, /*isVarArg=*/false);
+            }
+        }
+    }
     // A non-virtual, non-interface method ref must have a concrete origFn.
     if (!origFn && !dynamicDispatch) return nullptr;
 
@@ -2705,7 +3642,11 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // receiver-independent (it loads `this` from env), so one thunk per method
     // is correct. On a cache hit skip re-emitting the body and go straight to
     // building a fresh closure cell with the current receiver.
-    if (auto cit = methodThunks_.find({ms, extRef}); cit != methodThunks_.end())
+    // fix #2766: the LLVM signature is part of the key — see methodThunks_'s
+    // declaration. Same method + same instantiated signature still yields ONE
+    // thunk, so #1170's `+=`/`-=` identity is unaffected.
+    if (auto cit = methodThunks_.find({ms, extRef, methTy});
+        cit != methodThunks_.end())
         return buildMethodClosureCell(cit->second, instMethod, receiverVal, kind);
 
     // Build the thunk's parameter types: (ptr env, user_params...).
@@ -2848,9 +3789,160 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // or interface method (mirrors emitMethodCall's dynamic path); otherwise call
     // the concrete origFn directly. callArgs[0] is the receiver.
     llvm::Value* dynFnPtr = nullptr;
+    // fix #2766 (§4.6 / stdlib §9.6): state for the string-receiver arm below.
+    bool strRecvPossible = false;
+    llvm::BasicBlock* dispEndBB = nullptr;
+    llvm::BasicBlock* strDispEnd = nullptr;
+    llvm::BasicBlock* strNeBB = nullptr;
+    llvm::Value* strDispVal = nullptr;
     if (dynamicDispatch && !callArgs.empty() &&
         callArgs[0]->getType()->isPointerTy()) {
         llvm::Value* recv = callArgs[0];
+        // fix #2766 / §4.6 / stdlib §9.6: the SAME defect #2752 fixed in
+        // emitMethodCall's interface arm, at the METHOD-GROUP site. stdlib §9.6
+        // declares
+        //   `public class String: IEnumerable<char>, IComparable<string>,
+        //    IEquatable<string>`
+        // so `var eq: IEquatable<string> := s;` is a legal conversion — but a
+        // §4.6 string is a runtime-managed REFERENCE, and the slot holds a bare
+        // `bz_string*` whose word 0 is `char* data`, NOT a vtable (see
+        // bezel_runtime.h's bz_obj_is_string contract, §8.6/§12.7 #417). The
+        // itmap load at vptr[1] below therefore reads `data + 8` — 8 bytes past
+        // the payload — and SIGSEGVs (exit 139 on the plain oracle; ASan reports
+        // a global-/heap-buffer-overflow "in thunk$0").
+        //
+        // ⚠ THE FIX BELONGS HERE, IN THE THUNK BODY, NOT AT THE MINT SITE.
+        // Thunks are cached in methodThunks_ keyed {ms, extRef} and the body is
+        // receiver-independent, so a decision taken where the thunk is minted
+        // would be wrong for every other receiver reusing the cached thunk.
+        // Measured, not assumed: a program forming `IEquatable<string>` method
+        // groups over a user class AND over a string AND an `IEquatable<Object>`
+        // group emits exactly ONE `thunk$0`; likewise one thunk serves both
+        // `IComparable<int>` (boxed primitive) and `IComparable<string>`. The
+        // discrimination must therefore be a RUN-TIME test, which is what this is.
+        //
+        // ⚠ REACHABILITY ARGUMENT, RE-ESTABLISHED FOR THIS SITE (#2766 requires
+        // this rather than copying #2752's diamond on faith). bz_obj_is_string is
+        // a whitelist NEGATION (bezel_runtime_refcounting.cpp): it answers
+        // "string" for ANY pointer whose word 0 is absent from bz$vtable$table,
+        // and that table omits several vtable kinds — bz_array_t (no vtable word
+        // at all), bz_lazy_vtable (every lazy LINQ pipeline), the iterator /
+        // async-frame / collection-adapter vtables. So the question is NOT "does
+        // the receiver's type declare the interface?" (`Object` admits anything,
+        // so that question has no force) but: can a value with an unregistered
+        // word 0 reach THIS site, and did it previously dispatch CORRECTLY here?
+        //   * It CAN reach here, only through the IEquatable<Object> /
+        //     IComparable<Object> acceptance (#2765).
+        //   * It does NOT dispatch correctly today: both shapes were probed on
+        //     this exact method-group path and both already crash INSIDE thunk$0
+        //     before this change — `Array<int>` through `IEquatable<Object>` is a
+        //     heap-buffer-overflow, and a `.Where(...)` lazy pipeline is a null
+        //     deref (bz_lazy_vtable's word 1 is not an itmap).
+        // So no previously correct program becomes incorrect. The shapes that DO
+        // dispatch correctly today — a user/imported class declaring the
+        // interface, and a boxed primitive/value-builtin — all have REGISTERED
+        // vtables, so bz_obj_is_string answers "not a string" for them and they
+        // keep taking the itable path unchanged (probed: both still return their
+        // pre-change values).
+        //
+        // The static gate below only decides whether to EMIT the tests; it is
+        // deliberately as narrow as #2752's (the interface arm of exactly
+        // IEquatable.Equals / IComparable.CompareTo). It never fires on the
+        // VTABLE arm and never on a wider interface such as IEnumerable, where an
+        // unregistered-vtable receiver genuinely does dispatch correctly today
+        // and a false positive would be a real regression.
+        strRecvPossible =
+            ifaceIt != ifaceMethodIndex_.end() && ms->parent &&
+            callArgs.size() == 2 && callArgs[1] &&
+            callArgs[1]->getType()->isPointerTy() && !retTy->isVoidTy() &&
+            ((ms->parent->name == "IEquatable"  && ms->name == "Equals") ||
+             (ms->parent->name == "IComparable" && ms->name == "CompareTo")) &&
+            descArray_.count(ms->parent) != 0;
+        if (strRecvPossible) {
+            bool isEqualsMethod = ms->name == "Equals";
+            auto* strDispBB =
+                llvm::BasicBlock::Create(llvm_, "thunk.str", thunk);
+            auto* objDispBB =
+                llvm::BasicBlock::Create(llvm_, "thunk.obj", thunk);
+            auto* mixedBB =
+                llvm::BasicBlock::Create(llvm_, "thunk.mixed", thunk);
+            dispEndBB = llvm::BasicBlock::Create(llvm_, "thunk.dend", thunk);
+            strNeBB = llvm::BasicBlock::Create(
+                llvm_, isEqualsMethod ? "thunk.strne" : "thunk.strtrap", thunk);
+            auto* isStrFn =
+                declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+            // BOTH operands are tested, not just the receiver — the lesson
+            // #2752 needed two rounds to learn. emitStringEq / emitStringOrdCmp
+            // dereference `l` AND `r` as bz_string (loadStringLen reads offset
+            // 8, loadStringData offset 0), so a receiver-only guard would read a
+            // non-string ARGUMENT's vtable pointer as `char* data` and answer
+            // from whatever bytes follow it — a silent wrong answer, no crash.
+            // That argument is reachable here: one cached thunk serves
+            // IEquatable<Object> too, where the argument is statically `Object`
+            // and need not be a string. For IEquatable<string> /
+            // IComparable<string> the argument is statically `string`, so the
+            // extra test always passes and behaviour is unchanged.
+            llvm::Value* rIsStr = builder_.CreateICmpNE(
+                builder_.CreateCall(isStrFn, {recv, vtableTablePtr()},
+                                    "thunk.risstr"),
+                builder_.getInt32(0));
+            llvm::Value* aIsStr = builder_.CreateICmpNE(
+                builder_.CreateCall(isStrFn, {callArgs[1], vtableTablePtr()},
+                                    "thunk.aisstr"),
+                builder_.getInt32(0));
+            builder_.CreateCondBr(
+                builder_.CreateAnd(rIsStr, aIsStr, "thunk.bothstr"),
+                strDispBB, mixedBB);
+            builder_.SetInsertPoint(mixedBB);
+            builder_.CreateCondBr(rIsStr, strNeBB, objDispBB);
+            builder_.SetInsertPoint(strNeBB);
+            if (isEqualsMethod) {
+                // §9.6 answers a string-vs-non-string comparison directly:
+                //   public pure override method Equals(other: Object?): bool;
+                //     // content-based, not reference-based
+                // so the answer is FALSE. Neither operand is dereferenced, and
+                // the PHI below supplies the `false`.
+            } else {
+                // CompareTo: §9.6 declares only
+                //   public pure method CompareTo(other: string): int  // ordinal
+                // and spec §4.6 confines ordinal comparison to string operands,
+                // so there is NO ordering to return and inventing one would be a
+                // silent fabrication. Falling through to the itable path is not
+                // a "loud failure" either — bz_itable_lookup would scan the
+                // string payload as an itmap and then call through itab[k], an
+                // indirect call through arbitrary memory. Trap instead: one
+                // block, invents no ordering, strictly defined. Reachable only
+                // through the IComparable<Object> acceptance (#2765); for
+                // IComparable<string> the argument is statically a string, so
+                // this arm is dead there.
+                builder_.CreateCall(
+                    declareC("abort", llvm::Type::getVoidTy(llvm_), {}), {});
+            }
+            builder_.CreateBr(dispEndBB);
+            // Both operands are strings: §9.6 content equality / ordinal
+            // comparison. emitStringEq is null-safe on both operands;
+            // emitStringOrdCmp requires non-null, which §4.6 guarantees for an
+            // ordering operand ("Ordering requires non-nullable operands").
+            builder_.SetInsertPoint(strDispBB);
+            if (isEqualsMethod) {
+                strDispVal = emitStringEq(recv, callArgs[1]);
+            } else if (llvm::Value* c = emitStringOrdCmp(recv, callArgs[1])) {
+                strDispVal = c->getType()->isIntegerTy(32)
+                    ? c
+                    : builder_.CreateTrunc(c, i32(), "thunk.str.cmp");
+            }
+            // Match the dispatched slot's return type so the merge PHI is
+            // well-typed (Equals → i1, CompareTo → i32).
+            if (strDispVal && strDispVal->getType() != retTy &&
+                strDispVal->getType()->isIntegerTy() && retTy->isIntegerTy())
+                strDispVal = builder_.CreateZExtOrTrunc(strDispVal, retTy,
+                                                        "thunk.str.ret");
+            // The intrinsics can emit their own blocks, so the PHI's incoming
+            // block is wherever the builder ended up, not strDispBB.
+            strDispEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(dispEndBB);
+            builder_.SetInsertPoint(objDispBB);
+        }
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
         if (ifaceIt != ifaceMethodIndex_.end()) {
             // §13 itable: vptr[1] = itmap; bz_itable_lookup(itmap, td$I)[k].
@@ -2883,6 +3975,46 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     llvm::Value* result =
         dynFnPtr ? builder_.CreateCall(methTy, dynFnPtr, callArgs)
                  : builder_.CreateCall(origFn, callArgs);
+    // fix #2766: merge the string-receiver arm back in. Only reached when the
+    // diamond above was emitted.
+    if (strRecvPossible && strDispVal && strDispEnd && strNeBB && dispEndBB &&
+        strDispVal->getType() == result->getType()) {
+        llvm::BasicBlock* objDispEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(dispEndBB);
+        builder_.SetInsertPoint(dispEndBB);
+        auto* phi = builder_.CreatePHI(result->getType(), 3, "thunk.res");
+        phi->addIncoming(strDispVal, strDispEnd);
+        // §9.6 mixed-operand arm. For Equals this IS the answer — string vs
+        // non-string is false, and getNullValue is `false` for the i1 return
+        // type. For CompareTo the arm aborts before reaching here, so the
+        // incoming value is unreachable and exists only to keep the PHI
+        // well-formed.
+        phi->addIncoming(llvm::Constant::getNullValue(result->getType()),
+                         strNeBB);
+        phi->addIncoming(result, objDispEnd);
+        result = phi;
+    } else if (strRecvPossible && dispEndBB) {
+        // Defensive: an intrinsic returned null, or the arms disagreed on type
+        // (neither should happen for the two gated signatures). Keep the CFG
+        // well-formed by joining every arm and taking the dispatched result —
+        // never leave a block without a terminator.
+        llvm::BasicBlock* objDispEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(dispEndBB);
+        if (strDispEnd && !strDispEnd->getTerminator()) {
+            builder_.SetInsertPoint(strDispEnd);
+            builder_.CreateBr(dispEndBB);
+        }
+        builder_.SetInsertPoint(dispEndBB);
+        auto* phi = builder_.CreatePHI(result->getType(), 3, "thunk.res");
+        if (strDispEnd)
+            phi->addIncoming(llvm::UndefValue::get(result->getType()),
+                             strDispEnd);
+        if (strNeBB)
+            phi->addIncoming(llvm::Constant::getNullValue(result->getType()),
+                             strNeBB);
+        phi->addIncoming(result, objDispEnd);
+        result = phi;
+    }
     if (retTy->isVoidTy()) builder_.CreateRetVoid();
     else builder_.CreateRet(result);
 
@@ -2902,7 +4034,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
 
     // #1170 / §24.4: cache the thunk so subsequent references to this method
     // (e.g. the `-=` matching an earlier `+=`) reuse the SAME fn pointer.
-    methodThunks_[{ms, extRef}] = thunk;
+    methodThunks_[{ms, extRef, methTy}] = thunk;
 
     return buildMethodClosureCell(thunk, instMethod, receiverVal, kind);
 }
@@ -3334,6 +4466,16 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
             if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Enum)
                 currentEnumMethod_ = ps->parent;
             result = lowerExpr(*getter);
+            // fix #2761 (§8.6 "Boxing" / §27.6, v0.240): the PROPERTY-AS-
+            // FUNCTION-VALUE face of the same expression getter. Its `ret` is
+            // typed from `pd->type` a few lines above, so a value-typed body
+            // under an `Object`/interface declared type produced `ret i32` from
+            // a `ptr`-returning thunk — a hard build failure, reproduced on
+            // 0e554e3 with `var f: () -> Object := h.O; f()`. Same box, same
+            // reasoning as the inlined read (LlvmBackend_Exprs.cpp).
+            if (pd && pd->type)
+                result = boxForTarget(result, ctx_.resolvedType(*pd->type),
+                                      getter);
             currentEnumMethod_ = savedEnumMethod;
         } else if (const ast::PropertyAccessor* acc = blockGetterOf(ps)) {
             if (llvm::Function* fn = ensurePropertyBlockGetter(pd, acc)) {
@@ -3538,6 +4680,57 @@ sema::MemberSymbol* Emitter::storageMemberOf(sema::Symbol* sym) {
     // line was widened too — the layout fix alone was necessary but not
     // sufficient). See isAutoPropertyStorage's own comment
     // (LlvmBackend_impl.hpp) for the full rationale and scope boundary.
+    // fix #2931 (§11.2/§23.1/§22.3/§12.1, v0.240): a property DECLARED IN AN
+    // INTERFACE has NO backing storage — not in the interface (never
+    // instantiated) and not in any implementing object, whose own matching
+    // member owns whatever storage exists. §11.2, verbatim: "Interface members
+    // are implicitly public, have no body, and end with `;`. A class
+    // implements an interface implicitly: by declaring matching public
+    // members." §23.1's "The compiler generates the backing field" is the
+    // AUTO-PROPERTY rule; §23.2 names the two apart in one breath —
+    // "auto-properties (§23.1) and interface properties, whose accessor sets
+    // are declared, not shaped".
+    //
+    // The two forms are SPELLED IDENTICALLY (`property P: T;`) and the parser
+    // records both as `PropertyBodyKind::Auto` (Parser_Decls.cpp, the
+    // interface arm's "simple signature form"), so `isAutoProperty` answers
+    // TRUE for an interface property — and so does the exporter's wire bit
+    // (`ModuleMetadataBuilder.cpp`: `out.isAutoProperty = pd->bodyKind ==
+    // Auto`), which is how an IMPORTED interface property reached the same
+    // wrong answer through `isAutoPropertyStorage`'s decl-null fallback. Both
+    // sources meet at this one line, so excluding here covers the local and
+    // the cross-module spelling alike.
+    //
+    // WHAT IT COST (MEASURED on 10bd6d3). This function is "the central
+    // GEP-address resolution function for a plain member-access read/write",
+    // so `fieldAddr` returned a GEP into the RECEIVER at the interface
+    // property's ORDINAL among the interface's own declarations — not a
+    // constant 0: an interface declaring `A` then `B`, implemented by a class
+    // whose first two fields are `_f0`, `_f1`, sent `ref i.B`'s write into
+    // `_f1` and `ref i.A`'s into `_f0`. With FIVE interface properties and a
+    // ONE-field implementer, `ref i.E` was an ASan heap-buffer-overflow ("12
+    // bytes after 16-byte region"). Three `lvalueAddr` consumers reached it
+    // live and silently: a `ref` argument (`z=5, v=0` where `z=0, v=5` is
+    // correct), an `out` argument (`z=9, v=0`), and a BUILTIN `out`
+    // (`int.TryParse("42", out i.IP)` → `z=42, v=0`).
+    //
+    // Declining here is what routes the whole family at once: every one of
+    // those consumers already falls back to §22.3's copy-in/copy-out bracket
+    // (`emitAccessorRefArgCopyIn`) the moment `lvalueAddr` returns null, and
+    // that bracket drives the getter and the setter through the dispatching
+    // helpers. So the gate is the PROPERTY "does this member have a storage
+    // slot of its own?", not an enumeration of consumers. The concrete-type
+    // spelling of each shape was already correct, because a class's
+    // implementing property carries accessor bodies (`PropertyBodyKind::
+    // Block`) and so was never classified as storage.
+    //
+    // SCOPE: only the ADDRESS-resolution question is answered here.
+    // `isAutoPropertyStorage` deliberately keeps its `true` for an interface
+    // property — see its own comment for the disposal-classification consumers
+    // that would turn a borrow into a use-after-free if it flipped.
+    if (auto* ip = dynamic_cast<sema::PropertySymbol*>(sym))
+        if (ip->parent && ip->parent->kind == ast::TypeDeclKind::Interface)
+            return nullptr;
     if (isAutoPropertyStorage(sym))
         return dynamic_cast<sema::PropertySymbol*>(sym);
     return nullptr;
@@ -4305,7 +5498,6 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
         } else if (targetTy->kind == sema::TypeRef::Kind::Named &&
                    targetTy->declaration &&
                    targetTy->declaration != ms->parent &&
-                   !targetTy->genericArgs.empty() &&
                    !ms->parent->genericParams.empty()) {
             // §12 / §14 (issue #585): direct access of an INHERITED field
             // declared on a generic BASE (`ms->parent`) through a derived
@@ -4315,6 +5507,30 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
             // layout and the GEP/field type are wrong for a non-int base field
             // (read 0 / garbage). Bind the base's generic params to the concrete
             // arguments the derived class supplied (walking the base chain).
+            //
+            // fix #2840 (§12 / §14.1 / §2.5, v0.240): this branch used to
+            // ALSO require `!targetTy->genericArgs.empty()` — i.e. the
+            // receiver had to be a generic instantiation of its own. A
+            // NON-generic derived class (`class D : Base<long>`) has no
+            // generic args, so `d.v` / `d.tag` skipped the substitution
+            // entirely and GEP'd `classStruct(Base)` under the EMPTY subst —
+            // the T→i32 template layout — while `new D()` allocated the
+            // correctly specialized derived struct. Writing `d.v` then stored
+            // 8 bytes at the template's 4-byte-slot offset and silently
+            // clobbered the following field (measured: `tag` read back 28,
+            // the high half of the stored `long`); at `T = string` the same
+            // mismatch produced an unlocated IR-verifier abort. The bare-
+            // identifier twin of this access — `implicitFieldAddr`, fixed for
+            // exactly this shape by #989 — already builds a synthetic
+            // no-generic-args receiver TypeRef and calls
+            // computeAncestorGenericSubst; this is the qualified-access path
+            // doing the step its own sibling does. computeAncestorGenericSubst
+            // seeds `curArgs` from `recvTy->genericArgs` against the
+            // receiver's own param names, so an EMPTY-args non-generic
+            // receiver is the 0 == 0 case and walks the chain correctly; it
+            // returns false (leaving the substitution untouched) whenever the
+            // chain cannot be resolved, so widening the guard cannot install a
+            // wrong substitution.
             std::unordered_map<std::string_view, llvm::Type*> ancSubst;
             std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
             if (computeAncestorGenericSubst(targetTy, ms->parent, ancSubst,

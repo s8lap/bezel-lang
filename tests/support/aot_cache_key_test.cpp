@@ -50,6 +50,7 @@ using bezel::codegen::CodegenOptions;
 using bezel::test::aot_detail::composeLinkKey;
 using bezel::test::aot_detail::composeObjectKey;
 using bezel::test::aot_detail::sha256File;
+using bezel::test::aot_detail::toolchainIdentityFrom;
 
 using Digest = std::array<std::uint8_t, 32>;
 
@@ -62,12 +63,41 @@ Digest ident(std::uint8_t seed) {
     return d;
 }
 
+// A stand-in toolchain identity (per #3006): the external clang/ld/libLLVM the
+// cache key now folds in. Held CONSTANT in the existing object/link tests (so
+// their compiler/source/mode/runtime/recipe assertions are unchanged) and
+// VARIED in the new toolchain tests below.
+const Digest kToolchain = ident(5);
+
 const char kSourceA[] =
     "module M; class C public static method Main(): int return 0; end Main; "
     "end C;";
 const char kSourceB[] =
     "module M; class C public static method Main(): int return 1; end Main; "
     "end C;";
+// A program returning a DISTINCTIVE non-zero value, so an equivalence check
+// between two builds of it (both must exit 42) is non-trivial.  It declares
+// multiple enums and classes with methods/constructors so the pointer-keyed
+// emission maps (methodFns_/ctorFns_/disposerFns_/supersOf) have enough entries
+// for their iteration order to affect the .rodata layout — the exact hazard
+// fix #3020 made deterministic (name-sorted emission).  A regression that
+// restores unordered iteration would make two forked compiles of this source
+// diverge by a few .rodata bytes (an enum-name / descriptor reorder), which the
+// byte-equality assertion below catches.
+const char kSourceDistinct[] =
+    "module M; "
+    "enum FileAccess Read, Write; end FileAccess; "
+    "enum FileMode Append, Truncate; end FileMode; "
+    "enum FileShare None, Read; end FileShare; "
+    "class A public tag: int; "
+    "  public constructor(t: int) tag := t; end constructor; "
+    "  public method probe(o: Object): int => (if o is A then 1 else 0); "
+    "end A; "
+    "class B public tag: int; "
+    "  public constructor(t: int) tag := t; end constructor; "
+    "  public method probe(o: Object): int => (if o is B then 1 else 0); "
+    "end B; "
+    "public class C public static method Main(): int => 42; end C;";
 
 // A stand-in for the auto-imported stdlib prelude. The real text comes from
 // Driver::preludeSourceFingerprint; these tests only need two distinguishable
@@ -104,14 +134,14 @@ std::string checkedMode() {
 // single most important property in the file: it is what makes "the suite
 // validated THIS compiler" true.
 BEZEL_TEST(aot_cache_key, object_key_moves_when_the_compiler_moves) {
-    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA) !=
-                      composeObjectKey(ident(2), plainMode(), kPrelude, kSourceA));
+    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+                      composeObjectKey(ident(2), plainMode(), kPrelude, kSourceA, kToolchain));
 }
 
 // A different program must never serve another program's object.
 BEZEL_TEST(aot_cache_key, object_key_moves_when_the_source_moves) {
-    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA) !=
-                      composeObjectKey(ident(1), plainMode(), kPrelude, kSourceB));
+    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+                      composeObjectKey(ident(1), plainMode(), kPrelude, kSourceB, kToolchain));
 }
 
 // Every CodegenOptions bit alters the emitted object, so each must key apart.
@@ -120,9 +150,9 @@ BEZEL_TEST(aot_cache_key, object_key_moves_when_the_source_moves) {
 // net, and would report clean because nothing was watching.
 BEZEL_TEST(aot_cache_key, object_key_separates_every_codegen_mode) {
     const std::set<std::string> keys{
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA),
-        composeObjectKey(ident(1), asanMode(), kPrelude, kSourceA),
-        composeObjectKey(ident(1), checkedMode(), kPrelude, kSourceA),
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain),
+        composeObjectKey(ident(1), asanMode(), kPrelude, kSourceA, kToolchain),
+        composeObjectKey(ident(1), checkedMode(), kPrelude, kSourceA, kToolchain),
     };
     BEZEL_EXPECT_EQ(keys.size(), static_cast<std::size_t>(3));
 }
@@ -136,11 +166,11 @@ BEZEL_TEST(aot_cache_key, object_key_separates_every_codegen_mode) {
 // structural form of the claim; this pins that the LINK key does move with the
 // runtime, so the two halves genuinely separate rather than both being blind.
 BEZEL_TEST(aot_cache_key, object_key_is_independent_of_runtime_and_recipe) {
-    BEZEL_EXPECT_EQ(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA),
-                    composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA));
+    BEZEL_EXPECT_EQ(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain),
+                    composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain));
     const std::string recipe = Driver::linkRecipeSignature(false);
-    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), recipe) !=
-                      composeLinkKey(ident(9), ident(2), recipe));
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), recipe, kToolchain) !=
+                      composeLinkKey(ident(9), ident(2), recipe, kToolchain));
 }
 
 // The auto-imported stdlib PRELUDE (§2.20 Result<T,E>, §7.1/§7.2 System.IO
@@ -157,8 +187,8 @@ BEZEL_TEST(aot_cache_key, object_key_is_independent_of_runtime_and_recipe) {
 // removed, so the property cannot regress unnoticed.
 BEZEL_TEST(aot_cache_key, object_key_moves_when_the_stdlib_prelude_moves) {
     BEZEL_EXPECT_TRUE(
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA) !=
-        composeObjectKey(ident(1), plainMode(), kPreludeChanged, kSourceA));
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+        composeObjectKey(ident(1), plainMode(), kPreludeChanged, kSourceA, kToolchain));
 }
 
 // …and the key the harness actually mints must use the DRIVER's prelude text,
@@ -182,8 +212,96 @@ BEZEL_TEST(aot_cache_key, live_object_key_uses_the_drivers_prelude_text) {
     if (!live.empty()) {  // empty only where the split is unusable
         BEZEL_EXPECT_EQ(live, composeObjectKey(
                                   bezel::test::aot_detail::buildIdentity().compiler,
-                                  plainMode(), driverPrelude, kSourceA));
+                                  plainMode(), driverPrelude, kSourceA,
+                                  bezel::test::aot_detail::buildIdentity().toolchain));
     }
+}
+
+// ---------------------------------------------------------------------------
+// TOOLCHAIN identity (per #3006): the external clang/ld/libLLVM. Before #3006
+// neither key hashed the toolchain, so a Fedora clang/binutils/llvm-libs update
+// left ~16,830 stored products servable against a recipe that no longer matched
+// the toolchain that produced them. The toolchain digest is now folded into the
+// OBJECT key (the emitted object depends on the libLLVM backend), the LINK key
+// (the link runs clang/ld), and the whole-exe KE key. These pin all three.
+//
+// The composer is fed SYNTHETIC toolchain digests (ident(N)), mirroring how the
+// tests above vary the compiler identity — the pure function makes the toolchain
+// swappable without a real system update. The fail-closed property is pinned on
+// toolchainIdentityFrom directly (the function the live gatherer feeds).
+// ---------------------------------------------------------------------------
+
+// A toolchain update (new clang/ld/libLLVM) MUST invalidate every cached object:
+// the in-process codegen calls into libLLVM.so, so a backend change can emit
+// different bytes for the same source. Without this the split would serve a
+// stale object and link it into a stale executable — the false-green this whole
+// file exists to prevent. (#3006.)
+BEZEL_TEST(aot_cache_key, object_key_moves_when_the_toolchain_moves) {
+    BEZEL_EXPECT_TRUE(
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(5)) !=
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(6)));
+}
+
+// The same holds for the LINK product: a clang/ld update can link different
+// bytes from the same object, so the link key must carry the toolchain too.
+BEZEL_TEST(aot_cache_key, link_key_moves_when_the_toolchain_moves) {
+    const std::string recipe = Driver::linkRecipeSignature(false);
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), recipe, ident(5)) !=
+                      composeLinkKey(ident(9), ident(1), recipe, ident(6)));
+}
+
+// Stability is the other half: a no-op rebuild (the COMMON case — every test
+// iteration) MUST NOT move the key. The toolchain identity is stable across
+// relinks of bezel_tests (the system clang/ld/libLLVM are untouched by a
+// compiler rebuild), so two identical inputs reproduce the same key. If this
+// failed, the cache would never warm and the fix would be useless.
+BEZEL_TEST(aot_cache_key, toolchain_key_is_stable_across_rebuilds) {
+    BEZEL_EXPECT_EQ(
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(5)),
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(5)));
+    const std::string recipe = Driver::linkRecipeSignature(false);
+    BEZEL_EXPECT_EQ(composeLinkKey(ident(9), ident(1), recipe, ident(5)),
+                    composeLinkKey(ident(9), ident(1), recipe, ident(5)));
+}
+
+// FAIL CLOSED (Plan-A invariant 1.21/1.22). clang is the one tool the link
+// cannot proceed without, so an unidentified clang ⇒ no sound toolchain
+// identity ⇒ the cache disables itself for the process (returns no digest)
+// rather than mint an under-keyed entry a pre-update toolchain could later
+// stale-hit. Mirrors the existing fail-closed on an unreadable runtime archive.
+// ld and libLLVM are BEST-EFFORT (optional) — their absence does NOT fail.
+BEZEL_TEST(aot_cache_key, toolchain_identity_fails_closed_when_clang_is_absent) {
+    Digest d{};
+    // clang unidentified (empty version string) ⇒ fail CLOSED.
+    BEZEL_EXPECT_TRUE(!toolchainIdentityFrom("", "ld 2.43", "/usr/lib64/libLLVM.so|99|1234", d));
+    // clang present ⇒ succeeds even with ld/libLLVM absent (best-effort).
+    BEZEL_EXPECT_TRUE(toolchainIdentityFrom("clang 19", "", "", d));
+    // And the identity is DETERMINISTIC: same inputs ⇒ same digest (so two
+    // processes on the same toolchain agree, and a stable key follows).
+    Digest d2{};
+    BEZEL_EXPECT_TRUE(toolchainIdentityFrom("clang 19", "", "", d2));
+    BEZEL_EXPECT_TRUE(d == d2);
+    // A different clang version ⇒ a different digest (so the key moves).
+    Digest d3{};
+    BEZEL_EXPECT_TRUE(toolchainIdentityFrom("clang 20", "", "", d3));
+    BEZEL_EXPECT_TRUE(d != d3);
+}
+
+// The LIVE toolchain identity is computable in this environment (clang is on
+// PATH for the link to work at all) and feeds the real keys. This is the
+// end-to-end wiring check: the live build identity carries a non-zero
+// toolchain digest, so computeObjectKey/computeLinkKey (which pass it through)
+// actually depend on it.
+BEZEL_TEST(aot_cache_key, live_identity_carries_a_toolchain_component) {
+    const auto& id = bezel::test::aot_detail::buildIdentity();
+    if (!id.usable) return;  // split unusable in this configuration — nothing to pin
+    // clang is required for the cache to be usable at all (fail closed), so a
+    // usable identity implies a non-zero toolchain digest: the live keys really
+    // do carry the external toolchain, not just the compiler/runtime archives.
+    bool anyNonZero = false;
+    for (std::size_t i = 0; i < id.toolchain.size(); ++i)
+        if (id.toolchain[i]) { anyNonZero = true; break; }
+    BEZEL_EXPECT_TRUE(anyNonZero);
 }
 
 // ---------------------------------------------------------------------------
@@ -195,15 +313,15 @@ BEZEL_TEST(aot_cache_key, live_object_key_uses_the_drivers_prelude_text) {
 // containing the OLD runtime and report that the new one works.
 BEZEL_TEST(aot_cache_key, link_key_moves_when_the_runtime_moves) {
     const std::string recipe = Driver::linkRecipeSignature(false);
-    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), recipe) !=
-                      composeLinkKey(ident(9), ident(2), recipe));
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), recipe, kToolchain) !=
+                      composeLinkKey(ident(9), ident(2), recipe, kToolchain));
 }
 
 // Different generated code must never be served the same executable.
 BEZEL_TEST(aot_cache_key, link_key_moves_when_the_object_moves) {
     const std::string recipe = Driver::linkRecipeSignature(false);
-    BEZEL_EXPECT_TRUE(composeLinkKey(ident(8), ident(1), recipe) !=
-                      composeLinkKey(ident(9), ident(1), recipe));
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(8), ident(1), recipe, kToolchain) !=
+                      composeLinkKey(ident(9), ident(1), recipe, kToolchain));
 }
 
 // The link key deliberately does NOT contain the compiler identity — that is
@@ -215,8 +333,8 @@ BEZEL_TEST(aot_cache_key, link_key_moves_when_the_object_moves) {
 BEZEL_TEST(aot_cache_key, link_key_moves_when_the_recipe_moves) {
     const std::string real = Driver::linkRecipeSignature(false);
     const std::string edited = real + " -lsomethingnew";
-    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), real) !=
-                      composeLinkKey(ident(9), ident(1), edited));
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), real, kToolchain) !=
+                      composeLinkKey(ident(9), ident(1), edited, kToolchain));
 }
 
 // ASan and plain products must be distinct entries. They are separated TWICE
@@ -229,8 +347,8 @@ BEZEL_TEST(aot_cache_key, link_recipe_separates_asan_from_plain) {
     BEZEL_EXPECT_TRUE(plain != asan);
     BEZEL_EXPECT_TRUE(asan.find("-fsanitize=address") != std::string::npos);
     BEZEL_EXPECT_TRUE(plain.find("-fsanitize=address") == std::string::npos);
-    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), plain) !=
-                      composeLinkKey(ident(9), ident(1), asan));
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), plain, kToolchain) !=
+                      composeLinkKey(ident(9), ident(1), asan, kToolchain));
 }
 
 // The recipe fingerprint must abstract the per-invocation paths (or no two
@@ -262,8 +380,8 @@ BEZEL_TEST(aot_cache_key, object_and_link_keys_never_collide) {
     // Feed both composers the most similar inputs available and require the
     // outputs to differ; the "k3l;" tag on the link key guarantees it.
     BEZEL_EXPECT_TRUE(
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA) !=
-        composeLinkKey(ident(1), ident(1), Driver::linkRecipeSignature(false)));
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+        composeLinkKey(ident(1), ident(1), Driver::linkRecipeSignature(false), kToolchain));
 }
 
 // ---------------------------------------------------------------------------
@@ -286,18 +404,36 @@ BEZEL_TEST(aot_cache_key, relinking_the_same_object_is_reproducible) {
         os << kSourceA;
     }
 
-    Driver driver;
-    const std::string obj = dir + "/prog.o";
     CodegenOptions opts;
-    const bool compiled =
-        driver.compileExecutableObject(src, obj, /*deps=*/{}, opts).success;
-    BEZEL_EXPECT_TRUE(compiled);
-    if (!compiled) return;
-
+    const std::string obj = dir + "/prog.o";
     const std::string exe1 = dir + "/prog1";
     const std::string exe2 = dir + "/prog2";
-    BEZEL_EXPECT_TRUE(driver.linkExecutableObject(obj, exe1, /*deps=*/{}, opts));
-    BEZEL_EXPECT_TRUE(driver.linkExecutableObject(obj, exe2, /*deps=*/{}, opts));
+    const std::string ccErr = dir + "/cc.err";
+    // Fork-isolate each driver step. Every OTHER AOT test in the suite forks its
+    // compile because the front-end has a live crash history (see
+    // aot_crash_isolation_test.cpp — "without the fork, the SIGSEGV would abort
+    // the whole bezel_tests binary, taking down every other test in the shard").
+    // These two end-to-end cache-key tests were the lone paths that ran the
+    // Driver in-process, so an in-process compile fault here could kill a shard;
+    // for the split_build sibling it was also the #1608 flake source. Forking
+    // each step in its own child removes that path. // per #1608
+    auto run = [](const char* what,
+                  const bezel::test::aot_detail::CompileStatus& cc) -> bool {
+        if (cc.outcome != bezel::test::aot_detail::CompileOutcome::Ok)
+            std::cout << "    " << what << " did not succeed: " << cc.diag << "\n";
+        return cc.outcome == bezel::test::aot_detail::CompileOutcome::Ok;
+    };
+    const bool compiled =
+        run("compileExecutableObject",
+            bezel::test::aot_detail::forkedCompileObject(src, obj, opts, ccErr));
+    BEZEL_EXPECT_TRUE(compiled);
+    if (!compiled) return;
+    BEZEL_EXPECT_TRUE(run("linkExecutableObject(exe1)",
+                          bezel::test::aot_detail::forkedLink(
+                              obj, exe1, opts, ccErr)));
+    BEZEL_EXPECT_TRUE(run("linkExecutableObject(exe2)",
+                          bezel::test::aot_detail::forkedLink(
+                              obj, exe2, opts, ccErr)));
 
     Digest h1{}, h2{};
     BEZEL_EXPECT_TRUE(sha256File(exe1, h1));
@@ -348,12 +484,142 @@ BEZEL_TEST(aot_cache_key, link_cache_is_reached_and_preserves_behaviour) {
     BEZEL_EXPECT_EQ(st.linkHits.load(), l0 + 1);  // and its LINK was served
 }
 
-// The split path must be OBSERVATIONALLY EXACT: compiling+linking in ONE driver
+// The split path must be BYTE-FOR-BYTE EXACT: compiling+linking in ONE driver
 // call (what bezelc ships, and what the harness does when the cache is off) and
 // compiling then linking as TWO calls (what the cache does) must produce the
-// same executable. This is what lets the cache be an optimisation rather than a
-// second, weaker oracle.
+// SAME executable. This is what lets the cache be an optimisation rather than a
+// second, weaker oracle: a cache HIT serves a binary the real compile would have
+// produced.
+//
+// FORK-ISOLATED + DETERMINISTIC COMPILER (#1608 / #3020). Both builds compile
+// the SAME source in separate forked children. The byte-equality assertion
+// (hCombined == hSplit) was temporarily relaxed to observational equivalence
+// (#1608 narrow) because the compiler emitted its rodata globals in POINTER-KEYED
+// unordered_map iteration order — methodFns_ / ctorFns_ / disposerFns_ and the
+// supersOf descriptor maps — whose bucket order varies with the forked child's
+// inherited heap layout, making two forked compiles diverge by a few .rodata
+// bytes (~15% flake). Fix #3020 made the emission DETERMINISTIC by name-sorting
+// those maps' iteration (precedent: accessorSpecTagFor), plus fixed a latent
+// order-dependence in the buildSpecializedMethodFn cache key that the name-sort
+// exposed (a hasUnresolved check on the LLVM i32 type misclassified a genuine
+// `int` arg as a placeholder fallback, desyncing genericSubst_ from
+// genericSubstSemaTy_ and corrupting the specialization cache into an empty-idKey
+// collision — the #2192 transitive-generic break). With both fixes the compiler
+// is deterministic across processes/forks and the byte-equality pin is restored.
+// // per #1608 / #3020
 BEZEL_TEST(aot_cache_key, split_build_matches_the_combined_build_byte_for_byte) {
+    const std::string dir = bezel::test::aot_detail::makeWorkDir();
+    BEZEL_EXPECT_TRUE(!dir.empty());
+    if (dir.empty()) return;
+    bezel::test::aot_detail::WorkDir cleanup{dir};
+
+    const std::string src = dir + "/prog.bzl";
+    {
+        std::ofstream os(src, std::ios::binary);
+        os << kSourceDistinct;
+    }
+
+    CodegenOptions opts;
+    const std::string ccErr = dir + "/cc.err";
+    auto built = [](const char* what,
+                    const bezel::test::aot_detail::CompileStatus& cc) -> bool {
+        if (cc.outcome != bezel::test::aot_detail::CompileOutcome::Ok)
+            std::cout << "    " << what << " did not succeed: " << cc.diag << "\n";
+        return cc.outcome == bezel::test::aot_detail::CompileOutcome::Ok;
+    };
+
+    // COMBINED: compile+link in one driver call (the shipping bezelc path).
+    const std::string combined = dir + "/combined";
+    BEZEL_EXPECT_TRUE(built("compileFile(combined)",
+                            bezel::test::aot_detail::forkedCompile(
+                                src, combined, opts, ccErr)));
+    // compileFile must clean up after itself — a left-behind object would be a
+    // stray artifact in every bezelc invocation. The forked child removes it
+    // before _Exit, so it is gone by the time the parent resumes.
+    BEZEL_EXPECT_TRUE(!fs::exists(combined + ".o"));
+
+    // SPLIT: compile then link as two driver calls (the cache's path).
+    const std::string obj = dir + "/split.o";
+    const std::string split = dir + "/split";
+    BEZEL_EXPECT_TRUE(
+        built("compileExecutableObject(split.o)",
+              bezel::test::aot_detail::forkedCompileObject(src, obj, opts, ccErr)) &&
+        built("linkExecutableObject(split)",
+              bezel::test::aot_detail::forkedLink(obj, split, opts, ccErr)));
+
+    // #3020: BYTE-FOR-BYTE equality. Two forked compiles of the same source must
+    // now produce identical executables — the compiler's rodata emission is
+    // deterministic (name-sorted), so the inherited-heap-layout divergence that
+    // used to reorder a few globals is gone. A regression here means either the
+    // name-sort was reverted or a new pointer-keyed emission map was added
+    // without sorting.
+    std::array<uint8_t, 32> hCombined{}, hSplit{};
+    BEZEL_EXPECT_TRUE(sha256File(combined, hCombined));
+    BEZEL_EXPECT_TRUE(sha256File(split, hSplit));
+    if (hCombined != hSplit) {
+        std::cout << "    BYTE DIVERGENCE: combined and split executables differ\n";
+    }
+    BEZEL_EXPECT_EQ(hCombined, hSplit);
+
+    // Defense in depth: both must also RUN and exit 42 (the observational check
+    // the #1608 narrow kept as the sole assertion — kept now as a second gate).
+    auto exitCodeOf = [&](const std::string& exe,
+                          const std::string& tag) -> int {
+        const std::string out = dir + "/" + tag + ".out";
+        const std::string err = dir + "/" + tag + ".err";
+        bool timedOut = false;
+        int status = bezel::test::aot_detail::spawnCaptured(
+            {exe}, out, err, bezel::test::aot_detail::aotTimeoutSec(), timedOut, {});
+        if (timedOut) {
+            std::cout << "    " << tag << " timed out\n";
+            return -1;
+        }
+        if (WIFSIGNALED(status)) {
+            std::cout << "    " << tag << " killed by signal "
+                      << WTERMSIG(status) << "\n";
+            return -1;
+        }
+        return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    };
+    BEZEL_EXPECT_EQ(exitCodeOf(combined, "combined"), 42);
+    BEZEL_EXPECT_EQ(exitCodeOf(split, "split"), 42);
+}
+
+// ---------------------------------------------------------------------------
+// #1608 regression pin — recompiling the same source is DETERMINISTIC.
+// ---------------------------------------------------------------------------
+// This looks like a tautology ("obviously the same source compiles to the same
+// object"). It is NOT, and #1608 was the proof. The flake it pins was real and
+// gate-burning: when two compiles of the same source ran IN-PROCESS (the old
+// split_build shape), the first mutated process-global compiler state (LLVM
+// context / name-to-pointer maps) that the second then read; co-resident
+// runtime_* stress tests (round-robin'd into the same shard) dirtied the
+// initial state further; the two emitted objects diverged by a few bytes; the
+// linked executables got distinct GNU build-ids; and a content-equality
+// assertion flaked on ~15% of gate shard runs. run_parallel's crash attribution
+// names the LAST [ RUN ] line in the shard, so the failure was long misread as a
+// builtin_registry_snapshot "crash" (those tests are pure constexpr reads and
+// always passed — the gate log confirms [ OK ] on each).
+//
+// The fix was to fork-isolate each compile (forkedCompileObject) so every
+// compile starts from the SAME parent state — the only sound basis for a byte-
+// equality claim across recompiles. This test pins that property directly and
+// narrowly: three independent forked compiles of one source must be byte-for-
+// byte identical objects, every time, regardless of what prior co-resident
+// tests left in the process. If this ever flakes or fails, the #1608 isolation
+// has regressed — either an in-process compile path crept back in, or the
+// compiler grew a new state-dependent non-determinism. Either is a shard-killer
+// under the gate's parallel sharded run.
+//
+// SCOPE of this pin (#3020). It pins BACK-TO-BACK fork determinism: the three
+// forks here run in quick succession, so each child inherits near-identical
+// parent state and the emitted objects match. The deeper non-back-to-back fork
+// case (two forks SEPARATED by other work, the split_build shape) is now ALSO
+// pinned byte-for-byte by split_build_matches_the_combined_build_byte_for_byte
+// above, since fix #3020 made the compiler's rodata emission deterministic
+// (name-sorted). This test remains a narrow canary for the in-process-compile
+// class. // per #1608/#3020
+BEZEL_TEST(aot_cache_key, recompiling_same_source_is_deterministic_1608) {
     const std::string dir = bezel::test::aot_detail::makeWorkDir();
     BEZEL_EXPECT_TRUE(!dir.empty());
     if (dir.empty()) return;
@@ -364,30 +630,33 @@ BEZEL_TEST(aot_cache_key, split_build_matches_the_combined_build_byte_for_byte) 
         std::ofstream os(src, std::ios::binary);
         os << kSourceA;
     }
-
-    Driver driver;
     CodegenOptions opts;
+    const std::string ccErr = dir + "/cc.err";
 
-    const std::string combined = dir + "/combined";
-    const bool builtCombined =
-        driver.compileFile(src, combined, /*deps=*/{}, opts).success;
-    BEZEL_EXPECT_TRUE(builtCombined);
-    if (!builtCombined) return;
-    // compileFile must clean up after itself — a left-behind object would be a
-    // stray artifact in every bezelc invocation.
-    BEZEL_EXPECT_TRUE(!fs::exists(combined + ".o"));
+    // Each call forks a fresh child from the (compile-unchanged) parent, so all
+    // three compiles start from identical process state. An IN-PROCESS recompile
+    // here would reproduce the #1608 flake (the second/third object would read
+    // state the first mutated); the forked path cannot.
+    auto hashOfForkedCompile = [&](const std::string& objPath,
+                                   Digest& out) -> bool {
+        const auto cc = bezel::test::aot_detail::forkedCompileObject(
+            src, objPath, opts, ccErr);
+        if (cc.outcome != bezel::test::aot_detail::CompileOutcome::Ok) {
+            std::cout << "    forkedCompileObject did not succeed: " << cc.diag
+                      << "\n";
+            return false;
+        }
+        return sha256File(objPath, out);
+    };
 
-    const std::string obj = dir + "/split.o";
-    const std::string split = dir + "/split";
-    const bool builtSplit =
-        driver.compileExecutableObject(src, obj, /*deps=*/{}, opts).success &&
-        driver.linkExecutableObject(obj, split, /*deps=*/{}, opts);
-    BEZEL_EXPECT_TRUE(builtSplit);
-    if (!builtSplit) return;
-
-    Digest hCombined{}, hSplit{};
-    BEZEL_EXPECT_TRUE(sha256File(combined, hCombined));
-    BEZEL_EXPECT_TRUE(sha256File(split, hSplit));
-    // If this fails the cache is a DIFFERENT oracle from the shipping path.
-    BEZEL_EXPECT_TRUE(hCombined == hSplit);
+    Digest h1{}, h2{}, h3{};
+    BEZEL_EXPECT_TRUE(hashOfForkedCompile(dir + "/a.o", h1));
+    BEZEL_EXPECT_TRUE(hashOfForkedCompile(dir + "/b.o", h2));
+    BEZEL_EXPECT_TRUE(hashOfForkedCompile(dir + "/c.o", h3));
+    // The load-bearing pin: every forked compile of the same source is the same
+    // object. (Three pairwise checks, not one, so a two-way coincidence is not
+    // mistaken for determinism.)
+    BEZEL_EXPECT_TRUE(h1 == h2);
+    BEZEL_EXPECT_TRUE(h2 == h3);
+    BEZEL_EXPECT_TRUE(h1 == h3);
 }

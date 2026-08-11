@@ -149,7 +149,14 @@ bool ExprTC::implicitlyConvertible(const TypeRef* from, const TypeRef* to) {
     if (from->kind == TypeRef::Kind::Named && !from->declaration &&
         to->kind   == TypeRef::Kind::Named &&  to->declaration &&
         to->declaration->kind == ast::TypeDeclKind::Interface &&
-        to->declaration->name == "IReadOnlySpan") {
+        to->declaration->name == "IReadOnlySpan" &&
+        // fix #3022 (§11.3, v0.240): only the §4.16 BUILTIN interface has
+        // moduleName.empty() — SymbolCollection (local) and ModuleLoader
+        // (imported) populate moduleName on every real TypeSymbol. Without
+        // this gate a user interface named IReadOnlySpan would be admitted
+        // as the §4.16 target and codegen would box a span through a
+        // non-existent vtable.
+        to->declaration->moduleName.empty()) {
         // Inline name extraction (callsNamedTypeSimpleName is defined later).
         std::string_view fromN;
         if (from->astNode && from->astNode->name &&
@@ -232,6 +239,108 @@ void reportCollectionLiteralInterfaceTarget(
         "`Dictionary`); construct one of those and pass it (§15.4)");
 }
 
+// per §15.4 (#2914): the target type as the user spelled it, for the general
+// rejection below. Deliberately NOT the file-local `typeNameForDiag` above,
+// whose nullable marker is a PREFIX (`?Object`) — a diagnostic that names the
+// target the programmer must change has to spell it the way the grammar does
+// (§7: `T?`), or the remedy reads as a different type.
+static std::string collectionLiteralTargetSpelling(const TypeRef* t) {
+    if (!t) return "<unresolved>";
+    std::string s;
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+            s = primitiveSpellingForDiag(t->primitive);
+            break;
+        case TypeRef::Kind::Function:
+            s = "(fn ...)";
+            break;
+        case TypeRef::Kind::Unit:
+            s = "()";
+            break;
+        case TypeRef::Kind::Error:
+            s = "<unresolved>";
+            break;
+        case TypeRef::Kind::InlineArray:
+            // Unreachable through the caller (an inline array IS admissible),
+            // but spelled rather than defaulted so a future caller cannot get
+            // a "?" here.
+            s = "[";
+            s += t->arraySizeValue >= 0 ? std::to_string(t->arraySizeValue)
+                                        : std::string("N");
+            if (t->arrayOwned) s += " owned";
+            s += "]";
+            s += collectionLiteralTargetSpelling(t->arrayElement);
+            return s + (t->nullable ? "?" : "");
+        case TypeRef::Kind::Named: {
+            std::string_view nm = callsNamedTypeSimpleName(t);
+            s.append(nm.data(), nm.size());
+            if (s.empty()) s = "<unnamed>";
+            if (!t->genericArgs.empty()) {
+                s += "<";
+                for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                    if (i) s += ", ";
+                    s += collectionLiteralTargetSpelling(t->genericArgs[i]);
+                }
+                s += ">";
+            }
+            break;
+        }
+    }
+    if (t->nullable) s += "?";
+    return s;
+}
+
+// per §15.4 (#2914): the general rejection, for a target that is outside
+// §15.4's CLOSED target list but is not one of the interfaces #1174 named.
+// §15.4: "A collection literal has no standalone type. It is well-typed only in
+// a context that provides the target type" and "The target types that admit
+// collection literals are: [inline arrays … `Array<T>`/`OwningArray<T>` … any
+// user-defined type declaring the `FromCollectionLiteral` static factory]" —
+// a closed list that `Object` (and `int`, and a plain class) is not on, so the
+// literal is ill-typed there. Left un-rejected, a NON-EMPTY sequence literal at
+// such a target reached codegen's inline-array arm and emitted malformed IR
+// (an "Invalid indices for GEP pointer type" verifier abort — a compile-time
+// ICE), while an EMPTY or DICTIONARY literal lowered to nothing at all and
+// degraded to a zero-initialized slot — a silently wrong value. The spelling is
+// the target as written, so the message names the shape the user must change.
+void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
+                                      SourceLocation loc,
+                                      const TypeRef* target) {
+    std::string spelled = collectionLiteralTargetSpelling(target);
+    diags.report(
+        Severity::Error, loc,
+        "a collection literal `[...]` cannot target the type `" + spelled +
+        "` — §15.4 admits only a concrete collection target (an inline array "
+        "`[N]T`, `Array<T>`/`OwningArray<T>`, `Set`, `Stack`, `Queue`, "
+        "`LinkedList`, `Dictionary`, or a type declaring the "
+        "`FromCollectionLiteral` static factory); name one of those as the "
+        "target type and assign that (§15.4)");
+}
+
+// per §15.4 (#3031): the DICTIONARY-FORM specific rejection. §15.4's last
+// paragraph states the form-vs-target split explicitly: "The dictionary literal
+// form `[k1: v1, k2: v2, ...]` (colon-separated pairs) targets ONLY the
+// built-in `Dictionary<K, V>` and `OwningDictionary<K, V>`." The target
+// spelling is the same as the generic rejection above so the message names
+// the type the user must change, but the remediation is different — the
+// literal's FORM is the wrong thing here, not the target type. (The
+// `SortedDictionary<K,V>` family member is included both because it lives on
+// the same runtime as `Dictionary<K,V>` and because §15.4's `OwningDictionary`
+// synonym is the owning form of the same head; the user-extensible
+// dictionary-literal protocol is §18 deferred.)
+void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
+                                              SourceLocation loc,
+                                              const TypeRef* target) {
+    std::string spelled = collectionLiteralTargetSpelling(target);
+    diags.report(
+        Severity::Error, loc,
+        "a dictionary literal `[k: v, ...]` cannot target the type `" +
+        spelled + "` — §15.4 admits the dictionary-literal form only at "
+        "`Dictionary<K, V>`/`OwningDictionary<K, V>`/`SortedDictionary<K, V>`; "
+        "remove the key/value pairs to use the sequence-literal form, or "
+        "change the target type to a dictionary (§15.4)");
+}
+
 // per §15.4 (#1825): the POSITIVE side of `isCollectionLiteralInterfaceTarget`.
 // A collection literal is admissible (i.e. codegen can materialise it
 // against this target) when the target is one of:
@@ -240,7 +349,8 @@ void reportCollectionLiteralInterfaceTarget(
 //     paths, but the LAMBDA-BODY materialiser routes through here too;
 //   * a CONCRETE builtin collection named type (`Array`/`OwningArray`,
 //     `Stack`/`OwningStack`, `Queue`/`OwningQueue`, `LinkedList`/
-//     `OwningLinkedList`, `Set`/`OwningSet`, `Dictionary`/`OwningDictionary`)
+//     `OwningLinkedList`, `Set`/`OwningSet`, `Dictionary`/`OwningDictionary`/
+//     `SortedDictionary`)
 //     — matched by name in codegen's materializeHeapCollectionLiteral /
 //     materializeHeapDictLiteral;
 //   * a user type that declared `FromCollectionLiteral` (stdlib §15.4 — the
@@ -249,17 +359,48 @@ void reportCollectionLiteralInterfaceTarget(
 // isCollectionLiteralInterfaceTarget). Declared in ExprTypecheck_impl.hpp —
 // shared with the lambda-body materialisation path (#1825) and any future
 // site that needs the same positive check.
-bool isCollectionLiteralAdmissibleTarget(const TypeRef* t) {
+// per §15.4 (#3031): the predicate ALSO consults the literal's FORM. The
+// dictionary-literal form `[k: v, ...]` is admitted only at the dictionary
+// family (`Dictionary<K,V>`/`OwningDictionary<K,V>`/`SortedDictionary<K,V>`);
+// the sequence-literal form `[e1, e2, ...]` is admitted at every OTHER
+// §15.4 target (inline arrays, the sequence-shaped collection heads, and a
+// user type opting in via `FromCollectionLiteral` — §15.4.1 is sequence-only).
+// A target that pairs the wrong form of literal is rejected; the
+// diagnostics are `reportCollectionLiteralBadTarget` (target not on list)
+// and `reportCollectionLiteralDictFormBadTarget` (target IS on list but
+// pairs the wrong form — the remediation is to change the literal's form,
+// not the target type).
+// SPEC §15.4 EMPTY-LITERAL CARVE-OUT: the empty literal `[]` is admitted at
+// EVERY collection target listed on §15.4 ("the empty literal `[]` is
+// admitted for every collection target listed above … the target type
+// determines whether `[]` constructs an empty sequence collection or an
+// empty dictionary"). The parser therefore parses `[]` as the sequence
+// form (`isDict=false`) with zero elements, and the target type is the
+// only signal of which shape it built. The predicate below answers the
+// form-vs-target question for an arbitrary literal; the call sites handle
+// the empty case inline (short-circuiting to "admitted at any §15.4 list
+// target, excluding inline arrays") because they already have the literal
+// available. The inline-array case is independent: inline arrays require
+// `≥ 1` elements (the existing #2914-gate at ExprTypecheck.cpp:9717), so
+// the empty literal is REJECTED at an inline-array target regardless of
+// the form-vs-target question.
+bool isCollectionLiteralAdmissibleTarget(const TypeRef* t, bool isDict) {
     if (!t) return false;
-    // Inline array: any sized [N]T / [N owned]T.
-    if (t->kind == TypeRef::Kind::InlineArray) return true;
+    // Inline array: only the sequence form admits (no dict entries in an
+    // inline array). The empty-literal carve-out does NOT apply here:
+    // inline arrays require `≥ 1` elements (§15.4, the cell-typed
+    // local-init check at ExprTypecheck.cpp:9717 is the existing gate).
+    if (t->kind == TypeRef::Kind::InlineArray) return !isDict;
     if (t->kind != TypeRef::Kind::Named) return false;
     // A collection INTERFACE has no concrete backing → never admissible.
     if (isCollectionLiteralInterfaceTarget(t)) return false;
     // A user type that opted in via FromCollectionLiteral: walk its members
-    // for a static method of that exact name. Mirrors the codegen side (the
-    // runtime calls the static `FromCollectionLiteral(elements)` factory).
+    // for a static method of that exact name. §15.4.1 makes the protocol
+    // sequence-only — the dict form has no user-extensible dispatch today
+    // (rationale §18 deferred), so a dict literal at a FromCollectionLiteral
+    // user type is rejected here, not deferred to codegen.
     if (t->declaration) {
+        if (isDict) return false;
         for (const Symbol* m : t->declaration->members) {
             const auto* ms = dynamic_cast<const MethodSymbol*>(m);
             if (!ms || ms->name != "FromCollectionLiteral" || ms->params.empty())
@@ -274,10 +415,81 @@ bool isCollectionLiteralAdmissibleTarget(const TypeRef* t) {
         return false;
     }
     // Builtin collections: Array/OwningArray/Stack/OwningStack/Queue/
-    // OwningQueue/Set/OwningSet/LinkedList/OwningLinkedList/Dictionary/
-    // OwningDictionary — matched by simple name (the #1414 stage-3 registry
-    // is the single source of truth, but a name-only check is sufficient
-    // here because the codegen side does the same).
+    // OwningQueue/Set/OwningSet/LinkedList/OwningLinkedList + Dictionary/
+    // OwningDictionary/SortedDictionary — matched by simple name (the #1414
+    // stage-3 registry is the single source of truth, but a name-only check
+    // is sufficient here because the codegen side does the same).
+    if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
+        return false;
+    std::string_view n = t->headName();
+    // §15.4 last paragraph: only the dictionary family accepts the dict form.
+    if (n == "Dictionary" || n == "OwningDictionary" || n == "SortedDictionary")
+        return isDict;
+    // Every other §15.4 head is sequence-shaped; the seq form only.
+    return !isDict && (n == "Array" || n == "OwningArray" || n == "Stack" ||
+                       n == "OwningStack" || n == "Queue" || n == "OwningQueue" ||
+                       n == "Set" || n == "OwningSet" || n == "LinkedList" ||
+                       n == "OwningLinkedList");
+}
+
+// per §15.4 (v0.240): the empty literal `[]` is admitted at every collection
+// target on §15.4's closed list. This predicate answers the membership
+// question — is `t` on the list — so the call sites can short-circuit the
+// form-vs-target check for an empty literal: empty + on list → admit; empty
+// + off list → reject (the §15.4 sentence: "An empty literal in a non-
+// collection or undeterminable context is the usual 'cannot infer target
+// type' compile error"). The form-vs-target check is separate because the
+// non-empty forms obey the §15.4 form-vs-target split; the empty carve-out
+// exists because the parser cannot syntactically distinguish "empty seq"
+// from "empty dict" — both are written `[]` and the target type decides.
+// Inline arrays are EXCLUDED: they require `≥ 1` elements regardless of
+// form (§15.4 last paragraph).
+// §15.4.1 (v0.240) FCL carve-out — explicitly different from the form-vs-
+// target §15.4 rule, which is a form match (dict form vs seq form), and
+// instead a USER-EXTENSIBLE admission: "The empty literal `[]` targeting
+// such a type is admitted: the borrowing form receives an empty
+// `ReadOnlySpan<U>`; the owning form receives an empty `OwningArray<U>`.
+// The factory is responsible for handling the empty case." A user type
+// declaring `FromCollectionLiteral` is therefore ON the §15.4 list for
+// the empty-literal carve-out, just as it is for the non-empty sequence
+// form. The pre-fix code rejected this with a generic "user types have
+// no dispatch for a zero-element literal" comment; that was a real spec
+// violation measured against the §15.4.1 conformance test
+// `tests/conformance/cases/spec_0063.bzl:23` (`using var empty:
+// RingBuffer<int> := [];`).
+bool isCollectionLiteralEmptyAdmissibleTarget(const TypeRef* t) {
+    if (!t) return false;
+    // Inline arrays require `≥ 1` elements regardless of form.
+    if (t->kind == TypeRef::Kind::InlineArray) return false;
+    if (t->kind != TypeRef::Kind::Named) return false;
+    // A collection INTERFACE has no concrete backing → not on §15.4 list.
+    if (isCollectionLiteralInterfaceTarget(t)) return false;
+    // A user type that opted in via FromCollectionLiteral: §15.4.1 admits
+    // the empty literal at such a type. Walk its members for a static
+    // method of that exact name — the same walk the seq-form predicate
+    // uses at lines 404-413, mirrored here so a future opt-in shape
+    // (signature variant, visibility, etc.) is honored uniformly. A user
+    // type WITHOUT the opt-in is not on the §15.4 list and falls through
+    // to the builtin-name check, which returns false because its head
+    // name is not one of the §15.4 builtins.
+    if (t->declaration) {
+        for (const Symbol* m : t->declaration->members) {
+            const auto* ms = dynamic_cast<const MethodSymbol*>(m);
+            if (!ms || ms->name != "FromCollectionLiteral" ||
+                ms->params.empty())
+                continue;
+            // isStatic lives on the AST decl, not the Symbol (mirrors the
+            // sema-side pattern at ExprTypecheck_Exprs.cpp:6251-6254).
+            bool isStatic = false;
+            for (auto mod : ms->modifiers)
+                if (mod == "static") { isStatic = true; break; }
+            if (isStatic) return true;
+        }
+        return false;
+    }
+    // Builtin collections: Array/OwningArray/Stack/OwningStack/Queue/
+    // OwningQueue/Set/OwningSet/LinkedList/OwningLinkedList + Dictionary/
+    // OwningDictionary/SortedDictionary.
     if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
         return false;
     std::string_view n = t->headName();
@@ -285,7 +497,7 @@ bool isCollectionLiteralAdmissibleTarget(const TypeRef* t) {
            n == "OwningStack" || n == "Queue" || n == "OwningQueue" ||
            n == "Set" || n == "OwningSet" || n == "LinkedList" ||
            n == "OwningLinkedList" || n == "Dictionary" ||
-           n == "OwningDictionary";
+           n == "OwningDictionary" || n == "SortedDictionary";
 }
 
 // §22.6 classify how `argTy` matches `paramTy` at one argument position.
@@ -306,7 +518,8 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     const std::vector<const TypeRef*>& argTypes,
     const std::vector<bool>& fillsDefault,
     const std::vector<std::string>& candNames, SourceLocation loc,
-    const std::string& calleeDesc, const std::string& extraNote) {
+    const std::string& calleeDesc, const std::string& extraNote,
+    const std::vector<const ast::Expr*>& argExprs) {
     OverloadResult res;
     const std::size_t nCand = paramTypes.size();
     const std::size_t nArg = argTypes.size();
@@ -351,7 +564,42 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     for (std::size_t c = 0; c < nCand; ++c) {
         grid[c].resize(nArg);
         for (std::size_t i = 0; i < nArg; ++i) {
-            ArgMatch m = classifyArg(argTypes[i], paramTypes[c][i]);
+            // fix #2985 (§22.6 + §5.1 v0.240 *Constant narrowing*): delegate
+            // to narrowIntConstantToTarget first so an in-range compile-time
+            // int constant (literal, local / member const, enum constant of
+            // the underlying type) is re-typed against THIS candidate's
+            // parameter TYPE before classifyArg judges Exact / Convert /
+            // NotApplicable. Without the call, `Pick(3)` against
+            // `Pick(byte)`/`Pick(string)` sees the literal's `int` typed as
+            // such against every candidate: `int → byte` is a NARROWING, not
+            // in §5.1's widening table, so it is NotApplicable; `int →
+            // string` is NotApplicable; both are rejected; the unique-winner
+            // resolution that §5.1's own worked example (`Set(level: byte)`
+            // called as `Set(3)`) promises fails. The narrower int types
+            // (byte / sbyte / short / ushort / uint / ulong) are precisely
+            // those narrowIntConstantToTarget re-types for; everything
+            // else (widening int, non-int target) returns `from` unchanged,
+            // preserving the prior behaviour and the §5.1 widening-table
+            // membership (without this delegation the inner classifyArg
+            // would still be the authority for the widening arm, exactly
+            // as before). Empty `argExprs` (the pre-#2985 call shape on any
+            // site that does not yet supply the AST arguments) skips the
+            // re-type and keeps the old behaviour verbatim.
+            const TypeRef* argTy = argTypes[i];
+            if (!argExprs.empty() && i < argExprs.size() && argExprs[i]) {
+                // narrowIntConstantToTarget's signature takes TypeRef* (the
+                // #2925 mutating re-typing variant); both argTypes[i] and
+                // paramTypes[c][i] are const TypeRef*, so const_cast matches
+                // the existing pre-pass at line ~1141's pattern. The
+                // function may setExprType on the expression when the rule
+                // applies (a side effect that the existing pre-pass already
+                // documents); the AST itself is not touched.
+                argTy = narrowIntConstantToTarget(
+                    argExprs[i],
+                    const_cast<TypeRef*>(argTypes[i]),
+                    const_cast<TypeRef*>(paramTypes[c][i]));
+            }
+            ArgMatch m = classifyArg(argTy, paramTypes[c][i]);
             grid[c][i] = m;
             if (m == ArgMatch::NotApplicable) applicable[c] = false;
         }
@@ -644,9 +892,17 @@ bool containsMethodTypeParam(
     return containsMethodTypeParam(t->arrayElement, gpNames);
 }
 
+}  // namespace
+
 // §22.3 / §14.5 (#2266): true when `t` mentions one of `tpNames` ANYWHERE in its
 // structure. It additionally walks function parameter/return slots beyond
 // containsMethodTypeParam's generic arguments and inline-array element.
+//
+// #2926 gave it EXTERNAL linkage (it is declared in ExprTypecheck_impl.hpp and
+// lifted out of this file's anonymous namespace) so the field / auto-property /
+// default-value assignability checks defer on an unsubstituted type parameter
+// through the SAME superset walk, rather than growing a fourth private copy of
+// "does this type mention a type parameter?".
 //
 // It gates a SKIP of a rejection: checkArgsAgainstParams' §22.3 ref/out
 // exact-type check defers every parameter this returns true for to §14.5's
@@ -674,6 +930,8 @@ bool refOutParamTypeMentionsTypeParam(
         if (refOutParamTypeMentionsTypeParam(fp.type, tpNames)) return true;
     return refOutParamTypeMentionsTypeParam(t->funcReturn, tpNames);
 }
+
+namespace {
 
 // A printable spelling for a resolved TypeRef, used by the §14.5 ref/out
 // exact-unification diagnostics (checkGenericRefOutExactUnification below).
@@ -961,6 +1219,52 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // §22.6 defaulted-arity tie-break (v0.181, #1561): does candidate c's
     // binding leave any parameter to be filled by its declared default?
     std::vector<bool> fillsDefault(cands.size(), false);
+    // fix #2985 (§22.6 / §5.1, v0.240): §5.1 "Constant narrowing" says "An
+    // expression of integer type that is a compile-time constant implicitly
+    // converts to any integer type whose range contains its value" and the
+    // worked example names `Set(level: byte)` called as `Set(3)` as a well-
+    // typed case. §22.6 overload resolution classifies each (candidate, arg)
+    // cell by `classifyArg`, which calls `implicitlyConvertible` on the
+    // argument's static type — and that type was already set by an EARLIER
+    // `typecheckExpression` pass to `int` (a literal `3` has type `int`,
+    // `C.GK` and a named `const` resolve to their declared `int`). `Pick(3)`
+    // against `Pick(byte)`/`Pick(string)` therefore sees `int → byte` as a
+    // NARROWING, which §5.1 does NOT list in its widening table, and rejects
+    // every candidate — even though §5.1 explicitly admits the conversion via
+    // the constant-narrowing carve-out.
+    //
+    // narrowIntConstantToTarget is the single §5.1 narrowing implementation
+    // (#2925) — it re-types an integer-literal/const expression to a narrower
+    // integer target when (a) the source is plain `int` and (b) the value fits
+    // the target. Running it per candidate on each argument lets `classifyArg`
+    // see the post-narrowing type: `Pick(3)` against `Pick(byte)` becomes
+    // `byte → byte` (exact), against `Pick(string)` stays inapplicable, so the
+    // unique winner is `Pick(byte)` exactly as §5.1's worked example promises.
+    //
+    // SUBTLETY — ORDER DEPENDENCE. narrowIntConstantToTarget mutates the
+    // argument's recorded type in the typecheck side table via setExprType, so
+    // the LAST candidate that successfully narrows a given argument wins the
+    // recorded type. With two narrower-integer candidates (e.g. `Pick(byte)`
+    // and `Pick(short)`), the first-declared one wins the recorded type and
+    // the other becomes inapplicable (`byte → short` is a §5.1 widening, so
+    // it stays applicable, but then `short → byte` for the inverse order is
+    // not — the resolver still picks a unique candidate, just whichever
+    // declaration the resolver saw first). This is recorded as an
+    // implementation choice — the spec does not say what to do when two
+    // narrower-integer overloads both fit a constant, because §22.6's "no
+    // candidate is unambiguously better" rule expects EXACT vs CONVERT to
+    // decide, and both post-narrowing candidates are exact. An OUT-OF-RANGE
+    // constant still falls through (narrowIntConstantToTarget returns `from`
+    // unchanged when `fitsInIntType` is false), so an ambiguity remains
+    // diagnosable when a narrower candidate truly does not fit.
+    //
+    // OUT OF SCOPE — qualified const `C.GK` (filed as #2986). foldIntConstExprTC
+    // only resolves local/module consts through `lookupName`; a class member
+    // const is reached through a different lookup chain and may fold to a
+    // different value than #2985's #2925 fix delivered. Scoping this lane to
+    // the case `narrowIntConstantToTarget` already supports (literals + local /
+    // module consts); bundling #2986 would risk regressing this fix when the
+    // member-const resolver changes.
     for (std::size_t c = 0; c < cands.size(); ++c) {
         const auto& params = decls[c]->params;
         for (std::size_t j = 0; j < params.size(); ++j) {
@@ -972,10 +1276,37 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             const TypeRef* pt = params[j].type
                                     ? ctx_.resolvedType(*params[j].type)
                                     : nullptr;
-            const TypeRef* at = ce.args[static_cast<std::size_t>(ai)].value
-                                    ? ctx_.exprType(
-                                          *ce.args[static_cast<std::size_t>(ai)]
-                                               .value)
+            const ast::CallArgument* carg =
+                ce.args[static_cast<std::size_t>(ai)].value
+                    ? &ce.args[static_cast<std::size_t>(ai)]
+                    : nullptr;
+            // §22.3 / §14.5: ref/out arguments alias the caller's storage, so
+            // §22.6's exact-type rule applies (§22.3 "A `ref` argument naming a
+            // mutable local … is a true alias"; §14.5 "a `ref` or `out`
+            // parameter position unifies exactly"). The §5.1 narrowing carve-
+            // out does not apply to ref/out positions, so skip them here —
+            // `classifyArg` will see the un-narrowed type and reject unless
+            // the types already match exactly.
+            const bool skipNarrow =
+                !carg || carg->modifier == "ref" || carg->modifier == "out" ||
+                carg->modifier == "out var" ||
+                carg->modifier == "out using var" ||
+                carg->modifier == "out owned var";
+            if (!skipNarrow && carg && carg->value && pt) {
+                // narrowIntConstantToTarget re-types the expression via
+                // ctx_.setExprType when the rule applies; the subsequent
+                // ctx_.exprType below picks up the narrowed type. It is a
+                // no-op when (a) the source is not plain `int`, (b) the target
+                // is not a narrower integer, or (c) the value does not fit —
+                // the very predicates that let the existing checkArgsAgainst-
+                // Params path avoid false positives on non-constant or out-of-
+                // range values.
+                (void)narrowIntConstantToTarget(carg->value.get(),
+                                                ctx_.exprType(*carg->value),
+                                                const_cast<TypeRef*>(pt));
+            }
+            const TypeRef* at = carg && carg->value
+                                    ? ctx_.exprType(*carg->value)
                                     : nullptr;
             paramTypes[c].push_back(pt);
             argTypeRows[c].push_back(at);
@@ -1014,7 +1345,23 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     }
     OverloadResult r = resolveOverload(
         paramTypes, argTypes, fillsDefault, candNames, ce.span.begin,
-        std::string("`") + std::string(initial->name) + "`", extNote);
+        std::string("`") + std::string(initial->name) + "`", extNote,
+        // fix #2985 (§22.6 + §5.1): pass the AST expressions so the
+        // per-candidate narrowing arm can re-type a compile-time int constant
+        // via narrowIntConstantToTarget before classifyArg. ce.args is the
+        // call's argument list (§A.5); each CallArgument carries a
+        // std::unique_ptr<Expr> as its expression. Skip discard positions
+        // (whose value is null) so the inner loop's `argExprs[i]` check
+        // sees null and bypasses the re-type for the discard column
+        // (consistency with the existing `narrowIntConstantToTarget`
+        // pre-pass above, which already skips !carg->value).
+        [&]() {
+            std::vector<const ast::Expr*> es;
+            es.reserve(ce.args.size());
+            for (const auto& a : ce.args)
+                es.push_back(a.value.get());
+            return es;
+        }());
     switch (r.outcome) {
         case OverloadOutcome::Resolved:
             return cands[r.winnerIndex];
@@ -3428,7 +3775,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 !recvTy->astNode->name->parts.empty())
                                 spanHead = recvTy->headName();
                         } else if (!recvTy->declaration->decl ||
-                                   recvTy->declaration->name == "IReadOnlySpan") {
+                                   // fix #3022 (§11.3, v0.240): gate the
+                                   // IReadOnlySpan builtinClassSym match on
+                                   // moduleName.empty() so a USER interface
+                                   // named IReadOnlySpan (local or imported)
+                                   // does not get the §4.16 span-receiver
+                                   // typing — SymbolCollection and
+                                   // ModuleLoader populate moduleName on
+                                   // every real TypeSymbol.
+                                   (recvTy->declaration->name == "IReadOnlySpan" &&
+                                    recvTy->declaration->moduleName.empty())) {
                             spanHead = recvTy->declaration->name;
                         }
                     }
@@ -3779,9 +4135,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // result was otherwise left null → the downstream operator saw an
                 // untyped receiver). Range's own members (Contains/GetEnumerator)
                 // resolve through their dedicated handlers and are unaffected.
+                // fix #3022 (§11.3, v0.240): the `Range` head must be the §5
+                // builtin Range<T>, not a user class named Range — gate on
+                // moduleName.empty() (the discriminator the rest of the
+                // front-end adopted after #2995/#2997).
                 bool isRangeLinqRecv =
                     recvTy && recvTy->kind == TypeRef::Kind::Named &&
                     recvTy->declaration && recvTy->declaration->name == "Range" &&
+                    recvTy->declaration->moduleName.empty() &&
                     !recvTy->genericArgs.empty();
                 // stdlib §5 (#755): an `IGrouping<TKey, T>` receiver. `IGrouping :
                 // IEnumerable<T>` (stdlib §5:3076), so the whole §5 operator and
@@ -4100,9 +4461,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // codegen and `.Length`/`.Get` paths recognize); GetString → string;
                 // Name → string. Only Utf8 reaches here (the other singletons are
                 // rejected at member access).
+                // fix #3022 (§11.3, v0.240): the Encoding head must be the
+                // stdlib §3.2 builtin, not a user class named Encoding —
+                // gate on moduleName.empty() (the discriminator the rest of
+                // the front-end adopted after #2995/#2997). Without the gate
+                // a user class named `Encoding` reaches stdlib §3.2's
+                // specific member-typing arm and codegen tries to box
+                // `Encoding.Utf8` as a built-in singleton.
                 if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
                     recvTy->declaration &&
-                    recvTy->declaration->name == "Encoding") {
+                    recvTy->declaration->name == "Encoding" &&
+                    recvTy->declaration->moduleName.empty()) {
                     if (m == "GetBytes" && ce.args.size() <= 1) {
                         // fix #526 / stdlib §3.2: 1-arg GetBytes(s: string)
                         // returns owned Array<byte>. Use makeConcreteCollectionResult
@@ -4806,7 +5175,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                 "Array", recvTy->genericArgs[0]));
                         } else if (colName == "Array" && !recvTy->genericArgs.empty() &&
-                                   m == "Sorted" && ce.args.empty()) {
+                                   (m == "Sorted" || m == "Sort") &&
+                                   ce.args.empty()) {
+                            // fix #2790 (stdlib §4.4, spec §14.2, v0.240): the
+                            // PARAMETERLESS `Sort()` reached this branch under
+                            // `m == "Sorted"` only, so it had NO admissibility
+                            // gate at all while its sibling `Sorted()` did.
+                            // MEASURED consequence: `Array<Plain>.Sort()` for a
+                            // `Plain` implementing no `IComparable` COMPILED,
+                            // RAN, and SILENTLY DID NOTHING — elements 3,1,2
+                            // came back 3,1,2 — while `Array<Plain>.Sorted()`
+                            // was correctly rejected on the same type. The user
+                            // asks for a sort and gets a no-op with no
+                            // diagnostic. Both forms carry the same stdlib §4.4
+                            // constraint, so both take the same gate; only the
+                            // RESULT TYPE differs (Sorted() yields a new Array,
+                            // Sort() is in place), which is handled below.
                             // Constraint check: T must be IComparable<T>.  Accepts:
                             // (a) built-in primitive comparable types (int, string,
                             //     long, byte, double, float, char — §9.x);
@@ -4846,17 +5230,74 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     }
                                 }
                             }
+                            // fix #2768 (stdlib §4.4 / §2.8, spec §14.2,
+                            // v0.240): (c) an INTERFACE element that names
+                            // `IComparable<E>` with E the interface ITSELF.
+                            // §14.2's interface-conformance rule 3 admits an
+                            // interface substitution ("T is an interface that
+                            // has I in its extension chain"), and its worked
+                            // example states that `where T: IComparable<int>`
+                            // "admits a mix of primitive, class, record, and
+                            // interface substitutions" — so rejecting
+                            // `Array<IFoo>.Sorted()` for `interface IFoo:
+                            // IComparable<IFoo>` was a FALSE REJECT of a
+                            // document-admissible shape. The self-recurrence is
+                            // required, not just any IComparable base: it is
+                            // what `where T: IComparable<T>` literally asks,
+                            // and it is what keeps `string` (stdlib §9.6:
+                            // `IComparable<string>`, never
+                            // `IComparable<IComparable<string>>`) out of the
+                            // interface arm codegen selects for this shape.
+                            // This predicate is the same test codegen's
+                            // selfComparableIfaceCompareTo applies, with ONE
+                            // difference: codegen additionally requires that a
+                            // non-static one-parameter `CompareTo` actually be
+                            // found among IComparable's members. That is not an
+                            // exact mirror, but it cannot desynchronize the two
+                            // in the dangerous direction — codegen's extra
+                            // conjunct failing is a MISS (the pre-fix
+                            // comparator choice stands), never a fault. So sema
+                            // can never admit an element codegen crashes on.
+                            //
+                            // #1867's convention: the builtin interface is
+                            // matched by IDENTITY, not by name — see
+                            // TypeResolution_Checks.cpp, "Blanket-accepting by
+                            // decl/name was too lenient — it admitted a WRONG
+                            // generic argument".
+                            // #2787: was a hand-rolled copy of the §14.2
+                            // rule-3 self-recurrence scan; now delegates to
+                            // sema::selfComparableIface, THE one definition
+                            // (TypeResolution.hpp). Behaviour is unchanged —
+                            // same identity match on the builtin symbol, same
+                            // typeRefEqual on the argument, same nullable
+                            // exclusion. Do not re-inline it: #2776's pending
+                            // cross-module fix must reach every caller.
+                            if (!isComparableElem &&
+                                selfComparableIface(
+                                    elemTy472,
+                                    ctx_.builtinInterfaceSym("IComparable")))
+                                isComparableElem = true;
                             if (!isComparableElem) {
+                                // fix #2790: name the form the user actually
+                                // wrote, and point at that form's comparer
+                                // overload — suggesting `Sorted(comparer)` to
+                                // someone who called `Sort()` sends them to a
+                                // different operation (a copy, not in place).
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
-                                    "Array<T>.Sorted() requires T to implement "
+                                    "Array<T>." + std::string(m) +
+                                    "() requires T to implement "
                                     "IComparable<T> (§3 / #472); T is not a "
                                     "built-in comparable type. "
-                                    "Use Sorted(comparer: (T, T) -> int) instead.");
-                            } else {
+                                    "Use " + std::string(m) +
+                                    "(comparer: (T, T) -> int) instead.");
+                            } else if (m == "Sorted") {
                                 ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                     "Array", recvTy->genericArgs[0]));
                             }
+                            // `Sort()` sorts IN PLACE and yields no value, so it
+                            // gets no result type here — deliberately, and it is
+                            // why the two forms cannot simply share one arm.
                         } else if (colName == "Array" && !recvTy->genericArgs.empty() &&
                                    m == "Sorted" && ce.args.size() == 1) {
                             // #542 / §3 / #472: validate that the comparer argument
@@ -5734,6 +6175,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (colName == "string" || colName == "String") {
                         if (m == "Join")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        // §32.6 / §10 (v0.240, #2734): does `at` name the FFI
+                        // builtin `nm`? A builtin with no user TypeDecl reaches
+                        // us in EITHER of two TypeRef shapes and the difference
+                        // is invisible at the source level: a factory result
+                        // (`CString.From(s)`) carries declaration =
+                        // builtinClassSym("CString"), while an ANNOTATION
+                        // (`c: CString` on a parameter or field) carries
+                        // declaration = null and only the astNode head name
+                        // (TypeResolution_Names.cpp: the §10 names resolve to a
+                        // null-declaration Named ref). #1145's guard tested
+                        // only the first, so `string.From(c)` on a `CString`
+                        // PARAMETER was rejected as "no matching overload"
+                        // even though §9.6 declares exactly that overload.
+                        auto isFfiBuiltin = [](TypeRef* at,
+                                               std::string_view nm) {
+                            if (!at || at->kind != TypeRef::Kind::Named)
+                                return false;
+                            // declaration set → a builtinClassSym (factory
+                            // result); otherwise headName(), which is the
+                            // alias-transparent read and already falls back to
+                            // the metadata `importedName` for a cross-module
+                            // TypeRef with no astNode.
+                            return at->declaration ? at->declaration->name == nm
+                                                   : at->headName() == nm;
+                        };
                         // §9.6 / #1145: the single-argument `String.From`
                         // overloads accept only `char`, `CString`, or `WString`
                         // (the char-array form is the three-arg
@@ -5751,10 +6217,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (at && at->kind == TypeRef::Kind::Primitive &&
                                 at->primitive == P::Char)
                                 ok = true;
-                            else if (at && at->kind == TypeRef::Kind::Named &&
-                                     at->declaration &&
-                                     (at->declaration->name == "CString" ||
-                                      at->declaration->name == "WString"))
+                            else if (isFfiBuiltin(at, "CString") ||
+                                     isFfiBuiltin(at, "WString"))
                                 ok = true;
                             if (at && !ok)
                                 ctx_.diagnostics().report(
@@ -5765,6 +6229,38 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     "a string from a char array use "
                                     "`String.From(buffer, start, count)` "
                                     "(§9.6)");
+                        }
+                        // spec §32.6 / stdlib §9.6 + §10.4 (v0.240, #2734):
+                        // `string.FromCStringPointer(p: IntPtr): string` and
+                        // `string.FromWStringPointer(p: IntPtr): string` — "the
+                        // same operation on a raw `IntPtr`" (§32.6), for the
+                        // borrowed-pointer FFI shape where the Bezel side owns
+                        // nothing. Both take exactly one `IntPtr`; anything
+                        // else is a no-overload error rather than a silent
+                        // reinterpretation of some other pointer-shaped value
+                        // (a `string` argument would otherwise be decoded as if
+                        // it were a C buffer and yield garbage).
+                        if (m == "FromCStringPointer" ||
+                            m == "FromWStringPointer") {
+                            ctx_.setExprType(&ce,
+                                             ctx_.primitiveTypeRef(P::String));
+                            TypeRef* at = ce.args.size() == 1 && ce.args[0].value
+                                ? ctx_.exprType(*ce.args[0].value) : nullptr;
+                            bool ok = ce.args.size() == 1 &&
+                                      isFfiBuiltin(at, "IntPtr");
+                            // Stay silent when the sole argument is itself
+                            // untyped — it has already been diagnosed, and a
+                            // cascading second error only obscures it (the
+                            // #1145 convention directly above).
+                            if (!ok && (ce.args.size() != 1 || at))
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "no matching overload of `String." +
+                                    std::string(m) + "` — it takes exactly "
+                                    "one `IntPtr` (stdlib §9.6); to read "
+                                    "from an owned `CString`/`WString` "
+                                    "instance use `String.From(c)` "
+                                    "(§10.4)");
                         }
                     }
                     // File static methods (§7.3)
@@ -6384,6 +6880,323 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     ctx_.diagnostics().report(Severity::Error, ce.span.begin,
                         "use `await t` — blocking waits are not available in "
                         "async code (§30.3)");
+                }
+                // fix #2819 (§30.3 *The `Task`, `Task<T>` and `OwningTask<T>`
+                // types*, §4.7 *The unit type*, v0.240): `Wait()` is declared
+                // `public method Wait();` — no return type — so §4.7's "It is
+                // the return type of methods declared without an explicit
+                // return type" makes its result UNIT. §30.3 is explicit that
+                // the value is read elsewhere: "`Wait()` and `Result` are
+                // synchronous escape hatches"; the result comes from `Result`.
+                // Codegen already models this (LlvmBackend_Calls2: the result
+                // buffer pointer is discarded because `Wait()` returns unit),
+                // but sema left the CallExpr with NO exprType at all — null,
+                // not `Kind::Unit`.
+                //
+                // That gap is what let `total := total + t.Wait();` compile and
+                // contribute 0 on every iteration (#2819), and it is why the
+                // category-blind unit-operand gate in typeBinary could not see
+                // it: the gate correctly refuses to key on "untyped", since a
+                // null exprType means "sema could not type this", which is
+                // reachable from many unrelated shapes and would be a broad
+                // false reject. Recording the type the spec actually assigns is
+                // the fix; the gate then applies to `Wait()` exactly as it does
+                // to a user method declared without a return type.
+                //
+                // Covers all three receivers §30.3 names — `Task`, `Task<T>`
+                // (both `colName == "Task"`) and `OwningTask<T>` — and is set
+                // regardless of async context, so the shape is typed even on
+                // the path where the §30.3 blocking-wait error above fires.
+                if ((colName == "Task" || colName == "OwningTask") &&
+                    m == "Wait" && ce.args.empty() && !ctx_.exprType(ce)) {
+                    auto* unit = ctx_.makeTypeRef();
+                    unit->kind = TypeRef::Kind::Unit;
+                    ctx_.setExprType(&ce, unit);
+                }
+                // fix #3024 (§11.7 / §22.6, v0.240): per-static-class
+                // closed-surface guard for the static-class names whose
+                // member-call surface is documented in stdlib but which the
+                // existing colName-block arms above do not stamp — Task
+                // (§6.7), Stopwatch (§8.1), CancellationTokenSource (§6.1)
+                // — extending the #3021 pattern that previously covered
+                // File/Directory/Path/Debug/Domain. The brief originally
+                // filed #3024 as a separate issue so a later lane could
+                // extend the same fix in one place rather than redo the
+                // gate three times.
+                //
+                // The codegen gate in 'Emitter::emittedSideEffectSince'
+                // (LlvmBackend_impl.hpp:12225) fires only for INSTANCE
+                // member calls on built-in values — its 'builtinReceiverOf
+                // MemberCall' helper reads 'ctx_.exprType(*ma->target)',
+                // which is null for a type-identifier receiver like 'Task'
+                // (the IdentifierExpr visitor only sets the *symbol* for
+                // a builtin static class, not its exprType — see
+                // ExprTypecheck_Exprs.cpp:1088). So 'Task.TotallyBogusMember
+                // (1, 2)' on a class with no instance path went through
+                // the static-call dispatch, never triggered the gate,
+                // and degraded to zero with only the §2434 internal
+                // warning. Mirror the per-instance-type closed-surface
+                // arms further below (lines 6914-7775, the "no member `M`
+                // on `R`; documented surface: ..." diagnostic family)
+                // with a per-static-class arm stamping the documented
+                // surface per the stdlib §-citation.
+                //
+                // Builtin-only gate (the regression #3021 hit at Wave 3
+                // gate): the colName lambda at line 3512 falls back to
+                // the IdentifierExpr head for a declaration-less
+                // built-in, so a USER class that happens to share a name
+                // with a covered static class (e.g. `Path.Deserialize(d)`
+                // on `record Path(…): ISerializable, IDeserializable` —
+                // a legal §11.3 user record whose Deserialize is the
+                // synthesized IDeserializable member) ALSO has colName
+                // == "Path" and would be wrongly rejected by a naive
+                // name-only check. The user record's TypeRef carries a
+                // non-null `declaration` (the user's `ast::TypeDecl`,
+                // with `decl` set) populated by TypeResolution; a
+                // built-in static class's receiver either has no recvTy
+                // at all (the IdentifierExpr path never stamps exprType
+                // for a builtin static class) or has a `declaration`
+                // that points at a builtinClassSym (synthetic, decl ==
+                // null). So: only fire the reject when `!recvTy` (the
+                // canonical "this is the builtin name in a static-call
+                // position" shape). The earlier colName-block arms above
+                // already stamp `exprType` for the documented members
+                // they handle — known void members (Debug.Assert/
+                // WriteLine, File.Write* family, etc.) intentionally
+                // leave `exprType` null, and the membership check below
+                // is name-only, so the diagnostic does NOT fire for
+                // them. Excluded from this list: `Encoding` (abstract,
+                // has its own §3.2 singleton-property reject at line
+                // 12208), `BitConverter` (already rejected via the
+                // `rejectBuiltinStatic()` helper at line 15810),
+                // `BinarySerializer` / `BinaryDeserializer` /
+                // `JsonSerializer` / `JsonDeserializer` (already
+                // rejected via the `rcn == "X"` arms at lines 8006-8100,
+                // and §11.3 user classes of the same name would
+                // otherwise be wrongly false-rejected — see #2996 which
+                // fixed exactly that), `Linq` (a module name with no
+                // static-class surface — `Linq.X` is a name-lookup
+                // failure, not a member-call failure).
+                {
+                    struct StaticSurface {
+                        std::string_view colName;
+                        std::initializer_list<std::string_view> members;
+                        std::string_view surface;
+                        std::string_view stdlibSection;
+                    };
+                    static const StaticSurface kStaticSurfaces[] = {
+                        // §7.3 File — 12 static methods (4 async, 8 sync).
+                        {"File",
+                         {"ReadAllText", "ReadAllTextAsync", "WriteAllText",
+                          "WriteAllTextAsync", "ReadAllBytes", "WriteAllBytes",
+                          "ReadAllLines", "WriteAllLines", "Exists", "Delete",
+                          "Copy", "Move"},
+                         "ReadAllText(path), ReadAllBytes(path), "
+                         "ReadAllLines(path), "
+                         "ReadAllTextAsync(path, token := CancellationToken.None), "
+                         "WriteAllText(path, contents), WriteAllBytes(path, "
+                         "Array<byte>|ReadOnlySpan<byte>), "
+                         "WriteAllLines(path, IEnumerable<string>), "
+                         "WriteAllTextAsync(path, contents, "
+                         "token := CancellationToken.None), "
+                         "Exists(path), Delete(path), Copy(source, dest, "
+                         "overwrite), Move(source, dest)",
+                         "7.3"},
+                        // §7.4 Directory — 5 method names (Delete is two
+                        // arities; one entry covers both).
+                        {"Directory",
+                         {"Exists", "CreateDirectory", "Delete", "GetFiles",
+                          "GetDirectories"},
+                         "Exists(path), CreateDirectory(path), Delete(path), "
+                         "Delete(path, recursive), GetFiles(path), "
+                         "GetDirectories(path)",
+                         "7.4"},
+                        // §7.4 Path — 6 methods, all returning string.
+                        {"Path",
+                         {"Combine", "GetFileName", "GetExtension",
+                          "GetFileNameWithoutExtension", "GetDirectoryName",
+                          "GetFullPath"},
+                         "Combine(a, b), GetFileName(path), GetExtension(path), "
+                         "GetFileNameWithoutExtension(path), "
+                         "GetDirectoryName(path), GetFullPath(path)",
+                         "7.4"},
+                        // §8.2 Debug — 3 static methods (Assert has two
+                        // arities), all unit-returning.
+                        {"Debug",
+                         {"Assert", "WriteLine"},
+                         "Assert(condition), Assert(condition, message), "
+                         "WriteLine(message)",
+                         "8.2"},
+                        // §6.8 Domain — Spawn with many overloads
+                        // (sync/async, generic/non-generic, with/without
+                        // args/result). One entry covers the whole family.
+                        {"Domain",
+                         {"Spawn"},
+                         "Spawn(entry), Spawn<A>(entry, owned A), "
+                         "Spawn<A>(entry, A), Spawn<R>(entry) -> "
+                         "owned OwningTask<R>|owned Task<R>, plus the async "
+                         "entry variants and the with-args/with-result "
+                         "overloads (stdlib §6.8)",
+                         "6.8"},
+                        // §6.7 (v0.240 / #3024) — Task static helpers.
+                        // The full set per stdlib §6.7 (lines 2855-2993)
+                        // + the §30.5 Pattern B (FromOwnedResult) +
+                        // §30.10 aggregators (WhenAll, WhenAny, WhenEach,
+                        // and their <T>/Owned variants) + the
+                        // §30.9 FireAndForget. Wait is NOT listed —
+                        // Wait() is the synchronous escape hatch (§30.3),
+                        // an INSTANCE method on a Task / Task<T> receiver
+                        // (handled by the §30.3 rcn=="Task"/"OwningTask"
+                        // block at line 6783 above, which stamps unit +
+                        // the §30.3 async-context reject); listing it
+                        // here would be a duplicate and would intercept
+                        // the legitimate Wait() call on a Task instance
+                        // before the rcn block ran.
+                        {"Task",
+                         {"Delay", "FromResult", "FromOwnedResult",
+                          "FromException", "FromCancelled", "WhenAll",
+                          "WhenAllOwned", "WhenAny", "WhenEach",
+                          "WhenEachOwned", "FireAndForget"},
+                         "Delay(int)|Delay(TimeSpan)|Delay(int, "
+                         "CancellationToken)|Delay(TimeSpan, "
+                         "CancellationToken) -> Task; "
+                         "FromResult<T>(value: T) -> Task<T>; "
+                         "FromOwnedResult<T>(owned value: T) -> "
+                         "OwningTask<T> (Pattern B, §30.5); "
+                         "FromException<T>(exc) -> Task<T>; "
+                         "FromCancelled<T>() -> Task<T>; "
+                         "WhenAll(tasks: Array<Task>) -> Task; "
+                         "WhenAll<T>(tasks: Array<Task<T>>) -> "
+                         "Task<Array<T>>; "
+                         "WhenAllOwned<T>(owned tasks: "
+                         "OwningArray<OwningTask<T>>) -> "
+                         "OwningTask<OwningArray<T>> (§30.10); "
+                         "WhenAny(tasks: Array<Task>) -> "
+                         "Task<int> (winner index, §6.7); "
+                         "WhenEach(tasks: Array<Task>) -> "
+                         "IAsyncEnumerable<Task> (§30.10); "
+                         "WhenEach<T>(tasks: Array<Task<T>>) -> "
+                         "IAsyncEnumerable<Task<T>>; "
+                         "WhenEachOwned<T>(owned tasks: "
+                         "OwningArray<OwningTask<T>>) -> "
+                         "IOwningAsyncEnumerable<OwningTask<T>> "
+                         "(§30.10); "
+                         "FireAndForget(owned task) (§30.9)",
+                         "6.7"},
+                        // §8.1 (v0.240 / #3024) — Stopwatch static factory
+                        // only. Instance methods Start/Stop/Reset/Restart
+                        // are handled by the per-instance-type arms
+                        // below (rcn == "Stopwatch" arms). Elapsed,
+                        // ElapsedMilliseconds, ElapsedTicks are
+                        // PROPERTIES, dispatched through
+                        // resolveMemberAccess (not a method call).
+                        {"Stopwatch",
+                         {"StartNew"},
+                         "StartNew() -> owned Stopwatch (factory)",
+                         "8.1"},
+                        // §6.1 (v0.240 / #3024) — CancellationTokenSource
+                        // static factories. Instance members (Token, Cancel,
+                        // CancelAfter, Dispose) are handled by the rcn ==
+                        // "CancellationTokenSource" arm above at line 6297
+                        // (Token) and by the per-instance-type arms below
+                        // (Cancel/CancelAfter return unit; Dispose returns
+                        // unit). WithCancelAfter, CreateLinked,
+                        // CreateLinkedAll are the three documented static
+                        // factories.
+                        {"CancellationTokenSource",
+                         {"WithCancelAfter", "CreateLinked",
+                          "CreateLinkedAll"},
+                         "WithCancelAfter(delay: TimeSpan) -> "
+                         "owned CancellationTokenSource; "
+                         "CreateLinked(a: CancellationToken, "
+                         "b: CancellationToken) -> "
+                         "owned CancellationTokenSource (§30.8); "
+                         "CreateLinkedAll(parents: "
+                         "Array<CancellationToken>) -> "
+                         "owned CancellationTokenSource (§30.8)",
+                         "6.1"},
+                    };
+                    // Builtin-only gate: the receiver of a static call on
+                    // a built-in static class is an IdentifierExpr whose
+                    // exprType was never stamped (only its symbol was, via
+                    // ExprTypecheck_Exprs.cpp:1088's `setExprSymbol`); for
+                    // a USER class with the same name (a §11.3-allowed
+                    // collision — `Path.Deserialize(d)` on
+                    // `record Path(…): IDeserializable` is the canonical
+                    // case that broke #3021 at Wave 3), the user record's
+                    // TypeRef carries a non-null `declaration` populated by
+                    // TypeResolution, so recvTy is non-null and the
+                    // IsCancellationRequested-like dispatch correctly
+                    // leaves the user class to its own resolver. Skip the
+                    // table entirely when recvTy is set — that is the
+                    // single fact that distinguishes "this is the builtin
+                    // name in a static-call position" from "this is a user
+                    // type that happens to share a name with a builtin".
+                    if (!recvTy) {
+                        // Builtin-only gate (the regression #3021 hit at
+                        // Wave 3 gate — `Path.Deserialize(d)` on
+                        // `record Path(…): IDeserializable` is a legal
+                        // §11.3 user record whose Deserialize is the
+                        // synthesized IDeserializable member, and the
+                        // user's `Path` IdentifierExpr has colName ==
+                        // "Path" via the fallback branch above; a
+                        // name-only check wrongly false-rejected it).
+                        //
+                        // The single fact that distinguishes "this is
+                        // the builtin name in a static-call position"
+                        // from "this is a user type that happens to
+                        // share a name with a builtin" is the Symbol
+                        // attached to the IdentifierExpr: a builtin
+                        // static class's exprSymbol (set by
+                        // ExprTypecheck_Exprs.cpp:1088 via
+                        // `setExprSymbol(&e, builtinClassSym(name))`)
+                        // is a TypeSymbol whose `decl` field is
+                        // `nullptr` — synthetic, no backing
+                        // ast::TypeDecl — because the builtin class
+                        // has no source declaration. A user class's
+                        // TypeSymbol has `decl != nullptr` pointing
+                        // at the user's real TypeDecl (set by
+                        // TypeResolution's registerDecl). So: only
+                        // fire the reject when the receiver
+                        // IdentifierExpr's exprSymbol is the
+                        // declaration-less builtin-class TypeSymbol
+                        // (not a user-class TypeSymbol, not null,
+                        // not anything else).
+                        auto* tgtId = dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get());
+                        TypeSymbol* tgtSym = tgtId
+                            ? dynamic_cast<TypeSymbol*>(
+                                ctx_.exprSymbol(*tgtId))
+                            : nullptr;
+                        bool isBuiltinStatic =
+                            tgtSym && tgtSym->decl == nullptr;
+                        if (isBuiltinStatic) {
+                            for (const auto& s : kStaticSurfaces) {
+                                if (colName != s.colName) continue;
+                                bool known = false;
+                                for (auto km : s.members) {
+                                    if (m == km) { known = true; break; }
+                                }
+                                if (!known) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        std::string("no member `") +
+                                            std::string(m) +
+                                        "` on `" + std::string(s.colName) +
+                                        "`; documented surface: " +
+                                        std::string(s.surface) +
+                                        " (stdlib §" +
+                                        std::string(s.stdlibSection) + ")");
+                                }
+                                // Only one StaticSurface row matches
+                                // per receiver — stop scanning after
+                                // the match (the loop above already
+                                // skips rows whose colName doesn't
+                                // match).
+                                break;
+                            }
+                        }
+                    }
                 }
                 // §2.5: DateTime instance method return types.
                 // The receiver's TypeRef uses builtinClassSym (non-null declaration,
@@ -8109,6 +8922,65 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 ctx_.setExprType(&ce, rt);
             // If Function with null funcReturn: leave untyped (void/unknown)
         }
+        // fix #2964 (§8.1 / §8.3, v0.240): the §8.1 universal-Object instance
+        // members `GetHashCode` and `Equals` carry §8.1's declared RESULT TYPE
+        // on every receiver.
+        //
+        // §8.1 declares `Object` with `public virtual method GetHashCode():
+        // int;` and `public virtual method Equals(other: Object?): bool;`, and
+        // states verbatim: "`Object` is the universal root. Every type derives
+        // from it". So the result type of these calls is a property of the
+        // MEMBER, decided by §8.1 — never of the receiver. The two siblings are
+        // already typed that way: `ToString` in the `!calleeSym` member-access
+        // block above, and `GetType` right beside it, whose own comment records
+        // the same posture ("Typing is unconditional on receiver kind").
+        //
+        // These two had no such rule. They were typed only where some
+        // receiver-specific handler happened to type the MemberAccessExpr —
+        // records/enums/choices (the `!member` branch of resolveMemberAccess),
+        // `string`, a genuinely-declared type parameter — and the propagation
+        // just above then carried that to the CallExpr. Two receiver families
+        // had no handler at all, measured on 618c0c8 with a 6-receiver grid
+        // (`var h := x.GetHashCode(); Console.WriteLine("h=" + h.ToString());`):
+        // a CLASS receiver (plain user class, and a class through an interface
+        // it implements) and a PRIMITIVE receiver (`int`). Record, enum and
+        // `string` receivers were already typed.
+        //
+        // The consequence is not a diagnostic. The untyped call infects the
+        // local bound to it, so the next member access on that local is
+        // likewise untyped and codegen DROPS THE WHOLE ENCLOSING STATEMENT:
+        // #2964's repro is a `Console.WriteLine(h.ToString())` that emits ZERO
+        // BYTES with zero diagnostics at any severity, between two
+        // `Console.WriteLine`s that print normally, on a program that compiles
+        // and exits. (`h` itself is fine — `if h <> 0` branches correctly and
+        // two calls on one instance agree — so the value IS lowered; only its
+        // type was missing.)
+        //
+        // This is a LAST RESORT: it fires only when nothing above typed the
+        // call, so it can never override a receiver-specific answer, and it
+        // types the CALL, never the MemberAccessExpr — #2465's reject of these
+        // members on the not-yet-sliced collection receivers is gated on
+        // `!ctx_.exprType(ma)`, so it keeps firing untouched (pinned by a
+        // test). Whether this compiler can LOWER the call on a given receiver
+        // is a separate question and is #2922's, which now rejects an unlowered
+        // §8.1 member on a declaration-less built-in receiver loudly instead of
+        // degrading it — so a receiver-kind list here would buy nothing and
+        // would be the same list-shaped mistake #2922 was filed to remove.
+        // `GetType` is not handled here (it returns above, with §8.2's
+        // reflection deferral); `ToString` likewise returns above.
+        if (!ctx_.exprType(ce)) {
+            if (auto* uma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    ce.callee.get())) {
+                if (uma->target) {
+                    if (uma->member == "GetHashCode" && ce.args.empty())
+                        ctx_.setExprType(
+                            &ce, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    else if (uma->member == "Equals" && ce.args.size() == 1)
+                        ctx_.setExprType(
+                            &ce, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                }
+            }
+        }
         // stdlib §2.2: Math.Abs is polymorphic — its return type matches the
         // argument type (Abs(int):int, Abs(long):long, Abs(double):double).
         // Math.Min/Max/Clamp<T> are generic and also return T (same-as-arg).
@@ -8168,6 +9040,51 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                         ma->target.get())) {
                     if (tid->name == "Math") {
+                        // fix #2785 (stdlib §2.2 / §9.6, spec §14.2, v0.240): a
+                        // NULLABLE string argument. §14.2: "nullable types do
+                        // not themselves implement the interfaces of their
+                        // non-nullable counterparts: a `null` value satisfies
+                        // no interface contract" — so `string?` does not
+                        // satisfy §2.2's `where T: IComparable<T>` and this
+                        // must be REJECTED. The #1215 check just below applies
+                        // the same rule, but only to a record/enum/class/
+                        // interface argument (it requires a `declaration`),
+                        // and `string` is a PRIMITIVE TypeRef with none — so a
+                        // `string?` argument fell past every gate into the
+                        // float path and ABORTED the compiler on `CreateSIToFP`
+                        // of a pointer, the same abort the non-null string case
+                        // produced before this fix.
+                        // ⚠ §7.4 narrowing must be consulted explicitly here.
+                        // `nullNarrowed_` deliberately does NOT rewrite the
+                        // variable's exprType ("the declared (nullable) type is
+                        // preserved so codegen's nullable-value layout logic
+                        // stays correct"), so a `string?` PROVEN non-null by
+                        // `if p <> null then …` still reports a nullable
+                        // exprType. Rejecting on exprType alone would therefore
+                        // reject legal narrowed code — MEASURED: it did, before
+                        // this guard was added. Same shape as the
+                        // `narrowedPresent` test at ExprTypecheck_Exprs.cpp:3870.
+                        auto narrowedNonNull = [&](const ast::Expr* e) -> bool {
+                            if (auto* id =
+                                    dynamic_cast<const ast::IdentifierExpr*>(e))
+                                if (Symbol* s = ctx_.exprSymbol(*id))
+                                    return nullNarrowed_.count(s) > 0;
+                            return false;
+                        };
+                        if (auto* sTy = ctx_.exprType(*ce.args[0].value))
+                            if (sTy->nullable &&
+                                sTy->kind == TypeRef::Kind::Primitive &&
+                                sTy->primitive == PrimitiveType::String &&
+                                !narrowedNonNull(ce.args[0].value.get())) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "nullable type `string?` does not satisfy "
+                                    "the `where T: IComparable<T>` constraint "
+                                    "— nullable types do not implement "
+                                    "interface constraints (§14.2); narrow it "
+                                    "to `string` before calling `Math." +
+                                    std::string(ma->member) + "` (stdlib §2.2)");
+                            }
                         if (auto* argTy = ctx_.exprType(*ce.args[0].value))
                             if (argTy->kind == TypeRef::Kind::Named &&
                                 argTy->declaration &&
@@ -8180,7 +9097,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  // so member access on the returned borrow
                                  // resolves to the class's fields/methods.
                                  argTy->declaration->kind ==
-                                     ast::TypeDeclKind::Class)) {
+                                     ast::TypeDeclKind::Class ||
+                                 // fix #2782 (stdlib §2.2, spec §14.2, v0.240):
+                                 // an INTERFACE argument was omitted here, so
+                                 // the call was left mistyped (defaulting to
+                                 // int) exactly as a record/enum was before
+                                 // #1141. §14.2 rule 3 admits an interface
+                                 // substitution — "**T is an interface** that
+                                 // has I in its extension chain" — and its
+                                 // worked example says `where T:
+                                 // IComparable<int>` "admits a mix of
+                                 // primitive, class, record, and **interface**
+                                 // substitutions". The mistyping is why
+                                 // `Math.Min(x, y).Rank()` and an UNANNOTATED
+                                 // `var t := Math.Min(x, y)` degraded to a
+                                 // zero/null result: with the call typed int,
+                                 // member access on the result could not
+                                 // resolve. An annotated `var t: IFoo := …`
+                                 // masked it, which is why the codegen half
+                                 // alone was not enough.
+                                 argTy->declaration->kind ==
+                                     ast::TypeDeclKind::Interface)) {
                                 // #1215 / §14.2: nullable types do not satisfy
                                 // interface constraints — reject with a clean
                                 // diagnostic so the call never reaches codegen.
@@ -8218,6 +9155,38 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         "IComparable<T>` constraint — nullable "
                                         "types do not implement interface "
                                         "constraints (§14.2)");
+                                } else if (
+                                    argTy->declaration->kind ==
+                                        ast::TypeDeclKind::Interface &&
+                                    !selfComparableIfaceArg(argTy,
+                                                            icomparable)) {
+                                    // fix #2782: for an INTERFACE argument the
+                                    // loose `isSubtype(decl, IComparable)`
+                                    // below is NOT sufficient, and admitting
+                                    // more here than codegen can lower would be
+                                    // worse than the original defect: codegen's
+                                    // arm requires `IComparable<Self>` exactly
+                                    // (selfComparableIfaceCompareTo), and an
+                                    // interface it declines falls through to
+                                    // the FLOAT path, which emits `sitofp ptr
+                                    // … to double` on a pointer operand. So the
+                                    // two layers are held to the SAME test:
+                                    // `interface IG<T>: IComparable<IG<int>>`
+                                    // with argument `IG<string>` is rejected
+                                    // here (§12.9 — IComparable is invariant)
+                                    // rather than reaching a malformed-IR path.
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "type argument `" +
+                                        std::string(argTy->declaration->name) +
+                                        "` does not satisfy the constraint `where "
+                                        "T: IComparable<T>` — `Math." +
+                                        std::string(ma->member) +
+                                        "` requires an interface that names "
+                                        "`IComparable<" +
+                                        std::string(argTy->declaration->name) +
+                                        ">` (itself) in its extension chain "
+                                        "(§14.2, §12.9, stdlib §2.2)");
                                 } else if (icomparable &&
                                            !isSubtype(argTy->declaration,
                                                       icomparable)) {
@@ -8401,30 +9370,37 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 "#2393)");
             return;
         }
-        // §8.1/§8.3/§8.5 (#1075): an inherited Object value-semantics method
-        // (`ToString`/`GetHashCode`/`Equals`) on a VALUE-type/enum/record
-        // receiver has no MethodSymbol, so the member-access value-method typing
-        // (keyed on a plain `.`) never ran and the call is left untyped — codegen
-        // then zero-inits the `T?` result (= null) or crashes a string compare.
-        // Set the raw return type here (ToString→string, GetHashCode→int,
-        // Equals→bool) so the lift below makes it nullable, matching the codegen
-        // null-conditional value-method lowering.
+        // §8.1/§8.3/§8.5 (#1075, #2964): an Object value-semantics method
+        // (`ToString`/`GetHashCode`/`Equals`) with no resolved MethodSymbol — on
+        // a VALUE-type/enum/record receiver (#1075) OR a CLASS/Object/interface
+        // receiver (#2964) — has no member-access typing here: the plain-`.`
+        // value-method last-resort further above is keyed on `MemberAccessExpr`
+        // and a `?.` callee is a `NullCondMemberExpr`, so it never ran and the
+        // call is left untyped. On a class/Object/interface receiver the #2982
+        // LOWERING now dispatches the call (it runs and produces a value), but
+        // the RESULT carried no sema type, so an INLINE `??` on the value-typed
+        // results (GetHashCode→{i8,i32}, Equals→{i8,i1}) — which needs the sema
+        // type for lowerCoalesce to see the nullable-value struct and extract
+        // hasValue/payload — instead took the #1045 "non-pointer, non-nullable"
+        // fall-through and returned the RAW {i8,T} struct: `?.GetHashCode() ?? -1`
+        // printed the hasValue byte (1), not the hash; `?.Equals(o) ?? false`
+        // crashed the IR verifier (`trunc { i8, i1 } to i1`). Set the raw return
+        // type here (ToString→string, GetHashCode→int, Equals→bool) so the lift
+        // below makes it nullable, matching the codegen null-conditional
+        // object/value-method lowering. No receiver-kind list: the `!exprType(ce)`
+        // guard makes this a LAST RESORT (a receiver WITH an override resolved a
+        // MethodSymbol and was already typed above), and whether this compiler
+        // can LOWER the call on a given receiver is #2922's question, not sema's
+        // — the same argument the plain-`.` last-resort above uses for having no
+        // list (a list would be the list-shaped mistake #2922 was filed to
+        // remove).
         if (!ctx_.exprType(ce) && ncm->target) {
-            const TypeRef* rt = ctx_.exprType(*ncm->target);
-            const TypeSymbol* rd = rt ? rt->declaration : nullptr;
-            bool valuePrim = rt && rt->kind == TypeRef::Kind::Primitive &&
-                rt->primitive != PrimitiveType::String &&
-                rt->primitive != PrimitiveType::Object;
-            bool valueNamed = rd && (rd->kind == ast::TypeDeclKind::Record ||
-                                     rd->kind == ast::TypeDeclKind::Enum);
-            if (valuePrim || valueNamed) {
-                if (ncm->member == "ToString" && ce.args.empty())
-                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::String));
-                else if (ncm->member == "GetHashCode" && ce.args.empty())
-                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Int));
-                else if (ncm->member == "Equals" && ce.args.size() == 1)
-                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Bool));
-            }
+            if (ncm->member == "ToString" && ce.args.empty())
+                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::String));
+            else if (ncm->member == "GetHashCode" && ce.args.empty())
+                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Int));
+            else if (ncm->member == "Equals" && ce.args.size() == 1)
+                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         }
         if (auto* ct = ctx_.exprType(ce)) {
             if (!ct->nullable && ct->kind != TypeRef::Kind::Unit) {
@@ -9429,12 +10405,47 @@ void ExprTC::checkArgsAgainstParams(
         // value. Reject here (the literal is untyped, so checkAssignable below
         // would not catch it). Passing a CONCRETE collection (e.g. an
         // `Array<T>` variable) to the same parameter remains fine.
-        if (dynamic_cast<const ast::CollectionLiteralExpr*>(a.value.get()) &&
-            isCollectionLiteralInterfaceTarget(paramTy)) {
-            reportCollectionLiteralInterfaceTarget(
-                ctx_.diagnostics(), a.value->span.begin,
-                callsNamedTypeSimpleName(paramTy));
-            continue;
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                a.value.get())) {
+            // per §15.4 (#1174): a collection literal passed directly to a
+            // parameter of interface type (IEnumerable<T>/IList<T>/ICollection<T>/
+            // IReadOnly*) is not admissible — the literal has no concrete backing
+            // to materialize into and silently miscompiled to an empty/garbage
+            // value. Reject here (the literal is untyped, so checkAssignable below
+            // would not catch it). Passing a CONCRETE collection (e.g. an
+            // `Array<T>` variable) to the same parameter remains fine.
+            if (isCollectionLiteralInterfaceTarget(paramTy)) {
+                reportCollectionLiteralInterfaceTarget(
+                    ctx_.diagnostics(), a.value->span.begin,
+                    callsNamedTypeSimpleName(paramTy));
+                continue;
+            }
+            // per §15.4 (#3031): the full §15.4 target+form check at the
+            // call-arg position. A dict literal at a sequence-shaped
+            // parameter (and vice versa) is rejected with the
+            // form-specific diagnostic, NOT the generic "cannot target"
+            // form — the remediation is to change the literal's form, not
+            // the parameter type. Otherwise the literal reached codegen's
+            // inline-array arm with a `ptr` slot and the materializer
+            // returned null, producing a zero-initialized value at the
+            // parameter slot (the #2434 / #2491 `internal:` notes — a
+            // silent wrong value, the worse failure mode). The empty
+            // literal `[]` is admitted at every §15.4 collection target
+            // (the empty carve-out — membership-only).
+            const bool isEmpty = !cl->isDict && cl->elements.empty();
+            const bool admitted = isEmpty
+                ? isCollectionLiteralEmptyAdmissibleTarget(paramTy)
+                : isCollectionLiteralAdmissibleTarget(paramTy, cl->isDict);
+            if (paramTy && paramTy->kind != TypeRef::Kind::Error && !admitted) {
+                if (cl->isDict &&
+                    isCollectionLiteralAdmissibleTarget(paramTy, /*isDict=*/false))
+                    reportCollectionLiteralDictFormBadTarget(
+                        ctx_.diagnostics(), a.value->span.begin, paramTy);
+                else
+                    reportCollectionLiteralBadTarget(
+                        ctx_.diagnostics(), a.value->span.begin, paramTy);
+                continue;
+            }
         }
         checkAssignable(ctx_.exprType(*a.value),
                         paramTy,
@@ -9473,57 +10484,14 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                 // class-constructor / method paths use (checkArgsAgainstParams):
                 // it handles reordered named args (`new Pt(Y := 4, X := 3)`).
                 const auto& fields = td->positionalFields;
-                // §5.1 (#738): a record positional argument initializes a field,
-                // so an in-range int literal/constant bound to a narrower-int
-                // field (`new Box(30000)` into `short?`) narrows implicitly —
-                // mirror the local-decl / assignment retyping (ExprTypecheck.cpp
-                // AssignStmt path) before the assignability check. Bind first
-                // (no diagnostics) so each argument's target field is known even
-                // for reordered named args.
-                auto fitsInIntTy = [](long long v, PrimitiveType pt) -> bool {
-                    switch (pt) {
-                        case PrimitiveType::SByte:  return v >= -128 && v <= 127;
-                        case PrimitiveType::Byte:   return v >= 0 && v <= 255;
-                        case PrimitiveType::Short:  return v >= -32768 && v <= 32767;
-                        case PrimitiveType::UShort: return v >= 0 && v <= 65535;
-                        case PrimitiveType::UInt:   return v >= 0 && v <= 4294967295LL;
-                        case PrimitiveType::ULong:  return v >= 0;
-                        default:                    return true;
-                    }
-                };
-                BindResult pre = bindArgsToParams(
-                    fields, ne.args, ne.span.begin,
-                    /*calleeDesc=*/std::string(), /*emit=*/false);
-                if (pre.ok) {
-                    for (std::size_t j = 0; j < fields.size(); ++j) {
-                        int ai = pre.paramToArg[j];
-                        if (ai < 0 || !fields[j].type) continue;
-                        const ast::CallArgument& a =
-                            ne.args[static_cast<std::size_t>(ai)];
-                        if (!a.value || a.isDiscard || !a.modifier.empty())
-                            continue;
-                        TypeRef* fromTy = ctx_.exprType(*a.value);
-                        TypeRef* toTy = ctx_.resolvedType(*fields[j].type);
-                        if (fromTy && toTy &&
-                            fromTy->kind == TypeRef::Kind::Primitive &&
-                            fromTy->primitive == PrimitiveType::Int &&
-                            toTy->kind == TypeRef::Kind::Primitive) {
-                            PrimitiveType tgt = toTy->primitive;
-                            bool narrower =
-                                tgt == PrimitiveType::Byte ||
-                                tgt == PrimitiveType::SByte ||
-                                tgt == PrimitiveType::Short ||
-                                tgt == PrimitiveType::UShort ||
-                                tgt == PrimitiveType::UInt ||
-                                tgt == PrimitiveType::ULong;
-                            if (narrower) {
-                                auto cv = foldIntConstExprTC(*a.value);
-                                if (cv && fitsInIntTy(*cv, tgt))
-                                    ctx_.setExprType(a.value.get(), toTy);
-                            }
-                        }
-                    }
-                }
+                // §5.1 "Constant narrowing" (#738): a record positional
+                // argument initializes a field, so an in-range int
+                // literal/constant bound to a narrower-int field
+                // (`new Box(30000)` into `short?`) narrows implicitly. #2925
+                // gave that rule ONE definition inside `checkAssignable`
+                // (narrowIntConstantToTarget), which checkArgsAgainstParams
+                // below calls per argument — so the hand-written pre-pass here,
+                // with its own third copy of the range table, is gone.
                 checkArgsAgainstParams(
                     fields, ne.args, ne.span.begin,
                     std::string("`new ") + std::string(t->name) + "`",
@@ -9650,15 +10618,30 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                     fillsDefault[c] = true;
                     continue;
                 }
-                paramTypes[c].push_back(
-                    params[j].type
-                        ? substituteMemberType(
-                              ctx_.resolvedType(*params[j].type), &ne, t)
-                        : nullptr);
-                argTypeRows[c].push_back(
+                TypeRef* pt = params[j].type
+                                  ? substituteMemberType(
+                                        ctx_.resolvedType(*params[j].type),
+                                        &ne, t)
+                                  : nullptr;
+                const ast::CallArgument* carg =
                     ne.args[static_cast<std::size_t>(ai)].value
-                        ? ctx_.exprType(
-                              *ne.args[static_cast<std::size_t>(ai)].value)
+                        ? &ne.args[static_cast<std::size_t>(ai)]
+                        : nullptr;
+                // fix #2985 (§22.6 / §5.1, v0.240): same §5.1 constant-narrowing
+                // delegation as resolveMethodOverload above — a `new T(3)` against
+                // `constructor(x: byte)` / `constructor(x: string)` is a textbook
+                // §5.1 constant-narrowing case (the worked example in §5.1 names
+                // it directly). See the resolveMethodOverload block above for the
+                // full rationale and the order-dependence caveat.
+                if (carg && carg->value && pt && carg->modifier.empty()) {
+                    (void)narrowIntConstantToTarget(
+                        carg->value.get(),
+                        ctx_.exprType(*carg->value), pt);
+                }
+                paramTypes[c].push_back(pt);
+                argTypeRows[c].push_back(
+                    carg && carg->value
+                        ? ctx_.exprType(*carg->value)
                         : nullptr);
                 argIdxRows[c].push_back(ai);
             }
@@ -9678,9 +10661,28 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // winner needs no further per-argument check (each arg is already
         // exact or §5.1-convertible). On Undecidable we defer (no check),
         // matching the prior "overloaded → skip" behavior.
+        //
+        // fix #2985 (§22.6 + §5.1): pass the AST expressions so the
+        // per-candidate narrowing arm re-types a compile-time int constant
+        // for the constructor overload's parameter, matching the method-call
+        // dispatch's behaviour (`new Pick(3)` against `new(byte)` /
+        // `new(string)` resolves uniquely by §5.1, exactly like `Pick(3)`).
         resolveOverload(paramTypes, argTypes, fillsDefault, candNames,
                         ne.span.begin,
-                        std::string("`new ") + std::string(t->name) + "`");
+                        std::string("`new ") + std::string(t->name) + "`",
+                        /*extraNote=*/std::string(),
+                        // ne.args is the call's argument list (NewExpr
+                        // shares the §A.5 CallArgument shape with the
+                        // call-method path). Skip discard positions (whose
+                        // value is null) — the inner loop's `argExprs[i]`
+                        // check sees null and bypasses the re-type.
+                        [&]() {
+                            std::vector<const ast::Expr*> es;
+                            es.reserve(ne.args.size());
+                            for (const auto& a : ne.args)
+                                es.push_back(a.value.get());
+                            return es;
+                        }());
         return;
     }
     if (ctors.empty()) {
@@ -11364,7 +12366,83 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     bm == "ToString" || bm == "Equals" ||
                     bm == "GetHashCode" || bm == "GetType" ||
                     bm == "ReferenceEquals";
+                // fix #2983 (§12.3 / §31.4 / §12.1, v0.240): the loop above can
+                // never find a BUILT-IN exception base. §31.4 declares
+                // `public class Exception`, and `class ExB: Exception` plainly
+                // names it — but a built-in has no `TypeSymbol` at all, so it is
+                // absent from `TypeSymbol::baseTypes`. This is the third variant
+                // of the category-defect taxonomy: a correct predicate ("is
+                // there a class entry in baseTypes?") fed by a source collection
+                // that never held the population. Reading the predicate tells
+                // you nothing is wrong.
+                //
+                // Two things were wrong before, and the second is the worse
+                // one. (1) `base.Message` was REJECTED on a direct built-in
+                // exception subclass, while the identical spelling is legal one
+                // level further down the chain (`class ExT2: ExT`, `class ExT:
+                // Exception` — there `baseTypes` does hold the user base) — so
+                // the rule appeared to depend on how deep the class sat.
+                // (2) The diagnostic asserted a FALSEHOOD about the user's own
+                // declaration: "`ExB` has no class base (its base is `Object`)".
+                // Its base is `Exception`. A reader who believes it goes looking
+                // for a missing `: Exception` that is already there. Worse, the
+                // remedy it suggested — "use `this.Message`" — pointed at a
+                // spelling that was itself SIGSEGV'ing until #2972 landed.
+                //
+                // `sema::builtinExceptionBaseOf` is the ONE walk that answers
+                // "does this class derive from a built-in exception" (#2950);
+                // `builtinExceptionSurfaceMemberOf` is the ONE statement of what
+                // that base declares (#2971). Both are asked here, so `base.X`
+                // resolves exactly what `this.X` resolves, and the message can
+                // never name a surface the resolver would reject.
+                std::string_view bex = builtinExceptionBaseOf(currentType_);
+                if (!bex.empty() && !universalObjMember) {
+                    // A §31.4 member: type it exactly as the `this.` path does.
+                    // Codegen already reads `this`/`base` uniformly for these
+                    // (#2972 for Message, #2971 for the rest), because the
+                    // receiver object is the same `this` pointer either way and
+                    // the header sits at the same byte offsets.
+                    switch (builtinExceptionSurfaceMemberOf(bex, bm)) {
+                        case BuiltinExcMember::Message:
+                        case BuiltinExcMember::StackTrace:
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                            return;
+                        case BuiltinExcMember::ParamName:
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::String,
+                                                           /*nullable=*/true));
+                            return;
+                        case BuiltinExcMember::CauseChain:
+                            ctx_.setExprType(&ma, excCauseChainTypeRef());
+                            return;
+                        case BuiltinExcMember::None:
+                            break;
+                    }
+                    // Not on the base's surface. Still a reject — but one that
+                    // names the ACTUAL base and the surface it actually has.
+                    // #1307 / #2496: a degenerate MemberAccessExpr can carry a
+                    // zero span; fall back to the target's so this never reports
+                    // `0:0` (MEASURED: the old message did, on
+                    // `return base.CauseChain.Count;`).
+                    auto bLoc = ma.span.begin;
+                    if (bLoc.line == 0 && ma.target)
+                        bLoc = ma.target->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, bLoc,
+                        "`base." + std::string(bm) +
+                        "` does not name a base-class member: `" +
+                        std::string(currentType_->name) +
+                        "`'s class base is the built-in `" + std::string(bex) +
+                        "` (\xC2\xA7""31.4), whose surface is " +
+                        builtinExceptionSurfaceList(bex) +
+                        " and the universal `ToString`/`Equals`/`GetHashCode`/"
+                        "`GetType` (\xC2\xA7""8.1) — `base.M` calls a base "
+                        "class's implementation (\xC2\xA7""12.3)");
+                    return;
+                }
                 if (!universalObjMember) {
+                    // The class really has no class base — `base` is `Object`.
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "`base." + std::string(bm) +
@@ -11536,8 +12614,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // them from the accept set so they fall through to the clean
                     // "type 'string' has no static method 'Format'" §3.4 reject,
                     // exactly as any other unknown static (`string.Bogus()`).
+                    // §9.6 / §10.4 / spec §32.6 (v0.240, #2734):
+                    // FromCStringPointer / FromWStringPointer are the
+                    // raw-`IntPtr` twins of the `String.From(CString/WString)`
+                    // overloads. They were absent from this set, so the
+                    // spec's own FFI read-back idiom
+                    // (`return string.FromCStringPointer(resultPtr);`, §32.6's
+                    // `getenv` example) was rejected outright as an unknown
+                    // static. Both return `string`; codegen lowers them in
+                    // tryLowerPrimitiveStaticCall.
                     if (mbr == "Join" || mbr == "Empty" ||
-                        mbr == "From" || mbr == "Repeat") {
+                        mbr == "From" || mbr == "Repeat" ||
+                        mbr == "FromCStringPointer" ||
+                        mbr == "FromWStringPointer") {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                         return;
                     }
@@ -11769,9 +12858,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // miscompile (a null receiver → crash). A clear compile error is the
         // sound outcome until a real singleton object is modeled.
         if (auto* tt = ctx_.exprType(*ma.target)) {
+            // fix #3022 (§11.3, v0.240): `targetIsEncoding` must NOT match
+            // a USER class named Encoding — gate on moduleName.empty()
+            // (the discriminator the rest of the front-end adopted after
+            // #2995/#2997). Without it a user class named `Encoding`
+            // trips the stdlib §3.2 "Encoding is usable only as the
+            // immediate receiver" diagnostic on a program that contains
+            // no §3.2 built-in.
             bool targetIsEncoding =
                 tt->kind == TypeRef::Kind::Named && tt->declaration &&
-                tt->declaration->name == "Encoding";
+                tt->declaration->name == "Encoding" &&
+                tt->declaration->moduleName.empty();
             bool targetIsDirectSingleton = false;
             if (auto* inner =
                     dynamic_cast<const ast::MemberAccessExpr*>(ma.target.get())) {
@@ -12089,36 +13186,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
             if (ma.member == "CauseChain" && isExcType(rtt)) {
-                // Build a synthetic Array<ExceptionInfo> TypeRef (program-lifetime
-                // static astNodes, the pattern makeConcreteCollectionResult uses):
-                // Array so `.Count`/indexing resolve, ExceptionInfo element so
-                // `chain[i].TypeName` type-checks.
-                static const ast::Type* kArrayNode = []() -> ast::Type* {
-                    auto* qn = new ast::QualifiedName;
-                    qn->parts.push_back("Array");
-                    auto* t = new ast::Type;
-                    t->kind = ast::TypeKind::Named;
-                    t->name.reset(qn);
-                    return t;
-                }();
-                static const ast::Type* kExcInfoNode = []() -> ast::Type* {
-                    auto* qn = new ast::QualifiedName;
-                    qn->parts.push_back("ExceptionInfo");
-                    auto* t = new ast::Type;
-                    t->kind = ast::TypeKind::Named;
-                    t->name.reset(qn);
-                    return t;
-                }();
-                auto* elem = ctx_.makeTypeRef();
-                elem->kind = TypeRef::Kind::Named;
-                elem->declaration = nullptr;
-                elem->astNode = kExcInfoNode;
-                auto* arr = ctx_.makeTypeRef();
-                arr->kind = TypeRef::Kind::Named;
-                arr->declaration = nullptr;
-                arr->astNode = kArrayNode;
-                arr->genericArgs.push_back(elem);
-                ctx_.setExprType(&ma, arr);
+                ctx_.setExprType(&ma, excCauseChainTypeRef());
                 return;
             }
         }
@@ -12422,21 +13490,47 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 return;
             }
         }
-        // stdlib §10.3 / fix #985: RawBytes readonly properties. Length: int and
-        // Pointer: IntPtr. The RawBytes TypeRef carries declaration =
-        // builtinClassSym("RawBytes") (set by the RawBytes.From factory typing),
-        // so the ordinary member-lookup path never types these (no user TypeDecl).
-        // Without typing them here, the access fell through untyped and a
-        // `var p: IntPtr := rb.Pointer` would not see the IntPtr type.
+        // stdlib §10.1/§10.2/§10.3 (fix #985, #2825/#2810): the `Pointer: IntPtr`
+        // readonly property of the §10 FFI-boundary BUFFER classes. None of the
+        // three has a user TypeDecl, so the ordinary member-lookup path never
+        // types the bare (no-parens) property read; without typing it here the
+        // access falls through untyped and `var p: IntPtr := c.Pointer` never
+        // sees the IntPtr type.
+        //
+        // fix #2825 / #2810 (v0.240): this was `RawBytes`-only, on both axes —
+        // only one of the three §10 heads, and only ONE of the two TypeRef shapes
+        // a §10 builtin reaches sema in (see the `isFfiBuiltin` note at the
+        // `string.From` arm above: the FACTORY result carries declaration =
+        // builtinClassSym, the ANNOTATION `c: CString` on a parameter/field
+        // carries declaration = null and only the astNode head name). So
+        // `CString.Pointer` / `WString.Pointer` were untyped here and unlowered
+        // in codegen, and the read silently produced a NULL address — handed
+        // straight to C by stdlib §10.1's named consumer (`char*[]` argv-building
+        // over `OwningBuffer<IntPtr>`). Both axes are now read through ONE shared
+        // predicate rather than a per-arm enumeration, which is what produced
+        // this defect: the sibling `.Length` codegen arm already had all three.
         if (ma.target) {
             auto* tt = ctx_.exprType(*ma.target);
-            bool isRaw = tt && tt->kind == TypeRef::Kind::Named &&
-                tt->declaration && tt->declaration->name == "RawBytes";
-            if (isRaw && ma.member == "Length") {
-                ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
-                return;
+            // The both-shapes read, over `common::isFfiBufferBuiltinName` — the
+            // single home of the {CString, WString, RawBytes} set (#2809/#2757).
+            // Mirrors codegen's `Emitter::builtinTypeName`
+            // (LlvmBackend_Calls.cpp:374) branch for branch, INCLUDING its
+            // user-type exclusion: a `declaration` with a non-null `decl` is a
+            // real user `TypeDecl`, so a user-declared `class CString` with its
+            // own `Pointer` member keeps its own typing and is not claimed here.
+            // `headName()` is the alias-transparent accessor and already falls
+            // back to the metadata `importedName` for a cross-module TypeRef
+            // with no astNode, so a cross-module receiver matches too.
+            bool isFfiBuf = false;
+            if (tt && tt->kind == TypeRef::Kind::Named) {
+                std::string_view bn;
+                if (!tt->declaration)
+                    bn = tt->headName();
+                else if (!tt->declaration->decl)   // builtinClassSym
+                    bn = tt->declaration->name;
+                isFfiBuf = common::isFfiBufferBuiltinName(bn);
             }
-            if (isRaw && ma.member == "Pointer") {
+            if (isFfiBuf && ma.member == "Pointer") {
                 // IntPtr: a Named type resolved by name (no user TypeDecl); codegen
                 // lowers it to a pointer-sized integer (§32.7).
                 auto* ip = ctx_.makeTypeRef();
@@ -12448,6 +13542,32 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ann->name.reset(nm);
                 ip->astNode = ann;
                 ctx_.setExprType(&ma, ip);
+                return;
+            }
+            // §10.3 `Length: int` — deliberately left on the RawBytes-only,
+            // declaration-only test it has carried since #985. Widening it is a
+            // separate, larger change than #2825's `Pointer` defect: `CString`/
+            // `WString` `.Length` is untyped in sema today (codegen lowers it
+            // correctly via strlen / bz_wstrlen), and giving it a type changes
+            // what the §5.1 no-implicit-conversion rule sees at every existing
+            // use site. Measured, not inferred, and filed rather than folded in.
+            // fix #3022 (§11.3, v0.240): gate the RawBytes-specific `.Length`
+            // typing on moduleName.empty() so a USER class named RawBytes
+            // does not get the builtin pointer-length typing — the FFI
+            // pointer-length lowering is built-in specific. Without this
+            // gate a user `class RawBytes { method Length(): int … }`
+            // with a method returning int was previously typed int by
+            // this branch (silently overriding the user's own method
+            // dispatch) and short-circuited the real method lookup. The
+            // Pointer leg above uses `common::isFfiBufferBuiltinName`
+            // (which already has its own user-type exclusion, see
+            // comment); this is the matching leg for the §10.3
+            // RawBytes-only spelling the comment block above describes.
+            if (tt && tt->kind == TypeRef::Kind::Named && tt->declaration &&
+                tt->declaration->name == "RawBytes" &&
+                tt->declaration->moduleName.empty() &&
+                ma.member == "Length") {
+                ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                 return;
             }
         }
@@ -15166,97 +16286,22 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // exempt this access from the "no member" reject below.
             return;
         }
-        // #2517 (§9.2, §35.7): the §9.2 record use-site gate and §35.7 choice
-        // use-site gate for direct `.Equals(...)` / `.GetHashCode()` calls fire
-        // HERE, BEFORE the null-decl (`!targetType->decl`) builtin-class branch
-        // below. Before this fix, both gates lived nested inside the
-        // `else if (Record || Enum || Choice)` branch below — which is reached
-        // only when `targetType->decl != nullptr` (a local AST TypeDecl).
-        // IMPORTED records and choices have `decl == nullptr` (the loader's
-        // reconstructTypeSymbol never sets it, §11.3/issue #501), so they took
-        // the `if (!decl)` branch — intended for builtin classes (Console,
-        // Math, Guid, …) — fell through with no match, then past the "no
-        // member" reject (which exempts Equals/GetHashCode as universal
-        // members, §8.1), and compiled silently: a §9.2 / §35.7 use-site
-        // diagnostic bypass (the structural twin of #2374's `astNode`-gated
-        // defect). Hoisting these gates out of the `else if` branch makes
-        // them fire for BOTH null-decl (imported) and non-null-decl (local)
-        // records/choices, exactly as #2483's `=`/`<>` gate already does
-        // (ExprTypecheck_Exprs.cpp). En and ToString / GetType are NOT
-        // affected — the §8.5/§9.1 default ToString remains for every record,
-        // and GetType is universal.
-        const auto& gateMember = ma.member;
-        if (gateMember == "Equals" || gateMember == "GetHashCode") {
-            if (targetType->kind == ast::TypeDeclKind::Record) {
-                // §9.2 (v0.156)/§9.3 (v0.158, #1383): a direct
-                // `.Equals(...)`/`.GetHashCode()` on a body / combined-form
-                // record that is not auto-equality-bearing and declares no
-                // explicit `=`/`<>` overloads is a compile error. The
-                // `positional` flag uses `hasPositionalFields` first (covers
-                // imported records per #501), then falls back to the local
-                // `ast::TypeDecl` for any record that has one.
-                bool positional = targetType->hasPositionalFields;
-                if (!positional)
-                    if (auto* td =
-                            dynamic_cast<const ast::TypeDecl*>(targetType->decl))
-                        positional = td->hasPositionalFields;
-                bool isEq = positional
-                                ? isPositionalRecordEqualityBearing(
-                                      targetType, ctx_)
-                                : isAutoEqualityBearingBodyRecord(
-                                      targetType, ctx_);
-                if (!isEq && !recordHasUserDeclaredEquality(targetType)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, ma.span.begin,
-                        "`." + std::string(gateMember) +
-                        "` is not available on record `" +
-                        std::string(targetType->name) +
-                        "`: it is not auto-equality-bearing (§9.2/§9.3). Declare"
-                        " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
-                        " or simplify the record to an auto-equality-bearing"
-                        " form.");
-                }
-            } else if (targetType->kind == ast::TypeDeclKind::Choice) {
-                // §35.7 (v0.200, #2045; v0.226, #2110): a choice rejects direct
-                // `.Equals(...)`/`.GetHashCode()` at the call site when it is
-                // NOT auto-equality-bearing — any borrow-bearing or owning
-                // choice, AND any value-like choice whose case payload fails
-                // the §9.2 admissible-component rule. Mirrors the record gate
-                // above (and `=`/`<>`, isEqualityBearing §3.6, `where T:
-                // hashable` §14.2, checkHashContainerKeys — same predicate).
-                sema::TypeRef rt;
-                rt.kind = sema::TypeRef::Kind::Named;
-                rt.declaration = targetType;
-                if (!isAutoEqualityBearingChoice(targetType, ctx_, &rt)) {
-                    auto verdict = common::classifyChoiceType(&rt, ctx_);
-                    std::string reason;
-                    if (verdict &&
-                        *verdict != common::ChoiceClassification::ValueLike) {
-                        reason =
-                            std::string("it is not auto-equality-bearing "
-                                        "(§35.7) — the choice is ") +
-                            (*verdict == common::ChoiceClassification::Owning
-                                 ? "owning"
-                                 : "borrow-bearing") +
-                            ", and a non-value-like choice carries no "
-                            "value equality";
-                    } else {
-                        reason =
-                            "it is not auto-equality-bearing (§35.7): the "
-                            "choice is value-like but a case payload is not "
-                            "an admissible equality component (§9.2)";
-                    }
-                    ctx_.diagnostics().report(
-                        Severity::Error, ma.span.begin,
-                        "`." + std::string(gateMember) +
-                        "` is not available on choice `" +
-                        std::string(targetType->name) + "`: " + reason +
-                        ". Declare `=` and `<>` overloads (with "
-                        "`Equals`/`GetHashCode`), or restructure the choice "
-                        "payload to an admissible component type.");
-                }
-            }
-        }
+        // #2517 / #3019 (§9.2, §35.7): the §9.2 record use-site gate and §35.7
+        // choice use-site gate for direct `.Equals(...)` / `.GetHashCode()`
+        // calls fire HERE, BEFORE the null-decl (`!targetType->decl`)
+        // builtin-class branch below, via the shared checkEqualityMemberUseSite
+        // helper. #2517 hoisted this out of the `else if (Record || …)`
+        // branch (reached only when `targetType->decl != nullptr`): IMPORTED
+        // records/choices have `decl == nullptr` (the loader never sets it,
+        // §11.3/#501), so they took the builtin-class branch, fell past the
+        // "no member" reject (which exempts Equals/GetHashCode as universal
+        // §8.1 members), and compiled silently. #3019 routes the `?.` form
+        // through the SAME helper (called from resolveNullCondMember) so
+        // `r?.Equals(...)` / `r?.GetHashCode()` on a non-bearing record/choice
+        // is rejected at the call site instead of crashing codegen. ToString /
+        // GetType are NOT affected — the §8.5/§9.1 default ToString remains for
+        // every record, and GetType is universal.
+        checkEqualityMemberUseSite(targetType, ma.member, ma.span.begin);
         // §2.3: built-in class TypeSymbols (Console, Math, Convert, …)
         // have null `decl` and empty members. Assign return types for
         // their known methods so callers can infer the call result type.
@@ -15700,71 +16745,81 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             retTy->declaration = targetType;
             ctx_.setExprType(&ma, retTy);
         }
-        // #595 / §12 / §31: `Message` is an inherited member on any user class
-        // that derives (directly or via a user-class chain) from a built-in
+        // #595 / §12 / §31: `Message` is an inherited member on any class that
+        // derives (directly or through its class-ancestor chain) from a built-in
         // exception type (Exception, ArgumentException, …).  Built-in exception
-        // types are absent from TypeSymbol::baseTypes so we walk the AST
-        // TypeDecl::baseTypes chain to detect the inheritance.  When `Message` is
-        // found valid here, also set its resolved type to `string` so callers
-        // (e.g. `.Length` on the result) can infer the chain type.
+        // types are absent from TypeSymbol::baseTypes — they have no user
+        // TypeSymbol at all — so the inheritance is detected through
+        // `sema::builtinExceptionBaseOf`, which reads the symbol field #2950
+        // added for exactly that (see Symbol.hpp).  When `Message` is found
+        // valid here, also set its resolved type to `string` so callers (e.g.
+        // `.Length` on the result) can infer the chain type.
         bool isBuiltinExInheritedMember = false;
-        if (mm == "Message" && knownCompleteUserType &&
+        if (knownCompleteUserType &&
                 targetType->kind == ast::TypeDeclKind::Class) {
-            // Walk the user-class TypeSymbol chain checking each AST TypeDecl's
-            // base-type list for a built-in exception name.
-            auto isBuiltinExName = [](std::string_view n) -> bool {
-                return n == "Exception"             ||
-                       n == "ArgumentException"     ||
-                       n == "ArgumentNullException" ||
-                       // stdlib §2.5/§4.4 (v0.183, #1396).
-                       n == "ArgumentOutOfRangeException" ||
-                       n == "ArithmeticException"   ||
-                       n == "OverflowException"     ||
-                       n == "DivideByZeroException" ||
-                       n == "InvalidOperationException" ||
-                       n == "NotImplementedException"   ||
-                       n == "NullReferenceException"    ||
-                       n == "IndexOutOfRangeException"  ||
-                       n == "KeyNotFoundException"      ||
-                       n == "MatchFailureException"     ||
-                       n == "OperationCanceledException"||
-                       n == "TypeInitializationException" ||
-                       n == "FormatException"           ||
-                       n == "StackOverflowException"    ||
-                       // #976 / stdlib §7.4 / §7.5: System.Threading + System.IO.
-                       n == "TimeoutException"          ||
-                       n == "IOException"               ||
-                       n == "FileNotFoundException"     ||
-                       n == "DirectoryNotFoundException"||
-                       n == "EndOfStreamException"      ||
-                       n == "PathTooLongException"      ||
-                       // §22.16 (v0.203, #2053): clause-violation type.
-                       n == "ContractViolationException";
-            };
-            for (const TypeSymbol* cur = targetType; cur && !isBuiltinExInheritedMember;) {
-                auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl);
-                if (td) {
-                    for (const auto& bt : td->baseTypes) {
-                        if (!bt || !bt->name || bt->name->parts.empty()) continue;
-                        if (isBuiltinExName(bt->name->parts.back())) {
-                            isBuiltinExInheritedMember = true;
-                            break;
-                        }
-                    }
-                }
-                // Advance to next user-class base.
-                const TypeSymbol* next = nullptr;
-                for (const TypeSymbol* b : cur->baseTypes) {
-                    if (b && b->kind == ast::TypeDeclKind::Class && b->decl) {
-                        next = b; break;
-                    }
-                }
-                cur = next;
-            }
-            if (isBuiltinExInheritedMember) {
-                // `e.Message` returns a string (§31 / stdlib Exception.Message).
-                ctx_.setExprType(&ma,
-                    ctx_.primitiveTypeRef(PrimitiveType::String));
+            // fix #2950 (§12 / §31.4 / §2.8.2, v0.240): ask the ONE walk
+            // (`sema::builtinExceptionBaseOf`) that codegen's layout gate also
+            // asks. Two things were wrong with the hand-rolled copy this
+            // replaces, and they pulled in opposite directions:
+            //
+            //   * It read `ast::TypeDecl::baseTypes` and required `b->decl` on
+            //     each ancestor step, so it answered "no" for every IMPORTED
+            //     exception subclass — `e.Message` on one did not compile at
+            //     all ("no member `Message` on type `MyEx`"), while the same
+            //     declaration compiled fine as a local class.
+            //   * Its name list was a hand-listed positive set that had drifted
+            //     from the `kBuiltinExceptionHierarchy` table: it omitted
+            //     DisposedAccessException, SerializationException,
+            //     ChannelClosedException, ChannelFullException and
+            //     DomainFaultedException, every one of which codegen's own gate
+            //     DID carry. So a class deriving from one of those five was
+            //     laid out WITH the §31.4 header while sema rejected reading
+            //     the header's own `Message`.
+            //
+            // fix #2971 (§31.4 / §12.1 / §11.3, v0.240): the member NAME was
+            // the second half of the same defect and outlived the first. This
+            // arm read `mm == "Message"`, so `Message` was the ONLY one of the
+            // four §31.4 members a subclass exposed through its own static
+            // type: `s.StackTrace`, `s.CauseChain` and `l.ParamName` were
+            // rejected "no member `X` on type `Sub1` (§11.3, §12.1)" even
+            // though the object carries all four slots at their fixed byte
+            // offsets and retyping the receiver as the built-in base read the
+            // right values out of them (measured on 0dac23f: the same object
+            // gave `pn=pp` through an `ArgumentException`-typed receiver and a
+            // compile error through its own `ArgSub`). §31.4 declares all four
+            // on the built-in classes and §12.1 makes a base class's members
+            // available on a derived class; nothing carves out three of four.
+            // `sema::builtinExceptionSurfaceMemberOf` now states that surface
+            // once, so this arm can no longer hold a subset of it.
+            switch (builtinExceptionSurfaceMember(targetType, mm)) {
+                case BuiltinExcMember::Message:
+                case BuiltinExcMember::StackTrace:
+                    // §31.4 `readonly property Message/StackTrace: string`.
+                    isBuiltinExInheritedMember = true;
+                    ctx_.setExprType(&ma,
+                        ctx_.primitiveTypeRef(PrimitiveType::String));
+                    break;
+                case BuiltinExcMember::ParamName:
+                    // §31.4 `readonly property ParamName: string?` — NULLABLE
+                    // ("null when not supplied"). A subclass that chained the
+                    // one-argument `base(message)` leaves the slot calloc-
+                    // zeroed, so typing it `string` here would hand a null to
+                    // §7's non-nullable contract.
+                    isBuiltinExInheritedMember = true;
+                    ctx_.setExprType(&ma,
+                        ctx_.primitiveTypeRef(PrimitiveType::String,
+                                              /*nullable=*/true));
+                    break;
+                case BuiltinExcMember::CauseChain:
+                    // §31.4 `readonly property CauseChain: Array<ExceptionInfo>`
+                    // ("empty when no cause") — the same synthetic TypeRef the
+                    // built-in-typed receiver gets, so `.Count` and
+                    // `chain[i].TypeName` resolve identically either way.
+                    isBuiltinExInheritedMember = true;
+                    ctx_.setExprType(&ma, excCauseChainTypeRef());
+                    break;
+                case BuiltinExcMember::None:
+                    break;
             }
         }
         if (knownCompleteUserType && !isUniversalObjectMember &&
@@ -15914,6 +16969,47 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         checkMemberVisibility(msym, ma.member, ma.span.begin, recvTy);
     }
     ctx_.setExprSymbol(&ma, member);
+    // fix #2838 (§12.3 / §12.5 / §23, v0.240): `base.P` where the resolved
+    // base property is ABSTRACT has no implementation to reach — §12.3's
+    // whole contract is "calls the base class's implementation", and §12.5
+    // is what says an abstract member has none. The named-method form
+    // already rejects this ("cannot call abstract base method `M` via `base`
+    // — it has no implementation (§12.3/§12.5)", ExprTypecheck_Calls.cpp
+    // #874, ~L2143); the indexer form already rejects this ("cannot access
+    // an abstract base indexer via `base` — it has no implementation
+    // (§12.3/§12.5)", ExprTypecheck_Exprs.cpp #2832). The named-property
+    // form silently degraded to 0 — the resolved base has no getter body,
+    // so codegen's `base`-bypass branch (lowerVirtualPropertyGet /
+    // -Set's `baseQualified` decline, paired with the static accessor-body
+    // path) hit no body and zero-init'd. Reject it here so the wrong value
+    // is unreachable on the named-property shape as well. Reads the same
+    // PropertySymbol the #2530 attachment just published (an INDEXER access
+    // is an IndexExpr, not a MemberAccessExpr, and is already covered by
+    // the #2832 sibling). An IMPORTED abstract property has no
+    // ast::PropertyDecl to read modifiers from and is left alone (the
+    // same `!pd` scope limit every other AST-reading named-property
+    // check in this file carries — see propertyDeclIsSetOnly just below,
+    // #2386 / #1614).
+    if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        bool pAbstract = false;
+        if (pd)
+            for (auto mod : pd->modifiers)
+                if (mod == "abstract") { pAbstract = true; break; }
+        if (pAbstract && ma.target) {
+            if (auto* btid = dynamic_cast<const ast::IdentifierExpr*>(
+                    ma.target.get())) {
+                if (btid->name == "base") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "cannot access an abstract base property `" +
+                            std::string(ps->name) +
+                            "` via `base` — it has no implementation "
+                            "(\xC2\xA7""12.3/\xC2\xA7""12.5)");
+                }
+            }
+        }
+    }
     // §2.2 / §2.5 (issue #328 inc 3): an imported field/const member has no
     // ast::FieldDecl/ConstDecl, so its resolved type rides the loader's
     // symbol-keyed side table. Attach it for `obj.Field` access typing.
@@ -15926,7 +17022,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                          dynamic_cast<MemberSymbol*>(member)
                                              ? dynamic_cast<MemberSymbol*>(member)->parent
                                              : nullptr));
-        } else if (dynamic_cast<PropertySymbol*>(member)) {
+        } else if (auto* ips = dynamic_cast<PropertySymbol*>(member)) {
             // §2.5 / §22.9 (issue #503): an IMPORTED property has no
             // ast::PropertyDecl, so its type rides the importedMemberType side
             // table (set by the loader). Attach it so that `h.N` is typed for
@@ -15937,6 +17033,227 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                          dynamic_cast<MemberSymbol*>(member)
                                              ? dynamic_cast<MemberSymbol*>(member)->parent
                                              : nullptr));
+            // fix #2884 (§14.1 / §2.8.3 rule 4 / §2.8.2 clause 1, v0.240,
+            // decline-with-reasons): a property declared on an IMPORTED GENERIC
+            // class or record has NO working access path today, in any spelling
+            // — measured on real two-module builds:
+            //   * computed (arrow/block) property, read or `:=`
+            //         -> `undefined reference to bz$<Lib>.<Cls>$<P>$propget`
+            //            / `$propset` — a hard LINK error that aborts the build.
+            //            `emitExportedProperty{Getters,Setters}` define the stub
+            //            only for a NON-generic type (a generic type's accessor
+            //            is per-instantiation, §2.8.3 rule 4, and the exporter
+            //            cannot name the importer's instantiations), while
+            //            `declareImportedProperty{Getters,Setters}` have no
+            //            generic gate and emit the external reference anyway.
+            //   * AUTO-property, read or `:=`  -> the same link error (the
+            //            #2478 instance-storage path does not engage for a
+            //            generic receiver).
+            //   * VIRTUAL property, read or `:=`  -> SIGSEGV at runtime (the
+            //            vtable slot for the instantiation is not populated;
+            //            filed separately, it is a distinct defect from the
+            //            missing-symbol one).
+            //   * `+=` / `++`  -> the write is SILENTLY DROPPED (#2862's
+            //            lowering declines for a generic parent precisely to
+            //            avoid turning it into the link error above).
+            // Rejecting the access with a sourced diagnostic is strictly better
+            // than all four: it names the shape at the access site instead of
+            // surfacing a mangled symbol from the linker, and it converts the
+            // silently dropped compound write into a loud one. Nothing that
+            // works today is rejected — every listed shape is broken NOW, and
+            // the shapes that are NOT broken are outside this gate: a property
+            // reached through an INTERFACE-typed reference resolves to the
+            // interface's own PropertySymbol (parent kind Interface, excluded
+            // here), a method or field on the same generic class is untouched,
+            // and a LOCAL generic class is not imported.
+            //
+            // This mirrors the #783 gate for an imported generic class's METHOD
+            // ("not yet monomorphized (§14.1 / #783)") in both form and
+            // reasoning; the full fix is importer-side property
+            // monomorphization, which needs the accessor bodies carried in the
+            // artifact the way `methodBodyText`/`ctorBodyText` already carry
+            // method and constructor bodies (#2884, #428 family).
+            if (!ips->isIndexer && ips->parent &&
+                ctx_.isImported(ips->parent) &&
+                !ips->parent->genericParams.empty() &&
+                (ips->parent->kind == ast::TypeDeclKind::Class ||
+                 ips->parent->kind == ast::TypeDeclKind::Record)) {
+                // The member-access span is empty for some nested spellings
+                // (e.g. `g.P.ToString()`); fall back to the receiver's, exactly
+                // as the `no member` diagnostics above do with nmLoc.
+                auto loc = ma.span.begin;
+                if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "property `" + std::string(ips->name) +
+                    "` on the imported generic type `" +
+                    std::string(ips->parent->name) +
+                    "` is not yet monomorphized (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 "
+                    "rule 4 / #2884): a generic type's accessors are not "
+                    "exported per instantiation, so this access has no correct "
+                    "target — it fails at link time with an `undefined "
+                    "reference` to the property's accessor symbol, crashes for "
+                    "a virtual property, or silently drops the write for "
+                    "`+=`/`++`. Access a field directly, or route through a "
+                    "method, until importer-side property monomorphization "
+                    "lands");
+            }
+            // fix #2943 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §12.1, v0.240,
+            // NARROWER predicate than the reverted d11e7ca attempt). A property
+            // accessed through an IMPORTED NON-GENERIC INTERFACE-typed reference
+            // on a LAYOUT-MOVING imported generic instantiation has no working
+            // lower path today — the itable slot is filled by
+            // `buildImportedGenericVtable` (LlvmBackend_Setup.cpp ~5640) and the
+            // layout-moving arm deliberately keeps the slot NULL (#2894's
+            // refusal, kept by the #2943 codegen-side partial fix), so the
+            // dispatch faults with a SIGSEGV at runtime on the first call
+            // through the itable. Measured on the fix's parent (real two-module
+            // build, exit 139 = SIGSEGV):
+            //
+            //     `r.W` on `var r: IHas := new GIface<string>()` → exit 139
+            //
+            // The same shape reached DIRECTLY through the implementing class
+            // (`g.W` on a layout-moving imported generic) is #2884's decline
+            // above — the interface arm is the one #2884's predicate
+            // deliberately excludes ("parent kind Interface, excluded here").
+            //
+            // NARROW PREDICATE (§14.1 / §23 — "predicates are precise, not
+            // broad"). The decline fires ONLY when every one of the following
+            // holds:
+            //   (a) the accessed property is declared on the interface, NOT
+            //       inherited from a class or record (parent kind Interface,
+            //       not Class/Record — the converse of #2884's gate);
+            //   (b) the interface is IMPORTED (the slot is filled by the
+            //       imported-generic codegen path, not the local-monomorphize
+            //       path which inlines the body — the latter is OUT OF GATE);
+            //   (c) the interface is NOT generic — a generic interface with a
+            //       T-typed property return is the #2944 family (Lane 1's
+            //       narrower predicate), and a generic interface's INDEXER is
+            //       #2955's separate decline above (this arm is not indexer,
+            //       !ips->isIndexer, mirrored below);
+            //   (d) at least one IMPORTED GENERIC CLASS implementing this
+            //       interface declares >=2 fields whose resolved TypeRef is a
+            //       bare name matching one of the class's own generic
+            //       parameters. THIS IS THE NARROWER PART relative to the
+            //       reverted d11e7ca attempt (which fired on >=1 T-typed
+            //       field). The 2894 T3 maintenance comment (#2894 test,
+            //       layout_moving_instantiation_not_silently_wrong_spec_14_1)
+            //       states the discriminator explicitly: "TWO `T` fields are
+            //       load-bearing, because with a single one the i32
+            //       placeholder and the `ptr` share an 8-byte-aligned slot
+            //       and `_w` lands at the same offset either way". With a
+            //       SINGLE T-typed field the codegen-side
+            //       `instanceLayoutDiffersFromErasedTemplate` returns false
+            //       (layouts match), the itable slot IS filled, and the
+            //       program returns the correct value (2894 T1 = 108 with
+            //       single `_t: T`). The over-rejection there is the bug the
+            //       lane's previous attempt shipped and the gate caught —
+            //       this narrower predicate keeps the 2894 T1 case in the
+            //       accepted set.
+            //
+            // The codegen-side predicate
+            // (`instanceLayoutDiffersFromErasedTemplate`) is an exact layout
+            // check that requires LLVMDataLayout info we do not have at sema
+            // time. The ≥2-T-field count is its narrowest sema-time
+            // approximation: with a single T-typed field, the i32 placeholder
+            // (4 bytes, 4-byte aligned) and the substituted ptr (8 bytes,
+            // 8-byte aligned) share one 8-byte-aligned slot, so `_w` lands
+            // at the same offset either way; with two or more, the second
+            // T-typed field lands at offset 8 in the erased template but
+            // offset 16 in the substituted layout, and the offsets of all
+            // following fields diverge. The decline's over-rejection cost is
+            // a diagnostic at the access site instead of a value, which is
+            // the documented "value vs crash" trade #2884 made.
+            if (!ips->isIndexer && ips->parent &&
+                ctx_.isImported(ips->parent) &&
+                ips->parent->kind == ast::TypeDeclKind::Interface &&
+                ips->parent->genericParams.empty() &&  // NOT (c)'s generic interface
+                // Walk imported symbols; only generic classes implementing
+                // this interface with >=2 T-typed fields trigger the decline
+                // (the ≥2 is the narrower part, see (d) above).
+                [&]() -> bool {
+                    bool found = false;
+                    for (Symbol* sym : ctx_.importedSymbols()) {
+                        auto* t = dynamic_cast<TypeSymbol*>(sym);
+                        if (!t || t->kind != ast::TypeDeclKind::Class) continue;
+                        if (t->genericParams.empty()) continue;
+                        // The class implements this interface?
+                        bool impls = false;
+                        for (TypeSymbol* base : t->baseTypes) {
+                            if (base == ips->parent) { impls = true; break; }
+                        }
+                        if (!impls) continue;
+                        // Build generic-param NAME → index map for the
+                        // implementing class, exactly as #2955 does for the
+                        // receiver declaration.
+                        std::unordered_map<std::string_view, std::size_t>
+                            gpIndex;
+                        for (std::size_t gi = 0;
+                             gi < t->genericParams.size(); ++gi) {
+                            if (auto* gp = dynamic_cast<
+                                    const GenericParamSymbol*>(
+                                        t->genericParams[gi]))
+                                gpIndex[gp->name] = gi;
+                        }
+                        if (gpIndex.empty()) continue;
+                        // Count T-typed fields (>=2 is the layout-moving
+                        // discriminator, per 2894 T3's maintenance comment).
+                        std::size_t tFieldCount = 0;
+                        for (Symbol* m : t->members) {
+                            auto* fs = dynamic_cast<FieldSymbol*>(m);
+                            if (!fs) continue;
+                            TypeRef* fty = nullptr;
+                            // LOCAL field: ride the AST + resolvedType side
+                            // table (the typechecker resolves the field's
+                            // declared type during typecheck pass S5).
+                            if (auto* fd = dynamic_cast<
+                                    const ast::FieldDecl*>(fs->decl)) {
+                                if (fd->type) fty = ctx_.resolvedType(*fd->type);
+                            } else if (!fs->decl) {
+                                // IMPORTED field: there is no
+                                // ast::FieldDecl on the importer side
+                                // (#1488's metadata shape), so ride the
+                                // loader's importedMemberType side table —
+                                // exactly the path the §2.5 / §22.9 (#503)
+                                // member-typing above uses for an imported
+                                // property's return type.
+                                fty = ctx_.importedMemberType(fs);
+                            }
+                            if (!fty ||
+                                fty->kind != TypeRef::Kind::Named ||
+                                fty->declaration) continue;
+                            if (gpIndex.count(fty->headName()) != 0) {
+                                ++tFieldCount;
+                                if (tFieldCount >= 2) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (found) break;
+                    }
+                    return found;
+                }()) {
+                auto loc = ma.span.begin;
+                if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "property `" + std::string(ips->name) +
+                    "` on the imported interface `" +
+                    std::string(ips->parent->name) +
+                    "` is not yet monomorphized when dispatched through a "
+                    "layout-movable imported generic instantiation "
+                    "(\xC2\xA7""14.1 / \xC2\xA7""2.8.3 rule 4 / \xC2\xA7""13 / "
+                    "\xC2\xA7""23 / #2943): the itable slot the cross-module "
+                    "stub fills is fixed at the erased `T -> i32` template "
+                    "layout, and an instantiation whose layout moves (its "
+                    "class has TWO or more `T`-typed storage slots) keeps "
+                    "that slot null so the dispatch faults with a SIGSEGV "
+                    "at runtime. Reach the property through a method on "
+                    "the concrete receiver, or declare the accessor on a "
+                    "non-generic concrete class, until importer-side "
+                    "accessor-body monomorphization lands (#428)");
+            }
         } else if (auto* ec = dynamic_cast<EnumConstantSymbol*>(member)) {
             // §10 (issue #328 FINDING [1]): an IMPORTED enum-constant access
             // `Color.Green` has the enum type, exactly like the local-enum case
@@ -16090,6 +17407,94 @@ TypeRef* ExprTC::builtinValueMemberType(const TypeRef* recvTy,
     return nullptr;
 }
 
+// #3019 (§9.2/§9.3/§35.7): the use-site gate shared by the `.` form
+// (resolveMemberAccess) and the `?.` form (resolveNullCondMember) for a direct
+// `.Equals(...)`/`.GetHashCode()` (or `?.Equals(...)`/`?.GetHashCode()`) call
+// on a record/choice that is not auto-equality-bearing and declares no user
+// `=`/`<>` overloads. Extracted from resolveMemberAccess (#2517 hoisted it out
+// of the null-decl branch) so both access forms enforce the ONE check — the
+// one fact the compiler already computes for "is this record/choice auto-
+// equality-bearing" (isPositionalRecordEqualityBearing /
+// isAutoEqualityBearingBodyRecord / recordHasUserDeclaredEquality /
+// isAutoEqualityBearingChoice — the SAME predicates isEqualityBearing, the
+// `where T: hashable` §14.2 check, and checkHashContainerKeys use). No-op when
+// `targetType` is null or not a record/choice (a class/Object/interface
+// receiver uses the universal §9.6 Object surface, so `?.Equals`/`?.GetHashCode`
+// is valid there — #2982/#2964). §7.5: a null-conditional access evaluates the
+// member normally when the receiver is non-null, so the member must be
+// AVAILABLE; the gate is on availability, not on the receiver's nullness.
+void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
+                                        std::string_view member,
+                                        SourceLocation loc) {
+    if (!targetType) return;
+    if (member != "Equals" && member != "GetHashCode") return;
+    if (targetType->kind == ast::TypeDeclKind::Record) {
+        // §9.2 (v0.156)/§9.3 (v0.158, #1383): a direct `.Equals(...)`/
+        // `.GetHashCode()` on a body / combined-form record that is not
+        // auto-equality-bearing and declares no explicit `=`/`<>` overloads is
+        // a compile error. The `positional` flag uses `hasPositionalFields`
+        // first (covers imported records per #501), then falls back to the
+        // local `ast::TypeDecl` for any record that has one.
+        bool positional = targetType->hasPositionalFields;
+        if (!positional)
+            if (auto* td = dynamic_cast<const ast::TypeDecl*>(targetType->decl))
+                positional = td->hasPositionalFields;
+        bool isEq = positional
+                        ? isPositionalRecordEqualityBearing(targetType, ctx_)
+                        : isAutoEqualityBearingBodyRecord(targetType, ctx_);
+        if (!isEq && !recordHasUserDeclaredEquality(targetType)) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "`." + std::string(member) +
+                "` is not available on record `" +
+                std::string(targetType->name) +
+                "`: it is not auto-equality-bearing (§9.2/§9.3). Declare"
+                " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
+                " or simplify the record to an auto-equality-bearing"
+                " form.");
+        }
+    } else if (targetType->kind == ast::TypeDeclKind::Choice) {
+        // §35.7 (v0.200, #2045; v0.226, #2110): a choice rejects direct
+        // `.Equals(...)`/`.GetHashCode()` at the call site when it is NOT
+        // auto-equality-bearing — any borrow-bearing or owning choice, AND any
+        // value-like choice whose case payload fails the §9.2 admissible-
+        // component rule. Mirrors the record gate above (and `=`/`<>`,
+        // isEqualityBearing §3.6, `where T: hashable` §14.2,
+        // checkHashContainerKeys — same predicate).
+        sema::TypeRef rt;
+        rt.kind = sema::TypeRef::Kind::Named;
+        rt.declaration = targetType;
+        if (!isAutoEqualityBearingChoice(targetType, ctx_, &rt)) {
+            auto verdict = common::classifyChoiceType(&rt, ctx_);
+            std::string reason;
+            if (verdict &&
+                *verdict != common::ChoiceClassification::ValueLike) {
+                reason =
+                    std::string("it is not auto-equality-bearing "
+                                "(§35.7) — the choice is ") +
+                    (*verdict == common::ChoiceClassification::Owning
+                         ? "owning"
+                         : "borrow-bearing") +
+                    ", and a non-value-like choice carries no "
+                    "value equality";
+            } else {
+                reason =
+                    "it is not auto-equality-bearing (§35.7): the "
+                    "choice is value-like but a case payload is not "
+                    "an admissible equality component (§9.2)";
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "`." + std::string(member) +
+                "` is not available on choice `" +
+                std::string(targetType->name) + "`: " + reason +
+                ". Declare `=` and `<>` overloads (with "
+                "`Equals`/`GetHashCode`), or restructure the choice "
+                "payload to an admissible component type.");
+        }
+    }
+}
+
 // §7.5 null-conditional member access `x?.M`. Resolves the member on
 // the target's (non-nullable) type exactly like `.`, but the result
 // type is ALWAYS nullable (the access yields null when the target is
@@ -16134,7 +17539,41 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             }
         }
     }
-    if (!member) return;
+    if (!member) {
+        // #3019 (§9.2/§9.3/§35.7): the `?.` form of a direct Equals/GetHashCode
+        // call is the SAME use-site violation as the `.` form — route it
+        // through the shared checkEqualityMemberUseSite gate (the one fact the
+        // compiler already computes for "is this record/choice auto-equality-
+        // bearing") so a `r?.Equals(...)` / `r?.GetHashCode()` on a
+        // non-auto-equality-bearing record/choice is rejected at the call site,
+        // not silently compiled into a codegen crash (IR verification: "Basic
+        // Block ... does not have a terminator"). The `.` form applies this
+        // gate in resolveMemberAccess; before #3019 the `?.` form (a
+        // NullCondMemberExpr, resolved HERE) missed it — the use-site-check
+        // twin of the `?.` sema/lowering gaps #2982/#2964 just landed.
+        if (nm.member == "Equals" || nm.member == "GetHashCode") {
+            TypeSymbol* gateType = targetType;
+            // A nullable VALUE-type receiver (record?/choice?) may leave
+            // memberTargetType null (see the comment above: the receiver is a
+            // Named record/choice, not a class TypeSymbol) — unwrap the
+            // nullable from the receiver's own declared type so the gate sees
+            // the underlying record/choice (a Named TypeRef's `declaration` is
+            // the base type regardless of the nullable flag, per §7.5).
+            if (!gateType && nm.target) {
+                const TypeRef* rt = ctx_.exprType(*nm.target);
+                if (rt && rt->kind == TypeRef::Kind::Named)
+                    gateType = rt->declaration;
+            }
+            // The parser does not set a NullCondMemberExpr's own span, so fall
+            // back to the receiver's span when the callee span is degenerate
+            // (line/column 0) — the #1307 degenerate-callee-span pattern the
+            // extension lookup above also uses.
+            SourceLocation loc = nm.span.begin;
+            if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+            checkEqualityMemberUseSite(gateType, nm.member, loc);
+        }
+        return;
+    }
     // §13.1 (issue #432): full visibility check — delegates to the shared
     // checkMemberVisibility helper (same four-level rule as resolveMemberAccess).
     if (auto* msym = dynamic_cast<MemberSymbol*>(member)) {

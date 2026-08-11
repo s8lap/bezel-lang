@@ -4122,6 +4122,28 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     return obj;
 }
 
+// fix #2996: gate the built-in serializer dispatch on the SAME shape
+// tryLowerSerializationCall accepts — a TypeRef that is either (a) the
+// §2.15/§2.14 opaque handle (no `declaration` at all) or (b) a
+// builtinClassSym (`!decl && moduleName.empty()`, the #2997 discriminator).
+// A user class with the same name (spec §11.3 reserves no names) carries a
+// real `declaration` and is therefore NOT a serialization call — the
+// ordinary method-dispatch path must run. Without this gate the pre-check
+// returned true for a user class named BinarySerializer, but the actual
+// tryLowerSerializationCall body then refused to handle the call (its
+// own discriminator skipped the arm), so the dispatch returned nullptr
+// and the call degraded to the "return-value expression failed to lower"
+// internal: note (the user method body never ran).
+static bool isBuiltinSerializerTypeRef(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    // Shape (a): opaque handle, no TypeSymbol at all.
+    if (!rt->declaration) return true;
+    // Shape (b): builtinClassSym — `decl` is null and `moduleName` is empty
+    // (a synthetic builtin), so an IMPORTED user class (non-empty moduleName)
+    // is correctly excluded. See builtinTypeName in LlvmBackend_Calls.cpp.
+    return !rt->declaration->decl && rt->declaration->moduleName.empty();
+}
+
 // ---------------------------------------------------------------------------
 // Emitter::isSerializationCall
 //
@@ -4138,7 +4160,8 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
     // instance methods.
     auto* recvTy = ctx_.exprType(*ma.target);
     if (recvTy && recvTy->astNode && recvTy->astNode->name &&
-        !recvTy->astNode->name->parts.empty()) {
+        !recvTy->astNode->name->parts.empty() &&
+        isBuiltinSerializerTypeRef(recvTy)) {
         const std::string_view rcn = recvTy->headName();
         if (rcn == "BinarySerializer" || rcn == "BinaryDeserializer") return true;
         // §2.15: JsonSerializer / JsonDeserializer instance methods.

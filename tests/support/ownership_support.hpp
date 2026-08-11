@@ -46,6 +46,27 @@ inline bool hasAutoDropWarning(const OwnershipResult& r,
     return false;
 }
 
+// Issue 2988: a weak `BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors())` does not
+// distinguish WHICH rule fired — a §28.3 borrow-escape test passes if the
+// unknown-member (#414) error fires instead, hiding regressions in the rule
+// under test. `hasErrorMessage(r, needle)` returns true when any ERROR-severity
+// diagnostic contains `needle` as a substring, so a test that asserts both
+// `hasErrors()` AND a `hasErrorMessage(r, "<rule-specific fragment>")` cannot
+// pass on an unrelated rule. The substring should be a STABLE rule identifier
+// (a §-reference + a key term from the message) so diagnostic-wording tweaks
+// that rephrase the sentence do not silently break the test. Scoped to ERROR
+// severity — auto-drop warnings (K3.14) and use-after-dispose warnings
+// (§28.2) are filtered out, so this helper is the "which rule REJECTED"
+// predicate, complementing `hasAutoDropWarning` for the warning side.
+inline bool hasErrorMessage(const OwnershipResult& r,
+                            std::string_view needle) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != Severity::Error) continue;
+        if (d.message.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
 inline OwnershipResult parseAndCheckOwnership(std::string_view source) {
     OwnershipResult r;
     Lexer lexer(source, r.diagnostics);

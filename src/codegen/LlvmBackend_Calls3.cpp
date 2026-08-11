@@ -374,6 +374,38 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
         // (sema rejects a non-value-like one). Stored as the choice struct's
         // bytes; hashed/compared by tag + active payload (build*ChoiceTrampoline).
         eligible = true;
+    else if (!isSet && !ty->nullable && hasObjectHeaderEquality(ty))
+        // fix #2773 (rows A3/A4) / §3.6 / §8.3 / stdlib §4.8: a DICTIONARY key
+        // that carries the §8.3 object header — a class, an interface, or
+        // `Object`. §3.6's equality-bearing row admits "every type except (a) a
+        // record that is neither auto-equality-bearing nor declares user
+        // equality, and (b) a choice that is not value-like
+        // auto-equality-bearing", and sema's isEqualityBearing admits a class
+        // and an interface as a hash-container key verbatim ("class (reference
+        // identity), interface, enum — all bear consistent Equals/
+        // GetHashCode"), so the shape is legal and REACHABLE, not latent.
+        //
+        // Such a key has a perfectly good generic backing: the stored key bytes
+        // are the reference itself (pointer-sized, held by BORROW — stdlib §4.8
+        // "A class-typed key/element is held by borrow", and §4.9's
+        // `Add(key: K, owned value: V)` marks only the VALUE owned, so there is
+        // no key-disposal obligation to express), and its hash/equality are
+        // §8.3's `Equals`/`GetHashCode` pair, which buildValueEqTrampoline /
+        // buildValueHashTrampoline emit via the object vtable.
+        //
+        // Returning null here instead sent the key to the STRING fast path,
+        // which GEPs the object as a `%bz.string`. Measured on
+        // `new Dictionary<Box,int>().Add(b, 10)`: SEGV in
+        // `bz_dict_contains_str` → `fnv1a`. The `GetEnumerator` sites
+        // (LlvmBackend_Assign.cpp, LlvmBackend_Calls2.cpp) already classified
+        // such a dictionary GENERIC-mode — they use a real TypeRef string test
+        // — so BUILD mode and READ mode disagreed; converging on generic is
+        // what makes the two agree.
+        //
+        // `isSet` is excluded deliberately: a class/interface SET element keeps
+        // its ARRAY-backed linear-scan machinery (emitArrayBackedSetInsert,
+        // #1070), a separate and working design.
+        eligible = true;
     if (!eligible) return nullptr;
     if (byteSize) {
         llvm::Type* lt = lowerTypeRef(ty);
@@ -411,6 +443,25 @@ llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
     auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
     auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
                                       "bz$valkey$hash", module_.get());
+    // fix #2773 (rows A3/A4) / §8.3: a class/interface/`Object` key hashes by
+    // its §8.3 pair — the user's `GetHashCode` override when declared, else the
+    // ASSIGNED identity hash ("identity hashes are assigned, not derived …
+    // never expose addresses"). lowerObjectGetHashCode is that dispatch, and is
+    // the hash half of the same vtable pair buildValueEqTrampoline dispatches
+    // equality through, so `a.Equals(b)` ⇒ equal hashes holds in the table.
+    if (hasObjectHeaderEquality(ty)) {
+        auto savedIP2 = builder_.saveIP();
+        llvm::Function* savedFn2 = currentFn_;
+        currentFn_ = fn;
+        builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+        llvm::Value* k = builder_.CreateLoad(ptrTy(), fn->getArg(0), "objkey");
+        llvm::Value* oh = lowerObjectGetHashCode(k);
+        builder_.CreateRet(oh ? builder_.CreateZExt(oh, i64())
+                              : builder_.CreatePtrToInt(k, i64()));
+        builder_.restoreIP(savedIP2);
+        currentFn_ = savedFn2;
+        return fn;
+    }
     auto savedIP = builder_.saveIP();
     llvm::Function* savedFn = currentFn_;
     currentFn_ = fn;
@@ -481,8 +532,17 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
     llvm::Value* b = builder_.CreateLoad(lt, fn->getArg(1), "eq.b");
     bool isString = ty->kind == K::Primitive &&
                     ty->primitive == sema::PrimitiveType::String;
-    llvm::Value* eq;
-    if (isString)
+    // fix #2773 (rows A3/A4) / §8.3 / §8.4: a class/interface/`Object` key
+    // compares by its §8.3 pair — "For classes, `=` always invokes `Equals`.
+    // … classes customize equality by overriding `Equals`" — so dispatch the
+    // vtable slot rather than falling to the plain pointer ICmp below, which
+    // would silently ignore an override the hash trampoline DOES honour and
+    // break §8.3's hash/equality agreement inside the table.
+    llvm::Value* eq =
+        hasObjectHeaderEquality(ty) ? lowerObjectEquals(a, b) : nullptr;
+    if (eq) {
+        // (dispatched above)
+    } else if (isString)
         eq = emitStringEq(a, b);                           // §4.6 content compare
     else if (lt->isFloatingPointTy())
         eq = builder_.CreateFCmpOEQ(a, b);                 // float/double compare
@@ -567,7 +627,8 @@ llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
 
 llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
                                              llvm::Type* outTy,
-                                             const sema::TypeSymbol* elemRec) {
+                                             const sema::TypeSymbol* elemRec,
+                                             const sema::TypeRef* elemRef) {
     // Build a fresh internal function (each LINQ-operator site gets its own;
     // they are tiny and the closure type is baked into the IR).
     llvm::FunctionType* fty = nullptr;
@@ -606,7 +667,43 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
             eq = emitStructEquality(a, b, llvm::cast<llvm::StructType>(elemTy),
                                     elemRec);
         } else if (elemTy->isPointerTy()) {
-            eq = emitStringEq(a, b);           // string content equality (§4.6)
+            // fix #2773 / §8.3 / §8.4 / §4.6: `isPointerTy()` does NOT mean
+            // "string" — a class, an interface, `Object` and a boxed value all
+            // lower to `ptr` too. Decide by the sema TypeRef, following the
+            // buildValueEqTrampoline / emitValueEquality precedent ("when
+            // fieldTy is absent we do NOT assume ptr-means-string"). Only a
+            // TypeRef that PROVES `string` may take the `%bz.string` layout
+            // path; before this fix a class element ran loadStringLen/
+            // loadStringData over the object's own bytes — a heap-buffer-
+            // overflow (ASan: READ past the object) and a silently wrong
+            // dedup verdict.
+            //
+            // Every other pointer element goes through lowerObjectEquals,
+            // which is category-blind by construction: it decides at RUN time
+            // (null → reference identity, a genuine string → content equality,
+            // otherwise vtable[kEqualsSlot] → the class's `Equals` override or
+            // §8.3's reference-identity default). That is exactly the contract
+            // stdlib §5 states for these operators — "`Distinct`, `Union`,
+            // `Intersect`, `Except`, `Contains`, and `ToSet` require
+            // equality-bearing `T` … exactly as for `Set<T>`" — and `Set<C>`'s
+            // own membership scan (emitArrayBackedSetInsert) already honours a
+            // user `Equals` override and otherwise falls back to reference
+            // identity. It is also the safe default for a null/unresolved
+            // elemRef: a string still compares by content there.
+            const sema::TypeRef* er =
+                elemRef ? resolveTypeParamRef(elemRef) : nullptr;
+            const bool provenString =
+                er && er->kind == sema::TypeRef::Kind::Primitive &&
+                er->primitive == sema::PrimitiveType::String;
+            if (provenString) {
+                eq = emitStringEq(a, b);       // string content equality (§4.6)
+            } else {
+                eq = lowerObjectEquals(a, b);  // §8.3/§8.4 object equality
+                // Defensive: lowerObjectEquals only declines on a non-pointer
+                // operand, which cannot happen here. Reference identity is the
+                // §8.3 default and is always memory-safe.
+                if (!eq) eq = builder_.CreateICmpEQ(a, b);
+            }
         } else {
             eq = builder_.CreateICmpEQ(a, b);  // value equality
         }
@@ -781,12 +878,34 @@ llvm::Function* Emitter::buildLinqHashTrampoline(llvm::Type* elemTy,
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
     builder_.SetInsertPoint(entry);
     llvm::Value* v = builder_.CreateLoad(elemTy, fn->getArg(0), "hash.v");
-    llvm::Value* h = elemTy->isIntegerTy(64) ? v
-                   : elemTy->isIntegerTy(32)
-                       ? builder_.CreateZExt(v, i64())
-                       : elemTy->isPointerTy()
-                           ? builder_.CreatePtrToInt(v, i64())
-                           : builder_.CreateZExtOrBitCast(v, i64());
+    llvm::Value* h = nullptr;
+    if (elemTy->isPointerTy()) {
+        // fix #2773 / §8.3: a pointer-shaped element that is not an
+        // equality-bearing VALUE type is a class/interface/`Object` reference.
+        // Its §8.3 hash is the user's `GetHashCode` override when declared,
+        // else the ASSIGNED identity hash (bz_obj_identity_hash — "identity
+        // hashes are assigned, not derived … never expose addresses"), NOT the
+        // raw pointer bits. lowerObjectGetHashCode dispatches exactly that
+        // (null → 0, a run-time string → its content hash, otherwise
+        // vtable[kGetHashCodeSlot]), which is the hash side of the SAME
+        // vtable pair the equality trampoline now dispatches through
+        // (lowerObjectEquals → vtable[kEqualsSlot]). Keeping the pair together
+        // is what makes §8.3's `a.Equals(b) ⇒ a.GetHashCode() = b.GetHashCode()`
+        // hold inside the membership dict: before this fix the hash was
+        // pointer identity while the equality trampoline content-compared the
+        // object's bytes as a `%bz.string`, so the two disagreed *and* the
+        // comparison was memory-unsafe.
+        if (llvm::Value* oh = lowerObjectGetHashCode(v))
+            h = builder_.CreateZExt(oh, i64());
+        else
+            h = builder_.CreatePtrToInt(v, i64());  // defensive (unreachable)
+    } else if (elemTy->isIntegerTy(64)) {
+        h = v;
+    } else if (elemTy->isIntegerTy(32)) {
+        h = builder_.CreateZExt(v, i64());
+    } else {
+        h = builder_.CreateZExtOrBitCast(v, i64());
+    }
     builder_.CreateRet(h);
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
@@ -1584,7 +1703,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         int64_t esz = lazyElemSize(elemTy2, module_->getDataLayout());
         const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
         llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy2, elemRef, elemRec);
-        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy2, nullptr, elemRec);
+        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy2, nullptr, elemRec,
+                                                        elemRef);  // #2773
         auto* toSet = declareC("bz_lazy_to_set", ptrTy(),
                                {ptrTy(), i64(), ptrTy(), ptrTy()});
         return builder_.CreateCall(toSet,
@@ -1728,7 +1848,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Function* hashTramp = keyIsString
             ? nullptr : buildLinqHashTrampoline(keyTy, keyRefSema, keyRec);
         llvm::Function* eqTramp = keyIsString
-            ? nullptr : buildLinqTrampoline(3, keyTy, nullptr, keyRec);
+            ? nullptr : buildLinqTrampoline(3, keyTy, nullptr, keyRec,
+                                            keyRefSema);  // #2773
         llvm::Value* hashTrampV = hashTramp
             ? static_cast<llvm::Value*>(hashTramp)
             : llvm::ConstantPointerNull::get(ptrTy());
@@ -1935,7 +2056,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // on the aggregate. recordTypeOfRef is non-null only for an
         // equality-bearing record element type.
         const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
-        llvm::Function* eqTramp = buildLinqTrampoline(3, elemTy, nullptr, elemRec);
+        llvm::Function* eqTramp = buildLinqTrampoline(3, elemTy, nullptr, elemRec,
+                                                      elemRef);  // #2773
         auto* distFn = declareC("bz_lazy_distinct", ptrTy(), {ptrTy(), ptrTy()});
         return builder_.CreateCall(distFn, {src, eqTramp}, "linq.distinct");
     }
@@ -2089,7 +2211,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // Build element hash + equality trampolines for the membership dict.
         const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
         llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy, elemRef, elemRec);
-        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy, nullptr, elemRec);
+        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy, nullptr, elemRec,
+                                                        elemRef);  // #2773
         const char* rtFn = (m == "Union")     ? "bz_lazy_union"
                          : (m == "Intersect") ? "bz_lazy_intersect"
                                               : "bz_lazy_except";
@@ -2242,6 +2365,33 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     auto llRetainElem = [&](llvm::Value* v, const ast::Expr* argExpr) {
         if (llIsStrElem && !isPlusOneStringProducer(argExpr)) emitStringRetain(v);
     };
+    // fix #2692 / §28.11 / §28.9: the RELEASE half of the same co-ownership, for
+    // the removal operations. Every removal below hands the runtime a per-element
+    // disposer that `bz_llist_remove_first/_last/_node` invokes EXACTLY ONCE on
+    // the element of the node it unlinks, so releasing there consumes exactly the
+    // +1 `llRetainElem` (or a transferred +1 producer) put in at insert. Before
+    // #2686 no insert path retained and this had to stay null; now all SIX do
+    // (`.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter` above, the
+    // `bz_llist_add_last` arm of materializeHeapCollectionLiteral, and — since
+    // #2693 — the `new LinkedList<T>(source)` arm of lowerNew, which appends the
+    // drained source with the same unconditional per-element retain), which are
+    // the ONLY ways an element enters a bz_llist_t — the runtime exposes no other
+    // insert and codegen has exactly two `bz_llist_alloc` sites (that literal arm
+    // and `new LinkedList<T>(…)`, whose no-arg form allocates EMPTY and whose
+    // source form populates through the retaining append above). So the release
+    // is provably paired. This is a verbatim mirror of the Array/Stack/Queue arm
+    // (`if (!elemDisp && arrIsStringElem) elemDisp = stringElementReleaseThunk();`
+    // at .RemoveAt/.Remove/.Clear in LlvmBackend_Calls.cpp), which has released a
+    // borrowing `Array<string>`'s elements on removal since #602.
+    // `.TryPopFirst`/`.TryPopLast` deliberately do NOT use this: `bz_llist_pop_*`
+    // MOVES the element out by value into the caller's out-param, transferring
+    // the reference rather than dropping it.
+    auto llElemDisposer = [&](llvm::Function* owningDisp) -> llvm::Value* {
+        if (!owningDisp && llIsStrElem) owningDisp = stringElementReleaseThunk();
+        return owningDisp ? llvm::cast<llvm::Value>(owningDisp)
+                          : llvm::cast<llvm::Value>(
+                                llvm::ConstantPointerNull::get(ptrTy()));
+    };
 
     // --- AddFirst(item): LinkedListNode<T> ---
     if (m == "AddFirst" && call.args.size() == 1 && call.args[0].value) {
@@ -2361,9 +2511,15 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // unchanged. Before this fix it fell through → malformed IR (bug16).
     if ((m == "TryPopFirst" || m == "TryPopLast") &&
         call.args.size() == 1 && call.args[0].value) {
+        // fix #2938 / §22.3: see TryPop in Calls.cpp.
         llvm::Type* outTy = nullptr;
-        llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
-        if (!outAddr) return nullptr;
+        std::vector<AccessorRefArg> outArgs;
+        llvm::Value* outAddr = resolveOutAddrWithBracket(
+            *call.args[0].value, outTy, outArgs);
+        if (!outAddr) {
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+            return nullptr;
+        }
         auto* cntFn = declareC("bz_llist_count", i64(), {ptrTy()});
         llvm::Value* cnt = builder_.CreateCall(cntFn, {recv}, "lltrypop.cnt");
         llvm::Value* nonEmpty = builder_.CreateICmpNE(
@@ -2386,6 +2542,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         }
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
+        // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         auto* phi = builder_.CreatePHI(i1(), 2, "lltrypop.r");
         phi->addIncoming(builder_.getTrue(), foundBB);
         phi->addIncoming(builder_.getFalse(), preBB);
@@ -2395,10 +2553,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "RemoveFirst" && call.args.empty()) {
         // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk (hoisted above).
         // Interface elements now produce a non-null disposerThunk via ClassOwned.
-        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
-        llvm::Value* disp = elemDisp
-            ? llvm::cast<llvm::Value>(elemDisp)
-            : llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* disp =
+            llElemDisposer(isOwning ? llElemPol.disposerThunk : nullptr);
         auto* fn = declareC("bz_llist_remove_first", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), ptrTy()});
         builder_.CreateCall(fn, {recv, disp});
@@ -2407,10 +2563,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // --- RemoveLast() ---
     if (m == "RemoveLast" && call.args.empty()) {
         // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
-        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
-        llvm::Value* disp = elemDisp
-            ? llvm::cast<llvm::Value>(elemDisp)
-            : llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* disp =
+            llElemDisposer(isOwning ? llElemPol.disposerThunk : nullptr);
         auto* fn = declareC("bz_llist_remove_last", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), ptrTy()});
         builder_.CreateCall(fn, {recv, disp});
@@ -2421,10 +2575,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* node = lowerExpr(*call.args[0].value);
         if (!node) return nullptr;
         // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
-        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
-        llvm::Value* disp = elemDisp
-            ? llvm::cast<llvm::Value>(elemDisp)
-            : llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* disp =
+            llElemDisposer(isOwning ? llElemPol.disposerThunk : nullptr);
         auto* fn = declareC("bz_llist_remove_node", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), ptrTy(), ptrTy()});
         builder_.CreateCall(fn, {recv, node, disp});
@@ -2504,10 +2656,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "Clear" && call.args.empty()) {
         // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk (hoisted above).
         // Interface elements now produce a non-null disposerThunk via ClassOwned.
-        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
-        llvm::Value* disp = elemDisp
-            ? llvm::cast<llvm::Value>(elemDisp)
-            : llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* disp =
+            llElemDisposer(isOwning ? llElemPol.disposerThunk : nullptr);
         // Loop: while (first_node != null) remove_first.
         auto* condBB = llvm::BasicBlock::Create(llvm_, "ll.clr.c", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ll.clr.b", currentFn_);
@@ -2593,11 +2743,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         // OwningLinkedList disposes the element; LinkedList borrows, no disposal.
         // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk from policy
         // hoist.  Interface elements now produce a non-null disposerThunk.
-        llvm::Function* elemDisp =
-            isOwning ? llElemPol.disposerThunk : nullptr;
-        llvm::Value* disp = elemDisp
-            ? llvm::cast<llvm::Value>(elemDisp)
-            : llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* disp =
+            llElemDisposer(isOwning ? llElemPol.disposerThunk : nullptr);
         auto* remBB  = llvm::BasicBlock::Create(llvm_, "llr.rem", currentFn_);
         auto* contBB = llvm::BasicBlock::Create(llvm_, "llr.cont", currentFn_);
         builder_.CreateCondBr(found, remBB, contBB);
@@ -3693,9 +3840,22 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                             builder_.SetInsertPoint(endBB);
                             return builder_.getFalse();
                         }
+                        // fix #2938 / §22.3: see TryGetValue in Calls.cpp.
+                        // The pre-fix branch was `if (outAddr)` at both store
+                        // sites, so a null lvalueAddr silently dropped the
+                        // write. With the bracket, the slot is always present
+                        // — only the writeback gating changes — so both stores
+                        // run unconditionally and the bracket flushes at the
+                        // merge block.
                         llvm::Type* outTy = nullptr;
-                        llvm::Value* outAddr =
-                            lvalueAddr(*call.args[0].value, outTy);
+                        std::vector<AccessorRefArg> outArgs;
+                        llvm::Value* outAddr = resolveOutAddrWithBracket(
+                            *call.args[0].value, outTy, outArgs);
+                        if (!outAddr) {
+                            emitAccessorRefArgWriteBacks(outArgs,
+                                                         /*emit=*/false);
+                            return nullptr;
+                        }
                         // okBB: load, bswap if BE, bitcast, store to out, jump end
                         builder_.SetInsertPoint(okBB);
                         llvm::Value* raw =
@@ -3723,6 +3883,9 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                         }
                         builder_.CreateBr(endBB);
                         builder_.SetInsertPoint(endBB);
+                        // fix #2938 / §22.3: flush any bracket on the
+                        // normal-return edge.
+                        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
                         auto* phi = builder_.CreatePHI(i1(), 2, "bba.tryres");
                         phi->addIncoming(builder_.getTrue(),  okBB);
                         phi->addIncoming(builder_.getFalse(), failBB);
@@ -3897,12 +4060,21 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             //   - pointer outEty (class/string): store rawItem directly.
             if (mname == "TryReceive" && call.args.size() == 1 &&
                 call.args[0].value) {
-                // The out argument's address.
+                // The out argument's address. // fix #2938 / §22.3
+                // Pre-fix the fallback was a temp slot — a null lvalueAddr
+                // silently dropped the write. resolveOutAddrWithBracket falls
+                // back to the §22.3 bracket, so the write lands in the
+                // caller's property/indexer on normal return.
                 llvm::Type* outEty = nullptr;
-                llvm::Value* outSlot = lvalueAddr(*call.args[0].value, outEty);
+                std::vector<AccessorRefArg> outArgs;
+                llvm::Value* outSlot = resolveOutAddrWithBracket(
+                    *call.args[0].value, outEty, outArgs);
                 if (!outSlot) {
-                    // Fallback: create a temporary slot.
-                    outSlot = entryAlloca(ptrTy());
+                    // The previous fallback path was a scratch slot; with the
+                    // bracket, no fallback is needed — the slot is always
+                    // present once resolution succeeds.
+                    emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                    return nullptr;
                 }
                 // Allocate a ptr-sized slot for the raw item pointer.
                 llvm::AllocaInst* rawSlot = entryAlloca(ptrTy());
@@ -3971,6 +4143,8 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 }
                 builder_.CreateBr(contBB);
                 builder_.SetInsertPoint(contBB);
+                // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
                 return builder_.CreateICmpNE(ok, builder_.getInt32(0), "ch.try.r");
             }
 
@@ -5217,48 +5391,6 @@ llvm::Value* Emitter::tryLowerTcsCall(const ast::CallExpr& call) {
 }
 
 
-// §8.5 (v0.182, #1579): spell a TypeRef the way an inline array's default
-// `ToString` names its element type — "int", "MyRecord", "MyRecord?", etc.
-// This is the SOURCE spelling (for the user-facing "[3]int" string), not a
-// mangled name fragment like the generic-instantiation `mangleTy` helper
-// (LlvmBackend_Setup.cpp).
-static std::string inlineArrayElemTypeName(const sema::TypeRef* t) {
-    if (!t) return "?";
-    std::string base;
-    if (t->kind == sema::TypeRef::Kind::Primitive) {
-        switch (t->primitive) {
-            case sema::PrimitiveType::Bool:    base = "bool";    break;
-            case sema::PrimitiveType::Char:    base = "char";    break;
-            case sema::PrimitiveType::String:  base = "string";  break;
-            case sema::PrimitiveType::Byte:    base = "byte";    break;
-            case sema::PrimitiveType::SByte:   base = "sbyte";   break;
-            case sema::PrimitiveType::Short:   base = "short";   break;
-            case sema::PrimitiveType::UShort:  base = "ushort";  break;
-            case sema::PrimitiveType::Int:     base = "int";     break;
-            case sema::PrimitiveType::UInt:    base = "uint";    break;
-            case sema::PrimitiveType::Long:    base = "long";    break;
-            case sema::PrimitiveType::ULong:   base = "ulong";   break;
-            case sema::PrimitiveType::Float:   base = "float";   break;
-            case sema::PrimitiveType::Double:  base = "double";  break;
-            case sema::PrimitiveType::Decimal: base = "decimal"; break;
-            case sema::PrimitiveType::Object:  base = "Object";  break;
-            default:                           base = "?";       break;
-        }
-    } else if (t->kind == sema::TypeRef::Kind::Named) {
-        if (t->declaration) base = std::string(t->declaration->name);
-        else if (t->astNode && t->astNode->name &&
-                 !t->astNode->name->parts.empty())
-            base = std::string(t->astNode->name->parts.back());
-        else base = "?";
-    } else if (t->kind == sema::TypeRef::Kind::Unit) {
-        base = "()";
-    } else {
-        base = "?";
-    }
-    if (t->nullable) base += "?";
-    return base;
-}
-
 // §15.1.2 / §17.5 / #1342: lower an inline-array `[N]T` built-in intrinsic:
 //   ToArray()    — copies all N slots into a fresh bz_array_t* (owned Array<T>).
 //                  String elements are +1 retained (bz_array_retain_strings).
@@ -5286,22 +5418,31 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
     sema::TypeRef* elemRef = recvTy->arrayElement;
     int64_t N = recvTy->arraySizeValue;
 
-    // §8.5 (v0.182, #1579): the compiler-generated default `ToString` for an
-    // inline array is the type's name, "[3]int"-style — deliberately NOT an
-    // element listing (elements may be class-typed borrows whose formatting
-    // is not the container's business). N and the element type are both
-    // static, so the whole result is a compile-time string constant; the
-    // receiver's runtime value is never read. Handled here (rather than the
-    // general array-address path below) because it needs neither `arrAddr`
-    // nor `elemTy`/`esz`.
+    // §8.5 (v0.182, #1579, v0.240 move-only form): the compiler-generated
+    // default `ToString` for an inline array is the type's name, "[3]int"-
+    // style — deliberately NOT an element listing (elements may be class-typed
+    // borrows whose formatting is not the container's business). The "all
+    // forms" wording in §8.5 is explicit, and §15.1.1/§15.3 make `owned` part
+    // of the type — so an owning `[2 owned]R` is a DIFFERENT type from `[2]R`
+    // and must render DIFFERENTLY: `[2 owned]R`, not `[2]R`. N and the element
+    // type are both static, so the whole result is a compile-time string
+    // constant; the receiver's runtime value is never read. Handled here
+    // (rather than the general array-address path below) because it needs
+    // neither `arrAddr` nor `elemTy`/`esz`.
+    //
+    // #2959 (§8.5 v0.240): the direct-call arm used to build the name by hand
+    // (`"[" + N + "]" + <element name>`) and so silently dropped the `owned`
+    // marker, while the interpolation arm and the box thunk both already routed
+    // through `inlineArrayTypeSpelling` (which keeps it). One §8.5 answer, three
+    // renderers, disagreed on one cell. Delegate here too — same spelling,
+    // single authority.
     if (m == "ToString" && call.args.empty()) {
-        std::string name = "[" + std::to_string(N) + "]" +
-                            inlineArrayElemTypeName(elemRef);
         // lowerStringLiteral expects Bezel string-literal SOURCE TEXT
         // (including the surrounding quotes); a type name is always a plain
         // identifier sequence (plus "[", "]", "?"), none of which need
         // escaping for a non-verbatim literal.
-        return lowerStringLiteral("\"" + name + "\"", /*verbatim=*/false);
+        return lowerStringLiteral(
+            "\"" + inlineArrayTypeSpelling(recvTy) + "\"", /*verbatim=*/false);
     }
 
     llvm::Type* elemTy = elemRef ? lowerTypeRef(elemRef) : i64();

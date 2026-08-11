@@ -242,6 +242,71 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         }
         emitOwnedFieldDisposals(ts);
         emitBaseDisposeChain(ts);
+        // fix #2951 (§28.4 step 3 / §28.2 / §28.9 / §31.4, v0.240): release the
+        // INHERITED §31.4 header. §28.4's generated `Dispose()` step 3 states,
+        // verbatim: "Chains to the base class's `Dispose()`." `emitBaseDisposeChain`
+        // above iterates `ts->baseTypes`, which holds only ancestors that HAVE a
+        // TypeSymbol — and a built-in exception has none — so for a class whose
+        // base is `Exception` (or any built-in exception) step 3 chained to
+        // NOTHING. `vt$<C>` slot 2 is the class's own `bz$<C>$Dispose`, whose
+        // core never touched the header, so the shared `bz$exDisposeMsg` that a
+        // directly-constructed `new Exception(msg)` disposes through was never
+        // reached from a subclass and NOTHING released its Message (or
+        // ArgumentException's ParamName). Measured on the 20-iteration repro:
+        // `711 byte(s) leaked in 40 allocation(s)`, against an identical loop on
+        // the built-in `Exception` that is clean.
+        //
+        // §28.9 makes the slot's obligation explicit for a runtime-managed
+        // string field, and §28.2's exactly-once is the whole contract here, so
+        // both directions were measured, not just the leak:
+        //
+        //   * UNDER-release — LSan on the amplified loops; clean now.
+        //   * OVER-release — LSan is blind to it, so it is measured by keeping
+        //     an independent reference alive ACROSS the disposal and reading it
+        //     after, with churn in between: one `+1` string aliased into TWO
+        //     subclass instances, both disposed, then the original read. An
+        //     over-release faults there under ASan; it does not.
+        //
+        // Exactly-once holds structurally, not just on the probes, for the two
+        // shapes that would otherwise release twice:
+        //   * A MULTI-LEVEL hierarchy (`ExB: ExA: Exception`). The gate is the
+        //     TRANSITIVE `hasBuiltinExceptionBase`, so both levels' cores carry
+        //     this call and `emitBaseDisposeChain` runs ExA's core from ExB's.
+        //     `bz$exDisposeMsg` NULLS each slot after releasing it (see
+        //     setupBuiltinExceptions) and `bz_string_release` is null-safe, so
+        //     the second call is a no-op. The transitive gate is deliberate: it
+        //     also covers a LOCAL class over an IMPORTED exception base, where
+        //     the chain's reach into the dependency's compiled core is not this
+        //     module's to guarantee.
+        //   * §28.6 REPEAT DISPATCH (explicit `Dispose()` then scope-end). The
+        //     public wrapper's run-once flag already stops the second entry, and
+        //     the slot-nulling makes it idempotent even if it did not.
+        //
+        // BLOCKED UNTIL NOW, and both blockers are real: #2902 (the `base(msg)`
+        // chain stored the message UN-RETAINED, so releasing it here freed a
+        // reference the caller still owned — measured `heap-use-after-free ...
+        // #2 bz$exDisposeMsg`) and #2950 (an imported subclass was laid out
+        // WITHOUT the header, so the exporter-compiled disposer handed the
+        // importer's FIELD VALUE to `bz_string_release` — `SEGV on unknown
+        // address 0x2b`, rdi = the field's value). Both are in this batch; this
+        // call is only sound with them.
+        //
+        // CauseChain@24 is deliberately NOT released here — see the #811/#1389
+        // reasoning on `bz$exDisposeMsg`: it is reclaimed at the terminal
+        // `emitDisposeAndReclaim` site, which runs exactly once per object,
+        // rather than in a disposer that can be re-dispatched. (That reclaim
+        // now ALSO covers a user subclass: #2989 widened
+        // `bz_exc_reclaim_causechain`'s gate to walk the type-descriptor chain,
+        // so a user subclass's vt$<C> is recognized via its btd$Exception
+        // ancestor — the same authority `o is Exception` uses — not just the
+        // built-in vtable-identity table.)
+        //
+        // Inherits the pre-existing corner noted above: a destructor that
+        // returns early leaves `terminated` set and skips this block entirely,
+        // exactly as it already skips the owned-field cascade and the base chain.
+        if (hasBuiltinExceptionBase(ts) && builtinExceptionDisposeFn_ &&
+            currentThis_)
+            builder_.CreateCall(builtinExceptionDisposeFn_, {currentThis_});
         builder_.CreateRetVoid();
     }
 }
@@ -376,9 +441,34 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
         auto* deferFn = declareC("bz_defer_exc_dispose",
                                  llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(deferFn, {eo});
+        // §30.9 / #3030: null the task's error_obj field even on the
+        // DEFER path. The exception is in flight (the await/`.Result`
+        // re-raise marked it borrowed) and the catch arm's terminal act
+        // is the disposer of record (it disposes via bz_is_exc_deferred →
+        // emitDisposeAndReclaim + bz_clear_exc_deferred, the §30.9
+        // in-flight-deferral contract). The task's error_obj field, if
+        // left non-null after the defer, would be re-disposed by
+        // bz_task_fire_and_forget's FAST path below (the #3030 fix's
+        // new `if (error_obj && !fault_borrowed)` arm) — and the catch
+        // arm then reads the freed pointer (SIGSEGV / ASan UAF). The
+        // dispBB branch (synchronous dispose) gets the same null-write
+        // a few lines below for the same reason. Without this null the
+        // in-flight path becomes a use-after-free the moment #3030's
+        // FAST-path disposal guard is enabled.
+        auto* clearEoDeferFn = declareC("bz_task_clear_error_obj",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(clearEoDeferFn, {oldVal});
         builder_.CreateBr(eaBB);
         builder_.SetInsertPoint(dispBB);
         emitDisposeAndReclaim(eo);
+        // §30.9 / #3030: the task's error_obj field still holds a dangling
+        // pointer to the exception we just freed. bz_task_fire_and_forget
+        // (called below) takes the FAST path on a settled task and its
+        // error_obj-disposal guard would re-dispose the freed pointer. Null
+        // the field now so the FAST path's `if (error_obj && ...)` sees null.
+        auto* clearEoFn = declareC("bz_task_clear_error_obj",
+                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(clearEoFn, {oldVal});
         builder_.CreateBr(eaBB);
         builder_.SetInsertPoint(eaBB);
     }
@@ -626,8 +716,25 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                         // through the SAME stringElementReleaseThunk. IOwningList
                         // is owning and never reaches this string gate (owning-
                         // family disposer runs via elementPolicyFor instead).
+                        //
+                        // fix #2692: LinkedList joins the list. It is llist-
+                        // backed rather than array-backed (the `isLL` switch
+                        // below picks bz_llist_free), but the ELEMENT obligation
+                        // is identical — a borrowing `LinkedList<string>` co-owns
+                        // a +1 per element (§28.11's element-slot table), and
+                        // since #2686 all five insert paths take it. It was
+                        // excluded only because none of them did, which made a
+                        // release here unpaired; that is no longer true, and the
+                        // exclusion was leaking one reference per element of an
+                        // `owned` LinkedList<string> field. OwningLinkedList
+                        // cannot reach this gate: elementPolicyFor puts an
+                        // owning-family string in the Value row, so the
+                        // RuntimeManaged test above already fails (and sema
+                        // rejects `OwningLinkedList<string>` outright — stdlib
+                        // §4.2 / §14.4, #1327).
                         return n == "Array" || n == "Stack" || n == "Queue" ||
-                               n == "IList" || n == "IReadOnlyList";
+                               n == "IList" || n == "IReadOnlyList" ||
+                               n == "LinkedList";
                     }(it->collTy->headName()))
                 elemDisp = stringElementReleaseThunk();
             llvm::Value* disp = elemDisp
@@ -1292,8 +1399,14 @@ void Emitter::emitPendingCheck() {
     // gate is emittingDisposerBody_, so ONLY user destructor-body emission is
     // affected — the general dispatch and every built-in/runtime disposer (e.g.
     // event-subscription and CancellationTokenSource cleanup) are untouched.
-    if (emittingDisposerBody_ && disposerEntryExc_) {
-        llvm::Value* isNew = builder_.CreateICmpNE(exc, disposerEntryExc_);
+    //
+    // fix #2872: read the entry value through disposerEntryExcHere(), which also
+    // requires that we are still emitting into the DISPOSER's own function. A
+    // lambda body or a lazily-built specialization emitted mid-destructor-body
+    // is a different llvm::Function, and this `icmp` against the disposer's
+    // entry load was then a cross-function reference (malformed IR).
+    if (llvm::Value* entryExc = disposerEntryExcHere()) {
+        llvm::Value* isNew = builder_.CreateICmpNE(exc, entryExc);
         pending = builder_.CreateAnd(pending, isNew);
     }
     emitPendingCheckIf(pending);
@@ -1520,6 +1633,14 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
     // built-in-exception vtable table bz_unhandled_exception gates on (only a
     // built-in exception type installs bz$exDisposeMsg / carries the
     // CauseChain slot at BZ_EXC_CAUSE_OFFSET); a no-op for every other class.
+    // The third argument is the built-in exception DESCRIPTOR table: a USER
+    // subclass of a built-in exception (§31.4) carries the same header but its
+    // vtable is vt$<C>, absent from the vtable table — issue #2989/#2979. The
+    // runtime then walks obj's type-descriptor chain (vtable[0] = td$<C>, the
+    // same null-terminated ancestor array emitIsA uses for `o is Exception`)
+    // and reclaims iff a built-in exception descriptor is among the ancestors,
+    // which is the one fact the compiler already computes (hasBuiltinExceptionBase
+    // / builtinChainOf in setupBuiltinExceptions). See bezel_runtime_itable.cpp.
     //
     // Scope: this covers every reclaim that funnels through this function —
     // catch-arm dispose, using-var / owned-field scope-end dispose, and a
@@ -1534,8 +1655,8 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
     // follow-up (see the issue tracker) rather than fixed silently here.
     builder_.CreateCall(
         declareC("bz_exc_reclaim_causechain", llvm::Type::getVoidTy(llvm_),
-                 {ptrTy(), ptrTy()}),
-        {obj, builtinExcVtableTablePtr()});
+                 {ptrTy(), ptrTy(), ptrTy()}),
+        {obj, builtinExcVtableTablePtr(), builtinExcDescTablePtr()});
     // §28.2 v0.134 / issue #601: in checked disposal mode the block is
     // quarantined (not freed) after disposal so that the per-instance disposed
     // flag at slot 1 (or 2) remains readable when a subsequent member-entry
@@ -1548,6 +1669,324 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
     // readable for the disposed-flag guard.)
     if (!checkedDisposal_)
         builder_.CreateCall(freeFn(), {obj});
+}
+
+
+// §6.6 / issue #974 / §30.11: release a NON-NULL TaskCompletionSource<T> /
+// OwningTaskCompletionSource<T> / TaskCompletionSource (`bz_tcs_t*`). The
+// caller supplies the null guard and, where a slot holds `tcs`, nulls it
+// afterwards (§28.2 exactly-once).
+//
+// Factored out by fix #2921 (v0.240) so the `using var` scope-exit auto-drop
+// and an EXPLICIT `tcs.Dispose()` share ONE resolution of "what releases a
+// TCS". Before that, only the scope-exit path had one, and the explicit call
+// fell through to the generic vtable dispatch — which a `bz_tcs_t*` has no
+// vtable for (measured: SIGSEGV out of `Main`).
+//
+// The four steps, all on the non-null path:
+//   1. bz_tcs_fault_if_pending(tcs, ioe_vtable): if the inner task has not been
+//      completed yet, fault it with InvalidOperationException so that any
+//      awaiter wakes up with an error rather than hanging indefinitely.
+//   2. Error-obj cleanup on the inner task (mirrors the d.task arm): if the
+//      task is faulted, dispose the error object exactly once.
+//   3. bz_task_fire_and_forget(inner_task): release the task struct when it has
+//      finished running (immediate if already done, deferred if running).
+//   4. bz_tcs_free(tcs): free the bz_tcs_t wrapper itself.
+void Emitter::emitTcsRelease(llvm::Value* tcs) {
+    // Step 1: fault the inner task if not yet completed.
+    llvm::Value* ioeVt = llvm::ConstantPointerNull::get(ptrTy());
+    {   auto vit = builtinVtable_.find("InvalidOperationException");
+        if (vit != builtinVtable_.end()) ioeVt = vit->second;
+    }
+    auto* faultFn = declareC("bz_tcs_fault_if_pending",
+                              llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+    builder_.CreateCall(faultFn, {tcs, ioeVt});
+
+    // Step 2: get the inner task pointer and clean up its error object.
+    auto* innerFn = declareC("bz_tcs_task", ptrTy(), {ptrTy()});
+    llvm::Value* t = builder_.CreateCall(innerFn, {tcs}, "tcs.inner");
+    {
+        auto* isErrFn = declareC("bz_task_is_error", i1(), {ptrTy()});
+        llvm::Value* err = builder_.CreateCall(isErrFn, {t}, "tcs.task.err");
+        auto* edBB = llvm::BasicBlock::Create(llvm_, "tcs.task.errdisp",
+                                               currentFn_);
+        auto* eaBB = llvm::BasicBlock::Create(llvm_, "tcs.task.errcont",
+                                               currentFn_);
+        builder_.CreateCondBr(err, edBB, eaBB);
+        builder_.SetInsertPoint(edBB);
+        auto* eoFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
+        llvm::Value* eo = builder_.CreateCall(eoFn, {t}, "tcs.task.errobj");
+        llvm::Value* eoNull = builder_.CreateICmpEQ(
+            eo, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* doBB = llvm::BasicBlock::Create(llvm_, "tcs.task.eodisp",
+                                               currentFn_);
+        builder_.CreateCondBr(eoNull, eaBB, doBB);
+        builder_.SetInsertPoint(doBB);
+        // §30.9 in-flight-deferral (v0.179): if the fault is still in
+        // flight (borrowed by an awaiter mid-dispatch — a TCS-backed task
+        // bound inside a `try`, unwound by its own re-raised fault),
+        // defer its disposal to the catch arm's terminal act rather than
+        // freeing the object mid-dispatch (UAF). Otherwise dispose now.
+        auto* isBorrowedFn = declareC("bz_is_exc_borrowed",
+                                      llvm::Type::getInt8Ty(llvm_), {ptrTy()});
+        llvm::Value* bv = builder_.CreateCall(isBorrowedFn, {eo},
+                                              "tcs.eo.borrowed");
+        llvm::Value* isB = builder_.CreateICmpNE(
+            bv, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+        auto* deferBB = llvm::BasicBlock::Create(llvm_, "tcs.eo.defer",
+                                                 currentFn_);
+        auto* dispBB  = llvm::BasicBlock::Create(llvm_, "tcs.eo.dispnow",
+                                                 currentFn_);
+        builder_.CreateCondBr(isB, deferBB, dispBB);
+        builder_.SetInsertPoint(deferBB);
+        auto* deferFn = declareC("bz_defer_exc_dispose",
+                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(deferFn, {eo});
+        // §30.9 / #3030: null the task's error_obj field even on the
+        // DEFER path. The exception is in flight (the await/`.Result`
+        // re-raise marked it borrowed) and the catch arm's terminal act
+        // is the disposer of record (it disposes via bz_is_exc_deferred →
+        // emitDisposeAndReclaim + bz_clear_exc_deferred, the §30.9
+        // in-flight-deferral contract). The task's error_obj field, if
+        // left non-null after the defer, would be re-disposed by
+        // bz_task_fire_and_forget's FAST path below (the #3030 fix's
+        // new `if (error_obj && !fault_borrowed)` arm) — and the catch
+        // arm then reads the freed pointer (SIGSEGV / ASan UAF). The
+        // dispBB branch (synchronous dispose) gets the same null-write
+        // a few lines below for the same reason.
+        auto* clearEoDeferFn = declareC("bz_task_clear_error_obj",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(clearEoDeferFn, {t});
+        builder_.CreateBr(eaBB);
+        builder_.SetInsertPoint(dispBB);
+        emitDisposeAndReclaim(eo);
+        // §30.9 / #3030: the task's error_obj field still holds a dangling
+        // pointer to the exception we just freed. bz_task_fire_and_forget
+        // (called below) takes the FAST path on a settled task and its
+        // error_obj-disposal guard would re-dispose the freed pointer. Null
+        // the field now so the FAST path's `if (error_obj && ...)` sees null.
+        auto* clearEoFn = declareC("bz_task_clear_error_obj",
+                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(clearEoFn, {t});
+        builder_.CreateBr(eaBB);
+        builder_.SetInsertPoint(eaBB);
+    }
+
+    // Step 2.5: §28.3 / #1250: for OwningTaskCompletionSource<T:class>, dispose
+    // the inner task's owned result if set but never consumed via .Result/await.
+    // bz_tcs_dispose_owned_result is safe on all paths:
+    //   • owned_result_disposer == null → plain TCS or value-type; no-op.
+    //   • task->is_error → TrySetException or fault_if_pending fired; no result.
+    //   • task->result == null → bz_task_take_result already consumed it; no-op.
+    // Must run BEFORE fire-and-forget while inner_task is still alive.
+    {
+        auto* dispOwnedFn = declareC("bz_tcs_dispose_owned_result",
+                                      llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(dispOwnedFn, {tcs});
+    }
+
+    // Step 3: fire-and-forget the inner task.
+    auto* fafFn = declareC("bz_task_fire_and_forget",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    builder_.CreateCall(fafFn, {t});
+
+    // Step 4: free the TCS struct itself.
+    auto* freeFn2 = declareC("bz_tcs_free",
+                              llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    builder_.CreateCall(freeFn2, {tcs});
+}
+
+
+// fix #2921 (spec §28.2 / §28.9 / §8.1, v0.240): emit the RELEASE of a
+// vtable-less built-in class receiver `recv` whose built-in name is `bn`, and
+// report whether one was emitted.
+//
+// WHY THIS EXISTS. The explicit-`Dispose()` lowering (LlvmBackend_Calls2.cpp)
+// is a chain of per-built-in arms ending in the generic
+// `emitDisposeAndReclaim`, which loads word 0 as a vtable and calls slot 2. A
+// built-in class has no vtable there — word 0 is payload data — so every
+// built-in the chain did not name fell into a wild indirect jump. MEASURED on
+// f069645: `var sb := new StringBuilder(); sb.Dispose();` emitted
+// `mov (%rax),%rcx ; call *0x10(%rcx)` and SIGSEGV'd at address 0, with no
+// diagnostic; the same for `Random`, `EventSource<T>`, `AsyncEventSource<T>`,
+// `TaskCompletionSource<T>` and `OwningTaskCompletionSource<T>`.
+//
+// The caller gates on `common::isVtableLessBuiltinClassName` and, when this
+// returns false, emits NOTHING rather than the generic dispatch. That is
+// deliberate and is the point of the split: a built-in whose release this
+// function does not yet know leaks a bounded amount of memory, where the old
+// fall-through corrupted control flow. A leak is recoverable; a wild jump is
+// not (the same trade recorded on #2874 and #2823).
+//
+// Each release below is the SAME call the `using var` scope-exit auto-drop
+// already emits for that built-in, reached from the one place it is written:
+// StringBuilder → the borrowing-`Array<string>` free with the string-element
+// release thunk (LlvmBackend_Setup.cpp `registerUsingDisposal`, #1185);
+// EventSource/AsyncEventSource → `bz_event_source_free` (#2026);
+// TaskCompletionSource family → `emitTcsRelease` (#974). `Random` had NO
+// resolution on either path (its `bz_random_free` was declared in the runtime
+// header and referenced by no emitter at all — measured: 3200 bytes leaked in
+// 200 allocations under LSan), so this fix adds the one resolution and wires
+// BOTH paths to it.
+// fix #2973 (§28.3 / §28.9, stdlib §6.4, v0.240): which built-ins does the
+// `using var` SCOPE-EXIT auto-drop route through emitVtablelessBuiltinRelease?
+//
+// #2921 wired `Random` by hardcoding the name into `registerUsingDisposal`'s
+// arm. That arm's three DETECTION probes (declared type, NewExpr type name,
+// initializer exprType) are the reusable part and the name is the parameter, so
+// the name lives here and the arm reads it — adding a built-in to the auto-drop
+// is a line in this function, next to the release it must agree with, rather
+// than a fourth copy of the detection code somewhere else.
+//
+// ⚠ THIS IS STILL A POSITIVE LIST, and a positive list fails by omission. What
+// bounds the damage is that it fails toward a LEAK (the pre-existing behaviour)
+// and never toward a double free. The population was MEASURED rather than
+// guessed: a 200-iteration `using var x := new T(…)` loop under generated-code
+// LSan over every constructible built-in — Random, StringBuilder, Stopwatch,
+// Mutex, Semaphore, CancellationTokenSource, EventSource, AsyncEventSource,
+// Channel, TaskCompletionSource, Array, Dictionary, Set, SortedSet,
+// SortedDictionary, Stack, Queue, LinkedList, OwningBuffer, Buffer — found
+// EXACTLY TWO leaking, `Atomic<T>` and `AtomicInteger<T>`, at 4800 bytes in 200
+// allocations each. Everything else is already claimed by an arm. The general
+// defect ("a `using var` on a built-in that no arm claims emits NOTHING, in
+// silence") is filed separately; it needs a "does this built-in own heap?"
+// authority that does not exist yet, and inventing one here would be a negative
+// list — the shape that fails by ACCEPTING garbage.
+const char* Emitter::usingAutoDropVtablelessBuiltin(std::string_view n) {
+    if (n == "Random")        return "Random";           // #2921
+    if (n == "Atomic")        return "Atomic";           // #2973
+    if (n == "AtomicInteger") return "AtomicInteger";    // #2973
+    return nullptr;
+}
+
+
+bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
+                                           llvm::Value* recv) {
+    if (bn.empty() || !recv || !recv->getType()->isPointerTy()) return false;
+    auto callVoid = [&](const char* fn, llvm::ArrayRef<llvm::Value*> args) {
+        std::vector<llvm::Type*> ps(args.size(), ptrTy());
+        builder_.CreateCall(declareC(fn, llvm::Type::getVoidTy(llvm_), ps),
+                            args);
+    };
+    // stdlib §3.1 / #1185: a StringBuilder IS a `bz_array_t*` of string parts
+    // and owns a +1 per part; the string-element release thunk discharges each.
+    if (bn == "StringBuilder") {
+        llvm::Value* disp = stringElementReleaseThunk();
+        builder_.CreateCall(
+            declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy(), ptrTy()}),
+            {recv, disp ? disp
+                        : llvm::cast<llvm::Value>(
+                              llvm::ConstantPointerNull::get(ptrTy()))});
+        return true;
+    }
+    // stdlib §3 (v0.240): `Random`'s Dispose is a documented no-op — "`Random`
+    // is a class with a no-op `Dispose` (its only state is its internal seed;
+    // there is nothing to release)" — but the INSTANCE is still reclaimed:
+    // §28.9's trivial-dispose subsection says "the compiler frees the
+    // undischarged value at its owner's release point", which stdlib §1
+    // restates as "A trivial-dispose class's instances are compiler-freed at
+    // their owner's release point". `bz_random_alloc` mallocs one and
+    // `bz_random_free` is a plain `free`.
+    if (bn == "Random") { callVoid("bz_random_free", {recv}); return true; }
+    // fix #2973 (§28.3 / §28.9, stdlib §6.4, v0.240): `Atomic<T>` /
+    // `AtomicInteger<T>`. `bz_atomic_dispose` FREES — verified in the runtime,
+    // not inferred: it flips a `disposed.exchange(true)` once and then calls
+    // `atomic_core_release`, which `delete`s the `bz_atomic_t` when the last
+    // core ref drops (bezel_runtime_sync.cpp), while `bz_atomic_new` hands back
+    // refs=1. So a single call here is a complete release, not a mark — the
+    // question #2973 asked to settle before wiring anything, because a mark
+    // would have needed a free as well and a free plus a free is a double free.
+    //
+    // Exactly-once across the two spellings is already structural: #2967 made
+    // the explicit `a.Dispose()` arm NULL the receiver's slot, and the
+    // `vtablelessBuiltin` scope-exit path null-GUARDS its reload — measured
+    // clean here under generated-code ASan for `using var` + explicit
+    // `Dispose()` in the same 200-iteration loop.
+    if (bn == "Atomic" || bn == "AtomicInteger") {
+        callVoid("bz_atomic_dispose", {recv});
+        return true;
+    }
+    // §24.3 / §6.5 / #2026: sync and async sources share one runtime
+    // representation, so both free identically (null-safe).
+    if (bn == "EventSource" || bn == "AsyncEventSource") {
+        callVoid("bz_event_source_free", {recv});
+        return true;
+    }
+    // §6.6 / §30.11 / #974: the four-step TCS release (see emitTcsRelease).
+    if (bn == "TaskCompletionSource" || bn == "OwningTaskCompletionSource") {
+        emitTcsRelease(recv);
+        return true;
+    }
+    // §2.11 / §24.4: disposing a Subscription removes the handler from its
+    // event source. The explicit-Dispose chain reaches this only when
+    // `isSubscriptionExpr`'s STRUCTURAL detection (the local's initializer is an
+    // event `Subscribe(...)` call) did not fire — a Subscription-typed
+    // parameter/field, say — where the fall-through was the wild jump. Same
+    // release call as that arm.
+    if (bn == "Subscription") {
+        callVoid("bz_subscription_dispose", {recv});
+        return true;
+    }
+    return false;
+}
+
+
+// fix #2967 (spec §28.2 / §28.3, v0.240): an explicit `x.Dispose()` on a
+// BUILT-IN receiver performs that built-in's release right here; this is the
+// one spelling of the obligation that comes with having done so — null the
+// receiver's slot, so §28.3's scope-exit (or unwind) auto-drop reloads null and
+// discharges nothing. Without it the SAME object is released twice.
+//
+// WHY IT IS A PROPERTY OF THE RELEASE, NOT A PER-ARM HABIT. The explicit-
+// `Dispose()` lowering (LlvmBackend_Calls2.cpp) is a chain of per-built-in arms,
+// and most of them ended with a hand-copied nine-line "null the slot" block —
+// while the collection arms (`isCollectionTypeName` → `bz_array_free`,
+// `isLinkedListTypeName` → `bz_llist_free`, the dict-backed-`Set` arm), the
+// `Stopwatch` arm and the `Weak` arm did not. Those arms are not safe by
+// design; they were safe only where the runtime free HAPPENED to tolerate a
+// repeat (`bz_dict_free` returns early on a disposed table), which is an
+// accident of the runtime rather than a rule about disposal. Where it did not,
+// the second discharge was a double free with no diagnostic.
+//
+// MEASURED on this fix's parent, 200-iteration loops of
+// `using var x := new T(…); x.Dispose();` under generated-code ASan — TWELVE
+// receivers, against the three the issue named: `Array<T>`, `OwningArray<T>`,
+// `Set<T>`, `SortedSet<T>`, `Stack<T>`, `OwningStack<T>`, `Queue<T>`,
+// `OwningQueue<T>`, `LinkedList<T>`, `OwningLinkedList<T>` and `OwningBuffer<T>`
+// SEGV in the allocator on the second free; `Stopwatch` reports "attempting
+// double-free"; `Weak<T>`'s repeat release corrupts the handle count into an
+// 8000-byte leak. Each is clean in BOTH single-spelling controls (the explicit
+// call alone, and the `using var` auto-drop alone) — the signature of a double
+// DISCHARGE, not of a broken release. `objdump` of the `Array<int>` body shows
+// it directly: `bz_array_alloc` → store to the slot → `bz_array_free` →
+// unconditional reload of that same slot → `bz_array_free`, with no null test
+// anywhere between.
+//
+// So this is asked once, from one place, for the whole family; the arms it
+// serves state the rule by CALLING it rather than by re-typing it.
+//
+// Two deliberate silences:
+//   * CHECKED disposal mode (§28.2 v0.135) quarantines instead of freeing and
+//     the disposed-flag guard reads THROUGH the slot at the next member entry,
+//     so the pointer must stay readable — the same exclusion every arm that
+//     already nulled applied. (`FileStream` is the one arm that nulls even in
+//     checked mode, because it has no quarantine, and it keeps its own store.)
+//   * A receiver that is not a NAMED lvalue has no slot to null — a temporary
+//     (`new Array<int>(2).Dispose()`) owns nothing that outlives the statement.
+//     Restricting to `IdentifierExpr` / `MemberAccessExpr` — the test the
+//     `isDictTypeName` arm already used — also keeps this from re-lowering an
+//     `a[i].Dispose()` subscript through `lvalueAddr`, which would re-evaluate
+//     the index expression and re-emit its §15.1 bounds check.
+// // per §28.2 / §28.3
+void Emitter::nullExplicitlyDisposedBuiltinSlot(const ast::Expr& recvExpr) {
+    if (checkedDisposal_) return;
+    if (!dynamic_cast<const ast::IdentifierExpr*>(&recvExpr) &&
+        !dynamic_cast<const ast::MemberAccessExpr*>(&recvExpr))
+        return;
+    llvm::Type* slotTy = nullptr;
+    if (llvm::Value* slot = lvalueAddr(recvExpr, slotTy))
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), slot);
 }
 
 // #1833 (b) / #1467 / §22.4 / §28.3: dispose every `out _` discard-owned
@@ -2133,17 +2572,17 @@ void Emitter::emitInlineArrayStringReleases_impl(
 }
 
 
-void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
-                                          llvm::Value* recvPtr,
-                                          const sema::TypeRef* resultTy,
-                                          bool calleeReturnsOwned) {
+bool Emitter::freshNewReceiverTempEligible(const ast::Expr* recvExpr,
+                                           llvm::Value* recvPtr,
+                                           const sema::TypeRef* resultTy,
+                                           bool calleeReturnsOwned) const {
     // #1039 / #1053 / §28.3: a fresh owned-class producer used ONLY as the
     // receiver of a member access or method call — never bound to a variable —
     // is owned by nothing and leaks. Dispose it after the value result has been
     // extracted, when the receiver is a fresh `new`/`owned`-returning producer
     // (#1039/#1053-case-2) and the result cannot alias into it.
-    if (!recvExpr || !recvPtr || !resultTy) return;
-    if (!isFreshOwnedClassProducer(recvExpr)) return;
+    if (!recvExpr || !recvPtr || !resultTy) return false;
+    if (!isFreshOwnedClassProducer(recvExpr)) return false;
     // The extracted result must be a NON-REFERENCE value — provably free of any
     // reference or borrow into the receiver: a numeric/bool/char/decimal
     // primitive, an enum, or unit. EXCLUDED, because each may alias into the
@@ -2209,7 +2648,108 @@ void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
             valueResult = true;
         }
     }
-    if (!valueResult) return;
+    return valueResult;
+}
+
+
+// fix #2816 / §28.3 "Unbound owned temporaries" (v0.240) — the EXCEPTION-PATH
+// half of the #1039 family. See the declaration comment (LlvmBackend_impl.hpp)
+// for the mechanism; this is the soundness argument.
+//
+// WHY A REGISTRATION IS OWED. §28.3, immediately after the sentence #1039/#2751/
+// #2814 implement: "When the full expression is instead exited by an
+// **exception** — an operand or argument evaluated later throws before the
+// temporary's transfer or consumption point — every already-produced,
+// not-yet-consumed unbound owned temporary is disposed during unwinding by the
+// same implicit `try`/`finally` mechanism as named locals … each temporary's
+// disposal is established at its production, so the pass runs in reverse order
+// of production on the establishment-ordered cleanup stack". The whole
+// disposeFreshNewReceiverTemp family emitted its reclaim INLINE after the
+// accessor call, in the `emitPendingCheck` continuation — so a getter/indexer/
+// method that threw skipped it and the receiver leaked (#2816: MEASURED live
+// count 20 for 20 throwing iterations, against 0 for 20 normal ones).
+//
+// WHY IT CANNOT DOUBLE-DISPOSE. The entry is `unwindOnly`, so emitDisposals
+// skips it on every NORMAL exit; and it is DISCHARGED AT RUNTIME by the reclaim,
+// which stores null into the slot before freeing the block (the same
+// null-guarded discharge #1918 uses for a transferred owned local, and for the
+// same reason it gives there: "nulls at runtime instead of erasing the
+// registration"). Every unwindOnly disposal loads the slot, skips a null, and
+// nulls it again after disposing — so on any concrete execution the block is
+// disposed by exactly one of {the reclaim, the first unwind pass that reaches a
+// non-null slot}, never both. Registration and reclaim share ONE eligibility
+// predicate (freshNewReceiverTempEligible), so the two can never disagree about
+// whether a given temporary is covered.
+//
+// WHY THE DISCHARGE IS RUNTIME AND NOT AN ERASURE OF THE ENTRY. An erasure at
+// the reclaim would be cheaper IR, and was the first draft — but it silently
+// loses the try-WITH-`finally` shape: lowerTry pushes the try body's disposal
+// scope BELOW `unwindScopeDepth_` on purpose (#1263, §28.3's "the explicit
+// finally runs first … then the implicit auto-dispose runs as the scope unwinds
+// further"), so that scope's unwind pass is emitted LATER, at `finUnwindBB` —
+// after the whole body, and therefore after the reclaim would have erased the
+// entry. MEASURED: the erasing draft left the `finally` spelling of the issue's
+// own repro leaking all 20 receivers while every non-`finally` spelling was
+// clean. The runtime null is edge-order-independent, so it covers the deferred
+// pass too.
+//
+// The slot is `entryAllocaNullPtr` (#2733), NOT a bare `entryAlloca`: a disposal
+// pass can be reached on a path that never executed the production store (a
+// sibling branch of an `if`, an unwind out of an operand evaluated before it),
+// and a bare alloca would hand it an undef pointer to free.
+//
+// WHY IT CANNOT UAF. The value is a fresh `new`-produced heap class instance
+// whose only use in the expression is as this receiver (isFreshOwnedClassProducer
+// + the non-reference-result gate). On the unwind edge no result was produced at
+// all, so nothing can alias into it; on the normal edge the slot is nulled
+// before the inline reclaim frees the block, so no later pass reads a freed
+// pointer.
+llvm::AllocaInst* Emitter::registerFreshNewReceiverTempUnwind(
+        const ast::Expr* recvExpr, llvm::Value* recvPtr,
+        const sema::TypeRef* resultTy, bool calleeReturnsOwned) {
+    if (!freshNewReceiverTempEligible(recvExpr, recvPtr, resultTy,
+                                      calleeReturnsOwned))
+        return nullptr;
+    // No enclosing scope to unwind through (a disposer body, or a function whose
+    // scopes are not yet established) — nothing to register against.
+    if (disposeStack_.empty()) return nullptr;
+    if (emittingDisposerBody_) return nullptr;
+    // The eligibility gate already restricts to a heap CLASS producer, so this
+    // is belt-and-braces: a non-pointer or literal-null receiver is never a
+    // disposable heap instance.
+    if (!recvPtr->getType()->isPointerTy()) return nullptr;
+    if (llvm::isa<llvm::ConstantPointerNull>(recvPtr)) return nullptr;
+    llvm::AllocaInst* slot = entryAllocaNullPtr();
+    builder_.CreateStore(recvPtr, slot);
+    Disposal d{slot, nullptr};
+    d.unwindOnly = true;
+    d.dynamicDispose = false;
+    disposeStack_.back().push_back(d);
+    return slot;
+}
+
+
+void Emitter::dischargeFreshNewReceiverTempUnwind(llvm::AllocaInst* slot) {
+    if (!slot) return;
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), slot);
+}
+
+
+void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
+                                          llvm::Value* recvPtr,
+                                          const sema::TypeRef* resultTy,
+                                          bool calleeReturnsOwned,
+                                          llvm::AllocaInst* unwindSlot) {
+    // fix #2816: the normal path is about to reclaim the temporary, so retire
+    // its exception-edge registration FIRST — a slot left holding the pointer
+    // would make a later unwind through this scope dispose an already-freed
+    // block. Discharged unconditionally (before the eligibility test): the slot
+    // is non-null only when registerFreshNewReceiverTempUnwind accepted the same
+    // arguments, so this pairs exactly with a registration that happened.
+    dischargeFreshNewReceiverTempUnwind(unwindSlot);
+    if (!freshNewReceiverTempEligible(recvExpr, recvPtr, resultTy,
+                                      calleeReturnsOwned))
+        return;
     // Dispose (idempotent vtable Dispose + reclaim exactly once). A fresh `new`
     // is non-null, but null-guard for safety/uniformity (folded away for a
     // provably-non-null pointer).
@@ -2648,7 +3188,23 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
             elemDisposer = elemPol.disposerThunk;
         } else if (elemPol.cat == ElementPolicy::Category::RuntimeManaged &&
                    elemForDisposer->kind == sema::TypeRef::Kind::Primitive &&
-                   elemForDisposer->primitive == sema::PrimitiveType::String) {
+                   elemForDisposer->primitive == sema::PrimitiveType::String &&
+                   // fix #2692 / §28.11: `!nullable` — every one of the retain
+                   // guards on the construction side excludes a NULLABLE string
+                   // element (`litIsStrArr` / `llitIsStrElem` in
+                   // materializeHeapCollectionLiteral, `dictIsStringValue` in
+                   // materializeHeapDictLiteral, `llIsStrElem` in
+                   // LlvmBackend_Calls3.cpp, `arrIsStringElem` in
+                   // LlvmBackend_Calls.cpp), because elementPolicyFor does NOT
+                   // look at `nullable` and still reports RuntimeManaged for a
+                   // `string?`. This site was the only release site WITHOUT the
+                   // matching guard, so an `Array<string?>` / `LinkedList<string?>`
+                   // Pattern-A task result released a +1 nothing retained — an
+                   // unpaired release, i.e. the double-free direction. Dropping
+                   // it leaves a `string?` element leaking instead, which is the
+                   // standing safe direction of this file. Pre-existing and
+                   // family-wide; found while completing #2692's LinkedList half.
+                   !elemForDisposer->nullable) {
             // Borrowing Array<string> / Dictionary<string, int> / etc. —
             // release each string element. Mirrors the
             // collectionElemDisposer wiring in LlvmBackend_Setup.cpp
@@ -2925,30 +3481,34 @@ llvm::Function* Emitter::collectionNodeFreeThunk(const sema::TypeRef* nodeTy) {
         //   * Dictionary/SortedDictionary VALUE —
         //     `dictIsStringValue` in materializeHeapDictLiteral, added by
         //     fix #2682.                                   → RETAINS (was not)
-        //   * LinkedList/OwningLinkedList element —
-        //     the bz_llist_add_last arm, which deliberately mirrors `.AddLast`
-        //     (no retain on ANY LinkedList insert path).   → does NOT retain
+        //   * LinkedList element — the bz_llist_add_last arm of
+        //     materializeHeapCollectionLiteral (`llitIsStrElem`), added by
+        //     fix #2686.                                   → RETAINS (was not)
         //
-        // fix #2682 REVERTS the #2660 narrowing for the dictionary-value arm.
-        // #2660 had to free an interior `Dictionary<K,string>` node with a NULL
-        // child disposer because the construction side took no retain, so
-        // installing the release here would have made a flat container and an
-        // interior node sharing one string double-free — and that program did
-        // not compile at all before #2660, so it would have been a NEWLY
-        // reachable crash. #2682 fixed the construction side (the interior node
-        // is materialized by the very same materializeHeapDictLiteral), so the
-        // release is now the balanced half of a real retain and the bounded
-        // string leak that narrowing cost is gone.
+        // fix #2682 REVERTED the #2660 narrowing for the dictionary-value arm,
+        // and fix #2692 now reverts it for the LinkedList arm on exactly the
+        // same grounds. #2660 had to free an interior `Dictionary<K,string>` /
+        // `LinkedList<string>` node with a NULL child disposer because the
+        // construction side took no retain, so installing the release here
+        // would have made a flat container and an interior node sharing one
+        // string double-free — and that program did not compile at all before
+        // #2660, so it would have been a NEWLY reachable crash. #2682 fixed the
+        // dictionary construction side and #2686 fixed the LinkedList one (both
+        // interior forms are materialized by the very same
+        // materializeHeapDictLiteral / materializeHeapCollectionLiteral that
+        // this thunk frees), so each release is now the balanced half of a real
+        // retain and the bounded string leak those narrowings cost is gone.
         //
-        // LinkedList stays excluded: no LinkedList insert path retains, so a
-        // release here would still be unpaired. That leaves an interior
-        // `LinkedList<string>` node leaking its strings — the same bounded leak,
-        // preferred over a use-after-free, and tracked separately.
+        // OwningLinkedList is not a question here: `isOwningPrefixedName(head)`
+        // already returned null at the top of this function, and sema rejects
+        // `OwningLinkedList<string>` outright anyway (stdlib §4.2 / §14.4,
+        // #1327 — a runtime-managed element has no disposal obligation and
+        // cannot be owned), so no owning-family LinkedList reaches this arm.
         bool strChildRetainedAtConstruction =
-            !isLinkedListTypeName(nodeTy) &&
-            (childIsDictValue
-                 ? (head == "Dictionary" || head == "SortedDictionary")
-                 : (head == "Array" || head == "Stack" || head == "Queue"));
+            childIsDictValue
+                ? (head == "Dictionary" || head == "SortedDictionary")
+                : (head == "Array" || head == "Stack" || head == "Queue" ||
+                   head == "LinkedList");
         if (!childDisposer && isStrElem(childTy) && strChildRetainedAtConstruction)
             childDisposer = stringElementReleaseThunk();
         // The child is itself an aggregate node (`Dictionary<string,
@@ -3127,13 +3687,17 @@ void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
             // identical offsets; llvm::Type* are context-unique so `==` is
             // structural.) collectInstanceStorage/storageType only read the subst —
             // no fieldIndex_ / classStruct side effects here.
+            // fix #2897 (§14.1 / §12 / §28.4, v0.240): resolve each slot under
+            // the substitution of the class that DECLARES it. With the flat
+            // name-keyed map, a base that REUSES a derived parameter's spelling
+            // for a different argument (`class Mid<T> : Base<string>`, `Base`'s
+            // parameter also `T`) measured the SAME i32 placeholder on both
+            // sides — the test concluded "identical ⇒ the erased template
+            // disposer is already right", and that disposer then read `owned
+            // cell` 8 bytes short of where the object (correct since #2897's
+            // allocation half) has it: `SEGV in __asan::Allocator::Deallocate`.
             auto baseFieldLayout = [&]() {
-                std::vector<const sema::Symbol*> storage;
-                collectInstanceStorage(base, storage);
-                std::vector<llvm::Type*> tys;
-                tys.reserve(storage.size());
-                for (const sema::Symbol* m : storage) tys.push_back(storageType(m));
-                return tys;
+                return instanceStorageTypes(base);
             };
             auto savedSubst = genericSubst_;
             auto savedSema = genericSubstSemaTy_;
@@ -3142,6 +3706,20 @@ void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
             std::vector<llvm::Type*> tmplLayout = baseFieldLayout();
             genericSubst_ = std::move(newSubst);
             genericSubstSemaTy_ = std::move(newSema);
+            // fix #2889 (§14.1 / §12 / §28.4 step 3, v0.240): when `base` is
+            // ITSELF a generic derived class (`L<X> : M<W> : B<T>`), the
+            // substitution built just above binds only `M`'s parameter `W`.
+            // `baseFieldLayout` walks M's INHERITED storage too, and `v: T` is
+            // named in B's parameter — unbound here, so `storageType` produced
+            // the same i32 placeholder under BOTH substitutions and the #2019
+            // layout-identity test concluded "identical ⇒ the erased template
+            // disposer is already right". It is not: the object is laid out at
+            // the composed offsets, so the erased core read the wrong slot and
+            // the owned base field was never disposed — measured as a 16-byte
+            // Cell leak on a three-level generic chain, with no crash. Compose
+            // the rest of the chain so BOTH the comparison and the specialized
+            // core see the real layout.
+            mergeAncestorGenericSubst(base);
             std::vector<llvm::Type*> specLayout = baseFieldLayout();
             bool needSpec =
                 classHasOwnedTypeParamField(base) || (tmplLayout != specLayout);
@@ -3204,7 +3782,19 @@ void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
 }
 
 
-void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
+void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind,
+                            bool undischargedOwned) {
+    // fix #2869 / §28.3 "Exception-path discharge" (v0.240): the predicate for the
+    // UNWIND-EXCLUSIVE entries (`unwindOnly`, `releaseOnUnwindOnly`) is "the owned
+    // local never reached its static discharge point", NOT "an exception is in
+    // flight right now". Those coincide on every edge except the one a catch arm
+    // of a try-WITH-`finally` leaves after handling the exception: the try body
+    // WAS left by the throw, so its owned locals are undischarged, but no
+    // exception is in flight any more. `undischargedOwned` is that first question
+    // asked on its own; every other isUnwind-gated behavior below (caughtException
+    // stays in flight, asyncDispose/taskScope lose their `await`, #2334's
+    // skipCellFreeOnUnwind) keeps asking the second and so keeps reading isUnwind.
+    const bool dropUndischarged = isUnwind || undischargedOwned;
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
         // #422 / §4.6 / §28.9: a provably-non-escaping `var` string local.
         // Release its single (producer) reference at scope end — on BOTH the
@@ -3251,20 +3841,76 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.CreateCall(gfree, {g});
             continue;
         }
-        // #422 / §8.6 / §28.9: a provably-non-escaping `var` Object/interface
-        // local holding a BOXED VALUE. Release its single (producer) reference at
-        // scope end — on BOTH the normal and unwind exit (the reference dies
-        // either way; a given exit goes one way only, so this runs exactly once
-        // per scope exit). The local was proven non-escaping, so nothing else
-        // holds the box pointer: bz_box_release frees the box wrapper exactly
-        // once (no UAF, no double-free). The boxed value is a value-type leaf, so
-        // only the wrapper is freed. This is NEVER a class instance (a class
-        // coerced to Object is not a box producer, so it is never registered
-        // here) — the class-instance ownership/disposal path is untouched.
-        // bz_box_release is null-safe (a null T? boxes to a null Object).
+        // #422 / #2960 / §8.6 / §28.9: a provably-non-escaping `var`
+        // Object/interface local whose box-vs-class contents are tracked by the
+        // placement layer. Reassignable slots carry `boxReleaseState`: release
+        // only when the CURRENT value came from a known box producer. A class,
+        // string, closure, null, or other definitely-non-box source stores false,
+        // so its overlapping pointer representation never reaches bz_box_release.
+        // Unknown Object/interface provenance and escaping locals never receive
+        // this Disposal entry (safe leak direction). The null state fallback is
+        // the pre-#2960 unconditional form, retained defensively.
         if (it->boxRelease) {
-            llvm::Value* b = builder_.CreateLoad(ptrTy(), it->slot, "box.rel");
+            if (!it->boxReleaseState) {
+                llvm::Value* b =
+                    builder_.CreateLoad(ptrTy(), it->slot, "box.rel");
+                emitBoxRelease(b);
+                continue;
+            }
+            llvm::Value* armed = builder_.CreateLoad(
+                llvm::Type::getInt1Ty(llvm_), it->boxReleaseState,
+                "box.rel.armed");
+            auto* releaseBB = llvm::BasicBlock::Create(
+                llvm_, "box.rel.do", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(
+                llvm_, "box.rel.cont", currentFn_);
+            builder_.CreateCondBr(armed, releaseBB, contBB);
+            builder_.SetInsertPoint(releaseBB);
+            llvm::Value* b =
+                builder_.CreateLoad(ptrTy(), it->slot, "box.rel");
             emitBoxRelease(b);
+            builder_.CreateStore(builder_.getFalse(), it->boxReleaseState);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // fix #2900 / §28.9 / §28.3 (v0.240): the `Object`-slot / string-borrow
+        // twin of the box-release arm directly above. A non-escaping
+        // Object/interface local whose initializer was a bare string-typed
+        // identifier (one of `objectStringReleaseEligible_`) holds an
+        // independent +1 on the heap string (the bind site in
+        // `lowerLocalDecl` emitted `bz_string_retain`); at scope end the
+        // state bit is consulted and, if still set, bz_string_release frees
+        // exactly the alias's reference (no UAF: the source's own +1 lives in
+        // the source's slot; no double-free: the alias is the sole owner of
+        // this +1). The state bit lets a plain `o := <non-string>`
+        // reassignment flip the slot out of the string-release path so a
+        // class instance / box / null is never mis-released as a string.
+        // Mirrors `boxRelease` + `boxReleaseState` exactly. `slot` is the
+        // Object alloca.
+        if (it->objectStringRelease) {
+            if (!it->objectStringReleaseState) {
+                llvm::Value* s = builder_.CreateLoad(
+                    ptrTy(), it->slot, "ostr.rel");
+                emitStringRelease(s);
+                continue;
+            }
+            llvm::Value* armed = builder_.CreateLoad(
+                llvm::Type::getInt1Ty(llvm_), it->objectStringReleaseState,
+                "ostr.rel.armed");
+            auto* releaseBB = llvm::BasicBlock::Create(
+                llvm_, "ostr.rel.do", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(
+                llvm_, "ostr.rel.cont", currentFn_);
+            builder_.CreateCondBr(armed, releaseBB, contBB);
+            builder_.SetInsertPoint(releaseBB);
+            llvm::Value* s = builder_.CreateLoad(
+                ptrTy(), it->slot, "ostr.rel");
+            emitStringRelease(s);
+            builder_.CreateStore(builder_.getFalse(),
+                                 it->objectStringReleaseState);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
             continue;
         }
         // fix #1747 / §28.9 / §9.7 / §28.3: a plain `var` RECORD local bound
@@ -3519,7 +4165,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // order iteration) unwind path and skips. The unbox is load → null-
         // check → release → store null, identical shape to the class path.
         if (it->unwindOnly) {
-            if (!isUnwind) continue;
+            if (!dropUndischarged) continue;   // fix #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
@@ -3780,7 +4426,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // releases here only on unwind (the discharge site owns the normal
             // exit). A `using var` / auto-dropped owner leaves the flag false and
             // releases on both exits.
-            if (it->releaseOnUnwindOnly && !isUnwind) continue;
+            if (it->releaseOnUnwindOnly && !dropUndischarged) continue;   // fix #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* h = builder_.CreateLoad(ptrTy(), addr);
@@ -3919,9 +4565,33 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                 auto* deferFn = declareC("bz_defer_exc_dispose",
                                          llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(deferFn, {eo});
+                // §30.9 / #3030: null the task's error_obj field on the
+                // DEFER path too. The catch arm's terminal act is the
+                // disposer of record (this is the in-flight-deferral
+                // contract); leaving the field non-null lets
+                // bz_task_fire_and_forget's FAST path below re-dispose the
+                // in-flight exception, and the catch arm then reads the
+                // freed pointer (UAF). The dispBB branch (synchronous
+                // dispose) gets the same null-write a few lines below.
+                auto* clearEoDeferFn = declareC("bz_task_clear_error_obj",
+                                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(clearEoDeferFn, {t});
                 builder_.CreateBr(eaBB);
                 builder_.SetInsertPoint(dispBB);
                 emitDisposeAndReclaim(eo);
+                // §30.9 / #3030: null the task's error_obj field after dispose
+                // (third of three sites: emitTaskDisposal at line ~446, the
+                // OwningTCS field-store disposal at line ~1740, and THIS site
+                // — the Task<...> result-binding / await-fault scope-end
+                // disposal of an owned task local in a `try { ... } catch`
+                // arm or the await-result re-raise). All three funnel into
+                // bz_task_fire_and_forget (or its checked sibling) below; the
+                // same dangling-field guard is required to keep #3030's
+                // FAST-path error_obj-disposal from re-disposing a freed
+                // pointer.
+                auto* clearEoFn = declareC("bz_task_clear_error_obj",
+                                           llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(clearEoFn, {t});
                 builder_.CreateBr(eaBB);
                 builder_.SetInsertPoint(eaBB);
             }
@@ -4030,86 +4700,33 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* contBB  = llvm::BasicBlock::Create(llvm_, "tcs.cont",     currentFn_);
             builder_.CreateCondBr(isNull, contBB, dispBB);
             builder_.SetInsertPoint(dispBB);
-
-            // Step 1: fault the inner task if not yet completed.
-            llvm::Value* ioeVt = llvm::ConstantPointerNull::get(ptrTy());
-            {   auto vit = builtinVtable_.find("InvalidOperationException");
-                if (vit != builtinVtable_.end()) ioeVt = vit->second;
-            }
-            auto* faultFn = declareC("bz_tcs_fault_if_pending",
-                                      llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-            builder_.CreateCall(faultFn, {tcs, ioeVt});
-
-            // Step 2: get the inner task pointer and clean up its error object.
-            auto* innerFn = declareC("bz_tcs_task", ptrTy(), {ptrTy()});
-            llvm::Value* t = builder_.CreateCall(innerFn, {tcs}, "tcs.inner");
-            {
-                auto* isErrFn = declareC("bz_task_is_error", i1(), {ptrTy()});
-                llvm::Value* err = builder_.CreateCall(isErrFn, {t}, "tcs.task.err");
-                auto* edBB = llvm::BasicBlock::Create(llvm_, "tcs.task.errdisp",
-                                                       currentFn_);
-                auto* eaBB = llvm::BasicBlock::Create(llvm_, "tcs.task.errcont",
-                                                       currentFn_);
-                builder_.CreateCondBr(err, edBB, eaBB);
-                builder_.SetInsertPoint(edBB);
-                auto* eoFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
-                llvm::Value* eo = builder_.CreateCall(eoFn, {t}, "tcs.task.errobj");
-                llvm::Value* eoNull = builder_.CreateICmpEQ(
-                    eo, llvm::ConstantPointerNull::get(ptrTy()));
-                auto* doBB = llvm::BasicBlock::Create(llvm_, "tcs.task.eodisp",
-                                                       currentFn_);
-                builder_.CreateCondBr(eoNull, eaBB, doBB);
-                builder_.SetInsertPoint(doBB);
-                // §30.9 in-flight-deferral (v0.179): if the fault is still in
-                // flight (borrowed by an awaiter mid-dispatch — a TCS-backed task
-                // bound inside a `try`, unwound by its own re-raised fault),
-                // defer its disposal to the catch arm's terminal act rather than
-                // freeing the object mid-dispatch (UAF). Otherwise dispose now.
-                auto* isBorrowedFn = declareC("bz_is_exc_borrowed",
-                                              llvm::Type::getInt8Ty(llvm_), {ptrTy()});
-                llvm::Value* bv = builder_.CreateCall(isBorrowedFn, {eo},
-                                                      "tcs.eo.borrowed");
-                llvm::Value* isB = builder_.CreateICmpNE(
-                    bv, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
-                auto* deferBB = llvm::BasicBlock::Create(llvm_, "tcs.eo.defer",
-                                                         currentFn_);
-                auto* dispBB  = llvm::BasicBlock::Create(llvm_, "tcs.eo.dispnow",
-                                                         currentFn_);
-                builder_.CreateCondBr(isB, deferBB, dispBB);
-                builder_.SetInsertPoint(deferBB);
-                auto* deferFn = declareC("bz_defer_exc_dispose",
-                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                builder_.CreateCall(deferFn, {eo});
-                builder_.CreateBr(eaBB);
-                builder_.SetInsertPoint(dispBB);
-                emitDisposeAndReclaim(eo);
-                builder_.CreateBr(eaBB);
-                builder_.SetInsertPoint(eaBB);
-            }
-
-            // Step 2.5: §28.3 / #1250: for OwningTaskCompletionSource<T:class>, dispose
-            // the inner task's owned result if set but never consumed via .Result/await.
-            // bz_tcs_dispose_owned_result is safe on all paths:
-            //   • owned_result_disposer == null → plain TCS or value-type; no-op.
-            //   • task->is_error → TrySetException or fault_if_pending fired; no result.
-            //   • task->result == null → bz_task_take_result already consumed it; no-op.
-            // Must run BEFORE fire-and-forget while inner_task is still alive.
-            {
-                auto* dispOwnedFn = declareC("bz_tcs_dispose_owned_result",
-                                              llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                builder_.CreateCall(dispOwnedFn, {tcs});
-            }
-
-            // Step 3: fire-and-forget the inner task.
-            auto* fafFn = declareC("bz_task_fire_and_forget",
-                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(fafFn, {t});
-
-            // Step 4: free the TCS struct itself.
-            auto* freeFn2 = declareC("bz_tcs_free",
-                                      llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(freeFn2, {tcs});
-
+            emitTcsRelease(tcs);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // fix #2921 (spec §28.9 / §28.3 / §28.2, v0.240): a `using var` bound to
+        // a VTABLE-LESS BUILT-IN CLASS whose release no arm above spells (today:
+        // `Random`). Routed through `emitVtablelessBuiltinRelease` — the SAME
+        // resolution an explicit `x.Dispose()` takes — so the scope-exit and
+        // explicit spellings cannot drift about what releases a given built-in,
+        // which is exactly how `Random` came to leak on one path and SIGSEGV on
+        // the other. Null-guarded (a ctor that threw before the local was
+        // assigned, or a moved-out slot), and the slot is nulled after so a
+        // re-entrant / unwind pass is a no-op.
+        if (it->vtablelessBuiltin) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr, "vlb.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "vlb.free", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "vlb.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            emitVtablelessBuiltinRelease(it->vtablelessBuiltin, obj);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;
@@ -4271,6 +4888,30 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             } else {
                 builder_.CreateCall(freeFn(), {fbuf});
             }
+            // fix #2733 / §28.3 (v0.240): null the slot after reclaiming, exactly
+            // as the `unwindOnly` arm above does. Required now that #2733
+            // registers EXTERN-ARGUMENT buffer temporaries through this arm: it
+            // has no `isUnwind` gate, so one scope can be traversed twice.
+            //
+            // ⚠ THE SHAPE THAT ACTUALLY FORCES THIS is a BINDING ATOM, not the
+            // `catch`-resumes-normally shape an earlier draft named. Review
+            // could not construct the catch shape: emitUnwindDisposals walks only
+            // down to unwindScopeDepth_, and lowerTry sets that floor
+            // (LlvmBackend_Stmts.cpp:3313) BEFORE the body scope is pushed, so on
+            // a throw the body scope is disposed on the unwind edge and its
+            // normal-path scope-end code is not reached on that path. The real
+            // one: lowerBindExpr pushes a dispose scope MID-EXPRESSION
+            // (LlvmBackend_Exprs2.cpp:7137) and runs emitDisposals(isUnwind=false)
+            // at :7176 before popping, so a temp produced in an atom body is
+            // freed at the atom's completion and would then be freed AGAIN by
+            // flushFfiExprTemps at the enclosing boundary — a guaranteed double
+            // free on the same straight-line path. That hazard is INTRODUCED by
+            // #2733 (pre-fix there was no disposeStack_ entry) and closed here.
+            // Harmless for the `using
+            // var` registrations this arm already served (scope end is their last
+            // use); it makes the reclaim idempotent on every path, which is
+            // §28.3's dispose-exactly-once.
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;
@@ -4284,7 +4925,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // #1957: an `owned` Channel<T> PARAMETER discharged on the normal
             // path disposes here only on unwind; a `using var` / auto-dropped
             // owner leaves the flag false and disposes on both exits.
-            if (it->releaseOnUnwindOnly && !isUnwind) continue;
+            if (it->releaseOnUnwindOnly && !dropUndischarged) continue;   // fix #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* ch = builder_.CreateLoad(ptrTy(), addr);
@@ -4374,7 +5015,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // AUTO-DROPPED owned sender (§28.3, the never-discharged owner) leaves
             // the flag false and releases on both exits. As the last sender this
             // release closes the channel (§30.15).
-            if (it->releaseOnUnwindOnly && !isUnwind) continue;
+            if (it->releaseOnUnwindOnly && !dropUndischarged) continue;   // fix #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* tx = builder_.CreateLoad(ptrTy(), addr);
@@ -4613,9 +5254,19 @@ void Emitter::emitDisposalsInRange(std::size_t lo, std::size_t hi) {
     // skipped. A `return` routing through a `finally` uses this to dispose only
     // the try-body scopes before the finally and, in the finally's normal-exit
     // dispatch, the enclosing scopes after it — reverse establishment order.
+    //
+    // fix #2869 / §28.3 "Exception-path discharge" (v0.240): a scope listed in
+    // unwoundBodyScopes_ is a try body scope control ALREADY left by an exception
+    // (a catch arm of that same try is handling it), so its `unwindOnly` /
+    // `releaseOnUnwindOnly` entries — §28.3's auto-dispose of owned locals that
+    // never reached a discharge point — must fire even though this edge is not an
+    // unwind. Passing it as `undischargedOwned` rather than as `isUnwind` keeps
+    // caughtException / asyncDispose / taskScope / skipCellFreeOnUnwind on their
+    // existing normal-edge behavior (no `await` is lost, no boxed cell leaks).
     if (hi > disposeStack_.size()) hi = disposeStack_.size();
     for (std::size_t i = hi; i-- > lo;)
-        emitDisposals(disposeStack_[i]);
+        emitDisposals(disposeStack_[i], /*isUnwind=*/false,
+                      /*undischargedOwned=*/scopeLeftByException(i));
 }
 
 

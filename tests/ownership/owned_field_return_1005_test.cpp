@@ -28,6 +28,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -56,6 +57,8 @@ BEZEL_TEST(owned_field_return_1005, move_owned_field_exprbody_rejected) {
         "  public method Take(): Cell? => move v; "
         "end Box;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "cannot return an owned field's `move`d value through a non-`owned` return"));
 }
 
 // The same `move v` through a non-`owned` return in a BLOCK body is rejected too.
@@ -70,6 +73,8 @@ BEZEL_TEST(owned_field_return_1005, move_owned_field_blockbody_rejected) {
         "  end Take; "
         "end Box;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "cannot return an owned field's `move`d value through a non-`owned` return"));
 }
 
 // --- ACCEPT: bare owned-field borrows, the `owned` return type, non-owned. ---

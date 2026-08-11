@@ -43,6 +43,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -56,12 +57,12 @@ std::string wrap(const std::string& method) {
         "module M; "
         "class R "
         "  public V: int := 0; "
-        "  public Inner: R := null; "
+        "  public Inner: R? := null; "
         "  destructor end destructor; "
         "end R; "
         "record Holder(Ref: R); "
         "class Box "
-        "  public Ref: R := null; "         // non-`owned` (borrow) field — escape target
+        "  public Ref: R? := null; "         // non-`owned` (borrow) field — escape target
         "  public owned Owned: R? := null; " // owned field for the clean owned-store controls
         "end Box; "
         "class C ") + method + " end C;";
@@ -84,6 +85,8 @@ BEZEL_TEST(own_field_store_escape, store_reborrow_of_using_var_into_field_diagno
         "  box.Ref := r; "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "borrow of `r` stored into a field would outlive its source"));
 }
 
 // Direct, owned (non-`using var`) local source: same escape. `r` is owned by
@@ -96,6 +99,8 @@ BEZEL_TEST(own_field_store_escape, store_reborrow_of_owned_local_into_field_diag
         "  r.Dispose(); "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "borrow of `r` stored into a field would outlive its source"));
 }
 
 // Store into `this.field` is the same: the field of the receiver outlives the
@@ -104,13 +109,15 @@ BEZEL_TEST(own_field_store_escape, store_reborrow_of_using_var_into_this_field_d
     auto r = parseAndCheckOwnership(
         "module M; class R public V: int := 0; destructor end destructor; end R; "
         "class C "
-        "  public Held: R := null; "
+        "  public Held: R? := null; "
         "  public method Leak() "
         "    using var r := new R(); "
         "    this.Held := r; "
         "  end Leak; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "borrow of `r` stored into a field would outlive its source"));
 }
 
 // A borrow-bearing record carrying a borrow of an owned local, stored into a
@@ -128,6 +135,9 @@ BEZEL_TEST(own_field_store_escape, store_holder_record_borrowing_using_var_into_
         "  end Leak; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "borrow-bearing record may not be stored") ||
+        hasErrorMessage(r, "carries a borrow of `r`"));
 }
 
 // --- CASE 1 controls (must NOT be rejected) -------------------------------
@@ -200,6 +210,9 @@ BEZEL_TEST(own_outparam_escape, write_reborrow_of_using_var_through_out_diagnose
         "  o := r; "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "borrow of `r` written through an out/ref parameter") ||
+        hasErrorMessage(r, "§28.3 borrow-lifetime rule"));
 }
 
 // `ref o: R` then `o := r;` — a `ref` location is borrowed by the callee but
@@ -213,6 +226,9 @@ BEZEL_TEST(own_outparam_escape, write_reborrow_of_owned_local_through_ref_diagno
         "  r.Dispose(); "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "borrow of `r` written through an out/ref parameter") ||
+        hasErrorMessage(r, "§28.3 borrow-lifetime rule"));
 }
 
 // A closure capturing an owned local written through an out-param of function
@@ -225,6 +241,9 @@ BEZEL_TEST(own_outparam_escape, write_closure_capturing_using_var_through_out_di
         "  f := lambda() => r.V; "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "borrow of `r` written through an out/ref parameter") ||
+        hasErrorMessage(r, "§28.3 borrow-lifetime rule"));
 }
 
 // --- CASE 2 controls (must NOT be rejected) -------------------------------
@@ -280,6 +299,8 @@ BEZEL_TEST(own_multihop_escape, return_two_hop_reborrow_of_using_var_diagnosed_2
         "  return c; "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "§28.9 / §9.7 borrow-lifetime rule"));
 }
 
 // Three-hop chain, exercising the transitive follow more than once.
@@ -293,6 +314,8 @@ BEZEL_TEST(own_multihop_escape, return_three_hop_reborrow_of_using_var_diagnosed
         "  return d; "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "§28.9 / §9.7 borrow-lifetime rule"));
 }
 
 // Multi-hop where the FINAL escape is a store-to-field rather than a return:
@@ -305,6 +328,8 @@ BEZEL_TEST(own_multihop_escape, store_two_hop_reborrow_into_field_diagnosed_28_3
         "  box.Ref := b; "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "borrow of `r` stored into a field"));
 }
 
 // --- CASE 3 controls (must NOT be rejected) -------------------------------
@@ -322,6 +347,8 @@ BEZEL_TEST(own_multihop_escape, return_two_hop_reborrow_of_param_rejected_28_3_v
         "  return c; "
         "end Pass;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned from a static method"));
 }
 
 // CONTROL: a multi-hop chain that is used LOCALLY (a value projection read)
@@ -385,6 +412,8 @@ BEZEL_TEST(own_param_source, return_reborrow_of_param_rejected_28_3_v0180) {
         "  return b; "
         "end Pass;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned from a static method"));
 }
 
 // CONTROL: returning a record borrowing a parameter is accepted (parallels the

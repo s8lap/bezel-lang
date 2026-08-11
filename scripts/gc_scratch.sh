@@ -106,6 +106,65 @@ fi
 
 # ── stale ASan build trees (keep this repo's canonical one) ───────────────
 if [ "$DO_BUILDS" = 1 ]; then
+  # ---------------------------------------------------------------------------
+  # fix #3005: REAP ORPHANED LANE BUILD TREES on the fast disk.
+  #
+  # scripts/lane_setup.sh symlinks a lane worktree's build/ out to
+  # /mnt/fast/lane-builds/<name>. `git worktree remove` then deletes only the
+  # SYMLINK and orphans the tree. Nothing reaped these: before this block,
+  # `grep -c lane-builds scripts/gc_scratch.sh` was 0. Measured 2026-08-08:
+  # 68 GB across 54 orphans in four days (~17 GB/day), cleared by hand, having
+  # taken /mnt/fast to 92% full. CLAUDE.md meanwhile asserted the invariant that
+  # says this cannot happen — which is why nobody was watching the directory.
+  #
+  # ⚠ THE GUARDS ARE THE LOAD-BEARING PART. This project's own history records
+  # gc_scratch's liveness guard once being one commit away from reaping THREE
+  # ACTIVE worktrees. A tree is reaped only when ALL of these hold:
+  #   (1) its basename is no longer a registered git worktree, AND
+  #   (2) no live process has its cwd inside the tree, AND
+  #   (3) it is older than the age floor, AND
+  #   (4) it looks like a build tree (CMakeCache.txt present).
+  # (4) means an unrecognised directory is never deleted, whatever its name.
+  #
+  # ⚠ DO NOT substitute a shallow mtime probe for (2). Every build tree here is
+  # **Unix Makefiles**, not Ninja, and writes objects at depth 4-5 — a
+  # `-maxdepth 2` mtime check reports "idle" for a lane that is actively
+  # compiling. That mistake was proposed and measured wrong.
+  LB_ROOT="${BEZEL_LANE_BUILD_ROOT:-/mnt/fast/lane-builds}"
+  LB_AGE_MIN="${BEZEL_LANE_BUILD_AGE_MIN:-1440}"   # 24h
+  # The mountpoint check applies to the DEFAULT root only: it exists so an
+  # unmounted NVMe cannot make us reap a shadow directory on the slow disk
+  # (#3008). An explicitly-overridden root is the caller's business, and
+  # requiring a mountpoint there would make this block untestable.
+  LB_MOUNT_OK=1
+  if [ -z "${BEZEL_LANE_BUILD_ROOT:-}" ]; then
+    mountpoint -q "$(dirname "$LB_ROOT")" 2>/dev/null || LB_MOUNT_OK=0
+  fi
+  if [ -d "$LB_ROOT" ] && [ "$LB_MOUNT_OK" = 1 ]; then
+    live_wts="$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null \
+                  | awk '/^worktree /{n=split($2,p,"/"); print p[n]}')"
+    for d in "$LB_ROOT"/*; do
+      [ -d "$d" ] || continue
+      base="$(basename "$d")"
+      # (1) still a registered worktree?
+      if printf '%s\n' "$live_wts" | grep -qxF "$base"; then continue; fi
+      # (1b) the backref lane_setup.sh writes, if present, is authoritative
+      if [ -r "$d/.lane-worktree" ] && [ -d "$(cat "$d/.lane-worktree" 2>/dev/null)" ]; then continue; fi
+      # (2) any live process working inside it?
+      if ls -l /proc/*/cwd 2>/dev/null | grep -qF -- "$d"; then
+        tag "KEEP (live process cwd inside): $d"; continue
+      fi
+      # (3) age floor
+      if [ -n "$(find "$d" -maxdepth 0 -mmin "-$LB_AGE_MIN" 2>/dev/null)" ]; then continue; fi
+      # (4) shaped like a build tree?
+      if [ ! -e "$d/CMakeCache.txt" ]; then
+        tag "KEEP (not a configured build tree — refusing to guess): $d"; continue
+      fi
+      tag "reap orphaned lane build tree $d ($(du -Lsh "$d" 2>/dev/null | cut -f1))"   # symlink-read-ok
+      [ "$APPLY" = 1 ] && rm -rf "$d"
+    done
+  fi
+
   canon="build-asan-$(printf '%s' "$MAIN" | cksum | cut -d' ' -f1)"
   for d in /var/tmp/bezel-scratch/build-asan*; do
     [ -d "$d" ] || continue
@@ -127,10 +186,25 @@ if [ "$DO_BUILDS" = 1 ]; then
     # wholesale rm -rf here deleted the ~17-30 GiB working set after every
     # push, forcing the next gate cold. Fire only when the in-process GC has
     # evidently failed (dir far beyond its cap).
-    szk="$(du -sk "$binc" 2>/dev/null | cut -f1)"
+    # fix #3004: `du -sk` (no -L) on a SYMLINKED cache root returns 4 (the link
+    # itself), so `4 -gt 75497472` was false forever and this backstop has been
+    # dead code since the symlink was created on 2026-07-31. Measured 2026-08-08:
+    #   du -sk  -> 4          du -Lsk -> 53,463,648
+    # This is the THIRD instance of the class (#3000 gate.sh find, #3004 here);
+    # audit any du/find against a cache root for -L.  # symlink-read-ok
+    #
+    # The `rm -rf "$binc"` was a second, worse bug hiding behind the first: on a
+    # symlink that deletes the LINK, not the store. It would have freed 0 bytes,
+    # orphaned 50+ GiB on the NVMe with nothing pointing at it, and silently
+    # relocated the cache to sda3 — the slow disk this whole layout exists to
+    # avoid. Resolve the link and clear its CONTENTS.
+    szk="$(du -Lsk "$binc" 2>/dev/null | cut -f1)"   # symlink-read-ok
     if [ -n "$szk" ] && [ "$szk" -gt $((72*1024*1024)) ]; then
-      tag "trim runaway AOT link-cache $binc ($(du -sh "$binc" 2>/dev/null | cut -f1) > 72G backstop)"
-      [ "$APPLY" = 1 ] && rm -rf "$binc"
+      _bt="$(readlink -f "$binc" 2>/dev/null || printf '%s' "$binc")"
+      tag "trim runaway AOT link-cache $_bt ($(du -Lsh "$binc" 2>/dev/null | cut -f1) > 72G backstop)"
+      if [ "$APPLY" = 1 ] && [ -d "$_bt" ]; then
+        find "$_bt" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+      fi
     fi
   fi
 fi

@@ -13,7 +13,41 @@ extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
 
 namespace bezel::codegen {
 
+// fix #2733 / §28.3 *Unbound owned temporaries* (v0.240): the K8 full-expression
+// boundary hook. `lowerExprInner` (below) is the real lowering; this wrapper
+// tracks nesting depth so that the OUTERMOST lowerExpr call — which is exactly a
+// K8 full expression, since every statement expression, initializer, condition,
+// `for` source and `case` scrutinee reaches lowering as a fresh top-level call —
+// discharges the FFI buffer temporaries produced inside it. Hooking here rather
+// than at statement granularity is what gives K8.2 ("Each **evaluation** of a
+// condition, `when` arm condition, or pattern guard is its own boundary … so
+// condition temporaries are disposed per evaluation and never accumulate across
+// iterations") for free: a loop condition is its own top-level lowerExpr.
+// A NESTED FUNCTION BODY is a boundary too, and finding that out cost a real
+// leak: `lambda(): int => strlen(CString.From(s))` is lowered while the ENCLOSING
+// expression is still open, so nothing in the lambda's own function ever sees
+// depth 0. Measured at 64 x 85 B leaked before this clause was added — the
+// disposeStack_ backstop does not cover it either, because a nested-function
+// emitter does not leave the enclosing scope stack in place for the body.
+// Detecting it needs no hook at any of the ~95 `currentFn_ =` sites: a lowerExpr
+// frame whose function differs from its PARENT frame's is by construction the
+// outermost expression of a different function, hence that function's own K8
+// boundary. `fullExprFn_` carries the parent frame's function down.
 llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
+    llvm::Function* parentFn = fullExprFn_;
+    llvm::Function* thisFn = currentFn_;
+    fullExprFn_ = thisFn;
+    ++fullExprDepth_;
+    llvm::Value* v = lowerExprInner(e);
+    --fullExprDepth_;
+    fullExprFn_ = parentFn;
+    if (!ffiExprTemps_.empty() &&
+        (fullExprDepth_ == 0 || parentFn != thisFn))
+        flushFfiExprTemps();
+    return v;
+}
+
+llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     diverged_ = false;  // CG40: cleared per expression; a `throw` sets it
     // §27.6 (v0.184, #1758): inside a primitive-intrinsic thunk body, a synthetic
     // argument node lowers to the thunk's incoming parameter (see
@@ -350,7 +384,18 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     builder_.SetInsertPoint(liveBB);
                     sema::TypeRef liveTy = *rt;
                     liveTy.nullable = false;
-                    llvm::Value* liveStr = emitValueToString(ev, &liveTy);
+                    // fix #2968: the LIVE arm of a nullable OPAQUE slot
+                    // (`Object?` holding a vtable-less built-in) reaches
+                    // `emitValueToString` → `lowerObjectToString` and
+                    // double-frees exactly as the non-nullable spelling did.
+                    // Narrow it the same way; the surrounding runtime null
+                    // check still renders "null" on the null arm, and the
+                    // narrowing only fires when the slot's initializer names a
+                    // vtable-less built-in class (so it cannot be null here
+                    // unless the local was reassigned, which declines).
+                    llvm::Value* liveStr =
+                        tryOpaqueSlotBuiltinRender(ev, &liveTy, part.expr.get());
+                    if (!liveStr) liveStr = emitValueToString(ev, &liveTy);
                     auto* liveEnd = builder_.GetInsertBlock();
                     builder_.CreateBr(endBB);
                     builder_.SetInsertPoint(nullBB);
@@ -363,7 +408,27 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     phi->addIncoming(nullStr, nullEnd);
                     pv = phi;
                 } else if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
-                    pv = emitPrimitiveToString(ev, rt->primitive);
+                    // fix #2968 (spec §8.1 / §8.5 / §18.5 / §28.9, v0.240):
+                    // `Object` is a PRIMITIVE kind here (sema maps the
+                    // universal root to `PrimitiveType::Object`), so an
+                    // `Object`-typed hole falls straight into
+                    // `emitPrimitiveToString`, whose `P::Object` arm calls
+                    // `lowerObjectToString` — and `bz_obj_is_string`'s
+                    // NEGATIVE test ("word 0 is not an emitted vtable ⇒ a
+                    // string") mis-answers "string" for a vtable-less built-in
+                    // sitting in that slot per §8.1. The receiver is then
+                    // retained as a string and released by the consumer: the
+                    // measured double free. Ask FIRST whether the AST source
+                    // statically narrows the slot to a vtable-less built-in
+                    // class; if so render via the §2923 helper. If not, fall
+                    // through unchanged — correct for a genuine string, for a
+                    // user class, and for a box.
+                    if (llvm::Value* r = tryOpaqueSlotBuiltinRender(
+                            ev, rt, part.expr.get())) {
+                        pv = r;
+                    } else {
+                        pv = emitPrimitiveToString(ev, rt->primitive);
+                    }
                 } else if (rt && rt->kind == sema::TypeRef::Kind::Named &&
                            rt->declaration &&
                            rt->declaration->kind == ast::TypeDeclKind::Enum) {
@@ -387,6 +452,29 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             bn == "TimeOnly" || bn == "Guid")
                             pv = emitValueToString(ev, rt);
                     }
+                    // fix #2913 (spec §8.5 inline-array row / §18.5, v0.240):
+                    // an INLINE ARRAY interpolates as its type's NAME. Same
+                    // reason as the builtin value types just above — without
+                    // this it reaches the LLVM-type fallback below, matches no
+                    // integer/float width, and leaves `pv` null, which renders
+                    // as the EMPTY STRING with no diagnostic.
+                    //
+                    // MEASURED before: `$"[{a}]"` on `var a: [3]int` printed
+                    // `[]`, while `o.ToString()` on the SAME value boxed into
+                    // `Object` printed `[[3]int]` — two spellings of one §8.5
+                    // rule disagreeing inside one program. #2804 fixed the boxed
+                    // half; this is the unboxed half.
+                    //
+                    // Delegates to `emitValueToString` rather than rendering
+                    // here, so this path and the boxed one cannot drift: both
+                    // now bottom out in the single `inlineArrayTypeSpelling`.
+                    // That is deliberate — the interpolation chain is already a
+                    // second dispatch mirroring emitValueToString's, and adding
+                    // a rendering rather than a delegation would make it a third
+                    // place the §8.5 answer lives.
+                    if (!pv && rt &&
+                        rt->kind == sema::TypeRef::Kind::InlineArray)
+                        pv = emitValueToString(ev, rt);
                     if (!pv) {
                     if (llvmTy->isIntegerTy(1))
                         pv = emitPrimitiveToString(ev, P::Bool);
@@ -442,7 +530,38 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             // and otherwise dispatches the dynamic ToString.
                             // Previously this fell to `pv = ev`, reading the object
                             // as a bz_string → "".
-                            pv = emitValueToString(ev, rt);
+                            //
+                            // fix #2969 (spec §8.5 / §8.1 / §18.5 / §28.9,
+                            // v0.240): a declaration-less Named type whose head
+                            // is a built-in INTERFACE head
+                            // (`IList<T>`, `IEnumerable<T>`, `IDictionary<K,V>`,
+                            // …) is the OTHER declaration-less-Named inhabitant
+                            // besides the type-parameter one, and it may also be
+                            // a vtable-less built-in class at runtime
+                            // (`var e: IList<int> := new Array<int>(2);`).
+                            // §2923 deliberately declined to handle it because
+                            // the interface slot may also hold a USER class
+                            // declaring the interface; that arm is correct for
+                            // the user class, broken for the built-in collection.
+                            // Ask first whether the AST source statically
+                            // narrows the runtime value to a vtable-less built-in
+                            // class — if yes, render via the §2923 helper and
+                            // skip the broken `emitValueToString` call; if no,
+                            // fall through (correct for user class; deferral per
+                            // #2969 for the unanalysed built-in case).
+                            //
+                            // fix #2968: `Object` (§8.1's universal root) is
+                            // the other opaque slot that reaches here, and it
+                            // fails the same way — the helper now gates on it
+                            // too, so `var o: Object := mx; $"{o}"` renders
+                            // via the §2923 helper instead of double-freeing
+                            // `mx` through `lowerObjectToString`.
+                            if (llvm::Value* r = tryOpaqueSlotBuiltinRender(
+                                    ev, rt, part.expr.get())) {
+                                pv = r;
+                            } else {
+                                pv = emitValueToString(ev, rt);
+                            }
                         } else {
                             pv = ev;  // string or unknown ptr — use as-is
                         }
@@ -1842,6 +1961,433 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 return res;
             }
         }
+        // fix #2990 (§31.4 / §12.1 / §7.5, v0.240): `q?.M` on a nullable
+        // exception-typed receiver, where M is one of the four §31.4 header
+        // members (Message / StackTrace / CauseChain / ParamName). These carry
+        // NO storage FieldSymbol — the `.` form reads them through the
+        // byte-offset header GEPs in the MemberAccessExpr arm below (the
+        // `ma->member == "Message"` handler at CG22+ and the
+        // `isInheritedExcSurfaceAccess` block for the other three). That arm
+        // never runs for a `?.` access: a NullCondMemberExpr is a distinct AST
+        // node, so the access reached this storage-field path,
+        // `storageMemberOf` returned null, and the `!ms` guard at FINDING [3]
+        // returned nullptr — silently dropping the whole enclosing statement
+        // (no diagnostic at any severity, exit 0). MEASURED on 8eab3f8: the
+        // middle `Console.WriteLine(q?.Message ?? …)` line printed nothing at
+        // all for a non-null receiver carrying `Message = "zz"`.
+        //
+        // Route the `?.` form through the SAME header reads, gated by the SAME
+        // receiver-type predicates the `.` form uses (`isBuiltinExceptionTypeRef`
+        // / `hasBuiltinExceptionBase`) — the one fact sema already computes that
+        // decides how the access lowers — with a null-receiver short-circuit
+        // first per §7.5 (the result is always nullable, and a null receiver
+        // yields null). The `exprSymbol == nullptr` gate mirrors
+        // `isInheritedExcSurfaceAccess`: a subclass that DECLARES its own member
+        // of the same name resolves to a Symbol and is excluded, so this never
+        // shadows a declared property with a header read. (`this?.M` is not a
+        // concern: `this` is non-nullable, so `?.` on it is rejected upstream.)
+        //
+        // All four §31.4 members are reference-typed (string / Array<Exception
+        // Info>), so the §7.5 (always-nullable) result is a pointer that is null
+        // when the receiver is null and the header value otherwise — the same
+        // null-pointer-as-null representation FINDING [3] uses for a
+        // reference-typed storage member.
+        if (nm->member == "Message" || nm->member == "StackTrace" ||
+            nm->member == "CauseChain" || nm->member == "ParamName") {
+            const sema::TypeRef* ncRtt = ctx_.exprType(*nm->target);
+            bool ncExcReceiver = false;
+            if (ncRtt && ncRtt->kind == sema::TypeRef::Kind::Named &&
+                ctx_.exprSymbol(e) == nullptr) {
+                if (isBuiltinExceptionTypeRef(ncRtt))
+                    ncExcReceiver = true;
+                else if (ncRtt->declaration &&
+                         hasBuiltinExceptionBase(ncRtt->declaration))
+                    ncExcReceiver = true;
+            }
+            if (ncExcReceiver) {
+                llvm::Value* excObj = lowerExpr(*nm->target);
+                if (!excObj || !excObj->getType()->isPointerTy()) return nullptr;
+                auto* ncEntryBB = builder_.GetInsertBlock();
+                auto* ncAccessBB = llvm::BasicBlock::Create(
+                    llvm_, "ncexc.access", currentFn_);
+                auto* ncEndBB = llvm::BasicBlock::Create(
+                    llvm_, "ncexc.end", currentFn_);
+                llvm::Value* ncIsNull = builder_.CreateICmpEQ(
+                    excObj, llvm::ConstantPointerNull::get(ptrTy()));
+                builder_.CreateCondBr(ncIsNull, ncEndBB, ncAccessBB);
+                builder_.SetInsertPoint(ncAccessBB);
+                // The header GEPs mirror the MemberAccessExpr arm below
+                // (classStruct inserts all four slots at the SAME byte offsets
+                // in a user subclass — Message@8, CauseChain@24, ParamName@32).
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* ncAccessVal = nullptr;
+                if (nm->member == "StackTrace") {
+                    // §31.4 `StackTrace: string` — "" stub (no debug info yet),
+                    // matching the `.` form. The receiver was loaded for the
+                    // null check above; its bytes are not read.
+                    ncAccessVal = lowerStringLiteral("\"\"", false);
+                } else {
+                    int64_t ncOff = nm->member == "Message"    ? kExcMsgOffset
+                                  : nm->member == "CauseChain" ? kExcCauseOffset
+                                  : /*ParamName*/              kExcParamOffset;
+                    llvm::Value* ncSlot = builder_.CreateGEP(
+                        i8Ty, excObj, builder_.getInt64(ncOff));
+                    llvm::Value* ncPtr =
+                        builder_.CreateLoad(ptrTy(), ncSlot);
+                    if (nm->member == "Message") {
+                        // §31.4: null message (no `message` given) → "" per the
+                        // `.` form's contract.
+                        auto* ncMsgNull = builder_.CreateICmpEQ(
+                            ncPtr, llvm::ConstantPointerNull::get(ptrTy()));
+                        ncAccessVal = builder_.CreateSelect(
+                            ncMsgNull, lowerStringLiteral("\"\"", false),
+                            ncPtr);
+                    } else {
+                        ncAccessVal = ncPtr;
+                    }
+                }
+                auto* ncAccessEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(ncEndBB);
+                builder_.SetInsertPoint(ncEndBB);
+                auto* ncPhi = builder_.CreatePHI(ptrTy(), 2);
+                ncPhi->addIncoming(
+                    llvm::ConstantPointerNull::get(ptrTy()), ncEntryBB);
+                ncPhi->addIncoming(ncAccessVal, ncAccessEnd);
+                return ncPhi;
+            }
+        }
+        // fix #3015 (§7.5 / §23.2 / §23.3, v0.240): `q?.P` on a nullable class
+        // receiver, where P is a NON-VIRTUAL computed property getter —
+        // expression-bodied `=> expr` (§23.2) or block-form `get => do … end;`
+        // (§23.3). The `.` form evaluates the getter body (computedGetterOf /
+        // blockGetterOf in the MemberAccessExpr arm below); that arm never runs
+        // for `?.` (a NullCondMemberExpr is a distinct AST node), so the access
+        // reached FINDING [3] below, `storageMemberOf` returned null (a computed
+        // property carries NO storage FieldSymbol — only an auto-property does),
+        // and the `!ms` guard returned nullptr — silently dropping the whole
+        // enclosing statement (no diagnostic at any severity, exit 0). MEASURED
+        // on f386fda: `Console.WriteLine("p=" + (q?.Computed ?? "<null>"))` on a
+        // NON-NULL receiver printed nothing at all; the `start`/`end` markers
+        // printed around the gap.
+        //
+        // Route `?.` through the SAME getter evaluation the `.` form uses —
+        // computedGetterOf / blockGetterOf are the one fact the compiler already
+        // computes that decides "this is a computed getter, call the body" — with
+        // a null-receiver short-circuit first per §7.5 (the always-nullable
+        // result is null when the receiver is null, else the getter value lifted
+        // to nullable). VIRTUAL / INTERFACE properties are GATED OUT: they
+        // dispatch dynamically through propGetSlot_ / ifacePropertyGetIndex_ (the
+        // `.` form's lowerVirtualPropertyGet runs first and returns before the
+        // computed-getter path), and a static inline of the declaring getter
+        // would miscompile an override. The virtual-property-through-`?.` case is
+        // tracked separately (the vtable dispatch needs a null short-circuit
+        // before the slot load, a related but distinct lowering).
+        //
+        // The getter evaluation (generic substitution, `this` binding, result
+        // wrap/box) mirrors the qualified MemberAccessExpr getter paths verbatim;
+        // the §7.5 lift mirrors FINDING [3] below for a storage member.
+        if (auto* ncPropSym =
+                dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e))) {
+            if (!ncPropSym->isIndexer) {
+                bool ncIsVirtual = propGetSlot_.count(ncPropSym) > 0 ||
+                    ifacePropertyGetIndex_.count(ncPropSym) > 0;
+                const ast::Expr* ncGetter = nullptr;
+                const ast::PropertyAccessor* ncBlockAcc = nullptr;
+                if (!ncIsVirtual) {
+                    ncGetter = computedGetterOf(ctx_.exprSymbol(e));
+                    ncBlockAcc = blockGetterOf(ctx_.exprSymbol(e));
+                }
+                if (ncGetter || ncBlockAcc) {
+                    llvm::Value* obj = lowerExpr(*nm->target);
+                    if (!obj || !obj->getType()->isPointerTy()) return nullptr;
+                    auto* ncEntryBB = builder_.GetInsertBlock();
+                    auto* ncAccessBB = llvm::BasicBlock::Create(
+                        llvm_, "ncprop.access", currentFn_);
+                    auto* ncEndBB = llvm::BasicBlock::Create(
+                        llvm_, "ncprop.end", currentFn_);
+                    llvm::Value* ncIsNull = builder_.CreateICmpEQ(
+                        obj, llvm::ConstantPointerNull::get(ptrTy()));
+                    builder_.CreateCondBr(ncIsNull, ncEndBB, ncAccessBB);
+                    builder_.SetInsertPoint(ncAccessBB);
+                    // Evaluate the getter on the (now known non-null) receiver.
+                    auto* ncPd = dynamic_cast<const ast::PropertyDecl*>(
+                        ncPropSym->decl);
+                    const sema::TypeRef* ncDeclTy =
+                        ncPd ? ctx_.resolvedType(*ncPd->type) : nullptr;
+                    llvm::Value* ncRaw = nullptr;
+                    if (ncGetter) {
+                        // §23.2 expression-bodied getter: inline the body with
+                        // this = obj. The generic-substitution setup mirrors the
+                        // `.` form's qualified-getter path so a generic class's
+                        // `T`-typed field read inside the body resolves against
+                        // the receiver's concrete type args.
+                        auto ncSavedSubst = genericSubst_;
+                        auto ncSavedSemaTy = genericSubstSemaTy_;
+                        if (ncPropSym->parent && ncPropSym->parent->decl) {
+                            const sema::TypeRef* ncRecvTy =
+                                ctx_.exprType(*nm->target);
+                            if (ncRecvTy &&
+                                ncRecvTy->kind == sema::TypeRef::Kind::Named &&
+                                ncRecvTy->declaration == ncPropSym->parent &&
+                                !ncRecvTy->genericArgs.empty()) {
+                                auto* ncTd = dynamic_cast<const ast::TypeDecl*>(
+                                    ncPropSym->parent->decl);
+                                if (ncTd && ncTd->genericParams.size() ==
+                                            ncRecvTy->genericArgs.size()) {
+                                    std::unordered_map<std::string_view,
+                                                       llvm::Type*> ncSubst;
+                                    std::unordered_map<std::string_view,
+                                        const sema::TypeRef*> ncSema;
+                                    for (std::size_t ncGi = 0;
+                                         ncGi < ncTd->genericParams.size();
+                                         ++ncGi) {
+                                        ncSubst[ncTd->genericParams[ncGi].name] =
+                                            lowerTypeRef(
+                                                ncRecvTy->genericArgs[ncGi]);
+                                        ncSema[ncTd->genericParams[ncGi].name] =
+                                            resolveTypeParamRef(
+                                                ncRecvTy->genericArgs[ncGi]);
+                                    }
+                                    bool ncHasUnresolved = false;
+                                    for (auto& [n, ty] : ncSubst)
+                                        if (ty == i32()) {
+                                            ncHasUnresolved = true; break;
+                                        }
+                                    if (ncHasUnresolved) {
+                                        sema::Symbol* ncRecvSym =
+                                            ctx_.exprSymbol(*nm->target);
+                                        const ast::Node* ncDecl = nullptr;
+                                        if (auto* ncLoc =
+                                                dynamic_cast<sema::LocalSymbol*>(
+                                                    ncRecvSym))
+                                            ncDecl = ncLoc->decl;
+                                        if (ncDecl) {
+                                            auto ncLit =
+                                                localGenericSubst_.find(ncDecl);
+                                            if (ncLit !=
+                                                localGenericSubst_.end())
+                                                ncSubst = ncLit->second;
+                                        }
+                                    }
+                                    genericSubst_ = std::move(ncSubst);
+                                    genericSubstSemaTy_ = std::move(ncSema);
+                                }
+                            }
+                        }
+                        llvm::Value* ncSavedThis = currentThis_;
+                        currentThis_ = obj;
+                        ncRaw = lowerExpr(*ncGetter);
+                        // §23.2/§23.3 (#1168/#2761): wrap/box the body result to
+                        // the property's DECLARED type (not the §7.5-lifted
+                        // nullable result) — a `T?`-declared body yielding bare
+                        // `T` wraps here, an Object-typed value-type body boxes.
+                        ncRaw = wrapNullableGetterResult(ncDeclTy, ncRaw);
+                        ncRaw = boxForTarget(ncRaw, ncDeclTy, ncGetter);
+                        currentThis_ = ncSavedThis;
+                        genericSubst_ = std::move(ncSavedSubst);
+                        genericSubstSemaTy_ = std::move(ncSavedSemaTy);
+                    } else {
+                        // §23.3 block-form getter: call the standalone getter
+                        // function (ncPd is non-null — blockGetterOf returns
+                        // null for an imported property with no PropertyDecl).
+                        llvm::Function* ncGetterFn =
+                            ensurePropertyBlockGetter(ncPd, ncBlockAcc);
+                        ncRaw = builder_.CreateCall(
+                            ncGetterFn->getFunctionType(), ncGetterFn, {obj});
+                        emitPendingCheck();  // §31.1/§31.2: throw propagation
+                    }
+                    // Lift the getter result to the §7.5 (always-nullable)
+                    // result — the same logic FINDING [3] uses for a storage
+                    // member: a reference result is a pointer (null when the
+                    // receiver is null); a value result wraps into the tagged
+                    // {i8 hasValue; T} struct; a result already nullable passes
+                    // through with the receiver's edge.
+                    const sema::TypeRef* ncResultTy = ctx_.exprType(e);
+                    bool ncRef = ncRaw->getType()->isPointerTy();
+                    bool ncNullableMem = !ncRef && ncResultTy &&
+                        isNullableValueTy(ncResultTy) &&
+                        ncRaw->getType() == nullableValueStructTy(ncResultTy);
+                    llvm::Type* ncResTy = ncRef
+                        ? static_cast<llvm::Type*>(ptrTy())
+                        : (ncNullableMem
+                               ? ncRaw->getType()
+                               : static_cast<llvm::Type*>(llvm::StructType::get(
+                                     llvm_,
+                                     {nullablePrimHasValTy(), ncRaw->getType()})));
+                    llvm::Value* ncAccessVal;
+                    if (ncRef || ncNullableMem) {
+                        ncAccessVal = ncRaw;
+                    } else {
+                        ncAccessVal = builder_.CreateInsertValue(
+                            llvm::UndefValue::get(ncResTy),
+                            llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                            {0u});
+                        ncAccessVal =
+                            builder_.CreateInsertValue(ncAccessVal, ncRaw, {1u});
+                    }
+                    auto* ncAccessEnd = builder_.GetInsertBlock();
+                    builder_.CreateBr(ncEndBB);
+                    builder_.SetInsertPoint(ncEndBB);
+                    llvm::Value* ncNullVal = ncRef
+                        ? static_cast<llvm::Value*>(
+                              llvm::ConstantPointerNull::get(ptrTy()))
+                        : static_cast<llvm::Value*>(
+                              llvm::ConstantAggregateZero::get(ncResTy));
+                    auto* ncPhi = builder_.CreatePHI(ncResTy, 2);
+                    ncPhi->addIncoming(ncNullVal, ncEntryBB);
+                    ncPhi->addIncoming(ncAccessVal, ncAccessEnd);
+                    return ncPhi;
+                }
+            }
+        }
+        // fix #3016 (§7.5 / §12.1 / §13 / §23, v0.240): the VIRTUAL / INTERFACE
+        // case that #3015 (above) deliberately gated out — `q?.VProp` where
+        // VProp is a virtual (§12.1) or interface (§13) property getter. The `.`
+        // form dispatches dynamically through lowerVirtualPropertyGet (the
+        // vtable/itable slot); that path never runs for `?.` (a
+        // NullCondMemberExpr is a distinct AST node), so the access reached
+        // FINDING [3] below, `storageMemberOf` returned null (a virtual property
+        // carries NO storage FieldSymbol), and the `!ms` guard dropped the
+        // statement — MEASURED on d2a3d3e:
+        // `Console.WriteLine("p=" + (q?.VProp ?? "<null>"))` on a NON-NULL
+        // receiver printed nothing at all (start/end around the gap), exit 0.
+        //
+        // Route `?.` through the SAME vtable/itable slot dispatch the `.` form
+        // uses, with a §7.5 null-receiver short-circuit FIRST (loading the slot
+        // from a null receiver is the crash). The slot load + call mirror
+        // lowerVirtualPropertyGet's core dispatch verbatim — crucially the
+        // dispatch goes through the RUNTIME type's vtable, so an OVERRIDDEN
+        // getter runs (the reason #3015 gated this out: a static inline of the
+        // declaring getter body would miscompile the override). The §7.5 lift
+        // mirrors #3015's block above.
+        if (auto* ncVirtSym =
+                dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e))) {
+            if (!ncVirtSym->isIndexer) {
+                bool ncVIsIface = ncVirtSym->parent &&
+                    ncVirtSym->parent->kind == ast::TypeDeclKind::Interface;
+                auto ncVGetIt = propGetSlot_.find(ncVirtSym);
+                auto ncVIfGetIt = ifacePropertyGetIndex_.find(ncVirtSym);
+                if ((!ncVIsIface && ncVGetIt != propGetSlot_.end()) ||
+                    (ncVIsIface && ncVIfGetIt != ifacePropertyGetIndex_.end())) {
+                    // For an interface property, verify the itable descriptor
+                    // exists (mirrors lowerVirtualPropertyGet). A missing
+                    // descriptor cannot dispatch — fall through to the next arm
+                    // rather than crash mid-block.
+                    if (!ncVIsIface || descArray_.find(ncVirtSym->parent) !=
+                                           descArray_.end()) {
+                        // Derive the getter's return type (mirrors
+                        // lowerVirtualPropertyGet). pd is null for an IMPORTED
+                        // property; the type rides importedMemberType.
+                        auto* ncVpd = dynamic_cast<const ast::PropertyDecl*>(
+                            ncVirtSym->decl);
+                        llvm::Type* ncVValTy = nullptr;
+                        if (ncVpd) {
+                            ncVValTy = lowerType(ncVpd->type.get());
+                        } else if (sema::TypeRef* tr =
+                                       ctx_.importedMemberType(ncVirtSym)) {
+                            ncVValTy = lowerTypeRef(tr);
+                        }
+                        if (!ncVValTy) ncVValTy = i32();
+                        llvm::Value* obj = lowerExpr(*nm->target);
+                        if (!obj || !obj->getType()->isPointerTy()) return nullptr;
+                        auto* ncVEntryBB = builder_.GetInsertBlock();
+                        auto* ncVAccessBB = llvm::BasicBlock::Create(
+                            llvm_, "ncvprop.access", currentFn_);
+                        auto* ncVEndBB = llvm::BasicBlock::Create(
+                            llvm_, "ncvprop.end", currentFn_);
+                        llvm::Value* ncVIsNull = builder_.CreateICmpEQ(
+                            obj, llvm::ConstantPointerNull::get(ptrTy()));
+                        builder_.CreateCondBr(ncVIsNull, ncVEndBB, ncVAccessBB);
+                        builder_.SetInsertPoint(ncVAccessBB);
+                        // Dispatch through the vtable/itable slot — SAME logic
+                        // as lowerVirtualPropertyGet's core dispatch.
+                        auto* ncVFnTy = llvm::FunctionType::get(
+                            ncVValTy, {ptrTy()}, false);
+                        llvm::Value* ncVFnPtr = nullptr;
+                        if (ncVIsIface) {
+                            // §13 itable dispatch.
+                            llvm::Value* ncVVptr =
+                                builder_.CreateLoad(ptrTy(), obj);
+                            auto* ncVLookupFn = declareC(
+                                "bz_itable_lookup", ptrTy(),
+                                {ptrTy(), ptrTy()});
+                            llvm::Value* ncVItmapPtr = builder_.CreateLoad(
+                                ptrTy(),
+                                builder_.CreateGEP(
+                                    ptrTy(), ncVVptr,
+                                    {builder_.getInt32(1)}));
+                            llvm::Value* ncVItab = builder_.CreateCall(
+                                llvm::FunctionType::get(
+                                    ptrTy(), {ptrTy(), ptrTy()}, false),
+                                ncVLookupFn,
+                                {ncVItmapPtr,
+                                 descArray_.find(ncVirtSym->parent)->second},
+                                "ncvitab");
+                            ncVFnPtr = builder_.CreateLoad(
+                                ptrTy(),
+                                builder_.CreateGEP(
+                                    ptrTy(), ncVItab,
+                                    {builder_.getInt32(ncVIfGetIt->second)}),
+                                "ncvpget");
+                        } else {
+                            // §12.1 class virtual dispatch: vt[slot].
+                            llvm::Value* ncVVptr =
+                                builder_.CreateLoad(ptrTy(), obj);
+                            llvm::Value* ncVSlotPtr = builder_.CreateGEP(
+                                ptrTy(), ncVVptr,
+                                {builder_.getInt32(ncVGetIt->second)});
+                            ncVFnPtr = builder_.CreateLoad(ptrTy(), ncVSlotPtr);
+                        }
+                        llvm::Value* ncVRaw =
+                            builder_.CreateCall(ncVFnTy, ncVFnPtr, {obj});
+                        emitPendingCheck();  // §31.1/§31.2: throw propagation
+                        // Lift the getter result to the §7.5 (always-nullable)
+                        // result — SAME logic as #3015's block above and FINDING
+                        // [3] below: a reference result is a pointer (null when
+                        // the receiver is null); a value result wraps into the
+                        // tagged {i8 hasValue; T} struct; a result already
+                        // nullable passes through with the receiver's edge.
+                        const sema::TypeRef* ncVResultTy = ctx_.exprType(e);
+                        bool ncVRef = ncVRaw->getType()->isPointerTy();
+                        bool ncVNullableMem = !ncVRef && ncVResultTy &&
+                            isNullableValueTy(ncVResultTy) &&
+                            ncVRaw->getType() ==
+                                nullableValueStructTy(ncVResultTy);
+                        llvm::Type* ncVResTy = ncVRef
+                            ? static_cast<llvm::Type*>(ptrTy())
+                            : (ncVNullableMem
+                                   ? ncVRaw->getType()
+                                   : static_cast<llvm::Type*>(
+                                         llvm::StructType::get(llvm_,
+                                             {nullablePrimHasValTy(),
+                                              ncVRaw->getType()})));
+                        llvm::Value* ncVAccessVal;
+                        if (ncVRef || ncVNullableMem) {
+                            ncVAccessVal = ncVRaw;
+                        } else {
+                            ncVAccessVal = builder_.CreateInsertValue(
+                                llvm::UndefValue::get(ncVResTy),
+                                llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                                {0u});
+                            ncVAccessVal = builder_.CreateInsertValue(
+                                ncVAccessVal, ncVRaw, {1u});
+                        }
+                        auto* ncVAccessEnd = builder_.GetInsertBlock();
+                        builder_.CreateBr(ncVEndBB);
+                        builder_.SetInsertPoint(ncVEndBB);
+                        llvm::Value* ncVNullVal = ncVRef
+                            ? static_cast<llvm::Value*>(
+                                  llvm::ConstantPointerNull::get(ptrTy()))
+                            : static_cast<llvm::Value*>(
+                                  llvm::ConstantAggregateZero::get(ncVResTy));
+                        auto* ncVPhi = builder_.CreatePHI(ncVResTy, 2);
+                        ncVPhi->addIncoming(ncVNullVal, ncVEntryBB);
+                        ncVPhi->addIncoming(ncVAccessVal, ncVAccessEnd);
+                        return ncVPhi;
+                    }
+                }
+            }
+        }
         // §7.5 / FINDING [3]: the receiver is a class/string reference, so a null
         // receiver is the null pointer. Resolve the accessed member to either a
         // storage field (class receiver) or the `Length` intrinsic (string
@@ -2238,6 +2784,24 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 // the reclaim, leaking the temporary (the value is right by luck
                 // but the temp leaks). Route to the dedicated array path instead.
                 if (isCollectionTypeName(tt)) return false;
+                // fix #2809 / §32.5 / stdlib §10.1–§10.3 (v0.240): the three
+                // FFI-boundary BUFFER classes have their own `.Length` handler
+                // below (strlen / bz_wstrlen / bz_rawbytes_length) and are the
+                // ONE receiver family here for which the fallback is a MEMORY
+                // ERROR rather than a wrong value: a `CString`/`WString` is a
+                // bare malloc'd null-terminated buffer with no header at all, so
+                // loadStringLen's `%bz.string` field-1 read (offset 8..15) runs
+                // off the end of a short buffer — `len(CString.From("abc"))`
+                // (13-byte buffer) was an ASan heap-buffer-overflow INSIDE the
+                // callee. The receiver reaches here only in the ANNOTATION
+                // TypeRef shape (`c: CString` on a parameter/field, declaration
+                // == null); the factory shape carries a builtinClassSym
+                // declaration and never entered this fallback, which is why the
+                // `using var` spelling always worked and only the parameter
+                // spelling crashed. RawBytes was right by layout coincidence
+                // ({ptr,len} field 1 == the byte count) — routed here too so it
+                // stops depending on that coincidence.
+                if (common::isFfiBufferBuiltinName(n)) return false;
                 return true;
             };
             if (ma->member == "Length" && isStringFallbackTarget() &&
@@ -2802,15 +3366,20 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Length") {
             auto* tt = ctx_.exprType(*ma->target);
-            // A CString/WString/RawBytes TypeRef is a Named type whose declaration
-            // is the builtin class symbol (set in ExprTypecheck_Calls.cpp for the
-            // From/FromBytes factories), so match on the declaration's name.
-            bool isCStr = tt && tt->kind == sema::TypeRef::Kind::Named &&
-                tt->declaration && tt->declaration->name == "CString";
-            bool isWStr = tt && tt->kind == sema::TypeRef::Kind::Named &&
-                tt->declaration && tt->declaration->name == "WString";
-            bool isRaw = tt && tt->kind == sema::TypeRef::Kind::Named &&
-                tt->declaration && tt->declaration->name == "RawBytes";
+            // fix #2809 (v0.240): match through `isFfiBufferTypeRef`, which reads
+            // BOTH shapes a §10 builtin reaches codegen in — the FACTORY result
+            // (`CString.From(s)`, declaration = builtinClassSym, set in
+            // ExprTypecheck_Calls.cpp) and the ANNOTATION (`c: CString` on a
+            // parameter or field, declaration = null, head name only). The
+            // original declaration-only test covered only the first, so a
+            // `CString` PARAMETER's `.Length` fell through to the string
+            // fallback above and read the raw buffer at %bz.string field 1.
+            bool isCStr = isFfiBufferTypeRef(tt) &&
+                builtinTypeName(tt) == "CString";
+            bool isWStr = isFfiBufferTypeRef(tt) &&
+                builtinTypeName(tt) == "WString";
+            bool isRaw = isFfiBufferTypeRef(tt) &&
+                builtinTypeName(tt) == "RawBytes";
             if (isCStr || isWStr || isRaw) {
                 llvm::Value* buf = lowerExpr(*ma->target);
                 if (!buf) return nullptr;
@@ -2831,22 +3400,58 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
         }
     }
-    // stdlib §10.3 / fix #985: RawBytes.Pointer — the underlying buffer address
-    // as an IntPtr (i64 on the host). Reads the `ptr` field of the { ptr, len }
-    // struct (bz_rawbytes_ptr) and converts it to a pointer-sized integer, which
-    // is the codegen representation of IntPtr (§32.7). Valid until disposal.
+    // stdlib §10.1/§10.2/§10.3 (fix #985, #2825/#2810): the `Pointer` readonly
+    // property of the THREE §10 FFI-boundary buffer classes — the underlying
+    // buffer address as an IntPtr (i64 on the host, §32.7).
+    //
+    // fix #2825 / #2810 (v0.240): this arm used to test `RawBytes` ALONE, so
+    // `CString.Pointer` and `WString.Pointer` had no lowering at all: the read
+    // fell through to CG8's permissive member fall-through and the slot degraded
+    // to zero (#2547/#2434), handing the program a NULL address behind two
+    // `internal:` WARNINGS — the compile succeeded. That is the worst failure
+    // mode this member has, because stdlib §10.1 names the consumer: `Pointer`
+    // is "the element source for `char*[]` argv-building over
+    // `OwningBuffer<IntPtr>`", so the null is not caught on the Bezel side at
+    // all — it is dereferenced in C. Enumerating the three heads per-arm is what
+    // produced the defect (`.Length` directly above already had all three), so
+    // the family test is now the shared registry predicate, once.
+    //
+    // Lifetime, per spec §32.10 (v0.240) verbatim: "For addresses of Bezel-owned
+    // mutable storage (`RawBytes.Pointer`, `CString`/`WString.Pointer`,
+    // `OwningBuffer<T>.DangerousPointer()` — stdlib §10, §4.14): native retention
+    // of such an address past the synchronous call is a use-after-free hazard no
+    // rule in this chapter can track — validity ends at a disposal the native
+    // side is never told about." So the address is an ALIAS of the receiver's
+    // buffer, never a fresh allocation: nothing here is owned, nothing here is
+    // freed, and a read after the owner's disposal is the programmer's §32.10
+    // obligation, not a rule the compiler enforces (§32.12 item 7: "every
+    // address the language exposes is stable until its owner's disposal").
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Pointer") {
             auto* tt = ctx_.exprType(*ma->target);
-            bool isRaw = tt && tt->kind == sema::TypeRef::Kind::Named &&
-                tt->declaration && tt->declaration->name == "RawBytes";
-            if (isRaw) {
-                llvm::Value* rb = lowerExpr(*ma->target);
-                if (!rb) return nullptr;
-                auto* fn = declareC("bz_rawbytes_ptr", ptrTy(), {ptrTy()});
-                llvm::Value* p = builder_.CreateCall(fn, {rb}, "raw.ptr");
+            // fix #2809: both TypeRef shapes (see the `.Length` arm above) —
+            // `isFfiBufferTypeRef` reads the set through `builtinTypeName`, the
+            // accessor that handles the FACTORY result (`CString.From(s)`,
+            // declaration = builtinClassSym) and the ANNOTATION (`c: CString` on
+            // a parameter/field, declaration = null) alike.
+            if (isFfiBufferTypeRef(tt)) {
+                llvm::Value* buf = lowerExpr(*ma->target);
+                if (!buf) return nullptr;
+                llvm::Value* p;
+                if (builtinTypeName(tt) == "RawBytes") {
+                    // §10.3: the value is a { ptr, len } struct — read field 0.
+                    auto* fn = declareC("bz_rawbytes_ptr", ptrTy(), {ptrTy()});
+                    p = builder_.CreateCall(fn, {buf}, "raw.ptr");
+                } else {
+                    // §10.1/§10.2: a CString is a bare null-terminated char*
+                    // and a WString a bare null-terminated uint16_t*
+                    // (bz_string_to_utf8z / bz_string_to_utf16z /
+                    // bz_cstring_from_bytes each return the malloc'd buffer
+                    // itself). The runtime value IS the address — no helper.
+                    p = buf;
+                }
                 // §32.7: IntPtr is a pointer-sized integer (i64 host).
-                return builder_.CreatePtrToInt(p, i64(), "raw.ptr.i");
+                return builder_.CreatePtrToInt(p, i64(), "ffi.ptr.i");
             }
         }
     }
@@ -3975,6 +4580,81 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             if (!isBuiltinEx && tt &&
                 tt->kind == sema::TypeRef::Kind::Named && tt->declaration)
                 isUserDerivedEx = hasBuiltinExceptionBase(tt->declaration);
+            // fix #2972 (§31.4 / §12.3 / §11 / §21.7, v0.240): Case B seen from
+            // INSIDE the subclass — `this.Message` (and `base.Message`, when the
+            // class base is itself a user exception subclass, which is the only
+            // spelling of `base` sema admits here today).
+            //
+            // Both tests above start `tt && …`, and `tt` is null for a `this` /
+            // `base` receiver: sema deliberately never types that identifier in
+            // a named-type body (see `isThisOrBaseExpr`). So this whole handler
+            // was skipped, the access fell through every remaining arm of
+            // lowerExpr, and the caller substituted a degrade. MEASURED on
+            // 618c0c8 across five frames — method, constructor, destructor,
+            // property accessor, lambda — every one of them broken, and the
+            // first three showing three DIFFERENT outcomes from the SAME
+            // missing receiver type:
+            //   * method body   — `return this.Message;` printed
+            //     "internal: return-value expression failed to lower … #2491"
+            //     and returned a NULL string; the caller SIGSEGV'd on it
+            //     (exit 139; under ASan "SEGV on unknown address 0x…08 …
+            //     address points to the zero page").
+            //   * constructor body — `_n := this.Message.Length;` compiled with
+            //     NO diagnostic at all and stored 0 (the message was "abcd").
+            //   * destructor body — `Console.WriteLine("…" + this.Message);`
+            //     compiled with NO diagnostic and the whole statement vanished.
+            // (The property accessor lost its access site's whole statement,
+            // also silently; the lambda returned 0.)
+            // The UNQUALIFIED spelling (`Message`, #625) works in all of them:
+            // its own bare-identifier arm keys on `currentThis_`, never on a
+            // receiver type. §11 puts no restriction on `this.`, and §12.3
+            // makes `base.` the ordinary way to reach a base implementation, so
+            // all three spellings must read the one slot.
+            //
+            // THE GATE, and why it reads SEMA'S RESOLUTION rather than
+            // re-deriving the receiver type here.
+            //
+            // What has to be true for the byte-8 read below to be correct is
+            // that the object `this` denotes carries the §31.4 header — which
+            // `classStruct` inserts for exactly the classes
+            // `hasBuiltinExceptionBase` accepts, i.e. `builtinExceptionBaseOf`,
+            // the ONE walk #2950 established. Sema's own arm for this access
+            // (`ExprTC::resolveMemberAccess`'s `isBuiltinExInheritedMember`)
+            // asks that SAME function, of the LEXICALLY ENCLOSING type — which
+            // is precisely the type of `this`. So sema having resolved the
+            // access through that arm IS the property, already decided by the
+            // same predicate the layout gate uses; the two cannot diverge.
+            //
+            // That arm is observable here as: the access is typed `string` and
+            // carries NO member symbol. A class that declares its own `Message`
+            // member instead resolves to that member's FieldSymbol /
+            // PropertySymbol and is excluded. A class with no `Message` at all
+            // is rejected by sema before codegen runs. (#2984 has since made
+            // such a declaration a §12.2 hiding error when the class DOES
+            // derive from a built-in exception, so that exclusion is now
+            // reachable only on a class that does not — which is exactly the
+            // case it must still get right.)
+            //
+            // Re-deriving the enclosing type in codegen was written first and
+            // ABANDONED, because there is no premise-free way to do it: the
+            // recovery available (reverse-look `currentFn_` in the emitters'
+            // memo caches, as `currentReceiverRecordType` / `choiceTypeOf` do)
+            // rests on "currentFn_'s owner is the type of currentThis_", and
+            // that is FALSE wherever an accessor body is INLINED at its access
+            // site — `currentThis_` is re-pointed at the receiver while
+            // `currentFn_` still belongs to the enclosing method. It also
+            // covered no lambda body. Keying on sema's resolution is total over
+            // frames — method, constructor, destructor, accessor (inlined or
+            // not), lambda — with no frame enumeration at all.
+            if (!isBuiltinEx && !isUserDerivedEx && !tt &&
+                    isThisOrBaseExpr(*ma->target)) {
+                const sema::TypeRef* accessTy = ctx_.exprType(*ma);
+                isUserDerivedEx =
+                    accessTy &&
+                    accessTy->kind == sema::TypeRef::Kind::Primitive &&
+                    accessTy->primitive == sema::PrimitiveType::String &&
+                    ctx_.exprSymbol(*ma) == nullptr;
+            }
             // #1266 / stdlib §2.17 / §31.4: `ex.InnerException!.Message` (a DIRECT
             // chain). sema does not type `ex.InnerException` (the builtin
             // TypeInitializationException carries no PropertyDecl for it), so `tt`
@@ -4033,20 +4713,35 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         //  * ParamName  — offset kExcParamOffset (bz_string*; null when absent).
         //  * ExceptionInfo.TypeName/.Message/.StackTrace — fields 0/1/2 of the
         //    24-byte record element.
+        //
+        // fix #2971 (§31.4 / §12.1 / §11.3, v0.240): the receiver test was
+        // `isBuiltinExceptionTypeRef(rtt)`, i.e. a receiver STATICALLY TYPED as
+        // a built-in. That was in lockstep with sema, which admitted only
+        // `Message` on a user subclass — so a subclass exposed one quarter of
+        // its own inherited §31.4 surface. Now that sema admits all four, these
+        // readers must reach the same three receiver shapes sema does, or the
+        // sema half alone would produce #2972's failure mode: accepted at
+        // compile time, degraded to a null/zero at run time. See
+        // `isInheritedExcSurfaceAccess` for the shapes and why the header GEPs
+        // are correct on each (the header is at the SAME byte offsets in a
+        // user subclass — `classStruct` mirrors all four slots).
         if (ma->target) {
-            auto* rtt = ctx_.exprType(*ma->target);
             auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-            if (ma->member == "StackTrace" && isBuiltinExceptionTypeRef(rtt)) {
+            if (ma->member == "StackTrace" && isInheritedExcSurfaceAccess(ma)) {
+                // §31.4 `StackTrace: string` — "formatted; "" when
+                // unavailable". No debug info yet, so the "" stub, exactly as
+                // for a built-in receiver. (The receiver is deliberately NOT
+                // lowered, matching the pre-#2971 behaviour for built-ins.)
                 return lowerStringLiteral("\"\"", false);
             }
-            if (ma->member == "CauseChain" && isBuiltinExceptionTypeRef(rtt)) {
+            if (ma->member == "CauseChain" && isInheritedExcSurfaceAccess(ma)) {
                 llvm::Value* excObj = lowerExpr(*ma->target);
                 if (!excObj) return nullptr;
                 llvm::Value* ccSlot = builder_.CreateGEP(
                     i8Ty, excObj, builder_.getInt64(kExcCauseOffset));
                 return builder_.CreateLoad(ptrTy(), ccSlot, "exc.causechain");
             }
-            if (ma->member == "ParamName" && isBuiltinExceptionTypeRef(rtt)) {
+            if (ma->member == "ParamName" && isInheritedExcSurfaceAccess(ma)) {
                 llvm::Value* excObj = lowerExpr(*ma->target);
                 if (!excObj) return nullptr;
                 llvm::Value* pnSlot = builder_.CreateGEP(
@@ -4187,11 +4882,23 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 // Static property: no 'this', just evaluate the getter body.
                 // §23.2/§23.3 (#1168): wrap a bare-inner `T` body result to the
                 // declared `T?` optional, same as the instance paths below.
-                return wrapNullableGetterResult(ctx_.exprType(*ma),
-                                                lowerExpr(*getter));
+                llvm::Value* sv = wrapNullableGetterResult(
+                    ctx_.exprType(*ma), lowerExpr(*getter));
+                // fix #2761 (§8.6 "Boxing", v0.240): and box it when the
+                // property's declared type is Object/an interface — the static
+                // spelling of the instance-path box below; see there.
+                return boxForTarget(sv, ctx_.exprType(*ma), getter);
             }
             llvm::Value* obj = lowerExpr(*ma->target);
             if (!obj) return nullptr;
+            // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): establish
+            // the temporary's disposal AT ITS PRODUCTION, so an inlined getter
+            // body that throws unwinds through it. Discharged by the reclaim
+            // below. See registerFreshNewReceiverTempUnwind.
+            llvm::AllocaInst* recvUnwindSlot =
+                registerFreshNewReceiverTempUnwind(ma->target.get(), obj,
+                                                   ctx_.exprType(*ma),
+                                                   /*calleeReturnsOwned=*/false);
             // issue #347 / §9.2: a record is a by-value struct, not a heap
             // pointer. The getter body reads its fields against `this` via a
             // StructGEP, which requires a pointer base; binding a struct
@@ -4313,20 +5020,66 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             // return does (#541). Wrap while the receiver's generic context is
             // still active so a generic `T?` payload lowers correctly.
             v = wrapNullableGetterResult(ctx_.exprType(*ma), v);
+            // fix #2761 (§8.6 "Boxing" / §23.2, v0.240): an EXPRESSION-bodied
+            // property whose declared type is `Object` (or an interface) but
+            // whose body yields a VALUE type must box here — this inline is the
+            // getter's only value-production point, so it is the only place the
+            // §8.6 representation can be established. Every DOWNSTREAM
+            // boxForTarget keys on the sema type of its source EXPRESSION,
+            // which for a property read is already `Object`, so all of them
+            // no-op and the raw scalar used to travel into an `Object` slot:
+            //   `property O: Object => _n;` then `var o := h.O; o is int`
+            //   returned FALSE with no diagnostic (lowerTypeTest gives up on a
+            //   non-pointer operand and lowerIf's null-condition arm branches
+            //   past the body — reproduced, `if.body: No predecessors!`), and
+            //   `F(h.O)` for `F(o: Object)` failed IR verification outright
+            //   ("Call parameter type does not match function signature").
+            // The BLOCK-bodied twin has done this since #2703 (lowerReturn's
+            // §8.6 arm); this restores the #2688 agreement invariant between
+            // the two body forms. Boxed value types are runtime-managed and
+            // "exempt from manual disposal" (§28.9), so no release is added
+            // here — the box's lifetime question is #2760, shared with the
+            // block form. Emitted while the receiver's generic substitution is
+            // still installed, like the nullable wrap above, so a `T`-typed
+            // body under monomorphisation boxes as its CONCRETE type (#1279).
+            v = boxForTarget(v, ctx_.exprType(*ma), getter);
             currentEnumMethod_ = savedEnumMethod;
             currentThis_ = saved;
             genericSubst_ = std::move(savedSubst);
             genericSubstSemaTy_ = std::move(savedSemaTy);
+            // fix #2751 / §28.3 "Unbound owned temporaries" (v0.240): the
+            // EXPRESSION-BODIED getter spelling of the unbound-owned-receiver
+            // reclaim — `(new Src()).N` where `N`'s getter is `=> _v`. See
+            // lowerVirtualPropertyGet for the shared rationale and the
+            // soundness argument. `obj` is the receiver pointer this path
+            // already lowered (never re-lowered — that would run the producer
+            // twice); the getter body has been fully inlined and its result
+            // wrapped/boxed into `v` by now, so nothing reads the receiver
+            // after this point. Emitted after the generic-substitution restore
+            // because the disposal is the CALLER's (it dispatches through the
+            // receiver's vtable, so it is substitution-independent anyway).
+            if (!diverged_)
+                disposeFreshNewReceiverTemp(ma->target.get(), obj,
+                                            ctx_.exprType(*ma),
+                                            /*calleeReturnsOwned=*/false,
+                                            recvUnwindSlot);
             return v;
         }
         // CG33b: block-form getter (`get => do … end;`) — emit as a
         // standalone function so that `return` inside the body terminates
-        // only the getter, not the enclosing method (§22.9).
+        // only the getter, not the enclosing method (§21.7).
         if (const ast::PropertyAccessor* acc =
                 blockGetterOf(ctx_.exprSymbol(*ma))) {
             if (!ma->target) return nullptr;
             llvm::Value* obj = lowerExpr(*ma->target);
             if (!obj) return nullptr;
+            // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): establish
+            // the temporary's disposal AT ITS PRODUCTION so the standalone
+            // getter's throw edge (emitPendingCheck below) unwinds through it.
+            llvm::AllocaInst* recvUnwindSlot =
+                registerFreshNewReceiverTempUnwind(ma->target.get(), obj,
+                                                   ctx_.exprType(*ma),
+                                                   /*calleeReturnsOwned=*/false);
             // issue #347 / §9.2: the block getter is a function taking a
             // `this` pointer; a record receiver is a by-value struct, so spill
             // it to a stack slot and pass that slot's address (see the
@@ -4349,6 +5102,18 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             // an ordinary method call does (emitMethodCall → emitPendingCheck).
             // Without this the throw is swallowed and `res` is a garbage value.
             emitPendingCheck();
+            // fix #2751 / §28.3 "Unbound owned temporaries" (v0.240): the
+            // BLOCK-BODIED getter spelling (`get => do … end;`). See
+            // lowerVirtualPropertyGet for the shared rationale. `obj` may have
+            // been spilled to an alloca just above for a by-value RECORD
+            // receiver — harmless, because isFreshOwnedClassProducer (inside
+            // the helper) admits only a heap CLASS receiver, so the spilled
+            // form never reaches the disposal.
+            if (!diverged_)
+                disposeFreshNewReceiverTemp(ma->target.get(), obj,
+                                            ctx_.exprType(*ma),
+                                            /*calleeReturnsOwned=*/false,
+                                            recvUnwindSlot);
             return res;
         }
         // §2.5 / §23 (issue #503): imported non-virtual property getter.
@@ -4358,6 +5123,25 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // declareImportedPropertyGetters.
         if (auto* ps =
                 dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma))) {
+            // fix #2885 (§22.12/§22.13/§2.8.2 clause 1/§23, v0.240): an
+            // imported STATIC property reads through its own no-`this` stub.
+            // `ma->target` names a TYPE here, so the receiver lowering below
+            // produced nothing pointer-shaped and this whole `if` fell through
+            // — the read left `lowerExpr` as a bare nullptr, which the callers
+            // turn into a silent 0 (`var r := HS.SP;` hit lowerLocalDecl's
+            // #2434 zero-init backstop) or a CRASH (`"x" + HS.SP.ToString()`
+            // SIGSEGV'd, both measured on a real two-module build).
+            if (auto sgit = importedStaticPropGetterFns_.find(ps);
+                sgit != importedStaticPropGetterFns_.end()) {
+                // §22.13: a static-member access triggers the declaring type's
+                // lazy initialization — the same guard the cross-module static
+                // FIELD read emits (memberOwner/emitEnsureStaticInit above).
+                emitEnsureStaticInit(ps->parent);
+                llvm::Value* res = builder_.CreateCall(
+                    sgit->second->getFunctionType(), sgit->second, {});
+                emitPendingCheck();   // §31.1/§31.2: a throw out of the getter
+                return res;
+            }
             auto git = importedPropGetterFns_.find(ps);
             if (git != importedPropGetterFns_.end() && ma->target) {
                 llvm::Value* obj = lowerExpr(*ma->target);
@@ -4422,9 +5206,25 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     obj = tmp;
                 }
                 if (obj && obj->getType()->isPointerTy()) {
+                    // fix #2816 / §28.3 (v0.240): establish the temporary's
+                    // disposal at its production, so the imported getter's
+                    // throw edge (emitPendingCheck below) unwinds through it.
+                    llvm::AllocaInst* recvUnwindSlot =
+                        registerFreshNewReceiverTempUnwind(
+                            ma->target.get(), obj, ctx_.exprType(*ma),
+                            /*calleeReturnsOwned=*/false);
                     llvm::Value* res = builder_.CreateCall(
                         git->second->getFunctionType(), git->second, {obj});
                     emitPendingCheck();
+                    // fix #2751 / §28.3 "Unbound owned temporaries" (v0.240):
+                    // the IMPORTED (cross-module) getter spelling — the same
+                    // reclaim as the two local getter paths above. See
+                    // lowerVirtualPropertyGet for the shared rationale.
+                    if (!diverged_)
+                        disposeFreshNewReceiverTemp(ma->target.get(), obj,
+                                                    ctx_.exprType(*ma),
+                                                    /*calleeReturnsOwned=*/false,
+                                                    recvUnwindSlot);
                     return res;
                 }
             }
@@ -4668,11 +5468,17 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         if (id->name == "this" || id->name == "base") return currentThis_;
         // CG33b: a bare computed-property read evaluates its getter
         // against the current `this`.
-        if (const ast::Expr* getter = computedGetterOf(ctx_.exprSymbol(e)))
+        if (const ast::Expr* getter = computedGetterOf(ctx_.exprSymbol(e))) {
             // §23.2/§23.3 (#1168): wrap a bare-inner `T` body result to the
             // property's declared `T?` optional (see the qualified `obj.P`
             // read above for the rationale).
-            return wrapNullableGetterResult(ctx_.exprType(e), lowerExpr(*getter));
+            llvm::Value* bv =
+                wrapNullableGetterResult(ctx_.exprType(e), lowerExpr(*getter));
+            // fix #2761 (§8.6 "Boxing", v0.240): the BARE (`implicit this`)
+            // spelling of the same read — `var o := O;` inside the declaring
+            // class was silently unboxed too. See the qualified path above.
+            return boxForTarget(bv, ctx_.exprType(e), getter);
+        }
         // CG33b: block-form getter (`get => do … end;`) accessed bare.
         if (const ast::PropertyAccessor* acc = blockGetterOf(ctx_.exprSymbol(e))) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e));
@@ -4722,11 +5528,42 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // (CG22+): the message pointer lives at byte offset 8 in the exception
         // object layout regardless of whether the receiver is the builtin class
         // itself or a user-derived class (§31 / classStruct layout rule).
+        //
+        // fix #2971 (§31.4 / §12.1 / §11.3, v0.240): the other three §31.4
+        // members reach here the same way, through the same sema arm — this
+        // one read `id2->name == "Message"` and so covered a quarter of the
+        // surface. The gate is unchanged in shape (the name, NO resolved
+        // symbol — a local/field/parameter of the same spelling carries one and
+        // is excluded — and a live `this`); only the name set widened, and each
+        // member reads its own fixed §31.4 byte offset out of the header
+        // `currentThis_` points at.
         if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
-            if (id2->name == "Message" &&
-                    !ctx_.exprSymbol(e) &&
-                    currentThis_) {
+            const bool bareExcSurface =
+                id2->name == "Message" || id2->name == "StackTrace" ||
+                id2->name == "CauseChain" || id2->name == "ParamName";
+            if (bareExcSurface && !ctx_.exprSymbol(e) && currentThis_) {
                 auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                // §31.4 `StackTrace: string` — the "" stub (no debug info yet),
+                // the same value the qualified spellings produce.
+                if (id2->name == "StackTrace")
+                    return lowerStringLiteral("\"\"", false);
+                if (id2->name == "CauseChain") {
+                    // §31.4 `CauseChain: Array<ExceptionInfo>` @24 — null reads
+                    // as the empty chain (bz_array_len(null) == 0).
+                    llvm::Value* ccSlot = builder_.CreateGEP(
+                        i8Ty, currentThis_,
+                        builder_.getInt64(kExcCauseOffset), "cc.slot");
+                    return builder_.CreateLoad(ptrTy(), ccSlot, "cc.val");
+                }
+                if (id2->name == "ParamName") {
+                    // §31.4 `ParamName: string?` @32 — null when not supplied,
+                    // which is the property's own declared value, so NO
+                    // empty-string substitution here (unlike Message).
+                    llvm::Value* pnSlot = builder_.CreateGEP(
+                        i8Ty, currentThis_,
+                        builder_.getInt64(kExcParamOffset), "pn.slot");
+                    return builder_.CreateLoad(ptrTy(), pnSlot, "pn.val");
+                }
                 llvm::Value* msgSlot = builder_.CreateGEP(
                     i8Ty, currentThis_, builder_.getInt64(8), "msg.slot");
                 llvm::Value* msgPtr =
@@ -4761,6 +5598,10 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // — a silent no-op for event handlers (#880) and a SIGSEGV at the
         // call site (#881). Route through makeMethodThunk with currentThis_.
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e))) {
+            // A bare (implicit-`this`) reference has no receiver EXPRESSION, so
+            // there is no static interface type to instantiate from; the #2766
+            // substitution simply does not apply and the erased signature is
+            // used, exactly as before.
             if (isStaticMethod(ms)) return makeMethodThunk(ms, nullptr);
             else if (currentThis_) return makeMethodThunk(ms, currentThis_);
         }
@@ -4781,7 +5622,15 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             // uniformly for every non-static method ref.
             if (!isStaticMethod(ms) && ma->target)
                 recv = lowerExpr(*ma->target);
-            return makeMethodThunk(ms, recv);
+            // fix #2766: hand the RECEIVER's static type to makeMethodThunk. For
+            // `eq.Equals` with `eq: IEquatable<string>` that is the only place
+            // the type ARGUMENT (`string`) is recorded — sema leaves the
+            // reference's own function-type parameters null — and the thunk's
+            // ABI has to match it, not the interface's erased `T`.
+            const sema::TypeRef* recvTy =
+                (!isStaticMethod(ms) && ma->target) ? ctx_.exprType(*ma->target)
+                                                    : nullptr;
+            return makeMethodThunk(ms, recv, recvTy);
         }
         // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
         // method (`int.Parse`, `char.IsDigit`, …) — no MethodSymbol (intrinsics
@@ -4836,13 +5685,37 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
     // vtable slot was still populated by buildVtable (which ran for imported
     // classes too); we only need to derive the return type, which rides the
     // importedMemberType side table (set by the loader from MetaMember::type).
+    //
+    // fix #2944 (§12.1 / §14.1 / §23, v0.240): the call-site TYPE MUST be
+    // computed from the sema-resolved expr type — not from the AST `pd->type` —
+    // when the static type of the receiver BINDs a generic parameter the base
+    // declared `T` against. Otherwise `g.Item` where `g: GBase<string>` lowers
+    // the call's expected return type from the base declaration's bare `T`
+    // (which `lowerType` resolves to the i32 ERASED PLACEHOLDER, because no
+    // active genericSubst_ binds T here) while the per-instantiation vtable
+    // slot holds a spec body whose actual return type is `string` (`ptr`) —
+    // LLVM IR verifier aborts the build with "Function return type does not
+    // match operand type of return inst!" (and the read of the returned i32
+    // as a `%bz.string` base pointer fails first, "GEP base pointer is not a
+    // vector or a vector of pointers"). `ctx_.exprType(e)` is the post-
+    // substitution sema type (§14.1) — T is already bound to `string` here —
+    // and `lowerTypeRef` on it returns `ptr`, matching the slot. The AST
+    // `pd->type` fallback is kept for the case where sema did not annotate
+    // the expression (no static type), and for IMPORTED properties whose
+    // `pd` is null (where the importedMemberType side table IS the post-
+    // substitution carrier — same idea, different mechanism).
     llvm::Type* valTy = nullptr;
-    if (pd) {
-        valTy = lowerType(pd->type.get());
-    } else {
-        // Imported property: get the resolved type from the side table.
-        if (sema::TypeRef* tr = ctx_.importedMemberType(ps))
-            valTy = lowerTypeRef(tr);
+    if (sema::TypeRef* resolved = ctx_.exprType(e)) {
+        valTy = lowerTypeRef(resolved);
+    }
+    if (!valTy) {
+        if (pd) {
+            valTy = lowerType(pd->type.get());
+        } else {
+            // Imported property: get the resolved type from the side table.
+            if (sema::TypeRef* tr = ctx_.importedMemberType(ps))
+                valTy = lowerTypeRef(tr);
+        }
     }
     if (!valTy) valTy = i32();
     auto* fnTy = llvm::FunctionType::get(valTy, {ptrTy()}, false);
@@ -4898,6 +5771,14 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
                     llvm::Value* saved = currentThis_;
                     currentThis_ = obj;
                     llvm::Value* v = lowerExpr(*getter);
+                    // fix #2761 (§8.6 "Boxing" / §14.2, v0.240): the
+                    // record-devirtualised spelling of the inline
+                    // expression-getter read. `ctx_.exprType(e)` is the
+                    // INTERFACE property's declared type at this use site; when
+                    // that is `Object`/an interface and the record's body
+                    // yields a value type, the read owes a box exactly as the
+                    // direct path does.
+                    v = boxForTarget(v, ctx_.exprType(e), getter);
                     currentThis_ = saved;
                     return v;
                 }
@@ -4984,8 +5865,67 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
             ptrTy(), vptr, {builder_.getInt32(getIt->second)});
         fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
     }
+    // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): establish the
+    // temporary's disposal BEFORE the dispatched accessor runs, so its throw
+    // edge (the emitPendingCheck immediately below) unwinds through it. Placed
+    // here rather than at `recv`'s own lowering (line ~5022) because every
+    // early return between the two — the non-pointer guard, the missing
+    // type-descriptor guard — hands the read back to the static getter paths,
+    // which lower the receiver again; registering before them could strand an
+    // entry for a receiver this path no longer owns. A property read takes no
+    // arguments, so the accessor call is the whole throw window and nothing is
+    // lost by registering at its edge.
+    llvm::AllocaInst* recvUnwindSlot = registerFreshNewReceiverTempUnwind(
+        recvExpr, recv, ctx_.exprType(e), /*calleeReturnsOwned=*/false);
     llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, {recv});
     emitPendingCheck();  // the accessor body may throw (§23.3)
+    // fix #2751 / §28.3 "Unbound owned temporaries" (v0.240) — THE SHARED
+    // RATIONALE for all four property-read sites (this one, and the computed-
+    // getter / block-getter / imported-getter paths in lowerExprInner).
+    //
+    // §28.3 enumerates the member read among the borrowing uses that produce an
+    // unbound owned temporary: "An owned value may also be produced as an
+    // **unbound temporary**: the result of an `owned`-returning call (or other
+    // owned producer) that is not bound to any name, not `move`d, and not
+    // returned, but used only by *borrowing* operations within the expression —
+    // as the receiver of a further call, as a non-`owned` argument, as a member
+    // or index access, or as the scrutinee of a `case` … Such a temporary is
+    // disposed at the **end of the full expression** in which it is produced,
+    // after every use of it within that expression has completed."
+    //
+    // #1039 covered exactly two of the member-read shapes: the FIELD read
+    // (fieldAddr path in lowerExprInner) and the METHOD call (emitMethodCall).
+    // A PROPERTY read is neither — it resolves to a PropertySymbol and is
+    // lowered by one of the four getter paths, none of which disposed the
+    // receiver — so `(new Src()).N` leaked the `Src` in every position tested
+    // (local-variable initializer, field initializer, bare statement), for the
+    // arrow-bodied, block-bodied and virtual getter forms alike. Only the AUTO
+    // property (`property N: int := 5;`) was already covered, because it is
+    // backed by a field and travels the #1039 field path.
+    //
+    // SOUNDNESS — the disposal is delegated whole to disposeFreshNewReceiverTemp,
+    // which fires only when the receiver is a fresh owned-class producer AND the
+    // extracted result is a non-reference value (numeric/bool/char/decimal
+    // primitive, enum, unit). `calleeReturnsOwned` is FALSE at every property
+    // site by construction: §A.3's property grammar has no `owned` marker on a
+    // property type (only `StaticReadonlyDecl` carries one), so a property read
+    // can never announce a fresh transfer, and the #1859/#2205 class/interface/
+    // owning-collection widenings stay unreachable from here. That keeps this
+    // fix strictly inside the provably-safe subset and away from #2261's
+    // use-after-free shape (a deferred iterator/task frame that still borrows a
+    // freed receiver): a property returning `string`, a class reference, a span,
+    // an inline array, a record, `Object`, or an iterable/`Task` interface is
+    // NOT disposed here — it keeps leaking, which is the sound direction.
+    //
+    // Emitted after emitPendingCheck, so it lands in the normal-return
+    // continuation only: on the accessor's throw edge the temporary leaks, the
+    // same pre-existing safe direction the argument string-release at
+    // emitMethodCall (LlvmBackend_Calls2.cpp) documents. `recvExpr` is null for
+    // a bare `P` read (implicit `this`), where the helper returns immediately.
+    if (!diverged_)
+        disposeFreshNewReceiverTemp(recvExpr, recv, ctx_.exprType(e),
+                                    /*calleeReturnsOwned=*/false,
+                                    recvUnwindSlot);
     return r;
 }
 
@@ -4997,12 +5937,56 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
                                       const ast::Expr* valueExpr,
                                       bool valueIsPlusOne) {
     if (!v) return false;
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target);
-    if (!ma || !ma->target) return false;
-    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+    // fix #2849 (§12.1/§6.6/§23.3, v0.240): ACCEPT THE RECEIVER-LESS TARGET.
+    //
+    // The receiver is either an explicit `obj.P` target, or — for a bare `P`
+    // write inside an instance member — the current `this`. This function used
+    // to require an `ast::MemberAccessExpr` and bail on anything else, while
+    // its getter twin `lowerVirtualPropertyGet` (above) deliberately handles
+    // BOTH spellings. That asymmetry was the whole defect: a bare `P` target is
+    // an `ast::IdentifierExpr`, so every caller fell through to the STATICALLY
+    // bound setter and ran the compile-time type's accessor.
+    //
+    // §12.1, verbatim: "A method, property, or indexer is non-virtual unless
+    // marked `virtual`. To override a virtual member in a derived class, mark
+    // the matching member `override`."
+    //
+    // MEASURED on b0fa41a with a `virtual`/`override` pair whose accessors are
+    // +100/+1 (base) and +200/+2 (derived), receiver always a `D`:
+    //   * `P := 7`   stored 8 where 9 is correct — the BASE setter ran.
+    //   * `P += 1`   yielded 202 where 203 is correct — the diagnostic value:
+    //     the getter DISPATCHED (D's 200, +1 = 201) and the setter did NOT
+    //     (B's `value + 1` = 202). The two halves of one statement disagreed.
+    // `this.P := 7` / `this.P += 1` / `b.P += 1` were already correct, so the
+    // defect is specific to the receiver-less spelling — the most idiomatic
+    // way to write to one's own property.
+    //
+    // A STATIC property cannot reach the dispatch below even inside an instance
+    // member (where `currentThis_` is a live pointer): §12.1, verbatim,
+    // "Fields, constructors, destructors, and static members may not be
+    // virtual", and buildVtable's `isVirtualProperty`/`isVirtualIndexer` gate
+    // (LlvmBackend_Setup.cpp) is what populates propSetSlot_ — so a static
+    // property has no slot and the `setIt == propSetSlot_.end()` guard below
+    // declines it. Interfaces declare no static members, so the itable half is
+    // likewise unreachable. The getter twin relies on exactly this.
+    const ast::Expr* recvExpr = nullptr;
+    sema::PropertySymbol* ps = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+        if (!ma->target) return false;
+        ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+        recvExpr = ma->target.get();
+        // `base.P` (§12.3, verbatim: "Inside a derived member, `base.Name(...)`
+        // calls the base class's implementation, bypassing virtual dispatch"):
+        // decline — the static setter path handles it.
+        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(recvExpr))
+            if (tid->name == "base") return false;  // §12.3
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target)) {
+        ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*id));
+        // bare `P` → implicit `this.P`; no recvExpr (currentThis_ is the recv).
+    } else {
+        return false;
+    }
     if (!ps || ps->isIndexer) return false;
-    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
-        if (tid->name == "base") return false;  // §12.3
 
     bool isIfaceProp = ps->parent &&
                        ps->parent->kind == ast::TypeDeclKind::Interface;
@@ -5032,9 +6016,40 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
     auto* fnTy = llvm::FunctionType::get(
         llvm::Type::getVoidTy(llvm_), {ptrTy(), valTy}, false);
 
-    llvm::Value* recv = lowerExpr(*ma->target);
+    // fix #2849: `recvExpr` is null for the bare `P` spelling — the receiver is
+    // then `currentThis_`, exactly as in lowerVirtualPropertyGet. The
+    // pointer-typed requirement below is what excludes a static context (no
+    // `this`) and the erased-generic receiver, as it does in the getter.
+    llvm::Value* recv = recvExpr ? lowerExpr(*recvExpr) : currentThis_;
     if (!recv || !recv->getType()->isPointerTy()) return false;
-    v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));
+    // fix #2927 (§7.2/§5.1/§12.1/§23.3, v0.240): coerce the incoming value to
+    // the SETTER SLOT, not merely through §5.1's numeric widening.
+    //
+    // This site used to be a bare `coerceNumericToType(v, valTy, …)`, which
+    // handles §5.1's widening (`i.LongP := 5` and `i.DblP := 7` through an
+    // interface were both MEASURED correct on 10bd6d3 — the issue's inferred
+    // §5.1 sibling does NOT reproduce) but has no case for a NULLABLE VALUE
+    // slot. §7.2 makes that slot the tagged `{i8 hasValue; T}` struct while
+    // the RHS arrives as the bare payload `T`, so `i.IP := 4` on an `int?`
+    // property handed `i32 4` to a setter declared `void(ptr, {i8, i32})` and
+    // ABORTED THE COMPILE: "Call parameter type does not match function
+    // signature! i32 4 { i8, i32 } call void %pset(ptr %15, i32 4)" — an ICE
+    // on a legal program, with no diagnostic pointing at any source construct.
+    //
+    // The two helpers below are the SAME pair every other store into a
+    // nullable slot uses — #2903's one definition of an initializer's slot
+    // width (§5.1 in BOTH directions, with the nullable slot's payload as the
+    // width to match) followed by §7.2's present-wrap, which also normalizes a
+    // `null` literal to the all-zero form. Applied here rather than in
+    // `lowerStmt`'s `:=` arm on purpose: EVERY caller of this function needs
+    // them, not just that one. `i.IP ??= 4` (#2905) has been pre-wrapping at
+    // its own call site precisely because this one did not — which is how the
+    // gap became visible — and the §22.3 `ref`/`out` write-back and the
+    // compound-assign paths reach the same setter through here too. Both
+    // helpers are no-ops when `v` already IS the slot type, so the callers
+    // that wrap first are unaffected.
+    v = coerceInitializerToSlot(v, valTy, isUnsignedTargetExpr(target));
+    v = coerceToNullableSlot(valTy, v);
     // fix #2500 (§8.6/§23.3/§28.9, v0.236): virtual/interface-dispatch twin of
     // lowerImportedPropertySetValue's boxing — an Object/interface property's
     // setter slot expects a `ptr` (box) value parameter, but a value-typed RHS

@@ -256,65 +256,20 @@ static bool isLiteralDerivedExpr(const ast::Expr* e) {
     return false;
 }
 
-// #625 / §12 / §31: true when `name` is a built-in exception type identifier.
-// Mirrors the isBuiltinExName lambda in ExprTypecheck_Calls.cpp (kept in sync).
-static bool isBuiltinExceptionTypeName(std::string_view n) {
-    return n == "Exception"              ||
-           n == "ArgumentException"      ||
-           n == "ArgumentNullException"  ||
-           // stdlib §2.5/§4.4 (v0.183, #1396).
-           n == "ArgumentOutOfRangeException" ||
-           n == "ArithmeticException"    ||
-           n == "OverflowException"      ||
-           n == "DivideByZeroException"  ||
-           n == "InvalidOperationException" ||
-           n == "NotImplementedException"   ||
-           n == "NullReferenceException"    ||
-           n == "IndexOutOfRangeException"  ||
-           n == "KeyNotFoundException"      ||
-           n == "MatchFailureException"     ||
-           n == "OperationCanceledException"||
-           n == "TypeInitializationException" ||
-           n == "FormatException"           ||
-           n == "StackOverflowException"    ||
-           // #976 / stdlib §7.4 / §7.5: System.Threading + System.IO families.
-           n == "TimeoutException"          ||
-           n == "IOException"               ||
-           n == "FileNotFoundException"     ||
-           n == "DirectoryNotFoundException"||
-           n == "EndOfStreamException"      ||
-           n == "PathTooLongException"      ||
-           // §22.16 (v0.203, #2053): clause-violation exception type.
-           n == "ContractViolationException";
-}
-
-// #625 / §12 / §31: true when `ts` (a user class TypeSymbol) or any user-class
-// ancestor has a direct AST-declared base that is a built-in exception.
-// Used by the unqualified identifier resolver to allow bare `Message` in the
-// body of an exception-derived class without "unresolved identifier".
-static bool inheritsBuiltinException(const TypeSymbol* ts) {
-    if (!ts || ts->kind != ast::TypeDeclKind::Class) return false;
-    for (const TypeSymbol* cur = ts; cur;) {
-        auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl);
-        if (td) {
-            for (const auto& bt : td->baseTypes) {
-                if (!bt || !bt->name || bt->name->parts.empty()) continue;
-                if (isBuiltinExceptionTypeName(bt->name->parts.back()))
-                    return true;
-            }
-        }
-        // Walk to the next user-class base.
-        const TypeSymbol* next = nullptr;
-        for (const TypeSymbol* b : cur->baseTypes) {
-            if (b && b->kind == ast::TypeDeclKind::Class && b->decl) {
-                next = b;
-                break;
-            }
-        }
-        cur = next;
-    }
-    return false;
-}
+// #625 / §12 / §31 / fix #2950 / fix #2971: the "does `ts` inherit a built-in
+// exception" wrapper that used to live here is gone. It answered only half the
+// question the unqualified-identifier resolver actually asks — the other half
+// being WHICH §31.4 member the bare name denotes, which the resolver then
+// hard-coded as `Message` alone. Both halves now come from
+// `sema::builtinExceptionSurfaceMemberOf` (Symbol.hpp), the single statement of
+// §31.4's surface; see the call site below.
+//
+// (What #2950 fixed here is preserved by that helper's own walk: this was a
+// THIRD hand-rolled copy of the ancestor walk — AST base list, `b->decl`
+// required on each ancestor step, and its own positive name list — so a LOCAL
+// class whose base was an IMPORTED exception subclass got "unresolved
+// identifier `Message`" where the identical hierarchy declared in ONE module
+// resolved it.)
 
 // §14.1 (#2006): does `t` mention a free/rigid type variable anywhere — a Named
 // TypeRef with no declaration, no generic arguments, and a non-empty head (a
@@ -585,6 +540,125 @@ void ExprTC::collectLambdaReturnTypes(
         std::vector<TypeRef*>& out) {
     for (const auto& s : stmts)
         collectLambdaReturnTypeFromStmt(s.get(), out);
+}
+
+// fix #2619 (§7.1 / §7.4 / §23.4, v0.240) — the §7 check on an INDEX argument.
+//
+// §23.4: "An indexer is a property whose name is replaced by `[parameters]`",
+// so an index argument is a parameter pass, and §7.1: "The compiler enforces
+// the distinction at every assignment, parameter pass, and return." Every
+// indexer path in sema skipped that check (see the declaration's comment for
+// the failure it produced); this runs it once per IndexExpr for every receiver
+// family, builtin and user-declared alike.
+//
+// WHY THIS CANNOT FALSE-REJECT (the hazard for a widened rejection):
+//
+//  1. It fires only when the index argument's OWN static type is nullable.
+//     Every non-nullable index spelling the compiler accepts today — a plain
+//     `int`, a `const` local, an enum, a bare generic `T`, a `long`, a Range
+//     literal `[a..b]`, a Range-typed value — never reaches the check at all.
+//     (This is the gate #2613 chose, kept and generalized.)
+//  2. The target it checks against is the index's own type with `nullable`
+//     cleared — NOT the indexer's declared parameter type. So the only
+//     diagnostic reachable from here is the §7 "…is nullable but the target
+//     type is non-nullable" one; a type MISMATCH between an index argument and
+//     a declared parameter is a different question this fix does not open
+//     (nor does it touch the named/`ref`/`owned`/discard modifier axis, which
+//     is #2758's unresolved design question — those forms are skipped).
+//  3. The §7.4 narrowing exception is inherited by construction: it lives
+//     inside `checkAssignable`, which this reuses, so `if i <> null then a[i]`,
+//     an early-return narrowing, a `const` narrowing and `a[i!]` all stay
+//     accepted (§7.4 deliberately does not rewrite `exprType`, so a naive
+//     "is the argument type nullable" rejection would break them).
+//  4. A declared index parameter that is ITSELF nullable legitimately accepts
+//     a nullable argument (`property [i: int?]`, a `Dictionary<string?, V>`
+//     key). Those are detected from the declared parameter type — substituted
+//     against the receiver's concrete type arguments, so a `Box<int?>` whose
+//     indexer is declared `[k: T]` reports `int?` — and skipped.
+void ExprTC::checkIndexArgNullability(const ast::IndexExpr& ix,
+                                      const ast::Expr& e, TypeRef* recvTy) {
+    if (!recvTy || ix.indices.empty()) return;
+
+    // The receiver's declared index parameters, where they are knowable:
+    //   * a USER-declared indexer, whose resolved PropertySymbol the §23.4
+    //     branch attached to this node (#2530). Its k-th parameter type is
+    //     read through the ast::PropertyDecl for a local indexer and through
+    //     the reconstructed ParameterSymbols for an IMPORTED one (#2414's
+    //     dual read), then substituted like the result type is.
+    //   * a builtin dictionary receiver, whose indexer is `[key: K]`
+    //     (stdlib §4.8 / §4.9 / §4.17) — K is genericArgs[0].
+    // Every other family (Array<T> and the list interfaces, the span/buffer
+    // families, `string`, inline arrays, an indexer reached through a
+    // type-parameter constraint) declares a NON-nullable index parameter, so
+    // leaving `declared` null means exactly "non-nullable" here.
+    PropertySymbol* ps = nullptr;
+    if (auto* sym = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(e)))
+        if (sym->isIndexer) ps = sym;
+    TypeRef* dictKey = nullptr;
+    if (!ps && recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
+        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+        std::string_view cn = recvTy->headName();
+        if (cn == "Dictionary" || cn == "OwningDictionary" ||
+            cn == "SortedDictionary")
+            dictKey = recvTy->genericArgs[0];
+    }
+    auto declaredIndexParam = [&](std::size_t k) -> TypeRef* {
+        if (dictKey) return k == 0 ? dictKey : nullptr;
+        if (!ps) return nullptr;
+        TypeRef* p = nullptr;
+        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+            if (k < pd->indexerParams.size() && pd->indexerParams[k].type)
+                p = ctx_.resolvedType(*pd->indexerParams[k].type);
+        } else if (k < ps->indexerParams.size()) {
+            if (auto* prm =
+                    dynamic_cast<ParameterSymbol*>(ps->indexerParams[k]))
+                p = prm->resolvedDeclType;
+        }
+        if (!p) return nullptr;
+        return substituteMemberType(p, ix.target.get(), ps->parent);
+    };
+
+    // The diagnostic's subject. `<Receiver>[i]` (or `[key]` for a dictionary)
+    // for the single-index case — the wording #2613 introduced — and an
+    // ordinal for a multi-parameter indexer, where "the index argument" alone
+    // would not say which one.
+    std::string recvName;
+    if (recvTy->kind == TypeRef::Kind::Named) {
+        recvName = std::string(recvTy->headName());
+        if (recvName.empty() && recvTy->declaration)
+            recvName = std::string(recvTy->declaration->name);
+    } else if (recvTy->kind == TypeRef::Kind::Primitive &&
+               recvTy->primitive == PrimitiveType::String) {
+        recvName = "string";
+    }
+    const std::size_t nargs = ix.indices.size();
+    auto subject = [&](std::size_t k) -> std::string {
+        if (nargs == 1) {
+            if (recvName.empty()) return "index argument";
+            return "index argument to `" + recvName +
+                   (dictKey ? "[key]`" : "[i]`");
+        }
+        std::string s = "index argument " + std::to_string(k + 1);
+        if (!recvName.empty()) s += " to the `" + recvName + "` indexer";
+        return s;
+    };
+
+    for (std::size_t k = 0; k < nargs; ++k) {
+        const auto& arg = ix.indices[k];
+        // §22.3 / #2758: a named / `ref` / `out` / `owned` modifier or a `_`
+        // discard on an index argument is a separate, unresolved question
+        // (#2758). This governs the index VALUE only — the same guard #2613's
+        // check carried.
+        if (!arg.value || arg.isDiscard || !arg.modifier.empty()) continue;
+        TypeRef* idxTy = ctx_.exprType(*arg.value);
+        if (!idxTy || !idxTy->nullable) continue;      // gate (1)
+        TypeRef* declared = declaredIndexParam(k);
+        if (declared && declared->nullable) continue;  // gate (4)
+        TypeRef* nonNull = ctx_.makeTypeRef(*idxTy);   // gate (2)
+        nonNull->nullable = false;
+        checkAssignable(idxTy, nonNull, arg.value->span.begin, subject(k),
+                        arg.value.get());
+    }
 }
 
 void ExprTC::visitExpr(const ast::Expr& e) {
@@ -1013,23 +1087,51 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // as intrinsics.
             auto* ts = builtinClassSym(id->name);
             ctx_.setExprSymbol(&e, ts);
-        } else if (id->name == "Message" && currentType_ &&
-                   !inStaticMember_ &&
-                   inheritsBuiltinException(currentType_)) {
-            // #625 / §12 / §31: unqualified `Message` inside an INSTANCE method
-            // body of a class that inherits (directly or via a user-class chain)
-            // from a built-in exception type resolves as the inherited stdlib
-            // Exception.Message property (a string read of the slot at byte
-            // offset 8 in the exception layout).  No user TypeSymbol or
-            // FieldSymbol exists for it; the codegen's GEP-at-byte-8 path
-            // handles the read (same as `this.Message` — see the
-            // MemberAccessExpr case in LlvmBackend_Exprs.cpp CG22+).
+        } else if (currentType_ && !inStaticMember_ &&
+                   builtinExceptionSurfaceMember(currentType_, id->name) !=
+                       BuiltinExcMember::None) {
+            // #625 / §12 / §31: an unqualified §31.4 surface name inside an
+            // INSTANCE member body of a class that inherits (directly or via a
+            // user-class chain) from a built-in exception type resolves as the
+            // inherited property — a read of the corresponding slot in the
+            // §31.4 header the object carries. No user TypeSymbol or
+            // FieldSymbol exists for it; codegen's fixed-byte-offset path
+            // handles the read (same as `this.X` — see the MemberAccessExpr
+            // case in LlvmBackend_Exprs.cpp CG22+).
             // Static methods are excluded: there is no `this` in a static
-            // context so Message would have no meaningful receiver.
-            // Do NOT set a symbol — there is none; just set the type to string
-            // so downstream (type-assignability, .Length, etc.) can use it.
-            ctx_.setExprType(&e,
-                ctx_.primitiveTypeRef(PrimitiveType::String));
+            // context so the name would have no meaningful receiver.
+            // Do NOT set a symbol — there is none; just set the type so
+            // downstream (type-assignability, .Length, .Count, …) can use it.
+            //
+            // fix #2971 (§31.4 / §12.1 / §11.3, v0.240): this arm read
+            // `id->name == "Message"`, so the bare spelling of the other three
+            // §31.4 members was a THIRD rejection of the same inherited
+            // surface, with a THIRD diagnostic from a THIRD site — measured on
+            // 0dac23f inside `class ExS: Exception`:
+            //     bare.bzl:5:38: unresolved identifier `StackTrace`
+            //     bare.bzl:6:38: unresolved identifier `CauseChain`
+            //     bare.bzl:10:38: unresolved identifier `ParamName`
+            // while bare `Message` in the same bodies resolved. #2971 named the
+            // receiver-typed and `this.`-qualified spellings (both the member-
+            // lookup arm in ExprTypecheck_Calls.cpp); this site is the one it
+            // did not measure, and leaving it would have shipped the same
+            // reachable-but-inconsistent shape the issue is about.
+            switch (builtinExceptionSurfaceMember(currentType_, id->name)) {
+                case BuiltinExcMember::ParamName:
+                    // §31.4: `string?` — "null when not supplied".
+                    ctx_.setExprType(&e,
+                        ctx_.primitiveTypeRef(PrimitiveType::String,
+                                              /*nullable=*/true));
+                    break;
+                case BuiltinExcMember::CauseChain:
+                    ctx_.setExprType(&e, excCauseChainTypeRef());
+                    break;
+                default:
+                    // Message / StackTrace — §31.4 declares both `string`.
+                    ctx_.setExprType(&e,
+                        ctx_.primitiveTypeRef(PrimitiveType::String));
+                    break;
+            }
         } else if (
             // §2.2 v0.164 / §2.7 / #1365: an import alias (e.g. `ML` in
             // `import MathLib as ML;`) or a module-name prefix segment
@@ -1068,10 +1170,46 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // keeps today's "unresolved identifier" error.
             ctx_.setExprSymbol(&e, typeParamMarker(id->name));
         } else if (currentScope_) {
-            ctx_.diagnostics().report(
-                Severity::Error, id->span.begin,
-                std::string("unresolved identifier `") +
-                std::string(id->name) + "`");
+            // §22.16 (v0.240, #2942): `result` and `old` are contextual
+            // keywords (§22.16 / Appendix B.2), valid only inside an
+            // `ensures` clause — `result` denotes the method's return
+            // value (typed as the declared return type, read as a borrow),
+            // `old(E)` denotes the value of `E` at method entry. Neither
+            // is implemented in this revision (issue #2942); both fall
+            // through to ordinary name lookup and report "unresolved
+            // identifier". Replace that generic error with a context-aware
+            // one — outside `ensures`, point the user at §22.16's keyword
+            // rule; inside an `ensures` clause, point them at this issue
+            // (the "loud, hence safe" Option-A path the issue asks for).
+            // Inside a `requires` clause or an `invariant` member, §22.16
+            // also forbids these names, so the outside-`ensures` diagnostic
+            // applies uniformly — only `ensures` is the permitted position.
+            if (id->name == "result" || id->name == "old") {
+                if (currentClauseKind_ == ContractClauseKind::Ensures) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, id->span.begin,
+                        std::string("the contextual keyword `") +
+                        std::string(id->name) +
+                        "` is not yet implemented in `ensures` clauses "
+                        "(\xc2\xa7""22.16, v0.240; issue #2942) \xe2\x80\x94 "
+                        "postconditions cannot name the return value or "
+                        "the entry snapshot until that fix lands");
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, id->span.begin,
+                        std::string("`") + std::string(id->name) +
+                        "` is a contextual keyword reserved for `ensures` "
+                        "clauses (\xc2\xa7""22.16, v0.240; issue #2942); "
+                        "it is not an identifier and cannot be referenced "
+                        "from a method body, a `requires` clause, or an "
+                        "`invariant` member");
+                }
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, id->span.begin,
+                    std::string("unresolved identifier `") +
+                    std::string(id->name) + "`");
+            }
         }
         return;
     }
@@ -1448,7 +1586,134 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // §4.6: string indexer `s[i]` → char (code point).
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
         if (ix->target) {
-            if (auto* tt = ctx_.exprType(*ix->target)) {
+            TypeRef* tt = ctx_.exprType(*ix->target);
+            // fix #2795 (§23.4 / §7.1 / §7.4, v0.240): the receiver type of a
+            // `this`-rooted index. §23.4: "Inside a member of a class with its
+            // own indexer, `this[i]` is required (the brackets need a left-hand
+            // side)" — so this is the MANDATED spelling, not an exotic one.
+            // But the IdentifierExpr arm above deliberately leaves `this`
+            // WITHOUT an exprType (only #456's primitive/builtin-`extension`
+            // case sets one), so `ctx_.exprType(*ix->target)` was null and this
+            // ENTIRE block was skipped for `this[i]`. Everything the block does
+            // was therefore missing on the one spelling §23.4 requires: the
+            // indexer RESULT TYPE (`var s := this[i].ToString()` degraded to a
+            // zero-initialized value, #2434, and emitted malformed IR — "ret
+            // i32 %4 / ptr"), the #2530 PropertySymbol attachment, the #2543
+            // write-only-read gate, and the #2619 §7 index check (so
+            // `this[NI()]` with an `int?` index compiled with NO diagnostic and
+            // returned the WRONG VALUE — the null index became 0). A bare
+            // `return this[i];` happened to work because the return coercion
+            // supplies the type, which is why this went unnoticed.
+            //
+            // Resolved LOCALLY here rather than by publishing an exprType for
+            // `this` in the IdentifierExpr arm (the wider of the two shapes the
+            // issue proposed): that would turn on every exprType(`this`) reader
+            // at once, including codegen's `indexReceiverDecl`
+            // (LlvmBackend_Assign.cpp), whose #747 R42 branch deliberately
+            // recovers the owner TypeSymbol from `methodFns_` /
+            // `currentSpecMethodSymbol_` — a specialization-aware path that a
+            // sema-published TypeRef would silently short-circuit. Confining
+            // the resolution to this expression form changes nothing outside
+            // `this[i]`.
+            //
+            // GENERICS: `substituteMemberType` already handles a `this` target
+            // (its own #747 R42 branch seeds the base-chain walk from
+            // `currentType_` when the receiver carries no exprType), so passing
+            // `ix->target` through unchanged below is correct at both shapes —
+            // an INHERITED generic-base indexer resolves `T` to the enclosing
+            // instantiation's binding (`Derived: Base<int>` → `int`), while the
+            // declaring generic class's own indexer stays its rigid parameter
+            // (inside `Box<T>`, `this[i]` is `T`), which is exactly what a body
+            // in that class sees. The synthesized TypeRef therefore carries NO
+            // genericArgs — it denotes the enclosing declaration, not an
+            // instantiation of it.
+            //
+            // fix #2832 (§12.3 / §23.4, v0.240): `base[i]` — the OTHER
+            // keyword-rooted spelling — is covered too, now that its
+            // miscompile is fixed in the same change. #2795 deliberately left
+            // it out on the grounds that typing it alone would only widen the
+            // set of spellings reaching a known silent wrong value (`base[i]`
+            // on a `virtual` base indexer overridden in the derived class
+            // returned the OVERRIDE's value: 202 where 102 is correct), and
+            // that the receiver-resolution and non-virtual-dispatch halves
+            // had to land together. They do here: codegen's
+            // `indexAccessReceiverDecl` takes the §12.3 step to the class base
+            // and the two #1080 vtable branches now decline a `base` receiver
+            // (LlvmBackend_Assign.cpp), so this typing feeds a correct
+            // lowering rather than a wider one.
+            //
+            // The receiver is the CLASS BASE, mirroring `memberTargetType`'s
+            // own `base` arm (ExprTypecheck_Calls.cpp: "§12.3: `base.X`
+            // resolves X against the base class, so an override in the current
+            // type is bypassed and the base member is found"). Resolving it
+            // here rather than to `currentType_` is what makes the attached
+            // #2530 PropertySymbol the BASE's indexer — which is in turn what
+            // codegen's #2833 fallback reads.
+            //
+            // §12.3 also bounds where `base` is legal at all: "`base` is legal
+            // only inside instance members of a derived class." A class with
+            // no class base has `Object` as its base, and `Object` declares no
+            // indexer — so `base[i]` there names nothing. It used to compile
+            // and silently read the class's OWN indexer (MEASURED: 301, the
+            // derived value). Reject it, mirroring the named form's #1106
+            // defect-6 rejection in ExprTypecheck_Calls.cpp.
+            //
+            // A STATIC member is excluded so the existing "`this`/`base` is
+            // not available in a static method or static constructor (§12.3)"
+            // rejection stays the only diagnostic there.
+            if (!tt && currentType_ && !inStaticMember_) {
+                if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ix->target.get())) {
+                    TypeSymbol* recv = nullptr;
+                    if (tid->name == "this") {
+                        recv = currentType_;
+                    } else if (tid->name == "base") {
+                        for (TypeSymbol* b : currentType_->baseTypes)
+                            if (b && b->kind == ast::TypeDeclKind::Class) {
+                                recv = b;
+                                break;
+                            }
+                        if (!recv) {
+                            // fix #2983 (§12.3 / §31.4, v0.240): the REJECT is
+                            // right — §31.4 declares no indexer on any built-in
+                            // exception, so `base[i]` names nothing either way
+                            // — but the CLAIM was not. This loop scans
+                            // `TypeSymbol::baseTypes`, which never holds a
+                            // built-in exception base (a built-in has no
+                            // TypeSymbol), so a `class ExB: Exception` was told
+                            // "`ExB` has no class base", a falsehood about the
+                            // user's own declaration. A diagnostic can be right
+                            // to fire and wrong in what it says; name the real
+                            // base. `sema::builtinExceptionBaseOf` is the ONE
+                            // walk that knows it (#2950).
+                            std::string_view bex =
+                                builtinExceptionBaseOf(currentType_);
+                            ctx_.diagnostics().report(
+                                Severity::Error, e.span.begin,
+                                "`base[...]` does not name a base-class "
+                                "indexer: `" +
+                                    std::string(currentType_->name) +
+                                    (bex.empty()
+                                         ? std::string(
+                                               "` has no class base (its base "
+                                               "is `Object`, which declares no "
+                                               "indexer)")
+                                         : ("`'s class base is the built-in `" +
+                                            std::string(bex) +
+                                            "` (\xC2\xA7""31.4), which declares "
+                                            "no indexer")) +
+                                    " (§12.3/§23.4)");
+                        }
+                    }
+                    if (recv) {
+                        TypeRef* rt = ctx_.makeTypeRef();
+                        rt->kind = TypeRef::Kind::Named;
+                        rt->declaration = recv;
+                        tt = rt;
+                    }
+                }
+            }
+            if (tt) {
                 if (tt->kind == TypeRef::Kind::InlineArray && tt->arrayElement) {
                     // §15.6 (#746 R41-E): "Slicing is not supported on inline
                     // arrays in this version." A range index on an inline array
@@ -1638,41 +1903,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // declares the indexer `public property [i: int]: char`
                         // — a single NON-nullable `int` index, and the only
                         // indexer form the record declares (no Range overload).
-                        // The builtin has no PropertySymbol (ReadOnlyStringSpan
-                        // resolves to a synthetic Named TypeRef with a null
-                        // declaration, which is why this branch types the result
-                        // by hand), so nothing on the IndexExpr path ever ran
-                        // checkAssignable on the index — an un-narrowed `int?`
-                        // was silently accepted by sema and reached codegen,
-                        // where the indexer lowering truncated the `{ i8, i32 }`
-                        // nullable-value struct to `i32` and failed
-                        // verifyModule ("Trunc only operates on integer"). Same
-                        // §7 hole #2601 closed for `Slice` on the CallExpr path
-                        // (checkBuiltinSpanCallArgs), on the IndexExpr path.
-                        //
-                        // The check is deliberately gated to a NULLABLE index
-                        // type: this fix is scoped to the §7 nullable ->
-                        // non-nullable conversion #2613 reports, and gating it
-                        // that way makes a false reject of some other index
-                        // spelling structurally impossible (a non-nullable
-                        // index of any kind is left exactly as it was). A
-                        // NARROWED `int?` stays accepted — the §7.4 narrowing
-                        // exception lives inside checkAssignable, which this
-                        // reuses — and a `ref`/`out`-modified or discard index
-                        // is skipped, mirroring the CallExpr gates' guard.
-                        if (ix->indices.size() == 1 && ix->indices[0].value &&
-                            !ix->indices[0].isDiscard &&
-                            ix->indices[0].modifier.empty()) {
-                            TypeRef* idxTy =
-                                ctx_.exprType(*ix->indices[0].value);
-                            if (idxTy && idxTy->nullable)
-                                checkAssignable(
-                                    idxTy,
-                                    ctx_.primitiveTypeRef(PrimitiveType::Int),
-                                    ix->indices[0].value->span.begin,
-                                    "index argument to `ReadOnlyStringSpan[i]`",
-                                    ix->indices[0].value.get());
-                        }
+                        // The §7 check on that index used to live here, gated to
+                        // this one head name; #2619 found the SAME hole on every
+                        // other indexer path (including USER-declared indexers,
+                        // which do have a PropertySymbol, so the "builtin members
+                        // have no MethodSymbol" explanation never covered them)
+                        // and moved the check to checkIndexArgNullability, run
+                        // once for every receiver family at the end of this
+                        // block. Keeping a second copy here would double-report.
                         ctx_.setExprType(
                             &e, ctx_.primitiveTypeRef(PrimitiveType::Char));
                     }
@@ -1868,6 +2106,230 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // exactly as the single-indexer path always did).
                     if (!ps) ps = arityOnly;
                     if (ps && ps->isIndexer) {
+                        // fix #2955 (§23.4 / §13 / §14.1 / §2.8.3 rule 4,
+                        // v0.240): an INDEXER whose INDEX PARAMETER is typed
+                        // by the RECEIVER DECLARATION's own generic
+                        // parameter (e.g. `interface I<T> { property [i: T]:
+                        // int }` reached as `r[i]` over `r: I<string>`) has no
+                        // working lower path in the current ABI — the
+                        // exported cross-module stub is keyed by the open
+                        // type and erases `T -> i32`, while the call-site
+                        // argument is the concrete-substituted type (a `ptr`
+                        // for `string`), so the emitted indirect call carries
+                        // the wrong `i32 (ptr, i32)` signature for an `i32
+                        // (ptr, ptr)` argument and aborts at LLVM IR
+                        // verification with no located diagnostic. The named-
+                        // property twin is #2944 (return type) and the
+                        // property-side twin is #2928; this is the INDEX
+                        // PARAMETER form of the family.
+                        //
+                        // MEASURED (issue's own repro, two-module
+                        // `bezelc -c lib.bzl` then `bezelc --import lib.o
+                        // app.bzl`):
+                        //   * `r["k"]` on `var r: IAtU5<string> := g` →
+                        //     `Call parameter type does not match function
+                        //     signature! ptr @.bz.str.50` (raw verifier
+                        //     abort, no source location, exit non-zero).
+                        //   * the SAME shape reached DIRECTLY through the
+                        //     implementing class (`g["k"]` on `var g :=
+                        //     new GArrU5<string>()`) → byte-identical
+                        //     verifier abort, because the imported-stub
+                        //     dispatch goes through the same `bz$<Class>$
+                        //     idxget$<arity>` symbol whose signature is the
+                        //     same erasure.
+                        //
+                        // Decline with a sourced diagnostic, in the style of
+                        // #2884 (the property twin) and #2832 / #1943's
+                        // imported-generic shapes — and exactly as
+                        // `accessorAbiFits` (LlvmBackend_Setup.cpp, added in
+                        // #2946) refuses to install an itable slot whose ABI
+                        // doesn't fit the per-instantiation substitution
+                        // here refuses to TYPE an indexer access whose
+                        // declared ABI can't be made to fit the substitution
+                        // at the call site. The Driver gates codegen on
+                        // `!diagnostics.hasErrors()` (Driver.cpp's `if
+                        // (!objectPath.empty() && !diagnostics.hasErrors())`
+                        // before emitModule), so once this diagnostic fires
+                        // codegen is skipped and the verifier never sees the
+                        // broken module. The full fix is importer-side
+                        // accessor monomorphization per instantiation, the
+                        // way `methodBodyText` / `ctorBodyText` already
+                        // carry method/ctor bodies across the artifact
+                        // boundary (#428 family).
+                        //
+                        // GATED: only the shape the issue's own diagnosis
+                        // names, and only on the dispatch paths the ABI
+                        // mismatch actually breaks. The receiver must be a
+                        // generic Interface (any interface — local or
+                        // imported — because the itable slot is filled
+                        // with a function whose ABI is fixed at the erasure)
+                        // OR an IMPORTED generic Class/Record (because the
+                        // cross-module stub `bz$<Class>$idxget$<arity>` is
+                        // the same erasure and there is no per-instantiation
+                        // re-emission). The LOCAL generic Class/Record case
+                        // is OUT OF GATE — codegen inlines the body into
+                        // the caller (the `getterExpr` / `getterBlock`
+                        // paths in `lowerIndexerGet`/`-Set`), and the body
+                        // runs in the caller's substitution context, so a
+                        // body that doesn't touch the index parameter
+                        // works at runtime even when the indexer's
+                        // declared parameter type is the generic param.
+                        // PROBED: `GCtrl4<string>` accessed directly as
+                        // `g["k"]` (local generic class) returns the
+                        // correct 42, no verifier abort — the body is
+                        // `_w + 2`, never reads `i`. The same indexer
+                        // reached through a generic INTERFACE
+                        // (`r["k"]` on `var r: ICtrl3<string>`) DOES abort
+                        // the verifier — same root cause, but the dispatch
+                        // is itable-mediated.
+                        //
+                        // Receiver's index parameter type must additionally
+                        // be a bare TypeRef::Kind::Named whose `headName`
+                        // matches one of those generic params' names — a
+                        // Name-only reference, not a declaration-resolved
+                        // one (mirrors `interfaceIndexerElementType`'s
+                        // predicate shape). Out-of-gate shapes:
+                        //   * a NON-generic receiver — no substitution to
+                        //     erase, the stub ABI IS the call ABI.
+                        //   * an indexer parameter typed by a
+                        //     declaration-resolved class/record (e.g. `[i:
+                        //     SomeNamedClass]`) — `lowerType` lowers it to
+                        //     the same `ptr` the call site passes.
+                        //   * a builtin collection (Array<T>, dictionary,
+                        //     string, span/buffer) — has no PropertySymbol
+                        //     here and was already a builtin path; the issue
+                        //     is specific to a USER-declared indexer.
+                        //   * a `base`-rooted indexer — gated separately
+                        //     (#2832's `rejectImportedVirtualBaseIndexer` in
+                        //     codegen; this decline would also fire on it,
+                        //     which is correct — the same family).
+                        if (tt && tt->kind == TypeRef::Kind::Named &&
+                            tt->declaration &&
+                            !tt->declaration->genericParams.empty() &&
+                            (tt->declaration->kind ==
+                                 ast::TypeDeclKind::Interface ||
+                             ctx_.isImported(tt->declaration))) {
+                            // Map generic-param NAME → its positional index in
+                            // the receiver declaration's genericParams list,
+                            // so the per-parameter substitution check below
+                            // can walk `tt->genericArgs` in the same order.
+                            std::unordered_map<std::string_view, std::size_t>
+                                gpIndex;
+                            for (std::size_t gi = 0;
+                                 gi < tt->declaration->genericParams.size();
+                                 ++gi) {
+                                if (auto* gp =
+                                        dynamic_cast<const GenericParamSymbol*>(
+                                            tt->declaration->genericParams[gi]))
+                                    gpIndex[gp->name] = gi;
+                            }
+                            auto paramIsBareReceiverTypeParam =
+                                [&](const TypeRef* pty) -> bool {
+                                if (!pty || pty->kind != TypeRef::Kind::Named)
+                                    return false;
+                                if (pty->declaration) return false;
+                                std::string_view hn = pty->headName();
+                                if (hn.empty()) return false;
+                                return gpIndex.count(hn) != 0;
+                            };
+                            // For an index parameter typed by a generic
+                            // param of the receiver, the substitution MOVES
+                            // the index parameter's ABI iff the substituted
+                            // arg's lowered LLVM type is not the i32
+                            // erasure placeholder. The only TypeRef that
+                            // lowers to i32 is the int primitive — every
+                            // other kind (any other primitive, any named
+                            // type, any nested generic) lowers to a
+                            // different type and would abort the verifier on
+                            // the call. This is the same population the
+                            // call-site ABI (`gFnTy`/`sFnTy` in
+                            // `lowerIndexerGet`/`-Set`,
+                            // LlvmBackend_Assign.cpp) needs to match;
+                            // checking it here keeps the decline to the
+                            // shape that ACTUALLY breaks, instead of
+                            // catching the T=int case (where the
+                            // substitution is the same `i32` erasure and
+                            // the call type matches the argument type —
+                            // measured to compile clean and run clean).
+                            auto substitutedArgMovesAbi =
+                                [&](const TypeRef* pty) -> bool {
+                                if (!pty || pty->kind != TypeRef::Kind::Named)
+                                    return true;  // unknown / non-named:
+                                                  // be conservative
+                                if (pty->declaration) return true;
+                                std::string_view hn = pty->headName();
+                                auto it = gpIndex.find(hn);
+                                if (it == gpIndex.end()) return true;
+                                const std::size_t gi = it->second;
+                                if (gi >= tt->genericArgs.size()) return true;
+                                const TypeRef* arg = tt->genericArgs[gi];
+                                if (!arg) return true;
+                                // The ONLY shape that does NOT move the ABI:
+                                // the int primitive. Every other kind
+                                // (string, bool, byte, char, any Named
+                                // declaration, any nested generic, any
+                                // non-int primitive) lowers to a different
+                                // LLVM type.
+                                if (arg->kind == TypeRef::Kind::Primitive &&
+                                    arg->primitive == PrimitiveType::Int)
+                                    return false;
+                                return true;
+                            };
+                            bool paramHitsGenericParam = false;
+                            if (auto* pd2 =
+                                    dynamic_cast<const ast::PropertyDecl*>(
+                                        ps->decl)) {
+                                for (const auto& p : pd2->indexerParams) {
+                                    if (p.type) {
+                                        const TypeRef* pt =
+                                            ctx_.resolvedType(*p.type);
+                                        if (paramIsBareReceiverTypeParam(pt) &&
+                                            substitutedArgMovesAbi(pt)) {
+                                            paramHitsGenericParam = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (!paramHitsGenericParam) {
+                                for (const Symbol* pSym :
+                                     ps->indexerParams) {
+                                    if (auto* prm =
+                                            dynamic_cast<const ParameterSymbol*>(
+                                                pSym)) {
+                                        if (paramIsBareReceiverTypeParam(
+                                                prm->resolvedDeclType) &&
+                                            substitutedArgMovesAbi(
+                                                prm->resolvedDeclType)) {
+                                            paramHitsGenericParam = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (paramHitsGenericParam) {
+                                auto loc = e.span.begin;
+                                ctx_.diagnostics().report(
+                                    Severity::Error, loc,
+                                    "indexer `" + std::string(ps->name) +
+                                    "` on the generic type `" +
+                                    std::string(tt->declaration->name) +
+                                    "` is not yet monomorphized "
+                                    "(\xC2\xA7""23.4 / \xC2\xA7""14.1 / "
+                                    "\xC2\xA7""2.8.3 rule 4 / #2955): a "
+                                    "generic type's indexer accessors are "
+                                    "not exported per instantiation, so an "
+                                    "index parameter typed by a type "
+                                    "parameter of the receiver's "
+                                    "declaration has no correct target — "
+                                    "it aborts LLVM IR verification with "
+                                    "an `i32 (ptr, …)` call against a "
+                                    "substituted `ptr` argument. Access a "
+                                    "field directly, or route through a "
+                                    "method, until importer-side indexer "
+                                    "monomorphization lands");
+                            }
+                        }
                         auto* pd = dynamic_cast<const ast::PropertyDecl*>(
                             ps->decl);
                         TypeRef* rt = nullptr;
@@ -2021,6 +2483,55 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 std::to_string(nargs) +
                                 (nargs == 1 ? " argument" : " arguments") +
                                 " (§23.4)");
+                    }
+                }
+                // fix #2619 (§7.1 / §7.4 / §23.4, v0.240): run the §7
+                // index-argument check ONCE, after every receiver family above
+                // has been typed — a user-declared indexer's resolved
+                // PropertySymbol (#2530) is attached by then, which is what
+                // lets the check read its declared parameter types. Placed
+                // here rather than per-branch because the hole was in EVERY
+                // branch, and a single site cannot be forgotten by the next
+                // receiver family added above.
+                checkIndexArgNullability(*ix, e, tt);
+                // fix #2832 (§12.3 / §12.5 / §23.4, v0.240): `base[i]` where
+                // the resolved base indexer is ABSTRACT has no implementation
+                // to reach — §12.3's whole contract is "calls the base class's
+                // implementation", and §12.5 is what says an abstract member
+                // has none. The named form already rejects this ("cannot call
+                // abstract base method `M` via `base` — it has no
+                // implementation (§12.3/§12.5)", ExprTypecheck_Calls.cpp
+                // #874); the indexer form silently ran the DERIVED override
+                // instead (the #2832 miscompile), and with that fixed it would
+                // instead degrade to a zero/null value in codegen — the static
+                // accessor-body path finds no body. Reject it here so neither
+                // wrong value is reachable. Reads the resolved PropertySymbol
+                // the #2530 attachment just published, so it covers every
+                // arity and overload without re-doing the lookup. An IMPORTED
+                // abstract indexer has no ast::PropertyDecl to read modifiers
+                // from and is left alone (the same `!pd` scope limit every
+                // other AST-reading indexer check in this block carries).
+                if (auto* btid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ix->target.get())) {
+                    if (btid->name == "base") {
+                        auto* bps = dynamic_cast<PropertySymbol*>(
+                            ctx_.exprSymbol(e));
+                        auto* bpd = bps ? dynamic_cast<const ast::PropertyDecl*>(
+                                              bps->decl)
+                                        : nullptr;
+                        bool bAbstract = false;
+                        if (bpd)
+                            for (auto mod : bpd->modifiers)
+                                if (mod == "abstract") {
+                                    bAbstract = true;
+                                    break;
+                                }
+                        if (bAbstract)
+                            ctx_.diagnostics().report(
+                                Severity::Error, e.span.begin,
+                                "cannot access an abstract base indexer via "
+                                "`base` — it has no implementation "
+                                "(§12.3/§12.5)");
                     }
                 }
             }
@@ -3301,6 +3812,103 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             }
         }
     }
+    // fix #2819 (§3.5 *Operators on primitive types*, §6.2 *Mixed-type
+    // arithmetic*, §5.1 *Implicit conversions*, v0.240): an arithmetic,
+    // bitwise, shift or ordering operator with a UNIT (`()`) operand is
+    // ill-formed and must be rejected here.
+    //
+    // §3.5 enumerates each intrinsic operator group BY OPERAND TYPE —
+    // "**Arithmetic** on `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`,
+    // `long`, `ulong`, `float`, `double`, `decimal`", bitwise and shift on the
+    // integer types, "**Ordering** … on every primitive **except `bool`**" —
+    // and `()` is in none of those lists (it is not even a primitive: §3.1
+    // lists the unit type separately). §3.5 closes the door explicitly: "The
+    // set of admitted combinations is fixed; primitives do not declare
+    // cross-type `operator +` methods that user code could inspect." §6.2 then
+    // gives the disposition for an operand pair with no shared type: "If no
+    // implicit conversion exists between the operand types … the operation is a
+    // compile error and an explicit cast is required" — and §5.1's table has no
+    // row converting `()` to anything numeric (its only conversion out of unit
+    // is boxing to `Object`). Nor can a user supply one: §25.2 draws the
+    // candidate set for non-primitive operands from `operator` overloads
+    // declared on the operand types, and the unit type declares none and cannot
+    // be extended to (§26.2).
+    //
+    // Before this the expression was ACCEPTED, with three different wrong
+    // outcomes depending only on where the unit came from: `total + t.Wait()`
+    // compiled and contributed 0 on every iteration (the #2819 repro — and the
+    // reason #2807's original bug report carried a false exit-code claim that
+    // nobody, including the compiler, contradicted); `total + C.Nop()` on a
+    // void-returning call emitted malformed IR ("Call parameter type does not
+    // match function signature", an `sadd.with.overflow` fed a `void`); and
+    // `total + u` on a `()`-typed local degraded through the #2434 fallback to
+    // 0. One clean rejection replaces all three.
+    //
+    // CATEGORY-BLIND by construction, as #2819 asked: the gate is "this
+    // operand's resolved type is `Kind::Unit`", not an enumeration of the
+    // expressions that can produce unit (`Task.Wait()`, a void-returning call,
+    // a `()` literal, a `()`-typed local/param/field, a unit-returning lambda
+    // invocation) — the same hole is reachable from each, and enumerating
+    // source categories is how the §14.2 predicate family accreted four
+    // separate bug reports.
+    //
+    // Nullability is deliberately IGNORED, so a `()?` operand is rejected too:
+    // §7.11 lifts an operator "only where it is defined on the underlying type
+    // `T`", and it is defined nowhere on `()`. Same posture as the `bool`
+    // ordering check below, which notes it covers `bool?` for this reason.
+    //
+    // NOT rejected — the accept-controls this deliberately leaves alone:
+    //   * `=` and `<>`. §8.4 defines `a = b` as `a.Equals(b)` with a null-safe
+    //     wrapper, and unit reaches `Object` (§8.6 boxing; §8.5 even specifies
+    //     its `ToString` as `"()"`), so `u = v` is well-formed and always true.
+    //     No spec text withdraws equality from unit, so rejecting it would be a
+    //     false reject with no authority behind it.
+    //   * `and`/`or`/`in` — not in the token set below.
+    //   * Every non-operator position: a bare `t.Wait();` statement, a
+    //     unit-returning method called for effect, `_ := f();`, `var u: () :=
+    //     ();`, `u := ();`, `var o: Object := ();` (§8.6 *Boxing of the unit
+    //     value* — note a BOXED unit's static type is `Object`, not `()`, so it
+    //     never reaches this gate), `$"u={u}"` interpolation, and a lambda
+    //     whose body is a unit call. All verified still accepted.
+    if (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod" ||
+        op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>" ||
+        op == "<" || op == ">" || op == "<=" || op == ">=") {
+        auto isUnit = [](const TypeRef* t) {
+            return t && t->kind == TypeRef::Kind::Unit;
+        };
+        TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
+        TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
+        if (isUnit(lt) || isUnit(rt)) {
+            bool relational =
+                (op == "<" || op == ">" || op == "<=" || op == ">=");
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "operator `" + std::string(op) + "` is not defined for a unit "
+                "(`()`) operand (\xC2\xA7""3.5) \xE2\x80\x94 the unit type has "
+                "exactly one value and no arithmetic, comparison or bitwise "
+                "operations, and \xC2\xA7""5.1 provides no conversion from `()` "
+                "to a numeric type, so the operation is a compile error "
+                "(\xC2\xA7""6.2). A unit-valued expression \xE2\x80\x94 a method "
+                "declared without a return type, or `Task.Wait()` "
+                "(\xC2\xA7""30.3), whose result is read from `Result`, not from "
+                "`Wait()` \xE2\x80\x94 is a statement, not a value: call it on "
+                "its own line.");
+            // Error recovery: type the result so downstream uses do not cascade
+            // an "untyped expression" error. A relational yields `bool`; an
+            // arithmetic/bitwise/shift yields the OTHER (non-unit) operand's
+            // type when there is one, else `int`.
+            if (relational) {
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            } else if (!isUnit(lt) && lt) {
+                ctx_.setExprType(&be, lt);
+            } else if (!isUnit(rt) && rt) {
+                ctx_.setExprType(&be, rt);
+            } else {
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Int));
+            }
+            return;
+        }
+    }
     // §25.2 (#746 R41-C): a relational operator (`<`, `>`, `<=`, `>=`) on a
     // record/class operand requires a matching user-defined overload — none is
     // auto-generated. A partial comparison group (e.g. only `<`/`>` declared,
@@ -4298,6 +4906,26 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     // access on a moved value (`var s := move r; s.M`) fails to resolve.
     if (op == "+" || op == "-" || op == "~" || op == "move") {
         TypeRef* ot = ue.operand ? ctx_.exprType(*ue.operand) : nullptr;
+        // fix #2819 (§3.5, v0.240): the UNARY half of the same rule the binary
+        // arm enforces above — unary `+`, `-` and `~` on a unit (`()`) operand.
+        // §3.5 groups unary `+`/`-` under "Arithmetic on `byte`, … `decimal`"
+        // and `~` under "Bitwise on `byte`, … `ulong`"; `()` is in neither list.
+        // The #1574/#1588/#6.5 bad-kind checks below all gate on
+        // `Kind::Primitive`, so a Unit operand slipped past every one of them
+        // and fell through to the identity pass-through — `-u` compiled and
+        // read 0, `~u` compiled and read -1. Included here rather than deferred
+        // because it is the same rule, the same §, and the same silent wrong
+        // value as the binary form; leaving it would be a known residual.
+        // `move` is deliberately excluded: it is not an arithmetic operator
+        // (§28.3 ownership transfer) and rejecting it needs its own authority.
+        if (op != "move" && ot && ot->kind == TypeRef::Kind::Unit) {
+            ctx_.diagnostics().report(Severity::Error, ue.span.begin,
+                "unary operator `" + std::string(op) + "` is not defined for a "
+                "unit (`()`) operand (\xC2\xA7""3.5) \xE2\x80\x94 the unit type "
+                "has exactly one value and no arithmetic or bitwise operations. "
+                "A unit-valued expression is a statement, not a value.");
+            return;
+        }
         // §6.5: unary `~` (bitwise complement) is "not valid on bool, char, or
         // floating-point types" — it requires an integer operand. (`not` is the
         // boolean complement.) Primitive-only; a user type overloading `~` is
@@ -4429,14 +5057,46 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         // Task<bool> through this path, which IS a Named Task type and is NOT
         // flagged; any unresolved / unknown type (ot == nullptr) is left
         // undiagnosed to avoid false positives.
-        if (ot) {
-            bool isTaskType = false;
-            if (ot->kind == TypeRef::Kind::Named && !ot->nullable &&
-                ot->astNode && ot->astNode->name &&
-                ot->astNode->name->parts.size() == 1) {
-                std::string_view head = ot->headName();
-                isTaskType = (head == "Task" || head == "OwningTask");
+        // fix #2822 (spec §30.2/§30.3/§2.5/§2.8.2, v0.240): recover the awaited
+        // type's head NAME without requiring an ast::Type node.
+        //
+        // Both blocks below used to gate on `ot->astNode && ot->astNode->name`,
+        // which is an AST-SHAPE test standing in for the question actually being
+        // asked — "is this named type spelled `Task` / `OwningTask`?". An
+        // IMPORTED type has NO AST node by construction (ModuleLoader builds its
+        // TypeRefs from metadata; there is no ast::Type to point at), so an
+        // imported `Task<int>` failed the guard and `await` on a legal
+        // cross-module async call was REJECTED:
+        //
+        //   app.bzl:5:14: `await` requires a `Task`, `Task<T>`, or
+        //   `OwningTask<T>` operand (§30.2 / §30.3).
+        //
+        // The identical program in ONE module compiles — a §2.8.2 clause 2
+        // divergence, and one that makes every imported `async` method
+        // unusable, since §30 gives no other way to consume a `Task<T>`.
+        //
+        // `TypeRef::headName()` already falls back to `importedName` for exactly
+        // this case (TypeRef.hpp), so the head is recoverable; only the
+        // precondition was wrong. This is the #2374 `astNode`-only gate family.
+        //
+        // The `parts.size() == 1` half is KEPT where an AST node exists — it
+        // rejects a QUALIFIED spelling (`Foo.Task`), which must not be taken for
+        // the builtin. For an imported ref the metadata's name is already the
+        // bare head, so a non-empty `importedName` is the equivalent condition.
+        // One definition, used by both blocks, so they cannot drift the way
+        // these two mirrors already had.
+        auto awaitedTaskHead = [](const TypeRef* t) -> std::string_view {
+            if (!t || t->kind != TypeRef::Kind::Named || t->nullable) return {};
+            if (t->astNode && t->astNode->name) {
+                if (t->astNode->name->parts.size() != 1) return {};
+            } else if (t->importedName.empty()) {
+                return {};
             }
+            return t->headName();
+        };
+        if (ot) {
+            std::string_view head = awaitedTaskHead(ot);
+            bool isTaskType = (head == "Task" || head == "OwningTask");
             if (!isTaskType) {
                 ctx_.diagnostics().report(
                     Severity::Error, ue.span.begin,
@@ -4445,10 +5105,11 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 return;
             }
         }
-        if (ot && ot->kind == TypeRef::Kind::Named && !ot->nullable &&
-            ot->astNode && ot->astNode->name &&
-            ot->astNode->name->parts.size() == 1) {
-            std::string_view head = ot->headName();
+        // Same predicate as the guard above — see its comment. Sharing it is the
+        // point: when these were two copies, lifting only the rejection would
+        // have left the await UNTYPED rather than typed, which is a silent wrong
+        // value in place of a loud reject.
+        if (std::string_view head = awaitedTaskHead(ot); !head.empty()) {
             if (head == "Task") {
                 if (ot->genericArgs.empty()) {
                     // `await Task` → unit (no result value).
@@ -6097,6 +6758,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // nested lambdas.
         bool saveInLambda = inLambda_;
         inLambda_ = true;
+        // §22.16 (v0.240, #2942): a lambda body is its own callable, not a
+        // clause context. The contextual-keyword diagnostic for `result` /
+        // `old` is meaningless inside a lambda (a lambda has no return value
+        // to bind to, and is not in any member's clause scope). Saved/restored
+        // so a nested lambda inside a clause does not falsely inherit the
+        // surrounding clause's tracking.
+        const bool saveInContractClause = inContractClause_;
+        const ContractClauseKind saveClauseKind = currentClauseKind_;
+        inContractClause_ = false;
+        currentClauseKind_ = ContractClauseKind::None;
         // §22.4 (v0.183, #1585): a lambda is its own callable — a `return`
         // inside it never discharges the enclosing method's out-nullability
         // postcondition. Clear the set for the lambda body and restore after.
@@ -6247,11 +6918,21 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // lowerLambda) then reads `ctx_.exprType(*lam.exprBody)` and
             // materialises against the target type, mirroring the
             // `return [e1, …]` path in lowerReturnStmt.
-            if (lamTargetRet &&
-                isCollectionLiteralAdmissibleTarget(lamTargetRet) &&
-                dynamic_cast<const ast::CollectionLiteralExpr*>(
+            // per §15.4 (#3031): the predicate also consults the literal's
+            // FORM. The empty literal `[]` is admitted at every §15.4
+            // collection target — the empty carve-out is membership-only.
+            if (auto* clE = dynamic_cast<const ast::CollectionLiteralExpr*>(
                     lam->exprBody.get())) {
-                ctx_.setExprType(lam->exprBody.get(), lamTargetRet);
+                const bool isEmpty = !clE->isDict && clE->elements.empty();
+                const bool admitted = lamTargetRet && (
+                    (isEmpty &&
+                     isCollectionLiteralEmptyAdmissibleTarget(lamTargetRet)) ||
+                    (!isEmpty &&
+                     isCollectionLiteralAdmissibleTarget(lamTargetRet,
+                                                         clE->isDict)));
+                if (admitted) {
+                    ctx_.setExprType(lam->exprBody.get(), lamTargetRet);
+                }
             }
             visitExpr(*lam->exprBody);
         }
@@ -6274,21 +6955,42 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // reject it here too rather than miscompile. The idiom is a block body
         // binding an explicitly-typed local:
         // `(x) => do var inner: Array<U> := [...]; return inner; end`.
+        // per §15.4 (#3031): the form-vs-target split applies here too — a
+        // dict literal at a sequence-shaped lambda target (or vice versa) is
+        // a form mismatch, not a missing-target case. Distinguish the two
+        // with the dedicated form-specific diagnostic so the user is told
+        // to change the literal's form, not bind a local.
         if (lam->exprBody &&
             dynamic_cast<const ast::CollectionLiteralExpr*>(lam->exprBody.get()) &&
             !ctx_.exprType(*lam->exprBody)) {
-            ctx_.diagnostics().report(
-                Severity::Error, lam->exprBody->span.begin,
-                "collection literal has no determinable target type as a "
-                "lambda's expression body — a collection literal is well-typed "
-                "only against a concrete collection target (an inline array, or "
-                "`Array<T>`/`OwningArray<T>`, `Set`, `Stack`, `Queue`, "
-                "`LinkedList`, `Dictionary` and their owning forms), never a "
-                "collection interface such as the `IEnumerable<U>` a "
-                "`SelectMany`/`Select` selector returns; use a block body with "
-                "an explicitly-typed local instead "
-                "(`(x) => do var inner: Array<U> := [...]; return inner; end`) "
-                "(§15.4)");
+            const auto* cl =
+                static_cast<const ast::CollectionLiteralExpr*>(
+                    lam->exprBody.get());
+            if (lamTargetRet &&
+                !isCollectionLiteralInterfaceTarget(lamTargetRet) &&
+                isCollectionLiteralAdmissibleTarget(lamTargetRet, /*isDict=*/false)) {
+                if (cl->isDict)
+                    reportCollectionLiteralDictFormBadTarget(
+                        ctx_.diagnostics(), lam->exprBody->span.begin,
+                        lamTargetRet);
+                else
+                    reportCollectionLiteralBadTarget(
+                        ctx_.diagnostics(), lam->exprBody->span.begin,
+                        lamTargetRet);
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, lam->exprBody->span.begin,
+                    "collection literal has no determinable target type as a "
+                    "lambda's expression body — a collection literal is well-typed "
+                    "only against a concrete collection target (an inline array, or "
+                    "`Array<T>`/`OwningArray<T>`, `Set`, `Stack`, `Queue`, "
+                    "`LinkedList`, `Dictionary` and their owning forms), never a "
+                    "collection interface such as the `IEnumerable<U>` a "
+                    "`SelectMany`/`Select` selector returns; use a block body with "
+                    "an explicitly-typed local instead "
+                    "(`(x) => do var inner: Array<U> := [...]; return inner; end`) "
+                    "(§15.4)");
+            }
         }
         for (const auto& s : lam->stmts) if (s) visitStmt(*s);
         // issue #777 / §30.6: forgotten `await` in an expression-bodied async
@@ -6345,6 +7047,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         inBindAtom_ = saveInBindAtom;  // §17.15 (#2098)
         inIteratorMethod_ = saveIter;
         inLambda_ = saveInLambda;
+        inContractClause_ = saveInContractClause;
+        currentClauseKind_ = saveClauseKind;
         loopDepth_ = saveLoop;
         loopLabelStack_ = std::move(saveLoopLabels);  // §21.5 (v0.201)
         loopEdgeNarrowing_ = std::move(saveLoopEdges);  // §7.4 (#2152)

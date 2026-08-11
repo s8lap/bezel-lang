@@ -31,8 +31,7 @@ std::string wrap(const std::string& body, const std::string& sig = "M()") {
         "class T destructor end destructor; end T; "
         "class U destructor end destructor; end U; "
         "class Source public method Read(): T => new T(); end Source; "
-        "class C "
-        "  public source: Source := null; "
+        "class C(source: Source) "
         "  public method ") + sig + " " + body + " end; "
         "end C;";
 }

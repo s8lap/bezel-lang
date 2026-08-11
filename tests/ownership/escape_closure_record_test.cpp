@@ -24,6 +24,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -69,6 +70,8 @@ BEZEL_TEST(own_closure_escape, return_lambda_capturing_using_var_diagnosed_28_9)
         "  return lambda() => r.V; "
         "end MakeEscaping;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned closure captures `r`"));
 }
 
 // An owned local that is NOT a `using var` but is owned by virtue of holding a
@@ -81,6 +84,8 @@ BEZEL_TEST(own_closure_escape, return_lambda_capturing_owned_local_diagnosed_28_
         "  return lambda() => r.V; "
         "end MakeEscaping;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned closure captures `r`"));
 }
 
 // --- D1 controls: closures that do NOT escape an owned source (ACCEPT) ----
@@ -147,6 +152,8 @@ BEZEL_TEST(own_record_escape, return_record_borrowing_using_var_diagnosed_9_7) {
         "  return new Holder(r); "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned borrow-bearing record carries a borrow of `r`"));
 }
 
 // §9.7 with an owned (non-`using var`) local source: same escape.
@@ -157,6 +164,8 @@ BEZEL_TEST(own_record_escape, return_record_borrowing_owned_local_diagnosed_9_7)
         "  return new Holder(r); "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned borrow-bearing record carries a borrow of `r`"));
 }
 
 // --- D2 controls: records that carry no escaping borrow (ACCEPT) ----------
@@ -225,7 +234,7 @@ std::string wrapRefField(const std::string& method) {
         "module M; "
         "class R "
         "  public V: int := 0; "
-        "  public Inner: R := null; "
+        "  public Inner: R? := null; "
         "  destructor end destructor; "
         "end R; "
         "record Holder(Ref: R); "
@@ -254,7 +263,7 @@ BEZEL_TEST(own_indirect_escape, return_reborrow_of_using_var_diagnosed_28_3) {
 // source `obj`); returning `b` outlives `r`.
 BEZEL_TEST(own_indirect_escape, return_reborrow_of_reference_field_diagnosed_28_3) {
     auto r = parseAndCheckOwnership(wrapRefField(
-        "public static method Leak(): R "
+        "public static method Leak(): R? "
         "  using var r := new R(); "
         "  var b := r.Inner; "
         "  return b; "

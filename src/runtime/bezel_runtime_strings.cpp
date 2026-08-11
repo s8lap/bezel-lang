@@ -1062,6 +1062,7 @@ extern "C" char* bz_cstring_from_bytes(const void* arrp) {
 extern "C" void* bz_cstring_to_bytes(const char* cstr) {
     auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
     if (!arr) return nullptr;
+    arr->kind = BZ_RUNTIME_KIND_ARRAY;  // fix #3026
     if (!cstr) {
         // Null CString → empty owned Array<byte> (count 0, no data buffer).
         return arr;

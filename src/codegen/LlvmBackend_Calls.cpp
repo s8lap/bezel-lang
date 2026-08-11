@@ -192,15 +192,35 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     // issue #421: a NUMERIC/char primitive conversion (emitPrimitiveToString's
     // snprintf path) heap-allocates BOTH the bz_string object and its data
     // buffer solely to feed this write; nothing else references it, so it must
-    // be freed after the write or it leaks (~26 bytes/call for `WriteLine(7)`).
-    // The bool path returns a constant-global string (not heap) and the named-
-    // type ToString()/placeholder paths may return a retained/constant string,
-    // so only the numeric/char conversion sets this.
-    bool freeTransient = false;
-    auto isFreeablePrim = [](sema::PrimitiveType p) {
-        return p != sema::PrimitiveType::String &&
-               p != sema::PrimitiveType::Bool;  // bool → constant globals
-    };
+    // be reclaimed after the write or it leaks (~26 bytes/call for
+    // `WriteLine(7)`).
+    //
+    // fix #2875 / §8.5 / §28.9 (v0.240): reclaim it with the RC-AWARE release,
+    // never a raw free(), and key that on the PROPERTY "the console converted
+    // the argument" rather than on an enumeration of primitive kinds. The
+    // rendered string is a `+1` the console owns and discharges exactly once
+    // (the same contract #2066 records for the record-field render path) — but
+    // "+1" does not imply "a private malloc". Three of `emitPrimitiveToString`'s
+    // `P::Object` arms hand back something free() destroys or corrupts:
+    //   • a CLASS receiver renders §8.5's "the type's qualified name", an
+    //     immortal string LITERAL — free() on a constant global ABORTED the
+    //     process ("free(): invalid pointer");
+    //   • a STRING receiver gets the RECEIVER back (stdlib §9.6 `String`:
+    //     "public pure override method ToString(): string;  // returns this"),
+    //     retained since #2846 — free() destroyed the caller's own live string,
+    //     silently (a later read SEGV'd in bz_string_to_utf8z);
+    //   • a boxed `bool` or a boxed `enum` with the default rendering reaches
+    //     the box thunk's sentinel answer ("True"/"False", the type's name) —
+    //     a literal again.
+    // The old predicate excluded exactly `String` and `Bool` by name, so
+    // `Object` — which is none of the kinds it was written for — fell through
+    // to the raw free. `bz_string_release` is the one discharge correct for
+    // every arm: a no-op on a sentinel or null, a decrement on a shared
+    // reference, and precisely the `free(data); free(obj)` pair on a private
+    // rc==1 render. `P::String` never reaches the conversion at all (the branch
+    // below skips it), so the BORROWED string argument is still left to the
+    // #1031 producer arm after the write.
+    bool releaseRender = false;
     // fix #581 / fix #583 / §7 / §18.5: nullable VALUE types (int?, bool?,
     // double?, enum?, nullable record) lower to a tagged {i8 hasValue; T}
     // struct.  The existing Primitive dispatch below calls
@@ -239,20 +259,48 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         phi->addIncoming(valStr, valEnd);
         phi->addIncoming(nullStr, nullEnd);
         strPtr = phi;
-        // Note: freeTransient stays false here.  The valStr may be a
-        // transient heap string (for numeric inner types) or a constant
-        // global (for bool/string).  Freeing a PHI result conditionally after
-        // the write requires a second hasValue check; the minor leak matches
-        // what the interpolation path accepts.  Tracking this is a follow-up
-        // to issue #421 for nullable arguments.
-        emitConsoleWrite(strPtr, isWriteLine, stdfd);
-        return true;
+        // fix #2880 / §8.5 / §28.9 (v0.240): DISCHARGE this render too. The old
+        // note here said releasing a PHI result "requires a second hasValue
+        // check"; since #2875 the discharge is `emitStringRelease`, which is
+        // rc-aware and sentinel-safe, so no second check is needed — one
+        // unconditional release covers both arms:
+        //   • the `null` arm is `lowerStringLiteral("null")`, whose rc is the
+        //     #422 sentinel — release is a NO-OP, not a free of a constant
+        //     global (the hazard the raw free() of the pre-#2875 code posed);
+        //   • the hasValue arm is `emitValueToString` on the NON-nullable inner
+        //     type, which #2066 records as "a fresh +1 producer" for every
+        //     value-typed rendering (`bz_int_to_string`, `bz_double_to_string`,
+        //     `bz_char_to_string`, `bz_decimal_to_string`, a nested record's
+        //     final concat) and a sentinel literal for the rest (`bool` →
+        //     "True"/"False", an enum without a user `ToString` → §8.5's type
+        //     name). Release is exactly-once on the first group, a no-op on the
+        //     second.
+        // The one shape #2066 calls a BORROW — `string`'s identity render
+        // (stdlib §9.6 `String.ToString`: "returns this") — cannot reach here:
+        // `isNullableValueTy` admits only nullable PRIMITIVE-value / enum /
+        // record / choice / value-builtin types, and `string?` is a nullable
+        // REFERENCE (a plain `ptr`, so both this branch's guards fail). Nor can
+        // a nullable CLASS or INTERFACE, so the callee-side unknown #2879
+        // records for an `Object`/class `ToString` is structurally out of reach
+        // of this branch. Verified by re-reading every source after the write.
+        //
+        // Falls through to the SHARED write+discharge tail instead of doing its
+        // own — one write site, one discharge site.
+        releaseRender = true;
     }
-    if (argTy) {
+    // `strPtr == arg` — i.e. no conversion has happened yet. The nullable-value
+    // branch above is the one path that leaves this block with a converted
+    // `strPtr`, and it must NOT be re-converted: `emitPrimitiveToString` on the
+    // raw `{i8; T}` struct is exactly the #581/#583 crash/misprint that branch
+    // exists to prevent.
+    if (argTy && strPtr == arg) {
         if (argTy->kind == sema::TypeRef::Kind::Primitive &&
             argTy->primitive != sema::PrimitiveType::String) {
             strPtr = emitPrimitiveToString(arg, argTy->primitive);
-            freeTransient = isFreeablePrim(argTy->primitive);
+            // fix #2875: the render is a `+1` this call owns — discharge it
+            // rc-aware below. `strPtr != arg` is the whole condition: nothing
+            // here needs to know WHICH primitive produced it.
+            releaseRender = (strPtr != arg);
         } else if (argTy->kind == sema::TypeRef::Kind::Named &&
                    argTy->declaration) {
             // Named type (class/record) — call ToString() via virtual
@@ -289,6 +337,12 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
                     std::string("\"") + std::string(ts->name) + "\"",
                     false);
             }
+            // #2875 note: this branch deliberately still leaves its render
+            // un-discharged — a minting `ToString` override on a class argument
+            // leaks its rendered string once per call. That is the BOUNDED
+            // direction and is out of this fix's scope (measured and filed
+            // separately); the branch is listed here so the omission reads as a
+            // decision rather than an oversight.
         }
     }
     // issue #420: fall back on the lowered VALUE's LLVM type when the sema
@@ -306,10 +360,8 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     if (strPtr == arg && arg->getType() && !arg->getType()->isPointerTy()) {
         if (arg->getType()->isDoubleTy() || arg->getType()->isFloatTy()) {
             strPtr = emitPrimitiveToString(arg, sema::PrimitiveType::Double);
-            freeTransient = true;  // numeric snprintf path heap-allocates
         } else if (arg->getType()->isIntegerTy(1)) {
             strPtr = emitPrimitiveToString(arg, sema::PrimitiveType::Bool);
-            // bool → constant globals, nothing to free.
         } else if (arg->getType()->isIntegerTy()) {
             // Widen to i64 so the %lld snprintf path receives the full value
             // (matches the interpolation path's sign-extension to i64).
@@ -317,16 +369,21 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
                 ? arg
                 : builder_.CreateSExt(arg, i64());
             strPtr = emitPrimitiveToString(iv, sema::PrimitiveType::Long);
-            freeTransient = true;  // numeric snprintf path heap-allocates
         }
+        // fix #2875: same rule as the typed branch — the numeric snprintf path
+        // heap-allocates and the bool path yields a sentinel; a release is
+        // right for both, so no per-kind bookkeeping is needed here either.
+        releaseRender = (strPtr != arg);
     }
     if (!strPtr) return false;
     emitConsoleWrite(strPtr, isWriteLine, stdfd);
-    // issue #421: free the write-only transient (its data buffer first, then
-    // the bz_string object). Done AFTER the write, which only reads the string.
-    if (freeTransient) {
-        builder_.CreateCall(freeFn(), {loadStringData(strPtr)});
-        builder_.CreateCall(freeFn(), {strPtr});
+    // issue #421 / fix #2875: discharge the write-only render. Done AFTER the
+    // write, which only reads the string. `bz_string_release` frees the data
+    // buffer and then the header at rc == 0 — the exact pair the raw free()
+    // here used to emit — and is a no-op on the literal/sentinel and shared
+    // arms that free() corrupted (see the `releaseRender` declaration above).
+    if (releaseRender) {
+        emitStringRelease(strPtr);
     } else if (strPtr == arg && call.args[0].value &&
                isPlusOneStringProducer(call.args[0].value.get())) {
         // #1031 / §4.6 / §28.9: a fresh +1 STRING argument ($"..." interpolation,
@@ -337,8 +394,7 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         // A borrow (string local/field/literal) is NOT a plus-one producer, so it
         // is not released (no premature free of the shared reference).
         // emitStringRelease is null/sentinel-safe; gated on `strPtr == arg` so a
-        // converted numeric transient (freed via freeTransient above) is never
-        // double-released here.
+        // converted render (released above) is never double-released here.
         emitStringRelease(strPtr);
     }
     return true;
@@ -369,7 +425,9 @@ int64_t Emitter::collectionElemSize(const sema::TypeRef* collTy) {
 // §6.1 / §30.8: extract the builtin type name from a Named TypeRef with no
 // user TypeDecl.  Two shapes are possible:
 //   a) !rt->declaration: the name lives in rt->headName().
-//   b) rt->declaration is a builtinClassSym (null decl): name = declaration->name.
+//   b) rt->declaration is a builtinClassSym (null decl AND empty moduleName, so
+//      an imported user class — same null-decl shape, but a populated moduleName
+//      — is NOT mistaken for one; see #2997): name = declaration->name.
 // Returns an empty string_view if the TypeRef is not in either shape.
 std::string_view Emitter::builtinTypeName(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return {};
@@ -388,9 +446,32 @@ std::string_view Emitter::builtinTypeName(const sema::TypeRef* rt) {
         if (!rt->importedName.empty()) return rt->importedName;
         return {};
     }
-    // builtinClassSym — non-null declaration, null decl (no user TypeDecl).
-    if (!rt->declaration->decl) return rt->declaration->name;
+    // builtinClassSym — non-null declaration, null decl (no user TypeDecl), AND
+    // no originating module. fix #2997 (spec §11.3 / §28.3, v0.240): an IMPORTED
+    // user class is shaped EXACTLY like a builtinClassSym here — declaration
+    // non-null, decl null (there is no ast::TypeDecl for another module's
+    // source) — so `!decl` alone is not "built-in". §11.3 reserves no names, so
+    // a dependency module is free to export a class called `Stopwatch` and an
+    // importer's `using var s := new Stopwatch();` is a legal program with no
+    // built-in in it. The fact that tells them apart is one the compiler already
+    // computes: the module loader (ModuleLoader.cpp loadMetadataPass1) populates
+    // TypeSymbol::moduleName from the dependency's metadata for EVERY imported
+    // type, while a synthetic builtinClassSym (SemaContext::builtinClassSym)
+    // leaves it empty. That empty/non-empty split — not `!decl` — is what
+    // identifies a real built-in, and answering it in this one chokepoint fixes
+    // every probe routed through builtinTypeName (the five residual arms of
+    // registerUsingDisposal: Stopwatch / FileStream / CancellationTokenSource /
+    // Random / Atomic) at once.
+    if (!rt->declaration->decl && rt->declaration->moduleName.empty())
+        return rt->declaration->name;
     return {};
+}
+
+
+// fix #2809 / §32.5 / stdlib §10.1–§10.3 (v0.240): see the header for why this
+// must read BOTH TypeRef shapes rather than `declaration->name`.
+bool Emitter::isFfiBufferTypeRef(const sema::TypeRef* rt) {
+    return common::isFfiBufferBuiltinName(builtinTypeName(rt));
 }
 
 
@@ -2176,9 +2257,41 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                             findMethodByName(elemTypeRef->declaration, "CompareTo"))
                         if (cm->params.size() == 1) cmpMs = cm;
                 }
-                if (isStrElem || cmpMs) {
-                    // Element is a pointer (string object / class instance) in
-                    // both cases.
+                // fix #2770 (stdlib §5.1, spec §14.2, v0.240): an INTERFACE
+                // element never satisfies the probe above — findMethodByName
+                // walks CLASS bases only (baseClassOf) and additionally demands
+                // `methodFns_.count(ms)`, a COMPILED BODY, while the element's
+                // `CompareTo` is declared on `IComparable` and has none. So
+                // `cmpMs` stayed null, this whole arm was skipped, and the
+                // numeric path below built an `icmp` between a pointer and an
+                // i32 — LLVM's `ICmpInst::AssertOK` fired and the compiler
+                // ABORTED. stdlib §5.1 declares these forms in
+                //     public extension IEnumerable<T> where T: IComparable<T>
+                //       public method Min(): T;  public method Max(): T;
+                // and spec §14.2 conformance rule 3 admits an interface
+                // substitution — "**T is an interface** that has I in its
+                // extension chain" — so this is a document-admissible shape
+                // that must compile and must order by the user's CompareTo.
+                //
+                // Reuses #2768's `bz$ifacecmp$<Iface>` thunk UNCHANGED: its
+                // `bz_array_sort` ABI takes the ADDRESS of each element slot,
+                // and `ep` (from bz_array_ptr_at) and `accSlot` are exactly
+                // that, so no second thunk and no generalization is needed.
+                // The arm is chosen from the STATIC element type by the exact
+                // §5.1 constraint (see selfComparableIfaceCompareTo), never by
+                // a runtime word test — so, as in #2768, no other element
+                // category can be mis-routed into it. Tried only when `cmpMs`
+                // is null, so every shape that works today is bit-identical.
+                llvm::Function* ifaceCmpFn = nullptr;
+                if (!isStrElem && !cmpMs) {
+                    if (sema::MethodSymbol* ifm =
+                            selfComparableIfaceCompareTo(elemTypeRef))
+                        ifaceCmpFn = ensureIfaceCmpThunk(
+                            elemTypeRef->declaration, ifm);
+                }
+                if (isStrElem || cmpMs || ifaceCmpFn) {
+                    // Element is a pointer (string object / class or interface
+                    // instance) in all cases.
                     auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
                     llvm::Value* len = builder_.CreateCall(lenFn, {recv});
                     // stdlib §5.1: Min()/Max() throw on an empty source.
@@ -2227,6 +2340,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                 module_.get());
                         }
                         cmp = builder_.CreateCall(strcmpFn, {elData, accData}, "mm.cmp");
+                    } else if (ifaceCmpFn) {
+                        // fix #2770: §13 itable dispatch of the element's own
+                        // `CompareTo` — the identical dispatch a written-out
+                        // `el.CompareTo(acc)` uses. `ep` and `accSlot` are slot
+                        // ADDRESSES, which is the thunk's ABI.
+                        cmp = builder_.CreateCall(ifaceCmpFn, {ep, accSlot},
+                                                  "mm.cmp");
                     } else {
                         std::vector<llvm::Value*> cargs{el, acc};
                         cmp = emitMethodCall(cmpMs, cargs, /*baseQualified=*/false);
@@ -2249,6 +2369,79 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.SetInsertPoint(endBB);
                     freeLazyTemp();
                     return builder_.CreateLoad(ptrTy(), accSlot, "mm.r");
+                }
+                // fix #2770: a REFERENCE element (class or interface — both
+                // lower to a pointer) for which no comparator could be
+                // resolved must not fall through to the numeric path below.
+                // That path derives an i32 accumulator and folds the result
+                // with `icmp`, so it built `icmp ptr, i32` and LLVM's
+                // `ICmpInst::AssertOK` ABORTED the compiler — the ICE this
+                // issue reports. Sema's §5.1 gate scans the element's DIRECT
+                // AST base list for the NAME `IComparable` without checking
+                // its type argument or nullability, so it admits shapes the
+                // interface arm above correctly declines, and every one of
+                // them landed on that assertion. MEASURED to reach here:
+                //   * `Array<IFoo?>` — spec §14.2: "A type-bound constraint
+                //     — naming a class or interface — implies non-null T",
+                //     so a nullable element does not satisfy §5.1's
+                //     `where T: IComparable<T>`.
+                //   * `interface IG<T>: IComparable<IG<int>>` with element
+                //     `IG<string>` — §12.9, IComparable is INVARIANT, so this
+                //     does not satisfy the self-recurrence either.
+                // Reporting an Error and returning a type-correct null keeps
+                // the IR well-formed and ends the build with a diagnostic
+                // instead of an assertion failure. This can only affect
+                // programs that abort the compiler today: sema rejects a
+                // reference element whose type names no `IComparable` at all,
+                // so the residue reaching here is exactly the ICE set.
+                // fix #2784 (stdlib §5.1, spec §14.2, v0.240): this guard
+                // originally also required `elemTypeRef->declaration`, and a
+                // BUILTIN interface element has none — the whitelist at
+                // TypeResolution_Names.cpp:1511 attaches a synthesized
+                // Interface TypeSymbol to IComparable/IEquatable/
+                // IEqualityComparer/IReadOnlySpan/INumber/ISteppable/IParsable
+                // and NOT to IDisposable (root cause: #2789). So
+                // `Array<IDisposable>.Min()` slipped past BOTH this guard and
+                // sema's #1198 gate — which scans the element declaration's
+                // base list and likewise found nothing to scan — and compiled
+                // with NO diagnostic at all, returning a non-null pointer
+                // chosen under no defined ordering. MEASURED: it returned 92
+                // (a non-null result) where the user-defined analogue is
+                // correctly rejected.
+                //
+                // The declaration requirement is therefore dropped: what makes
+                // an element admissible here is that a comparator was RESOLVED
+                // (the arms above), not that it happens to carry a declaration.
+                // Anything reaching this point is a reference element with no
+                // usable ordering, whatever its symbol representation. Same
+                // reasoning as #2786's category-blind guard — enumerating the
+                // shapes that may arrive is exactly how this family kept
+                // acquiring new members.
+                //
+                // `headName()` is used for the message because it is defined
+                // for a Named TypeRef WITHOUT a declaration (it falls back to
+                // the syntactic head, then to the metadata importedName) and
+                // it resolves through a type alias (#1462).
+                if (elemTypeRef &&
+                    elemTypeRef->kind == sema::TypeRef::Kind::Named &&
+                    (!elemTypeRef->declaration ||
+                     elemTypeRef->declaration->kind == ast::TypeDeclKind::Class ||
+                     elemTypeRef->declaration->kind ==
+                         ast::TypeDeclKind::Interface)) {
+                    std::string_view en = elemTypeRef->declaration
+                                              ? elemTypeRef->declaration->name
+                                              : elemTypeRef->headName();
+                    ctx_.diagnostics().report(
+                        Severity::Error, call.span.begin,
+                        std::string(m) +
+                        "() without a selector requires the element type to "
+                        "satisfy `T: IComparable<T>` (stdlib §5.1 / spec "
+                        "§14.2 / #2770); `" +
+                        (en.empty() ? std::string("<element>") : std::string(en)) +
+                        "` does not — its `CompareTo` could not be resolved "
+                        "for dispatch. Use " + std::string(m) +
+                        "(selector: (T) -> U) instead.");
+                    return llvm::ConstantPointerNull::get(ptrTy());
                 }
             }
 
@@ -2286,7 +2479,25 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                             findMethodByName(uRef->declaration, "CompareTo"))
                         if (cm->params.size() == 1) uCmpMs = cm;
                 }
-                if (uIsStr || uCmpMs) {
+                // fix #2770: the SELECTOR sibling of the defect fixed above —
+                // the identical findMethodByName probe, so an INTERFACE
+                // projection U was equally invisible. stdlib §5 declares
+                //     public method Min<U>(selector: (T) -> U): U
+                //                                     where U: IComparable<U>
+                // so an interface U is admissible on exactly the §14.2 rule-3
+                // grounds. MEASURED: this site does not reach the `icmp`
+                // assertion — with U an interface the call degrades to the
+                // #2491 "return-value expression failed to lower" internal
+                // diagnostic instead — but the ROOT CAUSE is the same probe,
+                // and a class U at the same site compiles and runs correctly.
+                llvm::Function* uIfaceCmpFn = nullptr;
+                if (!uIsStr && !uCmpMs) {
+                    if (sema::MethodSymbol* ifm =
+                            selfComparableIfaceCompareTo(uRef))
+                        uIfaceCmpFn =
+                            ensureIfaceCmpThunk(uRef->declaration, ifm);
+                }
+                if (uIsStr || uCmpMs || uIfaceCmpFn) {
                     llvm::Value* closureP =
                         lowerLinqLambda(call.args[0].value.get(), uRef);
                     if (!closureP) return nullptr;
@@ -2299,6 +2510,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                            {ptrTy(), i64(), i64()});
                     auto* idxSlot = entryAlloca(i64());
                     auto* accSlot = entryAlloca(ptrTy());
+                    // fix #2770: scratch slot for the interface arm below (the
+                    // thunk takes slot addresses, not values). Unused by the
+                    // string / class arms.
+                    auto* pvSlot = entryAlloca(ptrTy());
                     // Seed the accumulator with selector(element[0]) and scan
                     // from index 1 (avoids comparing against a null accumulator).
                     llvm::Value* p0 = builder_.CreateCall(
@@ -2338,6 +2553,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                 module_.get());
                         }
                         cmp = builder_.CreateCall(strcmpFn, {pvData, accData},
+                                                  "mm.cmp");
+                    } else if (uIfaceCmpFn) {
+                        // fix #2770: the thunk's ABI is slot ADDRESSES, and the
+                        // projection `pv` is a value, so spill it to an entry
+                        // alloca. `accSlot` already is such a slot.
+                        builder_.CreateStore(pv, pvSlot);
+                        cmp = builder_.CreateCall(uIfaceCmpFn, {pvSlot, accSlot},
                                                   "mm.cmp");
                     } else {
                         std::vector<llvm::Value*> cargs{pv, acc};
@@ -3053,11 +3275,33 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     findMethodByName(elemTR->declaration, "CompareTo");
                 if (cm && cm->params.size() == 1) classCompareMs = cm;
             }
+            // fix #2768 (stdlib §4.4/§2.8, spec §14.2, v0.240): an INTERFACE
+            // element `IFoo: IComparable<IFoo>` is neither a Class (so
+            // classCompareMs stays null) nor a string, yet it lowers to
+            // ptrTy() — so isStringElem below used to select bz$strcmp, which
+            // strcmp'd each element's VTABLE POINTER as a char*. Every instance
+            // of one class shares one vtable, so every pair compared equal and
+            // Sort() was a silent no-op with CompareTo never called. Dispatch
+            // through the §13 itable instead. See selfComparableIfaceCompareTo
+            // / ensureIfaceCmpThunk for why no other element category can be
+            // routed here.
+            sema::MethodSymbol* ifaceCompareMs =
+                classCompareMs ? nullptr : selfComparableIfaceCompareTo(elemTR);
+            // Null when the interface descriptor or itable index is missing;
+            // the pre-fix comparator choice then stands unchanged.
+            llvm::Function* ifaceCmpFn =
+                ifaceCompareMs
+                    ? ensureIfaceCmpThunk(elemTR->declaration, ifaceCompareMs)
+                    : nullptr;
             // Choose comparator: class IComparable → bz$classcmp$<Name>,
+            // interface IComparable → bz$ifacecmp$<Name>,
             // string → bz$strcmp, int/other → bz$intcmp.
-            bool isStringElem = !classCompareMs && (elemTy2 == ptrTy());
+            bool isStringElem =
+                !classCompareMs && !ifaceCmpFn && (elemTy2 == ptrTy());
             llvm::Function* cmpFn = nullptr;
-            if (classCompareMs) {
+            if (ifaceCmpFn) {
+                cmpFn = ifaceCmpFn;
+            } else if (classCompareMs) {
                 // Class IComparable<T> comparator thunk: dispatches a.CompareTo(b)
                 // via vtable (virtual/override) or direct compiled call otherwise.
                 // Each thunk arg is ptr* — a pointer to the class-pointer slot in
@@ -3335,9 +3579,23 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     findMethodByName(elemTR2->declaration, "CompareTo");
                 if (cm && cm->params.size() == 1) classCompareMs2 = cm;
             }
-            bool isStringElem2 = !classCompareMs2 && (elemTy2 == ptrTy());
+            // fix #2768: interface element — see the Sort() site above. The
+            // sema gate on the comparerless Sorted() (ExprTypecheck_Calls.cpp)
+            // admits exactly the same self-referential shape, so this arm and
+            // that gate accept or reject in lockstep.
+            sema::MethodSymbol* ifaceCompareMs2 =
+                classCompareMs2 ? nullptr
+                                : selfComparableIfaceCompareTo(elemTR2);
+            llvm::Function* ifaceCmpFn2 =
+                ifaceCompareMs2
+                    ? ensureIfaceCmpThunk(elemTR2->declaration, ifaceCompareMs2)
+                    : nullptr;
+            bool isStringElem2 =
+                !classCompareMs2 && !ifaceCmpFn2 && (elemTy2 == ptrTy());
             llvm::Function* cmpFn2 = nullptr;
-            if (classCompareMs2) {
+            if (ifaceCmpFn2) {
+                cmpFn2 = ifaceCmpFn2;
+            } else if (classCompareMs2) {
                 // Class IComparable<T> comparator thunk (mirrors Sort() path).
                 // per §14.2 / #1195.
                 std::string thunkName2 = std::string("bz$classcmp$") +
@@ -4246,9 +4504,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
             llvm::Value* query = lowerExpr(*call.args[0].value);
             if (!query) return nullptr;
+            // fix #2938 / §22.3: see TryGetValue above.
             llvm::Type* outTy = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, outTy, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             // False-path null now (§22.3 / #891 pre-null convention); the
             // found path below overwrites it. T is always class (`where T:
             // class`, stdlib §4.10), so this is always a plain nullable
@@ -4294,6 +4558,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::BasicBlock* foundEnd = builder_.GetInsertBlock();
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             auto* phi2 = builder_.CreatePHI(i1(), 2, "tt.r");
             phi2->addIncoming(builder_.getTrue(), foundEnd);
             phi2->addIncoming(builder_.getFalse(), condBB);
@@ -4597,9 +4863,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // the TryGetValue out-write; bz_array_len/get/remove_at already exist.
         if ((m == "TryPop" || m == "TryDequeue" || m == "TryPeek") &&
             call.args.size() == 1 && call.args[0].value) {
+            // fix #2938 / §22.3: see TryGetValue above.
             llvm::Type* outTy = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[0].value, outTy, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             // v0.171 (#1336): the out param is `T?`. A value instantiation
             // (Stack<int>/Queue<int>) uses the tagged `{i8,T}` slot; a class
             // instantiation a nullable pointer. On the FALSE (empty) path the
@@ -4656,6 +4928,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             auto* phi = builder_.CreatePHI(i1(), 2, "trypop.r");
             phi->addIncoming(builder_.getTrue(), foundBB);
             phi->addIncoming(builder_.getFalse(), preBB);
@@ -4726,9 +5000,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // malformed IR (bug16). Modeled on TryPop + the PopFirst/PopLast pop.
         if ((m == "TryPopFirst" || m == "TryPopLast") &&
             call.args.size() == 1 && call.args[0].value) {
+            // fix #2938 / §22.3: see TryPop above.
             llvm::Type* outTy = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[0].value, outTy, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             // v0.171 (#1336): the out param is `owned T?`. Owning collections
             // require class elements, so the slot is a nullable pointer; still,
             // handle the tagged-struct form uniformly. False path → null.
@@ -4765,6 +5045,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             auto* phi = builder_.CreatePHI(i1(), 2, "trypopfl.r");
             phi->addIncoming(builder_.getTrue(), foundBB);
             phi->addIncoming(builder_.getFalse(), preBB);
@@ -4801,9 +5083,112 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
             return builder_.CreateICmpEQ(len, builder_.getInt64(0), "arr.empty");
         }
-        // per §3: .AddRange(other: Array<T>) — append all elements from another array
+        // stdlib §4.4 (v0.240) declares on `Array<T>`:
+        //     public method AddRange(items: IEnumerable<T>);
+        // and stdlib §4.5 declares the sibling owning overload on `OwningArray<T>`:
+        //     public method AddRange(owned items: OwningArray<T>);   // drains items into self
         if (m == "AddRange" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* other = lowerExpr(*call.args[0].value);
+            // fix #2721 / stdlib §4.4 (v0.240): `items` is declared
+            // `IEnumerable<T>`, NOT `Array<T>` — so the lowered argument is only
+            // a `bz_array_t*` when the source happens to be array-backed. For a
+            // lazy LINQ pipeline it is a `bz_lazy_t*`, and for an interface-typed
+            // source it is an iterator-vtable object; reading either with
+            // `bz_array_len`/`bz_array_ptr_at` silently appended the wrong
+            // elements (`xs.AddRange(ys.Where(…))` yielded a wrong Count with no
+            // diagnostic, no crash and no ASan report — it read a length out of a
+            // struct of a different shape).
+            //
+            // Same remedy as #2693's `new LinkedList<T>(source)`: drain the
+            // source once through lowerToLazyEnumerator, the one backing-agnostic
+            // normalizer (already used by ToArray/ToSet/ExceptWith), into a
+            // snapshot array and run the existing per-element append loop over
+            // THAT. It covers array-backed collections, bz_llist, Set/Dictionary,
+            // Range, lazy pipelines and vtable `IEnumerable<T>` in one call, and
+            // carries the "dispose the source only if it was a temporary" rule.
+            //
+            // SCOPE. The normalizer is taken only for a BORROWING receiver with a
+            // non-array-backed source, which is exactly the set of shapes that is
+            // broken today; every shape that already works (any array-backed
+            // source, and the whole owning family) keeps the byte-identical raw
+            // path below. Two reasons this restriction is deliberate rather than
+            // conservatism: (a) §4.5's owning overload takes `owned items:
+            // OwningArray<T>` — a concrete array-backed source by declaration, so
+            // there is no lazy shape to normalize; and (b) copying borrowed
+            // element pointers out of a snapshot into an OWNING array would give
+            // two owners for one element (§28.11), so widening the normalizer to
+            // the owning receiver would trade a wrong Count for a double dispose.
+            //
+            // ⚠ `isArrayBackedCollectionName` is NOT usable on its own here.
+            // `kArrayBackedCollections` (BuiltinRegistry.cpp) lists the whole
+            // SET family — `Set`, `OwningSet`, `SortedSet` — even though
+            // lowerNew builds them with `bz_dict_alloc_generic` whenever
+            // `genericBackingType` is non-null, i.e. for every record,
+            // non-nullable primitive, enum and string element (#2726). Trusting
+            // that list pointed `bz_array_len`/`bz_array_ptr_at` at a
+            // `bz_dict_t*` — the very defect this fix exists to remove. It hid
+            // because `bz_array_t{void* data; int64_t count; …}` and
+            // `bz_dict_t{bz_entry_t* buckets; int64_t count; …}` put `count` at
+            // the SAME offset, so the Count aliased correctly while the elements
+            // did not: `bz_array_ptr_at` indexes the bucket array at the
+            // receiver's stride, but `bz_dict_set_gen` stores a malloc'd copy of
+            // the key and puts that POINTER in `buckets[i].key`, so the loop
+            // read `bz_entry_t` header bytes. Measured: `Set<int>{7,8}` gave
+            // Count 2 but `b[0] <> 7`, and `Set<string>` lost the contents.
+            //
+            // So the fast path is taken only for a name that is provably
+            // `bz_array_t*`-backed. The set family is excluded and goes through
+            // lowerToLazyEnumerator, which re-decides with the SAME
+            // `genericBackingType` discriminator lowerNew constructs with:
+            // dict-backed sets take `bz_lazy_from_set`, and a class-element
+            // `Set`/`OwningSet` (for which `genericBackingType` is null, and
+            // which lowerNew therefore really does build as an array) falls
+            // through to the normalizer's own array path. `SortedSet` is
+            // excluded for the same honesty but is NOT thereby fixed — the
+            // normalizer's set branch tests only `Set`/`OwningSet`, so a
+            // `SortedSet` source is still misread there; that is #2726's blast
+            // radius (it also governs ToArray/ToSet/ExceptWith/for-in) and is
+            // deliberately not widened from here.
+            const sema::TypeRef* srcTy = ctx_.exprType(*call.args[0].value);
+            std::string_view srcHead =
+                (srcTy && srcTy->astNode && srcTy->astNode->name &&
+                 !srcTy->astNode->name->parts.empty())
+                    ? srcTy->headName() : std::string_view{};
+            bool srcIsSetFamily = srcHead == "Set" || srcHead == "OwningSet" ||
+                                  srcHead == "SortedSet";
+            bool srcIsArrayBacked =
+                !srcHead.empty() && !srcIsSetFamily &&
+                common::isArrayBackedCollectionName(srcHead);
+            llvm::Value* other = nullptr;
+            llvm::Value* snapToFree = nullptr;   // non-null ⇒ free the shell below
+            if (arrIsOwning || srcIsArrayBacked) {
+                other = lowerExpr(*call.args[0].value);
+            } else {
+                sema::TypeRef* srcElemRef = nullptr;
+                llvm::Value* lazy =
+                    lowerToLazyEnumerator(*call.args[0].value, srcElemRef);
+                if (!lazy) return nullptr;
+                // Element-type guard, mirroring OwningSet.ExceptWith's: reading
+                // the snapshot at the receiver's stride is only sound when the
+                // source's element lowers to the same LLVM type. Sema has no
+                // method model for the builtin collections (they have no
+                // TypeSymbol), so an ill-typed source reaches codegen unchecked.
+                // Only a POSITIVE mismatch is diagnosed — when the source element
+                // is unknown the raw path trusted the argument completely, and
+                // widening that into a rejection would be a false reject.
+                if (srcElemRef && arrElemRef &&
+                    lowerTypeRef(srcElemRef) != lowerTypeRef(arrElemRef)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, call.span.begin,
+                        "stdlib §4.4: 'Array<T>.AddRange(items: IEnumerable<T>)' "
+                        "requires an enumerable source whose element type is T");
+                    return llvm::ConstantInt::get(i32(), 0);
+                }
+                auto* toArrFn =
+                    declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+                other = builder_.CreateCall(
+                    toArrFn, {lazy, builder_.getInt64(esz)}, "ar.snap");
+                snapToFree = other;
+            }
             if (!other) return nullptr;
             llvm::Type* elemTy = getElemTy();
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
@@ -4824,6 +5209,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // borrowing Array<string> takes an INDEPENDENT +1 per appended element
             // (the source `other` keeps its own +1). The element is always RETAINED
             // (a borrowed copy from `other`). arrIsStringElem derived from arrElemPol.
+            // fix #2721: unchanged on the snapshot path. `bz_lazy_to_array` does
+            // NOT retain (the ToArray terminal calls bz_array_retain_strings
+            // separately), so a snapshot slot holds exactly the same BORROWED
+            // reference the raw source slot did — the same single +1 per appended
+            // element, consumed by the receiver's own release-on-removal thunk.
             if (arrIsStringElem) {
                 llvm::Value* elemVal = builder_.CreateLoad(ptrTy(), ep, "ar.elem");
                 emitStringRetain(elemVal);
@@ -4834,6 +5224,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
+            // fix #2721: the snapshot never took ownership of the (borrowed)
+            // elements it copied out of the source, and each one it handed to the
+            // receiver was retained above — so free its SHELL only, with a NULL
+            // disposer. This is the "consumed snapshot" idiom ExceptWith /
+            // IntersectWith use for their own bz_lazy_to_array snapshots.
+            if (snapToFree) {
+                auto* freeSnapFn = declareC("bz_array_free",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                builder_.CreateCall(freeSnapFn,
+                    {snapToFree, llvm::ConstantPointerNull::get(ptrTy())});
+            }
             return llvm::ConstantInt::get(i32(), 0);
         }
         // per §3/§25.2: .Contains(item: T): bool — first element that Equals
@@ -5350,9 +5751,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             call.args[0].value && call.args[1].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
+            // fix #2938 / §22.3: see TryGetValue above.
             llvm::Type* outTy = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, outTy, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             auto* tmpSlot = entryAlloca(ptrTy());
             // §28.11, #891: pre-null tmpSlot so that on the key-not-found
             // (false) path — where bz_dict_pop_value_* does NOT write *out —
@@ -5407,6 +5814,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             } else {
                 builder_.CreateStore(valPtr, outAddr);
             }
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return found;
         }
         // .TryGetValue(k, out v): bool
@@ -5417,8 +5826,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
             // Get the address of the out parameter.
+            // fix #2938 / §22.3: a property or indexer slot target is admitted
+            // by §22.3 and resolves through the §22.3 copy-in/copy-out bracket;
+            // `lvalueAddr` alone declines, so the builtin call bailed and the
+            // write-back silently dropped. `outArgs` carries the bracket record
+            // for the normal-return write-back flush at the merge block below.
             llvm::Type* outTy = nullptr;
             llvm::Value* outAddr;
+            std::vector<AccessorRefArg> outArgs;
             if (call.args[1].isDiscard) {
                 // §22.4 (#1301): `dict.TryGetValue(key, out _)` — the discard has
                 // no destination lvalue (the spec's canonical form: the receiving
@@ -5429,8 +5844,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (!outTy) outTy = ptrTy();
                 outAddr = entryAlloca(outTy);
             } else {
-                outAddr = lvalueAddr(*call.args[1].value, outTy);
-                if (!outAddr) return nullptr;
+                outAddr = resolveOutAddrWithBracket(
+                    *call.args[1].value, outTy, outArgs);
+                if (!outAddr) {
+                    emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                    return nullptr;
+                }
             }
             // bz_dict_try_get_* writes the stored void* into *tmpSlot.
             // For pointer values: the void* IS the string/object pointer.
@@ -5495,6 +5914,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(coerceToNullableSlot(outTy, dv), outAddr);
             builder_.CreateBr(tgEndBB);
             builder_.SetInsertPoint(tgEndBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            // The TryGetValue path never throws, so emit is always true.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return found;
         }
         // .GetOrAdd(k, factory): V  (stdlib §4.8 borrowing / §4.9 owning)
@@ -5915,32 +6337,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* total = builder_.CreateLoad(i64(), sumSlot);
             return builder_.CreateTrunc(total, i32());
         }
-        if (m == "ToString" && call.args.empty()) {
-            // Use the runtime helper to concatenate all string parts.
-            auto* outDataSlot = entryAlloca(ptrTy());
-            auto* outLenSlot  = entryAlloca(i64());
-            auto* fn = declareC("bz_strbuilder_to_string",
-                                llvm::Type::getVoidTy(llvm_),
-                                {ptrTy(), ptrTy(), ptrTy()});
-            builder_.CreateCall(fn, {recv, outDataSlot, outLenSlot});
-            llvm::Value* data = builder_.CreateLoad(ptrTy(), outDataSlot);
-            llvm::Value* len  = builder_.CreateLoad(i64(), outLenSlot);
-            // Build a bz.string object from the malloc'd buffer.
-            // #422: allocate the full header size (now 32 bytes incl. rc), not
-            // a hardcoded 24 — writing rc into field 3 of a 24-byte block would
-            // overflow. getTypeAllocSize is the single source of truth.
-            uint64_t sobjSz = module_->getDataLayout().getTypeAllocSize(stringType());
-            auto* sobj = builder_.CreateCall(
-                callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)sobjSz)});
-            builder_.CreateStore(data,
-                builder_.CreateStructGEP(stringType(), sobj, 0));
-            builder_.CreateStore(len,
-                builder_.CreateStructGEP(stringType(), sobj, 1));
-            builder_.CreateStore(builder_.getInt8(1),
-                builder_.CreateStructGEP(stringType(), sobj, 2));
-            initStringRc(sobj);  // #422: producer's reference, rc := 1
-            return sobj;
-        }
+        // stdlib §3.1 / §8.5 / §18.5: `sb.ToString()` — the builder's OWN
+        // declared `ToString(): string`, not the §8.5 type-name default.
+        // fix #2923 (v0.240): the body moved to `emitStringBuilderToString` so
+        // the §18.5 interpolation hole `$"{sb}"` reaches the SAME lowering
+        // instead of a second, drifting spelling of it (interpolation used to
+        // reach `lowerObjectToString`, which mis-read the builder's parts array
+        // as a `%bz.string`).
+        if (m == "ToString" && call.args.empty())
+            return emitStringBuilderToString(recv);
     }
 
     return nullptr;  // not a collection call
@@ -6227,6 +6632,161 @@ llvm::Value* Emitter::buildChoiceStructValue(
 }
 
 
+// fix #2728 / §32.6 + §28.3 *Unbound owned temporaries* (v0.240). See the
+// declaration in LlvmBackend_impl.hpp for the correctness argument; the short
+// form is that this must match the set of expressions that MINT a buffer, not
+// the set that merely HAS FFI-buffer type.
+//
+// ⚠ RawBytes.FromForeign(p, length, freeOnDispose) (stdlib §10.3) is a fifth
+// `owned`-returning static and is DELIBERATELY NOT in this table: its buffer is
+// FOREIGN, so bz_rawbytes_free would free memory Bezel never allocated. Anyone
+// widening this predicate must widen it by ENUMERATION, never by a rule of the
+// shape "any owned-returning factory" — that phrasing admits FromForeign and
+// turns this reclaim into a free of foreign memory. (Noted by the #2728 review;
+// FromForeign has no handler in tryLowerBuiltinClassCall today, so the hazard is
+// latent rather than live.)
+bool Emitter::isFfiBufferFactoryCall(const ast::Expr& e, bool& isRawBytes) {
+    isRawBytes = false;
+    auto* call = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!call || !call->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id) return false;
+    if (call->args.size() != 1 || !call->args[0].value) return false;
+    // (1) the syntactic factory table, kept in lockstep with the lowering below.
+    bool shape = false;
+    if (id->name == "CString") {
+        shape = (ma->member == "From" || ma->member == "FromBytes");
+    } else if (id->name == "WString") {
+        shape = (ma->member == "From");
+    } else if (id->name == "RawBytes") {
+        shape = (ma->member == "From");
+        isRawBytes = shape;
+    }
+    if (!shape) return false;
+    // (2) and sema must actually have resolved the result to the BUILTIN
+    // CString/WString/RawBytes head (ExprTypecheck_Calls.cpp stamps a
+    // builtinClassSym TypeRef). Without this conjunct a user type that happened
+    // to be named `CString` with a static `From` would have its result freed.
+    std::string_view n = builtinTypeName(ctx_.exprType(e));
+    if (n != id->name) { isRawBytes = false; return false; }
+    return true;
+}
+
+// fix #2728: the reclaim itself — the same null-guarded shape emitDisposals
+// uses for a `using var`-bound FFI buffer (LlvmBackend_Disposal.cpp's
+// `ffiBuffer` arm), so the bound and unbound spellings free identically.
+void Emitter::emitFfiBufferTempFree(llvm::AllocaInst* slot, bool isRawBytes) {
+    llvm::Value* buf = builder_.CreateLoad(ptrTy(), slot, "ffitmp.buf");
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        buf, llvm::ConstantPointerNull::get(ptrTy()), "ffitmp.isnull");
+    auto* frBB = llvm::BasicBlock::Create(llvm_, "ffitmp.free", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "ffitmp.cont", currentFn_);
+    builder_.CreateCondBr(isNull, contBB, frBB);
+    builder_.SetInsertPoint(frBB);
+    if (isRawBytes) {
+        // stdlib §10.3 / fix #985: a RawBytes is a { ptr, len } struct whose
+        // buffer is a separate allocation — both are reclaimed by the runtime
+        // helper, exactly as the `using var` path does.
+        auto* fn = declareC("bz_rawbytes_free", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy()});
+        builder_.CreateCall(fn, {buf});
+    } else {
+        builder_.CreateCall(freeFn(), {buf});
+    }
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
+// fix #2733 / §28.3 (v0.240): establish an extern-argument FFI buffer's reclaim.
+//
+// Two things happen here, and they are the two halves of the one defect:
+//
+// (1) A `ffiBuffer` Disposal is pushed onto disposeStack_.back() AT PRODUCTION.
+//     §28.3: "each temporary's disposal is established at its production, so the
+//     pass runs in reverse order of production on the establishment-ordered
+//     cleanup stack". This is what covers the EXCEPTION edge — the backend's
+//     unwind path (emitPendingCheck → emitUnwindDisposals) is literally a walk
+//     of disposeStack_, so a later argument that throws now disposes this
+//     buffer instead of leaking it.
+//
+//     ⚠ `unwindOnly` is deliberately NOT set. emitDisposals tests `unwindOnly`
+//     BEFORE `ffiBuffer` and each arm `continue`s, so an entry carrying both
+//     would take the unwindOnly arm and reach emitDisposeAndReclaim — a VTABLE
+//     DISPATCH through the first bytes of a raw malloc'd buffer (it has no
+//     object header). Leaving it a plain `ffiBuffer` entry also makes it fire
+//     on the normal scope-exit edge, which is the deliberate conservative
+//     BACKSTOP: if no full-expression boundary ever reaches this temp (a
+//     lowering path that produces it below depth 0 — e.g. inside a lambda body
+//     lowered mid-expression), it is still freed exactly once at its own scope
+//     end. Later than §28.3's boundary, never earlier: a bounded over-live, not
+//     a use-after-free.
+//
+// (2) The temp is queued for the next full-expression boundary, where
+//     flushFfiExprTemps frees it and NULLS the slot — after which the entry
+//     from (1) is a null-guarded no-op on every subsequent edge.
+//
+// ⚠ LATENT INVARIANT THIS DESIGN RESTS ON, undocumented before the #2733 review:
+// a LEAF THUNK must never call lowerExpr. The ~45 leaf thunks and trampolines
+// (LINQ, box ToString/Equals/GetHashCode, sort comparators, spawn adapters,
+// widening thunks) do not touch disposeStack_, which is safe ONLY because none
+// of them lowers a user expression, so this function never runs under one. If
+// one ever did, (1) would push a Disposal holding a FOREIGN function's alloca
+// onto the enclosing function's live disposeStack_ — malformed IR. Every emitter
+// that DOES lower user code under a swapped currentFn_ (the lambda body, the six
+// property/indexer accessor emitters, buildSpecializedMethodFn, the three
+// Layout.cpp thunks, genericInstSfinitFn, the specialized disposers) saves,
+// clears and restores disposeStack_, which is what keeps (1) per-function.
+void Emitter::registerFfiExprTemp(llvm::AllocaInst* slot, bool isRawBytes) {
+    if (!slot) return;
+    if (!disposeStack_.empty()) {
+        Disposal d{slot, nullptr};
+        d.ffiBuffer = true;
+        d.rawBytes = isRawBytes;
+        disposeStack_.back().push_back(d);
+    }
+    ffiExprTemps_.push_back({slot, isRawBytes, currentFn_});
+}
+
+// fix #2733 / §28.3 (v0.240): the full-expression boundary discharge. Called
+// from lowerExpr when nesting depth returns to 0 — i.e. once the whole K8 full
+// expression has been lowered and "every use of it within that expression has
+// completed", which is precisely where §28.3 puts the disposal. Emitting here
+// instead of after the callee's CreateCall is what keeps the buffer live across
+// an OUTER call that reads an alias the extern returned.
+void Emitter::flushFfiExprTemps() {
+    // A terminated block means the full expression diverged (a `throw`); the
+    // unwind edge's disposeStack_ walk has already reclaimed these, and emitting
+    // after a terminator would be invalid IR. Drop the queue: entry (1) above
+    // still guards every remaining edge.
+    llvm::BasicBlock* bb = builder_.GetInsertBlock();
+    bool live = currentFn_ && bb && !bb->getTerminator();
+    std::vector<FfiExprTemp> keep;
+    for (const auto& t : ffiExprTemps_) {
+        // Never emit a free against another function's alloca (see
+        // FfiExprTemp::fn), and — this is the part that matters — do not DROP it
+        // either. A nested-function boundary fires while the ENCLOSING
+        // expression is still open (`f(CString.From(x), lambda …)`), so the
+        // outer function's temps are still owed a reclaim at the outer boundary.
+        // Keeping them queued is what makes that boundary still find them.
+        if (t.fn != currentFn_) { keep.push_back(t); continue; }
+        // Diverged: the block is terminated, the unwind edge's disposeStack_
+        // walk already reclaimed this, and emitting after a terminator would be
+        // invalid IR. Drop without emitting.
+        if (!live) continue;
+        emitFfiBufferTempFree(t.slot, t.rawBytes);
+        // Discharge, exactly as buildOrderedArgs nulls transferredOwnedArgSlots:
+        // the disposeStack_ entry established at production stays registered but
+        // now loads null, so scope end / return / unwind are all no-ops. This is
+        // what makes the reclaim exactly-once on every path, and it is also what
+        // makes a LOOP correct — the slot is an entry-block alloca reused by
+        // every iteration, and each iteration's flush re-arms it.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), t.slot);
+    }
+    ffiExprTemps_.swap(keep);
+}
+
 llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -6320,9 +6880,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // instance method.)
     {
         auto* recvTy = ctx_.exprType(*ma->target);
-        bool isRaw = recvTy &&
-            recvTy->kind == sema::TypeRef::Kind::Named &&
-            recvTy->declaration && recvTy->declaration->name == "RawBytes";
+        // fix #2809 (v0.240): both TypeRef shapes — a `rb: RawBytes` PARAMETER
+        // carries no `declaration`, so the declaration-only test silently
+        // declined the call and `rb.CopyTo(dst, 0)` became a NO-OP that copied
+        // nothing (measured: the round-trip sum came back 0 instead of 26).
+        bool isRaw = builtinTypeName(recvTy) == "RawBytes" &&
+            isFfiBufferTypeRef(recvTy);
         if (isRaw && ma->member == "CopyTo" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
             llvm::Value* rb = lowerExpr(*ma->target);
@@ -6357,9 +6920,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // so the local picks up the array-backed disposal path (bz_array_free).
     {
         auto* recvTy = ctx_.exprType(*ma->target);
-        bool isCStr = recvTy &&
-            recvTy->kind == sema::TypeRef::Kind::Named &&
-            recvTy->declaration && recvTy->declaration->name == "CString";
+        // fix #2809 (v0.240): both TypeRef shapes — on a `c: CString` PARAMETER
+        // receiver the declaration-only test declined and the call fell through
+        // to codegen's "initializer failed to lower" internal degrade (#2434).
+        bool isCStr = builtinTypeName(recvTy) == "CString" &&
+            isFfiBufferTypeRef(recvTy);
         if (isCStr && ma->member == "ToBytes" && call.args.empty()) {
             llvm::Value* cstr = lowerExpr(*ma->target);
             if (!cstr) return nullptr;
@@ -6510,13 +7075,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (btn653 == "Weak") {
                 if (mname == "TryUpgrade" && call.args.size() == 1 &&
                     call.args[0].value) {
+                    // fix #2938 / §22.3: see TryGetValue above.
                     llvm::Type* slotTy = nullptr;
-                    llvm::Value* outAddr = lvalueAddr(*call.args[0].value, slotTy);
-                    if (!outAddr) return builder_.getFalse();
+                    std::vector<AccessorRefArg> outArgs;
+                    llvm::Value* outAddr = resolveOutAddrWithBracket(
+                        *call.args[0].value, slotTy, outArgs);
+                    if (!outAddr) {
+                        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                        return builder_.getFalse();
+                    }
                     auto* fn = declareC("bz_weak_try_upgrade", i32(),
                                         {ptrTy(), ptrTy()});
                     llvm::Value* r = builder_.CreateCall(fn, {handle, outAddr},
                                                          "weak.tryupgrade");
+                    // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+                    emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
                     return builder_.CreateICmpNE(r, builder_.getInt32(0),
                                                  "weak.upgraded");
                 }
@@ -7135,9 +7708,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
             // Address of the out parameter (slot pre-created by ensureOutVarSlots).
+            // fix #2938 / §22.3: see TryGetValue in tryLowerBuiltinClassCall.
             llvm::Type* et = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, et, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             // #1238: use strtoll (not strtol) for unambiguous 64-bit result so
             // we can range-check to [INT32_MIN, INT32_MAX] before truncating.
             auto* strtollTry = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
@@ -7169,6 +7748,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* trunc32 = builder_.CreateTrunc(val64, i32());
             llvm::Value* sel32 = builder_.CreateSelect(ok, trunc32, builder_.getInt32(0), "tryc.sel");
             builder_.CreateStore(sel32, outAddr);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return ok;
         }
         // per stdlib §2.3 / #1356: Convert.TryToInt64(value: string, out result: long): bool.
@@ -7177,9 +7758,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
+            // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et64 = nullptr;
-            llvm::Value* outAddr64 = lvalueAddr(*call.args[1].value, et64);
-            if (!outAddr64) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr64 = resolveOutAddrWithBracket(
+                *call.args[1].value, et64, outArgs);
+            if (!outAddr64) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             auto* strtollT64 = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
             auto* endSlotT64 = entryAlloca(ptrTy());
             llvm::Value* val64_t = builder_.CreateCall(
@@ -7199,6 +7786,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* sel64 = builder_.CreateSelect(
                 ok64, val64_t, builder_.getInt64(0), "tryc64.sel");
             builder_.CreateStore(sel64, outAddr64);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return ok64;
         }
         // per stdlib §2.3 / #1356: Convert.TryToDouble(value: string, out result: double): bool.
@@ -7207,9 +7796,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
+            // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* etd = nullptr;
-            llvm::Value* outAddrd = lvalueAddr(*call.args[1].value, etd);
-            if (!outAddrd) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddrd = resolveOutAddrWithBracket(
+                *call.args[1].value, etd, outArgs);
+            if (!outAddrd) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             auto* strtodTr = declareC("strtod",
                 llvm::Type::getDoubleTy(llvm_), {ptrTy(), ptrTy()});
             auto* endSlotTd = entryAlloca(ptrTy());
@@ -7231,6 +7826,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 okTd, dvTd,
                 llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), 0.0), "tryd.sel");
             builder_.CreateStore(selTd, outAddrd);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return okTd;
         }
         // per stdlib §2.3 / #1356: Convert.TryToDecimal(value: string, out result: decimal): bool.
@@ -7242,12 +7839,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::AllocaInst* slotDec = entryAlloca(dst);
             auto* fn = declareC("bz_decimal_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* okDec = builder_.CreateCall(fn, {strVal, slotDec}, "trydec.ok");
+            // fix #2938 / §22.3: see Convert.TryToInt32 above. Note the
+            // existing branch was `if (outAddrdec) { ... }` (the value
+            // assignment was conditional on outAddrdec being non-null,
+            // so a null lvalueAddr silently dropped the write). With the
+            // bracket, the slot is always present — only the writeback
+            // gating changes — so the assignment runs unconditionally.
             llvm::Type* etdec = nullptr;
-            llvm::Value* outAddrdec = lvalueAddr(*call.args[1].value, etdec);
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddrdec = resolveOutAddrWithBracket(
+                *call.args[1].value, etdec, outArgs);
+            if (!outAddrdec) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             if (outAddrdec) {
                 llvm::Value* resultDec = builder_.CreateLoad(dst, slotDec, "trydec.val");
                 builder_.CreateStore(resultDec, outAddrdec);
             }
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(okDec, builder_.getInt32(0), "trydec.bool");
         }
         // per stdlib §2.3 / #1356: Convert.TryToBoolean(value: string, out result: bool): bool.
@@ -7274,10 +7885,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* cmpOneTB = builder_.CreateICmpEQ(
                 builder_.CreateCall(strcmpFnTB, {strData, oneGVTB}), builder_.getInt32(0));
             llvm::Value* boolResult = builder_.CreateOr(cmpTrueTB, cmpOneTB, "tryb.res");
+            // fix #2938 / §22.3: see Convert.TryToInt32 above. Same pattern as
+            // TryToDecimal: the existing branch was `if (outAddrb)` (the value
+            // assignment was conditional on outAddrb being non-null), so a null
+            // lvalueAddr silently dropped the write. With the bracket, the slot
+            // is always present — only the writeback gating changes — so the
+            // assignment runs unconditionally.
             llvm::Type* etb = nullptr;
-            llvm::Value* outAddrb = lvalueAddr(*call.args[1].value, etb);
-            if (outAddrb)
-                builder_.CreateStore(boolResult, outAddrb);
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddrb = resolveOutAddrWithBracket(
+                *call.args[1].value, etb, outArgs);
+            if (!outAddrb) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                // (return nullptr would skip the ok computation below; the
+                // pre-existing site returned okTB regardless.)
+                return nullptr;
+            }
+            builder_.CreateStore(boolResult, outAddrb);
             // TryToBoolean always succeeds for "true"/"1"/"false"/"0" input; if neither
             // matches we return false and store false — mirrors Convert.ToBoolean contract.
             llvm::Constant* falseStrTB = llvm::ConstantDataArray::getString(llvm_, "false", true);
@@ -7294,6 +7918,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* okTB = builder_.CreateOr(
                 builder_.CreateOr(cmpTrueTB, cmpOneTB),
                 builder_.CreateOr(cmpFalseTB, cmpZeroTB), "tryb.ok");
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return okTB;
         }
         // Convert.ToString(n, radix: int): string — radix-based conversion.
@@ -7631,11 +8257,192 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         findMethodByName(t->declaration, "CompareTo"))
                     if (cm->params.size() == 1) return cm;
             }
+            // fix #2782 (stdlib §2.2, spec §14.2, v0.240): an INTERFACE
+            // argument was omitted from the kind test above, so this returned
+            // null, the `Math.Min`/`Max`/`Clamp` arms fell through to the
+            // float path, and the call degraded to a ZERO/NULL result with
+            // only the #2491 internal Warning — the build SUCCEEDED and the
+            // program silently computed the wrong answer. That is strictly
+            // worse than #2770's ICE on the sibling `Array<T>.Min()` shape:
+            // a stopped build cannot ship, a wrong value can.
+            //
+            // stdlib §2.2 declares
+            //     public static method Min<T>(a: T, b: T): T
+            //                                     where T: IComparable<T>;
+            // and spec §14.2 conformance rule 3 admits an interface
+            // substitution — "**T is an interface** that has I in its
+            // extension chain" — so this is a document-admissible shape that
+            // must compute the user's ordering.
+            //
+            // Selected by the exact §2.2 constraint (selfComparableIfaceCompareTo,
+            // shared with #2768/#2770), from the STATIC argument type, never by
+            // a runtime word test — so no other category can be mis-routed in,
+            // and `string` is structurally excluded (stdlib §9.6 names no
+            // `IComparable<Self>`). Tried only after the kind test above
+            // returns nothing, so every shape that works today is unchanged.
+            if (sema::MethodSymbol* ifm = selfComparableIfaceCompareTo(t))
+                return ifm;
             return nullptr;
+        };
+        // fix #2785 (stdlib §2.2 / §9.6, spec §4.6, v0.240): is this argument a
+        // non-null `string`? stdlib §9.6 declares
+        //     public class String: IEnumerable<char>, IComparable<string>,
+        //                          IEquatable<string>
+        // so string satisfies §2.2's `where T: IComparable<T>` and
+        // `Math.Min("b", "a")` is document-admissible. It was not admitted by
+        // `comparableCompareTo` (string is none of Record/Enum/Class and has no
+        // MethodSymbol to return), so the Min/Max/Clamp arms fell through to
+        // the FLOAT path and `CreateSIToFP` was handed a POINTER — the compiler
+        // ABORTED with "SIToFP source must be integer or integer vector".
+        //
+        // A NULLABLE `string?` TypeRef is accepted here as well, and that is
+        // deliberate rather than an oversight: §7.4 narrowing does NOT rewrite
+        // the variable's exprType (ExprTypecheck_impl.hpp:146 — "the declared
+        // (nullable) type is preserved so codegen's nullable-value layout logic
+        // … stays correct"), so a `string?` PROVEN non-null by `if p <> null`
+        // still presents as nullable here. Requiring non-null would abort the
+        // compiler on legal narrowed code. Safety comes from the paired sema
+        // gate, which rejects an UN-narrowed `string?` argument outright, and
+        // from `emitStrCmp`, which fails closed unless both operands lowered to
+        // pointers — `string?` shares `string`'s plain-pointer representation
+        // (verified by measuring the narrowed shape end-to-end, not assumed).
+        auto isStringArg = [&](const ast::Expr* e) -> bool {
+            const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+            return t && t->kind == sema::TypeRef::Kind::Primitive &&
+                   t->primitive == sema::PrimitiveType::String;
+        };
+        // fix #2785: ORDINAL comparison on the two data pointers — the same
+        // lowering `Array<string>.Min()` already uses (tryLowerCollectionInstanceCall's
+        // `isStrElem` arm), so `Math.Min` and the collection form agree by
+        // construction. stdlib §9.6 fixes string ordering as ordinal.
+        auto emitStrCmp = [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
+            if (!a || !b || !a->getType()->isPointerTy() ||
+                !b->getType()->isPointerTy())
+                return nullptr;
+            llvm::Value* aData = builder_.CreateLoad(
+                ptrTy(), builder_.CreateStructGEP(stringType(), a, 0));
+            llvm::Value* bData = builder_.CreateLoad(
+                ptrTy(), builder_.CreateStructGEP(stringType(), b, 0));
+            auto* strcmpFn = module_->getFunction("strcmp");
+            if (!strcmpFn) {
+                auto* ft =
+                    llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                strcmpFn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "strcmp",
+                    module_.get());
+            }
+            return builder_.CreateCall(strcmpFn, {aData, bData}, "mm.strcmp");
+        };
+        // fix #2786 (stdlib §2.2, spec §14.2, v0.240): the float fallback below
+        // is reached by anything the integer, CompareTo (#1141/#1148/#2782) and
+        // string (#2785) arms all declined. It immediately does
+        // `CreateSIToFP(v, double)`, which ABORTS the compiler outright on a
+        // POINTER operand ("SIToFP source must be integer or integer vector").
+        //
+        // This guard is deliberately CATEGORY-BLIND — it tests the lowered LLVM
+        // type rather than enumerating the source categories that may reach it.
+        // Enumerating is what produced this family in the first place: the kind
+        // tests listed Record|Enum|Class and were then found to be missing
+        // Interface (#2782), string (#2785), and now the builtin interfaces.
+        // Any operand that is not numeric cannot satisfy §2.2's
+        // `where T: IComparable<T>` in a form this lowering can compare, so the
+        // honest answer is a spec-cited Error, not an assertion failure.
+        //
+        // The known reacher is a BUILTIN interface argument (`IDisposable`).
+        // ROOT CAUSE, recorded here because the guard only contains it: the
+        // whitelist at TypeResolution_Names.cpp:1511 attaches a real synthesized
+        // Interface TypeSymbol to `IComparable`/`IEquatable`/`IEqualityComparer`/
+        // `IReadOnlySpan`/`INumber`/`ISteppable`/`IParsable` — and NOT to
+        // `IDisposable`, whose TypeRefs therefore carry no `declaration` at all.
+        // Every gate in this family keys on `declaration`, which is why the same
+        // blind spot shows up as #2784 (the §5.1 gate bypassed for
+        // `Array<IDisposable>`) and #2766 (no `resolvedDeclType`, so a thunk
+        // signature fell back to an i32 placeholder). Adding IDisposable to that
+        // whitelist would close all three at the source, but it changes the
+        // symbol representation of the type the whole §28 disposal machinery is
+        // built on — out of scope for a bug fix, filed instead.
+        auto rejectNonNumericMathOperand = [&](llvm::Value* v) -> bool {
+            if (!v) return false;
+            if (v->getType()->isIntegerTy() || v->getType()->isFloatingPointTy())
+                return false;
+            // ⚠ The message must NOT claim the argument type HAS no ordering.
+            // It reaches here whenever this lowering could not find one, and
+            // those are different claims: `decimal` also lands here (measured —
+            // it aborted identically before this guard), yet stdlib §4.4 gives
+            // it a perfectly good ordering that Math simply has no arm for.
+            // Filed as its own defect; an inaccurate diagnostic would be a poor
+            // trade for an assertion failure.
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "`Math." + std::string(m) +
+                "` could not lower a comparison for this argument type "
+                "(stdlib §2.2 requires `where T: IComparable<T>`): it is not a "
+                "numeric primitive this intrinsic handles, not `string`, and "
+                "exposes no `CompareTo` reachable from here. (#2786)");
+            return true;
+        };
+        // fix #2788 (stdlib §2.2 / §4.4, spec §4.4, v0.240): a `decimal`
+        // argument. decimal is a numeric primitive with a total order, so §2.2's
+        // `where T: IComparable<T>` admits it — but it lowers to a STRUCT, not
+        // an LLVM integer or float, so it too fell into the float fallback and
+        // aborted on `CreateSIToFP` (measured, identical to #2785's string
+        // abort). This is the fourth category this family was found to be
+        // missing, after Interface (#2782), string (#2785) and the builtin
+        // interfaces (#2786).
+        //
+        // Reuses the runtime comparison every other decimal ordering already
+        // uses — `bz_decimal_cmp` on two struct slots, returning -1/0/+1, the
+        // same path a plain `x < 2m` takes (LlvmBackend_Exprs2.cpp:7431's
+        // decCmp). So Math.Min and the `<` operator agree by construction.
+        auto isDecimalArg = [&](const ast::Expr* e) -> bool {
+            const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+            return t && !t->nullable &&
+                   t->kind == sema::TypeRef::Kind::Primitive &&
+                   t->primitive == sema::PrimitiveType::Decimal;
+        };
+        // Fails CLOSED: a null result falls through to #2786's guard, which
+        // reports a spec-cited Error, rather than to the aborting SIToFP.
+        auto emitDecCmp = [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
+            llvm::StructType* dst = decimalStructType();
+            if (!a || !b || !dst || a->getType() != dst || b->getType() != dst)
+                return nullptr;
+            llvm::AllocaInst* aSlot = entryAlloca(dst);
+            llvm::AllocaInst* bSlot = entryAlloca(dst);
+            builder_.CreateStore(a, aSlot);
+            builder_.CreateStore(b, bSlot);
+            auto* cmpFn = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+            return builder_.CreateCall(cmpFn, {aSlot, bSlot}, "mm.deccmp");
         };
         auto emitCompareToCmp = [&](sema::MethodSymbol* cmpMs, llvm::Value* a,
                                     llvm::Value* b,
                                     const ast::Expr* recvExpr) -> llvm::Value* {
+            // fix #2782: an interface receiver's `CompareTo` is declared on
+            // `IComparable` and has NO compiled body, so emitMethodCall below
+            // cannot reach it. Dispatch through #2768's `bz$ifacecmp$<Iface>`
+            // thunk instead — the same §13 itable dispatch a written-out
+            // `a.CompareTo(b)` uses. The thunk's ABI is two element-SLOT
+            // addresses, and here both operands are values, so each spills to
+            // one entry alloca (exactly as #2770's selector site does).
+            // Fail-CLOSED: any leg that cannot be established returns null,
+            // which the callers propagate as "not lowered" rather than
+            // silently selecting an operand.
+            if (cmpMs && cmpMs->parent &&
+                cmpMs->parent->kind == ast::TypeDeclKind::Interface) {
+                const sema::TypeRef* rt =
+                    recvExpr ? ctx_.exprType(*recvExpr) : nullptr;
+                if (!rt || !rt->declaration) return nullptr;
+                if (!a || !b || !a->getType()->isPointerTy() ||
+                    !b->getType()->isPointerTy())
+                    return nullptr;
+                llvm::Function* thunk =
+                    ensureIfaceCmpThunk(rt->declaration, cmpMs);
+                if (!thunk) return nullptr;
+                llvm::Value* aSlot = entryAlloca(ptrTy());
+                llvm::Value* bSlot = entryAlloca(ptrTy());
+                builder_.CreateStore(a, aSlot);
+                builder_.CreateStore(b, bSlot);
+                return builder_.CreateCall(thunk, {aSlot, bSlot}, "cmp.iface");
+            }
             // fix #1858 / §5 / §11 / §14.2: for a GENERIC-record IComparable
             // instantiation (`Box<string>`), install the per-instantiation
             // generic substitution from the receiver's concrete type arguments
@@ -7872,7 +8679,25 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     llvm::Value* le = builder_.CreateICmpSLE(
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(le, a, b, "min.cmp.result");
+                } else if (isStringArg(call.args[0].value.get())) {
+                    // fix #2785 / stdlib §9.6: ordinal string ordering.
+                    llvm::Value* cmp = emitStrCmp(a, b);
+                    if (!cmp) return nullptr;
+                    llvm::Value* le = builder_.CreateICmpSLE(
+                        cmp, llvm::ConstantInt::get(cmp->getType(), 0));
+                    return builder_.CreateSelect(le, a, b, "min.str.result");
+                } else if (llvm::Value* dcmp =
+                               isDecimalArg(call.args[0].value.get())
+                                   ? emitDecCmp(a, b) : nullptr) {
+                    // fix #2788 / stdlib §4.4: decimal ordering via bz_decimal_cmp.
+                    llvm::Value* le = builder_.CreateICmpSLE(
+                        dcmp, llvm::ConstantInt::get(dcmp->getType(), 0));
+                    return builder_.CreateSelect(le, a, b, "min.dec.result");
                 } else {
+                    // fix #2786: fail CLOSED before the SIToFP below.
+                    if (rejectNonNumericMathOperand(a) ||
+                        rejectNonNumericMathOperand(b))
+                        return nullptr;
                     // float/double: use llvm.minnum intrinsic
                     auto* dbl = llvm::Type::getDoubleTy(llvm_);
                     if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
@@ -7894,7 +8719,25 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     llvm::Value* ge = builder_.CreateICmpSGE(
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(ge, a, b, "max.cmp.result");
+                } else if (isStringArg(call.args[0].value.get())) {
+                    // fix #2785 / stdlib §9.6: ordinal string ordering.
+                    llvm::Value* cmp = emitStrCmp(a, b);
+                    if (!cmp) return nullptr;
+                    llvm::Value* ge = builder_.CreateICmpSGE(
+                        cmp, llvm::ConstantInt::get(cmp->getType(), 0));
+                    return builder_.CreateSelect(ge, a, b, "max.str.result");
+                } else if (llvm::Value* dcmp =
+                               isDecimalArg(call.args[0].value.get())
+                                   ? emitDecCmp(a, b) : nullptr) {
+                    // fix #2788 / stdlib §4.4: decimal ordering via bz_decimal_cmp.
+                    llvm::Value* ge = builder_.CreateICmpSGE(
+                        dcmp, llvm::ConstantInt::get(dcmp->getType(), 0));
+                    return builder_.CreateSelect(ge, a, b, "max.dec.result");
                 } else {
+                    // fix #2786: fail CLOSED before the SIToFP below.
+                    if (rejectNonNumericMathOperand(a) ||
+                        rejectNonNumericMathOperand(b))
+                        return nullptr;
                     auto* dbl = llvm::Type::getDoubleTy(llvm_);
                     if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
                     if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
@@ -7975,7 +8818,46 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     cmpHi, llvm::ConstantInt::get(cmpHi->getType(), 0));
                 llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
                 return builder_.CreateSelect(ltLo, lo, inner, "clamp.cmp.result");
+            } else if (isDecimalArg(call.args[0].value.get())) {
+                // fix #2788 / stdlib §4.4: decimal ordering via bz_decimal_cmp,
+                // same shape as the CompareTo arm above. Each comparison is
+                // emitted EXACTLY ONCE — testing emitDecCmp in the `else if`
+                // condition would emit its allocas and call and then emit them
+                // again in the body, leaving dead `bz_decimal_cmp` calls in the
+                // block.
+                llvm::Value* cmpLo = emitDecCmp(val, lo);
+                llvm::Value* cmpHi = emitDecCmp(val, hi);
+                // Fail CLOSED, and loudly: a null here means the operands did
+                // not carry the decimal struct layout after all, which must not
+                // become a silent zero/null result (#2491).
+                if (!cmpLo || !cmpHi) {
+                    rejectNonNumericMathOperand(val);
+                    return nullptr;
+                }
+                llvm::Value* ltLo = builder_.CreateICmpSLT(
+                    cmpLo, llvm::ConstantInt::get(cmpLo->getType(), 0));
+                llvm::Value* gtHi = builder_.CreateICmpSGT(
+                    cmpHi, llvm::ConstantInt::get(cmpHi->getType(), 0));
+                llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
+                return builder_.CreateSelect(ltLo, lo, inner, "clamp.dec.result");
+            } else if (isStringArg(call.args[0].value.get())) {
+                // fix #2785 / stdlib §9.6: ordinal string ordering, same shape
+                // as the CompareTo arm above.
+                llvm::Value* cmpLo = emitStrCmp(val, lo);
+                llvm::Value* cmpHi = emitStrCmp(val, hi);
+                if (!cmpLo || !cmpHi) return nullptr;
+                llvm::Value* ltLo = builder_.CreateICmpSLT(
+                    cmpLo, llvm::ConstantInt::get(cmpLo->getType(), 0));
+                llvm::Value* gtHi = builder_.CreateICmpSGT(
+                    cmpHi, llvm::ConstantInt::get(cmpHi->getType(), 0));
+                llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
+                return builder_.CreateSelect(ltLo, lo, inner, "clamp.str.result");
             } else {
+                // fix #2786: fail CLOSED before the SIToFP below.
+                if (rejectNonNumericMathOperand(val) ||
+                    rejectNonNumericMathOperand(lo) ||
+                    rejectNonNumericMathOperand(hi))
+                    return nullptr;
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
                 if (!val->getType()->isDoubleTy()) val = builder_.CreateSIToFP(val, dbl);
                 if (!lo->getType()->isDoubleTy())  lo  = builder_.CreateSIToFP(lo, dbl);
@@ -8809,13 +9691,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* fn = declareC("bz_decimal_try_parse", i32(),
                                 {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(fn, {strVal, slot}, "dec.tryp.ok");
-            // Write the result into the out parameter.
+            // Write the result into the out parameter. // fix #2938 / §22.3
+            // The pre-fix branch was `if (outAddr)`, which silently dropped
+            // the write when the target was an accessor-mediated location
+            // (lvalueAddr returned null). resolveOutAddrWithBracket falls back
+            // to the §22.3 bracket, so the assignment always runs and the
+            // bracket flushes below.
             llvm::Type* et = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-            if (outAddr) {
-                llvm::Value* result = builder_.CreateLoad(dst, slot, "dec.tryp.val");
-                builder_.CreateStore(result, outAddr);
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, et, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
             }
+            llvm::Value* result = builder_.CreateLoad(dst, slot, "dec.tryp.val");
+            builder_.CreateStore(result, outAddr);
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "dec.tryp.bool");
         }
     }
@@ -8890,9 +9782,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
+            // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, et, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             auto* strcasecmpFn = declareC("strcasecmp", i32(), {ptrTy(), ptrTy()});
             llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
             unsigned tid = stringLiteralIdx_++;
@@ -8911,6 +9809,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 builder_.getInt32(0), "btpc.isFalse");
             llvm::Value* ok = builder_.CreateOr(cmpTrue, cmpFalse, "btpc.ok");
             builder_.CreateStore(cmpTrue, outAddr);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return ok;
         }
     }
@@ -9004,9 +9904,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             const ast::Expr* parseArg = call.args[0].value.get();
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, et, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             // If the out slot is not a guid-struct slot (different elem type),
             // use our own slot and copy.  Normally outAddr is already the right size.
             auto* fn = declareC("bz_guid_try_parse", i32(), {ptrTy(), ptrTy()});
@@ -9021,6 +9927,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // is the full-expression boundary for the argument (§28.3).
             if (isPlusOneStringProducer(parseArg))
                 emitStringRelease(strVal);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "guid.tryp.bool");
         }
         // per stdlib §2.6 / #1357: Guid.FromByteArray(bytes: Array<byte>): Guid
@@ -9114,13 +10022,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             call.args[0].value && call.args[1].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, et, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             auto* tryFn = declareC("bz_datetime_try_parse", i32(),
                                    {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, outAddr},
                                                   "dt.tryp.ok");
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "dt.tryp.bool");
         }
         // per stdlib §2.5 / #1357: DateTime.FromUnixTimeSeconds(seconds: long): DateTime
@@ -9983,17 +10899,27 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* ticksSlot = entryAlloca(i64());
             auto* tryFn = declareC("bz_datetime_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, ticksSlot}, "do.tryp.ok");
+            // fix #2938 / §22.3: see Convert.TryToDecimal above. Pre-fix was
+            // `if (outAddrdo)` (write dropped silently on null lvalueAddr); with
+            // the bracket the slot is always present and the writeback flushes
+            // below.
             llvm::Type* etdo = nullptr;
-            llvm::Value* outAddrdo = lvalueAddr(*call.args[1].value, etdo);
-            if (outAddrdo) {
-                llvm::Value* ticks = builder_.CreateLoad(i64(), ticksSlot, "do.tryp.ticks");
-                llvm::Value* tpd = builder_.getInt64(864000000000LL);
-                llvm::Value* dn = builder_.CreateTrunc(
-                    builder_.CreateSDiv(ticks, tpd), i32(), "do.tryp.dn");
-                llvm::Value* okBool = builder_.CreateICmpNE(ok, builder_.getInt32(0));
-                llvm::Value* sel = builder_.CreateSelect(okBool, dn, builder_.getInt32(0));
-                builder_.CreateStore(sel, outAddrdo);
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddrdo = resolveOutAddrWithBracket(
+                *call.args[1].value, etdo, outArgs);
+            if (!outAddrdo) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
             }
+            llvm::Value* ticks = builder_.CreateLoad(i64(), ticksSlot, "do.tryp.ticks");
+            llvm::Value* tpd = builder_.getInt64(864000000000LL);
+            llvm::Value* dn = builder_.CreateTrunc(
+                builder_.CreateSDiv(ticks, tpd), i32(), "do.tryp.dn");
+            llvm::Value* okBool = builder_.CreateICmpNE(ok, builder_.getInt32(0));
+            llvm::Value* sel = builder_.CreateSelect(okBool, dn, builder_.getInt32(0));
+            builder_.CreateStore(sel, outAddrdo);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "do.tryp.bool");
         }
     }
@@ -10070,14 +10996,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* msSlot = entryAlloca(i32());
             auto* tryFn = declareC("bz_timeonly_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, msSlot}, "to.tryp.ok");
+            // fix #2938 / §22.3: see Convert.TryToDecimal above.
             llvm::Type* etto = nullptr;
-            llvm::Value* outAddrto = lvalueAddr(*call.args[1].value, etto);
-            if (outAddrto) {
-                llvm::Value* ms = builder_.CreateLoad(i32(), msSlot, "to.tryp.ms");
-                llvm::Value* okBool = builder_.CreateICmpNE(ok, builder_.getInt32(0));
-                llvm::Value* sel = builder_.CreateSelect(okBool, ms, builder_.getInt32(0));
-                builder_.CreateStore(sel, outAddrto);
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddrto = resolveOutAddrWithBracket(
+                *call.args[1].value, etto, outArgs);
+            if (!outAddrto) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
             }
+            llvm::Value* ms = builder_.CreateLoad(i32(), msSlot, "to.tryp.ms");
+            llvm::Value* okBool = builder_.CreateICmpNE(ok, builder_.getInt32(0));
+            llvm::Value* sel = builder_.CreateSelect(okBool, ms, builder_.getInt32(0));
+            builder_.CreateStore(sel, outAddrto);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "to.tryp.bool");
         }
     }
@@ -10159,14 +11092,28 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     // The out-slot was pre-created in ensureOutVarSlots.
                     if (mname == "TryUpgrade" && call.args.size() == 1 &&
                         call.args[0].value) {
+                        // fix #2938 / §22.3: a property or indexer slot target
+                        // is admitted by §22.3 and resolves through the §22.3
+                        // copy-in/copy-out bracket; `lvalueAddr` alone declines,
+                        // so the builtin call bailed (#2434) and the write-back
+                        // silently dropped. `outArgs` carries the bracket record
+                        // for the normal-return write-back flush below.
                         llvm::Type* slotTy = nullptr;
-                        llvm::Value* outAddr = lvalueAddr(*call.args[0].value,
-                                                          slotTy);
-                        if (!outAddr) return builder_.getFalse();
+                        std::vector<AccessorRefArg> outArgs;
+                        llvm::Value* outAddr = resolveOutAddrWithBracket(
+                            *call.args[0].value, slotTy, outArgs);
+                        if (!outAddr) {
+                            emitAccessorRefArgWriteBacks(outArgs,
+                                                         /*emit=*/false);
+                            return builder_.getFalse();
+                        }
                         auto* fn = declareC("bz_weak_try_upgrade", i32(),
                                             {ptrTy(), ptrTy()});
                         llvm::Value* r = builder_.CreateCall(fn, {handle, outAddr},
                                                              "weak.tryupgrade");
+                        // fix #2938 / §22.3: flush any bracket on the
+                        // normal-return edge.
+                        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
                         return builder_.CreateICmpNE(r, builder_.getInt32(0),
                                                      "weak.upgraded");
                     }

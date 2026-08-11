@@ -32,6 +32,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -69,6 +70,8 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "  public method Get(): OwningArray<Cell> return field; end Get; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrowed `OwningArray<…>` value may not be returned"));
 }
 
 // The other owning collection heads — same shape, all rejected at the def
@@ -85,6 +88,8 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "  public method Get(): OwningDictionary<int, Cell> return field; end Get; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrowed `OwningDictionary<…>` value may not be returned"));
 }
 
 BEZEL_TEST(owning_collection_borrow_return_1760,
@@ -98,6 +103,8 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "  public method Get(): OwningSet<Cell> return field; end Get; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrowed `OwningSet<…>` value may not be returned"));
 }
 
 BEZEL_TEST(owning_collection_borrow_return_1760,
@@ -111,6 +118,8 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "  public method Get(): OwningStack<Cell> return field; end Get; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrowed `OwningStack<…>` value may not be returned"));
 }
 
 BEZEL_TEST(owning_collection_borrow_return_1760,
@@ -124,6 +133,8 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "  public method Get(): OwningQueue<Cell> return field; end Get; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrowed `OwningQueue<…>` value may not be returned"));
 }
 
 BEZEL_TEST(owning_collection_borrow_return_1760,
@@ -137,6 +148,8 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "  public method Get(): OwningLinkedList<Cell> return field; end Get; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrowed `OwningLinkedList<…>` value may not be returned"));
 }
 
 // A bare identifier (`_items`, implicit `this._items`) — the #1008 Part C
@@ -151,6 +164,8 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "  public method Get(): OwningArray<Cell> => _items; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrowed `OwningArray<…>` value may not be returned"));
 }
 
 // An explicit `this._items` — the #1008 Part C carve-out admitted this; the
@@ -165,6 +180,8 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "  public method Get(): OwningArray<Cell> => this._items; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrowed `OwningArray<…>` value may not be returned"));
 }
 
 // ★ SOUNDNESS REGRESSION GUARD — the coverage gap the issue cites: every prior
@@ -198,6 +215,8 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "  end Consume; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrowed `OwningArray<…>` value may not be returned"));
 }
 
 // ===========================================================================
@@ -240,6 +259,8 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "  public method Take(): owned OwningArray<Cell> => _items; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a bare read of an owned field may not be returned through an `owned` return type"));
 }
 
 // ===========================================================================

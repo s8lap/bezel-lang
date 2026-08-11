@@ -182,6 +182,40 @@ public:
         auto it = lambdaParams_.find(lam);
         return it == lambdaParams_.end() ? nullptr : &it->second;
     }
+    // fix #2839 (§14.1/#783, §14/#662c, v0.240): iterate all lambda→param-list
+    // entries. Used by ModuleLoader to COPY a re-parsed imported generic body's
+    // lambda parameter lists from the fresh context into the main one — the
+    // fourth AST-keyed side table the body-reconstruction remap loops must
+    // carry, alongside allExprSymbols/allResolvedTypes/allExprTypes. Without it
+    // `lambdaParams(&lam)` is null in the importer, codegen's lowerLambda
+    // declares the closure with NO user parameters, and the lambda's value is
+    // lost. The keys are the re-parsed ast::LambdaExpr nodes (kept alive by
+    // ownImportedAst) and the values point into the fresh context's symbol
+    // arena (kept alive by ownImportedAuxiliary).
+    const std::unordered_map<const ast::LambdaExpr*, std::vector<Symbol*>>&
+    allLambdaParams() const {
+        return lambdaParams_;
+    }
+
+    // fix #2857 (§19.3/#1853 / §2.8.2 clause 2, v0.240): patternSymbols_ is the
+    // FIFTH AST-keyed side table the body-reconstruction remap loops must carry
+    // — the last one nothing copied. Without it `patternSymbol(p)` is null in
+    // the importer and codegen's `constValueForPatternName` cannot fold the
+    // local const's compile-time value, so a `case` arm whose pattern is a
+    // bare-name local `const` is rejected outright. Unlike its two silent
+    // siblings (#2818, #2839) this one fails LOUDLY — but it is still the same
+    // §2.8.2 clause 2 divergence: a body that compiles as ONE module fails to
+    // compile through the artifact boundary.
+    //
+    // Keys are the re-parsed ast::Pattern nodes (kept alive by ownImportedAst);
+    // values point into the fresh context's symbol arena (kept alive by
+    // ownImportedAuxiliary). Copied verbatim for the same reason as #2818's
+    // LocalSymbols: the symbol is declared INSIDE the re-parsed body and has no
+    // importer-side twin to remap to.
+    const std::unordered_map<const ast::Pattern*, Symbol*>&
+    allPatternSymbols() const {
+        return patternSymbols_;
+    }
 
     // --- Cross-module imports (§2.2 / §2.5, issue #328 increment 3) ---------
     //
@@ -512,6 +546,48 @@ public:
         return it == importedConstValues_.end() ? nullptr : &it->second;
     }
 
+    // fix #2860 (§2.8.2 "No restrictions beyond visibility" / §22.8 step 2,
+    // v0.240): the source text of an IMPORTED GENERIC class's INSTANCE field
+    // initializer (MetaMember::fieldInitText, recorded by ModuleLoader). A
+    // generic class exports no `bz$<Type>$init`, so the consumer monomorphizes
+    // construction and replays each initializer itself — but it can only replay
+    // one that crossed the boundary as a foldable constant (importedConstValue
+    // above). This table says "this field HAS an initializer", so a construction
+    // site whose replay produced no store can name the shape in a diagnostic
+    // (§2.8.2) instead of silently observing the §7.9 default. Absent → the
+    // field genuinely has no initializer and its §7.9 default is correct.
+    void setImportedInstanceFieldInitText(const Symbol* m,
+                                          std::string_view text) {
+        importedInstanceFieldInitTexts_[m] = std::string(text);
+    }
+    const std::string* importedInstanceFieldInitText(const Symbol* m) const {
+        auto it = importedInstanceFieldInitTexts_.find(m);
+        return it == importedInstanceFieldInitTexts_.end() ? nullptr
+                                                           : &it->second;
+    }
+
+    // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): a load-time-reconstructed
+    // ast::Expr* for an IMPORTED GENERIC class's INSTANCE field initializer —
+    // set by ModuleLoader when the field's `fieldInitText` (#2860) was
+    // successfully re-parsed and sema-typed in a fresh context, and remapped
+    // into mainCtx. Lives in the loader's imported-AST arena (ownImportedAst
+    // keeps the SourceFile alive; the Expr* is a node in that SourceFile).
+    // The codegen path `emitOwnFieldInit` reads this BEFORE consulting
+    // `importedInstanceFieldInitText` so a successful reconstruction runs the
+    // initializer instead of firing the construction-site diagnostic. A parse
+    // or sema failure leaves this null and the diagnostic still fires —
+    // matching the "failure path must not become a load-time reject" rule
+    // (a mere import of the module must still build, #2351 / §2.8.2).
+    void setImportedInstanceFieldInitExpr(const Symbol* m,
+                                          const ast::Expr* e) {
+        importedInstanceFieldInitExprs_[m] = e;
+    }
+    const ast::Expr* importedInstanceFieldInitExpr(const Symbol* m) const {
+        auto it = importedInstanceFieldInitExprs_.find(m);
+        return it == importedInstanceFieldInitExprs_.end() ? nullptr
+                                                           : it->second;
+    }
+
     // §9.8 / §2.3 / issue #922: allocate-and-cache a compiler-intrinsic
     // TypeSymbol for a builtin class name (e.g. "Range", "DateTime",
     // "TimeSpan").  The SAME pointer is returned on every call with the same
@@ -537,6 +613,33 @@ public:
     //   IEqualityComparer: Equals(a: T, b: T): bool; GetHashCode(value: T): int
     // Returns nullptr for any non-builtin-interface name.
     TypeSymbol* builtinInterfaceSym(std::string_view name);
+    // fix #3023 (§11.2 / §14.1 / §2.8.3 rule 5, v0.240): a non-creating
+    // lookup for the synthesized builtin interface symbol. Returns the cached
+    // TypeSymbol or `nullptr` if none has been minted yet — never mints one,
+    // which `builtinInterfaceSym` does as a side effect and which mutates
+    // `symbols_` (a `push_back` can reallocate). The only call site that needs
+    // this is `declareVtables` Pass B (LlvmBackend_Setup.cpp:3874), which is
+    // iterating `ctx_.symbols()` and would otherwise invalidate its iterators
+    // by triggering a reallocation from inside the loop body. Every other
+    // caller of `builtinInterfaceSym` is past sema and outside any
+    // `symbols_` iteration, so the creating form is correct for them.
+    TypeSymbol* builtinInterfaceSymIfCached(std::string_view name) const {
+        auto it = builtinInterfaceCache_.find(std::string(name));
+        return it != builtinInterfaceCache_.end() ? it->second : nullptr;
+    }
+
+    // #2776 / #2787: the CLOSED set of builtin interfaces that get a REAL
+    // synthesized Interface TypeSymbol (see TypeResolution_Names.cpp's
+    // name-resolution site for why each is on the list). Factored into one
+    // predicate rather than copied, because #1867's convention is that these
+    // are matched by IDENTITY against `builtinInterfaceSym` — so every place
+    // that must produce or recognise that identity has to agree on the same
+    // set, and a second hand-written copy is how they drift apart (#2787).
+    static bool isSynthesizedBuiltinInterfaceName(std::string_view n) {
+        return n == "IComparable" || n == "IEquatable" ||
+               n == "IEqualityComparer" || n == "IReadOnlySpan" ||
+               n == "INumber" || n == "ISteppable" || n == "IParsable";
+    }
 
     // §26.5 (#714): store/retrieve the free-type-variable binding that was
     // inferred when a generic extension method matched via ancestor lookup.
@@ -612,6 +715,22 @@ private:
     std::unordered_map<const Symbol*, bool> importedEventIsAsync_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const Symbol*, std::string> importedConstValues_;
+    // fix #2860 (§2.8.2): imported GENERIC class instance-field initializer
+    // source text, keyed by the reconstructed FieldSymbol. See the accessors.
+    std::unordered_map<const Symbol*, std::string>
+        importedInstanceFieldInitTexts_;
+    // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): a load-time-reconstructed
+    // ast::Expr* for an imported GENERIC class's instance field initializer,
+    // set when parseAndAttachFieldInit succeeded for a non-static member
+    // (the same parse path #2351 wrote for static members, without the final
+    // `importedFs->decl = parsedFd` attach that would re-route the imported
+    // member's LAYOUT through a TypeRef resolved in the throwaway context —
+    // see #2860's own decline comment). The Expr* rides in
+    // importedCtorAst_'s SourceFile (the fresh context's parsed SourceFile,
+    // kept alive via ownImportedAuxiliary), so the side-table pointer is
+    // valid for the lifetime of this SemaContext.
+    std::unordered_map<const Symbol*, const ast::Expr*>
+        importedInstanceFieldInitExprs_;
     // §14 / #662c: imported SourceFile objects that own re-parsed ctor/dtor
     // AST nodes for imported generic classes.  The re-parsed AST carries
     // ConstructorDecl / DestructorDecl nodes whose decl pointers are attached

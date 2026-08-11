@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "ast/Node.hpp"
@@ -290,6 +291,176 @@ bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
         return dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(*rma)) !=
                nullptr;
     return false;
+}
+
+// fix #2749 item 3: a builtin INSTANCE-call callee is EITHER a
+// `MemberAccessExpr` (`recv.M(..)`) OR a `NullCondMemberExpr` (`recv?.M(..)`).
+// The two are SIBLING `Expr` kinds — not one a subclass of the other — that
+// share identical `target`/`member` fields, so a `dynamic_cast<
+// MemberAccessExpr*>`-only gate silently misses every `?.` spelling.
+//
+// This is sema's own precedent, added for #2581 for exactly this reason
+// (`ExprTC::builtinInstanceCallee`, sema/ExprTypecheck_Calls.cpp) — duplicated
+// rather than shared because that one is a file-local static inside the sema
+// translation unit. Returns the (target, member) pair, or (nullptr, {}) when
+// the callee is neither kind. // per §7.5, #2581, #2749
+static std::pair<const ast::Expr*, std::string_view> builtinInstanceCallee(
+    const ast::Expr* callee) {
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        return {ma->target.get(), ma->member};
+    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+        return {ncm->target.get(), ncm->member};
+    return {nullptr, {}};
+}
+
+bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
+                                    const sema::SemaContext& ctx) {
+    // See the header contract. // per §21.1 v0.201, stdlib §5 / §4.4 / §9.6,
+    // #2709, #2749
+    auto [maTarget, mm] = builtinInstanceCallee(call.callee.get());
+    if (!maTarget) return false;
+    // The stdlib's `owned`-returning materializer members, each verified to
+    // leak under `const` before being added (100-of-100 under LSan):
+    //   stdlib §5   ToArray / ToSet / ToDictionary  (LINQ terminals)
+    //   stdlib §4.4 Sorted / Reversed / Slice       (Array copy-forms)
+    //   stdlib §9.6 Split                           (string)
+    //   stdlib §7   GetBytes                        (Encoding; the
+    //               `(s, destination: Span<byte>): int` overload returns a
+    //               value type and is excluded by the result-head gate below)
+    // `ToList` is NOT here: stdlib §5 states "There is no `ToList()` because
+    // Bezel does not have a dynamic-array type named `List<T>`".
+    //
+    // NOT EXHAUSTIVE, and knowingly so — see #2749. Grepping the stdlib for
+    // `owned Array` returns also finds ToCharArray, ToByteArray, ToBytes,
+    // CopyToArray, ReadAll / ReadAllBytes / ReadAllLines, GetFiles and
+    // GetDirectories, which are the same shape but were not individually
+    // measured here. The list is deliberately measurement-gated rather than
+    // grep-gated — but note the rationale precisely, because an earlier draft of
+    // this comment stated it wrongly. §21.1 rejects "an `owned`-returning call",
+    // and the STDLIB DECLARATION is the authority for that, NOT whether today's
+    // codegen happens to leak: a `const` binding of `ToCharArray()` is illegal
+    // per spec whether or not it leaks. So the measurement is evidence of
+    // SEVERITY, not of APPLICABILITY, and this list UNDER-APPROXIMATES the rule
+    // rather than tracking it. Under-approximating is the right call for a
+    // diagnostic-only change — the residual names are filed as #2749, one of
+    // them (`ToBytes`) additionally needs a result-head widening to
+    // `owned OwningBuffer<byte>`, and the file-I/O names are hard to probe.
+    if (mm != "ToArray" && mm != "ToSet" && mm != "ToDictionary" &&
+        mm != "Sorted" && mm != "Reversed" && mm != "Slice" &&
+        mm != "Split" && mm != "GetBytes")
+        return false;
+    // BUILTIN only, and the test is "NO symbol at all" — not "no MethodSymbol".
+    // The builtin member-call typing path in sema lives entirely inside
+    // `if (!calleeSym)` (ExprTypecheck_Calls.cpp), so every one of the eight
+    // above reaches its declaration-less collection return type with NOTHING
+    // attached to the callee. Anything sema DID resolve is therefore, by
+    // construction, not one of these builtins.
+    //
+    // A `MethodSymbol`-only cast (which is what isOwningCollectionDrainAliasCall
+    // uses, and what this predicate first copied) is too weak: it lets a
+    // FUNCTION-TYPED FIELD through. `public Split: (string) -> Array<string>;`
+    // attaches a `FieldSymbol` — not a MethodSymbol — and the call is typed
+    // from the field's `funcReturn`, whose plain `Array<string>` slot is
+    // declaration-less, so the result-head gate below passes too. §28.3's
+    // producers table classifies a function-value invocation with a
+    // non-`owned` concrete return as BORROWED, and §21.1 admits borrows
+    // verbatim ("Admitted: […] and **borrows**"), so `const parts :=
+    // cfg.Split(line);` over such a field is LEGAL and must keep compiling.
+    // An `owned`-marked function-typed slot is a different matter and is
+    // already Owned via producerState's `funcReturnOwned` arm — §21.1's FIRST
+    // branch, not this one. // per §28.3, §21.1, #2709
+    //
+    // ⚠ THE SAME NARROWNESS ARGUMENT HOLDS ON THE `?.` PATH, and that is what
+    // makes #2749 item 3's widening safe rather than a false-reject risk. The
+    // null-conditional form is typed by a SEPARATE function with its own
+    // resolution mirror (`ExprTC::resolveNullCondMember`,
+    // sema/ExprTypecheck_Calls.cpp), so the premise had to be re-established
+    // there rather than assumed: it calls `setExprSymbol(&nm, member)`
+    // UNCONDITIONALLY once `lookupMember` (or `lookupExtensionMember`) resolved
+    // one, and returns EARLY without attaching anything when neither did — which
+    // is exactly the builtin case. So `obj?.Sorted()` over a USER method gets a
+    // MethodSymbol, `cfg?.Split(line)` over a function-typed FIELD gets a
+    // FieldSymbol, and both are excluded here by the same one line that excludes
+    // their `.` spellings; only the compiler-known builtins arrive symbol-less.
+    // // per §7.5, §28.3, §21.1, #2581, #2749
+    if (call.callee && ctx.exprSymbol(*call.callee) != nullptr)
+        return false;
+    // The RESULT must be a declaration-less BUILTIN collection head. This is
+    // the second half of the narrowness: it excludes any user type reached
+    // through a symbol-less callee, and the owning families (`OwningArray`,
+    // …), which the stdlib gives no value copy-form at all ("OwningArray<T>
+    // deliberately has **no** value copy-forms — neither `Reversed`/`Sorted`
+    // nor `ToArray`", stdlib §4.4).
+    const sema::TypeRef* rt = ctx.exprType(call);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    std::string_view head;
+    if (!rt->aliasResolvedHead.empty())
+        head = rt->aliasResolvedHead;
+    else if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+        head = rt->headName();
+    else if (!rt->importedName.empty())
+        head = rt->importedName;
+    return head == "Array" || head == "Set" || head == "Dictionary";
+}
+
+bool isBuiltinArrayRangeSliceIndex(const ast::IndexExpr& ix,
+                                   const sema::SemaContext& ctx) {
+    // See the header contract. // per §28.3 producers "Range slice" row, §15.6,
+    // §21.1, v0.240, #2749 item 2
+    if (!ix.target) return false;
+    const sema::TypeRef* rt = ctx.exprType(*ix.target);
+    // (a) The RECEIVER must be a declaration-less builtin `Array` head with a
+    // generic argument — the exact shape sema's own range-slice arm requires
+    // (`ExprTypecheck_Exprs.cpp`: `tt->kind == Named && !tt->declaration &&
+    // tt->astNode && !tt->astNode->name->parts.empty()`, then
+    // `cn == "Array"`). `declaration == nullptr` is what makes this BUILTIN-only:
+    // a user type — including a user class that shadows the name `Array`, and
+    // any user type with a range-taking indexer — carries a declaration and is
+    // excluded here. `OwningArray<T>` is excluded by the head (§15.6 rejects
+    // slicing on it outright, and that rejection stands on its own); so are the
+    // span families, whose stdlib `Slice` overloads return span heads rather
+    // than owned arrays and whose range index sema types as the ELEMENT.
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    if (rt->headName() != "Array") return false;
+    if (rt->genericArgs.empty() || !rt->genericArgs[0]) return false;
+    // (b) The index must be a RANGE, in either of the two forms sema accepts: a
+    // syntactic range literal `arr[0..2]`, or a `Range`-typed value
+    // `var r := 0..2; arr[r]` (#1079). A single-element read `arr[i]` is
+    // §28.3's *indexer* row — a Borrow, which §21.1 admits verbatim
+    // ("Admitted: […] and **borrows**") — and must keep compiling as a `const`
+    // initializer.
+    if (ix.indices.empty() || !ix.indices[0].value) return false;
+    const ast::Expr* idx = ix.indices[0].value.get();
+    if (!dynamic_cast<const ast::RangeExpr*>(idx)) {
+        const sema::TypeRef* it = ctx.exprType(*idx);
+        if (!it || it->kind != sema::TypeRef::Kind::Named || !it->declaration ||
+            it->declaration->name != "Range")
+            return false;
+    }
+    // (c) And sema must in fact have typed the whole index expression as the
+    // RECEIVER'S OWN TypeRef object. WITHIN the receiver family (a) selects
+    // — Named, declaration-less, head `Array` — that is the range-slice arm's
+    // signature: it is the only arm there writing `tt` itself rather than a
+    // derived TypeRef (`tt->genericArgs[0]` / `[1]`), which cannot alias `tt`.
+    // ⚠ NOT unique across ALL IndexExpr arms: primitiveTypeRef is INTERNED, so
+    // the string range-slice arm collides too — harmless only because (a)
+    // rejects a Kind::Primitive receiver first. See the header.
+    //
+    // ★ The real work (c) does is NOT excluding a `Span<Array<int>>` element
+    // read — (a) already gates on the RECEIVER's head, so a span receiver never
+    // reaches (c). It is that sema tests the Range index by SYMBOL IDENTITY
+    // (`it->declaration == builtinClassSym("Range")`, ExprTypecheck_Exprs.cpp
+    // :1574) while (b) below tests by NAME STRING — so (b) is strictly WIDER
+    // than sema's arm, and a USER type named `Range` passes (b) but not sema.
+    // (c) catches exactly that, failing open. Load-bearing; the earlier stated
+    // reason was wrong. It is a cross-check on (a)+(b), not a substitute: if sema ever
+    // stops setting this arm's type by identity the predicate goes SILENT
+    // (accepting), never over-wide.
+    return ctx.exprType(ix) == rt;
 }
 
 namespace {

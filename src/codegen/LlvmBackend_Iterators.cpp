@@ -1305,6 +1305,38 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         groupingFreeEligibleFn_ = moveNextFn;
         setLiteralFreeEligibleFn_ = moveNextFn;   // #2142
         dictLiteralFreeEligibleFn_ = moveNextFn;  // #2143
+        // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §29.2 (v0.240): the
+        // `var` STRING-local refcount analysis must describe the MOVENEXT fn too
+        // — the same re-establishment #1897 made just above for the unwind sets
+        // and #2148/#2142/#2143 made for the collection-reclaim sets. EVERY
+        // consumer of the three string sets gates on `currentFn_ ==
+        // stringReleaseEligibleFn_`, and the iterator body lowers with currentFn_
+        // == moveNextFn while emitFunctionBody left the token naming the last
+        // SYNCHRONOUS method emitted, so no string local in any `yield return`
+        // body was ever retained OR released: both allocations (bz_string header
+        // + payload) leaked, per local, per element (#2817 — measured 1845 bytes
+        // / 78 allocations over 20 advances).
+        //
+        // THE ACTIVATION MODEL. A MoveNext resume runs ONCE PER ADVANCE, so the
+        // bind and the scope-end release of a local declared inside the yielding
+        // loop land in DIFFERENT advances: advance k binds it and suspends at the
+        // `yield`; advance k+1 resumes just past the yield, runs the loop body's
+        // scope-end disposals (releasing exactly the value the frame field
+        // restored — collectSuspendLocals gives every LocalDecl a frame field and
+        // the yield spills every mapped alloca), and only then re-binds for
+        // iteration k+1. One bind, one release, per element.
+        //
+        // ABANDONMENT is covered rather than leaked: the yield handler snapshots
+        // the disposals live at that suspend into smIterCleanupAtState_
+        // (LlvmBackend_Stmts.cpp) — a Disposal{stringRelease} is neither
+        // `caughtException` nor `unwindOnly`, and its slot IS in locals_, so it is
+        // recorded — and Dispose restores every frame local and runs that stack in
+        // reverse. The two are mutually exclusive: Dispose stamps the DISPOSED
+        // sentinel (-2) so a later MoveNext cannot resume past the yield, and a
+        // run-to-exhaustion iterator parks at -1, whose switch default runs no
+        // cleanup. So still exactly once on either exit. // per §29.7, §28.10
+        collectStringReleaseEligible(*ci.stmts);
+        stringReleaseEligibleFn_ = moveNextFn;
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", moveNextFn);
         builder_.SetInsertPoint(entry);
 
@@ -1312,6 +1344,26 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
         // Restore captured params (this + params) from the frame.
         emitFrameCaptureRestores(frame, self);
+
+        // fix #2817 / fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): CO-GATE the
+        // parameter retain with the parameter release the pin above just turned
+        // on. The `:=` / §4.6 `+=` drop-on-overwrite release admits ANY slot
+        // localSlot() resolves — including a `string` PARAMETER, whose single
+        // reference belongs to the CALLER (§28.1: on a `string`, "`owned` is a
+        // compile error: such values carry no disposal obligation to transfer
+        // (§28.9)"). Enabling that release without the paired bind-time retain
+        // frees the caller's borrow under it — the #2696 use-after-free — so the
+        // two predicates must move together.
+        //
+        // Emitted in the MoveNext ENTRY block, which dominates every state block
+        // and re-runs on EVERY advance, right after emitFrameCaptureRestores has
+        // re-restored the parameter slot from its capture field. A given advance
+        // can release the incoming value at most once (after the first assignment
+        // the slot holds a value this frame owns), and the assignment does not
+        // survive the suspend (capture fields are spilled once at construction
+        // and never re-spilled), so retains >= releases on every path: a surplus
+        // retain leaks one reference per advance, it can never over-release.
+        retainAssignedStringParams(*ci.stmts, ms->params);
 
         // State field GEP — read by the resume dispatch, written at each yield.
         llvm::Value* stateGEP =

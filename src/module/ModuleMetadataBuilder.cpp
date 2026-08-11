@@ -11,7 +11,9 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "common/IntLiteral.hpp"
 #include "lexer/Lexer.hpp"
+#include "sema/ConstFold.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -230,6 +232,45 @@ std::string renderConstExpr(const ast::Expr* e) {
         if (base.empty()) return "";
         return base + "." + std::string(ma->member);
     }
+    // fix #2898 (§17.14 / §2.8.2 clause 2, v0.240): a §17.14 compile-time
+    // constant that is not a BARE literal — `:= 100 + 7` — has no arm above, so
+    // it rendered "" and every consumer read that as "not a compile-time
+    // constant". For an imported generic's instance field that is a FALSE
+    // REJECT: #2860's guard is category-blind (it asks whether a value reached
+    // the slot), so an empty rendering makes it refuse a construction §2.8.2
+    // clause 2 requires to behave exactly as the same-module one does.
+    //
+    // FOLD, don't render. The alternative — rendering `100 + 7` textually —
+    // would widen what `valueText` may CONTAIN, and it is consumed as text by
+    // codegen (`constValues_`, ModuleLoader.cpp), so every consumer would have
+    // to become an evaluator. Folding keeps `valueText` a literal, the shape
+    // they all already assume, so no consumer changes and none can regress.
+    //
+    // The arithmetic is `sema::foldIntConst`, the ONE §17.14 folder — already
+    // shared by type resolution, ExprTypecheck and codegen's enum path — rather
+    // than a second evaluator here, which would be free to drift from it.
+    //
+    // The resolver deliberately answers nullopt for EVERY identifier, so only
+    // literal arithmetic folds. That is not a limitation to remove later
+    // without thought: `renderConstExpr` above renders a bare `IdentifierExpr`
+    // as its NAME, which has no guaranteed importer-side meaning, and resolving
+    // names here would let a same-named-but-different const on the importing
+    // side silently supply a value. A loud rejection is the correct outcome for
+    // anything this cannot fold; #2874 covers carrying genuinely non-constant
+    // initializers.
+    //
+    // Integer-only by construction (foldIntConst's domain): a float-valued
+    // constant expression still renders "" and is still rejected, unchanged.
+    // Range is deliberately NOT re-checked here — a folded value reaches its
+    // slot by exactly the path a bare literal of the same value does, so this
+    // makes `:= 100 + 7` behave identically to `:= 107` and introduces no case
+    // the literal spelling does not already have (see #2926 for the missing
+    // field-initializer assignability check, which governs both spellings).
+    if (auto folded = sema::foldIntConst(
+            *e, [](std::string_view, int) -> std::optional<long long> {
+                return std::nullopt;
+            }))
+        return std::to_string(*folded);
     return "";
 }
 
@@ -238,14 +279,12 @@ std::string renderConstExpr(const ast::Expr* e) {
 bool tryEvalIntLiteral(const ast::Expr* e, std::int64_t& out) {
     auto* i = dynamic_cast<const ast::IntLiteralExpr*>(e);
     if (i == nullptr) return false;
-    // The lexeme may carry a sign or suffix in richer programs; for the §10.2
-    // continuation rule we only need plain decimal literals (the common case).
-    // std::strtoll parses the leading integer and ignores a trailing suffix.
-    char* end = nullptr;
-    std::string text(i->text);
-    long long v = std::strtoll(text.c_str(), &end, 0);
-    if (end == text.c_str()) return false;  // not a number
-    out = static_cast<std::int64_t>(v);
+    // fix #2936: decode through the ONE literal parser. This was
+    // `std::strtoll(text, &end, 0)`, whose base-0 auto-detection covers `0x`
+    // but NOT grammar A.8's `0b` binary form and not `_` digit separators — so
+    // a §10.2 explicit enum value written `0b101` continued as if it were 0,
+    // and `1_000` as if it were 1.
+    out = common::parseIntLiteral(i->text);
     return true;
 }
 
@@ -866,8 +905,26 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             if (mod == "static") isStaticField = true;
         if (!isStaticField && fd->initializer) {
             out.valueText = renderConstExpr(fd->initializer.get());
-        } else if (isStaticField && isGenericType && fd->initializer &&
-                   !source.empty()) {
+        }
+        // fix #2860 (§2.8.2 "No restrictions beyond visibility" / §22.8 step 2,
+        // v0.240): also carry a GENERIC type's INSTANCE field initializer text.
+        // A non-generic public class replays every instance field initializer
+        // through its exported `bz$<Type>$init` (#328 FINDING [7]), so the
+        // `valueText` fold is only a shortcut there. A GENERIC class exports no
+        // such symbol — the importer monomorphizes construction — so an
+        // initializer `valueText` cannot render (`new Cell()`, `[1,2,3]`, a
+        // reference to another member) reaches the consumer as NOTHING, and the
+        // field is silently left at its §7.9 default: a non-nullable `owned`
+        // field parked on the null watermark. §2.8.2 requires an implementation
+        // "unable to carry some body shape in its interface format" to "reject
+        // the export, or the import, with a diagnostic naming the shape"; this
+        // text is what lets the IMPORT side name the shape at the construction
+        // site (SemaContext::importedInstanceFieldInitText → emitOwnFieldInit)
+        // instead of shipping the silent default. It is emitted for EVERY
+        // generic instance-field initializer, foldable or not, so the consumer's
+        // test is the category-blind "did a value actually reach the slot?"
+        // rather than a guess about which initializer shapes fold.
+        if (isGenericType && fd->initializer && !source.empty()) {
             const ast::Expr* init = fd->initializer.get();
             if (init->span.begin.offset < init->span.end.offset &&
                 init->span.end.offset <= source.size()) {
@@ -1227,8 +1284,26 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     out.hasPositionalFields = t.hasPositionalFields;
 
     const bool inInterface = (t.kind == ast::TypeDeclKind::Interface);
-    const bool isGenericClass = !t.genericParams.empty() &&
-                                t.kind == ast::TypeDeclKind::Class;
+    // fix #2871 (§2.8.2 clause 2 / §22.12 rule 1 / §22.13 / §9, v0.240): this
+    // predicate was `kind == Class`, which names a CATEGORY where the thing that
+    // actually matters is a PROPERTY — "this type is generic, so each consumer
+    // monomorphizes its OWN copy of its state and bodies, and the exporting
+    // module's compilation cannot run them on the consumer's behalf". That is
+    // true of a generic RECORD (§9) exactly as it is of a generic class, and a
+    // record fell out of every gate below.
+    //
+    // Consequence before this fix, MEASURED as a real two-module build: a
+    // `public static readonly Seed: int := 107;` on an imported generic RECORD
+    // read **0** in the importer with NO diagnostic at any severity, where the
+    // identical declarations compiled as ONE module read 107. It was silent
+    // rather than rejected because #2351's reject fires on the reconstruction
+    // path this flag also gates — so a record reached neither the carriage nor
+    // the rejection. The generic-class twin has been a hard located reject since
+    // #2351; only the record spelling was silently wrong.
+    const bool isGenericMonomorphized =
+        !t.genericParams.empty() &&
+        (t.kind == ast::TypeDeclKind::Class ||
+         t.kind == ast::TypeDeclKind::Record);
 
     // §14 generic params + their §14.2 constraints (from the TypeDecl AST).
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(t.decl)) {
@@ -1239,6 +1314,16 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // §12 base class + interfaces (resolved TypeRefs, parallel to baseTypes).
     for (sema::TypeRef* baseRef : t.baseTypeRefs)
         out.baseTypes.push_back(convertType(baseRef));
+
+    // fix #2950 (§12 / §31.4 / §2.8.2, v0.240): the BUILT-IN exception base,
+    // which the loop above structurally cannot carry — a built-in exception has
+    // no user TypeSymbol, so it is never in `baseTypeRefs` in the first place.
+    // It decides the class's LAYOUT (the §31.4 header), so an importer that
+    // cannot see it lays the class out 32 bytes shorter than this exporter did
+    // and then calls this exporter's own compiled constructor on the short
+    // block. Only the DIRECT base is carried; an ancestor chain reconstructs
+    // itself, because each exported ancestor carries its own.
+    out.builtinExceptionBase = t.builtinExceptionBase;
 
     // §22.16 / §2.8.2 (#2054): carry invariant records in base-first order.
     // The record list is declaration-derived; no per-call-site discharge is
@@ -1281,7 +1366,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         bool exported = isExportedMember(member->visibility, inInterface);
         // For generic classes, also include private/internal METHODS so the
         // importer's ctor/dtor body re-parsing can resolve self-calls (#695).
-        bool includeForCtorBody = isGenericClass && isMethod &&
+        bool includeForCtorBody = isGenericMonomorphized && isMethod &&
             !exported &&
             (member->visibility == ast::Visibility::Private ||
              member->visibility == ast::Visibility::Internal);
@@ -1298,7 +1383,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         // exported — no initializer, no ABI change. Mirrors the private-method
         // rationale (#695): the field is not accessible outside the class;
         // the stub is used solely for sema name-resolution in re-parsed bodies.
-        bool includeForMethodBody = isGenericClass && (isField || isAutoPropStorage) &&
+        bool includeForMethodBody = isGenericMonomorphized && (isField || isAutoPropStorage) &&
             !exported &&
             (member->visibility == ast::Visibility::Private ||
              member->visibility == ast::Visibility::Internal);
@@ -1392,7 +1477,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
             !includeForLayout)
             continue;
         MetaMember mm;
-        if (convertMember(*member, inInterface, ctx, mm, isGenericClass, source)) {
+        if (convertMember(*member, inInterface, ctx, mm, isGenericMonomorphized, source)) {
             // A field included ONLY for layout (not otherwise exported, and
             // not already carried for generic-body name resolution) is
             // name-invisible outside the class — strip the initializer text
@@ -1405,7 +1490,21 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
             // above already documents for the same reason).
             if (includeForLayout && !exported && !includeForMethodBody) {
                 mm.valueText.clear();
-                mm.fieldInitText.clear();
+                // fix #2860 (§2.8.2 definition-site visibility, v0.240): keep
+                // `fieldInitText` for a GENERIC class. The whole reason this
+                // clears the initializer carriage — "the default value is not
+                // needed to reconstruct the physical layout" — holds only where
+                // some OTHER mechanism replays the initializer, which for a
+                // non-generic class is the exported `bz$<Type>$init`. A generic
+                // class has none: its construction is monomorphized in the
+                // consumer, so a private field's initializer that does not cross
+                // is silently dropped there, exactly like a public one (and
+                // §2.8.2's definition-site clause is explicit that the interface
+                // "must therefore carry whatever internal machinery its exported
+                // generic bodies reach"). This is the text the consumer names in
+                // the §2.8.2 diagnostic; it adds no member, no slot and no ABI —
+                // the member itself was already being carried for layout.
+                if (!isGenericMonomorphized) mm.fieldInitText.clear();
             }
             out.members.push_back(std::move(mm));
         }
@@ -1428,7 +1527,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // so the importer can run user destructor side-effects (#662 foundation C).
     // The destructor is skipped by convertMember (§13.3 not user-callable), so
     // we walk members here to find a DestructorDecl with a non-empty body.
-    if (isGenericClass && !source.empty()) {
+    if (isGenericMonomorphized && !source.empty()) {
         for (sema::Symbol* ms : t.members) {
             const auto* ds = dynamic_cast<const sema::DestructorSymbol*>(ms);
             if (!ds) continue;

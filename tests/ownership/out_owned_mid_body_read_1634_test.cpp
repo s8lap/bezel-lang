@@ -18,6 +18,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -85,4 +86,8 @@ BEZEL_TEST(out_owned_mid_body_read_1634, plain_owned_still_rejected) {
         "  end Take; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "already moved out") ||
+        hasErrorMessage(r, "dropped here without disposal") ||
+        hasErrorMessage(r, "consumes"));
 }

@@ -2581,6 +2581,26 @@ const sema::TypeRef* Emitter::recordFieldType(const sema::FieldSymbol* fs) {
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
         if (fd->type)
             return ctx_.resolvedType(*fd->type);
+    // fix #2874 (§2.8.2 / §22.8 / §4.6 / §28.9, v0.240): an IMPORTED instance
+    // field's type rides ctx_.importedMemberType(fs) (the loader synthesizes a
+    // null-type posParam only for §9.1 positional-vs-body discrimination, not
+    // the type itself; the type itself is never recoverable from posParam for
+    // a #2516 imported positional field, and fs->decl is null for every
+    // imported member). Without this fallback isStringStorageMember /
+    // isClosureStorageMember / boxStorageFields_-membership all returned false
+    // for EVERY imported generic's instance field — a string field's §4.6
+    // retain is skipped at STORE time (no producer-side release to balance a
+    // missing consumer-side one) AND the §4.6 release is skipped at the
+    // matching DISPOSAL time (no consumer-side release to balance a missing
+    // producer-side one). Today both sides are skipped, so the string is
+    // balanced by accident; flipping the predicate in only ONE place would
+    // convert a leak into a UAF. The two sides read this predicate through
+    // isStringStorageMember / emitStringRetain / bz_string_release at the
+    // SAME site, so a single edit here is the single point of fix.
+    if (!fs->posParam && !fs->decl) {
+        if (const sema::TypeRef* rt = ctx_.importedMemberType(fs))
+            return rt;
+    }
     return nullptr;
 }
 
@@ -2594,6 +2614,250 @@ const sema::TypeRef* Emitter::recordMemberType(const sema::Symbol* m) {
             return ctx_.resolvedType(*pd->type);
     return nullptr;
 }
+
+// stdlib §3.1 / §8.5: `StringBuilder.ToString()` — concatenate the parts array
+// into ONE freshly malloc'd `%bz.string` with rc := 1 (a `+1` the consumer
+// discharges once). Factored out of the collection-call lowering by #2923 so
+// the direct call `sb.ToString()` and the §18.5 interpolation hole `$"{sb}"`
+// share one lowering instead of two hand-maintained spellings of stdlib §3.1's
+// declared member. // per stdlib §3.1 / §8.5 / §18.5
+llvm::Value* Emitter::emitStringBuilderToString(llvm::Value* sb) {
+    if (!sb || !sb->getType()->isPointerTy()) return nullptr;
+    // Use the runtime helper to concatenate all string parts.
+    auto* outDataSlot = entryAlloca(ptrTy());
+    auto* outLenSlot  = entryAlloca(i64());
+    auto* fn = declareC("bz_strbuilder_to_string",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy()});
+    builder_.CreateCall(fn, {sb, outDataSlot, outLenSlot});
+    llvm::Value* data = builder_.CreateLoad(ptrTy(), outDataSlot);
+    llvm::Value* len  = builder_.CreateLoad(i64(), outLenSlot);
+    // Build a bz.string object from the malloc'd buffer.
+    // #422: allocate the full header size (now 32 bytes incl. rc), not
+    // a hardcoded 24 — writing rc into field 3 of a 24-byte block would
+    // overflow. getTypeAllocSize is the single source of truth.
+    uint64_t sobjSz = module_->getDataLayout().getTypeAllocSize(stringType());
+    auto* sobj = builder_.CreateCall(
+        callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)sobjSz)});
+    builder_.CreateStore(data,
+        builder_.CreateStructGEP(stringType(), sobj, 0));
+    builder_.CreateStore(len,
+        builder_.CreateStructGEP(stringType(), sobj, 1));
+    builder_.CreateStore(builder_.getInt8(1),
+        builder_.CreateStructGEP(stringType(), sobj, 2));
+    initStringRc(sobj);  // #422: producer's reference, rc := 1
+    return sobj;
+}
+
+
+// fix #2923 (spec §8.5 / §8.1 / §18.5 / §28.9, v0.240): render a VTABLE-LESS
+// BUILT-IN CLASS receiver, i.e. one whose runtime value is a plain runtime C
+// struct (`bz_array_t*`, `bz_mutex_t*`, `bz_random_t*`, `bz_event_source_t*`,
+// …) with no Bezel object header. Returns null when `rt` is not such a type, so
+// callers can chain it ahead of their existing fallback.
+//
+// WHY THIS EXISTS. `lowerObjectToString`'s contract is that the dynamic value
+// is either a `%bz.string` or a vtable-bearing object; it separates the two
+// with `bz_obj_is_string`, which is a NEGATIVE test — "word 0 is not one of the
+// emitted vtables ⇒ it is a string" (bezel_runtime_refcounting.cpp). A built-in
+// class satisfies neither half of the premise: it has no vtable, so the test
+// answers "string", and the receiver is then read as a `%bz.string` (garbage
+// data/len/width) and — since #2846 made that arm RETAIN what it returns —
+// retained through the receiver's own bytes at the rc offset and RELEASED by
+// the consumer. MEASURED on f069645: `using var x := new Mutex();
+// Console.WriteLine($"val={x}")` printed `val=` and aborted with
+// "free(): double free detected in tcache 2" (exit 134); the same receiver
+// twice in one interpolation escalated to SIGSEGV; `new Random()` under ASan
+// gave a heap-buffer-overflow READ. Every built-in class receiver tested
+// reproduced some form of it — including `Array<int>` and `Dictionary<K,V>`,
+// which #2923's own scoping had classified as unaffected.
+//
+// WHAT IT RENDERS. §8.5's class bullet is unconditional — "For classes: the
+// type's qualified name" — so that is the answer for every one of them except
+// the two whose stdlib declaration DOES include a `ToString(): string` of its
+// own (`StringBuilder`, stdlib §3.1; `JsonSerializer`, stdlib §2.15 — the only
+// two among the pointer-shaped reserved built-in classes, checked against the
+// stdlib document). Those dispatch their own member instead, exactly as §18.5's
+// "A hole *without* a format spec formats via the value's ordinary
+// `ToString()`" requires. The type-name literal is a constant global with a
+// SENTINEL rc, so the caller's ordinary release of a rendered hole is a no-op
+// on it — the same discharge shape the user-class-without-override default
+// (`lowerStringLiteral(ts->name)`, just above `emitValueToString`'s tail)
+// already relies on.
+llvm::Value* Emitter::emitVtablelessBuiltinToString(llvm::Value* val,
+                                                    const sema::TypeRef* rt) {
+    if (!val || !val->getType()->isPointerTy()) return nullptr;
+    std::string_view bn = builtinTypeName(rt);
+    if (bn.empty() || !common::isVtableLessBuiltinClassName(bn)) return nullptr;
+    // stdlib §3.1: `StringBuilder` declares `public method ToString(): string`,
+    // so §8.5's type-name default does NOT apply to it — it renders its content.
+    if (bn == "StringBuilder") return emitStringBuilderToString(val);
+    // stdlib §2.15: `JsonSerializer` declares `public method ToString(): string`
+    // ("convenience: UTF-8 → string"), lowered to bz_jser_to_string by the §2.15
+    // instance-method handler (LlvmBackend_Serialization.cpp).
+    if (bn == "JsonSerializer")
+        return builder_.CreateCall(
+            declareC("bz_jser_to_string", ptrTy(), {ptrTy()}), {val},
+            "jser.str");
+    // §8.5: "For classes: the type's qualified name."
+    return lowerStringLiteral(std::string("\"") + std::string(bn) + "\"",
+                              false);
+}
+
+
+// fix #2969 (spec §8.5 / §8.1 / §18.5 / §28.9, v0.240): a special case of
+// `emitVtablelessBuiltinToString` — the static type `frt` is a BUILT-IN
+// INTERFACE HEAD (IEnumerable<T>, IList<T>, IDictionary<K,V>, …), but the AST
+// source `src` narrows the runtime value to a vtable-less built-in class.
+//
+// WHY THIS EXISTS (and is not just a call into emitVtablelessBuiltinToString).
+// §2923's fix gates on the STATIC type being a vtable-less built-in CLASS —
+// it deliberately excluded interface heads from the discriminator, because an
+// interface slot may LEGITIMATELY hold a user class declaring that interface
+// (`class MyE: IEnumerable<int>`, `var e: IEnumerable<int> := new MyE();
+// e.Dispose();` compiles and runs on 09ed9ca). Routing an interface slot
+// through `emitVtablelessBuiltinToString` statically would (a) render
+// "IEnumerable" instead of "MyE" for a user class — wrong per §8.5 — and (b)
+// stop disposing user-class instances through vtable[kDisposeSlot], which
+// §2975 has only just made safe.
+//
+// But for the COMMON shaping of an interface-head-typed local — the
+// initializer is a known constructor of a built-in collection, e.g.
+// `var e: IList<int> := new Array<int>(2);` (a direct NewExpr) or
+// `var e: IList<int> := a;` where `a: Array<int>` (an IdentifierExpr whose
+// sema type is the built-in class) — the §2923 premise DOES hold on the
+// runtime value. The renderer just needs the runtime TYPE, which the
+// initializer's static type already names.
+//
+// HOW THE SOURCE-TYPE LOOKUP WORKS. `src` is the interpolation hole's AST
+// expression. For the only shapes this fix admits:
+//   * `IdentifierExpr` — a plain local reference. Its sema symbol is a
+//     `LocalSymbol` whose `decl` is the `LocalDecl`; we read the decl's
+//     initializer's sema type (`ctx_.exprType(*ld->initializer)`). That type
+//     is the source of truth — for `var e: IList<int> := a;` where `a:
+//     Array<int>`, it returns `Array<int>` even though `ld->type` declares
+//     `IList<int>`.
+//   * A NON-`IdentifierExpr` shape (a member access on an object, a method
+//     call returning the interface head, a generic instantiation through a
+//     type parameter) returns nullptr — the §2923 dynamic path remains in
+//     force, which is correct for the user-class arm and DEFERS the
+//     unanalysed built-in case to a future design decision per #2969.
+//
+// SAFETY / WHAT IT DOES NOT DO. It does not modify `lowerObjectToString`, so
+// the user-class arm keeps its correct vtable dispatch. It does not change
+// `bz_obj_is_string`, so the interface-head -> vtable path remains available.
+// The receiver retains NOTHING — the returned string is a `lowerStringLiteral`
+// constant with a SENTINEL rc, the same discharge shape §2923 already relies
+// on. And the §2975 disposal fix (interface slot holding a raw user-class
+// instance routes to the class disposal) is untouched — its predicate is
+// `iterFormatWrappedDecls_`, never reaches the BuiltinInterfaceHead path here.
+//
+// WHAT IT DOES NOT FIX. The explicit `.ToString()` call on a built-in
+// interface head (rejected at sema on the parent commit, #2457). Logged in
+// the test's header so the boundary is explicit.
+//
+// fix #2968 (spec §8.1 / §8.5 / §18.5 / §28.9, v0.240): the OBJECT-slot
+// spelling — which #2969 recorded above as its own deferred residual — is the
+// SAME defect one level further out, and it admits the SAME remedy, so this
+// helper now gates on `Object` as well as on the interface heads.
+//
+// §8.1 makes `var o: Object := mx;` legal without a conversion, verbatim:
+//
+//   "classes, interfaces, `string`, heap arrays (`Array<T>`,
+//    `OwningArray<T>`), and function types are reference types whose values
+//    are already heap-allocated and reach `Object` directly through the
+//    inheritance chain"
+//
+// So the built-in sits in the slot AS ITSELF, with no vtable at word 0, and
+// `bz_obj_is_string`'s NEGATIVE test ("word 0 is not one of the emitted
+// vtables ⇒ a string") answers "string" for it. `lowerObjectToString` then
+// returns the receiver as a string and retains it — the retain landing on the
+// built-in's own bytes at the `%bz.string` rc offset — and the consumer's
+// matching release frees a live object. That is #2968's measured double free.
+//
+// WHY BOXING IS NOT THE FIX. #2968's filing offered "box the built-in on
+// assignment to `Object`" as option 2. The §8.1 sentence quoted above puts
+// these receivers explicitly on the REFERENCE side of §8.6's boxing line, so
+// boxing them would contradict §8.1's classification. Option 2 is closed
+// unless the spec is amended, which is a separate workflow.
+//
+// WHY THE `Object` SLOT IS SAFE TO ADMIT HERE (and the string hazard the
+// interface-head arm never faced). An interface-head slot cannot hold a
+// `string`; an `Object` slot can. The narrowing below is therefore load-
+// bearing in a way it was not for #2969: it fires ONLY when the initializer's
+// static type is a vtable-less built-in CLASS. `string` is in neither reserved
+// table (common/BuiltinRegistry.cpp), so `isVtableLess` answers false for it
+// and a genuine `var o: Object := "hi";` still falls through to
+// `lowerObjectToString`, whose `bz_obj_is_string` premise is TRUE for a real
+// string. A user class likewise carries a `declaration` and falls through to
+// its correct vtable dispatch. Only the receivers whose premise is false are
+// routed away.
+llvm::Value* Emitter::tryOpaqueSlotBuiltinRender(llvm::Value* val,
+                                                 const sema::TypeRef* frt,
+                                                 const ast::Expr* src) {
+    if (!val || !val->getType()->isPointerTy()) return nullptr;
+    if (!frt) return nullptr;
+    // The two OPAQUE slot spellings that reach this helper. Note they are
+    // different TypeRef KINDS, which is why the gate is not a single test:
+    //   * `Object` — sema models the universal root as a PRIMITIVE
+    //     (TypeResolution.cpp maps the name to `PrimitiveType::Object`), NOT
+    //     as a Named ref. This is #2968's slot, and it is also why the #2969
+    //     Named-only gate never fired for it.
+    //   * a built-in INTERFACE HEAD — a declaration-less Named ref (#2969).
+    const bool isObjectSlot =
+        frt->kind == sema::TypeRef::Kind::Primitive &&
+        frt->primitive == sema::PrimitiveType::Object;
+    if (!isObjectSlot) {
+        // §2923 deliberately excluded interface heads from the vtable-less
+        // discriminator; the interface slot may hold a user class. We are the
+        // OTHER arm of the exclusion — we only fire when the AST source
+        // statically narrows the runtime value to a built-in class.
+        if (frt->kind != sema::TypeRef::Kind::Named || frt->declaration)
+            return nullptr;
+        std::string_view bn = builtinTypeName(frt);
+        if (bn.empty() || !common::isBuiltinInterfaceHead(bn)) return nullptr;
+    }
+    if (!src) return nullptr;
+    // §2923's `common::isVtableLessBuiltinClassName` test asks whether the
+    // RUNTIME TYPE carries no Bezel vtable at word 0 — i.e. is one of the
+    // built-in classes whose runtime value is a plain C struct
+    // (`bz_array_t*`, `bz_dict_t*`, `bz_mutex_t*`, …). Same predicate, same
+    // table, same answer.
+    auto isVtableLess = [this](const sema::TypeRef* rt) -> bool {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+        std::string_view n = builtinTypeName(rt);
+        if (n.empty()) return false;
+        return common::isVtableLessBuiltinClassName(n);
+    };
+    // Only the IdentifierExpr shape is admitted here — the §2975 prior art
+    // shows the precise AST-and-sema walk this fix mirrors (the §2975
+    // `rawUserClassInBuiltinInterfaceSlot` reads the same `ld->initializer`
+    // source type for the disposal-side decision). A method-call or
+    // member-access source would need a wider analysis and is left for a
+    // future lane once the owner-signed-off direction for #2969 lands.
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(src);
+    if (!id) return nullptr;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!loc || !loc->decl) return nullptr;
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (!ld || !ld->initializer) return nullptr;
+    // fix #2968: the narrowing below reads the INITIALIZER's static type, so
+    // it describes the slot only while the slot still holds the initializer's
+    // value. A statement-level reassignment invalidates it — and for an
+    // `Object` slot the wrong answer would be a REGRESSION, not merely a
+    // missed fix (`var o: Object := mx; o := "hi";` renders correctly TODAY
+    // via the dynamic path, whose `bz_obj_is_string` premise a real string
+    // satisfies). Decline rather than narrow.
+    if (reassignedOpaqueLocals_.count(ld)) return nullptr;
+    const sema::TypeRef* srcRt = ctx_.exprType(*ld->initializer);
+    if (!isVtableLess(srcRt)) return nullptr;
+    // The receiver retains NOTHING (the literal has a sentinel rc), so this
+    // is a pure replacement of the broken `lowerObjectToString` call site —
+    // no memory obligation added for the renderer.
+    return emitVtablelessBuiltinToString(val, srcRt);
+}
+
 
 // Format a single field/element value of static type `fieldTy` as a string,
 // recursing for nested records (§9.1) and using each type's own ToString.
@@ -2662,6 +2926,33 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
         phi->addIncoming(liveStr, liveEnd);
         phi->addIncoming(nullStr, nullEnd);
         return phi;
+    }
+    // fix #2913 (spec §8.5 inline-array row / §18.5, v0.240): an INLINE ARRAY
+    // renders as its type's NAME. §8.5 is explicit, and explicit about why:
+    //
+    //   "For inline arrays (all forms, including move-only `[N owned]…` arrays,
+    //    whose receiver is borrowed for the call) and for the unit type: the
+    //    type's name — `"[3]int"`-style for an inline array … (element-listing
+    //    output is deliberately not synthesized — an inline array's elements may
+    //    be class-typed borrows whose formatting is not the container's
+    //    business)."
+    //
+    // #2804 gave the BOXED path this rendering, through the same
+    // `inlineArrayTypeSpelling` called here, so `o.ToString()` on an
+    // `Object`-typed inline array already answered `"[3]int"`. The UNBOXED
+    // interpolation path had no arm at all and fell through to the trailing
+    // empty-string fallback, so `$"{a}"` rendered the EMPTY STRING with no
+    // diagnostic — a silent wrong value, and one that disagreed with the boxed
+    // spelling of the very same value in the very same program.
+    //
+    // Deliberately the SAME function the box thunk uses rather than a second
+    // renderer: two spellings of one rule must not be able to drift, which is
+    // this run's recurring lesson. It is also why no `arrayOwned` special case
+    // is needed — §8.5 puts move-only arrays in the same row, and the spelling
+    // function already emits the `owned` marker.
+    if (fieldTy && fieldTy->kind == K::InlineArray) {
+        return lowerStringLiteral(
+            "\"" + inlineArrayTypeSpelling(fieldTy) + "\"", false);
     }
     if (fieldTy && fieldTy->kind == K::Primitive) {
         // §9.1: strings are formatted by their own ToString — which for
@@ -2791,6 +3082,21 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
             sit->second != fieldTy)
             return emitValueToString(val, sit->second);
     }
+    // fix #2923 (spec §8.5 / §8.1 / §18.5 / §28.9, v0.240): a declaration-less
+    // Named ref is one of exactly two things — a RESERVED BUILT-IN or a generic
+    // type PARAMETER (common/BuiltinRegistry.hpp, `isReservedBuiltinTypeName`).
+    // The #1118 fallback directly below is written for the second ("an
+    // unresolved generic-T operand"), and its premise is FALSE for the first: a
+    // built-in class is not a heap object with a vtable, so handing it to
+    // `lowerObjectToString` makes `bz_obj_is_string` mis-answer "string" and the
+    // receiver is retained + released as one — the #2923 double free. Ask the
+    // built-in question FIRST; a generic-T operand is unaffected (its head is a
+    // type-parameter name, which is in no builtin table).
+    if (fieldTy && fieldTy->kind == K::Named && !fieldTy->declaration &&
+        val->getType()->isPointerTy()) {
+        if (llvm::Value* r = emitVtablelessBuiltinToString(val, fieldTy))
+            return r;
+    }
     // §8.5 (#1118 fallback): an unresolved generic-T operand whose substitution
     // is unavailable but whose runtime value is a heap object (class/interface
     // pointer) — dispatch through the dynamic ToString (override else type name),
@@ -2849,8 +3155,28 @@ llvm::Value* Emitter::lowerObjectToString(llvm::Value* recv) {
     builder_.CreateCondBr(isStrBit, strBB, vtBB);
 
     // string: ToString is identity (§9.6).
+    //
+    // fix #2846 / §28.9 (v0.240): RETAIN it. This function's contract — relied
+    // on by every one of its callers — is that the value it hands back is a
+    // fresh `+1` the consumer discharges once: `emitPrimitiveToString`'s own
+    // declaration calls it "allocates a fresh heap string with rc := 1" and
+    // routes `P::Object` straight here; `StringBuilder.Append(o: Object)` sets
+    // `rendered = true` and TRANSFERS (no retain) precisely because of it; the
+    // interpolation render path does the same. The other two arms honour that
+    // (the vtable thunks mint, a literal is an immortal sentinel on which
+    // retain/release are no-ops) — this arm did not, and returning the
+    // receiver's own un-retained pointer to a consumer that releases it is a
+    // heap-use-after-free, not a leak. MEASURED on b0fa41a: `var o: Object := s;
+    // var r := $"[{o}]";` in a 20-iteration loop aborts with
+    // "AddressSanitizer: heap-use-after-free … freed by bz_string_release" on
+    // the SECOND iteration's read of `s`. Filed separately as the UAF it is; the
+    // retain lives here because #2846's fix (recognizing `Object.ToString()` as
+    // a +1 producer, LlvmBackend_Setup.cpp) is unsound without it — it would
+    // turn that shape's balanced retain/release into a bare release.
+    // `bz_string_retain` is null-safe and a no-op on the literal sentinel.
     builder_.SetInsertPoint(strBB);
     llvm::Value* strResult = recv;
+    emitStringRetain(strResult);
     builder_.CreateBr(endBB);
 
     // class/box: dispatch vtable[kToStringSlot](recv).

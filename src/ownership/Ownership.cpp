@@ -73,6 +73,31 @@ bool ownedParamIsFrameDisposable(const sema::ParameterSymbol& ps,
             pt->declaration->kind == ast::TypeDeclKind::Interface) &&
            !pt->declaration->isValueBuiltin;
 }
+
+// fix #3037 / §28.3 (v0.240): the source location of a §28.3 owned-binding
+// diagnostic. Most owned-binding kinds carry `obligationOrigin` populated by the
+// analysis (a back-pointer to the AST node where the obligation was created,
+// set at the `:= EXPR` site or at the for-iter seed). The PARAMETER arm does
+// not: a parameter's owned obligation is established at the parameter's own
+// declaration (the obligation's natural home — the parameter *is* an owned
+// slot from method entry, not from an expression), but `ast::Param` is NOT an
+// `ast::Node` (it carries a single `SourceLocation loc`, not a `span`), so
+// `LocalOwnership::obligationOrigin` was being seeded to `ps->decl` (which is
+// always null for parameters) and every parameter diagnostic fell through to
+// `SourceLocation{}` → `0:0`. SymbolCollection now stamps
+// `ParameterSymbol::declLoc` from the parser's `Param::loc`; this helper is
+// the uniform "use obligationOrigin when present, else the parameter's own
+// declLoc when the symbol is a parameter, else the default 0:0" diagnostic
+// site used at every §28.3 owned-binding emission. Keeping the fallback in
+// one place prevents the per-site drift the issue (#3037) describes.
+static SourceLocation obligationDiagLoc(sema::Symbol* sym,
+                                        const LocalOwnership& st) {
+    if (st.obligationOrigin) return st.obligationOrigin->span.begin;
+    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+        return ps->declLoc;
+    }
+    return SourceLocation{};
+}
 }  // namespace
 
 // §28.1 (v0.196, #1817/#1860): isValueSubstitutionErased is declared in
@@ -459,8 +484,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // disposal itself is unchanged. // per §28.3/§29.8/§30.1
                         ctx_.diagnostics().report(
                             Severity::Warning,
-                            st.obligationOrigin ? st.obligationOrigin->span.begin
-                                                : SourceLocation{},
+                            obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
                             std::string(sym->name) +
                             "` is implicitly disposed by the frame at teardown "
@@ -502,8 +526,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // the frame's teardown is an implicit drop.
                         ctx_.diagnostics().report(
                             Severity::Warning,
-                            st.obligationOrigin ? st.obligationOrigin->span.begin
-                                                : SourceLocation{},
+                            obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
                             std::string(sym->name) +
                             "` is implicitly disposed by the frame at teardown "
@@ -700,16 +723,31 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     // disposal obligation; a borrow parameter is never Owned here.
                     if (ps->modifier == "owned") {
                         ps->autoDropAtScopeEnd = true;
+                        // fix #3033 / §28.10 (v0.240): the fourth remedy used to
+                        // read "rebind it with `using var`", naming a spelling
+                        // that is NOT a discharge. §28.10 *Adopting a named owned
+                        // binding*, verbatim: "An **unmarked** `using var y := x;`
+                        // where `x` is a named owned binding does *not* adopt: it
+                        // is a borrow, pinned per the subsection below, and `x`
+                        // retains the obligation." Only the MARKED form adopts —
+                        // "`using var y := owned x;` transfers a named owned local
+                        // or `owned` parameter into a scope-bound binding: `y`
+                        // takes over the disposal obligation". So a user who
+                        // followed the old text verbatim got this same warning
+                        // again and no discharge; name the marker.
                         ctx_.diagnostics().report(
                             Severity::Warning,
-                            st.obligationOrigin ? st.obligationOrigin->span.begin
-                                                : SourceLocation{},
+                            obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
                             std::string(sym->name) +
                             "` is implicitly disposed at the end of the method "
                             "(§28.3 auto-drop); `move` / `return` / `.Dispose()` "
-                            "it, or rebind it with `using var`, to discharge it "
-                            "explicitly");
+                            "it, or adopt it with `using var " +
+                            std::string(sym->name) + "2 := owned " +
+                            std::string(sym->name) +
+                            ";` (the `owned` marker is required — an unmarked "
+                            "`using var` rebind is a borrow-pin, §28.10), to "
+                            "discharge it explicitly");
                         continue;
                     }
                 }
@@ -859,8 +897,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             }
             ctx_.diagnostics().report(
                 Severity::Error,
-                st.obligationOrigin ? st.obligationOrigin->span.begin
-                                    : SourceLocation{},
+                obligationDiagLoc(sym, st),
                 std::string("owned value in `") +
                 std::string(sym->name) +
                 "` would be dropped here without disposal "
@@ -2375,7 +2412,17 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // §3.6 rule; this site fires per instantiation category and the
     // diagnostic names the declaration.
     if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
-        if (lc->value && !suppressDiag_) {
+        // fix #2709 (v0.240): the SHARED gate. `constInitializerRejected` is
+        // the single authority for "does §21.1 reject this initializer?", and
+        // the lint guard in handleLocalDecl consults the SAME function — so
+        // the two can no longer skew. The branches below only pick which
+        // MESSAGE to emit; they never decide WHETHER to. A category added to
+        // the predicate and not to the branches degrades to silence here (a
+        // missing message, caught by the invariant test), never to the old
+        // failure mode where the lint recommended a spelling this arm then
+        // accepted. // per §21.1, §28.10, #2695, #2709
+        if (lc->value && !suppressDiag_ &&
+            constInitializerRejected(*lc->value)) {
             if (producerState(*lc->value) == OwnershipState::Owned) {
                 ctx_.diagnostics().report(
                     Severity::Error, lc->value->span.begin,
@@ -2405,6 +2452,92 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     "(§29.11) that a `const` binding cannot hold; iterate "
                     "`for var x in coll.Drain() do … end` directly, or bind "
                     "with `using var` (§21.1 / §28.10)");
+            } else if (auto* mce =
+                           dynamic_cast<const ast::CallExpr*>(lc->value.get());
+                       mce &&
+                       common::isBuiltinOwnedMaterializerCall(*mce, ctx_)) {
+                // fix #2709 / §21.1 (v0.201): "Rejected […]: a fresh `new`, an
+                // `owned`-returning call […]". The builtin collection
+                // materializers ARE `owned`-returning calls — stdlib §5:
+                // "`ToArray()` returns a fresh `Array<T>` containing the
+                // materialized sequence. The return is `owned` — the caller is
+                // responsible for disposing it" (and §4.4 for
+                // `Sorted`/`Reversed`, §9.6 for `Split`) — but they are
+                // compiler-known members with no user `MethodDecl`, so
+                // `producerState`'s `returnOwned` authority never sees them and
+                // the Owned branch above does not catch them.
+                //
+                // Left unrejected this was not merely bad advice: a `const`
+                // local is neither a `LocalDecl` (codegen's plain-`var`
+                // materializer reclaim,
+                // `isFreshBorrowingArrayMaterializerLocal`) nor a `using var`
+                // (`registerUsingDisposal`), so NOTHING freed the value.
+                // Measured under LSan: 100 of 100 iterations leaked, for each
+                // of the six materializers. The §21.1 rejection is the fix —
+                // both spellings that DO bind it are already reclaimed
+                // correctly, so no disposal machinery changes here.
+                // // per §21.1 v0.201, stdlib §5 / §4.4 / §9.6, #2709
+                ctx_.diagnostics().report(
+                    Severity::Error, lc->value->span.begin,
+                    std::string("a `const` local (`") + std::string(lc->name) +
+                    "`) must not take an owned production — a collection "
+                    "materializer returns a fresh `owned` collection (stdlib "
+                    "§5) that the binding would never dispose, so the value "
+                    "would leak; bind it with `using var` (§21.1 / §28.3)");
+            } else if (auto* rix =
+                           dynamic_cast<const ast::IndexExpr*>(lc->value.get());
+                       rix &&
+                       common::isBuiltinArrayRangeSliceIndex(*rix, ctx_)) {
+                // fix #2749 item 2 / §21.1 (v0.240). §28.3's producers table
+                // has an explicit row for this form: "Range slice `arr[r]` on
+                // `Array<T>` (§15.6) | Owned — a fresh `Array<T>`, the
+                // compiler-recognized `Slice(r: Range<int>): owned Array<T>`
+                // form (stdlib §4.4); **not** the indexer row above." So the
+                // spec treats `arr[0..2]` and `arr.Slice(0..2)` as ONE
+                // operation, and §21.1's "an `owned`-returning call" reaches
+                // both — but the branch above is keyed on a `CallExpr`, so
+                // #2709 rejected the method spelling and left the INDEXER
+                // spelling accepted. That was a live remedy loop and the more
+                // idiomatic half of it: measured on 0b9693e,
+                // `using var s := arr[0..2];` drew the #2073 vacuous lint
+                // ("use `const x := …;`") and `const s := arr[0..2];` was then
+                // accepted.
+                //
+                // ⚠ The message names §21.1's mandated remedy ("Rejected, with
+                // a diagnostic naming this rule and the `using var` remedy"),
+                // but be aware that for THIS form the `using var` spelling
+                // still leaks today — codegen reclaims `arr.Slice(r)` and
+                // reclaims nothing for `arr[r]`, in any binding spelling
+                // (measured 64-of-64 under LSan; filed as #2753). This branch
+                // is the §21.1 half only: it removes the `const` binding, which
+                // by construction has no free path at all, and stops the lint
+                // from advertising it. // per §21.1, §28.3, §15.6, v0.240,
+                // #2749, #2753
+                ctx_.diagnostics().report(
+                    Severity::Error, lc->value->span.begin,
+                    std::string("a `const` local (`") + std::string(lc->name) +
+                    "`) must not take an owned production — a range slice "
+                    "`arr[r]` produces a fresh `owned` Array<T> (§28.3, the "
+                    "compiler-recognized `Slice(r)` form) that the binding "
+                    "would never dispose, so the value would leak; bind it "
+                    "with `using var` (§21.1 / §28.3)");
+            } else {
+                // UNREACHABLE TODAY, and structural rather than defensive: the
+                // outer gate is `constInitializerRejected`, whose disjuncts are
+                // exactly the four branches above, so falling here means a
+                // fifth disjunct was added to the predicate without a message.
+                // Without this arm that combination would REJECT-BUT-SAY-
+                // NOTHING — the initializer accepted in silence while the lint
+                // (which consults the same predicate) also stays quiet: the
+                // #2709 accept-and-leak failure mode restored by omission.
+                // Emitting §21.1's general wording keeps the gate and the
+                // messages jointly total. // per §21.1, #2709
+                ctx_.diagnostics().report(
+                    Severity::Error, lc->value->span.begin,
+                    std::string("a `const` local (`") + std::string(lc->name) +
+                    "`) must not take an owned production — the binding never "
+                    "takes a disposal obligation; bind owned values with "
+                    "`using var` (§21.1 / §28.3)");
             }
         }
         // No state transition: a const local carries no obligation. The
@@ -3409,6 +3542,90 @@ bool MethodOwnership::checkBareBorrowLoopCarriedEscape(
                "returns* / borrow-lifetime rule, v0.194; accumulate with indices "
                "or an owned clone instead)");
         return true;
+    }
+    return false;
+}
+
+// §21.1 (v0.201), fix #2709, extended by #2749. See the header contract in
+// Ownership_impl.hpp. The disjuncts are exactly the categories the
+// `LocalConstDecl` arm of visitStmt reports on, in the same order — that arm
+// selects a MESSAGE, this function answers the yes/no the lint needs, and
+// neither may grow a category the other lacks. Diagnostic-only: no disposal, no
+// retain, no state.
+bool MethodOwnership::constInitializerRejected(const ast::Expr& e) {
+    if (producerState(e) == OwnershipState::Owned) return true;
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // §29.11 deferred-activation producer (#2146).
+        if (common::isOwningCollectionDrainAliasCall(*ce, ctx_)) return true;
+        // §21.1's "an `owned`-returning call", for the builtin materializers
+        // `producerState` cannot see (#2709).
+        if (common::isBuiltinOwnedMaterializerCall(*ce, ctx_)) return true;
+    }
+    // §28.3's "Range slice `arr[r]` on `Array<T>`" producer row (#2749 item 2).
+    // The spec makes the two spellings ONE operation — the row reads "Owned — a
+    // fresh `Array<T>`, the compiler-recognized `Slice(r: Range<int>): owned
+    // Array<T>` form (stdlib §4.4)" — but `arr[r]` is an `ast::IndexExpr`, so
+    // neither `producerState` (no IndexExpr arm) nor either CallExpr disjunct
+    // above could see it. #2709 therefore left `arr.Slice(0..2)` rejected and
+    // `arr[0..2]` accepted, with the #2073 lint still steering authors into the
+    // accepted-and-leaking one. // per §28.3, §15.6, §21.1, #2749
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+        if (common::isBuiltinArrayRangeSliceIndex(*ix, ctx_)) return true;
+    // fix #3017 (§28.3 / §28.9 / §28.10, v0.240): a STATIC CallExpr returning
+    // a chain-claimed built-in absent from the §28.10 lint's
+    // `kDisposableBuiltinHeadNames` table — the 13 borrowing collections and
+    // vtable-less builtins (Array/Stack/Queue/Set/SortedSet/Dictionary/
+    // SortedDictionary/LinkedList/Random/Atomic/AtomicInteger/Stopwatch/
+    // Buffer, see `common::isChainClaimedBuiltinHeadName`). producerState
+    // returns Borrowed for these because the result's declaration is null
+    // (builtin, no MethodSymbol to find a `returnOwned` flag on — the
+    // `md->returnOwned` arm of producerState reads null) and
+    // `staticFactoryReturnsFreshOwned` requires a non-null declaration on the
+    // RESULT side (OwnershipFacts.cpp:567 `!resultTy->declaration` → returns
+    // false). So the lint's outer guard `!constInitializerRejected` was not
+    // satisfied and a factory-call `using var x := C.Make()` over one of the
+    // 13 names fired the vacuous-pin warning on a REAL §28.10 disposal
+    // obligation (the chain reclaims each — measured in #2992's authority-
+    // differential analysis).
+    //
+    // The alias form (`var src := new Array<int>(); using var p := src;`) is
+    // PRESERVED: the IdentifierExpr RHS bypasses every CallExpr disjunct
+    // here, AND `rhsIsDisposableClassType` Path 2 still returns false for
+    // the 13 heads (they are deliberately absent from
+    // `kDisposableBuiltinHeadNames` by #2695's coherence invariant), so the
+    // lint still fires on the alias case with its existing message.
+    //
+    // Gated to STATIC methods to mirror §28.3's structural-source rule: an
+    // instance method has a borrow source (the receiver) and may legitimately
+    // return a borrow of receiver state — a `using var x := obj.GetArr()`
+    // over an instance getter returning a borrowed field would be wrongly
+    // accepted by an unguarded disjunct (a use-after-free at the receiver's
+    // scope end). A static method has no receiver, so a return is either a
+    // fresh `new T()` or a fresh built-in materializer, and the chain will
+    // reclaim it. `calleeMethodDecl` returns null for a callee through a
+    // value/function or an imported method; those fall through and the lint
+    // still fires, matching today's behaviour.
+    //
+    // Mirrors `rhsIsDisposableClassType` Path 2's own shape: declaration-less
+    // (builtin), single-part name, head is in the predicate's set. The
+    // declaration-less gate keeps a user class that happens to share one of
+    // the 13 names out of the disjunct (its declaration is non-null and the
+    // chain's arms would not reclaim it). // per §28.3, §28.9, §28.10, #3017
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_)) {
+            bool calleeIsStatic = false;
+            for (std::string_view mod : md->modifiers)
+                if (mod == "static") { calleeIsStatic = true; break; }
+            if (calleeIsStatic) {
+                if (const sema::TypeRef* rt = ctx_.exprType(e)) {
+                    if (rt->kind == sema::TypeRef::Kind::Named &&
+                        !rt->declaration && rt->astNode && rt->astNode->name &&
+                        !rt->astNode->name->parts.empty() &&
+                        common::isChainClaimedBuiltinHeadName(rt->headName()))
+                        return true;
+                }
+            }
+        }
     }
     return false;
 }
@@ -4544,8 +4761,58 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
     // steering, not rejection. Suppressed in generic bodies (the classification
     // varies per instantiation, §28.10's reason for the uniform admissibility).
     // // per §28.10, #2073
+    //
+    // #2695 / §21.1 (v0.201), v0.240: BOTH messages below end in "use `const
+    // x := …;`", so the lint may only fire where that remedy actually
+    // COMPILES. §21.1 rejects a `const` local whose initializer is an owned
+    // production — visitStmt's LocalConstDecl arm, same file: "a `const` local
+    // (`x`) must not take an owned production — the binding never takes a
+    // disposal obligation; bind owned values with `using var` (§21.1 /
+    // §28.3)". That arm's test is exactly `producerState(init) == Owned`, so
+    // reusing the SAME classifier here makes the two sites incapable of
+    // disagreeing: the lint fires iff its own advice is legal.
+    //
+    // Before this guard, `using var d := new Dictionary<string, string>();`
+    // produced advice the compiler then rejected, and the §28.3 auto-drop
+    // hint on the plain-`var` spelling pointed straight back at `using var`
+    // ("declare it `using var` to make the scope-bound disposal explicit") —
+    // a three-way loop with NO warning-free spelling for a fresh borrowing-
+    // collection producer. `using var` IS the correct spelling for a fresh
+    // production (§28.10), which is what the pre-existing negative control
+    // `fresh_owned_producer_load_bearing_no_warn_spec_28_10` already asserts
+    // for a destructor-bearing class; rework 3c carved the trivial-dispose
+    // collections back OUT of it on the strength of "`Dispose()` is a no-op",
+    // which is true of `Dispose()` (§28.11's element-slot table: a borrowing
+    // collection's `Dispose()` does "no user-visible work") but says nothing
+    // about whether an alternative spelling exists. None does.
+    //
+    // Note the premise was independently wrong for a string-element
+    // instantiation: `Dictionary<K, string>`'s scope-end work is the
+    // per-element release that #2682/#2686 added to `registerUsingDisposal`,
+    // so "no disposal obligation" misdescribes it. That is not what this
+    // guard turns on, though — it turns on the availability of the remedy,
+    // which is decidable and covers `Dictionary<K, int>` equally.
+    //
+    // Deliberately placed on the OUTER guard so it covers Case B as well.
+    // Case B cannot currently fire on a production (rhsIsVacuousBorrowPin
+    // classifies only identifier and field-chain shapes, both Borrowed), but
+    // its message carries the identical `const` remedy, so scoping the
+    // invariant to the whole lint keeps a future Case B widening honest.
+    // // per §21.1, §28.10, §28.3, v0.240, #2695
+    //
+    // fix #2709 (v0.240): the guard now calls `constInitializerRejected`, the
+    // SHARED authority the `LocalConstDecl` arm reports from, rather than
+    // re-spelling one of its three disjuncts here. #2695's claim that the two
+    // sites were "incapable of disagreeing" held for `producerState == Owned`
+    // only; §21.1's other two named categories were matched by separately
+    // maintained tests, and the builtin `owned`-returning MATERIALIZERS
+    // (`ToArray`/`ToSet`/`ToDictionary`/`Sorted`/`Reversed`/`Split`) were not
+    // matched on the const side at all — so the lint told the author to write
+    // `const a := xs.ToArray();`, the compiler accepted it, and the array
+    // leaked. Routing through one function closes the loop BY CONSTRUCTION for
+    // every category, present and future. // per §21.1, §28.10, #2709
     if (ld.isUsing && ld.initializer && !ld.initializerHasOwnedMarker &&
-        !isGenericBody_) {
+        !isGenericBody_ && !constInitializerRejected(*ld.initializer)) {
         // Case A: inert RHS. Value-typed or runtime-managed types carry no
         // disposal obligation (§28.9), so the scope-end `Dispose()` a `using
         // var` would call is a no-op; the only effect is the reassignment lock
@@ -4587,20 +4854,26 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         if (auto cv = common::classifyChoiceType(rhsTy, ctx_))
             rhsIsOwningChoice =
                 (*cv == common::ChoiceClassification::Owning);
-        // #2146: an owning-collection Drain() ALIAS pin is neither inert nor
-        // vacuous — it pins a scope-local owned collection (load-bearing), and
-        // the lint's `const` remedy is inapplicable (§21.1 rejects a Drain
-        // initializer as a deferred-activation producer). Its declaration-less
-        // IOwningEnumerable TypeRef would otherwise fall into Case A's
-        // "value-typed/runtime-managed" bucket. // per §28.10, §21.1, #2146
-        bool rhsIsDrainAliasPin = false;
-        if (auto* dce =
-                dynamic_cast<const ast::CallExpr*>(ld.initializer.get()))
-            rhsIsDrainAliasPin =
-                common::isOwningCollectionDrainAliasCall(*dce, ctx_);
+        // #2146's local `rhsIsDrainAliasPin` guard USED to sit here: an
+        // owning-collection `Drain()` alias pin is neither inert nor vacuous,
+        // and the lint's `const` remedy is inapplicable to it (§21.1 rejects a
+        // Drain initializer as a §29.11 deferred-activation producer). #2709
+        // removed it as DEAD: `constInitializerRejected` on the outer guard
+        // now covers the drain-alias category itself, so this arm is
+        // unreachable for such an RHS. That is the point — #2709 found the
+        // duplicate had closed the loop "by coincidence rather than by
+        // construction", i.e. only because both sides happened to spell the
+        // identical `common::isOwningCollectionDrainAliasCall` shape. The
+        // shared predicate removes the opportunity to drift.
+        //
+        // It does NOT newly protect Case B: `rhsIsVacuousBorrowPin` returns
+        // false for every `CallExpr` (it classifies only identifier and
+        // field-chain shapes), and both new disjuncts REQUIRE a `CallExpr`, so
+        // Case B was already unreachable for them and stays exactly as it was.
+        // That is a scope fact worth stating rather than a benefit: this fix
+        // widens nothing on the Case B path. // per §28.10, §21.1, #2146, #2709
         if (rhsTy && !isBorrowableType(rhsTy) &&
-            !rhsIsDisposableClassType(rhsTy) && !rhsIsOwningChoice &&
-            !rhsIsDrainAliasPin) {
+            !rhsIsDisposableClassType(rhsTy) && !rhsIsOwningChoice) {
             report(Severity::Warning, ld.span.begin,
                 std::string("`using var` `") + std::string(lsym->name) +
                 "` is vacuous — the RHS is a value-typed/runtime-managed "
@@ -4863,72 +5136,21 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
         }
         return false;
     }
-    // Path 2: built-in named type with no user TypeDecl. Match on the head
-    // name against the stdlib's runtime-disposal contract surface.
+    // Path 2: built-in named type with no user TypeDecl. Consult the SHARED
+    // authority — common::isDisposableBuiltinHeadName — that the codegen auto-
+    // drop chain (registerUsingDisposal, LlvmBackend_Setup.cpp) also consults at
+    // its end-of-chain guard. fix #2992 (§28.3 / §28.9 / §28.10, v0.240): this
+    // was a private hand-list that DISAGREED with codegen's per-arm enumeration
+    // — 13 names (the borrowing collections Array/Stack/Queue/Set/SortedSet/
+    // Dictionary/SortedDictionary/LinkedList, plus Stopwatch, Random, Atomic,
+    // AtomicInteger, Buffer) were claimed by the chain but absent here, so a
+    // factory-call `using var x := MakeArr()` over `Array<T>` fired the vacuous-
+    // pin warning on a real disposal (measured). The two now consult one table;
+    // the rationale for each name's disposal obligation lives in the shared
+    // table's own comments. // per §28.3 / §28.9 / §28.10, fix #2992
     if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
         return false;
-    std::string_view head = rt->headName();
-    // stdlib §3.1 / spec §28.9 (#2190): StringBuilder owns its heap parts
-    // array and a +1 reference to every appended string. Codegen's dedicated
-    // path releases those parts, so this built-in carries a real disposal
-    // obligation rather than the borrowing collections' no-op Dispose.
-    if (head == "StringBuilder") return true;
-    // §2.15 concrete serializers/deserializers: each explicitly implements
-    // IDisposable and owns parser or output-buffer state (the §2.15 spec
-    // example uses `using var s := new JsonSerializer();`), so a `using var`
-    // over `new BinarySerializer()` / `new JsonDeserializer()` is the
-    // canonical pattern — not vacuous. Added per §28.10 / §28.11 in #2073
-    // (rework 3b).
-    if (head == "BinarySerializer" || head == "BinaryDeserializer" ||
-        head == "JsonSerializer"   || head == "JsonDeserializer")
-        return true;
-    // #1718 / §32.6 / stdlib §10: a CString/WString/RawBytes from an owned-
-    // returning EXTERN or static From/FromBytes factory carries a real free()
-    // disposal obligation (§32.6: "a `using var` discharges it"). The classifier
-    // would otherwise lump them with value-typed/runtime-managed types and fire
-    // the §28.10 vacuous-pin warning — even though codegen's isFfiBuf branch
-    // (registerUsingDisposal, LlvmBackend_Setup) registers the free(). Recognize
-    // them here so the lint does not fight the disposal.
-    if (head == "CString" || head == "WString" || head == "RawBytes")
-        return true;
-    // stdlib §7.2 (#645): FileStream declares `destructor;` outright — "flushes
-    // buffered writes and closes the OS file handle" — and §7.2's own prose
-    // makes `using var` the canonical spelling ("the `using var` idiom
-    // guarantees this on every exit edge, including exceptions"). Without this
-    // arm the §28.10 lint would call that idiom vacuous.
-    if (head == "FileStream") return true;
-    // #2385/#2451 / §29.1, §29.2, stdlib §4.12/§4.13: the iteration-protocol
-    // sentinel family. `GetEnumerator()`/`GetOwningEnumerator()`/
-    // `GetAsyncEnumerator()`/`GetOwningAsyncEnumerator()` return an `owned`
-    // enumerator/enumerable — §29.1: "the caller takes ownership of the
-    // enumerator and must dispose it", unconditionally, independent of the
-    // callee's implementation shape (compiler-generated iterator, hand-
-    // written user class, or an Array<T>/user-class value wrapped into the
-    // interface by codegen's wrapUserClassAsIEnumerable). A `using var`/
-    // `await using var` bound to one of these eight names is exactly the
-    // canonical §28.10 pattern, mirrored by registerUsingDisposal's own
-    // isSyncIterEnum / isAsyncIterEnum head-name sets (LlvmBackend_Setup.cpp)
-    // — never a no-op. Without this arm, isBorrowableType's null-declaration
-    // fallthrough (these are declaration-less builtins, TypeResolution_
-    // Names.cpp) left every one of them in the "no disposal obligation"
-    // bucket, misfiring the vacuous-pin warning on a real disposal.
-    if (head == "IEnumerable" || head == "IEnumerator" ||
-        head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
-        head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
-        head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator")
-        return true;
-    return head == "Channel" || head == "ChannelSender" ||
-           head == "EventSource" || head == "AsyncEventSource" ||
-           head == "Subscription" || head == "TaskScope" ||
-           head == "CancellationTokenSource" || head == "Mutex" ||
-           head == "Semaphore" || head == "SemaphoreToken" || head == "Lock" ||
-           head == "OwningTask" || head == "Task" ||
-           head == "Shared" || head == "Weak" ||
-           head == "OwningArray" || head == "OwningDictionary" ||
-           head == "OwningSet" || head == "OwningStack" ||
-           head == "OwningQueue" || head == "OwningLinkedList" ||
-           head == "OwningBuffer" ||
-           head == "TaskCompletionSource" || head == "OwningTaskCompletionSource";
+    return common::isDisposableBuiltinHeadName(rt->headName());
 }
 
 void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {

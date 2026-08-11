@@ -289,51 +289,29 @@ BEZEL_TEST(codegen_stdlib_649_indexof_start, start_after_all_occurrences) {
 }
 
 // ---------------------------------------------------------------------------
-// §6.8 / #652 — Domain.Name: string property.
-// The spec (§6.8) provides a static class Domain with Spawn methods.  The
-// probe and matrix.tsv test the Name property on a newly constructed domain.
+// §6.8 / #652 — the four `codegen_stdlib_652_domain_name` tests that lived here
+// are DELETED by fix #2974 (v0.240). They asserted
+//
+//     var d := new Domain("test"); var n := d.Name; d.Dispose();
+//
+// under a `// §6.8` citation — but stdlib §6.8 declares `public static class
+// Domain` with twelve `Spawn` overloads and NO constructor and NO `Name`, and
+// language spec §11.7 says verbatim "A static class may not be instantiated:
+// `new` on a static class is a compile error" (and, two sentences later,
+// "Because a static class cannot be instantiated, it does not implement
+// `IDisposable`"). All three spellings these tests pinned are ill-formed under
+// the documents they cited.
+//
+// They were not testing an accident: the compiler carried a deliberate
+// `new Domain(name)` construction arm, a `.Name` getter and a `Dispose()` arm,
+// backed by three runtime functions, whose own comment recorded that a probe
+// suite wanted "an instance-creation path that lets programs name a domain for
+// diagnostics". That is CLAUDE.md rule 2's failure mode ("do not invent stdlib
+// APIs") occurring on the compiler's side and then being protected by its own
+// regression tests — which is exactly why they are removed rather than adjusted.
+//
+// What replaces them: `tests/codegen/builtin_static_class_new_2974_test.cpp`
+// pins the REJECTION of `new Domain(…)` (with its §11.7 citation) and, as its
+// anti-over-reject control, that §6.8's real surface — `Domain.Spawn` — still
+// runs and returns the right value.
 // ---------------------------------------------------------------------------
-
-// §6.8: new Domain("test").Name equals "test".
-BEZEL_TEST(codegen_stdlib_652_domain_name, name_matches_ctor_arg) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "var d := new Domain(\"test\"); "
-        "var n := d.Name; "
-        "var ok := (if n = \"test\" then 1 else 0); "
-        "d.Dispose(); "
-        "return ok; ")), 1);
-}
-
-// §6.8: Domain Name length == length of the string passed to ctor.
-BEZEL_TEST(codegen_stdlib_652_domain_name, name_length) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "var d := new Domain(\"hello\"); "
-        "var n := d.Name; "
-        "var len := n.Length; "
-        "d.Dispose(); "
-        "return len; ")), 5);
-}
-
-// §6.8: Domain with empty-string name — Name returns "".
-BEZEL_TEST(codegen_stdlib_652_domain_name, empty_name) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "var d := new Domain(\"\"); "
-        "var n := d.Name; "
-        "var ok := (if n = \"\" then 1 else 0); "
-        "d.Dispose(); "
-        "return ok; ")), 1);
-}
-
-// §6.8: Domain name is a fresh string (not a dangling pointer to a literal).
-// Verify by constructing two domains with different names and comparing both.
-BEZEL_TEST(codegen_stdlib_652_domain_name, two_domains_distinct_names) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "var d1 := new Domain(\"alpha\"); "
-        "var d2 := new Domain(\"beta\"); "
-        "var n1 := d1.Name; "
-        "var n2 := d2.Name; "
-        "var ok := (if n1 = \"alpha\" and n2 = \"beta\" then 1 else 0); "
-        "d1.Dispose(); "
-        "d2.Dispose(); "
-        "return ok; ")), 1);
-}

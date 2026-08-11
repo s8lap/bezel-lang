@@ -359,6 +359,34 @@ private:
     // `OwningDictionary<K,V>` key (K) and `Set<T>` / `OwningSet<T>` element (T)
     // must be equality-bearing (§3.6 rule 2, at the instantiation site).
     void checkHashContainerKeys();
+    // stdlib §4.2 / spec §14.4 (#1327/#1463/#2713): the single authoritative
+    // predicate for "may this type be an owning collection's element?".  Returns
+    // an empty string when `el` is admissible (a class or interface type, or an
+    // unresolved generic parameter — see below), otherwise a noun phrase naming
+    // the structural reason, for the §3.6-rule-2 diagnostic.
+    //
+    // An unresolved generic parameter (Kind::Named, declaration == nullptr, a
+    // name that is not a value builtin) returns "" — admissible — because no
+    // concrete type is known at the declaration site.  That is exactly why the
+    // per-instantiation sweep below exists: it re-runs this same predicate on
+    // the concrete binding.  Both callers share this one function so the
+    // declaration-site and instantiation-site answers cannot diverge (the #1463
+    // name-list-skew lesson).
+    static std::string owningElementBadDesc(const TypeRef* el);
+    // True iff `bound` is a BARE generic-parameter binding — a single-part
+    // Named ref with no declaration that names neither a primitive nor a
+    // builtin. Hoisted from checkDeferredNestedConstraints' local lambda
+    // (#2111) so that pass and the #2713 owning-element closure share ONE
+    // definition of "this binding is itself a type parameter"; two copies of
+    // this predicate is precisely the skew #1463 was about.
+    static bool isBareGenericParamBinding(const TypeRef* bound,
+                                          const ast::Type* boundAst);
+    // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (#2713): Pass 2 for the owning-
+    // collection element check.  The declaration-site check in resolveType()
+    // admits a bare generic parameter; this walks the recorded instantiations of
+    // the enclosing generic type and re-checks the concrete binding, reporting
+    // at the instantiation site per §3.6 rule 2.
+    void checkOwningElementInstantiations();
 
     void checkStaticClassMember(TypeSymbol* t, Symbol* m);
 
@@ -783,6 +811,23 @@ private:
     // the `where T: value` bound. Null outside a method/operator signature.
     const std::vector<ast::GenericConstraint>* currentMethodConstraints_ =
         nullptr;
+    // #2713: the generic parameters the CURRENT method signature/body binds,
+    // saved/restored exactly like currentMethodConstraints_ beside it.
+    //
+    // A method's type parameters and the enclosing type's are ONE name scope,
+    // and the compiler already relies on that: the `where`-clause checker in
+    // TypeResolution_Checks.cpp concatenates the two lists ("both are in
+    // scope"). Nothing forbids a method parameter SHADOWING an enclosing one —
+    // Appendix A.4's `GenericParam ::= Variance? Identifier` carries only the
+    // variance restriction, no §13/§14/§28.1 rule imposes name uniqueness, and
+    // sema/parser emit no shadowing diagnostic (not even for `M<T, T>`). So a
+    // bare parameter NAME plus currentOuterType_ does not identify a binding.
+    // The owning-element deferred obligation consults this to record only names
+    // the enclosing TYPE binds; a name the method binds is a different
+    // obligation whose bindings are not in instantiations_ at all (#2736(a)).
+    // Null outside a method/operator signature; an operator declares no generic
+    // parameters, so the OperatorDecl branch nulls it as well.
+    const std::vector<ast::GenericParam>* currentMethodGenericParams_ = nullptr;
 
     struct DeferredNestedObligation {
         TypeSymbol* outerType = nullptr;        // e.g. Box (owns outerParam)
@@ -799,6 +844,14 @@ private:
         std::vector<TypeRef*> argRefs;               // concrete arg TypeRefs
         std::vector<const ast::Type*> argAsts;       // arg AST nodes (spelling)
         const ast::Type* site = nullptr;             // the `Box<IFoo>` node
+        // #2713: the generic parameters the METHOD enclosing this site binds
+        // (null outside a method signature/body). A chained obligation that
+        // re-keys through this site must not attribute an argument name to
+        // `enclosingType` when the METHOD binds that name — `class Outer<U>`
+        // with `method M<U>()` containing `Inner<U>` would otherwise validate
+        // the method's `U` against Outer's, the same misattribution the
+        // recorder guards against at TypeResolution_Names.cpp.
+        const std::vector<ast::GenericParam>* methodGenericParams = nullptr;
     };
     std::vector<GenericInstantiation> instantiations_;
 
@@ -819,6 +872,21 @@ private:
         TypeSymbol* enclosingType = nullptr;
     };
     std::vector<HashContainerSite> hashContainerSites_;
+
+    // stdlib §4.2 / spec §14.4 / §3.6 rule 2 (#2713): one owning-collection
+    // instantiation whose owned element slot is a bare generic parameter of the
+    // enclosing generic type, e.g. `OwningLinkedList<T>` inside `class H<T>`.
+    // The declaration-site check cannot decide such a site (no concrete type is
+    // known), so it is recorded here and re-checked per instantiation of the
+    // enclosing type by checkOwningElementInstantiations().  Modelled on
+    // hashContainerSites_ above — the existing precedent for this exact shape.
+    struct OwningElementSite {
+        std::string_view container;       // "OwningLinkedList" / "OwningArray" / …
+        std::string_view paramName;       // the bare type parameter, e.g. "T"
+        const ast::Type* site = nullptr;  // the `OwningLinkedList<T>` node
+        TypeSymbol* enclosingType = nullptr;  // the generic body it sits in
+    };
+    std::vector<OwningElementSite> owningElementSites_;
 
     // §14.2: record deferred obligations for an inner instantiation whose
     // argument `argAst` is a generic parameter of the type currently being

@@ -1082,6 +1082,49 @@ void checkOneMember(SemaContext& ctx, MemberSymbol& member) {
     }
 }
 
+// §22.16 (v0.240, #2941): walk every source-defined invariant member's
+// predicate under the same clause rules as `requires`/`ensures` (clauseMode:
+// throw/await rejected, pure-body rules expression-wise, `old`/`result`
+// rejected). Invariants are emitted at codegen time and evaluated at the
+// construction-exit / public-entry / public-exit boundaries §22.16 fixes
+// (see LlvmBackend_Setup.cpp `emitInvariantCheck`); the sema walk here
+// validates the predicate's purity, name-resolves it, and type-checks it.
+// The walker takes a `MemberSymbol&` only for diagnostic context; it does
+// not dereference it. We pass the FIRST member symbol of the class (any
+// real member works; ctor would also work) so the reference is valid.
+// Imported classes are skipped (td == nullptr): their invariant records
+// are declaration facts in the artifact interface, not something this
+// compilation re-evaluates, and re-purity-checking them would break every
+// importer of a pre-built library.
+static void checkClassInvariants(SemaContext& ctx, const TypeSymbol& t) {
+    const auto* td = dynamic_cast<const ast::TypeDecl*>(t.decl);
+    if (!td) return;  // imported type: no AST in this compilation
+    // Find any real member symbol to satisfy the walker's constructor; the
+    // walker doesn't dereference the reference, only stores it.
+    MemberSymbol* anchor = nullptr;
+    for (const auto& m : t.members) {
+        if (auto* mem = dynamic_cast<MemberSymbol*>(m)) {
+            anchor = mem;
+            break;
+        }
+    }
+    if (!anchor) {
+        // Empty class with only invariants and no other members — skip
+        // (the class couldn't be instantiated anyway).
+        return;
+    }
+    for (const auto& member : td->members) {
+        const auto* inv =
+            dynamic_cast<const ast::InvariantDecl*>(member.get());
+        if (!inv || !inv->expr) continue;
+        PureBodyWalker w(ctx, *anchor,
+                         std::string("invariant of `") +
+                             std::string(t.name) + "`",
+                         /*isConstructor=*/false);
+        w.checkInvariantExpr(*inv->expr);
+    }
+}
+
 }  // namespace
 
 bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
@@ -1095,6 +1138,11 @@ bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
         if (auto* t = dynamic_cast<TypeSymbol*>(child)) types.push_back(t);
     }
     for (TypeSymbol* t : types) {
+        // §22.16 (v0.240, #2941): purity-check every source-defined
+        // invariant member BEFORE the member-purity walk, so an invariant
+        // diagnostic is reported ahead of any body diagnostic (matching the
+        // clause-before-body ordering at the checkOneMember call site).
+        checkClassInvariants(ctx, *t);
         for (Symbol* m : t->members) {
             auto* mem = dynamic_cast<MemberSymbol*>(m);
             if (!mem) continue;
@@ -1102,6 +1150,7 @@ bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
             // Recurse into nested types' members.
             if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
                 if (nt->type) {
+                    checkClassInvariants(ctx, *nt->type);
                     for (Symbol* nm : nt->type->members) {
                         auto* nmem = dynamic_cast<MemberSymbol*>(nm);
                         if (nmem) checkOneMember(ctx, *nmem);

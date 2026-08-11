@@ -111,7 +111,7 @@ BEZEL_TEST(codegen_cg49, compound_assign_times_equals) {
         "end C;"), 24);
 }
 
-// #739 / §22.9: a `return;` in a block-form setter ENDS the setter (it is a void
+// #739 / §21.7: a `return;` in a block-form setter ENDS the setter (it is a void
 // accessor), it does NOT return from the enclosing method. The setter body is
 // inlined at the assignment site, so the return is routed to an accessor-end
 // block. Conditional-return validate-then-set must keep the prior value.
@@ -131,7 +131,7 @@ BEZEL_TEST(codegen_block_setter, conditional_return_ends_setter_739) {
         "end Main; end C;"), 8);
 }
 
-// #739 / §22.9: an UNCONDITIONAL `return;` in a setter previously IR-failed
+// #739 / §21.7: an UNCONDITIONAL `return;` in a setter previously IR-failed
 // (terminator mid-block). Now it cleanly ends the setter (a no-op setter here).
 BEZEL_TEST(codegen_block_setter, unconditional_return_in_setter_no_irfail_739) {
     BEZEL_EXPECT_EQ(run(
@@ -157,7 +157,7 @@ BEZEL_TEST(codegen_block_setter, unconditional_return_in_setter_no_irfail_739) {
 //     early (inside the setter), freeing the object before the subsequent
 //     read — the write happened but the object was freed, giving wrong value.
 // Fix (LlvmBackend_Assign.cpp `lowerIndexerSet`): install `inlinedAccessorEnd_`
-// before `lowerScopedBlock`, mirroring `lowerPropertySetValue` (§22.9 / #739).
+// before `lowerScopedBlock`, mirroring `lowerPropertySetValue` (§21.7 / #739).
 // ---------------------------------------------------------------------------
 
 // #1236 / §23.5: unconditional `return;` at the end of a block-form indexer
@@ -199,7 +199,7 @@ BEZEL_TEST(codegen_block_setter, indexer_setter_conditional_return_write_persist
 }
 
 // #1236 / §23.5: validate-then-reject: negative values are rejected by an
-// early `return;`, positive values are stored — mirrors the §22.9 / #739
+// early `return;`, positive values are stored — mirrors the §21.7 / #739
 // pattern but for the indexer setter. Last non-negative write wins.
 BEZEL_TEST(codegen_block_setter, indexer_setter_return_rejects_invalid_1236) {
     BEZEL_EXPECT_EQ(run(

@@ -288,6 +288,22 @@ int64_t bz_dict_count(void* d);
 // Mismatch → codegen throws InvalidOperationException (per §29.12).
 int64_t bz_dict_get_mod(void* d);
 
+// fix #3026 (spec §28.2 / §28.9 / §8.1, stdlib §4.1 / §4.6-§4.9, v0.240):
+// dispose a heap-collection pointer whose concrete backing is unknown at the
+// call site (a polymorphic collection-interface receiver —
+// IReadOnlyCollection<T> / ICollection<T> / IOwningCollection<T>). Reads the
+// kind tag (see BZ_RUNTIME_KIND_* in bezel_runtime_internal.hpp) the alloc
+// fn stamped and dispatches to bz_array_free / bz_llist_free / bz_dict_free
+// accordingly. `dispose_elem` is the static-element-type disposer the caller
+// computed (null for borrowing, the class-element disposer for
+// IOwningCollection<T>); see the helper's definition for the sentinel layout
+// and probe order.
+void     bz_runtime_dispose(void* p, void (*dispose_elem)(void*));
+// Diagnostic accessor for the kind tag (returns BZ_RUNTIME_KIND_NONE on null
+// or on an untagged pointer). Used by codegen / tests; never by emitted
+// code.
+int64_t  bz_runtime_kind(void* p);
+
 // Enumerate all keys as (char*, int64_t len) pairs. The caller must free the
 // returned arrays with free(). `*keys_out` and `*lens_out` are malloc'd arrays.
 void bz_dict_keys_str(void* d, char*** keys_out, int64_t** lens_out,
@@ -867,6 +883,19 @@ const char* bz_task_error(void* task);
 // Null when the fault carried only a message.
 void* bz_task_error_obj(void* task);
 
+// §30.9 / #3030: null the task's error_obj slot. Codegen's scope-end
+// fault-disposal preamble reads error_obj via bz_task_error_obj, calls
+// emitDisposeAndReclaim on the result, and then calls bz_task_fire_and_forget.
+// Pre-#3030 bz_task_free never read error_obj, so leaving the field dangling
+// was fine; post-#3030 the FAST path of bz_task_fire_and_forget inspects
+// error_obj to decide whether to dispose it (the FAST path is reachable from
+// the explicit `Task.FireAndForget(owned t)` user-facing call, which has no
+// codegen preamble), so a non-null dangling field would be re-disposed ->
+// double-free. This setter nulls the field after codegen's dispose so the
+// FAST path's `if (error_obj && ...)` guard sees null and skips. Lock-free:
+// by the time codegen runs the preamble the task has settled.
+void  bz_task_clear_error_obj(void* task);
+
 // §30.10 / #1529: true if `task`'s error_obj is a BORROWED reference from an
 // input task's owned fault (a WhenAll/WhenAll<T> aggregate that propagated an
 // input's fault), not owned by `task` itself. Consulted before any fault-
@@ -1372,6 +1401,18 @@ void* bz_string_to_utf16z(const void* str);
 // null-terminated uint16_t buffer, excluding the terminating zero unit.
 int64_t bz_wstrlen(const void* wstr);
 
+// spec §32.6 / stdlib §10.4 (v0.240) / fix #2734: the FFI READ-BACK direction —
+// the inverses of bz_string_to_utf8z / bz_string_to_utf16z. Copy a
+// NUL-terminated C buffer into a fresh +1 managed Bezel string; the source
+// buffer is only read (never freed, never retained), so "the original is
+// unaffected and is still subject to the caller's disposal obligation" (§32.6).
+// Return NULL on ill-formed input (the stdlib §3.2 strict fault model — codegen
+// raises FormatException) and on a NULL argument. They back
+// `string.From(c: CString)` / `string.From(w: WString)` and the raw-pointer
+// forms `string.FromCStringPointer` / `string.FromWStringPointer`.
+void* bz_string_from_utf8z(const void* p);
+void* bz_string_from_utf16z(const void* p);
+
 // stdlib §10.3 / fix #977 / #985: RawBytes.From(buffer: Array<byte>) — copies
 // the byte array into a fresh malloc'd buffer and wraps it with its length in a
 // { ptr, len } heap struct so RawBytes is a backed pointer-and-length pair.
@@ -1861,6 +1902,24 @@ extern void* bz_ser_exc_vtable;
 
 // Register the SerializationException vtable; called by the generated main prologue.
 void bz_ser_exc_vtable_init(void* vtable);
+
+// issue 2330 / §31.4 / §30.9: register the built-in exception vtable and type-
+// descriptor tables with the runtime, from the same generated main prologue and
+// for the same reason as bz_ser_exc_vtable_init above. The pure-runtime
+// vtable-Dispose-then-free reclaim sites (bz_dispose_class_obj and
+// bz_domain_spawn's DomainFaultedException wrap, bezel_runtime_concurrency.cpp)
+// run with no codegen-supplied table argument; they reclaim a disposed
+// exception's §31.4 CauseChain snapshot through
+// bz_exc_reclaim_causechain_registered, which reads what was registered here.
+void bz_exc_tables_init(void** excVtableTable, void** excDescTable);
+
+// Reclaim `obj`'s §31.4 CauseChain snapshot using the tables registered by
+// bz_exc_tables_init. A no-op unless `obj` is a built-in exception or a user
+// subclass of one (the same gate the codegen reclaim site applies), so it is
+// safe to call on any class object about to be freed. Call it AFTER the virtual
+// Dispose dispatch and BEFORE freeing the object, matching the codegen terminal
+// reclaim site's order.
+void bz_exc_reclaim_causechain_registered(void* obj);
 
 // OwningBuffer<byte> helpers used by BinarySerializer/BinaryDeserializer.
 // bz_owned_buffer_alloc: allocate an OwningBuffer<byte> with the given bytes,

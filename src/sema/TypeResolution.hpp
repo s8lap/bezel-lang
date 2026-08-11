@@ -60,6 +60,36 @@ bool checkClassSerializationEligibilityLate(const ast::SourceFile& src,
 // other passes (e.g. §22.6 overload resolution).
 bool typeRefEqual(const TypeRef* a, const TypeRef* b);
 
+// #2787 / spec §14.2 rule 3 + §12.9 / stdlib §2.2 §4.4 §5.1: does the INTERFACE
+// type `t` satisfy the self-recurrent bound `where T: IComparable<T>` — i.e.
+// does it name `IComparable<t>` (ITSELF) in its extension clause?
+//
+// This is THE ONE definition of that predicate. It previously existed in three
+// independent copies — codegen's selfComparableIfaceCompareTo (#2768, reused by
+// #2770 and #2782), an inline scan in sema's Sort/Sorted gate (#2768), and
+// sema's selfComparableIfaceArg (#2782) — which is the shape that produced the
+// `outerDepth` sentinel defect an earlier run had to fix twice and then sweep.
+// A pending divergence made the risk concrete: #2776 records that this test does
+// not reach a CROSS-MODULE interface (an imported interface's `baseTypeRefs` does
+// not carry its `IComparable` base), and that fix must apply to every caller.
+//
+// It is deliberately the EXACT constraint, not a weaker proxy:
+//   * `IComparable` is matched by IDENTITY against the builtin symbol, never by
+//     name — #1867's recorded convention ("Blanket-accepting by decl/name was
+//     too lenient — it admitted a WRONG generic argument"), which also stops a
+//     user-declared interface that happens to be called `IComparable` from
+//     masquerading as the stdlib §2.8 one.
+//   * the argument is compared with `typeRefEqual`, §14.2's exact,
+//     component-wise, INVARIANT identity — so `interface IG<T>:
+//     IComparable<IG<int>>` does NOT satisfy it for `IG<string>` (§12.9,
+//     IComparable is invariant), where a bare `arg->declaration == d` would
+//     have admitted it.
+//   * nullable is excluded: §14.2 states "A type-bound constraint — naming a
+//     class or interface — implies non-null T".
+// `icomparable` is the caller's `ctx_.builtinInterfaceSym("IComparable")`;
+// passing null yields false.
+bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
+
 // Does a derived (override) parameter type MATCH a base parameter type —
 // exactly, or via the one nullability widening §12.1 admits (base `T`,
 // derived `T?`, v0.181, #1560)? The reverse (base `T?`, derived `T`) is NOT

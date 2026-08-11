@@ -69,8 +69,90 @@
 #                            (default 50 — the full pass then does the work anyway)
 set -u
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate: not in a git repo" >&2; exit 2; }
-MODE="${1:-default}"
+
+# Make scripts/ importable as the `gate` package so `python3 -m gate.serialize`
+# resolves from any cwd. Honor an operator's pre-set PYTHONPATH by appending
+# rather than overwriting.
+export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}scripts"
+# Scratch dir + verdict file path are set up BEFORE any preflight exit can fire,
+# so the verdict writer (gate_write_verdict, below) has a path on every exit path
+# (Phase 3, #3002). $S was previously set after the mode/builder preflights, so
+# early exits (exit 64/2 below) could not write a verdict — now they can.
 S=/var/tmp/bezel-scratch; mkdir -p "$S"
+GATE_VERDICT_FILE="${GATE_VERDICT_FILE:-$S/gate-verdict.json}"
+MODE="${1:-default}"
+
+# ---------------------------------------------------------------------------
+# gate_write_verdict — the authoritative verdict file writer (Phase 3, #3002).
+#
+# THE EXIT-CODE-TRAP CLASS: a backgrounded `gate_and_push.sh > log; echo EXIT=$?`
+# reports the WRAPPER's exit, not the gate's. The gate's real verdict is smeared
+# across ($?, banner greps, a status file) and they can disagree (#3002: rc=0
+# over 31% coverage; #2633: rc=0 under an undercount banner). This writes ONE
+# authoritative gate-verdict.json on EVERY exit, atomically, that Phase 3c
+# consumers will read instead of $?/greps.
+#
+# PHASE 3 IS ADDITIVE: the write lands here, but NO consumer switches yet. The
+# existing $?/banner/status-file outputs are UNCHANGED (back-compat). The file
+# is observation-only until N gates prove it matches the gate's outcome.
+#
+# Best-effort: the `|| true` ensures a verdict-write hiccup NEVER changes the
+# gate's exit code (the file is not load-bearing until Phase 3c switches a
+# consumer to read it). per #3002 / the exit-code-trap.
+# ---------------------------------------------------------------------------
+gate_write_verdict() { # rc [total_s] — write gate-verdict.json; best-effort, never changes exit
+  local rc="$1" total="${2:-0}"
+  local oracle="plain"; [ "${ASAN:-0}" = "1" ] && oracle="asan"
+  # per the exit-code-trap / #3010 Wave 3: the truncation banner grep AND the 12
+  # conditional `[ -n "${X+x}" ]` arg guards moved INTO verdict.py's
+  # write_from_state. Python reads the shard log itself (the "shard crash /
+  # undercount" banner grep is now an `in` check — ONE authority for run_parallel's
+  # wording, not a bash re-implementation) and computes truncated/undercount;
+  # the conditional guards collapse to `${VAR:-}` defaults + Python's empty->
+  # None normalization (an unmeasured number still emits null, never 0, #3010).
+  # Best-effort `|| true` preserved: a verdict-write hiccup NEVER changes the
+  # gate's exit code. Dual-run equivalence (new verdict == old verdict) is pinned
+  # by DualRunWriteFromStateTest over a matrix of reachable gate states.
+  # --mode uses the `=` form because MODE can be `--full`/`--quick`/`--no-asan`,
+  # and a bare `--mode --full` makes argparse treat `--full` as an unknown FLAG
+  # (exit 2), silently skipping the verdict write (the `|| true` swallows it).
+  PYTHONPATH=scripts python3 -m gate.verdict write_from_state \
+    --path "$GATE_VERDICT_FILE" --rc "$rc" \
+    --shard-log "$S/gate_shard.log" \
+    --head "${GATE_HEAD:-}" --mode="${MODE:-}" --oracle "$oracle" \
+    --started-epoch "${GATE_EPOCH:-0}" --total-s "$total" \
+    --failed-phase "${FAILED_PHASE:-}" \
+    --shard-count "${SHARD_COUNT:-0}" --shard-reported-s "${SHARD_REPORTED_S:-0}" \
+    --coverage-gtests "${COV_GTESTS:-}" --coverage-littests "${COV_LITTESTS:-}" \
+    --expected-gtests "${GATE_EXPECTED_GTESTS:-}" \
+    --asan-errors "${ASAN_ERRS:-}" --arbitration-suspects "${ARB_SUSPECTS:-}" \
+    2>/dev/null || true
+}
+# fix #3011: REJECT AN UNRECOGNISED MODE. `MODE` has exactly one semantic use
+# (`[ "$MODE" = "--full" ] && ASAN=1`, below), so before this check ANY other
+# argument ran a PLAIN gate while every log line, the status file, and the
+# telemetry record labelled it whatever was typed. A typo did not fail — it
+# silently ran the weaker oracle under the stronger name.
+#
+# That is not hypothetical. gate-timings.jsonl records six such runs:
+#   --fast x4, --clean-first x2   (both --clean-first runs recorded result=pass)
+# Each displaced a real oracle. `c7404bf` (#2917) made the DUAL-oracle rule
+# structural five commits before this; a mistyped flag defeated it anyway.
+#
+# The allow-list is a POSITIVE list, which is variant 1 of this project's own
+# category-defect taxonomy — it fails LOUD by rejecting a name it should know.
+# That is the correct direction here: a new mode announces itself at the first
+# invocation instead of silently degrading forever. Adding one is a one-word
+# edit; add it to gate_and_push.sh's --single-oracle help too.
+case "$MODE" in
+  default|--quick|--full|--no-asan) ;;
+  *)
+    echo "gate: UNRECOGNISED MODE '$MODE'" >&2
+    echo "  known modes: default | --quick | --no-asan (all plain) | --full (ASan)" >&2
+    echo "  Refusing rather than running a plain gate under a name you did not mean." >&2
+    gate_write_verdict 64 0
+    exit 64 ;;
+esac
 DH=scripts/dev_heavy.sh
 
 # Zero-builders preflight (cold-cache flake defense): a --full gate run
@@ -83,9 +165,51 @@ DH=scripts/dev_heavy.sh
 # pattern is a regex and -x anchors it to the WHOLE comm, so this still cannot
 # match this bash script.
 BUILDERS='cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests(_[a-z]+)?'
+# Sibling detection for the preflight (gate-infra preflight-lockfile lane):
+# when the ONLY matched builders are processes descended from another gate, do
+# NOT report them as "builders active" — they are this gate's own workers, not
+# a concurrent producer build. A second concurrent `gate_and_push.sh` must NOT
+# be blocked by the first's `cmake`/`run_parallel.sh` children — that deadlock
+# is the bug this whole lane exists to fix. The check uses /proc/<pid>/status
+# to walk ancestors: a process whose ancestor chain includes any of the gate
+# driver scripts is a sibling. If ANY matched builder has NO gate ancestor, the
+# original "builders active" message fires (an actual orphan producer build IS
+# active and a concurrent gate still risks the cold-cache flake).
+#
+# The /proc walk itself now lives in scripts/gate/serialize.py
+# (`is_gate_sibling`, post-run infra migration; pinned by
+# test_gate_serialization.py's SiblingDetectionTest). This wrapper is a thin
+# shell adapter so the gate.sh call sites read identically to the bash
+# implementation: returns 0 on yes, 1 on no. The verdict is captured first
+# (the helper exits 1 on "no" — using `|| return 1` would short-circuit the
+# assignment), then matched against "yes" via `[ ... ]`.
+_is_gate_ancestor() { # $1 = pid  -> returns 0 iff any ancestor's comm is a gate driver
+  local pid="$1" _verdict
+  _verdict=$(PYTHONPATH=scripts python3 -m gate.serialize is-sibling --pid "$pid" 2>/dev/null)
+  [ "$_verdict" = yes ]
+}
 if [ -z "${GATE_SKIP_BUILDER_CHECK:-}" ] && pgrep -x "$BUILDERS" >/dev/null 2>&1; then
+  # Separate sibling-only from mixed (sibling + non-sibling) matches. Mixed
+  # falls through to the original abort message — an orphan producer build IS
+  # active alongside a sibling, so the cold-cache flake risk is unchanged.
+  sibling_only=1; sibling_ppids=""
+  while IFS= read -r _pid; do
+    [ -n "$_pid" ] || continue
+    if _is_gate_ancestor "$_pid" >/dev/null 2>&1; then
+      sibling_ppids="$sibling_ppids $_pid"
+    else
+      sibling_only=0
+    fi
+  done < <(pgrep -x "$BUILDERS" 2>/dev/null)
+  if [ "$sibling_only" -eq 1 ]; then
+    echo "GATE ABORT: another gate is running (matched builders are all gate-and-push siblings; pids:${sibling_ppids}); wait for it to finish, or set GATE_SKIP_BUILDER_CHECK=1." >&2
+    pgrep -ax "$BUILDERS" >&2 || true
+    gate_write_verdict 2 0
+    exit 2
+  fi
   echo "GATE ABORT: heavy build/test process(es) already active — gating now risks the cold-cache flake (zero-builders rule). Stop them, or set GATE_SKIP_BUILDER_CHECK=1:" >&2
   pgrep -ax "$BUILDERS" >&2 || true
+  gate_write_verdict 2 0
   exit 2
 fi
 
@@ -102,7 +226,8 @@ fi
 # fits comfortably. Enable ASan for delicate merges (--full) or on a quiet host
 # (GATE_FAST_ASAN=1); flipping the default here is a one-line change if the
 # cold/contention cost is acceptable. The arbitration re-runs must force ASan too
-# (ARB_ENV) or an ASan-only failure would be falsely cleared as flaky.
+# (gate_arbitrate's --asan flag) or an ASan-only failure would be falsely cleared
+# as flaky.
 ASAN=0
 [ "$MODE" = "--full" ] && ASAN=1
 case "${GATE_FAST_ASAN:-}" in
@@ -110,7 +235,35 @@ case "${GATE_FAST_ASAN:-}" in
   0) ASAN=0 ;;
 esac
 
-SHARD_ENV=(); ARB_ENV=(); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
+# SHARD_ENV is spliced in as a COMMAND PREFIX at the run sites below, and
+# dev_heavy.sh ends in `exec systemd-run ... -- "$@"` — systemd-run execs the
+# first word after `--` as a FILENAME, so a bare `VAR=value` word there is not a
+# shell assignment, it is a nonexistent program. The leading `env` is therefore
+# load-bearing, and it is seeded here rather than in the ASan branch because as
+# of #2918 the PLAIN pass also contributes a variable (its shard ceiling).
+# ⚠ BEZEL_AOT_CACHE_STATS IS DELIBERATELY *NOT* SET HERE — see #3012.
+#
+# It was set here in the first draft of #3010, to get the AOT hit/miss numbers
+# this project has never had. The gate caught the consequence immediately: the
+# harness prints its `[aot-cache] …` line from an atexit hook that RACES the
+# shard's own summary printer, and on sema shard 6 it landed mid-line:
+#
+#     102 passed[aot-cache] hits=5 misses=2 (71% hit) …
+#     , 0 failed (shard 6/16), 1630 total
+#
+# run_parallel.sh matches `^[0-9]+ passed, [0-9]+ failed`, so a completed shard
+# (rc=0, 102 real tests) was counted as 102 unaccounted and the whole gate failed.
+# Enabling the measurement corrupted the thing being measured.
+#
+# The fix is to route the stats to their own file rather than into the stream the
+# summary is parsed from (#3012, code change). Until then this stays off: an
+# unmeasured number is a known gap, a corrupted count is a wrong answer.
+SHARD_ENV=(env); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
+# An explicit caller-supplied BEZEL_SHARD_TIMEOUT wins unconditionally, in BOTH
+# oracles (#2918 — this used to be read only in the ASan branch, so an operator
+# exporting it for a plain gate had it silently ignored by this script and only
+# honoured by run_parallel's own default-expansion).
+GATE_EXPLICIT_STO="${BEZEL_SHARD_TIMEOUT:-}"
 if [ "$ASAN" -eq 1 ]; then
   # The ASan per-shard ceiling is COLD-AWARE (#2100): a WARM ASan pass (k2
   # bincache populated) fits 900s with wide margin, but a COLD one — the first
@@ -123,9 +276,7 @@ if [ "$ASAN" -eq 1 ]; then
   # only the coarse per-shard backstop, and the CANARY is the fail-fast layer,
   # so a generous cold ceiling no longer delays broken-tree detection. A
   # caller's explicit BEZEL_SHARD_TIMEOUT always wins.
-  SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
-  GATE_EXPLICIT_STO="${BEZEL_SHARD_TIMEOUT:-}"
-  ARB_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
+  SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)   # see #3012 note above
   SHARD_NOTE="asan-instrumented"
   SHARD_LABEL="crash/undercount + generated-code ASan"
   # 2026-07-17: 16 concurrent ASan shards OOM-kill workers under the dev_heavy
@@ -194,17 +345,57 @@ rec_skip() { PH_NAME+=("$1"); PH_DUR+=("0.00"); PH_RC+=("0"); PH_STATUS+=("skipp
 emit_json() { # rc result total_s -> append one JSON object; best-effort
   local rc="$1" result="$2" total="$3"
   mkdir -p "$TLOGDIR" 2>/dev/null || return 0
-  local phases="" sep="" i n=${#PH_NAME[@]}
-  for (( i=0; i<n; i++ )); do
-    phases="${phases}${sep}{\"name\":\"${PH_NAME[$i]}\",\"s\":${PH_DUR[$i]},\"rc\":${PH_RC[$i]},\"status\":\"${PH_STATUS[$i]}\",\"note\":\"${PH_NOTE[$i]}\"}"
-    sep=","
-  done
-  local fp="null"; [ -n "$FAILED_PHASE" ] && fp="\"$FAILED_PHASE\""
-  printf '{"schema":1,"ts":"%s","epoch":%s,"host":"%s","mode":"%s","head":"%s","head_short":"%s","dirty":%s,"result":"%s","failed_phase":%s,"total_s":%s,"gtests":%s,"littests":%s,"shard_count":%s,"shard_reported_s":%s,"arbitration_suspects":%s,"serial_attempts":%s,"serial_total":%s,"asan_shards_reported":%s,"asan_errors":%s,"shard_times":[%s],"phases":[%s]}\n' \
-    "$GATE_TS" "${GATE_EPOCH:-0}" "$GATE_HOST" "$MODE" "$GATE_HEAD" "$GATE_HEAD_SHORT" "$GATE_DIRTY" \
-    "$result" "$fp" "$total" "${COV_GTESTS:-0}" "${COV_LITTESTS:-0}" "${SHARD_COUNT:-0}" "${SHARD_REPORTED_S:-0}" \
-    "${ARB_SUSPECTS:-0}" "${SERIAL_ATTEMPTS:-0}" "${SERIAL_TOTAL:-0}" "${ASAN_SHARDS:-0}" "${ASAN_ERRS:-0}" \
-    "$SHARD_TIMES" "$phases" >> "$TLOG" 2>/dev/null || return 0
+  # Wave 3 (#3010): the schema:2 record is now built by the gate.telemetry
+  # Python module. The 25-field bash printf, the awk per-binary merge (with its
+  # `exp`/`ran` gawk-builtin-names footgun), and the j_* null-vs-0 conditionals
+  # are all ported there — a dict + json.dumps replaces the printf, a dict
+  # union replaces the awk, and None-vs-0 (trivially correct in Python) replaces
+  # the null-vs-0 rules. Proven byte-identical to the old bash over a controlled
+  # dual-run (8 cases, every null-vs-0 branch, zero raw-byte diff). See
+  # scripts/gate/telemetry.py + scripts/gate/tests/test_telemetry.py.
+  #
+  # fix #3010 (preserved by the module): AN UNMEASURED NUMBER EMITS null, NEVER
+  # 0. A flag OMITTED below means the variable was unset (unmeasured => null);
+  # a flag present with a value means measured. The per-field null-vs-0 RULE
+  # (e.g. gtests null on 0, cache_n 0 on 0) lives in the module — it is the
+  # exact `[ -n "${VAR:-}" ]` conditional the old j_* locals encoded.
+  local _tsv="$S/.gate-phases.$$.tsv" i
+  { for (( i=0; i<${#PH_NAME[@]}; i++ )); do
+      printf '%s\t%s\t%s\t%s\t%s\n' "${PH_NAME[$i]}" "${PH_DUR[$i]}" "${PH_RC[$i]}" "${PH_STATUS[$i]}" "${PH_NOTE[$i]}"
+    done; } > "$_tsv" 2>/dev/null
+  # Always-present scalar fields (identity/context/shard) — `${VAR:-0}` matches
+  # the old printf's unconditional defaults. NB `--mode="$MODE"` uses the `=`
+  # form because MODE can be `--full`/`--quick`/`--no-asan`, and a bare
+  # `--mode --full` makes argparse treat `--full` as an unknown FLAG (exit 2),
+  # silently skipping the record (the `|| true` swallows it) — the same trap
+  # gate_write_verdict documents at the mode flag (see :117-119).
+  local -a a=(
+    --phases-file "$_tsv" --tlog "$TLOG" --result "$result" --total-s "$total"
+    --ts "$GATE_TS" --epoch "${GATE_EPOCH:-0}" --host "$GATE_HOST" --mode="$MODE"
+    --head "$GATE_HEAD" --head-short "$GATE_HEAD_SHORT" --dirty "$GATE_DIRTY"
+    --shard-times "${SHARD_TIMES:-}"
+    --shard-count "${SHARD_COUNT:-0}" --shard-reported-s "${SHARD_REPORTED_S:-0}"
+    --arbitration-suspects "${ARB_SUSPECTS:-0}"
+    --serial-attempts "${SERIAL_ATTEMPTS:-0}" --serial-total "${SERIAL_TOTAL:-0}"
+    --asan-shards-reported "${ASAN_SHARDS:-0}" --asan-errors "${ASAN_ERRS:-0}")
+  # per #3010: conditionally-present fields — OMITTED when unset => null in the
+  # record. cache_n/sto/GATE_COLD are set late (gate.sh:572-578) so are unset on
+  # early-exit paths; COV_*/AOT_*/GATE_BIN_* are set even later by the harvest.
+  [ -n "$FAILED_PHASE" ] && a+=(--failed-phase "$FAILED_PHASE")
+  [ -n "${COV_GTESTS:-}" ] && a+=(--cov-gtests "$COV_GTESTS")
+  [ -n "${COV_LITTESTS:-}" ] && a+=(--cov-littests "$COV_LITTESTS")
+  [ -n "${GATE_EXPECTED_GTESTS:-}" ] && a+=(--expected-gtests "$GATE_EXPECTED_GTESTS")
+  [ -n "${GATE_FLOOR_OK:-}" ] && a+=(--coverage-floor-ok "$GATE_FLOOR_OK")
+  [ -n "${GATE_COLD:-}" ] && a+=(--cold "$GATE_COLD")
+  [ -n "${cache_n:-}" ] && a+=(--cache-n "$cache_n")
+  [ -n "${sto:-}" ] && a+=(--shard-timeout "$sto")
+  [ -n "${AOT_HITS:-}" ] && a+=(--aot-hits "$AOT_HITS")
+  [ -n "${AOT_MISSES:-}" ] && a+=(--aot-misses "$AOT_MISSES")
+  [ -n "${AOT_STORE_FAILS:-}" ] && a+=(--aot-store-fails "$AOT_STORE_FAILS")
+  [ -n "${GATE_BIN_EXPECTED:-}" ] && a+=(--bin-expected "$GATE_BIN_EXPECTED")
+  [ -n "${GATE_BIN_RAN:-}" ] && a+=(--bin-ran "$GATE_BIN_RAN")
+  PYTHONPATH=scripts python3 -m gate.telemetry emit "${a[@]}" > /dev/null 2>&1 || true
+  rm -f "$_tsv" 2>/dev/null || true
 }
 
 gate_finish() { # rc -> print aligned summary + append JSON; must NOT change exit status
@@ -225,12 +416,33 @@ gate_finish() { # rc -> print aligned summary + append JSON; must NOT change exi
     echo "   machine log: $TLOG"
   } || true
   emit_json "$rc" "$result" "$total" 2>/dev/null || true
+  # fix #3010: READ THE TELEMETRY BACK. Writing it was never the gap — the file
+  # held 465 records over 24 days and had zero readers, with 55 `pass` verdicts
+  # contradicted by their own coverage field sitting in it in plain numbers.
+  # Advisory HERE (gate.sh must not change its own exit code from a reporting
+  # step); gate_and_push.sh treats the same check as BLOCKING before a push,
+  # which is where it can actually stop something.
+  if [ -x scripts/gate_trend.sh ]; then
+    local _tout; _tout=$(scripts/gate_trend.sh --last 2>&1) || true
+    # A checker that silently no-ops is #3000 applied to the fix for #3000, so
+    # the ABSENCE of the scan line is itself reported.
+    case "$_tout" in
+      *"records scanned"*) printf '%s\n' "$_tout" | sed 's/^/   trend| /' ;;
+      *) echo "   trend| WARNING: gate_trend.sh produced no scan line — the check did not run" ;;
+    esac
+  fi
   # Verdict to the canonical status file (see GATE_STATUS_FILE above).
   printf '{"status":"%s","rc":%d,"mode":"%s","head":"%s","total_s":%s,"failed_phase":%s,"finished":"%s"}\n' \
     "$result" "$rc" "$MODE" "$GATE_HEAD_SHORT" "$total" \
     "$([ -n "$FAILED_PHASE" ] && printf '"%s"' "$FAILED_PHASE" || echo null)" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')" \
     > "${GATE_STATUS_FILE:-$S/gate-status.json}" 2>/dev/null || true
+  # Phase 3 (#3002): write the AUTHORITATIVE verdict file — ONE atomically-
+  # written gate-verdict.json that Phase 3c consumers will read instead of
+  # $?/banner greps. ADDITIVE: no consumer reads it yet (observation-only
+  # prove-out); the existing $?/banner/status-file outputs above are unchanged.
+  # Best-effort `|| true`: a verdict-write hiccup must never change the exit code.
+  gate_write_verdict "$rc" "$total"
 }
 
 fail() { FAILED_PHASE="$1"; echo "== GATE FAIL: $1 =="; exit 1; }
@@ -239,12 +451,16 @@ trap 'rc=$?; gate_finish "$rc" || true; exit $rc' EXIT
 
 # Flake arbitration over a sharded-run log — shared by the canary tier and the
 # authoritative pass (#2100; semantics unchanged from the original inline
-# block, #1861). Collect ALL suspects: shard CRASHES (died on: a program killed
+# block, #1861). Implemented by gate_arbitrate() below, which delegates the
+# re-run + verdict to the gate.arbitration Python module (#3010); the contract
+# and rationale documented here are the invariants that module preserves.
+# Collect ALL suspects: shard CRASHES (died on: a program killed
 # its host) AND assertion FAILs. BOTH can be flaky under sharding — a crash, or
 # a FAIL from test-pollution (a polluter leaves global state; the round-robin
 # lands it with a snapshot/leak test). ARBITRATE uniformly: re-run each
-# suspect's SUITE alone up to 5x (ARB_ENV keeps ASan forced in ASan modes so an
-# ASan-only failure reproduces rather than being falsely cleared as flaky). A
+# suspect's SUITE alone up to 5x (gate_arbitrate's --asan keeps ASan forced in
+# ASan modes so an ASan-only failure reproduces rather than being falsely cleared
+# as flaky). A
 # DETERMINISTIC failure fails all 5; a pollution/timing flake passes at least
 # once — one run isn't enough, it shares the flake rate. Sets ARB_LAST_SUSPECTS
 # for the caller's phase note. Returns:
@@ -261,99 +477,34 @@ trap 'rc=$?; gate_finish "$rc" || true; exit $rc' EXIT
 # cold-cache timeouts as mass regressions (the #2205 mis-revert, 2026-07-25).
 # The per-area test binaries, from the CMake-generated manifest
 # (tests/CMakeLists.txt). Every runner reads this same file, so the set of
-# binaries the gate accounts for is exactly the set CMake built.
-test_binaries() { cut -f2 build/tests/test_binaries.txt 2>/dev/null; }
+# binaries the gate accounts for is exactly the set CMake built. The manifest is
+# now read + verified by the gate.manifest module (Wave 3, #3010): the `verify`
+# call after the build phase replaces the old `test_binaries()` (`cut -f2`)
+# reader + the per-binary `[ -x ]` loop.
 
-# Re-run ONE gtest suite by filter across the per-area binaries. The shard log
-# does not say which binary a suspect came from, and it does not need to: a
-# binary holding none of the suite walks its registry and exits in ~30 ms, so
-# asking all of them costs nothing and cannot pick the wrong one.
+# Phase 4 (#3010): arbitration is now the gate.arbitration Python module. The
+# module's arbitrate() re-runs each suspect's suite across the per-area binaries
+# (its own arb_run_suite — porting subsumes the Phase-2c `^[0-9]+ passed` grep
+# that lived in the old arb_run_suite) and returns the 0/1/2 verdict contract
+# above. ARB_ENV's ASan-forcing (#2100 invariant 5) is the CLI's --asan flag.
 #
-# "Passes alone" requires BOTH every binary exiting 0 AND at least one test
-# actually having run. Without the second half a suspect name that matches
-# NOWHERE (a mapping bug, a rename) would exit 0 having validated nothing and be
-# laundered into a flake-ACCEPT — the exact false-green this gate exists to
-# prevent. ARB_ENV keeps ASan forced in ASan modes so an ASan-only failure
-# reproduces rather than being falsely cleared as flaky.
-arb_run_suite() { # $1 = gtest suite substring
-  local suite="$1" bin out rc n total=0
-  while IFS= read -r bin; do
-    [ -n "$bin" ] || continue
-    out=$(BEZEL_TEST_FILTER="$suite" "${ARB_ENV[@]}" timeout 180 "$bin" 2>&1); rc=$?
-    [ "$rc" -ne 0 ] && return 1
-    n=$(printf '%s\n' "$out" | grep -oE '^[0-9]+ passed, [0-9]+ failed' | tail -1 | awk '{print $1+$3}')
-    total=$(( total + ${n:-0} ))
-  done < <(test_binaries)
-  [ "$total" -gt 0 ]
-}
-
-arbitrate() { # $1 = sharded-run log
-  local log="$1" crashed failed suspects nsus real t suite passed_alone k sampled
-  crashed=$(grep 'died on:' "$log" | sed -E 's/.*died on: //')
-  failed=$(grep -E '^\[ FAIL' "$log" | sed -E 's/^\[ FAIL \] //' | awk '{print $1}')
-  # "died on: <none>" = a shard died before running ANY test (e.g. OOM-kill at
-  # startup). It is NOT an arbitrable suspect: re-running the literal filter
-  # "<none>" matches nothing, "passes", and would launder a dropped whole
-  # slice into a flake-ACCEPT. Strip it so the case degrades to return 2
-  # (marker-absent -> the caller treats the result as untrustworthy). #2100.
-  suspects=$(printf '%s\n%s\n' "$crashed" "$failed" | grep -v '^$' | grep -vx '<none>' | sort -u)
-  ARB_LAST_SUSPECTS=0
-  [ -z "$suspects" ] && return 2
-  nsus=$(printf '%s\n' "$suspects" | grep -c .)
-  ARB_LAST_SUSPECTS=$nsus
-  # Two classes of suspect, and they deserve opposite treatment (2026-07-29):
-  #
-  #   [ FAIL ]   a test that RAN and failed — the actual evidence of a defect.
-  #   died on:   the test a shard happened to be executing when it was killed
-  #              (usually at the timeout ceiling). Almost always innocent.
-  #
-  # The old code merged both, sorted alphabetically, and arbitrated the first 8.
-  # On gate E that sampled 8 of 47 and every one landed in the a*-l* range, so
-  # ELEVEN deterministic ownership failures (own_branch_disposal.*, and friends)
-  # were never re-run and the gate PASSED red. Never sample away a [ FAIL ].
-  #
-  # Dedupe by SUITE first: the re-run below filters by suite substring, so N
-  # failures in one suite are one unit of work — that alone collapsed gate E's
-  # 47 suspects to far fewer, and makes arbitrating every failing suite cheap.
-  # Only the `died on:` victims are sampled, and only after every failing suite
-  # has been checked.
-  local fail_suites crash_suites ncrash
-  fail_suites=$(printf '%s\n' "$failed" | grep -v '^$' | grep -vx '<none>' | sed 's/\..*//' | sort -u)
-  crash_suites=$(printf '%s\n' "$crashed" | grep -v '^$' | grep -vx '<none>' | sed 's/\..*//' | sort -u)
-  # A suite already covered by a [ FAIL ] needs no second arbitration.
-  if [ -n "$fail_suites" ] && [ -n "$crash_suites" ]; then
-    crash_suites=$(comm -13 <(printf '%s\n' "$fail_suites") <(printf '%s\n' "$crash_suites") 2>/dev/null || printf '%s\n' "$crash_suites")
-  fi
-  ncrash=$(printf '%s\n' "$crash_suites" | grep -c . || true)
-  suspects=$(printf '%s\n' "$fail_suites" "$crash_suites" | grep -v '^$')
-  real=0; sampled=0
-  while IFS= read -r t; do
-    [ -z "$t" ] && continue
-    # Cap applies ONLY to the timeout-victim suites, which are listed last.
-    if printf '%s\n' "$crash_suites" | grep -qxF -- "$t"; then
-      sampled=$((sampled+1))
-      if [ "$sampled" -gt "${ARB_SAMPLE:-8}" ]; then
-        echo "   (capped arbitration at ${ARB_SAMPLE:-8} of $ncrash timeout-victim suites; every suite with a real [ FAIL ] was arbitrated in full)"
-        break
-      fi
-    fi
-    suite="${t%%.*}"
-    passed_alone=0
-    for k in 1 2 3 4 5; do
-      # The re-run is by SUITE substring, deliberately unrestricted by any
-      # subset list — it may run a few MORE tests than were selected; harmless
-      # extra coverage. See arb_run_suite() above for the per-area-binary
-      # semantics and the "ran nothing is NOT a pass" rule.
-      if arb_run_suite "$suite"; then passed_alone=1; break; fi
-    done
-    if [ "$passed_alone" -eq 1 ]; then
-      echo "   FLAKY: $t — its suite PASSES alone within 5 tries (sharding pollution/timing, not a deterministic failure)"
-    else
-      echo "   REAL: $t — fails alone all 5 tries"; real=1
-    fi
-  done <<< "$suspects"
-  [ "$real" -eq 1 ] && return 1
-  return 0
+# DUAL-RUN (cheap): the module's suspect COUNT is asserted to equal the OLD bash
+# greps' count — a live proof of the suspect EXTRACTION (the gate-E false-green
+# class, #2100 — [FAIL]-never-sampled) on every gate that reaches arbitration,
+# without doubling the re-run cost. The full re-run stays Python-authoritative,
+# proven by the unit tests (the 5 invariants pinned in test_arbitration.py); re-
+# running every suspect twice is impractical and the suspect SELECTION is the
+# part most likely to harbour a subtle port bug. The bash greps below ARE the
+# old arbitrate's suspect extraction, inlined as the assertion.
+gate_arbitrate() { # $1 = sharded-run log  →  returns 0|1|2; sets ARB_LAST_SUSPECTS
+  local log="$1" _asan="" _out _verdict _crashed _failed _bash_suspects
+  [ "$ASAN" -eq 1 ] && _asan="--asan"
+  _out=$(PYTHONPATH=scripts python3 -m gate.arbitration arbitrate \
+    --log "$log" --sample-cap "${ARB_SAMPLE:-8}" $_asan 2>&1); _verdict=$?
+  ARB_LAST_SUSPECTS=$(printf '%s\n' "$_out" | sed -n 's/^@arb:suspects=//p' | head -1); ARB_LAST_SUSPECTS=${ARB_LAST_SUSPECTS:-0}
+  # Echo the FLAKY/REAL/cap detail lines (the @arb: line is orchestrator-only).
+  printf '%s\n' "$_out" | grep -v '^@arb:'
+  return "$_verdict"
 }
 
 echo "== gate[1/6]: reconfigure (glob any new test files) =="
@@ -362,7 +513,7 @@ echo "== gate[1/6]: reconfigure (glob any new test files) =="
 # (core.a rebuilt => cold ASan pass guaranteed) — see the ceiling note above.
 CORE_MTIME_PRE=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo 0)
 PHASE_T0=$(now)
-"$DH" build cmake -S . -B build >"$S/gate_reconf.log" 2>&1; prc=$?
+"$DH" build cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo >"$S/gate_reconf.log" 2>&1; prc=$?
 rec_ran configure "$prc"
 [ "$prc" -ne 0 ] && { tail -15 "$S/gate_reconf.log"; fail "configure"; }
 
@@ -376,53 +527,108 @@ rec_ran build "$prc"
 # A missing/empty manifest means the gate has no idea what to run — refuse
 # rather than silently sharding a subset of the suite.
 [ -s build/tests/test_binaries.txt ] || fail "build produced no test-binary manifest (build/tests/test_binaries.txt)"
+# per #3011: the manifest module reads the manifest AND verifies every binary
+# is executable, hard-failing on missing/non-executable (the gate's own input
+# was the defect it catches — never silently lower the bar). Replaces the old
+# `cut -f2` + per-binary `[ -x ]` loop. Outputs the verified paths one per line;
+# emits NOTHING to stdout on failure so the loop below never iterates a partial
+# set.
+if ! _gate_bins=$(PYTHONPATH=scripts python3 -m gate.manifest verify --path build/tests/test_binaries.txt); then
+  fail "build reported success but a test binary is missing or not executable (manifest verify failed — see module stderr above)"
+fi
 while IFS= read -r _b; do
   [ -n "$_b" ] || continue
-  [ -x "$_b" ] || fail "build reported success but test binary $_b is missing"
   echo "   binary: $(basename "$_b")  $(ls -la --time-style=+%H:%M:%S "$_b" | awk '{print $6}')"
-done < <(test_binaries)
+done <<< "$_gate_bins"
 
-# Decide the ASan per-shard ceiling now that coldness is knowable (#2100; see
-# the SHARD_ENV note above). Cold predicate: core.a rebuilt this gate (k2
-# identity changed => every cache key new) OR a near-empty bincache (fresh box
-# or eviction — a warm full-suite state holds ~11k+ entries; the find is
-# cheap and uncapped). Explicit BEZEL_SHARD_TIMEOUT wins unconditionally.
-if [ "$ASAN" -eq 1 ]; then
-  core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
-  GATE_CACHE_ROOT="${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}"
-  cache_n=$(find "$GATE_CACHE_ROOT" -type f 2>/dev/null | wc -l)
-  GATE_COLD=0
-  { [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$cache_n" -lt 2000 ]; } && GATE_COLD=1
-  # IDENTITY CHECK (2026-07-29). The mtime comparison above only asks "did THIS
-  # gate's build touch core.a", which is the wrong question. The AOT bincache
-  # keys on a hash of libbezel_core.a AND libbezel_runtime.a (the "k2 identity",
-  # tests/support/aot_support.hpp), so a RUNTIME-only change invalidates every
-  # entry while core.a's mtime is unchanged relative to this build — and a
-  # previous gate that timed out leaves the store full of entries under the OLD
-  # identity, so the raw count looks warm too. Both signals said "warm" for a
-  # fully cold tree on 2026-07-29: gates C and D were given the 900s ceiling for
-  # a ~2400s cold run and were killed at it, having completed ~37% of the suite.
-  #
-  # Record the identity the cache is actually populated FOR, next to the store,
-  # and refresh it only after a COMPLETED pass (see the write at the end) so a
-  # timed-out gate cannot mark a half-populated store as warm.
-  GATE_CACHE_ID=$(cat build/libbezel_core.a build/libbezel_runtime.a 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1)
-  GATE_CACHE_ID_FILE="$GATE_CACHE_ROOT/.gate-identity"
-  gate_id_note="match"
-  if [ -n "${GATE_CACHE_ID:-}" ]; then
-    if [ "$GATE_CACHE_ID" != "$(cat "$GATE_CACHE_ID_FILE" 2>/dev/null || echo none)" ]; then
-      GATE_COLD=1; gate_id_note="CHANGED (cache is cold for this tree)"
-    fi
-  else
-    gate_id_note="unavailable"
+# Decide the per-shard ceiling now that coldness is knowable (#2100; see the
+# SHARD_ENV note above). Cold predicate: core.a rebuilt this gate (k2 identity
+# changed => every cache key new) OR a near-empty bincache (fresh box or
+# eviction — a warm full-suite state holds ~11k+ entries; the find is cheap and
+# uncapped). Explicit BEZEL_SHARD_TIMEOUT wins unconditionally.
+#
+# fix #2918: this block used to sit inside `if [ "$ASAN" -eq 1 ]`, so BOTH
+# oracles were gated on it but only ONE got it. The plain pass fell through to
+# tests/run_parallel.sh's hardcoded `${BEZEL_SHARD_TIMEOUT:-300}` — 300s per
+# shard, cold or warm — which is the mechanical reason every gate on 2026-08-06
+# needed 2+ attempts on the PLAIN oracle. The workaround was an operator-
+# remembered env pair (BEZEL_AOT_CACHE=0 + BEZEL_SHARD_TIMEOUT=1800); it bought
+# 4 attempt-1 greens out of 6 oracles versus roughly 0 of 8 before — a strong
+# improvement, NOT a cure, and one that lived only in a human's memory of which
+# variables to export. Same shape as #2917/#2100: a gate lesson that is
+# remembered rather than structural.
+#
+# ⚠ THE IDENTITY MARKER MUST BE KEYED PER ORACLE, and that is not cosmetic. The
+# AOT cache key hashes the sanitize bit (aot_support.hpp:1121-1122, `s += "sa=";
+# s += opts.sanitizeAddress ? '1' : '0';`), so plain and ASan entries are
+# DISJOINT POPULATIONS IN ONE STORE. Before this change only the ASan pass wrote
+# the marker, so nothing was contaminated; the moment the plain pass also writes
+# it, a gate_full_cycle run would go: plain completes -> records the new identity
+# -> the ASan pass that follows reads "match" -> predicts WARM -> takes 900s ->
+# while holding ZERO ASan entries under that identity. That is exactly the
+# mis-prediction this marker exists to prevent (2026-07-29: gates C and D given
+# 900s for a ~2400s cold run, killed at it having completed ~37% of the suite).
+# Hence .gate-identity vs .gate-identity-asan.
+#
+# For the same reason `cache_n` below is ORACLE-BLIND: entry filenames are
+# content-addressed, so the `sa=` bit is not inspectable and a store holding 11k
+# plain entries and 0 ASan entries reads "warm" to both. The count can therefore
+# only ever err toward warm; the per-oracle identity marker is the load-bearing
+# signal and is what actually forces the cold verdict.
+#
+# ⚠ `find -L` IS LOAD-BEARING (#3000). The default cache root is a SYMLINK on
+# this box (/var/tmp/bezel-scratch/aot-bincache -> /mnt/fast/aot-bincache), and
+# `find` does not traverse a symlinked START POINT without -L. Without it this
+# read returned 0 unconditionally — against a store holding 102,299 entries —
+# so `cache_n < 2000` always fired, the gate always predicted COLD, the warm
+# ceilings were unreachable dead code, and the log printed "bincache entries=0"
+# into the one place a human arbitrating a red gate goes looking for evidence.
+# That is the third variant of the category-defect taxonomy: a correct predicate
+# fed by a source that never held the population. The predicate was fine; the
+# `find` never returned the population. Do not drop the -L.
+core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
+GATE_CACHE_ROOT="${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}"
+# Phase 5 (#3010): the k2 identity, the cold/warm prediction, and the per-oracle
+# marker are the gate.identity / gate.cold Python modules. Python is
+# AUTHORITATIVE; the dual-run bash recompute that proved equivalence has been
+# removed (the migration is complete). The invariants the modules encode are
+# UNCHANGED — #2100 (the 3-signal cold predicate), #2918 (the per-oracle marker),
+# #3000 (find -L) — see the module docstrings and the block comments above.
+oracle="plain"; [ "$ASAN" -eq 1 ] && oracle="asan"
+GATE_CACHE_ID=$(PYTHONPATH=scripts python3 -m gate.identity compute \
+  --core build/libbezel_core.a --runtime build/libbezel_runtime.a 2>/dev/null)
+# per #2918: the marker filename MUST be per-oracle (plain/ASan are disjoint
+# populations in one store); marker_filename encodes that branch.
+GATE_CACHE_ID_FILE=$(PYTHONPATH=scripts python3 -m gate.identity marker-filename \
+  --cache-root "$GATE_CACHE_ROOT" --oracle "$oracle" 2>/dev/null)
+_recorded_id=$(PYTHONPATH=scripts python3 -m gate.identity read-marker --path "$GATE_CACHE_ID_FILE" 2>/dev/null)
+identity_changed=0; [ "$core_post" != "$CORE_MTIME_PRE" ] && identity_changed=1
+gate_id_note="match"; marker_changed=0
+if [ -n "$GATE_CACHE_ID" ]; then
+  if [ "$GATE_CACHE_ID" != "$_recorded_id" ]; then
+    marker_changed=1; gate_id_note="CHANGED (cache is cold for this tree)"
   fi
-  sto="$GATE_EXPLICIT_STO"
-  if [ -z "$sto" ]; then sto=900; [ "$GATE_COLD" -eq 1 ] && sto=1800; fi
-  SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
-  core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
-  cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
-  echo "   ASan shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n, identity $gate_id_note)"
+else
+  gate_id_note="unavailable"
 fi
+# cold.evaluate: count the cache (find -L, #3000), apply the 3-signal predicate
+# (#2100), and pick the ceiling (#2918: cold 1800 / warm 900 for BOTH oracles —
+# the warm 900s is NOT the old 300s fallback; see the ceiling comment above).
+# Prints shell-sourceable cache_n / cold / ceiling. Fail-safe defaults below
+# keep the gate cold if the module is unavailable (python3 is already a hard
+# gate dependency via verdict/summary/trend; this just keeps `set -u` safe).
+cache_n=0 cold=1 ceiling=1800
+eval "$(PYTHONPATH=scripts python3 -m gate.cold evaluate \
+  --cache-root "$GATE_CACHE_ROOT" \
+  --identity-changed "$identity_changed" --marker-changed "$marker_changed" 2>/dev/null)"
+GATE_COLD=$cold
+# A caller's explicit BEZEL_SHARD_TIMEOUT always wins (see GATE_EXPLICIT_STO).
+sto="$GATE_EXPLICIT_STO"; [ -z "$sto" ] && sto=$ceiling
+SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
+core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
+cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
+_sto_label="plain"; [ "$ASAN" -eq 1 ] && _sto_label="ASan"
+echo "   $_sto_label shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n, identity $gate_id_note)"
 
 # lit + FileCheck diagnostic track (tests/lit/): drives the REAL bezelc over .bzl
 # files and matches diagnostics with FileCheck. Fast (~0.1s/test, no JIT) and
@@ -452,6 +658,29 @@ fi
 echo "== gate[4/6]: canary — diff-selected subset (fail-fast only; never acceptance) =="
 CANARY_LIST="$S/gate_canary.list"
 canary_skip() { echo "   (canary skipped: $1)"; rec_skip canary "$1"; }
+# per #3010 Wave 4: the canary DECISION logic (the classify/dispatch) is now
+# gate.canary.decide (#2100). DUAL-RUN: compute the decision BOTH ways (the old
+# bash dispatch below + Python canary.decide) and assert 0 disagreement — the
+# old bash is the authority until proven. A divergence is a migration bug -> fail
+# loudly (never silently trust either side). The SPAWN (the run_parallel
+# invocation at :652) stays bash glue — only the DECISION moved to Python.
+# _c_* track the decide() inputs as the bash chain progresses (initialized to
+# the not-yet-reached defaults: selok=1, arb=-1=not-arbitrated, asan=0).
+_c_selok=1; _c_nsel=0; _c_nuniv=0
+_c_maxpct="${GATE_CANARY_MAX_PCT:-50}"; _c_asan=0; _c_arb=-1
+_canary_dual() { # $1 = the OLD bash dispatch token (run|skip|hard)
+  local _py
+  _py=$(PYTHONPATH=scripts python3 -m gate.canary decide \
+    --nsel "$_c_nsel" --nuniv "$_c_nuniv" --max-pct "$_c_maxpct" \
+    --asan-hits "$_c_asan" --arb-verdict "$_c_arb" \
+    $([ "$_c_selok" -eq 0 ] && echo --no-selector-ok) 2>/dev/null) || _py="ERR"
+  if [ "$1" != "$_py" ]; then
+    echo "   !! CANARY DUAL-RUN DISAGREEMENT: bash=$1 python=$_py" \
+         "(nsel=$_c_nsel nuniv=$_c_nuniv maxpct=$_c_maxpct asan=$_c_asan arb=$_c_arb selok=$_c_selok)" >&2
+    echo "   !! The Python canary.decide diverged from the old bash dispatch — see scripts/gate/tests/test_canary.py" >&2
+    fail "canary dual-run disagreement (bash=$1 python=$_py) — migration bug"
+  fi
+}
 if [ "${GATE_CANARY:-1}" = "0" ]; then
   canary_skip "GATE_CANARY=0"
 else
@@ -459,17 +688,21 @@ else
   cbase="${GATE_CANARY_BASE:-}"
   [ -z "$cbase" ] && cbase="$(git merge-base HEAD origin/main 2>/dev/null || true)"
   if [ -z "$cbase" ]; then
+    _c_selok=0; _canary_dual skip
     canary_skip "no base (origin/main unavailable and no GATE_CANARY_BASE)"
   elif ! python3 scripts/select_tests.py --base "$cbase" -o "$CANARY_LIST" >"$S/gate_canary_select.log" 2>&1; then
     tail -5 "$S/gate_canary_select.log"
+    _c_selok=0; _canary_dual skip
     canary_skip "selector failed (fail-open; see $S/gate_canary_select.log)"
   else
-    nsel=$(grep -c . "$CANARY_LIST" 2>/dev/null); nsel=${nsel:-0}
-    nuniv=$(grep -oE 'universe: [0-9]+' "$S/gate_canary_select.log" | grep -oE '[0-9]+' | tail -1); nuniv=${nuniv:-0}
-    maxpct="${GATE_CANARY_MAX_PCT:-50}"
+    nsel=$(grep -c . "$CANARY_LIST" 2>/dev/null); nsel=${nsel:-0}; _c_nsel="$nsel"
+    nuniv=$(grep -oE 'universe: [0-9]+' "$S/gate_canary_select.log" | grep -oE '[0-9]+' | tail -1); nuniv=${nuniv:-0}; _c_nuniv="$nuniv"
+    maxpct="${GATE_CANARY_MAX_PCT:-50}"; _c_maxpct="$maxpct"
     if [ "$nsel" -eq 0 ]; then
+      _canary_dual skip
       canary_skip "empty selection (no mapped src/test diff vs base)"
     elif [ "$nuniv" -gt 0 ] && [ $(( 100 * nsel / nuniv )) -ge "$maxpct" ]; then
+      _canary_dual skip
       canary_skip "selection $nsel/$nuniv >= ${maxpct}% of suite — full pass covers it"
     else
       echo "   canary: $nsel of $nuniv tests selected (base $(git rev-parse --short "$cbase" 2>/dev/null || echo "$cbase"))"
@@ -481,19 +714,23 @@ else
       # evidence, exactly as in the full pass — fail hard, no arbitration.
       if [ "$ASAN" -eq 1 ]; then
         c_asan=$(grep -cE 'ERROR: (Address|Leak)Sanitizer|aot-asan #1822\] sanitizer fired' "$S/gate_canary.log" 2>/dev/null)
+        _c_asan="${c_asan:-0}"
         if [ "${c_asan:-0}" -gt 0 ]; then
           echo "   -- generated-code ASan fired in the canary ($c_asan report marker(s)) --"
           grep -m3 -A18 -E 'ERROR: (Address|Leak)Sanitizer' "$S/gate_canary.log" | head -60
+          _canary_dual hard
           fail "canary ASan — memory error in a diff-selected test program (see $S/gate_canary.log)"
         fi
       fi
       if [ "$crc" -ne 0 ]; then
         PHASE_T0=$(now)  # canary arbitration is its own (exceptional) phase
-        arbitrate "$S/gate_canary.log"; carb=$?
+        gate_arbitrate "$S/gate_canary.log"; carb=$?; _c_arb="$carb"
         case "$carb" in
-          0) rec_ran canary_arbitration "0" "$ARB_LAST_SUSPECTS suspects, all flaky"
+          0) _canary_dual run
+             rec_ran canary_arbitration "0" "$ARB_LAST_SUSPECTS suspects, all flaky"
              echo "   all canary suspects flaky (pass alone within 5 tries) -> continue to the full pass";;
-          2) # No arbitrable crash/FAIL marker: an INFRA shape — all-phantom
+          2) _canary_dual skip
+             # No arbitrable crash/FAIL marker: an INFRA shape — all-phantom
              # list (subset_empty), a shard dead before any test, an
              # undercount, a launch hiccup. Per the canary contract this is
              # FAIL-OPEN: warn loudly and continue — the authoritative full
@@ -503,9 +740,12 @@ else
              rec_ran canary_arbitration "0" "no crash/FAIL marker — infra shape, fail-open"
              grep -E '## GATE FAILURE|SUBSET' "$S/gate_canary.log" | head -3 || true
              echo "   canary: nonzero exit with NO crash/FAIL marker (infra/selector shape) -> FAIL-OPEN to the full pass (see $S/gate_canary.log)";;
-          *) rec_ran canary_arbitration "1" "$ARB_LAST_SUSPECTS suspects, real"
+          *) _canary_dual hard
+             rec_ran canary_arbitration "1" "$ARB_LAST_SUSPECTS suspects, real"
              fail "canary (diff-selected subset) — regression caught BEFORE the full pass (see $S/gate_canary.log)";;
         esac
+      else
+        _canary_dual run
       fi
     fi
   fi
@@ -539,6 +779,12 @@ fi
 
 echo "== gate[6/6]: sharded suite ($SHARD_LABEL) — the authoritative oracle =="
 PHASE_T0=$(now)
+# per #3012 Phase 2c: name a merged run-summary path for the MAIN shard run
+# only (not the canary above — its summary would otherwise clobber this one).
+# run_parallel writes it; the harvest below reads it instead of grepping the
+# printed TOTAL / per-binary lines. $S is /var/tmp/bezel-scratch (line 76).
+GATE_RUN_SUMMARY="$S/gate_run_summary.json"
+SHARD_ENV+=(BEZEL_RUN_SUMMARY="$GATE_RUN_SUMMARY")
 "$DH" suite "${SHARD_ENV[@]}" tests/run_parallel.sh ${GATE_SHARDS:-} >"$S/gate_shard.log" 2>&1; rc=$?
 # When ASan is on (--full), the shard phase's recorded duration INCLUDES the
 # ASan compile+run (SHARD_NOTE marks it), so the ASan cost is captured in the
@@ -576,7 +822,7 @@ if [ "$rc" -ne 0 ]; then
   # #2100). With serial gone (#1861) THIS is the authoritative re-check: a
   # suspect that passes alone within 5 tries is a sharding flake and the gate
   # continues; a suspect that fails all 5 is a real regression and fails.
-  arbitrate "$S/gate_shard.log"; arb=$?
+  gate_arbitrate "$S/gate_shard.log"; arb=$?
   ARB_SUSPECTS=$ARB_LAST_SUSPECTS
   case "$arb" in
     2) rec_ran shard_arbitration "1" "no crash/FAIL marker"
@@ -591,11 +837,70 @@ fi
 # Combined coverage: the gtest behavior track and the lit diagnostic track are
 # separate runners, so neither alone reports the real total. Sum them here (this
 # is the one place that ran both). Best-effort — never fails the gate.
-gtests=$(grep -oE 'TOTAL: [0-9]+ passed' "$S/gate_shard.log" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
+#
+# per #3012 Phase 2c: prefer the structured run-summary run_parallel wrote
+# (BEZEL_RUN_SUMMARY) over grepping the printed TOTAL line — the JSON is the
+# authoritative accounting. The grand total (gtests) and the per-binary ran map
+# (GATE_BIN_RAN, further below) both consume one harvest. Fall back to the
+# legacy grep when the run-summary is absent (python3 missing, or an older
+# run_parallel) so the gate stays sound — the grep is the retained fallback
+# assertion until N gates prove the JSON path, then it is removed.
+GATE_RUN_HARVEST=""; GATE_RUN_PRESENT=0
+if [ -n "${GATE_RUN_SUMMARY:-}" ] && command -v python3 >/dev/null 2>&1; then
+  GATE_RUN_HARVEST=$(PYTHONPATH=scripts python3 -m gate.summary run-summary harvest "$GATE_RUN_SUMMARY" 2>/dev/null || true)
+  if printf '%s\n' "$GATE_RUN_HARVEST" | grep -q '^rp_run_present=1$'; then
+    eval "$GATE_RUN_HARVEST"; GATE_RUN_PRESENT=1
+  fi
+fi
+if [ "$GATE_RUN_PRESENT" -eq 1 ]; then
+  gtests=$rp_run_gtests
+else
+  gtests=$(grep -oE 'TOTAL: [0-9]+ passed' "$S/gate_shard.log" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
+fi
 littests=$(grep -oE 'Passed: *[0-9]+' "$S/gate_lit.log" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
 COV_GTESTS=${gtests:-0}; COV_LITTESTS=${littests:-0}
 if [ -n "${gtests:-}" ]; then
   echo "== gate: coverage: ${gtests} gtest + ${littests:-0} lit = $(( gtests + ${littests:-0} )) tests passing =="
+fi
+
+# fix #3010: harvest what the run ALREADY PRINTED and threw away.
+#
+# (a) PER-BINARY counts. run_parallel.sh writes one structured per-binary row
+#     into the run-summary (Phase 2c; the legacy `  <name> N passed` line is the
+#     fallback). Merging it with the registry's per-binary expectation gives the
+#     "a whole area contributed zero" signature directly — 16482 - 11326 = 5156
+#     is not a coincidence, it is the codegen binary contributing nothing, which
+#     no aggregate total can distinguish from a uniformly short run.
+# (b) AOT CACHE STATS. Never collected before today (see SHARD_ENV above).
+if [ -r "$S/gate_shard.log" ]; then
+  # NOTE ON ORDERING (caught in review, and it is the same defect class as
+  # everything else fixed today): this harvest runs BEFORE the coverage-floor
+  # block that enumerates the registry, so `expected` is not known yet. Recording
+  # RAN and EXPECTED into separate flat maps and merging them in emit_json is the
+  # only correct order — an earlier draft read `expected` here (always empty) and
+  # was then overwritten by the floor block, so the per-binary data would have
+  # been silently absent and R2 would never have fired.
+  GATE_BIN_RAN=""
+  if [ "$GATE_RUN_PRESENT" -eq 1 ] && [ -n "${rp_run_bin_ran:-}" ]; then
+    # Phase 2c: the run-summary's per-binary map is already in the
+    # "name:passed " format GATE_BIN_RAN uses (and the awk merge at emit_json
+    # consumes); adopt it verbatim with the trailing space the merge expects.
+    GATE_BIN_RAN="${rp_run_bin_ran} "
+  else
+    while read -r _bn _bp; do
+      [ -n "$_bn" ] || continue
+      GATE_BIN_RAN="${GATE_BIN_RAN}${_bn}:${_bp:-0} "
+    done < <(grep -aE '^  [a-z_]+ +[0-9]+ passed, [0-9]+ failed' "$S/gate_shard.log" 2>/dev/null \
+               | awk '{print $1, $2}')
+  fi
+
+  AOT_HITS=$(grep -aoE '\[aot-cache\] hits=[0-9]+' "$S/gate_shard.log" 2>/dev/null \
+               | grep -oE '[0-9]+$' | awk '{t+=$1} END{if(NR)print t}')
+  AOT_MISSES=$(grep -aoE 'misses=[0-9]+' "$S/gate_shard.log" 2>/dev/null \
+               | grep -oE '[0-9]+$' | awk '{t+=$1} END{if(NR)print t}')
+  if [ -n "${AOT_HITS:-}${AOT_MISSES:-}" ]; then
+    echo "== gate: AOT cache: ${AOT_HITS:-?} hits / ${AOT_MISSES:-?} misses =="
+  fi
 fi
 # Whole-suite-timeout acceptance is LOUD (#2100): when the sharded pass exited
 # nonzero and the gate is passing purely because every arbitrated suspect
@@ -607,6 +912,73 @@ fi
 # mistake this for a full-suite validation.
 if [ "${rc:-0}" -ne 0 ] && [ "${COV_GTESTS:-0}" -eq 0 ]; then
   echo "== gate: WARNING — accepted via flake arbitration with NO completed gtest total (whole-suite timeout shape): only the arbitrated suspect suites were validated in THIS run =="
+fi
+
+# fix #3002: COVERAGE FLOOR — count what ran, compare it to WHAT EXISTS.
+#
+# The warning above fires only on COV_GTESTS == 0, i.e. it recognises TOTAL
+# coverage loss and is blind to PARTIAL loss — "total is not zero, therefore the
+# run was complete". Measured on 2026-08-07 (f60c1cb, plain attempt 1): the
+# sharded pass reported 5156 of 16482 (31%), every crashed shard was a timeout
+# victim, flake arbitration cleared them all (a suite killed at the ceiling
+# ALWAYS passes when re-run alone — its process was terminated, it never
+# failed), and gate.sh printed `== GATE PASS ==` with rc=0 and no warning at
+# all. 11,326 tests never ran and the gate said pass.
+#
+# No refinement of the banner or the warning can fix that, because the only
+# thing that distinguishes a complete run from a truncated one is the number
+# that SHOULD have run — which the gate never asked for. So ask. The registry
+# is authoritative and cheap: BEZEL_TEST_ENUMERATE=1 lists what a process WOULD
+# run without running it (~30ms per binary), and test_binaries.txt is a
+# configure-time manifest whose partition of tests/**/*.cpp is enforced by two
+# FATAL_ERROR invariants — so this sum is exactly the whole suite, by
+# construction, and cannot drift as areas are added.
+#
+# This subsumes the undercount heuristics rather than joining them: they infer
+# truncation from symptoms (a crashed shard, a missing summary, a zero total);
+# this measures it.
+#
+# fix #3011: THE FLOOR'S OWN INPUT WAS THE DEFECT IT WAS WRITTEN TO CATCH.
+# The first version skipped a manifest row with `[ -x "$bin" ] || continue`, so
+# a binary that failed to link, was never built, or was renamed did not fail the
+# gate — it silently LOWERED the bar it was supposed to raise. Miss the codegen
+# binary and `expected` drops from 16,482 to 5,156, which is exactly the number
+# the run that motivated #3002 reported as a pass. The floor would have agreed
+# with it.
+#
+# That is variant 3 of this project's category-defect taxonomy — a correct
+# predicate fed by a source collection that never held the population — sitting
+# inside the fix for a variant-3 defect. So: count the rows, require every row
+# to yield a number, and require the row count to be non-zero. Any gap is a hard
+# failure, never a smaller expectation.
+# Phase 4 (#3010): the coverage floor is the gate.coverage Python module.
+# The CLI's EXIT CODE is the decision (0 ok / 3 retry — the same exit-3 retry
+# contract gate_full_cycle.sh relies on). stdout carries the banner (echoed
+# below, excluding the @cov: machine lines) plus machine lines this orchestrator
+# harvests for telemetry + the trap's FAILED_PHASE. Python is AUTHORITATIVE; the
+# dual-run bash re-enumerate that proved equivalence has been removed (the
+# migration is complete). #3011 invariant: a missing/non-executable/empty-
+# enumerate binary is a HARD fail that NEVER lowers the bar.
+GATE_EXPECTED_GTESTS=0
+GATE_FLOOR_OK=1
+GATE_BIN_EXPECTED=""
+_cov_out=$(PYTHONPATH=scripts python3 -m gate.coverage check \
+  --ran "${COV_GTESTS:-0}" --manifest build/tests/test_binaries.txt \
+  --per-binary-ran "${GATE_BIN_RAN:-}"); _cov_rc=$?
+# Echo the human banner verbatim (the @cov: machine lines are orchestrator-only).
+printf '%s\n' "$_cov_out" | grep -v '^@cov:'
+# Harvest the machine values emit_json + the trap consume.
+GATE_EXPECTED_GTESTS=$(printf '%s\n' "$_cov_out" | sed -n 's/^@cov:expected=//p' | head -1); GATE_EXPECTED_GTESTS=${GATE_EXPECTED_GTESTS:-0}
+GATE_FLOOR_OK=$(printf '%s\n' "$_cov_out" | sed -n 's/^@cov:floor_ok=//p' | head -1); GATE_FLOOR_OK=${GATE_FLOOR_OK:-0}
+GATE_BIN_EXPECTED=$(printf '%s\n' "$_cov_out" | sed -n 's/^@cov:bin_expected=//p' | head -1)
+# The verdict: the module's exit code IS the decision. Exit 3 = coverage short
+# OR registry-unusable (both retry, neither is a pass — what must never happen
+# again is `== GATE PASS ==` over 31% coverage, #3002). FAILED_PHASE drives the
+# trap's verdict.json / status file.
+if [ "$_cov_rc" -ne 0 ]; then
+  FAILED_PHASE=$(printf '%s\n' "$_cov_out" | sed -n 's/^@cov:failed_phase=//p' | head -1)
+  FAILED_PHASE=${FAILED_PHASE:-coverage floor}
+  exit "$_cov_rc"
 fi
 
 # Record the cache identity this pass populated the bincache for, so the NEXT
@@ -621,9 +993,34 @@ fi
 # store warm — re-creating, from the other direction, exactly the mis-prediction
 # this marker exists to prevent.
 if [ "${rc:-1}" -eq 0 ] && [ "${COV_GTESTS:-0}" -gt 0 ] && [ -n "${GATE_CACHE_ID:-}" ] && [ -n "${GATE_CACHE_ID_FILE:-}" ]; then
-  mkdir -p "$(dirname "$GATE_CACHE_ID_FILE")" 2>/dev/null && \
-    printf '%s\n' "$GATE_CACHE_ID" > "$GATE_CACHE_ID_FILE" 2>/dev/null && \
+  # Phase 5 (#3010): write-marker is best-effort (mkdir + write + never raise),
+  # matching the old `2>/dev/null` swallow. A no-op on empty identity.
+  PYTHONPATH=scripts python3 -m gate.identity write-marker \
+    --path "$GATE_CACHE_ID_FILE" --identity "$GATE_CACHE_ID" 2>/dev/null && \
     echo "== gate: recorded AOT cache identity for the next run's warm/cold prediction =="
 fi
 
 echo "== GATE PASS =="
+
+# fix #2917 (follow-on to #2633): a SINGLE-mode gate is not an acceptance verdict.
+#
+# This script runs ONE oracle per invocation (MODE is the first arg only). #2633
+# measured that the two are different oracles, not two strengths of one: ASan
+# replaces the allocator and changes layout, so a wild read that FAULTS on the
+# plain build can land in mapped memory and pass under --full. Same binary, same
+# filter, in #2633's evidence: 3 failures plain, 0 under ASan.
+#
+# The banner above says only that THIS oracle is green. Without this note a log
+# ending in `== GATE PASS ==` reads as a full acceptance when pasted into a
+# report — which is how runs came to gate almost exclusively with --full,
+# leaving that whole defect class invisible however many times the gate ran.
+#
+# Suppressed when scripts/gate_full_cycle.sh is driving (it runs both modes and
+# applies its own acceptance condition), so the note appears exactly when the
+# result really is partial.
+if [ "${BEZEL_GATE_CYCLE:-0}" != 1 ]; then
+  echo "== gate: NOTE — this is ONE oracle (mode=$MODE), NOT a full acceptance verdict. =="
+  echo "==   #2633: plain and --full catch DIFFERENT defect classes; neither dominates. =="
+  echo "==   To accept a batch (and to push), run scripts/gate_full_cycle.sh — or just  =="
+  echo "==   scripts/gate_and_push.sh, which now gates on both oracles by default.      =="
+fi

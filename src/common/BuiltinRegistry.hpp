@@ -85,6 +85,23 @@ bool isDictionaryName(std::string_view n);
 // bz_llist_t*-backed collections.  Backs isLinkedListTypeName. // per §4.6/§4.7
 bool isLinkedListName(std::string_view n);
 
+// #2809 / spec §32.5 / stdlib §10.1–§10.3: the three FFI-boundary BUFFER
+// classes — `CString`, `WString`, `RawBytes`. Each is a raw malloc'd buffer
+// (or, for RawBytes, a { ptr, len } struct over one), NOT a `%bz.string` and
+// NOT an object with a header, so any handler that reaches into one at a
+// `%bz.string` field offset reads out of bounds.
+//
+// This is the set the member-access handlers in `LlvmBackend_Exprs.cpp` must
+// recognise BEFORE the declaration-less `.Length` string fallback claims the
+// receiver: `isStringFallbackTarget` is a negative list ("not StringBuilder,
+// not Buffer, not FileStream, not a collection → assume `%bz.string`"), and
+// these three were its fifth missing category (#2809: a `c: CString` parameter
+// read `c.Length` as a `%bz.string` length field → heap-buffer-overflow).
+// The FFI value TYPES `IntPtr`/`UIntPtr` are deliberately NOT here: they are
+// pointer-sized integers, not buffers, and no member handler dereferences one.
+// per §32.5 / stdlib §10.1–§10.3
+bool isFfiBufferBuiltinName(std::string_view n);
+
 // The heap-pointer reference builtins shared by BOTH codegen representation
 // paths (the astNode-name path and the imported-name path in
 // LlvmBackend_Layout.cpp): collections, iteration/collection interfaces, task
@@ -94,6 +111,120 @@ bool isLinkedListName(std::string_view n);
 // imported path) that are NOT shared, so those stay explicit at the sites.
 // per §4 / §6 / §29 / §30 / §2.14–2.15
 bool isHeapPointerReferenceBuiltin(std::string_view n);
+
+// #2757 / §7.1 / §14.1: is `n` a RESERVED built-in type name — i.e. one of the
+// names `Emitter::lowerTypeRef`'s Named case lowers specially — as opposed to a
+// user-chosen generic type PARAMETER name?
+//
+// A declaration-less, single-part Named TypeRef is one of exactly two things: a
+// reserved builtin, or a type parameter. There is no positive registry of type-
+// PARAMETER names to test against (a parameter is defined by the ABSENCE of a
+// declaration), so every consumer necessarily asks the question negatively —
+// "not a builtin name, therefore a type parameter". That makes this set's
+// COMPLETENESS load-bearing: a missing name is silently read as a type
+// parameter. Three codegen sites depend on it, all with that shape:
+//   * lowerTypeRef's #568 nullable-type-parameter branch — a missed name takes
+//     the {i8, i32} placeholder instead of its own lowering, truncating a heap
+//     pointer into a 32-bit payload (#1390, #1406, #2757: `Stopwatch?`);
+//   * `Emitter::isBareTypeParamRef` (#2743);
+//   * the generic-argument INFERENCE binding in LlvmBackend_Calls2.cpp (#1162)
+//     — a missed name is skipped rather than bound, so the call lowers the
+//     parameter to the i32 fallback while the monomorphized body uses `ptr`.
+//
+// This is therefore the one home for the set, not a mirror of one: #2757 was
+// the third instance (after #1390 and #1406) of a hand-maintained duplicate
+// drifting from it, so `isBuiltinTypeRefName` now consults this and holds no
+// name list of its own. Built-in EXCEPTION names are NOT here — codegen tests
+// those against its live `builtinVtable_` map, which is not a duplicated list.
+// Adding a `lowerTypeRef` Named-case branch means adding its name here, in the
+// same commit, plus the snapshot row in
+// tests/support/builtin_registry_snapshot_test.cpp.
+bool isReservedBuiltinTypeName(std::string_view n);
+
+// #2921 / #2923 / §8.1 / §8.5 / §28.2 / §28.9: is `n` a reserved built-in
+// **class** whose runtime value carries NO Bezel vtable at word 0?
+//
+// The compiler emits vtables (layout `[0]=td$, [1]=itmap$, [2]=Dispose,
+// [3]=ToString, [4+]=virtuals`) for exactly three kinds of object: a user
+// `TypeSymbol`'s instances, a box, and a built-in EXCEPTION. Every other
+// built-in is a plain runtime C struct — `bz_array_t*`, `bz_mutex_t*`,
+// `bz_random_t*`, `bz_event_source_t*`, … — whose word 0 is payload data. Two
+// lowerings assume the vtable unconditionally, and both are memory-unsafe on
+// such a receiver:
+//   * `emitDynamicDispose` loads word 0 and calls slot 2 — the wild jump of
+//     #2921 (measured `mov (%rax),%rcx ; call *0x10(%rcx)` → address 0);
+//   * `lowerObjectToString` asks `bz_obj_is_string`, which is a NEGATIVE test
+//     ("word 0 is not one of the emitted vtables ⇒ it is a string"), so it
+//     answers "string" for every one of them; the receiver is then read as a
+//     `%bz.string` and, since #2846, RETAINED and later RELEASED — the double
+//     free / heap-buffer-overflow of #2923.
+// This predicate is the single gate both consult, so the question "does this
+// receiver carry a Bezel vtable?" is asked once, from one table, rather than
+// re-enumerated per site.
+//
+// Derived, deliberately, rather than hand-listed: it is
+// `isReservedBuiltinTypeName` MINUS `kBuiltinInterfaceHeads`. The subtraction
+// is the whole content of the rule — a built-in INTERFACE head is the one
+// reserved name whose runtime value may be a *user* class (measured: `var e:
+// IEnumerable<int> := new MyList(); e.Dispose();` compiles and runs), so those
+// must keep the dynamic dispatch. Deriving in this direction makes the
+// omission fail SAFE: a newly-added built-in CLASS joins this set
+// automatically and gets the vtable-free treatment, while a forgotten new
+// built-in INTERFACE costs a leak or a type-name rendering — never a wild
+// jump. // per §8.1 / §8.5 / §28.2 / §28.9
+bool isVtableLessBuiltinClassName(std::string_view n);
+
+// fix #2969 (§8.5 / §8.1 / §18.5 / §28.9, v0.240): is `n` one of the reserved
+// built-in INTERFACE heads? Exposed as its own predicate so the §2969 fix
+// (codegen-side routing of an interface-head-typed interpolation hole through
+// the vtable-less built-in renderer when the AST source statically determines
+// the value is a built-in collection) does not have to re-list the
+// `kBuiltinInterfaceHeads` names. See the header note on
+// `isVtableLessBuiltinClassName` for why these are deliberately split off from
+// that set — the predicate covers the case where a user class may legitimately
+// implement a built-in interface head, which the derived vtable-less
+// predicate excludes by construction.
+// per §8.1 / §8.5 / §18.5 / §28.9
+bool isBuiltinInterfaceHead(std::string_view n);
+
+// fix #2992 (§28.3 / §28.9, v0.240): is `head` a reserved built-in type whose
+// `using var` carries a REAL §28.10 disposal obligation? This is the SHARED
+// authority that previously lived as a private table inside
+// `MethodOwnership::rhsIsDisposableClassType`'s Path 2 (the §28.10 vacuity-lint
+// gate, Ownership.cpp ~5046). Both the lint and the codegen auto-drop chain's
+// end-of-chain guard (registerUsingDisposal, LlvmBackend_Setup.cpp) now consult
+// this table, so a built-in in this set that no disposal arm claims becomes a
+// compiler-detected hole rather than a silent leak.
+//
+// The table is lifted VERBATIM from the lint's pre-#2992 Path 2 — it is NOT
+// reconciled with codegen's broader chain-claimed set. The two DISAGREE on 13
+// names (the borrowing collections, Stopwatch, Random, Atomic/AtomicInteger,
+// Buffer): every one is chain-claimed but absent here. This produces a false-
+// positive vacuity warning on factory-call forms of those types (measured
+// 2026-08-09 on d2a3d3e). Reconciling requires a design decision — #2695
+// deliberately excluded the borrowing collections from this set so the lint
+// fires on a bound-then-pinned alias whose `const` remedy compiles — filed
+// separately. // per §28.3 / §28.9 / §28.10, fix #2992
+bool isDisposableBuiltinHeadName(std::string_view head);
+
+// fix #3017 (§28.3 / §28.9 / §28.10, v0.240): the 13 built-in class heads
+// the codegen auto-drop chain (registerUsingDisposal, LlvmBackend_Setup.cpp)
+// claims disposal for but that are DELIBERATELY ABSENT from
+// `isDisposableBuiltinHeadName` — the §28.10 vacuity-lint table — because
+// #2695's coherence invariant (the lint must fire on a bound-then-pinned
+// alias whose `const` remedy compiles) requires the borrowing collections to
+// stay out. For factory-call forms (`using var x := C.Make()`) the result IS
+// a fresh owned value, so the lint must NOT fire — the chain DOES reclaim it.
+// The alias form (`using var p := src;` over a local) keeps the current
+// behaviour because rhsIsDisposableClassType still returns false on these
+// heads and the IdentifierExpr RHS bypasses every CallExpr disjunct.
+//
+// The 13 names: 8 borrowing collections (§4 — §28.11 trivial-dispose; the
+// chain's collection-family arms reclaim the backing) and 5 vtable-less
+// builtins (Random/Atomic/AtomicInteger from fix #2921/#2973, Stopwatch from
+// §8.1, Buffer from #545). See Ownership.cpp's `constInitializerRejected`
+// for the disjunct this predicate closes the gap on.
+bool isChainClaimedBuiltinHeadName(std::string_view head);
 
 // §31.4 / #1621: given a built-in exception type's simple name, return the
 // name of its DIRECT parent in the built-in exception hierarchy (e.g.

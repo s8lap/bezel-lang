@@ -26,6 +26,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -73,6 +74,8 @@ BEZEL_TEST(owned_field_sink, add_bare_owned_field_rejected) {
         "  s.Add(this._owned); "
         "end M;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.8: the same hazard with an explicit `owned` call-site modifier on the
@@ -83,6 +86,8 @@ BEZEL_TEST(owned_field_sink, add_owned_modifier_on_bare_owned_field_rejected) {
         "  s.Add(owned this._owned); "
         "end M;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.8 / §28.11: the owning-collection `set(owned)` indexer with a bare
@@ -94,6 +99,8 @@ BEZEL_TEST(owned_field_sink, indexer_set_bare_owned_field_rejected) {
         "  s[0] := this._owned; "
         "end M;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.8: a bare owned-field read passed as the `owned` argument of a
@@ -112,6 +119,8 @@ BEZEL_TEST(owned_field_sink, new_ctor_bare_owned_field_rejected) {
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // stdlib §4.5: a bare owned-field read handed to the BUILT-IN
@@ -127,6 +136,8 @@ BEZEL_TEST(owned_field_sink, builtin_array_add_bare_owned_field_rejected) {
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // ---- POSITIVE cases: must stay ACCEPTED (no over-rejection) --------------

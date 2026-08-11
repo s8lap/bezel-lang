@@ -54,6 +54,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -86,6 +87,8 @@ BEZEL_TEST(owning_iterable_head_borrow_return_2369,
         "      IOwningEnumerable<Cell> => src; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 // `IOwningEnumerator<T>` — the first missing head. Pre-fix: admitted (the
@@ -98,6 +101,8 @@ BEZEL_TEST(owning_iterable_head_borrow_return_2369,
         "      IOwningEnumerator<Cell> => src; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 // `IOwningAsyncEnumerable<T>` — the second missing head.
@@ -109,6 +114,8 @@ BEZEL_TEST(owning_iterable_head_borrow_return_2369,
         "      IOwningAsyncEnumerable<Cell> => src; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 // `IOwningAsyncEnumerator<T>` — the third missing head.
@@ -120,6 +127,8 @@ BEZEL_TEST(owning_iterable_head_borrow_return_2369,
         "      IOwningAsyncEnumerator<Cell> => src; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 // ===========================================================================
@@ -143,6 +152,8 @@ BEZEL_TEST(owning_iterable_head_borrow_return_2369,
         "  public method Get(): IOwningEnumerator<Cell> return field; end Get; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 BEZEL_TEST(owning_iterable_head_borrow_return_2369,
@@ -156,6 +167,8 @@ BEZEL_TEST(owning_iterable_head_borrow_return_2369,
         "  public method Get(): IOwningAsyncEnumerable<Cell> return field; end Get; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 BEZEL_TEST(owning_iterable_head_borrow_return_2369,
@@ -169,6 +182,8 @@ BEZEL_TEST(owning_iterable_head_borrow_return_2369,
         "  public method Get(): IOwningAsyncEnumerator<Cell> return field; end Get; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 // ===========================================================================

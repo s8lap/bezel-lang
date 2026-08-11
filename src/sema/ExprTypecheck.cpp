@@ -250,7 +250,21 @@ TypeRef* ExprTC::namedValueBuiltinRef(std::string_view name) {
     auto* ann = new ast::Type();
     ann->kind = ast::TypeKind::Named;
     auto* nm = new ast::QualifiedName();
-    nm->parts.push_back(std::string(name));
+    // fix #2734: `QualifiedName::parts` is a vector of NON-OWNING
+    // `std::string_view`s (ast/Node.hpp) — every other producer fills it with
+    // views into the source buffer or into a string literal. This one pushed
+    // `std::string(name)`, a TEMPORARY destroyed at the end of the statement,
+    // so `headName()` on the resulting TypeRef read freed memory: every
+    // `IntPtr.Zero` / `UIntPtr.Zero` expression and every `IntPtr(v)`
+    // conversion carried a dangling type name. Nothing had read it before, so
+    // the UB was silent; the moment a check did (the §10.4
+    // `string.FromCStringPointer(IntPtr.Zero)` guard) it compared garbage and
+    // rejected the spec's own idiom. Store a static literal instead — the
+    // callers only ever pass one of these two names, and a literal's storage
+    // outlives every TypeRef. (Mirrors the `rb.Pointer` synthesis in
+    // ExprTypecheck_Calls.cpp, which already pushes a literal.)
+    nm->parts.push_back(name == "UIntPtr" ? std::string_view("UIntPtr")
+                                          : std::string_view("IntPtr"));
     ann->name.reset(nm);
     tr->astNode = ann;
     return tr;
@@ -2795,6 +2809,17 @@ bool ExprTC::primitiveBoxesIntoBuiltinIface(PrimitiveType fromPrim,
         to->declaration->kind != ast::TypeDeclKind::Interface ||
         to->genericArgs.size() != 1 || !to->genericArgs[0])
         return false;
+    // fix #3022 (spec §11.3, v0.240): a USER interface named IComparable /
+    // IEquatable must NOT trigger the §8.6 primitive-boxing predicate — the
+    // boxing lowering (§22.6 / §5.1) is built-in specific, and a user
+    // interface with that name is a perfectly ordinary user contract.
+    // `declaration->moduleName.empty()` is the discriminator the rest of
+    // the front-end adopted after #2995/#2997: a builtinClassSym leaves it
+    // empty, SymbolCollection (local) and ModuleLoader (imported) populate
+    // it on every real TypeSymbol. Without this gate a user IComparable<T>
+    // reaches the codegen path and the compiler SEGFAULTs trying to box a
+    // primitive into a non-builtin interface.
+    if (!to->declaration->moduleName.empty()) return false;
     bool isCmp = to->declaration->name == "IComparable";
     bool isEq  = to->declaration->name == "IEquatable";
     if (!isCmp && !isEq) return false;
@@ -2897,6 +2922,166 @@ static bool functionSlotConvertible(
     return functionSlotTypeRefEqual(from, to);
 }
 
+// per §8.6 (#2912): the locations that BOX a value-typed source — §8.6's
+// opening sentence, "When a value type is used where `Object` (or an interface
+// implemented by the value type) is expected, the value is **boxed**: a
+// heap-allocated wrapper holds the value." This deliberately mirrors codegen's
+// `Emitter::isObjectOrInterfaceTarget`, which answers the same question one
+// pass later: the two must agree, or sema would reject a location codegen does
+// not box (or, worse, admit one it does).
+static bool isBoxingTargetType(const TypeRef* to) {
+    if (!to) return false;
+    if (to->kind == TypeRef::Kind::Primitive)
+        return to->primitive == PrimitiveType::Object;
+    return to->kind == TypeRef::Kind::Named && to->declaration &&
+           to->declaration->kind == ast::TypeDeclKind::Interface;
+}
+
+// per §15.3 (#2912): is `t` a MOVE-ONLY value type? §15.3, *Move-only value
+// types*: "The move-only value type kinds in this specification are two: the
+// owning inline array (`[N owned]T` or `[N owned]T?`, see [§15.1.1]) and the
+// owning-classified choice ([§35.4])." — and, immediately after, "Move-only
+// membership follows from *structure*, never from a declaration form".
+//
+// That two-kind population is EXACTLY the one §8.6 excludes from boxing, so
+// this is written against the property (move-only) rather than against the one
+// spelling the bug report used: an owning-classified choice reaching an
+// `Object` location was measured to be accepted with the same silent `false`
+// as the owning inline array, and a predicate that named only inline arrays
+// would have left half the rule unenforced. `kindOut` receives the spec's own
+// name for whichever kind matched, so the diagnostic can say which one it is.
+static bool isMoveOnlyValueType(const TypeRef* t, const SemaContext& ctx,
+                                const char*& kindOut) {
+    if (!t) return false;
+    if (t->kind == TypeRef::Kind::InlineArray && t->arrayOwned) {
+        kindOut = "an owning inline array";
+        return true;
+    }
+    if (t->kind == TypeRef::Kind::Named && t->declaration &&
+        t->declaration->kind == ast::TypeDeclKind::Choice) {
+        auto verdict = common::classifyChoiceType(t, ctx);
+        if (verdict && *verdict == common::ChoiceClassification::Owning) {
+            kindOut = "an owning-classified choice";
+            return true;
+        }
+    }
+    return false;
+}
+
+// per §8.6 (#2912): a source spelling for the move-only rejection below.
+// Deliberately spells the `owned` marker (`[2 owned]R`) — that marker is the
+// whole reason the value is move-only, so a message that dropped it would name
+// a type the rule does not apply to.
+static std::string spellMoveOnlySource(const TypeRef* t) {
+    if (!t) return "?";
+    if (t->kind == TypeRef::Kind::InlineArray) {
+        std::string s = "[";
+        s += t->arraySizeValue >= 0 ? std::to_string(t->arraySizeValue)
+                                    : std::string("N");
+        if (t->arrayOwned) s += " owned";
+        s += "]";
+        s += spellMoveOnlySource(t->arrayElement);
+        return s;
+    }
+    if (t->kind == TypeRef::Kind::Named) {
+        std::string s(namedTypeSimpleName(t));
+        return s.empty() ? std::string("?") : s;
+    }
+    return "?";
+}
+
+// fix #2925 (§5.1 *Constant narrowing*, v0.240) — see the header for the rule
+// quoted in full. The predicate (`foldIntConstExprTC` + `fitsInIntType`) was
+// already right; what was wrong is the POPULATION it was fed. Three statement
+// kinds re-typed the constant by hand — a LOCAL declaration, an ASSIGNMENT
+// statement (both here) and a RECORD POSITIONAL `new Rec(...)` argument (which
+// carried a third copy of the range table) — and every OTHER §5.1 conversion
+// site simply never consulted the rule, so the constant kept its `int` type
+// and the surrounding check rejected it. MEASURED on 618c0c8:
+//
+//   c.Set(3) / Cfg.SSet(3) / new Cfg(lvl := 3)  "the argument `level` … is not
+//                                    implicitly convertible" — §5.1 names
+//                                    `Set(level: byte)` called as `Set(3)` AS
+//                                    AN EXAMPLE OF THE RULE
+//   return 200;  from `byte`         "the returned value … is not implicitly
+//                                    convertible"
+//   return 200;  from `byte?`        same (§5.1 "Nullable conversions": "`S`
+//                                    converts to `T?` via `S → T → T?`")
+//   method W(level: byte := 3)       admitted by sema, then MALFORMED IR:
+//                                    "Call parameter type does not match
+//                                    function signature! i32 3 / i8"
+//
+// Hoisting the rule into `checkAssignable` — which IS the §5.1 conversion-site
+// check — makes the population "every site that asks the §5.1 question",
+// including the ones nobody has written yet. The three hand-written copies are
+// deleted, so there is one range table and one fold.
+//
+// Deliberately NOT in scope here, filed separately: §22.6 overload resolution
+// asks the same question through `implicitlyConvertible`, which takes TYPES
+// only (no expression) and so cannot see the constant — `Pick(3)` against
+// `Pick(byte)`/`Pick(string)` still reports "no overload … is applicable".
+TypeRef* ExprTC::narrowIntConstantToTarget(const ast::Expr* fromExpr,
+                                           TypeRef* from, TypeRef* to) {
+    if (!fromExpr || !from || !to) return from;
+    // The rule's SOURCE side: "an expression of integer type that is a
+    // compile-time constant". A folded constant is typed plain `int` here (a
+    // suffixed / wide literal already carries its own wider type and needs no
+    // narrowing); a NULLABLE source is not a bare constant and stays out.
+    if (from->kind != TypeRef::Kind::Primitive ||
+        from->primitive != PrimitiveType::Int || from->nullable)
+        return from;
+    if (to->kind != TypeRef::Kind::Primitive) return from;
+    // The rule's TARGET side: "any integer type whose range contains its
+    // value". Only the integer types an `int` does NOT already widen to
+    // (§5.1's table) need the rule; everything else is an ordinary widening.
+    PrimitiveType tgt = to->primitive;
+    const bool narrowerIntTarget =
+        tgt == PrimitiveType::Byte  || tgt == PrimitiveType::SByte ||
+        tgt == PrimitiveType::Short || tgt == PrimitiveType::UShort ||
+        tgt == PrimitiveType::UInt  || tgt == PrimitiveType::ULong;
+    if (!narrowerIntTarget) return from;
+    // Only re-type an expression whose OWN recorded type is the one being
+    // checked. Some callers synthesise `from` (the `this` seed on the
+    // assignment path, a cloned non-nullable probe) — re-typing the expression
+    // to a target it was never measured against would be a silent miscompile.
+    if (ctx_.exprType(*fromExpr) != from) return from;
+    auto cv = foldIntConstExprTC(*fromExpr);
+    // "A constant whose value does not fit the target's range is a compile
+    // error at the conversion site — never a silent truncation", and "the rule
+    // applies to constants only; a run-time `int` value still requires the
+    // explicit `byte(x)` narrowing of §5.2": both fall through unchanged, and
+    // checkAssignable's own §5.1 rejection reports them.
+    if (!cv || !fitsInIntType(*cv, tgt)) return from;
+    // §5.1 "Nullable conversions": "The two rules compose through at most one
+    // `?` on each side ([§7.10]: `?` is idempotent): `S` converts to `T?` via
+    // `S → T → T?`". Re-typing to `to` itself (nullability included) is what
+    // the local-declaration path has always done — codegen lowers an integer
+    // literal at `lowerPrimitive(primitive)` and ignores `nullable`, so the
+    // value reaches the slot at the PAYLOAD width and the store site supplies
+    // §7.2's wrap (#2903).
+    ctx_.setExprType(const_cast<ast::Expr*>(fromExpr), to);
+    return to;
+}
+
+// §14.1 (#2926) — see the declaration comment. The type-parameter names in
+// scope at a member declaration are the enclosing TYPE's (a field / property /
+// parameter slot can name them) plus, for a parameter default, the enclosing
+// METHOD's own. Both sets are collected because a field is checked while
+// visiting the type and a default while visiting the method, and one call site
+// must not have to know which.
+bool ExprTC::mentionsUnsubstitutedTypeParam(const TypeRef* t) const {
+    if (!t) return false;
+    std::unordered_set<std::string_view> tpNames;
+    if (currentType_)
+        for (Symbol* gp : currentType_->genericParams)
+            if (gp) tpNames.insert(gp->name);
+    if (currentMethodDecl_)
+        for (const auto& gp : currentMethodDecl_->genericParams)
+            tpNames.insert(gp.name);
+    if (tpNames.empty()) return false;
+    return refOutParamTypeMentionsTypeParam(t, tpNames);
+}
+
 // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
 // Handles two cases and conservatively skips everything else
 // (mixed primitive/named, generics, null, Object target) so it
@@ -2908,6 +3093,67 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                              SourceLocation loc, const std::string& what,
                              const ast::Expr* fromExpr) {
     if (!from || !to) return;
+    // §5.1 "Constant narrowing" (#2925): applied HERE, once, for every §5.1
+    // conversion site — see narrowIntConstantToTarget above.
+    from = narrowIntConstantToTarget(fromExpr, from, to);
+    // fix #2912 (§8.6 *Boxing of inline arrays*, v0.240) — the whole rule:
+    //
+    //   "Move-only value types — owning inline arrays (`[N owned]T` and
+    //    `[N owned]T?`) and owning-classified choices ([§35.4]) — cannot be
+    //    boxed. Boxing a value type copies the value into a heap wrapper, but
+    //    move-only types forbid copying ([§15.3]). A program that needs the
+    //    contents of an owning inline array to cross a boxed-value boundary
+    //    must explicitly transfer ownership — typically by draining the inline
+    //    array into a heap collection (`OwningArray<T>`), which is itself a
+    //    class type and is passed by reference rather than boxed."
+    //
+    // "cannot be boxed" is a prohibition on the PROGRAM, stated together with
+    // the remedy the program is expected to use — so the compiler owes a
+    // rejection, and codegen is NOT the place to supply one: the copy §8.6
+    // describes is exactly what §15.3 forbids, and performing it would hand the
+    // box and the source two owners for one set of instances. Codegen's refusal
+    // to box is therefore correct and is left alone; what was missing is this.
+    //
+    // Nothing rejected it. MEASURED on f069645 across §8.6's boxing positions,
+    // none of them diagnosed:
+    //   * `var oo: Object := own;`     compiles; `oo is [2]R` reads FALSE (the
+    //                                  #2775 `internal:` note is the only sign)
+    //   * `oo := own;`                 compiles; the same silent false
+    //   * `Take(own)`, Object param    ICE: "Call parameter type does not match
+    //                                  function signature!" + IR verify abort
+    //   * `return own;`, Object return ICE: "Function return type does not
+    //                                  match operand type of return inst!"
+    // and an owning-classified CHOICE at an `Object` local behaved identically
+    // — which is why the predicate is §15.3's population, not the one spelling.
+    //
+    // Deliberately NOT swept in, because the spec admits them explicitly on a
+    // BORROWED receiver and neither is an assignability question: §8.5's
+    // `ToString` for an owning inline array ("all forms, including move-only
+    // `[N owned]…` arrays, whose receiver is borrowed for the call"), §18.5
+    // interpolation, which dispatches that same `ToString`, and §8.2's
+    // `GetType()` ("cannot be boxed … but may be asked their type — the
+    // receiver is borrowed, not copied").
+    if (isBoxingTargetType(to)) {
+        const char* moveOnlyKind = nullptr;
+        if (isMoveOnlyValueType(from, ctx_, moveOnlyKind)) {
+            std::string target =
+                to->kind == TypeRef::Kind::Primitive
+                    ? std::string("Object")
+                    : std::string(namedTypeSimpleName(to));
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what + " has type `" +
+                spellMoveOnlySource(from) + "`, " + moveOnlyKind +
+                " — a move-only value type, which §8.6 says cannot be boxed: "
+                "reaching a location of type `" + target +
+                "` boxes the value, and boxing copies it into a heap "
+                "wrapper, which move-only types forbid (§15.3). Transfer "
+                "ownership explicitly instead — drain the owned slots into an "
+                "`OwningArray<T>` (a class type, passed by reference rather "
+                "than boxed) and use that (§8.6)");
+            return;  // reported; the checks below would only cascade
+        }
+    }
     // §7.4 / §12.7 (#914): a value-type (primitive) nullable simple variable
     // proved non-null by null-flow narrowing (`if x is null then return; end`,
     // `is not null`, else-of-`is null`, or initialization with a non-null value)
@@ -3097,7 +3343,13 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
     if (from->kind == TypeRef::Kind::Named && !from->declaration &&
         to->kind   == TypeRef::Kind::Named &&  to->declaration &&
         to->declaration->kind == ast::TypeDeclKind::Interface &&
-        to->declaration->name == "IReadOnlySpan") {
+        to->declaration->name == "IReadOnlySpan" &&
+        // fix #3022 (§11.3, v0.240): only the §4.16 BUILTIN interface has
+        // moduleName.empty() — SymbolCollection (local) and ModuleLoader
+        // (imported) populate moduleName on every real TypeSymbol. Without
+        // this gate a user interface named IReadOnlySpan is wrongly admitted
+        // as the §4.16 target.
+        to->declaration->moduleName.empty()) {
         std::string_view fromN = namedTypeSimpleName(from);
         if (fromN == "ArraySpan" || fromN == "ReadOnlyArraySpan" ||
             fromN == "Span"      || fromN == "ReadOnlySpan") {
@@ -3473,6 +3725,39 @@ TypeRef* ExprTC::builtinAncestorTypeRef(std::string_view name) {
     ref->declaration = nullptr;
     ref->importedName = name;
     return ref;
+}
+
+// §31.4 (v0.240, #2971): see ExprTypecheck_impl.hpp. `Exception.CauseChain`'s
+// type, `Array<ExceptionInfo>`, as a synthetic TypeRef over two program-
+// lifetime static AST nodes. Neither `Array` nor `ExceptionInfo` has a user
+// TypeSymbol, so `declaration` stays null on both.
+TypeRef* ExprTC::excCauseChainTypeRef() {
+    static const ast::Type* kArrayNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("Array");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    static const ast::Type* kExcInfoNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("ExceptionInfo");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    auto* elem = ctx_.makeTypeRef();
+    elem->kind = TypeRef::Kind::Named;
+    elem->declaration = nullptr;
+    elem->astNode = kExcInfoNode;
+    auto* arr = ctx_.makeTypeRef();
+    arr->kind = TypeRef::Kind::Named;
+    arr->declaration = nullptr;
+    arr->astNode = kArrayNode;
+    arr->genericArgs.push_back(elem);
+    return arr;
 }
 
 // #1621 / §31.2.1: the ancestor-name chain of `ty` (most-specific first, `ty`
@@ -3992,6 +4277,238 @@ void ExprTC::checkLValueChainNotCallBased(const ast::Expr& target) {
     }
 }
 
+// §23.3 / §23.1 / §13.6 / §17.6 (v0.240, #2868). The shared
+// property-or-indexer WRITE-TARGET check, called from BOTH statement forms
+// that write through grammar A.6's `LValue`: AssignmentStmt (`x := e`,
+// `x op= e`) and IncrementStmt (`x++` / `x--`).
+//
+// WHY IT IS SHARED (fix #2868): this body used to be inline in visitStmt's
+// AssignmentStmt arm, and the IncrementStmt arm — which never reaches it —
+// carried a hand-maintained mirror of the assignment rules. That mirror has
+// now been found missing a check twice: #2309 (a positional record's
+// auto-generated property) and #2868 (a getter-only property OR indexer,
+// where `b.P++` and `b[0]++` both compiled clean, ran, and SILENTLY
+// DISCARDED the write while the `:=` and `+=` spellings of the same write
+// were correctly rejected). §17.6 states the increment operand rule in the
+// very terms the assignment target already obeys, verbatim: "The operand
+// must be an assignable lvalue (a local variable, a writable field, an
+// indexer slot, or a property with a setter — the same storage categories
+// §22.3's `ref`/`out` arguments reuse). Read-only locations cannot be
+// incremented." §6.6 makes the same identification for the compound form
+// ("§17.6's indexer desugaring is the indexer instance of this rule"), and
+// #2848 already removed the CODEGEN mirror on that authority. So the two
+// statement forms now share ONE implementation rather than a third copy.
+//
+// `incOp` is null for an assignment target and the operator token ("++" /
+// "--") for an increment target. It selects the diagnostic's verb and adds
+// the §17.6 citation; with `incOp == nullptr` every message below is
+// byte-identical to what it was before the extraction.
+//
+// §23.3 (#747 R42): a write to a property with NO setter — an
+// expression-bodied property (`P: T => e;`) or a block-form property with
+// only a getter — is rejected outright (no setter exists).
+// §23.1 (#747 R42): a readonly AUTO-property has an implicit setter, but is
+// assignable only in a field initializer or constructor (like a readonly
+// field), so a write OUTSIDE a constructor is also rejected. Without these
+// the write was silently accepted/dropped.
+// per §23.1 (#1173): the target may be a qualified member access (`this.X`,
+// `obj.X`) OR an UNQUALIFIED implicit-this identifier (`X := 9` inside the
+// declaring class). Both resolve to the same PropertySymbol and must obey
+// the readonly / no-setter / setter-visibility rules below. Previously only
+// the MemberAccessExpr shape was guarded, so an unqualified self-write to a
+// readonly auto-property slipped through (an ACCEPT_TRAP). A local variable
+// that shadows the property resolves to a LocalSymbol, so the dynamic_cast
+// below leaves it untouched.
+void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
+                                      const SourceLocation& loc,
+                                      const char* incOp) {
+    PropertySymbol* ps = nullptr;
+    std::string propName;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+        if ((ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(target))))
+            propName = std::string(ma->member);
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target)) {
+        if ((ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(target))))
+            propName = std::string(id->name);
+    } else if (dynamic_cast<const ast::IndexExpr*>(&target)) {
+        // fix #2851 (§23.3/§23.4, v0.240): the INDEXER twin of the
+        // read-only rejection below. §23.4 makes an indexer "a
+        // property whose name is replaced by `[parameters]`", so
+        // §23.3's setter rule governs it identically — but only the
+        // two NAMED spellings resolved a PropertySymbol here, so an
+        // indexer target left `ps` null and the whole check was
+        // skipped. Measured: `b[0] := 99;` on a getter-only indexer
+        // compiled clean, ran, and SILENTLY DISCARDED the write
+        // (read back 7), while the named twin `b.P := 99;` was
+        // correctly rejected with the §23.3 diagnostic.
+        //
+        // The symbol is the one #2530 attaches to the IndexExpr, so
+        // this asks the type-checker what the access resolved to
+        // rather than re-deriving it. A BUILTIN collection index
+        // (`Array`, `Dictionary`, a span) resolves no user
+        // PropertySymbol, so `ps` stays null and those are
+        // untouched by construction.
+        ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(target));
+        if (ps && !ps->isIndexer) ps = nullptr;
+        // An indexer's PropertySymbol::name is the synthetic
+        // ".this", which would render as gibberish in the message,
+        // so the diagnostic names the construct instead.
+        if (ps) propName.clear();
+    }
+    if (!ps) return;
+    // #2868: the verb and citation differ between the two callers; the rule
+    // and every branch below do not.
+    const std::string verb = incOp ? "increment/decrement " : "assign to ";
+    const std::string throughVerb =
+        incOp ? "increment/decrement through " : "assign through ";
+    const std::string cite = incOp ? "§17.6 / " : "";
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+        bool hasSetter = true;
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+            hasSetter = false;
+        } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+            hasSetter = false;
+            for (const auto& acc : pd->accessors)
+                if (acc.isSet) { hasSetter = true; break; }
+        }
+        bool isReadonlyAuto = false;
+        if (pd->bodyKind == ast::PropertyBodyKind::Auto)
+            for (auto mod : pd->modifiers)
+                if (mod == "readonly") {
+                    isReadonlyAuto = true;
+                    break;
+                }
+        if (!hasSetter) {
+            // #2851: `propName` is empty for an indexer (its symbol name is
+            // the synthetic ".this"), so name the construct rather than
+            // print it.
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                propName.empty()
+                    ? ("cannot " + throughVerb +
+                       "a read-only indexer — it has no setter (" + cite +
+                       "§23.3)")
+                    : ("cannot " + verb + "read-only property `" + propName +
+                       "` — it has no setter (" + cite + "§23.3)"));
+        } else if (isReadonlyAuto && !inConstructor_) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "cannot " + verb + "readonly property `" + propName +
+                "` outside a field initializer or constructor (" + cite +
+                "§23.1)");
+        } else if (hasSetter) {
+            // §13.6 (#747 R42): a property write must respect the SETTER
+            // accessor's visibility, which may be more restrictive than the
+            // property's (e.g. `private set`). Compute the setter's
+            // effective visibility and apply the §13.1 access rules;
+            // without this a `private set` was writable from any class.
+            ast::Visibility sv = pd->visibility;
+            if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+                for (const auto& acc : pd->accessors)
+                    if (acc.isSet &&
+                        acc.visibility != ast::Visibility::None) {
+                        sv = acc.visibility;
+                        break;
+                    }
+            } else if (pd->bodyKind == ast::PropertyBodyKind::Auto &&
+                       pd->hasAutoAccessorVis && pd->autoAccessorIsSet) {
+                sv = pd->autoAccessorVis;
+            }
+            TypeSymbol* declaring = ps->parent;
+            bool bad = false;
+            if (sv == ast::Visibility::Private)
+                bad = (currentType_ != declaring);
+            else if (sv == ast::Visibility::Protected)
+                bad = !(currentType_ == declaring ||
+                        (currentType_ && isSubtype(currentType_, declaring)));
+            else if (sv == ast::Visibility::Internal)
+                bad = ctx_.isImported(ps);
+            if (bad) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "cannot " + verb + "property `" + propName +
+                    "` — its setter is not accessible here (" + cite +
+                    "§13.6)");
+            }
+        }
+    } else {
+        // fix #2412 (§23.3, §2.8.2/§2.8.3 rule 4, v0.235): an IMPORTED
+        // PropertySymbol has no ast::PropertyDecl (`ps->decl` is
+        // unconditionally null — ModuleLoader never reconstructs a body-less
+        // imported property's decl), so the `pd`-gated check above silently
+        // skipped every imported property, accepting a write to a
+        // getter-only imported property that the identical same-module shape
+        // correctly rejects (confirmed asymmetry — a #2374-family instance).
+        // Fall back to the hasSetter side table #2400 publishes from
+        // MetaMember::hasSetter, which is false both for a genuinely
+        // getter-only property (expression-bodied or block-getter-only) and
+        // for a readonly auto-property (mirrors ModuleMetadataBuilder.cpp's
+        // export-time computation) — either way, no assignment is ever valid
+        // on it from outside its declaring module, so one message covers
+        // both source shapes the same way the local `!hasSetter` branch's
+        // message already does.
+        if (!ctx_.importedPropertyHasSetter(ps)) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "cannot " + verb + "read-only property `" + propName +
+                "` — it has no setter (" + cite + "§23.3)");
+        } else {
+            // fix #2415 (§13.6, §23.3, §2.8.2 clause 1 / §2.8.3 rule 4,
+            // v0.235): the setter EXISTS (hasSetter above), but its
+            // VISIBILITY was never enforced across the module boundary — a
+            // `private set` / `protected set` / `internal set` imported
+            // property was writable from anywhere through the import, even
+            // though the identical same-module shape is correctly rejected
+            // (§13.6: "A property or indexer's `get` or `set` may carry its
+            // own visibility, which must not be *less* restrictive than the
+            // property's overall visibility").
+            // `ctx_.importedPropertySetterVisibility(ps)` publishes
+            // MetaMember::setterVisibility (#2415), the ALREADY-RESOLVED
+            // effective visibility computed at export time by mirroring the
+            // `sv` computation just above verbatim.
+            //
+            // Applying the §13.1 access levels across a module boundary:
+            //   - Private ("the declaring class only"): always inaccessible
+            //     here — `declaring` is the imported TypeSymbol
+            //     reconstructed by ModuleLoader, and `currentType_` is
+            //     always a type compiled in THIS (importing) module, so the
+            //     two can never be the same symbol — unconditional reject.
+            //   - Protected ("the declaring class and all classes derived
+            //     from it", §13.1 — no module qualifier): reuse `isSubtype`,
+            //     which already walks `baseTypes` through a reconstructed
+            //     imported base (proven by #2400's inherited-setter itable
+            //     tests), so a LOCAL subclass of the imported declaring type
+            //     is still accepted.
+            //   - Internal ("code in the same module", §13.1): the importing
+            //     module is BY DEFINITION a different module than the
+            //     declaring one, so this is also an unconditional reject —
+            //     mirroring how the local check's `ctx_.isImported(ps)` is
+            //     unconditionally true for every ps that reaches this `else`
+            //     branch at all.
+            //   - Public / None (no restriction, or the property's own —
+            //     already-checked — visibility with no accessor override):
+            //     no further restriction.
+            ast::Visibility sv = ctx_.importedPropertySetterVisibility(ps);
+            TypeSymbol* declaring = ps->parent;
+            bool bad = false;
+            if (sv == ast::Visibility::Private) {
+                bad = true;
+            } else if (sv == ast::Visibility::Protected) {
+                bad = !(currentType_ && isSubtype(currentType_, declaring));
+            } else if (sv == ast::Visibility::Internal) {
+                bad = true;
+            }
+            if (bad) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "cannot " + verb + "property `" + propName +
+                    "` — its setter is not accessible here (" + cite +
+                    "§13.6)");
+            }
+        }
+    }
+}
+
 // §22.3 "ref and out argument locations" (v0.184, #1682). See the header for
 // the full contract; this covers the DECLARATION-based categories only (the
 // dataflow-based owned-state exclusion is MethodOwnership::
@@ -4333,12 +4850,13 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
     // for an IndexExpr (`d[i]`), and is therefore not widened for ref/out
     // here (it would false-reject the spec-LEGAL write-only-as-`out`
     // case). Mirror #2461's `kind == "ref"` guard so `out` is correctly
-    // admitted (§22.3: no getter call for `out`). The indexer coverage
-    // becomes uniform once ExprTypecheck_Exprs.cpp's IndexExpr visit
-    // attaches the resolved PropertySymbol — without that, this branch's
-    // exact message shape only fires for a LOCAL write-only INDEXER and a
-    // LOCAL write-only named PROPERTY reachable via `obj[i]` is still
-    // gated only by the original (IndexedExpr-doesn't-apply) read gate.
+    // admitted (§22.3: no getter call for `out`). (STALE NOTE CORRECTED,
+    // #2717 round 3: this used to say the coverage "becomes uniform once
+    // ExprTypecheck_Exprs.cpp's IndexExpr visit attaches the resolved
+    // PropertySymbol". It does attach it — ExprTypecheck_Exprs.cpp ~1918,
+    // `ctx_.setExprSymbol(&e, ps)`, landed with #2530 — and deliberately
+    // ONLY for the user-defined-indexer branch, so a builtin collection
+    // index still yields no PropertySymbol here.)
     // hasGetter mirrors propertyDeclIsSetOnly's INVERSE exactly:
     //   * Expression / Auto bodyKinds always have a getter (auto-derived).
     //   * Block bodyKind has a getter iff any accessor is a `get` arm
@@ -6912,6 +7430,32 @@ std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
         if (!val) return std::nullopt;
         return foldIntConst(*val, resolve, d + 1);
     };
+    // fix #2986 (§17.14 / §5.1 / §22.12, v0.240): admit a qualified class
+    // const `C.GK` as a compile-time integer constant so it can drive §5.1
+    // narrowing. The bare-name resolver above walks lexical / enclosing-type
+    // consts only — a class-member const sits one scope higher (behind a
+    // Named-type head) and needs its own path here. Per §A.8 / §22.12 (#1095)
+    // `K.V` is already a const-init shape in a class-level initializer;
+    // §17.14 narrows the same shape to a smaller integer target. The head is
+    // required to be a single-segment module-visible TypeSymbol (a class);
+    // an unresolvable head, a non-class head (an instance field/property),
+    // an inherited member whose look-up misses, or a non-const member all
+    // return nullopt and fall back to the historical narrowing diagnostic so
+    // no false accept is lifted.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        TypeSymbol* t = nullptr;
+        if (auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+            if (Symbol* head = lookupName(id->name))
+                t = dynamic_cast<TypeSymbol*>(head);
+        if (!t) return std::nullopt;
+        Symbol* mem = lookupMember(t, ma->member);
+        auto* cms = dynamic_cast<ConstMemberSymbol*>(mem);
+        if (!cms) return std::nullopt;
+        auto* cd = dynamic_cast<const ast::ConstDecl*>(cms->decl);
+        if (!cd || !cd->value) return std::nullopt;
+        return foldIntConst(*cd->value, resolve, 1);
+    }
     return foldIntConst(e, resolve, 0);
 }
 
@@ -8106,6 +8650,33 @@ void ExprTC::runMethodBody(
                     "declare the parameter `owned` to receive it, or use a "
                     "trivial-dispose default (§22.5)");
         }
+        // fix #2925 (§5.1 / §22.4, v0.240): a default value is stored into the
+        // parameter's slot when the argument is omitted, so it is a §5.1
+        // conversion site — §5.1 says so in as many words: "Collection-literal
+        // element typing ([§15.4]) and default-argument typing use this same
+        // rule." Nothing checked it. MEASURED on 618c0c8, `method W(level:
+        // byte := 3)` was ADMITTED by sema and then emitted malformed IR
+        // ("Call parameter type does not match function signature! i32 3 /
+        // i8") — the §5.1 constant-narrowing re-type never ran here, so the
+        // literal stayed `int` while the parameter slot was i8. Running the
+        // same checkAssignable every other conversion site runs supplies BOTH
+        // halves: the re-type (narrowIntConstantToTarget) for an in-range
+        // constant, and the §5.1 rejection for everything the rule does not
+        // admit.
+        //
+        // §14.1: a parameter whose declared type MENTIONS an unsubstituted
+        // generic type parameter is checked at the INSTANTIATION — the same
+        // deferral §22.3's ref/out check makes, for the same reason (#1756).
+        if (params[i].type) {
+            if (TypeRef* pty = ctx_.resolvedType(*params[i].type))
+                if (!mentionsUnsubstitutedTypeParam(pty))
+                    checkAssignable(
+                        ctx_.exprType(*params[i].defaultValue), pty,
+                        params[i].defaultValue->span.begin,
+                        std::string("default value of parameter `") +
+                            std::string(params[i].name) + "`",
+                        params[i].defaultValue.get());
+        }
     }
     forbiddenForwardParams_.clear();
     if (exprBody) {
@@ -8171,7 +8742,27 @@ void ExprTC::runMethodBody(
     if (clauses) {
         for (const auto& c : *clauses) {
             if (!c.expr) continue;
+            // §22.16 (v0.240, #2942): while visiting a clause, the
+            // IdentifierExpr path can detect `result` / `old` and emit a
+            // context-aware diagnostic — inside an `ensures`, the contextual
+            // keywords are not yet implemented (per this issue); in any
+            // other position, they are reported as contextual keywords
+            // reserved for `ensures` rather than the generic "unresolved
+            // identifier" the user gets today. The flag is saved and
+            // restored across each clause so a lambda nested inside a
+            // clause body returns to "not in a clause" (a lambda body is
+            // its own callable — the contextual-keyword context does not
+            // extend into it, exactly like the per-method scope).
+            const bool saveInClause = inContractClause_;
+            const ContractClauseKind saveClauseKind = currentClauseKind_;
+            inContractClause_ = true;
+            currentClauseKind_ =
+                (c.kind == ast::ContractClause::Kind::Ensures)
+                    ? ContractClauseKind::Ensures
+                    : ContractClauseKind::Requires;
             visitExpr(*c.expr);
+            inContractClause_ = saveInClause;
+            currentClauseKind_ = saveClauseKind;
             // §22.16 "Clause typing: bool, pure, borrow-only": each clause
             // expression must be `bool` (§4.1 — no truthiness). Conservative
             // like checkConditionIsBool: skip when the type is unresolved so
@@ -8382,6 +8973,127 @@ void ExprTC::visitMember(const ast::Member& m) {
                                 checkNewExprArgs(*shNe, fty->declaration);
                         }
                     }
+                }
+            }
+            // fix #2926 (§5.1 / §5.2 / §7.9, v0.240): a field initializer had
+            // NEVER been checked for assignability — not incompletely, ABSENT.
+            // This arm visited the expression, applied §4.2's wide-literal hint
+            // and §17.7's typeless-`new`, and stopped; the LOCAL declaration arm
+            // it otherwise mirrors ends in exactly this `checkAssignable`.
+            // MEASURED on 618c0c8:
+            //
+            //   public _over: byte := 300;    compiles; reads 44 — §5.1 says
+            //                                 verbatim that a constant "whose
+            //                                 value does not fit the target's
+            //                                 range is a **compile error** at
+            //                                 the conversion site — never a
+            //                                 silent truncation"
+            //   public _q: byte := Src._n;    compiles and reads 200, where
+            //                                 §5.1 says "a run-time `int` value
+            //                                 still requires the explicit
+            //                                 `byte(x)` narrowing of [§5.2]"
+            //
+            // and the hole admitted any type mismatch a field initializer can
+            // express, not only numeric ones. #2903 fixed the CODEGEN half of
+            // this same gap (the store now reaches the slot at the slot's
+            // width, so case 1 truncates consistently instead of also
+            // corrupting the neighbouring field); the missing REJECT is here.
+            //
+            // Run with the scope still set (moduleScope_ for a field
+            // initializer, #582) so `narrowIntConstantToTarget`'s fold can
+            // resolve a `const` reference, and BEFORE the restore below.
+            // `checkAssignable` no-ops on a null `from` — an untyped collection
+            // literal (§15.4), an unresolved name — so this reports only what
+            // the type lattice can actually judge.
+            //
+            // §14.1: a field whose declared type MENTIONS an unsubstituted
+            // generic type parameter is checked at the INSTANTIATION, not at
+            // the declaration — `class Box<U> { public V: U := Box.Noop; }`
+            // (#2068) is well-typed at `Box<(int) -> int>`, and judging the
+            // bare `U` here made checkAssignable's Function→non-Function arm
+            // reject it. That is exactly the incompleteness its contract says
+            // not to judge, and #1756's four reverts are the precedent.
+            if (fd->type) {
+                if (TypeRef* fty = ctx_.resolvedType(*fd->type)) {
+                    // per §15.4 (#2958): the §15.4 collection-literal target
+                    // gate that #2914 added at the LOCAL-DECL position and
+                    // #3031 extended to return / call-arg / lambda-body was
+                    // MISSING here. `checkAssignable` no-ops on a null `from`,
+                    // so a non-admissible field type (Object, int, string, a
+                    // class with no `FromCollectionLiteral`) walked past the
+                    // type-lattice check; codegen's materializeHeap* path then
+                    // returned null on the bad target and the slot was filled
+                    // with a zero/null value (the WORST of the three #2958
+                    // siblings — zero diagnostics, silently wrong value).
+                    // Mirror the local-decl arm's positive gate so the same
+                    // `isCollectionLiteralAdmissibleTarget` predicate that
+                    // rejected the same shape at `var o: Object := [...]` also
+                    // rejects it at `public Slot: Object := [...]`. The
+                    // local-decl position intentionally does NOT defer on a
+                    // generic-substituted target (`var x: T := [1, 2, 3]`
+                    // inside `Make<T>` rejects at declaration time even if a
+                    // later `Make<Array<int>>` could have substituted an
+                    // admissible target — #2914's accept-control at the
+                    // `Array<T>` head proves the generic-arg case still admits
+                    // when the head itself is on §15.4's list); match that
+                    // discipline here so a `Slot: T := [1, 2, 3]` in
+                    // `class Box<T>` cannot silently survive to a `Box<int>`
+                    // instantiation where `T` substitutes to `int` (the
+                    // #2958 silent-zero trap) or to `Box<Array<int>>` where
+                    // the substitution would have been admissible (a false
+                    // reject the local-decl position also pays).
+                    if (auto* cl = dynamic_cast<
+                                const ast::CollectionLiteralExpr*>(
+                                fd->initializer.get())) {
+                        const bool isEmpty =
+                            !cl->isDict && cl->elements.empty();
+                        const bool admitted =
+                            isEmpty
+                                ? isCollectionLiteralEmptyAdmissibleTarget(
+                                      fty)
+                                : isCollectionLiteralAdmissibleTarget(
+                                      fty, cl->isDict);
+                        if (fty->kind != TypeRef::Kind::Error &&
+                            !admitted) {
+                            if (isCollectionLiteralInterfaceTarget(fty))
+                                reportCollectionLiteralInterfaceTarget(
+                                    ctx_.diagnostics(),
+                                    fd->initializer->span.begin,
+                                    namedTypeSimpleName(fty));
+                            else if (cl->isDict &&
+                                     isCollectionLiteralAdmissibleTarget(
+                                         fty, /*isDict=*/false))
+                                reportCollectionLiteralDictFormBadTarget(
+                                    ctx_.diagnostics(),
+                                    fd->initializer->span.begin, fty);
+                            else
+                                reportCollectionLiteralBadTarget(
+                                    ctx_.diagnostics(),
+                                    fd->initializer->span.begin, fty);
+                            // Restore scope/flag state before returning
+                            // — the field-init's own save/restore at
+                            // lines 9077-9078 below is unreachable on this
+                            // path.
+                            currentScope_ = saveScope;
+                            inFieldInitializer_ = save;
+                            return;  // reported; skip the
+                                     // assignability check below
+                        }
+                    }
+                    // The §5.1 / §22.8 / §23.1 assignability check that
+                    // #2926 added still defers on `mentionsUnsubstitutedTypeParam`
+                    // (its contract says deferring is the SAFE direction —
+                    // a missed mention is what makes a check run against an
+                    // unsubstituted parameter); leave that deferral in place
+                    // for the assignability half, since #2926 has a
+                    // measurement-recorded false-reject probe that justifies
+                    // it for numeric widening.
+                    if (!mentionsUnsubstitutedTypeParam(fty))
+                        checkAssignable(ctx_.exprType(*fd->initializer), fty,
+                                        fd->initializer->span.begin,
+                                        std::string("initializer for field `") +
+                                            std::string(fd->name) + "`",
+                                        fd->initializer.get());
                 }
             }
             currentScope_ = saveScope;
@@ -8645,6 +9357,79 @@ void ExprTC::visitMember(const ast::Member& m) {
             }
             visitExpr(*pd->autoInitializer);
             currentLiteralWideningHint_ = savedPropHint;
+            // fix #2926 (§5.1 / §23.1, v0.240): an AUTO-PROPERTY initializer
+            // initializes the compiler-generated backing field (§23.1) at the
+            // same construction-time step §22.8 governs for an explicit field
+            // initializer — §11.1 speaks of "field and property initializers"
+            // together as one concept, which is why this arm already mirrors
+            // the FieldDecl arm's §4.2 hint. It must mirror its §5.1 check too:
+            // `public property P: byte := 300;` truncated exactly as the field
+            // spelling did. Same scope discipline as the FieldDecl arm.
+            if (pd->type) {
+                if (TypeRef* pty = ctx_.resolvedType(*pd->type)) {
+                    // per §15.4 (#2958): mirror the §15.4 collection-literal
+                    // target gate the FieldDecl arm just below gained. The
+                    // auto-property initializer initializes the same backing
+                    // field as an explicit field initializer (§23.1, §11.1's
+                    // "field and property initializers together as one
+                    // construction-time concept"), so the gate that #2914
+                    // added at local-decl and #3031 extended to return /
+                    // call-arg / lambda-body has to apply here too — without
+                    // it `public property P: Object := [1, 2, 3];` compiled
+                    // clean and the backing field was zero/null-filled (the
+                    // #2958 silent-wrong-value trap, same shape as the
+                    // explicit field-init sibling). The
+                    // `mentionsUnsubstitutedTypeParam` deferral is NOT used
+                    // here either, for the same reason as in the FieldDecl
+                    // arm — see that arm's comment for the measurement.
+                    if (auto* cl = dynamic_cast<
+                                const ast::CollectionLiteralExpr*>(
+                                pd->autoInitializer.get())) {
+                        const bool isEmpty =
+                            !cl->isDict && cl->elements.empty();
+                        const bool admitted =
+                            isEmpty
+                                ? isCollectionLiteralEmptyAdmissibleTarget(
+                                      pty)
+                                : isCollectionLiteralAdmissibleTarget(
+                                      pty, cl->isDict);
+                        if (pty->kind != TypeRef::Kind::Error &&
+                            !admitted) {
+                            if (isCollectionLiteralInterfaceTarget(pty))
+                                reportCollectionLiteralInterfaceTarget(
+                                    ctx_.diagnostics(),
+                                    pd->autoInitializer->span.begin,
+                                    namedTypeSimpleName(pty));
+                            else if (cl->isDict &&
+                                     isCollectionLiteralAdmissibleTarget(
+                                         pty, /*isDict=*/false))
+                                reportCollectionLiteralDictFormBadTarget(
+                                    ctx_.diagnostics(),
+                                    pd->autoInitializer->span.begin,
+                                    pty);
+                            else
+                                reportCollectionLiteralBadTarget(
+                                    ctx_.diagnostics(),
+                                    pd->autoInitializer->span.begin,
+                                    pty);
+                            currentScope_ = saveScope;
+                            inFieldInitializer_ = save;
+                            return;  // reported; skip the
+                                     // assignability check below
+                        }
+                    }
+                    // The assignability half still defers on
+                    // `mentionsUnsubstitutedTypeParam` for the same reason
+                    // as in the FieldDecl arm — see that arm's comment.
+                    if (!mentionsUnsubstitutedTypeParam(pty))
+                        checkAssignable(
+                            ctx_.exprType(*pd->autoInitializer), pty,
+                            pd->autoInitializer->span.begin,
+                            std::string("initializer for property `") +
+                                std::string(pd->name) + "`",
+                            pd->autoInitializer.get());
+                }
+            }
             currentScope_ = saveScope;
             inFieldInitializer_ = save;
         }
@@ -8742,6 +9527,31 @@ void ExprTC::visitMember(const ast::Member& m) {
                 if (innerM) visitMember(*innerM);
             }
             currentType_ = save;
+        }
+    } else if (auto* inv = dynamic_cast<const ast::InvariantDecl*>(&m)) {
+        // §22.16 (v0.240, #2941): the invariant predicate's expression is
+        // type-checked under the same clause rules as a `requires`/`ensures`
+        // clause. We use the property-getter shape (no `this` is bound for
+        // ctor-style purposes — invariants are evaluated on a fully-
+        // constructed instance, so `this` and its fields are readable) but
+        // with `returnCtx_` forced to ValueMethod and the return type set
+        // to `bool` so the predicate must type-check to a bool. A
+        // clause-mode predicate (which is what §22.16 wants) is admitted by
+        // the visitExpr / runMethodBody plumbing — `throw` / `await` are
+        // rejected by the PureBodyWalker (PureChecker.cpp
+        // `checkInvariantExpr`); `old`/`result` are rejected by the same
+        // walker under its clauseMode_ flag.
+        if (inv->expr) {
+            ReturnCtx saveRet = returnCtx_;
+            TypeRef* saveRetTy = currentReturnType_;
+            returnCtx_ = ReturnCtx::ValueMethod;
+            // The predicate's free names are `this`, fields, statics, and
+            // module-level types. The walker's scope chain picks up
+            // currentScope_ (= moduleScope_ for class-body members) and
+            // currentType_'s members, exactly like a property getter.
+            runMethodBody({}, nullptr, inv->expr.get(), nullptr);
+            returnCtx_ = saveRet;
+            currentReturnType_ = saveRetTy;
         }
     }
 }
@@ -9135,14 +9945,72 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // collection init (`var v: Array<T> := [...]`) is unaffected; the
                 // remedy names a concrete backing and (covariantly) assigns it:
                 // `var xs: Array<T> := [...]; var v: IEnumerable<T> := xs;`.
-                if (dynamic_cast<const ast::CollectionLiteralExpr*>(
-                        ld->initializer.get()) &&
-                    isCollectionLiteralInterfaceTarget(lsym->declType)) {
-                    reportCollectionLiteralInterfaceTarget(
-                        ctx_.diagnostics(), ld->initializer->span.begin,
-                        namedTypeSimpleName(lsym->declType));
-                    currentScope_->names[ld->name] = lsym;
-                    return;  // reported; skip the assignability check below
+                //
+                // per §15.4 (#2914): the interface question above is only the
+                // NEGATIVE half, and the negative half is the wrong shape for a
+                // rule whose target list §15.4 states POSITIVELY and CLOSED
+                // ("The target types that admit collection literals are: …").
+                // Everything outside the list that is not one of the named
+                // interfaces walked straight through: MEASURED on f069645,
+                // `var a: Object := [1,2,3];` — and equally `int`, `string`,
+                // `Object?`, a class with no `FromCollectionLiteral`, and a bare
+                // type parameter `T` — reached codegen's inline-array arm, which
+                // GEPs the (pointer/scalar) slot as an array and aborts the
+                // compile with "Invalid indices for GEP pointer type" (an ICE
+                // with no user-facing diagnostic), while the EMPTY (`[]`) and
+                // DICTIONARY (`["a": 1]`) forms at the same targets lowered to
+                // nothing and degraded to a zero-initialized slot — a silently
+                // wrong value that no diagnostic named. Ask the POSITIVE
+                // predicate instead, so a target can only be admitted by being
+                // ON §15.4's list; the interface arm keeps its own more
+                // specific message.
+                // A null / Kind::Error declType means type resolution already
+                // reported; staying silent there is the standard cascade
+                // suppression, and it is also why the predicate is asked only
+                // for a type that actually resolved.
+                // per §15.4 (#3031): the predicate now also consults the
+                // literal's FORM — a dict literal at a sequence-shaped target
+                // (and vice versa) is rejected here, not deferred to codegen.
+                // Distinguish the form-vs-target mismatch from the "target not
+                // on §15.4's list" miss so the diagnostic names the right
+                // remediation (change the literal's form, not the target type).
+                // The empty literal `[]` is special-cased: §15.4 admits it at
+                // every collection target listed (the target type decides
+                // between empty seq and empty dict), but REJECTS it at every
+                // other target (the §15.4 sentence: "An empty literal in a
+                // non-collection or undeterminable context is the usual
+                // 'cannot infer target type' compile error"). The empty
+                // carve-out is membership-only — the form-vs-target question
+                // is bypassed for empty literals.
+                if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        ld->initializer.get())) {
+                    const bool isEmpty = !cl->isDict && cl->elements.empty();
+                    const bool admitted = isEmpty
+                        ? isCollectionLiteralEmptyAdmissibleTarget(lsym->declType)
+                        : isCollectionLiteralAdmissibleTarget(lsym->declType,
+                                                              cl->isDict);
+                    if (lsym->declType &&
+                        lsym->declType->kind != TypeRef::Kind::Error &&
+                        !admitted) {
+                        if (isCollectionLiteralInterfaceTarget(lsym->declType))
+                            reportCollectionLiteralInterfaceTarget(
+                                ctx_.diagnostics(), ld->initializer->span.begin,
+                                namedTypeSimpleName(lsym->declType));
+                        else if (cl->isDict &&
+                                 isCollectionLiteralAdmissibleTarget(
+                                     lsym->declType, /*isDict=*/false))
+                            reportCollectionLiteralDictFormBadTarget(
+                                ctx_.diagnostics(),
+                                ld->initializer->span.begin,
+                                lsym->declType);
+                        else
+                            reportCollectionLiteralBadTarget(
+                                ctx_.diagnostics(),
+                                ld->initializer->span.begin,
+                                lsym->declType);
+                        currentScope_->names[ld->name] = lsym;
+                        return;  // reported; skip the assignability check below
+                    }
                 }
                 // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
                 // type-argument inference. When the initializer is a call to a
@@ -9159,45 +10027,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // Slice T1: when an explicit ascription and an
                 // initializer are both present and both primitive,
                 // check primitive assignability (§5.1).
-                // §5.1 special: an integer CONSTANT EXPRESSION assigns to any
-                // integer type that can represent its value — re-type it as the
-                // target type so the assignability check passes. #738: gate on
-                // the initializer actually being a compile-time int constant
-                // (foldIntConst: a literal, arithmetic on literals, or a `const`
-                // reference); a non-constant int value (a variable / call result)
-                // does NOT implicitly narrow and falls through to checkAssignable,
-                // which reports the §5.1 error (`var y: sbyte := someIntVar`).
+                // §5.1 "Constant narrowing" (#738, one definition since
+                // #2925): an integer CONSTANT EXPRESSION assigns to any integer
+                // type that can represent its value. checkAssignable itself
+                // re-types the constant to the target (narrowIntConstantToTarget)
+                // — the same rule now applies at every §5.1 conversion site, so
+                // this arm no longer carries its own copy.
                 if (ld->initializer) {
-                    TypeRef* fromTy = ctx_.exprType(*ld->initializer);
-                    if (fromTy && lsym->declType &&
-                        fromTy->kind == TypeRef::Kind::Primitive &&
-                        lsym->declType->kind == TypeRef::Kind::Primitive &&
-                        fromTy->primitive == PrimitiveType::Int) {
-                        PrimitiveType tgt = lsym->declType->primitive;
-                        bool narrowerIntTarget =
-                            tgt == PrimitiveType::Byte ||
-                            tgt == PrimitiveType::SByte ||
-                            tgt == PrimitiveType::Short ||
-                            tgt == PrimitiveType::UShort ||
-                            tgt == PrimitiveType::UInt ||
-                            tgt == PrimitiveType::ULong;
-                        if (narrowerIntTarget) {
-                            auto cv = foldIntConstExprTC(*ld->initializer);
-                            // #738 / §5.1: a compile-time int constant re-types to
-                            // the narrower target only when its value FITS — an
-                            // out-of-range constant (e.g. `sbyte := 300`) falls
-                            // through to checkAssignable, which reports the §5.1
-                            // error (no silent truncation). A non-constant value
-                            // never folds and is likewise rejected.
-                            if (cv && fitsInIntType(*cv, tgt)) {
-                                ctx_.setExprType(ld->initializer.get(),
-                                                 lsym->declType);
-                                fromTy = lsym->declType;
-                            }
-                        }
-                    }
                     checkAssignable(
-                        fromTy,
+                        ctx_.exprType(*ld->initializer),
                         lsym->declType, ld->initializer->span.begin,
                         std::string("initializer for `") +
                         std::string(ld->name) + "`",
@@ -9449,6 +10287,44 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     rs->value.get())) {
                 inferReturnTargetTypeArgs(*retCall, currentReturnType_,
                                           /*outNeedsInfer=*/nullptr);
+            }
+        }
+        // per §15.4 (#3031): extend the literal-vs-target gate to the
+        // `return` position. The codegen side (`lowerReturnStmt`,
+        // LlvmBackend_Stmts.cpp) tries both materializers and falls through
+        // to a zero/null return value (#2491) when the literal's form does
+        // not match the return type — a silently wrong value. Reject here
+        // before `checkAssignable` so the literal+target pair is checked at
+        // every site uniformly. The interface arm stays as the call-arg
+        // path handles it (#1174), and the unit/primitive return path is
+        // unaffected (the predicate's null-check rejects a non-Error nulled
+        // return type). The empty literal `[]` is admitted at every §15.4
+        // collection target (the empty carve-out — membership-only) and
+        // rejected at every other target.
+        if (auto* retCl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                rs->value.get())) {
+            const bool isEmpty = !retCl->isDict && retCl->elements.empty();
+            const bool admitted = isEmpty
+                ? isCollectionLiteralEmptyAdmissibleTarget(currentReturnType_)
+                : isCollectionLiteralAdmissibleTarget(currentReturnType_,
+                                                      retCl->isDict);
+            if (returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_ &&
+                currentReturnType_->kind != TypeRef::Kind::Error && !admitted) {
+                if (isCollectionLiteralInterfaceTarget(currentReturnType_))
+                    reportCollectionLiteralInterfaceTarget(
+                        ctx_.diagnostics(), rs->value->span.begin,
+                        namedTypeSimpleName(currentReturnType_));
+                else if (retCl->isDict &&
+                         isCollectionLiteralAdmissibleTarget(
+                             currentReturnType_, /*isDict=*/false))
+                    reportCollectionLiteralDictFormBadTarget(
+                        ctx_.diagnostics(), rs->value->span.begin,
+                        currentReturnType_);
+                else
+                    reportCollectionLiteralBadTarget(
+                        ctx_.diagnostics(), rs->value->span.begin,
+                        currentReturnType_);
+                return;  // skip the assignability check below
             }
         }
         // Slice T3: a returned value must be primitive-assignable to
@@ -9839,6 +10715,48 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "bypasses the setter); read it into a local, "
                                 "modify it, then assign the whole value back "
                                 "through the property setter (§23.5)");
+                    }
+                }
+            }
+        }
+        // §15.1 / §23.5 (#2940, v0.240): the inline-array-typed-PROPERTY twin
+        // of the two checks above. The target is `<propertyAccess>[i] := v`
+        // (an `IndexExpr` whose `target` is a `MemberAccessExpr` to a
+        // `PropertySymbol`); the property's declared type is an inline array
+        // (`[N]T`, §15.1), which is itself a value type (§3.1), so a property
+        // GET returns a COPY of the inline array and `arr[i] := v` modifies
+        // an element of that discarded copy. This is the same shape a
+        // record-typed property's field write raises above: the property
+        // accessor is bypassed entirely — the setter never fires — and the
+        // field-level emission in `lvalueAddr`'s inline-array branch
+        // (`src/codegen/LlvmBackend_Layout.cpp:126`) recurses into
+        // `lvalueAddr(*ix->target, arrSlotTy)`, which returns null for a
+        // property target (no backing slot of its own), and the caller's
+        // `if (!addr2) return false;` silently drops the write
+        // (`LlvmBackend_Stmts.cpp:374`). Reject it. A heap-collection indexer
+        // SETTER (`obj.A[i] := v` where `A: Array<T> | OwningArray<T>`) is a
+        // class-typed PROPERTY, so the property get yields a REFERENCE and
+        // the indexer setter is invoked via `lowerIndexerSet` / the property
+        // accessor pair — that path stays accepted. Only the inline-array
+        // value-typed-PROPERTY shape is broken.
+        if (auto* ix =
+                dynamic_cast<const ast::IndexExpr*>(as->target.get())) {
+            if (auto* innerMa =
+                    dynamic_cast<const ast::MemberAccessExpr*>(ix->target.get())) {
+                auto* ps =
+                    dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(*innerMa));
+                if (ps && !ps->isIndexer) {
+                    TypeRef* rt = ctx_.exprType(*innerMa);
+                    if (rt && rt->kind == TypeRef::Kind::InlineArray) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, as->target->span.begin,
+                            "assigning to an element of an inline-array-typed "
+                            "property result modifies a discarded copy — the "
+                            "property get returns the array by value (§15.1), "
+                            "so the element write is lost and the setter is "
+                            "bypassed; bind a local, mutate it, then assign "
+                            "the whole array back through the property setter "
+                            "(§23.5 / §15.1, #2940)");
                     }
                 }
             }
@@ -10627,231 +11545,31 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     }
                 }
             }
-            // §23.3 (#747 R42): assignment to a property with NO setter — an
-            // expression-bodied property (`P: T => e;`) or a block-form property
-            // with only a getter — is rejected outright (no setter exists).
-            // §23.1 (#747 R42): a readonly AUTO-property has an implicit setter,
-            // but is assignable only in a field initializer or constructor (like
-            // a readonly field), so a write OUTSIDE a constructor is also
-            // rejected. Without these the write was silently accepted/dropped.
-            // per §23.1 (#1173): the assignment target may be a qualified
-            // member access (`this.X`, `obj.X`) OR an UNQUALIFIED implicit-this
-            // identifier (`X := 9` inside the declaring class). Both resolve to
-            // the same PropertySymbol and must obey the readonly / no-setter /
-            // setter-visibility rules below. Previously only the
-            // MemberAccessExpr shape was guarded, so an unqualified self-write
-            // to a readonly auto-property slipped through (an ACCEPT_TRAP). A
-            // local variable that shadows the property resolves to a
-            // LocalSymbol, so the dynamic_cast below leaves it untouched.
-            if (as->target) {
-                PropertySymbol* ps = nullptr;
-                std::string propName;
-                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                        as->target.get())) {
-                    if ((ps = dynamic_cast<PropertySymbol*>(
-                             ctx_.exprSymbol(*as->target))))
-                        propName = std::string(ma->member);
-                } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                               as->target.get())) {
-                    if ((ps = dynamic_cast<PropertySymbol*>(
-                             ctx_.exprSymbol(*as->target))))
-                        propName = std::string(id->name);
-                }
-                if (ps) {
-                        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(
-                                ps->decl)) {
-                            bool hasSetter = true;
-                            if (pd->bodyKind ==
-                                ast::PropertyBodyKind::Expression) {
-                                hasSetter = false;
-                            } else if (pd->bodyKind ==
-                                       ast::PropertyBodyKind::Block) {
-                                hasSetter = false;
-                                for (const auto& acc : pd->accessors)
-                                    if (acc.isSet) { hasSetter = true; break; }
-                            }
-                            bool isReadonlyAuto = false;
-                            if (pd->bodyKind == ast::PropertyBodyKind::Auto)
-                                for (auto mod : pd->modifiers)
-                                    if (mod == "readonly") {
-                                        isReadonlyAuto = true;
-                                        break;
-                                    }
-                            if (!hasSetter) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, as->span.begin,
-                                    "cannot assign to read-only property `" +
-                                    propName +
-                                    "` — it has no setter (§23.3)");
-                            } else if (isReadonlyAuto && !inConstructor_) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, as->span.begin,
-                                    "cannot assign to readonly property `" +
-                                    propName +
-                                    "` outside a field initializer or "
-                                    "constructor (§23.1)");
-                            } else if (hasSetter) {
-                                // §13.6 (#747 R42): a property write must respect
-                                // the SETTER accessor's visibility, which may be
-                                // more restrictive than the property's (e.g.
-                                // `private set`). Compute the setter's effective
-                                // visibility and apply the §13.1 access rules;
-                                // without this a `private set` was writable from
-                                // any class.
-                                ast::Visibility sv = pd->visibility;
-                                if (pd->bodyKind ==
-                                    ast::PropertyBodyKind::Block) {
-                                    for (const auto& acc : pd->accessors)
-                                        if (acc.isSet &&
-                                            acc.visibility !=
-                                                ast::Visibility::None) {
-                                            sv = acc.visibility;
-                                            break;
-                                        }
-                                } else if (pd->bodyKind ==
-                                               ast::PropertyBodyKind::Auto &&
-                                           pd->hasAutoAccessorVis &&
-                                           pd->autoAccessorIsSet) {
-                                    sv = pd->autoAccessorVis;
-                                }
-                                TypeSymbol* declaring = ps->parent;
-                                bool bad = false;
-                                if (sv == ast::Visibility::Private)
-                                    bad = (currentType_ != declaring);
-                                else if (sv == ast::Visibility::Protected)
-                                    bad = !(currentType_ == declaring ||
-                                            (currentType_ &&
-                                             isSubtype(currentType_,
-                                                       declaring)));
-                                else if (sv == ast::Visibility::Internal)
-                                    bad = ctx_.isImported(ps);
-                                if (bad) {
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, as->span.begin,
-                                        "cannot assign to property `" +
-                                        propName +
-                                        "` — its setter is not accessible "
-                                        "here (§13.6)");
-                                }
-                            }
-                        } else {
-                            // fix #2412 (§23.3, §2.8.2/§2.8.3 rule 4,
-                            // v0.235): an IMPORTED PropertySymbol has no
-                            // ast::PropertyDecl (`ps->decl` is unconditionally
-                            // null — ModuleLoader never reconstructs a
-                            // body-less imported property's decl), so the
-                            // `pd`-gated check above silently skipped every
-                            // imported property, accepting a write to a
-                            // getter-only imported property that the
-                            // identical same-module shape correctly rejects
-                            // (confirmed asymmetry — a #2374-family instance).
-                            // Fall back to the hasSetter side table #2400
-                            // publishes from MetaMember::hasSetter, which is
-                            // false both for a genuinely getter-only property
-                            // (expression-bodied or block-getter-only) and
-                            // for a readonly auto-property (mirrors
-                            // ModuleMetadataBuilder.cpp's export-time
-                            // computation) — either way, no assignment is
-                            // ever valid on it from outside its declaring
-                            // module, so one message covers both source
-                            // shapes the same way the local `!hasSetter`
-                            // branch's message already does.
-                            if (!ctx_.importedPropertyHasSetter(ps)) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, as->span.begin,
-                                    "cannot assign to read-only property `" +
-                                    propName +
-                                    "` — it has no setter (§23.3)");
-                            } else {
-                                // fix #2415 (§13.6, §23.3, §2.8.2 clause 1 /
-                                // §2.8.3 rule 4, v0.235): the setter EXISTS
-                                // (hasSetter above), but its VISIBILITY was
-                                // never enforced across the module boundary —
-                                // a `private set` / `protected set` /
-                                // `internal set` imported property was
-                                // writable from anywhere through the import,
-                                // even though the identical same-module shape
-                                // is correctly rejected (§13.6: "A property or
-                                // indexer's `get` or `set` may carry its own
-                                // visibility, which must not be *less*
-                                // restrictive than the property's overall
-                                // visibility"). `ctx_.
-                                // importedPropertySetterVisibility(ps)`
-                                // publishes MetaMember::setterVisibility
-                                // (#2415), the ALREADY-RESOLVED effective
-                                // visibility computed at export time by
-                                // mirroring the `sv` computation just above
-                                // verbatim.
-                                //
-                                // Applying the §13.1 access levels across a
-                                // module boundary:
-                                //   - Private ("the declaring class only"):
-                                //     always inaccessible here — `declaring`
-                                //     is the imported TypeSymbol reconstructed
-                                //     by ModuleLoader, and `currentType_` is
-                                //     always a type compiled in THIS
-                                //     (importing) module, so the two can never
-                                //     be the same symbol — unconditional
-                                //     reject.
-                                //   - Protected ("the declaring class and all
-                                //     classes derived from it", §13.1 — no
-                                //     module qualifier): reuse `isSubtype`,
-                                //     which already walks `baseTypes` through
-                                //     a reconstructed imported base (proven by
-                                //     #2400's inherited-setter itable tests),
-                                //     so a LOCAL subclass of the imported
-                                //     declaring type is still accepted.
-                                //   - Internal ("code in the same module",
-                                //     §13.1): the importing module is BY
-                                //     DEFINITION a different module than the
-                                //     declaring one, so this is also an
-                                //     unconditional reject — mirroring how
-                                //     the local check's `ctx_.isImported(ps)`
-                                //     is unconditionally true for every ps
-                                //     that reaches this `else` branch at all.
-                                //   - Public / None (no restriction, or the
-                                //     property's own — already-checked —
-                                //     visibility with no accessor override):
-                                //     no further restriction.
-                                ast::Visibility sv =
-                                    ctx_.importedPropertySetterVisibility(ps);
-                                TypeSymbol* declaring = ps->parent;
-                                bool bad = false;
-                                if (sv == ast::Visibility::Private) {
-                                    bad = true;
-                                } else if (sv == ast::Visibility::Protected) {
-                                    bad = !(currentType_ &&
-                                            isSubtype(currentType_,
-                                                      declaring));
-                                } else if (sv == ast::Visibility::Internal) {
-                                    bad = true;
-                                }
-                                if (bad) {
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, as->span.begin,
-                                        "cannot assign to property `" +
-                                        propName +
-                                        "` — its setter is not accessible "
-                                        "here (§13.6)");
-                                }
-                            }
-                        }
-                }
-            }
+            // §23.3 / §23.1 / §13.6 (#747 R42 / #1173 / #2412 / #2415 /
+            // #2851): the property-or-indexer write-target check. Extracted
+            // to checkPropertyWriteTarget by #2868 so the IncrementStmt arm
+            // — which cannot reach this point — runs the SAME check instead
+            // of a third hand-maintained mirror of it (§17.6: "Read-only
+            // locations cannot be incremented"). Passing `nullptr` for
+            // `incOp` keeps every diagnostic here byte-identical.
+            if (as->target)
+                checkPropertyWriteTarget(*as->target, as->span.begin,
+                                         /*incOp=*/nullptr);
             // Slice S7: readonly field assignment outside a ctor.
             checkReadonlyAssignment(*as);
             // Slice T2: plain `:=` assignment must be primitive-
             // assignable (compound ops like `+=` have their own
             // operator semantics and are left to a later slice).
             if (as->op == ":=" && as->target && as->value) {
-                // §5.1 special (mirrors LocalDecl init narrowing above):
-                // an int CONSTANT EXPRESSION on the RHS assigns to a narrower
-                // integer target without a diagnostic — retype it so
-                // checkAssignable sees matching primitive types. This covers
-                // Buffer<byte>[i] := 1, local byte b := 1, etc. #738: gate on the
-                // RHS being a compile-time int constant (foldIntConstExprTC) — a
-                // non-constant int value (`b := someIntVar`) does not implicitly
-                // narrow and is reported by checkAssignable.
+                // §5.1 "Constant narrowing": an int CONSTANT EXPRESSION on the
+                // RHS assigns to a narrower integer target without a
+                // diagnostic — `Buffer<byte>[i] := 1`, `b := 1`, … #738 gated
+                // it on the RHS being a compile-time int constant; a
+                // non-constant int value (`b := someIntVar`) does not
+                // implicitly narrow and is reported by checkAssignable. Since
+                // #2925 the re-type is checkAssignable's own
+                // (narrowIntConstantToTarget), shared with every other §5.1
+                // conversion site.
                 TypeRef* fromTy = ctx_.exprType(*as->value);
                 TypeRef* toTy   = ctx_.exprType(*as->target);
                 // §5.1 / §9 / §22 (#1770): a bare `this` on the RHS is left
@@ -10881,29 +11599,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         }
                     }
                 }
-                if (fromTy && toTy &&
-                    fromTy->kind == TypeRef::Kind::Primitive &&
-                    toTy->kind   == TypeRef::Kind::Primitive &&
-                    fromTy->primitive == PrimitiveType::Int) {
-                    PrimitiveType tgt = toTy->primitive;
-                    bool narrowerIntTarget =
-                        tgt == PrimitiveType::Byte  ||
-                        tgt == PrimitiveType::SByte ||
-                        tgt == PrimitiveType::Short ||
-                        tgt == PrimitiveType::UShort||
-                        tgt == PrimitiveType::UInt  ||
-                        tgt == PrimitiveType::ULong;
-                    if (narrowerIntTarget) {
-                        auto cv = foldIntConstExprTC(*as->value);
-                        // #738 / §5.1: retype only an IN-RANGE int constant; an
-                        // out-of-range constant / a non-constant falls through to
-                        // checkAssignable's §5.1 rejection.
-                        if (cv && fitsInIntType(*cv, tgt)) {
-                            ctx_.setExprType(as->value.get(), toTy);
-                            fromTy = toTy;
-                        }
-                    }
-                }
+                // §5.1 "Constant narrowing" (#738, one definition since
+                // #2925): the re-type lives in checkAssignable
+                // (narrowIntConstantToTarget), which this arm's own copy used
+                // to duplicate.
                 checkAssignable(
                     fromTy,
                     toTy,
@@ -11875,6 +12574,31 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // fix #2868 (§17.6 / §23.3 / §23.4 / §23.1 / §13.6, v0.240): the
+        // §23.3 write-target rule, applied to the increment operand through
+        // the SAME implementation the assignment target uses. §17.6,
+        // verbatim: "The operand must be an assignable lvalue (a local
+        // variable, a writable field, an indexer slot, or a property with a
+        // setter — the same storage categories §22.3's `ref`/`out` arguments
+        // reuse). Read-only locations cannot be incremented." Before this
+        // call the IncrementStmt path reached NO property write-target check
+        // at all, so `b.P++` on a getter-only property and `b[0]++` on a
+        // getter-only indexer both compiled clean, ran, and SILENTLY
+        // DISCARDED the write (measured: read back 7 on both) — while
+        // `b.P := 99` / `b[0] += 1` on the same members were correctly
+        // rejected. Deliberately a CALL to the shared check rather than a
+        // fourth copy of the rules: the hand-maintained mirror was found
+        // missing a check twice (#2309 above, then this), and #2848 removed
+        // codegen's mirror on §6.6's own statement that §17.6's desugaring
+        // "is the indexer instance of this rule". The `is->op` argument
+        // selects the increment wording and adds the §17.6 citation; the
+        // #2309 branch above keeps its own distinct record diagnostic (its
+        // target resolves to a FieldSymbol, so `ps` is null here and the two
+        // can never both fire).
+        if (is->target)
+            checkPropertyWriteTarget(
+                *is->target, is->target->span.begin,
+                /*incOp=*/(is->op == "--" ? "--" : "++"));
         // §17.6 (v0.236, #2585 / #2599): the increment/decrement operators
         // are defined on exactly three operand categories — (1) a value-type
         // operand whose type T overloads `operator ++`, (2) a built-in numeric

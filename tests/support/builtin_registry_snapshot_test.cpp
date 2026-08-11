@@ -132,6 +132,25 @@ BEZEL_TEST(builtin_registry_snapshot, linked_list_set) {
         BEZEL_EXPECT_FALSE(isLinkedListName(n));
 }
 
+// --- isFfiBufferBuiltinName (#2809 / §32.5 / stdlib §10.1–§10.3): the three
+// FFI-boundary BUFFER classes, the set every §10 member handler must recognise
+// BEFORE the declaration-less `.Length` STRING fallback claims the receiver.
+// A name MISSING here is a `%bz.string` field-1 read off a raw malloc'd buffer
+// (#2809's ASan heap-buffer-overflow), so the set's completeness is
+// load-bearing in the same way isReservedBuiltinTypeName's is. The FFI VALUE
+// types IntPtr/UIntPtr are §32.7 pointer-sized integers, not buffers, and are
+// negatives here on purpose. ---
+BEZEL_TEST(builtin_registry_snapshot, ffi_buffer_builtin_set) {
+    static constexpr std::array<std::string_view, 3> kSnapshot = {
+        "CString", "WString", "RawBytes",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isFfiBufferBuiltinName(n));
+    for (std::string_view n : {"IntPtr", "UIntPtr", "Ptr", "string", "String",
+                               "StringBuilder", "Buffer", "OwningBuffer",
+                               "Array", ""})
+        BEZEL_EXPECT_FALSE(isFfiBufferBuiltinName(n));
+}
+
 // --- isIterableInterfaceHead (§28.3/§29.3/§30.7 v0.201, #2048 / proposal 0048):
 // the iterable/enumerator interface heads whose unmarked return type is the
 // iterator convention's announced caller-owned frame. A static signature
@@ -206,6 +225,216 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         BEZEL_EXPECT_FALSE(isHeapPointerReferenceBuiltin(n));
 }
 
+// --- isReservedBuiltinTypeName (#2757 / §7.1 / §14.1): the COMPLETE reserved
+// builtin type-name set — the heap table above plus the non-heap Named-case
+// names. `Emitter::isBuiltinTypeRefName` used to keep a hand-maintained
+// duplicate of this set and it DRIFTED (59 names against the registry's 65), so
+// a plain `Stopwatch?` was read as a nullable generic type PARAMETER and took
+// the {i8, i32} placeholder — a `bz_stopwatch_t*` passed as `i32`. That is the
+// third instance of the miss-a-list class (#1390, #1406) the registry exists to
+// end, so the duplicate is gone and the predicate derives from here.
+//
+// The test is necessarily NEGATIVE at its call sites ("not a builtin name,
+// therefore a type parameter" — a parameter is defined by the absence of a
+// declaration, so there is no positive parameter registry to test against),
+// which makes COMPLETENESS load-bearing rather than merely tidy: a name missing
+// here is silently misread as a type parameter at all three consumers. Pinned
+// in both directions — every name in, every near-neighbour out.
+BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
+    // (a) the non-heap half: the names lowerTypeRef's Named case compares that
+    // are NOT heap-pointer references. Exactly `kNonHeapReservedBuiltins`.
+    static constexpr std::array<std::string_view, 19> kNonHeapSnapshot = {
+        // §32.5 / §32.7 — FFI boundary
+        "IntPtr", "UIntPtr", "CString", "WString", "RawBytes",
+        // §2.5 — temporal / identity value builtins
+        "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid",
+        // §9.8 (#499)
+        "Range",
+        // §4.14 / §4.15 (#549/#779) / §3.3 (#883) — the {ptr,i32,i32} spans
+        "ArraySpan", "ReadOnlyArraySpan", "Span", "ReadOnlySpan",
+        "ReadOnlyStringSpan",
+        // §2.15 (#687)
+        "JsonOptions",
+        // §4.14 — heap ptr, but only on the astNode rep path
+        "OwningBuffer",
+        // §31.4 — the Exception.CauseChain element record
+        "ExceptionInfo",
+    };
+    for (auto n : kNonHeapSnapshot) {
+        BEZEL_EXPECT_TRUE(isReservedBuiltinTypeName(n));
+        // ...and each is genuinely OUTSIDE the heap table (no redundancy: if one
+        // of these were also in the heap set, the split would be meaningless).
+        BEZEL_EXPECT_FALSE(isHeapPointerReferenceBuiltin(n));
+    }
+    // (b) the heap half is reserved too — spot-check the names whose absence
+    // from the deleted duplicate WAS the defect, plus the long-standing ones.
+    for (std::string_view n : {"Stopwatch", "FileStream", "TaskScope",
+                               "SortedDictionary", "SortedSet",
+                               "IEvent", "IAsyncEvent", "EventSource",
+                               "AsyncEventSource", "ISerializer",
+                               "IDeserializer", "ISerializable",
+                               "IDeserializable", "BinarySerializer",
+                               "BinaryDeserializer", "JsonSerializer",
+                               "JsonDeserializer",
+                               "Array", "Dictionary", "Task", "Shared",
+                               "Mutex", "Buffer", "IGrouping"})
+        BEZEL_EXPECT_TRUE(isReservedBuiltinTypeName(n));
+    // (c) OUT: ordinary generic type-parameter spellings must stay classifiable
+    // as parameters — this is the whole point of the negative test.
+    for (std::string_view n : {"T", "U", "K", "V", "TKey", "TResult",
+                               "Self", "MyClass", "Stopwatch2", "stopwatch",
+                               ""})
+        BEZEL_EXPECT_FALSE(isReservedBuiltinTypeName(n));
+    // (d) OUT by deliberate exclusion: `DictionaryEntry` / `DrainedEntry` are
+    // compared in the Named case, but only on a SYNTHETIC TypeRef (no astNode,
+    // importedName-keyed, genericArgs.size() >= 2), and neither resolves as a
+    // written type annotation at all ("unresolved type name" — measured). No
+    // declaration-less single-part Named ref can carry them, so listing them
+    // would change only the generic-argument inference binding, to no end.
+    for (std::string_view n : {"DictionaryEntry", "DrainedEntry"})
+        BEZEL_EXPECT_FALSE(isReservedBuiltinTypeName(n));
+    // (e) OUT: built-in EXCEPTION names are not in the registry's reserved set —
+    // codegen tests those separately against its live `builtinVtable_` map,
+    // which is not a duplicated name list and so cannot drift from a table.
+    for (std::string_view n : {"Exception", "ArgumentException", "IOException"})
+        BEZEL_EXPECT_FALSE(isReservedBuiltinTypeName(n));
+}
+
+// --- isVtableLessBuiltinClassName (#2921 / #2923; spec §8.1 / §8.5 / §28.2 /
+// §28.9, v0.240): the reserved built-in CLASSES — every reserved name that is
+// NOT an interface head.
+//
+// WHY IT IS A DERIVATION, NOT A LIST. Two lowerings assume the receiver carries
+// a Bezel vtable at word 0 and are memory-unsafe without one: the slot-2 Dispose
+// dispatch (`emitDynamicDispose`) jumped to address 0 on a `StringBuilder`
+// (#2921, MEASURED `mov (%rax),%rcx ; call *0x10(%rcx)`), and
+// `lowerObjectToString`'s `bz_obj_is_string` — a NEGATIVE test, "word 0 is not
+// one of the emitted vtables ⇒ it is a string" — mis-answered "string" for every
+// built-in and got each one retained + released as a `%bz.string` (#2923, a
+// double free). Both now gate on this ONE predicate.
+//
+// The set is `isReservedBuiltinTypeName` MINUS the interface heads, and the
+// direction matters: a built-in INTERFACE head is the one reserved name whose
+// runtime value may be a USER class (`var e: IEnumerable<int> := new MyList();`
+// — measured to compile and run), so those must keep the dynamic dispatch. A
+// newly-added built-in CLASS therefore joins this set automatically and cannot
+// land back in the wild jump, while a forgotten new built-in INTERFACE costs a
+// leak or a type-name rendering. Pinned in both directions below.
+BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
+    // (a) IN: concrete built-in CLASSES across every family — collections,
+    // §3 nullary heap classes, sync primitives, tasks/TCS, event sources,
+    // Shared/Weak, serializer handles, and the non-heap reserved names.
+    for (std::string_view n : {"Array", "OwningArray", "Dictionary",
+                               "OwningDictionary", "SortedDictionary",
+                               "SortedSet", "Stack", "Queue", "Set",
+                               "LinkedList", "LinkedListNode",
+                               "StringBuilder", "Random", "Stopwatch",
+                               "FileStream", "Task", "OwningTask",
+                               "Subscription", "CancellationToken",
+                               "CancellationTokenSource", "TaskScope",
+                               "Shared", "Weak", "Channel", "ChannelSender",
+                               "EventSource", "AsyncEventSource",
+                               "Mutex", "Lock", "Semaphore", "SemaphoreToken",
+                               "TaskCompletionSource",
+                               "OwningTaskCompletionSource",
+                               "Atomic", "AtomicInteger", "Buffer",
+                               "OwningBuffer", "BinarySerializer",
+                               "BinaryDeserializer", "JsonSerializer",
+                               "JsonDeserializer", "CString", "WString",
+                               "RawBytes"})
+        BEZEL_EXPECT_TRUE(isVtableLessBuiltinClassName(n));
+    // (b) OUT: every reserved INTERFACE head — the receivers that may hold a
+    // user class and must keep dispatching through its vtable. This is the
+    // whole content of the subtraction, so it is pinned name-for-name.
+    static constexpr std::array<std::string_view, 21> kInterfaceHeads = {
+        "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
+        "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
+        "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
+        "ICollection", "IList", "IOwningCollection", "IOwningList",
+        "IEvent", "IAsyncEvent", "IGrouping",
+        "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
+    };
+    for (auto n : kInterfaceHeads) {
+        BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
+        // ...and each really is a reserved name (so the exclusion is a genuine
+        // subtraction, not a name that was never in the source set).
+        BEZEL_EXPECT_TRUE(isReservedBuiltinTypeName(n));
+    }
+    // (c) OUT: a generic type-PARAMETER spelling and a user type name — the
+    // other inhabitants of the declaration-less Named shape, which must keep
+    // dispatching dynamically.
+    for (std::string_view n : {"T", "U", "TKey", "MyClass", "Stopwatch2",
+                               "stringbuilder", ""})
+        BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
+    // (d) OUT: built-in EXCEPTIONS. They DO carry a vtable (codegen emits one
+    // per built-in exception type), so they must not be routed away from the
+    // dispatch — and they are outside `isReservedBuiltinTypeName` for exactly
+    // that reason, which this pins.
+    for (std::string_view n : {"Exception", "ArgumentException", "IOException",
+                               "DisposedAccessException"})
+        BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
+}
+
+// --- isBuiltinInterfaceHead (#2969; spec §8.1 / §8.5 / §18.5 / §28.9, v0.240):
+// the COMPLEMENT of `isVtableLessBuiltinClassName` within the reserved-name set
+// — the reserved built-in INTERFACE heads, exposed as a predicate of their own
+// for the §2969 codegen routing (`tryBuiltinIfaceHeadRender`,
+// `LlvmBackend_String.cpp`). Pinned name-for-name so an accidental add/drop
+// is caught mechanically — the predicate is the one table the §2969 routing
+// reads, so any drift between this snapshot and the `kBuiltinInterfaceHeads`
+// array it mirrors is the regression shape.
+BEZEL_TEST(builtin_registry_snapshot, builtin_interface_head_set_8_1) {
+    static constexpr std::array<std::string_view, 21> kInterfaceHeads = {
+        "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
+        "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
+        "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
+        "ICollection", "IList", "IOwningCollection", "IOwningList",
+        "IEvent", "IAsyncEvent", "IGrouping",
+        "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
+    };
+    for (auto n : kInterfaceHeads) {
+        BEZEL_EXPECT_TRUE(isBuiltinInterfaceHead(n));
+        // Every name is also reserved — the §2969 routing only fires on the
+        // declaration-less-Named-shape subset, and that subset IS the reserved
+        // name set. This guards against a future "interface head that's not
+        // reserved" silently bypassing the discriminator.
+        BEZEL_EXPECT_TRUE(isReservedBuiltinTypeName(n));
+        // Every name is EXCLUDED from `isVtableLessBuiltinClassName` — the
+        // whole content of the §2923/§2975 split. The complement predicate
+        // here exists precisely because the vtable-less set excludes these;
+        // pinning it makes the symmetry mechanical.
+        BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
+    }
+    // (c) OUT: a generic type-PARAMETER spelling and a user type name — the
+    // other inhabitants of the declaration-less Named shape.
+    for (std::string_view n : {"T", "U", "TKey", "MyClass", "Stopwatch2",
+                               "stringbuilder", ""})
+        BEZEL_EXPECT_FALSE(isBuiltinInterfaceHead(n));
+    // (d) OUT: every reserved built-in CLASS — they belong to the vtable-less
+    // half of the split, NOT the interface-head half. Listing them here is
+    // the more thorough end of the symmetry pin (above we checked every
+    // interface head against this predicate; here we walk the other way).
+    for (std::string_view n : {"Array", "OwningArray", "Dictionary",
+                               "OwningDictionary", "SortedDictionary",
+                               "SortedSet", "Stack", "Queue", "Set",
+                               "LinkedList", "LinkedListNode",
+                               "StringBuilder", "Random", "Stopwatch",
+                               "FileStream", "Task", "OwningTask",
+                               "Subscription", "CancellationToken",
+                               "CancellationTokenSource", "TaskScope",
+                               "Shared", "Weak", "Channel", "ChannelSender",
+                               "EventSource", "AsyncEventSource",
+                               "Mutex", "Lock", "Semaphore", "SemaphoreToken",
+                               "TaskCompletionSource",
+                               "OwningTaskCompletionSource",
+                               "Atomic", "AtomicInteger", "Buffer",
+                               "OwningBuffer", "BinarySerializer",
+                               "BinaryDeserializer", "JsonSerializer",
+                               "JsonDeserializer", "CString", "WString",
+                               "RawBytes"})
+        BEZEL_EXPECT_FALSE(isBuiltinInterfaceHead(n));
+}
+
 // --- §22.16 (v0.203, #2053): ContractViolationException registration ---
 // Per spec §22.16 "Failure semantics and the enforcement modes",
 // ContractViolationException joins the built-in hierarchy DERIVING DIRECTLY
@@ -225,4 +454,61 @@ BEZEL_TEST(builtin_registry_snapshot, contract_violation_exception_registered_sp
                     std::string_view("Exception"));
     BEZEL_EXPECT_EQ(builtinExceptionParentOf("IndexOutOfRangeException"),
                     std::string_view("Exception"));
+}
+
+// fix #2992 (§28.3 / §28.9 / §28.10, v0.240): the disposable-builtin-head set
+// — the table the §28.10 vacuity lint (rhsIsDisposableClassType Path 2) and the
+// codegen auto-drop chain's end-of-chain guard (registerUsingDisposal) now
+// SHARE. Pinning the exact membership here means a change to either site's
+// behaviour is caught mechanically: adding a name to the table without a
+// chain arm (or vice versa) is the defect class #2992 makes loud.
+BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3_28_9) {
+    // IN: every name in kDisposableBuiltinHeadNames — the lint's pre-#2992 Path 2
+    // population, lifted verbatim. A `using var` of any of these is the canonical
+    // §28.10 pattern (not vacuous), and the auto-drop chain MUST claim each one.
+    for (std::string_view n : {
+        "StringBuilder",
+        "BinarySerializer", "BinaryDeserializer",
+        "JsonSerializer", "JsonDeserializer",
+        "CString", "WString", "RawBytes",
+        "FileStream",
+        "IEnumerable", "IEnumerator",
+        "IOwningEnumerable", "IOwningEnumerator",
+        "IAsyncEnumerable", "IAsyncEnumerator",
+        "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+        "Channel", "ChannelSender",
+        "EventSource", "AsyncEventSource",
+        "Subscription",
+        "TaskScope", "CancellationTokenSource",
+        "Mutex", "Lock", "Semaphore", "SemaphoreToken",
+        "OwningTask", "Task", "Shared", "Weak",
+        "OwningArray", "OwningDictionary", "OwningSet", "OwningStack",
+        "OwningQueue", "OwningLinkedList", "OwningBuffer",
+        "TaskCompletionSource", "OwningTaskCompletionSource",
+    })
+        BEZEL_EXPECT_TRUE(isDisposableBuiltinHeadName(n));
+
+    // OUT: value builtins with no disposal obligation — a `using var` of these
+    // IS vacuous (§28.9), so the lint fires (correctly) and the chain registers
+    // nothing (there is nothing to release).
+    for (std::string_view n : {
+        "Guid", "DateTime", "TimeSpan", "DateOnly", "TimeOnly",
+        "Range", "CancellationToken", "JsonOptions",
+        "IntPtr", "UIntPtr",
+    })
+        BEZEL_EXPECT_FALSE(isDisposableBuiltinHeadName(n));
+
+    // OUT (measured disagreement, filed separately): the borrowing collections
+    // and four vtable-less builtins ARE chain-claimed (they own heap) but are
+    // intentionally NOT in this table — #2695 excluded the borrowing collections
+    // so the lint fires on a bound-then-pinned alias whose `const` remedy
+    // compiles. The four vtable-less builtins (Random/Atomic/AtomicInteger/
+    // Stopwatch/Buffer) share the same gap on factory-call forms. Pinning them
+    // OUT here documents the disagreement; reconciling it is a separate decision.
+    for (std::string_view n : {
+        "Array", "Stack", "Queue", "Set", "SortedSet",
+        "Dictionary", "SortedDictionary", "LinkedList",
+        "Random", "Atomic", "AtomicInteger", "Stopwatch", "Buffer",
+    })
+        BEZEL_EXPECT_FALSE(isDisposableBuiltinHeadName(n));
 }

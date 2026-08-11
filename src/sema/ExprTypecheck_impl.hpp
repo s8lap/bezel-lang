@@ -35,6 +35,12 @@
 
 namespace bezel::sema {
 
+// Declared in TypeResolution.hpp. Forward-declared rather than included to keep
+// this header's include graph unchanged. #2787: the §14.2 rule-3 self-recurrence
+// test now lives there as the single shared definition.
+bool typeRefEqual(const TypeRef* a, const TypeRef* b);
+bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
+
 // per §15.4 (#1174 / #1866): a collection literal's admissible TARGET types are
 // a CLOSED list of CONCRETE collections (inline array, `Array`/`OwningArray`,
 // `Set`, `Stack`, `Queue`, `LinkedList`, `Dictionary`, and their owning forms,
@@ -51,11 +57,52 @@ namespace bezel::sema {
 // call-arg function-typed slot) is a §15.4 admissible concrete target, the
 // literal is materialised against the target exactly like the call-arg and
 // local-decl paths already do.
+// per §15.4 (#2914): `isCollectionLiteralAdmissibleTarget` is ALSO the gate at
+// the local-declaration position, which until #2914 asked only the NEGATIVE
+// interface question — so every OTHER non-admissible target (`Object`,
+// `Object?`, `int`, `string`, a class with no `FromCollectionLiteral`, a bare
+// type parameter) walked past it into codegen. `reportCollectionLiteralBadTarget`
+// emits the general §15.4 rejection for those; the interface report above stays
+// the more specific message for the shape it names.
+// per §15.4 (#3031): the predicate ALSO consults the literal's FORM. The
+// dictionary-literal form `[k: v, ...]` is admitted only at the dictionary
+// family (`Dictionary<K,V>`/`OwningDictionary<K,V>`/`SortedDictionary<K,V>`,
+// §15.4 last paragraph); the sequence-literal form `[e1, e2, ...]` is admitted
+// at every sequence-shaped target but NOT at the dictionary family. Pre-fix the
+// predicate took the target alone, so a dict literal at any sequence-shaped
+// target (and vice versa) reached codegen, neither materializer claimed it,
+// and the slot was degraded to a zero-initialized value (the #2434/#2491
+// `internal:` notes — a silent wrong value, the worse failure mode). The `isDict`
+// argument is the literal's `cl->isDict`. The empty-literal carve-out
+// (`[]` admitted at every §15.4 collection target, including dictionary —
+// the spec lets the target type choose between empty seq and empty dict)
+// is handled at the call sites because they already have the literal
+// available; the predicate's form-only answer is the right one for sites
+// that have ALREADY addressed the empty case independently (the inline-array
+// N-element check at ExprTypecheck.cpp:9717 is the existing instance).
 bool isCollectionLiteralInterfaceTarget(const TypeRef* t);
-bool isCollectionLiteralAdmissibleTarget(const TypeRef* t);
+bool isCollectionLiteralAdmissibleTarget(const TypeRef* t, bool isDict);
+// §15.4 (v0.240): the empty literal carve-out — is `t` on the §15.4 closed
+// collection-target list? The empty literal `[]` is admitted at every
+// listed target (the target type decides between empty seq and empty dict);
+// at every other target (Object, int, a class with no
+// `FromCollectionLiteral`, a bare type parameter) the empty literal is
+// still rejected with the generic "cannot target" diagnostic (the §15.4
+// carve-out sentence: "An empty literal in a non-collection or
+// undeterminable context is the usual 'cannot infer target type' compile
+// error"). The inline-array case is separate: inline arrays require `≥ 1`
+// elements regardless of form/empty status, so this predicate returns
+// false for inline arrays and the call sites' emptiness check is
+// independent.
+bool isCollectionLiteralEmptyAdmissibleTarget(const TypeRef* t);
 void reportCollectionLiteralInterfaceTarget(DiagnosticEngine& diags,
                                             SourceLocation loc,
                                             std::string_view ifaceName);
+void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
+                                      SourceLocation loc, const TypeRef* target);
+void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
+                                              SourceLocation loc,
+                                              const TypeRef* target);
 
 // §27.1.1 (v0.180): exact structural equality of two TypeRefs — the INVARIANT
 // fallback for a function-value slot that is not a bare, non-generic
@@ -63,6 +110,16 @@ void reportCollectionLiteralInterfaceTarget(DiagnosticEngine& diags,
 // Resolver::typeRefEqual); shared with ExprTypecheck_Exprs.cpp for the
 // §27.3 divergent-return check (#2107).
 bool functionSlotTypeRefEqual(const TypeRef* a, const TypeRef* b);
+
+// §14.1 (#1756's lesson, reused by #2926): does `t` mention any of `tpNames`
+// ANYWHERE — as itself, a generic argument, an inline-array element, or a
+// function parameter/return? Defined in ExprTypecheck_Calls.cpp for the §22.3
+// ref/out deferral gate; declared here so the field-initializer check can use
+// the SAME superset walk. Answering true only DEFERS a check, so a superset is
+// the safe direction — a MISSED mention is what makes a check run against an
+// unsubstituted type parameter and false-reject.
+bool refOutParamTypeMentionsTypeParam(
+    const TypeRef* t, const std::unordered_set<std::string_view>& tpNames);
 
 class ExprTC {
 public:
@@ -429,6 +486,27 @@ private:
     // lambda and the program SIGSEGVs at runtime — #747 R42). Saved/restored
     // (not just set) so nested lambdas behave correctly.
     bool inLambda_ = false;
+
+    // §22.16 (v0.240, #2942): true while visiting a contract clause's
+    // expression (`requires` / `ensures`). Used by the IdentifierExpr
+    // resolution path to give a context-aware diagnostic when the contextual
+    // keywords `result` / `old` appear inside a clause (or outside one):
+    // inside `ensures`, they are rejected as not-yet-implemented per #2942;
+    // outside any clause (or inside a `requires`/`invariant` clause, where
+    // §22.16 also forbids them), they are reported as contextual keywords
+    // reserved for `ensures` rather than the generic "unresolved identifier"
+    // — the loud-reject path the issue asks for. Reset to false across every
+    // lambda boundary (a nested lambda body is its own callable, not a
+    // clause context) and set from `runMethodBody`'s clause loop.
+    bool inContractClause_ = false;
+    // §22.16 (v0.240, #2942): the kind of the clause currently being visited,
+    // or `None` when not inside a clause. Read by the IdentifierExpr handler
+    // to choose between the inside-`ensures` (not-yet-implemented) and
+    // outside-`ensures` (contextual-keyword) diagnostics. Mirror of the
+    // AST's `ast::ContractClause::Kind`, kept as a plain enum here so the
+    // sema layer does not pull in the AST header for a 3-valued flag.
+    enum class ContractClauseKind { None, Requires, Ensures };
+    ContractClauseKind currentClauseKind_ = ContractClauseKind::None;
 
     // per §24.3: when about to visit an event-handler lambda argument
     // (`<event>.Subscribe(h)` / `.Add` / `.Remove`, or `event += h`), this
@@ -973,6 +1051,15 @@ private:
     // interface)? BFS, cycle-guarded.
     static bool isSubtype(TypeSymbol* from, TypeSymbol* to);
 
+    // #2782 / #2787: does the INTERFACE `argTy` satisfy `where T:
+    // IComparable<T>`? Delegates to sema::selfComparableIface — THE one
+    // definition of this predicate (TypeResolution.hpp). This was one of three
+    // hand-rolled copies until #2787 collapsed them; do not re-inline it.
+    static bool selfComparableIfaceArg(const TypeRef* argTy,
+                                       const TypeSymbol* icomparable) {
+        return selfComparableIface(argTy, icomparable);
+    }
+
     // §8.6 / §5.1 (#1311): does a primitive value type box into a builtin
     // generic interface it implements — IComparable<T>/IEquatable<T> where T
     // is the primitive's own keyword alias (stdlib §9.1–§9.5: every numeric
@@ -995,6 +1082,40 @@ private:
     void checkAssignable(TypeRef* from, TypeRef* to,
                          SourceLocation loc, const std::string& what,
                          const ast::Expr* fromExpr = nullptr);
+
+    // §5.1 "Constant narrowing" (#2925) — the ONE definition of the rule, for
+    // every §5.1 conversion site. Verbatim (v0.240):
+    //
+    //   "**Constant narrowing.** An expression of integer type that is a
+    //    **compile-time constant** ([§17.14]) implicitly converts to any
+    //    integer type whose range contains its value: `var b: byte := 50;`,
+    //    `Set(level: byte)` called as `Set(3)`, and enum constants of the
+    //    underlying type ([§10.2]) are all well-typed by this rule. A constant
+    //    whose value does not fit the target's range is a **compile error** at
+    //    the conversion site — never a silent truncation. The rule applies to
+    //    constants only; a run-time `int` value still requires the explicit
+    //    `byte(x)` narrowing of [§5.2]. Collection-literal element typing
+    //    ([§15.4]) and default-argument typing use this same rule."
+    //
+    // Re-types `fromExpr` to `to` when the rule applies and returns the new
+    // source type; returns `from` unchanged otherwise (an out-of-range constant
+    // and a non-constant both fall through to checkAssignable's §5.1
+    // rejection — never a silent truncation). Called from checkAssignable
+    // itself so the POPULATION is "every §5.1 conversion site", not a
+    // hand-maintained list of statement kinds.
+    TypeRef* narrowIntConstantToTarget(const ast::Expr* fromExpr,
+                                       TypeRef* from, TypeRef* to);
+
+    // §14.1 (#2926): does `t` mention a generic type parameter that is still
+    // UNSUBSTITUTED at this point — one of the enclosing type's (currentType_)
+    // or the enclosing method's (currentMethodDecl_)? Such a slot's real type
+    // is only known at the instantiation, so `checkAssignable`'s contract —
+    // "conservatively skips everything else … so it never false-positives
+    // while the type lattice is incomplete" — says do not judge it here.
+    // Uses the SUPERSET walk `refOutParamTypeMentionsTypeParam`, the same one
+    // §22.3's ref/out deferral uses for the same reason (#1756: a narrower
+    // guard is what made that check false-reject and get reverted four times).
+    bool mentionsUnsubstitutedTypeParam(const TypeRef* t) const;
 
     // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
     // §20 if-expression). Only flags when the condition has a resolved
@@ -1075,6 +1196,18 @@ private:
     // the name so `namedRefSimpleName` still reports it correctly.
     TypeRef* builtinAncestorTypeRef(std::string_view name);
 
+    // §31.4 (v0.240, #2971): the type of `Exception.CauseChain` — a synthetic
+    // `Array<ExceptionInfo>` over program-lifetime static astNodes (the pattern
+    // `makeConcreteCollectionResult` uses): `Array` so `.Count` and indexing
+    // resolve, an `ExceptionInfo` element so `chain[i].TypeName` type-checks.
+    // Neither type has a user TypeSymbol.
+    //
+    // Shared rather than rebuilt: #2971 gave the SAME §31.4 member three more
+    // resolution sites (a subclass's own static type, `this.`, `base.`) and a
+    // second copy of this builder would be a second place for the element type
+    // to drift from the receiver's.
+    TypeRef* excCauseChainTypeRef();
+
     // #1621 / §31.2.1: the ancestor-name chain of `ty` (most-specific first,
     // `ty` itself included), walking the TypeSymbol base-type chain, the AST
     // TypeDecl's declared bases (built-in bases have no TypeSymbol and are
@@ -1132,6 +1265,25 @@ private:
     // AssignmentStmt and IncrementStmt, which both consume grammar A.6's
     // `LValue` production.
     void checkLValueChainNotCallBased(const ast::Expr& target);
+
+    // §23.3 / §23.1 / §13.6 / §17.6 (v0.240, #2868): the shared
+    // property-or-indexer WRITE-TARGET check — no setter, a readonly
+    // auto-property written outside its assignable context, or a setter that
+    // is not accessible here. Called from BOTH statement forms that write
+    // through grammar A.6's `LValue`: AssignmentStmt (`x := e`, `x op= e`)
+    // and IncrementStmt (`x++` / `x--`). §17.6 states the increment operand
+    // rule in the same terms the assignment target obeys — "The operand must
+    // be an assignable lvalue (a local variable, a writable field, an indexer
+    // slot, or a property with a setter …). Read-only locations cannot be
+    // incremented." — so the two share ONE implementation rather than the
+    // hand-maintained mirror that was found missing this check twice (#2309,
+    // #2868). `incOp` is null for an assignment target and the operator token
+    // ("++"/"--") for an increment target; it selects the diagnostic's verb
+    // and adds the §17.6 citation, leaving every assignment message
+    // byte-identical to what it was before the extraction.
+    void checkPropertyWriteTarget(const ast::Expr& target,
+                                  const SourceLocation& loc,
+                                  const char* incOp);
 
     // §22.3 "ref and out argument locations" (v0.184, #1682): validates a
     // bare `ref`/`out` call argument's operand against the section's
@@ -1637,7 +1789,9 @@ private:
         const std::vector<bool>& fillsDefault,
         const std::vector<std::string>& candNames, SourceLocation loc,
         const std::string& calleeDesc,
-        const std::string& extraNote = std::string());
+        const std::string& extraNote = std::string(),
+        const std::vector<const ast::Expr*>& argExprs =
+            std::vector<const ast::Expr*>());
 
     // §22.6 method-overload resolution. Given the initially-resolved
     // MethodSymbol for a call and the call site, returns the MethodSymbol
@@ -1761,6 +1915,28 @@ private:
     // overload is not a primitive slot and is not covered here.
     void checkBuiltinSpanCallArgs(const ast::CallExpr& ce);
 
+    // §7.1 / §7.4 / §23.4 (#2619): the INDEX-ARGUMENT twin of the CallExpr §7
+    // gates above, and the generalization of #2613 (which closed this hole for
+    // the single `ReadOnlyStringSpan` receiver). §23.4: "An indexer is a
+    // property whose name is replaced by `[parameters]`" — an index argument is
+    // therefore a parameter pass, and §7.1 states the compiler "enforces the
+    // distinction at every assignment, parameter pass, and return". NO indexer
+    // path in sema ran that check: the builtin receivers (Array<T>, string,
+    // Dictionary<K,V>, the span/buffer families, inline arrays) are synthetic
+    // Named/Primitive TypeRefs with no MethodSymbol, and the USER-declared
+    // indexer path — which DOES resolve a PropertySymbol, so the
+    // no-MethodSymbol explanation never applied to it — did not check its
+    // arguments either. An un-narrowed `int?` index was silently accepted and
+    // reached codegen, which emitted malformed IR (`SExt only operates on
+    // integer`, `GEP indexes must be integers`, `Call parameter type does not
+    // match function signature`) — an internal compiler error where §7 asks
+    // for a clean diagnostic. Called once per IndexExpr, after every receiver
+    // family has been typed (so a user indexer's resolved PropertySymbol is
+    // already attached to the node by #2530). See the definition in
+    // ExprTypecheck_Exprs.cpp for why it cannot false-reject.
+    void checkIndexArgNullability(const ast::IndexExpr& ix, const ast::Expr& e,
+                                  TypeRef* recvTy);
+
     // §2.5 / §22.7 (issue #328 FINDING [7] B): check `new ImportedT(args)`
     // against an imported type's reconstructed constructor signatures (no
     // ast::ConstructorDecl; ParameterSymbol resolved types). Single-ctor,
@@ -1877,6 +2053,22 @@ private:
     // null). The member's own type is looked up; its nullable form is the
     // expression's type, so member access chains (`a?.b?.c`) resolve.
     void resolveNullCondMember(const ast::NullCondMemberExpr& nm);
+
+    // #3019 (§9.2/§9.3/§35.7): the use-site gate for a direct
+    // `.Equals(...)`/`.GetHashCode()` (or `?.Equals(...)`/`?.GetHashCode()`)
+    // call on a record/choice that is not auto-equality-bearing and declares
+    // no user `=`/`<>` overloads. Shared by the `.` path
+    // (resolveMemberAccess) and the `?.` path (resolveNullCondMember) so the
+    // two forms enforce the SAME check: §7.5 evaluates the member normally
+    // when the receiver is non-null, so a `?.Equals` on a non-bearing record
+    // is the same use-site violation as the `.` form (the gate is on the
+    // member's availability, not the receiver's nullness). `targetType` is the
+    // receiver's underlying record/choice TypeSymbol (nullable wrapper already
+    // unwrapped by the caller); no-op when targetType is null or not a
+    // record/choice. `member` is "Equals"/"GetHashCode"; `loc` is the use site.
+    void checkEqualityMemberUseSite(TypeSymbol* targetType,
+                                    std::string_view member,
+                                    SourceLocation loc);
 
     // §7.5 / #751: result type of a builtin (string/primitive) RECEIVER's
     // property-like value member (e.g. `string.Length`, `string.IsAscii`) for

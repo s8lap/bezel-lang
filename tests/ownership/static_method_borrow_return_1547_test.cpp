@@ -41,6 +41,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -71,6 +72,9 @@ BEZEL_TEST(static_borrow_return_1547, param_return_blockbody_rejected) {
         "  end Pick; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a static method may not re-expose static storage") ||
+        hasErrorMessage(r, "without `owned`"));
 }
 
 // Same repro, expression-bodied form (`=>`) — the narrow expression-body
@@ -82,6 +86,8 @@ BEZEL_TEST(static_borrow_return_1547, param_return_exprbody_rejected) {
         "  public static method Pick(a: Res, b: Res): Res => a; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned from a static method"));
 }
 
 // The rule extends to a LOCAL re-borrowed from a parameter, not merely the
@@ -97,6 +103,8 @@ BEZEL_TEST(static_borrow_return_1547, local_reborrow_of_param_rejected) {
         "  end Relay; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned from a static method"));
 }
 
 // The rule also covers a FIELD read reached through a parameter (`h.Ref`,
@@ -104,13 +112,13 @@ BEZEL_TEST(static_borrow_return_1547, local_reborrow_of_param_rejected) {
 // parameter with no receiver-rooted proof of outliving the call.
 BEZEL_TEST(static_borrow_return_1547, field_through_param_rejected) {
     auto r = parseAndCheckOwnership(mod(
-        "class Holder "
-        "  public Ref: Res := null; "
-        "end Holder; "
+        "class Holder(Ref: Res) "
         "class P "
         "  public static method GetField(h: Holder): Res => h.Ref; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned from a static method"));
 }
 
 // --- ACCEPT: legitimate static-method returns are unaffected. ---
@@ -143,6 +151,9 @@ BEZEL_TEST(static_borrow_return_1547, static_field_read_stays_accepted) {
         "  public static method Get(): Res => _shared; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a static method may not re-expose static storage") ||
+        hasErrorMessage(r, "without `owned`"));
 }
 
 // §28.3 producers table (v0.180), #1546 conformance batch: a STATIC PROPERTY
@@ -261,6 +272,9 @@ BEZEL_TEST(static_borrow_return_1547, static_method_wrapping_static_property_rej
         "  public static method Get(): Res => Holder.Shared; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a static method may not re-expose static storage") ||
+        hasErrorMessage(r, "without `owned`"));
 }
 
 // --- ACCEPT: instance-method receiver-sourced returns are a separate,

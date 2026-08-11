@@ -18,10 +18,66 @@ extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
 
 namespace bezel::codegen {
 
+// fix #2805 (§17.7 short-circuit operators / §8.6, v0.240): an operand that
+// FAILED TO LOWER must degrade to a well-formed `false`, not to a null that
+// poisons the whole chain (and, for the right operand, not to an unterminated
+// basic block).
+//
+// Both halves were live. `lowerExpr` returns null for a DROPPED type test —
+// #2775's mechanism, e.g. a value type §8.6 requires to box that codegen does
+// not box yet. Before this fix:
+//   * a null LEFT operand made the entire `and`/`or` null, which `lowerIf`
+//     then turns into a silent `false`. Measured: `o is [3]int or oi is int`
+//     answered FALSE with a TRUE disjunct, and `not (o is [3]int) and true`
+//     answered FALSE where `true` is required.
+//   * a null RIGHT operand returned after `rhsBB` was already branched into,
+//     leaving `sc.rhs` and `sc.end` with no terminator — a hard
+//     `IR verification failed`, i.e. the compiler aborting on the operand
+//     position rather than the value.
+// So the same underlying condition produced a silent wrong value in one
+// position and a compiler abort in another; neither is acceptable.
+//
+// `false` is the correct degrade, not an arbitrary one: it is exactly what a
+// dropped test already reads as in the single-test case (`lowerIf` branches
+// past the body), so this makes the chain CONSISTENT with the unchained
+// spelling instead of accidentally right in one shape and wrong in the others.
+// The producer is responsible for the diagnostic — lowerTypeTest's four bails
+// report #2775 — and the guard below is the backstop for a producer that
+// reports nothing, so the degrade is never silent.
+//
+// ⚠ NOT applied when `diverged_` is set: there the operand THREW, the block is
+// already terminated, and synthesising a value would emit code after a
+// terminator. That path keeps returning null, which is its established
+// contract.
+llvm::Value* Emitter::degradedBoolOperand(
+        std::initializer_list<const ast::Expr*> locCandidates,
+        const char* what) {
+    // A synthesized node can carry an empty span (`line` is 1-based, so 0 means
+    // unset — the #2737 shape) and renders as a useless `file:0:0`. Both the
+    // operand AND its enclosing operator were observed unset on a chained
+    // `a and b and c`, so take the first candidate that names a real position
+    // rather than assuming any single node has one.
+    SourceLocation at{};
+    for (const ast::Expr* e : locCandidates)
+        if (e && e->span.begin.line != 0) { at = e->span.begin; break; }
+    if (!ctx_.diagnostics().hasErrors())
+        ctx_.diagnostics().report(
+            Severity::Warning, at,
+            std::string("internal: the ") + what +
+                " failed to lower to a value and was treated as `false` "
+                "— #2805");
+    return builder_.getInt1(false);
+}
+
+
 llvm::Value* Emitter::lowerShortCircuit(const ast::BinaryExpr& bin) {
     bool isAnd = (bin.op == "and");
     llvm::Value* l = lowerExpr(*bin.left);
-    if (!l) return nullptr;
+    if (!l) {
+        if (diverged_) return nullptr;   // the operand threw; block terminated
+        l = degradedBoolOperand({bin.left.get(), &bin, bin.right.get()},
+                                "left operand of a short-circuit operator");
+    }
     // §22.4 / §7.9 (v0.235, #2395): pre-create/zero-init any inline
     // `out var` slot inside the RIGHT operand — the one THIS operator may
     // SKIP (`and` skips it when `l` is false, `or` skips it when `l` is
@@ -42,7 +98,14 @@ llvm::Value* Emitter::lowerShortCircuit(const ast::BinaryExpr& bin) {
 
     builder_.SetInsertPoint(rhsBB);
     llvm::Value* r = lowerExpr(*bin.right);
-    if (!r) return nullptr;
+    if (!r) {
+        // #2805: returning null HERE is what left `sc.rhs`/`sc.end`
+        // unterminated — `rhsBB` has already been branched into above, so
+        // there is no longer a null-safe exit from this function.
+        if (diverged_) return nullptr;   // threw: rhsBB already terminated
+        r = degradedBoolOperand({bin.right.get(), &bin, bin.left.get()},
+                                "right operand of a short-circuit operator");
+    }
     auto* rhsEndBB = builder_.GetInsertBlock();
     builder_.CreateBr(endBB);
 
@@ -359,7 +422,23 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
     }
 
     llvm::Value* v = lowerExpr(*un.operand);
-    if (!v) return nullptr;
+    if (!v) {
+        // fix #2805 (§17.7 / §8.6, v0.240): `not X` where X failed to lower.
+        // Returning null here propagates the failure OUTWARD, and the enclosing
+        // short-circuit chain then degrades the whole `not X` to `false` — the
+        // WRONG polarity. A dropped test reads as `false` (#2775), so `not` of
+        // it must read as `true`; measured before this arm,
+        // `not (o is [3]int) and oi is int` answered false where true is
+        // required. Degrading the OPERAND and negating it keeps the polarity
+        // correct and keeps the degrade in one place.
+        //
+        // Only `not` is degraded. Every other unary operator is arithmetic on a
+        // value whose type we do not know here, so there is no safe stand-in —
+        // those keep propagating null, which is their established contract.
+        if (diverged_ || un.op != "not" || !un.operand) return nullptr;
+        v = degradedBoolOperand({un.operand.get(), &un},
+                                "operand of `not`");
+    }
     const auto& op = un.op;
 
     // §7.11 Lifted unary operators: `-` and `~` on nullable value types.
@@ -988,6 +1067,25 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // frees the 8-byte capture cell at last-drop. Single holder ⇒ no
         // double-free; definite escape ⇒ outer scope gone ⇒ no UAF.
         bool                   freeCellInEnvdtor = false;
+        // fix #2706 / §27.5 / §28.9 (v0.240): true when this capture's cell is
+        // WRITTEN by the enclosing function (or by a lambda body) after it can
+        // be captured, AND more than one env can share that one cell. The
+        // per-capture retain below and the envdtor release then refer to
+        // DIFFERENT strings — the retain lands on the value present at capture,
+        // the release on whatever the last write left in the cell — so N envs
+        // release the final value once each against its single +1: a double
+        // free. Both sides are suppressed together (the retain is skipped where
+        // this is set, the envdtor's release is skipped on the same flag), which
+        // leaks the cell's final value instead of over-releasing it. Never set
+        // for a box capture (releaseBoxInEnvdtor is a disjoint branch on a
+        // non-String, non-Function sema type).
+        //
+        // RESIDUAL, tracked as #2718: the leak this trades for. The sound model
+        // refcounts the CELL (rc(contents) must equal the LIVE ENV COUNT, a
+        // runtime quantity), which is a design change, not a local patch — four
+        // local patches were tried and each is unsound, see #2718. Write paths
+        // this gate does not see are #2719.
+        bool                   suppressContentRcInEnvdtor = false;
     };
     std::vector<CaptureEntry> captures;
 
@@ -1031,6 +1129,25 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // lambda's OWN return type); only the block-body path goes through
     // emitReturn, which reads currentReturnTypeNode_.
     const ast::Type* savedCurrentReturnTypeNode = currentReturnTypeNode_;
+    // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 (v0.240): save the `var`
+    // STRING-local refcount state across the WHOLE lambda emission. A lambda body
+    // is lowered MID-EMISSION of its enclosing function, and both the three sets
+    // and their fn token are per-function state owned by that enclosing body — so
+    // the pin below (and the one emitAsyncLambda performs for an async lambda's
+    // resume fn) must not survive back into it. This is the same discipline #1483
+    // established for the unwind sets and #2807 had to add to
+    // buildSpecializedMethodFn: without the restore, every string local the
+    // enclosing body declares AFTER this `var f := <lambda>` silently loses its
+    // bind-time retain and scope-end release (the leak direction, but a
+    // regression this change would have introduced — #2807 measured exactly that
+    // for the specialization case).
+    auto savedStringReleaseEligible = stringReleaseEligible_;
+    auto savedStringBorrowRetainEligible = stringBorrowRetainEligible_;
+    auto savedStringBorrowAll = stringBorrowAll_;
+    auto savedStringLocalCandidates = stringLocalCandidates_;
+    auto savedValueLikeChoiceStrReleaseEligible =
+        valueLikeChoiceStrReleaseEligible_;
+    llvm::Function* savedStringReleaseEligibleFn = stringReleaseEligibleFn_;
 
     // §27.5: the set of outer locals/params the body references.
     std::unordered_set<const sema::Symbol*> capturedSyms;
@@ -1147,15 +1264,25 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // retain and release predicates is the invariant. A captured ref/out
         // param is a different loop below and stays at semaTy = nullptr: it
         // borrows the caller's storage and the envdtor releases nothing.
-        if (isStringTypeRefNonNull(ce.semaTy)) {
-            llvm::Value* str =
-                builder_.CreateLoad(ptrTy(), ce.envValue, "str.pcap");
-            emitStringRetain(str);
-        } else if (ce.semaTy &&
-                   ce.semaTy->kind == sema::TypeRef::Kind::Function) {
-            llvm::Value* cl =
-                builder_.CreateLoad(ptrTy(), ce.envValue, "cl.pcap");
-            emitClosureRetain(cl);
+        //
+        // fix #2706: EXCEPT when the body WRITES this parameter's cell and more
+        // than one env can share it — see armMutatedSharedCaptureCell. The
+        // retain and the envdtor release are then suppressed TOGETHER; keeping
+        // the retain alone would merely move the leak.
+        ce.suppressContentRcInEnvdtor = mutatedSharedCaptureCell(
+            static_cast<const void*>(sym), ce.semaTy,
+            /*freshCellPerIteration=*/false);
+        if (!ce.suppressContentRcInEnvdtor) {
+            if (isStringTypeRefNonNull(ce.semaTy)) {
+                llvm::Value* str =
+                    builder_.CreateLoad(ptrTy(), ce.envValue, "str.pcap");
+                emitStringRetain(str);
+            } else if (ce.semaTy &&
+                       ce.semaTy->kind == sema::TypeRef::Kind::Function) {
+                llvm::Value* cl =
+                    builder_.CreateLoad(ptrTy(), ce.envValue, "cl.pcap");
+                emitClosureRetain(cl);
+            }
         }
         // §27.5 / §28.9 / #694: free the capture CELL in the envdtor when this
         // PARAMETER is captured by exactly ONE env (singleCaptureLocals_, which
@@ -1411,7 +1538,17 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // producer) + (N-1) retains = N references = N envdtor releases → 0 after the
         // last env dies. Exclude guarded boxing (loop-iteration cell reuse) for the
         // same reason the box branch does (conservative leak, never over-release).
-        if (alreadyBoxed && !wasGuardedLocal) {
+        //
+        // fix #2706: as in the captured-PARAMS loop, a cell the body WRITES and
+        // that more than one env can share has BOTH its retain and its envdtor
+        // release suppressed — the two would otherwise refer to different
+        // strings. Note the flag is consulted for EVERY capture of such a
+        // variable, not only the `alreadyBoxed` ones, because it is the ENVDTOR
+        // release (which the first env also emits) that must go away.
+        ce.suppressContentRcInEnvdtor = mutatedSharedCaptureCell(
+            static_cast<const void*>(decl), ce.semaTy,
+            /*freshCellPerIteration=*/forceFresh);
+        if (alreadyBoxed && !wasGuardedLocal && !ce.suppressContentRcInEnvdtor) {
             if (isStringTypeRefNonNull(ce.semaTy)) {
                 llvm::Value* str =
                     builder_.CreateLoad(ptrTy(), ce.envValue, "str.recap");
@@ -1641,6 +1778,52 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         }
     }
 
+    // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §27.3 (v0.240): run the
+    // `var` STRING-local refcount analysis for the LAMBDA's own block body and
+    // pin the token to the lambda's fn. EVERY consumer of the three string sets
+    // gates on `currentFn_ == stringReleaseEligibleFn_` (armStringLocalRefcount's
+    // bind-time retain AND its scope-end `Disposal{stringRelease}`,
+    // returnedStringLocalOwnsPlusOne, the two record-backed interface-property
+    // retains, and the `:=` / §4.6 `+=` drop-on-overwrite release), and until now
+    // that token never named a lambda fn — the case armStringLocalRefcount's own
+    // comment already recorded ("a lambda/thunk body lowered mid-function is not
+    // walked, so the eligibility sets are empty for its locals — they just
+    // leak"). Every `var` string local in every lambda body therefore leaked both
+    // of its allocations, per call (#2817 — measured 1904 bytes / 80 allocations
+    // for 20 invocations x 2 locals).
+    //
+    // WHY IT DOES NOT FIGHT THE ENV DESTRUCTOR. A lambda-body local captured by a
+    // NESTED lambda is marked ESCAPED by StringEscapeWalker (`inLambda` makes any
+    // read of the tracked local inside a lambda body an unconditional escape), so
+    // it enters NEITHER release set and no scope-end release is registered for it
+    // — exactly the suppression the envdtor's deferred release relies on. The
+    // only thing that changes for such a local is that a BORROW-initialized one
+    // now takes its bind-time retain (stringBorrowAll_), which is what the
+    // envdtor's unconditional content release was already assuming was there;
+    // that direction can only turn an over-release into a balanced pair.
+    //
+    // EXPRESSION bodies are excluded (no statements to analyze, no local to
+    // release, and leaving the token unpinned keeps the expr-body return path's
+    // `returnedStringLocalOwnsPlusOne` verdict bit-for-bit as it was). The async
+    // branch below is handled inside emitAsyncLambda, against its RESUME fn.
+    if (!lam.isAsync && !lam.exprBody) {
+        collectStringReleaseEligible(lam.stmts);
+        stringReleaseEligibleFn_ = fn;
+        // fix #2696 / §28.1 / §28.9 (v0.240): CO-GATE the parameter retain with
+        // the parameter release the pin above just turned on. The drop-on-
+        // overwrite release admits ANY slot localSlot() resolves — including a
+        // `string` PARAMETER, whose single reference belongs to the CALLER
+        // (§28.1: on a `string`, "`owned` is a compile error: such values carry
+        // no disposal obligation to transfer (§28.9)"). Enabling that release
+        // without the paired bind-time retain frees the caller's borrow under it
+        // — the #2696 use-after-free — so the two predicates move together, which
+        // is the invariant retainAssignedStringParams' step 0 states. Emitted in
+        // the lambda's ENTRY block, where the parameter binding loop above has
+        // just stored each incoming argument, so it dominates every assignment in
+        // the body and runs exactly once per INVOCATION.
+        if (paramSyms) retainAssignedStringParams(lam.stmts, *paramSyms);
+    }
+
     // §30.6 (#488): an `async` lambda's body is an async STATE MACHINE, not a
     // straight-line body. The closure entry fn (with its params + captured cells
     // + this now bound above) becomes the async ENTRY; emitAsyncLambda takes
@@ -1708,6 +1891,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         llvm::Function* savedCellFreeEligFn = cellFreeEligibleFn_;
         auto savedBoxCaptureLocals = boxCaptureLocals_;
         auto savedSingleCaptureLocals = singleCaptureLocals_;
+        auto savedAssignedCaptureVars = assignedCaptureVars_;  // fix #2706
         llvm::Function* savedBoxCaptureLocalsFn = boxCaptureLocalsFn_;
         auto savedDefinitelyEscaping = definitelyEscapingLambdas_;
         // #2132: emitAsyncLambda now ALSO recomputes the borrowing-array /
@@ -1749,6 +1933,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         cellFreeEligibleFn_ = savedCellFreeEligFn;
         boxCaptureLocals_ = std::move(savedBoxCaptureLocals);
         singleCaptureLocals_ = std::move(savedSingleCaptureLocals);
+        assignedCaptureVars_ = std::move(savedAssignedCaptureVars);  // fix #2706
         boxCaptureLocalsFn_ = savedBoxCaptureLocalsFn;
         definitelyEscapingLambdas_ = std::move(savedDefinitelyEscaping);
         borrowingArrayFreeEligible_ = std::move(savedBorrowingArrayFreeElig);
@@ -1863,9 +2048,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // struct/already-matching values pass through unchanged), so
                 // this is safe to run unconditionally ahead of the retain
                 // checks below (which only fire on pointer types).
+                // fix #2925: `coerceInitializerToSlot` — §5.1's narrowing
+                // direction as well as its widening one, for the same reason
+                // as the method arrow-body and ReturnStmt sites.
                 if (v->getType() != retTy)
-                    v = coerceNumericToType(v, retTy,
-                                            isUnsignedTargetExpr(*lam.exprBody));
+                    v = coerceExprValueToSlot(
+                        v, retTy, lam.exprBody.get(),
+                        isUnsignedTargetExpr(*lam.exprBody));
                 // #429 (closure CALL-RETURN category) / §28.9 / §27.5: a lambda
                 // with an expression body must also mint +1 for reference-counted
                 // return types, exactly as the block-body path does via
@@ -1935,6 +2124,16 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
 
     // --- Restore emitter state ---
     expectedFunctionType_ = savedExpectedFT;  // #731
+    // fix #2817: restore the enclosing body's string-refcount state (see the
+    // save above). Covers BOTH branches — the sync pin just above and the resume
+    // pin emitAsyncLambda performs.
+    stringReleaseEligible_ = std::move(savedStringReleaseEligible);
+    stringBorrowRetainEligible_ = std::move(savedStringBorrowRetainEligible);
+    stringBorrowAll_ = std::move(savedStringBorrowAll);
+    stringLocalCandidates_ = std::move(savedStringLocalCandidates);
+    valueLikeChoiceStrReleaseEligible_ =
+        std::move(savedValueLikeChoiceStrReleaseEligible);
+    stringReleaseEligibleFn_ = savedStringReleaseEligibleFn;
     currentReturnTypeNode_ = savedCurrentReturnTypeNode;  // #2515
     currentLambdaReturnSemaTy_ = savedLambdaRetSemaTy;    // fix #2688
     lambdaParamTypeHint_ = std::move(savedLambdaParamHints);
@@ -2077,7 +2276,18 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // The cell continues to leak — a pre-existing contained leak,
                 // safe in the direction of PRIME DIRECTIVE (never over-releases).
                 // Future work: free non-escaping cells at outer-scope exit.
-                if (isStringTypeRefNonNull(ce.semaTy)) {
+                // fix #2706 / §27.5 / §28.9 (v0.240): suppressContentRcInEnvdtor
+                // says the enclosing function WRITES this shared cell, so "the +1
+                // we retained" is a lie — the retain landed on the value present
+                // at CAPTURE and this load yields whatever the last write left
+                // behind. N envs would each release that final value against its
+                // single +1: a double free (the issue's `SEGV in
+                // bz$lam$0$envdtor`). The retain at the capture site is skipped
+                // under the same flag, so the two stay in agreement; the final
+                // value leaks instead — the bounded, non-over-releasing side.
+                if (ce.suppressContentRcInEnvdtor) {
+                    // no content release: see above.
+                } else if (isStringTypeRefNonNull(ce.semaTy)) {
                     // String capture: load and release the +1 we retained.
                     llvm::Value* str =
                         builder_.CreateLoad(ptrTy(), cell, "str");
@@ -2608,6 +2818,160 @@ llvm::Value* Emitter::lowerExceptionInfoField(const ast::Expr& target,
 }
 
 
+// fix #2722 / stdlib §4.8/§4.9/§4.10 (v0.240).
+//
+// WHY A DIAGNOSTIC AND NOT AN IMPLEMENTATION. The comparer overloads ARE
+// specified — §4.10 declares two of them on `Set<T>` and on `OwningSet<T>`,
+// §4.8/§4.9 the same pair on `Dictionary<K, V>`/`OwningDictionary<K, V>`, and
+// §4.8's "Stability while stored" paragraph names "the collection's
+// `IEqualityComparer` (hash forms)" as what governs lookup — so this is NOT the
+// #2693 `OwningLinkedList<T>(source)` case of an unspecified form invented by
+// codegen. It is nonetheless deferred rather than implemented here, for two
+// reasons that are recorded so the decision can be revisited. Both are purely
+// MECHANICAL — no design question is open, and an implementer should not go
+// looking for a ruling (see the note after them):
+//
+//  1. The runtime table has nowhere to put a comparer. `bz_dict_alloc_generic`
+//     (bezel_runtime_collections.cpp:719) takes bare
+//     `uint64_t (*)(const void*)` / `bool (*)(const void*, const void*)`
+//     function pointers with NO user-data parameter, and `bz_dict_t`
+//     (bezel_runtime_collections.cpp:369) has no context field. Threading an
+//     instance through means widening the struct and all eight `hash_fn`/`eq_fn`
+//     call sites, plus the dict→dict clone at :1298 — a runtime change, not a
+//     codegen one.
+//  2. Dispatching to the comparer from a trampoline is not yet safe. The
+//     existing builders (buildValueHashTrampoline / buildValueEqTrampoline,
+//     LlvmBackend_Calls3.cpp:393/440) save only the insert point and
+//     `currentFn_`; they do not reset `propagateBB_`/`unwindTarget_`/
+//     `disposeStack_`. An interface call goes through `emitMethodCall`, which
+//     calls `emitPendingCheck()` and would splice unwind edges belonging to the
+//     ENCLOSING user function into the trampoline. The iterator/async lowerers
+//     show the required reset idiom, but adopting it here is its own change.
+//
+// THE COMPARER'S LIFETIME IS ALREADY SETTLED — do not treat it as an open
+// question. An earlier draft of this comment listed it as a third, blocking
+// reason (that holding a borrowed comparer for the collection's whole life
+// needed a ruling). That was wrong and is withdrawn: the stdlib's own reference
+// implementation of `OwningDictionary<K, V>` declares `private _comparer:
+// IEqualityComparer<K>;` — an unmarked, i.e. BORROWING, field held for exactly
+// that lifetime — and calls `_comparer.Equals(...)` from inside `Add`
+// (Bezel_Standard_Library.md:2040 and :2057/:2083), and spec §9.7 confirms a
+// direct class-typed borrow field is a supported, statically checked construct.
+// The borrow reading is therefore already modelled normatively; implement it
+// rather than seeking a new ruling or proposing a stdlib amendment.
+//
+// Sema already records the same deferral in prose (SemaContext.hpp: "the
+// Dictionary/Set comparer-constructor overloads that would *consume* one are a
+// separate, still-deferred feature"). What was missing is that the deferral was
+// SILENT: codegen accepted the call and produced a wrong answer. Per the #511
+// `GetType` precedent, make it loud instead.
+//
+// SortedSet (§4.18) / SortedDictionary (§4.17) are deliberately NOT covered:
+// §4.17 states they order by `K`'s `IComparable<K>.CompareTo` and that "there is
+// no separate comparer parameter", so what a comparer argument means there is a
+// different question, filed rather than answered here.
+bool Emitter::rejectUnimplementedComparerCtor(const ast::NewExpr& ne,
+                                              std::string_view colName) {
+    // The section that DECLARES the overload, per type: §4.10 covers "Set<T> and
+    // OwningSet<T>" together, but the dictionary pair is split — §4.8 is
+    // `Dictionary<K, V>` and §4.9 is `OwningDictionary<K, V>`. Deriving it here
+    // rather than taking it from the call site is what keeps the two dictionary
+    // names from collapsing onto one section.
+    const char* sec = nullptr;
+    if (colName == "Set" || colName == "OwningSet")   sec = "§4.10";
+    else if (colName == "Dictionary")                 sec = "§4.8";
+    else if (colName == "OwningDictionary")           sec = "§4.9";
+    else return false;
+    if (ne.args.empty() || !ne.args[0].value) return false;
+    // Which forms carry a comparer: `(capacity, comparer)` is the only
+    // two-argument constructor either family declares, and a lone argument is
+    // the comparer form exactly when it is not the `capacity: int` overload.
+    //
+    // POLARITY. The discriminator mirrors the negative-capacity guard's
+    // non-nullable-int test, and — deliberately — mirrors its behavior on an
+    // UNKNOWN argument type too: a null `exprType` counts as NOT the comparer
+    // form, so it is skipped rather than rejected. Inverting that (treating
+    // unknown as a comparer) would turn any argument sema could not type into a
+    // hard error on a program that compiles today, and a false reject is worse
+    // than the silent drop this guard exists to catch — the drop is merely the
+    // pre-existing status quo for such an argument.
+    //
+    // WIDTH. The capacity form is every non-nullable integral primitive that
+    // spec §5.1 (v0.240) IMPLICITLY converts to `int`, not `int` alone:
+    //
+    //     sbyte -> short, int, long, …          byte  -> short, ushort, int, …
+    //     short -> int, long, …                 ushort -> int, uint, long, …
+    //     char  -> int, uint, long, …
+    //
+    // so `var b: byte := 8; new Set<int>(b)` is a well-typed call against the
+    // declared `constructor(capacity: int)`. Matching on `Int` alone classified
+    // it as the comparer form and hard-rejected a program that compiles today —
+    // a false reject carrying a WRONG explanation, which is the worse half.
+    // Nothing upstream rescues it: the builtin collections have
+    // `declaration == nullptr` so sema's `checkNewExprArgs` never runs, and
+    // `exprType` reports the argument's NATURAL type, never a target-converted
+    // one, so the widening is invisible here unless it is spelled out.
+    //
+    // `uint`, `long` and `ulong` are deliberately NOT accepted: §5.1's
+    // never-implicit list covers signed/unsigned of the same or narrower width
+    // and every narrowing, so none of them converts to `int` AS A RUNTIME VALUE.
+    // They stay on the comparer side, where the pre-existing negative-capacity
+    // guard also ignores them.
+    //
+    // ⚠ That is true of the IMPLEMENTATION, not of the spec. §5.1's *Constant
+    // narrowing* clause (spec line 667) also lets a compile-time CONSTANT of
+    // integer type convert to any integer type whose range contains its value,
+    // so `const N: long := 8; new Set<int>(N)` is a well-typed capacity call by
+    // the spec and is rejected here. It is not a live regression: sema
+    // implements constant narrowing only when the source's static type is
+    // exactly `Int`, and never *to* `Int`, so the compiler already rejects that
+    // conversion everywhere — this predicate merely inherits the existing gap
+    // rather than widening it. Filed separately; if sema ever gains the spec's
+    // full constant-narrowing rule, this set must widen with it.
+    //
+    // NULLABILITY is deliberately NOT tested. §7.4/§12.7 flow narrowing (#914)
+    // proves a nullable value non-null in value position, and
+    // ExprTypecheck.cpp's implementation says verbatim that it treats the
+    // narrowed source as non-nullable "WITHOUT rewriting its exprType" — so
+    // `var n: int? := 8; if n is not null then new Set<int>(n)` still reports
+    // `nullable == true` here, and a `!nullable` conjunct rejected a program
+    // that compiles and runs correctly (arg 0 was simply never lowered on the
+    // capacity path — capacity is only a hint). Dropping the conjunct cannot
+    // re-open the silent drop this guard exists to catch: `IEqualityComparer<T>`
+    // is an INTERFACE, hence `Kind::Named`, while every capacity primitive is
+    // `Kind::Primitive` — the two sets are disjoint by construction, nullable or
+    // not. The pre-existing negative-capacity guards keep their own `!nullable`
+    // test, which is theirs to keep: they must LOWER the argument, and a
+    // tagged-optional slot is not an i64.
+    auto isCapacityPrimitive = [](sema::PrimitiveType p) {
+        switch (p) {
+            case sema::PrimitiveType::SByte:
+            case sema::PrimitiveType::Byte:
+            case sema::PrimitiveType::Short:
+            case sema::PrimitiveType::UShort:
+            case sema::PrimitiveType::Char:
+            case sema::PrimitiveType::Int:
+                return true;
+            default:
+                return false;
+        }
+    };
+    bool comparerForm = ne.args.size() >= 2;
+    if (!comparerForm) {
+        const sema::TypeRef* a0ty = ctx_.exprType(*ne.args[0].value);
+        comparerForm = a0ty && !(a0ty->kind == sema::TypeRef::Kind::Primitive &&
+                                 isCapacityPrimitive(a0ty->primitive));
+    }
+    if (!comparerForm) return false;
+    ctx_.diagnostics().report(
+        Severity::Error, ne.span.begin,
+        "stdlib " + std::string(sec) + ": the '" + std::string(colName) +
+        "' IEqualityComparer constructor is not yet implemented — the comparer "
+        "would be silently ignored and default equality used instead. Omit it "
+        "and give the element type its own Equals/GetHashCode (spec §8.3).");
+    return true;
+}
+
 llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // §17.7 `new(args)` shorthand: there is no explicit `ne.type` — the target
     // type is inferred from context (the LHS annotation / assignment target) and
@@ -2634,6 +2998,29 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // bottom of lowerNew, before each `return obj`, exactly mirroring
     // lowerCall's loop. // per §22.4, §28.3, §17.13, #1833 (b), #1467
     const std::size_t newDiscardOwnedBase = discardOwnedOutSlots_.size();
+    // fix #2874 (§2.8.2 "No restrictions beyond visibility", v0.240): #2860's
+    // "constructing imported generic ... cannot run the initializer of its
+    // field" diagnostic is located from `importedFieldInitDiagLoc_`, but that
+    // was set only on the no-explicit-ctor branch near the bottom of this
+    // function. An imported generic WITH an explicit constructor reaches
+    // `emitOwnFieldInit` through `inlineCtorBody` instead, so the diagnostic
+    // came out UNLOCATED. MEASURED on 2ddd5b3, two real two-module builds of
+    // the same uncarriable initializer: the no-ctor spelling reported
+    // `app.bzl:5:20:` and the explicit-ctor spelling reported `app.bzl:0:0:` —
+    // and an explicit constructor is the ordinary shape, so the located case
+    // was the exception rather than the rule.
+    //
+    // Set it ONCE here, covering every construction path this function reaches,
+    // and restore on the way out. `lowerNew` has many returns, hence the scope
+    // guard rather than a paired assignment; the save/restore is what keeps a
+    // nested `new Outer(new Inner())` attributing each field to its own `new`.
+    struct ImportedFieldInitDiagLocScope {
+        SourceLocation& slot;
+        SourceLocation saved;
+        ImportedFieldInitDiagLocScope(SourceLocation& s, SourceLocation v)
+            : slot(s), saved(s) { slot = v; }
+        ~ImportedFieldInitDiagLocScope() { slot = saved; }
+    } importedFieldInitDiagLocScope(importedFieldInitDiagLoc_, ne.span.begin);
     // The ast::Type name node used for the builtin-exception / collection
     // dispatch below: the explicit type node when present, else the inferred
     // target's node (a shorthand targeting a builtin collection, e.g.
@@ -2886,6 +3273,31 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                  // branch lowerNew returned nullptr, leaving the slot uninitialized
                  // — same root cause as #1406 for SortedDictionary.
                  colName == "SortedSet")) {
+                // fix #2722 / stdlib §4.10 (v0.240): the comparer overloads.
+                // §4.10 declares FOUR constructors on `Set<T>` (and the same
+                // four on `OwningSet<T>`):
+                //     public constructor();
+                //     public constructor(capacity: int);
+                //     public constructor(comparer: IEqualityComparer<T>);
+                //     public constructor(capacity: int, comparer: IEqualityComparer<T>);
+                // The two comparer-bearing forms were lowered by DROPPING the
+                // comparer and building the table with the default content-based
+                // trampolines, so a caller who supplied a comparer precisely
+                // because default equality is wrong for their type silently got
+                // default equality — a wrong answer on a documented API with no
+                // diagnostic. Diagnose it instead, per the #511 `GetType`
+                // precedent (a loud "not yet implemented" beats a silent wrong
+                // value), and see rejectUnimplementedComparerCtor for why this
+                // is a deferral rather than an implementation.
+                // Return on rejection rather than falling through. A
+                // class-element `OwningSet<T>` has a null `genericBackingType`,
+                // so it falls out of this arm into the Array one, which reads
+                // arg 0 as a capacity and emitted `sext ptr to i64` — malformed
+                // IR ("SExt only operates on integer") stacked on top of the
+                // real diagnostic. The compile already fails on the error; a
+                // well-formed null keeps the verifier out of it.
+                if (rejectUnimplementedComparerCtor(ne, colName))
+                    return llvm::ConstantPointerNull::get(ptrTy());
                 // stdlib §1/§4.4 (v0.183, #1396): `Set<T>(capacity: int)` /
                 // `OwningSet<T>(capacity: int)` fault on a negative capacity
                 // rather than silently ignoring it. The first arg is the
@@ -2925,7 +3337,150 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // in each node — same sizing as bz_array_t (4 for int/float, 8 otherwise).
             if (colName == "LinkedList" || colName == "OwningLinkedList") {
                 auto* allocFn = declareC("bz_llist_alloc", ptrTy(), {i64()});
-                return builder_.CreateCall(allocFn, {builder_.getInt64(elemSize)});
+                auto allocEmpty = [&]() -> llvm::Value* {
+                    return builder_.CreateCall(allocFn,
+                                               {builder_.getInt64(elemSize)});
+                };
+                if (ne.args.empty() || !ne.args[0].value) return allocEmpty();
+                // fix #2693 / stdlib §4.6 (v0.240): the SOURCE constructor.
+                // §4.6 declares exactly two constructors on `LinkedList<T>`:
+                //   public constructor();
+                //   public constructor(source: IEnumerable<T>);
+                // and stdlib §5 recommends the second by name ("use `new
+                // LinkedList<T>(source)` if a linked list is wanted"). Codegen
+                // never read `ne.args`, so the second silently produced an EMPTY
+                // list — a wrong value on a documented API with no diagnostic.
+                //
+                // §4.7 declares only `constructor()` on `OwningLinkedList<T>`,
+                // so the source form is NOT specified there and is REJECTED
+                // rather than invented: taking elements out of an `IEnumerable<T>`
+                // into an owning list would have to either alias (two owners →
+                // double dispose) or consume the borrowed source, and the stdlib
+                // document answers neither. Same for a second argument on either
+                // type — no such constructor exists.
+                if (colName == "OwningLinkedList" || ne.args.size() != 1) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ne.span.begin,
+                        "no such constructor: stdlib " +
+                        std::string(colName == "OwningLinkedList" ? "§4.7"
+                                                                  : "§4.6") +
+                        " declares " +
+                        std::string(colName == "OwningLinkedList"
+                                        ? "only 'constructor()' on "
+                                          "'OwningLinkedList<T>'"
+                                        : "'constructor()' and "
+                                          "'constructor(source: IEnumerable<T>)' "
+                                          "on 'LinkedList<T>'"));
+                    return allocEmpty();
+                }
+                // The source is BORROWED (`source: IEnumerable<T>` carries no
+                // `owned` marker, spec §22.1). lowerToLazyEnumerator is the one
+                // backing-agnostic normalizer — it covers Array/OwningArray/
+                // Stack/Queue/OwningBuffer (bz_array_t*), LinkedList
+                // (bz_lazy_from_llist), Set/Dictionary, Range, a lazy LINQ
+                // pipeline, IGrouping, and a vtable-backed IEnumerable<T>.
+                //
+                // ⚠ We dispose the source NOWHERE, which is why no double
+                // dispose is possible. The "dispose only if it was a temporary"
+                // rule lives ONLY in lowerToLazyEnumerator's vtable path
+                // (materializeVtableIEnumerableToArray); the array path is a
+                // pure borrow (bz_lazy_from_array) that delegates temp-reclaim
+                // to the caller through its `outRecvArr` out-param, which we do
+                // not pass. Any temp-source leak here is inherited verbatim from
+                // the ToArray convention, not introduced by this arm.
+                sema::TypeRef* srcElemRef = nullptr;
+                llvm::Value* lazy =
+                    lowerToLazyEnumerator(*ne.args[0].value, srcElemRef);
+                // Element-type guard, mirroring OwningSet.ExceptWith's: reading
+                // the snapshot at the list's stride is only sound when the
+                // source's element lowers to the same LLVM type. Sema has no
+                // constructor model for the builtin collections (they have no
+                // TypeSymbol), so an ill-typed `new LinkedList<int>(42)` reaches
+                // codegen — diagnose it here instead of reading at a wrong
+                // stride or falling back to the silently-empty list.
+                if (!lazy || !srcElemRef || rt->genericArgs.empty() ||
+                    !rt->genericArgs[0] ||
+                    lowerTypeRef(srcElemRef) != lowerTypeRef(rt->genericArgs[0])) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ne.span.begin,
+                        "stdlib §4.6: 'new LinkedList<T>(source)' requires an "
+                        "enumerable source whose element type is T");
+                    return allocEmpty();
+                }
+                // Drain the pipeline once into a snapshot array, then append in
+                // source order. §4.6 fixes the orientation for the sibling
+                // literal form ("textual order is head-to-tail"); the source
+                // form follows the same convention, so element 0 of the source
+                // becomes `First` and the last becomes `Last`.
+                auto* toArrFn =
+                    declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+                llvm::Value* snap = builder_.CreateCall(
+                    toArrFn, {lazy, builder_.getInt64(elemSize)}, "ll.ctor.snap");
+                llvm::Value* list = allocEmpty();
+                // fix #2686/#2692 invariant: this is a SIXTH insert path into a
+                // bz_llist_t, so it must take the same +1 per `string` element
+                // that `.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter` and the
+                // collection-literal arm take — otherwise bz_llist_free's
+                // bz$strElemRelease over-releases (the ASan SEGV #2686 fixed).
+                // The predicate is a verbatim mirror of Calls3.cpp's
+                // `llIsStrElem`, minus its isPlusOneStringProducer escape: that
+                // guard exists because an `.AddLast($"…")` argument is a fresh +1
+                // being TRANSFERRED, whereas every element here is loaded out of
+                // a snapshot slot and is never a syntactic producer, so the
+                // retain is unconditional. bz_lazy_to_array itself does not
+                // retain (ToArray has to call bz_array_retain_strings after it),
+                // so the snapshot holds BORROWED references throughout.
+                const ElementPolicy ctorPol =
+                    elementPolicyFor(rt->genericArgs[0], /*owningFamily=*/false);
+                const bool ctorRetainStr =
+                    rt->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
+                    rt->genericArgs[0]->primitive == sema::PrimitiveType::String &&
+                    !rt->genericArgs[0]->nullable &&
+                    ctorPol.cat == ElementPolicy::Category::RuntimeManaged;
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                       {ptrTy(), i64(), i64()});
+                auto* addLastFn = declareC("bz_llist_add_last", ptrTy(),
+                                           {ptrTy(), ptrTy(), i64()});
+                llvm::Value* snapLen =
+                    builder_.CreateCall(lenFn, {snap}, "ll.ctor.n");
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* cBB = llvm::BasicBlock::Create(llvm_, "ll.ctor.c", currentFn_);
+                auto* bBB = llvm::BasicBlock::Create(llvm_, "ll.ctor.b", currentFn_);
+                auto* eBB = llvm::BasicBlock::Create(llvm_, "ll.ctor.e", currentFn_);
+                builder_.CreateBr(cBB);
+                builder_.SetInsertPoint(cBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot, "ll.ctor.i");
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(idx, snapLen), bBB, eBB);
+                builder_.SetInsertPoint(bBB);
+                {
+                    llvm::Value* ep = builder_.CreateCall(
+                        ptrFn, {snap, idx, builder_.getInt64(elemSize)},
+                        "ll.ctor.ep");
+                    if (ctorRetainStr) {
+                        llvm::Value* sv =
+                            builder_.CreateLoad(ptrTy(), ep, "ll.ctor.s");
+                        emitStringRetain(sv);
+                    }
+                    // bz_llist_add_last memcpy's elemSize bytes FROM ep, so the
+                    // snapshot slot address can be handed over directly.
+                    builder_.CreateCall(
+                        addLastFn, {list, ep, builder_.getInt64(elemSize)});
+                    builder_.CreateStore(
+                        builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                    builder_.CreateBr(cBB);
+                }
+                builder_.SetInsertPoint(eBB);
+                // The snapshot never took ownership of the elements it copied —
+                // free its shell only, with a NULL disposer (the same "consumed
+                // snapshot" idiom ExceptWith/IntersectWith use).
+                auto* freeSnapFn = declareC("bz_array_free",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                builder_.CreateCall(freeSnapFn,
+                    {snap, llvm::ConstantPointerNull::get(ptrTy())});
+                return list;
             }
             if (colName == "Array" || colName == "OwningArray" ||
                 // §4.14: OwningBuffer<T> uses the same bz_array_t* backing.
@@ -3172,6 +3727,26 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // leaving the variable slot uninitialized — bz_dict_* calls then
                 // received a zero/i32 receiver and produced malformed IR.
                 colName == "SortedDictionary") {
+                // fix #2722 / stdlib §4.8 (v0.240): the comparer overloads.
+                // §4.8 declares on `Dictionary<K, V>` (and §4.9 the same pair on
+                // `OwningDictionary<K, V>`):
+                //     public constructor(comparer: IEqualityComparer<K>);
+                //     public constructor(capacity: int, comparer: IEqualityComparer<K>);
+                // Both were lowered by DROPPING the comparer — see the §4.10
+                // note in the Set arm above; §4.8's "Stability while stored"
+                // paragraph names "the collection's `IEqualityComparer` (hash
+                // forms)" as governing lookup, so the comparer is normative
+                // rather than advisory and silently ignoring it is a wrong
+                // answer, not a liberty.
+                // Return on rejection rather than falling through. A
+                // class-element `OwningSet<T>` has a null `genericBackingType`,
+                // so it falls out of this arm into the Array one, which reads
+                // arg 0 as a capacity and emitted `sext ptr to i64` — malformed
+                // IR ("SExt only operates on integer") stacked on top of the
+                // real diagnostic. The compile already fails on the error; a
+                // well-formed null keeps the verifier out of it.
+                if (rejectUnimplementedComparerCtor(ne, colName))
+                    return llvm::ConstantPointerNull::get(ptrTy());
                 // stdlib §1/§4.8 (v0.183, #1396): `Dictionary<K,V>(capacity: int)`
                 // / `OwningDictionary<K,V>(capacity: int)` (bare or paired with a
                 // comparer) fault on a negative capacity. The first arg is the
@@ -3708,18 +4283,44 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 return builder_.CreateCall(
                     openFn, {pathData, pathLen, mode, access}, "fs.open");
             }
-            // per §6.8 / #652: new Domain(name: string) — allocate a named
-            // domain instance backed by a bz_domain_t with a stored name field.
-            // bz_domain_alloc(name_str_p) → bz_domain_t* (refs=1 for `using var`).
-            if (colName == "Domain") {
-                llvm::Value* nameArg = llvm::ConstantPointerNull::get(ptrTy());
-                if (!ne.args.empty() && ne.args[0].value) {
-                    llvm::Value* v = lowerExpr(*ne.args[0].value);
-                    if (v) nameArg = v;
-                }
-                auto* allocFn = declareC("bz_domain_alloc", ptrTy(), {ptrTy()});
-                return builder_.CreateCall(allocFn, {nameArg}, "dom.alloc");
-            }
+            // fix #2974 (language spec §11.7 "Static classes", stdlib §6.8,
+            // v0.240): THE `new Domain(name: string)` ARM IS DELETED HERE.
+            //
+            // It emitted `bz_domain_alloc` for a construction the standard
+            // library does not declare. stdlib §6.8 is `public static class
+            // Domain` with twelve `Spawn` overloads and NO constructor and NO
+            // `Name`; §11.7 is verbatim "A static class may not be instantiated:
+            // `new` on a static class is a compile error", and adds "Because a
+            // static class cannot be instantiated, it does not implement
+            // `IDisposable`" — so `using var d := new Domain(…)` was doubly
+            // ill-formed. The arm's own runtime comment records how it got here:
+            // "stdlib §6.8 documents Domain as a static-class for Domain.Spawn.
+            // The probe suite exercises `new Domain("test")` and `d.Name` as an
+            // instance-creation path…". A probe wanted a capability, the
+            // compiler grew it undeclared, and four tests pinned it under a
+            // `// §6.8` citation for a section that declares none of it.
+            //
+            // WHY DELETION IS THE FIX AND A GUARD IS NOT. #2974 read the
+            // acceptance as a missing check ("does this built-in name denote an
+            // instantiable class?"). It was not a gap: with the arm present,
+            // `new Domain("d")` PRODUCED A VALUE and so looked exactly like a
+            // working construction to every downstream check — which is why it
+            // ran, and why it leaked 714 bytes a call (nothing releases a
+            // built-in the auto-drop chain has no arm for). With the arm gone it
+            // produces no value like every other non-constructible built-in, and
+            // the ONE property in `lowerLocalDecl`/the return site
+            // (`unconstructedBuiltinNewName`) rejects it together with the seven
+            // others that were already silently degrading — `Path`, `File`,
+            // `Directory`, `Debug`, `BitConverter`, `Encoding`, `Linq`. One
+            // property, not a `Domain` special case.
+            //
+            // §6.8's REAL surface — `Domain.Spawn` — is a static call on the
+            // identifier and lives in LlvmBackend_Calls3.cpp; it is untouched.
+            // The `.Name` getter (LlvmBackend_Exprs.cpp) and the `Domain` arm of
+            // the explicit `Dispose()` chain (LlvmBackend_Calls2.cpp) survive
+            // this change unreachable-from-`new`, together with the runtime trio
+            // behind them; removing those is a wider change than this fix and is
+            // filed separately.
             // §2.5: new DateTime(year, month, day) or
             //        new DateTime(year, month, day, hour, minute, second) or
             //        new DateTime(year, month, day, hour, minute, second, ms).
@@ -4081,6 +4682,32 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         genericSubstSemaTy_ = std::move(savedSemaTy);
         return rec;
     }
+
+    // fix #2889 (§14.1 "Generic declarations" / §12 "Inheritance and
+    // Dispatch" / §22.8 "Field initializers", v0.240): a GENERIC class over a
+    // GENERIC ancestor needs the ANCESTOR's parameter names bound too, and it
+    // needs them bound for the WHOLE construction, not just for the layout
+    // query below.
+    //
+    // `classStruct` composes these bindings transiently for its own layout
+    // (so a field read / disposer / method body gets the right offsets from
+    // wherever it is called), but §22.8's construction sequence runs many more
+    // steps against the same object — the implicit base chain, each ancestor's
+    // field initializers, the inlined base constructor bodies. Those recurse
+    // level by level and hand each level's IMMEDIATE derived class to
+    // `computeAncestorGenericSubst`; at a middle link (`L<X> : M<W> : B<T>`)
+    // the receiver is `M`, whose parameter `W` the `new` site's substitution
+    // does not name, so the chain went unresolved and the base's initializers
+    // stored at the erased T→i32 offsets into a correctly sized object —
+    // measured: `cell := new Cell()` 8 bytes early, `l.cell.tag` SEGV.
+    //
+    // Composing the whole chain ONCE here, into the substitution `lowerNew`
+    // already keeps active until after the constructor runs (and already
+    // restores on every exit), makes every one of those steps resolvable
+    // without threading a most-derived receiver through the recursion.
+    // A no-op for a non-generic `t`, a `t` with no generic ancestor, and a
+    // `class D<T> : B<T>` whose base already shares the name.
+    mergeAncestorGenericSubst(t);
 
     llvm::StructType* st = classStruct(t);
     // Note: genericSubst_ stays active until after the constructor runs,
@@ -4502,6 +5129,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             }
         }
         emitNewPendingCheck(obj);
+        // §22.16 (v0.240, #2941): construction exit — evaluate the class
+        // invariant of the constructed type AFTER the ctor call returns
+        // normally and BEFORE the `obj` reference is exposed to the caller
+        // (§22.16 "Every fresh instance satisfies its full dynamic class
+        // invariant before it is observable"). Imported types' invariant
+        // records are declaration facts, so emitInvariantCheck is a no-op
+        // for them — their invariants were already checked at construction
+        // time in the exporter. Skipped when the ctor threw (the
+        // emitNewPendingCheck above branched to the unwind edge). The
+        // `disposeAndFreeOnThrow = true` flag wires the construction-exit
+        // unwind (§22.16 "the partially-constructed instance unwinds under
+        // §22.9's ordinary machinery"): a violated invariant here disposes
+        // + frees `obj` before ContractViolationException propagates,
+        // matching §22.9's ordinary cleanup shape so the heap block and
+        // every owned field are reclaimed.
+        emitInvariantCheck(obj, rt->declaration,
+                            /*disposeAndFreeOnThrow=*/true);
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
         // #1833 (b): the importedGenericWithBody path recorded
@@ -4513,7 +5157,29 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         return obj;
     }
 
-    if (ctx_.isImported(t)) {
+    // fix #2860 (§2.8.2 clause 2 / §22.8 step 2 / §7.9, v0.240): `&&
+    // !importedGenericNoBody`. This branch's every exit is a `return obj`, so
+    // it swallowed the no-explicit-ctor construction sequence below for EVERY
+    // imported type. For a NON-generic import that is right — its field
+    // initializers ran in the exported `bz$<Type>$init` called at the top of
+    // lowerNew (declareImportedInit). An imported GENERIC has no such symbol
+    // (it is monomorphized per instantiation, §14.1), so `emitInstanceInit`
+    // installed the per-instantiation vtable and NOTHING ever ran §22.8 step 2:
+    // every field of `new ImportedGeneric<T>()` kept its §7.9 default, with no
+    // diagnostic at any severity. §2.8.2 clause 2 is the rule broken — "An
+    // external instantiation behaves identically to a same-module instantiation
+    // of the same generic at the same arguments" — and the same declarations
+    // compiled as ONE module initialize correctly.
+    //
+    // Falling through instead of duplicating the sequence here is deliberate:
+    // `importedGenericNoBody` implies `!hasAnyConstructor(t)`, so `ctorForArgs`
+    // below returns null and control reaches the `else if (!hasAnyConstructor)`
+    // branch — the SAME code path a local no-explicit-ctor class takes, with its
+    // §22.7-step-2 throwing-initializer cleanup (#1291) and its `currentThis_ =
+    // obj` discipline already correct. Everything this branch would have done
+    // for a ctor-less type is a no-op anyway (no ctor to call; its trailing
+    // emitNewPendingCheck is re-emitted by the no-ctor branch).
+    if (ctx_.isImported(t) && !importedGenericNoBody) {
         // fix #2639 (§22.3 "Parameter modifiers" / §22.4, v0.236): a BY-REF
         // argument modifier does not make an argument non-positional. This
         // predicate is the branch's only admission gate and it originally
@@ -4739,6 +5405,28 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     v = lowerExpr(*ne.args[ai].value);
                 }
                 if (!v) { ok = false; break; }
+                // fix #2809 / §28.3 *Unbound owned temporaries* + §32.6
+                // (v0.240): the third argument-building site that needed the
+                // FFI-buffer temporary's reclaim — `new ImportedT(
+                // CString.From(s))`. Like lowerCall's imported-method arm, this
+                // path is hand-rolled because an imported ctor has no
+                // reconstructed AST (`buildOrderedArgs` cannot run), so it
+                // missed the registration the in-module ctor gets for free.
+                // Measured before this: 17 B leaked per construction.
+                // Same predicate, same `owned`-transfer exclusion (the callee
+                // takes the obligation, §28.3 transfer — reclaiming here would
+                // double-free).
+                if (!isByRefMod(formalMod) &&
+                    !isByRefMod(ne.args[ai].modifier) &&
+                    ne.args[ai].modifier != "owned" && formalMod != "owned") {
+                    bool argIsRawBytes = false;
+                    if (isFfiBufferFactoryCall(*ne.args[ai].value,
+                                               argIsRawBytes)) {
+                        auto* tmpSlot = entryAllocaNullPtr();
+                        builder_.CreateStore(v, tmpSlot);
+                        registerFfiExprTemp(tmpSlot, argIsRawBytes);
+                    }
+                }
                 // §5.1: widen an int argument to a wider numeric parameter, as
                 // the in-module ctor-call path does, so the ABI matches.
                 if (ai + 1 < fnTy->getNumParams())
@@ -4838,6 +5526,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // its own unwind path without freeing `this`; reclaim the instance block
         // here, the allocating site, exactly once on the unwind edge.
         emitNewPendingCheck(obj);  // CG20: an imported constructor may throw
+        // §22.16 (v0.240, #2941): construction exit on the imported-ctor
+        // path — evaluate the class invariant of the constructed type
+        // (a no-op for the imported type itself, since the exporter
+        // already evaluated it; but fires for any same-module-derived
+        // invariant chain). Skipped on the throw edge. The
+        // `disposeAndFreeOnThrow = true` flag wires the §22.9 unwind
+        // shape: a violated invariant disposes + frees `obj` before
+        // ContractViolationException propagates.
+        emitInvariantCheck(obj, rt->declaration,
+                            /*disposeAndFreeOnThrow=*/true);
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
         // #1833 (b): the imported-ctor path iterates ne.args manually (no
@@ -4987,6 +5685,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         for (llvm::Value* cl : ctorClosureArgs)
                             emitClosureRelease(cl);
                     }
+                    // §22.16 (v0.240, #2941): construction exit on the
+                    // explicit-ctor / non-generic / no-inline path —
+                    // evaluate the class invariant of the constructed type
+                    // AFTER the ctor call returns normally and BEFORE the
+                    // `obj` reference is exposed to the caller. Skipped on
+                    // the throw edge (emitNewPendingCheck above branched
+                    // to the unwind edge). The `disposeAndFreeOnThrow =
+                    // true` flag wires the §22.9 unwind shape: a violated
+                    // invariant disposes + frees `obj` before
+                    // ContractViolationException propagates, matching the
+                    // ordinary ctor-throw cleanup (which only frees, no
+                    // Dispose — the invariant-throw path is the correct
+                    // shape and the ctor-throw gap is a known follow-up).
+                    emitInvariantCheck(obj, rt->declaration,
+                                        /*disposeAndFreeOnThrow=*/true);
                 } else {
                     // Inline the constructor body with the generic
                     // substitution so field stores use concrete types.
@@ -5080,6 +5793,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // `this` (which was restored after the vtable install above).
         llvm::Value* savedThisNoCtor = currentThis_;
         currentThis_ = obj;
+        // fix #2860 (§2.8.2, v0.240): locate emitOwnFieldInit's "this imported
+        // generic's field initializer did not cross the module boundary"
+        // diagnostic on the `new` that would have observed the §7.9 default.
+        // fix #2874: the set/restore that used to live here covered ONLY this
+        // no-explicit-ctor branch, which is why the explicit-ctor construction
+        // path reported the same diagnostic unlocated. It now happens once at
+        // the top of `lowerNew` for every path, so nothing is needed here.
         emitImplicitBase(t, obj);
         // §22.7 step 2 (#1291): a throwing OWN field initializer must dispose the
         // earlier owned fields (whose initializers completed, in reverse
@@ -5117,6 +5837,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // base ctor's own cleanup disposed the base subobject without freeing
         // `this`, so reclaim the instance block here on the throw edge.
         emitNewPendingCheck(obj);  // CG20: the base constructor may throw
+        // §22.16 (v0.240, #2941): construction exit (no-explicit-ctor path).
+        // The implicit-base + field-init sequence is the construction body,
+        // so the invariant check fires here on the normal-completion edge.
+        // The `disposeAndFreeOnThrow = true` flag wires the §22.9 unwind
+        // shape: a violated invariant disposes + frees `obj` before
+        // ContractViolationException propagates.
+        emitInvariantCheck(obj, rt->declaration,
+                            /*disposeAndFreeOnThrow=*/true);
     }
     // CG-generic: record the substitution for this new object so that
     // lowerLocalDecl can associate it correctly even when the outer
@@ -5869,12 +6597,26 @@ llvm::Value* Emitter::buildRecordValue(
                     "field/property default initializer — #1386");
                 continue;
             }
+            // fix #2903 (§5.1 / §7.2 / §9.2 / §23.1, v0.240): a record body
+            // field / auto-property initializer reaches its slot at the SLOT's
+            // width. This loop had NEITHER direction of §5.1's numeric
+            // conversion — the class-side twin (emitInstanceInit) has had the
+            // widening since #408 — so measured on c7404bf every one of these
+            // was wrong: `wl: long := -42` read 4294967254 (the i32 bits
+            // zero-filled into the i64 slot), `wq: long? := -42` and
+            // `wd: double? := 3` read 0 (a bare i32 written over the tagged
+            // `{i8, T}` slot), and `nn: sbyte := -1` wrote `FF FF FF` over the
+            // three following `byte` fields (255 where 0 is correct). One
+            // definition, shared with the class site — see the declaration
+            // comment on coerceInitializerToSlot.
+            const sema::TypeRef* initFty = recordMemberType(m);
+            v = coerceInitializerToSlot(v, st->getElementType(idxIt->second),
+                                        isUnsignedTargetExpr(*init));
             // CG-nullable: a NULLABLE VALUE field initialized with a plain
             // value (`property N: int? := 9;`, or `property C: Color? :=
             // Color.Green;` — issue #364) must wrap the bare value into the
             // {i8 hasValue; T value} struct, like the positional path below.
             // per §9.2
-            const sema::TypeRef* initFty = recordMemberType(m);
             if (isNullableValueTy(initFty)) {
                 auto* expectedSt = nullableValueStructTy(initFty);
                 if (v->getType() != expectedSt) {
@@ -6212,6 +6954,17 @@ llvm::Value* Emitter::buildRecordValue(
                 paramSlots_[cs->params[pi]] = pslot;
             }
         }
+        // fix #2712 / §28.1 / §28.9 / §9 (v0.240): the INLINED RECORD-CONSTRUCTOR
+        // member of the #2696 family (recorded on #2707) — the identical shape to
+        // `inlineCtorBody`: this body is lowered into the ENCLOSING function with
+        // `currentFn_` untouched, so the drop-on-overwrite release fires on the
+        // constructor's own `string` parameter with no compensating +1 and frees
+        // the CALLER's string. Reproduced mechanically (`new Rec($"v-{i}")` where
+        // the record ctor does `s := s + "-x"`, and the caller reads the string
+        // afterwards): `heap-use-after-free`, frames `bz_string_release <- main`.
+        // Folded in here rather than filed because it is literally this one call
+        // and the alternative was leaving a proven use-after-free in the tree.
+        retainAssignedStringParams(cd->body, cs->params);
         lowerScopedBlock(cd->body);
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
@@ -6347,7 +7100,16 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 if (!disposeStack_.empty())
                     declScopeDepth_[bp] = disposeStack_.size();
                 locals_[bp] = slot;
+            // fix #2915: Kind::Unit is excluded EXPLICITLY rather than by
+            // isBoxableValueType (which now admits it — §4.7/§8.6 — so a boxed
+            // `()` has a runtime identity). This arm allocas and loads
+            // `lowerTypeRef(btyRef)`, and the unit type lowers to LLVM `void`:
+            // neither an `alloca void` nor a `load void` is constructible, and
+            // this arm has no `void`→`i8` placeholder substitution of the kind
+            // lowerLocalDecl applies (#1619). A `var u: ()` typed binding
+            // therefore keeps EXACTLY its pre-fix lowering.
             } else if (btyRef && isBoxableValueType(btyRef) &&
+                       btyRef->kind != sema::TypeRef::Kind::Unit &&
                        scrut->getType()->isPointerTy()) {
                 // #746 / §19.3 / §8.6: a typed binding `var n: T` where T is a
                 // boxable VALUE type (int/bool/long/enum/record) over a BOXED

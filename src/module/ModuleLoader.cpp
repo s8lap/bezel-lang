@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "lexer/Lexer.hpp"
@@ -185,6 +186,37 @@ struct Loader {
                 // type name branch, independent of astNode/declaration).
                 if (ref->declaration == nullptr && !mt.namedName.empty())
                     ref->importedName = ctx.internString(mt.namedName);
+                // fix #2776 (spec §14.2 rule 3, §2.5, v0.240): give an IMPORTED
+                // occurrence of a synthesized builtin interface the SAME
+                // TypeSymbol identity a local occurrence gets.
+                //
+                // `lookupNamed` searches the dependency's exported user types,
+                // and `IComparable` is not one — it is compiler-synthesized —
+                // so the base recorded for an imported `interface IRank:
+                // IComparable<IRank>` came back with `declaration == nullptr`.
+                // MEASURED with a two-module build (`bezelc -c lib.bzl` then
+                // `--import lib.o app.bzl`): the base's head is `IComparable`
+                // but its declaration is nil while the local builtin symbol is
+                // a real pointer, so #1867's IDENTITY test — which
+                // TypeResolution_Checks.cpp's selfComparableIface applies, and
+                // which exists because "blanket-accepting by decl/name was too
+                // lenient" — could never match. The consequence was that
+                // `Array<IRank>.Sort()/.Min()/.Max()` and `Math.Min` all
+                // silently declined a document-admissible CROSS-MODULE element,
+                // the limit recorded on #2776 and noted in
+                // selfComparableIfaceCompareTo's header.
+                //
+                // Resolving to `builtinInterfaceSym` here fixes it once for
+                // EVERY consumer of that identity rather than per call site —
+                // which is the point of #2787 having collapsed the predicate to
+                // a single definition. The name set is
+                // SemaContext::isSynthesizedBuiltinInterfaceName, the same
+                // closed list the local name-resolution site uses, so the two
+                // cannot drift.
+                if (ref->declaration == nullptr && !mt.namedName.empty() &&
+                    sema::SemaContext::isSynthesizedBuiltinInterfaceName(
+                        mt.namedName))
+                    ref->declaration = ctx.builtinInterfaceSym(mt.namedName);
                 for (const MetaType& ga : mt.genericArgs)
                     ref->genericArgs.push_back(convert(ga));
                 break;
@@ -304,6 +336,11 @@ struct Loader {
         t->moduleName = parent.moduleName;
         // §9.2 (issue #501): propagate positional-record flag.
         t->hasPositionalFields = td.hasPositionalFields;
+        // fix #2950 (§12 / §31.4 / §2.8.3 rule 4, v0.240): restore the built-in
+        // exception base. Without it this reconstructed symbol answers "no
+        // built-in base" to every layout consumer and the §31.4 header is
+        // dropped on the importing side only.
+        t->builtinExceptionBase = td.builtinExceptionBase;
         t->invariantContracts = toContractRecords(td.invariants);
         t->genericParams = convertGenericParams(td.genericParams, t->memberScope);
         for (const MetaType& base : td.baseTypes) {
@@ -971,13 +1008,38 @@ static std::string metaVisibilityToKeyword(MetaVisibility v) {
     }
 }
 
-// §14/#662c / #695: build a stub declaration for an instance method whose body
-// is not available.  The stub only carries the signature (enough for sema to
-// register a MethodSymbol and resolve calls to it inside the ctor/dtor body).
-// Limitations: operators, abstract methods, and methods with `Function`/
-// `InlineArray` return types receive an `=> 0`-style stub; they should not
-// normally be called from a ctor/dtor body, but we emit stubs anyway so that
-// any call to them is at least resolved (rather than silently returning zero).
+// §14/#662c / #695: build a stub declaration for a method whose body is not
+// available.  The stub only carries the signature — enough for sema to register
+// a MethodSymbol so a self-call inside the body being reconstructed (a ctor
+// body, a dtor body, a static-field initializer, or the #783 method body)
+// resolves to it and can be remapped to the imported MethodSymbol.  Abstract
+// methods have no body and are skipped; operators are skipped by the callers.
+//
+// fix #2820 (spec §14.1/§2.5, v0.240): the stub body used to be `=> 0` for EVERY
+// return type (only `bool` was special-cased, and the computed `retText` was
+// never used).  `0` does not typecheck against `string`, a class, `owned C`, an
+// interface, `Task<…>`, `[N]T`, `() -> R` — nor, per §5.1, against `byte`,
+// `sbyte`, `short`, `ushort`, `uint`, `ulong` or `char`, which reject an `int`
+// literal outright.  A stub that fails to typecheck makes the fresh context
+// report an error, and parseAndAttachMethodBody's #783 soundness gate then
+// refuses to attach THE BODY BEING RECONSTRUCTED — even though the failure is
+// entirely in an unrelated sibling's synthetic stub.  Declaring one
+// reference-returning method anywhere in an imported generic class therefore
+// silently disabled §14.1/#783 monomorphization for EVERY method of that class,
+// on a condition no author can see; via the fallback to the exporter's
+// placeholder-compiled function that could then become a wrong value (#2821).
+//
+// A per-return-type literal table is the wrong shape (the enumerate-the-
+// categories mistake of the #2787/#2790 family — several types have no literal
+// at all).  Emit instead a body that is type-correct BY CONSTRUCTION for any
+// signature: a SELF-CALL forwarding the stub's own parameters, whose type IS the
+// declared return type whatever that type is.  The stub is never lowered —
+// parseAndAttach* runs collectSymbols / resolveTypes / typecheckExpressions on
+// the synthetic module and nothing else — so the recursion is never emitted, let
+// alone executed; it exists only to give sema a well-typed body.  A BARE call
+// (not `this.`) is used so one spelling covers static and instance members
+// alike, and because a `this.`-rooted call inside an `async` stub takes a
+// different receiver-recovery path.
 static std::string buildMethodStub(const MetaMember& mm) {
     std::string s;
     // Visibility and non-body modifiers (skip abstract — it suppresses the body).
@@ -1015,18 +1077,92 @@ static std::string buildMethodStub(const MetaMember& mm) {
     bool hasReturnType = mm.type.kind != TypeKind::Unit &&
                          mm.type.kind != TypeKind::Error;
     if (hasReturnType) s += ": " + metaTypeToSourceText(mm.type);
-    // Minimal expression body.  Use a literal that matches the return type so
-    // the stub compiles without type errors.  For pointer-sized types that
-    // sema would flag as missing, fall back to `0`.
+    // fix #2820: an expression body that is well-typed for ANY return type — a
+    // self-call forwarding this stub's own parameters (see the header comment).
     if (hasReturnType) {
-        std::string retText = metaTypeToSourceText(mm.type);
-        bool isBool = (mm.type.kind == TypeKind::Primitive &&
-                       mm.type.primitive == PrimitiveKind::Bool);
-        s += " => " + std::string(isBool ? "false" : "0") + ";";
+        s += " => " + std::string(mm.name.empty() ? "unknown" : mm.name) + "(";
+        for (std::size_t i = 0; i < mm.params.size(); ++i) {
+            if (i) s += ", ";
+            s += mm.params[i].name;
+        }
+        s += ");";
     } else {
         s += " end " + std::string(mm.name.empty() ? "unknown" : mm.name) + ";";
     }
     return s;
+}
+
+// fix #2954 (§22.8 "Field initializers" / §2.8.3 rule 4 / §14.1 "Generic
+// declarations" / §2.5, v0.240): REBIND every TypeRef in a re-parsed body that
+// resolved to the SYNTHETIC reconstruction's own class so it names the IMPORTED
+// TypeSymbol instead.
+//
+// THE SIXTH SIDE TABLE, AND THE ONE WHOSE ENTRIES ARE WRONG RATHER THAN MISSING.
+// All four re-parse paths below copy `allResolvedTypes()` / `allExprTypes()` into
+// mainCtx verbatim (#2855's fix added the last of them). Verbatim is right for
+// every TypeRef naming an outside type — but a TypeRef naming the class being
+// reconstructed points at the FRESH TypeSymbol collected from
+// `buildSyntheticClassSource` / `buildSyntheticMethodSource`, and that symbol is
+// a DIFFERENT TYPE from the imported one in every way codegen cares about:
+//
+//   * its fields carry NO initializers — those functions emit each field as
+//     `name : Type;`, never `:= <fieldInitText>` — so §22.8's "Field
+//     initializers run as part of construction in textual declaration order" had
+//     nothing to run;
+//   * `ctx_.isImported()` is FALSE for it, so `lowerNew` takes neither the
+//     imported-generic branch nor the local branch and NO VTABLE is installed;
+//   * `classStruct` mints it a SECOND `%class.<Name>$spec0`, so one
+//     monomorphization has two LLVM struct types and two identities — flatly
+//     against §2.8.3 rule 4's "one runtime type identity ... regardless of which
+//     artifact produced the value".
+//
+// MEASURED on this fix's parent, `new GRe10<T>()` inside an imported generic's
+// own re-lowered `Nested()` body (the issue's repro): `w=21` beside
+// `nested=21` — the outer construction ran the initializer, the inner one read
+// `inner._w` as 0, so the sum was 21 where 42 is correct. The emitted IR for the
+// inner `new` is a bare `calloc` with no vtable store and no `store i32 21`,
+// against the outer's calloc + `store ptr @"vt$GRe10$spec0"` + `store i32 21`.
+//
+// #2954 REQUIRES THIS DIRECTION IN AS MANY WORDS — "whatever runs the
+// initializers has to be the SAME sequence the importing module's own `new
+// GRe10<string>()` runs, not a second reconstruction of it". Teaching the
+// synthetic source to re-emit each field's initializer would have been the
+// second reconstruction, and would still have left the type identity split.
+// Rebinding the reference makes the inner `new` reach the very same `lowerNew`
+// path as the outer one, so the two spellings cannot diverge again.
+//
+// The walk is over the whole TypeRef GRAPH, not just the top level, because the
+// self type can appear nested (`new Box<GRe10<T>>()`, a `[4]GRe10<T>` element, a
+// `(GRe10<T>) -> int` parameter). `seen` is required for termination: TypeRefs
+// are arena-owned and a self-referential generic argument would otherwise
+// recurse forever.
+static void rebindSelfTypeRefs(sema::TypeRef* ref,
+                               const sema::TypeSymbol* freshType,
+                               sema::TypeSymbol* importedType,
+                               std::unordered_set<sema::TypeRef*>& seen) {
+    if (!ref || !freshType || !importedType) return;
+    if (!seen.insert(ref).second) return;
+    if (ref->declaration == freshType) ref->declaration = importedType;
+    for (sema::TypeRef* a : ref->genericArgs)
+        rebindSelfTypeRefs(a, freshType, importedType, seen);
+    rebindSelfTypeRefs(ref->arrayElement, freshType, importedType, seen);
+    rebindSelfTypeRefs(ref->funcReturn, freshType, importedType, seen);
+    for (const auto& fp : ref->funcParams)
+        rebindSelfTypeRefs(fp.type, freshType, importedType, seen);
+}
+
+// fix #2954: the whole-table form — run over both type side tables of a fresh
+// re-parse context before they are copied into mainCtx. Every one of the four
+// reconstruction paths calls this, because the defect is a property of the
+// reconstruction (a synthetic self-class), not of any one member kind.
+static void rebindSelfTypeRefsIn(sema::SemaContext& freshCtx,
+                                 const sema::TypeSymbol* freshType,
+                                 sema::TypeSymbol* importedType) {
+    std::unordered_set<sema::TypeRef*> seen;
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        rebindSelfTypeRefs(ref, freshType, importedType, seen);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        rebindSelfTypeRefs(ref, freshType, importedType, seen);
 }
 
 // Build a synthetic Bezel source string for a mini class containing only the
@@ -1201,6 +1337,14 @@ static bool parseAndAttachCtorBody(
     // Build index→ParameterSymbol map for the imported ctor.
     const std::vector<sema::Symbol*>& importedParams = importedCs->params;
 
+    // fix #2839 (§14/#662c / §27.3/§27.5, v0.240): every symbol that is a
+    // LAMBDA's parameter somewhere in this ctor body — see the identical set in
+    // parseAndAttachMethodBody for why the ParameterSymbol arm below needs it.
+    std::unordered_set<const sema::Symbol*> freshLambdaParamSyms;
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        for (sema::Symbol* ps : syms)
+            if (ps) freshLambdaParamSyms.insert(ps);
+
     // Walk fresh context's exprSymbols and remap into mainCtx.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
@@ -1210,6 +1354,14 @@ static bool parseAndAttachCtorBody(
             if (it != importedFields.end())
                 mainCtx.setExprSymbol(expr, it->second);
         } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
+            // fix #2839: a LAMBDA parameter is declared inside the body and has
+            // no importer-side counterpart (like a body-local, §2290 bug 1
+            // below) — carry it over verbatim rather than running the
+            // positional ctor-param search that can never match it.
+            if (freshLambdaParamSyms.count(freshSym)) {
+                mainCtx.setExprSymbol(expr, freshSym);
+                continue;
+            }
             // Param reference: find by position in freshCs.params.
             for (std::size_t pi = 0; pi < freshCs->params.size(); ++pi) {
                 if (freshCs->params[pi] == freshSym &&
@@ -1249,10 +1401,37 @@ static bool parseAndAttachCtorBody(
     // arena, kept alive via ownImportedAuxiliary below; the AST-node keys are
     // the re-parsed nodes, kept alive via ownImportedAst. Copying the whole map
     // is harmless — the keys are unique to the fresh AST.
+    //
+    // fix #2954: but NOT verbatim for a TypeRef naming the class being
+    // reconstructed — that one points at the SYNTHETIC self-class, which has no
+    // field initializers, no vtable and its own struct identity. Rebind it to the
+    // imported TypeSymbol first (see rebindSelfTypeRefs).
+    rebindSelfTypeRefsIn(freshCtx, freshType,
+                         const_cast<sema::TypeSymbol*>(&importedType));
     for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
         if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
     for (const auto& [expr, ref] : freshCtx.allExprTypes())
         if (expr && ref) mainCtx.setExprType(expr, ref);
+    // fix #2839 (§14/#662c / §27.3 Lambda expressions, v0.240): carry the
+    // body's per-lambda parameter lists too — the fourth AST-keyed side table,
+    // and the only one no remap loop copied. codegen's lowerLambda reads
+    // `ctx_.lambdaParams(&lam)` to declare the closure's user parameters and to
+    // bind each incoming argument to its ParameterSymbol; with no entry the
+    // closure took ZERO user parameters and the lambda's value was lost, so
+    // `var f := lambda(x: int) => x + 1; tag := f(n);` in an imported generic
+    // constructor stored 0. Verbatim copy: keys are the re-parsed
+    // ast::LambdaExpr nodes, values the fresh ParameterSymbols with no
+    // importer-side twin; both are kept alive below.
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        if (lam) mainCtx.setLambdaParams(lam, syms);
+
+    // fix #2857 (§19.3/#1853 / §2.8.2 clause 2, v0.240): and the FIFTH — the
+    // body's bare-name local-const `case` patterns. See the identical copy in
+    // parseAndAttachMethodBody for the full reasoning; verbatim for the same
+    // reason as #2818's LocalSymbols (declared inside the body, no
+    // importer-side twin), with both key and value kept alive below.
+    for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
+        if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
 
     // Attach the parsed ConstructorDecl and keep the AST alive.
     // Keep the backing source string alive too: all string_view fields in the
@@ -1323,8 +1502,20 @@ static bool parseAndAttachDtorBody(
     auto sf = freshParser.parseCompilationUnit();
     if (!sf || freshDiag.hasErrors()) return false;
 
-    DiagnosticEngine semaDiag;
-    sema::SemaContext freshCtx(semaDiag);
+    // fix #2855 (§14/#662c / §28.4, v0.240): the fresh context AND its
+    // diagnostics must OUTLIVE this function, exactly as in the ctor (#2290)
+    // and method (#783) paths. Until this fix nothing in mainCtx pointed into
+    // freshCtx, so a stack context was safe — and the dtor body consequently
+    // arrived in the importer with NO types at all, which is the crash this
+    // change fixes. The four things carried below (resolved types, expr types,
+    // body-local symbols, lambda parameter lists) all point into the fresh
+    // arena, so it is heap-allocated and kept alive at the tail. Order matters:
+    // SemaContext holds a DiagnosticEngine&, so the engine is owned FIRST
+    // (destroyed last) and the context SECOND (destroyed first).
+    auto semaDiagPtr = std::make_shared<DiagnosticEngine>();
+    DiagnosticEngine& semaDiag = *semaDiagPtr;
+    auto freshCtxPtr = std::make_shared<sema::SemaContext>(semaDiag);
+    sema::SemaContext& freshCtx = *freshCtxPtr;
     sema::collectSymbols(*sf, freshCtx);
     if (semaDiag.hasErrors()) return false;
     sema::resolveTypes(*sf, freshCtx);
@@ -1374,6 +1565,18 @@ static bool parseAndAttachDtorBody(
         }
     }
 
+    // fix #2855 (§14/#662c / §27.3/§27.5, v0.240): every symbol that is a
+    // LAMBDA's parameter somewhere in this dtor body — see the identical set in
+    // parseAndAttachMethodBody for why the ParameterSymbol arm below needs it.
+    // (A destructor declares no parameters of its own, §28.4, so every
+    // ParameterSymbol reachable from a dtor body IS a lambda's; the set is
+    // still built and tested rather than assumed, so the arm stays guarded on
+    // the property it actually needs rather than on the symbol's category.)
+    std::unordered_set<const sema::Symbol*> freshLambdaParamSyms;
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        for (sema::Symbol* ps : syms)
+            if (ps) freshLambdaParamSyms.insert(ps);
+
     // Remap exprSymbols.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
@@ -1386,8 +1589,70 @@ static bool parseAndAttachDtorBody(
             auto it = importedMethods.find(freshMethodSigKey(freshMs));
             if (it != importedMethods.end())
                 mainCtx.setExprSymbol(expr, it->second);
+        } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
+            // fix #2855, the #2290-bug-1 / #2818 arm this path never had: a
+            // symbol DECLARED INSIDE the dtor body — a `var`/`const` local, a
+            // `for`/`for-in` iteration variable, a `using var` — has NO
+            // importer-side counterpart to remap to. It IS the fresh symbol,
+            // and its `decl` is the re-parsed ast::LocalDecl that codegen keys
+            // `locals_` on. Carry the binding VERBATIM; the arena that owns it
+            // is kept alive at the tail (ownImportedAuxiliary).
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
+            // fix #2855 / #2839: a LAMBDA parameter is a ParameterSymbol
+            // declared inside the body, with no importer-side twin — the same
+            // category as a body-local above. Carry it verbatim (its
+            // ParameterSymbol is the one codegen's lowerLambda keys
+            // `paramSlots_` on, from the lambdaParams entry copied below).
+            // Guarded on membership in the fresh context's lambdaParams_, not
+            // on the symbol's kind, so a ParameterSymbol arriving here by some
+            // other route is still declined rather than silently carried.
+            if (freshLambdaParamSyms.count(freshSym))
+                mainCtx.setExprSymbol(expr, freshSym);
         }
     }
+
+    // fix #2855 (§14/#662c, v0.240): carry the body's TYPE tables, which this
+    // path — alone among the four reconstructions — copied NEITHER of. codegen
+    // asks `ctx_.resolvedType(*declType)` / `ctx_.exprType(expr)` for every
+    // declaration and sub-expression it lowers; with mainCtx holding no entry
+    // for the re-parsed nodes it got a NULL TypeRef and dereferenced it —
+    // `TypeRef::headName()` inside `lowerLocalDecl`, reached from
+    // `emitDisposerCore` -> `emitSpecializedDisposer` ->
+    // `buildImportedGenericVtable`. So ANY local declaration in an imported
+    // generic class's destructor SIGSEGV'd the importing compiler with no
+    // diagnostic — the lambda in #2855's repro is one instance of that, not the
+    // axis: `var k: int := 5;` crashes identically.
+    //
+    // Verbatim copy, as in the three sibling paths and for the same reasons:
+    // the keys are the re-parsed AST nodes (unique to the fresh AST, so no
+    // collision with mainCtx's own) and the TypeRef* values point into the
+    // fresh arena, kept alive at the tail.
+    //
+    // fix #2954: with the same one exception the three sibling paths make — a
+    // TypeRef naming the class being reconstructed is rebound to the IMPORTED
+    // TypeSymbol, not carried as the synthetic self-class.
+    rebindSelfTypeRefsIn(freshCtx, freshType, &importedType);
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        if (expr && ref) mainCtx.setExprType(expr, ref);
+    // fix #2855 (§27.3 Lambda expressions, v0.240): and the per-lambda
+    // parameter lists, the copy #2839 added to the method and ctor paths and
+    // #2856 to the field-initializer path. codegen's lowerLambda reads
+    // `ctx_.lambdaParams(&lam)` to declare the closure's user parameters and to
+    // bind each incoming argument to its ParameterSymbol; with no entry the
+    // closure takes ZERO user parameters and the lambda's value is lost.
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        if (lam) mainCtx.setLambdaParams(lam, syms);
+
+    // fix #2857 (§19.3/#1853 / §2.8.2 clause 2, v0.240): and the FIFTH — the
+    // body's bare-name local-const `case` patterns. See the identical copy in
+    // parseAndAttachMethodBody for the full reasoning; verbatim for the same
+    // reason as #2818's LocalSymbols (declared inside the body, no
+    // importer-side twin), with both key and value kept alive below.
+    for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
+        if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
 
     // Create a DestructorSymbol on the imported type and attach the parsed decl.
     auto* importedDs = mainCtx.makeImportedSymbol<sema::DestructorSymbol>();
@@ -1401,6 +1666,15 @@ static bool parseAndAttachDtorBody(
     // re-parsed AST point into it) and the SourceFile itself.
     mainCtx.ownImportedSource(std::move(source));
     mainCtx.ownImportedAst(std::move(sf));
+    // fix #2855: and the fresh context + diagnostics, which the four carries
+    // above now point into. importedAuxiliary_ destroys in REVERSE insertion
+    // order and SemaContext holds a DiagnosticEngine&, so push the engine FIRST
+    // (destroyed last) and the context SECOND (destroyed first) —
+    // context-then-engine, never dangling. Every `return false` above happens
+    // BEFORE the first mainCtx.set*() call, so a declined reconstruction leaves
+    // nothing in mainCtx pointing at the arena this drops.
+    mainCtx.ownImportedAuxiliary(semaDiagPtr);
+    mainCtx.ownImportedAuxiliary(freshCtxPtr);
     return true;
 }
 
@@ -1553,6 +1827,19 @@ static bool parseAndAttachMethodBody(
     // Param remap: the target method's own parameters (by position).
     const std::vector<sema::Symbol*>& importedParams = importedMs->params;
 
+    // fix #2839 (§14.1/#783 / §27.3/§27.5, v0.240): every symbol that is a
+    // LAMBDA's parameter somewhere in this body. A lambda parameter is a
+    // ParameterSymbol, so without this set the ParameterSymbol arm below reads
+    // it as "the enclosing method's parameter", finds it in NO position of
+    // freshMs->params, and drops the binding. It belongs in the same category
+    // as a body-local (#2818): declared INSIDE the body, no importer-side twin,
+    // carried over verbatim. See the lambdaParams_ copy below for the other
+    // half of this fix.
+    std::unordered_set<const sema::Symbol*> freshLambdaParamSyms;
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        for (sema::Symbol* ps : syms)
+            if (ps) freshLambdaParamSyms.insert(ps);
+
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
         if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
@@ -1560,6 +1847,17 @@ static bool parseAndAttachMethodBody(
             if (it != importedFields.end())
                 mainCtx.setExprSymbol(expr, it->second);
         } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
+            // fix #2839: a LAMBDA parameter is not the enclosing method's — it
+            // is declared inside the body and has no importer-side counterpart,
+            // exactly like a body-local. Carry it over verbatim (its
+            // ParameterSymbol is the one codegen's lowerLambda keys paramSlots_
+            // on, from the lambdaParams entry copied below), instead of running
+            // the positional method-param search that can never match it and
+            // then dropping the binding.
+            if (freshLambdaParamSyms.count(freshSym)) {
+                mainCtx.setExprSymbol(expr, freshSym);
+                continue;
+            }
             for (std::size_t pi = 0; pi < freshMs->params.size(); ++pi) {
                 if (freshMs->params[pi] == freshSym &&
                     pi < importedParams.size()) {
@@ -1571,6 +1869,35 @@ static bool parseAndAttachMethodBody(
             auto it = importedMethods.find(freshMethodSigKey(fms));
             if (it != importedMethods.end())
                 mainCtx.setExprSymbol(expr, it->second);
+        } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
+            // fix #2818 (§14.1 monomorphization / §2.5 modules, v0.240): a
+            // symbol DECLARED INSIDE the re-parsed body — a `var`/`const`
+            // local, a `for`/`for-in` iteration variable, a `using var`, a
+            // pattern binding — is the one category with NO importer-side
+            // counterpart to remap to. It *is* the fresh symbol: its `decl`
+            // is the re-parsed `ast::LocalDecl` that codegen keys `locals_`
+            // on when the body is monomorphized, and the fresh SemaContext
+            // that owns it is kept alive below (ownImportedAuxiliary). Copy
+            // the binding VERBATIM.
+            //
+            // Field/parameter/method are remapped because the importer holds
+            // a different symbol for the same entity; a body-local has no
+            // such twin, so "remap" degenerates to "carry over". Before this,
+            // the entry was simply DROPPED: `ctx_.exprSymbol()` returned null
+            // for every read of a body-local, `lowerExpr` on the identifier
+            // produced no value, and the enclosing expression degraded to a
+            // zero/null result (the #2491 return-path fallback) — e.g.
+            // `var built := $"xm-{i}"; return built.Length;` in an imported
+            // `Box<T>` returned 0 while still executing (and allocating) the
+            // body. A silent wrong value across the module boundary.
+            //
+            // Note this hole was MASKED whenever any sibling method of the
+            // same class declared a reference-typed return: buildMethodStub
+            // emits `=> 0` for it, which fails to typecheck, which trips the
+            // #783 soundness gate above and leaves `decl` unattached — so the
+            // call fell back to the exporter's own compiled function and got
+            // the right answer by accident. See #2820.
+            mainCtx.setExprSymbol(expr, freshSym);
         }
     }
 
@@ -1582,10 +1909,70 @@ static bool parseAndAttachMethodBody(
     // re-parsed nodes, kept alive via ownImportedAst. Only nodes that belong to
     // the re-parsed body matter; copying the whole map is harmless because the
     // keys are unique to the fresh AST (no collision with mainCtx's own nodes).
+    //
+    // fix #2954 (§22.8 / §2.8.3 rule 4, v0.240): with ONE entry that must not be
+    // carried verbatim — a TypeRef naming the class being reconstructed, which
+    // resolves to the SYNTHETIC self-class this function's own
+    // `buildSyntheticMethodSource` declared. That class has no field
+    // initializers, is not `isImported`, and gets its own `classStruct`, so a
+    // `new Self<T>()` inside the body allocated a vtable-less, zero-initialized
+    // object of a second identity. Rebind it to the imported TypeSymbol so the
+    // inner `new` takes the SAME `lowerNew` path the importing module's own
+    // `new Self<Arg>()` takes. This is the direct arm of #2954's repro.
+    rebindSelfTypeRefsIn(freshCtx, freshType,
+                         const_cast<sema::TypeSymbol*>(&importedType));
     for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
         if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
     for (const auto& [expr, ref] : freshCtx.allExprTypes())
         if (expr && ref) mainCtx.setExprType(expr, ref);
+    // fix #2839 (§14.1/#783 / §27.3 Lambda expressions, v0.240): lambdaParams_
+    // is the FOURTH side table this reconstruction has to carry, and it was the
+    // only one nothing copied. codegen's lowerLambda reads
+    // `ctx_.lambdaParams(&lam)` to (a) build the closure function's user
+    // parameter type list and (b) bind each incoming argument to its
+    // ParameterSymbol in paramSlots_. With no entry in mainCtx it got null, the
+    // closure was declared with ZERO user parameters, and the lambda's value
+    // was lost — `var f := lambda(x: int) => x + 1; return f(6);` in an
+    // imported generic body returned 0, not 7, with no diagnostic. §2.8.2
+    // clause 2 is the rule broken: "An external instantiation behaves
+    // identically to a same-module instantiation of the same generic at the
+    // same arguments" — the same source compiled as ONE module answered 7.
+    //
+    // Copied VERBATIM, like the two type tables above and for the same reasons:
+    // the keys are the re-parsed ast::LambdaExpr nodes (unique to the fresh
+    // AST, so no collision with mainCtx's own lambdas) and the values are the
+    // fresh ParameterSymbols, which have no importer-side twin to remap to. The
+    // fresh context that owns them is kept alive below (ownImportedAuxiliary),
+    // exactly as for the TypeRefs.
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        if (lam) mainCtx.setLambdaParams(lam, syms);
+
+    // fix #2857 (§19.3/#1853 / §2.8.2 clause 2, v0.240): patternSymbols_ is the
+    // FIFTH AST-keyed side table this reconstruction has to carry, and it was
+    // the last one nothing copied. sema writes it (ExprTypecheck.cpp) for
+    // exactly one shape — a bare-name NamedPattern resolving to a
+    // compile-time-classified local `const` used as a `case` pattern constant
+    // (a Pattern is not an Expr, so exprSymbols_ cannot key it). codegen reads
+    // it in constValueForPatternName to fold that const's value at the case
+    // site; with no entry in mainCtx it got null and REJECTED the arm:
+    //   `const K := 9; case sel of K => …` in an imported generic body failed
+    //   with "the `case`/`when` pattern `K` is not supported by the backend",
+    // while the same source compiled as ONE module returned 105.
+    //
+    // Unlike its silent siblings (#2818 every local reads 0, #2839 the lambda's
+    // value is lost) this one fails LOUDLY — but it is the same §2.8.2 clause 2
+    // break: "An external instantiation behaves identically to a same-module
+    // instantiation of the same generic at the same arguments". A program that
+    // compiles as one module must not fail through the artifact boundary.
+    //
+    // Copied VERBATIM like the tables above: keys are the re-parsed
+    // ast::Pattern nodes (unique to the fresh AST, kept alive by
+    // ownImportedAst) and the value is a symbol declared INSIDE the body, so —
+    // exactly as for #2818's LocalSymbols — there is no importer-side twin to
+    // remap to. The fresh context that owns it is kept alive below
+    // (ownImportedAuxiliary).
+    for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
+        if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
 
     // Attach the parsed MethodDecl to the imported MethodSymbol and keep the
     // backing source + AST alive (string_view fields point into them), plus the
@@ -1717,16 +2104,37 @@ static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td,
 // source omits sibling/base types" limitation (#710 / #2290 bug 2) is a
 // separate, harder shape (a ctor body can reach arbitrary members, not
 // just type names) and remains tracked there.
+//
+// fix #2874 (§2.8.2 / §22.8 step 2, v0.240): added `bool isStatic` parameter.
+// `false` skips the load-time diagnostic on parse/sema failure (a program
+// that merely imports the module without ever constructing the offending
+// generic still has to build, §2.8.2) and replaces the final `decl = parsedFd`
+// attach with `setImportedInstanceFieldInitExpr` — keeping `decl` null so the
+// imported-member layout fallbacks continue to consult `importedMemberType`
+// (storageType / #662). See `importedInstanceFieldInitExpr` (SemaContext.hpp)
+// and the construction-site fallback in `emitOwnFieldInit` for the matching
+// reader side.
 static bool parseAndAttachFieldInit(
     const MetaTypeDecl& td,
     const std::string& moduleName,
     const MetaMember& target,
     sema::FieldSymbol* importedFs,
     const sema::TypeSymbol& importedType,
-    sema::SemaContext& mainCtx) {
+    sema::SemaContext& mainCtx,
+    bool isStatic) {
     std::string source = buildSyntheticFieldInitSource(td, moduleName);
 
     auto reject = [&](const char* reason) {
+        // fix #2874 (§2.8.2, v0.240): the instance-field path MUST NOT become
+        // a load-time reject (a program that merely imports the module
+        // without ever constructing the offending generic still has to build).
+        // The construction-site diagnostic #2860 added to `emitOwnFieldInit`
+        // is the fallback that fires at the offending `new`, naming the field
+        // and initializer shape — the SAME shape §2.8.2 wants named, just
+        // deferred until the construction site that would have observed the
+        // wrong value. Silently return so the text remains in
+        // `importedInstanceFieldInitText` for that path.
+        if (!isStatic) return;
         mainCtx.diagnostics().report(
             Severity::Error, SourceLocation{},
             "cannot import static field '" + td.name + "." + target.name +
@@ -1886,14 +2294,73 @@ static bool parseAndAttachFieldInit(
     // Copy resolved-type / expr-type entries so codegen's lowerExpr finds a
     // type for every sub-expression of the initializer (e.g. `new
     // AtomicInteger<int>(0)`'s constructed-type node).
+    //
+    // fix #2954: and — as in the three sibling paths — a TypeRef naming the
+    // class being reconstructed is rebound to the IMPORTED TypeSymbol first,
+    // rather than left pointing at this path's synthetic self-class.
+    rebindSelfTypeRefsIn(freshCtx, freshType,
+                         const_cast<sema::TypeSymbol*>(&importedType));
     for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
         if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
     for (const auto& [expr, ref] : freshCtx.allExprTypes())
         if (expr && ref) mainCtx.setExprType(expr, ref);
+    // fix #2856 (§22.8 Field initializers / §27.3 Lambda expressions, v0.240):
+    // carry the initializer's per-lambda parameter lists too — the same table
+    // and the same one-line copy #2839 added to the method and ctor paths, and
+    // the last of the four reconstruction paths to lack it. §22.8 admits a
+    // lambda here verbatim: "Field initializers may reference: constants,
+    // literals, static members of any class, `new` expressions, lambdas that
+    // capture only the above, primary-constructor parameters (§22.10), and
+    // `typeof` expressions."
+    //
+    // codegen's lowerLambda reads `ctx_.lambdaParams(&lam)` to (a) build the
+    // closure function's user parameter type list and (b) bind each incoming
+    // argument to its ParameterSymbol in paramSlots_. With no entry it got
+    // null, declared the closure with ZERO user parameters, and the value was
+    // lost: `public static readonly Seed: int := (lambda(x: int) => x + 1)(6);`
+    // in an imported generic class read 0 in the importer and 7 as one module.
+    // §2.8.2 clause 2 is the rule broken: "An external instantiation behaves
+    // identically to a same-module instantiation of the same generic at the
+    // same arguments."
+    //
+    // Verbatim copy, exactly as for the two type tables above: the keys are the
+    // re-parsed ast::LambdaExpr nodes (unique to the fresh AST) and the values
+    // are fresh ParameterSymbols with no importer-side twin. The lifetime
+    // contract the copy needs is already in place — ownImportedAuxiliary below
+    // keeps the fresh context alive. (No ParameterSymbol ARM is needed in the
+    // remap loop above, unlike the ctor/method paths: this path's `else` branch
+    // already carries every other symbol kind verbatim (#2375), so a lambda
+    // parameter's exprSymbol binding was already crossing.)
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        if (lam) mainCtx.setLambdaParams(lam, syms);
+
+    // fix #2857 (§19.3/#1853 / §2.8.2 clause 2, v0.240): and the FIFTH — the
+    // initializer's bare-name local-const `case` patterns. See the identical
+    // copy in parseAndAttachMethodBody for the full reasoning; verbatim for the
+    // same reason as #2818's LocalSymbols (declared inside the re-parsed
+    // expression, no importer-side twin), with both kept alive below.
+    for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
+        if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
 
     // Attach: importedFs->decl now points at a live ast::FieldDecl whose
     // `initializer` genericInstSfinitFn's existing loop lowers and stores.
-    importedFs->decl = parsedFd;
+    //
+    // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): for an INSTANCE field,
+    // `decl` MUST stay null — `decl == nullptr` is the discriminator every
+    // imported-member fallback in the backend keys on (storageType /
+    // recordFieldType / isOwnedReferenceField / …). Instead, publish the
+    // parsed initializer into the side table that emitOwnFieldInit reads
+    // ahead of its constant-foldable replay and its construction-site
+    // diagnostic fallback. The Expr* rides in `sf` (kept alive via
+    // ownImportedAst below), so the side-table pointer is valid for the
+    // lifetime of this SemaContext.
+    if (isStatic) {
+        importedFs->decl = parsedFd;
+    } else {
+        if (parsedFd->initializer)
+            mainCtx.setImportedInstanceFieldInitExpr(importedFs,
+                                                     parsedFd->initializer.get());
+    }
     mainCtx.ownImportedSource(std::move(source));
     mainCtx.ownImportedAst(std::move(sf));
     mainCtx.ownImportedAuxiliary(semaDiag);
@@ -1976,6 +2443,13 @@ static void loadMetadataPass1(
         // §9.2 auto-equality check in ExprTypecheck_Exprs.cpp reads it from
         // TypeSymbol::hasPositionalFields (no ast::TypeDecl exists for imported types).
         t->hasPositionalFields = td.hasPositionalFields;
+        // fix #2950 (§12 / §31.4 / §2.8.3 rule 4, v0.240): the built-in
+        // exception base, i.e. whether this class carries the §31.4 header. It
+        // is set in PASS 1 (not pass 2, where the other base-type work happens)
+        // because it decides the class's LAYOUT and is a property of the class
+        // itself, not of any resolvable base symbol — nothing about it needs
+        // the other dependencies' shells to exist yet.
+        t->builtinExceptionBase = td.builtinExceptionBase;
         t->invariantContracts = toContractRecords(td.invariants);
         // #1488 / §2.8.3 rule 3: this type's declaring-module identity, as
         // reconstructed from the dependency's own metadata — the far side of
@@ -2123,9 +2597,49 @@ static void loadMetadataPass2(
                     break;
                 }
             }
-            if (importedFs)
+            if (!importedFs) continue;
+            // fix #2860 (§2.8.2 "No restrictions beyond visibility", v0.240):
+            // #2351's re-parse+attach is a STATIC-field mechanism — it sets
+            // `FieldSymbol::decl`, which for an INSTANCE field is the key every
+            // decl-null fallback in the backend keys the imported-member layout
+            // path on (`storageType`'s `mem->decl == nullptr` guard above all),
+            // so attaching one would silently re-route an imported generic's
+            // instance layout through a TypeRef resolved in the throwaway
+            // context.
+            //
+            // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): the strictly better
+            // outcome §2.8.2 wants — carry AND RUN an imported generic's
+            // non-constant instance field initializer — IS now reached, by the
+            // SAME parse-and-attach pipeline as #2351 but with the final
+            // `importedFs->decl = parsedFd` step replaced by
+            // `setImportedInstanceFieldInitExpr(importedFs, parsedFd->initializer)`,
+            // leaving `decl` null so the imported-member layout fallbacks
+            // continue to consult `importedMemberType` (storageType / #662).
+            // A parse/sema failure is a NO-OP for the instance path
+            // (a program that merely imports the offending generic still has
+            // to build, §2.8.2); the construction-site diagnostic #2860 added
+            // is the fallback, and the text in `importedInstanceFieldInitText`
+            // drives it.
+            bool isStaticMember = false;
+            for (const std::string& mod : mm.modifiers)
+                if (mod == "static") { isStaticMember = true; break; }
+            if (isStaticMember) {
                 parseAndAttachFieldInit(td, md.moduleName, mm, importedFs, *t,
-                                        ctx);
+                                        ctx, /*isStatic=*/true);
+            } else {
+                // ALWAYS record the source text: emitOwnFieldInit's existing
+                // diagnostic path keys on it when neither the constant-fold
+                // replay NOR the parsed-expr lowering produced a value
+                // (parse failed / parse succeeded but lower returned null).
+                // Cost: one std::string copy per non-static imported field.
+                ctx.setImportedInstanceFieldInitText(importedFs,
+                                                     mm.fieldInitText);
+                // fix #2874: best-effort reconstruction. On success the
+                // side-table expr drives emitOwnFieldInit's lower path; on
+                // failure the construction-site diagnostic still fires.
+                parseAndAttachFieldInit(td, md.moduleName, mm, importedFs, *t,
+                                        ctx, /*isStatic=*/false);
+            }
         }
 
         // Dtor body: the dtorBodyText is on the MetaTypeDecl itself.

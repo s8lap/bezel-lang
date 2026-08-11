@@ -1,6 +1,7 @@
 #include "sema/SymbolCollection.hpp"
 
 #include "ast/Node.hpp"
+#include "common/BuiltinRegistry.hpp"  // isBuiltinExceptionName — §31.4 (#2950)
 #include "common/OwnershipFacts.hpp"  // classifyChoiceType — §35.7 equality-bearing choice edge (#2083/#2087)
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
@@ -105,6 +106,20 @@ std::vector<Symbol*> collectParams(const std::vector<ast::Param>& params,
         // §22.4 (v0.183, #1585): carry the out-nullability postcondition onto
         // the symbol so narrowing and override-match can consult it.
         sym->outNullPostcond = p.outNullPostcond;
+        // fix #3037 / §28.3 (v0.240): carry the parameter's own source
+        // location onto the symbol. The parser stamps `Param::loc` at the
+        // parameter's first token (modifier or name) — `Param` is not an
+        // `ast::Node` so it has no `span`, only this single SourceLocation.
+        // Without it, every §28.3 owned-parameter diagnostic that doesn't have
+        // a recorded `obligationOrigin` (the parameter arm — the obligation
+        // is established at the parameter declaration itself, not at an
+        // expression) would have fallen back to `SourceLocation{}` and
+        // printed `0:0`, pointing at nothing (the parameter is the only
+        // owned-binding kind whose diagnostic site is its declaration, not
+        // its first use site; the param arm has no "first use"). Mirrors
+        // fix #2418 (FieldSymbol/MethodSymbol/etc.) and fix #2482
+        // (PositionalField via FieldSymbol::declLoc).
+        sym->declLoc = (p.loc.line != 0) ? p.loc : sym->declLoc;
         out.push_back(sym);
     }
     return out;
@@ -457,6 +472,120 @@ std::size_t formalParamCount(const ConstructorSymbol& cs) {
     if (auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs.decl))
         return d->params.size();
     return cs.params.size();
+}
+
+// §12 / §31.4 (#595 / #2950): see Symbol.hpp for the contract. Two sources,
+// exactly like the constructor-formal helpers above: the LOCAL source is the
+// `ast::TypeDecl`'s base-type list; the IMPORTED source is
+// `TypeSymbol::builtinExceptionBase`, which ModuleLoader restores from the
+// artifact and which Type Resolution also populates for local types.
+//
+// The symbol field is consulted FIRST at every level so the two sources can
+// never disagree about a class both of them describe, and so a chain that
+// alternates local and imported ancestors resolves at whichever level actually
+// names the built-in.
+//
+// Membership is `common::isBuiltinExceptionName` — the single
+// `kBuiltinExceptionHierarchy` table — rather than a hand-listed set. The
+// hand-listed copies this replaces had already drifted: the §12 `Message`
+// member check in ExprTypecheck_Calls.cpp omitted DisposedAccessException,
+// SerializationException, ChannelClosedException, ChannelFullException and
+// DomainFaultedException, all five of which codegen's `builtinVtable_` gate DID
+// carry — so a class deriving from one of them was laid out WITH the header
+// while sema rejected `e.Message` on it.
+std::string_view builtinExceptionBaseOf(const TypeSymbol* t) {
+    if (!t || t->kind != ast::TypeDeclKind::Class) return {};
+    // Bound the walk. Sema rejects an inheritance cycle before codegen runs, so
+    // this can only be reached with an acyclic chain — but the walk no longer
+    // requires an `ast::TypeDecl` at each level (an imported ancestor has
+    // none), so it must not be able to spin on a malformed symbol graph either.
+    unsigned guard = 0;
+    for (const TypeSymbol* cur = t; cur != nullptr && guard < 256u; ++guard) {
+        if (!cur->builtinExceptionBase.empty()) return cur->builtinExceptionBase;
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl)) {
+            for (const auto& bt : td->baseTypes) {
+                if (!bt || !bt->name || bt->name->parts.empty()) continue;
+                std::string_view n = bt->name->parts.back();
+                if (common::isBuiltinExceptionName(n)) return n;
+            }
+        }
+        // Advance to the next CLASS ancestor. #2950: an imported ancestor has
+        // `decl == nullptr`, and the pre-#2950 walks required `b->decl` here —
+        // which stopped the walk dead at the module boundary, so a LOCAL class
+        // deriving from an IMPORTED exception subclass lost the header too
+        // (measured: `%class.Local = type { ptr, i8, i32, i32 }` against the
+        // exporter's 52-byte `ExA` chain, and its inherited field read 0).
+        const TypeSymbol* next = nullptr;
+        for (const TypeSymbol* b : cur->baseTypes) {
+            if (b && b != cur && b->kind == ast::TypeDeclKind::Class) {
+                next = b;
+                break;
+            }
+        }
+        cur = next;
+    }
+    return {};
+}
+
+// §31.4 (v0.240, #2971/#2983/#2984): see Symbol.hpp for the contract and for
+// what is deliberately excluded. The ONLY place the §31.4 surface is stated.
+//
+// It is stated as "which built-in DECLARES this name", then walked up the
+// hierarchy — not as "which built-in type names carry this member". The second
+// form is the positive-list shape this project's own defect taxonomy names: the
+// pre-existing hand-listed `ParamName` receiver set
+// ("ArgumentException" || "ArgumentNullException" || "ArgumentOutOfRangeException")
+// happens to be complete today only because nobody has added a fourth
+// ArgumentException descendant to `kBuiltinExceptionHierarchy`. The walk cannot
+// drift: adding an edge to that table is enough.
+BuiltinExcMember builtinExceptionSurfaceMemberOf(std::string_view builtinBase,
+                                                 std::string_view member,
+                                                 std::string_view* owner) {
+    if (builtinBase.empty() || member.empty()) return BuiltinExcMember::None;
+    // Bound the walk exactly as builtinExceptionBaseOf does: the table is
+    // acyclic by construction, but a malformed edit must not spin.
+    unsigned guard = 0;
+    for (std::string_view cur = builtinBase;
+         !cur.empty() && guard < 64u; ++guard) {
+        auto found = [&](BuiltinExcMember k) {
+            if (owner) *owner = cur;
+            return k;
+        };
+        // §31.4 `public class ArgumentException: Exception … ParamName: string?`
+        if (cur == "ArgumentException" && member == "ParamName")
+            return found(BuiltinExcMember::ParamName);
+        // §31.4 `public class Exception … Message / StackTrace / CauseChain`
+        if (cur == "Exception") {
+            if (member == "Message")    return found(BuiltinExcMember::Message);
+            if (member == "StackTrace") return found(BuiltinExcMember::StackTrace);
+            if (member == "CauseChain") return found(BuiltinExcMember::CauseChain);
+        }
+        cur = common::builtinExceptionParentOf(cur);
+    }
+    return BuiltinExcMember::None;
+}
+
+BuiltinExcMember builtinExceptionSurfaceMember(const TypeSymbol* t,
+                                               std::string_view member) {
+    return builtinExceptionSurfaceMemberOf(builtinExceptionBaseOf(t), member);
+}
+
+std::string builtinExceptionSurfaceList(std::string_view builtinBase) {
+    // Built by ASKING the resolver, member by member, rather than by a second
+    // hand-written list: a diagnostic that names a surface the resolver would
+    // reject is the #2983 defect over again (a message whose factual claim is
+    // false), so the two must share one source of truth.
+    static constexpr std::string_view kNames[] = {"Message", "StackTrace",
+                                                  "CauseChain", "ParamName"};
+    std::string out;
+    for (std::string_view n : kNames) {
+        if (builtinExceptionSurfaceMemberOf(builtinBase, n) ==
+            BuiltinExcMember::None)
+            continue;
+        if (!out.empty()) out += ", ";
+        out += std::string(n);
+    }
+    return out;
 }
 
 // §9.2 / §22.9: see Symbol.hpp. An auto-property is a non-static, non-indexer

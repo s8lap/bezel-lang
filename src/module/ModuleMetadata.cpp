@@ -57,7 +57,14 @@ enum RecordCode : unsigned {
     // shared
     REC_STRING = 7,      // a string payload record (bytes as values)
     REC_SCALARS = 8,     // a packed list of small scalars (kind/flags/etc.)
-    // 9.. additive; unknown codes are skipRecord()'d by the reader
+    // §12 / §31.4 (#2950): TYPE_BLOCK — the built-in exception base name, as a
+    // string payload under its OWN code. A distinct code (rather than a second
+    // trailing REC_STRING) is what keeps it independent of #662c's trailing
+    // `dtorBodyText` string: neither can be read as the other, in either order,
+    // and either may be absent. Unknown codes are skipRecord()'d, so a reader
+    // predating this field is unaffected — no schema bump (see kSchemaVersion).
+    REC_EXC_BASE = 9,    // string: §31.4 built-in exception base of a class
+    // 10.. additive; unknown codes are skipRecord()'d by the reader
     REC_UNKNOWN_FUTURE = 90, // test-only: a record code this reader skips
 };
 
@@ -222,6 +229,11 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
     hashBool(h, ty.hasPositionalFields);
     // §14 / #662c (schema v5): destructor body source text for generic classes.
     hashStr(h, ty.dtorBodyText);
+    // §12 / §31.4 (#2950): the built-in exception base. It decides the class's
+    // LAYOUT on both sides of the boundary, so it is public-interface content
+    // that staleness detection must track — a dependency that gains or loses
+    // `: Exception` must invalidate every dependent.
+    hashStr(h, ty.builtinExceptionBase);
 }
 
 } // namespace
@@ -404,7 +416,8 @@ bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
            baseTypes == o.baseTypes && members == o.members &&
            invariants == o.invariants &&
            hasPositionalFields == o.hasPositionalFields &&
-           dtorBodyText == o.dtorBodyText;
+           dtorBodyText == o.dtorBodyText &&
+           builtinExceptionBase == o.builtinExceptionBase;
 }
 
 bool MetaFunction::operator==(const MetaFunction& o) const {
@@ -444,6 +457,17 @@ void emitString(llvm::BitstreamWriter& w, const std::string& s) {
     vals.reserve(s.size());
     for (char c : s) vals.push_back(static_cast<std::uint8_t>(c));
     w.EmitRecord(REC_STRING, vals);
+}
+
+// The same byte payload under a CALLER-CHOSEN record code (#2950). Used for
+// records that must be identifiable independently of the plain-REC_STRING
+// trailing-string convention.
+void emitStringAs(llvm::BitstreamWriter& w, unsigned code,
+                  const std::string& s) {
+    llvm::SmallVector<std::uint64_t, 32> vals;
+    vals.reserve(s.size());
+    for (char c : s) vals.push_back(static_cast<std::uint8_t>(c));
+    w.EmitRecord(code, vals);
 }
 
 // A list of strings emitted as: REC_SCALARS [count], then `count` REC_STRINGs.
@@ -643,6 +667,12 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     // is silently ignored (tolerant skip-unknown). Only emit for generic classes.
     if (!ty.genericParams.empty())
         emitString(w, ty.dtorBodyText);
+    // §12 / §31.4 (#2950): the built-in exception base, under its own record
+    // code so it is independent of the trailing dtorBodyText string above.
+    // Emitted only when non-empty, so a module with no exception subclass
+    // produces byte-identical metadata to before.
+    if (!ty.builtinExceptionBase.empty())
+        emitStringAs(w, REC_EXC_BASE, ty.builtinExceptionBase);
     w.ExitBlock();
 }
 
@@ -910,7 +940,16 @@ bool enterSubblock(Reader& r, unsigned wantId) {
 // optional trailing §22.12 const `valueText` TOLERANTLY: a v1 blob has no such
 // trailing record, so `*captureString` is left untouched (empty) and the block
 // finishes exactly as before (issue #328 FINDING [3] BUG A).
-bool finishBlockImpl(Reader& r, std::string* captureString) {
+//
+// #2950: `codedCapture` is the same tolerant capture keyed on a record CODE
+// instead of on position — the FIRST trailing record whose code is
+// `capturedCode` is read into it. The two captures are independent: a blob may
+// carry either, both (in either order), or neither, and a reader predating a
+// coded record simply skips it. That independence is the point — the trailing
+// REC_STRING convention can only ever express ONE optional string per block.
+bool finishBlockImpl(Reader& r, std::string* captureString,
+                     unsigned capturedCode = 0,
+                     std::string* codedCapture = nullptr) {
     while (true) {
         unsigned id = 0;
         Next n = nextEntry(r, id);
@@ -920,17 +959,25 @@ bool finishBlockImpl(Reader& r, std::string* captureString) {
             return true;
         }
         if (n == Next::Record) {
-            if (captureString != nullptr) {
-                // Read this record; if it is a REC_STRING, capture it once.
+            if (captureString != nullptr || codedCapture != nullptr) {
+                // Read this record; capture it if it is one we are waiting for.
                 llvm::SmallVector<std::uint64_t, 32> vals;
                 auto got = r.cursor.readRecord(id, vals);
                 if (!got) { llvm::consumeError(got.takeError()); return false; }
-                if (got.get() == REC_STRING) {
-                    captureString->clear();
-                    captureString->reserve(vals.size());
-                    for (std::uint64_t v : vals)
-                        captureString->push_back(static_cast<char>(v & 0xFF));
+                const unsigned code = got.get();
+                std::string* dst = nullptr;
+                if (captureString != nullptr && code == REC_STRING) {
+                    dst = captureString;
                     captureString = nullptr;  // capture only the first string
+                } else if (codedCapture != nullptr && code == capturedCode) {
+                    dst = codedCapture;
+                    codedCapture = nullptr;
+                }
+                if (dst != nullptr) {
+                    dst->clear();
+                    dst->reserve(vals.size());
+                    for (std::uint64_t v : vals)
+                        dst->push_back(static_cast<char>(v & 0xFF));
                 }
                 continue;
             }
@@ -1240,8 +1287,15 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     // §14 / #662c (schema v5): trailing REC_STRING = dtorBodyText for generic
     // classes.  A v4 reader's finishBlock already skips all trailing content,
     // so this is safe.  Capture the first trailing REC_STRING as dtorBodyText.
-    return finishBlockImpl(r, !ty.genericParams.empty() ? &ty.dtorBodyText
-                                                        : nullptr);
+    //
+    // §12 / §31.4 (#2950): REC_EXC_BASE = the built-in exception base name.
+    // Captured by CODE, so it is read whether or not the type is generic and
+    // whatever order the two records appear in — the layout fact must survive
+    // for every class, and the dtorBodyText string only ever exists for a
+    // generic one.
+    return finishBlockImpl(
+        r, !ty.genericParams.empty() ? &ty.dtorBodyText : nullptr,
+        REC_EXC_BASE, &ty.builtinExceptionBase);
 }
 
 bool readTypeDecl(Reader& r, MetaTypeDecl& ty) {

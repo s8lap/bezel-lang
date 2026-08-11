@@ -18,6 +18,20 @@
 // ownership-pass behavior orthogonal to §28.1's declaration-site admissibility
 // (a move-only array's slots auto-dispose at scope end either way, §15.3).
 //
+// fix #3033 — SCOPE ANNOTATION ONLY, the assertion is unchanged in strength.
+// The second NOT still forbids a §28.1 citation; it merely gains a trailing
+// boundary so the citation cannot match as a PREFIX of a longer section
+// number. "§28.1" is a strict prefix of "§28.10", so the bare substring form
+// also fired on the very §28.3 auto-drop warning the comment above already
+// documents as expected and orthogonal, the moment that warning began citing
+// §28.10 for §28.10's borrow-pin rule. `{{§28\.1($|[^0-9])}}` matches every
+// real §28.1 citation (end-of-line, "§28.1)", "§28.1 ", "§28.1,") and only
+// declines §28.10–§28.19. Nothing this file previously rejected is now
+// accepted. The third NOT is added, not substituted: it pins the §28.1
+// rejection by its own wording as well — the exact text
+// owned_type_requirement_reject_1797.bzl positively checks for — so the
+// admissibility guarantee is now asserted along two independent axes.
+//
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 module M;
@@ -30,4 +44,5 @@ class R
 end R;
 
 // NODIAG-NOT: error
-// NODIAG-NOT: §28.1
+// NODIAG-NOT: {{§28\.1($|[^0-9])}}
+// NODIAG-NOT: `owned` is not admissible on a parameter of type

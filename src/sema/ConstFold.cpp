@@ -3,6 +3,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "common/IntLiteral.hpp"
+
 namespace bezel::sema {
 
 // per §6.5 (#1210): for shift operators the count is masked by the LEFT
@@ -39,27 +41,28 @@ std::optional<long long> foldIntConst(
     if (depth > 64) return std::nullopt;  // cyclic / runaway const reference
 
     // Integer literal — the leaf case.
-    if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
-        const std::string text(il->text);
-        try {
-            return std::stoll(text);
-        } catch (const std::out_of_range&) {
-            // §10 (#749): a `ulong` constant in [2^63, 2^64) overflows signed
-            // `long long` but fits `unsigned long long`. Preserve its bit
-            // pattern as the (negative) signed value — the i64 materialization
-            // (LlvmBackend::enumConstant casts back through uint64_t) then reads
-            // the correct unsigned value instead of falling back to 0. A leaf
-            // literal is always non-negative (a leading `-` is a UnaryExpr),
-            // so `stoull` never sees a sign and never silently wraps.
-            try {
-                return static_cast<long long>(std::stoull(text));
-            } catch (...) {
-                return std::nullopt;  // genuinely beyond the 64-bit range
-            }
-        } catch (...) {
-            return std::nullopt;  // not a valid integer literal
-        }
-    }
+    // fix #2936 (grammar A.8 / §4.2 / §15.1, v0.240): decode the lexeme with
+    // the ONE literal parser (common::parseIntLiteral), which codegen has
+    // always used.
+    //
+    // This arm used to be `std::stoll(text)` — a BASE-10 parse. Grammar A.8
+    // admits `0x`/`0b` bases and `_` digit separators in every base, and
+    // base-10 `stoll` handles none of them. Worse, it does not FAIL on them: it
+    // reads the leading `0` of `0x60` and stops at the `x`, returning 0 with no
+    // exception, so neither `catch` below could fire and the caller received a
+    // confidently wrong constant. Measured through §15.1 inline-array sizes:
+    // `[0x5]int` and `[0b101]int` folded to 0 (a loud false reject — "an
+    // inline-array size must be greater than 0"), while `[5_0]int` folded to 5
+    // and `[0x3 + 2]int` folded to 2 — SILENTLY wrong array sizes.
+    //
+    // `parseIntLiteral` also subsumes the #749 `ulong` case the old `catch
+    // (out_of_range)` arm existed for: it parses the bare magnitude with
+    // `strtoull`, so the whole [0, 2^64) range keeps its bit pattern and there
+    // is nothing left to fall back FROM. A leaf literal is always non-negative
+    // (a leading `-` is a UnaryExpr), and the out-of-range guard lives in
+    // sema's literal type-check (§5), not here.
+    if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(&e))
+        return static_cast<long long>(common::parseIntLiteral(il->text));
 
     // Unary `+ - ~`. (Source parentheses are not their own AST node — the tree
     // shape already encodes grouping.)

@@ -100,19 +100,61 @@ extern "C" void* bz_exc_causechain_link(void* causeTypeName, void* causeMessage,
 // on some path, so freeing it there raced that read. The reclaim site is
 // different: ownership discipline runs it EXACTLY ONCE per object, strictly
 // after every live borrow/read has concluded, so it cannot race an in-flight
-// read. `excVtableTable` is the same null-terminated built-in-exception
-// vtable table bz_unhandled_exception gates on — a no-op for a non-built-in
-// (or user-subclass) object, which either has no CauseChain slot or does not
-// share this vtable/disposer. Not wired into the pure-runtime
-// vtable-Dispose-then-free reclaim sites that bypass codegen
-// (bz_dispose_class_obj, bz_domain_spawn's DomainFaultedException wrap) —
-// tracked as a follow-up, see the issue tracker.
-extern "C" void bz_exc_reclaim_causechain(void* obj, void** excVtableTable) {
-    if (!obj || !excVtableTable) return;
+// read.
+//
+// WHAT CARRIES THE SLOT. `excVtableTable` is the same null-terminated
+// built-in-exception vtable table bz_unhandled_exception gates on: a directly
+// constructed built-in exception's vtable is one of these. A USER subclass of
+// a built-in exception (§31.4) carries the SAME §31.4 header (its layout
+// mirrors Message@8/InnerException@16/CauseChain@24/ParamName@32 via
+// hasBuiltinExceptionBase in classStruct), but its vtable is vt$<C>, which is
+// NOT in excVtableTable — so the vtable-identity gate alone skipped it and its
+// CauseChain leaked (issue #2989/#2979). The compiler already records that
+// header-bearing fact in the type's descriptor chain: vtable[0] is td$<C>, a
+// null-terminated array of the type and every ancestor, and setupBuiltinExceptions
+// appends the built-in exception ancestor descriptors (btd$Exception, …) for
+// exactly these classes — the SAME chain emitIsA walks for `o is Exception`.
+// `excDescTable` is that built-in exception descriptor set; when the vtable is
+// not a direct built-in, walk obj's descriptor chain and reclaim iff some
+// ancestor is a built-in exception descriptor. This is the one authority the
+// language already uses for the type test, not a second derivation; the
+// offset-24 read stays gated behind it. Reading vtable[0] here is safe because
+// emitDynamicDispose (run immediately above this call, LlvmBackend_Disposal.cpp)
+// already dispatched vtable[2], i.e. obj[0] is a CG35-itable vtable whose [0]
+// is its td$ descriptor — true of every class/box that reaches this site.
+// The pure-runtime vtable-Dispose-then-free reclaim sites that bypass codegen
+// (bz_dispose_class_obj, bz_domain_spawn's DomainFaultedException wrap) reach
+// this same reclaim through bz_exc_reclaim_causechain_registered below, which
+// supplies the tables from the program-start registration instead of from a
+// codegen-emitted argument they have no access to (issue 2330).
+extern "C" void bz_exc_reclaim_causechain(void* obj, void** excVtableTable,
+                                          void** excDescTable) {
+    if (!obj) return;
     void* vtable; memcpy(&vtable, obj, sizeof(void*));
+    // A null vtable cannot be a built-in exception, and the descriptor walk
+    // below would dereference it. The codegen reclaim site never passes one
+    // (every object reaching it is CG35-itable-headed), but the runtime sites
+    // added for issue 2330 explicitly tolerate a null vtable
+    // (bz_dispose_class_obj guards its own Dispose dispatch on it), so the
+    // guard belongs here rather than at each caller.
+    if (!vtable) return;
     bool builtinExc = false;
-    for (void** p = excVtableTable; *p; ++p)
-        if (*p == vtable) { builtinExc = true; break; }
+    if (excVtableTable)
+        for (void** p = excVtableTable; *p; ++p)
+            if (*p == vtable) { builtinExc = true; break; }
+    if (!builtinExc && excDescTable) {
+        // §31.4/#2989: obj's vtable is vt$<C> (a user subclass) or a non-class
+        // object. vtable[0] is td$<C>, a null-terminated ancestor-descriptor
+        // array; reclaim iff a built-in exception descriptor is among them.
+        void* desc; memcpy(&desc, vtable, sizeof(void*));
+        if (desc) {
+            for (void** d = (void**)desc; *d; ++d) {
+                for (void** p = excDescTable; *p; ++p)
+                    if (*d == *p) { builtinExc = true; break; }
+                if (builtinExc) break;
+            }
+        }
+    }
     if (!builtinExc) return;
     void* chain;
     memcpy(&chain, (uint8_t*)obj + BZ_EXC_CAUSE_OFFSET, sizeof(void*));
@@ -126,6 +168,51 @@ extern "C" void bz_exc_reclaim_causechain(void* obj, void** excVtableTable) {
     }
     free(arr->data);
     free(arr);
+    // §28.2 exactly-once: null the slot after reclaiming it. Every caller frees
+    // (or quarantines) the object immediately after this call, so the slot is
+    // already unreachable in practice — but with the runtime sites of issue 2330
+    // now sharing this reclaim, "exactly once" should not rest on each caller's
+    // ordering: a second call on the same object returns at the `!chain` guard
+    // above rather than double-freeing.
+    void* null_chain = nullptr;
+    memcpy((uint8_t*)obj + BZ_EXC_CAUSE_OFFSET, &null_chain, sizeof(void*));
+}
+
+// issue 2330 / §30.9 / §31.4: the built-in exception vtable + descriptor tables,
+// registered once by the generated main prologue (emitMainStaticInitPrologue,
+// LlvmBackend_Setup.cpp) before any user code runs.
+//
+// WHY A REGISTRATION rather than an argument. The codegen reclaim site passes
+// these tables directly, because it is emitting code and has them in hand. The
+// pure-runtime reclaim sites (bz_dispose_class_obj and bz_domain_spawn's
+// DomainFaultedException wrap, bezel_runtime_concurrency.cpp) run inside task
+// continuations with no codegen-supplied argument to carry them — which is
+// exactly why they were left out of the original fix and leaked. Registering
+// the tables at program start is the mechanism this runtime already uses for
+// the same problem: bz_ser_exc_vtable_init (bezel_runtime.h) hands the
+// SerializationException vtable to the runtime from the same prologue so
+// bz_ser_throw can build a well-formed exception. This follows that precedent
+// rather than inventing a second one.
+//
+// Both tables are module-level constants with program lifetime, and the
+// registration runs on the main thread before any task or domain can spawn, so
+// the later reads (which are the only other accesses) never race the write.
+// btd$<name> is LinkOnceODR — one canonical address per type across modules —
+// so the single registered descriptor table is authoritative program-wide.
+static void** g_bz_exc_vtable_table = nullptr;
+static void** g_bz_exc_desc_table = nullptr;
+
+extern "C" void bz_exc_tables_init(void** excVtableTable, void** excDescTable) {
+    g_bz_exc_vtable_table = excVtableTable;
+    g_bz_exc_desc_table = excDescTable;
+}
+
+// The registered-table entry point for the pure-runtime reclaim sites. Before
+// the tables are registered (or in a program whose entry point never ran) both
+// are null, and bz_exc_reclaim_causechain's gates then reclaim nothing — the
+// pre-issue-2330 behaviour, never a wrong free.
+extern "C" void bz_exc_reclaim_causechain_registered(void* obj) {
+    bz_exc_reclaim_causechain(obj, g_bz_exc_vtable_table, g_bz_exc_desc_table);
 }
 
 // Write a bz_string's UTF-8 bytes to `f` (nothing for a null / empty string).

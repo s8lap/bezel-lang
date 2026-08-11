@@ -36,6 +36,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -77,6 +78,8 @@ BEZEL_TEST(catch_escape_field, store_binding_into_owned_field_diagnosed_31_1) {
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "caught exception `ex` may not be assigned to a field"));
 }
 
 // Indirect via a holder local: `var b := ex; this._f := b;` re-borrows the
@@ -93,6 +96,8 @@ BEZEL_TEST(catch_escape_field, store_reborrow_holder_into_owned_field_diagnosed_
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "caught exception `ex` may not be assigned to a field"));
 }
 
 // --- POSITIVE 1 negative controls (must NOT be rejected) ------------------
@@ -141,6 +146,8 @@ BEZEL_TEST(catch_escape_return, return_binding_diagnosed_31_1) {
         "  return new Exception(); "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "caught exception `ex` may not be returned"));
 }
 
 // Indirect via a holder local: `var b := ex; return b;`. The holder re-borrows
@@ -157,6 +164,8 @@ BEZEL_TEST(catch_escape_return, return_reborrow_holder_diagnosed_31_1) {
         "  return new Exception(); "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "carries a borrow of the caught exception"));
 }
 
 // --- POSITIVE 2 negative controls (must NOT be rejected) ------------------
@@ -201,6 +210,8 @@ BEZEL_TEST(catch_escape_return, rethrow_borrowed_binding_rejected_31_1) {
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "the thrown value must be an OWNED exception"));
 }
 
 // CONTROL (§31.2.4): wrapping the exception in a new one — `throw new
@@ -235,6 +246,8 @@ BEZEL_TEST(catch_escape_closure, return_closure_capturing_binding_diagnosed_31_1
         "  return lambda() => 0; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned closure captures the caught exception"));
 }
 
 // Indirect via a holder local: `var f := () => Use(ex); return f;`. The closure
@@ -252,6 +265,8 @@ BEZEL_TEST(catch_escape_closure, return_holder_closure_capturing_binding_diagnos
         "  return lambda() => 0; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "carries a borrow of the caught exception"));
 }
 
 // --- POSITIVE 3 negative controls (must NOT be rejected) ------------------

@@ -52,10 +52,16 @@ extern "C" void* bz_encoding_utf8_get_bytes(const void* strp) {
     return arr;
 }
 
-// Encoding.Utf8.GetString(bytes, index, count): decode `count` UTF-8 bytes
-// starting at `index` of the byte array into a fresh +1 managed string. The
-// `index`/`count` pair models the §3.2 three-argument overload; the one-argument
-// overload passes index=0 and count=Array.Length.
+// bz_decode_utf8_range — THE strict UTF-8 decoder (there is exactly one).
+//
+// Decodes `nbytes` bytes at `p` into a fresh +1 managed bz.string, or returns
+// NULL when the byte sequence is not well-formed UTF-8. Two callers share it so
+// the well-formedness rules of stdlib §3.2 (v0.136) live in one place:
+//   - bz_encoding_utf8_get_string — an Array<byte> window (index/count), the
+//     §3.2 `Encoding.UTF8.GetString` family;
+//   - bz_string_from_utf8z — a NUL-terminated C buffer, the language spec
+//     §32.6 / stdlib §10.4 (v0.240) `string.From(c: CString)` direction.
+// The caller decides what a NULL means (both currently raise FormatException).
 //
 // The decoded string is stored at the NARROWEST width (1/2/4) that holds every
 // code point — exactly the §4.6 adaptive-storage rule the codegen literal
@@ -64,19 +70,9 @@ extern "C" void* bz_encoding_utf8_get_bytes(const void* strp) {
 // bytes via memcmp and is only correct when both operands share a width
 // (LlvmBackend_String.cpp comment at emitStringEquals). Producing the same width
 // the literal emitter would makes `GetString(GetBytes(s)) == s` compare correctly
-// and round-trip exactly. A malformed/truncated UTF-8 sequence is a defined fault
-// (stdlib §3.2 v0.136): the decoder returns NULL and the codegen caller raises
-// FormatException — no silent substitution.
-extern "C" void* bz_encoding_utf8_get_string(void* arrp, int64_t index,
-                                              int64_t count) {
-    auto* arr = (bz_array_t*)arrp;
-    const uint8_t* data = arr ? (const uint8_t*)arr->data : nullptr;
-    int64_t total = arr ? arr->count : 0;
-    if (index < 0) index = 0;
-    if (count < 0) count = 0;
-    if (index > total) index = total;
-    if (index + count > total) count = total - index;
-    const uint8_t* p = data + index;
+// and round-trip exactly.
+static void* bz_decode_utf8_range(const uint8_t* p, int64_t nbytes) {
+    int64_t count = nbytes < 0 ? 0 : nbytes;
     int64_t end = count;
 
     // Pass 1: decode into a temporary width-4 code-point buffer; track max cp.
@@ -150,6 +146,24 @@ extern "C" void* bz_encoding_utf8_get_string(void* arrp, int64_t index,
     s[16] = (uint8_t)width;                // width = 1/2/4
     bz_string_init_rc(s);                  // producer's reference, rc := 1
     return s;
+}
+
+// Encoding.Utf8.GetString(bytes, index, count): decode `count` UTF-8 bytes
+// starting at `index` of the byte array into a fresh +1 managed string. The
+// `index`/`count` pair models the §3.2 three-argument overload; the one-argument
+// overload passes index=0 and count=Array.Length. A malformed/truncated UTF-8
+// sequence is a defined fault (stdlib §3.2 v0.136): the shared decoder returns
+// NULL and the codegen caller raises FormatException — no silent substitution.
+extern "C" void* bz_encoding_utf8_get_string(void* arrp, int64_t index,
+                                              int64_t count) {
+    auto* arr = (bz_array_t*)arrp;
+    const uint8_t* data = arr ? (const uint8_t*)arr->data : nullptr;
+    int64_t total = arr ? arr->count : 0;
+    if (index < 0) index = 0;
+    if (count < 0) count = 0;
+    if (index > total) index = total;
+    if (index + count > total) count = total - index;
+    return bz_decode_utf8_range(data + index, count);
 }
 
 // ---------------------------------------------------------------------------
@@ -376,33 +390,21 @@ extern "C" void* bz_encoding_utf16_get_bytes(const void* strp) {
     return arr;
 }
 
-// Utf16 GetString(bytes, index, count): decode `count` UTF-16LE bytes starting
-// at `index` of the byte array.  Consumes one leading LE BOM if present.
-// Returns NULL (→ FormatException) on odd count, big-endian BOM, or unpaired
-// surrogate.  On success returns a fresh +1 managed bz.string*.
-extern "C" void* bz_encoding_utf16_get_string(void* arrp, int64_t index,
-                                               int64_t count) {
-    auto* arr = (bz_array_t*)arrp;
-    const uint8_t* data = arr ? (const uint8_t*)arr->data : nullptr;
-    int64_t total = arr ? arr->count : 0;
-    if (index < 0) index = 0;
-    if (count < 0) count = 0;
-    if (index > total) index = total;
-    if (index + count > total) count = total - index;
-    // Odd byte count → FormatException.
-    if (count % 2 != 0) return nullptr;
-    const uint8_t* p = data + index;
-    int64_t nBytes = count;
+// bz_decode_utf16le_range — THE strict UTF-16LE decoder (there is exactly one).
+//
+// Decodes `nbytes` bytes of UTF-16LE code units at `p` into a fresh +1 managed
+// bz.string, or returns NULL on an unpaired/truncated surrogate. Reads
+// byte-wise, so `p` need not be 2-byte aligned. Deliberately applies NO
+// byte-order-mark policy and no byte-count parity check: those belong to the
+// §3.2 `Encoding.UTF16` contract, not to the §32.6 FFI read-back, and the
+// callers differ on them (see bz_string_from_utf16z). Two callers share it so
+// the surrogate rules live in one place:
+//   - bz_encoding_utf16_get_string — stdlib §3.2 (v0.136), after its own parity
+//     and BOM handling;
+//   - bz_string_from_utf16z — language spec §32.6 / stdlib §10.4 (v0.240).
+static void* bz_decode_utf16le_range(const uint8_t* p, int64_t nbytes) {
+    int64_t nBytes = nbytes < 0 ? 0 : nbytes;
     int64_t pos = 0;
-
-    // Check for and consume leading BOM (FF FE = LE, allowed; FE FF = BE, error).
-    if (nBytes >= 2) {
-        if (p[0] == 0xFF && p[1] == 0xFE) {
-            pos = 2;  // consume LE BOM
-        } else if (p[0] == 0xFE && p[1] == 0xFF) {
-            return nullptr;  // big-endian BOM → FormatException
-        }
-    }
 
     // Decode UTF-16LE units into a temporary code-point buffer.
     // Maximum code points = nBytes/2 (surrogates pair into one cp, so actual ≤ nBytes/2).
@@ -454,6 +456,74 @@ extern "C" void* bz_encoding_utf16_get_string(void* arrp, int64_t index,
     str[16] = (uint8_t)width;
     bz_string_init_rc(str);
     return str;
+}
+
+// Utf16 GetString(bytes, index, count): decode `count` UTF-16LE bytes starting
+// at `index` of the byte array.  Consumes one leading LE BOM if present.
+// Returns NULL (→ FormatException) on odd count, big-endian BOM, or unpaired
+// surrogate.  On success returns a fresh +1 managed bz.string*.
+extern "C" void* bz_encoding_utf16_get_string(void* arrp, int64_t index,
+                                               int64_t count) {
+    auto* arr = (bz_array_t*)arrp;
+    const uint8_t* data = arr ? (const uint8_t*)arr->data : nullptr;
+    int64_t total = arr ? arr->count : 0;
+    if (index < 0) index = 0;
+    if (count < 0) count = 0;
+    if (index > total) index = total;
+    if (index + count > total) count = total - index;
+    // Odd byte count → FormatException.
+    if (count % 2 != 0) return nullptr;
+    const uint8_t* p = data + index;
+    int64_t pos = 0;
+
+    // Check for and consume leading BOM (FF FE = LE, allowed; FE FF = BE, error).
+    if (count >= 2) {
+        if (p[0] == 0xFF && p[1] == 0xFE) {
+            pos = 2;  // consume LE BOM
+        } else if (p[0] == 0xFE && p[1] == 0xFF) {
+            return nullptr;  // big-endian BOM → FormatException
+        }
+    }
+    return bz_decode_utf16le_range(p + pos, count - pos);
+}
+
+// ---------------------------------------------------------------------------
+// FFI read-back: C buffer → Bezel string (language spec §32.6, stdlib §10.4,
+// v0.240; fix #2734). The inverse of bz_string_to_utf8z / bz_string_to_utf16z.
+//
+// "`string.From(c)` reads from a caller-owned `CString` and produces a Bezel
+// `string`; the original is unaffected and is still subject to the caller's
+// disposal obligation" (spec §32.6). Both functions therefore only READ the
+// caller's buffer: no free, no retention — the returned string owns a fresh
+// copy, so the source may be disposed independently (§28.3 exactly-once).
+//
+// Both route through the shared strict decoders above, so an ill-formed buffer
+// is the §3.2 defined fault rather than a silent substitution: they return NULL
+// and the codegen caller raises FormatException. NULL in → NULL out; the
+// pointer forms guard IntPtr.Zero at the call site (§10.4 requires
+// ArgumentNullException there, which is a different exception).
+
+// string.From(c: CString) / string.FromCStringPointer(p): copy the UTF-8 bytes
+// up to (not including) the NUL terminator into a fresh Bezel string.
+extern "C" void* bz_string_from_utf8z(const void* p) {
+    if (!p) return nullptr;
+    return bz_decode_utf8_range((const uint8_t*)p,
+                                (int64_t)strlen((const char*)p));
+}
+
+// string.From(w: WString) / string.FromWStringPointer(p): copy the UTF-16LE
+// code units up to (not including) the terminating 0x0000 unit into a fresh
+// Bezel string. bz_wstrlen counts UNITS (strlen would stop at the high zero
+// byte of an ASCII code unit), so the byte count is 2× that.
+//
+// No BOM is consumed here, unlike Encoding.UTF16.GetString: §10.4 says the
+// conversion "reads ... 16-bit code units starting at the pointer until a null
+// terminator is found" and §32.6 says the copy is of the buffer's contents, so
+// a leading U+FEFF is an ordinary code point of the string — consuming it would
+// make string.From(WString.From(s)) unequal to s for such an s.
+extern "C" void* bz_string_from_utf16z(const void* p) {
+    if (!p) return nullptr;
+    return bz_decode_utf16le_range((const uint8_t*)p, bz_wstrlen(p) * 2);
 }
 
 // Utf32 GetBytes: encode each code point as 4-byte LE.  No BOM emitted.
