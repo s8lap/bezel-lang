@@ -1,6 +1,6 @@
 # Bezel Guide 6: Contracts and Purity
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.236.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.244.*
 
 Bezel lets a signature state obligations the compiler enforces: **`requires(...)`** for what the caller must guarantee, **`ensures(...)`** for what the member guarantees back, **`invariant(...);`** for what an object maintains at its public boundary (spec §22.16), and **`pure`** for members that promise no effects at all (spec §22.15). The syntax is small; the *postures* are what this guide teaches. Contracts are grammar, not a debug-mode assertion library: `requires` runs in every build, and a violation is a bug report, not an outcome (§1). Two postures will break habits you may bring along, and each is headed **How Bezel does it**. First: `requires` states only what a *correct caller already guarantees* — never validation of trust-boundary input, which is value-shape territory Guide 2 owns (§2). Second: `pure` is a promise you *declare* and the compiler verifies — never inferred from a body (§5). If you skim everything else, read those two and the table in §9.
 
@@ -201,22 +201,21 @@ Record construction is fine in a pure body (the synthesized positional construct
 - **All control flow is admitted**, `throw` included. `new E(args)` is admitted *only* as the immediate operand of a `throw`, with a `pure` constructor on a trivial-dispose class — the built-in exception types' `(message)` constructors qualify (spec §31.4) — so the validation idiom stays writable in the pure fragment.
 - **Calls resolve to `pure` declarations only.** This single rule fences off all I/O, tasks, channels, and synchronization — none of those entry points is or can be pure-declared.
 
-The rule that surprises people is the **`for`-loop rule**: a `for` over an `IEnumerable<T>`-typed source — including `Array<T>` and `string` — is rejected in a pure body, because its desugaring constructs an enumerator class instance. A `for` over a primitive `Range` is the admitted counted loop. So are `for` loops over inline arrays, spans, `ReadOnlyStringSpan`, and value-typed `OwningBuffer<T>`, whose desugarings are already direct indexed loops. The remedy for the rejected sources is the index loop (spec §22.15):
+The **`for`-loop rule** draws the fragment's line at enumerator construction, and the common loops fall on the admitted side: a `for` over a primitive `Range` is the counted loop; `for` loops over inline arrays, spans, `ReadOnlyStringSpan`, and value-typed `OwningBuffer<T>` are already direct indexed loops; and a `for` over a source **concretely typed** `Array<T>`, `OwningArray<T>`, class-typed `OwningBuffer<T>`, or `string` takes the direct-indexed elision as its normative pure-body semantics (spec §22.15 rule 5) — a bounds read and per-element reads, no enumerator built. So the everyday loop compiles in a pure body as written:
 
 ```bezel
 public static pure method CountOf(text: string, needle: char): int
   var n := 0;                       // frame-local mutation: root is a local
-  for var i in 0..<text.Length do   // counted loop over a Range — admitted
-    if text[i] = needle then        // string's indexer is pure (stdlib §9.6)
+  for var c in text do              // concrete string source — direct-indexed,
+    if c = needle then              //   admitted; no enumerator is built
       n := n + 1;
     end;
   end;
   return n;
 end CountOf;
-
-// for var c in text do … end;      // ERROR in a pure body: enumerating an
-//                                  //   IEnumerable<char> builds an enumerator
 ```
+
+What stays rejected is a source the checker cannot see concretely: an **interface-typed** source (`IEnumerable<T>` included) or a **generic type parameter** source — even one every caller instantiates at a concrete array type — because there the desugaring would construct an enumerator class instance, and pure-body checking never depends on the substitution (spec §22.15). For those sources the remedy is getting the source to a concrete sequence type: take the parameter as `Array<T>`, or bind the value at a concrete type before the loop. An index loop is *not* the workaround here — inside a pure body it hits the same wall (`IEnumerable<T>` has no `Count` or indexer, and an interface indexer read resolves to a declaration that is not `pure`-declared, so the element access is rejected too; spec §22.15 rule 5).
 
 And the two traps the checker will catch for you, both compile errors with the operation named:
 
