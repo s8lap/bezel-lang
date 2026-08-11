@@ -10,9 +10,9 @@ extern "sqlite3"
       errmsg: Ptr<IntPtr>): int;
 end;
 
-// C: void qsort_r(void*, size_t, size_t,
+// C: void qsort_r(void *base, size_t, size_t,
 //                 int (*compar)(const void*, const void*, void*), void* arg);
 extern "libc"
-  public method qsort_r(base: Ptr<byte>, nmemb: UIntPtr, size: UIntPtr,
+  public method qsort_r(basePtr: Ptr<byte>, nmemb: UIntPtr, size: UIntPtr,
       compar: (IntPtr, IntPtr, env) -> int, env): ();
 end;
