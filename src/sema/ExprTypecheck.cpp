@@ -533,25 +533,39 @@ bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
         //     For a Named CLASS scrutinee, caseArmsExhaustive returns false when
         //     the hierarchy is OPEN (its `closed` gate fails), so totality is
         //     correctly withheld there — admitting Class broadly does not grant
-        //     totality for open hierarchies. An ENUM is deliberately NOT admitted:
-        //     its value space is the underlying integer type, and an out-of-range
-        //     / non-constant cast `E(n)` produces a "raw" value equal to no
-        //     declared constant (§5.4) that falls through — so a constants-
-        //     exhaustive enum case is genuinely non-total (accepting it would be
-        //     unsound). The v0.196 N6 "totality does not key on the exhaustiveness
-        //     proof" ruling is superseded for the closed-value-space kinds above
-        //     (§21.7); a warning-only proof over an OPEN value space still grants
-        //     nothing.
+        //     totality for open hierarchies.
+        //
+        //     fix #3044 (§21.7 / §19.6 / §5.4, v0.242): the ENUM bullet JOINS
+        //     condition (i)'s closed-value-space list. Through v0.241 it was
+        //     deliberately excluded, on the recorded ground that "a non-constant
+        //     cast `E(n)` produces a raw value matching no declared constant
+        //     (§5.4), so the no-match fall-through of an enum `case` statement
+        //     is reachable". That ground is REPEALED with the rule that repealed
+        //     it: §5.4's cast is now checked (a constant undeclared value is a
+        //     compile error, a runtime one raises OverflowException) and §17.11's
+        //     `default(E)` no-zero-constant case is an error, so *every producer
+        //     of an enum value yields a declared value* and §5.4's invariant
+        //     "there is no value of an enum type that is not equal to a declared
+        //     constant" closes the value space to the declared values. The
+        //     no-match edge of a constants-exhaustive enum `case` statement is
+        //     therefore unreachable. The v0.196 N6 "totality does not key on the
+        //     exhaustiveness proof" ruling is superseded for the closed-value-
+        //     space kinds above (§21.7); a warning-only proof over an OPEN value
+        //     space (an open hierarchy, a `when` construct) still grants nothing,
+        //     and a constants-INEXHAUSTIVE enum `case` still grants nothing —
+        //     the caseArmsExhaustive verdict below is what decides.
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
         bool admitsTotality = scrutTy && (
             // bool bullet (§4.1)
             (scrutTy->kind == TypeRef::Kind::Primitive &&
              scrutTy->primitive == PrimitiveType::Bool) ||
-            // choice bullet (§35.1) + sealed-hierarchy bullet (§11.7)
+            // choice bullet (§35.1) + sealed-hierarchy bullet (§11.7) +
+            // enum constants-coverage bullet (§5.4's invariant, #3044)
             (scrutTy->kind == TypeRef::Kind::Named &&
              scrutTy->declaration &&
              (scrutTy->declaration->kind == ast::TypeDeclKind::Choice ||
+              scrutTy->declaration->kind == ast::TypeDeclKind::Enum ||
               scrutTy->declaration->kind == ast::TypeDeclKind::Class)));
         if (admitsTotality)
             return caseArmsExhaustive(cs->arms, cs->scrutinee.get(), scrutTy,

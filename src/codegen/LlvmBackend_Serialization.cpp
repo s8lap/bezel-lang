@@ -709,7 +709,23 @@ void Emitter::emitSerializeField(llvm::Value* val,
 // Emitter::emitEnumSerialize  §9.8
 //
 // For enum synthesis: writes the member NAME string (not the integer value).
-// If the enum value is not a declared constant, raises SerializationException.
+//
+// fix #3044 (§9.8 / §5.4 / §21.7, v0.242): §9.8 now reads "on write no failing
+// case exists — every enum value is a declared value, §5.4", so this function's
+// no-match arm is DEAD under the invariant. It is deliberately KEPT as a
+// `bz_ser_throw` trap rather than deleted, for the reason §21.7 gives for its
+// own statically-dead no-match edge: an implementation lowers a dead edge "as a
+// defined trap … so that the grant's soundness never rests on the
+// exhaustiveness computation alone". §9.8 does not mandate the trap, so deleting
+// it would also conform — but of the two conforming lowerings this is the safe
+// one, and the invariant is not yet airtight in this compiler: #3072 records
+// that a zero-less enum FIELD or inline-array element still zero-fills, and
+// §9.8 admits a non-owning inline array of enums as a record component, so the
+// edge is currently REACHABLE. Deleting the raise would trade a loud
+// `SerializationException` for silently writing the last-declared constant's
+// name. Revisit once #3072 closes. The READ side's SerializationException (an
+// encoded name matching no declared member) is untouched — that fault is about
+// the *input*, not about a value of the enum type.
 // ---------------------------------------------------------------------------
 void Emitter::emitEnumSerialize(const TypeSymbol* ts,
                                 llvm::Value* enumVal,
@@ -727,52 +743,57 @@ void Emitter::emitEnumSerialize(const TypeSymbol* ts,
     if (ev->getType() != uTy)
         ev = builder_.CreateSExtOrTrunc(ev, uTy, "enum.ev");
 
-    // Build a chain of comparisons, one per declared constant.
-    // If a constant matches, write its wire name and branch to end.
-    // If none match, call bz_ser_throw.
+    // Collect (wire name, underlying value) in DECLARATION order — §10.2's
+    // shared-value rule wants the FIRST-declared name for a duplicated value,
+    // and a first-match chain in declaration order delivers exactly that.
+    // enumValue_ (computeEnumValues()) covers local and imported enums alike;
+    // §10.3 (#740) keeps the full 64-bit value (a `: long` member exceeds i32).
+    std::vector<std::pair<std::string, std::int64_t>> entries;
+    for (const auto& ec : td->enumConstants) {
+        for (const Symbol* m : ts->members) {
+            if (m->name != ec.name) continue;
+            if (dynamic_cast<const EnumConstantSymbol*>(m)) {
+                auto it = enumValue_.find(m);
+                if (it != enumValue_.end())
+                    entries.emplace_back(std::string(enumConstWireName(ec)),
+                                         it->second);
+            }
+            break;
+        }
+    }
+    if (entries.empty()) return;  // no declared constants — nothing to write
+
+    auto* writeFn =
+        declareC("bz_binser_write_string", voidTy, {ptrTy(), ptrTy()});
+    auto emitWrite = [&](const std::string& wireName) {
+        llvm::Value* nameStr =
+            lowerStringLiteral(std::string("\"") + wireName + "\"", false);
+        builder_.CreateCall(writeFn, {serPtr, nameStr});
+    };
+
     auto* endBB   = llvm::BasicBlock::Create(llvm_, "enum.ser.end",   currentFn_);
     auto* throwBB = llvm::BasicBlock::Create(llvm_, "enum.ser.throw", currentFn_);
-
-    for (const auto& ec : td->enumConstants) {
-        // Determine the constant's integer value using enumValue_ (populated by
-        // computeEnumValues(), which handles both local and imported enums).
-        // §10.3 (#740): keep the full 64-bit value (a `: long` member exceeds
-        // i32); `found` distinguishes a real 0/-1 value from "not found".
-        int64_t ordinal = 0;
-        bool found = false;
-        for (const Symbol* m : ts->members) {
-            if (m->name == ec.name) {
-                if (dynamic_cast<const EnumConstantSymbol*>(m)) {
-                    auto it = enumValue_.find(m);
-                    if (it != enumValue_.end()) { ordinal = it->second; found = true; }
-                }
-                break;
-            }
-        }
-        if (!found) continue;  // not found — skip
-
-        std::string wireName = std::string(enumConstWireName(ec));
-        llvm::Value* cmpVal  = llvm::ConstantInt::get(
-            uTy, static_cast<std::uint64_t>(ordinal), /*isSigned=*/true);
+    // Every declared constant gets its compare, INCLUDING the last: making the
+    // last one an unconditional fallback would save one compare but would turn
+    // the dead edge into "write the last-declared name" — silent wrong data
+    // instead of the defined trap below.
+    for (const auto& e : entries) {
+        llvm::Value* cmpVal = llvm::ConstantInt::get(
+            uTy, static_cast<std::uint64_t>(e.second), /*isSigned=*/true);
         llvm::Value* matches = builder_.CreateICmpEQ(ev, cmpVal, "enum.eq");
-
-        auto* writeBB = llvm::BasicBlock::Create(llvm_, "enum.ser.write", currentFn_);
-        auto* nextBB  = llvm::BasicBlock::Create(llvm_, "enum.ser.next",  currentFn_);
+        auto* writeBB =
+            llvm::BasicBlock::Create(llvm_, "enum.ser.write", currentFn_);
+        auto* nextBB =
+            llvm::BasicBlock::Create(llvm_, "enum.ser.next", currentFn_);
         builder_.CreateCondBr(matches, writeBB, nextBB);
-
         builder_.SetInsertPoint(writeBB);
-        llvm::Value* nameStr = lowerStringLiteral(
-            std::string("\"") + wireName + "\"", false);
-        auto* writeFn = declareC("bz_binser_write_string", voidTy, {ptrTy(), ptrTy()});
-        builder_.CreateCall(writeFn, {serPtr, nameStr});
+        emitWrite(e.first);
         builder_.CreateBr(endBB);
-
         builder_.SetInsertPoint(nextBB);
     }
 
-    // No constant matched: throw SerializationException.
+    // No constant matched — dead under §5.4's invariant, a defined trap anyway.
     builder_.CreateBr(throwBB);
-
     builder_.SetInsertPoint(throwBB);
     auto* throwFn = declareC("bz_ser_throw", voidTy, {ptrTy(), ptrTy()});
     llvm::Value* msgStr = builder_.CreateGlobalString(
