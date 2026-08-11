@@ -15,9 +15,14 @@
 #                            prose mentions of other docs' sections are ignored).
 #   3b. Statics-facts derivation — the stdlib's per-type **Facts** lines
 #                            (stdlib §1, v0.245) are the single normative
-#                            carrier of the statics/sharing sets; recompute the
-#                            spec's three derived membership parentheticals
-#                            (§22.12 rules 2(i)/4, §28.13) and fail on divergence.
+#                            carrier of the statics/sharing sets; cross-check
+#                            every formula carrier (stdlib §1 symbolic, spec
+#                            prose, the script's own derivations) against one
+#                            hardcoded triple, recompute the spec's three
+#                            tagged membership parentheticals (§22.12 rules
+#                            2(i)/4, §28.13), assert the fact-line roster
+#                            (typed lines + named none-declaring types), and
+#                            fail on divergence.
 #   4. Example extraction  — scripts/extract_doc_examples.py runs clean over the
 #                            CURRENT docs into a scratch tree (never the committed
 #                            corpus, per #1380); any parse failure is a finding.
@@ -169,10 +174,19 @@ else:
 
 # ---- 3b. Statics-facts derivation (v0.245; proposal 0087, #3053) ----------
 # The stdlib's per-type '**Facts** (...): `Type` — **fact**, ...' lines are the
-# single normative carrier of the statics/sharing taxonomy (stdlib §1); the
-# spec's three membership parentheticals — §22.12 rule 2(i), §22.12 rule 4,
-# §28.13 — are tagged 'derived membership, informative — currently ...' and are
-# recomputed here from the fact lines. Any divergence is a gate failure.
+# single normative carrier of the statics/sharing taxonomy (stdlib §1). The
+# three derivation formulas are stated in three places — stdlib §1 (symbolic),
+# the spec's three sites (prose), and this script — so every carrier is
+# cross-checked against the one hardcoded triple below: (a) stdlib §1's
+# symbolic formulas are literally present and equal; (b) each spec site's
+# prose formula phrase is present; (c) the spec's three tagged membership
+# parentheticals — 'derived membership (<set>), informative — currently ...'
+# — match the sets recomputed from the fact lines (the tag names the enclosing
+# rule, so no positional lookback is needed); and (d) the fact-line roster is
+# complete (the typed lines, Channel<T>'s explicit '— none' included, plus the
+# named 'declares no facts' types), so a deleted line fails loudly. Any
+# divergence is a gate failure.
+bad = []
 facts = {}
 for m in re.finditer(r'^\*\*Facts\*\*[^:]*:\s*(.+)$', text['stdlib'], re.M):
     payload = m.group(1)
@@ -182,19 +196,61 @@ for m in re.finditer(r'^\*\*Facts\*\*[^:]*:\s*(.+)$', text['stdlib'], re.M):
     fs = set() if re.match(r'\s*none\b', facts_part) else set(re.findall(r'\*\*([a-z-]+)\*\*', facts_part))
     for n in re.findall(r'`([^`]+)`', types_part):
         facts[n] = fs
+# Prose 'declares no facts' clauses are roster entries too: capture the run of
+# backticked names immediately before the phrase.
+none_named = set()
+for m in re.finditer(r'((?:`[^`]+`[/,\s]*)+)declares? no facts', text['stdlib']):
+    none_named |= set(re.findall(r'`([^`]+)`', m.group(1)))
+
+EXPECT_TYPED = 10   # the 9 fact-granted types + Channel<T>'s explicit '— none' line
+EXPECT_NONE_NAMED = {'Lock', 'SemaphoreToken', 'EventSource<T>', 'AsyncEventSource<T>'}
+if len(facts) != EXPECT_TYPED:
+    bad.append(f"  Facts-line roster: expected {EXPECT_TYPED} typed entries, found {len(facts)}: {sorted(facts)}")
+if 'Channel<T>' not in facts or facts.get('Channel<T>'):
+    bad.append("  `Channel<T>` must carry an explicit '— none' Facts line (stdlib §6.9)")
+if none_named != EXPECT_NONE_NAMED:
+    bad.append(f"  'declares no facts' roster: expected {sorted(EXPECT_NONE_NAMED)}, found {sorted(none_named)}")
+
+# The one hardcoded triple every carrier must agree with.
+FORMULAS = {
+    'form-(i)':    'synchronized ∧ ¬displacement-unbounded',
+    'suppression': 'synchronized ∨ immutable',
+    'shared':      '(synchronized ∨ immutable) ∧ ¬self-distributing',
+}
 derived = {
     'form-(i)':    {t for t, f in facts.items() if 'synchronized' in f and 'displacement-unbounded' not in f},
     'suppression': {t for t, f in facts.items() if 'synchronized' in f or 'immutable' in f},
     'shared':      {t for t, f in facts.items() if ('synchronized' in f or 'immutable' in f) and 'self-distributing' not in f},
 }
+# (a) stdlib §1's symbolic formulas, literal and equal to the triple.
+for key, pat in (('form-(i)',    r'\*\*form-\(i\)\*\* set = ([^;.]+)'),
+                 ('suppression', r'\*\*warning-suppression set\*\* = ([^;.]+)'),
+                 ('shared',      r'\*\*`Shared`-payload synchronized set\*\* = ([^;.]+)')):
+    fm = re.search(pat, text['stdlib'])
+    got = fm.group(1).strip() if fm else None
+    if got != FORMULAS[key]:
+        bad.append(f"  stdlib §1 symbolic formula for {key}: expected '{FORMULAS[key]}', found '{got}'")
+# (b) each spec site's prose formula phrase, present verbatim — the three rule
+# sites (each anchored to its own surrounding wording, so a flip at one site is
+# never masked by another carrier) plus Appendix C.11's two restating rows.
+SPEC_PHRASES = {
+    'form-(i) (rule 2(i))':   'declares the **synchronized** fact and not the **displacement-unbounded** fact',
+    'suppression (rule 4)':   'derived, not curated: every type declaring the **synchronized** or the **immutable** fact (stdlib',
+    'shared (§28.13)':        'declaring the **synchronized** or the **immutable** fact and not the **self-distributing** fact',
+    'form-(i) (C.11)':        'declaring the **synchronized** and not the **displacement-unbounded** fact (stdlib §1)',
+    'suppression (C.11)':     'the types declaring the **synchronized** or the **immutable** fact (stdlib §1)',
+}
+for key, phrase in SPEC_PHRASES.items():
+    if phrase not in text['spec']:
+        bad.append(f"  spec prose formula for {key} missing its phrase: '{phrase}'")
+# (c) the tagged membership parentheticals, recomputed from the fact lines.
+TAGMAP = {'form-(i)': 'form-(i)', 'warning-suppression': 'suppression', 'shared-payload': 'shared'}
 stated = {}
-for m in re.finditer(r'derived membership, informative — currently ([^)]*)\)', text['spec']):
-    back = text['spec'][max(0, m.start()-600):m.start()]
-    which = ('shared' if 'self-distributing' in back
-             else 'suppression' if 'immutable' in back
-             else 'form-(i)')
-    stated[which] = set(re.findall(r'`([^`]+)`', m.group(1)))
-bad = []
+for m in re.finditer(r'derived membership \((form-\(i\)|warning-suppression|shared-payload)\), informative — currently (.*?) — stdlib', text['spec']):
+    stated[TAGMAP[m.group(1)]] = set(re.findall(r'`([^`]+)`', m.group(2)))
+n_dm = len(re.findall(r'derived membership', text['spec']))
+if n_dm != 3:
+    bad.append(f"  expected exactly 3 tagged 'derived membership' parentheticals in the spec, found {n_dm} mention(s)")
 if not facts:
     bad.append('  no **Facts** lines found in the stdlib (stdlib §1 expects them)')
 if set(stated) != set(derived):
@@ -204,10 +260,10 @@ for k in sorted(set(stated) & set(derived)):
         bad.append(f"  {k}: spec states {sorted(stated[k])} but the stdlib fact lines derive {sorted(derived[k])}")
 if bad:
     fail = 1
-    print("FACTS: stdlib fact lines and spec derivation parentheticals disagree:")
+    print("FACTS: stdlib fact lines, formulas, and spec derivation parentheticals disagree:")
     print("\n".join(bad))
 else:
-    print(f"FACTS: clean ({len(facts)} typed fact entries; all 3 derived-set parentheticals match)")
+    print(f"FACTS: clean ({len(facts)} typed fact entries + {len(none_named)} named none-types; formulas agree at every carrier; all 3 derived-set parentheticals match)")
 
 sys.exit(1 if fail else 0)
 PY

@@ -86,7 +86,7 @@ Greps at v0.241:
 ## 7. Migration and compatibility (changelog categories, if retired)
 
 - **Newly warned:** exhaustive matches over generic sealed hierarchies (previously proven) draw the non-exhaustiveness warning absent an irrefutable arm; in-corpus, only the rule's own test family (§4).
-- **Newly rejected:** nothing (no program becomes an error; the §21.7 grant's loss surfaces as the existing missing-return diagnostic with the `_`-arm remedy).
+- **Newly rejected:** nothing (no program becomes an error; the §21.7 grant's loss surfaces as the existing missing-return diagnostic with the `_`-arm remedy). [Landing note v0.245: the changelog records one newly-rejected consequence — a callable relying on §21.7's grant via the retired determined-leaf proof; see the v0.245 Migration.]
 - **Runtime behavior:** unchanged everywhere (§3).
 - **Doc-only:** rationale §8.2 annotation, the decision record, §19.6's shrinkage.
 
