@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — drafted 2026-08-11 (owner-directed, from the elegance review) |
+| **Status** | accepted — stage 1 graduated v0.243 (owner-ruled 2026-08-11; stage 2 stays on the shelf, gated on the first real selector want per Q2) |
 | **Tracking issue** | [#3054](https://github.com/s8lap/bezel-lang/issues/3054) |
 | **Target module(s)** | **Stage 1** (cheap, immediate): spec §28.3 (*Factory methods and sourceless returns* — diagnostic text only), rationale §5.7 (the cliff recorded). **Stage 2** (owner-gated): spec §28.3 (a `sourced` return announcement: caller-side classification row, callee-side admission), §22.1/§25 return-slot syntax, Appendix A (the return-slot productions), Appendix C.3; rationale §5.7 (the lift recorded). No stdlib signature changes in either stage. |
 | **Written against** | spec/stdlib v0.241 |

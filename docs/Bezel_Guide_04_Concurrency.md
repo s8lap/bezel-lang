@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.236.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.243.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A **task is a heap resource you own**, like every other class instance (§2). **No mutable state is ever reachable from two domains** — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a **structured scope**, not loose tasks (§4). If you skim everything else, read the three sections headed **How Bezel does it** and the table in §10.
 
@@ -72,15 +72,16 @@ using var t := DoTelemetryAsync();        // unsupervised: disposed at scope end
 
 Both are abandonment idioms, and abandonment carries the one temporal obligation in this chapter (spec §30.1): a suspended frame holds *borrows* of its receiver and plain arguments until the task **settles**. Once you stop supervising, nothing lexically bounds that moment. Awaiting before your borrows' owners go away discharges the obligation trivially; `TaskScope` (§4) discharges it structurally. Abandon only tasks whose inputs are owned (transferred in), copied, `string`/value-typed, or otherwise guaranteed to outlive the operation. A violation faults as `DisposedAccessException` in checked disposal mode.
 
-**The trap: a borrowing collection slot is not a holder.** A borrowing `Array<Task<T>>` slot takes no ownership, so pushing a freshly-minted task into one compiles — and abandons the task at the end of the statement (stdlib §6.7, the recorded #1813 ruling):
+**The trap: a borrowing collection slot is not a holder.** A borrowing `Array<Task<T>>` slot takes no ownership, so pushing a freshly-minted task into one compiles — and abandons the task at the end of the statement (stdlib §6.7, the recorded #1813 ruling). Since v0.243 the compiler **warns right here** (spec §15.4's fresh-store lint, extended to the task family): the diagnostic names the abandonment and the two sanctioned spellings, so the trap announces itself instead of waiting for checked mode:
 
 ```bezel
 var tasks := new Array<Task<string>>();
-tasks.Add(File.ReadAllTextAsync(path));   // compiles; the fresh task has no holder and
-                                          //   is abandoned when the statement ends
+tasks.Add(File.ReadAllTextAsync(path));   // compiles — but WARNS (spec §15.4): the fresh
+                                          //   task has no holder and is abandoned when
+                                          //   the statement ends
 ```
 
-The two sanctioned spellings: give each task a **named holder** and build the borrowed array over the names (below, §4), or use the owning family (`OwningArray<OwningTask<T>>` with `Task.WhenAllOwned`/`WhenEachOwned`) for dynamically-sized fan-in. Dynamic fan-in over fresh tasks is an ownership-transfer scenario by construction.
+The two sanctioned spellings — the ones the warning names: give each task a **named holder** and build the borrowed array over the names (below, §4), or use the owning family (`OwningArray<OwningTask<T>>` with `Task.WhenAllOwned`/`WhenEachOwned`) for dynamically-sized fan-in. Dynamic fan-in over fresh tasks is an ownership-transfer scenario by construction.
 
 ---
 
