@@ -1,8 +1,8 @@
 # Bezel Guide 5: Collections, Queries, and Iteration
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.243.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.246.*
 
-The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5, `import System.Collections.Linq;`). What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `owned` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
+The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5, `import System.Collections.Linq;`). What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `move` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
 
 **Contents:** §1 the two families · §2 what the loop variable is · §3 consuming iteration: `Drain()` and the take-forms · §4 affine queries · §5 `GroupBy` · §6 `First` at class elements · §7 spans and buffers · §8 choosing, and the five traps.
 
@@ -52,7 +52,7 @@ using var next := jobs.Pop();    // transfer — yours now, disposed at scope en
 
 ```bezel
 if not seen.Contains(candidate) then
-  seen.Add(owned candidate);     // ownership transfers (call-site marker, Guide 1 §1)
+  seen.Add(move candidate);      // ownership transfers (call-site marker, Guide 1 §1)
 end;
 // on the duplicate path, candidate is still yours
 ```
@@ -155,7 +155,7 @@ Default iteration looks; `Drain()` takes. Every owning collection has it: `Drain
 
 ```bezel
 for var conn in pool.Drain() do
-  using var c := owned conn;     // adopt: yours for this iteration, disposed at body end
+  using var c := move conn;      // adopt: yours for this iteration, disposed at body end
   c.SendShutdown();
 end;
 // pool is now empty
@@ -165,7 +165,7 @@ Skip the adoption and the element auto-drops at the body's end with a per-iterat
 
 ```bezel
 for var entry in sessions.Drain() do
-  using var e := owned entry;    // DrainedEntry owns its Value; adopting disposes both
+  using var e := move entry;     // DrainedEntry owns its Value; adopting disposes both
   Archive(e.Key, e.Value);       // e.Value: the owned Session, borrowed by Archive
 end;
 ```
@@ -320,7 +320,7 @@ For contiguous storage and zero-copy sub-ranges, the stdlib layers three things 
 
 - **`OwningBuffer<T>`** — the storage primitive: a fixed-but-runtime-sized block of slots. Class-typed T: nullable owned slots (`T?`), disposal cascades, `move buf[i]` admitted. Value-typed T: plain value slots, no per-slot disposal. The resizable owning collections are built over it.
 - **Spans** — non-allocating **views** into existing storage: `Span<T>`/`ReadOnlySpan<T>` over an `OwningBuffer<T>`, `ArraySpan<T>`/`ReadOnlyArraySpan<T>` over an `Array<T>`, `ReadOnlyStringSpan` over a `string`. Construct with the `AsSpan()`/`AsReadOnlySpan()` family; `Slice` narrows further. Range restriction is the point: a span bounds-checks against *its* length, not the whole source's.
-- **`FrozenArray<T>`** — deeply immutable, fixed after construction; T restricted to sendable value types and `string`. The share-forever form: it is sendable, `Shared<FrozenArray<T>>` lets N domains read one buffer with zero bytes copied, and the value-typed `From(owned buffer)` freeze is O(1) — it steals the storage (stdlib §4.19; spec §28.13).
+- **`FrozenArray<T>`** — deeply immutable, fixed after construction; T restricted to sendable value types and `string`. The share-forever form: it is sendable, `Shared<FrozenArray<T>>` lets N domains read one buffer with zero bytes copied, and the value-typed `From(move buffer)` freeze is O(1) — it steals the storage (stdlib §4.19; spec §28.13).
 
 ```bezel
 using var buf := new OwningBuffer<byte>(4096);   // runtime-sized, value slots
@@ -360,7 +360,7 @@ Finally, when data should stop changing and start being shared, **freeze it**:
 ```bezel
 var raw := LoadSamples();                             // owned OwningBuffer<double>
 using var input := new Shared<FrozenArray<double>>(
-    FrozenArray<double>.From(owned raw));             // O(1): the storage is stolen
+    FrozenArray<double>.From(move raw));              // O(1): the storage is stolen
 ```
 
 After the freeze no writer can exist — the consume takes the buffer, and the consume-site freeze rejects it while any span over the buffer is still live (spec §28.3; stdlib §4.19). Clone the handle per reader and the last one, wherever it lives, disposes the storage (spec §28.13). Iteration over a `FrozenArray<T>` yields plain copies — there is nothing to own and nothing to invalidate.
@@ -376,7 +376,7 @@ After the freeze no writer can exist — the consume takes the buffer, and the c
 | Read elements, either family | an `IEnumerable<T>` / `IReadOnlyList<T>` parameter |
 | Look at an element | indexer, `Peek`, `GetOrNull` — borrows, no obligation |
 | Take one element out | `Pop*` / `Dequeue` / `Take` / `PopValue` — owned result (`move coll[i]` + restore for replace-in-place) |
-| Consume every element | `for var x in coll.Drain() do using var c := owned x; … end;` |
+| Consume every element | `for var x in coll.Drain() do using var c := move x; … end;` |
 | Read query results twice | `.ToArray()` first — a bound query is single-consumption |
 | Aggregate one group many ways | `GroupBy` — outer sequence once, each group re-enumerable |
 | Keep an element past the loop | a concrete collection-backed source (or materialize); the owning path when elements are minted |

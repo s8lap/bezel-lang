@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.245 — August 2026**
+**Companion to the Bezel Language Specification, v0.246 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1167,7 +1167,7 @@ end Result;
 
 `T` and `E` are unconstrained; the `owned` payload markers follow the per-instantiation erasure of language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear): `Result<int, string>` is value-like (Core; copyable; auto-hashable when the payloads are admissible), while `Result<Connection, IoError>` is owning per instantiation (Extended — the move-only row of Appendix D.2). `Result` declares no interface conformances, keeping every instantiation classification-clean. There is no `Unwrap` — a method receives `this` as a borrow (spec [§35.2](Bezel_Language_Spec.md#sec-choice-members)), so an owned-payload extractor is unspellable as a method, correctly: extraction is consumption, and consumption is the owning match's job, exhaustiveness-checked where `Unwrap` would fault. (`UnwrapOr` below is not an extractor and does not disturb this record: it is total — a value-in/value-out fold with no fault path — and exists only at the value-like instantiations, where nothing is consumed.)
 
-**The value-payload combinators (v0.233).** `Map`, `MapError`, `AndThen`, and `UnwrapOr` are **compiler-provided per-instantiation members** (spec [§35.2](Bezel_Language_Spec.md#sec-choice-members)): admissible only where the receiver instantiation **and the member's result instantiation** (`Result<U, E>` for `Map`/`AndThen`, `Result<T, F>` for `MapError`) are both **value-like** (spec [§35.4](Bezel_Language_Spec.md#sec-choice-classification) rule 3 — every payload a value, `string`, runtime-managed type, or transitively value-like record or choice; no payload `owned`, move-only, or borrow-bearing; function-typed payloads are classification-neutral and ride), and rejected at the use site otherwise — a borrow-bearing or owning receiver, or an inferred `U`/`F` that would make the result borrow-bearing or owning (spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) rule 2), the diagnostic naming the classification, the deciding payload, and the owning-match remedy. Semantics: `Map(f)` maps `Ok(v)` to `Ok(f(v))` and passes `Error(e)` through unchanged; `MapError(f)` maps `Error(e)` to `Error(f(e))` and passes `Ok(v)` through; `AndThen(f)` returns `f(v)` on `Ok(v)` and passes `Error(e)` through; `UnwrapOr(fallback)` returns `v` on `Ok(v)` and `fallback` on `Error(_)` — `fallback` is an ordinary, eagerly evaluated argument (there is no lazy `UnwrapOrElse`), and the parameter name is API surface under spec [§22.5](Bezel_Language_Spec.md#sec-optional-parameters-and-named-arguments). The function parameters are plain, hence call-bounded (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters)) — invoked during the call, never retained — and `U`/`F` infer at the call site (spec [§14.5](Bezel_Language_Spec.md#sec-type-argument-inference) phase 2). None of the four is `pure`: invoking a function-typed value is on the pure body's prohibited list (spec [§22.15](Bezel_Language_Spec.md#sec-pure-members)), and `UnwrapOr` — which invokes nothing and would be pure-eligible — stays plain `method` so the four-member family carries one purity posture rather than a lone `pure` sibling (a uniformity choice, recorded liftable; unlike v0.215's `Contains` ruling, which turned on invoking user equality). The receiver is a borrow; at the admissible instantiations the internal match binds copies (value payloads) or shared references (`string`/runtime-managed payloads), and every result is a fresh copyable value — no disposal obligation arises anywhere in a combinator call, and the combinators declare no fault condition (all four are total; the [§1](#sec-failure-signal-rule) failure-signal rule is engaged vacuously). **Owning instantiations carry none of these members**: an owning `Map` would have to consume the payload through a receiver a method only ever borrows, and its `f` would need per-instantiation ownership polymorphism — the retired-and-deferred territory of spec [§14.4](Bezel_Language_Spec.md#sec-owned-and-generic-type-arguments); the owning idiom remains the owning match (`case owned x of …`; adopt with `using var` in the arm — the connect-or-explain example below).
+**The value-payload combinators (v0.233).** `Map`, `MapError`, `AndThen`, and `UnwrapOr` are **compiler-provided per-instantiation members** (spec [§35.2](Bezel_Language_Spec.md#sec-choice-members)): admissible only where the receiver instantiation **and the member's result instantiation** (`Result<U, E>` for `Map`/`AndThen`, `Result<T, F>` for `MapError`) are both **value-like** (spec [§35.4](Bezel_Language_Spec.md#sec-choice-classification) rule 3 — every payload a value, `string`, runtime-managed type, or transitively value-like record or choice; no payload `owned`, move-only, or borrow-bearing; function-typed payloads are classification-neutral and ride), and rejected at the use site otherwise — a borrow-bearing or owning receiver, or an inferred `U`/`F` that would make the result borrow-bearing or owning (spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) rule 2), the diagnostic naming the classification, the deciding payload, and the owning-match remedy. Semantics: `Map(f)` maps `Ok(v)` to `Ok(f(v))` and passes `Error(e)` through unchanged; `MapError(f)` maps `Error(e)` to `Error(f(e))` and passes `Ok(v)` through; `AndThen(f)` returns `f(v)` on `Ok(v)` and passes `Error(e)` through; `UnwrapOr(fallback)` returns `v` on `Ok(v)` and `fallback` on `Error(_)` — `fallback` is an ordinary, eagerly evaluated argument (there is no lazy `UnwrapOrElse`), and the parameter name is API surface under spec [§22.5](Bezel_Language_Spec.md#sec-optional-parameters-and-named-arguments). The function parameters are plain, hence call-bounded (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters)) — invoked during the call, never retained — and `U`/`F` infer at the call site (spec [§14.5](Bezel_Language_Spec.md#sec-type-argument-inference) phase 2). None of the four is `pure`: invoking a function-typed value is on the pure body's prohibited list (spec [§22.15](Bezel_Language_Spec.md#sec-pure-members)), and `UnwrapOr` — which invokes nothing and would be pure-eligible — stays plain `method` so the four-member family carries one purity posture rather than a lone `pure` sibling (a uniformity choice, recorded liftable; unlike v0.215's `Contains` ruling, which turned on invoking user equality). The receiver is a borrow; at the admissible instantiations the internal match binds copies (value payloads) or shared references (`string`/runtime-managed payloads), and every result is a fresh copyable value — no disposal obligation arises anywhere in a combinator call, and the combinators declare no fault condition (all four are total; the [§1](#sec-failure-signal-rule) failure-signal rule is engaged vacuously). **Owning instantiations carry none of these members**: an owning `Map` would have to consume the payload through a receiver a method only ever borrows, and its `f` would need per-instantiation ownership polymorphism — the retired-and-deferred territory of spec [§14.4](Bezel_Language_Spec.md#sec-owned-and-generic-type-arguments); the owning idiom remains the owning match (`case move x of …`; adopt with `using var` in the arm — the connect-or-explain example below).
 
 ```bezel
 // Value-like instantiation (Core): parse outcome with information.
@@ -1219,12 +1219,12 @@ public method Connect(host: string): Result<Connection, string>
   if conn = null then
     return Error($"unreachable: {host}");
   end;
-  return Ok(owned conn);                // owned payload slot: marker consumes (spec §35.3)
+  return Ok(move conn);                 // owned payload slot: marker consumes (spec §35.3)
 end Connect;
 
 case Connect(host) of                 // owning match over the temporary
   Ok(var c) => do
-    using var conn := owned c;        // adopt; disposed at block end
+    using var conn := move c;         // adopt; disposed at block end
     conn.Send(payload);
   end,
   Error(var m) => Console.WriteLine($"giving up: {m}")
@@ -1998,14 +1998,14 @@ end DrainAndProcess;
 // Single-call drain — each entry owns its value:
 public method DrainAndProcess2(dict: OwningDictionary<string, Connection>)
   for var entry in dict.Drain() do
-    using var e := owned entry;                // entry is owned; adopt to discharge (v0.180 marker)
+    using var e := move entry;                 // entry is owned; adopt to discharge (transfer marker)
     Process(e.Key, e.Value);                   // e.Value is the owned Connection
   end;
   // dict is now empty; each entry (and its Value) disposed at loop-body end
 end DrainAndProcess2;
 ```
 
-`Drain()` returns `IOwningEnumerable<DrainedEntry<K, V>>` ([§4.13](#sec-owning-enumeration-interfaces)). Iterating it transfers ownership of each `DrainedEntry<K, V>` to the consumer; the entry is a class that owns its `Value`, so adopting the iteration variable with `using var e := owned entry;` (the v0.180 transfer marker, language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)) — or otherwise discharging it — disposes both the entry shell and, via the standard owned-field cascade (language spec [§28.5](Bezel_Language_Spec.md#sec-owned-fields)), the contained value. Partial iteration drains only the entries yielded; the rest remain in the dictionary. This is the single-call drain; no language feature beyond the existing owning-class and `IOwningEnumerable<T>` machinery is required — `DrainedEntry<K, V>` owns its `Value` exactly as any class owns an `owned` field. The `Key` is carried by value (or as a borrow for class-typed K, following the standard field rules).
+`Drain()` returns `IOwningEnumerable<DrainedEntry<K, V>>` ([§4.13](#sec-owning-enumeration-interfaces)). Iterating it transfers ownership of each `DrainedEntry<K, V>` to the consumer; the entry is a class that owns its `Value`, so adopting the iteration variable with `using var e := move entry;` (the binding-position transfer marker, language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)) — or otherwise discharging it — disposes both the entry shell and, via the standard owned-field cascade (language spec [§28.5](Bezel_Language_Spec.md#sec-owned-fields)), the contained value. Partial iteration drains only the entries yielded; the rest remain in the dictionary. This is the single-call drain; no language feature beyond the existing owning-class and `IOwningEnumerable<T>` machinery is required — `DrainedEntry<K, V>` owns its `Value` exactly as any class owns an `owned` field. The `Key` is carried by value (or as a borrow for class-typed K, following the standard field rules).
 
 `GetOrAdd(key, factory)`'s factory produces an `owned V`; the dictionary stores the value (taking ownership) and the call returns a borrow of the now-stored value.
 
@@ -2069,8 +2069,8 @@ public class OwningDictionary<K, V>: IDisposable where V: class
         foundDup := true;              // test the key BEFORE the node is transferred
       end;
       chain.Next := rebuilt;           // restore (with the rebuilt-chain head)
-      rebuilt := owned chain;          // ownership transfers in (v0.180 marker)
-      chain := owned rest;             // (v0.180 marker)
+      rebuilt := move chain;           // ownership transfers in (transfer marker)
+      chain := move rest;              // (transfer marker)
     end;
     if foundDup then
       _buckets[idx] := rebuilt;       // restore bucket with unchanged chain
@@ -2078,7 +2078,7 @@ public class OwningDictionary<K, V>: IDisposable where V: class
       // The owned `value` parameter is auto-disposed on throw per the
       // [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) exception-path discharge rule.
     end;
-    _buckets[idx] := new Entry<K, V>(key, owned value, owned rebuilt);   // v0.169 call-site markers (spec §22.3)
+    _buckets[idx] := new Entry<K, V>(key, move value, move rebuilt);   // call-site markers (spec §22.3)
     _count := _count + 1;
     MaybeGrow();
   end Add;
@@ -2100,9 +2100,9 @@ public class OwningDictionary<K, V>: IDisposable where V: class
                                           //   destructor's auto-dispose passes are no-ops
       else
         chain.Next := rebuilt;            // restore (with rebuilt-chain head)
-        rebuilt := owned chain;          // (v0.180 marker)
+        rebuilt := move chain;           // (transfer marker)
       end;
-      chain := owned rest;               // (v0.180 marker)
+      chain := move rest;                // (transfer marker)
     end;
     _buckets[idx] := rebuilt;             // restore bucket
     if taken = null then
@@ -2188,7 +2188,7 @@ end OwningSet;
 
 ```bezel
 if not pool.Contains(candidate) then
-  pool.Add(owned candidate);   // ownership transfers (v0.169 call-site marker)
+  pool.Add(move candidate);    // ownership transfers (call-site marker)
 end;
 // On the duplicate path, candidate retains ownership.
 ```
@@ -3122,7 +3122,7 @@ trees are a designed future extension."*
 **Why no writer can exist — checked rules plus one named obligation (v0.186).** `FrozenArray<T>` has no mutating
 member, and both `From` forms sever their source: the owned overload consumes the buffer, the borrowing overload
 copies. The severance is delivered by named rules, not by assumption: the consume-site freeze (language spec
-[§28.3](Bezel_Language_Spec.md#sec-consume-site-freeze)) rejects `From(owned buf)` while any local borrow of `buf`
+[§28.3](Bezel_Language_Spec.md#sec-consume-site-freeze)) rejects `From(move buf)` while any local borrow of `buf`
 survives — **including a live span local over it**, which §28.3 states counts as such a borrow — and
 [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)'s escape bullets keep spans out of fields, statics, escaping
 closures, and async frames, so no span over the buffer outlives the freezing body invisibly. **The residual is the
@@ -3145,7 +3145,7 @@ synchronized operations, and the last handle — from whichever domain — dispo
 ```bezel
 var raw := LoadSamples();                                        // owned OwningBuffer<double>
 using var input := new Shared<FrozenArray<double>>(
-    FrozenArray<double>.From(owned raw));                        // O(1) freeze
+    FrozenArray<double>.From(move raw));                         // O(1) freeze
 using var t1 := Domain.Spawn(Program.ScanLow,  input.Clone());   // Shared<FrozenArray<double>>: sendable
 using var t2 := Domain.Spawn(Program.ScanHigh, input.Clone());
 var answer := await t1 + await t2;                               // zero bytes copied
@@ -3924,7 +3924,7 @@ public async method LoadAllConfigs(paths: Array<string>): OwningTask<OwningArray
   for var path in paths do
     tasks.Add(LoadConfigAsync(path));    // each task is OwningTask<Config>; transfers in
   end;
-  return await Task.WhenAllOwned(owned tasks); // tasks consumed; returned array owns the configs
+  return await Task.WhenAllOwned(move tasks); // tasks consumed; returned array owns the configs
 end LoadAllConfigs;
 ```
 
@@ -3940,7 +3940,7 @@ Implementation sketch (v0.179: the *behavior* shown — await in input order, fi
 public static async method WhenAllOwned<T>(
   owned tasks: OwningArray<OwningTask<T>>
 ): OwningTask<OwningArray<T>> where T: class
-  using var taskArray := owned tasks;                 // owned param adopted (v0.180 marker); disposes at end
+  using var taskArray := move tasks;                  // owned param adopted (transfer marker); disposes at end
   var results := new OwningArray<T>(capacity := taskArray.Count);
   for var task in taskArray.Drain() do                // drain yields owned OwningTask<T>
     results.Add(await task);                          // await produces owned T (Pattern B);
@@ -3967,13 +3967,13 @@ end OpenFiles;
 // Consumer takes ownership of each FileStream:
 public async method ProcessAll(paths: Array<string>): Task
   await for var file in OpenFiles(paths) do
-    using var f := owned file; // discharge on entry — covers all exit edges (v0.180 marker)
+    using var f := move file;  // discharge on entry — covers all exit edges (transfer marker)
     await ProcessAsync(f);
   end;
 end ProcessAll;
 ```
 
-The `using var f := owned file;` shape on entry to the body — the `owned` marker is the v0.180 binding-position transfer spelling (language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows); unmarked, the binding would only borrow-pin) — is the canonical way to discharge the iteration variable, exactly as for synchronous owned-element iteration (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for)).
+The `using var f := move file;` shape on entry to the body — the `move` marker is the binding-position transfer spelling (language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows); unmarked, the binding would only borrow-pin) — is the canonical way to discharge the iteration variable, exactly as for synchronous owned-element iteration (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for)).
 
 The async-iterator form is preferable when the consumer processes each result before requesting the next; `WhenAllOwned` is preferable when the consumer needs all results at once.
 
@@ -4003,7 +4003,7 @@ public static method WhenEachOwned<T>(
 - **Single consumption (affine).** Both returned sequences follow spec §29.11: a second `GetAsyncEnumerator` raises `InvalidOperationException`. The `CancellationToken` accepted by `GetAsyncEnumerator(token)` (the standard §30.7 shape) fires at `await MoveNextAsync()` boundaries and stops **enumeration only** — the tasks keep running and remain the caller's to settle.
 
 ```bezel
-await for var t in Task.WhenEachOwned(owned tasks) do   // t: owned OwningTask<Report>
+await for var t in Task.WhenEachOwned(move tasks) do    // t: owned OwningTask<Report>
   using var report := await t;                          // Pattern B: result transfers
   Publish(report);
 end;
@@ -4169,9 +4169,9 @@ end WorkerCtx;
 
 class Pool
   private static async method WorkerMain(owned ctx: WorkerCtx): Task
-    using var c := owned ctx;                              // adopt (v0.180 marker)
+    using var c := move ctx;                               // adopt (transfer marker)
     await for var job in c.Inbox.ReceiveAll() do           // drain form: completes normally on close
-      using var j := owned job;                            // owned iteration variable discharged
+      using var j := move job;                             // owned iteration variable discharged
       c.Results.Send(new JobResult(j.Id, true));           // value-form Send (record payload)
     end;
   end WorkerMain;                                          // ctx disposal releases the results-sender
@@ -4185,7 +4185,7 @@ class Pool
       var inbox := new Channel<Job>(capacity := 8);        // bounded: back-pressure (v0.174)
       senders.Add(inbox.NewSender());
       joins.Add(Domain.Spawn(WorkerMain,
-                new WorkerCtx(owned inbox, results.NewSender())));   // async-entry row (§6.8)
+                new WorkerCtx(move inbox, results.NewSender())));   // async-entry row (§6.8)
     end;
     for var n in 0..<100 do
       await senders[n mod workers].SendAsync(new Job(n));  // awaits capacity
@@ -4194,7 +4194,7 @@ class Pool
     var done := 0;
     await for var r in results.ReceiveAll() do done += 1; end;
     for var t in joins.Drain() do
-      using var jt := owned t;
+      using var jt := move t;
       await jt;                                            // join; faults surface as DomainFaultedException
     end;
     Console.WriteLine($"done: {done}");

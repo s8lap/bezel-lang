@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.240.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.246.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning (§2's trivial-dispose classes excepted). A use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -17,7 +17,7 @@ var view := conn.View();                             // borrowed, disposes nothi
 
 `using var` is the workhorse. It says *I own this, dispose it when this block ends.* Plain `var` takes whatever ownership the right-hand side produced. Here `View()` returns a borrow, so `view` is a borrow and carries no obligation.
 
-You never *declare* a local `owned`; a local gets its state from how it is introduced. But you will still type `owned` next to locals often. It appears as the *transfer marker* on a right-hand side or a call argument — `var y := owned x;`, `M(owned x)` — when you hand an owned value on to something that takes it (§28.3). The keyword written *on a declaration* is reserved for fields, parameters, and return types (sections 5–7).
+You never *declare* a local `owned`; a local gets its state from how it is introduced. The two keywords split cleanly by role: **`owned` describes a slot** — it appears only on declarations (fields, parameters, return types; sections 5–7) and answers "what obligation does this location hold?" — while **`move` performs the action**: it is the *transfer marker* on a right-hand side or a call argument — `var y := move x;`, `M(move x)` — when you hand an owned value on to something that takes it, and the same verb that empties a field or slot (`move x.f`, §7). Wherever you see `move`, a named location is being emptied, now, here (§28.3).
 
 The disposal is automatic and ordered. At the end of the enclosing block, `using var` values are disposed in reverse order of declaration, including on the exception path:
 
@@ -134,7 +134,7 @@ method CloneBuffer(): owned Buffer
 end CloneBuffer;
 ```
 
-Note this is plain `var`, not `using var`. Ownership is tracked on the value no matter how the local is declared — `new` produces an owned value. An owned value *should* reach a discharge point before the method ends: an `owned` field, a `using var`, an `owned` parameter, an **`owned` return**, an explicit `.Dispose()`, or the discard `_ := …`. If it reaches none, it is auto-dropped at scope end and the compiler warns (§2). `return fresh` under the `owned` return type *is* such a discharge point, so the obligation is discharged by the return itself. (Transferring a *named* owned local into another local or a `using var` is spelled with the marker, `:= owned x` — §8.) Nothing is disposed here; ownership transfers to the caller, who writes:
+Note this is plain `var`, not `using var`. Ownership is tracked on the value no matter how the local is declared — `new` produces an owned value. An owned value *should* reach a discharge point before the method ends: an `owned` field, a `using var`, an `owned` parameter, an **`owned` return**, an explicit `.Dispose()`, or the discard `_ := …`. If it reaches none, it is auto-dropped at scope end and the compiler warns (§2). `return fresh` under the `owned` return type *is* such a discharge point, so the obligation is discharged by the return itself. (Transferring a *named* owned local into another local or a `using var` is spelled with the marker, `:= move x` — §8.) Nothing is disposed here; ownership transfers to the caller, who writes:
 
 ```bezel
 using var s := factory.CloneBuffer();   // caller now owns it, disposes it
@@ -190,7 +190,7 @@ method Rotate()
 end Rotate;                              // old disposed here
 ```
 
-Forgetting to reassign `_log` is a compile error, not a runtime surprise. So is restoring *via* something that can throw. A call between the move and the reassignment puts an exception edge there, and on that edge the method would exit with the field still moved-from — hence the *build before take* order above (§28.8.1, “Exception paths are not exempt”). The same `move` form works on owning-collection slots (`move buffer[i]`); see spec §28.8.1 (the move expression) and §28.11 (collection element ownership).
+Forgetting to reassign `_log` is a compile error, not a runtime surprise. So is restoring *via* something that can throw. A call between the move and the reassignment puts an exception edge there, and on that edge the method would exit with the field still moved-from — hence the *build before take* order above (§28.8.1, “Exception paths are not exempt”). The same `move` form works on owning-collection slots (`move buffer[i]`) — and, as the transfer marker, on named bindings (`move x`; §1, §8). See spec §28.8.1 (the move expression) and §28.11 (collection element ownership).
 
 ---
 
@@ -329,7 +329,7 @@ x.Process();
 // `using var` discharges it at scope end.
 ```
 
-This works *precisely because both arms have the same ownership*. It is the same principle as the bad merge in §8, seen from the other side: a `(if c then value else value)` expression (and `??`, above) is only well-formed when both arms agree on ownership. Here they do — both are fresh owned producers — so there is nothing for the compiler to reject. (Write two *named* owned locals as **unmarked** arms and the expression becomes a borrow merge, exactly as with `??`. To coalesce them into one owned result, mark the arms: `using var best := (if a.Score() > b.Score() then owned a else owned b);` — each is consumed only on its selected path — or use the explicit `if`/`else` statement below.)
+This works *precisely because both arms have the same ownership*. It is the same principle as the bad merge in §8, seen from the other side: a `(if c then value else value)` expression (and `??`, above) is only well-formed when both arms agree on ownership. Here they do — both are fresh owned producers — so there is nothing for the compiler to reject. (Write two *named* owned locals as **unmarked** arms and the expression becomes a borrow merge, exactly as with `??`. To coalesce them into one owned result, mark the arms: `using var best := (if a.Score() > b.Score() then move a else move b);` — each is consumed only on its selected path — or use the explicit `if`/`else` statement below.)
 
 The statement form is equivalent and is what you fall back to when the branches need more than one expression each. Note it is a *statement* (`if … then … else … end;`), not the ternary above — declare the variable first, assign in each branch:
 
@@ -344,7 +344,7 @@ end;
 // An owned var still carries the disposal obligation; discharge it by
 // binding into a using var, returning it under an owned return type,
 // or storing it into an owned field:
-using var owned_x := owned x;     // adopt for scoped disposal (transfer marker)
+using var owned_x := move x;      // adopt for scoped disposal (transfer marker)
 owned_x.Process();
 ```
 
@@ -360,30 +360,30 @@ A few everyday situations follow directly from the model; each is one habit.
 
 ```bezel
 for var conn in pool.Drain() do
-  using var c := owned conn;      // adopt: disposed at end of this iteration
+  using var c := move conn;       // adopt: disposed at end of this iteration
   c.Send(heartbeat);
 end;
 ```
 
-Forget the adoption and the loop variable auto-drops each iteration with a per-iteration must-use warning — the compiler pointing you at that `using var … := owned …` line. (Plain `for … in pool do …` without `Drain()` yields *borrows*, and the pool keeps its elements.)
+Forget the adoption and the loop variable auto-drops each iteration with a per-iteration must-use warning — the compiler pointing you at that `using var … := move …` line. (Plain `for … in pool do …` without `Drain()` yields *borrows*, and the pool keeps its elements.)
 
 **Yielding an owned local — adopt, then yield.** Same shape: pin a named owned value before yielding it.
 
 ```bezel
-using var l := owned line;        // warning-free
+using var l := move line;         // warning-free
 yield return l;
 ```
 
 In a *borrowing* iterator the bare `yield return line;` also compiles (it re-borrows the frame-resident value) but leaves the must-use warning on `line`. In an *owning* iterator that bare yield instead *consumes* `line` — the owning return type is the announcement, so no marker is needed.
 
-**Frame-disposed `owned` parameters — adopt on entry.** An `owned` parameter of an iterator or async method is disposed by the frame at teardown, but the must-use warning still fires at the parameter; `using var r := owned reader;` on the first line declares the intent and silences it.
+**Frame-disposed `owned` parameters — adopt on entry.** An `owned` parameter of an iterator or async method is disposed by the frame at teardown, but the must-use warning still fires at the parameter; `using var r := move reader;` on the first line declares the intent and silences it.
 
-**Consuming a `choice` outcome — match the fresh call, adopt the payload.** A `case` directly over a call returning an owning `choice` (spec §35) is an *owning match*: the selected arm's `owned` payload binding is yours, and the adopt idiom applies inside the arm. By contrast, a `case` over a *named* binding just peeks (borrows). Consuming a named binding is spelled `case owned outcome of …` — the same marker discipline as every other transfer:
+**Consuming a `choice` outcome — match the fresh call, adopt the payload.** A `case` directly over a call returning an owning `choice` (spec §35) is an *owning match*: the selected arm's `owned` payload binding is yours, and the adopt idiom applies inside the arm. By contrast, a `case` over a *named* binding just peeks (borrows). Consuming a named binding is spelled `case move outcome of …` — the same marker discipline as every other transfer:
 
 ```bezel
 case Connect(host) of                 // fresh call: owning match
   Ok(var c) => do
-    using var conn := owned c;        // adopt; disposed at block end
+    using var conn := move c;         // adopt; disposed at block end
     conn.Send(payload);
   end,
   Error(var m) => Log(m)
@@ -403,11 +403,11 @@ end;
 | Hold a resource inside an object | `private owned _f: T := ...;` |
 | Point back at something that outlives you | `private _f: T := ...;` (no `owned`) |
 | Hand a new object to the caller | return type `: owned T`, `return x;` |
-| Hand an owned local to a method that takes it | `M(owned x)` (marker required) |
+| Hand an owned local to a method that takes it | `M(move x)` (marker required) |
 | Move an owned field's contents out | `move _f` (then reassign `_f` before exit) |
 | Dispose an unwanted owned value now | `_ := x;` (or `x.Dispose();` for an early release) |
 | Make a resource-free helper (no destructor, no `owned`/inline-owned fields) | just `new` it — trivial-dispose, no `using var` needed (§2) |
-| Drain an owning collection | `for var e in coll.Drain() do using var x := owned e; … end;` |
+| Drain an owning collection | `for var e in coll.Drain() do using var x := move e; … end;` |
 | Merge branches with mixed ownership | equalize first (Pattern A or B, §8) |
 
-Three habits cover almost everything. Reach for `using var` by default. Mark container-held resources `owned` and back-references plain. And when the compiler rejects a branch join, equalize the branches rather than fighting it — the rejection is almost always finding a real leak. Everything else — the explicit `.Dispose()`, the discard, the `owned` transfer marker — is just choosing *when* a disposal happens; auto-drop guarantees it always does.
+Three habits cover almost everything. Reach for `using var` by default. Mark container-held resources `owned` and back-references plain. And when the compiler rejects a branch join, equalize the branches rather than fighting it — the rejection is almost always finding a real leak. Everything else — the explicit `.Dispose()`, the discard, the `move` transfer marker — is just choosing *when* a disposal happens; auto-drop guarantees it always does.
