@@ -219,6 +219,83 @@ void ExprTC::run(const ast::SourceFile& src) {
         if (!decl) continue;
         visitTopDecl(*decl);
     }
+    // fix #3044 (§17.11 / §3.6 rule 2, v0.242): every `default(T)` obligation
+    // and every generic-method instantiation has now been seen, in whatever
+    // source order they appeared. Join them.
+    checkDeferredDefaultInstantiations();
+}
+
+
+// fix #3044 (§17.11 / §3.6 rule 2, v0.242): see the declarations in
+// ExprTypecheck_impl.hpp.
+void ExprTC::recordDefaultTypeParamUse(const void* owner,
+                                       std::string_view param,
+                                       SourceLocation loc) {
+    if (!owner || param.empty()) return;
+    for (const auto& u : defaultTypeParamUses_)
+        if (u.owner == owner && u.param == param) return;  // one is enough
+    defaultTypeParamUses_.push_back({owner, std::string(param), loc});
+}
+
+void ExprTC::recordGenericInstantiationSite(const void* owner,
+                                            std::string_view param,
+                                            TypeRef* arg, std::string argName,
+                                            SourceLocation loc) {
+    if (!owner || !arg || param.empty()) return;
+    genericInstantiationSites_.push_back(
+        {owner, std::string(param), arg, std::move(argName), loc});
+}
+
+void ExprTC::checkDeferredDefaultInstantiations() {
+    if (defaultTypeParamUses_.empty() || genericInstantiationSites_.empty())
+        return;
+    // §3.6 rule 4: "a diagnostic produced by a property-dependent rule names
+    // the property, the offending type argument, and the structural reason."
+    auto structuralReason = [&](const TypeRef* a) -> std::string {
+        if (a->kind == TypeRef::Kind::Named && a->declaration) {
+            switch (a->declaration->kind) {
+                case ast::TypeDeclKind::Enum:
+                    return "it is an enum with no declared constant of "
+                           "underlying value 0 (§17.11) — declare a "
+                           "zero-valued constant";
+                case ast::TypeDeclKind::Choice:
+                    return "a choice type has no principled zero (§35.10)";
+                case ast::TypeDeclKind::Record:
+                    return "it is a record one of whose fields is a "
+                           "non-nullable reference type (§17.11)";
+                default: break;
+            }
+        }
+        if (a->kind == TypeRef::Kind::InlineArray)
+            return "its element type has no well-defined zero value (§17.11)";
+        return "it is a non-nullable reference type (§17.11)";
+    };
+    for (const auto& site : genericInstantiationSites_) {
+        bool bodyTakesDefault = false;
+        SourceLocation useLoc{};
+        for (const auto& u : defaultTypeParamUses_) {
+            if (u.owner != site.owner || u.param != site.param) continue;
+            bodyTakesDefault = true;
+            useLoc = u.loc;
+            break;
+        }
+        if (!bodyTakesDefault) continue;
+        TypeRef* a = site.arg;
+        if (!a || a->kind == TypeRef::Kind::Error) continue;
+        // A substitution that is itself an unresolved bare type parameter
+        // (a generic body instantiating another generic with its own `T`)
+        // cannot be judged here — its own instantiation sites will be.
+        if (a->kind == TypeRef::Kind::Named && !a->declaration) continue;
+        if (!defaultIllFormed(a)) continue;
+        ctx_.diagnostics().report(
+            Severity::Error, site.loc,
+            "type argument `" + site.argName +
+            "` does not satisfy the constraint `where " + site.param +
+            ": value` (§14.2): the generic body takes `default(" + site.param +
+            ")` (line " + std::to_string(useLoc.line) +
+            "), which §17.11 guarantees is non-null under `value`, but " +
+            structuralReason(a));
+    }
 }
 
 // Return (or lazily create) a synthetic TypeSymbol for a built-in class.
@@ -1247,8 +1324,15 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
     if (arg->kind == TypeRef::Kind::Named && arg->declaration) {
         TypeSymbol* d = arg->declaration;
         if (d->kind == ast::TypeDeclKind::Enum) {
-            decided = true;  // enum default is the underlying-0 value (§17.11)
-            return true;
+            // fix #3044 (§17.11, v0.242): the enum default is the underlying-0
+            // value ONLY when a constant of that value is declared; otherwise
+            // `default(E)` — and so `new T()` at this substitution — is a
+            // compile error. Undecidable value set → defer (decided stays
+            // false), never a false exemption.
+            std::optional<bool> hasZero = enumHasZeroConstant(*d);
+            if (!hasZero) return false;
+            decided = true;
+            return *hasZero;
         }
         if (d->kind == ast::TypeDeclKind::Interface) {
             decided = true;

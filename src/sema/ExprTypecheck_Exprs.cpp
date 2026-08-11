@@ -2,6 +2,7 @@
 
 #include "common/BuiltinRegistry.hpp"
 #include "common/OwnershipFacts.hpp"  // §35.7 (#2045): classifyChoiceType
+#include "sema/EnumValues.hpp"  // enumHasZeroConstant — §17.11 default(E) (#3044)
 #include "sema/TypeResolution.hpp"  // fix #2320: typeRefEqual for ctor overload re-resolution
 
 #include <cmath>
@@ -325,7 +326,23 @@ bool ExprTC::defaultIllFormed(const TypeRef* t) {
             if (k == ast::TypeDeclKind::Class ||
                 k == ast::TypeDeclKind::Interface)
                 return !t->declaration->isValueBuiltin;
-            if (k == ast::TypeDeclKind::Enum) return false;
+            // fix #3044 (§17.11, v0.242): `default(E)` is a compile error for
+            // "an enum type with no declared constant of underlying value 0".
+            // Escalated from a warning by proposal 0078's Q3 rider: it is the
+            // LAST producer of a value equal to no declared constant, and
+            // §5.4's invariant ("there is no value of an enum type that is not
+            // equal to a declared constant") — on which §19.6's restored
+            // exhaustiveness guarantee and §21.7's totality grant both rest —
+            // is only true with it closed. An enum whose declared-value set
+            // cannot be decided (a non-constant initializer, already
+            // diagnosed) is NOT rejected: enumHasZeroConstant returns nullopt
+            // and the default is treated as well-formed, matching the
+            // conservative posture of the record arm below.
+            if (k == ast::TypeDeclKind::Enum) {
+                std::optional<bool> hasZero =
+                    enumHasZeroConstant(*t->declaration);
+                return hasZero && !*hasZero;
+            }
             // §35.10 (v0.200, #2044): `default(C)` is a compile error for
             // EVERY choice type — a sum has no principled zero (electing a
             // case would make meaning depend on declaration order). The
@@ -3337,7 +3354,21 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // (value-builtins/enums/records of value fields) stay accepted.
                 // (The generic-parameter constrained case is the #864 check
                 // below; defaultIllFormed returns false for a bare type param.)
-                if (defaultIllFormed(rt)) {
+                // fix #3044 (§17.11, v0.242): the enum arm gets its OWN
+                // diagnostic — its remedy is "declaring a zero-valued
+                // constant", not the `default(T?)` the shared reference-type
+                // message prescribes.
+                if (defaultIllFormed(rt) && rt->kind == TypeRef::Kind::Named &&
+                    rt->declaration &&
+                    rt->declaration->kind == ast::TypeDeclKind::Enum) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, de->span.begin,
+                        "`default(T)` is a compile error for enum `" +
+                        std::string(rt->declaration->name) +
+                        "` — it declares no constant of underlying value 0, so "
+                        "it has no well-defined zero value; declare a "
+                        "zero-valued constant (§17.11)");
+                } else if (defaultIllFormed(rt)) {
                     std::string detail;
                     if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
                         rt->declaration->kind == ast::TypeDeclKind::Record)
@@ -3420,6 +3451,48 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         if (auto* td = dynamic_cast<const ast::TypeDecl*>(
                                 currentType_->decl))
                             checkConstraintsFor(td->genericConstraints);
+                    // fix #3044 (§17.11 / §3.6 rule 2, v0.242): this body takes
+                    // `default(T)` of a bare type parameter, so an instantiation
+                    // that supplies a type whose `default` is NOT well-defined
+                    // must be rejected AT THE INSTANTIATION SITE. Which types
+                    // those are is not knowable here; record the obligation and
+                    // discharge it against each instantiation at the end of the
+                    // pass. The owner is the METHOD when the parameter is
+                    // method-level (its instantiation site is the call), else
+                    // the enclosing type.
+                    //
+                    // Gated on `where T: value`, and deliberately no wider.
+                    // §17.11's generic-body list makes a guarantee ONLY there —
+                    // "Under `where T: value`, `default(T)` is always non-null"
+                    // — and it is that guarantee a not-well-defined default
+                    // contradicts. For an UNCONSTRAINED `T` the same list says
+                    // "`default(T)` is permitted but its result is treated as
+                    // possibly null", so `Make<string>()` over an unconstrained
+                    // body is legal and must stay legal; rejecting it here would
+                    // be over-broad. (`where T: class` is already an error at the
+                    // `default(T)` itself, just above.)
+                    auto paramHasValueConstraint =
+                        [&](const std::vector<ast::GenericConstraint>& gcs) {
+                        for (const auto& gc : gcs) {
+                            if (gc.typeParam != paramName) continue;
+                            for (const auto& item : gc.items)
+                                if (item.kind == "value") return true;
+                        }
+                        return false;
+                    };
+                    if (isMethodParam) {
+                        if (paramHasValueConstraint(
+                                currentMethodDecl_->genericConstraints))
+                            recordDefaultTypeParamUse(
+                                currentMethodDecl_, paramName, de->span.begin);
+                    } else if (currentType_ && currentType_->decl) {
+                        if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                                currentType_->decl))
+                            if (paramHasValueConstraint(td->genericConstraints))
+                                recordDefaultTypeParamUse(
+                                    currentType_->decl, paramName,
+                                    de->span.begin);
+                    }
                 }
             }
         }

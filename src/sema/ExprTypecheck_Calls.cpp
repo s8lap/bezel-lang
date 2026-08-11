@@ -2499,6 +2499,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 auto checkMethodGenericConstraints =
                     [&](const std::unordered_map<std::string_view,
                                                  TypeRef*>& subst) {
+                        // fix #3044 (§17.11 / §3.6 rule 2, v0.242): record this
+                        // instantiation's bindings. If `md`'s body takes
+                        // `default(T)` of one of these parameters under
+                        // `where T: value`, the end-of-pass join
+                        // (checkDeferredDefaultInstantiations) rejects any
+                        // binding whose `default` is not well-defined — HERE, at
+                        // the instantiation site, per §17.11's closing rule.
+                        // Every binding is recorded, constrained or not: the
+                        // obligation comes from the BODY, not from the
+                        // constraint list this loop walks.
+                        for (const auto& sb : subst) {
+                            if (!sb.second) continue;
+                            recordGenericInstantiationSite(
+                                md, sb.first, sb.second, argNameOf(sb.second),
+                                ce.span.begin);
+                        }
                         for (const auto& gc : md->genericConstraints) {
                             auto ai = subst.find(gc.typeParam);
                             if (ai == subst.end() || !ai->second) continue;

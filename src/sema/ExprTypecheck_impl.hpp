@@ -686,11 +686,13 @@ private:
     TypeRef* bindLambdaDestructure(const ast::DestructuringPattern& dp,
                                    TypeRef* targetType, Scope& scope);
 
-    // §17.11 (#951): does `default(T)` have NO well-defined zero value? True for
-    // a non-nullable reference type (string/class/interface/function) and,
-    // recursively, a record any of whose positional fields — or an inline array
-    // whose element — is such a type. Nullable types, enums, value primitives,
-    // value-builtins, and generic-parameter/unresolved refs return false.
+    // §17.11 (#951; enum arm added #3044/v0.242): does `default(T)` have NO
+    // well-defined zero value? True for a non-nullable reference type
+    // (string/class/interface/function), an enum with no declared constant of
+    // underlying value 0, and, recursively, a record any of whose positional
+    // fields — or an inline array whose element — is such a type. Nullable
+    // types, value primitives, value-builtins, and generic-parameter/unresolved
+    // refs return false.
     bool defaultIllFormed(const TypeRef* t);
 
     // fix #3044 (§10.4 / stdlib §9.9, v0.242): the ENUM TypeSymbol an
@@ -701,6 +703,49 @@ private:
     // deliberately does not match.
     const TypeSymbol* enumTypeNamedBy(const ast::Expr& e);
 
+    // fix #3044 (§17.11 / §3.6 rule 2, v0.242): `default(T)` over a bare TYPE
+    // PARAMETER cannot be judged in the generic body — "a generic body
+    // type-checks under the weakest assumption its constraints establish" — so
+    // §17.11's closing rule defers it: "A substitution whose `default` is not
+    // well-defined — an enum with no zero-valued constant included — is
+    // rejected at the instantiation site (the §3.6 rule 2 pattern)."
+    //
+    // Deciding that needs two facts that are discovered at different points in
+    // one pass, in either order: WHICH parameters a generic body takes
+    // `default(T)` of, and WHAT each instantiation substitutes for them. Both
+    // are recorded as they are seen and joined once at the end of the pass
+    // (`checkDeferredDefaultInstantiations`), so a call that precedes its
+    // callee's declaration in source is checked exactly like one that follows
+    // it. (Scanning the callee's body AST at the call site would also be
+    // order-independent, but the AST has no uniform child enumeration, so a
+    // hand-written walk would silently miss whichever node kinds it forgot.)
+    struct DefaultTypeParamUse {
+        const void* owner;        // the ast::MethodDecl / ast::TypeDecl
+        std::string param;        // the type-parameter name
+        SourceLocation loc;       // the `default(T)` site (for the note)
+    };
+    struct GenericInstantiationSite {
+        const void* owner;        // the ast::MethodDecl being instantiated
+        std::string param;
+        TypeRef* arg = nullptr;   // the substituted type argument
+        std::string argName;      // its spelling, for the diagnostic
+        SourceLocation loc;       // the instantiation site
+    };
+    std::vector<DefaultTypeParamUse> defaultTypeParamUses_;
+    std::vector<GenericInstantiationSite> genericInstantiationSites_;
+
+    // Record a `default(T)` over the bare type parameter `param`, owned by
+    // `owner` (the method when `param` is method-level, else the enclosing
+    // type).
+    void recordDefaultTypeParamUse(const void* owner, std::string_view param,
+                                   SourceLocation loc);
+    // Record one type-argument binding of a generic METHOD instantiation.
+    void recordGenericInstantiationSite(const void* owner,
+                                        std::string_view param, TypeRef* arg,
+                                        std::string argName,
+                                        SourceLocation loc);
+    // §3.6 rule 2 join, run once at the end of the pass.
+    void checkDeferredDefaultInstantiations();
 
     // Slice DR1 (§21.7): does control definitely leave this statement
     // list abruptly (return / throw / non-terminating loop) before

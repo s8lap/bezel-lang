@@ -4,6 +4,7 @@
 #include "common/OwnershipFacts.hpp"  // classifyChoiceType — §35.7 equality-bearing choice edge (#2087)
 
 #include "sema/ConstFold.hpp"
+#include "sema/EnumValues.hpp"  // enumHasZeroConstant — §17.11 default(E) (#3044)
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation
 #include "sema/TypeResolution.hpp"
 
@@ -5294,8 +5295,18 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
     if (arg->kind == TypeRef::Kind::Named && arg->declaration) {
         TypeSymbol* d = arg->declaration;
         if (d->kind == ast::TypeDeclKind::Enum) {
-            decided = true;  // enum default is the underlying-0 value (§17.11)
-            return true;
+            // fix #3044 (§17.11 / §14.2, v0.242): `new T()` at a value
+            // substitution IS `default(T)`, and §17.11 rejects `default(E)`
+            // for "an enum type with no declared constant of underlying value
+            // 0" — explicitly naming `new T()` at such a substitution. The
+            // rejection lands at the INSTANTIATION SITE (the §3.6 rule 2
+            // pattern), which is where checkOneConstraint reports. An enum
+            // whose declared-value set cannot be decided leaves `decided`
+            // false (defer, no diagnostic).
+            std::optional<bool> hasZero = enumHasZeroConstant(*d);
+            if (!hasZero) return false;  // decided stays false — defer
+            decided = true;
+            return *hasZero;
         }
         // §35.10 (v0.200, #2044): "Choices never satisfy the value-type arm:
         // `default(C)` is undefined for every choice type." So a choice
@@ -6702,6 +6713,32 @@ static bool stmtsContainThisMethodCall(
 // §9.8: the serialized name for a positional field — the `serialized "X"` clause
 // if present, else the declared identifier.  Returns the clause name if set and
 // non-empty, else the field name.  Also returns whether this field is skip.
+// fix #3044 (§9.8 / §17.11, v0.242): §9.8 — "A `serialized skip` component whose
+// type has no well-defined default is a compile error at the conformance
+// declaration (the synthesized `Deserialize` would have no value to construct
+// with)." `skip` reconstructs the component with `default(T)`, and §17.11 makes
+// `default(E)` an error for an enum with no declared constant of underlying
+// value 0 — so such a component must be rejected rather than silently
+// reconstructing at 0, a value equal to no declared constant (§5.4).
+//
+// Scoped to the ENUM row of §17.11's not-well-defined set, which is the row this
+// fix owns. The other rows (a non-nullable reference type, a record carrying
+// one, a choice) are checked at their own sites or remain the pre-existing gap
+// #3072 records; this predicate answers only for enums so it can never widen a
+// reject beyond what #3044 changed. Returns the reason, or "" when fine.
+static std::string skipComponentEnumLacksZero(const TypeRef* ty) {
+    if (!ty || ty->nullable) return {};  // `T?` reconstructs as null — fine
+    if (ty->kind != TypeRef::Kind::Named || !ty->declaration) return {};
+    if (ty->declaration->kind != ast::TypeDeclKind::Enum) return {};
+    std::optional<bool> hasZero = enumHasZeroConstant(*ty->declaration);
+    if (!hasZero || *hasZero) return {};
+    return std::string("enum `") + std::string(ty->declaration->name) +
+           "` declares no constant of underlying value 0, so `default(" +
+           std::string(ty->declaration->name) + ")` — which `serialized skip` "
+           "reconstructs it with — is a compile error (§9.8/§17.11); declare a "
+           "zero-valued constant, make the component nullable, or drop `skip`";
+}
+
 static bool positionalFieldIsSkip(const ast::Param& pf) {
     return pf.serialized && pf.serialized->isSkip;
 }
@@ -6878,6 +6915,18 @@ void Resolver::checkSerializationEligibility() {
                     // so `skip` on it requires the nullable form.
                     if (positionalFieldIsSkip(pf) && pf.type) {
                         const TypeRef* ptr = ctx_.resolvedType(*pf.type);
+                        // fix #3044: the enum row of the same §9.8 rule.
+                        std::string whyE = skipComponentEnumLacksZero(ptr);
+                        if (!whyE.empty()) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, t->declLoc,
+                                "choice `" + std::string(t->name) +
+                                "`: `serialized skip` on payload `" +
+                                std::string(cc.name) + "." +
+                                std::string(pf.name) + "` — " + whyE);
+                            foundError = true;
+                            break;
+                        }
                         if (ptr && !ptr->nullable && ptr->kind == TypeRef::Kind::Named &&
                             ptr->declaration &&
                             ptr->declaration->kind == ast::TypeDeclKind::Choice) {
@@ -7003,7 +7052,24 @@ void Resolver::checkSerializationEligibility() {
         // Positional record: check positional fields.
         if (td->hasPositionalFields) {
             for (const auto& pf : td->positionalFields) {
-                if (positionalFieldIsSkip(pf)) continue;  // skip → excluded
+                if (positionalFieldIsSkip(pf)) {
+                    // fix #3044 (§9.8/§17.11): a skipped component still has to
+                    // reconstruct with `default(T)`.
+                    std::string whyE = pf.type
+                        ? skipComponentEnumLacksZero(ctx_.resolvedType(*pf.type))
+                        : std::string();
+                    if (!whyE.empty()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            std::string(isRecord ? "record" : "type") + " `" +
+                            std::string(t->name) +
+                            "`: `serialized skip` on field `" +
+                            std::string(pf.name) + "` — " + whyE);
+                        foundError = true;
+                        break;
+                    }
+                    continue;  // skip → excluded
+                }
                 // §2.15 v0.139: `serialized "xxx"` rename whose name begins with
                 // `$` is reserved for JSON graph-identity tokens — compile error.
                 if (pf.serialized && !pf.serialized->name.empty() &&
@@ -7042,7 +7108,23 @@ void Resolver::checkSerializationEligibility() {
                 auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                 if (!pd) continue;
                 // Check for serialized skip on the auto-property.
-                if (pd->serialized && pd->serialized->isSkip) continue;
+                if (pd->serialized && pd->serialized->isSkip) {
+                    // fix #3044 (§9.8/§17.11): same rule, auto-property form.
+                    std::string whyE = pd->type
+                        ? skipComponentEnumLacksZero(ctx_.resolvedType(*pd->type))
+                        : std::string();
+                    if (!whyE.empty()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            std::string(isRecord ? "record" : "type") + " `" +
+                            std::string(t->name) +
+                            "`: `serialized skip` on property `" +
+                            std::string(m->name) + "` — " + whyE);
+                        foundError = true;
+                        break;
+                    }
+                    continue;
+                }
                 // §2.15 v0.139: `serialized "xxx"` rename beginning with `$` reserved.
                 if (pd->serialized && !pd->serialized->name.empty() &&
                     pd->serialized->name.front() == '$') {
