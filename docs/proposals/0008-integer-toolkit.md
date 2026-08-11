@@ -8,7 +8,7 @@
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #9 (2×P0+P1), wave D1 of the [stdlib gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) |
 | **Unblocks** | Gap-review #27 (CRC-32/xxHash checksums, `System.IO.Hashing`); every custom `IEqualityComparer` / manual `GetHashCode` that needs a combiner better than XOR |
-| **Currency note** | Refreshed 2026-08-11 to v0.246: `hashable` vocabulary (v0.242; formerly *equality-bearing*). ⚠ The §2/§3 arguments quoting §6.5's silent shift-count masking predate v0.242's shift-domain fault (proposal 0079) and are flagged for a design-pass reconciliation, not respelled here — see the 2026-08-11 currency paper. Written-against pin unchanged. |
+| **Currency note** | Refreshed 2026-08-11 to v0.246: `hashable` vocabulary (v0.242; formerly *equality-bearing*). The 2026-08-11 currency paper's flag 1 — the §2/§3/§4.2 arguments leaning on §6.5's repealed silent shift-count masking (the paper cites the rotation contract as "§5.2"; its home here is §4.2/§4.4) — is **resolved**: §2/§3.2/§4.2/§4.4 re-derived against v0.242's count-domain fault under the owner's 2026-08-12 direction on the recorded flags; see "Delegated ruling 2026-08-12" below. Written-against pin unchanged. |
 
 ## 1. The problem, stated against §6
 
@@ -38,7 +38,7 @@ end WrappingMul32;
 
 **The 64-bit case has no such workaround, because there is no 128-bit integer to widen into.** A schoolbook decomposition into 32-bit limbs needs to sum the cross terms `aLo*bHi + aHi*bLo`, each up to ≈2⁶⁴, whose sum is ≈2⁶⁵ — and that `+` is a checked `ulong` add, which faults. So a 64-bit wrapping multiply reduces to needing a 64-bit **wrapping add**, which §6.1 also withholds.
 
-**Strictly, a `ulong` wrapping add *is* expressible** — via a bitwise ripple-carry adder built only from §6.5 operations, which the spec explicitly exempts from overflow checking ("a shift never raises `OverflowException` … it is a bit operation, not one of the overflow-checked operators of §6.1"; the same is true of `&`, `^`, `~`):
+**Strictly, a `ulong` wrapping add *is* expressible** — via a bitwise ripple-carry adder built only from §6.5 operations, every step of which is fault-free under the landed rules: `&` and `^` are not among §6.1's overflow-checked operators, and the adder's only shift is by the constant `1` — in-domain for every width — where §6.5 (v0.242) states that "bits shifted beyond the left operand's width are discarded silently — that is the operation, exactly as `&` discards bits — and the result never faults." *(Through v0.241 the exemption was blanket — "a shift never raises `OverflowException`" — v0.242's count-domain fault, proposal 0079, narrowed it to in-domain counts, which is all this construction ever uses; re-derived per the delegated ruling below.)*
 
 ```bezel
 // (a + b) mod 2^64, using only §6.5 bit ops — never the checked §6.1 `+`.
@@ -46,7 +46,7 @@ public method WrappingAdd64(a: ulong, b: ulong): ulong
   var x := a;
   var y := b;
   while y <> 0 do
-    var carry := (x & y) << 1;            // §6.5: `<<` discards the bit past width, never faults
+    var carry := (x & y) << 1;            // §6.5: count 1 is in-domain; the bit past the width is discarded — no fault
     x := x ^ y;                           // §6.5: `^` never faults
     y := carry;
   end;
@@ -74,13 +74,13 @@ Policies × operations, with the v1 decision in each cell:
 
 | | `Add` | `Sub` | `Mul` | `Neg` | `Div` | `Shl` |
 |---|---|---|---|---|---|---|
-| **Wrapping** | ✅ v1 | ✅ v1 | ✅ v1 | ✅ v1 | ❌ | ❌ (subsumed) |
+| **Wrapping** | ✅ v1 | ✅ v1 | ✅ v1 | ✅ v1 | ❌ | ❌ (declined) |
 | **Saturating** | ✅ v1 | ✅ v1 | ✅ v1 | ⏳ later | ❌ | ❌ |
 | **Checked (→ `T?`)** | ✅ v1 | ✅ v1 | ✅ v1 | ⏳ later | ❌ | — |
 
 Cuts, with reasons:
 
-- **`Shl` is excluded from every row** because §6.5 *already* provides wrapping shift semantics: `<<` "discards bits shifted beyond the left operand's width," reduces the count modulo the width, and "never raises `OverflowException`." A `WrappingShl` would duplicate the built-in operator. There is nothing to add.
+- **`Shl` is excluded from every row — the exclusion stands, its reason replaced at v0.242 (delegated ruling below).** Through v0.241 the ground was §6.5's silent count masking ("a `WrappingShl` would duplicate the built-in operator"); v0.242 (proposal 0079) repealed the masking — `<<` now faults on an out-of-domain count — so that ground is gone. The exclusion is re-reasoned, not reopened: (i) the `Wrapping*` family wraps *results* mod 2^w where §6.1 would fault, but an in-domain shift's result never faults (discarding the high bits *is* the operation, §6.5) — there is no checked-result behavior for a wrapping shift to step around, so a count-masking `WrappingShl` would be a false member of the family, policy-switching the count operand rather than the result; (ii) the deliberately-masked count already has its sanctioned spelling in the spec itself — §6.5 (v0.242) designates `v << (k & 31)` (`& 63` for 64-bit left operands) as the modular-count form, the mask in the source, visible and in-domain by construction — and a `WrappingShl(k)` would be a second, less legible spelling of the same thing; (iii) the consumers this proposal serves (§1's hash/checksum kernels) shift by in-domain constants and need neither.
 - **`Div` is excluded from v1.** Integer division overflows in exactly one case — `MinValue / -1` on a signed type — and faults on `/ 0` (`DivideByZeroException`, §6.1), which is a genuine error no policy should paper over. The single overflowing case is niche; defer `WrappingDiv`/`CheckedDiv` until a consumer needs it.
 - **`Neg`:** `WrappingNeg` is in v1 (it completes the modular set cheaply — `WrappingNeg(MinValue) = MinValue`). `SaturatingNeg`/`CheckedNeg` (only `MinValue` negation is interesting) are deferred as trivially-additive.
 - **Saturating and checked stay `Add`/`Sub`/`Mul`** — the three operations that actually overflow in practice.
@@ -130,7 +130,7 @@ for var b in data do
 end;
 ```
 
-The `^` stays the ordinary §6.5 operator (bitwise ops never fault); only the multiply — the operation §6.1 would fault on — takes the explicit `WrappingMul`.
+The `^` stays the ordinary §6.5 operator (`&`/`|`/`^`/`~` never fault); only the multiply — the operation §6.1 would fault on — takes the explicit `WrappingMul`.
 
 ### 3.5 Composition with constraint-generic numeric code (§11.8)
 
@@ -154,7 +154,8 @@ public static class BitOperations
   public static method TrailingZeroCount(value: uint): int;   // 0..32
   public static method TrailingZeroCount(value: ulong): int;  // 0..64
 
-  // Rotations. `offset` is reduced modulo the width (as shift counts are, §6.5); never faults.
+  // Rotations. A rotation of a w-bit lane is periodic in w — rotate-by-width is the identity —
+  //   so `offset` is reduced modulo the width as the operation's own definition; never faults.
   public static method RotateLeft(value: uint, offset: int): uint;
   public static method RotateLeft(value: ulong, offset: int): ulong;
   public static method RotateRight(value: uint, offset: int): uint;
@@ -185,7 +186,7 @@ Bezel's philosophy is defined faults, not silent sentinels (§6.1's `OverflowExc
 - `RoundUpToPowerOf2(value)` when the next power of two is not representable — for `uint`, any `value` in `(2³¹, 2³²)` rounds up to `2³²`, which does not fit; for `ulong`, any `value` in `(2⁶³, 2⁶⁴)`. **Raises `OverflowException`**, consistent with §6.1's treatment of a non-representable result.
 - `RoundUpToPowerOf2(0)` = `1` and `RoundUpToPowerOf2(1)` = `1` (the least power of two ≥ the input; defined, no fault).
 - `LeadingZeroCount(0)` / `TrailingZeroCount(0)` = the full width (32 or 64) — defined, total.
-- `PopCount`, `IsPow2`, `RotateLeft`, `RotateRight` — total on all inputs; rotation reduces `offset` modulo the width and never faults.
+- `PopCount`, `IsPow2`, `RotateLeft`, `RotateRight` — total on all inputs; rotation reduces `offset` modulo the width **on its own periodicity ground** (rotate-by-width is the identity) and never faults — deliberately *not* re-aligned to §6.5's v0.242 count-fault domain, which governs shifts, where an out-of-domain count is a programming error rather than a periodic offset (delegated ruling below).
 
 ## 5. `HashCode` (design question 3)
 
@@ -296,6 +297,14 @@ All four are resolved as follows (owner batch confirmations, 2026-07-04):
 
 All four owner questions were **already resolved in the owner batch of 2026-07-04** and are recorded verbatim in §8; acceptance carries them unchanged. In summary: (1) checked-op naming keeps the `Checked*` prefix (it names the semantics and stays parallel with `Wrapping*`/`Saturating*`; still shape-(b) Try behavior); (2) `HashCode` is the immutable-chaining value record of §5.3/§5.4 — the dichotomy dissolved, no value-receiver-mutation ruling is required; (3) v1 type coverage is `int`/`uint`/`long`/`ulong` only (scoping, not declining — the narrow-type overloads are mechanical and deferred); (4) `HashCode` uses per-process randomized seeding (§8.3 permits it, gives hash-flood defense; determinism belongs to checksums, #27). Nothing in §8 remained open at acceptance.
 
+## Delegated ruling 2026-08-12 (currency flag 1 — re-grounding on the v0.242 shift-count fault)
+
+Recorded under the owner's 2026-08-12 direction on the recorded flags ([2026-08-11 currency paper](proposals-currency-2026-08-11.md) §3 flag 1; option (i) as recommended — re-ground, no surface change). v0.242 (proposal 0079) repealed §6.5's silent shift-count masking: `<<`/`>>` now fault on an out-of-domain count (compile error for constants, `OverflowException` at runtime), in-domain shifts are bit-for-bit unchanged, and the deliberately-masked count has exactly one sanctioned spelling — **`v << (k & 31)`** (`& 63` for 64-bit left operands), the mask in the source, visible and in-domain by construction (§6.5, v0.242). Three of this proposal's arguments cited the repealed rule; each is re-derived in place above, and none of the proposal's decisions changes:
+
+1. **Rotation offsets (§4.2/§4.4) stay modular — on the operation's own ground, not by analogy.** The old contract comment justified `offset mod width` "as shift counts are (§6.5)"; that precedent now points the other way. The re-grounding: a rotation of a w-bit lane is inherently periodic — rotate-by-width is the identity, rotate-by-k *is* rotate-by-(k mod w) — so the modular reduction is the operation's own definition, not a policy import. Re-aligning rotation offsets to §6.5's `0..width−1` fault domain (the flag's option (ii)) is **declined**: for a shift, an out-of-domain count has no in-domain meaning and the fault catches a programming error; for a rotation, every offset has one canonical meaning. No behavior change to the proposed contract.
+2. **The §3 `WrappingShl` exclusion stands — with its reason replaced** (the flag's option (iii), adding a `Wrapping` shift row on the changed ground, is **declined**). The re-worked reasoning is in §3.2: (i) `Wrapping*` wraps *results* where §6.1 would fault, and an in-domain shift's result never faults — so a `WrappingShl` would policy-switch the *count operand*, a false member of the family; (ii) §6.5 (v0.242) itself designates `v << (k & 31)` as the deliberate modular-count spelling, and a method form would be a second, less legible spelling of it; (iii) §1's consumers shift by in-domain constants. Recorded honestly: the exclusion's *reason* changed even though the exclusion stands; if a real consumer ever surfaces with variable, deliberately-modular shift counts, the mask spelling is the answer before any new row is.
+3. **The §2 "strictly expressible" claim survives, re-derived.** The ripple-carry adder's steps are `&`/`^` (never overflow-checked) and `<< 1` (a constant, in-domain at every width; in-domain shifts never fault) — so the construction, and the "unwritable in practice" verdict it qualifies, stands under v0.242 exactly as at the v0.177 pin. §2's quotation is re-derived from the landed §6.5 text; the pre-v0.242 blanket wording is retained only as marked history.
+
 ## 9. Relationship to existing work
 
-§6.1/§6.5 (the checked-arithmetic default this steps around, and the unchecked bit ops it builds on) · §8.3/§9.2 (the auto-hash contract `HashCode` matches) · §11.8 + stdlib §2.19 (`INumber<T>`, the generic-numeric surface the deferred static interfaces would extend) · stdlib §2.12 `BitConverter` (the sibling `System` bit-surface and the `Reinterpret` bridge for signed inputs) · gap review #1403 item #9 (this proposal) and item #27 (CRC/xxHash — the downstream consumer of §3's wrapping ops) · wave D1 of the [gap DESIGN plan](stdlib-gap-design-plan-2026-07.md).
+§6.1/§6.5 (the checked-arithmetic default this steps around, and the bit ops it builds on — `&`/`|`/`^`/`~` never fault; shifts fault only on an out-of-domain count since v0.242) · §8.3/§9.2 (the auto-hash contract `HashCode` matches) · §11.8 + stdlib §2.19 (`INumber<T>`, the generic-numeric surface the deferred static interfaces would extend) · stdlib §2.12 `BitConverter` (the sibling `System` bit-surface and the `Reinterpret` bridge for signed inputs) · gap review #1403 item #9 (this proposal) and item #27 (CRC/xxHash — the downstream consumer of §3's wrapping ops) · wave D1 of the [gap DESIGN plan](stdlib-gap-design-plan-2026-07.md).
