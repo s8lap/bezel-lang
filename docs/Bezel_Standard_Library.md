@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.240 — August 2026**
+**Companion to the Bezel Language Specification, v0.241 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -449,6 +449,8 @@ public record Guid: IComparable<Guid>, IEquatable<Guid>
 end Guid;
 ```
 
+`Guid` declares no constructor, so `new Guid(...)` is a compile error at any argument list (language spec [§17.7](Bezel_Language_Spec.md#sec-the-new-operator)'s closed-constructor-surface rule); construct via `Empty`, `NewGuid()`, `FromByteArray`, `Parse`/`TryParse`/`ParseOrNull`, or `default(Guid)`.
+
 <a id="sec-random"></a>
 ### 2.7 `Random`
 
@@ -484,6 +486,8 @@ end IComparable;
 
 `a.CompareTo(b)` returns a negative number if `a < b`, zero if equal, a positive number if `a > b`.
 
+The stdlib's primitives and `string` conform to `IComparable<T>`/`IEquatable<T>` at their own type only (`Int32: IComparable<int>`, `String: IComparable<string>`, …); both interfaces are invariant (language spec [§12.9](Bezel_Language_Spec.md#sec-variance)), so no `IComparable<Object>`/`IEquatable<Object>` view of them exists — object-keyed equality is `Object.Equals` (language spec [§8.3](Bezel_Language_Spec.md#sec-equals-and-gethashcode)).
+
 <a id="sec-iequatablet"></a>
 ### 2.9 `IEquatable<T>`
 
@@ -493,7 +497,7 @@ public interface IEquatable<T>
 end IEquatable;
 ```
 
-A typed alternative to `Object.Equals(Object?)`. Records implement this implicitly; classes may implement it for type-safe equality without boxing.
+A typed alternative to `Object.Equals(Object?)`. Records implement this implicitly; classes may implement it for type-safe equality without boxing. As for `IComparable<T>` ([§2.8](#sec-icomparablet)), the stdlib's primitives and `string` conform at their own type only and the interface is invariant — no `IEquatable<Object>` view of them exists.
 
 <a id="sec-idisposable-and-iasyncdisposable"></a>
 ### 2.10 `IDisposable` and `IAsyncDisposable`
@@ -1334,6 +1338,10 @@ public record ReadOnlyStringSpan(Source: string, Start: int, Length: int): IRead
     new ReadOnlyStringSpan(Source, this.Start + start, length);
   public pure method Slice(start: int): ReadOnlyStringSpan =>       // v0.195: from offset to end
     Slice(start, Length - start);
+  public pure method Slice(r: Range<int>): ReadOnlyStringSpan;      // v0.241 — Range form: normalized
+                                                                    //   against Length (spec §16.3), then
+                                                                    //   equivalent to Slice(start, length);
+                                                                    //   §4.14's normalization contract
 
   // Search by char
   public pure method IndexOf(value: char): int;
@@ -2471,6 +2479,9 @@ public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOn
   public method Slice(start: int, length: int): Span<T> =>
     new Span<T>(Buffer, this.Start + start, length);
   public method Slice(start: int): Span<T> => Slice(start, Length - start);   // v0.195
+  public method Slice(r: Range<int>): Span<T>;   // v0.241 — Range form: normalized against
+                                                  //   Length (spec §16.3), then equivalent to
+                                                  //   Slice(start, length); see prose
 
   public method AsReadOnly(): ReadOnlySpan<T> =>
     new ReadOnlySpan<T>(Buffer, Start, Length);
@@ -2530,6 +2541,9 @@ public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOn
   public method Slice(start: int, length: int): Span<T> =>
     new Span<T>(Buffer, this.Start + start, length);
   public method Slice(start: int): Span<T> => Slice(start, Length - start);   // v0.195
+  public method Slice(r: Range<int>): Span<T>;   // v0.241 — Range form: normalized against
+                                                  //   Length (spec §16.3), then equivalent to
+                                                  //   Slice(start, length); see prose
 
   public method AsReadOnly(): ReadOnlySpan<T> =>
     new ReadOnlySpan<T>(Buffer, Start, Length);
@@ -2546,7 +2560,7 @@ end Span;
 
 A `Span<T>` is a borrow-bearing record ([§9.7](Bezel_Language_Spec.md#sec-records-and-disposal) of the language spec) viewing into a contiguous range of an `OwningBuffer<T>`. The `Buffer` field carries a borrow of an `OwningBuffer<T>`; per the borrow-bearing-record rule, the span's lifetime is bounded by the borrow's source, so a span cannot outlive the buffer it views.
 
-`Span<T>` is purely user-level Bezel — no compiler intrinsic. The record machinery, borrow lifetime tracking, and indexer dispatch are all standard language features.
+`Span<T>` is purely user-level Bezel — no compiler intrinsic. The record machinery, borrow lifetime tracking, and indexer dispatch are all standard language features. That includes the generated record members of language spec [§8.5](Bezel_Language_Spec.md#sec-tostring)/[§9.1](Bezel_Language_Spec.md#sec-positional-records): the span records carry them by the ordinary record rules (the positional-record `ToString` among them) — the listings in this section are a lower bound on the surface, and a member's absence from a body listing is not an exclusion.
 
 **Read access.** For class T: `span[i]` returns a borrow of the slot's value (which is `T?` because the underlying buffer's slots are nullable). For value T: `span[i]` returns a borrow of the slot (`T`, non-nullable). The borrow's source is the underlying `OwningBuffer<T>` (transitively reached through the span's `Buffer` field). For class T with potentially-null slots, programs that view into a buffer known to have non-null contents at every slot can use `span[i]!` for the null-forgiving access, raising `NullReferenceException` if the slot is null.
 
@@ -2559,6 +2573,8 @@ For value T: `span[i] := value` simply overwrites the slot with the new value. N
 A span carries the full read/write capability of the underlying buffer for its viewed range; what distinguishes it from holding the whole buffer is *range restriction*, not access mode. Programs that want a read-only view use `ReadOnlySpan<T>` instead.
 
 `Slice(start, length)` produces a sub-span that views into the same buffer. The slice's lifetime is the same as the original span's — both are borrows of the same source. The slice has the same access mode as its parent (a `Span<T>` slices to a `Span<T>`; a `ReadOnlySpan<T>` slices to a `ReadOnlySpan<T>`).
+
+The **Range overload** `Slice(r: Range<int>)` (v0.241, #2662) is the view counterpart of the `AsSpan(r: Range<int>)` factories above: the range is normalized against the span's `Length` under the standard `Range<int>` endpoint rules — closed (`a..b`), half-open (`a..<b`), and open-ended (`a..`, `..b`, `..`) forms per language spec [§16.3](Bezel_Language_Spec.md#sec-the-ranget-type) — and the call is then equivalent to `Slice(start, length)`: the same receiver-typed view over the same source, same lifetime, same access mode. Out-of-range endpoints raise `IndexOutOfRangeException`; an empty range produces an empty span. The overload is declared uniformly on all five span-shaped types — `Span<T>` and `ReadOnlySpan<T>` here, `ArraySpan<T>`/`ReadOnlyArraySpan<T>` ([§4.15](#sec-arrayspant-readonlyarrayspant)), and `ReadOnlyStringSpan` ([§3.3](#sec-readonlystringspan)) — with this same contract. (Contrast `Array<T>.Slice(r)`, [§4.4](#sec-arrayt): a different receiver with its own declared contract — it materializes a fresh owned array, where a span's `Slice` never copies.)
 
 `AsReadOnly()` returns a `ReadOnlySpan<T>` viewing the same buffer range. Bezel has no implicit record-to-record conversions, so passing a `Span<T>` where a `ReadOnlySpan<T>` is expected requires the explicit call. This is friction the C# precedent does not have (C# admits an implicit conversion from `Span<T>` to `ReadOnlySpan<T>`); Bezel's choice trades that convenience for the broader principle that record-type identity is nominal and conversions between records are always explicit. The `AsReadOnly()` call is cheap (record construction, no allocation) and makes the API-boundary intent visible at the call site.
 
@@ -2617,6 +2633,9 @@ public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int):
   public method Slice(start: int, length: int): ReadOnlySpan<T> =>
     new ReadOnlySpan<T>(Buffer, this.Start + start, length);
   public method Slice(start: int): ReadOnlySpan<T> => Slice(start, Length - start);   // v0.195
+  public method Slice(r: Range<int>): ReadOnlySpan<T>;   // v0.241 — Range form: normalized against
+                                                          //   Length (spec §16.3), then equivalent to
+                                                          //   Slice(start, length); see prose
 end ReadOnlySpan;
 ```
 
@@ -2646,6 +2665,9 @@ public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int):
   public method Slice(start: int, length: int): ReadOnlySpan<T> =>
     new ReadOnlySpan<T>(Buffer, this.Start + start, length);
   public method Slice(start: int): ReadOnlySpan<T> => Slice(start, Length - start);   // v0.195
+  public method Slice(r: Range<int>): ReadOnlySpan<T>;   // v0.241 — Range form: normalized against
+                                                          //   Length (spec §16.3), then equivalent to
+                                                          //   Slice(start, length); see prose
 
   public method CopyTo(destination: Span<T>);     // v0.109 — copy slot-by-slot to destination;
                                                    //   lengths must match
@@ -2821,7 +2843,7 @@ The unsigned variants follow by casting through the matching unsigned type at th
 
 Records carrying borrows of an `Array<T>` ([§4.4](#sec-arrayt)) plus a `(Start, Length)` range. The natural companion to `Array<T>.AsSpan()` and `Array<T>.AsReadOnlySpan()` for passing a sub-range of an array to a method without copying.
 
-`ArraySpan<T>` is the writable form; `ReadOnlyArraySpan<T>` is the read-only form. The split parallels `Span<T>` / `ReadOnlySpan<T>` ([§4.14](#sec-owned-buffers-and-spans)) but with `Array<T>` as the source instead of `OwningBuffer<T>`. The two span families coexist; they are not interchangeable (a method that takes `Span<T>` does not accept `ArraySpan<T>` and vice versa) because the underlying storage models differ — `OwningBuffer<T>` owns its slots for class T, while `Array<T>` borrows them.
+`ArraySpan<T>` is the writable form; `ReadOnlyArraySpan<T>` is the read-only form. The split parallels `Span<T>` / `ReadOnlySpan<T>` ([§4.14](#sec-owned-buffers-and-spans)) but with `Array<T>` as the source instead of `OwningBuffer<T>`. The two span families coexist; they are not interchangeable (a method that takes `Span<T>` does not accept `ArraySpan<T>` and vice versa) because the underlying storage models differ — `OwningBuffer<T>` owns its slots for class T, while `Array<T>` borrows them. Both types declare the three `Slice` overloads of the §4.14 family, including the `Slice(r: Range<int>)` Range form under [§4.14](#sec-owned-buffers-and-spans)'s normalization contract (v0.241).
 
 **Byte-buffer accessors (v0.165, #1358):** the §4.14 endianness-aware extension family is mirrored onto this family — all `Read*{Little,Big}Endian`/`TryRead*` forms on `ReadOnlyArraySpan<byte>` and `ArraySpan<byte>`, and the `Write*`/`TryWrite*` forms on `ArraySpan<byte>`, with identical semantics (no offset parameters; slice first). This closes the file→binary-parse path: `File.ReadAllBytes(p).AsReadOnlySpan().ReadUInt32LittleEndian()` is direct and zero-copy.
 
@@ -2852,6 +2874,9 @@ public record ArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnly
   public method Slice(start: int, length: int): ArraySpan<T> =>
     new ArraySpan<T>(Source, this.Start + start, length);
   public method Slice(start: int): ArraySpan<T> => Slice(start, Length - start);   // v0.195
+  public method Slice(r: Range<int>): ArraySpan<T>;   // v0.241 — Range form: normalized against
+                                                       //   Length (spec §16.3), then equivalent to
+                                                       //   Slice(start, length); §4.14's contract
 
   public method AsReadOnly(): ReadOnlyArraySpan<T> =>
     new ReadOnlyArraySpan<T>(Source, Start, Length);
@@ -2918,6 +2943,9 @@ public record ReadOnlyArraySpan<T>(Source: Array<T>, Start: int, Length: int): I
   public method Slice(start: int, length: int): ReadOnlyArraySpan<T> =>
     new ReadOnlyArraySpan<T>(Source, this.Start + start, length);
   public method Slice(start: int): ReadOnlyArraySpan<T> => Slice(start, Length - start);   // v0.195
+  public method Slice(r: Range<int>): ReadOnlyArraySpan<T>;   // v0.241 — Range form: normalized against
+                                                               //   Length (spec §16.3), then equivalent to
+                                                               //   Slice(start, length); §4.14's contract
 
   public method IndexOf(value: T): int;
   public method Contains(value: T): bool;
