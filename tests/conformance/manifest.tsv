@@ -224,7 +224,7 @@ spec_0221	spec	Interaction-with-overload-resolution-and-parameter-passing	error	
 spec_0222	spec	Interaction-with-overload-resolution-and-parameter-passing	skip	n/a	blocked-on-#1394 (stdlib-unresolved: Stream)
 spec_0223	spec	Trivial-dispose-for-generic-class-instantiations	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 spec_0224	spec	2810-using-var	fragment	compiles	
-spec_0225	spec	2810-using-var	fragment	compiles	
+spec_0225	spec	2810-using-var	skip	n/a	blocked-on-#3069 (stdlib-unresolved: FileStream.ReadCount — the §28.10 example calls a method the stdlib does not declare)
 spec_0226	spec	Borrowing-collections	fragment	compiles	preamble
 spec_0227	spec	Owning-collections	skip	n/a	skip:incomplete-fragment
 spec_0228	spec	move-on-a-collection-slot	skip	n/a	skip:signature-listing
