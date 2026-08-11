@@ -468,9 +468,18 @@ BEZEL_TEST(discard_reserved_3049, loop_label_underscore_rejected_spec_21_5) {
                 "cannot be used as a loop label name"));
 }
 
-// §17.13's "every declaration named `_`" tail: a field, a property, a method,
-// a type, an alias, a type parameter, a record positional field, an enum
-// constant, a module. Each was accepted pre-fix.
+// §17.13's "every declaration named `_`" tail. The cases below cover a field,
+// a property, a method, a type, an alias, a type parameter, a record
+// positional field and a module; each was accepted pre-fix.
+//
+// NOT covered here, though the parser DOES reject them (Parser_Decls.cpp:479
+// and :504 for enum constants, :554 and :566 for choice cases, both routed to
+// reportDiscardNotDeclarable): enum constant, choice case, import alias, event,
+// member const, extern method, case-payload field, and the interface-member
+// spellings. The rules are implemented; the tests are missing. Tracked as the
+// coverage gap on the issue rather than claimed here — an earlier revision of
+// this comment listed "an enum constant" among the covered cases, which was
+// not true.
 BEZEL_TEST(discard_reserved_3049, field_underscore_rejected_spec_17_13) {
     BEZEL_EXPECT_TRUE(
         rejects("module M; class C private _: int; "

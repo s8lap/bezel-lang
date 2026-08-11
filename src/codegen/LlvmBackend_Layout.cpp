@@ -527,8 +527,10 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
     // from the arithmetic trigger: no i32 floor (a same-width pair keeps its
     // type — `byte ^ byte : byte`, §6.6's `checksum ^= b` cell — and the exact
     // LHS-width op needs no check), and SHIFTS stay on the LHS-width path
-    // below: a shift's result already has the left operand's type (§6.5, the
-    // count masked per #1041) and a shift never raises OverflowException.
+    // below: a shift's result already has the left operand's type (§6.5). The
+    // count is NO LONGER masked — since #3045 (§6.5, v0.242) an out-of-domain
+    // count is a fault, so a shift CAN raise OverflowException; the guard is
+    // emitted by emitShiftCountInDomain above, ahead of the #1042 coercion.
     bool wideBitwise = (op == "&" || op == "|" || op == "^");
     if (l->getType()->isIntegerTy() && !l->getType()->isIntegerTy(1) &&
         r->getType()->isIntegerTy() && !r->getType()->isIntegerTy(1) &&
