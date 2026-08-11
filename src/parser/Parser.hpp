@@ -46,6 +46,29 @@ private:
     bool consumeKeyword(std::string_view text);
     bool consumePunctuator(std::string_view text);
 
+    // §1.3 / §17.13 / A.1 / B.1 (v0.244, proposal 0083; #3049): the bare `_`.
+    // A.1 splits the Identifier production (`Letter IdentCont* | "_"
+    // IdentCont+`), so the lexer hands the bare token back as its own kind and
+    // NO declaration-name slot can ever match it. `atDiscard()` is the test.
+    bool atDiscard() const { return current_.kind == TokenKind::Discard; }
+    // Report `_` in a declaration-name slot and CONSUME it (so one `_` does
+    // not cascade into a run of follow-on syntax errors, exactly as the
+    // Appendix-B.1 keyword-in-a-name-slot recovery does). `what` names the
+    // slot ("field", "parameter", …); `remedy` replaces the default
+    // "choose a name" tail when the position has a specific sanctioned form.
+    // §17.13's rejected-position list requires the diagnostic to name the
+    // sanctioned forms, which is what `remedy` carries.
+    void reportDiscardNotDeclarable(std::string_view what,
+                                    std::string_view remedy = {});
+    // A.6 `DiscardStmt ::= "_" ":=" Expression ";"` (§17.13). current_ is the
+    // `_` token; §17.13 states the form "is recognized lexically by the
+    // leading `_` token", which since v0.244 is the ONLY way to reach it —
+    // `_` is not an expression, so no leading-expression recovery exists.
+    // `semicolonOptional` is set in case/when arm-body position, where §19.7
+    // lets `,`/`end` terminate the arm directly. Returns null (having consumed
+    // the `_`) when what follows is not `:=`.
+    std::unique_ptr<ast::Stmt> parseDiscardStmt(bool semicolonOptional);
+
     // `>>` consumed by the lexer as one Punctuator must be split when it
     // closes nested generic argument lists (e.g. `List<List<int>>`). This
     // helper consumes a single closing `>`, splitting `>>` / `>>=` in place

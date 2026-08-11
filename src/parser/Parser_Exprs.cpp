@@ -810,6 +810,20 @@ std::unique_ptr<ast::Expr> Parser::parsePrimaryExpressionImpl() {
         return inner;
     }
 
+    // §17.13 (v0.244, #3049): "a bare `_` in expression position (`_` is not a
+    // value — nothing binds it, so no such read can resolve)". A.1 makes this
+    // grammatical: no Expression production contains the bare token, so this
+    // is the one place it can surface, and it gets its own diagnostic instead
+    // of the generic "expected expression".
+    if (atDiscard()) {
+        diagnostics_.report(
+            Severity::Error, current_.location,
+            "`_` is not a value — it is the reserved discard token, and "
+            "nothing binds it, so no read of `_` can resolve (§1.3, §17.13)");
+        advance();
+        return nullptr;
+    }
+
     diagnostics_.report(Severity::Error, current_.location,
                         "expected expression");
     return nullptr;
@@ -1067,13 +1081,17 @@ ast::Param Parser::parseLambdaParam() {
         hasMod = true;
     } else if (current_.kind == TokenKind::Identifier &&
                current_.text == "scoped" &&
-               peekAt(1).kind == TokenKind::Identifier) {
+               (peekAt(1).kind == TokenKind::Identifier ||
+                peekAt(1).kind == TokenKind::Discard)) {
         // per §27 / A.7 (v0.228): `scoped` is a CONTEXTUAL modifier (lexed
         // as Identifier, not a reserved keyword) listed in FuncParamMods and
         // therefore admissible on a LambdaParam, exactly mirroring the
         // method-param path (§22.3 ParamModifiers, A.4; Parser_Decls.cpp).
         // It is the modifier exactly when the next token is the parameter's
-        // name (an Identifier); a parameter NAMED `scoped` is followed by
+        // name (an Identifier) or the bare ignore `_` (the Discard token —
+        // matched here so the "no modifier composes with a bare ignore" rule
+        // below reports it, rather than reading `scoped` as the name); a
+        // parameter NAMED `scoped` is followed by
         // `:` and is not matched here, and a destructure head `scoped(` is
         // followed by `(` (a Punctuator) and likewise falls through to the
         // LambdaDestructure alternative below. Function-typed-ness and the
@@ -1105,6 +1123,39 @@ ast::Param Parser::parseLambdaParam() {
         return p;
     }
     p.modifier = mod;
+    // A.7 `LambdaParam ::= FuncParamMods? Identifier (":" Type)? | "_" |
+    // LambdaDestructure` (§27.3 / §17.13): the bare `"_"` alternative is the
+    // parameter IGNORE — accepted, binds nothing, still contributes its slot
+    // to the function type, and duplicates are legal because nothing is named.
+    // This is the Q2 asymmetry with method parameters, which cannot be named
+    // `_` at all (A.4 Param): a lambda parameter is not call-site-addressable
+    // API surface. "No FuncParamMods and no annotation compose with it — a
+    // typed ignore slot is spelled by the target type (§27.4)."
+    if (atDiscard()) {
+        if (hasMod) {
+            diagnostics_.report(
+                Severity::Error, modLoc,
+                "no parameter modifier composes with the bare ignore `_` "
+                "(`" + std::string(mod) +
+                "` here) — a `ref` parameter reads and writes through its "
+                "operand, which an ignore cannot supply, and a `scoped` "
+                "parameter that binds nothing stores nothing (§17.13, §27.3)");
+            p.modifier = {};
+        }
+        p.name = "_";
+        advance();
+        if (isPunctuator(":")) {
+            diagnostics_.report(
+                Severity::Error, current_.location,
+                "a type annotation is not permitted on the bare ignore `_` — "
+                "a bare ignore takes its type from context, never an "
+                "annotation; a typed ignore slot is spelled by the target "
+                "type (§17.13, §27.3, §27.4)");
+            advance();            // past `:`
+            p.type = parseType(); // consume it for recovery
+        }
+        return p;
+    }
     if (current_.kind != TokenKind::Identifier) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected lambda parameter name");
@@ -1344,8 +1395,10 @@ std::unique_ptr<ast::Pattern> Parser::parsePrimaryPattern(
     // exclusively the arm/slot separator, so `inPositional` no longer changes
     // this routine's behavior (it is retained for call-site symmetry with the
     // naked-binding recognition in parsePositionalPattern).
-    // `_` discard. `_` is an Identifier per the lexer.
-    if (current_.kind == TokenKind::Identifier && current_.text == "_") {
+    // A.7 `Pattern ::= "_"` — the wildcard, matching any value without
+    // binding. Since v0.244 `_` is the reserved discard token (A.1), not an
+    // Identifier.
+    if (atDiscard()) {
         advance();
         return std::make_unique<ast::DiscardPattern>();
     }
@@ -1356,6 +1409,18 @@ std::unique_ptr<ast::Pattern> Parser::parsePrimaryPattern(
     // `var IDENT (: TYPE)?` binding pattern.
     if (consumeKeyword("var")) {
         auto bp = std::make_unique<ast::BindingPattern>();
+        if (atDiscard()) {
+            // §17.13 / §19.3 (v0.244, #3049): the pattern-BINDING spelling of
+            // `_` is a rejected position — "the bare wildcard already means
+            // match-without-binding (write `_`)". Recover as that wildcard so
+            // the arm keeps its shape.
+            reportDiscardNotDeclarable(
+                "pattern binding",
+                "the bare wildcard `_` already matches without binding — drop "
+                "the `var` (§19.3)");
+            if (isPunctuator(":")) { advance(); parseType(); }
+            return std::make_unique<ast::DiscardPattern>();
+        }
         if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(
                 Severity::Error, current_.location,
@@ -1485,11 +1550,11 @@ ast::PositionalPattern Parser::parsePositionalPattern() {
     ast::PositionalPattern pp;
     // A.7 PositionalPattern: a Pattern OR a naked binding Identifier (valid
     // only inside destructuring position). Naked binding is detected as a
-    // single Identifier (not `_`) followed immediately by `,` or `)`. Any
-    // other shape (Identifier . ..., Identifier ( ..., literal, `var`, etc.)
-    // takes the Pattern path.
-    if (current_.kind == TokenKind::Identifier &&
-        current_.text != "_") {
+    // single Identifier followed immediately by `,` or `)`. Any other shape
+    // (Identifier . ..., Identifier ( ..., literal, `var`, etc.) takes the
+    // Pattern path — including the `_` wildcard slot, which since v0.244 is
+    // the reserved Discard token and so can no longer be an Identifier here.
+    if (current_.kind == TokenKind::Identifier) {
         const Token& nxt = peekAt(1);
         if (nxt.kind == TokenKind::Punctuator &&
             (nxt.text == "," || nxt.text == ")")) {
@@ -1513,8 +1578,9 @@ ast::CaseArm Parser::parseCaseArm(bool scrutineeLess) {
     if (scrutineeLess) {
         // §19.1 scrutinee-less form: each arm's "pattern" is a full boolean
         // expression (e.g. `int(this) < int(other)`, `score >= 90`, `_ `).
-        // The `_` discard is the only conventional pattern that remains as-is.
-        if (current_.kind == TokenKind::Identifier && current_.text == "_") {
+        // The `_` catch-all is the only conventional pattern that remains
+        // as-is; since v0.244 it is the reserved Discard token (A.1).
+        if (atDiscard()) {
             advance();
             arm.pattern = std::make_unique<ast::DiscardPattern>();
         } else {
@@ -1742,7 +1808,19 @@ std::unique_ptr<ast::Expr> Parser::parseBindExprAtom() {
         clause->isBindAtomClause = true;
         clause->span.begin = current_.location;
         advance();  // past `var`
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // §17.13 / §17.15 (v0.244, #3049): the binding-atom clause is one
+            // of the three positions the gate added to the rejected list, and
+            // its remedy is deliberately NOT the statement pair — "`_ := e;`"
+            // and "`using var _ := e;`" are statements and are not spellable
+            // inside the `(var … )` atom.
+            reportDiscardNotDeclarable(
+                "binding-atom clause",
+                "name the binding or restructure the expression — the "
+                "statement discards (`_ := e;`, `using var _ := e;`) are not "
+                "spellable inside the `(var …)` atom (§17.15)");
+            clause->name = "_";  // recovery: keep parsing this clause
+        } else if (current_.kind != TokenKind::Identifier) {
             // Appendix B.1 / #2090 sibling: a keyword in the clause-name slot
             // is almost certainly an attempted binding name; diagnose the
             // cause directly so one typo does not cascade.

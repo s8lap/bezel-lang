@@ -396,10 +396,12 @@ struct IncrementStmt : Stmt {
     std::string_view op; // "++" or "--"
 };
 
-// A.6: `DiscardStmt ::= "_" ":=" Expression ";"`. Lexically the `_` here is
-// the same Identifier token the lexer always produces for it; the parser
-// recognises the discard form when an expression statement's LHS is
-// IdentifierExpr "_" followed by `:=`.
+// A.6: `DiscardStmt ::= "_" ":=" Expression ";"`. Since v0.244 (proposal 0083,
+// #3049) the `_` here is its OWN reserved token (A.1 splits the Identifier
+// production), so the parser commits the discard form on that leading token —
+// §17.13: "the form is recognized lexically by the leading `_` token". The
+// former recovery (an expression statement whose LHS is IdentifierExpr "_"
+// followed by `:=`) is gone; `_` is not an expression at all.
 struct DiscardStmt : Stmt {
     std::unique_ptr<Expr> value;
     // §17.13 / §28.3 v0.150 (#1009): set by the ownership pass when `value` is an

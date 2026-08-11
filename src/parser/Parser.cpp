@@ -398,6 +398,30 @@ bool Parser::consumePunctuator(std::string_view text) {
     return true;
 }
 
+// §1.3 / §17.13 / A.1 / B.1 (v0.244, proposal 0083; #3049). The bare `_` is a
+// reserved TOKEN — "held out of the identifier namespace like a punctuation
+// symbol" (B.1) — so §17.13's rejected-position list is grammatical, not a
+// name-resolution rule: "every declaration named `_` — a method or constructor
+// parameter …, a field, property, method, type, module, enum constant, choice
+// case, loop label …, or alias" is a compile error "whose diagnostic names the
+// sanctioned forms". This is that diagnostic; each caller supplies the slot
+// name and, where the position has one, its specific remedy.
+void Parser::reportDiscardNotDeclarable(std::string_view what,
+                                        std::string_view remedy) {
+    std::string msg = "`_` is the reserved discard token and cannot be used as a ";
+    msg += what;
+    msg += " name — it is never declarable and never readable as a name "
+           "(§1.3, §17.13)";
+    if (remedy.empty()) {
+        msg += "; choose a name";
+    } else {
+        msg += "; ";
+        msg += remedy;
+    }
+    diagnostics_.report(Severity::Error, current_.location, std::move(msg));
+    advance();  // consume the `_` so one token does not cascade
+}
+
 // §1.6 / v0.170 (#1374): uniform end-label for keyword-labelled constructs.
 // The keyword after `end` is optional; when present it must match the
 // construct's introducing keyword. If a different keyword from the known

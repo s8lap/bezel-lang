@@ -134,6 +134,10 @@ std::unique_ptr<ast::Import> Parser::parseImport() {
         if (current_.kind == TokenKind::Identifier) {
             decl->alias = std::string(current_.text);
             advance(); // past alias identifier
+        } else if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): "every declaration named `_` —
+            // … or alias" is a compile error.
+            reportDiscardNotDeclarable("import alias");
         } else {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected identifier after 'as' in import alias "
@@ -249,7 +253,11 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
     decl->visibility = visibility;
     decl->modifiers = std::move(modifiers);
 
-    if (current_.kind != TokenKind::Identifier) {
+    if (atDiscard()) {
+        // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+        // a compile error — `_` is a reserved token, not an Identifier.
+        reportDiscardNotDeclarable("type");
+    } else if (current_.kind != TokenKind::Identifier) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected type name");
     } else {
@@ -468,7 +476,11 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
         }
     } else if (decl->kind == ast::TypeDeclKind::Enum) {
         // A.3: `EnumConstants ::= EnumConstant ("," EnumConstant)* ";"`.
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+            // a compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("enum constant");
+        } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(
                 Severity::Error, current_.location,
                 "expected enum constant name (enum body requires at least "
@@ -489,6 +501,12 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                 // per §1.6 / proposal 0059 (v0.214): optional trailing `,`
                 // before the closing `;`.
                 if (isPunctuator(";")) break;
+                if (atDiscard()) {
+                    // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+                    // a compile error — `_` is a reserved token, not an Identifier.
+                    reportDiscardNotDeclarable("enum constant");
+                    break;
+                }
                 if (current_.kind != TokenKind::Identifier) {
                     diagnostics_.report(
                         Severity::Error, current_.location,
@@ -533,7 +551,11 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
         //   ChoiceCase  ::= Identifier CasePayload? SerializedClause?
         //   CasePayload ::= "(" CaseField ("," CaseField)* ")"
         // A choice requires at least one case (§35.1).
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+            // a compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("choice case");
+        } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(
                 Severity::Error, current_.location,
                 "expected choice case name (choice body requires at least "
@@ -541,7 +563,11 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
         } else {
             auto parseOneCase = [&]() -> ast::ChoiceCase {
                 ast::ChoiceCase c;
-                if (current_.kind != TokenKind::Identifier) {
+                if (atDiscard()) {
+                    // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+                    // a compile error — `_` is a reserved token, not an Identifier.
+                    reportDiscardNotDeclarable("choice case");
+                } else if (current_.kind != TokenKind::Identifier) {
                     diagnostics_.report(
                         Severity::Error, current_.location,
                         "expected choice case name");
@@ -732,7 +758,11 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
             advance(); // make progress
             continue;
         }
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+            // a compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("method");
+        } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected method name");
         } else {
@@ -808,7 +838,11 @@ std::unique_ptr<ast::TypeAlias> Parser::parseTypeAlias() {
     auto alias = std::make_unique<ast::TypeAlias>();
     advance(); // past `type`
 
-    if (current_.kind != TokenKind::Identifier) {
+    if (atDiscard()) {
+        // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+        // a compile error — `_` is a reserved token, not an Identifier.
+        reportDiscardNotDeclarable("type alias");
+    } else if (current_.kind != TokenKind::Identifier) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected type alias name after 'type'");
     } else {
@@ -1125,7 +1159,11 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         auto cd = std::make_unique<ast::ConstDecl>();
         cd->visibility = visibility;
         cd->isStatic = isStatic;
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+            // a compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("const");
+        } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected const name");
         } else {
@@ -1180,7 +1218,11 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         ed->visibility = visibility;
         ed->isStatic = isStatic;
         ed->isAsync = isAsync;
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+            // a compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("event");
+        } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected event name");
         } else {
@@ -1226,6 +1268,10 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                     Severity::Error, current_.location,
                     "expected ']' to close indexer parameter list");
             }
+        } else if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is a
+            // compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("property");
         } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(
                 Severity::Error, current_.location,
@@ -1513,6 +1559,12 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             "destructor)");
         return nullptr;
     }
+    if (atDiscard()) {
+        // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is a
+        // compile error — `_` is a reserved token, not an Identifier.
+        reportDiscardNotDeclarable("field");
+        return nullptr;
+    }
     if (current_.kind != TokenKind::Identifier) {
         diagnostics_.report(
             Severity::Error, current_.location,
@@ -1613,6 +1665,10 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
                     Severity::Error, current_.location,
                     "expected ']' to close interface indexer parameters");
             }
+        } else if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is a
+            // compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("property");
         } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(
                 Severity::Error, current_.location,
@@ -1689,7 +1745,11 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
         auto ed = std::make_unique<ast::EventDecl>();
         ed->visibility = ast::Visibility::None;
         ed->isAsync = asyncMod;
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+            // a compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("event");
+        } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected event name");
         } else {
@@ -1720,7 +1780,11 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
         // §22.15 (v0.202, #2052): IfaceMethod/IfaceStaticMethod admit `pure?`
         // before `method` per A.4.
         if (pureMod) m->modifiers.push_back("pure");
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+            // a compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("method");
+        } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected method name");
         } else {
@@ -2131,7 +2195,11 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
             static_cast<std::uint32_t>(current_.text.size());
     };
 
-    if (current_.kind != TokenKind::Identifier) {
+    if (atDiscard()) {
+        // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+        // a compile error — `_` is a reserved token, not an Identifier.
+        reportDiscardNotDeclarable("method");
+    } else if (current_.kind != TokenKind::Identifier) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected method name");
     } else {
@@ -2378,7 +2446,8 @@ std::vector<ast::Param> Parser::parseParamList() {
             p.modifier = "owned";
         } else if (current_.kind == TokenKind::Identifier &&
                    current_.text == "scoped" &&
-                   peekAt(1).kind == TokenKind::Identifier) {
+                   (peekAt(1).kind == TokenKind::Identifier ||
+                    peekAt(1).kind == TokenKind::Discard)) {
             // per §28.14 / §22.3 (v0.175): `scoped` is a CONTEXTUAL modifier
             // (lexed as Identifier, not a reserved keyword) valid only on
             // function-typed parameters. It is the modifier exactly when the
@@ -2389,7 +2458,21 @@ std::vector<ast::Param> Parser::parseParamList() {
             p.modifier = "scoped";
             advance();
         }
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // A.4 Param (v0.244, #3049, accepted Q2): "A method/constructor
+            // parameter cannot be named `_` — the bare token is not an
+            // Identifier (A.1) … parameter names are call-site-addressable API
+            // surface (§22.5, §2.8.2); choose a name (§17.13). Lambda
+            // parameters differ: LambdaParam (A.7) admits the bare-`_`
+            // ignore." The asymmetry is the whole point of Q2.
+            reportDiscardNotDeclarable(
+                "parameter",
+                "parameter names are call-site-addressable API surface carried "
+                "by the artifact interface (§22.5, §2.8.2), so choose a name — "
+                "a LAMBDA parameter differs: `lambda(_) => …` is the true "
+                "ignore (§27.3)");
+            p.name = "_";  // recovery: keep parsing this parameter
+        } else if (current_.kind != TokenKind::Identifier) {
             // Recovery: if a keyword was used as a parameter name, accept
             // it (with a diagnostic) and advance. This prevents an infinite
             // loop in error recovery. Note: `base`, `this`, and other
@@ -2515,6 +2598,10 @@ std::vector<ast::CallArgument> Parser::parseArgList() {
         } else if (current_.kind == TokenKind::Identifier &&
                    current_.text == "scoped" &&
                    (peekAt(1).kind == TokenKind::Identifier ||
+                    // v0.244: the reserved `_` too, so `scoped _` reaches the
+                    // ArgExpression rejection below with its own diagnostic
+                    // instead of reading `scoped` as the argument value.
+                    peekAt(1).kind == TokenKind::Discard ||
                     (peekAt(1).kind == TokenKind::Keyword &&
                      (peekAt(1).text == "this" || peekAt(1).text == "base" ||
                       // per §9.7 / §28.14 (v0.180): the canonical FRESH-
@@ -2552,14 +2639,63 @@ std::vector<ast::CallArgument> Parser::parseArgList() {
             advance(); // identifier
             advance(); // :=
         }
-        // ArgExpression — `_` discard or full Expression. `_` is detected
-        // as a lone Identifier followed by `,` or `)`.
-        if (current_.kind == TokenKind::Identifier &&
-            current_.text == "_" &&
-            peekAt(1).kind == TokenKind::Punctuator &&
-            (peekAt(1).text == "," || peekAt(1).text == ")")) {
+        // A.4 `ArgExpression ::= Expression | "_"`. Since v0.244 the bare `_`
+        // is its own reserved token, so the alternative needs no lookahead
+        // disambiguation — "no Expression contains the bare token (A.1)".
+        // §17.13 sanctions it only under the `out` modifier: "the discard
+        // composes with `out` only: **`ref _` is a compile error**"; the
+        // inline-declaration modifiers (`out var` / `out owned var` /
+        // `out using var`) declare a local, and `_` is never declarable.
+        if (atDiscard()) {
+            const SourceLocation discardLoc = current_.location;
+            if (a.modifier == "ref") {
+                diagnostics_.report(
+                    Severity::Error, discardLoc,
+                    "`ref _` is a compile error — a `ref` argument reads its "
+                    "operand, which a discard cannot supply; pass a named "
+                    "location, or use `out _` if the parameter is pure output "
+                    "(§17.13, §22.3)");
+            } else if (a.modifier == "out var" ||
+                       a.modifier == "out owned var" ||
+                       a.modifier == "out using var") {
+                diagnostics_.report(
+                    Severity::Error, discardLoc,
+                    "`" + std::string(a.modifier) +
+                    " _` is a compile error — it would declare nothing; write "
+                    "`out _`, which already means exactly this (§17.13, "
+                    "§22.4)");
+            } else if (a.modifier != "out") {
+                // `owned _` / `scoped _` mark an operand that is READ (moved
+                // from, or lent), which a discard cannot supply; an UNMODIFIED
+                // `_` argument is a plain by-value operand, i.e. a read of a
+                // name that binds nothing. Both are "every other position" in
+                // §17.13's out-argument rule. (Unmodified `_` previously
+                // reached codegen and emitted malformed IR — an int formal
+                // received the address of the compiler's scratch slot.)
+                diagnostics_.report(
+                    Severity::Error, discardLoc,
+                    (a.modifier.empty()
+                         ? std::string("`_`")
+                         : "`" + std::string(a.modifier) + " _`") +
+                    " is a compile error in argument position — the discard "
+                    "`_` is sanctioned there only under the `out` modifier, "
+                    "where receiving-and-ignoring a value is coherent "
+                    "(§17.13, §22.3)");
+            }
             a.isDiscard = true;
             advance();
+            if (isPunctuator(":")) {
+                // §17.13 / §22.4: "A type annotation on `out _` is not
+                // permitted (`out _: int` is a syntax error) … a bare ignore
+                // takes its type from context, never an annotation."
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "a type annotation is not permitted on the discard `_` — "
+                    "a bare ignore takes its type from context, never an "
+                    "annotation (§17.13, §22.4)");
+                advance();     // past `:`
+                parseType();   // consume it for recovery
+            }
         } else {
             a.value = parseExpression();
             // v0.217 (§27.3, #2101): `Foo((x) => …)` — a retired-spelling
@@ -2599,7 +2735,11 @@ std::vector<ast::Param> Parser::parsePositionalFieldList() {
         // fix #2482: stamp the field's own location at its first token (the
         // name) so a member diagnostic points at the field, not the record.
         p.loc = current_.location;
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+            // a compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("positional field");
+        } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected positional field name");
         } else {
@@ -2645,7 +2785,11 @@ std::vector<ast::Param> Parser::parseCasePayloadList() {
             p.modifier = "owned";
             advance();
         }
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+            // a compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("case payload field");
+        } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected case payload field name");
         } else {
@@ -2861,6 +3005,12 @@ std::vector<ast::GenericParam> Parser::parseGenericParams() {
         } else if (isKeyword("out")) {
             p.variance = current_.text;
             advance();
+        }
+        if (atDiscard()) {
+            // §1.3 / §17.13 (v0.244, #3049): every declaration named `_` is
+            // a compile error — `_` is a reserved token, not an Identifier.
+            reportDiscardNotDeclarable("type parameter");
+            return p;
         }
         if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
@@ -3097,6 +3247,13 @@ std::unique_ptr<ast::QualifiedName> Parser::parseTypeName() {
 std::unique_ptr<ast::QualifiedName> Parser::parseQualifiedName() {
     // A.2: `QualifiedName ::= Identifier ("." Identifier)*`
     auto name = std::make_unique<ast::QualifiedName>();
+    if (atDiscard()) {
+        // §1.3 / §17.13 (v0.244, #3049): a module name (and every other
+        // qualified-name component) is a name; `_` is never one. §17.13's
+        // rejected list names "module" explicitly.
+        reportDiscardNotDeclarable("module or qualified-name component");
+        return name;
+    }
     if (current_.kind != TokenKind::Identifier) {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected identifier");

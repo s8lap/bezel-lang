@@ -212,38 +212,42 @@ BEZEL_TEST(lexer_numeric_integration,
 // --- v0.127: digit-run must end with a digit (no trailing `_`) --------------
 // Per grammar A.1, the four digit-run productions are `Digit ("_"* Digit)*`,
 // so a trailing `_` is not part of the literal. The bare `_` that follows is
-// a valid identifier (§1.3), so a trailing-`_` source like `42_` lexes as
-// IntLiteral "42" plus Identifier "_". Consecutive underscores between digits
-// remain legal.
+// the RESERVED DISCARD TOKEN (§1.3 / A.1 / B.1 at v0.244, proposal 0083 —
+// `Identifier ::= Letter IdentCont* | "_" IdentCont+` no longer matches the
+// one-character lexeme), so a trailing-`_` source like `42_` lexes as
+// IntLiteral "42" plus Discard "_". What this pins is unchanged and is the
+// only thing it ever pinned: the trailing `_` is NOT part of the literal.
+// (These five asserted `{Identifier, "_"}` up to v0.243.) Consecutive
+// underscores between digits remain legal.
 
 BEZEL_TEST(lexer_int_literals, v0_127_decimal_trailing_underscore_not_in_literal) {
     expectTokens(lexAll("42_"),
                  {{TokenKind::IntLiteral, "42"},
-                  {TokenKind::Identifier, "_"}});
+                  {TokenKind::Discard, "_"}});
 }
 
 BEZEL_TEST(lexer_int_literals, v0_127_hex_trailing_underscore_not_in_literal) {
     expectTokens(lexAll("0xFF_"),
                  {{TokenKind::IntLiteral, "0xFF"},
-                  {TokenKind::Identifier, "_"}});
+                  {TokenKind::Discard, "_"}});
 }
 
 BEZEL_TEST(lexer_int_literals, v0_127_binary_trailing_underscore_not_in_literal) {
     expectTokens(lexAll("0b1010_"),
                  {{TokenKind::IntLiteral, "0b1010"},
-                  {TokenKind::Identifier, "_"}});
+                  {TokenKind::Discard, "_"}});
 }
 
 BEZEL_TEST(lexer_float_literals, v0_127_fractional_trailing_underscore_not_in_literal) {
     expectTokens(lexAll("1.0_"),
                  {{TokenKind::FloatLiteral, "1.0"},
-                  {TokenKind::Identifier,   "_"}});
+                  {TokenKind::Discard,   "_"}});
 }
 
 BEZEL_TEST(lexer_float_literals, v0_127_exponent_trailing_underscore_not_in_literal) {
     expectTokens(lexAll("1e5_"),
                  {{TokenKind::FloatLiteral, "1e5"},
-                  {TokenKind::Identifier,   "_"}});
+                  {TokenKind::Discard,   "_"}});
 }
 
 // Consecutive underscores between digits are still allowed by the grammar

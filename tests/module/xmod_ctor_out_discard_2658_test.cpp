@@ -48,7 +48,10 @@
 //       is "As a positional argument with the `out` modifier" — `out`, not
 //       `ref`. An earlier draft admitted `ref _` too and made it work; that
 //       would have committed the backend to a form the spec does not define,
-//       so it was narrowed. `ref _` now reaches the loud residual (U3).
+//       so it was narrowed. `ref _` then reached the loud residual (U3).
+//       (SUPERSEDED at v0.244 by proposal 0083 / #3049: §17.13 now states
+//       "`ref _` is a compile error" outright, so the form never reaches
+//       codegen from any path and U3 pins the REJECTION instead — see U3.)
 //
 //   (2) MAKE THE RESIDUAL LOUD. An `out owned` formal's discard is still NOT
 //       lowered, and that is a decline of a NORMATIVE obligation, recorded as
@@ -99,6 +102,7 @@
 //     U1 `out _` vs `out n: int`, ctor-assigned field      0          3
 //     U2 `out _` vs `out n: string` (8-byte formal)        0          8
 //     U3 `ref _`: declined, diagnostic emitted          SILENT      loud
+//        (re-pointed at v0.244/#3049: now a hard compile REJECT, see U3)
 //     U4 `out owned` discard: diagnostic emitted        SILENT      loud
 //     U5 control: no modifiers at all                     49         49
 //     U6 control: imported type with NO constructor       60         60
@@ -314,26 +318,32 @@ BEZEL_TEST(xmod_ctor_out_discard_2658,
 }
 
 // ===========================================================================
-// U3 — `ref _` is NOT admitted, deliberately, and must be LOUD.
+// U3 — `ref _` is a COMPILE ERROR (§17.13, v0.244; #3049 / proposal 0083).
 //
-// §17.13 sanctions the discard in exactly three positions, and its
-// out-argument position reads "As a positional argument with the `out`
-// modifier, `_` discards the out-parameter result" — `out`, not `ref`. The
-// section opens: "Discard is permitted in three positions; in every other
-// position `_` is treated as a normal identifier." An earlier draft of this
-// fix admitted `ref _` and made it return 6, which would have committed the
-// backend to a form the spec does not define; it was narrowed to `out` on that
-// reading. (The parser does set `isDiscard` for `ref _`, which is why the form
-// reaches codegen at all — whether sema should reject it outright is filed, not
-// settled here.)
+// History, because this case has now been re-pointed twice and the reason
+// matters. #2658 narrowed its scratch-slot lowering to a plain borrowing `out`
+// formal because §17.13's out-argument position reads "As a positional
+// argument with the `out` modifier" — `out`, not `ref`. `ref _` therefore
+// reached the loud `internal:` residual instead of being silently mis-lowered,
+// and this case pinned that DECLINE. Whether sema should reject `ref _`
+// outright was filed rather than settled (#2679).
 //
-// So this case pins the DECLINE, not a value: `ref _` reaches the loud residual
-// instead of being silently mis-lowered. Asserting only "wrong value" would
-// pass identically pre-fix, which is exactly the vacuity trap; the diagnostic
-// is the observable that changed.
+// It is settled now, and in the direction that removes the residual entirely:
+// §17.13 at v0.244 states it as a rule — "the discard composes with `out`
+// only: **`ref _` is a compile error** — a `ref` argument reads its operand,
+// which a discard cannot supply; pass a named location (§22.3)" — and A.4's
+// ArgExpression note repeats it ("in every non-out position — `ref _` included
+// — it is a compile error"). The form no longer reaches codegen from ANY path,
+// imported or not, so there is no residual left to be loud about: the program
+// is rejected in the parser.
+//
+// The case still pins a DIAGNOSTIC rather than a value (asserting only "wrong
+// value" would pass identically pre-fix — the vacuity trap), just a different
+// one: the compile must FAIL, naming `ref _` and its remedy.
+// per spec §17.13 / §22.3 / A.4, v0.244
 // ===========================================================================
 BEZEL_TEST(xmod_ctor_out_discard_2658,
-           imported_ctor_ref_discard_is_declined_loudly) {
+           imported_ctor_ref_discard_is_rejected_spec_17_13) {
     std::string err;
     int rc = runImported2658(
         "    var w := new W8(ref _); "
@@ -341,9 +351,11 @@ BEZEL_TEST(xmod_ctor_out_discard_2658,
         "    _ := w; "
         "    return q; ", "U3", &err);
     if (rc == -2) return;
-    BEZEL_EXPECT_TRUE(err.find("#2658") != std::string::npos);
-    BEZEL_EXPECT_TRUE(
-        err.find("no constructor call could be lowered") != std::string::npos);
+    BEZEL_EXPECT_EQ(rc, -1);  // the app did not compile
+    BEZEL_EXPECT_TRUE(err.find("`ref _` is a compile error") !=
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(err.find("pass a named location") != std::string::npos);
+    BEZEL_EXPECT_TRUE(err.find("\xc2\xa7""17.13") != std::string::npos);
 }
 
 // ===========================================================================

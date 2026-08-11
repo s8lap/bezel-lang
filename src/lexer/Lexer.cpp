@@ -224,6 +224,14 @@ Token Lexer::next() {
             ++position_;
         }
         std::string_view text = source_.substr(start, position_ - start);
+        // per A.1 / §1.3 / B.1 (v0.244, proposal 0083): `Identifier ::= Letter
+        // IdentCont* | "_" IdentCont+`. The bare single-character `_` matches
+        // NEITHER alternative — the second requires at least one IdentCont
+        // after the underscore — so it is lexed as its own reserved token, the
+        // discard (§17.13). `_x`, `_1`, `__` and `snake_case` all satisfy a
+        // production and stay ordinary identifiers.
+        if (text.size() == 1 && text[0] == '_')
+            return Token{TokenKind::Discard, text, locationAt(start)};
         TokenKind kind =
             isReservedKeyword(text) ? TokenKind::Keyword : TokenKind::Identifier;
         return Token{kind, text, locationAt(start)};

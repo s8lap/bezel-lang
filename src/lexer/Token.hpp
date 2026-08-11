@@ -38,6 +38,15 @@ enum class TokenKind {
     // (and a future split-pass) decode the `{` … `}` interpolation parts.
     InterpolatedString,
     InterpolatedVerbatimString,
+    // per §1.3 / §17.13 / A.1 / B.1 (v0.244, proposal 0083): the bare
+    // single-character `_`. A.1 splits the Identifier production —
+    // `Identifier ::= Letter IdentCont* | "_" IdentCont+` — so the bare token
+    // is NOT an Identifier at all; it is held out of the identifier namespace
+    // like a punctuation symbol (B.1 "The reserved token `_`"), never
+    // declarable and never readable as a name. Identifiers that merely BEGIN
+    // with or contain `_` (`_camelCase`, `_f`, `__`, `_1`, `snake_case`) stay
+    // ordinary Identifiers — only the one-character lexeme is this kind.
+    Discard,
     Unknown,
 };
 

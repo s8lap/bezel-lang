@@ -22,12 +22,44 @@ NodePtr stampSpan(NodePtr node, const SourceLocation& start,
 } // namespace
 
 
+// A.6 `DiscardStmt ::= "_" ":=" Expression ";"` — see Parser.hpp.
+std::unique_ptr<ast::Stmt> Parser::parseDiscardStmt(bool semicolonOptional) {
+    const SourceLocation start = current_.location;
+    advance();  // past the reserved `_`
+    if (!isPunctuator(":=")) {
+        // §17.13: `_` is a sink, not a name and not an lvalue, so `_` followed
+        // by anything but `:=` (`_;`, `_ += e;`, `_.M();`, `_++;`) has no
+        // reading at all. Name the two statement-position spellings.
+        diagnostics_.report(
+            Severity::Error, start,
+            "`_` is the reserved discard token — it is not a value and not an "
+            "lvalue, so the only statement it spells is the discard "
+            "`_ := expression;` (evaluate, then release at end of statement); "
+            "to hold the value anonymously until scope end write "
+            "`using var _ := expression;` (§1.3, §17.13, §28.10)");
+        return nullptr;
+    }
+    advance();  // past `:=`
+    auto d = std::make_unique<ast::DiscardStmt>();
+    d->span.begin = start;
+    d->value = parseExpression();
+    if (!consumePunctuator(";") && !semicolonOptional) {
+        // v0.217 (§27.3, #2101): retired lambda spelling.
+        if (!checkRetiredExprSpelling() || !consumePunctuator(";"))
+            diagnostics_.report(Severity::Error, current_.location,
+                                "expected ';' after discard statement");
+    }
+    return std::unique_ptr<ast::Stmt>(d.release());
+}
+
 ast::CaseArm Parser::parseCaseStmtArm(bool scrutineeLess) {
     ast::CaseArm arm;
     if (scrutineeLess) {
         // §19.1 scrutinee-less: arm pattern is a full boolean expression.
-        // `_` is the discard pattern and remains special.
-        if (current_.kind == TokenKind::Identifier && current_.text == "_") {
+        // `_` is the always-true catch-all (A.7 `WhenArm ::= (Expression |
+        // "_") "=>" ArmBody`) and remains special. Since v0.244 it arrives as
+        // the reserved Discard token rather than an Identifier (A.1).
+        if (atDiscard()) {
             advance();
             arm.pattern = std::make_unique<ast::DiscardPattern>();
         } else {
@@ -97,6 +129,16 @@ ast::CaseArm Parser::parseCaseStmtArm(bool scrutineeLess) {
         // at `:=` and cascaded a parse error (#932). The terminating `;` is
         // OPTIONAL — `,`/`end` may follow directly (§19.7). The arm is uniformly
         // represented as a Block with one statement.
+        //
+        // §17.13 / A.6 (v0.244): `_ := e;` is committed on its leading token —
+        // `_` is the reserved discard token, never an Identifier, so it can no
+        // longer arrive here as a leading IdentifierExpr. §19.7 makes the
+        // arm's `;` optional (`,`/`end` may follow directly).
+        if (atDiscard()) {
+            if (auto d = parseDiscardStmt(/*semicolonOptional=*/true))
+                arm.stmts.push_back(std::move(d));
+            return arm;
+        }
         SourceLocation start = current_.location;
         auto lhs = parseExpression();
         bool isInc = current_.kind == TokenKind::Punctuator &&
@@ -117,32 +159,22 @@ ast::CaseArm Parser::parseCaseStmtArm(bool scrutineeLess) {
             consumePunctuator(";");
             arm.stmts.push_back(std::move(inc));
         } else if (isAssign) {
-            auto* idLhs = current_.text == ":="
-                              ? dynamic_cast<ast::IdentifierExpr*>(lhs.get())
-                              : nullptr;
-            if (idLhs && idLhs->name == "_") {
-                // Discard form `_ := expr`.
-                advance();
-                auto d = std::make_unique<ast::DiscardStmt>();
-                d->span.begin = start;
-                d->value = parseExpression();
-                consumePunctuator(";");
-                arm.stmts.push_back(std::move(d));
-            } else {
-                auto a = std::make_unique<ast::AssignmentStmt>();
-                a->target = std::move(lhs);
-                a->op = current_.text;
-                a->span.begin = start;
-                advance();
-                // §28.3 / §28.7 / §28.10 (v0.180, #1965): the `owned`
-                // assignment-position transfer marker — `y := owned x;` — in a
-                // case/when arm body. See parseStatementImpl for the rationale.
-                if (a->op == ":=" && consumeKeyword("owned"))
-                    a->valueHasOwnedMarker = true;
-                a->value = parseExpression();
-                consumePunctuator(";");
-                arm.stmts.push_back(std::move(a));
-            }
+            // (The former `_ := expr` recovery — an IdentifierExpr LHS named
+            // `_` — is gone: since v0.244 the discard is committed on its own
+            // token above, so nothing named `_` can reach this branch.)
+            auto a = std::make_unique<ast::AssignmentStmt>();
+            a->target = std::move(lhs);
+            a->op = current_.text;
+            a->span.begin = start;
+            advance();
+            // §28.3 / §28.7 / §28.10 (v0.180, #1965): the `owned`
+            // assignment-position transfer marker — `y := owned x;` — in a
+            // case/when arm body. See parseStatementImpl for the rationale.
+            if (a->op == ":=" && consumeKeyword("owned"))
+                a->valueHasOwnedMarker = true;
+            a->value = parseExpression();
+            consumePunctuator(";");
+            arm.stmts.push_back(std::move(a));
         } else {
             // Expression body (form 3). Optional trailing `;`.
             consumePunctuator(";");
@@ -246,14 +278,42 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                 "`while`, or `await for` (§21.5)");
             loopLabel = {}; // drop it; parse whatever follows for recovery
         }
+    } else if (atDiscard() && peekNext().kind == TokenKind::Punctuator &&
+               peekNext().text == ":") {
+        // §17.13 / §21.5 (v0.244, #3049): "`_` is not a valid loop label: a
+        // label is a declaration, and `_` cannot be declared." (`_ :=` is one
+        // lexeme, so this cannot collide with the discard statement below.)
+        reportDiscardNotDeclarable(
+            "loop label",
+            "a label is a declaration, and `_` cannot be declared (§21.5)");
+        consumePunctuator(":");  // drop the `:` too; parse the loop unlabeled
     }
+
+    // A.6 DiscardStmt (§17.13): `_ := Expression ;`. Committed on the leading
+    // reserved token — §17.13's "the form is recognized lexically by the
+    // leading `_` token" — because since v0.244 `_` is not an Identifier and
+    // therefore not an expression, so the old parse-an-expression-then-check
+    // recovery has nothing to recover from.
+    if (atDiscard()) return parseDiscardStmt(/*semicolonOptional=*/false);
 
     // A.6 LocalConstDecl (slice 53):
     //   "const" Identifier (":" Type)? ":=" ConstExpr ";"
     if (isKeyword("const")) {
         advance(); // past `const`
         auto lc = std::make_unique<ast::LocalConstDecl>();
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // §21.1 / §17.13 (v0.244, #3049): "`const _ := e;` is likewise
+            // rejected (a never-readable constant is useless by construction)".
+            // The two-remedy tail is the same as `var _`'s: nothing about a
+            // `const` changes which sanctioned spelling replaces it.
+            reportDiscardNotDeclarable(
+                "local const",
+                "a never-readable constant is useless by construction — write "
+                "`_ := e;` to evaluate and release the value at end of "
+                "statement, or `using var _ := e;` to hold it anonymously "
+                "until scope end (§21.1, §28.10)");
+            lc->name = "_";  // recovery: keep parsing this declaration
+        } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected name in local const declaration");
         } else {
@@ -308,7 +368,26 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
         } else {
             advance(); // past `var`
         }
-        if (current_.kind != TokenKind::Identifier) {
+        if (atDiscard()) {
+            // A.6 LocalDecl (v0.244, #3049): the `"_"` alternative exists ONLY
+            // on the `using var` / `await using var` forms — the anonymous
+            // owning binding of §17.13 ("the one `_` form that owns storage":
+            // scope-end disposal, no name bound), whose `(":" Type)?`
+            // ascription slot is deliberately RETAINED (`using var _: Stream
+            // := e;`). Plain `var _ := e;` does not parse as a LocalDecl and
+            // is rejected with §21.1's two-remedy diagnostic.
+            if (decl->isUsing) {
+                decl->name = "_";
+                advance();
+            } else {
+                reportDiscardNotDeclarable(
+                    "local",
+                    "write `_ := e;` to evaluate and release the value at end "
+                    "of statement, or `using var _ := e;` to hold it "
+                    "anonymously until scope end (§21.1, §28.10)");
+                decl->name = "_";  // recovery: keep parsing this declaration
+            }
+        } else if (current_.kind != TokenKind::Identifier) {
             // Appendix B.1 (v0.215) / #2090: a keyword in the identifier
             // slot is almost certainly an attempted local name. Diagnose the
             // cause directly and consume it so one typo does not cascade into
@@ -499,7 +578,17 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                 ast::CatchArm arm;
                 if (consumeKeyword("var")) {
                     arm.hasBinding = true;
-                    if (current_.kind != TokenKind::Identifier) {
+                    if (atDiscard()) {
+                        // §17.13 / §31.2 (v0.244, #3049): the catch-arm
+                        // BINDING spelling of `_` is a rejected position —
+                        // "write … the bindingless `catch E =>`". Recover as
+                        // exactly that (drop the binding, keep the type).
+                        reportDiscardNotDeclarable(
+                            "catch-arm binding",
+                            "write the bindingless form `catch E => …`, which "
+                            "already binds nothing (§31.2)");
+                        arm.hasBinding = false;
+                    } else if (current_.kind != TokenKind::Identifier) {
                         diagnostics_.report(
                             Severity::Error, current_.location,
                             "expected exception-binding name");
@@ -512,6 +601,17 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                             Severity::Error, current_.location,
                             "expected ':' after catch binding name");
                     }
+                } else if (atDiscard() &&
+                           peekAt(1).kind == TokenKind::Punctuator &&
+                           peekAt(1).text == ":") {
+                    // The `var`-less binding alias `catch name: Type` with the
+                    // reserved `_` in the name slot — same rejection, same
+                    // remedy (§17.13, §31.2).
+                    reportDiscardNotDeclarable(
+                        "catch-arm binding",
+                        "write the bindingless form `catch E => …`, which "
+                        "already binds nothing (§31.2)");
+                    advance();  // past ":"
                 } else if (current_.kind == TokenKind::Identifier &&
                            peekAt(1).kind == TokenKind::Punctuator &&
                            peekAt(1).text == ":") {
@@ -597,6 +697,12 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                     isKeyword("await")) {
                     // Statement-leading: delegate to parseStatement() as before.
                     arm.body = parseStatement();
+                } else if (atDiscard()) {
+                    // §17.13 / A.6 (v0.244): `_ := e;` in a catch-arm body.
+                    // The discard is committed on its leading token, so it can
+                    // no longer arrive as an IdentifierExpr in the
+                    // expression-leading path below.
+                    arm.body = parseDiscardStmt(/*semicolonOptional=*/false);
                 } else {
                     // Expression-leading (includes bare `throw` re-raise and
                     // `throw expr`). Parse the expression first, then detect
@@ -622,43 +728,25 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                          current_.text == "|="  || current_.text == "^="  ||
                          current_.text == "<<=" || current_.text == ">>=" ||
                          current_.text == "??=")) {
-                        // Discard form: `_ := expr;`
-                        bool isDiscard = false;
-                        if (current_.text == ":=") {
-                            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                                    lhs.get())) {
-                                if (id->name == "_") {
-                                    isDiscard = true;
-                                    advance(); // past `:=`
-                                    auto d = std::make_unique<ast::DiscardStmt>();
-                                    d->value = parseExpression();
-                                    if (!consumePunctuator(";")) {
-                                        diagnostics_.report(
-                                            Severity::Error, current_.location,
-                                            "expected ';' after discard statement");
-                                    }
-                                    arm.body = std::move(d);
-                                }
-                            }
+                        // (The former `_ := expr` recovery — an IdentifierExpr
+                        // LHS named `_` — is gone: since v0.244 the discard is
+                        // committed on its own token above.)
+                        auto a = std::make_unique<ast::AssignmentStmt>();
+                        a->target = std::move(lhs);
+                        a->op = current_.text;
+                        advance();
+                        // §28.3 / §28.7 / §28.10 (v0.180, #1965): the `owned`
+                        // assignment-position transfer marker `y := owned x;`
+                        // in a catch-arm body. See parseStatementImpl.
+                        if (a->op == ":=" && consumeKeyword("owned"))
+                            a->valueHasOwnedMarker = true;
+                        a->value = parseExpression();
+                        if (!consumePunctuator(";")) {
+                            diagnostics_.report(
+                                Severity::Error, current_.location,
+                                "expected ';' after assignment");
                         }
-                        if (!isDiscard) {
-                            auto a = std::make_unique<ast::AssignmentStmt>();
-                            a->target = std::move(lhs);
-                            a->op = current_.text;
-                            advance();
-                            // §28.3 / §28.7 / §28.10 (v0.180, #1965): the `owned`
-                            // assignment-position transfer marker `y := owned x;`
-                            // in a catch-arm body. See parseStatementImpl.
-                            if (a->op == ":=" && consumeKeyword("owned"))
-                                a->valueHasOwnedMarker = true;
-                            a->value = parseExpression();
-                            if (!consumePunctuator(";")) {
-                                diagnostics_.report(
-                                    Severity::Error, current_.location,
-                                    "expected ';' after assignment");
-                            }
-                            arm.body = std::move(a);
-                        }
+                        arm.body = std::move(a);
                     } else {
                         // Pure expression form (§31.2.2 form 1) or expression
                         // statement form (form 2, with optional `;`).
@@ -750,14 +838,34 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected 'var' after 'for'");
         }
-        if (current_.kind != TokenKind::Identifier) {
+        // A.6 ForStmt `(Identifier | "_")` (§21.4 / §17.13): the `_`
+        // alternative is the loop-variable IGNORE — "iterates for the body's
+        // effects with the element unbound". It binds nothing readable (since
+        // v0.244 no read of `_` can even be spelled), and the grammar's note
+        // says the ascription it over-admits is rejected semantically: "a bare
+        // ignore takes its type from context, never an annotation".
+        const bool ignoreLoopVar = atDiscard();
+        if (ignoreLoopVar) {
+            stmt->varName = "_";
+            advance();
+            if (isPunctuator(":")) {
+                diagnostics_.report(
+                    Severity::Error, current_.location,
+                    "a type ascription is not permitted on the loop-variable "
+                    "ignore `_` — a bare ignore takes its type from context, "
+                    "never an annotation; write `for var _ in …` (§17.13, "
+                    "§21.4)");
+                advance();          // past `:`
+                stmt->varType = parseType();  // consume it for recovery
+            }
+        } else if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected loop variable name");
         } else {
             stmt->varName = current_.text;
             advance();
         }
-        if (consumePunctuator(":")) {
+        if (!ignoreLoopVar && consumePunctuator(":")) {
             stmt->varType = parseType();
         }
         if (!consumeKeyword("in")) {
@@ -914,8 +1022,8 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
     }
 
     // Otherwise parse an expression and decide between IncrementStmt (`++`/
-    // `--`), DiscardStmt (LHS is identifier `_` and the op is `:=`),
-    // AssignmentStmt (other assignment ops), and ExpressionStmt (fallback).
+    // `--`), AssignmentStmt (assignment ops), and ExpressionStmt (fallback).
+    // (DiscardStmt is committed on its leading `_` token above, §17.13.)
     auto lhs = parseExpression();
 
     if (current_.kind == TokenKind::Punctuator &&
@@ -939,25 +1047,10 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
          current_.text == "|="  || current_.text == "^="  ||
          current_.text == "<<=" || current_.text == ">>=" ||
          current_.text == "??=")) {
-        // Discard form: LHS is the bare `_` identifier and the op is `:=`.
-        if (current_.text == ":=") {
-            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(lhs.get())) {
-                if (id->name == "_") {
-                    advance(); // past `:=`
-                    auto d = std::make_unique<ast::DiscardStmt>();
-                    d->value = parseExpression();
-                    if (!consumePunctuator(";")) {
-                        // v0.217 (§27.3, #2101): retired lambda spelling.
-                        if (!checkRetiredExprSpelling() ||
-                            !consumePunctuator(";"))
-                            diagnostics_.report(
-                                Severity::Error, current_.location,
-                                "expected ';' after discard statement");
-                    }
-                    return std::unique_ptr<ast::Stmt>(d.release());
-                }
-            }
-        }
+        // (The former discard recovery — an IdentifierExpr LHS named `_` — is
+        // gone: since v0.244 `_` is the reserved discard token, so the
+        // DiscardStmt is committed on its leading token at the top of this
+        // function and never reaches the expression path.)
         auto a = std::make_unique<ast::AssignmentStmt>();
         a->target = std::move(lhs);
         a->op = current_.text;
