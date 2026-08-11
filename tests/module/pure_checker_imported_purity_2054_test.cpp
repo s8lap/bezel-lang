@@ -74,6 +74,29 @@ ModuleMetadata buildMathLibWithImportedPurity() {
     calc.kind = MetaTypeDeclKind::Class;
     calc.visibility = MetaVisibility::Public;
 
+    // §31.1 (v0.243, #3046): every throw operand must be an `Exception`-derived
+    // class. `imported_pure_constructor_throw_admitted_spec_22_15` below throws
+    // `new MathLib.Calc()`, so the carried class must derive from `Exception`
+    // or the §31.1 operand check rejects the program before §22.15's carve-out
+    // is ever reached. This fixture predates v0.243 and carried neither field.
+    //
+    // Carried exactly as a real exporter carries it, which is BOTH:
+    //   - `builtinExceptionBase`, the dedicated field ModuleMetadataBuilder
+    //     copies off the exporter's TypeSymbol (set by TypeResolution_Names for
+    //     a class whose base names a built-in exception) and ModuleLoader
+    //     restores — this is the field `sema::builtinExceptionBaseOf` reads
+    //     first, and the one that makes the §31.1 walk succeed across the
+    //     module boundary without an `ast::TypeDecl` (#2950);
+    //   - the `baseTypes` entry, which is what the §12 base-class convention
+    //     records (baseTypes[0] is the base class).
+    calc.builtinExceptionBase = "Exception";
+    {
+        MetaType exc;
+        exc.kind = TypeKind::Named;
+        exc.namedName = "Exception";
+        calc.baseTypes.push_back(exc);
+    }
+
     // §22.15 / #2054: pure constructor carried across the boundary.
     {
         MetaMember ctor;
