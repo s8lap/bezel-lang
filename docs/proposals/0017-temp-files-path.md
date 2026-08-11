@@ -236,6 +236,15 @@ Pattern-based `GetFiles` with `**` requires careful semantics around symlink fol
 1. **`TempFile.Create()` on failure**: if the OS fails to create the temp file (disk full, permissions), `Create()` raises `IOException`. The object is not returned. This is straightforward — is there a concern about the error model here?
 2. **`CreateTempSubdirectory` name**: `.NET 6` uses `Directory.CreateTempSubdirectory`; Go uses `os.MkdirTemp`. The .NET name is proposed for consistency; object if preferred otherwise.
 
+## Delegated rulings 2026-08-11 (stdlib-wave readiness; owner review in repo)
+
+Resolving the two §7 questions under the owner's 2026-08-11 delegation ("work autonomously... don't ask me for confirmations or rulings"; review-in-repo) (delegated ruling, 0012-precedent style). Status stays draft.
+
+1. **Q1 — `Create()` raising `IOException` on OS failure: CONFIRMED, no error-model concern.** This is exactly `FileStream`'s throwing-constructor shape (stdlib §7.2), and under the v0.229 failure-signal rule an environmental fault (disk full, permissions) is a raising band, not a branch tier — a temp file that cannot be created is not an expected-absence the caller probes for. A `TryCreate` dual is not added until a probing consumer appears (the §1 Try-convention then applies); declined now as speculative surface.
+2. **Q2 — `Directory.CreateTempSubdirectory`: CONFIRMED.** Consistency with the .NET-shaped `Directory`/`Path` surface (§7.3) outweighs brevity; Go's `MkdirTemp` has no local naming precedent to anchor to ("Mkdir" appears nowhere in the stdlib). Declined: `CreateTempDirectory` (reads as creating *the* temp directory, which `Path.GetTempPath` already locates — the .NET name's "Subdirectory" states the actual contract: a fresh directory *under* the temp root).
+
+With these, this proposal carries no open design question; the remaining path is the ordinary acceptance/graduation workflow.
+
 ---
 
 ## 8. Relationship to existing issues and proposals
