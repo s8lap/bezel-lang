@@ -1,6 +1,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
 #include "common/OwnershipFacts.hpp"  // #2098: bindClauseNeedsAtomDisposal (§17.15/K8.5)
+#include "sema/EnumValues.hpp"  // enumDeclaredValues — §5.4 checked cast (#3044)
 
 // This translation unit continues the definitions of Emitter's expression-lowering
 // member functions begun in LlvmBackend_Exprs.cpp.  It was split off mechanically
@@ -6473,6 +6474,88 @@ llvm::Value* Emitter::lowerConversion(sema::PrimitiveType target,
 }
 
 
+std::vector<std::int64_t> Emitter::enumDeclaredValueSet(
+        const sema::TypeSymbol* ts) {
+    std::vector<std::int64_t> vals;
+    if (!ts || ts->kind != ast::TypeDeclKind::Enum) return vals;
+    // The value set comes from the SHARED sema/EnumValues.hpp computation, not
+    // from `enumValue_`, so codegen's runtime check and sema's constant check
+    // (ExprTypecheck_Calls.cpp) can never disagree about which values are
+    // declared — a divergence would mean either a spurious runtime raise on a
+    // constant sema accepted, or a silent pass on one it would have rejected.
+    // In particular both DECLINE together (empty set here) when some constant's
+    // initializer does not fold: sema's fallback would then be the §10.2
+    // auto-increment default, which is a guess, and no rule may fault on it.
+    sema::EnumDeclaredValues declared = sema::enumDeclaredValues(*ts);
+    if (!declared.complete) return vals;
+    for (const auto& c : declared.constants) vals.push_back(c.second);
+    // §10.2: same-valued constants denote ONE value — the declared-value set is
+    // the set of DISTINCT values. Order by the underlying type's own signedness
+    // so the contiguity test below (and its unsigned range compare) is exact
+    // for a `ulong`-backed enum whose values run past long.MaxValue.
+    const bool uns = enumIsUnsigned(ts);
+    std::sort(vals.begin(), vals.end(),
+              [uns](std::int64_t a, std::int64_t b) {
+                  return uns ? static_cast<std::uint64_t>(a) <
+                                   static_cast<std::uint64_t>(b)
+                             : a < b;
+              });
+    vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
+    return vals;
+}
+
+llvm::Value* Emitter::enumDeclaredValueTest(const sema::TypeSymbol* ts,
+                                            llvm::Value* v) {
+    if (!ts || !v || !v->getType()->isIntegerTy()) return nullptr;
+    std::vector<std::int64_t> vals = enumDeclaredValueSet(ts);
+    if (vals.empty()) return nullptr;  // unknown value set — decline to check
+    const unsigned bits = v->getType()->getIntegerBitWidth();
+    // Normalize a declared value to `v`'s width, as raw bits: a `byte`-backed
+    // constant 200 is the i8 pattern 0xC8, which sign-extends to -56 — comparing
+    // the int64 forms directly would miss it.
+    auto atWidth = [&](std::int64_t x) {
+        return llvm::APInt(bits, static_cast<std::uint64_t>(x),
+                           /*isSigned=*/true);
+    };
+    // A CONSTANT operand is answered at compile time — no runtime compare is
+    // emitted for a cast of a declared constant (§5.4's constant arm has
+    // already rejected an undeclared one in sema; a constant that survives to
+    // here and is still undeclared folds to a `false` test, i.e. an
+    // unconditional raise, rather than being waved through).
+    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(v)) {
+        for (std::int64_t d : vals)
+            if (ci->getValue() == atWidth(d)) return builder_.getTrue();
+        return builder_.getFalse();
+    }
+    // A CONTIGUOUS value set (the overwhelmingly common `0, 1, 2, …` shape) is
+    // one unsigned range compare: `(v - lo) u<= (hi - lo)`. The subtraction
+    // wraps, so the form is exact for a negative `lo` too.
+    bool contiguous = true;
+    for (std::size_t i = 1; i < vals.size(); ++i)
+        if (atWidth(vals[i]) != atWidth(vals[i - 1]) + 1) {
+            contiguous = false;
+            break;
+        }
+    if (contiguous) {
+        llvm::Value* lo =
+            llvm::ConstantInt::get(v->getType(), atWidth(vals.front()));
+        llvm::Value* span = llvm::ConstantInt::get(
+            v->getType(), atWidth(vals.back()) - atWidth(vals.front()));
+        llvm::Value* off = builder_.CreateSub(v, lo, "enum.declared.off");
+        return builder_.CreateICmpULE(off, span, "enum.declared");
+    }
+    // Sparse set: an OR-chain of equality compares (enums are small; a switch
+    // would need extra blocks and a PHI for the same answer).
+    llvm::Value* acc = nullptr;
+    for (std::int64_t d : vals) {
+        llvm::Value* eq = builder_.CreateICmpEQ(
+            v, llvm::ConstantInt::get(v->getType(), atWidth(d)),
+            "enum.declared.eq");
+        acc = acc ? builder_.CreateOr(acc, eq, "enum.declared.or") : eq;
+    }
+    return acc;
+}
+
 llvm::Value* Emitter::lowerEnumCast(const ast::CallExpr& call) {
     if (call.args.size() != 1 || !call.args[0].value) return nullptr;
     llvm::Value* src = lowerExpr(*call.args[0].value);
@@ -6499,18 +6582,48 @@ llvm::Value* Emitter::lowerEnumCast(const ast::CallExpr& call) {
     // type cannot overflow, so it keeps the plain extension.
     unsigned srcBits = src->getType()->getIntegerBitWidth();
     unsigned dstBits = uTy->getIntegerBitWidth();
+    llvm::Value* result = nullptr;
     if (dstBits < srcBits) {
         bool dstUns = enumIsUnsigned(enumTy);
         llvm::Value* trunc = builder_.CreateTrunc(src, uTy, "enum.cast.trunc");
         llvm::Value* back = dstUns
             ? builder_.CreateZExt(trunc, src->getType(), "enum.cast.back")
             : builder_.CreateSExt(trunc, src->getType(), "enum.cast.back");
-        emitGuardThrow(builder_.CreateICmpNE(back, src, "enum.cast.oor"),
-                       "OverflowException");
-        return trunc;
+        emitEnumCastGuardThrow(
+            builder_.CreateICmpNE(back, src, "enum.cast.oor"), enumTy, src,
+            srcUnsigned);
+        result = trunc;
+    } else {
+        result = srcUnsigned
+            ? builder_.CreateZExtOrTrunc(src, uTy, "enum.cast")
+            : builder_.CreateSExtOrTrunc(src, uTy, "enum.cast");
     }
-    return srcUnsigned ? builder_.CreateZExtOrTrunc(src, uTy, "enum.cast")
-                       : builder_.CreateSExtOrTrunc(src, uTy, "enum.cast");
+    // fix #3044 (§5.4, v0.242): the checked cast's RUNTIME arm — "When `n` is
+    // not a constant, a value equal to no declared constant raises
+    // OverflowException at runtime". The narrowing guard above stays and runs
+    // FIRST: it compares at the SOURCE width, so a wider out-of-range value
+    // (`Color(256)` on a byte-backed enum) faults there instead of aliasing a
+    // declared value after truncation. Both faults are OverflowException, which
+    // is exactly §5.4's "In-range-vs-out-of-range is not a user-visible
+    // distinction". A constant operand folds the test away (declared → no
+    // compare at all). Both sites raise through emitEnumCastGuardThrow, which
+    // carries §5.4's required message "naming the enum type and the value";
+    // the message is built inside the fault block, so the succeeding path pays
+    // nothing for it.
+    if (llvm::Value* declared = enumDeclaredValueTest(enumTy, result)) {
+        const bool resUnsigned = enumIsUnsigned(enumTy);
+        if (auto* c = llvm::dyn_cast<llvm::ConstantInt>(declared)) {
+            if (c->isZero())  // constant, undeclared → unconditional raise
+                emitEnumCastGuardThrow(builder_.getTrue(), enumTy, result,
+                                       resUnsigned);
+            // constant, declared → nothing to emit
+        } else {
+            emitEnumCastGuardThrow(
+                builder_.CreateNot(declared, "enum.cast.undeclared"), enumTy,
+                result, resUnsigned);
+        }
+    }
+    return result;
 }
 
 

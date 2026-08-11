@@ -6006,6 +6006,26 @@ private:
     // kExcObjSize block (§31.4). Leaves the current block terminated.
     void emitThrowContractViolation(llvm::Value* msgStr);
 
+    // fix #3044 (§5.4, v0.242): the generalisation of the helper above —
+    // construct + throw the named built-in exception carrying `msgStr` as its
+    // Message slot. §5.4 is the one fault site in this chapter that asks for a
+    // message: "raises `OverflowException` at runtime, **the diagnostic naming
+    // the enum type and the value**" (§6.1's checked arithmetic asks for none,
+    // which is why `emitThrowBuiltin` leaves the slot null). Falls back to the
+    // message-less form when `msgStr` is null or the name is not a registered
+    // built-in. Leaves the current block terminated.
+    void emitThrowBuiltinWithMessage(const char* name, llvm::Value* msgStr);
+
+    // fix #3044 (§5.4, v0.242): `emitGuardThrow`'s enum-cast variant — raises
+    // `OverflowException` when `cond` holds, with §5.4's required message
+    // naming `enumTy` and the offending `value`. The message is built INSIDE
+    // the guard's error block, so the non-faulting path pays nothing.
+    // `valueUnsigned` selects the rendering of `value` (a `ulong`-backed enum
+    // past long.MaxValue must not print negative).
+    void emitEnumCastGuardThrow(llvm::Value* cond,
+                                const sema::TypeSymbol* enumTy,
+                                llvm::Value* value, bool valueUnsigned);
+
     // §22.16 (v0.203, #2053): emit the runtime checks for a member's
     // `requires` clauses — the always-on prologue that runs AFTER argument
     // binding and BEFORE any of the member's own execution (before a
@@ -11589,9 +11609,27 @@ private:
     llvm::Value* emitDecimalOne();
 
     // CG44: lower an enum cast `E(i)` (§5.4). The enum's underlying type is
-    // i32, so width-adjust the integer argument to i32. (Out-of-range
-    // checks for the checked cast forms are deferred.)
+    // i32, so width-adjust the integer argument to i32. Since v0.242 (#3044)
+    // the cast is CHECKED against the declared constants — an undeclared value
+    // raises OverflowException (enumDeclaredValueTest below).
     llvm::Value* lowerEnumCast(const ast::CallExpr& call);
+
+    // fix #3044 (§5.4, v0.242): the distinct declared underlying values of the
+    // enum `ts`, ordered by the underlying type's own signedness. Empty when
+    // `ts` is not an enum or none of its constants have a known value (an
+    // imported enum whose metadata carried none) — callers must then decline to
+    // check rather than reject.
+    std::vector<std::int64_t> enumDeclaredValueSet(const sema::TypeSymbol* ts);
+
+    // fix #3044 (§5.4, v0.242): an i1 "is `v` the underlying value of some
+    // declared constant of `ts`?" — the predicate behind both the checked cast
+    // (which raises OverflowException when it is false) and
+    // `E.FromUnderlyingOrNull` (which returns null). `v` must already be at the
+    // enum's underlying width. Returns nullptr when the value set is unknown
+    // (no check emitted); folds to a compile-time answer when `v` is constant,
+    // so a cast of a declared constant emits NO runtime compare.
+    llvm::Value* enumDeclaredValueTest(const sema::TypeSymbol* ts,
+                                       llvm::Value* v);
 
     // §22.4/§22.7: can the given call arguments fill the parameter list?
     // (named arguments matched by name, positionals by position, every

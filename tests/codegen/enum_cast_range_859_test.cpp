@@ -4,7 +4,13 @@
 // 255) instead of raising OverflowException. lowerEnumCast now range-checks the
 // value on a narrowing using the underlying type's signedness, mirroring the
 // int->int narrowing guard. (The compile-time-constant case is rejected in sema
-// — see tests/sema/enum_cast_const_range_859_test.cpp.)
+// — see the lit family tests/lit/sema/enum_cast_const_range_859__*.bzl.)
+//
+// v0.242 (#3044): §5.4's cast is now checked against the DECLARED CONSTANTS,
+// which SUBSUMES this range check — every out-of-range value is a fortiori
+// undeclared, so the three raising tests below keep their verdicts, while the
+// two that relied on an in-range UNDECLARED value being waved through are
+// flipped (see their own comments).
 //
 // Value tests — runJit returns the raw int (kept in 0..255).
 
@@ -52,21 +58,32 @@ BEZEL_TEST(enum_cast_range_859, runtime_short_above_range_throws) {
         "end Main; end C;"), 42);
 }
 
-// Regression: an in-range runtime cast is unaffected.
-BEZEL_TEST(enum_cast_range_859, runtime_in_range_ok) {
+// FLIPPED at v0.242 by #3044 (§5.4's checked cast). Was: "an in-range runtime
+// cast is unaffected" — `Color(200)` on a byte-backed `Red := 0, Green := 1,
+// Blue := 2` fit the UNDERLYING TYPE's range and so passed #859's guard, even
+// though 200 is the underlying value of no declared constant. §5.4 now checks
+// declaredness, not range ("In-range-vs-out-of-range is not a user-visible
+// distinction"), so 200 raises OverflowException — while the DECLARED value 2
+// still casts to `Blue`, which is what the second half of this test now pins.
+BEZEL_TEST(enum_cast_range_859, runtime_in_underlying_range_but_undeclared_raises_3044) {
     BEZEL_EXPECT_EQ(run(std::string(kColor) +
         "class C public static method Main(): int "
-        "  var n: int := 200; var c: Color := Color(n); "
         "  var m: int := 2; var c2: Color := Color(m); "
-        "  return int(c) + int(c2); "          // 202
-        "end Main; end C;"), 202);
+        "  try var n: int := 200; var c: Color := Color(n); return int(c); "
+        "  catch OverflowException => return 40 + int(c2); end; "   // 40+2
+        "end Main; end C;"), 42);
 }
 
-// Regression: a default int-backed enum still accepts a normal int.
-BEZEL_TEST(enum_cast_range_859, default_int_backed_ok) {
+// FLIPPED at v0.242 by #3044. Was: "a default int-backed enum still accepts a
+// normal int" — `E(100000)` on `A := 0, B := 1, C := 2` fit `int` and so passed
+// #859's range guard while naming no declared constant. It now raises; a
+// DECLARED value still casts.
+BEZEL_TEST(enum_cast_range_859, default_int_backed_undeclared_raises_3044) {
     BEZEL_EXPECT_EQ(run(
         "module M; enum E A := 0, B := 1, C := 2; end E; "
         "class C public static method Main(): int "
-        "  var n: int := 100000; var e: E := E(n); return int(e) - 99958; "  // 42
+        "  var d: int := 2; var ok: E := E(d); "
+        "  try var n: int := 100000; var e: E := E(n); return int(e); "
+        "  catch OverflowException => return 40 + int(ok); end; "   // 40+2
         "end Main; end C;"), 42);
 }

@@ -5361,6 +5361,69 @@ llvm::Value* Emitter::emitShiftCountInDomain(llvm::Value* l,
     return builder_.CreateZExtOrTrunc(count, l->getType(), "shcnt");
 }
 
+// fix #3044 (§5.4, v0.242): see the declaration in LlvmBackend_impl.hpp.
+void Emitter::emitThrowBuiltinWithMessage(const char* name,
+                                          llvm::Value* msgStr) {
+    auto vit = builtinVtable_.find(name);
+    if (!msgStr || vit == builtinVtable_.end()) {
+        emitThrowBuiltin(name);
+        return;
+    }
+    llvm::Value* obj = builder_.CreateCall(
+        callocFn(), {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
+    builder_.CreateStore(vit->second, obj);
+    // Message ptr is at byte offset 8 - slot 1 of the raw built-in layout
+    // (§31.4); calloc zero-fills InnerException/CauseChain/ParamName. The
+    // built-in disposer bz$exDisposeMsg releases this slot, so the +1 the
+    // caller hands over is owned from here on - the same contract
+    // emitThrowContractViolation relies on.
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+    llvm::Value* msgSlot =
+        builder_.CreateGEP(i8Ty, obj, builder_.getInt64(8));
+    builder_.CreateStore(msgStr, msgSlot);
+    builder_.CreateStore(obj, emitExcSlot());
+    emitUnwindDisposals();
+    builder_.CreateBr(unwindBB());
+}
+
+
+// fix #3044 (§5.4, v0.242): see the declaration in LlvmBackend_impl.hpp.
+void Emitter::emitEnumCastGuardThrow(llvm::Value* cond,
+                                     const sema::TypeSymbol* enumTy,
+                                     llvm::Value* value, bool valueUnsigned) {
+    auto* errBB = llvm::BasicBlock::Create(llvm_, "enumcast.err", currentFn_);
+    auto* cont = llvm::BasicBlock::Create(llvm_, "enumcast.cont", currentFn_);
+    builder_.CreateCondBr(cond, errBB, cont);
+    builder_.SetInsertPoint(errBB);
+
+    llvm::Value* msg = nullptr;
+    if (enumTy && value && value->getType()->isIntegerTy()) {
+        // Render the value at 64 bits under its own signedness, so a
+        // `ulong`-backed enum past long.MaxValue does not print negative and a
+        // negative `sbyte`-backed one does.
+        llvm::Value* wide = valueUnsigned
+            ? builder_.CreateZExt(value, i64(), "enumcast.msgv")
+            : builder_.CreateSExt(value, i64(), "enumcast.msgv");
+        llvm::Value* num = emitPrimitiveToString(
+            wide, valueUnsigned ? sema::PrimitiveType::ULong
+                                : sema::PrimitiveType::Long);
+        // ASCII only: this is a runtime exception message, not a compiler
+        // diagnostic, and §5.4 asks it to name "the enum type and the value" -
+        // not to carry a section citation.
+        llvm::Value* pre = lowerStringLiteral("\"enum cast: \"", false);
+        llvm::Value* c1 = emitStringConcat(pre, num);
+        emitStringRelease(num);  // concat took its own +1 copy
+        llvm::Value* post = lowerStringLiteral(
+            std::string("\" is not the underlying value of any declared "
+                       "constant of enum '") + std::string(enumTy->name) +
+            "'\"", false);
+        msg = emitStringConcat(c1, post);
+        emitStringRelease(c1);
+    }
+    emitThrowBuiltinWithMessage("OverflowException", msg);
+    builder_.SetInsertPoint(cont);
+}
+
 
 // §28.5 / §14.1 / §2.5 (#662 foundation A): build (or return the cached)
 // per-instantiation vtable for an IMPORTED generic class using the currently
