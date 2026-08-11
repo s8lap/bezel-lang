@@ -18,11 +18,11 @@ VCL is built on a dual reference structure that every Delphi programmer carries 
 |---|---|---|
 | `TComponent.Owner` frees its `Components` | `owned` fields; `owned _components: OwningArray<Control>` | §28.5, stdlib §4.5 |
 | `TControl.Parent` (up-pointer, never freed through) | plain non-`owned` class-typed field `_parent: Control?` — the sanctioned back-reference idiom | §28.5, §28.3 borrowed-field store rule |
-| `TWinControl.Controls` (visual children, not owned) | borrowing collection field `_controls: Array<Control>` | §28.11 borrowing-collection store rule |
+| `TWinControl.Controls` (visual children, not owned) | `owned _controls: Array<Control>` — the array *object* is owned (§28.6 fresh-store rule), its *elements* are borrows | §28.6, §28.11 borrowing-collection store rule |
 | `Free` / `FreeAndNil`, destructor cascade | `Dispose()` / drop of the owner; cascade over owned fields (reverse declaration order) and owning-collection elements (reverse insertion order) — exactly-once is compile-checked, not a convention | §28.4, §28.5, §28.11 |
 | `Button1.OnClick := Button1Click` | `_sub := button.Clicked.Subscribe(OnOkClick)` with the `Subscription` in an owned field of the form | stdlib §6.5; §28.14 form 3 |
 | `TThread.Synchronize` (documentation-enforced) | domain sendability — cross-domain touch of a widget is a compile error at the send site | §30.13/§30.14; exploration-ui.md §0 |
-| stale component pointer → AV, mitigated by `FreeNotification` | checked disposal mode faults deterministically (`DisposedAccessException`); `Weak<T>` for genuinely dynamic cross-refs | §28.2 (K4.1), §28.13 |
+| stale component pointer → AV, mitigated by `FreeNotification` | checked disposal mode faults deterministically (`DisposedAccessException`); `Shared<T>`+`Weak<T>` for genuinely dynamic cross-refs (§6 item 3 below) | §28.2 (K4.1), §28.13 |
 
 Two rules make the back-pointer side legal rather than merely tolerated. §28.3's borrowed-field store rule admits storing a borrow in a field when the borrow is **parameter- or receiver-sourced**, with the outlives obligation a recorded K4.3 trust clause; and §9.8's serialization model already names this exact shape — an **owning spanning tree plus back-edges**, where "for a plain borrow the target is necessarily present in the owning tree, because a borrow's lifetime is bounded by an owner that outlives it." A parent-owns-child tree with child→parent pointers is the spec's own DAG case (rationale §5.22), not the refused cyclic case.
 
@@ -36,7 +36,11 @@ public record ClickEvent(Sender: Control, X: int, Y: int);
 public abstract class Control
   // VCL's reference graphs, as the language's reference kinds:
   private owned _components: OwningArray<Control> := new();  // Owner graph — this control disposes these
-  private _controls: Array<Control> := new();                // Parent graph — visual children, borrowed (§28.11)
+  private owned _controls: Array<Control> := new();          // Parent graph — the array object is owned
+                                                             //   (§28.6: a fresh value may not land in a
+                                                             //   non-owned field); its ELEMENTS are borrows
+                                                             //   (§28.11), and `owned` over a trivial-dispose
+                                                             //   borrowing collection flips nothing (§28.6)
   private _parent: Control? := null;                         // TControl.Parent — back-reference, NOT owned (§28.5)
 
   private owned readonly _clicked: EventSource<ClickEvent> := new();
@@ -45,7 +49,8 @@ public abstract class Control
 
   // Owner graph: take over a component's disposal obligation.
   public method Adopt(owned c: Control)
-    _components.Add(owned c);              // discharge into an owning slot (K3.1)
+    _components.Add(owned c);              // discharged as an owned argument (K3.3);
+                                           //   lands in an owning slot (K3.1) inside Add
   end Adopt;
 
   // Parent graph: place a control (owned elsewhere) in this control's visual tree.
@@ -75,7 +80,7 @@ Notes:
 
 - `child._parent := this` inside `Mount` is the §28.3 admission working exactly as specified: the stored borrow's source is the receiver, the store-site check is structural and decidable, and the residual (parent outlives child's use of the pointer) is the K4.3-recorded trust clause — discharged *by construction* whenever the child is owned inside the parent's subtree, since an owner outlives what it owns.
 - The `_clicked` field plus `Clicked` property is stdlib §6.5's normative pattern verbatim (its own example is a `Button`); the source's destructor severs the subscriber list before reclamation, so a control's disposal is a deterministic unsubscribe-all with no `Notification` protocol.
-- Teardown needs zero user code: disposing a `Control` runs the compiler-generated cascade — owned fields in reverse declaration order, `OwningArray` elements in reverse insertion order, recursively (§28.4, §28.11). The `_controls` borrow list is passive data and simply dies with its array.
+- Teardown needs zero user code: disposing a `Control` runs the compiler-generated cascade — owned fields in reverse declaration order, `OwningArray` elements in reverse insertion order, recursively (§28.4, §28.11). The `_controls` element borrows are passive data; the cascade disposes the array object itself (a no-op for a trivial-dispose borrowing collection), and the borrows end with it.
 
 ## 3. Sketch — the form: the Delphi authoring experience
 
@@ -112,14 +117,15 @@ end LoginForm;
 Why each line is admitted:
 
 - **The subscribe line is §28.14 form 3.** `OnOkClick` is an instance method reference, which captures `this` (§27.6) — normally a rejected escape. Storing the returned `Subscription` in an **owned field of `this`** resolves the bounding object to `this`, and stdlib §6.5 states the consequence: the capture is admitted *"regardless of how the publisher was reached — a parameter, a field, an interface face."* Disposing the form disposes `_okSub`, severing the registration before the captured `this` dangles (§28.12 logical-before-physical). This is `OnClick := method` with the lifetime bug class removed.
-- **The handler's shape is forced into the VCL style — pleasantly.** §28.14 admits `this`-rooted captures and rejects ad-hoc closures over arbitrary locals; handlers as form methods that reach sibling widgets *through `this`* are exactly the admitted form. The checker independently reinvents the form-as-mediator convention Delphi reached by habit.
+- **The handler's shape is forced into the VCL style — pleasantly.** For a subscription that lives as long as the form (form 3), §28.14 admits exactly `this`-rooted captures; closures over arbitrary locals are admissible only under form 2's scope-bound `using var` (with a declared-before test and a freeze). Handlers as form methods that reach sibling widgets *through `this`* are the admitted long-lived form — the checker independently reinvents the form-as-mediator convention Delphi reached by habit.
 - **Constructor legality:** every non-nullable field carries an initializer, so implicit-`this` calls (`Mount(…)`) pass §22.7's definite-assignment gate, and `Mount` is non-virtual, so the no-virtual-dispatch-in-constructors rule (§22.7) is not touched.
 - **Unsubscription** is `Subscription` disposal (or reassignment of `_okSub` — drop-on-overwrite severs the old registration, §28.7). There is no `OnClick := nil`; the handle is the idiom, and `-=` would not match a lambda anyway (§27.7.1).
 
 ## 4. Sketch — dynamic construction, reparenting, teardown
 
 ```bezel
-// Runtime-created controls — VCL's owner-parented dynamic UI:
+// Runtime-created controls — VCL's owner-parented dynamic UI.
+// Inside some form/builder class:
 public method BuildToolbar(bar: Control, captions: Array<string>)
   for var caption in captions do
     var b := new Button(caption);
@@ -144,15 +150,15 @@ end GiveTo;
 ## 5. What the checker enforces that VCL could only document
 
 1. **Exactly-once disposal.** The double-`Free` and leaked-component bug classes become compile errors and must-use warnings (K1.7 one-holder; K3 discharge).
-2. **Handler lifetime.** A subscription cannot outlive its form unnoticed: the owned `Subscription` field ties registration to the subscriber's life, and source destructors guarantee quiescence (stdlib §6.5). `FreeNotification` bookkeeping has no job left.
+2. **Handler lifetime.** The owned `Subscription` field ties registration to the subscriber's life, and source destructors guarantee quiescence (stdlib §6.5) — `FreeNotification` bookkeeping has no job left. One recorded residual the checker does not close: `move`-ing the handle out into longer-lived storage re-opens the invocation window (§28.14's registration-lifetime residual), backstopped by K4.1.
 3. **Thread affinity.** A control with a `_parent` field is transfer-closed-ineligible (§30.14 rule 3) — the widget tree is UI-domain-confined *by construction*, and "don't touch the UI from a thread" is a compile error at the send site (exploration-ui.md §0's headline win).
-4. **Capture discipline.** §28.14 admits precisely the form-mediator handler shape and rejects the closure-over-random-locals shape — the leak-prone half of the observer pattern is unwritable.
+4. **Capture discipline.** Long-lived handlers (form 3) may capture only `this`-rooted state; closures over locals are confined to form 2's scope-bound `using var` — the *unbounded* observer closure, the leak-prone half of the pattern, is unwritable.
 
 ## 6. What does not carry over
 
-1. **DFM/LFM streaming and `published` RTTI.** No reflection, on settled grounds (rationale §18 stance; exploration-ui.md row 7). A form designer would emit Bezel source into the constructor — the Qt-`uic` shape — not stream a resource at runtime. Worth noting: §9.8's *compile-time* serialization synthesis already handles exactly this graph shape (owning tree + `_parent` back-edges as `$ref`), so a declarative form format is not structurally impossible — but it would be codegen against declared constructors, not runtime `published`-property streaming.
+1. **DFM/LFM streaming and `published` RTTI.** No reflection, on settled grounds (rationale §5.18 "Type identity, not reflection", recorded as declined-not-deferred in §18; exploration-ui.md row 7). A form designer would emit Bezel source into the constructor — the Qt-`uic` shape — not stream a resource at runtime. Worth noting: §9.8's *compile-time* serialization synthesis already handles exactly this graph shape (owning tree + `_parent` back-edges as `$ref`), so a declarative form format is not structurally impossible — but it would be codegen against declared constructors, not runtime `published`-property streaming.
 2. **Virtual dispatch during construction** (`CreateParams`, `CreateWnd`, `Loaded`). A compile error in non-`sealed` constructors (§22.7). The deferred-handle-creation dance LCL already performs becomes an explicit post-construction step (`Realize()`/`Show()`), which is arguably the honest spelling of what VCL was doing implicitly.
-3. **`TComponent.Notification` auto-nil.** No runtime notification of reference holders. The model substitutes structure (owner-outlives-borrower, discharged by construction in a tree) plus the checked-disposal backstop; genuinely dynamic cross-references — an inspector window tracking a selection, say — use `Weak<T>` (§28.13) at its stated refcount cost, the parent-strong/child-weak shape.
+3. **`TComponent.Notification` auto-nil.** No runtime notification of reference holders. The model substitutes structure (owner-outlives-borrower, discharged by construction in a tree) plus the checked-disposal backstop; genuinely dynamic cross-references — an inspector window tracking a selection, say — need `Weak<T>` (§28.13), which is mintable only from a `Shared<T>` handle (`Downgrade()`, stdlib §2.16): the tracked control's owning edge must become a `Shared<Control>` rather than a plain `OwningArray` slot — a local change to that subtree, at `Shared<T>`'s stated refcount cost.
 4. **Data binding / `TAction` lists.** Reflection-shaped; falls out (same grounds as WPF-style binding in exploration-ui.md). Plain methods and properties instead — or 0004's answer, where synchronization is the framework's job.
 5. **Handler plumbing details.** Subscribe sites accept lambda literals and method references only (§28.14 bound 3) — no handler-in-a-variable indirection; cross-domain publication (`SharedEventSource<T>`) admits capture-free handlers only, so background→UI traffic goes through channels as sendable messages… which is 0004's loop arriving by necessity.
 6. **The heterogeneous runtime `Owner` registry.** VCL's `Owner` accepts any component from anywhere at any time. Bezel's spelling is a declared owning slot (`owned` field or `OwningArray`), so ownership topology is part of the type surface — less fluid, and deliberately so.
