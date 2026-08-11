@@ -1,6 +1,6 @@
 extern "libc"
   public method qsort(
-    base: IntPtr,
+    basePtr: IntPtr,     // C: void *base
     nmemb: UIntPtr,
     size: UIntPtr,
     compar: (IntPtr, IntPtr) -> int): ();

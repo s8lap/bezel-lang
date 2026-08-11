@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.247 — August 2026**
+**Version 0.248 — August 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -7193,8 +7193,9 @@ public method Process()
   var result := 0;
   do
     using var fs := new FileStream("data.txt", FileMode.Open);
-    result := fs.ReadCount();
-  end;     // fs disposed here
+    using var buffer := new Array<byte>(4096, 0);   // sized ctor (stdlib §4.4)
+    result := fs.Read(buffer, 0, buffer.Count);     // bytes read (stdlib §7.1)
+  end;     // fs and buffer disposed here
   Console.WriteLine($"count = {result}");
 end Process;
 ```
@@ -9246,7 +9247,7 @@ Native APIs that accept function pointers are supported via Bezel's function-typ
 ```bezel
 extern "libc"
   public method qsort(
-    base: IntPtr,
+    basePtr: IntPtr,     // C: void *base
     nmemb: UIntPtr,
     size: UIntPtr,
     compar: (IntPtr, IntPtr) -> int): ();
@@ -9292,10 +9293,10 @@ extern "sqlite3"
       errmsg: Ptr<IntPtr>): int;
 end;
 
-// C: void qsort_r(void*, size_t, size_t,
+// C: void qsort_r(void *base, size_t, size_t,
 //                 int (*compar)(const void*, const void*, void*), void* arg);
 extern "libc"
-  public method qsort_r(base: Ptr<byte>, nmemb: UIntPtr, size: UIntPtr,
+  public method qsort_r(basePtr: Ptr<byte>, nmemb: UIntPtr, size: UIntPtr,
       compar: (IntPtr, IntPtr, env) -> int, env): ();
 end;
 ```
