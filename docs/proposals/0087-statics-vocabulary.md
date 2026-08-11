@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | under-review — drafted 2026-08-11 (owner-directed, from the elegance review) |
+| **Status** | superseded — graduated v0.245 (owner-ruled 2026-08-11, all questions as recommended; doc-structural, no compiler work — the Q3 check_docs check landed with the train) |
 | **Tracking issue** | [#3053](https://github.com/s8lap/bezel-lang/issues/3053) |
 | **Target module(s)** | **spec** — §22.12 rules 2(i) and 4 (the enumerations become derived sets), §28.13 (the sendability bullet's set-arithmetic sentence replaced by a derivation). **stdlib** — §1 (the facts vocabulary defined once), per-type fact lines at §4.19, §6.2, §6.3, §6.4, §6.5, §6.9, §6.11. **rationale** — a short decision record (the vocabulary and the reproduction proof). **guides** — Guide 04 §8 simplification at graduation. **This is doc-structural: NO behavior changes** — every membership, warning, admission, and rejection is reproduced exactly (§3's table is the proof), and any delta the reproduction had surfaced would have been flagged as a finding, not silently fixed. |
-| **Written against** | spec/stdlib v0.241 |
+| **Written against** | spec/stdlib v0.241; re-verified at v0.244 before graduation (§22.12/§28.13 byte-identical across v0.242–v0.244; only line anchors moved — rule 2(i) 5029→5088, rule 4 5048→5107, rule 5 5049→5108, §28.13 bullet 7439→7502; the 10×3 reproduction table reproduces with zero delta) |
 | **Origin** | Elegance review 2026-08-11, finding 6: §28.13 must define its synchronized set as — quoting the spec — form (i) "**minus `ChannelSender<T>`** … **minus `SharedEventSource<T>`** … **plus the three members**." When a normative document states set differences between its own allowlists, the taxonomy has outgrown its presentation. Each *membership* is a recorded ruling; the three-list structure itself is defended nowhere. |
 
 *Reference convention: unprefixed §-references are language-spec references; stdlib references are marked.*

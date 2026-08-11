@@ -2,7 +2,7 @@
 # check_docs.sh — the one-command docs gate for the six normative documents.
 #
 # Symmetric with scripts/gate.sh (the compiler gate): a single blessed signal
-# that a docs revision is internally consistent before it lands. Runs four
+# that a docs revision is internally consistent before it lands. Runs five
 # mechanical checks and exits non-zero if any fails.
 #
 #   1. Anchor resolution   — every intra/cross-doc [...](file#anchor) link whose
@@ -13,6 +13,11 @@
 #   3. §-citation sanity   — flags §N.M references to section numbers that have
 #                            no heading anywhere in that document (typos only;
 #                            prose mentions of other docs' sections are ignored).
+#   3b. Statics-facts derivation — the stdlib's per-type **Facts** lines
+#                            (stdlib §1, v0.245) are the single normative
+#                            carrier of the statics/sharing sets; recompute the
+#                            spec's three derived membership parentheticals
+#                            (§22.12 rules 2(i)/4, §28.13) and fail on divergence.
 #   4. Example extraction  — scripts/extract_doc_examples.py runs clean over the
 #                            CURRENT docs into a scratch tree (never the committed
 #                            corpus, per #1380); any parse failure is a finding.
@@ -161,6 +166,48 @@ if uniq:
         print(f"  ... and {len(uniq)-20} more")
 else:
     print("CITATION: clean")
+
+# ---- 3b. Statics-facts derivation (v0.245; proposal 0087, #3053) ----------
+# The stdlib's per-type '**Facts** (...): `Type` — **fact**, ...' lines are the
+# single normative carrier of the statics/sharing taxonomy (stdlib §1); the
+# spec's three membership parentheticals — §22.12 rule 2(i), §22.12 rule 4,
+# §28.13 — are tagged 'derived membership, informative — currently ...' and are
+# recomputed here from the fact lines. Any divergence is a gate failure.
+facts = {}
+for m in re.finditer(r'^\*\*Facts\*\*[^:]*:\s*(.+)$', text['stdlib'], re.M):
+    payload = m.group(1)
+    if ' — ' not in payload:
+        continue
+    types_part, facts_part = payload.split(' — ', 1)
+    fs = set() if re.match(r'\s*none\b', facts_part) else set(re.findall(r'\*\*([a-z-]+)\*\*', facts_part))
+    for n in re.findall(r'`([^`]+)`', types_part):
+        facts[n] = fs
+derived = {
+    'form-(i)':    {t for t, f in facts.items() if 'synchronized' in f and 'displacement-unbounded' not in f},
+    'suppression': {t for t, f in facts.items() if 'synchronized' in f or 'immutable' in f},
+    'shared':      {t for t, f in facts.items() if ('synchronized' in f or 'immutable' in f) and 'self-distributing' not in f},
+}
+stated = {}
+for m in re.finditer(r'derived membership, informative — currently ([^)]*)\)', text['spec']):
+    back = text['spec'][max(0, m.start()-600):m.start()]
+    which = ('shared' if 'self-distributing' in back
+             else 'suppression' if 'immutable' in back
+             else 'form-(i)')
+    stated[which] = set(re.findall(r'`([^`]+)`', m.group(1)))
+bad = []
+if not facts:
+    bad.append('  no **Facts** lines found in the stdlib (stdlib §1 expects them)')
+if set(stated) != set(derived):
+    bad.append(f"  expected one tagged spec parenthetical per derived set {sorted(derived)}, found {sorted(stated)}")
+for k in sorted(set(stated) & set(derived)):
+    if stated[k] != derived[k]:
+        bad.append(f"  {k}: spec states {sorted(stated[k])} but the stdlib fact lines derive {sorted(derived[k])}")
+if bad:
+    fail = 1
+    print("FACTS: stdlib fact lines and spec derivation parentheticals disagree:")
+    print("\n".join(bad))
+else:
+    print(f"FACTS: clean ({len(facts)} typed fact entries; all 3 derived-set parentheticals match)")
 
 sys.exit(1 if fail else 0)
 PY

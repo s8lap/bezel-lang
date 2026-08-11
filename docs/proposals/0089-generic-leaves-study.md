@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | under-review — drafted 2026-08-11 (owner-directed, from the elegance review) |
+| **Status** | superseded — graduated v0.245 (owner-ruled 2026-08-11: retire by deletion, Q1–Q4 as recommended; impl catch-up [#3055](https://github.com/s8lap/bezel-lang/issues/3055)) |
 | **Tracking issue** | [#3055](https://github.com/s8lap/bezel-lang/issues/3055) |
 | **Target module(s)** | question-shaped — if ruled *retire*: **spec** §19.6 (the "Generic leaves: the determination rule" subsection deletes; the sealed-hierarchy bullet's generic clause shrinks to the replacement text in §5), §21.7 (one consequence sentence), Appendix C.7; **rationale** §8.2 (post-choices annotation) + a new decision record; **compiler** `src/sema/ExprTypecheck.cpp` (the determination machinery deletes); **tests** (the rule's family inverts to pin the new warning). If ruled *keep*: **rationale** only (§8.2 gains the re-affirmation; the study is the record). |
-| **Written against** | spec/stdlib v0.241 |
+| **Written against** | spec/stdlib v0.241; re-verified at v0.244 before graduation, with the drift-memo corrections applied at landing: §1's example root spelling is `closed` since v0.242 (`sealed abstract` is rejected — the argument survives the respell); the "Generic leaves" span re-anchored to spec 4071–4112; the §21.7 consequence re-derived against the v0.242-restructured totality rule (it vanishes by flow-through); the §9 rows for 0078 and 0086 read as landed (both v0.242), not pending |
 | **Origin** | The 2026-08-11 elegance review (coordinator Tier 3 item 13; back-half critic finding), owner-accepted for study. The trigger: rationale §9.6 (v0.200) itself describes the rule as "a page of machinery that exists only because class sums encode the discriminant in the runtime *type*," and rationale §8.2 — the rule's only rationale anchor — predates choices. |
 
 *Reference convention: unprefixed §-references are language spec references; rationale references are marked.*
