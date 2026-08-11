@@ -15114,7 +15114,25 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     if (disposeStack_.empty()) return;
     if (emittingDisposerBody_) return;
     if (currentFn_ != unwindIneligibleFn_) return;
-    if (unwindIneligible_.count(static_cast<const void*>(psym))) return;
+    // fix #3035 / §28.3 / §28.10 (v0.240): the unwinding-INELIGIBLE bail moved
+    // DOWN below the autoDropAtScopeEnd branch. The walker stays
+    // over-conservative for the unwindOnly path (it can't distinguish a real
+    // consume from a borrow position like `var alias := r;` — K3.13), so it
+    // taints `r` as unwind-ineligible for any "consuming-looking" use of the
+    // slot. But the auto-drop branch's disposal covers the NORMAL exit too
+    // (a never-discharged owner is the precondition for the K3.14 affine
+    // auto-drop: the slot holds a live value at method end by construction).
+    // An unmoved owned parameter under a `var alias := r;` alias binding
+    // MUST dispose on the normal exit; bailing here before reaching the
+    // autoDrop branch would leak the parameter on every path (the issue's
+    // 40-byte-in-2-allocations measured leak). The autoDrop / builtin /
+    // collection branches are all safe to fire on a parameter the walker
+    // tainted: the ownership pass has proven the slot holds a live value at
+    // method end (never-discharged), so the disposal is exactly once — no
+    // double-free with any prior consume the walker may have seen. The bail
+    // STAYS in its originally intended place — the unwindOnly branch — where
+    // it continues to guard the double-free hazard the walker was designed
+    // to bound. // per §28.3 K3.13, K3.14
     auto* ps = dynamic_cast<sema::ParameterSymbol*>(psym);
     if (!ps) return;
     // Only an `owned` parameter carries a disposal obligation (§28.8); `ref`/
@@ -15223,7 +15241,17 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
         d.dynamicDispose = true;
     } else {
         // Otherwise an `owned` parameter is auto-disposed only on the exception-
-        // unwind path (the param is discharged on the normal path).
+        // unwind path (the param is discharged on the normal path). The walker
+        // taints the parameter as unwinding-INELIGIBLE when it sees what looks
+        // like a consume of the slot; if the actual transfer nulls the slot
+        // (`buildOrderedArgs` for a user method, the explicit-dispose `Dispose()`
+        // nulling, etc.), the null-guard catches the double-free — but for a
+        // borrow-position "consume" the walker can't structurally distinguish
+        // (e.g. `var alias := r;` — K3.13: a borrow, the slot is NOT nulled),
+        // bailing here keeps the residual prudent (a leak on the unwind edge,
+        // never a double-free). The auto-drop branch above is the #3035 fix
+        // path that this guard does NOT cover — a never-discharged owner.
+        if (unwindIneligible_.count(static_cast<const void*>(psym))) return;
         d.unwindOnly = true;
     }
     disposeStack_.front().push_back(d);
