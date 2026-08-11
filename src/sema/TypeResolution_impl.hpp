@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "sema/ConstFold.hpp"   // §6.5/§17.14 (#3045): ConstShiftDomainFault
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -651,6 +652,15 @@ private:
     // const references.
     std::optional<long long> foldIntConstExpr(const ast::Expr& e, Scope* scope,
                                               int depth);
+
+    // §6.5 / §17.14 (v0.242, #3045): the fault probe paired with
+    // `foldIntConstExpr` — same identifier resolution, so both walks see the
+    // same const values. Called when the fold returns nullopt, to tell "a
+    // constant shift count outside the §6.5 domain" (an evaluation fault,
+    // a compile error at the constant expression) apart from "not a foldable
+    // constant expression".
+    ConstShiftDomainFault findConstShiftDomainFaultInScope(const ast::Expr& e,
+                                                           Scope* scope);
 
     void resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref);
 

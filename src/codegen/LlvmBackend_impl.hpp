@@ -6112,6 +6112,29 @@ private:
     // continue. Splits the current block.
     void emitGuardThrow(llvm::Value* cond, const char* name);
 
+    // §6.5 / §31.4 (v0.242, #3045): guard a shift's COUNT against its domain
+    // `0 .. bitwidth(l)−1` — the width of the LEFT (shifted) operand, since
+    // §6.5 keeps the count out of §6.2's promotion — and return the count
+    // coerced to `l`'s integer type, ready for shl/lshr/ashr.
+    //
+    // This REPLACES the pre-v0.242 `and count, bitwidth-1` mask: the count is
+    // no longer reduced modulo the width, it FAULTS. An out-of-domain count
+    // raises `OverflowException` ("a value outside the destination type's or
+    // operation's domain: … out-of-domain shift counts (§6.5)", §31.4). A
+    // CONSTANT out-of-domain count never reaches here — sema rejects it at the
+    // expression (§17.14) — so on any reachable path the guard is the runtime
+    // half of one rule.
+    //
+    // `countUnsigned` is the count expression's own signedness; it decides
+    // whether the widening to i64 is a zext or a sext, which is what makes a
+    // negative signed count (`x << k` with `k = -1`) fault instead of reading
+    // as a huge unsigned one. The returned count is EXACT: the guard has
+    // established `0 <= count < bitwidth(l)`, so truncating it to `l`'s type
+    // loses nothing. Returns `count` unchanged for non-integer operands (the
+    // caller's own kind checks then apply).
+    llvm::Value* emitShiftCountInDomain(llvm::Value* l, llvm::Value* count,
+                                        bool countUnsigned);
+
     // §16.3 (v0.183, #1586): compute the value `step` successor-applications
     // away from `cur` for a `Range<char>` iterator, skipping the UTF-16
     // surrogate gap U+D800-U+DFFF (the successor of U+D7FF is U+E000, the

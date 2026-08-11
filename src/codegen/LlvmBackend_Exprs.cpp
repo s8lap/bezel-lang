@@ -7365,29 +7365,31 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     else if (op == "|")   payloadResult = builder_.CreateOr(lp, rp);
                     else if (op == "^")   payloadResult = builder_.CreateXor(lp, rp);
                     else if (op == "<<" || op == ">>") {
-                        // §6.5 (#1094): a nullable shift's result type is the LEFT
-                        // operand's type — it is NOT promoted by the count. The
-                        // lifted operands were widened to a common width, so mask
-                        // and shift at the RESULT payload width (the left operand's
-                        // true width), not the widened `lp` width. Without this,
-                        // `byte? << int 9` widened lp to i32, masked &31 (i32),
-                        // shifted 1<<9 = 512, then truncated to byte = 0 instead of
-                        // masking &7 → 1<<1 = 2. Narrow lp to the result width, mask
-                        // the count by that width, and coerce the count to it (the
-                        // masked count fits). Coercing the count also avoids the
-                        // LLVM "both shift operands same type" assert (a crash) when
-                        // lp/rp widths differ.
+                        // §6.5 (#1094; domain rule v0.242, #3045): a nullable
+                        // shift's result type is the LEFT operand's type — it is
+                        // NOT promoted by the count. The lifted operands were
+                        // widened to a common width, so the DOMAIN and the shift
+                        // are at the RESULT payload width (the left operand's true
+                        // width), not the widened `lp` width. Without this,
+                        // `byte? << int 9` widened lp to i32 and used the i32
+                        // domain, shifting 1<<9 = 512, then truncating to byte = 0
+                        // — instead of `byte`'s `0..7` domain, under which count 9
+                        // now raises OverflowException. Narrow lp to the result
+                        // width and check the count against THAT width.
+                        // emitShiftCountInDomain also coerces the count to the
+                        // shifted value's type, which avoids the LLVM "both shift
+                        // operands same type" assert (a crash) when lp/rp differ.
+                        // §7.11: this runs only on the both-present branch, so a
+                        // null operand still yields null and never faults.
                         llvm::Type* resTy =
                             nullableValueStructTy(nvTy)->getElementType(1);
                         llvm::Value* lsh = lp;
                         if (resTy->isIntegerTy() && resTy != lp->getType())
                             lsh = builder_.CreateTrunc(lp, resTy);
-                        unsigned bits = lsh->getType()->getIntegerBitWidth();
-                        llvm::Value* mask =
-                            llvm::ConstantInt::get(rp->getType(), bits - 1);
-                        llvm::Value* cnt = builder_.CreateAnd(rp, mask, "shcnt");
-                        if (cnt->getType() != lsh->getType())
-                            cnt = builder_.CreateZExtOrTrunc(cnt, lsh->getType());
+                        bool cntUns =
+                            bin.right && isUnsignedTargetExpr(*bin.right);
+                        llvm::Value* cnt =
+                            emitShiftCountInDomain(lsh, rp, cntUns);
                         if (op == "<<") {
                             payloadResult = builder_.CreateShl(lsh, cnt);
                         } else {
@@ -8069,22 +8071,19 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         if (op == "&") return builder_.CreateAnd(l, r);
         if (op == "|") return builder_.CreateOr(l, r);
         if (op == "^") return builder_.CreateXor(l, r);
-        // §6.5: shift count is reduced modulo the LEFT operand's bit width.
-        // LLVM shl/lshr/ashr with count >= bitwidth produces poison; mask
-        // the count to [0, bitwidth-1] before emitting the shift.
+        // §6.5 (v0.242, #3045): the shift count's DOMAIN is `0 .. width−1` of
+        // the LEFT operand's type; outside it the shift FAULTS with
+        // `OverflowException` (§31.4) instead of being reduced modulo the
+        // width. #1094's point still holds and is what makes the domain
+        // width-dependent: `bits` is the LEFT operand's width — the count does
+        // not promote it (§6.2 exclusion above) — so `byte << 8` is out of
+        // domain (8 for byte, 16 for short, 32/64 for the rest). A CONSTANT
+        // out-of-domain count is rejected in sema (§17.14), so only a runtime
+        // count reaches the guard. emitShiftCountInDomain also coerces the
+        // count to the left operand's type, which LLVM requires.
         if (op == "<<" || op == ">>") {
-            // #1094: `bits` is the LEFT operand's width — it is no longer widened
-            // to the count's width (the §6.2 promotion exclusion above), so this
-            // is the spec's "operand bit width" (8 for byte, 16 for short, …).
-            unsigned bits = l->getType()->getIntegerBitWidth();
-            llvm::Value* mask = llvm::ConstantInt::get(r->getType(), bits - 1);
-            llvm::Value* cnt = builder_.CreateAnd(r, mask, "shcnt");
-            // The count and the shifted (left) operand may now differ in width
-            // (e.g. `byte << int`). The masked count is in [0, bits-1], so it
-            // fits the left operand's type; coerce it there (LLVM requires both
-            // shift operands to share a type) — a no-op when widths already match.
-            if (cnt->getType() != l->getType())
-                cnt = builder_.CreateZExtOrTrunc(cnt, l->getType());
+            bool cntUns = bin.right && isUnsignedTargetExpr(*bin.right);
+            llvm::Value* cnt = emitShiftCountInDomain(l, r, cntUns);
             if (op == "<<")  return builder_.CreateShl(l, cnt);
             // #814 / §6.5: `>>` fill is logical (LShr) iff the SHIFTED value (the
             // LEFT operand) is unsigned; arithmetic (AShr) for a signed value.

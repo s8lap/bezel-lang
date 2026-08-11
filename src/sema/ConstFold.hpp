@@ -54,4 +54,37 @@ bool containsConstDivByZero(
         resolveIdent,
     int depth = 0);
 
+// per §6.5 (v0.242, #3045): the shift count's DOMAIN is `0 .. width−1`, where
+// width is the bit width of the **left (shifted) operand's type** — 8 for
+// `byte`/`sbyte`, 16 for `short`/`ushort`, 32 for `int`/`uint`, 64 for
+// `long`/`ulong`. The left operand's SOURCE type is the authority: §6.5 keeps
+// the count out of §6.2's promotion ("a narrower left operand is *not* widened
+// to match a wider count (`byte << int` yields `byte`, not `int`)"), so
+// `byte << k` has domain `0..7` no matter how wide `k` is.
+// Returns 0 for a non-integer primitive (`bool`, `char`, the floats,
+// `decimal`, `string`, `Object`) — §6.5 rejects those operands on their own
+// kind, so there is no domain to check and callers skip.
+int shiftCountDomainWidth(PrimitiveType p);
+
+// per §6.5 / §17.14 (v0.242, #3045): a constant shift count outside the §6.5
+// domain is an evaluation FAULT — "a compile error at the constant
+// expression", exactly like a constant `5 / 0` — so `foldIntConst` declines to
+// fold such a node (it has no value). This is the companion probe, the sibling
+// of `containsConstDivByZero`: called when `foldIntConst` returns nullopt, it
+// finds the offending shift so the caller can report the specific cause
+// instead of silently treating the expression as "not constant".
+// `resolveIdent` should be the SAME resolver passed to the sibling
+// `foldIntConst` call so both walks see consistent const values.
+struct ConstShiftDomainFault {
+    bool found = false;
+    bool leftShift = true;   // `<<` when true, `>>` when false
+    long long count = 0;     // the folded, out-of-domain count
+    int width = 0;           // the left operand's bit width (the domain bound)
+};
+ConstShiftDomainFault findConstShiftDomainFault(
+    const ast::Expr& e,
+    const std::function<std::optional<long long>(std::string_view, int)>&
+        resolveIdent,
+    int depth = 0);
+
 }  // namespace bezel::sema

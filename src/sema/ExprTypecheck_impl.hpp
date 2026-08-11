@@ -1440,6 +1440,26 @@ private:
     // compiled and deferred the fault to a runtime DivideByZeroException).
     bool localConstDivByZeroTC(const ast::Expr& e);
 
+    // §6.5 / §17.14 (v0.242, #3045): the shift count's domain is
+    // `0 .. width−1` of the LEFT (shifted) operand's type — the operand's own
+    // SOURCE type, because §6.5 keeps the count out of §6.2's promotion ("a
+    // narrower left operand is *not* widened to match a wider count (`byte <<
+    // int` yields `byte`, not `int`)"), so `byte << k` has domain `0..7`.
+    // A count that is a compile-time constant (§17.14) outside the domain is a
+    // COMPILE ERROR reported here; a non-constant count raises
+    // `OverflowException` at runtime (§31.4; codegen's emitShiftCountInDomain).
+    // `leftTy` is the left operand's (or, for `<<=`/`>>=`, the target's) type;
+    // a nullable `T?` carries the underlying `T`'s domain (§7.11 lifts the
+    // operator where `T` defines it). `opSpelling` is the operator as written
+    // (`<<`, `>>`, `<<=`, `>>=`) so the compound forms name themselves.
+    // `fallbackLoc` is used when the count expression carries no span (a
+    // unary-minus node, `x << -1`, has an unset span — the diagnostic would
+    // otherwise point at 0:0).
+    void checkShiftCountDomain(const TypeRef* leftTy,
+                               const ast::Expr& countExpr,
+                               std::string_view opSpelling,
+                               SourceLocation fallbackLoc);
+
     // §15.1 (issue #734): fold a LOCAL-`const` inline-array size onto its
     // resolved TypeRef. Member/module consts are folded earlier (type
     // resolution); a local const is only in scope during this pass, so when a

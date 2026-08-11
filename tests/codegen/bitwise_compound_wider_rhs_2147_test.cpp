@@ -41,6 +41,21 @@ int run(const std::string& body) {
     return r.ran ? r.exitCode : -999;
 }
 
+// §6.5/§17.14 (v0.242, #3045): is `body` rejected with the constant shift-count
+// domain diagnostic (and not for some unrelated reason)?
+bool rejectsShiftDomain(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    if (!r.diagnostics.hasErrors()) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("is outside the domain") != std::string::npos &&
+            d.message.find("(\xC2\xA7""6.5/\xC2\xA7""17.14)") !=
+                std::string::npos)
+            return true;
+    return false;
+}
+
 // Returns 1 if `body` raises OverflowException, 0 if it runs to completion,
 // -999 on a front-end failure.
 int throwsOverflow(const std::string& body) {
@@ -175,14 +190,16 @@ BEZEL_TEST(codegen_2147_bitwise_neighbors, and_wide_in_range_stores) {
     BEZEL_EXPECT_EQ(run("var m: int := 12; m &= 10L; return m;"), 8);
 }
 
-// Shifts stay on the LHS-width path (§6.5: result has the left operand's
-// type; the count is reduced mod the width and a shift NEVER raises):
-// 1 <<= 33 → 2; 1 <<= 40L (wide count) → 1 << 8 = 256; byte(5) <<= 1 → 10.
-BEZEL_TEST(codegen_2147_bitwise_neighbors, shift_count_mod_width_unchanged) {
-    BEZEL_EXPECT_EQ(run("var s: int := 1; s <<= 33; return s;"), 2);
-    BEZEL_EXPECT_EQ(run(
-        "var t: int := 1; t <<= 40L; "
-        "if t = 256 then return 1; end; return 0;"), 1);
+// Shifts stay on the LHS-width path (§6.5: the result has the left operand's
+// type, so §6.6's checked write-back never applies to them). ⚠ THE COUNT RULE
+// CHANGED AT v0.242 (proposal 0079, #3045): the count is no longer reduced mod
+// the width — a CONSTANT count outside the LHS type's `0..width−1` domain is a
+// compile error (§17.14). WAS: `s <<= 33` gave 2 and `t <<= 40L` gave 256.
+// The in-domain cell (`byte(5) <<= 1` → 10) is unchanged, and is what still
+// proves shifts skip the wide-bitwise branch this file is about.
+BEZEL_TEST(codegen_2147_bitwise_neighbors, shift_out_of_domain_count_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsShiftDomain("var s: int := 1; s <<= 33;"));
+    BEZEL_EXPECT_TRUE(rejectsShiftDomain("var t: int := 1; t <<= 40L;"));
     BEZEL_EXPECT_EQ(run("var b: byte := 5; b <<= 1; return int(b);"), 10);
 }
 

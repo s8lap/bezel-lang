@@ -7480,6 +7480,68 @@ bool ExprTC::localConstDivByZeroTC(const ast::Expr& e) {
     return containsConstDivByZero(e, resolve);
 }
 
+// §6.5 / §17.14 (v0.242, #3045) — see the declaration for the rule. Reports
+// nothing when the count is not a compile-time constant: that count's domain
+// is checked at RUNTIME (`OverflowException`, §31.4), which is the other half
+// of the same ruling.
+void ExprTC::checkShiftCountDomain(const TypeRef* leftTy,
+                                   const ast::Expr& countExpr,
+                                   std::string_view opSpelling,
+                                   SourceLocation fallbackLoc) {
+    if (!leftTy || leftTy->kind != TypeRef::Kind::Primitive) return;
+    const int width = shiftCountDomainWidth(leftTy->primitive);
+    if (width <= 0) return;   // not an integer left operand — §6.5 rejects it
+                              // on its own operand-kind rule
+    auto cv = foldIntConstExprTC(countExpr);
+    if (!cv) return;                              // runtime count: codegen's job
+    if (*cv >= 0 && *cv < width) return;          // in domain
+    // Diagnostic-only spelling; `primitiveSpelling` is file-local to
+    // ExprTypecheck_Exprs.cpp and the compound-assign block has its own copy.
+    auto spell = [](PrimitiveType p) -> const char* {
+        using P = PrimitiveType;
+        switch (p) {
+            case P::Byte:   return "byte";
+            case P::SByte:  return "sbyte";
+            case P::Short:  return "short";
+            case P::UShort: return "ushort";
+            case P::Int:    return "int";
+            case P::UInt:   return "uint";
+            case P::Long:   return "long";
+            case P::ULong:  return "ulong";
+            default:        return "<integer>";
+        }
+    };
+    // §6.5's own remedy spelling: "Code that wants the modular count
+    // deliberately writes it: `v << (k & 31)` (`& 63` for 64-bit left
+    // operands)". The mask constant is width−1, i.e. the domain's upper bound.
+    const std::string mask = "& " + std::to_string(width - 1);
+    const bool compound = opSpelling.size() > 2;   // `<<=` / `>>=`
+    const bool leftShift = opSpelling.rfind("<<", 0) == 0;
+    const std::string opposite =
+        std::string(leftShift ? ">>" : "<<") + (compound ? "=" : "");
+    std::string msg =
+        "shift count " + std::to_string(*cv) + " is outside the domain `0.." +
+        std::to_string(width - 1) + "` of the left operand's type `" +
+        spell(leftTy->primitive) + (leftTy->nullable ? "?" : "") +
+        "` — a compile-time-constant count outside the domain is a compile "
+        "error (§6.5/§17.14)";
+    if (*cv < 0)
+        // §6.5: "The constant-count diagnostic for a negative count notes the
+        // direction confusion: a negative count does not reverse the shift's
+        // direction — use the opposite operator, or mask deliberately with
+        // `& 31`."
+        msg += "; a negative count does not reverse the shift's direction — "
+               "use the opposite operator (`" + opposite +
+               "`), or mask deliberately with `(k " + mask + ")`";
+    else
+        msg += "; write `x " + std::string(opSpelling) + " (k " + mask +
+               ")` if the modular count is intended";
+    const SourceLocation loc = countExpr.span.begin.line != 0
+                                   ? countExpr.span.begin
+                                   : fallbackLoc;
+    ctx_.diagnostics().report(Severity::Error, loc, msg);
+}
+
 void ExprTC::foldLocalConstArraySize(TypeRef* declType) {
     if (!declType || declType->kind != TypeRef::Kind::InlineArray) return;
     if (declType->arraySizeValue >= 0) return;  // already folded (literal/member)
@@ -11111,6 +11173,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // A shift's result is always the left operand's type
                     // (§6.5) — once the operand-kind check above passes
                     // there is no R-vs-T mismatch left to check.
+                    //
+                    // §6.5 / §6.6 / §17.14 (v0.242, #3045): `x <<= k` and
+                    // `x >>= k` "inherit §6.5's count-domain rule through the
+                    // desugaring: an out-of-domain count is the same fault —
+                    // compile error for a constant count, `OverflowException`
+                    // at runtime otherwise" (§6.6). The domain is the TARGET's
+                    // width (the desugared left operand), not the count's:
+                    // `b <<= 8` on `b: byte` is out of domain. Skipped when
+                    // the operand-kind check already fired, so one ill-formed
+                    // compound gets one diagnostic.
+                    if (isShift && !badKind)
+                        checkShiftCountDomain(tTy, *as->value, as->op,
+                                              as->span.begin);
                 } else if (tTy->primitive == P::Bool) {
                     // §6.6/§3.5 (#2153): no arithmetic is defined on `bool`
                     // (§3.5 lists the numeric types only), so `bool op= e`

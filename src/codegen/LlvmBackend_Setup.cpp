@@ -5314,6 +5314,54 @@ void Emitter::emitGuardThrow(llvm::Value* cond, const char* name) {
 }
 
 
+// §6.5 / §31.4 (v0.242, #3045) — see the declaration for the rule this
+// implements and why it replaced the count mask.
+llvm::Value* Emitter::emitShiftCountInDomain(llvm::Value* l,
+                                             llvm::Value* count,
+                                             bool countUnsigned) {
+    if (!l || !count) return count;
+    if (!l->getType()->isIntegerTy() || !count->getType()->isIntegerTy())
+        return count;
+    const unsigned bits = l->getType()->getIntegerBitWidth();
+    llvm::Type* i64t = llvm::Type::getInt64Ty(llvm_);
+    // A count LLVM already knows is in `0..bits-1` needs no guard — emit the
+    // shift alone. Bit-flag code (`1 << 3`, `v >> 8`) is overwhelmingly this
+    // case, and the branch pair would be dead in every one of them. Only a
+    // provably IN-domain constant is skipped: an out-of-domain constant still
+    // gets the guard (which then throws unconditionally) rather than being
+    // silently reinterpreted — sema rejects those first (§17.14), so this is a
+    // belt-and-braces path, not the rule.
+    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(count)) {
+        const llvm::APInt& v = ci->getValue();
+        const bool inDomain = countUnsigned
+                                  ? v.ult(bits)
+                                  : (!v.isNegative() && v.slt(bits));
+        if (inDomain)
+            return count->getType() == l->getType()
+                       ? count
+                       : builder_.CreateZExtOrTrunc(count, l->getType(),
+                                                    "shcnt");
+    }
+    // Widen the count to i64 by ITS OWN signedness, then compare signed. A
+    // `ulong` count with the high bit set zexts to a NEGATIVE i64 — still out
+    // of domain, so the verdict is right either way; every other case is exact.
+    llvm::Value* wide =
+        count->getType() == i64t
+            ? count
+            : (countUnsigned ? builder_.CreateZExt(count, i64t, "shcnt.z")
+                             : builder_.CreateSExt(count, i64t, "shcnt.s"));
+    llvm::Value* below = builder_.CreateICmpSLT(
+        wide, llvm::ConstantInt::get(i64t, 0), "shcnt.neg");
+    llvm::Value* above = builder_.CreateICmpSGE(
+        wide, llvm::ConstantInt::get(i64t, bits), "shcnt.wide");
+    emitGuardThrow(builder_.CreateOr(below, above, "shcnt.bad"),
+                   "OverflowException");
+    if (count->getType() == l->getType()) return count;
+    // In-domain by the guard above, so this narrowing is value-preserving.
+    return builder_.CreateZExtOrTrunc(count, l->getType(), "shcnt");
+}
+
+
 // §28.5 / §14.1 / §2.5 (#662 foundation A): build (or return the cached)
 // per-instantiation vtable for an IMPORTED generic class using the currently
 // active genericSubst_.  Unlike specializedVtableFor (which patches an

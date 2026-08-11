@@ -646,7 +646,16 @@ void Resolver::checkEnumRestrictions() {
                     if (auto folded = foldIntConst(*ec.value, resolve))
                         val = *folded;
                     else
-                        haveVal = false;  // non-constant — a separate concern
+                        // non-constant — a separate concern. §6.5/§17.14
+                        // (v0.242, #3045): an enum member whose value is a
+                        // constant shift with an out-of-domain count also
+                        // lands here (foldIntConst declines a faulting
+                        // expression), and it is NOT silently skipped: the
+                        // value expression is visited by ExprTC, whose
+                        // checkShiftCountDomain reports it at the shift with
+                        // the operand's real type. Adding a probe here would
+                        // only double the diagnostic.
+                        haveVal = false;
                 }
                 if (haveVal) {
                     siblings[ec.name] = val;
@@ -896,6 +905,15 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
                         "zero — a const initializer must fold to a "
                         "representable compile-time-constant value (§22.12)");
                 }
+                // §6.5 / §17.14 (v0.242, #3045): the OTHER evaluation fault
+                // that leaves an otherwise-constant initializer unfoldable —
+                // "`const F := 1 << 64;` [is] rejected where [it is] written"
+                // (§17.14) — needs no probe here. Unlike a `/ 0`, the const's
+                // initializer expression is visited by ExprTC, whose
+                // checkShiftCountDomain reports the fault at the shift itself
+                // and with the left operand's real type (which this walk can
+                // only infer from the AST shape). A probe here would only
+                // double the diagnostic.
             }
         }
     }

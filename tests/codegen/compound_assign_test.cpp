@@ -83,38 +83,80 @@ BEZEL_TEST(codegen_cg31, compound_on_instance_field) {
     BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 42);
 }
 
-// #1041 / §6.5: the compound shift assignments `<<=` / `>>=` must reduce the
-// shift count modulo the operand's bit width, exactly as the non-compound
-// `<<` / `>>` do (L538). Before the fix, emitCompoundOp emitted a raw
-// `shl`/`lshr`/`ashr` with the unmasked count, so `x <<= 40` on an i32
-// produced poison (a wrong value) while `x << 40` correctly gave `x << 8`.
-BEZEL_TEST(codegen_1041_compound_shift, shl_count_reduced_mod_width) {
-    // 40 mod 32 = 8 → 1 << 8 = 256. 256 does not fit an 8-bit exit code, so
-    // this builds the full program directly and observes stdout (run()'s
-    // body-only wrapper can't route through runAotOut).
-    BEZEL_EXPECT_EQ(runAotOut(
-        "module M; class C public static method Main(): int "
-        "var x: int := 1; x <<= 40; Console.WriteLine(x); return 0; "
-        " end Main; end C;"), "256");
+// #1041 / §6.5 / §6.6 — the compound shift assignments. ⚠ THE RULE CHANGED AT
+// v0.242 (proposal 0079, #3045). #1041 fixed `<<=` / `>>=` to reduce the count
+// modulo the operand's bit width, matching the non-compound forms (before it,
+// emitCompoundOp emitted a raw `shl`/`lshr`/`ashr` with an unmasked count, so
+// `x <<= 40` on an i32 produced poison). §6.6 now says instead: "`x <<= k` and
+// `x >>= k` inherit §6.5's count-domain rule through the desugaring: an
+// out-of-domain count is the same fault — compile error for a constant count,
+// `OverflowException` at runtime otherwise." So each cell below flips to the
+// arm its count's form selects, and the poison #1041 removed stays removed —
+// the guarded path never reaches `shl` with an out-of-domain count.
+
+namespace {
+// The compound form's §6.5 constant-count reject.
+bool rejectsCompoundShiftDomain(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    if (!r.diagnostics.hasErrors()) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("is outside the domain") != std::string::npos &&
+            d.message.find("(\xC2\xA7""6.5/\xC2\xA7""17.14)") !=
+                std::string::npos)
+            return true;
+    return false;
 }
-BEZEL_TEST(codegen_1041_compound_shift, shr_count_reduced_mod_width) {
-    // 40 mod 32 = 8 → 256 >> 8 = 1.
-    BEZEL_EXPECT_EQ(run("var x: int := 256; x >>= 40; return x;"), 1);
+// 1 = the body raised OverflowException, 0 = ran to completion.
+int compoundShiftThrows(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int "
+                    "  try ") +
+        body +
+        " return 0; catch OverflowException => return 1; end; return 0; "
+        "end Main; end C;");
+    return r.ran ? r.exitCode : -999;
 }
-BEZEL_TEST(codegen_1041_compound_shift, shl_variable_count_reduced) {
-    // 256 does not fit an 8-bit exit code — observe on stdout.
-    BEZEL_EXPECT_EQ(runAotOut(
-        "module M; class C public static method Main(): int "
-        "var x: int := 1; var y: int := 40; x <<= y; "
-        "Console.WriteLine(x); return 0; "
-        " end Main; end C;"), "256");
+}  // namespace
+
+// §6.5/§6.6/§17.14 (v0.242): a CONSTANT count of 40 on an `int` target is
+// outside `0..31` → compile error. WAS: `x <<= 40` gave 256 (40 mod 32 == 8).
+BEZEL_TEST(codegen_1041_compound_shift, shl_const_count_40_rejected_3045) {
+    BEZEL_EXPECT_TRUE(rejectsCompoundShiftDomain("var x: int := 1; x <<= 40;"));
 }
-BEZEL_TEST(codegen_1041_compound_shift, long_count_reduced_mod_64) {
-    // long is 64-bit: 65 mod 64 = 1 → 1 << 1 = 2 (confirms per-type width).
-    BEZEL_EXPECT_EQ(run("var x: long := 1; x <<= 65; return int(x);"), 2);
+// §6.5/§6.6 (v0.242): same for `>>=`. WAS: `x >>= 40` gave 1 (256 >> 8).
+BEZEL_TEST(codegen_1041_compound_shift, shr_const_count_40_rejected_3045) {
+    BEZEL_EXPECT_TRUE(
+        rejectsCompoundShiftDomain("var x: int := 256; x >>= 40;"));
+}
+// §6.5/§6.6/§31.4 (v0.242): the RUNTIME arm — a variable count of 40 raises
+// OverflowException. WAS: `x <<= y` with y = 40 gave 256.
+BEZEL_TEST(codegen_1041_compound_shift, shl_runtime_count_40_raises_3045) {
+    BEZEL_EXPECT_EQ(compoundShiftThrows(
+        "var x: int := 1; var y: int := 40; x <<= y;"), 1);
+}
+// §6.5/§6.6 (v0.242): `long`'s domain is `0..63`, so a constant 65 is outside
+// it. WAS: `x <<= 65` on a long gave 2 (65 mod 64 == 1).
+BEZEL_TEST(codegen_1041_compound_shift, long_const_count_65_rejected_3045) {
+    BEZEL_EXPECT_TRUE(
+        rejectsCompoundShiftDomain("var x: long := 1; x <<= 65;"));
+}
+// §6.6 (v0.242): `x <<= k` faults IDENTICALLY to its desugaring `x := x << k`
+// — the same count, the same runtime fault, on both spellings.
+BEZEL_TEST(codegen_1041_compound_shift, compound_matches_desugaring_3045) {
+    BEZEL_EXPECT_EQ(compoundShiftThrows(
+        "var x: int := 1; var y: int := 40; x <<= y;"), 1);
+    BEZEL_EXPECT_EQ(compoundShiftThrows(
+        "var x: int := 1; var y: int := 40; x := x << y;"), 1);
 }
 BEZEL_TEST(codegen_1041_compound_shift, ordinary_shift_still_correct) {
     BEZEL_EXPECT_EQ(run("var x: int := 1; x <<= 4; return x;"), 16);
+}
+// §6.5 (v0.242): the domain's upper edge on a `long` target — 63 shifts.
+BEZEL_TEST(codegen_1041_compound_shift, long_count_63_in_domain_3045) {
+    BEZEL_EXPECT_EQ(run("var x: long := 1; x <<= 63; "
+                        "return (if x < 0L then 1 else 0);"), 1);
 }
 
 // #1042: compound arithmetic/bitwise/shift assignment on a sub-i32 integer type

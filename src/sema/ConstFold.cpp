@@ -7,16 +7,17 @@
 
 namespace bezel::sema {
 
-// per §6.5 (#1210): for shift operators the count is masked by the LEFT
-// operand's bit width before the shift — matching the runtime behaviour that
-// §6.5 mandates and that codegen already enforces (#1094). This helper infers
-// the bit width purely from the AST shape, without a type-checker context:
+// per §6.5 (#1210; domain rule since v0.242, #3045): the shift count's domain
+// is bounded by the LEFT operand's bit width. This helper infers that width
+// purely from the AST shape, without a type-checker context:
 //   • an untyped integer literal is `int` (32-bit) per §2;
 //   • unary +/-/~ on a known-width sub-expression inherits that width;
 //   • a binary arithmetic/bitwise expression whose BOTH sides have the same
 //     known width inherits that width (Bezel has no implicit integer widening);
 //   • any other form (identifier naming a const, cast, …) returns 0, meaning
-//     "unknown" — the caller leaves those shifts unmasked.
+//     "unknown" — the caller cannot decide the domain for those here, and the
+//     typed check in ExprTypecheck (which does know the operand's type) covers
+//     them.
 // Only 32 is returned for normal literal-arithmetic; 8/16/64 require type
 // information that is not available at this level.
 static int inferIntWidthBitsForShift(const ast::Expr& e) {
@@ -107,25 +108,31 @@ std::optional<long long> foldIntConst(
         // the same C++ `%` operation with the same zero-divisor guard.
         if (b->op == "%" || b->op == "mod")
             return *r == 0 ? std::nullopt : std::optional<long long>(*l % *r);
-        // §6.5 (#1210): mask the shift count by the left operand's bit width
-        // so the const-fold matches the runtime value produced by the §6.5
-        // rule (and the codegen masking added in #1094). An unmasked
-        // `*l << *r` with r >= 64 is UB in C++, and with r >= 32 (for int-
-        // typed left operands) diverges from the §6.5 value — most critically
-        // producing a giant arraySizeValue for `[1 << 40]int` (SIGSEGV).
-        // Width inference returns 0 when the left expr type is unavailable
-        // (e.g. a named-const identifier); those shifts remain unmasked here
-        // (the same as before this fix) — acceptable for the rare case and
-        // noted in the helper's comment above.
+        // §6.5 / §17.14 (v0.242, #3045): a shift count outside the left
+        // operand's `0 .. width−1` domain is an evaluation FAULT — §17.14:
+        // "An evaluation fault — integer or `decimal` overflow, division or
+        // `mod` by zero, a shift count outside the §6.5 domain — is a compile
+        // error at the constant expression, never a deferred runtime fault:
+        // … and `const F := 1 << 64;` are rejected where they are written."
+        // A faulting expression has NO value, so decline to fold; the caller
+        // reports the specific cause via findConstShiftDomainFault (below).
+        //
+        // Before v0.242 this MASKED the count (`*r & (leftBits - 1)`), because
+        // §6.5 then read "the shift count is reduced modulo the operand's bit
+        // width" — the silent-masking rule proposal 0079 retired. `1 << 40`
+        // folded to `1 << 8` = 256; it is now a compile error.
+        //
+        // Width inference returns 0 when the left expr's type is unavailable
+        // (e.g. a named-const identifier); the §6.5 domain cannot be decided
+        // here for those, and the typed check in ExprTypecheck covers them.
+        // The C++-UB guard stays either way: a shift by >= 64 (or negative) on
+        // a `long long` is UB in the host language regardless of the spec.
         if (b->op == "<<" || b->op == ">>") {
             int leftBits = inferIntWidthBitsForShift(*b->left);
-            long long cnt = (leftBits > 0) ? (*r & (leftBits - 1)) : *r;
-            // Guard against C++ UB: a shift by >= 64 on a long long is UB
-            // regardless of the spec rule; clamp to a no-op shift when the
-            // left-operand width is unknown and the count is out of range.
-            if (cnt < 0 || cnt >= 64) return std::nullopt;
-            if (b->op == "<<") return *l << cnt;
-            return *l >> cnt;
+            if (leftBits > 0 && (*r < 0 || *r >= leftBits)) return std::nullopt;
+            if (*r < 0 || *r >= 64) return std::nullopt;
+            if (b->op == "<<") return *l << *r;
+            return *l >> *r;
         }
         if (b->op == "&") return *l & *r;
         if (b->op == "|") return *l | *r;
@@ -187,6 +194,66 @@ bool containsConstDivByZero(
         return u->operand &&
                containsConstDivByZero(*u->operand, resolveIdent, depth + 1);
     return false;
+}
+
+// per §6.5 (v0.242, #3045). The eight integer-family primitives are the only
+// ones with a shift domain; every other primitive is rejected by §6.5's own
+// operand-kind rule ("not valid on `bool`, `char`, or floating-point types").
+int shiftCountDomainWidth(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Byte:  case P::SByte:  return 8;
+        case P::Short: case P::UShort: return 16;
+        case P::Int:   case P::UInt:   return 32;
+        case P::Long:  case P::ULong:  return 64;
+        default:                       return 0;
+    }
+}
+
+// per §6.5 / §17.14 (v0.242, #3045): the sibling of containsConstDivByZero for
+// the shift-domain fault. Structurally identical walk — only meaningful once
+// the caller has confirmed `e` is structurally a constant expression; this is
+// a fault probe, not an "is this constant" check.
+ConstShiftDomainFault findConstShiftDomainFault(
+    const ast::Expr& e,
+    const std::function<std::optional<long long>(std::string_view, int)>&
+        resolveIdent,
+    int depth) {
+    ConstShiftDomainFault none;
+    if (depth > 64) return none;  // cyclic / runaway const reference
+    if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (!b->left || !b->right) return none;
+        if (b->op == "<<" || b->op == ">>") {
+            int leftBits = inferIntWidthBitsForShift(*b->left);
+            if (leftBits > 0) {
+                if (auto r = foldIntConst(*b->right, resolveIdent, depth + 1)) {
+                    if (*r < 0 || *r >= leftBits) {
+                        ConstShiftDomainFault f;
+                        f.found = true;
+                        f.leftShift = (b->op == "<<");
+                        f.count = *r;
+                        f.width = leftBits;
+                        return f;
+                    }
+                }
+            }
+        }
+        auto lf = findConstShiftDomainFault(*b->left, resolveIdent, depth + 1);
+        if (lf.found) return lf;
+        return findConstShiftDomainFault(*b->right, resolveIdent, depth + 1);
+    }
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (!u->operand) return none;
+        return findConstShiftDomainFault(*u->operand, resolveIdent, depth + 1);
+    }
+    // A bare identifier naming a `const` whose own initializer carries the
+    // fault: `const SZ: int := 1 << 40; var a: [SZ]int;` — the fold recurses
+    // into the initializer, so the probe must too. `resolveIdent` returns only
+    // a VALUE, so the initializer expression is not reachable from here; the
+    // declaration site reports its own fault (every const initializer is
+    // checked where it is written, §17.14), which is where the diagnostic
+    // belongs.
+    return none;
 }
 
 }  // namespace bezel::sema

@@ -569,6 +569,21 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
             return trunc;
         }
     }
+    // §6.5 / §6.6 (v0.242, #3045): `x <<= k` / `x >>= k` "inherit §6.5's
+    // count-domain rule through the desugaring" (§6.6) — the count's domain is
+    // `0 .. width−1` of the TARGET's type, and an out-of-domain runtime count
+    // raises `OverflowException` (§31.4) instead of being reduced modulo the
+    // width. This arm must run BEFORE the #1042 tail below, which coerces the
+    // RHS to the LHS width: a `long` count of 2^40 truncates to 0 in i32 and
+    // would then read as in-domain. (Before v0.242 the arm at the bottom of
+    // this function masked the count `& (bits-1)`, the #1041 fix; the mask is
+    // gone with the rule it implemented.)
+    if ((op == "<<" || op == ">>") && l->getType()->isIntegerTy() &&
+        r->getType()->isIntegerTy()) {
+        llvm::Value* cnt = emitShiftCountInDomain(l, r, rUns);
+        if (op == "<<") return builder_.CreateShl(l, cnt);
+        return uns ? builder_.CreateLShr(l, cnt) : builder_.CreateAShr(l, cnt);
+    }
     // #1042: the compound result has the LHS type, and the checked-arith
     // intrinsics / shifts below require both operands to share that integer
     // type. The RHS is lowered at its own natural width (an `int` literal/value
@@ -622,19 +637,7 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
     if (op == "&") return builder_.CreateAnd(l, r);
     if (op == "|") return builder_.CreateOr(l, r);
     if (op == "^") return builder_.CreateXor(l, r);
-    // §6.5 (#1041): the shift count is reduced modulo the operand's bit width —
-    // exactly as the non-compound `<<`/`>>` path does (LlvmBackend_Exprs.cpp).
-    // LLVM shl/lshr/ashr with a count >= the bit width produces poison, so
-    // without this mask `x <<= 40` (i32) emitted `shl x, 40` and yielded a wrong
-    // value (the non-compound `x << 40` correctly gave `x << 8`). Mask to
-    // [0, bitwidth-1] before the shift.
-    if (op == "<<" || op == ">>") {
-        unsigned bits = l->getType()->getIntegerBitWidth();
-        llvm::Value* cnt = builder_.CreateAnd(
-            r, llvm::ConstantInt::get(r->getType(), bits - 1), "shcnt");
-        if (op == "<<") return builder_.CreateShl(l, cnt);
-        return uns ? builder_.CreateLShr(l, cnt) : builder_.CreateAShr(l, cnt);
-    }
+    // (§6.5's shift arm ran above, before the #1042 RHS coercion — see there.)
     return nullptr;
 }
 

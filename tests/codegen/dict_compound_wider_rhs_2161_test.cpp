@@ -78,6 +78,22 @@ std::string dictBody(const std::string& init /*int*/,
            "  return " + returnRhs + ";";
 }
 
+// §6.5/§17.14 (v0.242, #3045): is `body` rejected with the constant shift-count
+// domain diagnostic? (Not merely "rejected" — a different reject would pass a
+// bare hasErrors() check for the wrong reason.)
+bool rejectsShiftDomain(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    if (!r.diagnostics.hasErrors()) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("is outside the domain") != std::string::npos &&
+            d.message.find("(\xC2\xA7""6.5/\xC2\xA7""17.14)") !=
+                std::string::npos)
+            return true;
+    return false;
+}
+
 }  // namespace
 
 // ============================================================================
@@ -170,20 +186,32 @@ BEZEL_TEST(codegen_2161_var_long_oor, xor_2_32_raises) {
         dictBody("0", "var w: long := 4294967296L; d[\"a\"] ^= w", "0")), 1);
 }
 
-// `<<=` — shifts per §6.5 stay on the LHS-width path (the count is masked
-// mod the operand's bit width and a shift never raises). The variable RHS
-// was the crash repro; after the fix the count widens by the RHS's signedness
-// then is masked to i32. 1 << 33 = 2 (mask 33 & 31 = 1).
-BEZEL_TEST(codegen_2161_var_long_oor, shl_wide_count_masked) {
-    BEZEL_EXPECT_EQ(run(dictBody("1",
-                                  "var w: long := 33L; d[\"a\"] <<= w",
-                                  "d[\"a\"]")), 2);
+// `<<=` — shifts stay on the LHS-width path (a shift's result already has the
+// left operand's type, §6.5, so the §6.6 checked write-back never applies).
+// ⚠ THE COUNT RULE CHANGED AT v0.242 (proposal 0079, #3045): the count is no
+// longer masked mod the width — its DOMAIN is `0..width−1` of the LHS type, and
+// a RUNTIME count outside it raises OverflowException (§31.4). The variable RHS
+// was the crash repro; the count still widens by the RHS's signedness, and the
+// domain check now runs on it BEFORE the coercion to the LHS width (a wide count
+// that truncates to an in-domain value must not slip through).
+// WAS: `d["a"] <<= w` with w = 33L gave 2 (33 & 31 == 1).
+BEZEL_TEST(codegen_2161_var_long_oor, shl_wide_count_out_of_domain_raises) {
+    BEZEL_EXPECT_EQ(throwsOverflow(
+        dictBody("1", "var w: long := 33L; d[\"a\"] <<= w", "0")), 1);
 }
-// `>>=` — 8 >> 33 = 8 >> 1 = 4.
-BEZEL_TEST(codegen_2161_var_long_oor, shr_wide_count_masked) {
-    BEZEL_EXPECT_EQ(run(dictBody("8",
-                                  "var w: long := 33L; d[\"a\"] >>= w",
-                                  "d[\"a\"]")), 4);
+// `>>=` — WAS: `d["a"] >>= w` with w = 33L gave 4 (8 >> 1).
+BEZEL_TEST(codegen_2161_var_long_oor, shr_wide_count_out_of_domain_raises) {
+    BEZEL_EXPECT_EQ(throwsOverflow(
+        dictBody("8", "var w: long := 33L; d[\"a\"] >>= w", "0")), 1);
+}
+// An IN-DOMAIN wide (`long`) count still works and still keeps the LHS width:
+// `d["a"] <<= 3L` on an int dict → 1 << 3 = 8. This is the cell that proves the
+// #2161 crash fix (a variable long RHS on the dict indexer path) survives the
+// v0.242 rewrite — the domain check replaced the mask, not the coercion.
+BEZEL_TEST(codegen_2161_var_long_oor, shl_wide_count_in_domain_unchanged) {
+    BEZEL_EXPECT_EQ(run(dictBody("1",
+                                  "var w: long := 3L; d[\"a\"] <<= w",
+                                  "d[\"a\"]")), 8);
 }
 
 // ============================================================================
@@ -219,11 +247,22 @@ BEZEL_TEST(codegen_2161_const_long_oor, xor_2_32_plus_1_raises) {
     BEZEL_EXPECT_EQ(throwsOverflow(
         dictBody("0", "d[\"a\"] ^= 4294967297L", "0")), 1);
 }
-BEZEL_TEST(codegen_2161_const_long_oor, shl_33_no_raise) {
-    BEZEL_EXPECT_EQ(run(dictBody("1", "d[\"a\"] <<= 33L", "d[\"a\"]")), 2);
+// §6.5/§6.6/§17.14 (v0.242, #3045): a CONSTANT count of 33 is outside the int
+// dict value's `0..31` domain — a COMPILE ERROR, not a masked value. The count's
+// own type (`long`, from the `33L` literal) is irrelevant: §6.5 bounds the
+// domain by the LEFT operand's type, which for `d[k] <<= e` is the dict's value
+// type. WAS: `d["a"] <<= 33L` stored 2; `d["a"] >>= 33L` stored 4.
+BEZEL_TEST(codegen_2161_const_long_oor, shl_const_33_rejected_3045) {
+    BEZEL_EXPECT_TRUE(rejectsShiftDomain(
+        dictBody("1", "d[\"a\"] <<= 33L", "d[\"a\"]")));
 }
-BEZEL_TEST(codegen_2161_const_long_oor, shr_33_no_raise) {
-    BEZEL_EXPECT_EQ(run(dictBody("8", "d[\"a\"] >>= 33L", "d[\"a\"]")), 4);
+BEZEL_TEST(codegen_2161_const_long_oor, shr_const_33_rejected_3045) {
+    BEZEL_EXPECT_TRUE(rejectsShiftDomain(
+        dictBody("8", "d[\"a\"] >>= 33L", "d[\"a\"]")));
+}
+// IN-DOMAIN constant wide count: still stores through the LHS-width path.
+BEZEL_TEST(codegen_2161_const_long_oor, shl_const_in_domain_unchanged) {
+    BEZEL_EXPECT_EQ(run(dictBody("1", "d[\"a\"] <<= 3L", "d[\"a\"]")), 8);
 }
 
 // ============================================================================

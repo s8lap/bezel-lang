@@ -4414,6 +4414,16 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     }
                 }
             }
+            // §6.5 / §17.14 (v0.242, #3045): both operands are now known to be
+            // integer-kinded, so the shift count's DOMAIN can be checked. It is
+            // `0 .. width−1` of the LEFT operand's own type — §6.5 excludes the
+            // count from §6.2's promotion, so `byte << 8` is out of domain even
+            // though 8 fits an `int`. A constant out-of-domain count is a
+            // compile error here; a runtime one raises `OverflowException`
+            // (§31.4), emitted by codegen. Both replace the pre-v0.242 silent
+            // masking (`count mod width`).
+            if ((op == "<<" || op == ">>") && be.right)
+                checkShiftCountDomain(lt, *be.right, op, be.span.begin);
         }
         // §7.11 lifted operators: when EITHER operand is a nullable value
         // primitive (`int?`, `double?`, `bool?`, …), the arithmetic / bitwise /

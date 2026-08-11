@@ -986,6 +986,31 @@ TypeRef* Resolver::resolveType(const ast::Type& t, Scope* scope) {
                     } else {
                         ref->arraySizeValue = *v;
                     }
+                } else if (auto sf = findConstShiftDomainFaultInScope(*sz,
+                                                                      scope);
+                           sf.found) {
+                    // §6.5 / §17.14 (v0.242, #3045): a size that did not fold
+                    // because a constant shift count is outside the left
+                    // operand's `0..width−1` domain is an evaluation FAULT —
+                    // "a compile error at the constant expression" (§17.14) —
+                    // not merely "unfoldable". `[1 << 40]int` used to fold to
+                    // `[1 << 8]int` = `[256]int` under the retired masking
+                    // rule; leaving it unfoldable would silently degrade the
+                    // type to codegen's scalar fallback. Unlike a `const`
+                    // initializer or an enum member value, an inline-array
+                    // SIZE expression is not visited by ExprTC, so this is the
+                    // only place the fault can be reported — no duplicate.
+                    ctx_.diagnostics().report(
+                        Severity::Error, sz->span.begin,
+                        std::string("an inline-array size shifts by ") +
+                        std::to_string(sf.count) +
+                        ", outside the left operand's `0.." +
+                        std::to_string(sf.width - 1) +
+                        "` domain — a constant shift count outside the domain "
+                        "is a compile error at the constant expression "
+                        "(§6.5/§17.14); write `(k & " +
+                        std::to_string(sf.width - 1) +
+                        ")` if the modular count is intended");
                 }
             }
             break;
@@ -1310,6 +1335,39 @@ std::optional<long long> Resolver::foldIntConstExpr(const ast::Expr& e,
         return std::nullopt;
     };
     return foldIntConst(e, resolve, depth);
+}
+
+// §6.5 / §17.14 (v0.242, #3045) — see the declaration. The resolver closure is
+// a verbatim copy of foldIntConstExpr's (each of this file's folding entry
+// points carries its own, matching the file's existing style) so the probe and
+// the fold agree on every const value they can see.
+ConstShiftDomainFault Resolver::findConstShiftDomainFaultInScope(
+    const ast::Expr& e, Scope* scope) {
+    std::function<std::optional<long long>(std::string_view, int)> resolve =
+        [&](std::string_view name, int d) -> std::optional<long long> {
+        for (TypeSymbol* ts = currentOuterType_; ts;) {
+            for (Symbol* m : ts->members)
+                if (auto* cms = dynamic_cast<ConstMemberSymbol*>(m))
+                    if (cms->name == name)
+                        if (auto* cd =
+                                dynamic_cast<const ast::ConstDecl*>(cms->decl))
+                            if (cd->value)
+                                return foldIntConst(*cd->value, resolve, d + 1);
+            TypeSymbol* nb = nullptr;
+            for (TypeSymbol* base : ts->baseTypes)
+                if (base && base->kind == ast::TypeDeclKind::Class) {
+                    nb = base;
+                    break;
+                }
+            ts = nb;
+        }
+        if (Symbol* s = lookupName(name, scope))
+            if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
+                if (cd->value)
+                    return foldIntConst(*cd->value, resolve, d + 1);
+        return std::nullopt;
+    };
+    return findConstShiftDomainFault(e, resolve);
 }
 
 void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {

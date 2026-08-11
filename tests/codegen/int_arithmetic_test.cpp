@@ -154,31 +154,52 @@ BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_null_propagates) 
         "return (if (r ?? false) then 1 else 0);"), 0);
 }
 
-// #1210 / §6.5: const-fold of a shift masks the count by the LEFT operand's
-// bit width (int → & 31, matching the runtime rule enforced by codegen #1094).
-// Before the fix, `1 << 40` folded to 1099511627776 (unmasked), causing an
-// inline-array with that size to allocate a ~16 GB stack frame → SIGSEGV.
-// After the fix it folds to `1 << (40 & 31)` = `1 << 8` = 256.
+// #1210 / §6.5 — the const-fold of a shift. ⚠ THE RULE CHANGED AT v0.242
+// (proposal 0079, #3045). #1210 made the fold MASK the count by the LEFT
+// operand's bit width (int → & 31), because §6.5 then reduced the count modulo
+// the width; that stopped `[1 << 40]int` from folding to 1099511627776 and
+// allocating a ~16 GB stack frame (SIGSEGV). §6.5 now gives the count a DOMAIN
+// (`0 .. width−1`) instead, and §17.14 makes an out-of-domain CONSTANT count an
+// evaluation fault — "a compile error at the constant expression, never a
+// deferred runtime fault: … `const F := 1 << 64;` [is] rejected where [it is]
+// written". So the fold no longer masks: it declines, and the site reports.
+// The crash #1210 fixed stays fixed — a rejected program allocates nothing.
 
-// CRASH FIX: an inline array whose size is a shift const-fold with count >= 32
-// must NOT produce a giant stack frame. `[1 << 40]int` must have length 256.
+namespace {
+// Does the program get rejected with the §6.5 constant-count domain diagnostic?
+bool rejectsShiftDomain(const std::string& body) {
+    auto r = bezel::test::runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    if (!r.diagnostics.hasErrors()) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("outside the") != std::string::npos &&
+            d.message.find("domain") != std::string::npos &&
+            d.message.find("(\xC2\xA7""6.5/\xC2\xA7""17.14)") !=
+                std::string::npos)
+            return true;
+    return false;
+}
+}  // namespace
+
+// §6.5/§17.14 (v0.242): the count 40 is outside `int`'s `0..31` domain, so the
+// inline-array size is a faulting constant expression → compile error.
+// WAS: `[1 << 40]int` had Length 256 (40 & 31 == 8).
 BEZEL_TEST(shift_const_fold_masks_count_1210,
-           inline_array_shift_size_no_overflow_1210) {
-    // §6.5: 1 << 40 for int-typed operand: 40 & 31 = 8, so 1 << 8 = 256.
-    // Length must be 256, not ~1e12 (which was the pre-fix unmasked value).
-    BEZEL_EXPECT_EQ(runBody(
-        "var a: [1 << 40]int; return a.Length - 255;"), 1);
+           inline_array_shift_size_rejected_3045) {
+    BEZEL_EXPECT_TRUE(rejectsShiftDomain(
+        "var a: [1 << 40]int; return a.Length - 255;"));
 }
 
-// RIGHT-SHIFT: same masking applies to >>.
-// 1024 >> 33: 33 & 31 = 1, so 1024 >> 1 = 512.
+// §6.5/§17.14 (v0.242): same for `>>`. WAS: `[1024 >> 33]int` had Length 512
+// (33 & 31 == 1).
 BEZEL_TEST(shift_const_fold_masks_count_1210,
-           inline_array_right_shift_size_masked_1210) {
-    BEZEL_EXPECT_EQ(runBody(
-        "var a: [1024 >> 33]int; return a.Length - 511;"), 1);
+           inline_array_right_shift_size_rejected_3045) {
+    BEZEL_EXPECT_TRUE(rejectsShiftDomain(
+        "var a: [1024 >> 33]int; return a.Length - 511;"));
 }
 
-// NO-REGRESSION: a normal in-range shift const must still fold correctly.
+// NO-REGRESSION: an IN-DOMAIN shift const still folds exactly as before.
 // 1 << 4 = 16; array length must be 16, not 0 or some other value.
 BEZEL_TEST(shift_const_fold_masks_count_1210,
            inline_array_normal_shift_size_unchanged_1210) {
@@ -186,11 +207,21 @@ BEZEL_TEST(shift_const_fold_masks_count_1210,
         "var a: [1 << 4]int; return a.Length;"), 16);
 }
 
-// CONST-THROUGH-IDENTIFIER: `const SZ: int := 1 << 40;` used as array size —
-// the fold recurses into the const's initialiser, masking there too.
+// CONST-THROUGH-IDENTIFIER: `const SZ: int := 1 << 40;` used as an array size.
+// The declaration is itself the faulting constant expression (§17.14), so the
+// program is rejected there. WAS: the fold recursed into the initialiser and
+// masked, giving Length 256.
 BEZEL_TEST(shift_const_fold_masks_count_1210,
-           inline_array_const_shift_size_masked_1210) {
-    BEZEL_EXPECT_EQ(runBody(
+           inline_array_const_shift_size_rejected_3045) {
+    BEZEL_EXPECT_TRUE(rejectsShiftDomain(
         "const SZ: int := 1 << 40; "
-        "var a: [SZ]int; return a.Length - 255;"), 1);
+        "var a: [SZ]int; return a.Length - 255;"));
+}
+
+// NO-REGRESSION: the same const-through-identifier path with an IN-DOMAIN
+// count still folds — `const SZ: int := 1 << 5;` gives `[32]int`.
+BEZEL_TEST(shift_const_fold_masks_count_1210,
+           inline_array_const_shift_size_in_domain_unchanged) {
+    BEZEL_EXPECT_EQ(runBody(
+        "const SZ: int := 1 << 5; var a: [SZ]int; return a.Length;"), 32);
 }
