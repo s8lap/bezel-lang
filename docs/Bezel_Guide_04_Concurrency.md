@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.245.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.246.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A **task is a heap resource you own**, like every other class instance (§2). **No mutable state is ever reachable from two domains** — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a **structured scope**, not loose tasks (§4). If you skim everything else, read the three sections headed **How Bezel does it** and the table in §10.
 
@@ -186,7 +186,7 @@ await Task.WhenAll(both);                                // settles ALL inputs; 
                                                          //   first non-successful input's fault
 ```
 
-`WhenAll` never abandons laggards (spec §30.10). `WhenAny` yields the *index* of the first task to settle and never re-raises — you inspect the winner (spec §30.10). For results-bearing named holders, await each after the `WhenAll` — a completed await resumes synchronously. For a dynamically-sized set, use the owning family: `Task.WhenAllOwned(owned tasks)` collects everything, `Task.WhenEachOwned(owned tasks)` streams each task as it completes (stdlib §6.7).
+`WhenAll` never abandons laggards (spec §30.10). `WhenAny` yields the *index* of the first task to settle and never re-raises — you inspect the winner (spec §30.10). For results-bearing named holders, await each after the `WhenAll` — a completed await resumes synchronously. For a dynamically-sized set, use the owning family: `Task.WhenAllOwned(move tasks)` collects everything, `Task.WhenEachOwned(move tasks)` streams each task as it completes (stdlib §6.7).
 
 ---
 
@@ -203,7 +203,7 @@ public sealed class Batch                            // sendable: sealed, wholly
 end Batch;
 
 public static method Summarize(owned batch: Batch): Digest
-  using var b := owned batch;                        // adopt (Guide 1 §9)
+  using var b := move batch;                         // adopt (Guide 1 §9)
   return new Digest(b.Rows.Count, 0);
 end Summarize;
 
@@ -222,7 +222,7 @@ The compiler enforces two things at every `Spawn` call site (stdlib §6.8):
 
 ```bezel
 using var j1 := Domain.Spawn(lambda() => Index(repo));   // ERROR: entry captures repo
-using var j2 := Domain.Spawn(Work, owned sessions);      // ERROR when sessions is a
+using var j2 := Domain.Spawn(Work, move sessions);       // ERROR when sessions is a
                                                          //   Dictionary<string, Session>:
                                                          //   borrowing slots of class
                                                          //   elements are not sendable
@@ -244,7 +244,7 @@ The **actor idiom** — a domain that owns its state outright and serializes eve
 public record Transfer(From: string, To: string, Amount: decimal);   // sendable payload
 
 public static async method LedgerMain(owned rx: Channel<Transfer>): Task
-  using var inbox := owned rx;                             // adopt the owned parameter
+  using var inbox := move rx;                              // adopt the owned parameter
   using var balances := new Dictionary<string, decimal>(); // domain-local state: no lock
   await for var t in inbox.ReceiveAll() do                 // drain; suspends while empty
     balances[t.From] := (balances.GetOrNull(t.From) ?? 0m) - t.Amount;
@@ -255,7 +255,7 @@ end LedgerMain;
 // Elsewhere:
 var ledger := new Channel<Transfer>();
 using var pay := ledger.NewSender();                       // mint before moving the channel
-using var actor := Domain.Spawn(LedgerMain, owned ledger); // the receiving end moves in
+using var actor := Domain.Spawn(LedgerMain, move ledger);  // the receiving end moves in
 
 pay.Send(new Transfer("ada", "lin", 25m));                 // value payload: copied across
 pay.Dispose();                // last sender disposed: the channel closes and drains
@@ -268,7 +268,7 @@ The semantics to internalize:
 - **Closing is graceful, twice over.** Disposing the *last sender* closes the channel: buffered items remain receivable, an active `ReceiveAll` yields the tail and completes normally, and only then do further receives raise `ChannelClosedException`. The receiver can close first-class with `Close()` — same drained state, idempotent. Disposing the `Channel<T>` itself is the abrupt form: undelivered class-typed items are disposed. The worked shutdown above is nothing but these rules composing.
 - **Abandonment gives back; failed sends dispose.** Disposing a pending `Receive` task deregisters the waiter and *no item is consumed or lost* — one mid-handoff is returned to the channel's head. A send that faults goes the other way: `ChannelClosedException` (closed) and `ChannelFullException` (sync `Send` on a full bounded channel) both dispose the offered item first. **A channel never retains an item it did not accept**, and there is no hand-it-back failure path in this revision (a recorded deferral, spec §30.15). A producer that cannot afford the loss uses `SendAsync`, which awaits capacity instead of faulting.
 - **Back-pressure is a constructor argument.** `new Channel<T>(capacity)` bounds the buffer — capacity ≥ 1, buffered only; there is no rendezvous form in this revision. `SendAsync` awaits space; the synchronous `Send` never blocks on any channel. Bound your inboxes: unbounded channels are an accepted leak under a runaway producer.
-- **Class-typed items arrive owned.** `Receive()` is `OwningTask<T>` for class T — award it into a `using var`. In an owning `ReceiveAll` loop, adopt each item on the body's first line (`using var r := owned report;`, Guide 1 §9). One consumption at a time: a second `ReceiveAll` or a `Receive` racing one raises `InvalidOperationException`.
+- **Class-typed items arrive owned.** `Receive()` is `OwningTask<T>` for class T — award it into a `using var`. In an owning `ReceiveAll` loop, adopt each item on the body's first line (`using var r := move report;`, Guide 1 §9). One consumption at a time: a second `ReceiveAll` or a `Receive` racing one raises `InvalidOperationException`.
 
 Cross-domain *fan-in* is channels; the sanctioned multi-source shape is to merge: one forwarder per source, each sending into a single merged channel (spec §30.15).
 
