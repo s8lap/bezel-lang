@@ -620,8 +620,9 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
                              : builder_.CreateURem(l, r);
         // Signed INT_MIN op -1 (§6.1): only division overflows; modulo is 0 and
         // must not raise. srem of INT_MIN,-1 is UB, so force divisor to 1 and
-        // select 0 on that path. (`mod=` is not valid syntax per §17.2, so the
-        // `mod` arm is currently unreachable, but kept correct for parallelism.)
+        // select 0 on that path. (The `mod` arm became reachable at v0.242
+        // with the `mod=` compound form — §6.6/A.6, #3052; it was already
+        // reachable through `x := x mod y` in the plain-assignment lowering.)
         llvm::Value* negOne = llvm::ConstantInt::getSigned(r->getType(), -1);
         llvm::Value* isMinNegOne =
             builder_.CreateAnd(builder_.CreateICmpEQ(l, minIntLike(r)),

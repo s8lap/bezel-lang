@@ -2029,7 +2029,8 @@ ast::PropertyAccessor Parser::parsePropertyAccessor() {
                 current_.kind == TokenKind::Punctuator &&
                 (current_.text == ":="  || current_.text == "+="  ||
                  current_.text == "-="  || current_.text == "*="  ||
-                 current_.text == "/="  || current_.text == "&="  ||
+                 current_.text == "/="  || current_.text == "mod=" ||
+                 current_.text == "&="  ||
                  current_.text == "|="  || current_.text == "^="  ||
                  current_.text == "<<=" || current_.text == ">>=" ||
                  current_.text == "??=");
@@ -2261,7 +2262,8 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
             current_.kind == TokenKind::Punctuator &&
             (current_.text == ":="  || current_.text == "+="  ||
              current_.text == "-="  || current_.text == "*="  ||
-             current_.text == "/="  || current_.text == "&="  ||
+             current_.text == "/="  || current_.text == "mod=" ||
+             current_.text == "&="  ||
              current_.text == "|="  || current_.text == "^="  ||
              current_.text == "<<=" || current_.text == ">>=" ||
              current_.text == "??=");

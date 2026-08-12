@@ -233,6 +233,23 @@ Token Lexer::next() {
         // production and stay ordinary identifiers.
         if (text.size() == 1 && text[0] == '_')
             return Token{TokenKind::Discard, text, locationAt(start)};
+        // A.6 `AssignOp` (v0.242, #3052), verbatim: "`mod=` is one token,
+        // lexed by longest match: the keyword `mod` immediately followed by
+        // `=` with no intervening space. `x mod = y` remains a syntax error."
+        //
+        // The rule is stated on the KEYWORD, so it belongs here rather than in
+        // the punctuator switch below: an identifier that merely ENDS in "mod"
+        // (`amod=5`) is consumed whole by the loop above and never reaches
+        // this test. `mod=` is emitted as a Punctuator so it joins the other
+        // compound-assignment tokens (`+=`, `<<=`, `??=`) at every parser site
+        // that tests `TokenKind::Punctuator` against the AssignOp set.
+        if (text == "mod" && position_ < source_.size() &&
+            source_[position_] == '=') {
+            ++position_;
+            return Token{TokenKind::Punctuator,
+                         source_.substr(start, position_ - start),
+                         locationAt(start)};
+        }
         TokenKind kind =
             isReservedKeyword(text) ? TokenKind::Keyword : TokenKind::Identifier;
         return Token{kind, text, locationAt(start)};

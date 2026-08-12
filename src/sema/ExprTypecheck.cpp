@@ -11297,6 +11297,37 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // §6.1 / §6.3 / §6.6 (v0.242, #3052): `mod=` carries the same
+        // operand-type restriction as the binary `mod` it desugars to — §6.1,
+        // verbatim: "`mod` is defined on integer types and on `decimal` … It
+        // is **not** defined on `float` or `double`; an expression of the form
+        // `x mod y` where either operand has a binary floating-point type is a
+        // compile error." Compound assignments do not route through
+        // typeBinary, so — exactly as for the bitwise arm above — the target
+        // kind is guarded here. `decimal` is ADMITTED (unlike the bitwise
+        // list): §6.1 defines `mod` on it, with the same dividend-sign rule
+        // and `DivideByZeroException`.
+        if (as->target && as->op == "mod=") {
+            if (TypeRef* tt = ctx_.exprType(*as->target)) {
+                if (tt->kind == TypeRef::Kind::Primitive) {
+                    PrimitiveType p = tt->primitive;
+                    const char* badKind =
+                        (p == PrimitiveType::Float ||
+                         p == PrimitiveType::Double)
+                            ? "binary floating-point types (use `Math.Fmod` "
+                              "or `Math.IEEERemainder`, §6.3)"
+                        : (p == PrimitiveType::Bool)
+                            ? "`bool` (boolean operations use `and`/`or`/`not`)"
+                        : (p == PrimitiveType::Char)   ? "`char`"
+                        : (p == PrimitiveType::String) ? "`string`" : nullptr;
+                    if (badKind)
+                        ctx_.diagnostics().report(Severity::Error, as->span.begin,
+                            std::string("operator `mod=` is not valid on ") +
+                            badKind + " — `mod` is defined on the integer "
+                            "types and `decimal` (§6.1)");
+                }
+            }
+        }
         // per §24.4: `event += handler` / `event -= handler` — type the
         // handler lambda's param as the event payload `T` (these forms desugar
         // to Add/Remove; they are not real compound assignments).
@@ -11441,9 +11472,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // (`decimal? += record?` reinterpreted the record's bits as a
         // decimal; `int? += bool?` sign-extended the i1), runtime segfaults
         // (`string?(null) += "x"`), or malformed-IR aborts (`int += int?`).
+        // (v0.242, #3052: `mod=` joins the list — it is an ordinary §6.6
+        // compound form with the same operand-pair admissibility as `/=`.)
         if (!eventPayload && as->target && as->value &&
             (as->op == "+=" || as->op == "-=" || as->op == "*=" ||
-             as->op == "/=" || as->op == "&=" || as->op == "|=" ||
+             as->op == "/=" || as->op == "mod=" || as->op == "&=" ||
+             as->op == "|=" ||
              as->op == "^=" || as->op == "<<=" || as->op == ">>=")) {
             TypeRef* tTy = ctx_.exprType(*as->target);
             TypeRef* rTy = ctx_.exprType(*as->value);
@@ -12137,6 +12171,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     if (o == "-=")  return "-";
                     if (o == "*=")  return "*";
                     if (o == "/=")  return "/";
+                    // §25.1 (v0.242, #3052): "the compound forms desugar
+                    // mechanically to read-modify-write using the underlying
+                    // binary operator's overload" — a user `operator mod`
+                    // composes into `mod=` exactly as the other forms do.
+                    if (o == "mod=") return "mod";
                     if (o == "&=")  return "&";
                     if (o == "|=")  return "|";
                     if (o == "^=")  return "^";

@@ -146,7 +146,8 @@ ast::CaseArm Parser::parseCaseStmtArm(bool scrutineeLess) {
         bool isAssign = current_.kind == TokenKind::Punctuator &&
                         (current_.text == ":="  || current_.text == "+="  ||
                          current_.text == "-="  || current_.text == "*="  ||
-                         current_.text == "/="  || current_.text == "&="  ||
+                         current_.text == "/="  || current_.text == "mod=" ||
+                         current_.text == "&="  ||
                          current_.text == "|="  || current_.text == "^="  ||
                          current_.text == "<<=" || current_.text == ">>=" ||
                          current_.text == "??=");
@@ -724,7 +725,8 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                         current_.kind == TokenKind::Punctuator &&
                         (current_.text == ":="  || current_.text == "+="  ||
                          current_.text == "-="  || current_.text == "*="  ||
-                         current_.text == "/="  || current_.text == "&="  ||
+                         current_.text == "/="  || current_.text == "mod=" ||
+                         current_.text == "&="  ||
                          current_.text == "|="  || current_.text == "^="  ||
                          current_.text == "<<=" || current_.text == ">>=" ||
                          current_.text == "??=")) {
@@ -1043,7 +1045,8 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
     if (current_.kind == TokenKind::Punctuator &&
         (current_.text == ":="  || current_.text == "+="  ||
          current_.text == "-="  || current_.text == "*="  ||
-         current_.text == "/="  || current_.text == "&="  ||
+         current_.text == "/="  || current_.text == "mod=" ||
+         current_.text == "&="  ||
          current_.text == "|="  || current_.text == "^="  ||
          current_.text == "<<=" || current_.text == ">>=" ||
          current_.text == "??=")) {
