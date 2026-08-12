@@ -1643,20 +1643,39 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // literal also falls through lowerExpr → null.  The `!cl->isDict` guard
         // below is widened to also handle dict literals via the same
         // materializeHeapDictLiteral helper that #534 introduced for local-decls.
-        // §30.5 / #1332 (v0.162): detect `return await <call>` with a pointer-typed
+        // §30.5 / #1332 (v0.162): detect `return await <source>` with a pointer-typed
         // result inside an async method — Pattern A chained return. If detected, set
         // asyncChainedReturn_ so lowerAwait does NOT free the source task immediately;
         // lowerStmt will chain the source task to the outer task after the await.
+        // (v0.252 / fix #3096: `<source>` is an anonymous producer CALL *or* an
+        // OWNED named task local — see the widening note on the inner `if`.)
         // Guard: no finally in flight (the finally path's emitAsyncComplete call would
         // need separate chaining, deferred; in that case fall back to normal free).
         // Guard: asyncResultTy_ is a pointer type (class/string, not int/bool/struct).
         if (rs->value && smKind_ == SuspendKind::Await && smStateStruct_ &&
             asyncResultTy_ && asyncResultTy_->isPointerTy() && finallyStack_.empty()) {
+            // fix #3096 / §30.5 kind 2 *Chaining from a scope-bound source*
+            // (v0.252): the CallExpr test was the WHOLE gate, so
+            // `using var task := P(); return await task;` — the very shape
+            // §30.5 works out, and the one that needs its "no move occurs,
+            // disposal is deferred" dispensation — never called
+            // bz_task_set_chained at all. The outer task therefore took no
+            // ownership of the source, and the
+            // `else if (v && asyncPatternAResultDisposer_)` arm below fired
+            // instead, giving the borrowed result TWO owners: the source task
+            // (via its own scope-end disposal, which runs FIRST and frees the
+            // result through the #1503 per-`T` disposer — the use-after-free in
+            // the report) and the outer task (via the kind-1 disposer just
+            // attached — the double free behind it).
+            // chainedReturnOwnedTaskSource admits exactly the OWNED named
+            // sources; a kind-3 BORROWED source stays out, because no transfer
+            // is possible there (§30.5 kind 3).
             if (const auto* awaitUE =
                     dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
-                if (awaitUE->op == "await" &&
-                    dynamic_cast<const ast::CallExpr*>(awaitUE->operand.get()) !=
-                        nullptr) {
+                if (awaitUE->op == "await" && awaitUE->operand &&
+                    (dynamic_cast<const ast::CallExpr*>(awaitUE->operand.get()) !=
+                         nullptr ||
+                     chainedReturnOwnedTaskSource(*awaitUE->operand) != nullptr)) {
                     asyncChainedReturn_ = true;
                 }
             }
@@ -1947,6 +1966,46 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 builder_.CreateStore(builder_.getInt32(5), fr.exitModSlot);
                 builder_.CreateBr(fr.finNormalBB);
                 return true;
+            }
+            // fix #3096 / §30.5 kind 2 *Chaining from a scope-bound source*
+            // (v0.252): "the source's slot already lives in the enclosing
+            // state-machine frame, and the chained-slot arrangement **defers
+            // its disposal** from the frame's scope end to the outer task's
+            // teardown … On both paths the source task is disposed exactly once
+            // — by the outer task's destructor, transitively."
+            //
+            // This is that deferral, and it belongs HERE rather than at the
+            // local's registration: the dispensation applies to THIS return
+            // edge only. Every other exit of the same body — a fault re-raised
+            // by the await, a different `return`, an exception — chains nothing,
+            // so the local must keep its ordinary scope-end disposal on those.
+            // Nulling the slot immediately before emitAllDisposals is exactly
+            // "defer": the `d.task` entry is null-guarded (emitDisposals'
+            // `task.faf` arm skips a null task), and this is the same technique
+            // #776 uses one screen above for a task local being TRANSFERRED out.
+            // The pointer itself survives in the frame's pending-task slot,
+            // which emitAwaitSuspend wrote at the await and nothing clears, so
+            // the chained branch below still finds it. The window between this
+            // store and bz_task_set_chained is the same one the anonymous-
+            // CallExpr source has always had.
+            if (chainedReturn && rs->value) {
+                if (const auto* awaitUE =
+                        dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
+                    if (awaitUE->op == "await" && awaitUE->operand) {
+                        if (const ast::LocalDecl* srcLd =
+                                chainedReturnOwnedTaskSource(*awaitUE->operand)) {
+                            auto sit = locals_.find(srcLd);
+                            if (sit != locals_.end()) {
+                                llvm::Type* sety = nullptr;
+                                llvm::Value* saddr =
+                                    boxedStorage(sit->second, sety);
+                                builder_.CreateStore(
+                                    llvm::ConstantPointerNull::get(ptrTy()),
+                                    saddr);
+                            }
+                        }
+                    }
+                }
             }
             // No enclosing finally: dispose all live scopes, then complete.
             emitAllDisposals();

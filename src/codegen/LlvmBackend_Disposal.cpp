@@ -4515,6 +4515,12 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // frees tasks whose operand is an anonymous CallExpr (`await Producer()`),
         // never a named local (`await t`), so a using-var-bound task is fired-
         // and-forgotten exactly once here at scope end.
+        // fix #3096 / §30.5 kind 2 (v0.252): the ONE edge on which that scope-end
+        // disposal must NOT run is a `return await <this local>` chained return,
+        // where §30.5 "defers its disposal … to the outer task's teardown". The
+        // return edge nulls this slot immediately before emitAllDisposals
+        // (LlvmBackend_Stmts.cpp), so the null guard above is what implements the
+        // deferral — and it stays per-edge: every other exit still disposes here.
         if (it->task) {
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);

@@ -8758,6 +8758,20 @@ private:
     // emitAsyncLambda.
     llvm::Function* patternAResultDisposerFor(const sema::TypeRef* taskTypeRef);
 
+    // fix #3096 / §30.5 "Pattern A result slots are of three kinds", kind 2
+    // (v0.252): the `LocalDecl` of the task local a `return await <operand>`
+    // chains FROM, when this async body OWNS that local's task frame — a
+    // `using var`/`await using var` task local, or the §28.3 v0.190 SB-01
+    // plain-`var` mint. Null for every kind-3 BORROWED source (an alias, a
+    // storage read, a plain borrow parameter), for a non-`Task` operand, and
+    // for a result type whose disposal does not cascade through the task. The
+    // caller uses it for BOTH halves of kind 2: widening the chained-return
+    // detection past the anonymous-`CallExpr` source, and suppressing that
+    // local's own scope-end disposal, which §30.5 defers to the outer task's
+    // teardown. Definition (with the two asked-not-re-derived predicates it
+    // rests on) in LlvmBackend_Async.cpp beside patternAResultDisposerFor.
+    const ast::LocalDecl* chainedReturnOwnedTaskSource(const ast::Expr& operand);
+
     // #2279 (§30.5 Pattern A, v0.236): when the result type of a Pattern A
     // `Task<T:class>` is itself an INTRINSIC COLLECTION (Array<T> / Set<T> /
     // Dictionary<K,V> / LinkedList<T> / Stack<T> / Queue<T> / OwningBuffer<T> /

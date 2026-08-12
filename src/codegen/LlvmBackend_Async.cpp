@@ -792,6 +792,66 @@ llvm::Function* Emitter::patternAResultDisposerFor(
 }
 
 
+// fix #3096 / §30.5 "Pattern A result slots are of three kinds", kind 2 —
+// *Chaining from a scope-bound source* (v0.252). Returns the `LocalDecl` of the
+// task local a `return await <operand>` chains FROM, when this async body OWNS
+// that local's task frame; null otherwise (including for every kind-3 BORROWED
+// source, which transfers nothing).
+//
+// §30.5 kind 2: "When the source is a `using var`/`await using var` local —
+// which §28.3 forbids moving — no move occurs: the source's slot already lives
+// in the enclosing state-machine frame, and the chained-slot arrangement
+// **defers its disposal** from the frame's scope end to the outer task's
+// teardown … On both paths the source task is disposed exactly once — by the
+// outer task's destructor, transitively."
+//
+// Two predicates are ASKED rather than re-derived, which is what keeps this from
+// drifting away from the code it must agree with:
+//
+//  (1) `patternAResultDisposerFor` — the one function that decides "disposing
+//      this task disposes its result" (#1503, and the gate #3070/#3099 use).
+//      It is null for `Task<value/string/runtime-managed T>` (no borrow is
+//      produced, so the source's ordinary scope-end disposal is already
+//      correct) and for `OwningTask<T>` — Pattern B, where the await TAKES the
+//      result and the outer task owns it directly (kind 1), so chaining the
+//      source would be wrong. Restricting to this row keeps the change to
+//      exactly the shape that has two owners today.
+//
+//  (2) codegen's OWN "this local owns the task frame" test — `ld->isUsing`, or
+//      the §28.3 v0.190 SB-01 mint test (`!taskLocalInitializerIsBorrowSource &&
+//      !ld->initializerCallIsBorrow`) that lowerStmt's LocalDecl arm uses to
+//      decide whether to register the scope-end `d.task` at all. The disposal
+//      this defers and the disposal that was registered are therefore selected
+//      by the same expression: a local for which no `d.task` exists is a
+//      BORROW (an alias, a storage read — "calls mint, storage lends"), it is
+//      §30.5 kind 3, and its owner elsewhere must keep disposing it.
+const ast::LocalDecl* Emitter::chainedReturnOwnedTaskSource(
+    const ast::Expr& operand) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&operand);
+    if (!id) return nullptr;
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!ls) return nullptr;
+    const auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+    if (!ld) return nullptr;
+    const sema::TypeRef* taskTy = taskTypeOfLocal(ld);
+    if (!taskTy) return nullptr;
+    if (!patternAResultDisposerFor(taskTy)) return nullptr;   // (1)
+    if (ld->isUsing) return ld;                               // (2) `using var`
+    if (!taskLocalInitializerIsBorrowSource(ld) &&
+        !ld->initializerCallIsBorrow)
+        return ld;                                            // (2) SB-01 mint
+    return nullptr;                                           // kind 3: a borrow
+}
+// Not admitted here, and each is its own filed defect rather than an oversight:
+// an `owned` PARAMETER source — kind 2's move-out half, whose suppression is the
+// §30.1 frame auto-drop rather than a local's slot, and which SEGVs today
+// because that auto-drop disposes a `Task` through class-vtable dispatch
+// (#3125); and every kind-3 BORROWED source, which needs the kind-1 disposer
+// SKIPPED rather than a chain established — a third state this two-valued
+// function cannot express (#3126). Returning null for both leaves their codegen
+// exactly as it was.
+
+
 void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                               const CallableInfo& ci) {
     if (!ci.stmts) return;
