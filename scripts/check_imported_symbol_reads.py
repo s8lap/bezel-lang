@@ -70,6 +70,39 @@ SYMBOL_DECL = re.compile(r'->\s*decl\s*$|\.\s*decl\s*$')
 TYPE_SYMBOL = re.compile(r'->\s*declaration\s*$|\btypeSymbol\s*$|\bts\s*$|\bsym\s*$')
 
 
+def strip_comments(text):
+    """Blank out // and /* */ comments, preserving length and newlines.
+
+    A prose MENTION of the cast is not a cast. This file's own docstring and the
+    Symbol.hpp accessor comments both quote the pattern verbatim in order to
+    explain it, and the audit's own census noted that one of its 159 grep hits
+    was a comment. Counting those would make the ratchet fire on documentation,
+    which trains readers to route around it — the one outcome that makes a
+    ratchet worthless. Offsets are preserved so reported line numbers stay true.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '/' and i + 1 < n and text[i + 1] == '/':
+            j = text.find('\n', i)
+            j = n if j < 0 else j
+            out.append(' ' * (j - i)); i = j
+        elif c == '/' and i + 1 < n and text[i + 1] == '*':
+            j = text.find('*/', i + 2)
+            j = n if j < 0 else j + 2
+            out.append(''.join(ch if ch == '\n' else ' ' for ch in text[i:j]))
+            i = j
+        elif c in '"\'':
+            q, j = c, i + 1
+            while j < n and text[j] != q:
+                j += 2 if text[j] == '\\' else 1
+            j = min(j + 1, n)
+            out.append(text[i:j]); i = j
+        else:
+            out.append(c); i += 1
+    return ''.join(out)
+
+
 def _balanced_arg(text, start):
     """Return the text between the '(' at start-1 and its matching ')'."""
     depth, i = 1, start
@@ -82,8 +115,9 @@ def _balanced_arg(text, start):
     return text[start:i - 1]
 
 
-def scan_text(text, path):
+def scan_text(raw, path):
     """-> (class1_sites, class2_sites); each site is (path, line, arg)."""
+    text = strip_comments(raw)
     c1, c2 = [], []
     for m in CAST.finditer(text):
         arg = ' '.join(_balanced_arg(text, m.end()).split())
@@ -188,6 +222,18 @@ FIXTURES = [
      'auto* t2 = dynamic_cast<const ast::TypeDecl*>(child.get());\n', 0, 0),
     ('negative_other_node_type.cpp',
      'auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);\n', 0, 0),
+    # A prose mention is not a cast — line and block form alike.
+    ('negative_line_comment.cpp',
+     '// dynamic_cast<const ast::TypeDecl*>(ts->decl) is wrong for an import\n',
+     0, 0),
+    ('negative_block_comment.cpp',
+     '/* explains dynamic_cast<const ast::TypeDecl*>(ts->decl) at length */\n',
+     0, 0),
+    # ...but a real cast on the SAME line as a comment still counts, so the
+    # exemption cannot be used to hide one.
+    ('positive_code_beside_comment.cpp',
+     'auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);  // see #3152\n',
+     1, 0),
 ]
 
 
