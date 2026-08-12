@@ -3340,17 +3340,7 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
             // SAME full expression (`Use2(await P(), await Q())`) suspends
             // between the store here and the boundary read, and a resume may run
             // on a different thread's stack (§30.13).
-            // entryAllocaNullPtr, NOT entryAlloca: the reclaim is reachable
-            // from edges this store does not dominate — an await inside a
-            // ConditionalExpr arm or a short-circuit `and`/`or`/`??` right
-            // operand, and the elif-condition shape whose disposals run at
-            // lowerIf's mergeBB. Freeing an undef pointer there is the #2733
-            // hazard, and every entryAllocaNullPtr site in
-            // LlvmBackend_Calls2.cpp exists for exactly this reason. The slot
-            // happens to be force-promoted into the calloc-zeroed async spill
-            // area today, which masks it — but that is a non-local accident of
-            // an unrelated allocation, not a guarantee to rely on.
-            llvm::AllocaInst* taskSlot = entryAllocaNullPtr();
+            llvm::AllocaInst* taskSlot = entryAlloca(ptrTy());
             builder_.CreateStore(awaitedTask, taskSlot);
             registerAwaitedTaskTemp(taskSlot);
             if (smStateStruct_) asyncHandlerSpillSlots_.push_back(taskSlot);
