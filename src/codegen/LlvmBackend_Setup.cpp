@@ -14185,6 +14185,16 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // Recognised by the initializer's inferred expression type name "Task" or
     // "OwningTask", or by the declared type name.
     if (const sema::TypeRef* tt = taskTypeOfLocal(ld)) {
+        // fix #3096 follow-up (§28.10 / §28.3 SB-01, v0.252): registration site
+        // ONE of the `d.task` scope-end disposal, gated on THE shared
+        // owns-the-frame predicate. Today this is implied by the
+        // `usingVarSourceIsBorrow` early-return at the top of this function, so
+        // the guard changes no behavior — it is here so that the site which
+        // REGISTERS the obligation and the site which MOVES it into a chained
+        // slot (chainedReturnOwnedTaskSource) ask the same function rather than
+        // two expressions that happen to agree. They did not agree: #3096
+        // shipped reading `ld->isUsing` alone and chained a borrow pin.
+        if (!taskLocalOwnsFrame(ld)) return;
         Disposal d{it->second, nullptr};
         d.task = true;
         // §30.15 (v0.179, #1524): a Receive() task overrides the ordinary
@@ -26131,6 +26141,43 @@ bool Emitter::taskLocalInitializerIsBorrowSource(const ast::LocalDecl* ld) {
            dynamic_cast<const ast::MemberAccessExpr*>(init) != nullptr ||
            dynamic_cast<const ast::NullCondMemberExpr*>(init) != nullptr ||
            dynamic_cast<const ast::IndexExpr*>(init) != nullptr;
+}
+
+
+// fix #3096 follow-up (§28.3 v0.190 SB-01 "calls mint, storage lends" + §28.10
+// borrow pins, v0.252): THE owns-the-frame predicate for a task-typed local —
+// "does this body hold the disposal obligation for this `bz_task_t*`?".
+//
+// It exists because that question had two answers written in two places, and
+// they had already drifted. The `d.task` scope-end disposal is registered by
+// two sites — registerUsingDisposal's task arm (a `using var`) and lowerStmt's
+// LocalDecl arm (a plain `var`) — and each carried its own spelling of the
+// test: the plain-`var` site the SB-01 pair below, the `using var` site an
+// early `if (ld->usingVarSourceIsBorrow) return;` at the top of
+// registerUsingDisposal. #3096 then added a THIRD reader
+// (chainedReturnOwnedTaskSource, which moves that obligation into the outer
+// task's chained slot) and matched only the first spelling, so a §28.10 BORROW
+// PIN — `using var t2 := task;`, or a task-typed field read — looked owned to
+// it while registering no disposal at all: the chain handed the outer task's
+// teardown a frame the body never owned, a double free of the `bz_task_t*` plus
+// a second cascade through the #1503 result disposer (measured: a
+// heap-use-after-free on the local-alias spelling, a hang on the field-read
+// one).
+//
+// Every one of those three sites now asks THIS function, so "the disposal moved
+// and the disposal registered are selected by one expression" is structural
+// rather than a claim about two expressions that happen to agree.
+//
+// The two arms mirror the ownership pass's own localIsOwnedObligation
+// (Ownership_Checks.cpp): a `using var` owns iff its source is not a borrow
+// pin (#1285); a plain `var` owns iff its initializer MINTS the frame rather
+// than reading it out of storage (SB-01, plus the ownership pass's recorded
+// verdict for the two exotic call shapes producerState classifies Borrowed).
+// // per §28.3 v0.190 SB-01, §28.10, §30.5
+bool Emitter::taskLocalOwnsFrame(const ast::LocalDecl* ld) {
+    if (!ld || !taskTypeOfLocal(ld)) return false;
+    if (ld->isUsing) return !ld->usingVarSourceIsBorrow;
+    return !taskLocalInitializerIsBorrowSource(ld) && !ld->initializerCallIsBorrow;
 }
 
 

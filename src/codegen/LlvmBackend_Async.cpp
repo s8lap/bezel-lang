@@ -817,14 +817,19 @@ llvm::Function* Emitter::patternAResultDisposerFor(
 //      source would be wrong. Restricting to this row keeps the change to
 //      exactly the shape that has two owners today.
 //
-//  (2) codegen's OWN "this local owns the task frame" test — `ld->isUsing`, or
-//      the §28.3 v0.190 SB-01 mint test (`!taskLocalInitializerIsBorrowSource &&
-//      !ld->initializerCallIsBorrow`) that lowerStmt's LocalDecl arm uses to
-//      decide whether to register the scope-end `d.task` at all. The disposal
-//      this defers and the disposal that was registered are therefore selected
-//      by the same expression: a local for which no `d.task` exists is a
-//      BORROW (an alias, a storage read — "calls mint, storage lends"), it is
-//      §30.5 kind 3, and its owner elsewhere must keep disposing it.
+//  (2) `taskLocalOwnsFrame` (LlvmBackend_Setup.cpp) — THE owns-the-frame test,
+//      and the same function BOTH `d.task` registration sites are gated on.
+//      That sharing is the point, and it is a correction: #3096 first shipped
+//      this arm reading `ld->isUsing` alone, which is NOT the registration
+//      test, because registerUsingDisposal returns before registering anything
+//      when `ld->usingVarSourceIsBorrow` is set. A §28.10 borrow PIN
+//      (`using var t2 := task;`, or a task-typed field read) therefore looked
+//      owned here while owning nothing, and the chain handed the outer task's
+//      teardown a frame this body never held — a double free of the
+//      `bz_task_t*` plus a second cascade through the #1503 result disposer.
+//      Asking one function makes "the obligation moved is the obligation
+//      registered" structural: a local with no `d.task` is a BORROW, it is
+//      §30.5 kind 3, and its real owner must keep disposing it.
 const ast::LocalDecl* Emitter::chainedReturnOwnedTaskSource(
     const ast::Expr& operand) {
     const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&operand);
@@ -836,11 +841,7 @@ const ast::LocalDecl* Emitter::chainedReturnOwnedTaskSource(
     const sema::TypeRef* taskTy = taskTypeOfLocal(ld);
     if (!taskTy) return nullptr;
     if (!patternAResultDisposerFor(taskTy)) return nullptr;   // (1)
-    if (ld->isUsing) return ld;                               // (2) `using var`
-    if (!taskLocalInitializerIsBorrowSource(ld) &&
-        !ld->initializerCallIsBorrow)
-        return ld;                                            // (2) SB-01 mint
-    return nullptr;                                           // kind 3: a borrow
+    return taskLocalOwnsFrame(ld) ? ld : nullptr;             // (2)
 }
 // Not admitted here, and each is its own filed defect rather than an oversight:
 // an `owned` PARAMETER source — kind 2's move-out half, whose suppression is the

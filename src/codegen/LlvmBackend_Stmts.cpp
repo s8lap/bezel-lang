@@ -177,10 +177,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // codegen and the ownership pass in agreement — the borrow no longer
         // registers a second `d.task` (a double-free of the real owner's frame).
         // // per §28.3 v0.190 SB-01 (#1872)
+        // fix #3096 follow-up (v0.252): registration site TWO of the `d.task`
+        // scope-end disposal. The two SB-01 conjuncts that used to be spelled
+        // out here now live in taskLocalOwnsFrame, which is also what the
+        // `using var` registration arm and chainedReturnOwnedTaskSource ask —
+        // one expression, three readers, so the obligation cannot be moved by a
+        // reader that disagrees about whether it was ever registered.
         else if (const sema::TypeRef* taskTy = taskTypeOfLocal(ld);
-                 taskTy && !disposeStack_.empty() &&
-                 !taskLocalInitializerIsBorrowSource(ld) &&
-                 !ld->initializerCallIsBorrow) {
+                 taskTy && !disposeStack_.empty() && taskLocalOwnsFrame(ld)) {
             auto it = locals_.find(ld);
             if (it != locals_.end()) {
                 Disposal d{it->second, nullptr};
@@ -1651,6 +1655,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // OWNED named task local — see the widening note on the inner `if`.)
         // Guard: no finally in flight (the finally path's emitAsyncComplete call would
         // need separate chaining, deferred; in that case fall back to normal free).
+        // ⚠ #3129: that fallback is now known to be WRONG rather than merely
+        // conservative — a `return await <source>` routed through a `finally`
+        // reaches NEITHER the chained-slot branch NOR the kind-1 disposer arm
+        // below (both live in the *no enclosing finally* branch), so the outer
+        // task records neither of §30.5's kinds and the source's scope end frees
+        // a result the caller still borrows. Filed, not fixed here.
         // Guard: asyncResultTy_ is a pointer type (class/string, not int/bool/struct).
         if (rs->value && smKind_ == SuspendKind::Await && smStateStruct_ &&
             asyncResultTy_ && asyncResultTy_->isPointerTy() && finallyStack_.empty()) {

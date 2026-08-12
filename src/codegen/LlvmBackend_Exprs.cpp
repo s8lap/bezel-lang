@@ -3769,28 +3769,45 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             // TaskTemps frees it "after every use of the borrow".
                             //
                             // The slot's INITIALIZATION differs from #3070's, and
-                            // the difference is load-bearing. A `.Result` read
-                            // lives in a SYNCHRONOUS body (§30.3 rejects it in
-                            // async code: "use `await t` — blocking waits are not
-                            // available in async code"), so the slot is NOT
-                            // frame-promoted and nothing zeroes it. #3070's
-                            // `entryAlloca(ptrTy())` would then leave the K8
-                            // flush freeing uninitialized stack whenever the read
-                            // sits in a NOT-TAKEN conditional arm — measured on
-                            //   `var n := (if F() then Use(P().Result) else 7);`
-                            // as a SEGV inside free(). A synchronous entry block
-                            // runs exactly once, so entryAllocaNullPtr is both
-                            // safe and required here.
+                            // the difference is load-bearing. The rule is stated
+                            // CODEGEN-side, not sema-side, because that is what
+                            // the code actually rests on:
                             //
-                            // The async arm below is therefore unreachable today
-                            // and written only so the rule is stated once for
-                            // both spellings: inside a resume function the slot
-                            // must be frame-spilled and left to the frame's
-                            // CALLOC zeroing, because entryAllocaNullPtr's
-                            // entry-block `store null` re-runs on EVERY resume
-                            // and wipes the saved pointer (measured, then
-                            // reverted, at a69b9d9). Should §30.3's restriction
-                            // ever be lifted, both halves are already correct.
+                            //   entryAlloca(ptrTy())  ⟺  the slot is pushed into
+                            //   asyncHandlerSpillSlots_, i.e. force-promoted into
+                            //   the frame's CALLOC'd spill area.
+                            //
+                            // Those are the same `inAsyncResume` condition below,
+                            // deliberately: the calloc is what zeroes the slot,
+                            // and it does so ONCE PER FRAME rather than once per
+                            // resume — which is the whole point, since
+                            // entryAllocaNullPtr's entry-block `store null`
+                            // re-executes on EVERY resume and wipes the saved
+                            // pointer (measured, then reverted, at a69b9d9). A
+                            // slot that is NOT frame-promoted therefore MUST be
+                            // null-initialized here, or the K8 flush frees
+                            // uninitialized stack on any path that skipped the
+                            // read — measured on
+                            //   `var n := (if F() then Use(P().Result) else 7);`
+                            // as a SEGV inside free().
+                            //
+                            // The guard is `currentFn_ == asyncResumeFn_` rather
+                            // than anything sema knows, and that is on purpose.
+                            // §30.3 rejects `Wait()`/`Result` only "lexically
+                            // inside `async` methods and `async` lambdas", so
+                            // "this is a synchronous body whose entry block runs
+                            // exactly once" is NOT a safe reading of it: a
+                            // synchronous ITERATOR's MoveNext re-enters its entry
+                            // block on every call, and a resume landing in a
+                            // later state block jumps past the store while the
+                            // registered scope-end disposal is still reachable —
+                            // entryAllocaNullPtr is required there too, for that
+                            // second reason. Keying on the emitter's own
+                            // frame-promotion decision is correct in both frames
+                            // and stays correct wherever the lexical check has
+                            // holes (a default-argument expression containing
+                            // `.Result` is checked in a non-async context yet can
+                            // be lowered inside a resume function).
                             const bool inAsyncResume =
                                 smStateStruct_ && asyncResumeFn_ &&
                                 currentFn_ == asyncResumeFn_;

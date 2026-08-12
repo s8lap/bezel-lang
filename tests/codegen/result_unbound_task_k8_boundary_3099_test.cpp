@@ -57,10 +57,18 @@
 // to borrow.
 //
 // THE SLOT INITIALIZATION is the one place this fix deliberately differs from
-// #3070's: a `.Result` read is only legal in a SYNCHRONOUS body (§30.3 rejects
-// it in async code), so its slot is not frame-promoted and nothing zeroes it.
-// `not_taken_conditional_arm_*` below is the case that pins that — with #3070's
-// uninitialized `entryAlloca` it SEGVs inside `free()` at the boundary flush.
+// #3070's, and the rule is codegen-side: `entryAlloca(ptrTy())` is used EXACTLY
+// where the slot is also pushed into `asyncHandlerSpillSlots_` and so is
+// force-promoted into the frame's CALLOC'd spill area (zeroed once per frame,
+// which is what #3070 needs and what an entry-block `store null` would defeat by
+// re-running on every resume). A slot that is not frame-promoted must be
+// null-initialized instead. `not_taken_conditional_arm_*` below is the case that
+// pins that — with #3070's uninitialized `entryAlloca` it SEGVs inside `free()`
+// at the boundary flush. Note §30.3 rejects `Wait()`/`Result` only "lexically
+// inside `async` methods and `async` lambdas", so "a synchronous body's entry
+// block runs once" is NOT the guarantee being relied on (a synchronous
+// iterator's MoveNext re-enters its entry block per call); the emitter's own
+// frame-promotion decision is.
 //
 // ORACLES. Every case runs on BOTH the plain and the ASan/LSan build (#2633:
 // neither dominates), and each proves reclaim POSITIVELY through a live-object

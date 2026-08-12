@@ -8758,6 +8758,18 @@ private:
     // emitAsyncLambda.
     llvm::Function* patternAResultDisposerFor(const sema::TypeRef* taskTypeRef);
 
+    // fix #3096 follow-up (§28.3 v0.190 SB-01 + §28.10, v0.252): THE
+    // owns-the-frame predicate for a task-typed local — "does this body hold
+    // the disposal obligation for this `bz_task_t*`?". Asked by all three
+    // readers: the two `d.task` registration sites (registerUsingDisposal's
+    // task arm and lowerStmt's LocalDecl arm) and chainedReturnOwnedTaskSource,
+    // which MOVES that obligation into the outer task's chained slot. Sharing
+    // one function is what makes "the obligation moved is the obligation
+    // registered" structural; #3096 first shipped a second spelling here and it
+    // was already wrong for a §28.10 borrow pin. Definition + rationale in
+    // LlvmBackend_Setup.cpp beside taskLocalInitializerIsBorrowSource.
+    bool taskLocalOwnsFrame(const ast::LocalDecl* ld);
+
     // fix #3096 / §30.5 "Pattern A result slots are of three kinds", kind 2
     // (v0.252): the `LocalDecl` of the task local a `return await <operand>`
     // chains FROM, when this async body OWNS that local's task frame — a

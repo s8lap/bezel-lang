@@ -53,13 +53,58 @@
 //   (3) do not attach the kind-1 result disposer on the chained path — which
 //       (1) achieves on its own, the two arms being mutually exclusive.
 //
-// SCOPE. Two adjacent shapes are NOT fixed here and are filed separately:
+// THE OWNS-THE-FRAME PREDICATE. Part (1) must ask the SAME question the `d.task`
+// registration asks, or it moves an obligation that was never registered. That
+// is now literally one function, `taskLocalOwnsFrame` (LlvmBackend_Setup.cpp),
+// called by all three readers: the two registration sites
+// (registerUsingDisposal's task arm, lowerStmt's LocalDecl arm) and
+// chainedReturnOwnedTaskSource. It is a correction: this fix first shipped
+// reading `ld->isUsing` alone, which is NOT the registration test — a §28.10
+// BORROW PIN (`using var t2 := task;`, or a task-typed field read) sets
+// `usingVarSourceIsBorrow`, and registerUsingDisposal returns before registering
+// anything. Chaining such a pin handed the outer task's teardown a `bz_task_t*`
+// the body never owned: a double free of the frame plus a second cascade through
+// the #1503 result disposer (measured: heap-use-after-free on the local-alias
+// spelling, a HANG — the documented corrupted-continuation symptom — on the
+// field-read one).
+//
+// SCOPE. Adjacent shapes NOT fixed here, each filed separately:
 // #3125 — an `owned` PARAMETER source (kind 2's move-out half, which SEGVs
 // because the §30.1 auto-drop disposes a `Task` through class-vtable dispatch);
-// and #3126 — every kind-3 BORROWED source (an alias local, a plain borrow
-// parameter, an owned-field read, a static task field), which still attaches the
-// kind-1 disposer §30.5 kind 3 says must dispose nothing. Both are untouched
-// here: `chainedReturnOwnedTaskSource` returns null for them.
+// and #3126 — every kind-3 BORROWED source, which still attaches the kind-1
+// disposer §30.5 kind 3 says must dispose nothing. #3126 covers a plain `var`
+// alias, a plain borrow parameter, an owned-field read, a static task field AND
+// (added after the pin finding above) both §28.10 borrow-pin spellings. #3129 —
+// a `return await` routed through a `finally`, which reaches neither the chained
+// branch nor the kind-1 arm, so the outer task records neither kind; the
+// `finallyStack_.empty()` gate on the detection above is deliberately untouched.
+//
+// The two pin programs are reproduced verbatim below. They are NOT live cases
+// here, and the reason is recorded rather than hidden: they cannot be green
+// until #3126 lands, because with chaining correctly declined they fall back to
+// #3126's kind-1 double-owner and still abort under ASan. What IS established
+// mechanically is that they are byte-for-byte what they were before this fix
+// existed: compiled at the base commit 663a68e and at this commit, both
+// programs produce executables with IDENTICAL ASan BuildIds
+// (b14 536138ace919d98e94a29aa0096542eb7b2148af,
+//  b15 e03b47d0a1b41d912c77f6cbe3c3111a2c776ca5) and identical failure stacks.
+// They are listed as #3126's acceptance criteria; whoever fixes it should make
+// them live tests here, and should extend `taskLocalOwnsFrame` /
+// `chainedReturnOwnedTaskSource` rather than write a third copy of the
+// predicate.
+//
+//   // #3126 acceptance case A — the §28.10 local-alias pin.
+//   public static async method ChainAsync(): Task<Cell>
+//     using var task := C.P(42);
+//     using var t2 := task;      // pin: usingVarSourceIsBorrow, NO d.task
+//     return await t2;
+//   end ChainAsync;
+//
+//   // #3126 acceptance case B — the §28.10 field-read pin.
+//   public static async method ChainAsync(h: Holder): Task<Cell>
+//     using var t := h.f;        // storage read -> pin -> NO d.task
+//     return await t;
+//   end ChainAsync;
 //
 // ORACLES. Every case runs on BOTH the plain and the ASan/LSan build (#2633:
 // neither dominates), and each proves reclaim POSITIVELY through a live-object
@@ -142,6 +187,15 @@ const char* kAwaitUsingVarSource =
 // `d.task`), so it is kind 2's "plain owned local".
 const char* kPlainOwnedLocalSource =
     "  var task := C.P(42); "
+    "  return await task; ";
+
+// A §28.10 borrow PIN declared alongside the real owner, with the CHAINED
+// return taking the OWNER. `taskLocalOwnsFrame` must say yes to `task` and no to
+// `t2`: the owner's disposal is deferred to the outer teardown, and the pin —
+// which registers no disposal at all — must neither be chained nor disturb that.
+const char* kPinBesideOwnedSource =
+    "  using var task := C.P(42); "
+    "  using var t2 := task; "
     "  return await task; ";
 
 // CONTROL — the anonymous `CallExpr` source, the only shape the pre-fix gate
@@ -303,6 +357,15 @@ BEZEL_TEST(chained_return_scope_bound_3096, non_chained_exit_still_disposes_sour
 BEZEL_TEST(chained_return_scope_bound_3096, faulted_source_unwind_disposal_unchanged_30_9) {
     BEZEL_EXPECT_EQ(runPlain(kFaultEdgeProgram), 0);
     const int c = runChecked(kFaultEdgeProgram);
+    BEZEL_EXPECT_TRUE(c == 0 || c == -1000);
+}
+
+// A borrow pin in the same body as the chained owner: the predicate must
+// separate them.
+BEZEL_TEST(chained_return_scope_bound_3096, pin_beside_owned_source_28_10) {
+    const std::string src = program(kPinBesideOwnedSource, kAwaitThenDrop);
+    BEZEL_EXPECT_EQ(runPlain(src), 0);
+    const int c = runChecked(src);
     BEZEL_EXPECT_TRUE(c == 0 || c == -1000);
 }
 
