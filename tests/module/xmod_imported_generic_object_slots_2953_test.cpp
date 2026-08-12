@@ -372,7 +372,7 @@ BEZEL_TEST(xmod_imported_generic_object_slots_2953, no_override_keeps_default_to
         // `GObj2953T6<string>`, and stdlib §2.13 rule 3 — which §8.5 pins this
         // default to — requires a generic instantiation to render its type
         // ARGUMENTS: the conforming answer is
-        // "GObjLib2953T6.GObj2953T6<string>". This commit ships only the
+        // "GObjLib2953T6.GObj2953T6<string>". #2934 shipped only the
         // module-path half of the pin (the emission sites hold a
         // `TypeSymbol*`, which carries generic PARAMETERS, not the
         // instantiation's arguments). This expectation therefore encodes

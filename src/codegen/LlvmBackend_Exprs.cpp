@@ -481,6 +481,28 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     if (!pv && rt &&
                         rt->kind == sema::TypeRef::Kind::InlineArray)
                         pv = emitValueToString(ev, rt);
+                    // fix #2661 (spec §8.5 / §18.5, v0.252): a SPAN or a
+                    // `Range<T>` hole. Exactly the #2913 shape one type over:
+                    // both lower to a STRUCT whose TypeRef carries no user
+                    // `TypeSymbol`, so they matched none of the integer/float/
+                    // pointer tests below and none of the struct-typed record
+                    // arm further down (which is gated on
+                    // `structRt->declaration`); `pv` stayed null and the hole
+                    // rendered as the EMPTY STRING with no diagnostic —
+                    // MEASURED in #2661 section A: `Console.WriteLine($"{sp}")`
+                    // printed an empty line, exit 0. Delegated to
+                    // `emitValueToString` rather than rendered here, for #2913's
+                    // recorded reason: the interpolation chain is already a
+                    // second dispatch mirroring `emitValueToString`'s, and a
+                    // rendering here would make it a third place the §8.5 answer
+                    // lives.
+                    if (!pv && rt && ev->getType()->isStructTy() &&
+                        (isSpanLikeTypeName(rt) || isRangeType(rt) ||
+                         (rt->kind == sema::TypeRef::Kind::Named &&
+                          !rt->declaration && rt->astNode && rt->astNode->name &&
+                          !rt->astNode->name->parts.empty() &&
+                          rt->astNode->name->parts[0] == "Range")))
+                        pv = emitValueToString(ev, rt);
                     if (!pv) {
                     if (llvmTy->isIntegerTy(1))
                         pv = emitPrimitiveToString(ev, P::Bool);
@@ -958,6 +980,31 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         if (it != genericSubstSemaTy_.end() && it->second &&
                             it->second->kind == sema::TypeRef::Kind::Primitive)
                             tt = const_cast<sema::TypeRef*>(it->second);
+                    }
+                    // fix #2661 (spec §8.5, v0.252): `Range<T>.ToString()` —
+                    // §8.5's AUTO-EQUALITY BODY-RECORD default, which §8.5
+                    // names for this type by name ("`Range<T>` (a compiler-
+                    // intrinsic body record, stdlib §9.8) carries the auto-
+                    // equality body-record default of the bullet above,
+                    // rendering its auto-properties"). Was an ACCEPT-TRAP with
+                    // the sharpest symptom of the family: sema typed the call
+                    // `string` by the universal rule, no arm lowered it, and the
+                    // WHOLE enclosing statement disappeared — `Console.WriteLine
+                    // ("range: " + r.ToString())` printed nothing at all, exit
+                    // 0, no diagnostic (#2661 section B). Placed beside
+                    // `Contains` because that is where a Range receiver's member
+                    // calls lower; the rendering itself is the shared
+                    // `emitRangeToString`, so this and the §18.5 hole agree.
+                    if (isRangeType(tt) && ma->member == "ToString" &&
+                        call->args.empty()) {
+                        llvm::Value* rv = lowerExpr(*ma->target);
+                        if (rv) {
+                            const sema::TypeRef* rElem =
+                                tt->genericArgs.empty() ? nullptr
+                                                        : tt->genericArgs[0];
+                            if (llvm::Value* s = emitRangeToString(rv, rElem))
+                                return s;
+                        }
                     }
                     // fix #499 / §9.8: Range<T>.Contains(x) inside the
                     // CallExpr dispatch path (ma->target has Range type).

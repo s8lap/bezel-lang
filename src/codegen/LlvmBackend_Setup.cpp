@@ -17066,6 +17066,35 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #2661 (spec §8.5 / §28.3 / §28.9, v0.252): `sp.ToString()` on a SPAN
+    // and `r.ToString()` on a `Range<T>` are +1 producers for the same reason
+    // the Record arm just above is — `emitSpanToString` / `emitRangeToString`
+    // (LlvmBackend_String.cpp) mint a fresh rc=1 accumulator through
+    // `emitStringConcat`, unconditionally (the head/open-paren concat always
+    // runs). Without this arm a `var s := sp.ToString();` local was bound as a
+    // BORROW and retained, never dropping the producer's +1: LSan-measured on
+    // this fix's own probe, 960 bytes / 20 objects for a 20-iteration loop
+    // binding the render to a local. Matched structurally on the RECEIVER's
+    // type, exactly like the Record/Choice arms — a span and a `Range<T>` are
+    // Named TypeRefs with no user `TypeSymbol`, so `tt->declaration` is null (or
+    // the builtin Range stub) and the Record test above cannot see them.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->args.empty() && call->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "ToString" && ma->target) {
+                    const sema::TypeRef* tt = ctx_.exprType(*ma->target);
+                    if (tt && (isSpanLikeTypeName(tt) || isRangeType(tt) ||
+                               (tt->kind == sema::TypeRef::Kind::Named &&
+                                !tt->declaration && tt->astNode &&
+                                tt->astNode->name &&
+                                !tt->astNode->name->parts.empty() &&
+                                tt->astNode->name->parts[0] == "Range")))
+                        return true;
+                }
+            }
+        }
+    }
     // §9.6 / §28.3 (#1184): `string.Join(separator, items)` lowers (in
     // LlvmBackend_Calls.cpp) to a freshly malloc'd buffer wrapped in a heap
     // `bz.string` whose rc := 1 (initStringRc) — exactly the +1 single-reference
@@ -28256,15 +28285,17 @@ llvm::Value* Emitter::builtinExcDescTablePtr() {
 // load src->data (the first field of bz_array_t, at offset 0) to get the
 // raw element buffer, then GEP into that buffer. Length/IsEmpty use `len`
 // directly from the span struct (pre-computed by AsReadOnlySpan/AsSpan).
-llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy) {
-    auto cached = spanBoxVtables_.find(elemTy);
+llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy,
+                                                   std::string_view head) {
+    const auto key = std::make_pair(elemTy, std::string(head));
+    auto cached = spanBoxVtables_.find(key);
     if (cached != spanBoxVtables_.end()) return cached->second;
 
     // Locate the IReadOnlySpan TypeSymbol and its descriptor.
     sema::TypeSymbol* irsSym = ctx_.builtinInterfaceSym("IReadOnlySpan");
     auto descIt = irsSym ? descArray_.find(irsSym) : descArray_.end();
     if (!irsSym || descIt == descArray_.end()) {
-        spanBoxVtables_[elemTy] = nullptr;
+        spanBoxVtables_[key] = nullptr;
         return nullptr;
     }
     llvm::GlobalVariable* irsDesc = descIt->second;
@@ -28474,6 +28505,40 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy) {
         tb.CreateRet(val);
     }
 
+    // --- ToString (vtable slot 3, NOT an itable entry) -------------------------
+    // fix #2661 (spec §8.5 / §8.6, v0.252): slot 3 was left NULL here, so
+    // `s.ToString()` on an `IReadOnlySpan<T>` receiver loaded a null function
+    // pointer out of the box vtable and jumped through it — #2311's measured
+    // SIGSEGV, ASan reporting "pc points to the zero page", on the receiver
+    // shape §8.6 calls canonical ("The canonical sanctioned use is passing a
+    // span to a parameter of type `IReadOnlySpan<TElement>`"). #2311's holding
+    // position was a sema deferral diagnostic; the ruling on #2661 makes the
+    // §8.5 positional-record default the answer, so the slot gets a real thunk.
+    //
+    // The payload is the `bz.arrayspan` two words into the box (box+16), the
+    // same offset every other function above reads through `loadSpan`. The
+    // rendering is the SHARED `emitSpanToString`, so the boxed spelling and the
+    // unboxed `sp.ToString()` cannot disagree — §8.6's boxed dispatch is the
+    // same member. The vtable is keyed by (elemTy, head) since this fix, so the
+    // head rendered here is the head of the span that was actually boxed.
+    llvm::Function* toStringFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+        toStringFn = llvm::Function::Create(
+            fnTy, llvm::Function::InternalLinkage,
+            "bzspan$ToString$" + std::string(head), module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", toStringFn);
+        ThunkScope scope(currentFn_, builder_, toStringFn, entry);
+        llvm::Value* spanPtr = builder_.CreateGEP(
+            ptrTy(), toStringFn->getArg(0),
+            {llvm::ConstantInt::get(i32(), 2)}, "span.ptr");
+        llvm::Value* spanVal =
+            builder_.CreateLoad(spanSt, spanPtr, "span");
+        llvm::Value* rendered = emitSpanToString(spanVal, head);
+        builder_.CreateRet(rendered ? rendered
+                                    : lowerStringLiteral("\"\"", false));
+    }
+
     // --- Build itable [IndexOf, Contains, SequenceEqual, Length, IsEmpty, Indexer] ---
     std::vector<llvm::Constant*> itabElems = {
         indexOfFn, containsFn, seqEqFn, lenGetFn, isEmptyFn, idxGetFn
@@ -28512,6 +28577,7 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy) {
     vtElems[0] = boxDesc;
     vtElems[1] = llvm::ConstantExpr::getPointerCast(itmapGV, ptrTy());
     if (builtinDisposeFn_) vtElems[2] = builtinDisposeFn_;
+    vtElems[kToStringSlot]    = toStringFn;   // fix #2661 — was NULL (#2311 SEGV)
     vtElems[kEqualsSlot]      = boxDefaultEqualsThunk();
     vtElems[kGetHashCodeSlot] = boxDefaultHashCodeThunk();
     auto* vtArrTy = llvm::ArrayType::get(ptrTy(), vtElems.size());
@@ -28519,10 +28585,10 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy) {
         *module_, vtArrTy, /*isConstant=*/true,
         llvm::GlobalValue::InternalLinkage,
         llvm::ConstantArray::get(vtArrTy, vtElems),
-        "bvt$spanbox");
+        "bvt$spanbox$" + std::string(head));
     allVtables_.push_back(vtGV);
 
-    spanBoxVtables_[elemTy] = vtGV;
+    spanBoxVtables_[key] = vtGV;
     return vtGV;
 }
 
@@ -29282,7 +29348,7 @@ llvm::GlobalVariable* Emitter::boxVtableFor(const sema::TypeRef* rt) {
             llvm::Type* et = lowerTypeRef(rt->genericArgs[0]);
             if (et) elemTy = et;
         }
-        return ensureSpanBoxVtable(elemTy);
+        return ensureSpanBoxVtable(elemTy, rt->headName());
     }
     return nullptr;
 }

@@ -406,6 +406,37 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             // rc-aware below. `strPtr != arg` is the whole condition: nothing
             // here needs to know WHICH primitive produced it.
             releaseRender = (strPtr != arg);
+        } else if (arg->getType()->isStructTy() &&
+                   (isSpanLikeTypeName(argTy) || isRangeType(argTy) ||
+                    (argTy->kind == sema::TypeRef::Kind::Named &&
+                     !argTy->declaration && argTy->astNode &&
+                     argTy->astNode->name &&
+                     !argTy->astNode->name->parts.empty() &&
+                     argTy->astNode->name->parts[0] == "Range"))) {
+            // fix #2661 (spec §8.5 / stdlib §2.1, v0.252): a SPAN or `Range<T>`
+            // argument. `Console.Write(Line)` "renders its one argument", and
+            // since §8.5's defaults are universal that argument now HAS a
+            // rendering. Before this the value fell past every arm and the raw
+            // `bz.arrayspan` / `bz.range` struct was handed to
+            // `bz_string_to_utf8z` as if it were a `%bz.string` — MEASURED as
+            // an IR-verifier abort ("Call parameter type does not match
+            // function signature"), i.e. a hard miscompile, not a wrong value.
+            //
+            // WHY IT FELL PAST — and it is NOT one reason for both. A struct
+            // matches no primitive kind, so the Primitive arm above never sees
+            // either. Below, the Named arm is gated on `argTy->declaration`: a
+            // SPAN has none (`isSpanLikeTypeName` requires exactly that), so it
+            // never reached the arm at all; a `Range<T>` DOES carry a
+            // declaration — the builtin stub, which is what `isRangeType` keys
+            // on — so it reached the arm and was mis-rendered there as a
+            // name-only default instead. This test therefore has to run BEFORE
+            // the Named arm, not merely alongside it.
+            //
+            // Delegated to `emitValueToString`, the one renderer the explicit
+            // call and the §18.5 hole also reach.
+            strPtr = emitValueToString(arg, argTy);
+            if (!strPtr) return false;
+            releaseRender = true;   // a fresh +1 concat accumulator
         } else if (argTy->kind == sema::TypeRef::Kind::Named &&
                    argTy->declaration) {
             // Named type (class/record) — call ToString() via virtual
@@ -719,7 +750,7 @@ const sema::TypeSymbol* Emitter::recordTypeOfRef(const sema::TypeRef* ref) {
     // ⚠ #3132: this reads the AST decl ONLY, which is null for every IMPORTED
     // type, so an imported positional record is misclassified here as having no
     // auto equality and is routed away from the record-key fast path. That is
-    // the SAME one-line defect this commit fixed at the two §8.5 sites
+    // the SAME one-line defect #2934's follow-up fixed at the two §8.5 sites
     // (`recordIsPositional` reads both sources), but it is a DIFFERENT defect —
     // hash/equality routing, not rendering — with its own blast radius, so it
     // is filed rather than swept in here. The fix is `recordIsAutoBearing(ts)`.
