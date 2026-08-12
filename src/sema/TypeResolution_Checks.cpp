@@ -1562,6 +1562,21 @@ void Resolver::checkTypeModifierCombinations(TypeSymbol* t) {
             "` may not be both `sealed` and `static` "
             "(mutually exclusive — §11.7)");
     }
+    // §11.7 (v0.242, #3052), verbatim: "(Through v0.241 the semantics were
+    // spelled as the modifier pair `sealed abstract`; that spelling is
+    // rejected, the diagnostic naming `closed`.)" Appendix C.1 carries the
+    // same invariant. The pair gets its own fix-it-shaped diagnostic — it
+    // prints the replacement declaration — because it is the MIGRATION case:
+    // an author who writes it means exactly `closed`, unlike the three
+    // `closed`+X combinations below, which are ordinary contradictions.
+    if (isSealed && isAbstract && !isClosed) {
+        ctx_.diagnostics().report(
+            Severity::Error, t->declLoc,
+            std::string("class `") + std::string(t->name) +
+            "` may not be both `sealed` and `abstract` — the closed abstract "
+            "class is spelled with the dedicated modifier: write `closed "
+            "class " + std::string(t->name) + "` (§11.7)");
+    }
     // §11.7 (v0.242, #3052), verbatim: "combining `closed` with `abstract`,
     // `sealed`, or `static` is a compile error."
     if (isClosed) {
