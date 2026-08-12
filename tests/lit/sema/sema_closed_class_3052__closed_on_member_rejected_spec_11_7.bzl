@@ -7,7 +7,13 @@
 // ("`sealed` alone is a class-level modifier … it does not appear on
 // individual members").
 
-module M; class C public closed method Area(): int => 1; end C;
+// Both a CLASS member and a RECORD member are checked: the member scan runs
+// ahead of the type-kind gate, so the modifier cannot ride along inertly on a
+// type kind that never reaches the class rules.
+
+module M; class C public closed method Area(): int => 1; end C; record R(X: int) public closed method Twice(): int => X * 2; end R;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: member `Area` may not be `closed`
+// CHECK-SAME: (§11.7)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: member `Twice` may not be `closed`
 // CHECK-SAME: (§11.7)

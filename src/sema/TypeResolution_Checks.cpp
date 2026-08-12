@@ -1517,6 +1517,27 @@ void Resolver::checkClassModifierCombinations() {
 }
 
 void Resolver::checkTypeModifierCombinations(TypeSymbol* t) {
+    // §11.7 / A.4: `closed` is a class-shape modifier, never a member one.
+    // The parser collects it in the shared member-modifier prefix so a NESTED
+    // type can carry it (Parser_Decls.cpp); on any other member kind it is
+    // meaningless — the posture §11.5 states for `sealed` ("`sealed` alone is
+    // a class-level modifier … it does not appear on individual members").
+    // Runs BEFORE the type-kind gate below, so a member of a record/enum/
+    // interface/choice is checked too.
+    for (Symbol* m : t->members) {
+        if (dynamic_cast<NestedTypeSymbol*>(m)) continue;
+        auto* mem = dynamic_cast<MemberSymbol*>(m);
+        if (!mem) continue;
+        for (auto mod : mem->modifiers) {
+            if (mod != "closed") continue;
+            ctx_.diagnostics().report(
+                Severity::Error, m->declLoc,
+                std::string("member `") + std::string(mem->name) +
+                "` may not be `closed` — `closed` is a class-level modifier "
+                "(§11.7); it does not appear on individual members");
+            break;
+        }
+    }
     // §11.7 / A.3 (v0.242, #3052): `closed` is defined for a CLASS. The
     // grammar's `Modifier*` is shared by every type-declaration production
     // (and, for a nested type, by the member-modifier prefix), so `closed
@@ -1591,23 +1612,6 @@ void Resolver::checkTypeModifierCombinations(TypeSymbol* t) {
                 "` may not be both `closed` and `" + other +
                 "` — `closed` already means \"abstract and inheritable only "
                 "within the declaring module\" (§11.7)");
-        }
-    }
-    // §11.7 / A.4: `closed` is a class-shape modifier, never a member one.
-    // The member-modifier prefix collects it so a NESTED type can carry it
-    // (Parser_Decls.cpp); on any other member kind it is meaningless.
-    for (Symbol* m : t->members) {
-        if (dynamic_cast<NestedTypeSymbol*>(m)) continue;
-        auto* mem = dynamic_cast<MemberSymbol*>(m);
-        if (!mem) continue;
-        for (auto mod : mem->modifiers) {
-            if (mod != "closed") continue;
-            ctx_.diagnostics().report(
-                Severity::Error, m->declLoc,
-                std::string("member `") + std::string(mem->name) +
-                "` may not be `closed` — `closed` is a class-level modifier "
-                "(§11.7); it does not appear on individual members");
-            break;
         }
     }
 }
