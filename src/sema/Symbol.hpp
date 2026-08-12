@@ -89,7 +89,9 @@ struct ModuleSymbol : Symbol {
 struct TypeSymbol : Symbol {
     ast::TypeDeclKind kind = ast::TypeDeclKind::Class;
     ast::Visibility visibility = ast::Visibility::None;
-    std::vector<std::string_view> modifiers; // "abstract", "sealed", "static"
+    // A.3 `Modifier` (v0.242): "abstract", "closed", "sealed", "static".
+    // Read through the predicates below, not by hand — see their comment.
+    std::vector<std::string_view> modifiers;
     std::vector<Symbol*> genericParams;      // GenericParamSymbol*
     std::vector<Symbol*> members;            // Field/Method/Property/...
     // §22.16 / #2054: invariant records carried by an imported class, in
@@ -178,6 +180,44 @@ struct TypeSymbol : Symbol {
     // stays in one place.
     std::string builtinExceptionBase;
 };
+
+// §11.7 / §12.5 / §19.6 (v0.242, #3052): the class-shape modifier predicates,
+// stated once so the whole `abstract`-keyed rule family reaches `closed`.
+//
+// `closed` is the dedicated spelling of what through v0.241 was the modifier
+// PAIR `sealed abstract` (§11.7, verbatim: "A class declared with the
+// **`closed`** modifier is a **closed abstract class**: a class that cannot be
+// instantiated directly and cannot be inherited from outside the declaring
+// module. … A `closed` class may declare abstract members (§12.5) without
+// carrying the `abstract` modifier — `closed` subsumes it"). Three distinct
+// questions were being answered by reading the raw modifier list, and they do
+// NOT have the same answer for a `closed` class:
+//
+//   * "has no instances / cannot be `new`ed / need not implement its abstract
+//     members / is not a §19.6 leaf" → `abstract` OR `closed`
+//     (§12.5: "`new` on an abstract or `closed` class is a compile error";
+//      §19.6: "A **leaf type** is every **concrete** (neither `abstract` nor
+//      `closed`) class in the closed set").
+//   * "admits no subclass anywhere" → plain `sealed` only. A `closed` class is
+//     inheritable WITHIN its declaring module (§11.7), exactly as the pair was.
+//   * "roots a hierarchy closed across module boundaries" → `closed` only.
+inline bool typeSymbolHasModifier(const TypeSymbol* t, std::string_view m) {
+    if (!t) return false;
+    for (std::string_view mod : t->modifiers)
+        if (mod == m) return true;
+    return false;
+}
+
+// §11.7: does `t` carry the `closed` modifier?
+inline bool typeIsClosed(const TypeSymbol* t) {
+    return typeSymbolHasModifier(t, "closed");
+}
+
+// §12.5 / §19.6: is `t` instance-less — `abstract` or `closed`? This is the
+// predicate every former bare-`abstract` class-level test wants.
+inline bool typeIsAbstractOrClosed(const TypeSymbol* t) {
+    return typeSymbolHasModifier(t, "abstract") || typeIsClosed(t);
+}
 
 // §12 / §31.4 (#595 / #2950): the built-in exception type `t` inherits — its
 // own `builtinExceptionBase` when it names one directly, else the first one

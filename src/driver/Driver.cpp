@@ -120,7 +120,7 @@ void injectOnePrelude(ast::SourceFile& unit, const std::string& preludeSrc) {
     // names... may be shadowed by local declarations under the normal
     // name-resolution rules"). Inject a prelude decl ONLY when the user
     // declares no type of that name. Without this, a program that declares its
-    // own `Result` (the corpus does — e.g. a `sealed abstract class Result<T>`
+    // own `Result` (the corpus does — e.g. a `closed class Result<T>`
     // hierarchy) collides with the injected `Result<T, E>` choice: two
     // same-named top-level types corrupt name resolution and
     // per-monomorphization descriptor emission for the WHOLE module (an

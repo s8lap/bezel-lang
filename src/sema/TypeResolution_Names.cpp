@@ -624,20 +624,42 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
                     if (mod == "sealed") sealed = true;
                     else if (mod == "abstract") baseAbstract = true;
                 }
-                // §11.7: `sealed abstract` is a *closed abstract class* — it
-                // may be inherited from within its declaring module, but not
-                // across module boundaries. This is the spec's recommended
-                // closed-hierarchy idiom for exhaustive `case` matching
-                // (§19.6), so a same-module subclass must be accepted; only a
-                // cross-module subclass is rejected. The current module owns
-                // every locally-declared type, so a base flagged
-                // `isImported` (reconstructed from a dependency's metadata,
-                // §2.5) is from another module; a non-imported base is
-                // same-module.
+                const bool baseClosed = typeIsClosed(base);
+                // §11.7 (v0.242, #3052): a `closed` class is a *closed
+                // abstract class* — it may be inherited from within its
+                // declaring module, but not across module boundaries
+                // ("Classes derived from a `closed` base must be declared in
+                // the same module; the compiler rejects subclasses in other
+                // modules"). This is the spec's recommended closed-hierarchy
+                // idiom for exhaustive `case` matching (§19.6), so a
+                // same-module subclass must be accepted; only a cross-module
+                // subclass is rejected. The current module owns every
+                // locally-declared type, so a base flagged `isImported`
+                // (reconstructed from a dependency's metadata, §2.5) is from
+                // another module; a non-imported base is same-module.
                 //
-                // Plain `sealed` (non-abstract) keeps the §12.4 rule: it can
-                // never be inherited from, same module or not.
-                if (sealed) {
+                // Through v0.241 the same semantics were spelled as the
+                // modifier PAIR `sealed abstract`; that spelling is now
+                // rejected at the declaration (checkClassModifierCombinations),
+                // and the pair arm here is kept only so a program that carries
+                // both errors reports the inheritance one at the same place it
+                // always did rather than silently changing shape.
+                //
+                // Plain `sealed` (non-abstract, non-`closed`) keeps the §12.4
+                // rule: it can never be inherited from, same module or not.
+                if (baseClosed) {
+                    if (ctx_.isImported(base)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, bt->span.begin,
+                            std::string("cannot inherit from `closed` class `") +
+                            std::string(base->name) +
+                            "` declared in another module; a `closed` class "
+                            "may be subclassed only within its declaring "
+                            "module (§11.7)");
+                    }
+                    // else: same-module subclass of a `closed` base —
+                    // permitted (§11.7).
+                } else if (sealed) {
                     if (baseAbstract) {
                         if (ctx_.isImported(base)) {
                             ctx_.diagnostics().report(

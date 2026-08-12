@@ -127,6 +127,11 @@ BEZEL_TEST(sendable_component_diag_2059,
 // §14.2 / §30.14 / §3.6 rule 4: an OPEN user class is not transfer-closed —
 // rule 1 (sealing) fails — and the structural reason is the class itself,
 // not a field. The diagnostic must name rule 1.
+//
+// v0.242 (#3052): rule 1 has two arms — "The class is `sealed` (§12.4); or it
+// is `closed` and every class in its module-closed hierarchy is itself
+// transfer-closed" — so the message names both spellings. `OpenData` carries
+// neither, which is what makes it the rule-1 case.
 BEZEL_TEST(sendable_component_diag_2059,
            type_inst_open_class_names_sealing_rule_1_spec_30_14) {
     auto r = parseSemaAll(
@@ -140,7 +145,7 @@ BEZEL_TEST(sendable_component_diag_2059,
         "  using var mb := new Mailbox<OpenData>(); "
         "  return 0; "
         "end Main; end P;");
-    BEZEL_EXPECT_TRUE(sendableDiagHasRule(r, "not sealed"));
+    BEZEL_EXPECT_TRUE(sendableDiagHasRule(r, "neither `sealed` nor `closed`"));
     BEZEL_EXPECT_TRUE(sendableDiagHasRule(r, "rule 1"));
 }
 

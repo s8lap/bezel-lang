@@ -700,7 +700,8 @@ struct MetaTypeDecl {
     std::string name;
     MetaTypeDeclKind kind = MetaTypeDeclKind::Class;
     MetaVisibility visibility = MetaVisibility::Public;
-    std::vector<std::string> modifiers; // "abstract","sealed","static"
+    // A.3 `Modifier` (v0.242): "abstract","closed","sealed","static".
+    std::vector<std::string> modifiers;
     std::vector<MetaGenericParam> genericParams; // §14
     // §12 base class + interfaces, as types (carrying their generic args). By
     // convention the first entry, if it is a class, is the base class; the rest

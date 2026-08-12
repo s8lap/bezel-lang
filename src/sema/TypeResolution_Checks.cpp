@@ -1503,26 +1503,96 @@ void Resolver::checkClassModifierCombinations() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t || t->kind != ast::TypeDeclKind::Class) continue;
-        bool isStatic = false, isAbstract = false, isSealed = false;
-        for (auto mod : t->modifiers) {
-            if (mod == "static") isStatic = true;
-            else if (mod == "abstract") isAbstract = true;
-            else if (mod == "sealed") isSealed = true;
+        if (!t) continue;
+        checkTypeModifierCombinations(t);
+        // Nested types carry the same A.3 `Modifier*` production (§11.6 reuses
+        // the type-declaration productions), so they are checked identically —
+        // the walk mirrors checkStaticNotVirtual's.
+        for (Symbol* m : t->members) {
+            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
+                if (nt->type) checkTypeModifierCombinations(nt->type);
+            }
         }
-        if (isStatic && isAbstract) {
+    }
+}
+
+void Resolver::checkTypeModifierCombinations(TypeSymbol* t) {
+    // §11.7 / A.3 (v0.242, #3052): `closed` is defined for a CLASS. The
+    // grammar's `Modifier*` is shared by every type-declaration production
+    // (and, for a nested type, by the member-modifier prefix), so `closed
+    // record R`, `closed enum E`, `closed interface I`, and `closed choice C`
+    // all parse; none has a meaning. Recorded interpretation (CLAUDE.md rule
+    // 4): reject, naming §11.7 — the alternative, letting the modifier ride
+    // along inertly, would make `new R()` fail on a record with a diagnostic
+    // about a class rule. This mirrors the same over-admit-and-reject split
+    // the `abstract record` rejection below uses (#2431).
+    if (t->kind != ast::TypeDeclKind::Class) {
+        if (typeIsClosed(t)) {
+            const char* kindWord =
+                t->kind == ast::TypeDeclKind::Record    ? "record"
+                : t->kind == ast::TypeDeclKind::Enum    ? "enum"
+                : t->kind == ast::TypeDeclKind::Choice  ? "choice"
+                                                        : "interface";
+            ctx_.diagnostics().report(
+                Severity::Error, t->declLoc,
+                std::string(kindWord) + " `" + std::string(t->name) +
+                "` may not be `closed` — `closed` is a class modifier "
+                "(§11.7); it declares a closed abstract CLASS hierarchy");
+        }
+        return;
+    }
+    bool isStatic = false, isAbstract = false, isSealed = false;
+    for (auto mod : t->modifiers) {
+        if (mod == "static") isStatic = true;
+        else if (mod == "abstract") isAbstract = true;
+        else if (mod == "sealed") isSealed = true;
+    }
+    const bool isClosed = typeIsClosed(t);
+    if (isStatic && isAbstract) {
+        ctx_.diagnostics().report(
+            Severity::Error, t->declLoc,
+            std::string("class `") + std::string(t->name) +
+            "` may not be both `abstract` and `static` "
+            "(mutually exclusive — §11.7)");
+    }
+    if (isStatic && isSealed) {
+        ctx_.diagnostics().report(
+            Severity::Error, t->declLoc,
+            std::string("class `") + std::string(t->name) +
+            "` may not be both `sealed` and `static` "
+            "(mutually exclusive — §11.7)");
+    }
+    // §11.7 (v0.242, #3052), verbatim: "combining `closed` with `abstract`,
+    // `sealed`, or `static` is a compile error."
+    if (isClosed) {
+        const char* other = isAbstract ? "abstract"
+                          : isSealed   ? "sealed"
+                          : isStatic   ? "static"
+                                       : nullptr;
+        if (other) {
             ctx_.diagnostics().report(
                 Severity::Error, t->declLoc,
                 std::string("class `") + std::string(t->name) +
-                "` may not be both `abstract` and `static` "
-                "(mutually exclusive — §11.7)");
+                "` may not be both `closed` and `" + other +
+                "` — `closed` already means \"abstract and inheritable only "
+                "within the declaring module\" (§11.7)");
         }
-        if (isStatic && isSealed) {
+    }
+    // §11.7 / A.4: `closed` is a class-shape modifier, never a member one.
+    // The member-modifier prefix collects it so a NESTED type can carry it
+    // (Parser_Decls.cpp); on any other member kind it is meaningless.
+    for (Symbol* m : t->members) {
+        if (dynamic_cast<NestedTypeSymbol*>(m)) continue;
+        auto* mem = dynamic_cast<MemberSymbol*>(m);
+        if (!mem) continue;
+        for (auto mod : mem->modifiers) {
+            if (mod != "closed") continue;
             ctx_.diagnostics().report(
-                Severity::Error, t->declLoc,
-                std::string("class `") + std::string(t->name) +
-                "` may not be both `sealed` and `static` "
-                "(mutually exclusive — §11.7)");
+                Severity::Error, m->declLoc,
+                std::string("member `") + std::string(mem->name) +
+                "` may not be `closed` — `closed` is a class-level modifier "
+                "(§11.7); it does not appear on individual members");
+            break;
         }
     }
 }
@@ -3690,11 +3760,18 @@ void Resolver::checkAbstractImplementations() {
         // way — out of scope for #2416 (filed as #2431); this loop simply
         // preserves the existing "abstract types need not implement
         // obligations" reading for whichever type kind carries the modifier.
-        bool isAbstract = false;
-        for (auto mod : t->modifiers) {
-            if (mod == "abstract") { isAbstract = true; break; }
-        }
-        if (isAbstract) continue;  // abstract classes need not impl.
+        //
+        // §12.5 (v0.242, #3052): "A class containing one or more abstract
+        // members must itself be `abstract` (or `closed`, §11.7)" — a
+        // `closed` class "may declare abstract members without carrying the
+        // `abstract` modifier — `closed` subsumes it". This loop is where
+        // that rule is ENFORCED (a non-abstract class declaring an abstract
+        // member reaches the "does not implement inherited abstract member"
+        // report below, since the BFS starts at `t` itself), so `closed` must
+        // join the skip or every `closed` class with an abstract member would
+        // be rejected.
+        const bool isAbstract = typeIsAbstractOrClosed(t);
+        if (isAbstract) continue;  // abstract / `closed` classes need not impl.
 
         std::unordered_set<std::string_view> abstractNames;
         std::unordered_set<std::string_view> concreteNames;

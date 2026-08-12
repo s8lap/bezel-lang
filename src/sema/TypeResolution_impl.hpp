@@ -322,10 +322,13 @@ private:
     bool signaturesIndistinguishable(const std::vector<Symbol*>& a,
                                      const std::vector<Symbol*>& b);
 
-    // Slice S17 (§11.7): `abstract` and `static` are mutually
-    // exclusive; `sealed` and `static` are mutually exclusive.
-    // `sealed abstract` is permitted (a closed abstract class).
+    // Slice S17 (§11.7): `abstract` and `static` are mutually exclusive;
+    // `sealed` and `static` are mutually exclusive. v0.242 (#3052): the
+    // `sealed abstract` PAIR is rejected too — the closed abstract class is
+    // spelled `closed`, which combines with none of `abstract`/`sealed`/
+    // `static` and appears only on a class.
     void checkClassModifierCombinations();
+    void checkTypeModifierCombinations(TypeSymbol* t);
 
     // Slice S16 (§11.7): a class declared `static` may contain only
     // static members — no instance fields, methods, properties,

@@ -3537,11 +3537,17 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         if (mod == "abstract") isAbstract = true;
                         if (mod == "static") isStatic = true;
                     }
-                    if (isAbstract) {
+                    // §12.5 (v0.242, #3052), verbatim: "`new` on an abstract
+                    // or `closed` class is a compile error." The two spellings
+                    // are named separately so the diagnostic points at the
+                    // modifier the author actually wrote.
+                    const bool isClosed = typeIsClosed(t);
+                    if (isAbstract || isClosed) {
                         ctx_.diagnostics().report(
                             Severity::Error, ne->span.begin,
-                            std::string("cannot instantiate abstract "
-                                        "class `") +
+                            std::string("cannot instantiate ") +
+                            (isAbstract ? "abstract" : "`closed`") +
+                            " class `" +
                             std::string(t->name) + "` with `new` "
                             "(§12.5)");
                     } else if (isStatic) {

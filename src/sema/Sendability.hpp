@@ -55,7 +55,7 @@ inline bool isSendableType(const TypeRef* rt, SemaContext& ctx) {
 // APPEND to the existing flat constraint-failure diagnostic, e.g.
 //   ": field `f` of type `Open` is not owned (§30.14 rule 3)"
 //   ": element type `Open` is not sendable (§30.14 value-type rule)"
-//   ": class is not sealed (§30.14 rule 1)"
+//   ": class is neither `sealed` nor `closed` (§30.14 rule 1)"
 //
 // Returns empty when the walk is ambiguous (generic-parameter reference,
 // stdlib compiler-known override, function-typed value at the root, an

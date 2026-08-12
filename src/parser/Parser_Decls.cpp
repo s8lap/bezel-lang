@@ -199,7 +199,9 @@ std::unique_ptr<ast::TopDecl> Parser::parseTopDecl() {
         advance();
     }
 
-    // Grammar `Modifier* = ("abstract" | "sealed" | "static")*`. The set of
+    // Grammar A.3 `Modifier ::= "abstract" | "closed" | "sealed" | "static"`
+    // (v0.242, #3052 — `closed` joined the production as the dedicated
+    // spelling of the former `sealed abstract` pair, §11.7). The set of
     // semantically valid combinations is constrained by §11.7 (sema's
     // problem); the parser admits any combination per the grammar.
     // Now-after-visibility, check for `extension` (admits visibility prefix).
@@ -208,7 +210,8 @@ std::unique_ptr<ast::TopDecl> Parser::parseTopDecl() {
     }
 
     std::vector<std::string_view> modifiers;
-    while (isKeyword("abstract") || isKeyword("sealed") || isKeyword("static")) {
+    while (isKeyword("abstract") || isKeyword("closed") ||
+           isKeyword("sealed") || isKeyword("static")) {
         modifiers.push_back(current_.text);
         advance();
     }
@@ -1072,7 +1075,14 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         if (isKeyword("static")   || isKeyword("owned")    ||
             isKeyword("readonly") || isKeyword("async")    ||
             isKeyword("abstract") || isKeyword("virtual")  ||
-            isKeyword("sealed")   || isKeyword("override")) {
+            isKeyword("sealed")   || isKeyword("override") ||
+            // A.3 `Modifier` (v0.242, #3052): `closed` reaches a NESTED type
+            // through this shared member-modifier prefix — the NestedTypeDecl
+            // branch below hands the collected list down to
+            // parseTypeOrInterfaceDecl. On any other member kind it is
+            // rejected semantically (§11.7 defines `closed` for classes),
+            // the same over-admit-and-reject split the rest of this list uses.
+            isKeyword("closed")) {
             modifiers.push_back(current_.text);
             advance();
             continue;
@@ -1127,7 +1137,7 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                 "(§13.3, §11.6)");
         }
         // Modifiers that are valid on nested types are the same as on
-        // top-level types per A.3 — `abstract`/`sealed`/`static`. The
+        // top-level types per A.3 — `abstract`/`closed`/`sealed`/`static`. The
         // member-modifier set is a superset; semantic validation belongs
         // to sema (§11.7).
         auto td = parseTypeOrInterfaceDecl(visibility, std::move(modifiers));

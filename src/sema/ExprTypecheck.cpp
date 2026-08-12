@@ -570,7 +570,7 @@ bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
         // (2) §21.7 closed-value-space bullets (#2129 choice, #2133 bool +
         //     sealed): a CHOICE (§35.1 — the case set is closed by declaration),
         //     a BOOL primitive (§4.1 — no conversion manufactures a third value),
-        //     or a `sealed abstract` closed class hierarchy (§11.7 — every
+        //     or a `closed` class hierarchy (§11.7 — every
         //     instance is one of the closed concrete-leaf set) each have a CLOSED
         //     VALUE SPACE, so an EXHAUSTIVE case-statement whose arms all diverge
         //     has no reachable fall-through and is total. The exhaustiveness
@@ -740,10 +740,11 @@ bool armsCoverNull(const std::vector<ast::CaseArm>& arms) {
 
 // §11.7 / §19.6: is `cls` a closed abstract base — one whose complete set
 // of leaf types is statically knowable? Two forms qualify:
-//   * `sealed abstract`: no subclass outside the declaring module can
-//     exist, so the closed set holds across module boundaries (§11.7).
+//   * `closed` (v0.242, #3052; through v0.241 the modifier pair `sealed
+//     abstract`): no subclass outside the declaring module can exist, so the
+//     closed set holds across module boundaries (§11.7).
 //   * a same-module (non-imported) `abstract` class whose every direct
-//     subclass is itself `sealed`/closed (recursively forms a closed set,
+//     subclass is itself `sealed`/`closed` (recursively forms a closed set,
 //     §19.6). An imported plain-abstract base may have unseen subclasses,
 //     so it is treated as open.
 bool hasModifier(const TypeSymbol* t, std::string_view m) {
@@ -1765,7 +1766,7 @@ bool ExprTC::ancestorArmCoversDeterminedLeaf(
 // §19.6: emit a non-exhaustiveness WARNING for an expression-position
 // `case` whose arms the compiler cannot prove cover every possible value.
 // The spec lists the scrutinee shapes for which exhaustiveness IS provable
-// — enum (all constants), bool (both literals), a closed sealed-abstract
+// — enum (all constants), bool (both literals), a `closed`-rooted
 // class hierarchy (all leaves), and the nullable variant of those (the
 // above plus an explicit `null` arm). An unguarded `_` or unconstrained
 // `var x` arm is a catch-all and is always exhaustive. Every other shape
@@ -1787,7 +1788,7 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
 // §19.6 / §35.6: the shared exhaustiveness VERDICT — returns true iff `arms`
 // provably cover every value of the scrutinee (the spec-listed shapes: an
 // unguarded `_`/untyped-`var x` catch-all, a total `..` range, a covering typed
-// binding, and enum / bool / choice / sealed-abstract closed-hierarchy coverage,
+// binding, and enum / bool / choice / `closed`-hierarchy coverage,
 // each in its nullable variant). Reused by BOTH the expression-position warning
 // (checkCaseExhaustiveness, quiet=false — emits the §19.6 warning and runs the
 // §5.1 pattern-range side-check exactly as before) and the statement-position
@@ -2091,19 +2092,30 @@ bool ExprTC::caseArmsExhaustive(
     }
 
     if (sub && sub->kind == ast::TypeDeclKind::Class) {
-        // §11.7 / §19.6: the scrutinee's hierarchy is closed only when the
-        // base is `sealed abstract`, or a same-module abstract whose every
-        // subclass is recursively sealed/closed. Otherwise the set of leaf
-        // types is open and exhaustiveness cannot be proven.
+        // §11.7 / §19.6 (v0.242, #3052): the scrutinee's hierarchy is closed
+        // only when the base is `closed` — §19.6 verbatim: "when the
+        // scrutinee's static type is a `closed` class, or an `abstract` class
+        // whose only direct subclasses are themselves `sealed` or recursively
+        // form a closed set" — or a same-module abstract whose every subclass
+        // is recursively sealed/closed. Otherwise the set of leaf types is
+        // open and exhaustiveness cannot be proven.
+        //
+        // Through v0.241 the cross-module guarantee was spelled `sealed
+        // abstract`; the pair arm below is kept so a program still carrying
+        // the retired spelling keeps its verdict rather than silently losing
+        // exhaustiveness on top of the modifier-combination error.
         bool isAbstract = hasModifier(sub, "abstract");
         bool isSealed = hasModifier(sub, "sealed");
+        bool isClosedRoot = hasModifier(sub, "closed");
 
         // Gather every transitive subclass of `sub` visible in this
-        // compilation. A leaf to cover is a concrete (non-abstract)
-        // subclass; abstract intermediates are matched only through their
-        // concrete descendants. `descendants` keeps the full set (including
-        // abstract intermediates) so a pattern naming an intermediate by
-        // name still resolves (subtype matching, §19.3).
+        // compilation. §19.6 verbatim: "A **leaf type** is every **concrete**
+        // (neither `abstract` nor `closed`) class in the closed set …
+        // Abstract and `closed` members of the set have no instances (§11.7,
+        // §12.5) and need no arm." Abstract/`closed` intermediates are matched
+        // only through their concrete descendants. `descendants` keeps the
+        // full set (including those intermediates) so a pattern naming an
+        // intermediate by name still resolves (subtype matching, §19.3).
         std::vector<TypeSymbol*> leaves;
         std::vector<TypeSymbol*> descendants;
         bool sawOpenLeaf = false;  // a non-sealed subclass leaves the set open
@@ -2124,19 +2136,26 @@ bool ExprTC::caseArmsExhaustive(
             }
             if (!isDescendant) continue;
             descendants.push_back(ts);
-            if (!hasModifier(ts, "abstract"))
+            // §19.6's leaf definition, both halves: a `closed` intermediate is
+            // NOT a leaf (it has no instances, §11.7/§12.5, so it needs no
+            // arm), and it does NOT leave the set open (it admits no subclass
+            // outside the module) — exactly the two facts the retired `sealed
+            // abstract` pair supplied through its two separate modifiers.
+            const bool tsInstanceless =
+                hasModifier(ts, "abstract") || hasModifier(ts, "closed");
+            if (!tsInstanceless)
                 leaves.push_back(ts);  // concrete leaf to be covered
-            if (!hasModifier(ts, "sealed") && !hasModifier(ts, "abstract"))
+            if (!hasModifier(ts, "sealed") && !tsInstanceless)
                 sawOpenLeaf = true;    // a non-sealed concrete subclass
         }
 
-        // The hierarchy is provably closed when the base is `sealed
-        // abstract` (cross-module guarantee, §11.7), OR a same-module
-        // abstract base with no non-sealed concrete leaf (recursively
-        // closed, §19.6). A non-imported plain-abstract base whose leaves
-        // are all sealed still forms a closed set within the module.
+        // The hierarchy is provably closed when the base is `closed`
+        // (cross-module guarantee, §11.7), OR a same-module abstract base
+        // with no non-sealed concrete leaf (recursively closed, §19.6). A
+        // non-imported plain-abstract base whose leaves are all sealed still
+        // forms a closed set within the module.
         bool closed =
-            (isAbstract && isSealed) ||
+            isClosedRoot || (isAbstract && isSealed) ||
             (isAbstract && !ctx_.isImported(sub) && !sawOpenLeaf);
         if (!closed) {
             warn("class hierarchy rooted at `" + std::string(sub->name) +
@@ -5807,10 +5826,12 @@ bool ExprTC::typeTestGenericInstantiationImpossible(const TypeRef* scrutTy,
 }
 
 // §12.4 (#1920): is `d` a FINAL class — plain `sealed`, non-`abstract`? Such a
-// class admits no subclass anywhere (`sealed` prevents inheritance; only the
-// `sealed abstract` combination stays inheritable within its module, §11.7), so
-// its implemented-interface set is exhaustive over all runtime values that pass
-// the erased class-tag type-test.
+// class admits no subclass anywhere (`sealed` prevents inheritance; a `closed`
+// class stays inheritable within its module, §11.7 — and never carries
+// `sealed`, so it cannot reach this predicate), so its implemented-interface
+// set is exhaustive over all runtime values that pass the erased class-tag
+// type-test. (The `!abstract` guard is what excluded the retired `sealed
+// abstract` pair, which was module-inheritable for the same reason.)
 static bool isFinalClass(const TypeSymbol* d) {
     if (!d || d->kind != ast::TypeDeclKind::Class) return false;
     const auto* td = dynamic_cast<const ast::TypeDecl*>(d->decl);

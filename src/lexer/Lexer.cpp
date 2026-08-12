@@ -107,7 +107,8 @@ bool isReservedKeyword(std::string_view text) {
     static constexpr std::string_view kReserved[] = {
         "abstract",  "and",      "as",        "async",      "await",
         "base",      "bool",     "break",     "byte",       "case",
-        "catch",     "char",     "choice",    "class",      "const",
+        "catch",     "char",     "choice",    "class",      "closed",
+        "const",
         "constructor", "continue", "decimal",  "default",    "destructor",
         "do",        "double",   "elif",      "else",       "end",
         "enum",

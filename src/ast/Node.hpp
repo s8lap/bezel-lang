@@ -820,7 +820,8 @@ struct ChoiceCase {
 struct TypeDecl : TopDecl {
     TypeDeclKind kind = TypeDeclKind::Class;
     Visibility visibility = Visibility::None;
-    std::vector<std::string_view> modifiers; // "abstract", "sealed", "static"
+    // A.3 `Modifier` (v0.242): "abstract", "closed", "sealed", "static".
+    std::vector<std::string_view> modifiers;
     std::string_view name;
     std::vector<GenericParam> genericParams; // empty if no `<...>`
     // A.3 `InheritItem ::= Type ("(" ArgList? ")")?` — the optional argument

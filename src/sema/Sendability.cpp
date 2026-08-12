@@ -429,18 +429,23 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
             if (inProgress.count(decl)) return true;
             inProgress.insert(decl);
 
-            // Rule 1: must be `sealed` (or `sealed abstract` with all-sendable
-            // closed hierarchy).
+            // §30.14 rule 1 (v0.242, #3052), verbatim: "The class is `sealed`
+            // (§12.4); or it is `closed` and every class in its module-closed
+            // hierarchy is itself transfer-closed (then the whole closed
+            // hierarchy is sendable)." Through v0.241 the second arm was
+            // spelled `sealed abstract`; both spellings are accepted here so a
+            // program still carrying the retired pair keeps its verdict.
             bool isSealed = false;
             bool isAbstract = false;
             for (auto mod : decl->modifiers) {
                 if (mod == "sealed") isSealed = true;
                 if (mod == "abstract") isAbstract = true;
             }
-            if (!isSealed) { inProgress.erase(decl); return false; }
+            const bool isClosed = typeIsClosed(decl);
+            if (!isSealed && !isClosed) { inProgress.erase(decl); return false; }
 
-            if (isAbstract) {
-                // `sealed abstract`: sendable iff every concrete subclass in the
+            if (isClosed || isAbstract) {
+                // `closed`: sendable iff every concrete subclass in the
                 // module is also sendable (coinductive over the closed hierarchy).
                 // Collect subclasses: scan all TypeSymbols in the module whose
                 // base-type chain includes this class.
@@ -454,7 +459,7 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
                     // Check if sub is a direct or indirect subclass of decl.
                     bool isSubclass = false;
                     // Simple: check baseTypes directly (direct subclasses only
-                    // for the sealed-abstract case, since in Bezel a sealed abstract
+                    // for the `closed`-root case, since in Bezel a `closed`
                     // hierarchy is always closed and shallow per §12.5).
                     for (TypeSymbol* base : sub->baseTypes) {
                         if (base == decl) { isSubclass = true; break; }
@@ -772,10 +777,15 @@ std::string sealedClassFailurePath(const TypeRef* rt, SemaContext& ctx,
                 bool innerSealed = false;
                 for (auto mod : ft->declaration->modifiers)
                     if (mod == "sealed") { innerSealed = true; break; }
+                // §30.14 rule 1's second arm (v0.242, #3052): a `closed`
+                // root satisfies the sealing requirement, so it must not be
+                // reported as "not sealed".
+                innerSealed = innerSealed || typeIsClosed(ft->declaration);
                 sub = innerSealed ? sealedClassFailurePath(ft, ctx, depth + 1)
                                   : std::string(" class `") +
                                         typeDisplayName(ft) +
-                                        "` is not sealed (§30.14 rule 1)";
+                                        "` is neither `sealed` nor `closed` "
+                                        "(§30.14 rule 1)";
             }
             return std::string("has `owned` class type `") +
                    typeDisplayName(ft) + "` that is not sendable" + sub;
@@ -985,14 +995,15 @@ std::string sendableFailureComponentPath(const TypeRef* rt, SemaContext& ctx) {
 
     // Class: §30.14 transfer-closed rules.
     if (decl->kind == ast::TypeDeclKind::Class) {
-        // Rule 1: sealing. A non-sealed class fails at the root for a
+        // Rule 1: sealing. A class that is neither `sealed` nor `closed`
+        // (v0.242, #3052 — rule 1's two arms) fails at the root for a
         // structural reason the field walk cannot pin — name the rule.
         bool isSealed = false;
         for (auto mod : decl->modifiers)
             if (mod == "sealed") { isSealed = true; break; }
-        if (!isSealed)
+        if (!isSealed && !typeIsClosed(decl))
             return std::string(kPrefix) +
-                   "class is not sealed (§30.14 rule 1)";
+                   "class is neither `sealed` nor `closed` (§30.14 rule 1)";
         // Sealed: walk fields per rule 2/3.
         std::string inner = sealedClassFailurePath(rt, ctx, 0);
         return inner.empty() ? std::string() : std::string(kPrefix) + inner;

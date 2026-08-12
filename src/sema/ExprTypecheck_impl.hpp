@@ -799,7 +799,7 @@ private:
     // cannot prove exhaustiveness statically. Statement-position `case`
     // falls through with no action and is exempt (handled in CaseStmt). The
     // analysis proves exhaustiveness for the four spec-listed scrutinee
-    // shapes (enum / bool / sealed-abstract closed hierarchy / nullable),
+    // shapes (enum / bool / `closed`-rooted class hierarchy / nullable),
     // and treats an unguarded `_` or unconstrained `var x` arm as a
     // catch-all that is always exhaustive.
     void checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy);
