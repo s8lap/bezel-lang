@@ -110,7 +110,10 @@ BEZEL_TEST(codegen_nullcond_object_method_2982,
              "  Console.WriteLine(\"start\"); "
              "  Console.WriteLine(w?.ToString() ?? \"<null>\"); "
              "  Console.WriteLine(\"end\"); "),
-        "start\nWidget\nend"));
+        // #2934 (§8.5, v0.252): was "Widget" — the §8.5 class default is
+        // now module-path-qualified. The null short-circuit below is
+        // unaffected (it never dispatches ToString at all, §7.5).
+        "start\nM2982.Widget\nend"));
 }
 
 // B. `?.ToString()` on a NULL receiver → the §7.5 null short-circuit yields a

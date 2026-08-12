@@ -17030,9 +17030,25 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     //     single reference (no extra retain is emitted), so the release drops it
     //     exactly once. No double-free.
     // The shape is matched structurally — CallExpr, empty args, member "ToString",
-    // receiver type a Named record, auto-bearing per the SAME positional ||
-    // isAutoEqualityBearingBodyRecord test lowerValueSemMethodOn keys on — so the
-    // producer decision and the lowering decision stay in lockstep.
+    // receiver type a Named record, auto-bearing per the SAME predicate
+    // lowerValueSemMethodOn keys on — so the producer decision and the lowering
+    // decision stay in lockstep.
+    //
+    // ⚠ THAT LOCKSTEP IS THE WHOLE CONTRACT, and #2934 broke it once already.
+    // Both sides used to spell the question inline as `positional ||
+    // isAutoEqualityBearingBodyRecord`, reading `positional` off the AST decl —
+    // which is null for every IMPORTED type. While the lowering ALSO answered
+    // "not auto-bearing" there, the two agreed and the answer was a name-only
+    // literal sentinel, so nothing leaked. #2934 fixed the lowering (an imported
+    // positional record must render "Pt(X: 1, Y: 2)", not a qualified head) and
+    // left this copy on the AST-only read: the lowering then minted a fresh
+    // rc=1 string that this recognizer did not recognize, so the bind RETAINED
+    // it (1->2) and the scope-end release dropped it back to 1 — the producer's
+    // original +1 never decremented. MEASURED across a real two-module build:
+    // 962 bytes / 40 allocations over 20 iterations of
+    // `var s := p.ToString();` on an imported `record Pt(X: int, Y: int)`.
+    // Both sides now ask `recordIsAutoBearing`, so the lockstep is enforced by
+    // there being ONE predicate rather than by two copies agreeing.
     if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
         if (call->args.empty() && call->callee) {
             if (auto* ma =
@@ -17042,13 +17058,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     if (tt && tt->kind == sema::TypeRef::Kind::Named &&
                         tt->declaration &&
                         tt->declaration->kind == ast::TypeDeclKind::Record) {
-                        const sema::TypeSymbol* ts = tt->declaration;
-                        bool positional = false;
-                        if (auto* td =
-                                dynamic_cast<const ast::TypeDecl*>(ts->decl))
-                            positional = td->hasPositionalFields;
-                        if (positional ||
-                            sema::isAutoEqualityBearingBodyRecord(ts, ctx_))
+                        if (recordIsAutoBearing(tt->declaration))
                             return true;  // emitRecordToString → rc=1 heap string
                     }
                     // #2479 / §35.7 (mirrors the Record recognizer just above,
@@ -27176,8 +27186,13 @@ void Emitter::emitClassToStringThunkBody(const sema::TypeSymbol* ts,
         result = builder_.CreateCall(target->getFunctionType(), target,
                                      {thunk->getArg(0)});
     if (!result)
+        // fix #2934 (§8.5, v0.252): the class default is the MODULE-PATH-
+        // QUALIFIED name (stdlib §2.13's `Type.FullName` rendering), not the
+        // bare identifier. This thunk is vtable slot 3, i.e. the answer every
+        // dynamic consumer sees — `Object.ToString()`, an interface receiver,
+        // a boxed receiver, and `$"{o}"` on an `Object`-typed hole.
         result = lowerStringLiteral(
-            std::string("\"") + std::string(ts->name) + "\"", false);
+            std::string("\"") + spec85QualifiedTypeName(ts) + "\"", false);
     builder_.CreateRet(result);
 }
 
@@ -27979,8 +27994,10 @@ llvm::Value* Emitter::emitEnumToString(llvm::Value* enumVal,
             return builder_.CreateCall(fty, fit->second, {enumVal});
         }
     }
+    // fix #2934 (§8.5, v0.252): "for … enums: the type's qualified name (the
+    // stdlib §2.13 `FullName` rendering, as for classes)".
     return lowerStringLiteral(
-        std::string("\"") + std::string(ts->name) + "\"", false);
+        std::string("\"") + spec85QualifiedTypeName(ts) + "\"", false);
 }
 
 // per §10.5 (v0.183): equality of two enum values (`a`, `b` are the underlying
@@ -28095,10 +28112,23 @@ llvm::Constant* Emitter::boxToStringThunk(const sema::TypeSymbol* ts) {
                                                  fit->second, {payload});
             }
             if (!result) {
-                // Load the record value and build the §9.1/§9.2 form.
-                llvm::StructType* recTy = recordStruct(ts);
-                llvm::Value* recVal = builder_.CreateLoad(recTy, payload, "rec");
-                result = emitRecordToString(recVal, ts);
+                // fix #2934 (§8.5, v0.252): a body record that does NOT satisfy
+                // §9.2's auto-equality conditions has no field listing — its
+                // §8.5 default is the qualified type name — and the BOXED
+                // spelling must answer what the unboxed `.ToString()` answers
+                // (§8.6's boxed dispatch is the same member). Asked through the
+                // shared predicate, not re-derived.
+                if (spec85NameOnlyDefaultIsQualified(ts)) {
+                    result = lowerStringLiteral(
+                        std::string("\"") + spec85QualifiedTypeName(ts) + "\"",
+                        false);
+                } else {
+                    // Load the record value and build the §9.1/§9.2 form.
+                    llvm::StructType* recTy = recordStruct(ts);
+                    llvm::Value* recVal =
+                        builder_.CreateLoad(recTy, payload, "rec");
+                    result = emitRecordToString(recVal, ts);
+                }
             }
         }
         builder_.CreateRet(result);

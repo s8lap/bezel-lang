@@ -151,7 +151,10 @@ BEZEL_TEST(generic_bare_typeparam_tostring_record_2469,
         "  end F; "
         "  public static method Main(): int "
         "    var s := F(new Opaque(5)); "
-        "    return (if s = \"Opaque\" then 42 else 1); "
+        // #2934 (§8.5, v0.252): was "Opaque" — a body record with an
+        // explicit field is not auto-hashable (§9.2), so its default is
+        // the QUALIFIED type name, through the bare-T substitution too.
+        "    return (if s = \"M.Opaque\" then 42 else 1); "
         "  end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(run(program), 42);
@@ -173,7 +176,8 @@ BEZEL_TEST(generic_bare_typeparam_tostring_record_2469,
         "  end F; "
         "  public static method Main(): int "
         "    var s := F(Color.Green); "
-        "    return (if s = \"Color\" then 42 else 1); "
+        // #2934 (§8.5, v0.252): was "Color".
+        "    return (if s = \"M.Color\" then 42 else 1); "
         "  end Main; "
         "end C;";
     BEZEL_EXPECT_EQ(run(program), 42);

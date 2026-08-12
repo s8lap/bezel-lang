@@ -199,7 +199,10 @@ BEZEL_TEST(enum_underlying_740, long_enum_tostring_is_type_name) {
         "enum Big: long A := 1L, B := 9000000000L; end Big; "
         "class C public static method Main(): int "
         "  var x: Big := Big.B; "
-        "  return (if x.ToString() = \"Big\" then 0 else 1); "
+        // #2934 (§8.5, v0.252): was "Big" — the enum default is the
+        // module-path-qualified type name, independent of §10.3's
+        // underlying type.
+        "  return (if x.ToString() = \"M.Big\" then 0 else 1); "
         "end Main; end C;"), 0);
 }
 

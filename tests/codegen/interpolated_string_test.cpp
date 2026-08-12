@@ -284,8 +284,11 @@ BEZEL_TEST(codegen_cg27d, enum_alignment_renders_type_name_1283) {
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var col := Color.Green; "
-        "  var s := $\"[{col,8}]\"; "        // "[   Color]" (5-char name in width 8)
-        "  return (if s = \"[   Color]\" then 1 else 0); "
+        // #2934 (§8.5, v0.252): the enum default is now the module-path-
+        // qualified name, so the padded operand is "M.Color" (7 chars in
+        // width 8) — was "Color" (5) giving "[   Color]".
+        "  var s := $\"[{col,8}]\"; "        // "[ M.Color]"
+        "  return (if s = \"[ M.Color]\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -295,8 +298,10 @@ BEZEL_TEST(codegen_cg27d, enum_alignment_left_1283) {
         "module M; enum Color Red, Green, Blue; end Color; "
         "class C public static method Main(): int "
         "  var col := Color.Green; "
-        "  var s := $\"[{col,-8}]\"; "       // "[Color   ]"
-        "  return (if s = \"[Color   ]\" then 1 else 0); "
+        // #2934 (§8.5, v0.252): was "[Color   ]"; the rendered operand is
+        // now "M.Color" (7 chars), left-aligned in width 8.
+        "  var s := $\"[{col,-8}]\"; "       // "[M.Color ]"
+        "  return (if s = \"[M.Color ]\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

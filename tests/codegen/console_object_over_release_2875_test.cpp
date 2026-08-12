@@ -464,6 +464,10 @@ BEZEL_TEST(codegen_console_object_over_release_2875,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_TRUE(out(r) ==
-        "Pt2875F(X: 1, Y: 2)\n7\nColor2875F\nKDef2875F\nK9\nabcd\n"
+        // #2934 (§8.5, v0.252): the ENUM row ("Color2875F") and the
+        // no-override CLASS row ("KDef2875F") are now module-path-
+        // qualified; the record head stays unqualified, and the class
+        // WITH an override ("K9") is untouched.
+        "Pt2875F(X: 1, Y: 2)\n7\nM2875F.Color2875F\nM2875F.KDef2875F\nK9\nabcd\n"
         "True\nz\n2.5\n1.5\nlit\nnull\n");
 }

@@ -11,6 +11,15 @@
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
+// #2934 (spec §8.5, v0.252): the expectation(s) marked below changed value
+// when §8.5's *name-only* `ToString` defaults were pinned to stdlib §2.13's
+// `Type.FullName` rendering ("the module-path-qualified rendering stdlib
+// §2.13 defines for `Type.FullName`"). Only the three name-only defaults
+// moved — classes, enums, and body records that do NOT satisfy §9.2's
+// auto-equality conditions. Record HEADS are unchanged (§8.5: "positional-
+// record and auto-equality formatting keeps the **unqualified** head"), and
+// so is every user `ToString` override.
+
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -33,8 +42,8 @@ BEZEL_TEST(base_tostring_1106, no_base_override_typename_default) {
         "class Aa public override method ToString(): string => base.ToString(); end Aa; "
         "class C public static method Main(): int "
         "  using var a := new Aa(); var s := a.ToString(); "
-        "  return s.Length; "                              // "Aa" → 2
-        "end Main; end C;"), 2);
+        "  return s.Length; "                              // #2934 (§8.5, v0.252):
+        "end Main; end C;"), 4);   // was "Aa" (2); now "M.Aa" (4)
 }
 
 // #1106/5: base.ToString() where the EXPLICIT base class overrides ToString
@@ -59,8 +68,8 @@ BEZEL_TEST(base_tostring_1106, explicit_base_no_override_typename) {
         "class Abc: B public override method ToString(): string => base.ToString(); end Abc; "
         "class C public static method Main(): int "
         "  using var a := new Abc(); var s := a.ToString(); "
-        "  return s.Length; "                              // "Abc" (runtime type) → 3
-        "end Main; end C;"), 3);
+        "  return s.Length; "                              // #2934 (§8.5, v0.252):
+        "end Main; end C;"), 5);   // was "Abc" (3); now "M.Abc" (5)
 }
 
 // Regression guard: a plain (non-base) overriding ToString() is unchanged.
@@ -98,8 +107,8 @@ BEZEL_TEST(base_tostring_1110, concat_operand_object_base) {
         "class Aa public override method ToString(): string => \"x\" + base.ToString(); end Aa; "
         "class C public static method Main(): int "
         "  using var a := new Aa(); var s := a.ToString(); "
-        "  return s.Length; "                              // "xAa" → 3
-        "end Main; end C;"), 3);
+        "  return s.Length; "                              // #2934 (§8.5, v0.252):
+        "end Main; end C;"), 5);   // was "xAa" (3); now "xM.Aa" (5)
 }
 
 // #1110 (§4.6 / §8.5 / §12.3): the same for the LEFT `+` operand position,
@@ -110,8 +119,8 @@ BEZEL_TEST(base_tostring_1110, concat_left_operand_object_base) {
         "class Aa public override method ToString(): string => base.ToString() + \"!\"; end Aa; "
         "class C public static method Main(): int "
         "  using var a := new Aa(); var s := a.ToString(); "
-        "  return s.Length; "                              // "Aa!" → 3
-        "end Main; end C;"), 3);
+        "  return s.Length; "                              // #2934 (§8.5, v0.252):
+        "end Main; end C;"), 5);   // was "Aa!" (3); now "M.Aa!" (5)
 }
 
 // #1110 (§4.6 / §8.5 / §12.3): an EXPLICIT class base whose override returns a

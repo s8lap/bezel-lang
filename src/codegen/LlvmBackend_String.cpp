@@ -3001,8 +3001,27 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
     }
     if (fieldTy && fieldTy->kind == K::Named && fieldTy->declaration) {
         const sema::TypeSymbol* ts = fieldTy->declaration;
-        if (ts->kind == ast::TypeDeclKind::Record && val->getType()->isStructTy())
+        if (ts->kind == ast::TypeDeclKind::Record && val->getType()->isStructTy()) {
+            // fix #2934 (§8.5, v0.252): ask the SAME three-way question the
+            // direct `.ToString()` call asks (LlvmBackend_Calls2.cpp's
+            // `autoBearing`) and the interpolation chain asks
+            // (LlvmBackend_Exprs.cpp) — a body record that does NOT satisfy
+            // §9.2's auto-equality conditions has NO field listing at all; its
+            // §8.5 default is the qualified type name. This arm used to recurse
+            // into `emitRecordToString` for EVERY record kind, so one program
+            // could render the same ineligible record two ways: `Reports.Manual`
+            // from `m.ToString()` / `$"{m}"`, and `Manual(A: 3)` from the very
+            // same value reached as a record COMPONENT or through an alignment
+            // spec (`$"{m,10}"`, emitWithFormatSpec's Named arm). §8.5's
+            // component rule — "Each component renders as its own `ToString`
+            // renders it" — makes those the same question, so they get the same
+            // answer here.
+            if (spec85NameOnlyDefaultIsQualified(ts))
+                return lowerStringLiteral(
+                    std::string("\"") + spec85QualifiedTypeName(ts) + "\"",
+                    false);
             return emitRecordToString(val, ts);          // §9.1 recurse
+        }
         if (ts->kind == ast::TypeDeclKind::Enum)
             // per §10.5 (v0.183): a user `ToString(): string` replaces the §8.5
             // default (the type's qualified name) inside interpolation; `val`
@@ -3050,8 +3069,16 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
                 std::vector<llvm::Value*> a{val};
                 if (llvm::Value* r = emitMethodCall(toStr, a, false)) return r;
             }
+            // fix #2934 (§8.5, v0.252): the class default is the module-path-
+            // qualified name (stdlib §2.13 `FullName`). This is the arm §8.5's
+            // component rule names — "Each component renders as its own
+            // `ToString` renders it (virtual dispatch — a class-typed component
+            // with no override renders its class default, the qualified name
+            // per the bullet above)" — so a record's class-typed FIELD renders
+            // QUALIFIED inside the record's own UNQUALIFIED-headed rendering.
+            // Both halves of that asymmetry are §8.5's, deliberately.
             return lowerStringLiteral(
-                std::string("\"") + std::string(ts->name) + "\"", false);
+                std::string("\"") + spec85QualifiedTypeName(ts) + "\"", false);
         }
         if (ts->kind == ast::TypeDeclKind::Interface &&
             val->getType()->isPointerTy()) {

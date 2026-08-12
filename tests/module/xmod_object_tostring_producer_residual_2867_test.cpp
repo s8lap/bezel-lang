@@ -208,7 +208,13 @@ BEZEL_TEST(xmod_object_tostring_producer_residual_2867,
         "      var churn: string := \"c\" + i.ToString(); "
         "      if churn.Length < 1 then return 4; end if; "
         "    end while; "
-        "    if acc <> \"PlainEx2867|PlainK2867\" then return 3; end if; "
+        // #2934 (§8.5, v0.252): both sentinel defaults are now the
+        // MODULE-PATH-QUALIFIED name, and an imported type carries its
+        // EXPORTER's module path (#1488's TypeSymbol::moduleName, which
+        // ModuleLoader restores from the dependency's metadata). Still a
+        // pooled immortal literal, so the lifetime property this test
+        // exists to pin is unchanged — only the text.
+        "    if acc <> \"TsLib2867T2.PlainEx2867|TsLib2867T2.PlainK2867\" then return 3; end if; "
         "    return 0; "
         "  end Main; "
         "end C2867T2;");

@@ -438,8 +438,15 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
                 strPtr = emitMethodCall(toStr, args, false);
             } else {
                 // No ToString override — use type name as placeholder string.
+                // fix #2934 (§8.5, v0.252): this arm is reached by a CLASS, an
+                // ENUM and a RECORD receiver alike (the gate above is only
+                // "Named with a declaration"), and §8.5 renders those three
+                // differently — the first two qualified, a record head not.
+                // `spec85NameOnlyDefaultSpelling` is the one predicate that
+                // knows the split; do not inline a `ts->name` here again.
                 strPtr = lowerStringLiteral(
-                    std::string("\"") + std::string(ts->name) + "\"",
+                    std::string("\"") + spec85NameOnlyDefaultSpelling(ts) +
+                        "\"",
                     false);
             }
             // #2875 note: this branch deliberately still leaves its render
@@ -709,6 +716,13 @@ const sema::TypeSymbol* Emitter::recordTypeOfRef(const sema::TypeRef* ref) {
         return nullptr;
     const sema::TypeSymbol* ts = ref->declaration;
     if (ts->kind != ast::TypeDeclKind::Record) return nullptr;
+    // ⚠ #3132: this reads the AST decl ONLY, which is null for every IMPORTED
+    // type, so an imported positional record is misclassified here as having no
+    // auto equality and is routed away from the record-key fast path. That is
+    // the SAME one-line defect this commit fixed at the two §8.5 sites
+    // (`recordIsPositional` reads both sources), but it is a DIFFERENT defect —
+    // hash/equality routing, not rendering — with its own blast radius, so it
+    // is filed rather than swept in here. The fix is `recordIsAutoBearing(ts)`.
     bool positional = false;
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
         positional = td->hasPositionalFields;
