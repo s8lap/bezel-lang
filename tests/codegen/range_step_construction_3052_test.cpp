@@ -104,3 +104,30 @@ BEZEL_TEST(codegen_range_step_construction_3052,
         "var r := 1..4; var sum: int := 0; "
         "for var i in r do sum := sum + i; end; return sum;"), 10);
 }
+
+// §16.4 / §17.5: the `in`-operand position is a third spelling of the range
+// expression (`x in lo..hi step s`, §16.3's `Contains`), reached by its own
+// lowering rather than the value path. §16.4's fault is stated on the
+// EXPRESSION, so it must fire here too — pinned because the three range-expr
+// lowerings are separate code paths and a future one could easily be missed.
+BEZEL_TEST(codegen_range_step_construction_3052,
+           computed_zero_step_in_in_operand_faults_spec_16_4) {
+    BEZEL_EXPECT_EQ(expectsOverflow(
+        "var z: int := 0; var m: bool := 3 in 0..10 step z;"), 0);
+}
+
+// §16.4 / §17.5 control: the same `in` spelling with a nonzero computed step
+// still evaluates membership — `3 in 0..10 step 2` is true (§16.3: "`Step`
+// affects membership only through emptiness/direction — `0..10 step 2`
+// contains `3`"). Exit 5 distinguishes "no fault, membership true" from the
+// helper's 0 (faulted) and 7 (ran, never entered the catch).
+BEZEL_TEST(codegen_range_step_construction_3052,
+           nonzero_step_in_in_operand_still_evaluates_spec_16_3) {
+    BEZEL_EXPECT_EQ(run(
+        "  var z: int := 2; var ok: int := 7; "
+        "  try var m: bool := 3 in 0..10 step z; "
+        "      ok := (if m then 5 else 6); "
+        "  catch var e: OverflowException => do ok := 0; end "
+        "  end; "
+        "  return ok;"), 5);
+}

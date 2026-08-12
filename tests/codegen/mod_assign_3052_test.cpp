@@ -134,6 +134,64 @@ BEZEL_TEST(codegen_mod_assign_3052, decimal_target_admitted_spec_6_1) {
         "end Main; end C;"), "7.5");
 }
 
+// §6.6's lvalue-chain rule reaches every ACCESSOR-mediated target shape, not
+// just locals: "when the final segment is accessor-mediated (a property or an
+// indexer), its getter and setter are each invoked exactly once — the getter
+// produces the left operand, the setter stores the result". A block-form
+// property is the shape whose compound lowering is a separate backend path
+// from the local one, so it is pinned here.
+BEZEL_TEST(codegen_mod_assign_3052, block_form_property_target_spec_6_6) {
+    auto r = runAot(
+        "module M; "
+        "class Box "
+        "  private _v: int := 0; "
+        "  public property V: int "
+        "    get => _v; "
+        "    set => do _v := value; end; "
+        "  end V; "
+        "  destructor end destructor; "
+        "end Box; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var b := new Box(); "
+        "    b.V := 47; "
+        "    b.V mod= 10; "
+        "    return b.V; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// §7.11: the arithmetic operators lift to `T?`, and §6.6's write-back stores
+// the lifted result back into a nullable target (R = T = `int?`, so no
+// narrowing is involved). The nullable arm of the compound lowering is a
+// distinct control-flow construct, so `mod=` is pinned on it.
+BEZEL_TEST(codegen_mod_assign_3052, nullable_int_target_lifts_spec_7_11) {
+    BEZEL_EXPECT_EQ(run(
+        "var n: int? := 47; n mod= 10; return n ?? -1;"), 7);
+}
+
+// §22.12: a static field is the third storage shape a compound assignment can
+// target (local, instance/accessor, static). The declaration-site warning the
+// mutable static draws (§22.12 rule 2 form (iii)) is expected and irrelevant
+// here — the assertion is on the computed value.
+BEZEL_TEST(codegen_mod_assign_3052, static_field_target_spec_6_6) {
+    auto r = runAot(
+        "module M; "
+        "class S "
+        "  public static Counter: int := 47; "
+        "end S; "
+        "class C "
+        "  public static method Main(): int "
+        "    S.Counter mod= 10; "
+        "    return S.Counter; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
 // §6.6 control: the binary `mod` operator is untouched by the new token —
 // `a mod b` with surrounding space still parses and evaluates as before.
 BEZEL_TEST(codegen_mod_assign_3052, binary_mod_unchanged_control_spec_6_1) {
