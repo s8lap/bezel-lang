@@ -26,27 +26,89 @@ namespace bezel::ownership {
 
 namespace {
 // §29.3 (#945): does this statement list use `yield` (making the method an
-// iterator)? Recurses into control-flow block bodies (if/elif/else, while, for,
-// do, try body — §29.6 forbids yield in catch/finally). Mirrors
-// ExprTC::stmtsContainYield.
+// iterator)?
+//
+// DERIVED, NOT ACCUMULATED (fix #3148, following #3074). The arms below are the
+// COMPLETE `: Stmt` hierarchy of `src/ast/Node.hpp`, in that header's order, and
+// every kind is named — including the ten that can never carry a `yield` — so
+// that adding a statement kind without deciding its iterator-classification
+// behaviour is a visible omission rather than a silent exemption. The previous
+// six-arm list was missing `ast::CaseStmt`, which is BOTH the `case` and the
+// `when` statement (Parser_Stmts.cpp::parseWhenStmt builds the same node with a
+// null scrutinee), so an iterator whose only `yield` sat in a `case`/`when` arm
+// was analysed here as an ordinary method while codegen's `Emitter::
+// containsYield` still lowered it to a state machine — the §29.8 owned-parameter
+// frame auto-dispose never fired and the parameter leaked (#3148).
+//
+// `yield` is a STATEMENT (grammar A.6; there is no yield-expression in A.7), so
+// only the kinds that own a statement LIST can hide one. Per kind:
+//   LocalDecl, LocalConstDecl, ReturnStmt, ExpressionStmt, AssignmentStmt,
+//   ThrowStmt, BreakStmt, ContinueStmt, IncrementStmt, DiscardStmt — carry
+//     expressions only and own no statement list, so no `yield` can nest in
+//     them. A lambda body inside such an expression is its own iterator/async
+//     scope (§29.3, §30.6) and is deliberately not descended into.
+//   YieldStmt — is the `yield`.
+//   IfStmt / WhileStmt / ForStmt / DoEndBlock — own bodies; recurse.
+//   TryStmt — recurse into the protected body, every catch arm body AND the
+//     finally, matching codegen's `Emitter::containsYield`
+//     (LlvmBackend_Iterators.cpp), which is the walk that decides whether a
+//     state machine is emitted at all. §29.6 forbids `yield` in a catch arm or
+//     in a finally, but that rejection is issued from `emitIteratorMethod` —
+//     i.e. only once codegen has already classified the body as an iterator —
+//     so agreeing with codegen here cannot admit a shape §29.6 rejects, while
+//     disagreeing would leave the ownership pass analysing a different body
+//     kind from the one being emitted.
+//   CaseStmt — owns its arm bodies. A statement-position arm is always
+//     `CaseArmBodyKind::Block` (Parser_Stmts.cpp::parseCaseStmtArm represents
+//     the `do … end`, single-statement and expression forms uniformly in
+//     `arm.stmts`), so walking `arm.stmts` covers every arm shape; recurse.
 bool bodyContainsYield(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     for (const auto& s : body) {
         if (!s) continue;
+        // — kinds that ARE, or that OWN, a `yield` —
         if (dynamic_cast<const ast::YieldStmt*>(s.get())) return true;
-        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get()))
-            if (bodyContainsYield(fs->body)) return true;
-        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get()))
-            if (bodyContainsYield(ws->body)) return true;
         if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s.get())) {
             if (bodyContainsYield(ifs->ifBranch.body)) return true;
             for (const auto& el : ifs->elifBranches)
                 if (bodyContainsYield(el.body)) return true;
             if (ifs->hasElse && bodyContainsYield(ifs->elseBody)) return true;
+            continue;
         }
-        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get()))
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
+            if (bodyContainsYield(ws->body)) return true;
+            continue;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
+            if (bodyContainsYield(fs->body)) return true;
+            continue;
+        }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
             if (bodyContainsYield(db->body)) return true;
-        if (auto* trys = dynamic_cast<const ast::TryStmt*>(s.get()))
+            continue;
+        }
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(s.get())) {
             if (bodyContainsYield(trys->body)) return true;
+            for (const auto& arm : trys->catches) {
+                const ast::Stmt* ab = arm.body.get();
+                if (!ab) continue;
+                if (dynamic_cast<const ast::YieldStmt*>(ab)) return true;
+                if (auto* adb = dynamic_cast<const ast::DoEndBlock*>(ab))
+                    if (bodyContainsYield(adb->body)) return true;
+            }
+            if (bodyContainsYield(trys->finallyBody)) return true;
+            continue;
+        }
+        // #3148 / #1107 / #16: `case` AND `when` statement arms, in lockstep
+        // with sema's ExprTC::stmtsContainYield and codegen's containsYield.
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s.get())) {
+            for (const auto& arm : cs->arms)
+                if (bodyContainsYield(arm.stmts)) return true;
+            continue;
+        }
+        // — the remaining ten kinds own no statement list; nothing to walk —
+        //   LocalDecl, LocalConstDecl, ReturnStmt, ExpressionStmt,
+        //   AssignmentStmt, ThrowStmt, BreakStmt, ContinueStmt, IncrementStmt,
+        //   DiscardStmt. Listed in the header comment above with the reason.
     }
     return false;
 }
