@@ -195,6 +195,145 @@ def classify_wrap(code):
 
 
 # -----------------------------------------------------------------------
+# The composite ("mixed") wrap — opt-in via the manifest note `wrap:mixed`.
+#
+# WHY: classify_wrap dispatches the WHOLE block on its FIRST line, so a block
+# that mixes top-level declarations with top-level statements (the docs'
+# standard "here is the type, here is a call on it, here is what it resolves
+# to" shape) can never compile: whichever wrap the first line picks strands the
+# other half. The v0.247 corpus regeneration recorded exactly that as skip
+# rule R7 — `skip:mixed`, "no single wrap can hold both" — for 36 cases, and
+# #683 found the same thing for extension blocks.
+#
+# One wrap CAN hold both, because SourceFile ::= ModuleDecl Import* TopDecl*
+# (spec Appendix A.1) admits declarations and a class beside each other: sort
+# the block's top-level items into imports / module declarations / class
+# members / statements, and emit
+#
+#     module Conf;  <imports>  <module decls>
+#     class W  <members>  public static method Main()  <statements>  end Main;
+#     end W;
+#
+# This adds only ENCLOSING scaffolding. No token inside the block is rewritten,
+# reordered within its group, or dropped — the corpus's value is that it runs
+# the documents verbatim, so a case is never made to compile by editing what
+# the document says.
+#
+# Item boundaries use the column-0 invariant the docs' fenced blocks hold to: a
+# top-level item starts in column 0 and its body is indented. A column-0
+# continuation keyword (`end`/`else`/`elif`/`catch`/`finally`) belongs to the
+# item in progress, and an absorbed `end` closes it.
+# -----------------------------------------------------------------------
+
+_COL0_RE = re.compile(r'^\S')
+_ITEM_CONT_RE = re.compile(r'^(?:end\b|else\b|elif\b|catch\b|finally\b)')
+_ITEM_END_RE = re.compile(r'^end\b')
+
+_ITEM_MODDECL_RE = re.compile(
+    r'^\s*(?:(?:public|private|internal)\s+)?'
+    r'(?:(?:sealed|abstract|closed|static)\s+)*'
+    r'(?:class|record|enum|interface|choice|extension|type|extern)\b')
+_ITEM_MEMBER_RE = re.compile(
+    r'^\s*(?:(?:public|private|internal|protected)\s+)?'
+    r'(?:(?:static|virtual|override|abstract|async|pure|sealed|readonly|owned'
+    r'|scoped)\s+)*'
+    r'(?:method|property|constructor|destructor|const)\s+')
+_ITEM_FIELD_RE = re.compile(
+    r'^\s*(?:public|private|internal|protected)\s+'
+    r'(?:(?:owned|readonly|static|scoped)\s+)*_?\w+\s*:\s*\S')
+
+
+def _is_lead_in(lines):
+    """True when everything accumulated so far is blank or a `//` comment — a
+    lead-in that belongs to the item it precedes, not an item of its own.
+    Without this a doc comment above a declaration would be split off and, being
+    codeless, sorted into the statement group: legal, but it would tear the
+    document's own annotation away from what it annotates."""
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("//"):
+            return False
+    return True
+
+
+def split_top_level_items(code):
+    """Split a doc block into its top-level items, preserving text exactly.
+    ''.join(split_top_level_items(code)) == code."""
+    lines = code.splitlines(keepends=True)
+    items = []
+    cur = []
+    for line in lines:
+        if not cur or not line.strip() or not _COL0_RE.match(line):
+            cur.append(line)
+            continue
+        if _ITEM_CONT_RE.match(line):
+            cur.append(line)
+            if _ITEM_END_RE.match(line):
+                items.append("".join(cur))
+                cur = []
+            continue
+        if _is_lead_in(cur):
+            cur.append(line)
+            continue
+        items.append("".join(cur))
+        cur = [line]
+    if cur:
+        items.append("".join(cur))
+    return items
+
+
+def classify_top_level_item(item):
+    """'import' | 'moddecl' | 'member' | 'stmt' for one top-level item. Judged
+    on the item's first non-blank, non-comment line (comments and blank lines
+    ride along with the item they precede)."""
+    head = ""
+    for line in item.splitlines():
+        s = line.strip()
+        if s and not s.startswith("//"):
+            head = line
+            break
+    if not head.strip():
+        return "stmt"
+    if _IMPORT_RE.match(head):
+        return "import"
+    if _ITEM_MODDECL_RE.match(head):
+        return "moddecl"
+    if _ITEM_MEMBER_RE.match(head) or _ITEM_FIELD_RE.match(head):
+        return "member"
+    return "stmt"
+
+
+def wrap_mixed(code):
+    """The composite wrap. Always yields a `Main`, so the case is an executable
+    program (WRAP_STMT) and its run phase is checked like any other."""
+    groups = {"import": [], "moddecl": [], "member": [], "stmt": []}
+    for item in split_top_level_items(code):
+        groups[classify_top_level_item(item)].append(item)
+    out = ["module Conf;\n"]
+    out += groups["import"]
+    out += groups["moddecl"]
+    out.append("\nclass W\n")
+    out += groups["member"]
+    out.append("  public static method Main()\n")
+    out += [_indent_four(item) for item in groups["stmt"]]
+    out.append("\n  end Main;\nend W;\n")
+    return WRAP_STMT, "".join(out)
+
+
+# -----------------------------------------------------------------------
+# Manifest `notes` is a `;`-separated token list. Tokens the harness acts on:
+#   preamble    — splice preamble.bzl (existing behaviour)
+#   wrap:mixed  — use wrap_mixed instead of the classify_wrap cascade
+# Any other token (`chained:1`, a skip rationale, free prose) is provenance
+# only. Exact-token matching keeps prose that merely CONTAINS a keyword — e.g.
+# `name-collides-with-preamble (Shape/…)` — from switching behaviour on.
+# -----------------------------------------------------------------------
+
+def note_tokens(notes):
+    return {t.strip() for t in (notes or "").split(";") if t.strip()}
+
+
+# -----------------------------------------------------------------------
 # Preamble splice — for notes=preamble cases. Mirrors the awk splice.
 # -----------------------------------------------------------------------
 
@@ -345,8 +484,12 @@ def run_case(case, bezelc, cases_dir, tmpdir, preamble_text, run=caged_run):
     with open(src_path, encoding="utf-8") as f:
         code = f.read()
 
-    wrap_mode, wrapped = classify_wrap(code)
-    if case.get("notes") == "preamble" and preamble_text is not None:
+    tokens = note_tokens(case.get("notes"))
+    if "wrap:mixed" in tokens:
+        wrap_mode, wrapped = wrap_mixed(code)
+    else:
+        wrap_mode, wrapped = classify_wrap(code)
+    if "preamble" in tokens and preamble_text is not None:
         wrapped = splice_preamble(wrapped, preamble_text)
 
     wrap_file = os.path.join(tmpdir, case_id + "_wrapped.bzl")

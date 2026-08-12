@@ -169,6 +169,114 @@ class ClassifyWrapTest(unittest.TestCase):
 
 
 # -----------------------------------------------------------------------
+# The composite ("mixed") wrap — opt-in via the `wrap:mixed` manifest note.
+# -----------------------------------------------------------------------
+
+class SplitTopLevelItemsTest(unittest.TestCase):
+    def test_split_is_lossless(self):
+        # The scaffolding must never drop or rewrite a byte of the doc block.
+        code = ("public class Logger\n  public method Log(n: int);\nend Logger;\n"
+                "\nvar lg := new Logger();\nlg.Log(1);\n")
+        self.assertEqual("".join(cf.split_top_level_items(code)), code)
+
+    def test_block_decl_absorbs_its_column0_end(self):
+        code = "public class A\n  x: int;\nend A;\nvar y := 1;\n"
+        self.assertEqual(cf.split_top_level_items(code),
+                         ["public class A\n  x: int;\nend A;\n", "var y := 1;\n"])
+
+    def test_single_line_decl_is_its_own_item(self):
+        code = "public record Point(X: int, Y: int);\nvar p := new Point(1, 2);\n"
+        self.assertEqual(len(cf.split_top_level_items(code)), 2)
+
+    def test_column0_continuation_keywords_stay_with_their_item(self):
+        # `else`/`catch`/`finally` in column 0 continue the statement in
+        # progress; only the absorbed `end` closes it.
+        code = "if c then\n  a();\nelse\n  b();\nend;\nc();\n"
+        self.assertEqual(cf.split_top_level_items(code),
+                         ["if c then\n  a();\nelse\n  b();\nend;\n", "c();\n"])
+
+    def test_leading_blank_and_comment_ride_with_the_next_item(self):
+        code = "\n// note\npublic record P(X: int);\n"
+        self.assertEqual(cf.split_top_level_items(code), [code])
+
+
+class ClassifyTopLevelItemTest(unittest.TestCase):
+    def test_kinds(self):
+        cases = [
+            ("import System.Text;\n", "import"),
+            ("public class A\nend A;\n", "moddecl"),
+            ("public record P(X: int);\n", "moddecl"),
+            ("extension Array<T>\nend;\n", "moddecl"),
+            ("public choice C\n  A;\nend C;\n", "moddecl"),
+            ("public method Log(m: string)\nend Log;\n", "member"),
+            ("private owned _log: FileStream;\n", "member"),
+            ("var x := 1;\n", "stmt"),
+            ("lg.Log(1);\n", "stmt"),
+        ]
+        for code, want in cases:
+            self.assertEqual(cf.classify_top_level_item(code), want, code)
+
+    def test_head_skips_leading_comments_and_blanks(self):
+        self.assertEqual(
+            cf.classify_top_level_item("\n// prose\npublic class A\nend A;\n"),
+            "moddecl")
+
+
+class WrapMixedTest(unittest.TestCase):
+    def test_decls_and_statements_both_land_somewhere_legal(self):
+        # The shape skip rule R7 (`skip:mixed`) declared unwrappable: a type
+        # declaration plus top-level statements in one block.
+        code = ("public class Logger\n  public method Log(n: int) end Log;\nend Logger;\n"
+                "\nvar lg := new Logger();\nlg.Log(1);\n")
+        mode, src = cf.wrap_mixed(code)
+        self.assertEqual(mode, cf.WRAP_STMT)
+        self.assertTrue(src.startswith("module Conf;\n"))
+        # declaration is at module level, before `class W`
+        self.assertLess(src.index("public class Logger"), src.index("class W\n"))
+        # statements are inside Main
+        self.assertLess(src.index("public static method Main()"), src.index("lg.Log(1);"))
+        self.assertLess(src.index("lg.Log(1);"), src.index("end Main;"))
+
+    def test_imports_precede_declarations(self):
+        # SourceFile ::= ModuleDecl Import* TopDecl* (spec Appendix A.1).
+        mode, src = cf.wrap_mixed("public record P(X: int);\nimport System.Text;\nvar p := 1;\n")
+        self.assertLess(src.index("import System.Text;"), src.index("public record P"))
+        self.assertLess(src.index("module Conf;"), src.index("import System.Text;"))
+
+    def test_members_land_in_the_class_not_at_module_level(self):
+        mode, src = cf.wrap_mixed("private _items: Array<int> := new();\nvar xs := 1;\n")
+        self.assertLess(src.index("class W\n"), src.index("private _items"))
+        self.assertLess(src.index("private _items"), src.index("public static method Main()"))
+
+    def test_every_block_token_survives_the_wrap(self):
+        # No token inside the block is rewritten or dropped — the corpus runs
+        # the documents verbatim.
+        code = ("public record P(X: int);\n"
+                "public method M() end M;\n"
+                "import System.Text;\n"
+                "var v := new P(1);\n")
+        _, src = cf.wrap_mixed(code)
+        for line in code.splitlines():
+            self.assertIn(line.strip(), src)
+
+
+class NoteTokensTest(unittest.TestCase):
+    def test_semicolon_separated_tokens(self):
+        self.assertEqual(cf.note_tokens("wrap:mixed; preamble"),
+                         {"wrap:mixed", "preamble"})
+
+    def test_prose_containing_a_keyword_is_not_that_token(self):
+        # `name-collides-with-preamble (…)` must NOT switch the preamble splice
+        # on — exact-token matching, not substring.
+        self.assertNotIn("preamble",
+                         cf.note_tokens("name-collides-with-preamble (Shape/Circle)"))
+
+    def test_empty(self):
+        self.assertEqual(cf.note_tokens(""), set())
+        self.assertEqual(cf.note_tokens(None), set())
+
+
+# -----------------------------------------------------------------------
 # splice_preamble — the awk splice for notes=preamble.
 # -----------------------------------------------------------------------
 

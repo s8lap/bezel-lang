@@ -45,17 +45,17 @@ spec_0042	spec	owned-in-interface-signatures	fragment	compiles
 spec_0043	spec	115-Modifier-order	skip	n/a	skip:elided
 spec_0044	spec	116-Nested-types	fragment	compiles	
 spec_0045	spec	117-Static-classes	fragment	compiles	
-spec_0046	spec	117-Static-classes	skip	n/a	name-collides-with-preamble (Shape/Circle/Square); the `closed` modifier itself compiles since #3052
+spec_0046	spec	117-Static-classes	fragment	compiles	
 spec_0047	spec	118-Static-interface-members	fragment	compiles	
-spec_0048	spec	118-Static-interface-members	skip	n/a	skip:signature-listing
-spec_0049	spec	124-Sealing	skip	n/a	skip:signature-listing (carried spec_0039)
+spec_0048	spec	118-Static-interface-members	fragment	compiles	wrap:mixed
+spec_0049	spec	124-Sealing	fragment	compiles	wrap:mixed; preamble
 spec_0050	spec	125-Abstract-classes-and-members	fragment	compiles	
 spec_0051	spec	126-async-and-abstract	skip	n/a	skip:incomplete-fragment
 spec_0052	spec	127-Type-tests-is-is-not-as	skip	n/a	skip:incomplete-fragment
 spec_0053	spec	127-Type-tests-is-is-not-as	skip	n/a	skip:incomplete-fragment
 spec_0054	spec	128-Constructor-chaining	skip	n/a	skip:signature-listing (carried spec_0044)
 spec_0055	spec	129-Variance	fragment	compiles	
-spec_0056	spec	Variance-and-interface-inheritance	skip	n/a	skip:signature
+spec_0056	spec	Variance-and-interface-inheritance	fragment	compiles	
 spec_0057	spec	132-Top-level-types	fragment	compiles	
 spec_0058	spec	136-Accessor-visibility	skip	n/a	skip:incomplete-fragment
 spec_0059	spec	137-Visibility-and-inheritance	error	diagnose	
@@ -136,17 +136,17 @@ spec_0133	spec	222-Expression-bodied-methods	skip	n/a	skip:incomplete-fragment
 spec_0134	spec	224-Inline-out-declarations	skip	n/a	skip:incomplete-fragment
 spec_0135	spec	224-Inline-out-declarations	skip	n/a	skip:incomplete-fragment
 spec_0136	spec	Nullability-postcondition-on-out-parameters	skip	n/a	skip:signature-listing
-spec_0137	spec	225-Optional-parameters-and-named-arguments	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
+spec_0137	spec	225-Optional-parameters-and-named-arguments	fragment	compiles	wrap:mixed
 spec_0138	spec	Evaluation-timing	skip	n/a	skip:signature-listing (carried spec_0120)
 spec_0139	spec	Practical-pattern	skip	n/a	skip:signature-listing
 spec_0140	spec	Practical-pattern	fragment	compiles	preamble
 spec_0141	spec	Practical-pattern	skip	n/a	skip:incomplete-fragment
 spec_0142	spec	Implicit-conversions-and-tie-breaking	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 spec_0143	spec	Implicit-conversions-and-tie-breaking	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
-spec_0144	spec	Implicit-conversions-and-tie-breaking	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
+spec_0144	spec	Implicit-conversions-and-tie-breaking	fragment	compiles	wrap:mixed
 spec_0145	spec	Implicit-conversions-and-tie-breaking	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 spec_0146	spec	Implicit-conversions-and-tie-breaking	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
-spec_0147	spec	Implicit-conversions-and-tie-breaking	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
+spec_0147	spec	Implicit-conversions-and-tie-breaking	fragment	compiles	wrap:mixed
 spec_0148	spec	227-Constructors	skip	n/a	skip:syntax-snippet (carried spec_0130)
 spec_0149	spec	227-Constructors	fragment	compiles	
 spec_0150	spec	228-Field-initializers	fragment	compiles	preamble
@@ -173,7 +173,7 @@ spec_0170	spec	254-No-user-defined-conversion-operators	fragment	compiles
 spec_0171	spec	261-Declaration	fragment	compiles	
 spec_0172	spec	264-Generic-extensions	fragment	compiles	
 spec_0173	spec	264-Generic-extensions	fragment	compiles	
-spec_0174	spec	2651-Specificity-ordering	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
+spec_0174	spec	2651-Specificity-ordering	fragment	compiles	wrap:mixed
 spec_0175	spec	2651-Specificity-ordering	error	diagnose	
 spec_0176	spec	271-Function-types	fragment	compiles	
 spec_0177	spec	271-Function-types	fragment	compiles	
@@ -222,7 +222,7 @@ spec_0219	spec	Interaction-with-using-var	skip	n/a	blocked-on-#1394 (stdlib-unre
 spec_0220	spec	Detaching-via-a-nullable-field	skip	n/a	blocked-on-#1394 (stdlib-unresolved: Stream)
 spec_0221	spec	Interaction-with-overload-resolution-and-parameter-passing	error	diagnose	
 spec_0222	spec	Interaction-with-overload-resolution-and-parameter-passing	skip	n/a	blocked-on-#1394 (stdlib-unresolved: Stream)
-spec_0223	spec	Trivial-dispose-for-generic-class-instantiations	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
+spec_0223	spec	Trivial-dispose-for-generic-class-instantiations	fragment	compiles	wrap:mixed; preamble
 spec_0224	spec	2810-using-var	fragment	compiles	
 spec_0225	spec	2810-using-var	fragment	compiles	
 spec_0226	spec	Borrowing-collections	fragment	compiles	preamble
@@ -233,7 +233,7 @@ spec_0230	spec	Compatibility-between-borrowing-and-owning-forms	fragment	compile
 spec_0231	spec	2812-Asynchronous-disposal	fragment	compiles	
 spec_0232	spec	2812-Asynchronous-disposal	skip	n/a	skip:incomplete-fragment
 spec_0233	spec	2813-Shared-ownership-SharedT-and-WeakT	skip	n/a	skip:incomplete-fragment
-spec_0234	spec	291-The-protocol	skip	n/a	skip:signature
+spec_0234	spec	291-The-protocol	fragment	compiles	
 spec_0235	spec	292-Desugaring-of-for	skip	n/a	skip:incomplete-fragment
 spec_0236	spec	292-Desugaring-of-for	skip	n/a	skip:incomplete-fragment
 spec_0237	spec	292-Desugaring-of-for	skip	n/a	skip:incomplete-fragment
@@ -256,7 +256,7 @@ spec_0253	spec	Constructing-a-completed-task-with-a-class-typed-result	fragment	
 spec_0254	spec	Idiom-async-resource-acquisition	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 spec_0255	spec	306-Async-lambdas	skip	n/a	blocked-on-#1376 (stdlib-unresolved: HttpClient)
 spec_0256	spec	307-Async-iterators	skip	n/a	skip:incomplete-fragment
-spec_0257	spec	307-Async-iterators	skip	n/a	skip:signature
+spec_0257	spec	307-Async-iterators	fragment	compiles	
 spec_0258	spec	307-Async-iterators	skip	n/a	skip:incomplete-fragment
 spec_0259	spec	Cancellation-in-await-for	skip	n/a	skip:incomplete-fragment
 spec_0260	spec	Async-iteration-with-owned-yields	skip	n/a	skip:incomplete-fragment
@@ -288,7 +288,7 @@ spec_0285	spec	323-Library-specification	fragment	compiles
 spec_0286	spec	324-Calling-conventions	fragment	compiles	
 spec_0287	spec	Boundary-out-and-ref	fragment	compiles	
 spec_0288	spec	326-String-marshalling	skip	n/a	skip:incomplete-fragment
-spec_0289	spec	326-String-marshalling	skip	n/a	skip:stdlib-unresolved (string.FromCStringPointer)
+spec_0289	spec	326-String-marshalling	fragment	compiles	
 spec_0290	spec	327-Pointers-and-IntPtr	skip	n/a	skip:incomplete-fragment
 spec_0291	spec	328-Callbacks	skip	n/a	skip:signature-listing (elided `CompareInts` body `// ...` fails definite-return; #3067's `base`→`basePtr` rename landed at v0.248)
 spec_0292	spec	Capture-bearing-callbacks-the-env-clause	skip	n/a	skip:not-implemented (FFI callback env-slot form, spec §32)
@@ -416,7 +416,7 @@ guide6_0004	guide6	2-How-Bezel-does-it-requires-is-for-caller-bugs-never-trust-	
 guide6_0005	guide6	2-How-Bezel-does-it-requires-is-for-caller-bugs-never-trust-	skip	n/a	skip:incomplete-fragment
 guide6_0006	guide6	3-ensures-and-old-naming-what-you-guarantee-back	skip	n/a	blocked-on-#2942 (ensures result/old not yet implemented)
 guide6_0007	guide6	3-ensures-and-old-naming-what-you-guarantee-back	skip	n/a	blocked-on-#2942 (ensures result/old not yet implemented)
-guide6_0008	guide6	6-The-pure-signature-and-body	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
+guide6_0008	guide6	6-The-pure-signature-and-body	fragment	compiles	wrap:mixed
 guide6_0009	guide6	6-The-pure-signature-and-body	skip	n/a	blocked-on-#3051 (docs-ahead: pure-body for elision, v0.244)
 guide6_0010	guide6	6-The-pure-signature-and-body	error	diagnose	
 guide6_0011	guide6	7-What-pure-buys	skip	n/a	skip:incomplete-fragment
@@ -437,7 +437,7 @@ stdlib_0012	stdlib	211-Subscription	skip	n/a	skip:incomplete-fragment (carried s
 stdlib_0013	stdlib	212-BitConverter	skip	n/a	skip:signature
 stdlib_0014	stdlib	213-The-Type-class	skip	n/a	skip:signature
 stdlib_0015	stdlib	213-The-Type-class	skip	n/a	skip:signature-listing (carried stdlib_0013)
-stdlib_0016	stdlib	214-Serialization-vocabulary	skip	n/a	skip:signature
+stdlib_0016	stdlib	214-Serialization-vocabulary	fragment	compiles	
 stdlib_0017	stdlib	214-Serialization-vocabulary	fragment	compiles	chained:1
 stdlib_0018	stdlib	214-Serialization-vocabulary	skip	n/a	skip:signature-listing (carried stdlib_0016)
 stdlib_0019	stdlib	214-Serialization-vocabulary	skip	n/a	skip:incomplete-fragment (carried stdlib_0017)
@@ -451,12 +451,12 @@ stdlib_0026	stdlib	215-Concrete-serialization-formats	skip	n/a	skip:signature
 stdlib_0027	stdlib	215-Concrete-serialization-formats	skip	n/a	skip:signature
 stdlib_0028	stdlib	215-Concrete-serialization-formats	skip	n/a	skip:signature-listing
 stdlib_0029	stdlib	215-Concrete-serialization-formats	skip	n/a	skip:syntax-snippet (carried stdlib_0025)
-stdlib_0030	stdlib	215-Concrete-serialization-formats	skip	n/a	skip:signature
+stdlib_0030	stdlib	215-Concrete-serialization-formats	fragment	compiles	
 stdlib_0031	stdlib	216-SharedT-and-WeakT	skip	n/a	skip:signature
 stdlib_0032	stdlib	216-SharedT-and-WeakT	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 stdlib_0033	stdlib	217-Built-in-exception-types-cross-reference	fragment	compiles	
 stdlib_0034	stdlib	218-IFormattable-and-format-specifiers-v0172-8121339	fragment	compiles	
-stdlib_0035	stdlib	219-INumberT-ISteppableT-IParsableT-v0176-807	skip	n/a	skip:signature
+stdlib_0035	stdlib	219-INumberT-ISteppableT-IParsableT-v0176-807	fragment	compiles	
 stdlib_0036	stdlib	220-ResultT-E-v0200	skip	n/a	skip:signature-listing
 stdlib_0037	stdlib	220-ResultT-E-v0200	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 stdlib_0038	stdlib	220-ResultT-E-v0200	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
@@ -464,8 +464,8 @@ stdlib_0039	stdlib	220-ResultT-E-v0200	skip	n/a	blocked-on-#3056 (docs-ahead: mo
 stdlib_0040	stdlib	31-StringBuilder	skip	n/a	skip:signature
 stdlib_0041	stdlib	32-Encoding	skip	n/a	skip:signature
 stdlib_0042	stdlib	33-ReadOnlyStringSpan	skip	n/a	skip:signature-listing
-stdlib_0043	stdlib	41-Borrowing-collection-interfaces	skip	n/a	skip:signature
-stdlib_0044	stdlib	42-Owning-collection-interfaces	skip	n/a	skip:signature
+stdlib_0043	stdlib	41-Borrowing-collection-interfaces	fragment	compiles	
+stdlib_0044	stdlib	42-Owning-collection-interfaces	fragment	compiles	
 stdlib_0045	stdlib	43-How-the-borrowing-and-owning-hierarchies-relate	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 stdlib_0046	stdlib	44-ArrayT	skip	n/a	skip:signature
 stdlib_0047	stdlib	45-OwningArrayT	skip	n/a	skip:signature
@@ -484,10 +484,10 @@ stdlib_0059	stdlib	Reference-implementation	skip	n/a	skip:incomplete-fragment
 stdlib_0060	stdlib	410-SetT-and-OwningSetT	skip	n/a	skip:signature
 stdlib_0061	stdlib	410-SetT-and-OwningSetT	skip	n/a	skip:incomplete-fragment
 stdlib_0062	stdlib	411-StackT-OwningStackT-QueueT-and-OwningQueueT	skip	n/a	skip:signature
-stdlib_0063	stdlib	412-Borrowing-enumeration-interfaces	skip	n/a	skip:signature
-stdlib_0064	stdlib	412-Borrowing-enumeration-interfaces	skip	n/a	skip:signature
-stdlib_0065	stdlib	413-Owning-enumeration-interfaces	skip	n/a	skip:signature
-stdlib_0066	stdlib	413-Owning-enumeration-interfaces	skip	n/a	skip:signature
+stdlib_0063	stdlib	412-Borrowing-enumeration-interfaces	fragment	compiles	
+stdlib_0064	stdlib	412-Borrowing-enumeration-interfaces	fragment	compiles	
+stdlib_0065	stdlib	413-Owning-enumeration-interfaces	fragment	compiles	
+stdlib_0066	stdlib	413-Owning-enumeration-interfaces	fragment	compiles	
 stdlib_0067	stdlib	OwningBufferT	skip	n/a	skip:signature
 stdlib_0068	stdlib	OwningBufferT	skip	n/a	skip:signature
 stdlib_0069	stdlib	SpanT	skip	n/a	skip:signature-listing
@@ -499,7 +499,7 @@ stdlib_0074	stdlib	Byte-buffer-accessors	fragment	compiles
 stdlib_0075	stdlib	Byte-buffer-accessors	fragment	compiles	
 stdlib_0076	stdlib	ArraySpanT	skip	n/a	skip:signature-listing
 stdlib_0077	stdlib	ReadOnlyArraySpanT	skip	n/a	skip:signature-listing
-stdlib_0078	stdlib	416-IReadOnlySpanTElement	skip	n/a	skip:signature
+stdlib_0078	stdlib	416-IReadOnlySpanTElement	fragment	compiles	
 stdlib_0079	stdlib	416-IReadOnlySpanTElement	skip	n/a	skip:signature-listing
 stdlib_0080	stdlib	417-SortedDictionaryK-V-added-in-v0136	skip	n/a	skip:signature
 stdlib_0081	stdlib	418-SortedSetT-added-in-v0136	skip	n/a	skip:signature
