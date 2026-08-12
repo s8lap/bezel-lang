@@ -51,8 +51,11 @@
 // The disposal set on that edge is unchanged, only RELOCATED: pre-fix the guard's
 // throw site disposed [savedDepth, thisTryDepth) itself; post-fix it stops at
 // thisTryDepth and finUnwindBB's `emitUnwindDisposalsInRange(savedDepth,
-// thisTryDepth)` disposes exactly that range AFTER the finally body — the §28.3
-// finally-first ordering.  The superseded exception's single free is unchanged
+// thisTryDepth)` disposes exactly that range AFTER the finally body.  Those are
+// the scopes established BEFORE the try, which §28.10 (v0.252) puts after the
+// finally; the try BODY's own scope is not among them — it is established after
+// the finally and was disposed at the ORIGINAL throw site, before the guard even
+// ran (#2892).  The superseded exception's single free is unchanged
 // too: it is performed at the guard's own throw / pending-check site by the
 // #1108 / #1216 path, which fires iff `caughtExcArmTarget_` equals the throw's
 // resolved unwind target — both are derived from `unwindTarget_`, so they still
@@ -259,22 +262,23 @@ BEZEL_TEST(finally_throwing_guard_2881,
                  "    if Src._dtor <> 20 then bad := bad + 8; end if; "))), 0);
 }
 
-// EDGE CONSISTENCY (not a normative ordering claim). The guard-throw edge must
-// interleave the `finally` body and the try body's implicit disposal exactly as
-// the try's OTHER exception edges do — both now route through the same
-// `finUnwindBB`, which runs the finally body and then
-// `emitUnwindDisposalsInRange`. The oracle compares the guard-throw sequence
-// against the unmatched-arm sequence of the identical try (1 = finally body,
-// 2 = the body local's destructor), so a future change to that shared
-// interleave moves both together or fails here. Pre-fix the guard edge produced
-// 2 (the finally never ran) against the unmatched edge's 12.
+// EDGE CONSISTENCY. The guard-throw edge must interleave the `finally` body and
+// the try body's implicit disposal exactly as the try's OTHER exception edges do.
+// The oracle compares the guard-throw sequence against the unmatched-arm sequence
+// of the identical try (1 = finally body, 2 = the body local's destructor), so a
+// change to that shared interleave moves both together or fails here. Pre-#2881
+// the guard edge produced 2 (the finally never ran) against the unmatched edge's
+// 12.
 //
-// (The tree's interleave for BOTH edges is finally-then-dispose, pinned since
-// #1263 by finally_before_autodispose_1263. Whether that is what §28.3/§28.10's
-// reverse-establishment rule requires for a `finally` established at try entry
-// and a local declared inside the body is a separate, pre-existing question —
-// filed, not decided here. This test deliberately asserts only that the two
-// edges agree, plus the value the tree currently produces.)
+// THE VALUE, AND WHY IT MOVED. The open question this test flagged — "whether
+// finally-then-dispose is what §28.3/§28.10's reverse-establishment rule requires
+// for a `finally` established at try entry and a local declared inside the body"
+// — was #2892, and it is now decided: §28.10 and §31.2 (v0.252) both state that a
+// `try`'s own `finally` is established at ENTRY to the protected block, so a body
+// local established later is disposed BEFORE it. Both edges therefore moved
+// together, exactly as this test's consistency claim predicted: 12 -> 21
+// (destructor, then finally body). The consistency claim itself is untouched.
+// See tests/codegen/finally_established_at_try_entry_2892_test.cpp.
 BEZEL_TEST(finally_throwing_guard_2881,
            guard_throw_edge_interleaves_like_the_unmatched_edge_2881) {
     const char* kSeqPrelude =
@@ -315,7 +319,7 @@ BEZEL_TEST(finally_throwing_guard_2881,
         "    end; "
         "    return Seq._seq; "
         "  end Main; "
-        "end C;"), 12);
+        "end C;"), 21);
     // Edge B: no arm matches at all — the reference interleave, unchanged by
     // this fix and green before it.
     BEZEL_EXPECT_EQ(runPlain(std::string(kSeqPrelude) +
@@ -341,7 +345,7 @@ BEZEL_TEST(finally_throwing_guard_2881,
         "    end; "
         "    return Seq._seq; "
         "  end Main; "
-        "end C;"), 12);
+        "end C;"), 21);
 }
 
 // §31.2.1 (v0.240) — "it is not caught by a later arm of the same `try`": a

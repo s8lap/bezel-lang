@@ -306,15 +306,22 @@ BEZEL_TEST(fresh_receiver_temp_unwind_2816,
     BEZEL_EXPECT_EQ(run(src), 0);
 }
 
-// §28.3 "the explicit finally runs first … then the implicit auto-dispose runs
-// as the scope unwinds further": with a `finally` and NO catch, lowerTry defers
-// the try body's disposal scope to `finUnwindBB`, which is emitted after the
-// whole body.  This is why the discharge is a runtime null rather than an
-// erasure of the registration — an erasure at the reclaim would be gone by the
-// time that deferred pass is emitted.  (The try-with-`finally`-AND-a-MATCHING-
-// catch-arm edge is a SEPARATE, pre-existing lowerTry defect that skips EVERY
-// `unwindOnly` entry in the body scope, temporaries and named owned locals
-// alike; it is filed on its own and is deliberately not asserted here.)
+// §28.10 (v0.252): the same shape with a `finally` and NO catch.  The oracle
+// here is the LEAK count (`Src._live` must be 0 and the finally must have run 20
+// times), not an ordering — the fresh receiver temporary is disposed exactly
+// once on the exception edge either way.  The discharge is a runtime null rather
+// than an erasure of the registration precisely because the disposal is emitted
+// on a block other than the reclaim site, so an erasure at the reclaim would be
+// gone by the time that block is emitted.
+//
+// (Two stale notes corrected here.  The comment used to quote §28.3's "the
+// explicit finally runs first … then the implicit auto-dispose runs as the scope
+// unwinds further", a sentence the document no longer contains: #2892 ruled
+// (v0.241) that a `try`'s own `finally` is established at ENTRY to the protected
+// block, so the body scope is now unwind-disposed at the THROW SITE, not deferred
+// past the finally.  And the try-with-`finally`-AND-a-matching-catch-arm defect
+// it flagged as filed-separately was #2869, fixed at v0.240 and now closed
+// structurally by #2892 — see finally_caught_arm_unwind_disposal_2869_test.cpp.)
 BEZEL_TEST(fresh_receiver_temp_unwind_2816,
            finally_without_catch_disposed_spec_28_3) {
     std::string src = std::string(kSrc) +

@@ -17,10 +17,11 @@
 //     The implicit auto-dispose composes with explicit `finally` blocks on the
 //     single establishment-ordered cleanup stack of §28.10
 //
-// THE DEFECT.  For a try WITH a `finally`, lowerTry deliberately pushes the try
+// THE DEFECT (as it stood at v0.240 — the mechanism was retired by #2892, below).
+// For a try WITH a `finally`, lowerTry deliberately pushed the try
 // body's disposal scope BELOW `unwindScopeDepth_` (#1263), so a throw inside the
-// body does NOT dispose that scope at the throw site — the disposal is deferred
-// to one of the finally's post-body dispatch blocks, which is what makes the
+// body did NOT dispose that scope at the throw site — the disposal was deferred
+// to one of the finally's post-body dispatch blocks, which is what made the
 // explicit `finally` run first.  Three of those blocks reached the body scope on
 // the UNWIND path (`emitUnwindDisposalsInRange`, isUnwind=true) and were correct.
 // The fourth — the edge a catch arm of THIS try leaves by after handling the
@@ -52,22 +53,28 @@
 //   `finally` / genuine normal fall-through / discharge-then-throw /
 //   owned-argument transfer-then-throw   — ALL already correct, and must stay so.
 //
-// THE FIX.  `isUnwind` conflated two questions that diverge on exactly this
-// edge: "did this scope's owned locals miss their discharge point?" (what
-// `unwindOnly`/`releaseOnUnwindOnly` ask) and "is an exception in flight right
-// now?" (what `caughtException`, `asyncDispose`, `taskScope` and #2334's
+// THE FIX (as shipped for #2869, since SUPERSEDED — see below).  `isUnwind`
+// conflated two questions that diverge on exactly this edge: "did this scope's
+// owned locals miss their discharge point?" (what `unwindOnly` /
+// `releaseOnUnwindOnly` ask) and "is an exception in flight right now?" (what
+// `caughtException`, `asyncDispose`, `taskScope` and #2334's
 // `skipCellFreeOnUnwind` ask).  `emitDisposals` gained a separate
-// `undischargedOwned` parameter answering only the first, so the missing
-// disposals fire without degrading an `await using var` to its synchronous
-// fallback or leaking a #2334 boxed cell.  lowerTry then marks the try body's
-// scope index in `unwoundBodyScopes_` while the catch arms are lowered (covering
-// every `return`/`break`/`continue`/labeled/async exit site, which all route
-// through `emitDisposalsInRange`), and a new exit mode 6 — stored by a catch
-// arm's fall-through — selects a dispatch block that disposes the body scope the
-// same way, AFTER the finally body, at the same point mode 0 already disposes the
-// auto-drop entries.  Mode 0 keeps its old isUnwind=false pass, so a genuine
-// normal fall-through still skips `unwindOnly`; disposing there would be a DOUBLE
-// dispose of a local the program discharged itself.
+// `undischargedOwned` parameter answering only the first; lowerTry marked the try
+// body's scope index in `unwoundBodyScopes_` while the catch arms were lowered,
+// and a new exit mode 6 disposed the body scope after the finally body.
+//
+// SUPERSEDED BY #2892 (§28.10 / §31.2, v0.241).  All of that machinery existed
+// only because #1263 kept the body scope on the dispose stack past the finally,
+// which the owner ruling retired: a `try`'s own `finally` is established at entry
+// to the protected block, so the body scope is unwind-disposed AT THE THROW SITE
+// and popped before any arm is lowered.  The divergence has no edge left to live
+// on, and the #2869 gap is closed STRUCTURALLY rather than by recovery — nothing
+// emitted after the throw can name the body scope, so its `unwindOnly` entries
+// can neither be skipped (the leak) nor fired twice (the double dispose).  The
+// `undischargedOwned` parameter, `unwoundBodyScopes_` and mode 6 were removed
+// with the ruling.  Every leak/double-dispose oracle below is unchanged and
+// still fails if either direction regresses; only the ORDERING pin moved (213 ->
+// 321, at the end of this file).
 //
 // THE ORACLE IS A LIVE-OBJECT COUNTER, NOT "NO LEAK".  The direction this fix can
 // break is a double dispose, which LeakSanitizer cannot see.  Every program below
@@ -82,7 +89,6 @@
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
-using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
 namespace {
@@ -94,11 +100,20 @@ int run(const std::string& program) {
     return r.ran ? r.exitCode : -999;
 }
 
-// Plain AOT (no LSan exit-code override) — for the ordering oracle, whose
-// observable is a sequence value rather than a leak.
-int runPlain(const std::string& program) {
-    auto r = runAot(program);
-    return r.ran ? r.exitCode : -999;
+// The ordering oracle's VALUE CHANNEL. Its observable is a sequence value, and
+// since the #2892 re-derivation that value (321) exceeds the 8-bit exit-code
+// ceiling — a process exit status is masked to WEXITSTATUS, so it must travel on
+// stdout (tests/README.md). Still ASan/LSan-instrumented, so a leak or double
+// dispose shows up as "<did-not-run>" rather than as a shifted digit.
+std::string runOrderingOut(const std::string& program) {
+    auto r = runAotChecked(program);
+    if (!r.ran) return std::string("<did-not-run>");
+    std::string out = r.stdoutText;
+    if (!out.empty() && out.back() == '\n') {
+        out.pop_back();
+        if (!out.empty() && out.back() == '\r') out.pop_back();
+    }
+    return out;
 }
 
 // `Src` counts live instances AND destructor runs, so the oracle distinguishes a
@@ -476,18 +491,27 @@ BEZEL_TEST(finally_caught_arm_unwind_2869,
 }
 
 // ===========================================================================
-// ORDERING — WHERE the recovered disposal runs.  #1263 pinned that with a
-// matching catch AND a finally the order is catch, then finally, then the body's
-// implicit auto-dispose (its `catch_then_finally_then_autodispose_spec_28_3`
-// case, whose locals are auto-drop `dynamicDispose` entries).  The recovered
-// `unwindOnly` disposal joins that same point, so the DISCHARGED spelling now
-// orders identically to the undischarged one: catch=2, finally=1, dtor=3 -> 213.
-// Pre-fix this was 21 (the destructor never ran at all).
+// ORDERING — WHERE the recovered disposal runs.
+//
+// RE-DERIVED for #2892 (§28.10 / §31.2, v0.241; text current at v0.252): "A
+// `try` statement's own `finally` is established at entry to the protected
+// block ... an owned local or `using var` declared inside the protected block
+// (established later) is disposed before the `finally` runs" on every exit edge.
+// The body local is therefore disposed as the exception leaves the protected
+// block — before the arm that handles it and before the finally: dtor=3,
+// catch=2, finally=1 -> 321.  It is still the same single disposal this file
+// exists to prove happens (pre-#2869 the destructor never ran at all, giving
+// 21); only its POSITION moved, from after the finally to before the arm.
+//
+// The value pinned between #2869 and #2892 was 213 (catch, finally, dtor),
+// matching #1263's retired `catch_then_finally_then_autodispose` ordering; that
+// ordering was ruled against in v0.241 and the whole family re-derived in
+// tests/codegen/finally_established_at_try_entry_2892_test.cpp.
 // ===========================================================================
 
 BEZEL_TEST(finally_caught_arm_unwind_2869,
-           recovered_disposal_runs_after_the_finally_spec_28_3) {
-    BEZEL_EXPECT_EQ(runPlain(
+           recovered_disposal_runs_before_the_finally_spec_28_10) {
+    BEZEL_EXPECT_EQ(runOrderingOut(
         "module M; "
         "class R "
         "  private _v: int := 5; "
@@ -513,9 +537,10 @@ BEZEL_TEST(finally_caught_arm_unwind_2869,
         "    finally "
         "      C._seq := C._seq * 10 + 1; "
         "    end; "
-        "    return C._seq; "
+        "    Console.WriteLine(C._seq); "
+        "    return 0; "
         "  end Main; "
-        "end C;"), 213);
+        "end C;"), "321");
 }
 
 // ===========================================================================

@@ -1367,8 +1367,14 @@ void Emitter::emitUnwindDisposalsInRange(std::size_t lo, std::size_t hi) {
     // BETWEEN the inner try and the enclosing handler (e.g. an outer `using var`
     // declared in the same block as, but textually before, the inner try) is
     // still live and must be disposed here — AFTER the explicit finally body, as
-    // the scope unwinds further outward (§28.3: "the explicit finally runs first
-    // ... then the implicit auto-dispose runs as the scope unwinds further").
+    // the scope unwinds further outward (§28.10, v0.252: the finally is
+    // "established at entry to the protected block", so "cleanups established
+    // before the `try` run after the `finally`"; the body's OWN scope is not in
+    // this range — it was established after the finally and is disposed at the
+    // throw site).  (This comment previously quoted a §28.3 sentence — "the
+    // explicit finally runs first ... then the implicit auto-dispose runs as the
+    // scope unwinds further" — that no longer exists; #2892 ruled on which
+    // establishment point it had meant.)
     // All entries are disposed on the isUnwind path; caughtException entries are
     // skipped — they stay in flight for the enclosing handler.
     for (std::size_t i = hi; i-- > lo;)
@@ -2682,16 +2688,18 @@ bool Emitter::freshNewReceiverTempEligible(const ast::Expr* recvExpr,
 // whether a given temporary is covered.
 //
 // WHY THE DISCHARGE IS RUNTIME AND NOT AN ERASURE OF THE ENTRY. An erasure at
-// the reclaim would be cheaper IR, and was the first draft — but it silently
-// loses the try-WITH-`finally` shape: lowerTry pushes the try body's disposal
-// scope BELOW `unwindScopeDepth_` on purpose (#1263, §28.3's "the explicit
-// finally runs first … then the implicit auto-dispose runs as the scope unwinds
-// further"), so that scope's unwind pass is emitted LATER, at `finUnwindBB` —
-// after the whole body, and therefore after the reclaim would have erased the
-// entry. MEASURED: the erasing draft left the `finally` spelling of the issue's
-// own repro leaking all 20 receivers while every non-`finally` spelling was
-// clean. The runtime null is edge-order-independent, so it covers the deferred
-// pass too.
+// the reclaim would be cheaper IR, and was the first draft — but an erasure is a
+// COMPILE-TIME removal, so it only covers disposal passes emitted after it, and
+// this entry's passes are not all emitted in program order. When #2816 measured
+// it, the shape that broke was try-WITH-`finally`: lowerTry then pushed the try
+// body's disposal scope below `unwindScopeDepth_` (#1263), deferring its unwind
+// pass to `finUnwindBB` — emitted after the whole body, hence after the reclaim
+// had erased the entry — and the erasing draft leaked all 20 receivers on that
+// spelling while every non-`finally` spelling was clean. That particular
+// deferral is gone (#2892, §28.10 v0.241: the finally is established at
+// protected-block entry, so the body scope is unwind-disposed at the throw
+// site), but the argument for the runtime null is not: it is edge-order-
+// independent, so it stays correct no matter which block a given pass lands on.
 //
 // The slot is `entryAllocaNullPtr` (#2733), NOT a bare `entryAlloca`: a disposal
 // pass can be reached on a path that never executed the production store (a
@@ -3782,19 +3790,15 @@ void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
 }
 
 
-void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind,
-                            bool undischargedOwned) {
-    // fix #2869 / §28.3 "Exception-path discharge" (v0.240): the predicate for the
-    // UNWIND-EXCLUSIVE entries (`unwindOnly`, `releaseOnUnwindOnly`) is "the owned
-    // local never reached its static discharge point", NOT "an exception is in
-    // flight right now". Those coincide on every edge except the one a catch arm
-    // of a try-WITH-`finally` leaves after handling the exception: the try body
-    // WAS left by the throw, so its owned locals are undischarged, but no
-    // exception is in flight any more. `undischargedOwned` is that first question
-    // asked on its own; every other isUnwind-gated behavior below (caughtException
-    // stays in flight, asyncDispose/taskScope lose their `await`, #2334's
-    // skipCellFreeOnUnwind) keeps asking the second and so keeps reading isUnwind.
-    const bool dropUndischarged = isUnwind || undischargedOwned;
+void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
+    // fix #2892 / §28.10 (v0.241): the UNWIND-EXCLUSIVE entries (`unwindOnly`,
+    // `releaseOnUnwindOnly`) fire when the scope's owned locals never reached
+    // their static discharge point, which — now that a `try`'s finally is
+    // established at protected-block entry and so no longer defers its body
+    // scope's disposal past itself — coincides with `isUnwind` on every edge.
+    // (#2869 needed a separate `undischargedOwned` question for the one edge where
+    // they diverged; see the declaration in LlvmBackend_impl.hpp.)
+    const bool dropUndischarged = isUnwind;
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
         // fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): an
         // awaited Pattern A `Task<T:class>` temporary produced by an anonymous
@@ -5290,19 +5294,9 @@ void Emitter::emitDisposalsInRange(std::size_t lo, std::size_t hi) {
     // skipped. A `return` routing through a `finally` uses this to dispose only
     // the try-body scopes before the finally and, in the finally's normal-exit
     // dispatch, the enclosing scopes after it — reverse establishment order.
-    //
-    // fix #2869 / §28.3 "Exception-path discharge" (v0.240): a scope listed in
-    // unwoundBodyScopes_ is a try body scope control ALREADY left by an exception
-    // (a catch arm of that same try is handling it), so its `unwindOnly` /
-    // `releaseOnUnwindOnly` entries — §28.3's auto-dispose of owned locals that
-    // never reached a discharge point — must fire even though this edge is not an
-    // unwind. Passing it as `undischargedOwned` rather than as `isUnwind` keeps
-    // caughtException / asyncDispose / taskScope / skipCellFreeOnUnwind on their
-    // existing normal-edge behavior (no `await` is lost, no boxed cell leaks).
     if (hi > disposeStack_.size()) hi = disposeStack_.size();
     for (std::size_t i = hi; i-- > lo;)
-        emitDisposals(disposeStack_[i], /*isUnwind=*/false,
-                      /*undischargedOwned=*/scopeLeftByException(i));
+        emitDisposals(disposeStack_[i], /*isUnwind=*/false);
 }
 
 
