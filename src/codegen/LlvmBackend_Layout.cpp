@@ -99,6 +99,39 @@ bool Emitter::isCharTargetExpr(const ast::Expr& e) {
 
 
 llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
+    // fix #3090 (§12.7 / §8.6, v0.252): a §12.7 value-narrowed identifier
+    // denotes the boxed VALUE, so its address is the box payload — not the
+    // `Object` slot, whose bytes are the box POINTER. Checked FIRST, ahead of
+    // the ref-param and local-slot arms, because those are exactly the arms
+    // that would otherwise hand back the reference slot: `o[0]` inside
+    // `if o is [3]int then … end` reached the inline-array arm below with
+    // `elemTy == ptr`, failed its `dyn_cast<ArrayType>`, and the whole read
+    // dropped (#3079's "argument failed to lower" note, or #2434's
+    // zero-initialized slot). Declines — returning nullptr — for every read
+    // that is not one, so no other lvalue changes.
+    //
+    // A direct reassignment `o := …` cannot reach this arm: §12.7's
+    // "Reassignment within the controlled block invalidates the narrowing" is
+    // implemented in sema by erasing the narrowing BEFORE the assignment
+    // target is visited (ExprTypecheck.cpp's AssignmentStmt arm), so the
+    // target identifier carries its declared `Object` type and the predicate
+    // declines. A `ref`/`out` argument is likewise erased (#1188).
+    //
+    // A write THROUGH the narrowed binding (`o[0] := 9`, whose lvalue chain is
+    // rooted here) does reach this arm, and lands in the box payload — coherent
+    // (readable back through the same binding) but not something §12.7 or §8.6
+    // decides; §23.5 rejects the structurally identical indexer-result shape.
+    // Recorded as a spec question rather than settled in code: **#3117**.
+    //
+    // ⚠ NOTE FOR THE NEXT READER: this arm EMITS IR (one `load` of the slot and
+    // one `GEP`) before the pure-lookup arms below, so `lvalueAddr` is no longer
+    // side-effect-free to ask "is this an lvalue?" of. It is harmless — the load
+    // reads the slot the un-narrowed read would have read anyway and never
+    // dereferences the box, so a caller that discards the answer leaves dead but
+    // valid instructions, and LLVM CSEs duplicates from repeated queries on the
+    // same operand. It fires only for a §12.7 value-narrowed identifier; every
+    // other target returns nullptr before any instruction is built.
+    if (llvm::Value* p = narrowedBoxPayloadAddr(target, elemTy)) return p;
     // CG50: a ref/out parameter — its address is the incoming pointer.
     if (llvm::Value* a = refParamAddr(target, elemTy)) return a;
     if (llvm::AllocaInst* slot = localSlot(target)) {
@@ -2373,7 +2406,36 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // double free), and what the filed residuals track.
     llvm::Value* savedBoxMint = lastBoxMint_;
     lastBoxMint_ = nullptr;
+    // fix #3090 (§12.7 / §8.6, v0.252): a type test whose operand is a BARE
+    // IDENTIFIER lowers that identifier as its §8.6 BOX, never as its
+    // §12.7-narrowed value — §12.7: "the operation inspects the runtime type tag
+    // without moving from the operand", and that tag is the wrapper's vtable
+    // word. Without the suppression a NESTED test (`if o is int then … o is T
+    // … end`) handed `emitIsA` an `i32` and walked a descriptor chain off it. The
+    // answer is unchanged either way (a narrowed `o` and its box carry the same
+    // runtime type), so that position keeps its pre-fix lowering exactly.
+    //
+    // GATED on the identifier shape, and the gate is LOAD-BEARING rather than
+    // tidiness: the flag suppresses for the whole lowering it brackets, so an
+    // ungated increment also silenced the unbox for a narrowed identifier nested
+    // INSIDE a compound operand — `if o is int then if Take(o) is Foo then … end;
+    // end;` handed a `ptr` to an `i32` parameter and failed IR verification.
+    // Sema accepts that program only BECAUSE this fix widened the narrowing, so
+    // the crash shape would have been a new one. A bare identifier is also the
+    // only shape `narrowedIdentDeclaredType` — the classification half this
+    // suppression must stay in step with — can answer for at all, so both halves
+    // now key on exactly the same condition.
+    //
+    // The gate does NOT weaken the case the classification half exists for: in
+    // `if ostr is string and not (ostr is decimal) then …` the inner test's
+    // operand IS the bare identifier `ostr`, so the suppression still applies
+    // there and #2793's sweep still reads 4095. The two requirements are
+    // disjoint, not in tension.
+    const bool suppressOperandUnbox =
+        dynamic_cast<const ast::IdentifierExpr*>(te.operand.get()) != nullptr;
+    if (suppressOperandUnbox) ++narrowedUnboxSuppressed_;
     llvm::Value* obj = lowerExpr(*te.operand);
+    if (suppressOperandUnbox) --narrowedUnboxSuppressed_;
     const bool freshBoxTemp =
         obj && obj->getType()->isPointerTy() &&
         ((lastBoxMint_ && obj == lastBoxMint_) ||
@@ -2426,12 +2488,29 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                 " (a value type reaching an Object/interface location must be "
                 "boxed, §8.6) — #2775");
     };
+    // fix #3090 (§12.7 / §8.6, v0.252): the operand's type AS LOWERED HERE. The
+    // suppression above lowered a §12.7-narrowed identifier as its §8.6 box /
+    // declared reference, so every classification below must read the DECLARED
+    // type, not the narrowed one — otherwise the two disagree and the decisions
+    // are made about a value that was never produced. This was a live SIGSEGV:
+    // after `if ostr is string and not (ostr is decimal) then …`, the second
+    // conjunct's `ostr` types as `string`, so `mightHoldString` answered FALSE
+    // for an operand that is exactly a bare vtable-less `bz_string*` and emitIsA
+    // walked its `char* data` as a descriptor chain (MEASURED: #2793's
+    // `other_primitive_boxes_are_unchanged` sweep, 4095 -> core dump).
+    // `narrowedIdentDeclaredType` declines for every non-narrowed operand, so
+    // this is `ctx_.exprType` everywhere else.
+    auto operandStaticTy = [&]() -> const sema::TypeRef* {
+        if (const sema::TypeRef* d = narrowedIdentDeclaredType(*te.operand))
+            return d;
+        return ctx_.exprType(*te.operand);
+    };
     // True when the OPERAND is statically a reference location (Object or an
     // interface): sema has already promised a pointer, so a non-pointer lowered
     // value is by construction a producer that failed to establish the §8.6
     // boxed representation.
     auto operandIsReferenceLocation = [&]() {
-        const sema::TypeRef* opTy = ctx_.exprType(*te.operand);
+        const sema::TypeRef* opTy = operandStaticTy();
         return opTy && isObjectOrInterfaceTarget(opTy);
     };
     // §8.6 / §12.7 (#417): `is string` / `as string`. A string stored in an
@@ -2559,7 +2638,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (!obj->getType()->isPointerTy()) {
         // Only the nullable-VALUE-type struct case is handled here (nullable
         // CLASS types lower to ptr and never reach this branch).
-        const sema::TypeRef* operandTy = ctx_.exprType(*te.operand);
+        const sema::TypeRef* operandTy = operandStaticTy();  // fix #3090
         if (operandTy && isNullableValueTy(operandTy) &&
             obj->getType()->isStructTy()) {
             llvm::Value* hasVal = nullablePrimHasValue(obj);  // i1
@@ -2583,7 +2662,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // bz_obj_is_string: a string yields isA=false (`is`→false, `is not`→true,
     // `as`→null) and only a genuine box/class runs the descriptor walk.
     bool mightHoldString = false;
-    if (const sema::TypeRef* opTy = ctx_.exprType(*te.operand)) {
+    if (const sema::TypeRef* opTy = operandStaticTy()) {  // fix #3090
         if (opTy->kind == sema::TypeRef::Kind::Primitive &&
             opTy->primitive == sema::PrimitiveType::Object) {
             mightHoldString = true;
@@ -2957,6 +3036,97 @@ llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
     // (which would mean it was lowered as a reference — leave it alone).
     if (v->getType()->isPointerTy() && !isNullableValueTy(srcTy)) return v;
     return boxValue(v, srcTy);
+}
+
+
+// fix #3090 (§12.7 / §8.6, v0.252). See the declaration comment in
+// LlvmBackend_impl.hpp for the mechanism and why the gate is a positive
+// conjunction.
+const sema::TypeRef* Emitter::narrowedIdentDeclaredType(const ast::Expr& e) {
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id || id->name == "this" || id->name == "base") return nullptr;
+    sema::Symbol* sym = ctx_.exprSymbol(e);
+    if (!sym) return nullptr;
+    // §12.7 narrows only SIMPLE VARIABLES — "Narrowing applies to the original
+    // variable" — which sema keys by LocalSymbol / ParameterSymbol
+    // (narrowFromTypeTest). Anything else (a field, a property, a static) is not
+    // a narrowing site at all, so it is not a narrowed read either.
+    const sema::TypeRef* declTy = nullptr;
+    if (auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym)) {
+        declTy = ls->declType;
+    } else if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
+        declTy = ps->resolvedDeclType;
+        if (!declTy && ps->declType) declTy = ctx_.resolvedType(*ps->declType);
+    } else {
+        return nullptr;
+    }
+    // Only an `Object`/interface DECLARED location holds a §8.6 box (or, for a
+    // string/class source, the bare pointer that IS the value — #399/#1071). A
+    // local declared at the value type itself already stores the value directly.
+    if (!isObjectOrInterfaceTarget(declTy)) return nullptr;
+    const sema::TypeRef* nt = ctx_.exprType(e);
+    if (!nt || nt == declTy) return nullptr;
+    // Narrowing from `Object` to an INTERFACE leaves the operand classified as a
+    // reference either way, so there is nothing to correct and the published type
+    // is the more precise one — leave those callers reading it.
+    if (isObjectOrInterfaceTarget(nt)) return nullptr;
+    return declTy;
+}
+
+
+const sema::TypeRef* Emitter::narrowedBoxedValueTypeOf(const ast::Expr& e) {
+    if (narrowedUnboxSuppressed_) return nullptr;  // see the flag's comment
+    const sema::TypeRef* declTy = narrowedIdentDeclaredType(e);
+    if (!declTy) return nullptr;
+    const sema::TypeRef* nt = ctx_.exprType(e);
+    if (!nt) return nullptr;
+    // A §12.7 narrowing is non-nullable by construction (narrowFromTypeTest
+    // strips it): a nullable published type here is some OTHER rule's, not this
+    // one's, so decline rather than guess.
+    if (nt->nullable) return nullptr;
+    // §4.7/§8.6: the unit type lowers to LLVM `void`, so there is no value to
+    // load — the same exclusion #2915 made on the `as` unbox arm. Sema does not
+    // narrow to it either (narrowFromTypeTest's positive list), so this is a
+    // belt-and-braces guard on an unreachable shape rather than a live arm.
+    if (nt->kind == sema::TypeRef::Kind::Unit) return nullptr;
+    if (!isBoxableValueType(nt)) return nullptr;
+    return nt;
+}
+
+
+// fix #3090 (§12.7 / §8.6, v0.252). See the declaration comment.
+llvm::Value* Emitter::narrowedBoxPayloadAddr(const ast::Expr& e,
+                                             llvm::Type*& elemTy) {
+    const sema::TypeRef* nt = narrowedBoxedValueTypeOf(e);
+    if (!nt) return nullptr;
+    llvm::Type* payloadTy = lowerTypeRef(nt);
+    if (!payloadTy || payloadTy->isVoidTy()) return nullptr;
+    // The STORAGE still holds the `Object` reference, so read the box pointer
+    // out of the slot exactly as the un-narrowed read would. Deliberately does
+    // NOT go through lvalueAddr — that function calls this one.
+    llvm::Type* slotTy = nullptr;
+    llvm::Value* slotAddr = refParamAddr(e, slotTy);
+    if (!slotAddr) {
+        if (llvm::AllocaInst* slot = localSlot(e))
+            slotAddr = boxedStorage(slot, slotTy);  // §27.5 capture cell
+    }
+    if (!slotAddr || !slotTy || !slotTy->isPointerTy()) return nullptr;
+    llvm::Value* boxPtr = builder_.CreateLoad(ptrTy(), slotAddr, "narrow.box");
+    // Payload two words in — past the vtable word and the #422 rc word, the
+    // same `{ vtable*, i64 rc, payload }` layout boxValue writes and the §17.4
+    // `as` arm reads.
+    elemTy = payloadTy;
+    return builder_.CreateGEP(ptrTy(), boxPtr, {builder_.getInt32(2)},
+                              "narrow.payload");
+}
+
+
+// fix #3090 (§12.7 / §8.6, v0.252). See the declaration comment.
+llvm::Value* Emitter::unboxNarrowedRead(const ast::Expr& e) {
+    llvm::Type* payloadTy = nullptr;
+    llvm::Value* p = narrowedBoxPayloadAddr(e, payloadTy);
+    if (!p || !payloadTy) return nullptr;
+    return builder_.CreateLoad(payloadTy, p, "narrow.unbox");
 }
 
 
@@ -5604,7 +5774,18 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                 ? llvm::StructType::get(llvm_,
                       {nullablePrimHasValTy(), st})
                 : st;
-        if (llvm::AllocaInst* slot = localSlot(*ma.target)) {
+        // fix #3090 (§12.7 / §8.6, v0.252): `o.X` where `o: Object` is
+        // §12.7-narrowed to this record reads the BOXED record, whose storage is
+        // the box payload two words into the wrapper. Checked ahead of the
+        // localSlot arm, which short-circuits lvalueAddr (where the sibling hook
+        // lives) and would otherwise StructGEP the `Object` SLOT — reading the
+        // box pointer's own bytes as the record's first fields (measured: `o.X`
+        // on a `Pt(7, 9)` printed 707433248, and the two-field arithmetic raised
+        // OverflowException).
+        llvm::Type* narrowedTy = nullptr;
+        if (llvm::Value* np = narrowedBoxPayloadAddr(*ma.target, narrowedTy)) {
+            base = np;
+        } else if (llvm::AllocaInst* slot = localSlot(*ma.target)) {
             // §27.5: a captured record local lives in its shared cell.
             llvm::Type* ety = nullptr;
             base = boxedStorage(slot, ety);

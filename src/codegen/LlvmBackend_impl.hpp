@@ -6477,6 +6477,87 @@ private:
     // kind of declared location that triggers boxing of a value-typed source?
     bool isObjectOrInterfaceTarget(const sema::TypeRef* target);
 
+    // fix #3090 (§12.7 / §8.6, v0.252): the §12.7 flow-narrowed VALUE type of an
+    // identifier read, or nullptr when this read is not one.
+    //
+    // §12.7: "When the test succeeds and the tested expression is a simple
+    // variable, the variable is **flow-narrowed** to `T` within the controlled
+    // block." Sema publishes that narrowed `T` as the identifier node's own
+    // exprType (ExprTypecheck_Exprs.cpp's `narrowings_` lookup); the identifier's
+    // STORAGE is unchanged — it is still the `Object`/interface slot holding the
+    // §8.6 box. Codegen had no §12.7 awareness at all, so every such read handed
+    // the BOX POINTER to a consumer that had been told it was a `T`. Under opaque
+    // pointers `store ptr` + `load i32` through one alloca is valid IR, so
+    // `verifyModule` could not catch it: an `int` printed the low 32 bits of a
+    // heap address, a record raised OverflowException, a `[3]int` read all zeros.
+    //
+    // The predicate is a POSITIVE conjunction, not a shape coincidence: the
+    // expression is a bare identifier resolving to a local or parameter, its
+    // DECLARED type is an `Object`/interface location (the only kind that holds a
+    // box), and the type sema published on this node is a §8.6-boxable value type
+    // other than the declared one. Every other narrowing is left byte-identical —
+    // a class/interface/string narrowing lowers to `ptr` and is not boxable, so
+    // it never reaches the unbox.
+    const sema::TypeRef* narrowedBoxedValueTypeOf(const ast::Expr& e);
+
+    // fix #3090 (§12.7 / §8.6, v0.252): the DECLARED type of an identifier that a
+    // §12.7 test has narrowed away from its `Object`/interface location, or
+    // nullptr when this is not such a read. WIDER than `narrowedBoxedValueTypeOf`
+    // in two ways: it answers for EVERY narrowed kind, including `string` and a
+    // class, not only the §8.6-boxable value ones; and it ignores
+    // `narrowedUnboxSuppressed_`, because a classification is needed exactly
+    // where the unbox is suppressed. `narrowedBoxedValueTypeOf` is defined on
+    // top of it, so the two cannot drift on what "is narrowed" means.
+    //
+    // It exists because a position that lowers the operand as its BOX must also
+    // CLASSIFY it as its box. lowerTypeTest is that position, and reading the
+    // narrowed type there was a live SIGSEGV: after `if o is string and …`, the
+    // second conjunct's `o` types as `string`, so `mightHoldString` — which asks
+    // whether the operand could be a vtable-less bare `bz_string*` — answered
+    // FALSE for an operand that is exactly that, and `emitIsA` walked the
+    // string's `char* data` as a descriptor chain. (MEASURED: #2793's
+    // `other_primitive_boxes_are_unchanged` sweep went from 4095 to a core dump.)
+    const sema::TypeRef* narrowedIdentDeclaredType(const ast::Expr& e);
+
+    // fix #3090 (§12.7 / §8.6, v0.252): the address of the §8.6 box PAYLOAD for a
+    // read through a §12.7 value-narrowed identifier, with `elemTy` set to the
+    // narrowed type's LLVM type; nullptr when `narrowedBoxedValueTypeOf` declines.
+    // The box layout is `{ vtable*, i64 rc, payload }` (boxValue), so the payload
+    // is two words in — the same offset the `as` unbox arm reads. The box is
+    // non-null on every path that reaches here by construction (the read is
+    // dominated by the `is` test, and `emitIsA` answers false for a null operand).
+    llvm::Value* narrowedBoxPayloadAddr(const ast::Expr& e, llvm::Type*& elemTy);
+
+    // fix #3090 (§12.7 / §8.6, v0.252): non-zero while lowering an expression
+    // position that needs the operand's §8.6 BOX rather than its §12.7-narrowed
+    // value — currently exactly one such position, a type test whose operand is
+    // a BARE IDENTIFIER. §12.7: "the operation inspects the runtime type tag
+    // without moving from the operand", and a boxed value's runtime tag is the
+    // wrapper's vtable word, not anything in the payload. So a nested
+    // `if o is int then … o is T … end` must hand `emitIsA` the box pointer;
+    // handing it the unboxed payload would emit a descriptor walk off an `i32`
+    // (malformed IR). Holding the pre-fix lowering at that ONE position also
+    // keeps every existing type test byte-identical.
+    //
+    // ⚠ THE FLAG SUPPRESSES THE WHOLE LOWERING IT BRACKETS, not just the
+    // identifier at its root — which is why lowerTypeTest sets it only for an
+    // identifier operand. Set unconditionally, it also silenced the unbox for a
+    // narrowed identifier nested inside a COMPOUND operand (`if Take(o) is Foo`
+    // inside `if o is int`), handing a `ptr` to an `i32` parameter. See the
+    // gate's own comment at the set site for why that shape is newly reachable.
+    //
+    // A COUNT, not a bool, so nesting restores correctly.
+    int narrowedUnboxSuppressed_ = 0;
+
+    // fix #3090 (§12.7 / §8.6, v0.252): the VALUE half — load the payload out of
+    // the box, which is §8.6's "a boxed value, when unboxed, yields the original"
+    // and §17.4's "copying the value out". Returns nullptr when this is not a
+    // §12.7 value-narrowed read, so a caller falls through to its normal load.
+    // NON-DESTRUCTIVE on the operand per §12.7 ("Both `is` and `as` are
+    // non-destructive on their operand"): the box is neither released nor moved
+    // from — the `Object` local remains its owner.
+    llvm::Value* unboxNarrowedRead(const ast::Expr& e);
+
     // §8.6: box `value` (already lowered, of static type `srcTy`) into a heap
     // wrapper `{ boxVtable*, value-bytes }` and return the box pointer. A
     // nullable value type whose source is null boxes to a null pointer (§8.6

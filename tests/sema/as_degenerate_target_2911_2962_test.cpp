@@ -56,13 +56,18 @@
 //
 // The remedy tests are load-bearing in their own right — a diagnostic that
 // names a remedy which does not work is worse than one that names none — and
-// they carry the one uncomfortable finding of this fix, stated on each of them:
-// the `is` TEST works and discriminates, but the COPY-OUT half of §17.4's
-// printed remedy silently yields an all-zero array, because §12.7 narrowing to
-// a value type is never unboxed by codegen at all (an `int` there reads the box
-// POINTER: 866251552). That is PRE-EXISTING and orthogonal — none of the
-// programs that show it contains an `as` — and is filed as **#3090**, with the
-// instruction to strengthen these tests when it lands.
+// they carried the one uncomfortable finding of #2911, stated on each of them:
+// the `is` TEST worked and discriminated, but the COPY-OUT half of §17.4's
+// printed remedy silently yielded an all-zero array, because §12.7 narrowing to
+// a value type was never unboxed by codegen at all (an `int` there read the box
+// POINTER: 866251552). That was PRE-EXISTING and orthogonal — none of the
+// programs that show it contains an `as` — and was filed as **#3090**, with the
+// instruction to strengthen these tests when it landed.
+//
+// ✅ #3090 LANDED (§12.7 / §8.6 / §17.4, v0.252) and the strengthening is done:
+// `remedy_copy_out_recovers_the_values_spec_12_7_17_4` below now asserts the
+// recovered 456 instead of merely `r.ran`. Both remedies §17.4 and §4.7 print
+// are therefore pinned by VALUE, not by "it compiles".
 
 #include <string>
 
@@ -71,6 +76,7 @@
 
 using bezel::test::JitResult;
 using bezel::test::runAot;
+using bezel::test::runAotOut;  // #3090: the restored 456 is outside 0..255
 
 namespace {
 
@@ -223,24 +229,23 @@ BEZEL_TEST(sema_as_degenerate_target_2962,
 //     [4]int` false. That is the property the rejected `as` could not deliver
 //     at all (its miss yielded an all-zero array indistinguishable from a
 //     legitimately zero one), and it is what this test asserts. Want 1.
-//   * the COPY-OUT's value does NOT work yet. MEASURED on the fix build:
-//     `var b: [3]int := o;` inside the narrowed block silently produces an
-//     ALL-ZERO array, and the read after it draws #2961's "store dropped"
-//     internal warning — because §12.7 narrowing to a value type is never
-//     unboxed by codegen at all (`int` reads the box POINTER: 866251552; a
-//     record throws OverflowException). Filed as **#3090**, which is a
-//     PRE-EXISTING gap this fix neither causes nor touches: none of those
-//     programs contains an `as`.
+//   * the COPY-OUT's value did NOT work when this file was written. MEASURED on
+//     the #2911 fix build: `var b: [3]int := o;` inside the narrowed block
+//     silently produced an ALL-ZERO array, and the read after it drew #2961's
+//     "store dropped" internal warning — because §12.7 narrowing to a value type
+//     was never unboxed by codegen at all (`int` read the box POINTER:
+//     866251552; a record threw OverflowException). Filed as **#3090**, a
+//     PRE-EXISTING gap #2911 neither caused nor touched: none of those programs
+//     contains an `as`.
 //
-// ⚠ WHEN #3090 LANDS, STRENGTHEN THIS TEST: add `var b: [3]int := o;` inside
-// the true branch and assert the recovered value 456, which is what §17.4's
-// printed remedy line promises and what `o as [3]int` used to return before
-// this rejection. The copy-out is deliberately NOT written here today — a test
-// asserting the value would fail, and a test asserting the zero would pin the
-// bug as correct. (tests/codegen/box_inline_array_2804_test.cpp's
-// kUnboxRoundTripNowRejected carries the same instruction from the other side:
-// it held the 456 assertion in its `as` spelling, and this fix re-points it at
-// the rejection with the identical "restore it when #3090 lands" note.)
+// ✅ #3090 HAS LANDED (§12.7 / §8.6 / §17.4, v0.252). Sema now narrows to a
+// PRIMITIVE and INLINE-ARRAY test type as well as to a Named one, and codegen
+// unboxes the §8.6 wrapper at the narrowed read — so the copy-out §17.4 PRINTS
+// recovers the values, and the 456 assertion this file parked is restored in
+// `remedy_copy_out_recovers_the_values_spec_12_7_17_4` below.
+// (tests/codegen/box_inline_array_2804_test.cpp's kUnboxRoundTrip carries the
+// same restoration from the other side: it held the 456 assertion in the `as`
+// spelling #2911 rejected, and now holds it in the `is` + copy-out spelling.)
 BEZEL_TEST(sema_as_degenerate_target_2911,
            remedy_is_test_discriminates_where_as_could_not_spec_12_7) {
     JitResult r = runAot(
@@ -258,26 +263,28 @@ BEZEL_TEST(sema_as_degenerate_target_2911,
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
 
-// The copy-out SPELLING the diagnostic prints must at least be well-formed
-// Bezel — a diagnostic that prints a line which does not even compile would be
-// wrong on its face, independently of #3090's lowering gap. This asserts
-// exactly that and no more: the program compiles and runs. Its VALUE is #3090's
-// to assert (see the note above).
+// The copy-out the §17.4 diagnostic PRINTS must actually recover the values — a
+// diagnostic naming a remedy that silently yields zeros is worse than one naming
+// none. RESTORED by #3090 (§12.7 / §8.6 / §17.4, v0.252): this test previously
+// asserted only `r.ran` ("the printed line is at least well-formed Bezel"),
+// because the value assertion would have failed and an assertion on the zero
+// would have pinned the bug as correct. 456 is the value `o as [3]int` returned
+// before §17.4 rejected that spelling, so the round trip §8.6 owes is now
+// pinned in the spelling §17.4 sanctions. Outside 0..255, so it goes to stdout.
 BEZEL_TEST(sema_as_degenerate_target_2911,
-           remedy_copy_out_spelling_compiles_spec_12_7_17_4) {
-    JitResult r = runAot(
+           remedy_copy_out_recovers_the_values_spec_12_7_17_4) {
+    BEZEL_EXPECT_EQ(runAotOut(
         "module M; class C "
         "  public static method Main(): int "
         "    var a: [3]int := [4, 5, 6]; "
         "    var o: Object := a; "
         "    if o is [3]int then "
         "      var b: [3]int := o; "
-        "      if b[0] = 4 then return 0; end; "
+        "      Console.WriteLine(b[0] * 100 + b[1] * 10 + b[2]); "
         "    end; "
         "    return 0; "
         "  end Main; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
+        "end C;"), std::string("456"));
 }
 
 // §4.7 / §8.6 (#2915): `x is ()` — the unit arm's remedy. Want 1.

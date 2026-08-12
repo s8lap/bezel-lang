@@ -82,6 +82,11 @@
 //       rejection. The 456 value assertion is not deleted but PARKED: §17.4's
 //       replacement unbox (the §12.7 `is` narrowing + copy-out) does not lower
 //       yet, filed as #3090, and the restore instruction is on the test.
+//       ↳ RESTORED, #3090 (spec §12.7 / §8.6 / §17.4, v0.252): the §12.7
+//         narrowing + copy-out now lowers, so `kUnboxRoundTrip` is back with its
+//         456 assertion in the spelling §17.4 sanctions, ALONGSIDE the `as`
+//         rejection. Both halves are kept: the operator stays rejected, and the
+//         round trip §8.6 owes is pinned again.
 //       The rejection and its accept-controls live in
 //       tests/sema/as_degenerate_target_2911_2962_test.cpp.
 //   * `$"{ia}"` string interpolation of an inline array still renders the empty
@@ -255,20 +260,21 @@ const char* kElementKinds =
 // from a legitimately zero one. That is precisely the gap the header above
 // predicted and filed; the fix answers it by rejecting the operator.
 //
-// ⚠ THE 456 ASSERTION IS NOT GONE BY CHOICE — IT IS CURRENTLY UNREACHABLE, AND
-// THAT IS TRACKED. §17.4's diagnostic names the replacement unbox: the §12.7
-// `is` test with narrowing and copy-out (`if o is [3]int then var b: [3]int :=
-// o; … end;`). MEASURED: that spelling compiles but yields an ALL-ZERO array,
-// because §12.7 narrowing to a value type is never unboxed by codegen — filed
-// as **#3090** (an `int` there reads the box POINTER, 866251552; a record
-// throws). So today there is NO working spelling of "recover the values of a
-// boxed inline array", and this test asserts the rejection instead.
+// ⚠ THE 456 ASSERTION WAS NOT GONE BY CHOICE — IT WAS UNREACHABLE, AND THAT WAS
+// TRACKED. §17.4's diagnostic names the replacement unbox: the §12.7 `is` test
+// with narrowing and copy-out (`if o is [3]int then var b: [3]int := o; … end;`).
+// MEASURED at #2911: that spelling compiled but yielded an ALL-ZERO array,
+// because §12.7 narrowing to a value type was never unboxed by codegen — filed
+// as **#3090** (an `int` there read the box POINTER, 866251552; a record threw).
+// So there was then NO working spelling of "recover the values of a boxed inline
+// array", and this test asserted the rejection instead.
 //
-// WHEN #3090 LANDS, RESTORE THE VALUE ASSERTION HERE in the copy-out spelling
-// and keep both halves. Do NOT delete #2804's round-trip intent, and do not
-// relax it to "compiles somehow": what must stay pinned is that a boxed inline
-// array's values survive the trip, which is the whole point of §8.6's
-// "Unboxing reverses the process".
+// ✅ #3090 HAS LANDED (§12.7 / §8.6 / §17.4, v0.252) and the value assertion is
+// RESTORED below as `kUnboxRoundTrip`, in the copy-out spelling — BOTH halves
+// kept, exactly as the instruction required. #2804's round-trip intent is not
+// deleted and is not relaxed to "compiles somehow": what stays pinned is that a
+// boxed inline array's values survive the trip, which is the whole point of
+// §8.6's "Unboxing reverses the process".
 const char* kUnboxRoundTripNowRejected =
     "module M; class C "
     "  public static method Main(): int "
@@ -276,6 +282,25 @@ const char* kUnboxRoundTripNowRejected =
     "    var o: Object := a; "
     "    var back := o as [3]int; "
     "    Console.WriteLine(back[0] * 100 + back[1] * 10 + back[2]); "
+    "    return 0; "
+    "  end Main; "
+    "end C;";
+
+// #2804's ROUND TRIP, RESTORED by #3090 (spec §12.7 / §8.6 / §17.4, v0.252) in
+// the spelling §17.4's own diagnostic prints as the remedy for the `as` form it
+// rejects, verbatim: "if o is [3]int then var a: [3]int := o; end;". §8.6's
+// *Nullable value-type boxing* states the property this pins — "Unboxing
+// reverses the process" — and §12.7 supplies the narrowing that admits the
+// copy-out. Same 456, same intent, a legal spelling. Wants "456".
+const char* kUnboxRoundTrip =
+    "module M; class C "
+    "  public static method Main(): int "
+    "    var a: [3]int := [4, 5, 6]; "
+    "    var o: Object := a; "
+    "    if o is [3]int then "
+    "      var back: [3]int := o; "
+    "      Console.WriteLine(back[0] * 100 + back[1] * 10 + back[2]); "
+    "    end; "
     "    return 0; "
     "  end Main; "
     "end C;";
@@ -489,13 +514,22 @@ BEZEL_TEST(codegen_box_inline_array_2804,
 // #2804 — §8.6 "Unboxing reverses the process".
 // =====================================================================
 
+// #2804 / #3090 — the round trip itself, in the spelling §17.4 sanctions. This
+// is the assertion #2911 parked; it is back, and the rejection test below keeps
+// its own half. Pre-#3090 this printed nothing at all (the copy-out produced an
+// all-zero array and drew codegen's #2434 note); want "456".
+BEZEL_TEST(codegen_box_inline_array_2804,
+           boxed_inline_array_is_narrowing_copy_out_round_trip_spec_8_6_12_7) {
+    BEZEL_EXPECT_EQ(runAotOut(kUnboxRoundTrip), std::string("456"));
+}
+
 BEZEL_TEST(codegen_box_inline_array_2804,
            boxed_inline_array_as_unbox_now_rejected_spec_17_4_15_1) {
     // This test used to read
     //   BEZEL_EXPECT_EQ(runAotOut(kUnboxRoundTrip), std::string("456"));
-    // and that assertion is the one to restore once #3090 lands — see the
-    // maintenance note on kUnboxRoundTripNowRejected above, which records why
-    // it is currently unreachable and in which spelling it comes back.
+    // and that assertion is RESTORED — in the §12.7 copy-out spelling — by the
+    // sibling test immediately above, now that #3090 has landed. The `as`
+    // spelling stays rejected; both halves are pinned.
     //
     // §17.4 (v0.241) now rejects the `as` spelling outright: `as` "requires its
     // result type `T?` to exist and to be informative", and §15.1 "admits no

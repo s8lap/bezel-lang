@@ -8024,13 +8024,89 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
     if (!dynamic_cast<LocalSymbol*>(sym) &&
         !dynamic_cast<ParameterSymbol*>(sym))
         return false;
-    // The narrowed type is the test type. It must resolve to a Named type with
-    // a declaration so member lookup can run against it. The narrowed form is
-    // non-nullable (a successful `is T` means the value is a non-null T).
+    // The narrowed type is the test type. The narrowed form is non-nullable
+    // (a successful `is T` means the value is a non-null T).
     if (!te->testType) return false;
     TypeRef* tt = ctx_.resolvedType(*te->testType);
-    if (!tt || tt->kind != TypeRef::Kind::Named || !tt->declaration)
-        return false;
+    if (!tt) return false;
+    // fix #3090 (§12.7, v0.252): the narrowable test-type kinds are a POSITIVE
+    // list. This was `tt->kind != Named || !tt->declaration → return false`,
+    // whose comment justified the restriction as "so member lookup can run
+    // against it" — but §12.7 states the rule over `T` without qualification
+    // ("`is T` tests whether a value is an instance of `T` … the variable is
+    // **flow-narrowed** to `T` within the controlled block"), and §17.4's
+    // *Degenerate value-type targets* clause names that narrowing at an
+    // INLINE-ARRAY target as the sanctioned remedy for the `as` form it rejects,
+    // verbatim: "The remedy is the `is` test, whose [§12.7] narrowing admits
+    // copying the value out: `if o is [3]int then var a: [3]int := o; end;`".
+    // An InlineArray TypeRef is not Named, so that printed remedy narrowed
+    // nothing at all and the copy-out read the declared `Object` — silently,
+    // because §3's permissive acceptance admits an `Object` initializer for a
+    // value-typed local (#605). The same held for every PRIMITIVE target
+    // (`o is int` narrowed nothing, so `var i: int := o;` read the box pointer).
+    //
+    // Kept a POSITIVE list rather than "not Named ⇒ narrow anyway": the Error
+    // kind must not manufacture a fact out of a failed resolution, the Function
+    // kind is not a runtime type test, and the Unit kind has NO lowered value at
+    // all (it lowers to LLVM `void`, so a narrowed read could not be emitted —
+    // the same exclusion #2915 made on the `as` unbox arm). A bare type
+    // PARAMETER is a Named TypeRef with `declaration == nullptr`; it stays
+    // excluded here, and that half is tracked separately as #3092.
+    //
+    // The two NEW kinds are additionally gated on the tested variable's own
+    // DECLARED type being an `Object`/interface location — the only kind that
+    // holds a §8.6 box, and exactly the shape #3090 is about. Without that gate
+    // the change would reach a NULLABLE VALUE local (`var n: int?;
+    // if n is int then …`, whose type test §7 admits as a non-null test) and
+    // rewrite its published type from `int?` to `int` — but the storage is still
+    // the tagged `{i8 hasValue, i32}` struct, and codegen locates that payload
+    // BY the published type. narrowFromNullTest states the same constraint on
+    // its own path, verbatim: "Unlike §12.7 type-narrowing this does NOT rewrite
+    // the variable's exprType (codegen relies on the declared nullable type to
+    // locate the tagged-optional payload)." Named targets keep their pre-fix,
+    // ungated behaviour so nothing that narrowed before stops or starts.
+    auto isBoxHoldingLocation = [](const TypeRef* d) {
+        if (!d) return false;
+        if (d->kind == TypeRef::Kind::Primitive)
+            return d->primitive == PrimitiveType::Object;
+        return d->kind == TypeRef::Kind::Named && d->declaration &&
+               d->declaration->kind == ast::TypeDeclKind::Interface;
+    };
+    bool narrowable = false;
+    switch (tt->kind) {
+        case TypeRef::Kind::Named:
+            narrowable = tt->declaration != nullptr;
+            break;
+        case TypeRef::Kind::Primitive:
+            // `x is Object` narrows nothing (every value is an Object), and
+            // PrimitiveType::None is not a type.
+            narrowable = tt->primitive != PrimitiveType::None &&
+                         tt->primitive != PrimitiveType::Object &&
+                         isBoxHoldingLocation(declaredTypeOf(sym));
+            break;
+        case TypeRef::Kind::InlineArray:
+            // §8.6 *Boxing of inline arrays*, verbatim: "Move-only value types —
+            // owning inline arrays (`[N owned]T` and `[N owned]T?`) and
+            // owning-classified choices ([§35.4]) — cannot be boxed. Boxing a
+            // value type copies the value into a heap wrapper, but move-only
+            // types forbid copying ([§15.3])." An `Object`/interface location
+            // therefore never holds one, so there is no boxed value for the
+            // narrowing to denote. Mirrors the first line of codegen's
+            // `inlineArrayBoxable` (LlvmBackend_Setup.cpp) so the two predicates
+            // cannot drift. Without it sema published a MOVE-ONLY narrowed type
+            // into a block the ownership pass still walks — the block is
+            // runtime-dead (the type test is dropped with #2775's Warning, so no
+            // wrong value is produced), but the state should not exist at all.
+            narrowable = !tt->arrayOwned &&
+                         isBoxHoldingLocation(declaredTypeOf(sym));
+            break;
+        case TypeRef::Kind::Error:
+        case TypeRef::Kind::Unit:
+        case TypeRef::Kind::Function:
+            narrowable = false;
+            break;
+    }
+    if (!narrowable) return false;
     TypeRef* narrowed = tt;
     if (tt->nullable) {
         narrowed = ctx_.makeTypeRef(*tt);

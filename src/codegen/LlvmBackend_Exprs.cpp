@@ -5600,6 +5600,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     isNull, emptyStr, msgPtr, "msg.val");
             }
         }
+        // fix #3090 (§12.7 / §8.6, v0.252): a read through a §12.7 narrowing to
+        // a VALUE type yields the boxed value — §8.6's "a boxed value, when
+        // unboxed, yields the original", and §17.4's "copying the value out".
+        // Placed ahead of the two storage arms below because those load the
+        // `Object` SLOT, whose bytes are the box POINTER: `var i: int := o;`
+        // inside `if o is int then … end` stored that pointer into an i32-typed
+        // read (silent under opaque pointers — `store ptr` + `load i32` through
+        // one alloca is valid IR, so verifyModule could not see it) and printed
+        // the low 32 bits of a heap address. Declines for every read that is not
+        // a §12.7 value-narrowing, so the ordinary local/param load is unchanged.
+        if (llvm::Value* unboxed = unboxNarrowedRead(e)) return unboxed;
         // CG50: a ref/out parameter — load through the incoming pointer.
         llvm::Type* refElem = nullptr;
         if (llvm::Value* a = refParamAddr(e, refElem)) {
