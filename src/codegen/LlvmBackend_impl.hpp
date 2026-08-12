@@ -12353,6 +12353,34 @@ private:
     // but reads the declared type from the FieldDecl (or importedMemberType for
     // an imported field). Null if the field's type is not Task-family.
     const sema::TypeRef* taskFamilyTypeFromField(const sema::FieldSymbol* fs);
+    // fix #3125 (§29.8 / §30.1 / §30.5, v0.254): recover the resolved Task /
+    // Task<T> / OwningTask<T> TypeRef for a PARAMETER. The third shape-accessor
+    // of the family — taskTypeOfLocal reads a LocalDecl, taskFamilyTypeFromField
+    // a FieldSymbol, this one a ParameterSymbol — and all three bottom out in
+    // the ONE classification, `isTaskTypeName`. That is deliberate: the guard
+    // this feeds is the same guard `unwindOwnedLocalClass` already carries
+    // ("Task / Task<T> — disposed via bz_task_free, not class vtable dispatch"),
+    // and writing a second spelling of "is this a task?" beside it is exactly
+    // the drift that produced #3096's double free. Null when the parameter is
+    // not Task-family. Ownership is NOT part of this predicate: it answers "how
+    // is this pointer released", not "must it be released" — the callers have
+    // already established the disposal obligation.
+    const sema::TypeRef* taskFamilyTypeFromParam(sema::Symbol* p);
+    // fix #3125 (§29.8 / §30.1, v0.254): dispose ONE `owned` parameter capture
+    // held in a state-machine frame slot, routed by the parameter's declared
+    // type. THE single answer to "how does a frame teardown release this owned
+    // capture", asked by all three frame-owning emitters' auto-drop loops — the
+    // sync iterator's disposeOwnedParams (LlvmBackend_Iterators.cpp), the async
+    // iterator's Dispose sweep and the plain async method's
+    // emitAsyncOwnedParamAutoDispose (both LlvmBackend_Async.cpp). All three
+    // called `emitDisposeAndReclaim` unconditionally, which dispatches through
+    // the object's class vtable; a `bz_task_t*` has no Bezel vtable, so the
+    // "vtable pointer" load read task-struct bytes and the indirect call jumped
+    // into garbage (measured: SEGV reading 0x10 in bz$async$M$Resume,
+    // bz$iter$Gen$Dispose and bz$asynciter$Gen$Dispose alike). `obj` must
+    // already be null-checked by the caller (each loop's null guard is also its
+    // runtime moved-from test); the caller nulls the slot afterwards.
+    void emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj);
     // §28.3 / §30.5 (#1905): dispose an already-evaluated owned Task-family
     // value with the complete protocol (fault object, unconsumed owned result,
     // then fire-and-forget/free). Used at an unbound task receiver's full-

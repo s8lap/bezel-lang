@@ -540,6 +540,51 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
 }
 
 
+// fix #3125 (§29.8 / §30.1 / §30.5, v0.254): THE frame-teardown release of one
+// `owned` PARAMETER capture, routed by the parameter's declared type.
+//
+// §30.1: "any `owned` parameter never moved out is disposed by the frame when
+// the task reaches its terminal state"; §29.8 states the iterator twin. What
+// the rule does NOT say — and what all three frame-owning emitters assumed — is
+// that "disposed" means class-vtable dispatch. For a `Task`/`Task<T>`/
+// `OwningTask<T>` parameter it does not: a `bz_task_t*` is a runtime struct
+// with no Bezel vtable, and §30.5's disposal of a task is ABANDONMENT (the
+// operation "runs to its terminal state unsupervised and its result, if owned,
+// is disposed on arrival"), which is what emitTaskDisposal performs — the fault
+// object first, then the per-`T` result disposer, then fire-and-forget. Sending
+// a task through emitDisposeAndReclaim instead loaded "the vtable pointer" out
+// of task-struct bytes and made an indirect call through it: a wild jump, and a
+// SEGV on the very first slot read (measured at 701cb2d on all three emitters —
+// bz$async$SinkAsync$Resume, bz$iter$Gen$Dispose, bz$asynciter$Gen$Dispose,
+// each "SEGV on unknown address 0x10").
+//
+// This function is the single place that answers the question, so the three
+// loops cannot drift the way `unwindOwnedLocalClass`'s task exclusion and this
+// path already had. It is a pure ROUTING decision: whether the capture must be
+// released at all is the caller's (each loop's `iteratorAutoDispose` /
+// `iteratorFrameConditionalAutoDispose` / yield-state gate), and `obj` arrives
+// already proven non-null by the caller's guard — which is also its runtime
+// moved-from test. The caller nulls the slot afterwards, unchanged.
+//
+// Deliberately NOT widened here: an `owned` parameter of any OTHER vtable-less
+// built-in class (a collection, `TaskCompletionSource<T>`, `Shared<T>`, …) has
+// the same wild-dispatch shape. Each needs its own release protocol, not this
+// one, and lumping them in under a "not a task ⇒ vtable" negative list is the
+// category defect this fix exists to remove. Measured, not assumed: with this
+// fix applied an `owned r: Random` / `Channel<T>` / `StringBuilder` parameter
+// still SEGVs in bz$async$SinkAsync$Resume. Filed as #3157 rather than guessed
+// at — and #3157 records that the DEFAULT is the wrong way round here: an
+// unrecognised name should raise a loud `internal:` note (the #2992 shape)
+// rather than take a silent vtable jump. // per §29.8, §30.1, §30.5
+void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
+    if (const sema::TypeRef* taskTy = taskFamilyTypeFromParam(p)) {
+        emitTaskDisposal(taskTy, obj);
+        return;
+    }
+    emitDisposeAndReclaim(obj);
+}
+
+
 void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // Each owned field carries either a class/interface object (disposed via
     // its vtable) or — #362 / stdlib §4.5 — a heap collection (freed via

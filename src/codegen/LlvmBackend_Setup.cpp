@@ -26155,6 +26155,20 @@ const sema::TypeRef* Emitter::taskTypeOfLocal(const ast::LocalDecl* ld) {
     return nullptr;
 }
 
+// fix #3125 (§29.8 / §30.1 / §30.5, v0.254): the PARAMETER shape-accessor of
+// the task-type family. See the declaration comment in LlvmBackend_impl.hpp for
+// why this asks `isTaskTypeName` rather than re-deriving the classification:
+// the guard it feeds (emitOwnedParamCaptureDispose) must not be able to drift
+// from `unwindOwnedLocalClass`'s "Task / Task<T> — disposed via bz_task_free,
+// not class vtable dispatch" exclusion above, and asking one function is the
+// only way to make that structural. `paramTypeOf` is the established resolution
+// order for a ParameterSymbol's declared type (prefer resolvedDeclType, else
+// resolve declType) — the same one the closure-capture release loop uses.
+const sema::TypeRef* Emitter::taskFamilyTypeFromParam(sema::Symbol* p) {
+    const sema::TypeRef* pt = paramTypeOf(p);
+    return isTaskTypeName(pt) ? pt : nullptr;
+}
+
 // §30.15 (v0.179, #1524): recognise `ld`'s initializer as a no-arg `Receive()`
 // call on a `Channel<T>` receiver — the exact same syntactic shape
 // tryLowerChannelAndDomainCall matches when lowering the call

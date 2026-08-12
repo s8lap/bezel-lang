@@ -2826,7 +2826,12 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                     llvm::BasicBlock::Create(llvm_, "aitp.cont", disposeFn);
                 builder_.CreateCondBr(isNull, contBB, dispBB);
                 builder_.SetInsertPoint(dispBB);
-                emitDisposeAndReclaim(obj);
+                // fix #3125 (§29.8 / §30.5, v0.254): as in the plain-async
+                // frame's emitAsyncOwnedParamAutoDispose — a Task-family
+                // capture is released by the §30.5 abandonment protocol, not
+                // by class-vtable dispatch (measured: SEGV in
+                // bz$asynciter$Gen$Dispose). One shared routing decision.
+                emitOwnedParamCaptureDispose(frame.captures[i].first, obj);
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()), fptr);
                 builder_.CreateBr(contBB);
@@ -3765,7 +3770,13 @@ void Emitter::emitAsyncOwnedParamAutoDispose(llvm::Value* self) {
         auto* contBB = llvm::BasicBlock::Create(llvm_, "aop.cont", currentFn_);
         builder_.CreateCondBr(isNull, contBB, dispBB);
         builder_.SetInsertPoint(dispBB);
-        emitDisposeAndReclaim(obj);
+        // fix #3125 (§30.1 / §30.5, v0.254): route by the parameter's declared
+        // type. This was an unconditional emitDisposeAndReclaim — a class-vtable
+        // dispatch — so an `owned t: Task<T>` parameter the body never moved out
+        // read its "vtable pointer" out of `bz_task_t` bytes and jumped through
+        // it. emitOwnedParamCaptureDispose is the ONE routing decision, shared
+        // with the two iterator frames' identical loops.
+        emitOwnedParamCaptureDispose(frame.captures[i].first, obj);
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), fptr);
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);

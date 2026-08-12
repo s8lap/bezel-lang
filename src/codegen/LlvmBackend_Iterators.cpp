@@ -1711,7 +1711,12 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 }
                 builder_.CreateCondBr(shouldDispose, dispBB, contBB);
                 builder_.SetInsertPoint(dispBB);
-                emitDisposeAndReclaim(obj);
+                // fix #3125 (§29.8 / §30.5, v0.254): as in the two async frames'
+                // identical loops — a Task-family capture is released by the
+                // §30.5 abandonment protocol, not by class-vtable dispatch
+                // (measured: SEGV in bz$iter$Gen$Dispose). One shared routing
+                // decision, so the three frame emitters cannot drift.
+                emitOwnedParamCaptureDispose(frame.captures[i].first, obj);
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()), fptr);
                 builder_.CreateBr(contBB);
