@@ -1326,6 +1326,18 @@ private:
         // struct exactly once via bz_rawbytes_free. Set together with ffiBuffer
         // so the disposal path (emitDisposals) can pick the RawBytes free helper.
         bool rawBytes = false;
+        // fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): a
+        // Pattern A (`Task<T>` for class T) task produced by an ANONYMOUS
+        // producer call and consumed by `await` — an unbound owned temporary
+        // whose reclaim §28.3 puts at the K8 full-expression boundary, not at
+        // the await. `slot` holds the task pointer; the boundary discharge
+        // (flushAwaitedTaskTemps) frees it via bz_task_free and NULLS the slot,
+        // after which this entry is a null-guarded no-op on every later edge.
+        // It exists for the EXCEPTION edge (a later operand of the same full
+        // expression throwing after the await) and as the conservative backstop
+        // if no boundary flush ever reaches the temp — never earlier than the
+        // boundary, so it can only over-live, never dangle.
+        bool awaitedTaskTemp = false;
         // §29.7 (#623): an iterator enumerator (IEnumerable<T> state machine)
         // whose Dispose is at vtable slot 1 (iterator vtable format:
         // [0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current) — NOT slot 2 (class
@@ -8750,10 +8762,20 @@ private:
     // the result and re-raises a faulted task (§30.9). Returns the result value.
     // takeResultAfter=true: after loading the result, call bz_task_take_result to
     // null the task's result buffer (§28.3/#1250: consumed-tracking for owned results).
+    // deferTaskFree=true (fix #3070 / §30.5 + §28.3, v0.249): the awaited task is
+    // an unbound owned temporary whose RESULT is a Pattern A class-typed borrow,
+    // so the `freeTaskAfter` reclaim on the SUCCESS edge is deferred to the K8
+    // full-expression boundary (registerAwaitedTaskTemp / flushAwaitedTaskTemps)
+    // instead of running at the await — freeing at the await cascades through
+    // bz_task_free's result_disposer (#1503) and destroys the very borrow the
+    // rest of the full expression is entitled to read. Ignored when
+    // freeTaskAfter is false; the FAULT edge is unaffected (no result exists
+    // there, so nothing borrows it).
     llvm::Value* emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                   bool freeTaskAfter,
                                   bool takeResultAfter = false,
-                                  bool markSpentAfter = false);
+                                  bool markSpentAfter = false,
+                                  bool deferTaskFree = false);
 
     // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
     // stdlib §6.10 (v0.175, #808): emit the TaskScope disposal for one scope
@@ -10773,6 +10795,38 @@ private:
     // NULL its slot, so the disposeStack_ registration left behind is a
     // null-guarded no-op on every later edge (scope end, return, unwind).
     void flushFfiExprTemps();
+
+    // fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): the awaited
+    // Pattern A task temporary, the exact twin of FfiExprTemp above.
+    //
+    // §30.5 admits `Process(await Producer())` and `(await Producer()).v`: "the
+    // temporary is then disposed at the expression's end, AFTER EVERY USE of the
+    // borrow, and disposing the task disposes the borrowed result with it".
+    // Codegen used to free such a task inside emitAwaitSuspend, immediately after
+    // loading the result. That is sound for a value/`string`/runtime-managed
+    // result — the load copies the value out of the task's result buffer — but
+    // for a Pattern A CLASS result the loaded "value" IS the heap pointer, and
+    // since #1503 bz_task_free cascades into the per-`T` result disposer and
+    // frees the pointee. Every use later in the same full expression then reads
+    // freed memory (measured: heap-use-after-free under ASan on both of §30.5's
+    // own admitted shapes). The reclaim therefore moves to K8's boundary, which
+    // is where §28.3 puts every other unbound owned temporary.
+    struct AwaitedTaskTemp {
+        llvm::AllocaInst* slot = nullptr;
+        // The function the slot's alloca belongs to — same contract as
+        // FfiExprTemp::fn: a nested function body's boundary must neither emit
+        // against nor DROP the enclosing function's still-owed entry.
+        llvm::Function* fn = nullptr;
+    };
+    std::vector<AwaitedTaskTemp> awaitedTaskTemps_;
+    // Record an awaited Pattern A task temporary at the await's success edge:
+    // registers the null-guarded bz_task_free on disposeStack_ (covering the
+    // exception edge and acting as the conservative backstop) and queues it for
+    // the next full-expression boundary.
+    void registerAwaitedTaskTemp(llvm::AllocaInst* slot);
+    // The K8 full-expression boundary discharge: bz_task_free each queued task
+    // and NULL its slot.
+    void flushAwaitedTaskTemps();
     // lowerExpr's body; lowerExpr is the depth-tracking wrapper around it.
     llvm::Value* lowerExprInner(const ast::Expr& e);
 

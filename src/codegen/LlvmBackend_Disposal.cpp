@@ -3796,6 +3796,42 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind,
     // skipCellFreeOnUnwind) keeps asking the second and so keeps reading isUnwind.
     const bool dropUndischarged = isUnwind || undischargedOwned;
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
+        // fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): an
+        // awaited Pattern A `Task<T:class>` temporary produced by an anonymous
+        // producer call. Its reclaim belongs at the K8 full-expression boundary
+        // (flushAwaitedTaskTemps), which NULLS the slot; this entry is the
+        // establishment-ordered EXCEPTION-edge cover for the window between the
+        // await and that boundary, plus the conservative backstop if no boundary
+        // ever reaches it. Freed via bz_task_free — which cascades into the
+        // per-`T` result disposer (#1503) and the chained source (#1332), so the
+        // borrowed result is disposed with the task exactly as §30.5 requires.
+        // Null-guarded, so a discharged (flushed) entry is a no-op on every
+        // later edge; checked FIRST because such an entry carries no other flag
+        // and must not be mistaken for one of the arms below.
+        if (it->awaitedTaskTemp) {
+            llvm::Value* tk =
+                builder_.CreateLoad(ptrTy(), it->slot, "awaittmp.d.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                tk, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB =
+                llvm::BasicBlock::Create(llvm_, "awaittmp.d.free", currentFn_);
+            auto* contBB =
+                llvm::BasicBlock::Create(llvm_, "awaittmp.d.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* freeTaskFn = declareC("bz_task_free",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(freeTaskFn, {tk});
+            // Null after reclaiming: one scope can be traversed twice (a
+            // mid-expression binding-atom dispose scope, the same shape the
+            // `ffiBuffer` arm below documents), and the reclaim must stay
+            // exactly-once.
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 it->slot);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
         // #422 / §4.6 / §28.9: a provably-non-escaping `var` string local.
         // Release its single (producer) reference at scope end — on BOTH the
         // normal and the unwind exit (the reference dies either way; a given

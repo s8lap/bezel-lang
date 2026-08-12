@@ -3069,8 +3069,25 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
             }
         }
     }
+    // fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): when the
+    // anonymous producer's task is Pattern A `Task<T>` for a class (or intrinsic
+    // collection) T, the awaited value is a BORROW of the task's result and
+    // bz_task_free cascades into the per-`T` result disposer (#1503) — so freeing
+    // at the await destroys the borrow §30.5 says is live "for the duration of
+    // the call". Defer that reclaim to K8's full-expression boundary.
+    //
+    // The predicate is patternAResultDisposerFor itself, not a re-derivation of
+    // it: it is the ONE place that decides "disposing this task disposes its
+    // result", and asking it directly is what keeps the two sides from drifting
+    // apart (the same drift that made the original comment here — "the value and
+    // the task's freed result buffer do not alias afterwards" — true for `int`
+    // and false for a class from #1503 onward).
+    bool deferTaskFree = false;
+    if (freeTaskAfter && resultTy)
+        deferTaskFree =
+            patternAResultDisposerFor(ctx_.exprType(*un.operand)) != nullptr;
     return emitAwaitSuspend(task, resultTy, freeTaskAfter, takeResultAfter,
-                            markSpentAfter);
+                            markSpentAfter, deferTaskFree);
 }
 
 
@@ -3085,7 +3102,8 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
 // convergence reads the result and re-raises a faulted task (§30.9).
 llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                        bool freeTaskAfter, bool takeResultAfter,
-                                       bool markSpentAfter) {
+                                       bool markSpentAfter,
+                                       bool deferTaskFree) {
     if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
@@ -3279,6 +3297,13 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
         // The result is loaded BY VALUE into the await site before the task is
         // freed below, so the value (and the task's freed result buffer) do not
         // alias afterwards.
+        //
+        // ⚠ fix #3070 (§30.5 / §28.3, v0.249): that reasoning holds ONLY for a
+        // value / `string` / runtime-managed result. For a Pattern A CLASS result
+        // the loaded "value" IS the heap pointer, and since #1503 bz_task_free
+        // cascades into the per-`T` result disposer and frees the pointee — so
+        // the load does NOT decouple them. `deferTaskFree` is exactly that row,
+        // and moves the reclaim to the K8 boundary below.
         // §28.3 / #1250: for a BOUND OwningTask<T:class> await, null the result
         // buffer after loading (consumed-tracking). bz_tcs_dispose_owned_result
         // checks task->result; a null here tells it the result was already taken.
@@ -3304,11 +3329,99 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
     // case. (Multi-await Pattern A on a class-typed Task<T> is deferred; the
     // value-typed minimal cut's anonymous producer results are single-consumer.)
     if (freeTaskAfter) {
-        auto* freeTaskFn = declareC("bz_task_free", llvm::Type::getVoidTy(llvm_),
-                                    {ptrTy()});
-        builder_.CreateCall(freeTaskFn, {awaitedTask});
+        if (deferTaskFree) {
+            // fix #3070 / §30.5 + §28.3 (v0.249): a Pattern A class-typed result.
+            // The await produced a BORROW of it, and §30.5 says the temporary
+            // "is then disposed at the expression's end, AFTER EVERY USE of the
+            // borrow". Park the task pointer in a slot, register the reclaim on
+            // the cleanup stack (exception edge + backstop) and queue it for the
+            // K8 boundary, exactly as registerFfiExprTemp does for an FFI buffer
+            // temporary. The slot is frame-spilled because a LATER await in the
+            // SAME full expression (`Use2(await P(), await Q())`) suspends
+            // between the store here and the boundary read, and a resume may run
+            // on a different thread's stack (§30.13).
+            llvm::AllocaInst* taskSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(awaitedTask, taskSlot);
+            registerAwaitedTaskTemp(taskSlot);
+            if (smStateStruct_) asyncHandlerSpillSlots_.push_back(taskSlot);
+        } else {
+            auto* freeTaskFn = declareC("bz_task_free",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(freeTaskFn, {awaitedTask});
+        }
     }
     return result;
+}
+
+
+// fix #3070 / §30.5 + §28.3 *Unbound owned temporaries* (v0.249): record an
+// awaited Pattern A task temporary at its await's success edge. The two halves
+// mirror registerFfiExprTemp (LlvmBackend_Calls.cpp) exactly, for the same two
+// reasons:
+//
+// (1) An `awaitedTaskTemp` Disposal is pushed onto disposeStack_.back(). §28.3:
+//     "every already-produced, not-yet-consumed unbound owned temporary is
+//     disposed during unwinding … each temporary's disposal is established at
+//     its production, so the pass runs in reverse order of production on the
+//     establishment-ordered cleanup stack". That covers the exception edge — a
+//     LATER operand of the same full expression that throws (`Use2(await P(),
+//     Thrower())`) now reclaims this task instead of leaking it — and doubles as
+//     the conservative backstop if no boundary flush ever reaches the temp: the
+//     task is then freed at its own scope end, later than §28.3's boundary but
+//     never earlier, so a bounded over-live and never a use-after-free.
+//
+// (2) The temp is queued for the next full-expression boundary, where
+//     flushAwaitedTaskTemps frees it and NULLS the slot — after which the entry
+//     from (1) is a null-guarded no-op on every subsequent edge.
+void Emitter::registerAwaitedTaskTemp(llvm::AllocaInst* slot) {
+    if (!slot) return;
+    if (!disposeStack_.empty()) {
+        Disposal d{slot, nullptr};
+        d.awaitedTaskTemp = true;
+        disposeStack_.back().push_back(d);
+    }
+    awaitedTaskTemps_.push_back({slot, currentFn_});
+}
+
+// fix #3070 / §30.5 + §28.3 (v0.249): the K8 full-expression boundary discharge,
+// called from lowerExpr alongside flushFfiExprTemps once the whole full
+// expression has been lowered — "after every use of it within that expression
+// has completed", which is precisely where §30.5 puts the task's disposal for
+// `Process(await Producer())`.
+void Emitter::flushAwaitedTaskTemps() {
+    llvm::BasicBlock* bb = builder_.GetInsertBlock();
+    bool live = currentFn_ && bb && !bb->getTerminator();
+    std::vector<AwaitedTaskTemp> keep;
+    for (const auto& t : awaitedTaskTemps_) {
+        // Never emit against another function's alloca, and never DROP such an
+        // entry either — it belongs to the enclosing boundary and merely passed
+        // through while a nested function body was being emitted (the identical
+        // retain flushFfiExprTemps documents).
+        if (t.fn != currentFn_) { keep.push_back(t); continue; }
+        // Diverged (the full expression threw): the unwind edge's disposeStack_
+        // walk already reclaimed this via entry (1), and emitting after a
+        // terminator would be invalid IR. Drop without emitting.
+        if (!live) continue;
+        llvm::Value* tk = builder_.CreateLoad(ptrTy(), t.slot, "awaittmp.load");
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            tk, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* frBB = llvm::BasicBlock::Create(llvm_, "awaittmp.free", currentFn_);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "awaittmp.cont", currentFn_);
+        builder_.CreateCondBr(isNull, contBB, frBB);
+        builder_.SetInsertPoint(frBB);
+        auto* freeTaskFn = declareC("bz_task_free", llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy()});
+        builder_.CreateCall(freeTaskFn, {tk});
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+        // Discharge: the disposeStack_ entry established at production stays
+        // registered but now loads null, so scope end / return / unwind are all
+        // no-ops. This is also what makes a LOOP correct — the slot is one
+        // entry-block alloca reused by every iteration, and each iteration's
+        // flush re-arms it.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), t.slot);
+    }
+    awaitedTaskTemps_.swap(keep);
 }
 
 

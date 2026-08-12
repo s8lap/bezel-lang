@@ -41,9 +41,15 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     llvm::Value* v = lowerExprInner(e);
     --fullExprDepth_;
     fullExprFn_ = parentFn;
-    if (!ffiExprTemps_.empty() &&
-        (fullExprDepth_ == 0 || parentFn != thisFn))
+    const bool atBoundary = (fullExprDepth_ == 0 || parentFn != thisFn);
+    if (!ffiExprTemps_.empty() && atBoundary)
         flushFfiExprTemps();
+    // fix #3070 / §30.5 + §28.3 (v0.249): the same K8 boundary discharges an
+    // awaited Pattern A task temporary — `Process(await Producer())` disposes the
+    // task "at the expression's end, after every use of the borrow" (§30.5), not
+    // at the await.
+    if (!awaitedTaskTemps_.empty() && atBoundary)
+        flushAwaitedTaskTemps();
     return v;
 }
 
