@@ -50,20 +50,23 @@
 //                                                 arriving through a silent
 //                                                 fallback
 //
-// ── THE OTHER HALF OF THE #2922 HAZARD IS *NOT* CLOSED BY THIS FIX ─────────
+// ── THE OTHER HALF OF THE #2922 HAZARD — CLOSED SEPARATELY BY #3098 ────────
 //
 // The ruling states that rejecting the parameterless form "still makes the
 // #2434 degrade's null-`string` values unspellable, closing the #2922-class
-// hazard at the root". Measured on the FIXED compiler, that is half true: the
-// DECLARED positional constructor degrades identically —
+// hazard at the root". Measured on the compiler this file was written against,
+// that was half true: the DECLARED positional constructor degraded identically
+// —
 //
 //   var e := new ExceptionInfo("T", "M", "S");
-//   Console.WriteLine(e.TypeName);        prints an EMPTY LINE, exit 0
+//   Console.WriteLine(e.TypeName);        printed an EMPTY LINE, exit 0
 //
-// — because `lowerNew` has no arm for it either. §17.7 says that form is
-// declared and must keep working, so this fix leaves it accepted; the codegen
-// gap is filed separately and pinned below as a KNOWN-GAP control so the day it
-// is fixed, this file says so.
+// — because `lowerNew` had no arm for it either. §17.7 says that form is
+// declared and must keep working, so #2994 left it accepted and pinned the gap
+// below as a KNOWN-GAP control. **fix #3098 grew those arms**, so the pin has
+// FLIPPED: the assertion below now requires the supplied value, and the full
+// behavioural grid lives in
+// tests/codegen/builtin_record_positional_ctor_3098_test.cpp.
 //
 // ── ANTI-OVER-REJECT ───────────────────────────────────────────────────────
 //
@@ -188,25 +191,26 @@ BEZEL_TEST(builtin_closed_ctor_surface_2994,
 }
 
 BEZEL_TEST(builtin_closed_ctor_surface_2994,
-           KNOWN_GAP_the_declared_positional_ctor_still_degrades_spec_17_7) {
-    // ⚠ NOT a property this fix establishes — a MEASURED gap it does not close,
-    // pinned so the day codegen grows the arm, this assertion flips and points
-    // the reader at the rest of the story.
+           the_declared_positional_ctor_now_constructs_spec_17_7) {
+    // ⚠ WAS `KNOWN_GAP_the_declared_positional_ctor_still_degrades_spec_17_7`,
+    // and this is the day it flipped — fix #3098 grew `lowerNew`'s arms for the
+    // two record-shaped builtins, so §17.7's KEPT spelling now constructs
+    // instead of reaching #2434's zero-init fallback.
     //
-    // `lowerNew` has no `ExceptionInfo` arm, so even the DECLARED constructor
-    // reaches #2434's zero-init fallback and the supplied strings are dropped:
-    // `Console.WriteLine(e.TypeName)` prints an EMPTY line where `TypeName` was
-    // passed. That is the same #2922-class null-`string` value the ruling
-    // expected arm 2 to make unspellable — arm 2 closes the PARAMETERLESS
-    // spelling of it, not this one. Filed separately.
+    // What was pinned here (measured on 663a68e, #3098's own base): even the
+    // DECLARED constructor dropped every supplied string, so
+    // `Console.WriteLine(e.TypeName)` printed an EMPTY line, and reading the
+    // same field through a CONCATENATION — `"[" + e.TypeName + "]"` — exited
+    // 139 (SIGSEGV) on the null `bz_string*`. That was the #2922-class value
+    // the #2994 ruling expected arm 2 to make unspellable; arm 2 closed the
+    // PARAMETERLESS spelling of it, and #3098 closed this one.
     //
-    // ⚠ AND IT IS NOT MERELY A WRONG VALUE. Measured on the fixed compiler,
-    // reading the same field through a CONCATENATION —
-    // `Console.WriteLine("[" + e.TypeName + "]")` — exits 139 (SIGSEGV): the
-    // null `string` is dereferenced. The shape asserted below is the stable
-    // one (exit 0 under both the plain and the ASan oracle), so this pin does
-    // not itself depend on where a wild read happens to land; the crashing
-    // shape is recorded in the filed issue instead of asserted here.
+    // The full behavioural grid — both types, the user-record twin §17.7 names
+    // as the reference, named arguments, and the crashing concatenation — lives
+    // in tests/codegen/builtin_record_positional_ctor_3098_test.cpp. What stays
+    // asserted HERE is the pin's own subject: the declared positional form is
+    // accepted by arm 2 AND produces the supplied value, so the two halves of
+    // §17.7 cannot drift apart unnoticed.
     auto r = runAot(
         "module M; class C public static method Main(): int "
         "  var e := new ExceptionInfo(\"TypeName\", \"M\", \"S\"); "
@@ -216,7 +220,7 @@ BEZEL_TEST(builtin_closed_ctor_surface_2994,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(0, r.exitCode);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("done") != std::string::npos);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("TypeName") == std::string::npos);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("TypeName") != std::string::npos);
 }
 
 // ── ACCEPT: every declared PRODUCER of the rejected types ──────────────────

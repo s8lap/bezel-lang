@@ -3273,6 +3273,124 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                "IndexOutOfRangeException");
                 return buildArraySpan(src, start, len);
             }
+            // fix #3098 (language spec §17.7 "Standard-library builtins have
+            // a closed constructor surface", v0.241; §31.4; stdlib §3.3): the
+            // DECLARED positional primary constructors of the two RECORD-SHAPED
+            // reserved builtins.
+            //
+            // §17.7, verbatim: "For a builtin record whose only declared
+            // constructor is its positional primary constructor
+            // (`ExceptionInfo`, §31.4; `ReadOnlyStringSpan`, stdlib §3.3), the
+            // undeclared parameterless form `new T()` is rejected the same way
+            // — exactly as for an identically-shaped user record." #2994
+            // implemented that REJECTION; the same sentence KEEPS the positional
+            // form, and `lowerNew` had no arm for it, so the kept spelling fell
+            // through to `lowerLocalDecl`'s #2434 zero-init fallback: a record of
+            // NULL strings behind an `internal: … #2434` note. MEASURED on
+            // 663a68e, `new ExceptionInfo("TypeName","M","S")` then printed an
+            // EMPTY line for `e.TypeName`, and reading the same field through a
+            // concatenation — `"[" + e.TypeName + "]"` — exited 139
+            // (SIGSEGV) on the null `bz_string*`. That is the #2922 class: a
+            // silent wrong value escalating to a crash, on the spelling §31.4
+            // and stdlib §3.3 themselves write (stdlib §3.3's own `Slice` is
+            // defined as `new ReadOnlyStringSpan(Source, this.Start + start,
+            // length)`).
+            //
+            // The reference behaviour §17.7 names is "an identically-shaped
+            // user record", which works today, so both arms simply build the
+            // value each type's LAYOUT already is: `ExceptionInfo` the
+            // {ptr,ptr,ptr} of three `bz_string*` that `lowerTypeRef` gives it
+            // and `lowerExceptionInfoField` reads back, `ReadOnlyStringSpan` the
+            // shared {ptr,i32,i32} span struct (arraySpanStructType) that
+            // `string.AsSpan()` already mints.
+            //
+            // ⚠ NO EAGER RANGE CHECK for `ReadOnlyStringSpan`, deliberately,
+            // and unlike the four array-backed span constructors above: stdlib
+            // §4.14 "Construction patterns" is explicit that "the direct
+            // constructors of the five span records do **not** range-check
+            // `(Start, Length)` against the source (v0.195): a mis-constructed
+            // span faults at each out-of-range *access* instead". The indexer's
+            // own `i < 0 or i >= Length` guard and the source string's bounds
+            // check are what fault, exactly as §3.3 declares them.
+            //
+            // Named arguments are honoured by NAME rather than by position: a
+            // record's positional constructor takes its field names as parameter
+            // names (§9.1), so `new ExceptionInfo(Message: m, TypeName: t,
+            // StackTrace: s)` is the same value as the positional spelling.
+            // Reading them positionally would be a SILENT field permutation —
+            // the defect class this fix exists to remove — so an argument
+            // naming nothing this record declares makes the arm DECLINE
+            // (nullptr), which surfaces as the pre-existing located #2434 note
+            // rather than as a wrong value.
+            if (colName == "ExceptionInfo" || colName == "ReadOnlyStringSpan") {
+                const bool isEI = (colName == "ExceptionInfo");
+                static const char* const kEIFields[3] =
+                    {"TypeName", "Message", "StackTrace"};      // §31.4
+                static const char* const kRSFields[3] =
+                    {"Source", "Start", "Length"};              // stdlib §3.3
+                const char* const* fields = isEI ? kEIFields : kRSFields;
+                if (ne.args.size() == 3) {
+                    // Pass 1: resolve each WRITTEN argument to its field slot.
+                    std::size_t slotOf[3] = {3, 3, 3};
+                    bool claimed[3] = {false, false, false};
+                    std::size_t pos = 0;
+                    bool ok = true;
+                    for (std::size_t ai = 0; ai < 3; ++ai) {
+                        const auto& a = ne.args[ai];
+                        if (!a.value) { ok = false; break; }
+                        std::size_t slot = 3;
+                        if (a.name.empty()) {
+                            slot = pos++;
+                        } else {
+                            for (std::size_t j = 0; j < 3; ++j)
+                                if (a.name == fields[j]) { slot = j; break; }
+                        }
+                        if (slot >= 3 || claimed[slot]) { ok = false; break; }
+                        claimed[slot] = true;
+                        slotOf[ai] = slot;
+                    }
+                    if (ok) {
+                        // Pass 2: lower in SOURCE order (the order the arguments
+                        // are WRITTEN), not in field order — §17.13's
+                        // left-to-right argument evaluation is observable
+                        // through side effects — and place each result in its
+                        // own field slot.
+                        llvm::Value* vals[3] = {nullptr, nullptr, nullptr};
+                        for (std::size_t ai = 0; ai < 3; ++ai) {
+                            llvm::Value* av = lowerExpr(*ne.args[ai].value);
+                            if (!av) { ok = false; break; }
+                            vals[slotOf[ai]] = av;
+                        }
+                        if (ok && vals[0] && vals[1] && vals[2]) {
+                            if (isEI) {
+                                auto* eiTy = llvm::StructType::get(
+                                    llvm_, {ptrTy(), ptrTy(), ptrTy()});
+                                llvm::Value* v = llvm::UndefValue::get(eiTy);
+                                for (unsigned f = 0; f < 3; ++f)
+                                    v = builder_.CreateInsertValue(
+                                        v, vals[f], {f}, "excinfo.ctor");
+                                return v;
+                            }
+                            // {ptr Source, i32 Start, i32 Length}: `int` lowers
+                            // to i32 already, but a `long`-typed constant-narrowed
+                            // argument can arrive wider — truncate as the
+                            // span-ctor arm above does.
+                            llvm::Value* st0 = vals[1];
+                            llvm::Value* ln0 = vals[2];
+                            if (!st0->getType()->isIntegerTy(32))
+                                st0 = builder_.CreateTrunc(st0, i32(), "ross.st");
+                            if (!ln0->getType()->isIntegerTy(32))
+                                ln0 = builder_.CreateTrunc(ln0, i32(), "ross.len");
+                            return buildArraySpan(vals[0], st0, ln0);
+                        }
+                    }
+                }
+                // Any other argument list is not a declared constructor of
+                // either type. §17.7's own rejection of the parameterless form
+                // is sema's (checkBuiltinClosedConstructorSurface, fix #2994);
+                // declining here leaves every OTHER shape exactly where it was.
+                return nullptr;
+            }
             // issues #343 / D8 / §4.10: a Set<T> (or OwningSet<T>) is backed by
             // the generic-key hash table so equality and hashing follow T's
             // contract (§8.3) — real set semantics (dedup by content). This

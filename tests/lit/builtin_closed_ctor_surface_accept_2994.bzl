@@ -28,17 +28,18 @@
 //     instead of on §17.7's two sets would have rejected it.
 //
 // ⚠ THIS FILE DELIBERATELY DOES NOT ASSERT `NODIAG-NOT: internal:`, unlike its
-// #2758 sibling. Three shapes here still emit a PRE-EXISTING `internal:`
-// residual that this fix neither causes nor closes, and hiding them behind a
-// NODIAG would misrepresent the state of the tree:
+// #2758 sibling — but the reason has SHRUNK, and the note is updated rather
+// than left to rot:
 //   * `new ExceptionInfo(…)` and `new ReadOnlyStringSpan(…)` — §17.7 KEEPS
-//     these declared positional primary constructors, but `lowerNew` has no arm
-//     for either, so both still reach #2434's zero-init fallback and produce a
-//     record of null strings. That is the other half of the #2922-class hazard
-//     the ruling expected arm 2 to close; it is filed separately and pinned as
-//     a KNOWN-GAP control in the gtest.
+//     these declared positional primary constructors, and when this file was
+//     written `lowerNew` had no arm for either, so both reached #2434's
+//     zero-init fallback and produced a record of null strings. **fix #3098
+//     grew those arms**, so these two no longer emit anything: their silence is
+//     now asserted outright in
+//     tests/lit/builtin_record_positional_ctor_accept_3098.bzl.
 //   * the `where T: new()` body's `new T()` — #2477's dead-abstract-template
-//     note, which every generic factory in the tree emits.
+//     note, which every generic factory in the tree emits. THIS is what still
+//     keeps a blanket `NODIAG-NOT: internal:` off this file.
 // The oracle here is exactly that no §17.7 diagnostic fires and the file
 // compiles.
 //
