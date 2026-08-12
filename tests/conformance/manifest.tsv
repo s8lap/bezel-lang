@@ -57,7 +57,7 @@ spec_0054	spec	128-Constructor-chaining	skip	n/a	skip:signature-listing (carried
 spec_0055	spec	129-Variance	fragment	compiles	
 spec_0056	spec	Variance-and-interface-inheritance	fragment	compiles	
 spec_0057	spec	132-Top-level-types	fragment	compiles	
-spec_0058	spec	136-Accessor-visibility	skip	n/a	skip:incomplete-fragment
+spec_0058	spec	136-Accessor-visibility	fragment	compiles	wrap:mixed; env:_name
 spec_0059	spec	137-Visibility-and-inheritance	error	diagnose	
 spec_0060	spec	141-Generic-declarations	fragment	compiles	
 spec_0061	spec	Generic-constraints-and-class-types	fragment	compiles	
@@ -109,22 +109,22 @@ spec_0106	spec	185-Interpolated-strings	skip	n/a	skip:syntax-snippet (carried sp
 spec_0107	spec	185-Interpolated-strings	skip	n/a	skip:syntax-snippet (carried spec_0096)
 spec_0108	spec	185-Interpolated-strings	fragment	compiles	
 spec_0109	spec	186-Verbatim-strings	fragment	compiles	
-spec_0110	spec	187-Interpolated-verbatim-strings	skip	n/a	skip:incomplete-fragment
-spec_0111	spec	191-Forms	skip	n/a	skip:incomplete-fragment
-spec_0112	spec	191-Forms	skip	n/a	skip:incomplete-fragment
-spec_0113	spec	191-Forms	skip	n/a	skip:incomplete-fragment
-spec_0114	spec	191-Forms	skip	n/a	skip:incomplete-fragment
+spec_0110	spec	187-Interpolated-verbatim-strings	fragment	compiles	wrap:mixed; env:user
+spec_0111	spec	191-Forms	fragment	compiles	wrap:mixed; env:delta
+spec_0112	spec	191-Forms	fragment	compiles	wrap:mixed; env:score
+spec_0113	spec	191-Forms	fragment	compiles	wrap:mixed; env:score
+spec_0114	spec	191-Forms	fragment	compiles	wrap:mixed; env:score
 spec_0115	spec	192-Arms	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
-spec_0116	spec	194-Guards	skip	n/a	skip:incomplete-fragment
+spec_0116	spec	194-Guards	fragment	compiles	wrap:mixed; env:temperature
 spec_0117	spec	196-Exhaustiveness	skip	n/a	skip:elided
-spec_0118	spec	197-Termination	skip	n/a	skip:incomplete-fragment
+spec_0118	spec	197-Termination	fragment	compiles	wrap:mixed; env:score,month
 spec_0119	spec	20-The-if-Expression	skip	n/a	skip:syntax-snippet
 spec_0120	spec	20-The-if-Expression	skip	n/a	skip:incomplete-fragment
-spec_0121	spec	20-The-if-Expression	skip	n/a	skip:incomplete-fragment
+spec_0121	spec	20-The-if-Expression	fragment	compiles	wrap:mixed; env:score
 spec_0122	spec	211-Variable-declarations	fragment	compiles	
 spec_0123	spec	Runtime-const-locals	error	diagnose	
-spec_0124	spec	212-The-if-statement	skip	n/a	skip:incomplete-fragment
-spec_0125	spec	213-The-while-statement	skip	n/a	skip:incomplete-fragment
+spec_0124	spec	212-The-if-statement	fragment	compiles	wrap:mixed; env:score,grade,amount,Balance
+spec_0125	spec	213-The-while-statement	fragment	compiles	wrap:mixed; env:i
 spec_0126	spec	214-The-for-statement	skip	n/a	skip:incomplete-fragment
 spec_0127	spec	214-The-for-statement	skip	n/a	skip:elided
 spec_0128	spec	215-break-and-continue	skip	n/a	skip:incomplete-fragment
@@ -162,7 +162,7 @@ spec_0159	spec	Properties-indexers-accessors	fragment	compiles
 spec_0160	spec	2216-Contract-clauses	skip	n/a	blocked-on-#2942 (ensures result/old not yet implemented)
 spec_0161	spec	231-Auto-properties	fragment	compiles	
 spec_0162	spec	232-Expression-bodied-read-only-properties	skip	n/a	skip:incomplete-fragment
-spec_0163	spec	233-Block-form-properties	skip	n/a	skip:incomplete-fragment
+spec_0163	spec	233-Block-form-properties	fragment	compiles	wrap:mixed; env:_balance
 spec_0164	spec	233-Block-form-properties	fragment	compiles	
 spec_0165	spec	234-Indexers	skip	n/a	skip:incomplete-fragment
 spec_0166	spec	234-Indexers	fragment	compiles	
@@ -183,12 +183,12 @@ spec_0180	spec	273-Lambda-expressions	fragment	compiles
 spec_0181	spec	273-Lambda-expressions	skip	n/a	skip:incomplete-fragment
 spec_0182	spec	273-Lambda-expressions	fragment	compiles	
 spec_0183	spec	273-Lambda-expressions	fragment	compiles	
-spec_0184	spec	274-Parameter-type-inference	skip	n/a	skip:incomplete-fragment
+spec_0184	spec	274-Parameter-type-inference	fragment	compiles	wrap:mixed; env:numbers
 spec_0185	spec	Lambda-parameter-record-destructuring	skip	n/a	skip:incomplete-fragment
 spec_0186	spec	275-Closures	fragment	compiles	
 spec_0187	spec	276-Method-references	skip	n/a	skip:incomplete-fragment
 spec_0188	spec	276-Method-references	skip	n/a	skip:stdlib-unresolved (IEnumerable<T> static-receiver method reference)
-spec_0189	spec	Method-references-to-overloaded-methods	skip	n/a	skip:incomplete-fragment
+spec_0189	spec	Method-references-to-overloaded-methods	fragment	compiles	wrap:mixed; env:numbers
 spec_0190	spec	277-Calling-function-values	skip	n/a	skip:incomplete-fragment
 spec_0191	spec	2771-Equality-of-function-values	skip	n/a	skip:incomplete-fragment
 spec_0192	spec	2771-Equality-of-function-values	skip	n/a	skip:incomplete-fragment
@@ -234,8 +234,8 @@ spec_0231	spec	2812-Asynchronous-disposal	fragment	compiles
 spec_0232	spec	2812-Asynchronous-disposal	skip	n/a	skip:incomplete-fragment
 spec_0233	spec	2813-Shared-ownership-SharedT-and-WeakT	skip	n/a	skip:incomplete-fragment
 spec_0234	spec	291-The-protocol	fragment	compiles	
-spec_0235	spec	292-Desugaring-of-for	skip	n/a	skip:incomplete-fragment
-spec_0236	spec	292-Desugaring-of-for	skip	n/a	skip:incomplete-fragment
+spec_0235	spec	292-Desugaring-of-for	fragment	compiles	wrap:mixed; env:source
+spec_0236	spec	292-Desugaring-of-for	fragment	compiles	wrap:mixed; env:source
 spec_0237	spec	292-Desugaring-of-for	skip	n/a	skip:incomplete-fragment
 spec_0238	spec	293-Iterator-methods	fragment	compiles	
 spec_0239	spec	298-Iterators-with-owned-parameters	skip	n/a	blocked-on-#1394 (stdlib-unresolved: StreamReader)
@@ -347,8 +347,8 @@ guide1_0020	guide1	9-More-rules-youll-meet-draining-yielding-discarding-capturi	
 guide1_0021	guide1	9-More-rules-youll-meet-draining-yielding-discarding-capturi	skip	n/a	skip:incomplete-fragment
 guide1_0022	guide1	9-More-rules-youll-meet-draining-yielding-discarding-capturi	skip	n/a	skip:incomplete-fragment
 guide2_0000	guide2	1-Non-nullable-by-default-familiar	error	diagnose	
-guide2_0001	guide2	1-Non-nullable-by-default-familiar	skip	n/a	skip:incomplete-fragment
-guide2_0002	guide2	1-Non-nullable-by-default-familiar	skip	n/a	skip:incomplete-fragment
+guide2_0001	guide2	1-Non-nullable-by-default-familiar	fragment	compiles	wrap:mixed; env:maybe
+guide2_0002	guide2	1-Non-nullable-by-default-familiar	fragment	compiles	wrap:mixed; env:maybe
 guide2_0003	guide2	1-Non-nullable-by-default-familiar	skip	n/a	skip:incomplete-fragment
 guide2_0004	guide2	2-Expected-failure-absence-T-the-OrNull-tier-and-the-Try-pat	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 guide2_0005	guide2	2-Expected-failure-absence-T-the-OrNull-tier-and-the-Try-pat	skip	n/a	skip:incomplete-fragment

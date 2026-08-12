@@ -321,9 +321,130 @@ def wrap_mixed(code):
 
 
 # -----------------------------------------------------------------------
+# Ambient bindings — env.bzl, opt-in per case via the note `env:a,b,c`.
+#
+# WHY: the corpus's largest skip class by far is `skip:incomplete-fragment`
+# (176 rows at the v0.247 regeneration). Measured against this tree's bezelc,
+# 160 of those 176 fail on an UNBOUND NAME — a prose-context local or helper
+# the surrounding text assumes and the block does not declare. The wrap is not
+# the problem; the fragment is a sentence with a pronoun in it.
+#
+# preamble.bzl already establishes the answer for illustrative *types*
+# ("Many spec example fragments reference illustrative helper TYPES that the
+# surrounding prose assumes exist … without defining them in the fragment").
+# env.bzl is the same mechanism one level down, for the values and members
+# those fragments assume, with two disciplines that keep it honest:
+#
+#   1. Each entry is opted into BY NAME, per case. Nothing is ambient by
+#      default, so a reader sees exactly which assumption each row was granted.
+#   2. Each entry's type must be FORCED BY THE FRAGMENT'S OWN TEXT (or stated
+#      in the prose), and env.bzl records that derivation beside the entry.
+#      Choosing a binding by trying spellings until the compiler stops
+#      complaining is circular, and worse than circular here: it measures
+#      accept-anything holes rather than conformance. That is not hypothetical
+#      — an auto-solver written to size this bucket "solved" cases by binding
+#      called names to `int` (#3153, a call on a non-callable compiles and is
+#      dropped) and by binding `?.` receivers to `int` (#3155, `?.` never
+#      resolves its member). Both are filed; neither is a binding.
+#
+# An entry whose anchor is missing FAILS the case loudly. A silently-unapplied
+# ambient would make its row pass for a reason nobody chose.
+# -----------------------------------------------------------------------
+
+ENV_LOCAL = "local"      # a statement at the top of the Main body
+ENV_MEMBER = "member"    # a member of the synthesized class W
+ENV_TYPE = "type"        # a top-level declaration beside the module's others
+
+_ENV_HEADER_RE = re.compile(r'^//@\s+(local|member|type)\s+(\S+)\s*$')
+_ENV_MAIN_ANCHOR_RE = re.compile(r'^(\s*)public static method Main\(\)\s*$')
+_ENV_CLASS_ANCHOR_RE = re.compile(r'^class W\s*$')
+
+
+class EnvError(Exception):
+    """An env entry could not be applied — an unknown name or a missing anchor.
+    Raised rather than swallowed: see the module comment above."""
+
+
+def parse_env(text):
+    """Parse env.bzl into {name: (kind, text)}. Entries are introduced by a
+    `//@ <kind> <name>` header line and run to the next header or EOF; the
+    prose between the header and the code is the derivation record and rides
+    along into the emitted source as comments."""
+    entries = {}
+    name = kind = None
+    body = []
+    for line in (text or "").splitlines(keepends=True):
+        m = _ENV_HEADER_RE.match(line.rstrip("\n"))
+        if m:
+            if name is not None:
+                entries[name] = (kind, "".join(body))
+            kind, name = m.group(1), m.group(2)
+            body = []
+            continue
+        if name is not None:
+            body.append(line)
+    if name is not None:
+        entries[name] = (kind, "".join(body))
+    return entries
+
+
+def env_names(notes):
+    """The ordered, de-duplicated env entry names a manifest note asks for."""
+    out = []
+    for token in note_tokens(notes):
+        if not token.startswith("env:"):
+            continue
+        for n in token[len("env:"):].split(","):
+            n = n.strip()
+            if n and n not in out:
+                out.append(n)
+    return sorted(out)
+
+
+def splice_env(wrapped_src, names, entries):
+    """Insert the named ambient bindings at their anchors. `type` entries go
+    beside the module's other top-level declarations (after the module line and
+    any imports, per `SourceFile ::= ModuleDecl Import* TopDecl*`, spec Appendix
+    A.1), `member` entries directly inside `class W`, and `local` entries at the
+    top of the `Main` body, ahead of the fragment's own statements."""
+    by_kind = {ENV_TYPE: [], ENV_MEMBER: [], ENV_LOCAL: []}
+    for n in names:
+        if n not in entries:
+            raise EnvError("no env entry named `%s`" % n)
+        kind, body = entries[n]
+        by_kind[kind].append(body)
+
+    if by_kind[ENV_TYPE]:
+        wrapped_src = splice_preamble(wrapped_src, "".join(by_kind[ENV_TYPE]))
+
+    lines = wrapped_src.splitlines(keepends=True)
+    out = []
+    placed = {ENV_MEMBER: not by_kind[ENV_MEMBER], ENV_LOCAL: not by_kind[ENV_LOCAL]}
+    for line in lines:
+        out.append(line)
+        if not placed[ENV_MEMBER] and _ENV_CLASS_ANCHOR_RE.match(line.rstrip("\n")):
+            out.extend(by_kind[ENV_MEMBER])
+            placed[ENV_MEMBER] = True
+            continue
+        m = _ENV_MAIN_ANCHOR_RE.match(line.rstrip("\n"))
+        if not placed[ENV_LOCAL] and m:
+            out.extend(_indent_four(b) for b in by_kind[ENV_LOCAL])
+            placed[ENV_LOCAL] = True
+    for kind, ok in placed.items():
+        if not ok:
+            raise EnvError(
+                "no anchor for the `%s` env entries in the wrapped source "
+                "(a `%s` binding needs the mixed wrap, which always emits "
+                "`class W` and a `Main`)"
+                % (kind, kind))
+    return "".join(out)
+
+
+# -----------------------------------------------------------------------
 # Manifest `notes` is a `;`-separated token list. Tokens the harness acts on:
 #   preamble    — splice preamble.bzl (existing behaviour)
 #   wrap:mixed  — use wrap_mixed instead of the classify_wrap cascade
+#   env:a,b,c   — splice these env.bzl ambient bindings
 # Any other token (`chained:1`, a skip rationale, free prose) is provenance
 # only. Exact-token matching keeps prose that merely CONTAINS a keyword — e.g.
 # `name-collides-with-preamble (Shape/…)` — from switching behaviour on.
@@ -475,7 +596,8 @@ def caged_run(cmd, cwd=None):
 # Returns (status, kind, detail) — see evaluate_run for the shape.
 # -----------------------------------------------------------------------
 
-def run_case(case, bezelc, cases_dir, tmpdir, preamble_text, run=caged_run):
+def run_case(case, bezelc, cases_dir, tmpdir, preamble_text, run=caged_run,
+             env_entries=None):
     case_id = case["case_id"]
     src_path = os.path.join(cases_dir, case_id + ".bzl")
     if not os.path.isfile(src_path):
@@ -491,6 +613,12 @@ def run_case(case, bezelc, cases_dir, tmpdir, preamble_text, run=caged_run):
         wrap_mode, wrapped = classify_wrap(code)
     if "preamble" in tokens and preamble_text is not None:
         wrapped = splice_preamble(wrapped, preamble_text)
+    names = env_names(case.get("notes"))
+    if names:
+        try:
+            wrapped = splice_env(wrapped, names, env_entries or {})
+        except EnvError as e:
+            return "FAIL", "env-error", str(e)
 
     wrap_file = os.path.join(tmpdir, case_id + "_wrapped.bzl")
     with open(wrap_file, "w", encoding="utf-8") as f:
@@ -580,6 +708,11 @@ def main(argv, base_dir=None, run=caged_run):
     if os.path.isfile(preamble_file):
         with open(preamble_file, encoding="utf-8") as f:
             preamble_text = f.read()
+    env_file = os.path.join(here, "env.bzl")
+    env_entries = {}
+    if os.path.isfile(env_file):
+        with open(env_file, encoding="utf-8") as f:
+            env_entries = parse_env(f.read())
 
     if not os.path.isfile(manifest):
         print("ERROR: manifest not found: " + manifest, file=sys.stderr)
@@ -607,7 +740,8 @@ def main(argv, base_dir=None, run=caged_run):
                 counts["SKIP"] += 1
                 continue
             status, kind, detail = run_case(
-                case, bezelc, cases_dir, tmpdir, preamble_text, run=run)
+                case, bezelc, cases_dir, tmpdir, preamble_text, run=run,
+                env_entries=env_entries)
             counts[status] += 1
             if status == "FAIL":
                 fail_kinds[kind] = fail_kinds.get(kind, 0) + 1
@@ -624,7 +758,7 @@ def main(argv, base_dir=None, run=caged_run):
     print("Failure breakdown:")
     # Mirror the bash's fixed ordering of failure categories.
     for kind in ("compile-error", "wrong-result", "crash/signal",
-                 "missing-diagnostic", "timeout"):
+                 "missing-diagnostic", "timeout", "env-error"):
         print("  {:20} {}".format(kind + ":", fail_kinds.get(kind, 0)))
 
     if counts["FAIL"] > 0:

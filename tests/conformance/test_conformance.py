@@ -260,6 +260,82 @@ class WrapMixedTest(unittest.TestCase):
             self.assertIn(line.strip(), src)
 
 
+class EnvTest(unittest.TestCase):
+    CAT = ("// header prose\n"
+           "//@ local score\n"
+           "// derivation: the range patterns force an integral.\n"
+           "var score: int := 85;\n"
+           "\n"
+           "//@ member _name\n"
+           "  private _name: string := \"\";\n"
+           "\n"
+           "//@ type Widget\n"
+           "public record Widget(X: int);\n")
+
+    def test_parse_env(self):
+        e = cf.parse_env(self.CAT)
+        self.assertEqual(sorted(e), ["Widget", "_name", "score"])
+        self.assertEqual(e["score"][0], cf.ENV_LOCAL)
+        self.assertEqual(e["_name"][0], cf.ENV_MEMBER)
+        self.assertEqual(e["Widget"][0], cf.ENV_TYPE)
+        # the derivation comment rides along into the emitted source
+        self.assertIn("derivation:", e["score"][1])
+        self.assertIn("var score: int := 85;", e["score"][1])
+
+    def test_parse_env_ignores_prose_before_the_first_header(self):
+        self.assertNotIn("header prose", "".join(
+            b for _, b in cf.parse_env(self.CAT).values()))
+
+    def test_env_names_ordered_and_deduped(self):
+        self.assertEqual(cf.env_names("wrap:mixed; env:score,month,score"),
+                         ["month", "score"])
+        self.assertEqual(cf.env_names("preamble"), [])
+        self.assertEqual(cf.env_names(""), [])
+
+    def test_splice_env_places_each_kind_at_its_anchor(self):
+        _, wrapped = cf.wrap_mixed("var g := score;\n")
+        out = cf.splice_env(wrapped, ["Widget", "_name", "score"],
+                            cf.parse_env(self.CAT))
+        # type beside the module's other top-level decls, before `class W`
+        self.assertLess(out.index("public record Widget"), out.index("class W\n"))
+        # member inside class W, before Main
+        self.assertLess(out.index("class W\n"), out.index("private _name"))
+        self.assertLess(out.index("private _name"),
+                        out.index("public static method Main()"))
+        # local at the top of the Main body, ahead of the fragment's statements
+        self.assertLess(out.index("public static method Main()"),
+                        out.index("var score: int := 85;"))
+        self.assertLess(out.index("var score: int := 85;"), out.index("var g := score;"))
+
+    def test_unknown_env_name_raises(self):
+        _, wrapped = cf.wrap_mixed("var g := 1;\n")
+        with self.assertRaises(cf.EnvError):
+            cf.splice_env(wrapped, ["nope"], cf.parse_env(self.CAT))
+
+    def test_missing_anchor_raises_rather_than_silently_dropping(self):
+        # A silently-unapplied ambient would make its row pass for a reason
+        # nobody chose. The lib wrap has a `class W` but no `Main`.
+        wrapped = "module Conf;\nclass W\n  method F() end F;\nend W;\n"
+        with self.assertRaises(cf.EnvError):
+            cf.splice_env(wrapped, ["score"], cf.parse_env(self.CAT))
+
+    def test_run_case_reports_env_error_as_a_failure(self):
+        # An env misconfiguration must be a loud FAIL, never a quiet pass.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        cases = os.path.join(tmp, "cases")
+        os.makedirs(cases)
+        with open(os.path.join(cases, "z.bzl"), "w") as f:
+            f.write("var g := 1;\n")
+        case = {"case_id": "z", "doc": "d", "section": "S", "cls": "fragment",
+                "expectation": "compiles", "notes": "wrap:mixed; env:absent"}
+        status, kind, detail = cf.run_case(
+            case, "/bin/true", cases, tmp, None,
+            run=lambda cmd, cwd=None: (0, ""), env_entries={})
+        self.assertEqual(status, "FAIL")
+        self.assertEqual(kind, "env-error")
+
+
 class NoteTokensTest(unittest.TestCase):
     def test_semicolon_separated_tokens(self):
         self.assertEqual(cf.note_tokens("wrap:mixed; preamble"),
