@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.250.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.252.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A **task is a heap resource you own**, like every other class instance (§2). **No mutable state is ever reachable from two domains** — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a **structured scope**, not loose tasks (§4). If you skim everything else, read the three sections headed **How Bezel does it** and the table in §10.
 
@@ -218,8 +218,8 @@ The compiler enforces two things at every `Spawn` call site (stdlib §6.8):
 - **The entry is capture-free** — a static method reference or a non-capturing lambda. Captures are borrows of the origin domain's scopes and cannot cross. Data enters *only* through the explicit argument (aggregate several values into one sendable class, an `OwningArray`, or send the rest over a channel).
 - **Argument and result types are sendable** — the derived property that answers "may this value cross?" (spec §30.14). The rules you actually hit:
   - **Value types** are sendable iff they are neither **borrow-bearing** — no class- or interface-typed field anywhere, spec §9.7 — nor **move-only** (spec §15.3): primitives, enums, and those records and value-like choices whose fields and payloads are themselves sendable (spec §30.14; §35.12 for choices). They cross as *copies*. `string` crosses as a shared immutable reference.
-  - **A class is sendable iff it is transfer-closed**: `sealed`, and every field is a sendable value, `string`, an `owned` sendable class, an owning inline array of sendable classes, or an owning-choice field whose every `owned` payload class is sendable — no interface-, `Object`-, or function-typed fields, and no plain (non-`owned`) class fields, because a back-reference aliases something another domain owns. Such an instance crosses as an **owned transfer** of its whole ownership tree.
-  - **Never sendable**: open classes, interfaces, function values, tasks, lock guards, `CancellationToken` (§9). An owning choice does not cross directly (it is move-only, §3) but rides inside a transfer-closed owner's field (spec §35.12).
+  - **A class is sendable iff it is transfer-closed**: `sealed`, and every field is a sendable value, `string`, an `owned` sendable class, an owning inline array of sendable classes, or an owning-choice field that carries no borrows (spec §35.4's census — no plain class-typed payload anywhere) and whose every obligation-bearing payload is transfer-compatible — `owned` class payloads by their class's sendability, owning-inline-array payloads by their element class, nested owning choices recursively (spec §35.12) — no interface-, `Object`-, or function-typed fields, and no plain (non-`owned`) class fields, because a back-reference aliases something another domain owns. Such an instance crosses as an **owned transfer** of its whole ownership tree.
+  - **Never sendable**: open classes, interfaces, function values, tasks, lock guards, `CancellationToken` (§9). An owning choice does not cross directly (it is move-only, §3) but rides inside a transfer-closed owner's field — provided it carries no borrows (spec §35.4/§35.12).
 
 ```bezel
 using var j1 := Domain.Spawn(lambda() => Index(repo));   // ERROR: entry captures repo
