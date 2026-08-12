@@ -63,6 +63,22 @@ class ClassifyWrapTest(unittest.TestCase):
         self.assertEqual(self._mode("public record Point(X: int, Y: int);\n"),
                          cf.WRAP_LIB)
 
+    # v0.242 (#3052): `closed` joined A.3's `Modifier` production. §11.7's
+    # worked example leads with `public closed class Shape`, so a fragment
+    # extracted from it must classify as a type declaration, not fall through
+    # to the statement wrap (where it could never compile).
+    def test_closed_class_declaration_wraps_as_lib(self):
+        code = ("public closed class Shape\n"
+                "  public abstract method Area(): double;\n"
+                "end Shape;\n")
+        mode, wrapped = cf.classify_wrap(code)
+        self.assertEqual(mode, cf.WRAP_LIB)
+        self.assertIn(code, wrapped)
+
+    def test_closed_class_without_visibility_wraps_as_lib(self):
+        self.assertEqual(self._mode("closed class Shape\nend Shape;\n"),
+                         cf.WRAP_LIB)
+
     def test_extension_block_wraps_as_lib(self):
         code = "extension int\n  method Doubled() => this * 2;\nend int;\n"
         mode, wrapped = cf.classify_wrap(code)

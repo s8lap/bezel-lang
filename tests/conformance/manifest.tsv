@@ -45,7 +45,7 @@ spec_0042	spec	owned-in-interface-signatures	fragment	compiles
 spec_0043	spec	115-Modifier-order	skip	n/a	skip:elided
 spec_0044	spec	116-Nested-types	fragment	compiles	
 spec_0045	spec	117-Static-classes	fragment	compiles	
-spec_0046	spec	117-Static-classes	skip	n/a	blocked-on-#3052 (docs-ahead: closed/mod=, v0.243)
+spec_0046	spec	117-Static-classes	skip	n/a	name-collides-with-preamble (Shape/Circle/Square); the `closed` modifier itself compiles since #3052
 spec_0047	spec	118-Static-interface-members	fragment	compiles	
 spec_0048	spec	118-Static-interface-members	skip	n/a	skip:signature-listing
 spec_0049	spec	124-Sealing	skip	n/a	skip:signature-listing (carried spec_0039)
@@ -317,7 +317,7 @@ spec_0314	spec	A2-Source-file	skip	n/a	skip:ebnf-grammar
 spec_0315	spec	A3-Type-declarations	skip	n/a	blocked-on-#3050 (docs-ahead: equality-skip, v0.244)
 spec_0316	spec	A4-Members	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker unification, v0.246)
 spec_0317	spec	A5-Types	skip	n/a	skip:ebnf-grammar
-spec_0318	spec	A6-Statements	skip	n/a	blocked-on-#3052 (docs-ahead: closed/mod=, v0.243)
+spec_0318	spec	A6-Statements	skip	n/a	grammar-production block, not Bezel source (permanently skip)
 spec_0319	spec	A7-Expressions	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker unification, v0.246)
 spec_0320	spec	A8-Constants-and-literals	skip	n/a	skip:ebnf-grammar
 spec_0321	spec	owned-and-overload-resolution	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683; hand-added v0.250 — also docs-ahead on #3086: the owned pair itself rejects at HEAD pre-lift); also docs-ahead on #3056 (the identifier-operand move w)

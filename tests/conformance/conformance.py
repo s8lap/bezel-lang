@@ -75,9 +75,13 @@ _FNS_LINE_RE = re.compile(r'^[ \t]*[^ \t/]')
 # the original cascade predates their appearance as fragment-leading forms in
 # the docs, so such fragments fell through to the stmt wrap and could never
 # compile.
+# v0.242 (#3052): `closed` joined A.3's `Modifier` production as the dedicated
+# spelling of the retired `sealed abstract` pair, and the docs' §11.7 worked
+# example leads with `public closed class Shape`. Without it here the cascade
+# fell through to the stmt wrap and the fragment could never compile.
 _TYPE_DECL_RE = re.compile(
     r'^\s*(?:(?:public|private|internal)\s+)?'
-    r'(?:(?:sealed|abstract|static)\s+)*'
+    r'(?:(?:sealed|abstract|closed|static)\s+)*'
     r'(?:class|record|enum|interface|choice)\s+\w')
 # Visibility prefix admitted since the v0.247 regeneration: §26.1 defaults
 # extensions to internal, so the docs' fragments now spell `public extension`.
