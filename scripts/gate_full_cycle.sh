@@ -316,6 +316,44 @@ if [ -x "$REPO/build/bezelc" ]; then
   fi
 fi
 
+# ── VACUOUS-ASSERTION PHASE (#3138) ────────────────────────────────────────
+# A static source check, so it runs FIRST: a tree carrying an assertion that
+# cannot fail is rejected in under a second instead of after two ~20-minute
+# sharded passes agree that it is green — which is exactly what they would do,
+# because a vacuous assertion passes under BOTH oracles by construction. That is
+# the point: this is the one defect class neither gate.sh pass can see, so the
+# phase belongs in the CYCLE (which runs once) rather than in gate.sh (which
+# runs twice and would only duplicate a source scan).
+#
+# `runAot` fills JitResult::diagnostics only on a REJECT, so a test asserting the
+# ABSENCE of a Warning on a program it also asserts RAN is a tautology — it
+# claims coverage it does not have. #2992's entire regression file was in that
+# state (7 of 7 tests), with a fails-without recipe that could not reproduce.
+#
+# --self-test runs FIRST and is not optional: the detector's own first draft
+# reported the whole tree clean because a `^BEZEL_TEST` regex matched zero
+# wrapped macros. A green from a matcher that matched nothing is worth nothing,
+# so the phase proves the detector still goes red on a known-positive fixture
+# before it is allowed to certify the tree.
+say "vacuous-assertion phase: detector self-test + tree scan (#3138)"
+if ! python3 scripts/check_vacuous_tests.py --self-test \
+      > "$LOGDIR/${TAG}_vacuous.log" 2>&1; then
+  say "CYCLE FAILURE: check_vacuous_tests SELF-TEST failed — the detector is"
+  say "  broken, so its verdict on the tree means nothing. See $LOGDIR/${TAG}_vacuous.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_vacuous.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_vacuous_tests.py --strict \
+      >> "$LOGDIR/${TAG}_vacuous.log" 2>&1; then
+  say "CYCLE FAILURE: vacuous assertion(s) found — a test that cannot fail is"
+  say "  worse than no test (#3138). See $LOGDIR/${TAG}_vacuous.log"
+  sed -n '/VACUOUS/,$p' "$LOGDIR/${TAG}_vacuous.log" 2>/dev/null | head -40 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "vacuous-assertion phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_vacuous.log"))"
+
 run_until_trustworthy "$LOGDIR/${TAG}_plain.log" "plain" || exit $?
 
 # --full folds whole-suite generated-code AddressSanitizer into the same sharded

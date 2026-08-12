@@ -56,6 +56,7 @@
 
 #include "codegen/LlvmBackend.hpp"   // codegen::CodegenOptions
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -124,7 +125,7 @@ std::string runXmodOut2934(const std::string& libSrc,
     std::vector<bezel::Dependency> deps{dep};
     codegen::CodegenOptions opts;
     opts.sanitizeAddress = true;   // see the note above: this IS the leak gate
-    if (!driver.compileFile(mSrc.path, mExe.path, deps, opts).success)
+    if (!bezel::test::compileFileForTest(driver, mSrc.path, mExe.path, deps, opts).success)
         return "<did-not-run>";
 
     std::string cmd = mExe.path + " > " + mOut.path + " 2>/dev/null";

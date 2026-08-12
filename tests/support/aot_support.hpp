@@ -110,6 +110,7 @@
 #include <unistd.h>
 
 #include "support/codegen_support.hpp"   // JitResult + codegen::CodegenOptions
+#include "support/force_sanitize.hpp"    // the ONE BEZEL_AOT_FORCE_SANITIZE parse
 #include "driver/Driver.hpp"             // Driver::compileFile (the AOT path)
 
 #include "llvm/ADT/ArrayRef.h"
@@ -395,15 +396,15 @@ inline bool hasSanitizerReport(const std::string& text) {
 // and under the AOT harness only broke the per-program links (plain-clang links
 // against an ASan-instrumented runtime archive → undefined __asan_* refs), so no
 // program ran under ASan and the sweep validated NOTHING (false-green).
-inline bool forceSanitizeAddress() {
-    static const bool v = [] {
-        const char* e = std::getenv("BEZEL_AOT_FORCE_SANITIZE");
-        if (!e || *e == '\0') return false;
-        std::string s(e);
-        return s == "address" || s == "asan" || s == "1";
-    }();
-    return v;
-}
+//
+// THE DEFINITION MOVED to support/force_sanitize.hpp and this is now a re-export,
+// so the `aot_detail::forceSanitizeAddress()` call sites below are untouched.
+// The reason it moved: there were THREE independent copies of this parse — here,
+// in test_main.cpp's shard-summary writer, and (implicitly, by absence) in the
+// ~200 hand-rolled `Driver::compileFile` runners, which had none at all and were
+// therefore invisible to the sweep. One definition, three consumers; the third
+// is support/driver_run_support.hpp.
+using bezel::test::forceSanitizeAddress;
 
 // #1822: re-emit a fired sanitizer report to the harness's real stderr (fd 2) so
 // the whole-suite sweep (scripts/asan_sweep.sh) can grep the shard log for the

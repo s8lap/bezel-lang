@@ -69,6 +69,7 @@
 
 #include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -121,7 +122,7 @@ int compileImportRunAsan2505(const std::string& libSrc,
 
     bezel::codegen::CodegenOptions opts;
     opts.sanitizeAddress = true;
-    if (!driver.compileFile(bSrc.path, bExe.path, deps, opts).success)
+    if (!bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps, opts).success)
         return -1;
 
     std::string runCmd = std::string("ASAN_OPTIONS=detect_leaks=") +
@@ -147,7 +148,7 @@ int compileRunAsan2505Local(const std::string& src, bool leaks) {
     bezel::Driver driver;
     bezel::codegen::CodegenOptions opts;
     opts.sanitizeAddress = true;
-    if (!driver.compileFile(srcFile.path, exe.path, {}, opts).success)
+    if (!bezel::test::compileFileForTest(driver, srcFile.path, exe.path, {}, opts).success)
         return -1;
 
     std::string runCmd = std::string("ASAN_OPTIONS=detect_leaks=") +

@@ -52,6 +52,7 @@
 
 #include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -97,7 +98,7 @@ int compileImportAndRunAsan2867(const std::string& libSrc,
     deps.push_back(d);
     codegen::CodegenOptions opts;
     opts.sanitizeAddress = true;
-    if (!driver.compileFile(bSrc.path, bExe.path, deps, opts).success)
+    if (!bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps, opts).success)
         return -1;
     int status = std::system(bExe.path.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;

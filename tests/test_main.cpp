@@ -13,6 +13,7 @@
 #include <iostream>
 #include <unordered_set>
 
+#include "support/force_sanitize.hpp"
 #include "test_harness.hpp"
 
 // Test entry point — compiled into EVERY per-area test binary
@@ -284,13 +285,12 @@ int main(int argc, char** argv) {
         const double elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();
         const char* bin = (argc > 0 && argv[0]) ? argv[0] : "";
-        // Mirrors forceSanitizeAddress (#1822): generated-code ASan is forced
-        // when BEZEL_AOT_FORCE_SANITIZE is address/asan/1 (the --full oracle).
-        const char* asanEnv = std::getenv("BEZEL_AOT_FORCE_SANITIZE");
-        const bool asan = asanEnv && *asanEnv &&
-                          (std::string(asanEnv) == "address" ||
-                           std::string(asanEnv) == "asan" ||
-                           std::string(asanEnv) == "1");
+        // #1822: generated-code ASan is forced when BEZEL_AOT_FORCE_SANITIZE is
+        // address/asan/1 (the --full oracle). This used to be a hand-inlined
+        // copy of that parse that "mirrors forceSanitizeAddress" by comment
+        // only; it now IS forceSanitizeAddress, so the field this shard summary
+        // records cannot disagree with the bit the harness actually applied.
+        const bool asan = ::bezel::test::forceSanitizeAddress();
         char elapsedBuf[32];
         std::snprintf(elapsedBuf, sizeof(elapsedBuf), "%.3f", elapsed);
         std::string json = "{\"schema\":\"bezel.shard-summary.v1\",";

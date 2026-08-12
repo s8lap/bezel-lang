@@ -72,6 +72,7 @@
 
 #include "driver/Driver.hpp"   // Driver::compileObject / compileFile (AOT path)
 #include "test_harness.hpp"
+#include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 
 #include <cstdlib>
 #include <filesystem>
@@ -131,7 +132,7 @@ int buildLibAndRunChecked(const std::string& libSrc, const std::string& mainSrc,
     // owned-field cascade leaves 200 Payloads on the heap — LSan exits non-zero.
     bezel::codegen::CodegenOptions opts;
     opts.sanitizeAddress = true;
-    bezel::CompileResult rMain = driver.compileFile(
+    bezel::CompileResult rMain = bezel::test::compileFileForTest(driver, 
         mainSrcF.path, mainExeF.path, deps, opts);
     if (!rMain.success) return -1;
 
@@ -154,7 +155,7 @@ int buildSingleChecked(const std::string& src, const std::string& tag) {
     bezel::codegen::CodegenOptions opts;
     opts.sanitizeAddress = true;
     bezel::CompileResult r =
-        driver.compileFile(srcF.path, exeF.path, {}, opts);
+        bezel::test::compileFileForTest(driver, srcF.path, exeF.path, {}, opts);
     if (!r.success) return -1;
 
     int status = std::system(exeF.path.c_str());

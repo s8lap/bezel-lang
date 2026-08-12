@@ -77,6 +77,7 @@
 
 #include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -123,7 +124,7 @@ int compileImportAndRun2950(const std::string& libSrc,
     deps.push_back(d);
     codegen::CodegenOptions opts;
     opts.sanitizeAddress = sanitize;
-    if (!driver.compileFile(bSrc.path, bExe.path, deps, opts).success)
+    if (!bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps, opts).success)
         return -1;
     // #2951 (the leak this fix does NOT close) is expected on every exception
     // subclass, so LeakSanitizer is off here; AddressSanitizer's out-of-bounds
