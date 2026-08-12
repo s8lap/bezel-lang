@@ -1182,6 +1182,46 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 substituteMemberType(rt, nullptr, ps->parent));
                     }
                 }
+            } else if (auto* cms = dynamic_cast<ConstMemberSymbol*>(sym)) {
+                // fix #3079 (§22.12 / §2.7 / §8.5, v0.249): the BARE-identifier
+                // sibling of resolveMemberAccess's #609 `ConstMemberSymbol`
+                // arm. §22.12 makes a class-level `const` implicitly static and
+                // gives it "a primitive value type or `string`"; §2.7 rule 1
+                // reaches it unqualified from inside the declaring type (the
+                // chain-head member fallback), so `K` and `C.K` name the same
+                // constant. Only the QUALIFIED spelling was typed: the
+                // MemberAccess path sets the exprType (#609), the bare path had
+                // no arm at all, so `K` carried no type.
+                //
+                // A missing exprType on a RECEIVER is not inert — it silently
+                // deletes code. MEASURED on 309356e with `public const K: int
+                // := 7;`: `Console.WriteLine(K)` printed `7` (the console path
+                // folds the constant itself) while `Console.WriteLine(
+                // K.ToString())` printed NOTHING AT ALL — no newline, no
+                // diagnostic at any severity, exit 0 — because CG27c
+                // (LlvmBackend_Exprs.cpp, "ToString() on any primitive") is
+                // gated on `ctx_.exprType(*ma->target)` being a Primitive, the
+                // untyped receiver skipped every primitive-method arm, and
+                // lowerCall's `if (!ms)` chain fell through to its unconditional
+                // `return nullptr`, which `tryLowerConsoleCall` then read as
+                // "not a console call". `K.GetHashCode()` and `K.CompareTo(3)`
+                // dropped identically, and `var h: int := K.GetHashCode();`
+                // degraded to the #2434 zero-init slot. The type is the one
+                // fact all of those arms ask for.
+                //
+                // Read exactly as the #609 arm reads it: the explicit `: Type`
+                // annotation when present, else the initializer's own exprType
+                // (already set by visitMember → visitExpr) for an inferred
+                // `const K := 7;`.
+                if (auto* cd = dynamic_cast<const ast::ConstDecl*>(cms->decl)) {
+                    if (cd->type) {
+                        if (auto* rt = ctx_.resolvedType(*cd->type))
+                            ctx_.setExprType(&e, rt);
+                    } else if (cd->value) {
+                        if (auto* rt = ctx_.exprType(*cd->value))
+                            ctx_.setExprType(&e, rt);
+                    }
+                }
             }
             // §12.7: flow narrowing. Inside the controlled block of `if x is T`
             // (or the else of `if x is not T`), a reference to the narrowed

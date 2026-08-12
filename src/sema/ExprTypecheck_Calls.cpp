@@ -12334,6 +12334,33 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // the call typed to nothing and any consumer silently
                     // dropped it.)
                     ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                } else if (mm == "Length") {
+                    // fix #3079 (§15.1.2, v0.249): "`arr.Length: int` —
+                    // compile-time constant N". `Length` has been on the
+                    // allow-list since #1100/#1342 but was the one admitted
+                    // member with NO exprType — the same omission the #1579
+                    // note directly above records for `ToString` ("fell through
+                    // the allow-list with no exprType set at all, so the call
+                    // typed to nothing and any consumer silently dropped it"),
+                    // one member later.
+                    //
+                    // The read itself works — codegen recognises the shape
+                    // structurally and folds N — so the gap is invisible until
+                    // `a.Length` is a CHAIN HEAD, where the next segment asks
+                    // for its type. MEASURED on 309356e with `var a: [16]int;`:
+                    // `Console.WriteLine(a.Length)` printed `16`, `$"{a.Length}"`
+                    // rendered `16`, and `var n: int := a.Length;` then
+                    // `n.ToString()` printed `16` — while
+                    // `Console.WriteLine(a.Length.ToString())` printed NOTHING
+                    // AT ALL (no newline, no diagnostic at any severity, exit
+                    // 0). CG27c (LlvmBackend_Exprs.cpp, "ToString() on any
+                    // primitive") is gated on the receiver's exprType being a
+                    // Primitive, so the untyped `a.Length` skipped every
+                    // primitive-method arm and lowerCall's `if (!ms)` chain fell
+                    // through to its unconditional `return nullptr`.
+                    // `a.Length.GetHashCode()` and `(a.Length + 0).ToString()`
+                    // dropped identically.
+                    ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                 }
             }
         }

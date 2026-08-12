@@ -186,7 +186,112 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     // Evaluate the argument. If it's a string, use directly; if it's a
     // primitive, convert via emitPrimitiveToString first.
     llvm::Value* arg = lowerExpr(*call.args[0].value);
-    if (!arg) return false;
+    if (!arg) {
+        // fix #3079 (§8.5 / §21, v0.249): THE THIRD VALUE-DEMANDING DEGRADE —
+        // the one #2966 named as a residual ("the three OTHER value-demanding
+        // degrades are deliberately NOT covered") and the only one of the three
+        // whose degrade is not a wrong value but the DISAPPEARANCE OF THE WHOLE
+        // STATEMENT.
+        //
+        // This `return false` says "not a console call" about a call this
+        // function has ALREADY positively identified as `Console[.Error|.Out]
+        // .Write(Line)` with exactly one argument. Nothing downstream matches
+        // that shape, so lowerCallDispatch runs out of arms and its `if (!ms)`
+        // chain returns nullptr — and a nullptr call result in statement
+        // position emits nothing at all. Not even `Console.NewLine`: exit 0, no
+        // diagnostic at ANY severity, output silently missing.
+        //
+        // MEASURED on 309356e, three times over, on the ORDINARY forms this
+        // file's other notes each measured once:
+        //   • `Console.WriteLine(K.ToString())` for `public const K: int := 7;`
+        //     — printed nothing (#3079 shape (i); root cause: sema left the
+        //     bare `const` receiver untyped, fixed in ExprTypecheck_Exprs.cpp).
+        //   • `Console.WriteLine(a.Length.ToString())` for `var a: [16]int;` —
+        //     printed nothing (#3079 shape (ii); sema left `a.Length` untyped,
+        //     fixed in ExprTypecheck_Calls.cpp).
+        //   • `Console.WriteLine(w?.GetHashCode())` on a non-null `Widget?` —
+        //     the SAME disappearance recorded verbatim at
+        //     LlvmBackend_Calls2.cpp's #2982 note, and again at its #2469 note.
+        // Both #3079 shapes are typed by this commit, so neither reaches here
+        // any more. This guard is for the NEXT one: a receiver shape nobody has
+        // written down yet must not be able to delete a user's output line in
+        // silence.
+        //
+        // The severity split is #2434/#2491/#2935's, reused rather than
+        // re-derived — the shared `builtinReceiverOfMemberCall` /
+        // `unconstructedBuiltinNewName` predicates, not a fourth copy of them
+        // (#2924's four-way-mirror finding):
+        //   (a) a UNIT-typed argument is EXEMPT and silent — `()` lowers to
+        //       LLVM `void` (#2915), so having no lowered value IS the type's
+        //       representation, not a lowering failure.
+        //   (b) a member call on a BUILT-IN receiver, or a `new` on one, that
+        //       neither sema nor codegen could make sense of ⇒ located Error.
+        //       The conjunction #2935 requires holds here for the same reason
+        //       it holds at a local declaration and at §21.7's `return expr;`:
+        //       a value is DEMANDED. `Console.Write(Line)` renders its one
+        //       argument (stdlib §2.1); an argument that yields nothing cannot
+        //       be rendered.
+        //   (c) everything else ⇒ the `internal:` Warning, NOT an Error — the
+        //       §3/#605 permissive surface (`Console.WriteLine(o.Anything())`
+        //       for `o: Object`) is accepted by sema BY DESIGN and reaches
+        //       here, so an Error would false-reject legal programs exactly as
+        //       #2434's lit-corpus check found for the local-decl twin.
+        //       `Driver::compileExecutableObject` prints every diagnostic
+        //       whatever its severity, so the Warning is fully visible on
+        //       stderr without failing the build.
+        // All three are guarded on `!hasErrors()` for message quality: lowerExpr
+        // has sites that return nullptr AFTER reporting their own specific
+        // Error, and stacking a generic note on those is noise.
+        //
+        // The `return false` itself is UNCHANGED — deliberately. Reporting is
+        // what closes the silence; re-routing the dispatch would additionally
+        // claim no later arm can ever serve this shape, which this fix has no
+        // evidence for and does not need.
+        const ast::Expr* argE = call.args[0].value.get();
+        const sema::TypeRef* aTy = ctx_.exprType(*argE);
+        const bool unitArg = aTy && aTy->kind == sema::TypeRef::Kind::Unit;
+        std::string argMember, argAppliedMember;
+        const std::string argBuiltinRecv =
+            unitArg ? std::string()
+                    : builtinReceiverOfMemberCall(argE, &argMember,
+                                                  &argAppliedMember);
+        const std::string argBuiltinNew =
+            (unitArg || !argBuiltinRecv.empty())
+                ? std::string()
+                : unconstructedBuiltinNewName(argE);
+        const char* siteClause = isWriteLine ? "supply this `Console.WriteLine` "
+                                               "argument"
+                                             : "supply this `Console.Write` "
+                                               "argument";
+        if (unitArg) {
+            // (a) — nothing to report.
+        } else if (!argBuiltinRecv.empty() && !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Error, argE->span.begin,
+                "`" + argMember + "` on built-in type `" + argBuiltinRecv +
+                "` produced no value, so it cannot " + siteClause + ". `" +
+                argBuiltinRecv + "` has no user declaration, so its member "
+                "surface is exactly what the standard library documents for "
+                "it: either `" + argMember + "` is not on that surface (a "
+                "misspelling), or it is documented but yields nothing here "
+                "(#2935 \xE2\x80\x94 if it is documented and should yield a "
+                "value, it is unimplemented, #2457)" +
+                builtinMemberChainNote(argMember, argAppliedMember));
+        } else if (!argBuiltinNew.empty() && !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Error, argE->span.begin,
+                unconstructedBuiltinNewNote(argBuiltinNew, siteClause));
+        } else if (!ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Warning, argE->span.begin,
+                std::string("internal: the argument of this `Console.") +
+                (isWriteLine ? "WriteLine" : "Write") +
+                "` failed to lower to a value, so the whole statement emits "
+                "nothing \xE2\x80\x94 not even the line terminator (stdlib "
+                "\xC2\xA7""2.1 / \xC2\xA7""21.9) \xE2\x80\x94 #3079");
+        }
+        return false;
+    }
     auto* argTy = ctx_.exprType(*call.args[0].value);
     llvm::Value* strPtr = arg;
     // issue #421: a NUMERIC/char primitive conversion (emitPrimitiveToString's
