@@ -96,7 +96,8 @@ additive feature catch-up, in that order.
     marker unification (~633 test lines + parser/sema). **Only after** Train E (v0.246) merges
     AND phase 0's #3049 migration is in. Resolves the
     [#3060](https://github.com/s8lap/bezel-lang/issues/3060) §30.5/A7 seam (cite it at landing).
-    Last because every earlier phase's tests would otherwise be respelled twice.
+    Last of the original R0 set because every earlier phase's tests would otherwise be
+    respelled twice; items 20–21 (added 2026-08-12) are sequenced behind it.
 20. ⏳ **[#3086](https://github.com/s8lap/bezel-lang/issues/3086)** — the v0.250 owned-overload
     lift (proposal 0091): the four-clause applicability filter, the §11.3 erasure-guard clash
     narrowing, the reworded §22.6 diagnostic family, and the `WhenAll`/`WhenEach` recognition

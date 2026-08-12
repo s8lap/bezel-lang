@@ -81,7 +81,7 @@ tasks.Add(File.ReadAllTextAsync(path));   // compiles — but WARNS (spec §15.4
                                           //   the statement ends
 ```
 
-The two sanctioned spellings — the ones the warning names: give each task a **named holder** and build the borrowed array over the names (below, §4), or use the owning family (`OwningArray<OwningTask<T>>` with the owning `Task.WhenAll`/`WhenEach` overloads — `Task.WhenAll(move tasks)`, spec §22.6/stdlib §6.7, v0.250) for dynamically-sized fan-in. Dynamic fan-in over fresh tasks is an ownership-transfer scenario by construction.
+The two sanctioned spellings — the ones the warning names: give each task a **named holder** and build the borrowed array over the names (below, §4), or use the owning family (`OwningArray<OwningTask<T>>` with the owning `Task.WhenAll`/`WhenEach` overloads — same names since the v0.250 merge, the parameter type distinguishing them and the `move` marker announcing the transfer: `Task.WhenAll(move tasks)`, spec §22.3/stdlib §6.7) for dynamically-sized fan-in. Dynamic fan-in over fresh tasks is an ownership-transfer scenario by construction.
 
 ---
 
@@ -187,7 +187,7 @@ await Task.WhenAll(both);                                // settles ALL inputs; 
                                                          //   first non-successful input's fault
 ```
 
-`WhenAll` never abandons laggards (spec §30.10). `WhenAny` yields the *index* of the first task to settle and never re-raises — you inspect the winner (spec §30.10). For results-bearing named holders, await each after the `WhenAll` — a completed await resumes synchronously. For a dynamically-sized set, use the owning overloads — same names, the `move` marker announcing the consuming form (spec §22.6, v0.250): `Task.WhenAll(move tasks)` collects everything, `Task.WhenEach(move tasks)` streams each task as it completes (stdlib §6.7).
+`WhenAll` never abandons laggards (spec §30.10). `WhenAny` yields the *index* of the first task to settle and never re-raises — you inspect the winner (spec §30.10). For results-bearing named holders, await each after the `WhenAll` — a completed await resumes synchronously. For a dynamically-sized set, use the owning overloads — same names since the v0.250 merge, the parameter type distinguishing them, the `move` marker announcing the consuming form (spec §22.3): `Task.WhenAll(move tasks)` collects everything, `Task.WhenEach(move tasks)` streams each task as it completes (stdlib §6.7).
 
 ---
 
