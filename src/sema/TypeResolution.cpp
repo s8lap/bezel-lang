@@ -308,6 +308,8 @@ void Resolver::run(const ast::SourceFile& src) {
     checkStaticClassMembers();
     // §23.5 (#747): static indexers are not supported (any type).
     checkStaticIndexers();
+    // §23.5 (v0.241, #2758): indexer parameters may not declare defaults.
+    checkIndexerParamDefaults();
     // §25.2 (#746): comparison/equality operators must form a complete group.
     checkOperatorGroups();
     // §8.3 (#1193): a type overriding `Equals` must also override `GetHashCode`.

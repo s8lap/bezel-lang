@@ -334,6 +334,10 @@ private:
     // are implicitly static), and nested types are permitted.
     void checkStaticClassMembers();
     void checkStaticIndexers();  // §23.5: static indexers are not supported
+    // fix #2758 (§23.5, v0.241): "Indexer parameters may not declare default
+    // values" — the declaration-side premise of the positional-only index-
+    // argument rule (A.4 IndexerDecl records the ParamList over-admission).
+    void checkIndexerParamDefaults();
 
     // §22.12 rules 2 and 4 (v0.163, #1363): statics-and-domains enforcement.
     //   Rule 2: a mutable (non-readonly, non-const) static field or static

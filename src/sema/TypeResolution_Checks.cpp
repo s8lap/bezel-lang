@@ -1562,6 +1562,54 @@ void Resolver::checkStaticIndexers() {
     }
 }
 
+// fix #2758 (§23.5, v0.241): the DECLARATION-SIDE half of the same §23.5
+// bullet the index-argument rule lives in — "Indexer parameters may not
+// declare default values, so §22.5's optional-parameter and named-binding
+// machinery is never reached from an index position".
+//
+// This is the premise the positional-only rule rests on: with no defaults an
+// index list can never be short, so there is nothing for a name to bind
+// out-of-order to. A.4's IndexerDecl comment records the over-admission in
+// the same shape as the `static` one directly above: "Parameter default
+// values (`:=` in the shared ParamList) are likewise over-admitted and
+// rejected: indexer parameters may not declare defaults (§23.5)."
+//
+// `Parser::parseParamList` is shared with methods and primary constructors,
+// so `public property [i: int := 0]: int` PARSES. Measured on 309356e it
+// compiled clean and the default was simply unreachable — no call site can
+// omit an index (`q[]` does not parse), and no consumer of `indexerParams`
+// reads `defaultValue`. Rejecting it at the declaration is bug-revealing:
+// the tree contains no such declaration, in `src/`, `tests/`, or `docs/`.
+void Resolver::checkIndexerParamDefaults() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        for (Symbol* m : t->members) {
+            auto* ps = dynamic_cast<PropertySymbol*>(m);
+            if (!ps || !ps->isIndexer) continue;
+            // The AST is the only place a default VALUE survives: the
+            // reconstructed ParameterSymbols an IMPORTED indexer carries do
+            // not record one, so an imported declaration is skipped here and
+            // caught in its own module.
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd) continue;
+            for (const auto& p : pd->indexerParams) {
+                if (!p.defaultValue) continue;
+                ctx_.diagnostics().report(
+                    Severity::Error, p.loc,
+                    "indexer parameter `" + std::string(p.name) +
+                    "` may not declare a default value — an index list can "
+                    "never be short (there is no argument-less `[]` form) and "
+                    "index arguments are positional-only, so §22.5's "
+                    "optional-parameter and named-binding machinery is never "
+                    "reached from an index position; remove the `:= …` "
+                    "(§23.5)");
+            }
+        }
+    }
+}
+
 // §25.2 (#746 R41): comparison operators must be overloaded as a complete group
 // — `<`, `>`, `<=`, `>=` together; `=` and `<>` together. A partial group was
 // silently accepted, and then using a missing member (`v1 <= v2` with only

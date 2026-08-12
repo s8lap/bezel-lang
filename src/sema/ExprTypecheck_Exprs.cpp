@@ -678,6 +678,76 @@ void ExprTC::checkIndexArgNullability(const ast::IndexExpr& ix,
     }
 }
 
+// fix #2758 (§23.5, v0.241) — INDEX ARGUMENTS ARE POSITIONAL-ONLY.
+//
+// §23.5, verbatim: "Index arguments are **positional-only**. The named-argument
+// form (`Identifier :=`, §22.5) is not admitted at an index position — a
+// compile error naming this rule. Indexer parameters may not declare default
+// values, so §22.5's optional-parameter and named-binding machinery is never
+// reached from an index position; an indexer's parameter names are
+// declaration-internal, not caller-bindable API surface (consistent with
+// §23.4's overloading by parameter *type* list)."
+//
+// WHY THE FORM EXISTS TO REJECT. A.7's `PrimarySuffix ::= "[" ArgList "]"`
+// shares the CALL argument grammar, and the parser genuinely shares the
+// production (`Parser::parseArgList`, Parser_Exprs.cpp) rather than merely the
+// struct — so `d[key := "k"]` parses into a `CallArgument` with a non-empty
+// `name`. A.4's Argument comment records exactly that over-admission: "Named
+// arguments are additionally rejected at the index position (§23.5) — admitted
+// by the shared grammar, rejected semantically."
+//
+// WHAT IT COST BEFORE. Indexer overload selection never consults `a.name`, and
+// ~18 sema/codegen sites map `indices[k]` to `indexerParams[k]` positionally.
+// Measured on 309356e against `property [key: string, fallback: int]: int`:
+//
+//   d[key := "abcd", fallback := 1]   accepted; the names are dropped and the
+//                                     arguments bind by position (they happen
+//                                     to agree, so it "works")
+//   d[fallback := 1, key := "abcd"]   accepted by sema, then `1` binds to the
+//                                     `string` slot and bezelc DIES IN THE LLVM
+//                                     VERIFIER: "GEP base pointer is not a
+//                                     vector or a vector of pointers", "Load
+//                                     operand must be a pointer", "Call
+//                                     parameter type does not match function
+//                                     signature" — an internal compiler error
+//                                     where §23.5 asks for a diagnostic.
+//
+// WHY IT CANNOT FALSE-REJECT. The predicate is `!a.name.empty()`, which the
+// parser sets ONLY for the literal `Identifier ":="` prefix inside the
+// brackets (Parser_Decls.cpp parseArgList) and never for a modifier, a
+// discard, or any expression — including a bare index whose value is a local
+// literally named `key` (`d[key, 1]`), which parses as an unmodified
+// ArgExpression with an EMPTY name. Every positional spelling on every
+// receiver family (user indexer, `Array<T>`, `Dictionary<K,V>`, `string`, an
+// inline array, a span, `this[i]`, `base[i]`, an overloaded or generic
+// indexer, the setter form, a trailing comma) leaves `name` empty and is not
+// reached at all; the accept controls in tests/lit/index_positional_accept_2758
+// .bzl and tests/sema/index_named_arg_positional_only_2758_test.cpp pin each.
+// The named form in a CALL (`M(x := 1)`) and in a `new` (`new C(v := true)`)
+// is a different node kind entirely and is untouched.
+void ExprTC::checkIndexArgsPositional(const ast::IndexExpr& ix) {
+    for (const auto& a : ix.indices) {
+        if (a.name.empty()) continue;
+        // The name has no span of its own (CallArgument carries only the
+        // value's), so report at the value — inside the brackets, which is
+        // what a reader needs — falling back to the whole index expression
+        // for the value-less `d[key := _]` shape (#3049 rejects that `_`
+        // separately; this still names the §23.5 rule for the prefix).
+        ctx_.diagnostics().report(
+            Severity::Error,
+            a.value ? a.value->span.begin : ix.span.begin,
+            "the named-argument form `" + std::string(a.name) +
+            " := \xE2\x80\xA6` is not admitted at an index position — index "
+            "arguments are positional-only: an indexer's parameter names are "
+            "declaration-internal, not caller-bindable API surface (indexer "
+            "parameters may not declare default values, so \xC2\xA7""22.5's "
+            "named-binding machinery is never reached here, and \xC2\xA7""23.4 "
+            "overloads indexers by parameter TYPE list). Drop the `" +
+            std::string(a.name) + " := ` prefix and pass the index "
+            "positionally (\xC2\xA7""23.5)");
+    }
+}
+
 void ExprTC::visitExpr(const ast::Expr& e) {
     // §17.15 (v0.216, #2098): the binding atom `(var x := E; body)`. Handled
     // before visitChildren — the clauses are §21.1 declaration statements
@@ -6208,6 +6278,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         for (const auto& a : ix->indices) {
             if (a.value) visitExpr(*a.value);
         }
+        // fix #2758 (§23.5, v0.241): index arguments are positional-only.
+        // This arm is the IndexExpr counterpart of the CallExpr arm's
+        // per-argument `checkRefOutOperandCategory` above, and — like it —
+        // runs once per node inside the single `visitChildren` walk. Placed
+        // HERE rather than beside #2619's `checkIndexArgNullability` (which
+        // lives under `if (tt)` in the receiver-typing block) because §23.5's
+        // rule is a property of the index ARGUMENT alone: it must fire for a
+        // receiver whose type never resolves, and it must not depend on which
+        // receiver family the indexer belongs to.
+        checkIndexArgsPositional(*ix);
     } else if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(&e)) {
         if (bg->operand) visitExpr(*bg->operand);
     } else if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {

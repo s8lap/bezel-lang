@@ -2073,6 +2073,17 @@ private:
     void checkIndexArgNullability(const ast::IndexExpr& ix, const ast::Expr& e,
                                   TypeRef* recvTy);
 
+    // fix #2758 (§23.5, v0.241): "Index arguments are **positional-only**. The
+    // named-argument form (`Identifier :=`, §22.5) is not admitted at an index
+    // position — a compile error naming this rule." An IndexExpr's indices
+    // share the call ArgList grammar (A.7 PrimarySuffix `[ ArgList ]`), so
+    // `d[key := "k"]` PARSES; every consumer then maps `indices[k]` to
+    // `indexerParams[k]` POSITIONALLY and the name is silently dropped. Called
+    // from visitChildren's IndexExpr arm — once per node, before any receiver
+    // family has been resolved, because the rule is a property of the index
+    // ARGUMENT alone and holds for a receiver whose type never resolves.
+    void checkIndexArgsPositional(const ast::IndexExpr& ix);
+
     // §2.5 / §22.7 (issue #328 FINDING [7] B): check `new ImportedT(args)`
     // against an imported type's reconstructed constructor signatures (no
     // ast::ConstructorDecl; ParameterSymbol resolved types). Single-ctor,
