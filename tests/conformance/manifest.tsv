@@ -320,6 +320,8 @@ spec_0317	spec	A5-Types	skip	n/a	skip:ebnf-grammar
 spec_0318	spec	A6-Statements	skip	n/a	blocked-on-#3052 (docs-ahead: closed/mod=, v0.243)
 spec_0319	spec	A7-Expressions	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker unification, v0.246)
 spec_0320	spec	A8-Constants-and-literals	skip	n/a	skip:ebnf-grammar
+spec_0321	spec	owned-and-overload-resolution	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683; hand-added v0.250 — also docs-ahead on #3086: the owned pair itself rejects at HEAD pre-lift); also docs-ahead on #3056 (the identifier-operand move w)
+spec_0322	spec	193-Patterns	skip	n/a	blocked-on-#1409 (docs-ahead: named destructure v0.224 incl. the v0.250 marked slot, #3087; hand-added v0.250)
 guide1_0000	guide1	1-The-two-declarations-you-will-actually-type	fragment	compiles	preamble
 guide1_0001	guide1	1-The-two-declarations-you-will-actually-type	fragment	compiles	preamble
 guide1_0002	guide1	3-Borrowing-the-default-for-just-let-me-use-it	skip	n/a	skip:incomplete-fragment
@@ -361,6 +363,7 @@ guide2_0014	guide2	6-How-Bezel-does-it-exceptions-and-cleanup-there-is-no-leak-	
 guide2_0015	guide2	6-How-Bezel-does-it-exceptions-and-cleanup-there-is-no-leak-	skip	n/a	skip:incomplete-fragment
 guide3_0000	guide3	1-The-five-data-kinds-which-one	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 guide3_0001	guide3	2-Selecting-over-a-value-if-when-case	skip	n/a	skip:incomplete-fragment
+guide3_0002	guide3	2-Selecting-over-a-value-if-when-case	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683; hand-added v0.250 — also docs-ahead on #1409/#3087: the marked named slot)
 guide4_0000	guide4	1-How-Bezel-does-it-one-continuation-at-a-time	fragment	compiles	
 guide4_0001	guide4	1-How-Bezel-does-it-one-continuation-at-a-time	error	diagnose	
 guide4_0002	guide4	2-How-Bezel-does-it-a-task-is-a-resource-you-own	skip	n/a	skip:incomplete-fragment
@@ -528,9 +531,9 @@ stdlib_0107	stdlib	66-TaskCompletionSourceT-and-OwningTaskCompletionSourceT	skip
 stdlib_0108	stdlib	67-Task-static-helpers	skip	n/a	skip:signature
 stdlib_0109	stdlib	67-Task-static-helpers	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683)
 stdlib_0110	stdlib	FromException-and-FromCancelled-for-class-T	fragment	compiles	preamble
-stdlib_0111	stdlib	WhenAll-for-class-T-WhenAllOwned	skip	n/a	skip:incomplete-fragment
-stdlib_0112	stdlib	WhenAll-for-class-T-WhenAllOwned	fragment	compiles	
-stdlib_0113	stdlib	WhenAll-for-class-T-WhenAllOwned	skip	n/a	skip:incomplete-fragment
+stdlib_0111	stdlib	WhenAll-for-class-T-the-owning-overload	skip	n/a	skip:incomplete-fragment
+stdlib_0112	stdlib	WhenAll-for-class-T-the-owning-overload	fragment	compiles	
+stdlib_0113	stdlib	WhenAll-for-class-T-the-owning-overload	skip	n/a	skip:incomplete-fragment
 stdlib_0114	stdlib	WhenEach-streaming-fan-in-v0212-graduated-from-proposal-0023	skip	n/a	skip:signature-listing
 stdlib_0115	stdlib	WhenEach-streaming-fan-in-v0212-graduated-from-proposal-0023	skip	n/a	skip:incomplete-fragment
 stdlib_0116	stdlib	68-Domain	skip	n/a	skip:signature

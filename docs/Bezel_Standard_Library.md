@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.249 — August 2026**
+**Companion to the Bezel Language Specification, v0.250 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -38,6 +38,7 @@ Throughout this document:
 - **The Try convention (v0.171, #1336; shape (c) codified v0.184; shape (d) v0.195).** Exactly three Try shapes are sanctioned for payload extraction, plus the payload-free shape (d) at the end of this bullet. **(a) `bool` + nullable out** — `TryX(..., out item: T?): bool` (with `owned` on the out where the payload transfers) — for keyed/positional extraction: the bool distinguishes the outcome from a legitimately-null payload, and, for a **generic or class-typed** payload, the out parameter is *nullable in every form*, because a class payload has no `default` to assign on the false path (spec §17.11) and a generic payload may be instantiated by a class; §22.3 requires every out assigned on every return path (v0.184 wording; throw paths carry no obligation), and the false path assigns `null`. **(b) nullable return** — `TryX(...): owned T?` — when null alone is the signal (e.g. `Mutex.TryAcquire` — simpler call sites; `Weak<T>.TryUpgrade` — the handle payload is statically non-nullable at every instantiation, so a bool would carry no information). **(c) `bool` + non-nullable value-typed out** — `TryX(..., out result: T): bool` with `default(T)` assigned on the false path (spec §22.3) — for APIs whose payload type is a **concrete value type**: the §9 primitive `TryParse` family, `Convert.TryTo*` (§2.3), the `DateTime`/`DateOnly`/`TimeOnly`/`Guid` `TryParse` members (§2.5/§2.6), and the §4.14/§4.15 `TryRead*` accessors. The `when true` postcondition does not apply — the out is never null, so `default(T)` (a real value distinguished only by the `bool`) is what the false path assigns. **Every shape-(a) signature in this document carries the `when true` nullability postcondition** on its out parameter (language spec §22.4, v0.183) — `TryX(..., out item: T? when true): bool` — so in a region where the call is known `true`, the recipient is narrowed non-null and no `!` is needed. The clause is elided from the per-type listings below for brevity but is normative for **every** shape-(a) member in this document (`TryGetValue`, `TryPop`/`TryPeek`/`TryDequeue`, `TryPopFirst`/`TryPopLast`, `Channel<T>.TryReceive`, `OwningSet<T>.TryTake`, `OwningDictionary<K, V>.TryPopValue`, and `IParsable<T>.TryParse` through the constraint). A fourth, payload-free shape exists alongside the three extraction shapes — **(d) bool-only attempt** (v0.195): `TryX(...): bool` with no out parameter, for operations whose only outcome is succeeded/declined and whose payload, if any, was passed *in* — `TryAdd` (§4.10/§4.18), the `TrySet*` completion family (§6.6), and the span `TryWrite*` accessors (§4.14/§4.15). Shape (d) carries no nullability postcondition: there is no out to narrow. **The `*OrNull` convenience tier (v0.231).** Beside the Try shapes, a surface may carry a nullable-return **convenience form**, named with the `OrNull` suffix (`ParseOrNull`, `GetOrNull`, `ReadKeyOrNull`, §5's `*OrNull` element accessors) — a recorded tier in the sense of the no-dual rule below, and band 2's nullable-return value shape in the failure-signal rule below. The three access tiers, named: the **throwing form** (`Parse`, the `[key]` indexer) treats absence as a bug, the **`*OrNull` form** returns `T?` for direct `??`/`?.` composition where the payload can carry the signal (where it cannot — a nullable payload type — the surface carries the §7.10 conflation caveat: §4.8, §4.17, §5), and the **`Try` form** remains the only shape that distinguishes the outcomes a collapsed `T?` cannot (spec §7.10). Shape (b)'s `TryX` spelling stays reserved for acquisition-shaped members whose payload is statically non-nullable (`TryAcquire`, `TryUpgrade`).
 - **Negative magnitudes fault (v0.183, #1396).** Every constructor parameter that states a magnitude — `capacity`, `size`, `length` — raises `ArgumentOutOfRangeException` when passed a negative value: `StringBuilder(capacity)`, `Array<T>(capacity)`, `Array<T>(size, fill)`, `OwningArray<T>(capacity)`, the `Dictionary`/`OwningDictionary`/`Set`/`OwningSet` capacity forms, and `OwningBuffer<T>(length)` with its `init` overloads. Zero is valid (an empty container or zero-length buffer). A negative magnitude is a programming error, not a request — the defined-fault stance of `DateTime`'s component validation (§2.5), chosen over a silent empty fallback. (`Channel<T>(capacity)` is stricter under its own v0.174 contract — `capacity >= 1`, `ArgumentException` otherwise — and is unchanged.)
 - **The `Async` suffix (v0.195).** The suffix marks the asynchronous member of a sync/async pair (`Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`); an operation that exists only in asynchronous form carries no suffix (`Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`). `Receive` beside `SendAsync` on the §6.9 endpoint pair is this rule at work, not an inconsistency.
+- **Borrowing/owning duals are overloads, not `Owned`-suffixed names (v0.250).** Where one operation has a borrowing and an owning argument-side form, the two are declared as a same-name overload pair — distinguished by parameter type where the types already differ (the merged `Task.WhenAll`/`WhenEach`, §6.7: ordinary applicability selects, with spec [§22.3](Bezel_Language_Spec.md#sec-parameter-modifiers)'s call-site marker announcing the consuming form), or by `owned` on the marked parameter where they do not (spec [§22.6](Bezel_Language_Spec.md#sec-owned-and-overload-resolution)'s ownership-mode applicability) — and the `Owned` name suffix for such duals is retired where the pair is declarable. *Return-side* `Owned` names — the `ParseOwned` family (`Json.ParseOwned<T>`, `Binary.ParseOwned<T>`) — stand because the return position carries no call-site marker and no overloading-by-return exists; there the name is the §28.3 announcement discipline at a static producer. `Task.FromOwnedResult` marks its *parameter* and stands for a different reason: its would-be pair with `FromResult` is undeclarable under spec [§22.6](Bezel_Language_Spec.md#sec-overloading)'s declaration guard — no [§14.2](Bezel_Language_Spec.md#sec-constraints) constraint spells the owning-generic domain ([§14.4](Bezel_Language_Spec.md#sec-owned-as-a-generic-argument)'s recorded imprecision) — so the argument-side name carries the distinction the overload cannot. Stdlib pairs do not declare a default value on the marked position (the two-defaults-filled ambiguity of spec [§22.6](Bezel_Language_Spec.md#sec-overloading) would make the argument-omitting call unwritable).
 - Compiler-intrinsic types (primitive wrappers, `Range<T>`) may declare `const` members whose values are provided by the compiler rather than by a source-level initializer expression. In the declarations below, a `const` field shown without `:= value` (e.g. `public static const MaxValue: double;`) is such a compiler-provided constant. User-defined code may not omit `const` initializers (see language spec [§22.12](Bezel_Language_Spec.md#sec-static-members)).
 - **Elided interface-required members.** When a class declares it implements an interface, the members required by that interface are part of the class's public contract whether or not the declaration shows them explicitly. Some declarations show every interface-required member; others elide the redundant ones with a marker comment such as `// plus standard ICollection<T> operations` or `// ICollection<T> operations plus:`. Both forms are equivalent — the elided members are still part of the public contract, with signatures determined by the interface declaration plus the implementation's type substitution (per the [§11.2](Bezel_Language_Spec.md#sec-interface-declaration) exact-match rule). For interfaces whose substitution produces a member with the same name but a different parameter type than another method on the class — `Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>` is the leading example, where ICollection's `Add(item: T)` substitutes to `Add(item: DictionaryEntry<K, V>)` while Dictionary also offers `Add(key: K, value: V)` — both forms are public members of the class and both are reachable.
 
@@ -3868,10 +3869,12 @@ public class Task
   // For non-class T (value types, string, runtime-managed reference types).
   public static method WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>;
 
-  // For class T. Aggregates OwningTask<T> results into an owned array of owned elements.
-  // The caller transfers ownership of the input array (and its tasks) to WhenAllOwned;
+  // For class T: the owning WhenAll overload (v0.250 — the parameter type
+  // distinguishes it; the call site is Task.WhenAll(move tasks)).
+  // Aggregates OwningTask<T> results into an owned array of owned elements.
+  // The caller transfers ownership of the input array (and its tasks);
   // the returned task produces an owned OwningArray<T>.
-  public static method WhenAllOwned<T>(
+  public static method WhenAll<T>(
     owned tasks: OwningArray<OwningTask<T>>
   ): OwningTask<OwningArray<T>> where T: class;
 
@@ -3914,9 +3917,9 @@ end FailFast;
 An `OwningTaskCompletionSource<T>` cannot express this shape as a return value (v0.184 — an earlier revision showed `return src.Task;` out of the `using var src` scope, which the source-owns-task contract of spec [§30.11](Bezel_Language_Spec.md#sec-common-semantics) rejects as a borrow escaping its source; the same example also passed an exception of unstated provenance where `SetException` requires a visibly-owned argument — a caught borrow additionally needs a fresh cause-chained instance, [§6.6](#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet)). The TCS remains the tool for **imperative** completion — callback bridging inside a live scope — not for minting detached faulted tasks.
 
 <a id="sec-whenall-for-class-t-whenallowned"></a>
-#### `WhenAll` for class T: `WhenAllOwned`
+#### `WhenAll` for class T: the owning overload
 
-The generic `WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>` aggregates results from non-class T (value types, `string`, runtime-managed reference types). For class T held by `OwningTask<T>`, use `WhenAllOwned<T>`:
+The generic `WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>` aggregates results from non-class T (value types, `string`, runtime-managed reference types). For class T held by `OwningTask<T>`, use the **owning overload** — same name, its parameter type already distinct, its consuming form announced by the call-site marker (`Task.WhenAll(move tasks)`; spec [§22.6](Bezel_Language_Spec.md#sec-owned-and-overload-resolution), v0.250 — the merge that retired the former `Owned`-suffix dual name):
 
 ```bezel
 public async method LoadAllConfigs(paths: Array<string>): OwningTask<OwningArray<Config>>
@@ -3924,20 +3927,20 @@ public async method LoadAllConfigs(paths: Array<string>): OwningTask<OwningArray
   for var path in paths do
     tasks.Add(LoadConfigAsync(path));    // each task is OwningTask<Config>; transfers in
   end;
-  return await Task.WhenAllOwned(move tasks); // tasks consumed; returned array owns the configs
+  return await Task.WhenAll(move tasks);      // tasks consumed; returned array owns the configs
 end LoadAllConfigs;
 ```
 
-The caller's pattern matches `WhenAll`: build an array of tasks, await `WhenAllOwned`, receive an array of results. The differences are in the type and ownership flow:
+The caller's pattern matches the borrowing form: build an array of tasks, await `WhenAll`, receive an array of results. The differences are in the type and ownership flow:
 
 - The input array is `OwningArray<OwningTask<Config>>`, not `Array<OwningTask<Config>>`. Each element is itself owned (OwningTask<T> for class T is single-consumer per language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal); the array owns its tasks for the duration).
-- The input parameter is `owned OwningArray<...>`: the caller transfers ownership of the array (and its contents) to `WhenAllOwned`. After the call, the caller no longer holds the array.
+- The input parameter is `owned OwningArray<...>`: the caller transfers ownership of the array (and its contents) to the aggregator — announced at the call site by the transfer marker. After the call, the caller no longer holds the array.
 - The result is `OwningTask<OwningArray<Config>>`: a Pattern B task whose result is an owned array of owned configs. The caller awaits with `using var`, gaining scope-bound disposal of the whole structure.
 
 Implementation sketch (v0.179: the *behavior* shown — await in input order, first-fault re-raise, disposal of already-produced and laggard results — is now contract, spec §30.10 "Aggregation contracts"; the code itself remains illustrative):
 
 ```bezel
-public static async method WhenAllOwned<T>(
+public static async method WhenAll<T>(
   owned tasks: OwningArray<OwningTask<T>>
 ): OwningTask<OwningArray<T>> where T: class
   using var taskArray := move tasks;                  // owned param adopted (transfer marker); disposes at end
@@ -3948,12 +3951,12 @@ public static async method WhenAllOwned<T>(
                                                       //   context, satisfying §30.5
   end;
   return results;                                     // ownership transfers to caller
-end WhenAllOwned;
+end WhenAll;
 ```
 
 The implementation uses `OwningArray<T>.Drain()` to take ownership of each task out of the input array, awaits each (Pattern B), and transfers the awaited result into the result array via `Add(owned item)`. The pattern works because every collection slot in the chain is an owned-element slot, and because `Add(owned item)` is an owned-consuming context that admits `await` directly per the loosened Pattern B rule (language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)). The for-loop's iteration variable `task` is owned (per the new rule for iterators returning `IOwningEnumerable<T>`, language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) — "Iterator yield ownership"), and is consumed by the await on each iteration.
 
-For genuine concurrency (the underlying tasks running in parallel), the caller should start the tasks *before* passing the array to `WhenAllOwned`. Each task's underlying operation begins when the task is constructed; awaiting blocks for completion. The `WhenAllOwned` body awaits sequentially, but the tasks themselves run in parallel because they were started earlier.
+For genuine concurrency (the underlying tasks running in parallel), the caller should start the tasks *before* passing the array to the aggregator. Each task's underlying operation begins when the task is constructed; awaiting blocks for completion. The owning `WhenAll` body awaits sequentially, but the tasks themselves run in parallel because they were started earlier.
 
 For producer-consumer pipelines that yield owned values incrementally, an async iterator remains the clean idiom. When the iterator's return type is `IOwningAsyncEnumerable<T>`, the consumer takes ownership of each yielded value, with the standard owned-discharge rules applying to the iteration variable inside the `await for` body (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) — "Iterator yield ownership"):
 
@@ -3975,7 +3978,7 @@ end ProcessAll;
 
 The `using var f := move file;` shape on entry to the body — the `move` marker is the binding-position transfer spelling (language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows); unmarked, the binding would only borrow-pin) — is the canonical way to discharge the iteration variable, exactly as for synchronous owned-element iteration (language spec [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for)).
 
-The async-iterator form is preferable when the consumer processes each result before requesting the next; `WhenAllOwned` is preferable when the consumer needs all results at once.
+The async-iterator form is preferable when the consumer processes each result before requesting the next; the owning `WhenAll` overload is preferable when the consumer needs all results at once.
 
 #### `WhenEach`: streaming fan-in (v0.212, graduated from proposal 0023)
 
@@ -3989,21 +3992,23 @@ public static method WhenEach(tasks: Array<Task>): IAsyncEnumerable<Task>;
 // already-completed Task<T>; await it to observe the result or re-raise its fault.
 public static method WhenEach<T>(tasks: Array<Task<T>>): IAsyncEnumerable<Task<T>>;
 
-// Owning form for class T (Pattern B). Takes ownership of the array and every
-// task in it; yields each completed OwningTask<T> as an owned iteration variable.
-public static method WhenEachOwned<T>(
+// Owning overload for class T (Pattern B; v0.250 — same name, the parameter type
+// distinguishes it, the call site is Task.WhenEach(move tasks)). Takes ownership
+// of the array and every task in it; yields each completed OwningTask<T> as an
+// owned iteration variable.
+public static method WhenEach<T>(
     owned tasks: OwningArray<OwningTask<T>>
 ): IOwningAsyncEnumerable<OwningTask<T>> where T: class;
 ```
 
 - **Completion order.** The first element yielded is whichever task completed first; ties break in unspecified order. An empty input produces an enumerator that completes immediately.
 - **Faulted and cancelled tasks are yielded, not skipped**: the fault or `OperationCanceledException` surfaces when the caller awaits the yielded element — the caller decides per task, unlike `WhenAll`'s first-fault re-raise.
-- **Observer, not owner.** `WhenEach` borrows its input: the returned iterable is a deferred-activation frame carrying the array's borrow (spec §28.3, v0.179 carriage), so the compiler holds the array alive for the frame's bound; enumeration neither cancels nor settles the tasks. `WhenEachOwned` is the ownership-transferring dual: tasks not consumed before enumeration ends are disposed by the enumerator. Supervision (fault ⇒ cancel siblings) remains `TaskScope`'s job (§6.10; rationale §12.12) — `WhenEach` only reports.
-- **Building the borrowed input.** Under spec §28.3's calls-mint rule a fresh `GetXAsync(…)` result is an *owned* task, and a borrowing `Array<Task<T>>` slot takes no ownership — so `tasks.Add(GetXAsync(url))` abandons the freshly-minted task at end of statement (the #1813 seam, shared with `WhenAll`'s input). Build the borrowed array over **named** task bindings (`var t1 := GetXAsync(a); … var tasks: Array<Task<string>> := [t1, t2];`), or use the owning forms (`WhenEachOwned`, `WhenAllOwned`) for dynamically-sized fan-in — these two spellings are the complete input story (#1813, ruled 2026-07-24): dynamic fan-in over freshly-minted tasks is an ownership-transfer scenario by construction, so the owning forms are its spelling, and no borrowing-family dynamic-build facility is planned. (Should the give-back protocol (proposal 0060) later yield a general conditional-consume form, revisiting is a new proposal, not a reserved seam.)
+- **Observer, not owner.** The borrowing forms of `WhenEach` borrow their input: the returned iterable is a deferred-activation frame carrying the array's borrow (spec §28.3, v0.179 carriage), so the compiler holds the array alive for the frame's bound; enumeration neither cancels nor settles the tasks. The owning overload is the ownership-transferring form: tasks not consumed before enumeration ends are disposed by the enumerator. Supervision (fault ⇒ cancel siblings) remains `TaskScope`'s job (§6.10; rationale §12.12) — `WhenEach` only reports.
+- **Building the borrowed input.** Under spec §28.3's calls-mint rule a fresh `GetXAsync(…)` result is an *owned* task, and a borrowing `Array<Task<T>>` slot takes no ownership — so `tasks.Add(GetXAsync(url))` abandons the freshly-minted task at end of statement (the #1813 seam, shared with `WhenAll`'s input). Build the borrowed array over **named** task bindings (`var t1 := GetXAsync(a); … var tasks: Array<Task<string>> := [t1, t2];`), or use the owning overloads (`WhenEach(move tasks)`, `WhenAll(move tasks)`) for dynamically-sized fan-in — these two spellings are the complete input story (#1813, ruled 2026-07-24): dynamic fan-in over freshly-minted tasks is an ownership-transfer scenario by construction, so the owning forms are its spelling, and no borrowing-family dynamic-build facility is planned. (Should the give-back protocol (proposal 0060) later yield a general conditional-consume form, revisiting is a new proposal, not a reserved seam.)
 - **Single consumption (affine).** Both returned sequences follow spec §29.11: a second `GetAsyncEnumerator` raises `InvalidOperationException`. The `CancellationToken` accepted by `GetAsyncEnumerator(token)` (the standard §30.7 shape) fires at `await MoveNextAsync()` boundaries and stops **enumeration only** — the tasks keep running and remain the caller's to settle.
 
 ```bezel
-await for var t in Task.WhenEachOwned(move tasks) do    // t: owned OwningTask<Report>
+await for var t in Task.WhenEach(move tasks) do         // t: owned OwningTask<Report>
   using var report := await t;                          // Pattern B: result transfers
   Publish(report);
 end;

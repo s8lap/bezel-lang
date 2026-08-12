@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.247.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.250.*
 
 Most of the syntax here is mainstream: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. The *emphasis* is not. Bezel splits failure signals by one rule (the **failure-signal rule**, stdlib §1), and it is worth knowing the shape before the details (teaching order here, not the rule's band order):
 
@@ -103,7 +103,7 @@ method TryTakeCached(name: string, out owned conn: Connection? when true): bool
 end TryTakeCached;
 ```
 
-The method is named `TryTakeCached`, not `TryGetCached`, on purpose. The stdlib gives the borrowing accessor and the ownership-transferring one distinct names — `Get`/`Peek` borrow; `Pop`/`Drain`/`Take` transfer — so the name alone tells you whether you now owe a disposal (spec §22.6). This one transfers: it hands the caller ownership through `out owned`. The parameter is typed `Connection?` (nullable) because the false path must assign *something*, and `default(Connection)` is illegal for a non-nullable reference type. The `when true` clause states the contract in the signature — "a `true` return implies `conn` is non-null" — and the caller's flow analysis picks it up:
+The method is named `TryTakeCached`, not `TryGetCached`, on purpose. Where the two operations genuinely differ — `Get`/`Peek` leave the entry in place and borrow; `Pop`/`Drain`/`Take` also remove it and transfer — the stdlib keeps distinct names, so the name alone tells you whether you now owe a disposal (spec §22.6's `out owned` rule; stdlib §1). A pair that differs *only* in ownership is instead a same-name overload pair since v0.250, the call-site `move` marker telling the forms apart (stdlib §1). This one transfers: it hands the caller ownership through `out owned`. The parameter is typed `Connection?` (nullable) because the false path must assign *something*, and `default(Connection)` is illegal for a non-nullable reference type. The `when true` clause states the contract in the signature — "a `true` return implies `conn` is non-null" — and the caller's flow analysis picks it up:
 
 ```bezel
 if pool.TryTakeCached("primary", out using var c) then

@@ -1,6 +1,6 @@
 # Bezel Guide 3: Modeling Data
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.247.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.250.*
 
 Bezel gives you five ways to declare a data shape and three ways to select over one. This guide is the picking rule for each. The definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing a **failure signal** (`T?` vs `Try` vs `Result` vs `requires`/exceptions), see Guide 2 §7 — that table is the home; this guide does not repeat it.
 
@@ -66,6 +66,22 @@ var label  := (case outcome of                                 // shape dispatch
 - `case` is the only form that *binds* — patterns destructure payloads (`Fetched(var body)`) and narrow types (`var c: Circle`). If you need the scrutinee's pieces, you want `case` regardless of arity.
 - Exhaustiveness: `case` over an enum, choice, or closed hierarchy needs no `_` arm when every case is covered (§19.6) — prefer that. A `_` arm silences the compiler's help when the type grows. One carve (v0.245): when a closed hierarchy's root or any leaf is *generic*, leaf coverage is not attempted — no arrangement of type-pattern arms is a static proof, and the `case` is completable only by an irrefutable arm (an unguarded `_` or unguarded untyped `var`); a value-shaped sum there is better modeled as a `choice`, whose exhaustiveness is counted by case name and needs no `_` (§19.6).
 - Ownership in arms follows the meet rule (Guide 1 §8): arms must agree — all owned or all borrowed. A named owned binding as an arm is a borrow unless you mark it (`move x`, consume-if-selected).
+- **Extracting by name from an owning match** (spec §19.3/§35.5, v0.250): named slots read their field names at the pattern instead of by position, and in an owning match a named slot transfers exactly when you mark it — `move field = var x` hands the arm an owned binding, per slot, while unmarked named siblings stay borrows or copies, disposed with the construct. Same disposal story as the positional destructure; you just say which payload you are taking, by name.
+
+```bezel
+public choice PollOutcome                          // an owning choice: Ready carries a resource
+  Ready(owned conn: Connection, attempts: int),
+  Empty;
+end PollOutcome;
+
+case pool.Poll() of                                // owning match over the fresh outcome
+  Ready(move conn = var c, attempts = var n) => do // c: owned Connection; n: int copy
+    using var live := move c;                      // adopt: scope-bound disposal
+    Console.WriteLine($"connected after {n} tries");
+  end,
+  Empty => ()
+end;
+```
 
 ## 3. Where the failure signal fits
 
