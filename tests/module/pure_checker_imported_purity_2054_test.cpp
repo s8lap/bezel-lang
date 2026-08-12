@@ -66,7 +66,7 @@ MetaType prim(PrimitiveKind p, bool nullable = false) {
 ModuleMetadata buildMathLibWithImportedPurity() {
     ModuleMetadata md;
     md.moduleName = "MathLib";
-    md.exports = {"Calc"};
+    md.exports = {"Calc", "Impure"};
     md.contractRecordsCarried = true;
 
     MetaTypeDecl calc;
@@ -123,6 +123,34 @@ ModuleMetadata buildMathLibWithImportedPurity() {
     }
 
     md.types.push_back(calc);
+
+    // The CONSTRUCTOR-side negative control (see the test of the same name).
+    // Identical to `Calc` in every respect the throw carve-out reads EXCEPT
+    // that its constructor is carried NOT pure: same class kind, same
+    // Exception base, no destructor and no owned fields (so still
+    // trivial-dispose, gate (b) of §22.15's carve-out). The only difference
+    // between admitting `new MathLib.Calc()` and rejecting
+    // `new MathLib.Impure()` is therefore the carried `isPure` bit itself.
+    MetaTypeDecl impure;
+    impure.name = "Impure";
+    impure.kind = MetaTypeDeclKind::Class;
+    impure.visibility = MetaVisibility::Public;
+    impure.builtinExceptionBase = "Exception";  // §31.1 (v0.243): throwable
+    {
+        MetaType exc;
+        exc.kind = TypeKind::Named;
+        exc.namedName = "Exception";
+        impure.baseTypes.push_back(exc);
+    }
+    {
+        MetaMember ctor;
+        ctor.kind = MetaMemberKind::Constructor;
+        ctor.name = "Impure";
+        ctor.visibility = MetaVisibility::Public;
+        ctor.isPure = false;  // <-- the whole point of this class
+        impure.members.push_back(ctor);
+    }
+    md.types.push_back(impure);
     return md;
 }
 
@@ -262,6 +290,56 @@ BEZEL_TEST(pure_checker_imported_purity_2054,
         "  public static method Main(): int => 0; "
         "end Program;");
     // The pure call site must produce a §22.15 purity diagnostic.
+    BEZEL_EXPECT_TRUE(r->hasPurityError);
+}
+
+
+// ---------------------------------------------------------------------------
+// CONSTRUCTOR-side control for `imported_pure_constructor_throw_admitted`.
+//
+// WHY THIS EXISTS. That test asserts an ABSENCE (`!hasErrors()`), and
+// `PureBodyWalker::throwCarveOutAdmits` (src/sema/PureChecker.cpp:425) opens
+// with:
+//
+//     if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration)
+//         return true;   // "conservatively admit unknown new-targets"
+//
+// So a fixture whose class fails to RESOLVE is admitted by that early return
+// and produces exactly the same green as one whose carried `isPure` was
+// loaded correctly. The admitted-test alone therefore cannot distinguish
+// "the carried purity bit works" -- the thing it exists to pin -- from
+// "the imported symbol was never reconstructed at all".
+//
+// This control closes that hole permanently. `Impure` differs from `Calc`
+// ONLY in its carried `isPure`, so:
+//   - if symbol reconstruction breaks, `rt->declaration` goes null, the early
+//     return admits, and THIS test fails loudly;
+//   - if the loader stops publishing `isPure` onto the reconstructed
+//     ConstructorSymbol, the admitted-test fails.
+// The pair brackets the behaviour from both sides; neither alone does.
+//
+// The method side already had its control (`imported_non_pure_method_
+// rejected_spec_22_15`); the constructor side did not. That asymmetry is what
+// let the gap sit unnoticed.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(pure_checker_imported_purity_2054,
+           imported_non_pure_constructor_throw_rejected_spec_22_15) {
+    ModuleMetadata dep = buildMathLibWithImportedPurity();
+    auto r = runWithImportedMathLib(
+        dep,
+        "module App; "
+        "import MathLib; "
+        "public class Program "
+        "  public pure method Checked(low: int, n: int): int "
+        "    if n < low then "
+        "      throw new MathLib.Impure(); "
+        "    end if; "
+        "    return n; "
+        "  end Checked; "
+        "  public static method Main(): int => 0; "
+        "end Program;");
+    // §22.15 carve-out gate (a): the invoked constructor is NOT pure, so the
+    // throw is not admitted in a pure body.
     BEZEL_EXPECT_TRUE(r->hasPurityError);
 }
 
