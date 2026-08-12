@@ -2115,6 +2115,33 @@ void Resolver::resolveTypesInPattern(const ast::Pattern& p, Scope* scope) {
     }
 }
 
+// fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): see the declarations in
+// TypeResolution_impl.hpp.
+void Resolver::recordAsTargetSite(const ast::Type& t, SourceLocation loc) {
+    if (!currentOuterType_) return;  // module scope: no parameter to bind
+    TypeRef* ref = ctx_.resolvedType(t);
+    // Only a BARE parameter defers — a concretely-spelled degenerate target is
+    // already rejected outright by ExprTypecheck, and every other concrete
+    // target is admissible. `isBareGenericParamBinding` is the SAME predicate
+    // #2111/#2713 use for "this binding is itself a type parameter" (it also
+    // excludes primitives and builtin names, which carry no declaration
+    // either).
+    if (!isBareGenericParamBinding(ref, &t)) return;
+    const std::string_view name = t.name->parts.front();
+    // #2713's misattribution guard, mirrored: a generic METHOD may declare a
+    // parameter of the same name, SHADOWING the enclosing type's, and nothing
+    // forbids it. Inside such a method the name denotes the METHOD's parameter,
+    // whose bindings this pass never sees; recording it would validate the
+    // method's `T` against the type's and FALSELY REJECT a legal program. A
+    // method parameter that does not shadow is skipped by the same test, which
+    // is correct for the same reason — and is not a residual here, because
+    // ExprTC::checkDeferredAsTargetInstantiations owns exactly that case.
+    if (currentMethodGenericParams_)
+        for (const ast::GenericParam& gp : *currentMethodGenericParams_)
+            if (gp.name == name) return;
+    asTargetSites_.push_back({name, currentOuterType_, loc});
+}
+
 void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
     // First handle expressions that own a Type node directly.
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
@@ -2126,6 +2153,14 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
     }
     if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
         if (te->testType) resolveType(*te->testType, scope);
+        // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): `as` at a bare
+        // TYPE-parameter target defers to the enclosing generic's instantiation
+        // sites (checkAsTargetInstantiations). `is` / `is not` are deliberately
+        // NOT recorded: §17.4 rejects only the operator whose result type must
+        // exist and be informative, and §12.7's type TEST at those same targets
+        // is exactly the remedy the diagnostic names.
+        if (te->op == "as" && te->testType)
+            recordAsTargetSite(*te->testType, e.span.begin);
         if (te->operand) resolveTypesInExpr(*te->operand, scope);
         return;
     }

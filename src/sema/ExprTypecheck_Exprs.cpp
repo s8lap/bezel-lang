@@ -1577,6 +1577,63 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                              ctx_.primitiveTypeRef(PrimitiveType::Bool));
         } else if (te->op == "as" && te->testType) {
             if (TypeRef* tt = ctx_.resolvedType(*te->testType)) {
+                // fix #2911 + fix #2962 (§17.4 "Degenerate value-type
+                // targets", v0.241): the DIRECT arm — a concretely-spelled
+                // inline-array or unit target, the two halves of ONE spec
+                // paragraph, rejected through ONE predicate
+                // (degenerateAsTargetReason, TypeResolution_Checks.cpp).
+                //
+                // MEASURED on 309356e, which is what makes this a rejection
+                // rather than a tidy-up. `var o: Object := a; var miss := o as
+                // [4]int;` compiled silently and produced an ALL-ZERO array
+                // indistinguishable from a legitimately zero-valued one — the
+                // `null` §17.4 promises had nowhere to live, because §15.1
+                // admits no `([4]int)?` for it to live in (#2911). `o as ()`
+                // and `o as ()?` likewise compiled silently, falling through
+                // codegen's reference-target arm to a bare pointer typed
+                // `()?`, a value of undefined shape (#2962; #2915 had already
+                // excluded `Kind::Unit` from the unbox arm because the unit
+                // type lowers to LLVM `void` and `load void` is not
+                // constructible).
+                //
+                // The existing typing below is left running after the report:
+                // downstream passes then see EXACTLY the types they saw before
+                // this fix, so a rejected program cannot reach a shape they
+                // have never handled. The error stops the compile before
+                // codegen either way.
+                if (std::string degenerate = degenerateAsTargetReason(tt);
+                    !degenerate.empty()) {
+                    ctx_.diagnostics().report(Severity::Error, e.span.begin,
+                                              degenerate);
+                } else if (tt->kind == TypeRef::Kind::Named &&
+                           !tt->declaration && tt->genericArgs.empty() &&
+                           currentMethodDecl_) {
+                    // §17.4's generic clause: "When the target is a generic
+                    // type parameter, the check applies per instantiation
+                    // (§3.6 rule 2)". A bare parameter cannot be judged here —
+                    // "a generic body type-checks under the weakest assumption
+                    // its constraints establish" — so record the obligation and
+                    // discharge it against each instantiation at the end of the
+                    // pass, the #3044 `default(T)` shape reused verbatim.
+                    //
+                    // ONLY a parameter the enclosing METHOD binds is recorded:
+                    // this pass sees a generic method's instantiations (they
+                    // are CALLS) but not a generic TYPE's (they are `Named<…>`
+                    // annotations the Resolver walks), so the type-parameter
+                    // arm lives in Resolver::checkAsTargetInstantiations
+                    // against the same shared predicate. Matching the name
+                    // against the method's own list is also what makes
+                    // SHADOWING correct: inside `class Box<T>`'s `method M<T>`
+                    // the name denotes the METHOD's parameter, whose bindings
+                    // `Box`'s instantiations know nothing about (#2713's
+                    // misattribution guard, mirrored).
+                    for (const auto& gp : currentMethodDecl_->genericParams) {
+                        if (gp.name != tt->headName()) continue;
+                        recordAsTargetTypeParamUse(currentMethodDecl_, gp.name,
+                                                   e.span.begin);
+                        break;
+                    }
+                }
                 if (tt->nullable) {
                     ctx_.setExprType(&e, tt);
                 } else {

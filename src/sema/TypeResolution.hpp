@@ -29,6 +29,7 @@
 //   - Constraint-clause resolution (sema slice with constraint handling).
 //   - Variance compatibility checks (typecheck-time).
 
+#include <string>
 #include <string_view>
 
 #include "ast/Node.hpp"
@@ -124,5 +125,29 @@ bool isBuiltinTypeName(std::string_view n);
 // codegen's descTypeArgConcrete lacks (the nested `is Wrap<Inner<T>>` collapse,
 // #2184). Single source of truth: ExprTC::typeArgRuntimeReified delegates here.
 bool typeArgRuntimeReified(const TypeRef* t);
+
+// §17.4 "Degenerate value-type targets" (v0.241; #2911 + #2962) — THE predicate
+// for the two arms of ONE spec paragraph, which opens with the shared principle
+// they both instantiate: "`as` requires its result type `T?` to exist and to be
+// informative."
+//
+//   * an INLINE-ARRAY target (any form — `[N]T`, `[N]T?`, and the owning forms)
+//     has no `T?` to be: §15.1 "admits no nullable inline-array form", so the
+//     operator's contract is unsatisfiable;
+//   * the UNIT target has nothing to say: `()` has exactly one value, so the
+//     result could never carry more information than `x is ()`. (#2962 — the
+//     branch for this arm lands in the next commit; the rule is quoted whole
+//     here because it IS one rule.)
+//
+// Returns the reason-and-remedy body of the diagnostic (each arm names its OWN
+// remedy — `is` + copy-out vs. `x is ()`), or an empty string when the target is
+// an admissible `as` target. One definition, because the spec is one paragraph:
+// the DIRECT check at the `as` expression (ExprTypecheck_Exprs.cpp) and the two
+// §3.6-rule-2 per-instantiation joins (Resolver::checkAsTargetInstantiations for
+// a TYPE parameter, ExprTC's deferred join for a METHOD parameter) all call it,
+// so the answer and the wording cannot drift between them — the #1463
+// name-list-skew lesson, generalized exactly as `owningElementBadDesc` applies
+// it for §14.4.
+std::string degenerateAsTargetReason(const TypeRef* target);
 
 } // namespace bezel::sema

@@ -76,6 +76,14 @@
 //     from all-zeros to the real values); the miss case is not, because the
 //     representation the spec would need does not exist. Filed as a spec
 //     question rather than answered here.
+//     ↳ RESOLVED, #2911 (spec §17.4 "Degenerate value-type targets", v0.241):
+//       the spelling is now a compile error — this exact prediction is what the
+//       ruling acted on — and the round trip below is re-pointed at the
+//       rejection. The 456 value assertion is not deleted but PARKED: §17.4's
+//       replacement unbox (the §12.7 `is` narrowing + copy-out) does not lower
+//       yet, filed as #3090, and the restore instruction is on the test.
+//       The rejection and its accept-controls live in
+//       tests/sema/as_degenerate_target_2911_2962_test.cpp.
 //   * `$"{ia}"` string interpolation of an inline array still renders the empty
 //     string rather than §8.5's "[3]int" — a separate emitValueToString gap,
 //     untouched by this change, filed.
@@ -234,10 +242,34 @@ const char* kElementKinds =
     "  end Main; "
     "end C;";
 
-// §8.6 "Unboxing reverses the process" — a MATCHING `as` recovers the element
-// values, not a zero fill. (The non-matching direction is the §17.4/§15.1 gap
-// noted in the header; it is not asserted.) Want 456.
-const char* kUnboxRoundTrip =
+// §8.6 "Unboxing reverses the process" — this held #2804's round trip: a
+// MATCHING `o as [3]int` recovers the element values (456), where before the
+// boxing fix it produced an all-zero array.
+//
+// RE-POINTED by #2911 (spec §17.4 "Degenerate value-type targets", v0.241),
+// following the same discipline #2912 applied to kOwningNotBoxed above and
+// #2804 itself applied to tests/lit/type_test_dropped_warns_2775.bzl. The
+// spelling this test used — `var back := o as [3]int;` — is now a COMPILE
+// ERROR: §15.1 admits no `([3]int)?` for the `T?` result §17.4 promises, so a
+// FAILED cast could only ever manufacture an all-zero array indistinguishable
+// from a legitimately zero one. That is precisely the gap the header above
+// predicted and filed; the fix answers it by rejecting the operator.
+//
+// ⚠ THE 456 ASSERTION IS NOT GONE BY CHOICE — IT IS CURRENTLY UNREACHABLE, AND
+// THAT IS TRACKED. §17.4's diagnostic names the replacement unbox: the §12.7
+// `is` test with narrowing and copy-out (`if o is [3]int then var b: [3]int :=
+// o; … end;`). MEASURED: that spelling compiles but yields an ALL-ZERO array,
+// because §12.7 narrowing to a value type is never unboxed by codegen — filed
+// as **#3090** (an `int` there reads the box POINTER, 866251552; a record
+// throws). So today there is NO working spelling of "recover the values of a
+// boxed inline array", and this test asserts the rejection instead.
+//
+// WHEN #3090 LANDS, RESTORE THE VALUE ASSERTION HERE in the copy-out spelling
+// and keep both halves. Do NOT delete #2804's round-trip intent, and do not
+// relax it to "compiles somehow": what must stay pinned is that a boxed inline
+// array's values survive the trip, which is the whole point of §8.6's
+// "Unboxing reverses the process".
+const char* kUnboxRoundTripNowRejected =
     "module M; class C "
     "  public static method Main(): int "
     "    var a: [3]int := [4, 5, 6]; "
@@ -458,10 +490,27 @@ BEZEL_TEST(codegen_box_inline_array_2804,
 // =====================================================================
 
 BEZEL_TEST(codegen_box_inline_array_2804,
-           boxed_inline_array_unboxes_with_values_intact_spec_8_6) {
-    // The value must survive the round trip, not merely the type test. Without
-    // the fix the unbox produced an all-zero array (printed 0).
-    BEZEL_EXPECT_EQ(runAotOut(kUnboxRoundTrip), std::string("456"));
+           boxed_inline_array_as_unbox_now_rejected_spec_17_4_15_1) {
+    // This test used to read
+    //   BEZEL_EXPECT_EQ(runAotOut(kUnboxRoundTrip), std::string("456"));
+    // and that assertion is the one to restore once #3090 lands — see the
+    // maintenance note on kUnboxRoundTripNowRejected above, which records why
+    // it is currently unreachable and in which spelling it comes back.
+    //
+    // §17.4 (v0.241) now rejects the `as` spelling outright: `as` "requires its
+    // result type `T?` to exist and to be informative", and §15.1 "admits no
+    // nullable inline-array form", so the operator's contract is unsatisfiable
+    // — a failed cast had nowhere to put the `null` and manufactured an
+    // all-zero array instead (#2911).
+    JitResult r = runAot(kUnboxRoundTripNowRejected);
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool rejected = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("admits no nullable inline-array form") !=
+                std::string::npos &&
+            d.message.find("§17.4") != std::string::npos)
+            rejected = true;
+    BEZEL_EXPECT_TRUE(rejected);
 }
 
 // =====================================================================

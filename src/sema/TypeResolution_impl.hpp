@@ -389,6 +389,16 @@ private:
     // at the instantiation site per §3.6 rule 2.
     void checkOwningElementInstantiations();
 
+    // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): Pass 2 for the
+    // degenerate-`as`-target rule at a TYPE-level generic parameter. The
+    // declaration-site check in ExprTypecheck admits `o as T` inside the
+    // generic body (T is a placeholder there); this walks the recorded
+    // instantiations of the enclosing generic and re-checks the concrete
+    // binding, reporting at the instantiation site. Modelled on
+    // checkOwningElementInstantiations above and asking the SAME shared
+    // predicate the direct check asks (degenerateAsTargetReason).
+    void checkAsTargetInstantiations();
+
     void checkStaticClassMember(TypeSymbol* t, Symbol* m);
 
     // Slice S14: within one type, two members that aren't both
@@ -897,6 +907,26 @@ private:
         TypeSymbol* enclosingType = nullptr;  // the generic body it sits in
     };
     std::vector<OwningElementSite> owningElementSites_;
+
+    // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): one `x as T` in a
+    // generic body whose target is a bare type parameter OF THE ENCLOSING TYPE.
+    // §17.4: "When the target is a generic type parameter, the check applies
+    // per instantiation (§3.6 rule 2)". A METHOD's own parameter is excluded
+    // here (its bindings are calls, which ExprTypecheck sees and this pass does
+    // not) and is handled by ExprTC::checkDeferredAsTargetInstantiations —
+    // the same split, and the same shadowing guard, as the #2713 owning-element
+    // obligation beside it.
+    struct AsTargetSite {
+        std::string_view paramName;           // the bare parameter, e.g. "T"
+        TypeSymbol* enclosingType = nullptr;  // the generic body it sits in
+        SourceLocation loc;                   // the `x as T` expression
+    };
+    std::vector<AsTargetSite> asTargetSites_;
+
+    // Record an `x as T` site when `t` is a bare parameter of the enclosing
+    // TYPE; a no-op otherwise. Called from resolveTypesInExpr's TypeTestExpr
+    // arm, where `t` has just been resolved.
+    void recordAsTargetSite(const ast::Type& t, SourceLocation loc);
 
     // §14.2: record deferred obligations for an inner instantiation whose
     // argument `argAst` is a generic parameter of the type currently being

@@ -323,6 +323,11 @@ void Resolver::run(const ast::SourceFile& src) {
     // each instantiation of the enclosing generic binds (runs after all member
     // types are resolved, so every instantiation has been recorded).
     checkOwningElementInstantiations();
+    // §17.4 / §3.6 rule 2 (#2911, #2962): `x as T` over a TYPE-level parameter
+    // is re-checked against the type each instantiation of the enclosing
+    // generic binds (runs here for the same reason: every instantiation site
+    // has been recorded by now).
+    checkAsTargetInstantiations();
     // Slice S17: class-level modifier mutual-exclusions.
     checkClassModifierCombinations();
     // Slice S19: overloads must differ in signature.

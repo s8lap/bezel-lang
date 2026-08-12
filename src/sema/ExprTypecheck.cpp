@@ -223,6 +223,9 @@ void ExprTC::run(const ast::SourceFile& src) {
     // and every generic-method instantiation has now been seen, in whatever
     // source order they appeared. Join them.
     checkDeferredDefaultInstantiations();
+    // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): the same join for
+    // `x as T`, over the same instantiation records.
+    checkDeferredAsTargetInstantiations();
 }
 
 
@@ -295,6 +298,51 @@ void ExprTC::checkDeferredDefaultInstantiations() {
             ")` (line " + std::to_string(useLoc.line) +
             "), which §17.11 guarantees is non-null under `value`, but " +
             structuralReason(a));
+    }
+}
+
+// fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): see the declarations in
+// ExprTypecheck_impl.hpp. The METHOD-parameter half of §17.4's generic clause;
+// the TYPE-parameter half is Resolver::checkAsTargetInstantiations, and both
+// ask the SAME predicate (degenerateAsTargetReason) the direct check asks.
+void ExprTC::recordAsTargetTypeParamUse(const void* owner,
+                                        std::string_view param,
+                                        SourceLocation loc) {
+    if (!owner || param.empty()) return;
+    for (const auto& u : asTargetTypeParamUses_)
+        if (u.owner == owner && u.param == param) return;  // one is enough
+    asTargetTypeParamUses_.push_back({owner, std::string(param), loc});
+}
+
+void ExprTC::checkDeferredAsTargetInstantiations() {
+    if (asTargetTypeParamUses_.empty() || genericInstantiationSites_.empty())
+        return;
+    for (const auto& site : genericInstantiationSites_) {
+        SourceLocation useLoc{};
+        bool bodyCastsToParam = false;
+        for (const auto& u : asTargetTypeParamUses_) {
+            if (u.owner != site.owner || u.param != site.param) continue;
+            bodyCastsToParam = true;
+            useLoc = u.loc;
+            break;
+        }
+        if (!bodyCastsToParam) continue;
+        TypeRef* a = site.arg;
+        if (!a || a->kind == TypeRef::Kind::Error) continue;
+        // A substitution that is itself an unresolved bare type parameter (a
+        // generic body instantiating another generic with its own `T`) cannot
+        // be judged here — its own instantiation sites will be. Same guard as
+        // the #3044 join beside this one.
+        if (a->kind == TypeRef::Kind::Named && !a->declaration) continue;
+        const std::string degenerate = degenerateAsTargetReason(a);
+        if (degenerate.empty()) continue;
+        ctx_.diagnostics().report(
+            Severity::Error, site.loc,
+            "type parameter `" + site.param +
+            "` is used as an `as` target in the generic body (line " +
+            std::to_string(useLoc.line) +
+            "), so this instantiation is rejected at the instantiation site "
+            "(§3.6 rule 2): " + degenerate);
     }
 }
 

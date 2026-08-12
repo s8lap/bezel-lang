@@ -2195,6 +2195,77 @@ void Resolver::checkOwningElementInstantiations() {
     }
 }
 
+// fix #2911 + fix #2962 — §17.4 / §3.6 rule 2 (v0.241). Pass 2 for the
+// degenerate-`as`-target rule at a TYPE-level generic parameter; the shape is
+// checkOwningElementInstantiations above, minus its chained-binding worklist
+// (see the residual note at the end).
+//
+// §17.4 (v0.241): "When the target is a generic type parameter, the check
+// applies per instantiation (§3.6 rule 2): `x as T` at an inline-array or unit
+// substitution is rejected at the instantiation site."
+//
+// MEASURED on 309356e: this is not a tidy-up. `class Box<T>` with `var r := o
+// as T;` in a member, instantiated `new Box<[3]int>()`, SEGFAULTED the compiler
+// (exit 139, core dumped) on the executable path; at `Box<()>` it emitted two
+// #2434 "initializer expression failed to lower … degraded to a zero-initialized
+// value" internal warnings. The rule turns both into one sourced diagnostic at
+// the instantiation site.
+void Resolver::checkAsTargetInstantiations() {
+    if (asTargetSites_.empty() || instantiations_.empty()) return;
+    // One diagnostic per (instantiation site, parameter): a body may write
+    // `as T` several times over the same parameter for one user error, and
+    // §3.6 rule 2 asks for one diagnostic at the instantiation site. The
+    // parameter IS in the key, so a body misusing two parameters reports each.
+    std::set<std::pair<const ast::Type*, std::string_view>> reported;
+    for (const AsTargetSite& s : asTargetSites_) {
+        if (!s.enclosingType) continue;
+        // Index of the recorded parameter within the enclosing type's list.
+        std::size_t paramIdx = s.enclosingType->genericParams.size();
+        for (std::size_t i = 0; i < s.enclosingType->genericParams.size(); ++i)
+            if (s.enclosingType->genericParams[i] &&
+                s.enclosingType->genericParams[i]->name == s.paramName) {
+                paramIdx = i;
+                break;
+            }
+        if (paramIdx >= s.enclosingType->genericParams.size()) continue;
+        for (const GenericInstantiation& inst : instantiations_) {
+            if (inst.type != s.enclosingType) continue;
+            if (paramIdx >= inst.argRefs.size()) continue;
+            const TypeRef* arg = inst.argRefs[paramIdx];
+            // Kind::Error → resolution already failed; suppress the cascade.
+            if (!arg || arg->kind == TypeRef::Kind::Error) continue;
+            const std::string degenerate = degenerateAsTargetReason(arg);
+            if (degenerate.empty()) continue;
+            if (!reported.insert({inst.site, s.paramName}).second) continue;
+            // §3.6 rule 2 wants the diagnostic AT the instantiation site, and
+            // that is where it goes — except that some `Named<…>` nodes carry
+            // no span (measured: a `new Box<[3]int>()` type node reports 0:0),
+            // and a 0:0 diagnostic is not actionable. Fall back to the `as`
+            // expression, which is a real location naming the body at fault;
+            // the message identifies both ends either way.
+            const SourceLocation at =
+                (inst.site && inst.site->span.begin.line != 0)
+                    ? inst.site->span.begin
+                    : s.loc;
+            ctx_.diagnostics().report(
+                Severity::Error, at,
+                "type parameter `" + std::string(s.paramName) + "` of `" +
+                std::string(s.enclosingType->name) +
+                "` is used as an `as` target in the generic body (line " +
+                std::to_string(s.loc.line) +
+                "), so this instantiation is rejected at the instantiation "
+                "site (§3.6 rule 2): " + degenerate);
+        }
+    }
+    // RESIDUAL, recorded rather than guessed at (#3093): a binding that is
+    // itself another generic's parameter (`class Outer<U>` holding an
+    // `Inner<U>` whose body does the `as U`) is not walked — the #2713 pass
+    // beside this one carries a worklist for exactly that composition, and the
+    // right close is to SHARE that walk, not to grow a second copy of it.
+    // Nothing here FALSELY rejects such a program; the check simply does not
+    // reach it.
+}
+
 void Resolver::checkStaticClassMember(TypeSymbol* t, Symbol* m) {
     auto reportInstance = [&](std::string_view kind,
                               std::string_view name) {
@@ -8127,6 +8198,53 @@ static std::string describeStaticValueType(const TypeRef* rt) {
             return "?";
     }
     return "?";
+}
+
+// fix #2911 + fix #2962 — §17.4 "Degenerate value-type targets" (v0.241).
+// See the declaration comment in TypeResolution.hpp for why this is ONE
+// function: the spec states both arms in one paragraph under one principle,
+// so the compiler states them from one predicate.
+//
+// Spec §17.4 (v0.241, verbatim): "`as` requires its result type `T?` to exist
+// and to be informative. An **inline-array target** (any form — `[N]T`,
+// `[N]T?`, and the owning forms, which cannot even be boxed, §8.6) is a
+// **compile error naming this rule**: §15.1 admits no nullable inline-array
+// form, so the operator's contract is unsatisfiable. The remedy is the `is`
+// test, whose §12.7 narrowing admits copying the value out: `if o is [3]int
+// then var a: [3]int := o; end;`. The **unit type** is likewise a compile error
+// as an `as` target: `()` has exactly one value, so the operation could never
+// carry more information than `x is ()` (§12.7), which the diagnostic names as
+// the remedy — `()?` remains a well-formed type (§4.7); the rejection is of the
+// operator form, not of the type."
+//
+// THE UNIT ARM OF THE SAME PARAGRAPH IS #2962 and lands in the next commit, as
+// one more branch of THIS function — which is the point of quoting the
+// paragraph whole above: it is one rule with two degenerate targets, and the
+// compiler states it from one predicate so the two can never drift apart.
+std::string degenerateAsTargetReason(const TypeRef* target) {
+    if (!target) return {};
+    if (target->kind == TypeRef::Kind::InlineArray) {
+        const std::string spelled = describeStaticValueType(target);
+        std::string s =
+            "`as` requires its result type `T?` to exist and to be informative "
+            "(§17.4), and the inline-array target `" + spelled +
+            "` has no such result: §15.1 admits no nullable inline-array form, "
+            "so `(" + spelled + ")?` — the type §17.4 requires this expression "
+            "to have — is not a type";
+        if (target->arrayOwned) {
+            // §8.6's parenthetical: an owning inline array "cannot even be
+            // boxed", so no operand could ever match this target either.
+            s += ", and an owning inline array cannot even be boxed (§8.6). "
+                 "Use the `is` test (§12.7) if a type test is what is wanted"
+                 " (§17.4/§15.1)";
+        } else {
+            s += ". Use the `is` test instead, whose §12.7 narrowing admits "
+                 "copying the value out: `if o is " + spelled + " then var a: " +
+                 spelled + " := o; end;` (§17.4/§15.1)";
+        }
+        return s;
+    }
+    return {};
 }
 
 void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {

@@ -747,6 +747,34 @@ private:
     // §3.6 rule 2 join, run once at the end of the pass.
     void checkDeferredDefaultInstantiations();
 
+    // fix #2911 + fix #2962 (§17.4 / §3.6 rule 2, v0.241): the generic reach of
+    // §17.4's "Degenerate value-type targets" paragraph for a METHOD-level type
+    // parameter. "When the target is a generic type parameter, the check applies
+    // per instantiation (§3.6 rule 2): `x as T` at an inline-array or unit
+    // substitution is rejected at the instantiation site."
+    //
+    // Same two-facts-discovered-in-either-order shape as the #3044 `default(T)`
+    // join above, and it REUSES that join's `genericInstantiationSites_`
+    // recording rather than adding a second one — the call-site hook already
+    // records every binding, "constrained or not: the obligation comes from the
+    // BODY, not from the constraint list". Only the body-side obligation is new.
+    //
+    // Not gated on any constraint: unlike `default(T)`, whose guarantee exists
+    // only under `where T: value`, §17.4's rule is unconditional — an
+    // inline-array or unit substitution has no admissible `as` result whatever
+    // the parameter's bounds say (unit does satisfy `where T: value`).
+    struct AsTargetTypeParamUse {
+        const void* owner;   // the ast::MethodDecl whose body holds the `as`
+        std::string param;   // the type parameter used as the `as` target
+        SourceLocation loc;  // the `x as T` site (named in the diagnostic)
+    };
+    std::vector<AsTargetTypeParamUse> asTargetTypeParamUses_;
+    // Record that `owner`'s body uses `param` as an `as` target.
+    void recordAsTargetTypeParamUse(const void* owner, std::string_view param,
+                                    SourceLocation loc);
+    // §3.6 rule 2 join, run once at the end of the pass beside the #3044 one.
+    void checkDeferredAsTargetInstantiations();
+
     // Slice DR1 (§21.7): does control definitely leave this statement
     // list abruptly (return / throw / non-terminating loop) before
     // reaching its end? Conservatively returns true only when certain,
