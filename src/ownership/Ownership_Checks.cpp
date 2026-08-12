@@ -3607,6 +3607,61 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
                 return it->second.source->sym;
         }
     }
+    // §30.5 *Consumer-side rules*, Pattern A (fix #3071, v0.249): "The borrow
+    // produced by `await task` (where `task` occupies one of the admitted
+    // positions) may flow to: - A `var` binding: `var r := await task;` — `r` is
+    // a non-owned local **with the same source as `task`**."
+    //
+    // That "with the same source" clause is the load-bearing one: every onward
+    // flow of `r` is bounded by `task`'s scope through §28.3's borrow-lifetime
+    // rules, which read `states_[r].source`. There was no `await` arm here, so
+    // the field stayed empty and the "Borrow held by `x` would outlive its
+    // source `y`" rejection was STRUCTURALLY unable to fire for an
+    // await-produced borrow: a store into a strictly-wider-scope local and a
+    // non-chained `return r;` were both silently accepted, and both dangled once
+    // the source task was disposed at its own scope end (the second SIGSEGVs).
+    //
+    // Only Pattern A produces a borrow, and `awaitTaskKind` is the SAME
+    // classifier the §30.5 await-site check uses, so the two cannot disagree
+    // about which awaits carry a source.
+    //
+    // Two deliberate narrowings:
+    //   * `returnedExprMayBorrow` (the gate Shape 1 below uses) is NOT consulted:
+    //     a `Task<T>` is a declaration-less builtin, which `isBorrowableType`
+    //     reads as a value type, so that gate is false for every awaited operand
+    //     — the same mis-classification the catch-binding branch above bypasses
+    //     for built-in exception types.
+    //   * the operand must be a NAMED location (identifier / field path /
+    //     indexer), never a call. `identifierRoot` peels a `CallExpr` to its
+    //     RECEIVER, so `await p.MakeShared()` would otherwise record `p` as the
+    //     borrow's source, which it is not — an unbound producer's task is a
+    //     temporary bounded by its K8 full-expression boundary (§28.3, and the
+    //     escaping bind is already the §30.5 rejection), with no named source at
+    //     all. // per §30.5, §28.3
+    if (const auto* ue = dynamic_cast<const ast::UnaryExpr*>(&rhs)) {
+        if (ue->op == "await" && ue->operand &&
+            (dynamic_cast<const ast::IdentifierExpr*>(ue->operand.get()) ||
+             dynamic_cast<const ast::MemberAccessExpr*>(ue->operand.get()) ||
+             dynamic_cast<const ast::NullCondMemberExpr*>(ue->operand.get()) ||
+             dynamic_cast<const ast::IndexExpr*>(ue->operand.get())) &&
+            awaitTaskKind(*ue) == AwaitTaskKind::PatternA) {
+            if (const ast::IdentifierExpr* root = identifierRoot(*ue->operand)) {
+                sema::Symbol* sym = ctx_.exprSymbol(*root);
+                // The awaited task is itself a live owned scope-bound binding
+                // (`using var t := Producer();`, a plain owned local, an owning-
+                // collection slot rooted at one): the borrow's source is it.
+                if (isOwnedTrackedLocal(sym)) return sym;
+                // …or a holder that already carries a source — the same
+                // multi-hop alias chain Shape 1 below follows.
+                if (sym) {
+                    auto it = states_.find(sym);
+                    if (it != states_.end() && it->second.source &&
+                        isEscapeBoundLocal(it->second.source->sym))
+                        return it->second.source->sym;
+                }
+            }
+        }
+    }
     // Shape 1 — a re-borrow rooted at an Owned local. Per §28.3 producers:
     // a local read `r` of an owned local in a borrow-consuming position is a
     // borrow (source: `r`); a field/indexer access `r.f` / `r[i]` is a
