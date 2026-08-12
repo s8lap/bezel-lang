@@ -576,10 +576,27 @@ const TypeRef* storageComponentType(const Symbol* m, const SemaContext& ctx);
 
 // True when `pred(field, fieldType)` holds for ANY of `ts`'s §9.1/§9.2 storage
 // FIELDS — positional and body alike, `static` fields excluded (per-TYPE
-// storage, not per-value; mirrors Resolver::recordValueContainsSelf). Field
-// order is declaration order. Auto-properties are deliberately NOT included:
-// the §9.7 walk this serves has always been fields-only, and widening it here
-// would be a silent semantic change riding on a plumbing fix.
+// storage, not per-value; mirrors Resolver::recordValueContainsSelf).
+//
+// ⚠ ORDER IS `members` ORDER, WHICH IS NOT DECLARATION ORDER for a combined-form
+// record: SymbolCollection appends the §9.1 positional FieldSymbols AFTER the
+// body members (SymbolCollection.cpp — body at :298, positional at :326). An
+// earlier revision of this comment claimed declaration order; it was wrong. This
+// predicate is an existential, so order cannot change its answer — but a future
+// caller that needs order must not take it from here. Use
+// `recordPositionalFieldSymbols` for the index-aligned positional view.
+//
+// ⚠ The predicate does NOT receive an `owned` marker, and a caller must not try
+// to recover one from `FieldSymbol::modifiers`: that vector is never populated
+// for a positional field (SymbolCollection.cpp:310-327). The marker lives on
+// `ast::Param::modifier` (`ast/Node.hpp`), which is a DIFFERENT field from
+// `MemberDecl::modifiers`, so reading the latter silently answers "not owned"
+// for every positional field. That mis-read caused a real false-reject once
+// (a `sealed class Node(owned l: Leaf)` rejected as "not `owned`").
+//
+// Auto-properties are deliberately NOT included: the §9.7 walk this serves has
+// always been fields-only, and widening it here would be a silent semantic
+// change riding on a plumbing fix.
 bool anyRecordStorageField(
     const TypeSymbol* ts, const SemaContext& ctx,
     const std::function<bool(const Symbol*, const TypeRef*)>& pred);
