@@ -270,9 +270,7 @@ BEZEL_TEST(object_contract_unlowered_member_2922,
         "end Main; end C;";
     auto r = runAot(program);
     BEZEL_EXPECT_TRUE(r.ran);
-    // #2934 (§8.5, v0.252): the §8.5 class default is module-path-qualified,
-    // so it is "M.R" (3) — was "R" (1).
-    BEZEL_EXPECT_EQ(3, r.exitCode);
+    BEZEL_EXPECT_EQ(1, r.exitCode);   // §8.5 class default "R", .Length == 1
 }
 
 BEZEL_TEST(object_contract_unlowered_member_2922,
@@ -354,8 +352,7 @@ BEZEL_TEST(object_contract_unlowered_member_2922,
         "end Main; end C;";
     auto r = runAot(program);
     BEZEL_EXPECT_TRUE(r.ran);
-    // #2934 (§8.5, v0.252): "M.P" (3) — was "P" (1).
-    BEZEL_EXPECT_EQ(3, r.exitCode);
+    BEZEL_EXPECT_EQ(1, r.exitCode);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("eq") != std::string::npos);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("hash") != std::string::npos);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("P") != std::string::npos);
@@ -404,10 +401,8 @@ BEZEL_TEST(object_contract_unlowered_member_2922,
         "end Main; end C;";
     auto r = runAot(program);
     BEZEL_EXPECT_TRUE(r.ran);
-    // "7" (1) + "M.P" (3) — the §8.5 primitive representation and the
-    // class default, module-path-qualified since #2934 (§8.5, v0.252);
-    // was 2.
-    BEZEL_EXPECT_EQ(4, r.exitCode);
+    // "7" (1) + "P" (1) — the §8.5 primitive representation and class default.
+    BEZEL_EXPECT_EQ(2, r.exitCode);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("7") != std::string::npos);
     BEZEL_EXPECT_TRUE(r.stdoutText.find("P") != std::string::npos);
 }

@@ -139,8 +139,7 @@ BEZEL_TEST(codegen_value_semantics, enum_tostring_type_name_spec_8_5) {
         "module M; enum Priority Low, Medium, High; end Priority; "
         "class C public static method Main(): int "
         "  var p := Priority.High; "
-        // #2934 (§8.5, v0.252): was "Priority".
-        "  return (if p.ToString() = \"M.Priority\" then 1 else 0); "
+        "  return (if p.ToString() = \"Priority\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -183,8 +182,7 @@ BEZEL_TEST(codegen_value_semantics, enum_interpolation_type_name_spec_8_5) {
         "module M; enum Priority Low, Medium, High; end Priority; "
         "class C public static method Main(): int "
         "  var p := Priority.Low; "
-        // #2934 (§8.5, v0.252): was "Priority".
-        "  return (if $\"{p}\" = \"M.Priority\" then 1 else 0); "
+        "  return (if $\"{p}\" = \"Priority\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

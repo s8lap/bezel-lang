@@ -208,7 +208,7 @@ BEZEL_TEST(codegen_interp_iface_head_vtableless_2969,
             "    return a.GetEnumerator(); "
             "  end GetEnumerator; "
             "end MyE; ")),
-        std::string("val=M.MyE"));   // #2934 (§8.5, v0.252): was "val=MyE"
+        std::string("val=MyE"));
 }
 
 // A USER class with an explicit ToString override must still dispatch it

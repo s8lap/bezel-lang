@@ -3182,20 +3182,6 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         spanElemPol.cat == ElementPolicy::Category::ClassOwned ||
         spanElemPol.cat == ElementPolicy::Category::ClassBorrow;
 
-    // -- ToString ---------------------------------------------------------------
-    // fix #2661 (spec §8.5, v0.252): the §8.5 positional-record default, which
-    // §8.5 states is generated for "**every** type of the applicable kind,
-    // wherever declared — user modules and the standard library alike". Was an
-    // ACCEPT-TRAP: sema typed the call `string` (the universal-ToString rule)
-    // and nothing lowered it, so the enclosing statement was silently dropped
-    // (#2311 measured `Console.WriteLine(sp.ToString())` printing nothing, exit
-    // 0, no diagnostic). #2311's holding position was a deferral diagnostic;
-    // this is the lowering that replaces it. Delegates to the ONE renderer the
-    // §18.5 interpolation hole and the boxed §4.16 receiver also use, so the
-    // three spellings of this default cannot drift.
-    if (m == "ToString" && call.args.empty())
-        return emitSpanToString(spanVal, rcn);
-
     // -- Length / IsEmpty -------------------------------------------------------
     if (m == "Length" && call.args.empty()) {
         return loadLen();  // i32

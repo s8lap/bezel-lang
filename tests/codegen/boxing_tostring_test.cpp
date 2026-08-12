@@ -98,9 +98,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, boxed_enum_tostring_via_object) {
         "module M; enum Color Red := 0, Green := 1, Blue := 2; end Color; "
         "class C public static method Main(): int "
         "  var o: Object := Color.Green; "
-        // #2934 (§8.5, v0.252): was "Color" — §8.5 renders an enum's
-        // default as the QUALIFIED type name, boxed dispatch included.
-        "  return (if o.ToString() = \"M.Color\" then 1 else 0); "
+        "  return (if o.ToString() = \"Color\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -126,9 +124,7 @@ BEZEL_TEST(codegen_boxing_tostring_417, class_default_tostring_via_object) {
         "class Gadget end Gadget; "
         "class C public static method Main(): int "
         "  using var g: Object := new Gadget(); "
-        // #2934 (§8.5, v0.252): was "Gadget" — "For classes: the type's
-        // qualified name".
-        "  return (if g.ToString() = \"M.Gadget\" then 1 else 0); "
+        "  return (if g.ToString() = \"Gadget\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

@@ -264,11 +264,7 @@ BEZEL_TEST(codegen_object_tostring_result_leak_2846,
         "    t := t + churn.Length; "
         "  end while; "
         "  if rc.Name <> \"name\" then return 2; end if; "
-        // #2934 (§8.5, v0.252): the only term that moved is `Plain`'s §8.5
-        // class DEFAULT, "Plain" (5) -> "App.Plain" (9), 20 iterations:
-        // 282 + 20*4 = 362. The two OVERRIDES ("S<i>", "name") and the
-        // churn string are untouched.
-        "  if t <> 362 then return 3; end if; "
+        "  if t <> 282 then return 3; end if; "
         "  return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_EQ(run(r), 0);
@@ -374,9 +370,5 @@ BEZEL_TEST(codegen_object_tostring_result_leak_2846,
         "  Console.WriteLine(o6.ToString()); "
         "  return 0; "
         "end Main; end C;"));
-    // #2934 (§8.5, v0.252): the ENUM row ("Color") and the no-override
-    // CLASS row ("KDef") are now module-path-qualified; the record head,
-    // the boxed int, the override and the string are unchanged.
-    BEZEL_EXPECT_TRUE(r ==
-                      "Pt(X: 1, Y: 2)\n7\nApp.Color\nApp.KDef\nK9\nabcd\n");
+    BEZEL_EXPECT_TRUE(r == "Pt(X: 1, Y: 2)\n7\nColor\nKDef\nK9\nabcd\n");
 }

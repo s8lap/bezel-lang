@@ -158,9 +158,7 @@ BEZEL_TEST(codegen_nullable_enum, interpolate_null_spec_8_5) {
 BEZEL_TEST(codegen_nullable_enum, interpolate_value_spec_8_5) {
     BEZEL_EXPECT_EQ(run(kColor,
         "var c: Color? := Color.Green; var s := $\"{c}\"; "
-        // #2934 (§8.5, v0.252): was "Color" — a present nullable enum
-        // renders its inner value's §8.5 default, now module-qualified.
-        "return int(s = \"M.Color\");"), 1);
+        "return int(s = \"Color\");"), 1);
 }
 
 // §7: reassigning a null `enum?` to a value (and back) tracks the tag through

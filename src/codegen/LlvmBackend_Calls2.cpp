@@ -2502,11 +2502,9 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
 
     if (isEnum) {
         // §8.5: enum ToString → the type's qualified name (spec default).
-        // fix #2934 (§8.5, v0.252): "qualified" is stdlib §2.13's `FullName`
-        // rendering — module-path-qualified — not the bare identifier.
         if (isToString)
             return lowerStringLiteral(
-                std::string("\"") + spec85QualifiedTypeName(ts) + "\"", false);
+                std::string("\"") + std::string(ts->name) + "\"", false);
         // §8.3: enum GetHashCode → the underlying integer value (i32).
         if (isGetHashCode)
             return builder_.CreateZExtOrTrunc(recv, i32());
@@ -2525,28 +2523,16 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
     // carries them only when it is auto-hashable (§9.2); an ineligible
     // body record gets the type-name default for ToString (§8.5) and no auto
     // equality.
-    // fix #2934 follow-up (§8.5 / §9.1, v0.252): asked through the SHARED
-    // predicate. This computation used to read `ts->decl` only, which is null
-    // for every IMPORTED type (ModuleLoader sets `TypeSymbol::hasPositional
-    // Fields` and never assigns `decl`) — so an imported positional record was
-    // classified as an ineligible BODY record and took the name-only arm below,
-    // rendering a QUALIFIED RECORD HEAD ("Dep.Pt"), which §8.5 forbids
-    // ("positional-record and auto-equality formatting keeps the **unqualified**
-    // head"). MEASURED across a real two-module build on f1175c6: this site
-    // answered "Dep.Pt" while the boxed spelling of the same value answered
-    // "Pt(X: 1, Y: 2)" and the interpolated one answered "Pt".
-    bool autoBearing = recordIsAutoBearing(ts);
+    bool positional = false;
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
+        positional = td->hasPositionalFields;
+    bool autoBearing =
+        positional || sema::isAutoEqualityBearingBodyRecord(ts, ctx_);
 
     if (isToString && !autoBearing)
         // §8.5: an ineligible body record's ToString is the type-name default.
-        // fix #2934 (§8.5, v0.252): "For body records that do not satisfy
-        // auto-equality conditions, and for enums: the type's qualified name
-        // (the stdlib §2.13 `FullName` rendering, as for classes)" — this is
-        // the THIRD of the three name-only defaults, and it IS qualified. The
-        // eligible/positional heads a few lines below are the ones that stay
-        // unqualified (§8.5's recorded asymmetry).
         return lowerStringLiteral(
-            std::string("\"") + spec85QualifiedTypeName(ts) + "\"", false);
+            std::string("\"") + std::string(ts->name) + "\"", false);
     if ((isGetHashCode || isEquals) && !autoBearing)
         // §9.2: an ineligible body record has no auto equality. Do not
         // synthesize; fall through to ordinary dispatch (which finds the
@@ -4624,13 +4610,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     }
                     // No base override → §8.5 type-name default (the enclosing
                     // class's name; Object.ToString returns the runtime type).
-                    // fix #2934 (§8.5, v0.252): module-path-qualified, so that
-                    // `base.ToString()` and the vtable slot 3 default this
-                    // shortcut stands in for (emitClassToStringThunkBody) keep
-                    // answering with ONE string.
                     return lowerStringLiteral(
-                        std::string("\"") + spec85QualifiedTypeName(cg_cls) +
-                            "\"",
+                        std::string("\"") + std::string(cg_cls->name) + "\"",
                         false);
                 }
             }

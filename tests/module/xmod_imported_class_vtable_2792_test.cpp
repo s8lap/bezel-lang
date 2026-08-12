@@ -212,11 +212,7 @@ BEZEL_TEST(xmod_imported_class_vtable_2792, object_tostring_on_imported_instance
         "    using var a := new Plain(7); "
         "    var o: Object := a; "
         "    var s: string := o.ToString(); "
-        // #2934 (§8.5, v0.252): the §8.5 class default is module-path-
-        // qualified, and an IMPORTED type carries its EXPORTER's module
-        // (ModuleLoader populates TypeSymbol::moduleName from the
-        // dependency's metadata, #1488) — "Lib.Plain" (9), was "Plain" (5).
-        "    return s.Length; ")), 9);
+        "    return s.Length; ")), 5);
 }
 
 // #2792 / §19.3 + §2.8.3 rule 4 — a `case` TYPE PATTERN over an `Object`

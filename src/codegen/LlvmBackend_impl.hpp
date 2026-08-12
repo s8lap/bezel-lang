@@ -2372,24 +2372,10 @@ private:
     // §4.16 / §8.6 (#970): per-element-LLVM-type span box vtable. A span
     // value boxed into IReadOnlySpan<T> uses this vtable + a synthesized itable.
     // Keyed by the concrete element LLVM type (i32 for int, ptr for string, etc.)
-    // so each element-specialization shares one vtable.
-    //
-    // fix #2661 (spec §8.5, v0.252): the key now ALSO carries the boxed span's
-    // declared HEAD name. Slot 3 (`kToStringSlot`) used to be left NULL —
-    // #2311's measured SIGSEGV, "pc points to the zero page", on the receiver
-    // shape §8.6 calls canonical ("passing a span to a parameter of type
-    // `IReadOnlySpan<TElement>`"). Filling it means the vtable now carries a
-    // rendering whose head is `Span` / `ReadOnlySpan` / `ArraySpan` /
-    // `ReadOnlyArraySpan`, which the four names DO differ in, so they can no
-    // longer share one vtable per element type. The head is known at every
-    // creation site (the box is minted at the coercion, from the concrete span
-    // TypeRef), so the boxed rendering equals the unboxed one by construction.
-    //
-    // Populated lazily by ensureSpanBoxVtable().
-    std::map<std::pair<llvm::Type*, std::string>, llvm::GlobalVariable*>
-        spanBoxVtables_;
-    llvm::GlobalVariable* ensureSpanBoxVtable(llvm::Type* elemTy,
-                                              std::string_view head);
+    // so each element-specialization shares one vtable even when the four span
+    // names differ.  Populated lazily by ensureSpanBoxVtable().
+    std::unordered_map<llvm::Type*, llvm::GlobalVariable*> spanBoxVtables_;
+    llvm::GlobalVariable* ensureSpanBoxVtable(llvm::Type* elemTy);
 
     // fix #2804 (§8.6 "Boxing of inline arrays", v0.240): per-`[N]T` box
     // descriptor + box vtable, minted on demand. Unlike every other boxable
@@ -3405,32 +3391,6 @@ private:
     // first — this function does not re-check it.
     llvm::Value* emitChoiceToString(llvm::Value* val,
                                     const sema::TypeSymbol* choiceTy);
-    // fix #2661 (spec §8.5, v0.252): the §8.5 POSITIONAL-RECORD default for the
-    // standard library's span records — "The defaults above are generated for
-    // **every** type of the applicable kind, wherever declared — user modules
-    // and the standard library alike." `spanVal` is the shared
-    // `bz.arrayspan` value { ptr source, i32 start, i32 length }; `head` is the
-    // declared head name, which selects the component name §4.14/§4.15 declare
-    // (`Buffer: OwningBuffer<T>` for Span/ReadOnlySpan, `Source: Array<T>` for
-    // ArraySpan/ReadOnlyArraySpan). Returns a fresh +1 string.
-    llvm::Value* emitSpanToString(llvm::Value* spanVal, std::string_view head);
-    // fix #2661 (spec §8.5, v0.252): the §8.5 AUTO-EQUALITY BODY-RECORD default
-    // for `Range<T>` (stdlib §9.8) — "`Range<T>` (a compiler-intrinsic body
-    // record, stdlib §9.8) carries the auto-equality body-record default of the
-    // bullet above, rendering its auto-properties." `rangeVal` is the
-    // `bz.range` value { i64 start, i64 end, i64 step, i8 flags }. Returns a
-    // fresh +1 string.
-    //
-    // `elemTy` is the instantiation's element type (`rt->genericArgs[0]`), and
-    // it is REQUIRED for correctness, not decoration: §8.5 says "Each component
-    // renders as its own `ToString` renders it", and stdlib §9.8 types the
-    // `Start`/`End` components `T?`. `Range<char>` must therefore render
-    // characters, not code points, and `Range<ulong>` must render unsigned.
-    // Null (or a non-primitive/unresolved argument) falls back to `long`, which
-    // is exact for every signed integer T and for the unsigned ones below
-    // `long.MaxValue`.
-    llvm::Value* emitRangeToString(llvm::Value* rangeVal,
-                                   const sema::TypeRef* elemTy);
     // §8.5: enum ToString → the type's qualified name (the spec default for
     // enums; member-name formatting is left to user code via Type.EnumNames).
     // §8.3: enum GetHashCode → the underlying integer value.
@@ -5155,120 +5115,6 @@ private:
         if (!ts) return "";
         if (ts->moduleName.empty()) return std::string(ts->name);
         return ts->moduleName + "." + std::string(ts->name);
-    }
-
-    // fix #2934 (spec §8.5, v0.252; stdlib §2.13 `Type.FullName`): the ONE
-    // spelling §8.5's three *name-only* `ToString` defaults render — for
-    // classes, for enums, and for body records that do NOT satisfy the §9.2
-    // auto-equality conditions. §8.5 pins it to the stdlib §2.13 `FullName`
-    // rendering — "the module-path-qualified rendering stdlib §2.13 defines for
-    // `Type.FullName` (`"BankingApp.BankAccount"`) … The default and `FullName`
-    // are one rendering contract, not two."
-    //
-    // ⚠ NOT for a record HEAD. §8.5 makes the asymmetry explicit and
-    // deliberate: "positional-record and auto-equality formatting keeps the
-    // UNQUALIFIED head (`"Point(X: 10, Y: 20)"`, §9.1) — a record rendering
-    // already identifies itself by shape, while a bare class or enum default is
-    // *only* a name and therefore carries the module path." So
-    // `emitRecordToString`'s `rec->name` head, `emitChoiceToString`'s
-    // `choiceTy->name` head (§35.7, not one of §8.5's bullets at all), and the
-    // §8.5 inline-array / unit rows stay exactly as they are. Qualifying the
-    // record head is the obvious over-broad failure mode of this fix.
-    //
-    // Deliberately a SEPARATE function from `mangledTypeName` above even though
-    // the two produce the same string today: that one names a LINKER symbol
-    // under §2.8.3 rule 3 (whose identity also counts generic arity, so it may
-    // legitimately grow an arity component), this one is OBSERVABLE PROGRAM
-    // OUTPUT under §8.5 + stdlib §2.13 (whose rule 3 renders type ARGUMENTS,
-    // not arity). Coupling them would make a mangling change silently rewrite
-    // every program's log lines, and vice versa.
-    //
-    // `moduleName` is populated for every real TypeSymbol — local declarations
-    // by SymbolCollection (from the enclosing ModuleDecl) and imported ones by
-    // ModuleLoader (from ModuleMetadata::moduleName), the #1488 invariant — so
-    // the empty-string fallback covers only the synthetic builtin TypeSymbols
-    // (`ts->decl == nullptr`), which have no module to name. The remaining
-    // builtin-class residual (a reserved built-in class rendering "Mutex"
-    // rather than "System.Threading.Mutex", and stdlib §2.13 rule 3's
-    // type-argument rendering, neither of which any table in this compiler can
-    // supply today) is recorded in #3119, not guessed at here.
-    static std::string spec85QualifiedTypeName(const sema::TypeSymbol* ts) {
-        if (!ts) return "";
-        if (ts->moduleName.empty()) return std::string(ts->name);
-        return ts->moduleName + "." + std::string(ts->name);
-    }
-
-    // §9.1 / §9.3 (#501, #1488): is `rec` a POSITIONAL (or combined-form)
-    // record — the §9.1 package that always synthesizes value semantics?
-    //
-    // ⚠ BOTH sources are load-bearing, and reading only the AST one is a live
-    // defect. `ModuleLoader` sets `TypeSymbol::hasPositionalFields` for an
-    // IMPORTED record and never assigns `TypeSymbol::decl`, so
-    // `dynamic_cast<const ast::TypeDecl*>(ts->decl)` is null for every imported
-    // type — SymbolCollection.cpp says so outright at its own copy of this
-    // predicate ("Imported positional records (no ast::TypeDecl — only
-    // hasPositionalFields flag)"), and sema's copies read both. The codegen
-    // copies read only the AST decl, which classified an imported `record
-    // Pt(X: int, Y: int)` as a BODY record: MEASURED on f1175c6 across a real
-    // two-module build, `p.ToString()` rendered "Dep.Pt" (a QUALIFIED record
-    // head, which §8.5 forbids outright) while the boxed and interpolated
-    // spellings of the same value in the same program rendered
-    // "Pt(X: 1, Y: 2)" and "Pt".
-    //
-    // One predicate, every caller, so the two sources cannot be read apart
-    // again. Mirrors `sema::isAutoEqualityBearingBodyRecord`'s own guard
-    // (SymbolCollection.cpp) rather than re-deriving it.
-    bool recordIsPositional(const sema::TypeSymbol* rec) const {
-        if (!rec) return false;
-        if (rec->hasPositionalFields) return true;
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(rec->decl))
-            return td->hasPositionalFields;
-        return false;
-    }
-
-    // §9.1 / §9.2: does `rec` carry the SYNTHESIZED value-semantics package —
-    // i.e. does its `ToString` render a field listing rather than a bare name?
-    // True for a positional/combined-form record (§9.1, always) and for a body
-    // record that satisfies §9.2's auto-equality conditions.
-    bool recordIsAutoBearing(const sema::TypeSymbol* rec) const {
-        if (!rec || rec->kind != ast::TypeDeclKind::Record) return false;
-        return recordIsPositional(rec) ||
-               sema::isAutoEqualityBearingBodyRecord(rec, ctx_);
-    }
-
-    // fix #2934 (spec §8.5, v0.252): does §8.5's *name-only* `ToString` default
-    // for `ts` render the QUALIFIED name? True for exactly the three bullets
-    // that say "qualified name" — classes, enums, and body records that do NOT
-    // satisfy the §9.2 auto-equality conditions. False for everything else,
-    // most importantly a positional record and an auto-equality body record,
-    // whose heads §8.5 keeps unqualified.
-    //
-    // Exists so every site that renders a name-only default for a receiver
-    // whose KIND is not statically narrowed asks ONE predicate instead of
-    // re-deriving the three-way split — the recurring "a correct predicate fed
-    // by a different population" failure this repo keeps finding.
-    //
-    // ⚠ The positional test must come BEFORE the auto-equality one and cannot
-    // be folded into it: `isAutoEqualityBearingBodyRecord` returns false for a
-    // positional record (it is scoped to BODY records), so negating it alone
-    // would qualify every positional head — the exact outcome §8.5 forbids.
-    bool spec85NameOnlyDefaultIsQualified(const sema::TypeSymbol* ts) const {
-        if (!ts) return false;
-        if (ts->kind == ast::TypeDeclKind::Class ||
-            ts->kind == ast::TypeDeclKind::Enum)
-            return true;
-        if (ts->kind != ast::TypeDeclKind::Record) return false;
-        if (recordIsPositional(ts)) return false;
-        return !sema::isAutoEqualityBearingBodyRecord(ts, ctx_);
-    }
-
-    // The rendered form of §8.5's name-only default for `ts`: qualified for the
-    // three bullets above, the bare declared identifier otherwise.
-    std::string spec85NameOnlyDefaultSpelling(const sema::TypeSymbol* ts) const {
-        if (!ts) return "";
-        return spec85NameOnlyDefaultIsQualified(ts)
-                   ? spec85QualifiedTypeName(ts)
-                   : std::string(ts->name);
     }
 
     // §26 (#433): is `ms` an extension method (declared in an `extension`

@@ -14,11 +14,6 @@
 //
 // runJit returns the raw exit code (0..255).
 
-// #2934 (spec §8.5, v0.252): the length expectations marked below grew by the
-// module-path prefix when §8.5's class default was pinned to stdlib §2.13's
-// `Type.FullName` rendering. Each is annotated with its old value; the
-// override and value-type controls are unchanged.
-
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -38,8 +33,8 @@ BEZEL_TEST(interp_default_tostring_1077, concrete_class_default_is_type_name) {
         "module M; class MyClass end MyClass; "
         "class C public static method Main(): int "
         "  using var obj := new MyClass(); "
-        "  return $\"[{obj}]\".Length; "          // #2934: "[M.MyClass]" = 11
-        "end Main; end C;"), 11);   // was "[MyClass]" (9)
+        "  return $\"[{obj}]\".Length; "          // "[MyClass]" = 9
+        "end Main; end C;"), 9);
 }
 
 // The Object static type renders the dynamic type name (already worked).
@@ -49,8 +44,8 @@ BEZEL_TEST(interp_default_tostring_1077, object_static_type_dynamic_name) {
         "class C public static method Main(): int "
         "  using var obj := new MyClass(); "
         "  var o: Object := obj; "
-        "  return $\"[{o}]\".Length; "             // #2934: "[M.MyClass]" = 11
-        "end Main; end C;"), 11);   // was "[MyClass]" (9)
+        "  return $\"[{o}]\".Length; "             // "[MyClass]" = 9
+        "end Main; end C;"), 9);
 }
 
 // An INTERFACE static type renders the runtime type name (was "" before #1077).
@@ -60,8 +55,8 @@ BEZEL_TEST(interp_default_tostring_1077, interface_static_type_runtime_name) {
         "class C public static method Main(): int "
         "  using var sq := new Sq(); "
         "  var s: IShape := sq; "
-        "  return $\"[{s}]\".Length; "             // #2934: "[M.Sq]" = 6
-        "end Main; end C;"), 6);   // was "[Sq]" (4)
+        "  return $\"[{s}]\".Length; "             // "[Sq]" = 4
+        "end Main; end C;"), 4);
 }
 
 // An explicit ToString override is still used (not the type name).
@@ -143,8 +138,8 @@ BEZEL_TEST(interp_default_tostring_1077, generic_param_class_default_1118) {
         "  public method Show<T>(x: T): int => ($\"{x}\").Length; "
         "  public static method Main(): int "
         "    using var c := new C(); using var p := new Plain(); "
-        "    return c.Show<Plain>(p); "            // #2934: "M.Plain" = 7
-        "  end Main; end C;"), 7);   // was "Plain" (5)
+        "    return c.Show<Plain>(p); "            // "Plain" = 5
+        "  end Main; end C;"), 5);
 }
 
 // T bound to a value type (int) resolves through the substitution → "42".
