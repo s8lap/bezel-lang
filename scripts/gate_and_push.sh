@@ -37,6 +37,30 @@
 # REFUSED: --quick (shard-only). It is a diagnosis mode that skips coverage by
 # design, so it can never be the basis of a push. Run it via scripts/gate.sh.
 set -u
+
+# --- completion signalling (2026-08-12) -------------------------------------
+# WHY: twice in the 2026-08-12 run the coordinator lost hours waiting on a gate
+# that had already finished, because the wait-loop matched a process pattern that
+# also appeared in the waiter's own command line (see scripts/wait_pid.sh). Once,
+# a PASSING gate sat unnoticed for an hour. Publish identity + a terminal marker
+# so no caller ever has to pattern-match a process list again:
+#   $BEZEL_GATE_PIDFILE  - this script's pid, written at start, removed at exit
+#   $BEZEL_GATE_DONEFILE - written ONCE on exit, containing the exit status
+# Wait with:  scripts/wait_pid.sh "$BEZEL_GATE_PIDFILE"
+BEZEL_GATE_PIDFILE="${BEZEL_GATE_PIDFILE:-/var/tmp/bezel-scratch/gate.pid}"
+BEZEL_GATE_DONEFILE="${BEZEL_GATE_DONEFILE:-/var/tmp/bezel-scratch/gate.done}"
+mkdir -p "$(dirname "$BEZEL_GATE_PIDFILE")" 2>/dev/null || true
+rm -f "$BEZEL_GATE_DONEFILE" 2>/dev/null || true
+echo $$ > "$BEZEL_GATE_PIDFILE"
+_bezel_gate_signal_done() {
+  local rc=$?
+  echo "$rc" > "$BEZEL_GATE_DONEFILE" 2>/dev/null || true
+  rm -f "$BEZEL_GATE_PIDFILE" 2>/dev/null || true
+  return $rc
+}
+trap _bezel_gate_signal_done EXIT
+# ---------------------------------------------------------------------------
+
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate_and_push: not in a git repo" >&2; exit 2; }
 
 # Make scripts/ importable as the `gate` package so `python3 -m gate.serialize`
