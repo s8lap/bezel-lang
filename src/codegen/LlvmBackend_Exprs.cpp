@@ -3735,14 +3735,78 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // bz_task_complete and freed when we call bz_task_free
                     // below — but the value is already in a register at that
                     // point so the freed buffer does not alias the returned val.
+                    //
+                    // ⚠ fix #3099 (§28.3 *Unbound owned temporaries* / §30.3 /
+                    // §30.5, v0.252): that reasoning holds ONLY for a value /
+                    // `string` / runtime-managed result. For a Pattern A CLASS
+                    // (or intrinsic-collection) result the loaded "value" IS the
+                    // heap pointer, and since #1503 bz_task_free cascades into
+                    // the per-`T` result disposer and frees the pointee — so the
+                    // load does NOT decouple them. This is the exact twin of the
+                    // `await` defect fixed in #3070, and §28.3 names the two in
+                    // ONE clause: "the operand of a Pattern A `await` OR
+                    // `.Result` read whose borrowed result is itself confined to
+                    // the same full expression … for such an operand the
+                    // disposal is deferred to the end of the full expression
+                    // rather than performed at the await, so the borrowed result
+                    // outlives its uses."
                     llvm::Value* resultVal =
                         builder_.CreateLoad(resTy, resPtr, "result.value");
                     // §30.5 (#1127): reclaim anonymous task on the ok path too.
                     if (!isBoundTask) {
-                        auto* freeTaskFn =
-                            declareC("bz_task_free", llvm::Type::getVoidTy(llvm_),
-                                     {ptrTy()});
-                        builder_.CreateCall(freeTaskFn, {task});
+                        // fix #3099: the predicate is patternAResultDisposerFor
+                        // itself — the ONE function that decides "disposing this
+                        // task disposes its result" — exactly as lowerAwait asks
+                        // it (#3070), so the `await` and `.Result` sides cannot
+                        // drift apart again. Null for `Task<value/string/
+                        // runtime-managed T>` and for `OwningTask<T>` (Pattern
+                        // B), each of which keeps freeing at the read.
+                        if (patternAResultDisposerFor(tt) != nullptr) {
+                            // §28.3: park the task in a slot, register the
+                            // reclaim on the cleanup stack (exception edge +
+                            // conservative backstop) and queue it for the K8
+                            // full-expression boundary, where flushAwaited-
+                            // TaskTemps frees it "after every use of the borrow".
+                            //
+                            // The slot's INITIALIZATION differs from #3070's, and
+                            // the difference is load-bearing. A `.Result` read
+                            // lives in a SYNCHRONOUS body (§30.3 rejects it in
+                            // async code: "use `await t` — blocking waits are not
+                            // available in async code"), so the slot is NOT
+                            // frame-promoted and nothing zeroes it. #3070's
+                            // `entryAlloca(ptrTy())` would then leave the K8
+                            // flush freeing uninitialized stack whenever the read
+                            // sits in a NOT-TAKEN conditional arm — measured on
+                            //   `var n := (if F() then Use(P().Result) else 7);`
+                            // as a SEGV inside free(). A synchronous entry block
+                            // runs exactly once, so entryAllocaNullPtr is both
+                            // safe and required here.
+                            //
+                            // The async arm below is therefore unreachable today
+                            // and written only so the rule is stated once for
+                            // both spellings: inside a resume function the slot
+                            // must be frame-spilled and left to the frame's
+                            // CALLOC zeroing, because entryAllocaNullPtr's
+                            // entry-block `store null` re-runs on EVERY resume
+                            // and wipes the saved pointer (measured, then
+                            // reverted, at a69b9d9). Should §30.3's restriction
+                            // ever be lifted, both halves are already correct.
+                            const bool inAsyncResume =
+                                smStateStruct_ && asyncResumeFn_ &&
+                                currentFn_ == asyncResumeFn_;
+                            llvm::AllocaInst* taskSlot =
+                                inAsyncResume ? entryAlloca(ptrTy())
+                                              : entryAllocaNullPtr();
+                            builder_.CreateStore(task, taskSlot);
+                            registerAwaitedTaskTemp(taskSlot);
+                            if (inAsyncResume)
+                                asyncHandlerSpillSlots_.push_back(taskSlot);
+                        } else {
+                            auto* freeTaskFn =
+                                declareC("bz_task_free",
+                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                            builder_.CreateCall(freeTaskFn, {task});
+                        }
                     }
                     // §28.3 / #1250: for a BOUND OwningTask<T:class> .Result read,
                     // null the task's result buffer after loading so the TCS
