@@ -2740,7 +2740,16 @@ TypeRef* ExprTC::substituteGenericCaseFieldType(
 bool ExprTC::returnsValue(const ast::Type* rt) {
     if (!rt) return false;
     TypeRef* r = ctx_.resolvedType(*rt);
-    if (r && r->kind == TypeRef::Kind::Unit) return false;
+    // fix #3095 / §4.7 (v0.252): `!r->nullable` is load-bearing. `()` IS the
+    // implicit return type of a callable declared without one, so a `: ()`
+    // ascription is a void-method context — but `()?` is a DIFFERENT type,
+    // "an optional with two values, `null` and `()`" (§4.7), and a method
+    // ascribed `()?` therefore DOES return a value. Without the conjunct this
+    // folded `()?` into the no-return-type case and §21.7's value-carrying-
+    // `return` rejection fired on `return null;` — "this callable has no return
+    // type — `return` may not carry a value" reported for a callable that has
+    // one. // per §4.7, §21.7
+    if (r && r->kind == TypeRef::Kind::Unit && !r->nullable) return false;
     return true;
 }
 

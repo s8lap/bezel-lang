@@ -10219,9 +10219,28 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         // return positions use, so all four agree by construction. A no-op for
         // every other null-`v` shape and for a non-Object parameter, so the
         // #1386 ICE below still fires for the cases it was written for.
-        if (!v && params[idx].type)
-            v = boxForTarget(v, ctx_.resolvedType(*params[idx].type),
-                             a.value.get());
+        if (!v && params[idx].type) {
+            sema::TypeRef* formal0 = ctx_.resolvedType(*params[idx].type);
+            // fix #3095 (§4.7, v0.252): the two OTHER unit-source targets a
+            // call argument can have, both of which demand a real operand
+            // because the callee's signature has a slot for them.
+            //   * `()?` — the present optional `{i8 1, i8 0}`
+            //     (unitValueForTarget; §4.7's "two values, `null` and `()`").
+            //   * `()` itself — the inert placeholder byte. `lowerParamType`
+            //     substitutes `unitPlaceholderTy()` for the `void` a unit
+            //     parameter would otherwise lower to (void is not a valid
+            //     parameter/alloca type — it SIGILL'd `bezelc` in
+            //     bindParameters), so the caller owes one byte here to keep
+            //     the call's arity and types matching the callee.
+            llvm::Value* uv = unitValueForTarget(v, formal0, a.value.get());
+            if (uv != v)
+                v = uv;
+            else if (formal0 && formal0->kind == sema::TypeRef::Kind::Unit &&
+                     !formal0->nullable)
+                v = llvm::ConstantInt::get(unitPlaceholderTy(), 0);
+            else
+                v = boxForTarget(v, formal0, a.value.get());
+        }
         if (!v) {
             // #1386: ICE — lowerExpr returned null for a call argument value;
             // the expression kind is not yet handled by codegen.

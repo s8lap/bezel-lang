@@ -11732,10 +11732,13 @@ llvm::FunctionType* Emitter::methodFnType(const sema::MethodSymbol* ms) {
         for (sema::Symbol* p : ms->params) {
             auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);
             sema::TypeRef* pt = ps ? ps->resolvedDeclType : nullptr;
+            // fix #3095 / §4.7: lowerParamTypeRef — this function computes the
+            // TYPE a call is emitted against, so it must make exactly the same
+            // `()` substitution the declaration sites make.
             paramTys.push_back(
                 isByRefMod(ps ? ps->modifier : std::string_view())
                     ? ptrTy()
-                    : (pt ? lowerTypeRef(pt) : i32()));
+                    : (pt ? lowerParamTypeRef(pt) : i32()));
         }
         return llvm::FunctionType::get(retTy, paramTys, /*isVarArg=*/false);
     }
@@ -11746,7 +11749,7 @@ llvm::FunctionType* Emitter::methodFnType(const sema::MethodSymbol* ms) {
     for (const auto& p : md->params)
         paramTys.push_back(isByRefMod(p.modifier)
                                ? ptrTy()  // CG50: ref/out by reference
-                               : lowerType(p.type.get()));
+                               : lowerParamType(p.type.get()));
     return llvm::FunctionType::get(retTy, paramTys, /*isVarArg=*/false);
 }
 

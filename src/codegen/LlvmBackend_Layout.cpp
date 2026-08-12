@@ -863,6 +863,18 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
     }
     switch (rt->kind) {
         case sema::TypeRef::Kind::Unit:
+            // §4.7: the NON-nullable unit type. `void` is right here and only
+            // here — it is what a unit-returning function returns. It is NOT a
+            // valid `alloca`/parameter/struct-member type, so every STORAGE
+            // position substitutes the one-byte placeholder instead
+            // (`unitPlaceholderTy`: `lowerLocalDecl`'s #1619 guard,
+            // `lowerParamType`'s signature substitution).
+            //
+            // fix #3095 / §4.7: `()?` never reaches here — `isNullableValueTy`
+            // at the top of this function claims it first and returns the
+            // tagged `{i8 hasValue, i8}` optional (nullableValueStructTy).
+            // Before that, this arm answered `void` for `()?` as well, which
+            // SIGILL'd `bezelc` at a `()?` parameter (CreateAlloca(void)).
             return llvm::Type::getVoidTy(llvm_);
         case sema::TypeRef::Kind::Primitive:
             return lowerPrimitive(rt->primitive);
@@ -2176,6 +2188,15 @@ const sema::TypeRef* Emitter::recordMemberTypeResolved(const sema::Symbol* m) {
 // primitive it is the primitive's LLVM type. Defined here (not inline in the
 // header) because the record case needs recordStruct.
 llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
+    // fix #3095 / §4.7 (v0.252): `()?` — "an optional with two values, `null`
+    // and `()`". The tag carries both; the payload is ONE INERT BYTE
+    // (unitPlaceholderTy) because §4.7 gives the unit type exactly one value,
+    // so no byte pattern distinguishes one `()` from another and nothing ever
+    // reads it. The two-element shape is deliberate (see isNullableUnitTy):
+    // every family site that reads element 1 stays well-typed for `()?`.
+    if (isNullableUnitTy(rt))
+        return llvm::StructType::get(
+            llvm_, {nullablePrimHasValTy(), unitPlaceholderTy()});
     if (isNullableEnumTy(rt))
         // §10.3 (#740): the nullable-enum payload slot is the enum's underlying
         // integer width (default i32), matching the non-nullable enum lowering.
@@ -3127,6 +3148,33 @@ llvm::Value* Emitter::unboxNarrowedRead(const ast::Expr& e) {
     llvm::Value* p = narrowedBoxPayloadAddr(e, payloadTy);
     if (!p || !payloadTy) return nullptr;
     return builder_.CreateLoad(payloadTy, p, "narrow.unbox");
+}
+
+// fix #3095 (§4.7, v0.252): the `()?` sibling of boxForTarget's unit rescue.
+//
+// A unit-typed source expression has NO lowered value — `()` lowers to LLVM
+// `void`, so `lowerExpr` returns nullptr for it (#2915). At a `()?` LOCATION
+// that nothing must become the PRESENT optional `{i8 1, i8 0}`: §4.7 gives
+// `()?` "an optional with two values, `null` and `()`", and leaving the slot as
+// it was (the pre-fix behaviour) collapses the two — MEASURED on 663a68e,
+// `var u: ()? := null; u := ();` left `u` reading as `null`, behind the #2961
+// "store dropped" Warning.
+//
+// Called from the SAME four value-demanding positions #2915 enumerates — local
+// declaration, assignment, call argument, `return` — immediately alongside the
+// `boxForTarget` call each of them already makes, so the two rescues agree by
+// construction. It is a no-op whenever a value WAS lowered, whenever the target
+// is not `()?`, and whenever the source is not the non-nullable unit value
+// (a `()?`-typed source already carries its own tag).
+llvm::Value* Emitter::unitValueForTarget(llvm::Value* v,
+                                         const sema::TypeRef* declTy,
+                                         const ast::Expr* init) {
+    if (v || !declTy || !init) return v;
+    if (!isNullableUnitTy(declTy)) return v;
+    const sema::TypeRef* srcTy = ctx_.exprType(*init);
+    if (!srcTy || srcTy->kind != sema::TypeRef::Kind::Unit || srcTy->nullable)
+        return v;
+    return nullableUnitPresent(declTy);
 }
 
 

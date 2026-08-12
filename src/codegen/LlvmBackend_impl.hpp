@@ -2473,9 +2473,29 @@ private:
 
     // Create an alloca in the function's entry block (the conventional
     // home for locals, so they dominate all uses once control flow lands).
+    //
+    // fix #3095 / §4.7 / #1619: the void→placeholder substitution is made HERE,
+    // structurally, and not only at the two positions known to need it. LLVM
+    // `void` has no size or alignment, so `CreateAlloca(void)` reaches a
+    // `DataLayout` `llvm_unreachable` that this libLLVM build compiles to a
+    // HARDWARE TRAP — `bezelc` dies with SIGILL and no diagnostic, the single
+    // worst failure mode available. #1619 already made this substitution in
+    // `lowerLocalDecl`; `bindParameters` had no such guard, so a `()` (or, then,
+    // `()?`) PARAMETER trapped — a defect that was invisible until someone wrote
+    // the program, because the guard was a per-site convention rather than a
+    // property of the operation.
+    //
+    // The substitution is only ever CORRECT because `lowerTypeRef` produces
+    // `void` for exactly one thing — the unit type (its `Kind::Unit` arm; every
+    // other arm returns a sized type) — and a type with exactly one value
+    // carries no information, so one inert byte is a faithful slot (§4.7).
+    // Callers that must also make the caller/callee SIGNATURE agree still use
+    // `lowerParamType`; this is the backstop that keeps a missed one from being
+    // a trap.
     llvm::AllocaInst* entryAlloca(llvm::Type* ty) {
         llvm::BasicBlock& entry = currentFn_->getEntryBlock();
         llvm::IRBuilder<> tmp(&entry, entry.begin());
+        if (ty && ty->isVoidTy()) ty = unitPlaceholderTy();
         return tmp.CreateAlloca(ty);
     }
 
@@ -3786,19 +3806,54 @@ private:
     // Guid {i64,i64}. Defined in LlvmBackend_Layout.cpp (delegates to
     // valueBuiltinName); the four unify under isNullableValueTy below.
     bool isNullableValueBuiltinTy(const sema::TypeRef* rt);
+    // fix #3095 / §4.7 (v0.252): is `rt` the NULLABLE UNIT type `()?`? §4.7,
+    // verbatim: "Wrapping the unit type with `?` (yielding `()?`) is permitted
+    // by the grammar and produces an optional with **two values**, `null` and
+    // `()`." Two values is one BIT of state, so the tag alone carries the whole
+    // type — but the type still needs a REPRESENTATION, and before this fix it
+    // had none: `lowerTypeRef`'s `Kind::Unit` case returned LLVM `void`
+    // REGARDLESS of `nullable`, which is right for a unit RETURN type and wrong
+    // for every storage position. At a PARAMETER that void reached
+    // `entryAlloca` (bindParameters), and `CreateAlloca(void)` hits a
+    // `DataLayout` `llvm_unreachable` that this libLLVM build compiles to a
+    // hardware trap — `bezelc` died with SIGILL, no diagnostic, on a program
+    // §4.7 declares well-formed. `()?` is therefore a member of the nullable-
+    // VALUE-type family like every other optional over a value type, and joins
+    // it HERE so that the family's shared machinery (the all-zero `null`
+    // constant, the `{i8 1, …}` present wrap, the `= null` tag test, parameter
+    // /return/field passing) covers it with no per-site `()?` arm to forget.
+    // Its payload slot is one INERT byte (unitPlaceholderTy): §4.7 gives the
+    // unit type exactly one value, so no byte pattern distinguishes one `()`
+    // from another and the payload is never read — exactly the reasoning #1619
+    // already recorded for the unit LOCAL slot. Keeping the two-element shape
+    // (rather than a tag-only `{i8}`) is what makes the family's existing
+    // element-1 reads well-typed for `()?` too. // per §4.7
+    bool isNullableUnitTy(const sema::TypeRef* rt) {
+        return rt && rt->kind == sema::TypeRef::Kind::Unit && rt->nullable;
+    }
+    // fix #1619 / #3095 / §4.7: the one-byte placeholder a UNIT-typed storage
+    // slot occupies. `()` lowers to LLVM `void`, which is a valid function
+    // RETURN type and not a valid `alloca` / parameter / struct-member type; a
+    // type with exactly one value carries no information, so a single inert
+    // byte is a faithful stand-in. This is the ONE definition of that
+    // substitution — `lowerLocalDecl`'s #1619 guard, the parameter-signature
+    // substitution (`lowerParamType`) and the `()?` payload slot all read it.
+    llvm::Type* unitPlaceholderTy() { return llvm::Type::getInt8Ty(llvm_); }
     // A nullable VALUE type — a value primitive (isNullablePrimTy), an enum
     // (isNullableEnumTy), a record (isNullableRecordTy), a CHOICE
-    // (isNullableChoiceTy, fix #2447), or a value-builtin
-    // (isNullableValueBuiltinTy, #1954). All lower to the tagged {i8 hasValue; T
+    // (isNullableChoiceTy, fix #2447), a value-builtin
+    // (isNullableValueBuiltinTy, #1954), or the UNIT type (isNullableUnitTy,
+    // fix #3095). All lower to the tagged {i8 hasValue; T
     // value} struct; the only difference is T (the primitive's LLVM type, i32 for
-    // an enum, the bare record struct, the bare choice struct, or the
+    // an enum, the bare record struct, the bare choice struct, the
     // value-builtin's lowering — i64 for DateTime/TimeSpan, i32 for
-    // DateOnly/TimeOnly, {i64,i64} for Guid). All null/wrap/value-semantics
-    // sites key off this combined predicate.
+    // DateOnly/TimeOnly, {i64,i64} for Guid — or unit's inert placeholder
+    // byte). All null/wrap/value-semantics sites key off this combined
+    // predicate.
     bool isNullableValueTy(const sema::TypeRef* rt) {
         return isNullablePrimTy(rt) || isNullableEnumTy(rt) ||
                isNullableRecordTy(rt) || isNullableChoiceTy(rt) ||
-               isNullableValueBuiltinTy(rt);
+               isNullableValueBuiltinTy(rt) || isNullableUnitTy(rt);
     }
     // The tagged struct for a nullable value type (prim, enum, or record). For
     // an enum the value slot is the underlying integer (i32 — CG44); for a record
@@ -3808,6 +3863,18 @@ private:
     // Constant null for a nullable value type: {i8 0, T 0}.
     llvm::Constant* nullableValueNull(const sema::TypeRef* rt) {
         return llvm::ConstantAggregateZero::get(nullableValueStructTy(rt));
+    }
+    // fix #3095 / §4.7 (v0.252): the PRESENT value of `()?` — `{i8 1, i8 0}`.
+    // A Constant rather than an `insertvalue` pair so it is equally usable at a
+    // field/global initializer and mid-body; the payload byte is inert (there
+    // is exactly one unit value, so nothing distinguishes byte patterns — see
+    // isNullableUnitTy). The `null` value is nullableValueNull's all-zero
+    // constant, exactly as for every other nullable value type.
+    llvm::Constant* nullableUnitPresent(const sema::TypeRef* rt) {
+        auto* st = nullableValueStructTy(rt);
+        return llvm::ConstantStruct::get(
+            st, {llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                 llvm::ConstantInt::get(unitPlaceholderTy(), 0)});
     }
     // Wrap a plain value (primitive or enum integer) into a nullable: {i8 1, v}.
     // §5.1 / §5.2 (#743): materialize the bz_decimal for an integer source into
@@ -4108,6 +4175,40 @@ private:
     }
 
     llvm::Type* lowerTypeRef(const sema::TypeRef* rt);
+
+    // fix #3095 / §4.7 / #1619: the LLVM type of a BY-VALUE PARAMETER slot.
+    //
+    // `lowerTypeRef` answers LLVM `void` for the unit type, which is correct at
+    // the one position `void` is valid — a function's RETURN type — and invalid
+    // at every other. A `void` PARAMETER is not merely useless: `bindParameters`
+    // allocas each by-value parameter, and `CreateAlloca(void)` reaches a
+    // `DataLayout` `llvm_unreachable` that this libLLVM build compiles to a
+    // hardware trap, so `bezelc` died with SIGILL and no diagnostic on
+    // `method Take(u: ())` (measured on 663a68e: exit 132, core dumped, with
+    // the trap in `DataLayout::getPrefTypeAlign` under
+    // `IRBuilderBase::CreateAlloca` under `bindParameters`). §4.7 gives the
+    // unit type exactly one value, so the parameter carries no information and
+    // one inert byte is a faithful slot — the SAME substitution #1619 already
+    // makes for a unit LOCAL, now made at the signature so caller and callee
+    // agree on the arity and types. The caller supplies the byte in
+    // `buildOrderedArgs`.
+    //
+    // `()?` never needs this: `lowerTypeRef` gives it the tagged `{i8, i8}`
+    // optional (isNullableUnitTy), which is an ordinary first-class type.
+    llvm::Type* lowerParamType(const ast::Type* t) {
+        llvm::Type* ty = lowerType(t);
+        // `lowerType(nullptr)` also answers void, but that is "no type node"
+        // (an unannotated parameter), which this substitution must not claim.
+        return (t && ty && ty->isVoidTy()) ? unitPlaceholderTy() : ty;
+    }
+    // The sema-TypeRef face of lowerParamType — used by the imported-signature
+    // paths, which reconstruct parameters from `ParameterSymbol::resolvedDeclType`
+    // rather than from an AST node. Both faces must substitute identically or a
+    // cross-module call is emitted against a mismatched signature.
+    llvm::Type* lowerParamTypeRef(const sema::TypeRef* rt) {
+        llvm::Type* ty = lowerTypeRef(rt);
+        return (rt && ty && ty->isVoidTy()) ? unitPlaceholderTy() : ty;
+    }
 
     // fix #568 / §14.1 / §7.1: coerce a ReturnStmt value `v` to the function's
     // declared nullable-VALUE return type when that type is reached through the
@@ -6782,6 +6883,15 @@ private:
     // value; a no-op for reference sources and non-Object targets.
     llvm::Value* boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
                               const ast::Expr* init);
+
+    // fix #3095 (§4.7, v0.252): boxForTarget's `()?` sibling — a unit-typed
+    // source expression lowers to no llvm::Value, and at a `()?` LOCATION the
+    // PRESENT optional `{i8 1, i8 0}` must be synthesized for it (§4.7: `()?`
+    // has "two values, `null` and `()`"). Called from the same four
+    // value-demanding positions as boxForTarget. Defined in
+    // LlvmBackend_Layout.cpp beside it.
+    llvm::Value* unitValueForTarget(llvm::Value* v, const sema::TypeRef* declTy,
+                                    const ast::Expr* init);
 
     // fix #2915 (§4.7 / §8.6): rescue a unit-typed `:=` RHS, which lowers to no
     // llvm::Value at all and was therefore dropped SILENTLY by the assignment

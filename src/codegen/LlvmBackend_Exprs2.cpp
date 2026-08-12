@@ -882,6 +882,18 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // binding below registers it in refParams_ so reads/writes route
             // through the incoming pointer.
             if (par && isByRefMod(par->modifier)) ty = ptrTy();
+            // fix #3095 / §4.7 (v0.252): a `()`-typed lambda parameter lowers to
+            // LLVM `void`, which is not a valid parameter type — the store of
+            // the incoming argument into its slot below traps
+            // (`DataLayout::getABITypeAlign(void)`, SIGILL, measured on the
+            // #3095 fix's own base). Substitute the one-byte placeholder, the
+            // same substitution `lowerParamType` makes for a named method's
+            // parameter and `lowerLocalDecl` (#1619) makes for a unit local.
+            // Reached however `ty` was derived — the written annotation, the
+            // inferred `resolvedDeclType`, or the expected function type — so no
+            // derivation path can reintroduce the trap. `()?` never needs it: it
+            // is the tagged `{i8, i8}` optional (isNullableUnitTy). // per §4.7
+            if (ty && ty->isVoidTy()) ty = unitPlaceholderTy();
             userParamTys.push_back(ty);
             ++pi;
         }
@@ -7004,6 +7016,20 @@ llvm::Value* Emitter::buildRecordValue(
                 llvm::Value* v = lowerExpr(*fieldArg[i]->value);
                 genericSubst_ = std::move(recSubst);
                 genericSubstSemaTy_ = std::move(recSemaTy);
+                // §9.1 / §14.1 (#769): resolve the field's type through the
+                // active record generic substitution — see the nullable-value
+                // wrap below, which is the reason this is resolved and not read
+                // off the declaration.
+                const sema::TypeRef* fty = recordMemberTypeResolved(posFields[i]);
+                // fix #3095 (§4.7, v0.252): the RECORD POSITIONAL-ARGUMENT
+                // position of the same unit rescue the local-declaration,
+                // assignment, call-argument and `return` positions make. A
+                // unit-typed argument lowers to no llvm::Value, so `new R(1, ())`
+                // at a `U: ()?` field took the `!v` bail below and the WHOLE
+                // record construction degraded (measured: `internal: … #2434`,
+                // and `b.U` then read as `null` — §4.7's two values collapsed).
+                // A no-op for every non-`()?` field. // per §4.7
+                if (!v) v = unitValueForTarget(v, fty, fieldArg[i]->value.get());
                 if (!v) return nullptr;
                 // CG-nullable: a NULLABLE VALUE field (int?, bool?, …, and a
                 // nullable enum — issue #364) stores the tagged struct {i8
@@ -7012,13 +7038,11 @@ llvm::Value* Emitter::buildRecordValue(
                 // mirroring buildOrderedArgs — without this the bare T would be
                 // stored into the wider struct slot, leaving the value half
                 // uninitialized. per §9.1
-                // §9.1 / §14.1 (#769): resolve the field's type through the
-                // active record generic substitution — for `Box<int>` with a
-                // field `V: T?`, the declared `T?` must resolve to `int?` so the
-                // nullable-value wrap below fires and the value is stored as the
-                // tagged `{i8 hasValue; int value}` struct (the unresolved `T?`
-                // was mis-judged, leaving the field wrong).
-                const sema::TypeRef* fty = recordMemberTypeResolved(posFields[i]);
+                // (`fty` is resolved above — for `Box<int>` with a field
+                // `V: T?`, the declared `T?` must resolve to `int?` so this wrap
+                // fires and the value is stored as the tagged `{i8 hasValue; int
+                // value}` struct; the unresolved `T?` was mis-judged, leaving the
+                // field wrong.)
                 if (isNullableValueTy(fty)) {
                     auto* expectedSt = nullableValueStructTy(fty);
                     llvm::Type* valTy = expectedSt->getElementType(1);

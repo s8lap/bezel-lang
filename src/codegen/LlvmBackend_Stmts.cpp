@@ -98,10 +98,22 @@ bool Emitter::lowerVirtualPropertyIncrDecr(const ast::IncrementStmt& inc) {
 // non-Object/interface target and for every non-unit source, so this rescue
 // only ever converts "silently dropped" into "boxed"). A null return still
 // means "nothing to store" for every other shape.
+//
+// fix #3095 (§4.7, v0.252): the same rescue is owed at a `()?` target, for the
+// same reason and one step earlier in the type lattice — `u := ();` on a
+// `var u: ()?` dropped its store too (MEASURED on 663a68e behind the #2961
+// "store dropped" Warning, leaving `u` reading `null`), and §4.7 says `()?`
+// has "two values, `null` and `()`", so a dropped store is a WRONG VALUE, not
+// a missing no-op. unitValueForTarget supplies the present `{1, 0}`; it is a
+// no-op for every non-`()?` target, so boxForTarget's `Object` case below is
+// reached exactly as before.
 llvm::Value* Emitter::rescueUnitAssignRhs(llvm::Value* rhs,
                                           const ast::AssignmentStmt& as) {
     if (rhs || !as.target || !as.value) return rhs;
-    return boxForTarget(rhs, ctx_.exprType(*as.target), as.value.get());
+    const sema::TypeRef* tgt = ctx_.exprType(*as.target);
+    llvm::Value* uv = unitValueForTarget(rhs, tgt, as.value.get());
+    if (uv != rhs) return uv;
+    return boxForTarget(rhs, tgt, as.value.get());
 }
 
 
@@ -2091,9 +2103,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // caller received null. boxForTarget bails on a null value for every
         // other shape, and is a no-op whenever the declared return type is not
         // Object/interface, so dropping the guard changes nothing else.
+        // fix #3095 (§4.7, v0.252): the `()?` sibling of that rescue, at the
+        // same site — `return ();` from a `: ()?` method has no lowered value
+        // either, and §4.7's `()?` has "two values, `null` and `()`", so the
+        // present `{i8 1, i8 0}` must be synthesized rather than `ret`'ing the
+        // all-zero (null) pattern. A no-op for every non-`()?` return type, so
+        // the §8.6 box below is reached exactly as before.
         if (const ast::Type* rn = returnReprTypeNode())
-            if (rs->value)
-                v = boxForTarget(v, ctx_.resolvedType(*rn), rs->value.get());
+            if (rs->value) {
+                sema::TypeRef* rnTy = ctx_.resolvedType(*rn);
+                llvm::Value* uv = unitValueForTarget(v, rnTy, rs->value.get());
+                v = (uv != v) ? uv : boxForTarget(v, rnTy, rs->value.get());
+            }
         // §29.2 / §4.3 (#1310): a value returned as `IEnumerable<T>` must be a
         // vtable-backed enumerator, not a raw bz_array_t* / class instance — the
         // caller's for-in and its scope-end iterEnumDispose both dispatch through

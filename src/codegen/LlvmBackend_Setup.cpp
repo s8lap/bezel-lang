@@ -1775,9 +1775,12 @@ void Emitter::declareFunctions() {
             paramTys.push_back(ptrTy());  // argv (char**)
         } else {
             for (const auto& p : *ci.params) {
+                // fix #3095 / §4.7: lowerParamType, not lowerType — a `()`
+                // parameter would otherwise be typed LLVM `void`, which
+                // bindParameters' alloca turns into a SIGILL.
                 paramTys.push_back(isByRefMod(p.modifier)
                                        ? ptrTy()  // CG50: ref/out by reference
-                                       : lowerType(p.type.get()));
+                                       : lowerParamType(p.type.get()));
             }
         }
         auto* fnType = llvm::FunctionType::get(retTy, paramTys,
@@ -1811,9 +1814,10 @@ void Emitter::declareFunctions() {
             // (above). Without this the signature declared the value type while
             // lowerNew passed a pointer and bindParameters read through it as a
             // ref param → malformed IR.
+            // fix #3095 / §4.7: lowerParamType — see the method loop above.
             paramTys.push_back(isByRefMod(p.modifier)
                                    ? ptrTy()
-                                   : lowerType(p.type.get()));
+                                   : lowerParamType(p.type.get()));
         }
         auto* fnType = llvm::FunctionType::get(
             llvm::Type::getVoidTy(llvm_), paramTys, /*isVarArg=*/false);
@@ -2067,9 +2071,11 @@ void Emitter::declareImportedFunctions() {
         for (sema::Symbol* p : ms->params) {
             auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);
             sema::TypeRef* pt = ps ? ps->resolvedDeclType : nullptr;
+            // fix #3095 / §4.7: lowerParamTypeRef — the imported face of the
+            // same `()`-parameter substitution declareFunctions makes.
             paramTys.push_back(isByRefMod(ps ? ps->modifier : std::string_view())
                                    ? ptrTy()
-                                   : (pt ? lowerTypeRef(pt) : i32()));
+                                   : (pt ? lowerParamTypeRef(pt) : i32()));
         }
         auto* fnType = llvm::FunctionType::get(retTy, paramTys,
                                                /*isVarArg=*/false);
@@ -3000,9 +3006,10 @@ llvm::Function* Emitter::declareImportedCtor(const sema::ConstructorSymbol* cs) 
     for (sema::Symbol* p : cs->params) {
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(p);
         sema::TypeRef* pt = ps ? ps->resolvedDeclType : nullptr;
+        // fix #3095 / §4.7: lowerParamTypeRef — the imported-ctor face.
         paramTys.push_back(isByRefMod(ps ? ps->modifier : std::string_view())
                                ? ptrTy()
-                               : (pt ? lowerTypeRef(pt) : i32()));
+                               : (pt ? lowerParamTypeRef(pt) : i32()));
     }
     auto* fnType = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                            paramTys, /*isVarArg=*/false);
@@ -11747,8 +11754,17 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // was emitted. boxForTarget is a no-op for every other null-`v` shape (it
     // bails on a null value once past the unit case), so dropping the guard
     // changes nothing else.
-    if (declType)
-        v = boxForTarget(v, ctx_.resolvedType(*declType), init);
+    // fix #3095 (§4.7, v0.252): the `()?` sibling of that rescue, at the same
+    // site and for the same reason — `var v: ()? := ();` has no lowered
+    // initializer either, and §4.7 gives `()?` "two values, `null` and `()`",
+    // so leaving the slot at its all-zero (null) pattern is a WRONG VALUE, not
+    // a harmless no-op. A no-op for every non-`()?` declared type, so
+    // boxForTarget's Object case below is reached exactly as before.
+    if (declType) {
+        sema::TypeRef* declTy0 = ctx_.resolvedType(*declType);
+        llvm::Value* uv = unitValueForTarget(v, declTy0, init);
+        v = (uv != v) ? uv : boxForTarget(v, declTy0, init);
+    }
     // §29.2 (#552): when a user class (implementing IEnumerable<T>) is assigned
     // to a local declared as IEnumerable<T>, wrap it in a thin sm-compatible
     // enumerator exactly as buildOrderedArgs does at call sites.  Without this,
