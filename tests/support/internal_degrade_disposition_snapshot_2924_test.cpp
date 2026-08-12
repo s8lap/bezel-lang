@@ -96,7 +96,8 @@ struct Entry {
     const char* reason;
 };
 
-// The sixteen WARNING-severity `internal:` degrades as of v0.240, each with the
+// The WARNING-severity `internal:` degrades (sixteen as of v0.240; #3079 added
+// at v0.249), each with the
 // judgement #2924 asks for.  Ordered by file, then by the tag.
 const Entry kWarningDegrades[] = {
     {"src/codegen/LlvmBackend_Assign.cpp", "#2833",
@@ -216,13 +217,28 @@ const Entry kWarningDegrades[] = {
      "null value; nullable member access still requires narrowing or the "
      "checked `!` unwrap. No raw pointer is substituted — the bounded harm is "
      "that the coalescing assignment failed to establish a value."},
+
+    {"src/codegen/LlvmBackend_Calls.cpp", "#3079",
+     Disposition::WrongValue,
+     "the third value-demanding degrade (#2966's named residual): a "
+     "`Console.Write`/`WriteLine` whose single argument failed to lower. "
+     "Branch (c) of the guard — the \u00a73/#605 permissive surface, which "
+     "reaches this BY DESIGN — reports and leaves control flow unchanged, so "
+     "the statement still emits nothing. NO value is substituted at all: the "
+     "site returns `false` (\"not a console call\") rather than handing a "
+     "zero or null onward, so unlike #2434/#2477 there is no pointer for a "
+     "caller to dereference. The bounded harm is an ABSENT statement — the "
+     "narrowest of the three dispositions in this table, and the reason this "
+     "is a Warning while branches (a)/(b) escalate. Tracked for the residual "
+     "sites (ordinary call arguments, the `?.` twin) as #3105."},
 };
 
-// How many of the sixteen can hand a user a memory-unsafe binary. Pinned as
-// its own number so that changing a disposition is a deliberate edit in two
-// places. The two #2961 and two #3025 entries are WrongValue (no null pointer
-// is substituted), so this count is unchanged at 9 from the twelve-degrade
-// population.
+// How many of these can hand a user a memory-unsafe binary. Pinned as its own
+// number so that changing a disposition is a deliberate edit in two places.
+// The two #2961 and two #3025 entries are WrongValue (no null pointer is
+// substituted), so this count was unchanged at 9 from the twelve-degrade
+// population; #3079 (v0.249) is likewise WrongValue — it substitutes nothing
+// at all, it declines the site — so the count stays 9.
 constexpr std::size_t kUnsafePointerCount = 9;
 
 // Locate the repo root from this translation unit's own path:
