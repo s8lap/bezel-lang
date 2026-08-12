@@ -301,11 +301,12 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
     auto* recvTy = ctx_.exprType(*ix.target);
 
     // §3.3 (#883): ReadOnlyStringSpan[i] → the (Start + i)-th CODE POINT of the
-    // source string (a char), bounds-checked against the span's Length (not the
-    // string's). The source (field 0) is a string pointer, so the element is read
-    // via loadCodePoint — NOT bz_array_get (the array-span path below). This must
-    // precede the isSpanLikeTypeName branch, which would mis-treat the string
-    // source as an array.
+    // source string (a char), bounds-checked against the span's Length AND
+    // against the SOURCE STRING's length (see below). The source (field 0) is a
+    // string pointer, so the element is read via loadCodePoint — NOT
+    // bz_array_get (the array-span path below). This must precede the
+    // isSpanLikeTypeName branch, which would mis-treat the string source as an
+    // array.
     if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
         !recvTy->declaration && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
@@ -332,6 +333,36 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         llvm::Value* absIdx = builder_.CreateAdd(
             builder_.CreateSExt(base, i64()),
             builder_.CreateSExt(idx,  i64()), "ss.absi");
+        // fix #3098 (follow-up) / stdlib §3.3 + §4.14 (v0.195): bounds-check the
+        // ABSOLUTE index against the SOURCE STRING, not only against the span's
+        // own `Length` above.
+        //
+        // stdlib §4.14 "Construction patterns" is explicit that the direct span
+        // constructors "do **not** range-check `(Start, Length)` against the
+        // source (v0.195): a mis-constructed span faults at each out-of-range
+        // *access* instead — the span-level check passes and **the source's own
+        // bounds check throws `IndexOutOfRangeException`**". That composition is
+        // what makes the no-eager-check rule memory-SAFE — and for this type it
+        // did not exist: the span-level check above compares against `Length`
+        // and then calls `loadCodePoint` DIRECTLY, and `loadCodePoint`
+        // (LlvmBackend_String.cpp) performs no check of its own — its header
+        // states its precondition outright, "idx < len is guaranteed by every
+        // caller". The plain string indexer supplies exactly this guard
+        // (LlvmBackend_Exprs.cpp, `ICmpUGE(idx64, loadStringLen(...))`, R33);
+        // the span path bypassed it, so `new ReadOnlyStringSpan("abc", 0, 100)`
+        // then `s[50]` read ~50 code points past the buffer. Adding the arm that
+        // makes the direct constructor construct (#3098) is what made such a
+        // span reachable, so the guard §4.14 promises is owed here.
+        //
+        // UNSIGNED compare, deliberately: it rejects a negative `absIdx` in the
+        // same instruction. The span-level check above rejects a negative `idx`
+        // but says nothing about `Start`, and a negative `Start` is the other
+        // half of a mis-constructed span (`new ReadOnlyStringSpan("abc", -5, 10)`);
+        // sign-extended, it is a huge unsigned value and fails this compare.
+        // Mirrors the string indexer's own unsigned test. // per stdlib §3.3, §4.14
+        emitGuardThrow(
+            builder_.CreateICmpUGE(absIdx, loadStringLen(src), "ss.src.oor"),
+            "IndexOutOfRangeException");
         return loadCodePoint(src, absIdx);   // i32 code point (char)
     }
 

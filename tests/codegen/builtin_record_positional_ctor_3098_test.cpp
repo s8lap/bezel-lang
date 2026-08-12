@@ -65,8 +65,14 @@
 // stdlib §4.14 "Construction patterns" states that "the direct constructors of
 // the five span records do **not** range-check `(Start, Length)` against the
 // source (v0.195): a mis-constructed span faults at each out-of-range *access*
-// instead". Constructing a span is therefore not the place a bad range is
-// reported, and this file does not claim it is.
+// instead — the span-level check passes and the source's own bounds check
+// throws `IndexOutOfRangeException`". Constructing a span is therefore not the
+// place a bad range is reported, and this file does not claim it is — but the
+// ACCESS-time throw §4.14 promises in the same sentence is the precondition that
+// makes the rule memory-safe, it did NOT exist for this type, and it is
+// asserted below (`a_misranged_span_throws_at_the_access_not_out_of_bounds…`).
+// Recorded on #3135, which named this exact risk for the other four span
+// records.
 
 #include <string>
 
@@ -265,8 +271,79 @@ BEZEL_TEST(builtin_record_positional_ctor_3098,
         "  Console.WriteLine(\"<end>\"); "
         "  return 0; "
         "end Main; end C;");
-    if (r.ran) {
-        BEZEL_EXPECT_TRUE(r.stdoutText.find("AAA") == std::string::npos);
-        BEZEL_EXPECT_TRUE(r.stdoutText.find("BBB") == std::string::npos);
-    }
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("<start>") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("<end>") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("AAA") == std::string::npos);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("BBB") == std::string::npos);
+}
+
+// ── THE ACCESS-TIME GUARD stdlib §4.14 PROMISES ─────────────────────────
+
+BEZEL_TEST(builtin_record_positional_ctor_3098,
+           a_misranged_span_throws_at_the_access_not_out_of_bounds_stdlib_3_3_4_14) {
+    // ⚠ THE SAFETY PRECONDITION OF THE NO-EAGER-CHECK RULE, made real.
+    //
+    // stdlib §4.14 "Construction patterns" (v0.195) says the direct span
+    // constructors "do **not** range-check `(Start, Length)` against the source
+    // … a mis-constructed span faults at each out-of-range *access* instead —
+    // the span-level check passes and **the source's own bounds check throws
+    // `IndexOutOfRangeException`**". Following that rule (which this fix does)
+    // is only memory-safe if that second check EXISTS. For
+    // `ReadOnlyStringSpan` it did not: the indexer checked the span's own
+    // `Length` and then called `loadCodePoint` directly, whose header states
+    // "idx < len is guaranteed by every caller" and which performs no check —
+    // so `new ReadOnlyStringSpan("abc", 0, 100)` then `s[50]` read ~50 code
+    // points past the buffer. Before the ctor arm existed the construction
+    // degraded to an all-zero span and `s[0]` threw on `0 >= 0`: a wrong value,
+    // but memory-SAFE. Making the constructor construct is what made the
+    // out-of-bounds read constructible, so the guard is owed by the same fix.
+    //
+    // Both halves of a mis-range are covered: an over-long `Length` (the span
+    // check passes, the source check must fire) and a NEGATIVE `Start` (the
+    // span check says nothing about `Start`, so only the source check can).
+    auto r = runAot(
+        "module M; class C public static method Main(): int "
+        "  var over := new ReadOnlyStringSpan(\"abc\", 0, 100); "
+        "  var neg  := new ReadOnlyStringSpan(\"abc\", -5, 10); "
+        "  var got: int := 0; "
+        "  try "
+        "    var c := over[50]; "
+        "    Console.WriteLine(\"NO THROW over\"); "
+        "  catch "
+        "    var e: IndexOutOfRangeException => got := got + 1; "
+        "  end; "
+        "  try "
+        "    var c := neg[0]; "
+        "    Console.WriteLine(\"NO THROW neg\"); "
+        "  catch "
+        "    var e: IndexOutOfRangeException => got := got + 2; "
+        "  end; "
+        "  return got; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(3, r.exitCode);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("NO THROW") == std::string::npos);
+}
+
+BEZEL_TEST(builtin_record_positional_ctor_3098,
+           an_in_range_span_still_indexes_and_slices_stdlib_3_3) {
+    // The accept-control for the guard above: it must fire only on a genuine
+    // out-of-source access. stdlib §3.3's indexer reads "the code point at
+    // position `Start + i` in the source string", and `Slice(start, length)` is
+    // "`new ReadOnlyStringSpan(Source, this.Start + start, length)`" — the
+    // standard library's own use of the constructor this fix lowered, and the
+    // path by which a mis-range would propagate, so it is exercised here too.
+    auto r = runAot(
+        "module M; class C public static method Main(): int "
+        "  var s := new ReadOnlyStringSpan(\"abcdef\", 1, 4); "
+        "  var t := s.Slice(1, 2); "
+        "  Console.WriteLine(s.ToString()); "
+        "  Console.WriteLine(t.ToString()); "
+        "  return int(t[0]) - int(s[0]); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(1, r.exitCode);               // 'c' (99) - 'b' (98)
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("bcde") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("cd") != std::string::npos);
 }

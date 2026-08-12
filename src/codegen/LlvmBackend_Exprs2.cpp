@@ -3315,8 +3315,9 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             //
             // Named arguments are honoured by NAME rather than by position: a
             // record's positional constructor takes its field names as parameter
-            // names (§9.1), so `new ExceptionInfo(Message: m, TypeName: t,
-            // StackTrace: s)` is the same value as the positional spelling.
+            // names (§9.1), so `new ExceptionInfo(Message := m, TypeName := t,
+            // StackTrace := s)` — §22.5's named-argument spelling is
+            // `name := value` — is the same value as the positional spelling.
             // Reading them positionally would be a SILENT field permutation —
             // the defect class this fix exists to remove — so an argument
             // naming nothing this record declares makes the arm DECLINE
@@ -3351,9 +3352,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     }
                     if (ok) {
                         // Pass 2: lower in SOURCE order (the order the arguments
-                        // are WRITTEN), not in field order — §17.13's
-                        // left-to-right argument evaluation is observable
-                        // through side effects — and place each result in its
+                        // are WRITTEN), not in field order — §22.5 "Evaluation
+                        // order": "A call's supplied argument expressions are
+                        // evaluated in call-site textual order — left to right
+                        // as written, for positional and named arguments alike;
+                        // naming an argument changes which parameter it binds
+                        // to, never when it runs" — and place each result in its
                         // own field slot.
                         llvm::Value* vals[3] = {nullptr, nullptr, nullptr};
                         for (std::size_t ai = 0; ai < 3; ++ai) {
