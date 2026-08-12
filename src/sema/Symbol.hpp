@@ -612,6 +612,20 @@ std::vector<const Symbol*> recordPositionalFieldSymbols(const TypeSymbol* ts);
 // auto-property storage.
 bool isAutoPropertySymbol(const Symbol* m);
 
+// §9.2 / §22.9 / §2.8.2 clause 1 (umbrella #3152): the BOTH-SOURCES twin of
+// `isAutoPropertySymbol`. That predicate reads `ast::PropertyDecl::bodyKind`
+// off `ps->decl`, which is null for EVERY imported property (ModuleLoader has
+// no AST for a dependency's types), so it answers "not auto-property storage"
+// for an imported auto-property — a silent wrong answer, not a null-deref.
+// This one asks the same question of whichever source the symbol has: the
+// declaration when there is one, else the `MetaMember::isAutoProperty` wire bit
+// #2478 published as `ctx.importedPropertyIsAutoStorage`. Both sources compute
+// the SAME predicate (Auto body form, non-indexer, non-static — the exporter
+// mirrors `isAutoPropertySymbol` when it sets the bit), so the two agree by
+// construction. Mirrors codegen's `Emitter::isAutoPropertyStorage` for sema
+// consumers, minus that helper's deliberate interface-property widening.
+bool isAutoPropertyStorageSymbol(const Symbol* m, const SemaContext& ctx);
+
 // §9.3 (v0.158, #1383): true when a positional or combined-form record
 // synthesizes equality — i.e. every positional field's type (and every body
 // auto-property's type for the combined form) is an admissible component type

@@ -20,7 +20,7 @@
 10   src/sema/ExprTypecheck_Calls.cpp
 10   src/sema/ExprTypecheck_Exprs.cpp
 4    src/sema/PureChecker.cpp
-8    src/sema/Sendability.cpp
+2    src/sema/Sendability.cpp
 6    src/sema/SymbolCollection.cpp
 16   src/sema/TypeResolution_Checks.cpp
 2    src/sema/TypeResolution_Names.cpp

@@ -55,6 +55,190 @@ bool isUserRecord(const TypeRef* rt) {
            rt->declaration->kind == ast::TypeDeclKind::Record;
 }
 
+// ── §30.14 rule 2 storage enumeration: ONE walk, both sources ─────────────
+//
+// One storage member as this file needs it: the name for a diagnostic, the
+// declared type, and the §28.5 `owned` bit rule 2 dispatches on.
+struct StorageMember {
+    std::string_view name;
+    const TypeRef* type = nullptr;
+    bool isOwned = false;
+};
+
+// Applies `fn` to every §30.14 rule 2 storage member DECLARED BY `ts` (not its
+// bases — the class caller walks the base CHAIN itself, as rule 2's "including
+// inherited fields" requires), stopping at the first `fn` that returns false.
+//
+// §2.8.2 clause 1 / umbrella #3152. Until this commit every walk in this file
+// existed TWICE — an `ast::TypeDecl` walk and a `TypeSymbol::members` walk,
+// selected by casting `ts->decl` to an `ast::TypeDecl` — i.e. by which source
+// happened to exist. `ModuleLoader` never assigns `Symbol::decl` for an
+// imported type, so that cast picked the AST copy for every local type and the
+// symbol copy for every imported one, and the two copies did not agree: the
+// symbol copy counted a COMPUTED property as storage (measured: an imported
+// `sealed class` with `property Shape: IShape? => null;` was rejected from
+// `Channel<T>` and from `where T: sendable` while the byte-identical local
+// declaration was accepted, and the §14.2 component path named the computed
+// property as a "field"). The audit's rule
+// (docs/proposals/imported-symbol-audit-2026-08-13.md §4) is that an accessor
+// must consult both sources rather than switch on which one exists, so this
+// walk enumerates the members SYMBOL-side — the one enumeration both a local
+// and an imported type have — and asks the shared both-sources accessors for
+// each member's facts: `sema::storageComponentType` for the type (positional
+// `ast::Param` -> body `FieldDecl`/`PropertyDecl` -> `ctx.importedMemberType`)
+// and `sema::isAutoPropertyStorageSymbol` for auto-vs-computed
+// (`ast::PropertyDecl::bodyKind` -> the #2478 `MetaMember::isAutoProperty`
+// wire bit).
+//
+// What counts as storage is §30.14 rule 2's own wording:
+//   - every INSTANCE `FieldSymbol` of a class, and a RECORD's §9.1 positional
+//     fields (a record's positional field IS a field, §9.1).
+//   - every auto-property, which §9.2 makes storage exactly like a field.
+//   - NOT computed (expression- or accessor-bodied) properties, NOT indexers,
+//     NOT `const` members (an `ast::ConstDecl` collects to a
+//     `ConstMemberSymbol`, a sibling of `FieldSymbol`), NOT events, NOT
+//     methods/constructors/nested types.
+//   - NOT `static` members, of either shape. §30.14 rule 2 is "Every instance
+//     field, including inherited fields"; a static is not one. Static state is
+//     process-global and is policed where it is declared — §22.12 rule 2
+//     refuses a mutable static of class/interface type outright and rule 4
+//     warns a `static readonly` one is "reachable from every domain" — so it
+//     never travels with a transferred instance and has no business in the
+//     transfer closure. This is a DELIBERATE narrowing, forced by the collapse
+//     rather than chosen alongside it: the only both-sources auto-property
+//     predicate available is non-static on BOTH sides (the #2478 wire bit
+//     mirrors `isAutoPropertySymbol`, which excludes statics), so a static
+//     auto-property could not have been kept without a new wire bit — and
+//     keeping static FIELDS while dropping static auto-properties would leave
+//     the predicate incoherent in a way neither former copy was.
+//   - NOT a CLASS's §22.10 primary-constructor parameters, even though
+//     SymbolCollection gives each one a `posParam` FieldSymbol exactly as it
+//     does a record's positional field (Parser_Decls.cpp sets
+//     `hasPositionalFields` for a class too). This is not a shortcut; it is
+//     the only answer a SINGLE predicate can give today, and both halves of
+//     the reason are structural:
+//       * §22.10's rule is capture-iff-body-referenced — "Parameters used only
+//         in field initializers ... are *not* captured ... no separate
+//         parameter-named field exists" — and the capture bit,
+//         `FieldSymbol::posParamBodyRef`, is computed by ExprTypecheck's OWN
+//         expression walk. The §14.2 `where T: sendable` query runs from
+//         `Resolver::checkOneConstraint`, i.e. inside `resolveTypes()`, which
+//         finishes BEFORE that walk begins; #2325 had to move a whole §9.8
+//         pass late for exactly this reason (see TypeResolution.hpp's comment
+//         on `checkClassSerializationEligibilityLate`). Reading the bit here
+//         would answer "uncaptured" for every class on the constraint route
+//         and "partially computed" on the ExprTypecheck route — an
+//         ORDER-DEPENDENT derived property, which is worse than a uniform one.
+//       * The imported side has no such bit at all: ModuleMetadataBuilder
+//         emits every `posParam` FieldSymbol as a positional Field member
+//         consulting neither `posParamBodyRef` nor `posParam->modifier`, so an
+//         imported class primary-ctor parameter arrives indistinguishable from
+//         a captured one AND with its `owned` marker lost.
+//     Skipping them reproduces what the former AST copy did (it iterated
+//     `atd->members`, which never contains primary-ctor parameters) and makes
+//     the IMPORTED side agree with it, which is the direction §2.8.2 clause 1
+//     requires — measured before this change: `sealed class Node(owned l:
+//     Leaf)` was sendable locally and NOT sendable imported.
+//     The residue is a pre-existing ACCEPT-HOLE, unchanged in size by this
+//     commit and filed as #3165: a captured parameter whose type is NOT
+//     sendable is not weighed by rule 2 on either side. Closing it needs the
+//     capture bit and the `owned` marker on the wire plus a late-enough query
+//     point — a new-channel job on the #2478/#2950 template, not a walk
+//     change.
+bool forEachStorageMember(const TypeSymbol* ts, const SemaContext& ctx,
+                          const std::function<bool(const StorageMember&)>& fn) {
+    if (!ts) return true;
+    // A `posParam` FieldSymbol is a RECORD's §9.1 positional field, which is
+    // storage — or a CLASS's §22.10 primary-constructor parameter, which is
+    // not (see the comment above for why a single predicate cannot say
+    // "captured" here). SymbolCollection builds both the same way, so the
+    // parent's kind is the only thing that separates them, and it reads
+    // identically on both sides of a module boundary (`TypeSymbol::kind` is
+    // set from the AST locally and from `fromMetaTypeDeclKind` on import).
+    const bool positionalIsStorage = ts->kind == ast::TypeDeclKind::Record;
+    // Two passes so a §9.1 positional field is visited before a body member,
+    // matching the order the AST copies used (SymbolCollection appends the
+    // positional FieldSymbols AFTER the body members, so a single pass over
+    // `members` would reverse the two groups). Only the diagnostic walkers can
+    // observe an order — the verdict walks require every member to pass — but
+    // they pin which component a §14.2 message names.
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 0 && !positionalIsStorage) continue;
+        for (Symbol* ms : ts->members) {
+            const MemberSymbol* mem = nullptr;
+            const ast::Param* posParam = nullptr;
+            StorageMember sm;
+            if (auto* fs = dynamic_cast<const FieldSymbol*>(ms)) {
+                const bool positional = fs->posParam != nullptr;
+                if (positional != (pass == 0)) continue;
+                // §30.14 rule 2 "instance field". The modifier list is
+                // populated identically on both sides (SymbolCollection from
+                // the `ast::FieldDecl`, ModuleLoader from
+                // `MetaMember::modifiers`), so this reads the same on a local
+                // and an imported field.
+                bool isStatic = false;
+                for (auto mod : fs->modifiers)
+                    if (mod == "static") { isStatic = true; break; }
+                if (isStatic) continue;
+                mem = fs;
+                posParam = fs->posParam;
+                sm.name = (fs->posParam && !fs->posParam->name.empty())
+                              ? fs->posParam->name
+                              : fs->name;
+            } else if (auto* ps = dynamic_cast<const PropertySymbol*>(ms)) {
+                if (pass == 0) continue;  // properties are never positional
+                if (!isAutoPropertyStorageSymbol(ps, ctx)) continue;
+                mem = ps;
+                sm.name = ps->name;
+            } else {
+                continue;  // methods/ctors/consts/events/nested: not storage
+            }
+            sm.type = storageComponentType(ms, ctx);
+            // The `owned` marker lives in two DIFFERENT places and a caller
+            // that reads only one silently gets "not owned" for the other
+            // (bc0edd5's warning on `anyRecordStorageField`, earned by this
+            // very walk): `MemberDecl::modifiers` for a body field or
+            // auto-property, `ast::Param::modifier` for a positional one —
+            // `FieldSymbol::modifiers` is never populated for a positional
+            // field. Read both. Today only the record arm can reach the
+            // positional branch and §9.7 forbids an `owned` record field, so
+            // this changes no verdict; it is here so that whoever makes
+            // positional storage reachable from the class arm does not have to
+            // rediscover the split.
+            if (posParam) {
+                sm.isOwned = posParam->modifier == "owned";
+            } else {
+                for (auto mod : mem->modifiers)
+                    if (mod == "owned") { sm.isOwned = true; break; }
+            }
+            if (!fn(sm)) return false;
+        }
+    }
+    return true;
+}
+
+// §30.14 rule 2's "including inherited fields" — every ANCESTOR of `ts`, not
+// just its direct base. Both walks used to stop after one level, so a field on
+// a GRANDparent was never weighed: measured before this change (and on `main`),
+// `class GrandBase { Shape: IShape? } <- class Mid <- sealed class Leaf` was
+// reported sendable, an accept-hole in a data-race rule (pinned by T12 of
+// tests/module/xmod_sendability_storage_walk_3152_test.cpp). Bezel classes are
+// single-inheritance so the chain is linear; the depth cap is a hang-guard
+// against a cyclic base chain (rejected elsewhere — a wrong verdict beats a
+// non-terminating compiler). Interfaces in `baseTypes` are skipped: an
+// interface declares no storage.
+bool forEachInheritedStorageMember(
+    const TypeSymbol* ts, const SemaContext& ctx,
+    const std::function<bool(const StorageMember&)>& fn, int depth = 0) {
+    if (!ts || depth > 64) return true;
+    for (const TypeSymbol* base : ts->baseTypes) {
+        if (!base || base->kind != ast::TypeDeclKind::Class) continue;
+        if (!forEachStorageMember(base, ctx, fn)) return false;
+        if (!forEachInheritedStorageMember(base, ctx, fn, depth + 1)) return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 bool isSendableType(const TypeRef* rt, SemaContext& ctx,
@@ -235,50 +419,15 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
         TypeSymbol* decl = rt->declaration;
         if (!decl) return false;
 
-        // §2.8.2 clause 1 / §30.14 (#1732, #1824): a cross-module-IMPORTED
-        // record OR class has no ast::TypeDecl (decl->decl is null) — the
-        // ModuleLoader reconstructs its members as sema::FieldSymbol /
-        // PropertySymbol on a side table (§2.5) — so an AST walk cannot see its
-        // fields. Both the record and the class branch below must therefore
-        // NOT vacuously default such a type to sendable (that silently lets a
-        // borrow-bearing imported value cross a domain boundary: a data race).
-        // This shared helper walks the reconstructed storage members instead:
-        // a field / auto-property's resolved type rides ctx.importedMemberType()
-        // and its `owned` modifier rides MemberSymbol::modifiers. It applies the
-        // caller-supplied per-field predicate `check(fieldType, isOwned)` — the
-        // SAME check the branch's AST path uses — and returns false on the first
-        // rejection. Positional record fields, body fields, and auto-properties
-        // all reconstruct here (Field/Property members with a side-table type),
-        // so all three are covered.
-        //
-        // Metadata does not distinguish an auto-property (storage) from a
-        // computed one (no storage) — both reconstruct as PropertySymbol — so a
-        // computed property whose type is a reference type is treated
-        // conservatively here as storage: a SOUND over-approximation (may
-        // over-reject, never under-reject). Carrying the §3.6 auto/computed
-        // structural fact in the artifact interface is tracked by #1732.
-        auto forEachReconstructedStorageMember =
-            [&](const TypeSymbol* ts,
-                const std::function<bool(const TypeRef*, bool)>& check) -> bool {
-            for (Symbol* ms : ts->members) {
-                const MemberSymbol* mem = nullptr;
-                if (auto* fs = dynamic_cast<const FieldSymbol*>(ms)) {
-                    mem = fs;
-                } else if (auto* ps =
-                               dynamic_cast<const PropertySymbol*>(ms)) {
-                    if (ps->isIndexer) continue; // indexer: not storage
-                    mem = ps;
-                } else {
-                    continue; // methods/ctors/consts/nested: not storage
-                }
-                const TypeRef* ft = ctx.importedMemberType(ms);
-                bool isOwned = false;
-                for (auto mod : mem->modifiers)
-                    if (mod == "owned") { isOwned = true; break; }
-                if (!check(ft, isOwned)) return false;
-            }
-            return true;
-        };
+        // §2.8.2 clause 1 / §30.14 (#1732, #1824, #3152): the record and class
+        // branches below walk storage through `forEachStorageMember` (above) —
+        // ONE walk that reads whichever source each member has. A
+        // cross-module-IMPORTED record or class has no ast::TypeDecl, so an AST
+        // walk sees no fields at all and must never be allowed to vacuously
+        // default such a type to sendable (that silently lets a borrow-bearing
+        // imported value cross a domain boundary: a data race); a locally
+        // declared one has no metadata side table. Neither branch may therefore
+        // select a walk by which source exists.
 
         // Enum: value type → sendable.
         if (decl->kind == ast::TypeDeclKind::Enum) return true;
@@ -300,7 +449,17 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
                 return false;  // borrow-bearing or owning → not sendable
             const auto* td =
                 dynamic_cast<const ast::TypeDecl*>(decl->decl);
-            if (!td) return true;  // no AST → trust the value-like verdict
+            // §35.12 / §2.8.2 clause 1 (#3144, family F9): no AST means an
+            // IMPORTED choice, whose CASE LIST does not cross the wire at all —
+            // so the per-payload recursion below cannot run and this verdict is
+            // unbacked. Answer NOT sendable rather than "trust the value-like
+            // verdict": the line is unreachable today only because
+            // `classifyChoiceType` returns nullopt for every imported choice
+            // (caught by the `!verdict` guard two lines up), and the moment F9
+            // gives that classifier a symbol-side path this becomes a silent
+            // ACCEPT for a choice whose payloads were never examined. A reject
+            // is the recoverable direction; a data race is not.
+            if (!td) return false;
 
             // §35.11 / §35.12 (v0.226, #2211): #2183 made the §35.4
             // classifier instantiation-aware, but this payload recursion still
@@ -334,9 +493,6 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
         // reference (non-owned) or a function type. Already covered
         // by value-type rule.
         if (decl->kind == ast::TypeDeclKind::Record) {
-            const auto* td =
-                dynamic_cast<const ast::TypeDecl*>(decl->decl);
-
             // Collect all fields and check each.
             auto fieldSendable = [&](const TypeRef* ft) -> bool {
                 if (!ft) return true;
@@ -375,51 +531,20 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
                 return true; // conservative: accept unknown
             };
 
-            // §2.8.2 clause 1 / §30.14 (#1824): an IMPORTED record has no
-            // ast::TypeDecl, so the AST field walk below cannot see its fields.
-            // Do NOT vacuously default to sendable — a borrow-bearing imported
-            // record (e.g. one with a non-owned class-typed or interface-typed
-            // field) would then silently satisfy the §30.15 Channel<T> element
-            // rule and cross a domain boundary: a data race (the exact sibling
-            // of the #1732 class-branch hole). Walk the reconstructed members
-            // instead, applying the SAME per-field `fieldSendable` check the AST
-            // path uses. A record cannot carry `owned` fields (§9.7), so the
-            // helper's isOwned bit is ignored here (fieldSendable rejects any
-            // class-typed field regardless — a sound over-approximation).
-            if (!td) {
-                return forEachReconstructedStorageMember(
-                    decl,
-                    [&](const TypeRef* ft, bool /*isOwned*/) {
-                        return fieldSendable(ft);
-                    });
-            }
-
-            // Check positional fields.
-            for (const ast::Param& f : td->positionalFields) {
-                if (f.type) {
-                    const TypeRef* ft = ctx.resolvedType(*f.type);
-                    if (!fieldSendable(ft)) return false;
-                }
-            }
-            // Check body fields and auto-properties.
-            // In Bezel records, properties declared as `public Name: T;` are
-            // auto-properties (PropertyDecl with bodyKind=Auto) — these are
-            // semantically fields and must be checked for sendability (§30.14).
-            for (const auto& m : td->members) {
-                if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
-                    if (fd->type) {
-                        const TypeRef* ft = ctx.resolvedType(*fd->type);
-                        if (!fieldSendable(ft)) return false;
-                    }
-                } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m.get())) {
-                    // Auto-property: check its type for sendability.
-                    if (pd->bodyKind == ast::PropertyBodyKind::Auto && pd->type) {
-                        const TypeRef* ft = ctx.resolvedType(*pd->type);
-                        if (!fieldSendable(ft)) return false;
-                    }
-                }
-            }
-            return true;
+            // §2.8.2 clause 1 / §30.14 (#1824, #3152): §9.1 positional fields,
+            // body fields, and auto-properties (in a record, `public Name: T;`
+            // is an auto-property — semantically a field, so §30.14 checks it)
+            // all come from the one storage walk, for a locally declared and an
+            // IMPORTED record alike. An imported record has no ast::TypeDecl, so
+            // an AST field walk would see no fields and vacuously call it
+            // sendable — a borrow-bearing imported record would then satisfy the
+            // §30.15 Channel<T> element rule and cross a domain boundary: a data
+            // race (the sibling of the #1732 class-branch hole). A record cannot
+            // carry `owned` fields (§9.7), so the walk's isOwned bit is ignored
+            // here — `fieldSendable` rejects any class-typed field regardless.
+            return forEachStorageMember(
+                decl, ctx,
+                [&](const StorageMember& sm) { return fieldSendable(sm.type); });
         }
 
         // Class: sendable iff "transfer-closed" per §30.14.
@@ -479,10 +604,7 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
             }
 
             // Sealed (non-abstract) class: apply Rule 2 + Rule 3.
-            // Walk fields directly from the TypeDecl to check owned modifiers.
             {
-                const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl);
-
                 // Helper: check one TypeRef + owned modifier pair.
                 // Rule 2: class-typed fields must be `owned` AND the class sendable.
                 // Rule 3: no function, Object, or interface-typed fields.
@@ -503,56 +625,26 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
                     return isSendableType(ft, ctx, inProgress);
                 };
 
-                // Walk own fields and auto-properties.
-                // (Auto-properties in classes are stored as PropertyDecl with
-                // bodyKind=Auto; they are semantically fields for §30.14.)
-                auto walkMembersForSend = [&](const ast::TypeDecl* atd) -> bool {
-                    for (const auto& m : atd->members) {
-                        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
-                            if (!fd->type) continue;
-                            const TypeRef* ft = ctx.resolvedType(*fd->type);
-                            bool isOwned = false;
-                            for (auto mod : fd->modifiers)
-                                if (mod == "owned") { isOwned = true; break; }
-                            if (!checkField(ft, isOwned)) return false;
-                        } else if (auto* pd =
-                                       dynamic_cast<const ast::PropertyDecl*>(m.get())) {
-                            // Auto-properties (field-like) must also satisfy §30.14.
-                            if (pd->bodyKind != ast::PropertyBodyKind::Auto ||
-                                !pd->type) continue;
-                            const TypeRef* ft = ctx.resolvedType(*pd->type);
-                            bool isOwned = false;
-                            for (auto mod : pd->modifiers)
-                                if (mod == "owned") { isOwned = true; break; }
-                            if (!checkField(ft, isOwned)) return false;
-                        }
-                    }
-                    return true;
+                auto memberSendable = [&](const StorageMember& sm) -> bool {
+                    return checkField(sm.type, sm.isOwned);
                 };
 
-                // §2.8.2 clause 1 / §30.14 (#1732): an IMPORTED class has no
-                // ast::TypeDecl (decl->decl is null), so the AST walk above
-                // cannot see its fields. Do NOT vacuously default to sendable —
-                // that silently lets a non-sendable imported class (e.g. one
-                // with a non-owned class-typed / interface-typed field) cross a
-                // domain boundary, a data race. Instead walk the reconstructed
-                // sema member list via forEachReconstructedStorageMember (shared
-                // with the record branch, #1824), applying the SAME per-field
-                // Rule 2/3 `checkField` the AST path uses.
-                if (td ? !walkMembersForSend(td)
-                       : !forEachReconstructedStorageMember(decl, checkField)) {
+                // §2.8.2 clause 1 / §30.14 (#1732, #3152): own fields and
+                // auto-properties (in a class an auto-property is a
+                // PropertyDecl with bodyKind=Auto; §9.2 makes it storage, so
+                // §30.14 rule 2 covers it), from the ONE storage walk. An
+                // IMPORTED class has no ast::TypeDecl, so an AST walk sees no
+                // fields and would vacuously default it to sendable — that
+                // silently lets a non-sendable imported class (one with a
+                // non-owned class-typed / interface-typed field) cross a domain
+                // boundary: a data race.
+                if (!forEachStorageMember(decl, ctx, memberSendable)) {
                     inProgress.erase(decl); return false;
                 }
-                // Walk inherited fields from base classes. An imported base has
-                // no ast::TypeDecl, so use the reconstructed-member walk for it
-                // too (#1732); a local base uses the AST walk.
-                for (TypeSymbol* base : decl->baseTypes) {
-                    if (!base || base->kind != ast::TypeDeclKind::Class) continue;
-                    const auto* btd = dynamic_cast<const ast::TypeDecl*>(base->decl);
-                    if (btd ? !walkMembersForSend(btd)
-                            : !forEachReconstructedStorageMember(base, checkField)) {
-                        inProgress.erase(decl); return false;
-                    }
+                // §30.14 rule 2's "including inherited fields": the same walk
+                // over the whole ancestor chain, imported or local.
+                if (!forEachInheritedStorageMember(decl, ctx, memberSendable)) {
+                    inProgress.erase(decl); return false;
                 }
             }
             inProgress.erase(decl);
@@ -631,7 +723,6 @@ bool isStdlibSendabilityOverride(const TypeRef* rt) {
 std::string recordFailurePath(const TypeRef* rt, SemaContext& ctx, int depth) {
     const TypeSymbol* decl = rt->declaration;
     if (!decl) return {};
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl);
 
     // Per-field predicate matching Sendability.cpp's `fieldSendable` (record
     // branch): a field fails when its type is function-typed, Object-typed,
@@ -673,68 +764,19 @@ std::string recordFailurePath(const TypeRef* rt, SemaContext& ctx, int depth) {
         return {};
     };
 
-    // AST path: positional fields, body fields, auto-properties.
-    if (td) {
-        for (const ast::Param& f : td->positionalFields) {
-            if (!f.type || f.name.empty()) continue;
-            const TypeRef* ft = ctx.resolvedType(*f.type);
-            if (!ft) continue;
-            std::string verdict = checkOne(ft);
-            if (!verdict.empty())
-                return std::string("field `") + std::string(f.name) + "` " +
-                       verdict;
-        }
-        for (const auto& m : td->members) {
-            std::string_view fName;
-            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
-                if (!fd->type) continue;
-                fName = fd->name;
-                const TypeRef* ft = ctx.resolvedType(*fd->type);
-                if (!ft) continue;
-                std::string verdict = checkOne(ft);
-                if (!verdict.empty())
-                    return std::string("field `") + std::string(fName) + "` " +
-                           verdict;
-            } else if (auto* pd =
-                           dynamic_cast<const ast::PropertyDecl*>(m.get())) {
-                if (pd->bodyKind != ast::PropertyBodyKind::Auto || !pd->type)
-                    continue;
-                fName = pd->name;
-                const TypeRef* ft = ctx.resolvedType(*pd->type);
-                if (!ft) continue;
-                std::string verdict = checkOne(ft);
-                if (!verdict.empty())
-                    return std::string("field `") + std::string(fName) + "` " +
-                           verdict;
-            }
-        }
-        return {};
-    }
-
-    // #1824 imported-record path: walk reconstructed storage members via
-    // the side table (no ast::TypeDecl available). Positional / body fields
-    // and auto-properties all reconstruct as Field/Property members here.
-    for (Symbol* ms : decl->members) {
-        std::string_view fName;
-        if (auto* fs = dynamic_cast<const FieldSymbol*>(ms)) {
-            if (fs->posParam && !fs->posParam->name.empty())
-                fName = fs->posParam->name;
-            else
-                fName = fs->name;
-        } else if (auto* ps = dynamic_cast<const PropertySymbol*>(ms)) {
-            if (ps->isIndexer) continue;
-            fName = ps->name;
-        } else {
-            continue;
-        }
-        if (fName.empty()) continue;
-        const TypeRef* ft = ctx.importedMemberType(ms);
-        if (!ft) continue;
-        std::string verdict = checkOne(ft);
-        if (!verdict.empty())
-            return std::string("field `") + std::string(fName) + "` " + verdict;
-    }
-    return {};
+    // #1824 / #3152: §9.1 positional fields, body fields and auto-properties,
+    // through the SAME storage walk the verdict uses — so the component this
+    // names is always a component the verdict actually weighed. An unnamed
+    // member is skipped: it cannot be named in a message.
+    std::string path;
+    forEachStorageMember(decl, ctx, [&](const StorageMember& sm) {
+        if (sm.name.empty() || !sm.type) return true;
+        std::string verdict = checkOne(sm.type);
+        if (verdict.empty()) return true;
+        path = std::string("field `") + std::string(sm.name) + "` " + verdict;
+        return false;
+    });
+    return path;
 }
 
 // One-level walk for a user-declared sealed class: returns the diagnostic
@@ -796,88 +838,22 @@ std::string sealedClassFailurePath(const TypeRef* rt, SemaContext& ctx,
         return {};
     };
 
-    // AST path: walk own members then inherited members.
-    auto walkAtd = [&](const ast::TypeDecl* atd) -> std::string {
-        for (const auto& m : atd->members) {
-            std::string_view fName;
-            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
-                if (!fd->type) continue;
-                fName = fd->name;
-                const TypeRef* ft = ctx.resolvedType(*fd->type);
-                if (!ft) continue;
-                bool isOwned = false;
-                for (auto mod : fd->modifiers)
-                    if (mod == "owned") { isOwned = true; break; }
-                std::string verdict = checkOne(ft, isOwned);
-                if (!verdict.empty())
-                    return std::string("field `") + std::string(fName) + "` " +
-                           verdict;
-            } else if (auto* pd =
-                           dynamic_cast<const ast::PropertyDecl*>(m.get())) {
-                if (pd->bodyKind != ast::PropertyBodyKind::Auto || !pd->type)
-                    continue;
-                fName = pd->name;
-                const TypeRef* ft = ctx.resolvedType(*pd->type);
-                if (!ft) continue;
-                bool isOwned = false;
-                for (auto mod : pd->modifiers)
-                    if (mod == "owned") { isOwned = true; break; }
-                std::string verdict = checkOne(ft, isOwned);
-                if (!verdict.empty())
-                    return std::string("field `") + std::string(fName) + "` " +
-                           verdict;
-            }
-        }
-        return {};
+    // #1732 / #3152: the SAME storage walks the verdict uses, for a local and
+    // an imported class alike, so this never names a component the verdict did
+    // not weigh — before this commit the imported copy could name a COMPUTED
+    // property as a "field".
+    std::string path;
+    auto probe = [&](const StorageMember& sm) -> bool {
+        if (sm.name.empty() || !sm.type) return true;  // unnameable: skip
+        std::string verdict = checkOne(sm.type, sm.isOwned);
+        if (verdict.empty()) return true;
+        path = std::string("field `") + std::string(sm.name) + "` " + verdict;
+        return false;  // stop at the first offender
     };
 
-    // Imported-class path: reconstructed storage members via the side table
-    // (#1732). Same predicate; the `owned` modifier rides MemberSymbol.
-    auto walkReconstructed = [&](const TypeSymbol* ts) -> std::string {
-        for (Symbol* ms : ts->members) {
-            const MemberSymbol* mem = nullptr;
-            std::string_view fName;
-            if (auto* fs = dynamic_cast<const FieldSymbol*>(ms)) {
-                mem = fs;
-                if (fs->posParam && !fs->posParam->name.empty())
-                    fName = fs->posParam->name;
-                else
-                    fName = fs->name;
-            } else if (auto* ps = dynamic_cast<const PropertySymbol*>(ms)) {
-                if (ps->isIndexer) continue;
-                mem = ps;
-                fName = ps->name;
-            } else {
-                continue;
-            }
-            if (fName.empty()) continue;
-            const TypeRef* ft = ctx.importedMemberType(ms);
-            if (!ft) continue;
-            bool isOwned = false;
-            for (auto mod : mem->modifiers)
-                if (mod == "owned") { isOwned = true; break; }
-            std::string verdict = checkOne(ft, isOwned);
-            if (!verdict.empty())
-                return std::string("field `") + std::string(fName) + "` " +
-                       verdict;
-        }
-        return {};
-    };
-
-    if (const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl)) {
-        if (std::string r = walkAtd(td); !r.empty()) return r;
-    } else {
-        if (std::string r = walkReconstructed(decl); !r.empty()) return r;
-    }
-    for (const TypeSymbol* base : decl->baseTypes) {
-        if (!base || base->kind != ast::TypeDeclKind::Class) continue;
-        const auto* btd = dynamic_cast<const ast::TypeDecl*>(base->decl);
-        if (btd) {
-            if (std::string r = walkAtd(btd); !r.empty()) return r;
-        } else {
-            if (std::string r = walkReconstructed(base); !r.empty()) return r;
-        }
-    }
+    // Own members, then §30.14 rule 2's inherited ones.
+    if (!forEachStorageMember(decl, ctx, probe)) return path;
+    if (!forEachInheritedStorageMember(decl, ctx, probe)) return path;
     return {};
 }
 
@@ -957,6 +933,11 @@ std::string sendableFailureComponentPath(const TypeRef* rt, SemaContext& ctx) {
         if (!verdict) return {};
         if (*verdict != common::ChoiceClassification::ValueLike)
             return {};  // category-level — flat reason
+        // #3144/F9 twin of the property walk's guard above — but here the
+        // fail-safe answer is the EMPTY path: this function only decorates an
+        // already-failed verdict with a component name, so returning nothing
+        // falls back to the flat §30.14 diagnostic and can never admit
+        // anything. It stays as-is deliberately.
         const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl);
         if (!td) return {};
 

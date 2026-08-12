@@ -603,6 +603,21 @@ bool isAutoPropertySymbol(const Symbol* m) {
     return true;
 }
 
+// §9.2 / §22.9 / §2.8.2 clause 1 (umbrella #3152): see Symbol.hpp. The
+// both-sources twin of the predicate above — the declaration when the symbol
+// has one, the #2478 wire bit when it does not. Consulting both is the point:
+// switching on which source EXISTS is how the same question came to have two
+// answers on the two sides of a module boundary.
+bool isAutoPropertyStorageSymbol(const Symbol* m, const SemaContext& ctx) {
+    if (isAutoPropertySymbol(m)) return true;
+    auto* ps = dynamic_cast<const PropertySymbol*>(m);
+    if (!ps || ps->isIndexer) return false;
+    // A property that HAS a declaration was already answered above; only a
+    // decl-less (imported) one falls through to the wire bit.
+    if (ps->decl != nullptr) return false;
+    return ctx.importedPropertyIsAutoStorage(ps);
+}
+
 // §9.3 (v0.158, #1383): forward declaration for mutual recursion with
 // isAdmissibleComponentType — a positional field's type calls
 // isAdmissibleComponentType recursively, which in turn calls this function
