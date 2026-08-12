@@ -628,13 +628,14 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         // eligible body record, gets the synthesized
                         // property-listing ToString; an ineligible body record
                         // gets the type-name default.
-                        bool positional = false;
-                        if (auto* td =
-                                dynamic_cast<const ast::TypeDecl*>(ts->decl))
-                            positional = td->hasPositionalFields;
-                        bool autoBearing =
-                            positional ||
-                            sema::isAutoEqualityBearingBodyRecord(ts, ctx_);
+                        // fix #2934 follow-up (§8.5 / §9.1, v0.252): the same
+                        // AST-decl-only read as `lowerValueSemMethodOn`'s, with
+                        // the same consequence one step further on — for an
+                        // IMPORTED positional record this arm answered false,
+                        // so `$"{p}"` rendered the bare head "Pt" instead of
+                        // §9.1's "Pt(X: 1, Y: 2)". Asked through the shared
+                        // predicate, which reads BOTH sources.
+                        bool autoBearing = recordIsAutoBearing(ts);
                         if (toStr) {
                             // Spill the record value to an alloca so we have a ptr.
                             llvm::AllocaInst* spill = entryAlloca(ev->getType());
@@ -687,8 +688,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             pv = llvm::PoisonValue::get(ptrTy());
                         } else {
                             // No ToString — use type name (§8.5).
+                            // fix #2934 (§8.5, v0.252): the arms above have
+                            // already taken the positional / auto-equality
+                            // record and the auto-hashable choice, so what
+                            // reaches here is §8.5's name-only default — for a
+                            // body record that does not satisfy auto-equality,
+                            // which §8.5 renders QUALIFIED (stdlib §2.13
+                            // `FullName`). Asked through the shared predicate
+                            // rather than re-derived, so this hole and the
+                            // direct `.ToString()` call cannot disagree.
                             pv = lowerStringLiteral(
-                                std::string("\"") + std::string(ts->name) + "\"", false);
+                                std::string("\"") +
+                                    spec85NameOnlyDefaultSpelling(ts) + "\"",
+                                false);
                         }
                     }
                 }

@@ -267,8 +267,10 @@ BEZEL_TEST(codegen_generic_interface_bound_record_box_2901,
 // working and keep NOT boxing — a reference source is not §8.6's case. Kept
 // here as the control that localizes the defect to VALUE-typed arguments, and
 // as the cell whose identical `internal:` #2477 warning shows that warning is
-// pre-existing template-body noise rather than a symptom. 4 = `"CBox".Length`
-// (§8.5's default for classes: the type's qualified name).
+// pre-existing template-body noise rather than a symptom. 8 =
+// `"App.CBox".Length` (§8.5's default for classes: the type's qualified name,
+// which since #2934/v0.252 is stdlib §2.13's module-path-qualified `FullName`
+// rendering — it read 4 = `"CBox".Length` before that).
 BEZEL_TEST(codegen_generic_interface_bound_record_box_2901,
            class_implementor_spelling_unchanged_control_8_5) {
     auto r = runAotChecked(
@@ -299,5 +301,7 @@ BEZEL_TEST(codegen_generic_interface_bound_record_box_2901,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_EQ(run(r), 0);
-    BEZEL_EXPECT_EQ(out(r), std::string("4\n"));
+    // #2934 (§8.5, v0.252): the §8.5 class default is module-path-
+    // qualified, so the rendered name is "App.CBox" (8) — was "CBox" (4).
+    BEZEL_EXPECT_EQ(out(r), std::string("8\n"));
 }

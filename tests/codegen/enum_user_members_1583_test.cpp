@@ -143,7 +143,9 @@ BEZEL_TEST(codegen_enum_user_1583, default_tostring_interpolation) {
     BEZEL_EXPECT_EQ(run(std::string("module M; ") + kColor +
         "class C public static method Main(): int "
         "  var g: Color := Color.Green; "
-        "  return (if $\"{g}\" = \"Color\" then 1 else 0); "
+        // #2934 (§8.5, v0.252): was "Color" — the enum default is the
+        // qualified type name; the user-override tests below are unchanged.
+        "  return (if $\"{g}\" = \"M.Color\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -152,7 +154,8 @@ BEZEL_TEST(codegen_enum_user_1583, default_tostring_boxed_dispatch) {
     BEZEL_EXPECT_EQ(run(std::string("module M; ") + kColor +
         "class C public static method Main(): int "
         "  var o: Object := Color.Green; "
-        "  return (if o.ToString() = \"Color\" then 1 else 0); "
+        // #2934 (§8.5, v0.252): was "Color".
+        "  return (if o.ToString() = \"M.Color\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

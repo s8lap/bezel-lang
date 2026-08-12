@@ -364,7 +364,22 @@ BEZEL_TEST(xmod_imported_generic_object_slots_2953, no_override_keeps_default_to
         "    var o: Object := g; "
         "    var s: string := o.ToString(); "
         "    if s.Length = 0 then return 91; end; "
-        "    if s <> \"GObj2953T6\" then return 92; end; "
+        // #2934 (§8.5, v0.252): was "GObj2953T6" — an IMPORTED type's
+        // §8.5 default carries its EXPORTER's module path (#1488's
+        // TypeSymbol::moduleName, restored by ModuleLoader).
+        //
+        // ⚠ #3119 RESIDUAL, pinned deliberately. The receiver is
+        // `GObj2953T6<string>`, and stdlib §2.13 rule 3 — which §8.5 pins this
+        // default to — requires a generic instantiation to render its type
+        // ARGUMENTS: the conforming answer is
+        // "GObjLib2953T6.GObj2953T6<string>". This commit ships only the
+        // module-path half of the pin (the emission sites hold a
+        // `TypeSymbol*`, which carries generic PARAMETERS, not the
+        // instantiation's arguments). This expectation therefore encodes
+        // TODAY'S INCOMPLETE ANSWER on purpose, so that when #3119 lands this
+        // test fails with a breadcrumb naming it rather than as a mystery —
+        // the fix is to append "<string>" here.
+        "    if s <> \"GObjLib2953T6.GObj2953T6\" then return 92; end; "
         "    return 44; "
         "  end Main; "
         "end M2953T6;");

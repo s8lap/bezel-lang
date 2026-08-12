@@ -179,7 +179,10 @@ BEZEL_TEST(codegen_body_record, manual_equals_tostring_type_name_spec_8_5) {
         "end Tagged; "
         "class C public static method Main(): int "
         "  var a := new Tagged(7); "
-        "  return (if a.ToString() = \"Tagged\" then 1 else 0); "
+        // #2934 (§8.5, v0.252): was "Tagged"; a body record with a
+        // manually-declared `Equals` is not auto-hashable (§9.2), so its
+        // §8.5 default is the QUALIFIED type name.
+        "  return (if a.ToString() = \"M.Tagged\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -197,7 +200,9 @@ BEZEL_TEST(codegen_body_record, explicit_field_ineligible_spec_9_2) {
         "end HasField; "
         "class C public static method Main(): int "
         "  var a := new HasField(5); "
-        "  return (if a.ToString() = \"HasField\" and a.X = 5 then 1 else 0); "
+        // #2934 (§8.5, v0.252): was "HasField" — same clause as above
+        // (an explicit field declaration is §9.2's own disqualifier).
+        "  return (if a.ToString() = \"M.HasField\" and a.X = 5 then 1 else 0); "
         "end Main; end C;"), 1);
 }
 
@@ -224,7 +229,9 @@ BEZEL_TEST(codegen_body_record, interpolation_ineligible_type_name_spec_8_5) {
         "end HasField; "
         "class C public static method Main(): int "
         "  var a := new HasField(5); "
-        "  return (if $\"{a}\" = \"HasField\" then 1 else 0); "
+        // #2934 (§8.5, v0.252): was "HasField"; the §18.5 hole dispatches
+        // the same default the explicit call above does.
+        "  return (if $\"{a}\" = \"M.HasField\" then 1 else 0); "
         "end Main; end C;"), 1);
 }
 

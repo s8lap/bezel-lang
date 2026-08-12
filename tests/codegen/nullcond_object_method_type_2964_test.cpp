@@ -147,7 +147,8 @@ BEZEL_TEST(codegen_nullcond_object_method_type_2964,
     BEZEL_EXPECT_TRUE(prints(
         prog("  var w: Widget? := new Widget(); "
              "  Console.WriteLine(w?.ToString() ?? \"<null>\"); "),
-        "Widget"));
+        // #2934 (§8.5, v0.252): was "Widget".
+        "M2964.Widget"));
 }
 
 // C2. `o?.GetHashCode() ?? -1` INLINE on an Ovr? receiver that DECLARES its own

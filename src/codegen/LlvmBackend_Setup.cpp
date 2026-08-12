@@ -27160,8 +27160,13 @@ void Emitter::emitClassToStringThunkBody(const sema::TypeSymbol* ts,
         result = builder_.CreateCall(target->getFunctionType(), target,
                                      {thunk->getArg(0)});
     if (!result)
+        // fix #2934 (§8.5, v0.252): the class default is the MODULE-PATH-
+        // QUALIFIED name (stdlib §2.13's `Type.FullName` rendering), not the
+        // bare identifier. This thunk is vtable slot 3, i.e. the answer every
+        // dynamic consumer sees — `Object.ToString()`, an interface receiver,
+        // a boxed receiver, and `$"{o}"` on an `Object`-typed hole.
         result = lowerStringLiteral(
-            std::string("\"") + std::string(ts->name) + "\"", false);
+            std::string("\"") + spec85QualifiedTypeName(ts) + "\"", false);
     builder_.CreateRet(result);
 }
 
@@ -27963,8 +27968,10 @@ llvm::Value* Emitter::emitEnumToString(llvm::Value* enumVal,
             return builder_.CreateCall(fty, fit->second, {enumVal});
         }
     }
+    // fix #2934 (§8.5, v0.252): "for … enums: the type's qualified name (the
+    // stdlib §2.13 `FullName` rendering, as for classes)".
     return lowerStringLiteral(
-        std::string("\"") + std::string(ts->name) + "\"", false);
+        std::string("\"") + spec85QualifiedTypeName(ts) + "\"", false);
 }
 
 // per §10.5 (v0.183): equality of two enum values (`a`, `b` are the underlying
@@ -28079,10 +28086,23 @@ llvm::Constant* Emitter::boxToStringThunk(const sema::TypeSymbol* ts) {
                                                  fit->second, {payload});
             }
             if (!result) {
-                // Load the record value and build the §9.1/§9.2 form.
-                llvm::StructType* recTy = recordStruct(ts);
-                llvm::Value* recVal = builder_.CreateLoad(recTy, payload, "rec");
-                result = emitRecordToString(recVal, ts);
+                // fix #2934 (§8.5, v0.252): a body record that does NOT satisfy
+                // §9.2's auto-equality conditions has no field listing — its
+                // §8.5 default is the qualified type name — and the BOXED
+                // spelling must answer what the unboxed `.ToString()` answers
+                // (§8.6's boxed dispatch is the same member). Asked through the
+                // shared predicate, not re-derived.
+                if (spec85NameOnlyDefaultIsQualified(ts)) {
+                    result = lowerStringLiteral(
+                        std::string("\"") + spec85QualifiedTypeName(ts) + "\"",
+                        false);
+                } else {
+                    // Load the record value and build the §9.1/§9.2 form.
+                    llvm::StructType* recTy = recordStruct(ts);
+                    llvm::Value* recVal =
+                        builder_.CreateLoad(recTy, payload, "rec");
+                    result = emitRecordToString(recVal, ts);
+                }
             }
         }
         builder_.CreateRet(result);

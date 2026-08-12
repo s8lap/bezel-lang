@@ -382,7 +382,11 @@ BEZEL_TEST(codegen_console_nullable_render_leak_2880,
     BEZEL_EXPECT_TRUE(plain.ran);
     BEZEL_EXPECT_EQ(plain.exitCode, 41);
     BEZEL_EXPECT_TRUE(out(plain) ==
-                      "7\n8\n1.5\nz\nTrue\n2.5\nColor2880E\n"
+                      // #2934 (§8.5, v0.252): the ENUM row is now the
+                      // module-path-qualified name ("Color2880E" ->
+                      // "M2880E.Color2880E"); the record head and the
+                      // §35.7 choice head stay unqualified.
+                      "7\n8\n1.5\nz\nTrue\n2.5\nM2880E.Color2880E\n"
                       "Pt2880E(X: 1, Y: 2)\nSh2880E.Circle(r: 3)\n"
                       "00:00:00\nnull\nnull\n7\n");
 }

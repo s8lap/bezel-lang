@@ -456,7 +456,14 @@ BEZEL_TEST(codegen_object_tostring_producer_residual_2867,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_EQ(run(r), 0);
-    BEZEL_EXPECT_TRUE(out(r).find("Exception|Plain|NoOv") != std::string::npos);
+    // #2934 (§8.5, v0.252): the two USER classes now render the
+    // module-path-qualified name; the genuine BUILT-IN `Exception` still
+    // renders bare, because a reserved built-in has no declaring module
+    // on its synthetic TypeSymbol (the residual filed as #3119). All
+    // three remain pooled immortal literals, which is the lifetime
+    // property this test exists to pin.
+    BEZEL_EXPECT_TRUE(out(r).find("Exception|App.Plain|App.NoOv") !=
+                      std::string::npos);
 }
 
 // #2867 control — the substitutions #2475 ALREADY recognized (a value

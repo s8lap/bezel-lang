@@ -208,7 +208,7 @@ BEZEL_TEST(codegen_interp_vtableless_builtin_2923, user_class_without_override_s
     BEZEL_EXPECT_EQ(
         out(prog("using var u := new U(); Console.WriteLine($\"{u}\");",
                  "class U public constructor() end constructor; end U; ")),
-        std::string("U"));
+        std::string("M.U"));   // #2934 (§8.5, v0.252): was "U"
 }
 
 // A user class WITH a ToString override still dispatches it virtually

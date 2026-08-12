@@ -21,6 +21,15 @@
 //
 // runJit returns the FULL int from Main() (not 8-bit wrapped); values ≤ 255.
 
+// #2934 (spec §8.5, v0.252): the expectation(s) marked below changed value
+// when §8.5's *name-only* `ToString` defaults were pinned to stdlib §2.13's
+// `Type.FullName` rendering ("the module-path-qualified rendering stdlib
+// §2.13 defines for `Type.FullName`"). Only the three name-only defaults
+// moved — classes, enums, and body records that do NOT satisfy §9.2's
+// auto-equality conditions. Record HEADS are unchanged (§8.5: "positional-
+// record and auto-equality formatting keeps the **unqualified** head"), and
+// so is every user `ToString` override.
+
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
@@ -172,8 +181,8 @@ BEZEL_TEST(class_object_method_dispatch_1106, base_call_universal_object_member_
         "module M; "
         "class A public override method ToString(): string => base.ToString(); end A; "
         "class C public static method Main(): int "
-        "  using var a := new A(); return a.ToString().Length; "  // "A" → 1
-        "end Main; end C;"), 1);
+        "  using var a := new A(); return a.ToString().Length; "  // #2934:
+        "end Main; end C;"), 3);   // was "A" (1); now "M.A" (3)
 }
 
 // ---- #1111 (§12.3 / §8.3): base.Equals / base.GetHashCode non-virtual dispatch
