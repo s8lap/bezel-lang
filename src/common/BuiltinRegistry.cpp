@@ -197,6 +197,37 @@ constexpr std::array<std::string_view, 19> kNonHeapReservedBuiltins = {
     "ExceptionInfo",
 };
 
+// fix #2994 (§17.7 "Standard-library builtins have a closed constructor
+// surface", v0.241): the two REJECTING arms of that rule. See the header for
+// the contract and for why the rest of `kNonHeapReservedBuiltins` stays out.
+//
+// New name-set FACTS, not a #1414 refactor of a pre-existing hand-list (the
+// `kTaskFamilyHeads` precedent above), so neither has a pre-refactor snapshot
+// row in tests/support/builtin_registry_snapshot_test.cpp to pin; they are
+// pinned by the behavioral grid in
+// tests/codegen/builtin_closed_ctor_surface_2994_test.cpp instead.
+constexpr std::array<std::string_view, 3> kNoConstructorBuiltins = {
+    // stdlib §2.6, verbatim: "`Guid` declares no constructor, so
+    // `new Guid(...)` is a compile error at any argument list (language spec
+    // §17.7's closed-constructor-surface rule); construct via `Empty`,
+    // `NewGuid()`, `FromByteArray`, `Parse`/`TryParse`/`ParseOrNull`, or
+    // `default(Guid)`."
+    "Guid",
+    // stdlib §10.0 declares `Zero`, `operator =` and `operator <>` on each —
+    // and no constructor. The §5.2 explicit conversions `IntPtr(longValue)` /
+    // `long(ptr)` are CallExprs, not `new`, and are unaffected.
+    "IntPtr", "UIntPtr",
+};
+
+constexpr std::array<std::string_view, 2> kPositionalCtorOnlyBuiltinRecords = {
+    // §31.4: `public record ExceptionInfo(TypeName: string, Message: string,
+    // StackTrace: string);` — the Exception.CauseChain element type.
+    "ExceptionInfo",
+    // stdlib §3.3: `public record ReadOnlyStringSpan(Source: string,
+    // Start: int, Length: int): IReadOnlySpan<char>`.
+    "ReadOnlyStringSpan",
+};
+
 // #2921 / #2923: the reserved built-in INTERFACE heads — the subset of
 // `isReservedBuiltinTypeName` whose runtime value may be a USER class (a user
 // type may declare `class MyList: IEnumerable<int>`, and an
@@ -325,6 +356,18 @@ bool isReservedBuiltinTypeName(std::string_view n) {
     return contains(kHeapPointerReferenceBuiltins, n) ||
            contains(kNonHeapReservedBuiltins, n);
 }
+
+// fix #2994 / §17.7 (v0.241): the closed-constructor-surface arms. Both are
+// subsets of kNonHeapReservedBuiltins — the value-shaped half codegen's #2974
+// gate exempts — so neither can collide with the pointer-shaped population
+// that gate still rejects.
+bool isNoConstructorBuiltin(std::string_view n) {
+    return contains(kNoConstructorBuiltins, n);
+}  // per §17.7 / stdlib §2.6 / stdlib §10.0 — `new T(...)` at NO argument list
+
+bool isPositionalCtorOnlyBuiltinRecord(std::string_view n) {
+    return contains(kPositionalCtorOnlyBuiltinRecords, n);
+}  // per §17.7 / §31.4 / stdlib §3.3 — only the undeclared `new T()` is rejected
 
 // #2921 / #2923 / §8.1 / §8.5 / §28.2 / §28.9: the reserved built-in CLASSES —
 // every reserved name that is not an interface head. Their runtime values are

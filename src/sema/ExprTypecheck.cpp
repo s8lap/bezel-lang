@@ -9433,6 +9433,16 @@ void ExprTC::visitMember(const ast::Member& m) {
                                 fty->declaration->kind ==
                                     ast::TypeDeclKind::Class)
                                 checkNewExprArgs(*shNe, fty->declaration);
+                            // fix #2994 (§17.7, v0.241): the shorthand is the
+                            // SAME construction with the type taken from the
+                            // declared target, so the closed-constructor-
+                            // surface rule applies to it too. Checked here
+                            // rather than in the NewExpr arm because that arm
+                            // runs only for the explicit `new T(...)` form —
+                            // the shorthand node has no `type` and is given
+                            // its exprType by the `setExprType` above, which
+                            // is what the check reads.
+                            checkBuiltinClosedConstructorSurface(*shNe);
                         }
                     }
                 }
@@ -10362,6 +10372,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                     ast::TypeDeclKind::Class)
                                 checkNewExprArgs(
                                     *shNe, lsym->declType->declaration);
+                            // fix #2994 (§17.7, v0.241): the local-declaration
+                            // twin of the field-initializer shorthand check
+                            // above — `var g: Guid := new();` is `new Guid()`
+                            // with the type taken from the declared target.
+                            checkBuiltinClosedConstructorSurface(*shNe);
                         }
                     }
                 }

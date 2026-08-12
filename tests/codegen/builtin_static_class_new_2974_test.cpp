@@ -185,26 +185,45 @@ BEZEL_TEST(builtin_static_class_new_2974,
     BEZEL_EXPECT_TRUE(hasError(newLocal("new Task()"), "produced no value"));
 }
 
-// ── THE VALUE-SHAPED BUILT-INS ARE EXEMPT, and that was MEASURED ───────────
+// ── THE VALUE-SHAPED BUILT-INS ARE EXEMPT *FROM THIS GATE* ─────────────────
 //
-// The first draft of this gate rejected these too. Measured on the PARENT
-// compiler, `var g := new Guid(); Console.WriteLine(g.ToString());` prints
-// `00000000-0000-0000-0000-000000000000` — exactly the documented `Guid.Empty`.
-// It was never a degraded null: for a value-shaped built-in the substituted
-// all-zero pattern IS `default(T)` (§17.11), and §14.2 says outright that
-// "`new T()` for a value substitution is equivalent to `default(T)`". Rejecting
-// it would have broken a program that works and returns the right answer —
-// which is why the gate reads the existing `kNonHeapReservedBuiltins` registry
-// split rather than "is it a built-in".
+// ⚠ THE TWO TESTS BELOW WERE REWRITTEN AT #2994 (spec §17.7, v0.241). They are
+// no longer status-quo pins; read this block before touching them.
 //
-// (Whether `new Guid()` is legal Bezel at an ordinary, non-generic site is a
-// question the spec does not settle. Per CLAUDE.md rule 1 that is an issue, not
-// an interpretation committed to here; filed separately. These tests pin the
-// STATUS QUO for it, so whichever way that question is answered, the answer is
-// a deliberate edit.)
+// #2974's gate deliberately exempted the value-shaped half of the built-in
+// population by reading `kNonHeapReservedBuiltins`, because measured on its
+// parent `var g := new Guid(); Console.WriteLine(g.ToString());` printed
+// `00000000-0000-0000-0000-000000000000` — the documented `Guid.Empty` — and
+// rejecting it would have broken a program that returned the right answer.
+// Whether `new Guid()` is legal Bezel at an ordinary (non-generic) site was a
+// question the spec did not settle, so per CLAUDE.md rule 1 it was FILED
+// (#2994) rather than decided in codegen, and these two tests pinned the status
+// quo so that whichever way it was answered, the answer would be a deliberate
+// edit. THIS IS THAT EDIT.
+//
+// The owner ruled interpretation (2) at v0.241 (PR #3043): standard-library
+// builtins have a CLOSED CONSTRUCTOR SURFACE (§17.7). `Guid` and
+// `IntPtr`/`UIntPtr` declare no constructor and admit no `new` at any argument
+// list; `ExceptionInfo` and `ReadOnlyStringSpan` keep their declared positional
+// primary constructors and reject only the undeclared parameterless form.
+//
+// #2974's GATE IS UNCHANGED and this file's other tests are untouched: the
+// rejection now arrives from SEMA (`ExprTC::checkBuiltinClosedConstructorSurface`,
+// keyed on the same registry split), so codegen never sees these programs, and
+// #2974's own population — the pointer-shaped built-ins whose "produced no
+// value" IS a null reference — still reaches the codegen gate exactly as before.
+// The exemption in `unconstructedBuiltinNewName` therefore stays: removing it
+// would re-reject `new DateTime(2024, 1, 2)` and the rest of the value-shaped
+// half that #2994's ruling deliberately leaves alone.
 
 BEZEL_TEST(builtin_static_class_new_2974,
-           new_guid_still_yields_the_empty_guid_spec_17_11_stdlib_2_6) {
+           new_guid_is_now_rejected_by_the_closed_ctor_surface_spec_17_7) {
+    // Was `new_guid_still_yields_the_empty_guid_spec_17_11_stdlib_2_6`,
+    // asserting exit 36 and the empty-Guid rendering. §17.7 (v0.241): "`Guid`
+    // … admits no `new T(...)` at any argument list; the diagnostic names the
+    // declared producers". The VALUE that test asserted is still reachable —
+    // via `Guid.Empty` / `default(Guid)` — and that is pinned in
+    // tests/codegen/builtin_closed_ctor_surface_2994_test.cpp.
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
@@ -212,25 +231,37 @@ BEZEL_TEST(builtin_static_class_new_2974,
         "  Console.WriteLine(g.ToString()); "
         "  return g.ToString().Length; "
         "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(program, "is not admitted at any argument list"));
     auto r = runAot(program);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(36, r.exitCode);
-    BEZEL_EXPECT_TRUE(
-        r.stdoutText.find("00000000-0000-0000-0000-000000000000") !=
-        std::string::npos);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("00000000") == std::string::npos);
 }
 
 BEZEL_TEST(builtin_static_class_new_2974,
-           other_value_shaped_builtins_stay_accepted_spec_17_11) {
-    // `IntPtr` (stdlib §10), `ExceptionInfo` (§31.4) and `ReadOnlyStringSpan`
-    // (stdlib §3.3) are the rest of the exemption the grid surfaced. The oracle
-    // is only that they still COMPILE — their runtime shape is not this fix's
-    // business, and asserting more would over-specify the status quo.
+           other_value_shaped_builtins_are_now_rejected_spec_17_7) {
+    // Was `other_value_shaped_builtins_stay_accepted_spec_17_11`, whose oracle
+    // was only "they still compile". Under §17.7's two arms all three of these
+    // spellings are undeclared: `IntPtr` (stdlib §10.0) declares no constructor
+    // at all, and `ExceptionInfo` (§31.4) / `ReadOnlyStringSpan` (stdlib §3.3)
+    // declare only their positional primary constructor, so the PARAMETERLESS
+    // form is rejected "exactly as for an identically-shaped user record".
+    //
+    // This is also what closes the #2922-class hazard the ruling names: those
+    // two records' fields are `string`, so the #2434 all-zero degrade this test
+    // used to accept was a value carrying NULL strings.
     for (const char* ctor : {"new IntPtr()", "new ExceptionInfo()",
                              "new ReadOnlyStringSpan()"}) {
         auto r = runAot(newLocal(ctor));
-        BEZEL_EXPECT_TRUE(r.ran);
+        BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+        BEZEL_EXPECT_TRUE(r.stdoutText.find("constructed") ==
+                          std::string::npos);
     }
+    // The §17.7 diagnostic, per arm — not merely "some error".
+    BEZEL_EXPECT_TRUE(hasError(newLocal("new IntPtr()"),
+                               "is not admitted at any argument list"));
+    for (const char* ctor : {"new ExceptionInfo()", "new ReadOnlyStringSpan()"})
+        BEZEL_EXPECT_TRUE(
+            hasError(newLocal(ctor), "is not a declared constructor of"));
 }
 
 // ── The REAL §6.8 surface must be untouched ────────────────────────────────

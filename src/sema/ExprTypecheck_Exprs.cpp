@@ -748,6 +748,110 @@ void ExprTC::checkIndexArgsPositional(const ast::IndexExpr& ix) {
     }
 }
 
+// fix #2994 — see the declaration. A generic type PARAMETER and a reserved
+// builtin have the SAME TypeRef shape (Named, `declaration == nullptr`), so
+// the closed-surface arms below must be able to tell them apart by name.
+// Mirrors the §14.1 (#992) detection in the NewExpr arm: a name is a type
+// parameter when the enclosing method's or the enclosing type's own
+// `genericParams` list it.
+bool ExprTC::isEnclosingGenericTypeParamName(std::string_view name) const {
+    if (name.empty()) return false;
+    if (currentMethodDecl_)
+        for (const auto& gp : currentMethodDecl_->genericParams)
+            if (gp.name == name) return true;
+    if (currentType_ && currentType_->decl)
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
+            for (const auto& gp : td->genericParams)
+                if (gp.name == name) return true;
+    return false;
+}
+
+// fix #2994 (§17.7, v0.241) — STANDARD-LIBRARY BUILTINS HAVE A CLOSED
+// CONSTRUCTOR SURFACE.
+//
+// §17.7, verbatim: "For a standard-library builtin type — any type the
+// standard-library document declares — the constructor surface is exactly what
+// that document declares — `new T(...)` resolves only against a declared
+// constructor, never against a compiler-supplied fallback. A builtin declaring
+// **no** constructor — `Guid` (stdlib §2.6), `IntPtr`/`UIntPtr` (stdlib §10.0)
+// — admits no `new T(...)` at any argument list; the diagnostic names the
+// declared producers … For a builtin record whose only declared constructor is
+// its positional primary constructor (`ExceptionInfo`, §31.4;
+// `ReadOnlyStringSpan`, stdlib §3.3), the undeclared parameterless form
+// `new T()` is rejected the same way — exactly as for an identically-shaped
+// user record."
+//
+// WHAT IT REPLACES. Measured on 309356e, all five reached the RIGHT-ANSWER-BY-
+// ACCIDENT path #2994 filed: `lowerNew` has no arm for them, returns nullptr,
+// and `lowerLocalDecl`'s #2434 fallback stores `getNullValue(slotTy)` behind an
+// `internal: … (degraded to a zero-initialized value) — #2434` message. For
+// `Guid`/`IntPtr` the all-zero pattern happens to BE the documented value; for
+// `ExceptionInfo` and `ReadOnlyStringSpan` it is a record of NULL strings —
+// the #2922 class, arriving through a silent fallback.
+//
+// WHY IT IS KEYED ON NAMES. The compiler has no table of declared builtin
+// constructors to resolve against: a builtin's constructors are arms of
+// codegen's `lowerNew`, not `ConstructorSymbol`s sema can see (§22.7's implicit
+// default-constructor check is gated on a real `TypeSymbol`, so it never sees a
+// builtin at all). The two registry predicates are exactly §17.7's two
+// enumerated populations; the rest of `kNonHeapReservedBuiltins` is out.
+//
+// WHY §14.2 IS UNAFFECTED. §14.2's generic-body equivalence — "`new T()` for a
+// value substitution is equivalent to `default(T)`" — is written on `T`, and a
+// generic body writes `new T()`, whose head name is `T`. `Guid` still satisfies
+// `where T: new()` (its `default` is well-defined, §17.11), so a generic
+// factory instantiated at `Guid` still mints empty Guids. The one shape that
+// could confuse the two — a type parameter that SHADOWS a builtin name — is
+// excluded by `isEnclosingGenericTypeParamName`.
+//
+// WHY IT CANNOT FALSE-REJECT A USER TYPE. A user type carries a real `decl`,
+// or (imported) a non-empty `moduleName`; both are excluded before the name is
+// consulted, exactly as in codegen's `unconstructedBuiltinNewName` twin. A user
+// `class Guid` therefore keeps constructing.
+void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
+    // Resolved exactly as `lowerNew` resolves it (and as codegen's #2974 twin
+    // does): the explicit `ne.type` when present, else the §17.7 `new(...)`
+    // shorthand's recorded exprType, which the field-initializer / local-decl
+    // sites publish from the declared target type before calling this.
+    const TypeRef* rt =
+        ne.type ? ctx_.resolvedType(*ne.type) : ctx_.exprType(ne);
+    if (!rt || rt->kind != TypeRef::Kind::Named) return;
+    const TypeSymbol* rd = rt->declaration;
+    if (rd && (rd->decl || !rd->moduleName.empty())) return;   // a USER type
+    std::string n = rd ? std::string(rd->name) : std::string(rt->headName());
+    if (n.empty()) return;
+    if (isEnclosingGenericTypeParamName(n)) return;            // §14.2 shape
+
+    if (common::isNoConstructorBuiltin(n)) {
+        // §17.7 names the declared producers, per builtin. Anything else would
+        // be the #2935 re-wording lesson paid twice: a diagnostic that says
+        // only "no constructor" leaves the reader to find the spelling that
+        // does exist.
+        std::string producers =
+            n == "Guid"
+                ? "`Guid.Empty`, `Guid.NewGuid()`, or `default(Guid)`"
+                : "`" + n + ".Zero` or `default(" + n + ")`";
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            "`new " + n + "(\xE2\x80\xA6)` is not admitted at any argument "
+            "list — `" + n + "` is a standard-library builtin and declares no "
+            "constructor, and a builtin's constructor surface is exactly what "
+            "the standard library documents for it (never a compiler-supplied "
+            "fallback). Use " + producers + " (\xC2\xA7""17.7)");
+        return;
+    }
+    if (common::isPositionalCtorOnlyBuiltinRecord(n) && ne.args.empty()) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            "`new " + n + "()` is not a declared constructor of `" + n +
+            "` — its only declared constructor is its positional primary "
+            "constructor, so the parameterless form is rejected exactly as it "
+            "would be for an identically-shaped user record; supply every "
+            "positional field, or obtain the value from the standard-library "
+            "producer that yields it (\xC2\xA7""17.7)");
+    }
+}
+
 void ExprTC::visitExpr(const ast::Expr& e) {
     // §17.15 (v0.216, #2098): the binding atom `(var x := E; body)`. Handled
     // before visitChildren — the clauses are §21.1 declaration statements
@@ -2756,6 +2860,12 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         if (ne->type) {
             if (auto* rt = ctx_.resolvedType(*ne->type)) {
                 ctx_.setExprType(&e, rt);
+                // fix #2994 (§17.7, v0.241): a standard-library builtin's
+                // constructor surface is exactly what the standard library
+                // documents for it. Runs on the EXPLICIT `new T(...)` form
+                // here; the §17.7 `new()` shorthand is checked at the two
+                // sites that give it its target type (ExprTypecheck.cpp).
+                checkBuiltinClosedConstructorSurface(*ne);
                 // §5.4 / §10 (#960): `new` cannot construct an enum. An enum
                 // value is produced by the int→enum CAST `E(n)` (§5.4), not by
                 // construction — an enum has no constructor (§10). `new E(...)`

@@ -2084,6 +2084,27 @@ private:
     // ARGUMENT alone and holds for a receiver whose type never resolves.
     void checkIndexArgsPositional(const ast::IndexExpr& ix);
 
+    // fix #2994 (§17.7 "Standard-library builtins have a closed constructor
+    // surface", v0.241): `new T(...)` on a standard-library builtin resolves
+    // only against a DECLARED constructor, never against a compiler-supplied
+    // fallback. Called for every NewExpr — the explicit `new T(...)` form from
+    // the NewExpr typing arm, and the §17.7 `new()` shorthand from the two
+    // sites that give the shorthand its target type (a field initializer and a
+    // typed local declaration), since those are the same construction with the
+    // type taken from context. See the definition for the two arms and for why
+    // §14.2's generic-body `new T()` ≡ `default(T)` equivalence is untouched.
+    void checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne);
+
+    // fix #2994: is `name` a generic type PARAMETER of the enclosing method or
+    // type? A type parameter resolves to a Named TypeRef with a null
+    // declaration — exactly the shape a reserved builtin has — so a body
+    // writing `new T()` under `where T: new()` is indistinguishable from
+    // `new Guid()` by TypeRef shape alone. Consulted so a type parameter that
+    // SHADOWS a builtin name (`class Box<Guid>`) is never claimed by the
+    // closed-surface arms. Mirrors the §14.1 (#992) detection in the NewExpr
+    // arm.
+    bool isEnclosingGenericTypeParamName(std::string_view name) const;
+
     // §2.5 / §22.7 (issue #328 FINDING [7] B): check `new ImportedT(args)`
     // against an imported type's reconstructed constructor signatures (no
     // ast::ConstructorDecl; ParameterSymbol resolved types). Single-ctor,

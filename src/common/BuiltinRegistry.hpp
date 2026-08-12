@@ -141,6 +141,44 @@ bool isHeapPointerReferenceBuiltin(std::string_view n);
 // tests/support/builtin_registry_snapshot_test.cpp.
 bool isReservedBuiltinTypeName(std::string_view n);
 
+// fix #2994 (§17.7 "Standard-library builtins have a closed constructor
+// surface", v0.241): the two arms of that rule's REJECTING population, split
+// out of `kNonHeapReservedBuiltins` — the value-shaped half that codegen's
+// #2974 gate exempts, and therefore the half sema must now answer for.
+//
+// §17.7, verbatim: "For a standard-library builtin type — any type the
+// standard-library document declares — the constructor surface is exactly what
+// that document declares — `new T(...)` resolves only against a declared
+// constructor, never against a compiler-supplied fallback."
+//
+// The compiler has no table of DECLARED builtin constructors to resolve
+// against — a builtin's constructors live as arms of codegen's `lowerNew`, not
+// as `ConstructorSymbol`s sema can see — so the rule is applied name-keyed, to
+// exactly the two populations §17.7 enumerates. Every other member of
+// `kNonHeapReservedBuiltins` (`DateTime` and the temporal family,
+// `CString`/`WString`/`RawBytes`, `Range`, the span shapes, `JsonOptions`,
+// `OwningBuffer`) is deliberately OUT: some declare constructors that work
+// today, and the rest are their own measured gaps, tracked separately rather
+// than folded in here on a guess.
+
+// Arm 1 — the builtins that declare NO constructor at all: `Guid` (stdlib
+// §2.6, whose prose carries the matching insurance note), `IntPtr`/`UIntPtr`
+// (stdlib §10.0). §17.7: they admit "no `new T(...)` at any argument list", and
+// the diagnostic names the declared producers. `IntPtr(longValue)` is the §5.2
+// explicit CONVERSION, a CallExpr — not a `new` — and is untouched.
+// per §17.7 / stdlib §2.6 / stdlib §10.0
+bool isNoConstructorBuiltin(std::string_view n);
+
+// Arm 2 — the builtin RECORDS whose only declared constructor is the positional
+// primary one: `ExceptionInfo` (spec §31.4, `record ExceptionInfo(TypeName:
+// string, Message: string, StackTrace: string)`) and `ReadOnlyStringSpan`
+// (stdlib §3.3, `record ReadOnlyStringSpan(Source: string, Start: int, Length:
+// int)`). §17.7 rejects "only the undeclared parameterless form `new T()` …
+// exactly as for an identically-shaped user record" — and an identically-shaped
+// user record does reject it ("required parameter `A` is not supplied", §22.5).
+// per §17.7 / §31.4 / stdlib §3.3
+bool isPositionalCtorOnlyBuiltinRecord(std::string_view n);
+
 // #2921 / #2923 / §8.1 / §8.5 / §28.2 / §28.9: is `n` a reserved built-in
 // **class** whose runtime value carries NO Bezel vtable at word 0?
 //
