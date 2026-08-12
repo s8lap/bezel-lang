@@ -135,7 +135,7 @@ public method Discard(count: int)
 end Discard;
 ```
 
-**`old` is shallow.** A class-typed capture holds the entry *reference*, so `old(_items).Count` reads the count *now* — almost never what you meant. `old(_items.Count)` captures the entry count. The idiom is value-typed projections inside `old`, and implementations are directed to warn on the dereferenced-class-capture form (spec §22.16). One operand kind is rejected outright: a **move-only value** (an owning inline array, an owning choice — spec §15.3) cannot be captured at all — a copy is forbidden and a borrow would observe post-state — so capture a copyable projection instead (`old(pool[i] <> null)`; a `pure` choice method's result), spec §22.16, v0.253.
+**`old` is shallow.** A class-typed capture holds the entry *reference*, so `old(_items).Count` reads the count *now* — almost never what you meant. `old(_items.Count)` captures the entry count. The idiom is value-typed projections inside `old`, and implementations are directed to warn on the dereferenced-class-capture form (spec §22.16). One operand kind is rejected outright: a **move-only value** (an owning inline array, an owning choice — spec §15.3) cannot be captured at all — a copy is forbidden and a borrow would observe post-state — so capture a copyable projection instead: given an owning-inline-array field `private _pool: [16 owned]Connection?;`, write `old(_pool[slot] <> null)`, or capture a `pure` choice method's result (spec §22.16, v0.253).
 
 Contracts compose. Here the class invariant from §1 is what makes the postcondition true:
 
