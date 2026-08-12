@@ -754,20 +754,30 @@ const sema::TypeSymbol* Emitter::recordTypeOfRef(const sema::TypeRef* ref) {
     if (!ref || ref->kind != sema::TypeRef::Kind::Named || !ref->declaration)
         return nullptr;
     const sema::TypeSymbol* ts = ref->declaration;
-    if (ts->kind != ast::TypeDeclKind::Record) return nullptr;
-    // ⚠ #3132: this reads the AST decl ONLY, which is null for every IMPORTED
-    // type, so an imported positional record is misclassified here as having no
-    // auto equality and is routed away from the record-key fast path. That is
-    // the SAME one-line defect #2934's follow-up fixed at the two §8.5 sites
-    // (`recordIsPositional` reads both sources), but it is a DIFFERENT defect —
-    // hash/equality routing, not rendering — with its own blast radius, so it
-    // is filed rather than swept in here. The fix is `recordIsAutoBearing(ts)`.
-    bool positional = false;
-    if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
-        positional = td->hasPositionalFields;
-    if (positional || sema::isAutoEqualityBearingBodyRecord(ts, ctx_))
-        return ts;
-    return nullptr;  // an ineligible body record has no auto equality (§9.2)
+    // fix #3132 (§9.1 / §9.2 / §8.3 / §2.8.3 rule 4, v0.252; family F7 of the
+    // imported-symbol seam #3152). This used to decide "is it positional?" by
+    // casting `ts->decl` to an `ast::TypeDecl` and reading that node's
+    // `hasPositionalFields`. `ModuleLoader` never assigns `TypeSymbol::decl` for
+    // an imported type, so the cast was null for every import and an imported
+    // positional record answered "no auto equality" here — routed off the
+    // structural record-key/record-element path.
+    //
+    // MEASURED on a0b655e with a real two-module build (`bezelc -c dep.bzl`
+    // then `bezelc --import dep.o app.bzl`) for `record PtR(X: int, Y: int)`:
+    // the importer ABORTED the compiler — `ICmpInst::AssertOK` "Invalid operand
+    // types for ICmp instruction" — because the fallback path an ineligible
+    // record takes compares the loaded struct with an integer compare. The
+    // record arm is, as `emitRemoveElementEquality` states above its own call,
+    // "mandatory (not an extension)", so this was never a slow path: it was a
+    // wrong answer that produces invalid IR. The same program with `PtR`
+    // declared locally compiled and ran clean.
+    //
+    // `recordIsAutoBearing` is the both-sources predicate (`hasPositionalFields`
+    // first, AST fallback, then §9.2's body-record conditions) introduced by
+    // #2934's follow-up for the two §8.5 rendering sites. One predicate, every
+    // caller, so the two sources cannot be read apart again.
+    if (recordIsAutoBearing(ts)) return ts;
+    return nullptr;  // not a record, or an ineligible body record (§9.2)
 }
 
 const sema::TypeSymbol* Emitter::recordKeyType(const sema::TypeRef* collTy,
