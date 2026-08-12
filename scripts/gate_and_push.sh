@@ -52,13 +52,52 @@ BEZEL_GATE_DONEFILE="${BEZEL_GATE_DONEFILE:-/var/tmp/bezel-scratch/gate.done}"
 mkdir -p "$(dirname "$BEZEL_GATE_PIDFILE")" 2>/dev/null || true
 rm -f "$BEZEL_GATE_DONEFILE" 2>/dev/null || true
 echo $$ > "$BEZEL_GATE_PIDFILE"
+# fix #3158: ONE EXIT trap, doing BOTH jobs.
+#
+# Bash supports exactly one EXIT trap; a second `trap … EXIT` silently REPLACES
+# the first. This script had two — this one, and the serialization-lock cleanup
+# registered ~60 lines below once the lock is acquired. The later registration
+# won, so on the normal path (lock acquired) `_bezel_gate_signal_done` NEVER RAN:
+# no donefile was ever written and the pidfile was never removed. The waiter
+# machinery added in 383d01c to end the #3010 self-matching-waiter class was
+# therefore dead on arrival — it was layered on top of an existing EXIT trap
+# (2ea36f2) that nothing pointed out.
+#
+# Measured before the fix, in two seconds and on the real path:
+#   $ scripts/gate_and_push.sh --quick     # refused at the arg loop, AFTER the
+#                                          # lock is taken and the trap replaced
+#   exit=64   donefile: ABSENT   pidfile: left behind
+# — exactly the state a completed 2026-08-13 gate left, which is why a donefile
+# waiter learned nothing from a gate that had exited cleanly with rc=0.
+#
+# `rc=$?` MUST stay the first statement: any command run before it clobbers the
+# status being reported. The lock release therefore comes after the capture, and
+# the donefile is written with the SAVED rc.
+_bezel_gate_cleanup_ran=0
 _bezel_gate_signal_done() {
   local rc=$?
+  # Idempotent: a future signal trap may also route here, and writing the
+  # donefile twice would race a waiter that is already reading it.
+  if [ "$_bezel_gate_cleanup_ran" = "1" ]; then return $rc; fi
+  _bezel_gate_cleanup_ran=1
+  # Release the serialization lock, if this run ever took it. Empty on every
+  # path that exited before acquiring, so this is a no-op there.
+  if [ -n "${_gate_serialize_pid:-}" ]; then
+    kill "$_gate_serialize_pid" 2>/dev/null || true
+    wait "$_gate_serialize_pid" 2>/dev/null || true
+  fi
+  # Publish the terminal marker LAST, so a waiter that sees the donefile knows
+  # the lock is already released and may start its own gate immediately.
   echo "$rc" > "$BEZEL_GATE_DONEFILE" 2>/dev/null || true
   rm -f "$BEZEL_GATE_PIDFILE" 2>/dev/null || true
   return $rc
 }
+_gate_serialize_pid=""
 trap _bezel_gate_signal_done EXIT
+# ⚠ DO NOT add another `trap … EXIT` in this file — it would silently replace
+# the handler above, which is the bug #3158 records. Add the work to
+# _bezel_gate_signal_done instead. scripts/gate/tests/test_gate_and_push_trap.py
+# fails the build if a second one appears.
 # ---------------------------------------------------------------------------
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate_and_push: not in a git repo" >&2; exit 2; }
@@ -117,10 +156,15 @@ if [ -z "${GATE_SKIP_LOCK:-}" ]; then
     fi
     exit 0
   fi
-  # ACQUIRED — register cleanup so the daemon dies (and the kernel releases
-  # the flock) when this bash script exits. SIGTERM is caught by the helper's
-  # signal handler (clean release); SIGKILL is the unconditional fallback.
-  trap 'kill "$_gate_serialize_pid" 2>/dev/null || true; wait "$_gate_serialize_pid" 2>/dev/null || true' EXIT
+  # ACQUIRED — the daemon must die (so the kernel releases the flock) when this
+  # bash script exits. SIGTERM is caught by the helper's signal handler (clean
+  # release); SIGKILL is the unconditional fallback.
+  #
+  # fix #3158: this used to register its own `trap … EXIT` here, which REPLACED
+  # the donefile/pidfile handler set at the top of the file — bash keeps only one
+  # EXIT trap. The release now lives INSIDE that single handler, keyed on
+  # `_gate_serialize_pid` being non-empty, which is set immediately above. No
+  # second trap.
 fi
 
 # The authoritative verdict file path (matches gate.sh:77 / gate_full_cycle.sh).
