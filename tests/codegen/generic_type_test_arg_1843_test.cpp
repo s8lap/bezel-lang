@@ -30,7 +30,7 @@ int runProg(const std::string& mainBody) {
         "module M; "
         "class Box<U> public V: U; "
         "  public constructor(v: U) V := v; end constructor; end Box; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> public Value: T; "
         "  public constructor(v: T) Value := v; end constructor; end Ok; "
         "sealed class Err<T> : Result<T> public Msg: string; "
@@ -126,7 +126,7 @@ BEZEL_TEST(codegen_1843, is_nested_generic_inner_arg) {
 BEZEL_TEST(codegen_1843, case_generic_leaf_arm_honors_arg) {
     int code = run(
         "module M; "
-        "sealed abstract class Message end Message; "
+        "closed class Message end Message; "
         "sealed class Text : Message public B: string; "
         "  public constructor(b: string) B := b; end constructor; end Text; "
         "sealed class Tagged<U> : Message public T: U; "

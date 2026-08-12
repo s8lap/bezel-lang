@@ -16,7 +16,7 @@
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
 module M;
-sealed abstract class Shape
+closed class Shape
   public abstract method Tag(): int;
 end Shape;
 sealed class Circle : Shape

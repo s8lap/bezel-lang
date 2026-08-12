@@ -375,14 +375,14 @@ BEZEL_TEST(codegen_result_2047, spec_35_5_no_collision_case_this_still_resolves)
 // (two same-named top-level types), corrupting name resolution and
 // per-monomorphization descriptor emission for the WHOLE module (an unrelated
 // `is Box<string>` mis-resolved). Mirrors the corpus shape that regressed
-// (a `sealed abstract class Result<T>` hierarchy + a generic `is`/`as`).
+// (a `closed class Result<T>` hierarchy + a generic `is`/`as`).
 BEZEL_TEST(codegen_result_2047, spec_2_20_user_result_type_shadows_prelude) {
     BEZEL_EXPECT_EQ(runDecls(
         "class Box<U> "
         "  public V: U; "
         "  public constructor(v: U) V := v; end constructor; "
         "end Box; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> "
         "  public Value: T; "
         "  public constructor(v: T) Value := v; end constructor; "

@@ -1,7 +1,7 @@
 // Ported from tests/sema/sealed_class_test.cpp
-//   (BEZEL_TEST sema_sealed, sealed_abstract_same_module_plain_subclass_ok_spec_11_7).
+//   (BEZEL_TEST sema_sealed, closed_class_same_module_plain_subclass_ok_spec_11_7).
 //
-// §11.7: a non-sealed subclass of a `sealed abstract` base, same module, is
+// §11.7: a non-sealed subclass of a `closed` base, same module, is
 // equally allowed — the closed-abstract base restricts only cross-module
 // derivation, not the subclass's own modifiers.
 //
@@ -10,7 +10,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; sealed abstract class Base public abstract method V(): int; end Base; class Derived : Base public override method V(): int => 1; end Derived;
+module M; closed class Base public abstract method V(): int; end Base; class Derived : Base public override method V(): int => 1; end Derived;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

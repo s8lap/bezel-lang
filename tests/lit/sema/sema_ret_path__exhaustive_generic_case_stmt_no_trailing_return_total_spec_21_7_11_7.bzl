@@ -2,7 +2,7 @@
 // statement-case totality grant — matching the issue's example: a determined
 // `Ok<int>` / `Err<int>` leaf set over scrutinee `Result<int>`.
 //
-// `Result` is `sealed abstract` (§11.7), so the hierarchy is closed across
+// `Result` is `closed` (§11.7), so the hierarchy is closed across
 // module boundaries. §19.6's determination rule makes `Ok<int>` and `Err<int>`
 // the sole inhabiting instantiations at the scrutinee's static type `Result<int>`
 // — the canonical "determined" exhaustive shape. Every arm returns; there is no
@@ -20,7 +20,7 @@
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
 module M;
-sealed abstract class Result<T>
+closed class Result<T>
   public abstract method IsOk(): bool;
 end Result;
 sealed class Ok<T> : Result<T>

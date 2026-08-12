@@ -49,10 +49,10 @@ bool hasInstantiationError(const bezel::test::SemaResult& r) {
 }
 
 // The shared closed generic hierarchy (§19.6's determined shape):
-//   sealed abstract class Result<T>; sealed class Ok<T>: Result<T>; Err<T>: …
+//   closed class Result<T>; sealed class Ok<T>: Result<T>; Err<T>: …
 constexpr const char* kHierarchy =
     "module M;\n"
-    "sealed abstract class Result<T> end Result;\n"
+    "closed class Result<T> end Result;\n"
     "sealed class Ok<T> : Result<T> end Ok;\n"
     "sealed class Err<T> : Result<T> end Err;\n";
 
@@ -206,7 +206,7 @@ BEZEL_TEST(case_type_test_instantiation_1913,
            non_generic_hierarchy_unaffected) {
     auto r = parseSemaAll(
         "module M;\n"
-        "sealed abstract class Shape end Shape;\n"
+        "closed class Shape end Shape;\n"
         "sealed class Circle : Shape end Circle;\n"
         "sealed class Square : Shape end Square;\n"
         "class Program\n"

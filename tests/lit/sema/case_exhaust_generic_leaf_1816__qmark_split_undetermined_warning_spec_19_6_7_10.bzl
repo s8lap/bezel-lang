@@ -16,7 +16,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
-module M; sealed abstract class B<T> end B; sealed class L<Y> : B<Y?> end L; sealed class R : B<int?> end R; class Calc public method M(b: B<int?>): int var a := (case b of var r: R => 1, var l: L<int> => 2); return a; end M; end Calc;
+module M; closed class B<T> end B; sealed class L<Y> : B<Y?> end L; sealed class R : B<int?> end R; class Calc public method M(b: B<int?>): int var a := (case b of var r: R => 1, var l: L<int> => 2); return a; end M; end Calc;
 
 // CHECK: non-exhaustive
 // CHECK-SAME: closed hierarchy `B`

@@ -15,7 +15,7 @@
 //
 //   2. PROVABLE SHAPES. The compiler proves exhaustiveness for: an enum
 //      scrutinee (every declared constant matched), a bool scrutinee (both
-//      `true` and `false`), a sealed-abstract closed class hierarchy (every
+//      `true` and `false`), a `closed` class hierarchy (every
 //      leaf matched, §11.7), and the nullable variants of those (the above
 //      plus an explicit `null` pattern). An unguarded `_` or unconstrained
 //      `var x` arm is a catch-all that is always exhaustive. Every other
@@ -333,13 +333,13 @@ BEZEL_TEST(sema_case_exhaust, nullable_bool_missing_false_warns_spec_19_6) {
 // --- Sealed-abstract closed hierarchy (§11.7 / §19.6 example) ---------------
 
 // The §19.6 spec example, adapted to integer fields (stdlib Math.Pi is real
-// but uses doubles; we keep the structure — a `sealed abstract` Shape base
+// but uses doubles; we keep the structure — a `closed` Shape base
 // with three sealed leaves, each matched by a `var c: T` pattern). Every
 // leaf covered → exhaustive, no `_` needed.
 BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_all_leaves_ok_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Shape "
+        "closed class Shape "
         "  public abstract method Area(): int; "
         "end Shape; "
         "sealed class Circle : Shape "
@@ -368,7 +368,7 @@ BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_all_leaves_ok_spec_19_6) {
 BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_missing_leaf_warns_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Shape "
+        "closed class Shape "
         "  public abstract method Area(): int; "
         "end Shape; "
         "sealed class Circle : Shape "
@@ -398,7 +398,7 @@ BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_missing_leaf_warns_spec_19_6) {
 BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_bare_type_patterns_ok_spec_19_3) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Shape end Shape; "
+        "closed class Shape end Shape; "
         "sealed class Circle : Shape end Circle; "
         "sealed class Square : Shape end Square; "
         "class Calc "
@@ -431,7 +431,7 @@ BEZEL_TEST(sema_case_exhaust, sealed_hierarchy_bare_type_patterns_ok_spec_19_3) 
 BEZEL_TEST(sema_case_exhaust, generic_ground_mismatch_leaf_exempt_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Box<T> end Box; "
+        "closed class Box<T> end Box; "
         "sealed class IntBox : Box<int> end IntBox; "
         "sealed class StrBox : Box<string> end StrBox; "
         "class Calc "
@@ -454,7 +454,7 @@ BEZEL_TEST(sema_case_exhaust,
            nongeneric_missing_leaf_unaffected_by_generic_filter_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Shape end Shape; "
+        "closed class Shape end Shape; "
         "sealed class Circle : Shape end Circle; "
         "sealed class Square : Shape end Square; "
         "sealed class Triangle : Shape end Triangle; "
@@ -494,7 +494,7 @@ BEZEL_TEST(sema_case_exhaust,
 BEZEL_TEST(sema_case_exhaust, determined_idiom_stays_exhaustive_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
@@ -524,7 +524,7 @@ BEZEL_TEST(sema_case_exhaust, determined_idiom_stays_exhaustive_spec_19_6) {
 BEZEL_TEST(sema_case_exhaust, repeated_param_inconsistent_leaf_exempt_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class D<A, B> end D; "
+        "closed class D<A, B> end D; "
         "sealed class L<Y> : D<Y, Y> end L; "      // root inst D<Y,Y> — inconsistent
         "sealed class P : D<int, string> end P; "  // ground — the required arm
         "class Calc "
@@ -548,7 +548,7 @@ BEZEL_TEST(sema_case_exhaust, repeated_param_inconsistent_leaf_exempt_spec_19_6)
 BEZEL_TEST(sema_case_exhaust, determined_missing_leaf_still_warns_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
@@ -581,7 +581,7 @@ BEZEL_TEST(sema_case_exhaust, no_occurrence_param_undetermined_spec_19_6) {
     // warning names Tagged and its undetermined parameter U.
     auto warned = parseSemaAll(
         "module M; "
-        "sealed abstract class Message end Message; "
+        "closed class Message end Message; "
         "sealed class Text : Message end Text; "
         "sealed class Tagged<U> : Message end Tagged; "  // U free — Message non-generic
         "class Calc "
@@ -603,7 +603,7 @@ BEZEL_TEST(sema_case_exhaust, no_occurrence_param_undetermined_spec_19_6) {
     // leaf (§19.6): now exhaustive, no warning.
     auto cleared = parseSemaAll(
         "module M; "
-        "sealed abstract class Message end Message; "
+        "closed class Message end Message; "
         "sealed class Text : Message end Text; "
         "sealed class Tagged<U> : Message end Tagged; "
         "class Calc "
@@ -648,7 +648,7 @@ BEZEL_TEST(sema_case_exhaust, rigid_result_leaf_never_exempt_spec_19_6) {
     // so the case is non-exhaustive and the warning NAMES IntError.
     auto warned = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<A> end Result; "
+        "closed class Result<A> end Result; "
         "sealed class Ok<Y> : Result<Y> end Ok; "       // determined: Y := T
         "sealed class IntError : Result<int> end IntError; "  // int ≡ T undecidable
         "class Handle<T> "
@@ -669,7 +669,7 @@ BEZEL_TEST(sema_case_exhaust, rigid_result_leaf_never_exempt_spec_19_6) {
     // an irrefutable `_` arm — now exhaustive, no warning.
     auto cleared = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<A> end Result; "
+        "closed class Result<A> end Result; "
         "sealed class Ok<Y> : Result<Y> end Ok; "
         "sealed class IntError : Result<int> end IntError; "
         "class Handle<T> "
@@ -698,7 +698,7 @@ BEZEL_TEST(sema_case_exhaust, rigid_result_leaf_never_exempt_spec_19_6) {
 BEZEL_TEST(sema_case_exhaust, rigid_determined_leaf_stays_exhaustive_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<A> end Result; "
+        "closed class Result<A> end Result; "
         "sealed class Ok<Y> : Result<Y> end Ok; "
         "sealed class Err<Y> : Result<Y> end Err; "
         "class Handle<T> "
@@ -738,7 +738,7 @@ BEZEL_TEST(sema_case_exhaust,
            wrong_instantiation_ground_arm_does_not_cover_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
@@ -769,7 +769,7 @@ BEZEL_TEST(sema_case_exhaust,
            wrong_instantiation_rigid_arm_does_not_cover_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<A> end Result; "
+        "closed class Result<A> end Result; "
         "sealed class Ok<Y> : Result<Y> end Ok; "
         "sealed class Err<Y> : Result<Y> end Err; "
         "class Handle<T> "
@@ -796,7 +796,7 @@ BEZEL_TEST(sema_case_exhaust,
            correct_instantiation_control_stays_covered_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
@@ -837,7 +837,7 @@ BEZEL_TEST(sema_case_exhaust,
            wrong_instantiation_ancestor_root_does_not_cover_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
@@ -867,7 +867,7 @@ BEZEL_TEST(sema_case_exhaust,
            correct_instantiation_ancestor_root_covers_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
@@ -893,8 +893,8 @@ BEZEL_TEST(sema_case_exhaust,
            wrong_instantiation_ancestor_intermediate_does_not_cover_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
-        "sealed abstract class Wrap<T> : Result<T> end Wrap; "
+        "closed class Result<T> end Result; "
+        "closed class Wrap<T> : Result<T> end Wrap; "
         "sealed class Ok<T> : Wrap<T> end Ok; "
         "sealed class Err<T> : Wrap<T> end Err; "
         "class Calc "
@@ -925,7 +925,7 @@ BEZEL_TEST(sema_case_exhaust,
            wrong_instantiation_ancestor_rigid_does_not_cover_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<A> end Result; "
+        "closed class Result<A> end Result; "
         "sealed class Ok<Y> : Result<Y> end Ok; "
         "sealed class Err<Y> : Result<Y> end Err; "
         "class Handle<T> "
@@ -948,7 +948,7 @@ BEZEL_TEST(sema_case_exhaust,
            correct_instantiation_ancestor_rigid_covers_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<A> end Result; "
+        "closed class Result<A> end Result; "
         "sealed class Ok<Y> : Result<Y> end Ok; "
         "sealed class Err<Y> : Result<Y> end Err; "
         "class Handle<T> "
@@ -970,7 +970,7 @@ BEZEL_TEST(sema_case_exhaust,
            nongeneric_base_binding_still_covers_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Shape end Shape; "
+        "closed class Shape end Shape; "
         "sealed class Circle : Shape end Circle; "
         "sealed class Square : Shape end Square; "
         "class Calc "
@@ -1015,8 +1015,8 @@ BEZEL_TEST(sema_case_exhaust,
            crossdecl_wrong_instantiation_ancestor_ground_does_not_cover_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
-        "sealed abstract class Wrap<T> : Result<T> end Wrap; "
+        "closed class Result<T> end Result; "
+        "closed class Wrap<T> : Result<T> end Wrap; "
         "sealed class Ok<T> : Wrap<T> end Ok; "
         "sealed class Err<T> : Wrap<T> end Err; "
         "class Calc "
@@ -1044,8 +1044,8 @@ BEZEL_TEST(sema_case_exhaust,
            crossdecl_correct_instantiation_ancestor_ground_covers_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
-        "sealed abstract class Wrap<T> : Result<T> end Wrap; "
+        "closed class Result<T> end Result; "
+        "closed class Wrap<T> : Result<T> end Wrap; "
         "sealed class Ok<T> : Wrap<T> end Ok; "
         "sealed class Err<T> : Wrap<T> end Err; "
         "class Calc "
@@ -1073,8 +1073,8 @@ BEZEL_TEST(sema_case_exhaust,
            crossdecl_wrong_instantiation_ancestor_rigid_does_not_cover_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<A> end Result; "
-        "sealed abstract class Wrap<B> : Result<B> end Wrap; "
+        "closed class Result<A> end Result; "
+        "closed class Wrap<B> : Result<B> end Wrap; "
         "sealed class Ok<Y> : Wrap<Y> end Ok; "
         "sealed class Err<Y> : Wrap<Y> end Err; "
         "class Handle<T> "
@@ -1098,8 +1098,8 @@ BEZEL_TEST(sema_case_exhaust,
            crossdecl_correct_instantiation_ancestor_rigid_covers_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<A> end Result; "
-        "sealed abstract class Wrap<B> : Result<B> end Wrap; "
+        "closed class Result<A> end Result; "
+        "closed class Wrap<B> : Result<B> end Wrap; "
         "sealed class Ok<Y> : Wrap<Y> end Ok; "
         "sealed class Err<Y> : Wrap<Y> end Err; "
         "class Handle<T> "
@@ -1135,7 +1135,7 @@ BEZEL_TEST(sema_case_exhaust,
 BEZEL_TEST(sema_case_exhaust, leaf_where_value_filters_solutions_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class B<T> end B; "
+        "closed class B<T> end B; "
         "sealed class L<Y> : B<Y> where Y: value end L; "  // Y:=string ✗ value
         "sealed class R : B<string> end R; "               // ground — the arm
         "class Calc "
@@ -1161,7 +1161,7 @@ BEZEL_TEST(sema_case_exhaust,
            leaf_where_class_satisfied_keeps_leaf_required_spec_19_6) {
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class B<T> end B; "
+        "closed class B<T> end B; "
         "sealed class L<Y> : B<Y> where Y: class end L; "  // Y:=string ✓ class
         "sealed class R : B<string> end R; "
         "class Calc "
@@ -1207,7 +1207,7 @@ BEZEL_TEST(sema_case_exhaust, type_bound_filters_solved_param_spec_19_6) {
         "module M; "
         "interface IShape end IShape; "
         "class Square : IShape end Square; "
-        "sealed abstract class B<T> end B; "
+        "closed class B<T> end B; "
         "sealed class L<Y> : B<Y> where Y: IShape end L; "  // Y:=Square ✓ IShape
         "sealed class R : B<Square> end R; "                // ground leaf — arm
         "class Calc "
@@ -1226,7 +1226,7 @@ BEZEL_TEST(sema_case_exhaust, type_bound_filters_solved_param_spec_19_6) {
     auto exempt = parseSemaAll(
         "module M; "
         "interface IShape end IShape; "
-        "sealed abstract class B<T> end B; "
+        "closed class B<T> end B; "
         "sealed class L<Y> : B<Y> where Y: IShape end L; "  // Y:=int ✗ IShape
         "sealed class Ri : B<int> end Ri; "                 // ground leaf at B<int>
         "class Calc "
@@ -1260,7 +1260,7 @@ BEZEL_TEST(sema_case_exhaust,
     auto r = parseSemaAll(
         "module M; "
         "sealed class SealedC end SealedC; "  // a sealed bound, zero conformers
-        "sealed abstract class Message end Message; "
+        "closed class Message end Message; "
         "sealed class Text(body: string) : Message end Text; "  // ground leaf
         "sealed class L<Z>(z: Z) : Message where Z: SealedC end L; "  // Z free
         "class Calc "
@@ -1306,7 +1306,7 @@ BEZEL_TEST(sema_case_exhaust, qmark_split_unconstrained_undetermined_spec_19_6) 
     // undetermined; the warning names L and Y despite the `var l: L<int>` arm.
     auto warned = parseSemaAll(
         "module M; "
-        "sealed abstract class B<T> end B; "
+        "closed class B<T> end B; "
         "sealed class L<Y> : B<Y?> end L; "   // Y? occurrence — the §7.10 split
         "sealed class R : B<int?> end R; "    // ground leaf — determined, covered
         "class Calc "
@@ -1327,7 +1327,7 @@ BEZEL_TEST(sema_case_exhaust, qmark_split_unconstrained_undetermined_spec_19_6) 
     // The only remedy for an undetermined split leaf (§19.6): an irrefutable arm.
     auto cleared = parseSemaAll(
         "module M; "
-        "sealed abstract class B<T> end B; "
+        "closed class B<T> end B; "
         "sealed class L<Y> : B<Y?> end L; "
         "sealed class R : B<int?> end R; "
         "class Calc "
@@ -1363,7 +1363,7 @@ BEZEL_TEST(sema_case_exhaust, qmark_split_constraint_suppresses_nullable_spec_19
     // non-null pre-image, covered by the arm ⇒ no warning.
     auto determined = parseSemaAll(
         "module M; "
-        "sealed abstract class B<T> end B; "
+        "closed class B<T> end B; "
         "sealed class L<Y> : B<Y?> where Y: notnull end L; "  // kills Y := int?
         "sealed class R : B<int?> end R; "
         "class Calc "
@@ -1384,7 +1384,7 @@ BEZEL_TEST(sema_case_exhaust, qmark_split_constraint_suppresses_nullable_spec_19
     auto exempt = parseSemaAll(
         "module M; "
         "interface IShape end IShape; "
-        "sealed abstract class B<T> end B; "
+        "closed class B<T> end B; "
         "sealed class L<Y> : B<Y?> where Y: IShape end L; "   // int? and int both ✗
         "sealed class R : B<int?> end R; "                    // the only obligation
         "class Calc "
@@ -1434,7 +1434,7 @@ BEZEL_TEST(sema_case_exhaust,
     // and IntOnly exempt.
     auto warned = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "               // determined: T:=int
         "sealed class IntOnly : Result<string> end IntOnly; "   // exempt: ground mismatch
         "sealed class Tagged<U> : Result<int> end Tagged; "     // U free -> undetermined
@@ -1458,7 +1458,7 @@ BEZEL_TEST(sema_case_exhaust,
     // exemption were never the problem, so adding `_` alone clears it.
     auto cleared = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "
         "sealed class IntOnly : Result<string> end IntOnly; "
         "sealed class Tagged<U> : Result<int> end Tagged; "
@@ -1492,7 +1492,7 @@ BEZEL_TEST(sema_case_exhaust,
     // composed in one hierarchy: every leaf determined-and-covered, no `_`.
     auto r = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "               // T:=int? — determined
         "sealed class Err<T> : Result<T> end Err; "             // T:=int? — determined
         "sealed class Nullable<Y> : Result<Y?> where Y: notnull end Nullable; "
@@ -1526,7 +1526,7 @@ BEZEL_TEST(sema_case_exhaust,
     auto r = parseSemaAll(
         "module M; "
         "interface IShape end IShape; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "               // determined: T:=int
         "sealed class Err<T> : Result<T> end Err; "             // determined: T:=int
         "sealed class Shapely<Y> : Result<Y> where Y: IShape end Shapely; "  // exempt
@@ -1587,7 +1587,7 @@ BEZEL_TEST(sema_case_exhaust,
     // BEFORE the upstream addition: Ok/Err alone are exhaustive at Result<int>.
     auto before = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "
         "sealed class Err<T> : Result<T> end Err; "
         "class Calc "
@@ -1606,7 +1606,7 @@ BEZEL_TEST(sema_case_exhaust,
     // names the newly-determined, newly-uncovered leaf.
     auto after = parseSemaAll(
         "module M; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Ok<T> : Result<T> end Ok; "
         "sealed class Err<T> : Result<T> end Err; "
         "sealed class Pending<T> : Result<T> end Pending; "  // upstream addition
@@ -1644,9 +1644,9 @@ BEZEL_TEST(sema_case_exhaust,
         "module M; "
         "class Unrelated1 end Unrelated1; "
         "interface IUnrelated end IUnrelated; "
-        "sealed abstract class OtherHierarchy end OtherHierarchy; "
+        "closed class OtherHierarchy end OtherHierarchy; "
         "sealed class OtherLeaf : OtherHierarchy end OtherLeaf; "
-        "sealed abstract class Result<T> end Result; "
+        "closed class Result<T> end Result; "
         "sealed class Pending<T> : Result<T> end Pending; "  // declared FIRST this time
         "sealed class Err<T> : Result<T> end Err; "
         "class Padding end Padding; "                        // more ambient noise

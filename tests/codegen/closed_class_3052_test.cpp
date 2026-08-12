@@ -12,9 +12,10 @@
 //
 // These tests AOT-compile and RUN the §11.7 example form and assert the
 // produced exit code, proving the program compiles, links, and runs — the
-// same shape as the retired-spelling sibling in sealed_abstract_test.cpp.
-// Without the fix `closed` is an ordinary identifier and every program here
-// fails to parse.
+// same shape as sealed_abstract_test.cpp, whose two FINDING[6] regressions
+// this file's first two cases carry forward at the new spelling, plus three
+// cases the old spelling could not express. Without the fix `closed` is an
+// ordinary identifier and every program here fails to parse.
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
