@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 #include "common/OwnershipFacts.hpp"  // §28.1 per-instantiation owned-marker erasure (#2047)
 
@@ -3722,20 +3723,27 @@ void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
         // already bound to e.g. Cell in the active subst) and the non-generic
         // `class ConcreteChild : Base<Cell>` (Cell is concrete in baseTypeRefs) —
         // the same per-base-arg map classStruct builds for inherited fields.
-        const ast::TypeDecl* btd =
-            base->decl ? dynamic_cast<const ast::TypeDecl*>(base->decl) : nullptr;
-        if (btd && !btd->genericParams.empty() && bi < ts->baseTypeRefs.size() &&
+        // fix #3143 (§14.1 / §2.5 / §28.4, v0.254): the base's parameter names
+        // through the one both-sources walk. Read off `base->decl` alone this
+        // whole block was skipped for an IMPORTED generic base — the case (a)
+        // and (b) hazards above are then live across a module boundary: an owned
+        // type-parameter field is never disposed (leak), and a width-varying
+        // value field ahead of an owned concrete one leaves the erased template
+        // disposer freeing the WRONG offset.
+        const std::vector<std::string_view> btdNames =
+            sema::genericParamNames(base);
+        if (!btdNames.empty() && bi < ts->baseTypeRefs.size() &&
             ts->baseTypeRefs[bi] &&
-            btd->genericParams.size() == ts->baseTypeRefs[bi]->genericArgs.size()) {
+            btdNames.size() == ts->baseTypeRefs[bi]->genericArgs.size()) {
             const sema::TypeRef* baseRef = ts->baseTypeRefs[bi];
             std::unordered_map<std::string_view, llvm::Type*> newSubst;
             std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
-            for (std::size_t gi = 0; gi < btd->genericParams.size(); ++gi) {
+            for (std::size_t gi = 0; gi < btdNames.size(); ++gi) {
                 // Resolve each base arg under the OUTER subst BEFORE installing
                 // the new one (so `Base<T>` with the outer T=Cell maps to Cell).
-                newSubst[btd->genericParams[gi].name] =
+                newSubst[btdNames[gi]] =
                     lowerTypeRef(baseRef->genericArgs[gi]);
-                newSema[btd->genericParams[gi].name] =
+                newSema[btdNames[gi]] =
                     resolveTypeParamRef(baseRef->genericArgs[gi]);
             }
             // #2019: compute the base's instance-field storage-type sequence under

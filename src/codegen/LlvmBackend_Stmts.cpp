@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 namespace bezel::codegen {
 
@@ -1425,19 +1426,23 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         if (tgtTy->kind == sema::TypeRef::Kind::Named &&
                             tgtTy->declaration == opMethod->parent &&
                             !tgtTy->genericArgs.empty()) {
-                            auto* td = dynamic_cast<const ast::TypeDecl*>(
-                                tgtTy->declaration->decl);
-                            if (td && td->genericParams.size() ==
-                                          tgtTy->genericArgs.size()) {
+                            // fix #3143 (§14.1 / §2.5, v0.254): parameter names
+                            // through the one both-sources walk — an IMPORTED
+                            // generic record's `operator ++` was called
+                            // unspecialized with a specialized operand.
+                            const std::vector<std::string_view> gpNames =
+                                sema::genericParamNames(tgtTy->declaration);
+                            if (!gpNames.empty() &&
+                                gpNames.size() == tgtTy->genericArgs.size()) {
                                 std::unordered_map<std::string_view,
                                                    llvm::Type*> ns;
                                 std::unordered_map<std::string_view,
                                     const sema::TypeRef*> nsem;
                                 for (std::size_t gi = 0;
-                                     gi < td->genericParams.size(); ++gi) {
-                                    ns[td->genericParams[gi].name] =
+                                     gi < gpNames.size(); ++gi) {
+                                    ns[gpNames[gi]] =
                                         lowerTypeRef(tgtTy->genericArgs[gi]);
-                                    nsem[td->genericParams[gi].name] =
+                                    nsem[gpNames[gi]] =
                                         resolveTypeParamRef(
                                             tgtTy->genericArgs[gi]);
                                 }

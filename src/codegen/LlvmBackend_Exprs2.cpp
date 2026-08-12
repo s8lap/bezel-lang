@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 #include "common/OwnershipFacts.hpp"  // #2098: bindClauseNeedsAtomDisposal (§17.15/K8.5)
 #include "sema/EnumValues.hpp"  // enumDeclaredValues — §5.4 checked cast (#3044)
@@ -348,18 +349,20 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
             if (opTy && opTy->kind == sema::TypeRef::Kind::Named &&
                 opTy->declaration == opm->parent &&
                 !opTy->genericArgs.empty()) {
-                auto* td = dynamic_cast<const ast::TypeDecl*>(
-                    opTy->declaration->decl);
-                if (td && td->genericParams.size() ==
-                               opTy->genericArgs.size()) {
+                // fix #3143 (§14.1 / §2.5, v0.254): parameter names through the
+                // one both-sources walk, so an IMPORTED generic record's unary
+                // operator specializes too.
+                const std::vector<std::string_view> gpNames =
+                    sema::genericParamNames(opTy->declaration);
+                if (!gpNames.empty() &&
+                    gpNames.size() == opTy->genericArgs.size()) {
                     std::unordered_map<std::string_view, llvm::Type*> ns;
                     std::unordered_map<std::string_view,
                         const sema::TypeRef*> nsem;
-                    for (std::size_t gi = 0;
-                         gi < td->genericParams.size(); ++gi) {
-                        ns[td->genericParams[gi].name] =
+                    for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+                        ns[gpNames[gi]] =
                             lowerTypeRef(opTy->genericArgs[gi]);
-                        nsem[td->genericParams[gi].name] =
+                        nsem[gpNames[gi]] =
                             resolveTypeParamRef(opTy->genericArgs[gi]);
                     }
                     genericSubst_       = std::move(ns);
@@ -4727,9 +4730,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // so that field types are computed with the concrete type arguments.
     auto savedSubst = genericSubst_;  // save outer subst (nested generics)
     auto savedSemaTy = genericSubstSemaTy_;
-    if (!rt->genericArgs.empty() && t->decl) {
-        auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
-        if (td && td->genericParams.size() == rt->genericArgs.size()) {
+    //
+    // fix #3143 (§14.1 / §2.5, v0.254): ONE branch, reading the parameter names
+    // from whichever source carries them. This used to be two — a local
+    // (`t->decl`) arm and #428's separate imported arm — and they had DRIFTED:
+    // only the local arm applied #732's `allUnbound` guard, so
+    // `new ImportedBox<T>()` inside a generic method's (dead, unspecialized)
+    // TEMPLATE body installed a T→i32 substitution and produced a
+    // `%record.Box$spec0` value in a function whose declared return type was
+    // emitted as the unspecialized `%record.Box`. One predicate now, so the two
+    // cannot disagree again.
+    {
+        const std::vector<std::string_view> gpNames =
+            rt->genericArgs.empty() ? std::vector<std::string_view>{}
+                                    : sema::genericParamNames(t);
+        if (!gpNames.empty() && gpNames.size() == rt->genericArgs.size()) {
             // #732: if EVERY generic arg is an UNBOUND type parameter (a generic
             // METHOD template body, e.g. `new Box<T>` inside `Make<T>` where T
             // is not bound in the active subst), do NOT install a substitution.
@@ -4738,7 +4753,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // declared return type `Box<T>` was emitted UNspecialized
             // (`record.Box`, via recordStruct's matching allUnbound path), so the
             // produced value would mismatch the return type → IR-verify failure.
-            // Mirrors the allUnbound test in LlvmBackend_Layout.cpp:594-609.
+            // Mirrors the allUnbound test in lowerTypeRef's generic-RECORD
+            // branch (LlvmBackend_Layout.cpp) -- corrected citation: the
+            // pre-#3143 comment pointed at :594-609, which is a different
+            // function entirely. The two must agree, because that branch
+            // returning the UNSPECIALIZED struct while this one installs a
+            // substitution is exactly the IR mismatch #3143's T5 measured.
             bool allUnbound = true;
             for (const auto& arg : rt->genericArgs) {
                 // issue #787: a bare type parameter (`T`) has NO generic args of
@@ -4761,12 +4781,20 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // Resolve generic args WITH the outer substitution active so
             // that `new Pair<T>` inside a `Pair<string>` method correctly
             // maps T → ptr (string) rather than the i32 fallback.
+            // #428 / §14.1 / §2.5: this covers the IMPORTED generic type too —
+            // no ast::TypeDecl is available (decl is null for imported
+            // TypeSymbols), but the parameter names are in `t->genericParams`
+            // (GenericParamSymbol*, populated by
+            // ModuleLoader::convertGenericParams), which is where
+            // `sema::genericParamNames` reads them. Without the substitution
+            // recordStruct/classStruct laid the T-typed fields out at the i32
+            // placeholder for a non-int type argument.
             if (!allUnbound) {
                 std::unordered_map<std::string_view, llvm::Type*> newSubst;
                 std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
-                for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
+                for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
                     llvm::Type* concrTy = lowerTypeRef(rt->genericArgs[gi]);
-                    std::string_view pname = td->genericParams[gi].name;
+                    std::string_view pname = gpNames[gi];
                     newSubst[pname] = concrTy;
                     // Record the sema TypeRef for the concrete arg so the
                     // binary `=` handler can distinguish string vs. class ptr.
@@ -4777,27 +4805,6 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 genericSubstSemaTy_ = std::move(newSema);
             }
         }
-    } else if (!rt->genericArgs.empty() && !t->decl &&
-               t->genericParams.size() == rt->genericArgs.size()) {
-        // #428 / §14.1 / §2.5: IMPORTED generic type — no ast::TypeDecl is
-        // available (decl is null for imported TypeSymbols), but the generic
-        // parameter names are in t->genericParams (GenericParamSymbol* with
-        // .name, populated by ModuleLoader::convertGenericParams).  Build the
-        // same per-instantiation substitution so recordStruct (and classStruct)
-        // compute correct field layouts for non-int type arguments (the
-        // prior silent miscompile was due to this substitution being skipped
-        // entirely for imported types, leaving T's i32 placeholder in place).
-        std::unordered_map<std::string_view, llvm::Type*> newSubst;
-        std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
-        for (std::size_t gi = 0; gi < t->genericParams.size(); ++gi) {
-            llvm::Type* concrTy = lowerTypeRef(rt->genericArgs[gi]);
-            std::string_view pname = t->genericParams[gi]->name;
-            newSubst[pname] = concrTy;
-            // §14.1 (#766): resolve a bare-param arg through the outer subst.
-            newSema[pname] = resolveTypeParamRef(rt->genericArgs[gi]);
-        }
-        genericSubst_ = std::move(newSubst);
-        genericSubstSemaTy_ = std::move(newSema);
     }
 
     // §9 / §9.5 / issue #460: `new Record(args)` builds a value-type struct

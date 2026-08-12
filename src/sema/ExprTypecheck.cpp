@@ -1,6 +1,7 @@
 #include "sema/ExprTypecheck.hpp"
 #include "sema/ExprTypecheck_impl.hpp"
 #include "sema/EnumValues.hpp"  // enumDeclaredValues — §10.2/§17.11 (#3044)
+#include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 #include <cerrno>
 #include <cstdlib>
@@ -5715,11 +5716,17 @@ static bool variantGenericAssignable(
             variance = builtinParamVariance(toName, i);
         } else {
             // User-declared: read from the GenericParam annotations.
-            if (auto* td = dynamic_cast<const ast::TypeDecl*>(
-                    to->declaration->decl)) {
-                if (i < td->genericParams.size())
-                    variance = td->genericParams[i].variance;
-            }
+            // fix #3143 (§12.9 / §14.1 / §2.5, v0.254): through the one
+            // both-sources walk. Read off `to->declaration->decl` alone the
+            // variance of an IMPORTED interface was always "" — invariant — so a
+            // legal §12.9 covariant assignment was REJECTED across a module
+            // boundary while the byte-identical single-module program compiled:
+            // measured as "the initializer for `x` has a type that is not
+            // implicitly convertible to the target type (§5.1)" on
+            // `var x: I<Animal> := a;` with `a: I<Dog>` and an imported
+            // `interface I<out T>`. The marker crosses on the wire already
+            // (MetaGenericParam::variance → GenericParamSymbol::variance).
+            variance = genericParamVariance(to->declaration, i);
             // §12.9 L1590: classes and records are always invariant.
             if (to->declaration->kind == ast::TypeDeclKind::Class ||
                 to->declaration->kind == ast::TypeDeclKind::Record)
@@ -6145,17 +6152,45 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
     // admits a subtype/supertype RANGE of conforming class instantiations
     // (§12.9), so the invariant uniqueness reasoning below does not apply to
     // it. Variance is read from the interface declaration's GenericParam
-    // annotations, mirroring variantGenericAssignable; when unavailable (an
-    // imported interface with no AST), conservatively treat as possibly-variant
-    // and accept (the pre-#1941 posture, kept for the no-AST case).
-    const auto* itd = dynamic_cast<const ast::TypeDecl*>(sd->decl);
-    if (!itd) return IfaceBindReject::None;
-    bool variantIface = false;
-    for (const auto& gp : itd->genericParams)
-        if (gp.variance == "in" || gp.variance == "out") {
-            variantIface = true;
-            break;
-        }
+    // annotations, mirroring variantGenericAssignable.
+    //
+    // fix #3143 (§12.9 / §19.3 / §2.8.2 clause 2 / §2.8.3 rule 4, v0.254):
+    // through the one both-sources accessor. The "unavailable — conservatively
+    // accept" escape hatch this used to take for a no-AST declaration was the
+    // IMPORTED case and nothing else, and the variance it wanted is on the
+    // symbol (`GenericParamSymbol::variance`, set by
+    // ModuleLoader::convertGenericParams from the artifact), so the imprecision
+    // was avoidable rather than necessary.
+    //
+    // ⚠ DROPPING THE BLANKET `!itd -> accept` OPENS **TWO** ACCEPT→REJECT
+    // CLASSES, not one. An imported scrutinee interface now reaches BOTH
+    // branches below, and both can return an error verdict where the pre-#3143
+    // compiler silently accepted:
+    //
+    //   1. VARIANT + still-ERASED argument -> `ErasedAmbiguous` (#1941's
+    //      #2001/#2006 type-confusion reject). Measured cross-module on the
+    //      parent commit, the accept was not even benign: `interface ISrc<out T>`
+    //      imported, pattern `Prod<(int)->int>`, produced
+    //      "Basic Block ... does not have terminator!" / "IR verification
+    //      failed" — a malformed-IR compile abort where the fix emits the
+    //      sourced §19.3 diagnostic instead.
+    //   2. REIFIED + INVARIANT -> `Unreachable` (#1913/#1920's dead-arm
+    //      reject, `Severity::Error`). Measured: imported invariant
+    //      `interface IBox<T>`, scrutinee `IBox<int>`, arm `Box<string>` —
+    //      compiled silently before, rejects now, matching its single-module
+    //      twin exactly.
+    //
+    // The authority for BOTH is direct rather than inferred. §2.8.2 clause 2:
+    // "An external instantiation behaves identically to a same-module
+    // instantiation of the same generic at the same arguments." §2.8.3 rule 4:
+    // "`is` tests, `catch` clauses, and §19 patterns over values of the
+    // instantiation match identically regardless of which artifact produced the
+    // value or performs the test." A verdict that differed by artifact is what
+    // those two forbid, so an imported interface takes the same branch its local
+    // twin does. Both classes are pinned by tests/module/
+    // xmod_imported_generic_params_3143_test.cpp (T8, T9) against their
+    // single-module twins.
+    const bool variantIface = hasVariantGenericParam(sd);
 
     // Split on runtime PRECISION (post-#1843). `is C<A>` is precise iff EVERY type
     // argument of `A` is runtime-reified (a concrete class/record/enum/primitive
@@ -6301,6 +6336,18 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
         for (std::string_view m : pd->modifiers)
             if (m == "sealed") { sealedPd = true; break; }
         constexpr bool kClashProtectionAdmitEnabled = true;  // #2186 unblocked
+        // fix #3143 (§19.3 / §2.5, v0.254): `ifaceClashProtectedAllParams` is
+        // genuinely NEEDS-AST — it walks the interface's member DECLARATIONS
+        // (`itd->members`, each member's `returnType`/`params` AST nodes), which
+        // an IMPORTED interface does not have at all. This function's old
+        // blanket `!itd -> accept` early-out is gone (the VARIANCE it was
+        // standing in for is on the symbol), so the residue is confined here:
+        // with no declaration to probe, keep the conservative accept rather than
+        // let a missing AST read as "not clash-protected" and turn into a
+        // reject. Lifting it needs a symbol-side member-shape channel — filed
+        // as #3161, against the surface umbrella #3149 scopes.
+        const auto* itd = dynamic_cast<const ast::TypeDecl*>(sd->decl);
+        if (!itd) return IfaceBindReject::None;
         if (!sealedPd &&
             !(kClashProtectionAdmitEnabled && uniqueConformer &&
               ifaceClashProtectedAllParams(itd, ctx_)))

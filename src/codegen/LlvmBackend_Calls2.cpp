@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 namespace bezel::codegen {
 
@@ -8059,22 +8060,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                 recvTy->declaration == ms->parent &&
                 !recvTy->genericArgs.empty()) {
-                auto* td = dynamic_cast<const ast::TypeDecl*>(
-                    ms->parent->decl);
                 // §14.1 / #783: an IMPORTED generic class has no ast::TypeDecl
                 // (ms->parent->decl is null) but DOES carry sema-level
                 // genericParams (reconstructed by the loader). Take the type
                 // parameter NAMES from the AST decl when present, else from the
                 // imported TypeSymbol's genericParams, so the per-instantiation
                 // substitution installs for a cross-module receiver too.
-                std::vector<std::string_view> gpNames;
-                if (td) {
-                    for (const auto& gp : td->genericParams)
-                        gpNames.push_back(gp.name);
-                } else {
-                    for (sema::Symbol* gp : ms->parent->genericParams)
-                        if (gp) gpNames.push_back(gp->name);
-                }
+                // fix #3143: that fallback is `sema::genericParamNames`, the one
+                // shared walk, rather than this site's own copy of it.
+                const std::vector<std::string_view> gpNames =
+                    sema::genericParamNames(ms->parent);
                 if (gpNames.size() == recvTy->genericArgs.size() &&
                     !gpNames.empty()) {
                     // Resolve generic args using the OUTER substitution so
@@ -8312,11 +8307,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // the correct per-instantiation genericSubst_ and
                         // staticFieldGlobal routes to the per-instantiation
                         // global, not the external template-level declaration.
-                        auto* td = dynamic_cast<const ast::TypeDecl*>(
-                            ms->parent->decl);
-                        const std::size_t nGP =
-                            td ? td->genericParams.size()
-                               : ms->parent->genericParams.size();
+                        // fix #3143: through the one shared walk.
+                        const std::vector<std::string_view> gpNames =
+                            sema::genericParamNames(ms->parent);
+                        const std::size_t nGP = gpNames.size();
                         if (nGP == recvTy->genericArgs.size()) {
                             std::unordered_map<std::string_view, llvm::Type*>
                                 newSubst;
@@ -8328,9 +8322,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                     lowerTypeRef(recvTy->genericArgs[gi]);
                                 // Local generic: name comes from ast::TypeDecl;
                                 // imported: name comes from sema::Symbol.
-                                std::string_view pname =
-                                    td ? td->genericParams[gi].name
-                                       : ms->parent->genericParams[gi]->name;
+                                std::string_view pname = gpNames[gi];
                                 newSubst[pname] = concrTy;
                                 newSema[pname] = recvTy->genericArgs[gi];
                             }
@@ -8666,16 +8658,20 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (sema::TypeRef* resultTy = ctx_.exprType(call)) {
         if (resultTy->kind == sema::TypeRef::Kind::Named &&
             resultTy->declaration && !resultTy->genericArgs.empty()) {
-            auto* td = dynamic_cast<const ast::TypeDecl*>(
-                resultTy->declaration->decl);
-            if (td && td->genericParams.size() ==
-                      resultTy->genericArgs.size()) {
+            // fix #3143 (§14.1 / §2.5, v0.254): the result type's parameter
+            // names through the one both-sources walk — an IMPORTED generic
+            // result (`Pair<int,string>.Swap()` on a dependency's type) has no
+            // ast::TypeDecl, so this recorded NO subst for the result local and
+            // its layout fell back to the caller's (receiver's) binding.
+            const std::vector<std::string_view> gpNames =
+                sema::genericParamNames(resultTy->declaration);
+            if (!gpNames.empty() &&
+                gpNames.size() == resultTy->genericArgs.size()) {
                 std::unordered_map<std::string_view, llvm::Type*> newSubst;
-                for (std::size_t gi = 0;
-                     gi < td->genericParams.size(); ++gi) {
+                for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
                     llvm::Type* concrTy =
                         lowerTypeRef(resultTy->genericArgs[gi]);
-                    newSubst[td->genericParams[gi].name] = concrTy;
+                    newSubst[gpNames[gi]] = concrTy;
                 }
                 if (!newSubst.empty()) {
                     lastCallGenericSubst_ = std::move(newSubst);
@@ -8915,25 +8911,9 @@ void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
     }
 }
 
-// §14.1 / §2.5 (fix #711): a type's generic PARAMETER NAMES, from whichever
-// source exists — the AST decl for a locally-declared type, the TypeSymbol
-// (built by ModuleLoader::convertGenericParams) for an IMPORTED one, which has
-// no ast::TypeDecl at all. Hoisted out of computeAncestorGenericSubst so #2896's
-// descendant walk reads the names the same way rather than re-deriving them.
-static std::vector<std::string_view> genericParamNamesOf(
-        const sema::TypeSymbol* ts) {
-    std::vector<std::string_view> names;
-    if (!ts) return names;
-    if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl)) {
-        names.reserve(td->genericParams.size());
-        for (const auto& gp : td->genericParams) names.push_back(gp.name);
-        return names;
-    }
-    names.reserve(ts->genericParams.size());
-    for (const sema::Symbol* gp : ts->genericParams)
-        if (gp) names.push_back(gp->name);
-    return names;
-}
+// fix #3143 (§14.1 / §2.5, v0.254): `genericParamNamesOf` used to live here as
+// a file-static. It is now `sema::genericParamNames` (sema/GenericParams.hpp) —
+// the ONE both-sources walk the whole family calls, sema included.
 
 // §14.1 / §2.5 (fix #711): is `arg` a BARE generic-parameter reference (as
 // opposed to a concrete or constructed type)? Locally that is a single-part
@@ -8970,13 +8950,15 @@ bool Emitter::computeAncestorGenericSubst(
     // `Box<string> : Container<string>` (both imported), so the inherited base
     // field `item` was read through the unspecialized T→i32 `%class.Container`
     // template layout — `b.item.Length` loaded padding and returned 0.
-    const auto& genericParamNames = genericParamNamesOf;
+    // fix #3143: that walk is now `sema::genericParamNames` (GenericParams.hpp),
+    // called directly below rather than through a file-local alias.
 
     // curArgs: the concrete TypeRefs bound to `cur`'s generic params at this
     // level. Seeded from the receiver's own generic args, then re-derived for
     // each base level by resolving the base ref's args through this map.
     std::unordered_map<std::string_view, const sema::TypeRef*> curArgs;
-    const std::vector<std::string_view> curParams = genericParamNames(cur);
+    const std::vector<std::string_view> curParams =
+        sema::genericParamNames(cur);
     // fix #2889 (§14.1 "Generic declarations" / §12 "Inheritance and
     // Dispatch" / §2.5 "Dependency resolution", v0.240): seed a GENERIC
     // receiver whose ref carries NO arguments from the ACTIVE substitution.
@@ -9074,7 +9056,7 @@ bool Emitter::computeAncestorGenericSubst(
             // fix #711: same AST-decl-or-TypeSymbol name source as the seed
             // above, so an IMPORTED generic base resolves instead of bailing.
             const std::vector<std::string_view> baseParams =
-                genericParamNames(base);
+                sema::genericParamNames(base);
             if (!baseRef || baseParams.size() != baseRef->genericArgs.size())
                 return false;
             for (std::size_t gi = 0; gi < baseParams.size(); ++gi) {
@@ -9159,7 +9141,7 @@ bool Emitter::deriveDescendantGenericSubst(
     // (the call site installed exactly those — see emitMethodCall's receiver
     // block). A parameter the active map does not bind is not derivable.
     std::unordered_map<std::string_view, const sema::TypeRef*> known;
-    for (std::string_view pn : genericParamNamesOf(ancestor)) {
+    for (std::string_view pn : sema::genericParamNames(ancestor)) {
         auto it = genericSubstSemaTy_.find(pn);
         if (it == genericSubstSemaTy_.end() || !it->second) return false;
         known[pn] = it->second;
@@ -9169,7 +9151,7 @@ bool Emitter::deriveDescendantGenericSubst(
     for (const sema::TypeSymbol* level : chain) {
         std::unordered_map<std::string_view, const sema::TypeRef*> bound;
         const std::vector<std::string_view> aboveParams =
-            genericParamNamesOf(above);
+            sema::genericParamNames(above);
         if (!aboveParams.empty()) {
             // The base clause `level : above<args…>`, whose arguments are
             // written in `level`'s own parameter names.
@@ -9201,7 +9183,7 @@ bool Emitter::deriveDescendantGenericSubst(
         }
         // Every parameter this level declares must now be pinned; a level that
         // declares none is trivially satisfied (a non-generic intermediate link).
-        for (std::string_view pn : genericParamNamesOf(level)) {
+        for (std::string_view pn : sema::genericParamNames(level)) {
             auto bit = bound.find(pn);
             if (bit == bound.end() || !bit->second) return false;
         }
@@ -9991,11 +9973,14 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     if (!genericSubst_.empty()) {
         // Check if the method's parent class has generic params (i.e., is a
         // generic class that has been instantiated with the current subst).
-        bool parentIsGeneric = false;
-        if (ms->parent && ms->parent->decl) {
-            auto* td = dynamic_cast<const ast::TypeDecl*>(ms->parent->decl);
-            if (td && !td->genericParams.empty()) parentIsGeneric = true;
-        }
+        // fix #3143 (§14.1 / §2.5, v0.254): "is the parent generic?" through the
+        // one both-sources walk. Read off `ms->parent->decl` alone it answered
+        // NO for every imported generic class, so the body was not monomorphized
+        // at all and a static-field access inside it resolved to the
+        // unspecialized template global rather than the per-instantiation one.
+        // (`genericParamCount`, not `genericParamNames`: the whole question is
+        // "any at all", and this runs on every call with a live substitution.)
+        const bool parentIsGeneric = sema::genericParamCount(ms->parent) != 0;
         if (parentIsGeneric) {
             llvm::Value* r = emitInlineGenericMethod(ms, args);
             if (r != nullptr || diverged_) {
@@ -10799,7 +10784,7 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
                     // the `new` site minted it and as `is Box<int>` resolves it.
                     std::vector<const sema::TypeRef*> cArgs;
                     const auto& own = levels.back().args;
-                    for (std::string_view pn : genericParamNamesOf(c)) {
+                    for (std::string_view pn : sema::genericParamNames(c)) {
                         auto ait = own.find(pn);
                         if (ait == own.end() || !ait->second) return nullptr;
                         cArgs.push_back(ait->second);

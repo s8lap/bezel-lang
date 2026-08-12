@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 // §4.4 fix #521: decimal compile-time literal parser (defined in bezel_runtime.cpp).
 extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
@@ -705,19 +706,26 @@ std::unordered_map<std::string_view, llvm::Type*>
 Emitter::setupReceiverGenericSubst(const ast::Expr* target,
                                    const sema::TypeSymbol* parent) {
     auto savedSubst = genericSubst_;
-    if (!target || !parent || !parent->decl) return savedSubst;
-    auto* td = dynamic_cast<const ast::TypeDecl*>(parent->decl);
-    if (!td || td->genericParams.empty()) return savedSubst;
+    if (!target || !parent) return savedSubst;
+    // fix #3143 (§14.1 / §2.5, v0.254): the parameter names through the one
+    // both-sources accessor. The old `!parent->decl` early-out plus the AST-only
+    // read meant an IMPORTED generic receiver installed NO substitution at all,
+    // so the callee ran against the erased T→i32 template layout. The cheap
+    // ARITY question is asked first and the name list is built only once every
+    // guard has passed — `genericParamCount` allocates nothing.
+    const std::size_t nGP = sema::genericParamCount(parent);
+    if (nGP == 0) return savedSubst;
     sema::TypeRef* recvTy = ctx_.exprType(*target);
     if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named ||
         recvTy->declaration != parent || recvTy->genericArgs.empty())
         return savedSubst;
-    if (td->genericParams.size() != recvTy->genericArgs.size())
+    if (nGP != recvTy->genericArgs.size())
         return savedSubst;
+    const std::vector<std::string_view> gpNames =
+        sema::genericParamNames(parent);
     std::unordered_map<std::string_view, llvm::Type*> newSubst;
-    for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi)
-        newSubst[td->genericParams[gi].name] =
-            lowerTypeRef(recvTy->genericArgs[gi]);
+    for (std::size_t gi = 0; gi < gpNames.size(); ++gi)
+        newSubst[gpNames[gi]] = lowerTypeRef(recvTy->genericArgs[gi]);
     // A still-unresolved positional arg (i32 fallback) — recover the local's
     // stored concrete substitution, the same fallback fieldAddr / the property
     // getter path use for a generic receiver bound through a `var` local.
@@ -8619,15 +8627,9 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     // §14.1 / #783: take the type-parameter NAMES from the AST
                     // decl when present (local generic), else from the imported
                     // TypeSymbol's genericParams (cross-module).
-                    auto* td = dynamic_cast<const ast::TypeDecl*>(
-                        cmpMs->parent->decl);
-                    std::vector<std::string_view> gpNames;
-                    if (td)
-                        for (const auto& gp : td->genericParams)
-                            gpNames.push_back(gp.name);
-                    else
-                        for (sema::Symbol* gp : cmpMs->parent->genericParams)
-                            if (gp) gpNames.push_back(gp->name);
+                    // fix #3143: through the one shared walk.
+                    const std::vector<std::string_view> gpNames =
+                        sema::genericParamNames(cmpMs->parent);
                     if (gpNames.size() == recvTy->genericArgs.size() &&
                         !gpNames.empty()) {
                         // Resolve the args under the OUTER substitution (still

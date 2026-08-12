@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 #include <limits>
 
@@ -2206,28 +2207,33 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         // the receiver's concrete type args.
                         auto ncSavedSubst = genericSubst_;
                         auto ncSavedSemaTy = genericSubstSemaTy_;
-                        if (ncPropSym->parent && ncPropSym->parent->decl) {
+                        if (ncPropSym->parent) {
                             const sema::TypeRef* ncRecvTy =
                                 ctx_.exprType(*nm->target);
+                            // fix #3143 (§14.1 / §2.5, v0.254): parameter names
+                            // through the one both-sources accessor (and the
+                            // `parent->decl` pre-guard dropped with it). Built
+                            // only once the receiver guards have passed.
                             if (ncRecvTy &&
                                 ncRecvTy->kind == sema::TypeRef::Kind::Named &&
                                 ncRecvTy->declaration == ncPropSym->parent &&
                                 !ncRecvTy->genericArgs.empty()) {
-                                auto* ncTd = dynamic_cast<const ast::TypeDecl*>(
-                                    ncPropSym->parent->decl);
-                                if (ncTd && ncTd->genericParams.size() ==
-                                            ncRecvTy->genericArgs.size()) {
+                                const std::vector<std::string_view> ncGpNames =
+                                    sema::genericParamNames(ncPropSym->parent);
+                                if (!ncGpNames.empty() &&
+                                    ncGpNames.size() ==
+                                        ncRecvTy->genericArgs.size()) {
                                     std::unordered_map<std::string_view,
                                                        llvm::Type*> ncSubst;
                                     std::unordered_map<std::string_view,
                                         const sema::TypeRef*> ncSema;
                                     for (std::size_t ncGi = 0;
-                                         ncGi < ncTd->genericParams.size();
+                                         ncGi < ncGpNames.size();
                                          ++ncGi) {
-                                        ncSubst[ncTd->genericParams[ncGi].name] =
+                                        ncSubst[ncGpNames[ncGi]] =
                                             lowerTypeRef(
                                                 ncRecvTy->genericArgs[ncGi]);
-                                        ncSema[ncTd->genericParams[ncGi].name] =
+                                        ncSema[ncGpNames[ncGi]] =
                                             resolveTypeParamRef(
                                                 ncRecvTy->genericArgs[ncGi]);
                                     }
@@ -5102,13 +5108,19 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             auto savedSemaTy = genericSubstSemaTy_;
             if (auto* sym = ctx_.exprSymbol(*ma)) {
                 if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
-                    if (ps->parent && ps->parent->decl) {
+                    if (ps->parent) {
                         sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                        // fix #3143 (§14.1 / §2.5, v0.254): parameter names
+                        // through the one both-sources accessor (and the
+                        // `parent->decl` pre-guard dropped with it). Built only
+                        // once the receiver guards have passed.
                         if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
                             recvTy->declaration == ps->parent &&
                             !recvTy->genericArgs.empty()) {
-                            auto* td = dynamic_cast<const ast::TypeDecl*>(ps->parent->decl);
-                            if (td && td->genericParams.size() == recvTy->genericArgs.size()) {
+                            const std::vector<std::string_view> gpNames =
+                                sema::genericParamNames(ps->parent);
+                            if (!gpNames.empty() &&
+                                gpNames.size() == recvTy->genericArgs.size()) {
                                 std::unordered_map<std::string_view, llvm::Type*> newSubst;
                                 // §14.1 (#768): build the SEMA-type substitution
                                 // too — the getter body resolves the member type
@@ -5117,10 +5129,10 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 // the wrong type (wrong value / mismatched ICmp).
                                 std::unordered_map<std::string_view,
                                                    const sema::TypeRef*> newSema;
-                                for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
+                                for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
                                     llvm::Type* concrTy = lowerTypeRef(recvTy->genericArgs[gi]);
-                                    newSubst[td->genericParams[gi].name] = concrTy;
-                                    newSema[td->genericParams[gi].name] =
+                                    newSubst[gpNames[gi]] = concrTy;
+                                    newSema[gpNames[gi]] =
                                         resolveTypeParamRef(recvTy->genericArgs[gi]);
                                 }
                                 // Check unresolved (i32 fallback) → use localGenericSubst_
@@ -6582,16 +6594,20 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                     opTy->declaration != opm->parent ||
                     opTy->genericArgs.empty())
                     continue;
-                auto* td = dynamic_cast<const ast::TypeDecl*>(
-                    opTy->declaration->decl);
-                if (!td || td->genericParams.size() != opTy->genericArgs.size())
+                // fix #3143 (§14.1 / §2.5, v0.254): parameter names through the
+                // one both-sources walk — an IMPORTED generic record's binary
+                // operator was emitted unspecialized and called with
+                // specialized operands (the IR_FAIL this block exists to stop).
+                const std::vector<std::string_view> gpNames =
+                    sema::genericParamNames(opTy->declaration);
+                if (gpNames.empty() ||
+                    gpNames.size() != opTy->genericArgs.size())
                     continue;
                 std::unordered_map<std::string_view, llvm::Type*> ns;
                 std::unordered_map<std::string_view, const sema::TypeRef*> nsem;
-                for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
-                    ns[td->genericParams[gi].name] =
-                        lowerTypeRef(opTy->genericArgs[gi]);
-                    nsem[td->genericParams[gi].name] =
+                for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+                    ns[gpNames[gi]] = lowerTypeRef(opTy->genericArgs[gi]);
+                    nsem[gpNames[gi]] =
                         resolveTypeParamRef(opTy->genericArgs[gi]);
                 }
                 genericSubst_ = std::move(ns);

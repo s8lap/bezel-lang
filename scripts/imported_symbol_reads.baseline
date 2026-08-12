@@ -6,21 +6,17 @@
 
 # class1: dynamic_cast<const ast::TypeDecl*>(<sym>->decl) - wrong-but-quiet
 #         for an imported symbol.
-3    src/codegen/LlvmBackend_Calls.cpp
-5    src/codegen/LlvmBackend_Calls2.cpp
-3    src/codegen/LlvmBackend_Disposal.cpp
-3    src/codegen/LlvmBackend_Exprs.cpp
-5    src/codegen/LlvmBackend_Exprs2.cpp
-6    src/codegen/LlvmBackend_Layout.cpp
+1    src/codegen/LlvmBackend_Calls.cpp
+2    src/codegen/LlvmBackend_Disposal.cpp
+3    src/codegen/LlvmBackend_Exprs2.cpp
 22   src/codegen/LlvmBackend_Serialization.cpp
-10   src/codegen/LlvmBackend_Setup.cpp
-1    src/codegen/LlvmBackend_Stmts.cpp
+8    src/codegen/LlvmBackend_Setup.cpp
 1    src/codegen/LlvmBackend_impl.hpp
 2    src/common/OwnershipFacts.cpp
 4    src/module/ModuleMetadataBuilder.cpp
 6    src/ownership/Ownership_Checks.cpp
 1    src/sema/EnumValues.hpp
-16   src/sema/ExprTypecheck.cpp
+15   src/sema/ExprTypecheck.cpp
 10   src/sema/ExprTypecheck_Calls.cpp
 10   src/sema/ExprTypecheck_Exprs.cpp
 4    src/sema/PureChecker.cpp

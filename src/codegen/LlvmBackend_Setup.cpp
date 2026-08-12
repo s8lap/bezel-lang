@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 #include "common/OwnershipFacts.hpp"  // #1414 stage 4: shared ownership-facts core
 #include "sema/ConstFold.hpp"
@@ -7749,13 +7750,19 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         // a type-parameter pattern in the (dead) template body is recognizable
         // even with no active substitution (genericSubstSemaTy_ empty there).
         templateGenericParamNames_.clear();
-        if (ms->parent && ms->parent->decl) {
-            if (auto* ptd = dynamic_cast<const ast::TypeDecl*>(ms->parent->decl))
-                if (!ptd->genericParams.empty()) {
-                    genericTemplate = true;
-                    for (const auto& gp : ptd->genericParams)
-                        templateGenericParamNames_.insert(gp.name);
-                }
+        // fix #3143 (§14.1 / §2.5, v0.254): the parent's parameter names through
+        // the one both-sources walk. (`emitFunctionBody` returns above for an
+        // imported method, so no imported parent reaches here today — converted
+        // with the family so the read cannot answer differently from its
+        // siblings if that early-out ever moves.)
+        {
+            const std::vector<std::string_view> gpNames =
+                sema::genericParamNames(ms->parent);
+            if (!gpNames.empty()) {
+                genericTemplate = true;
+                for (std::string_view gp : gpNames)
+                    templateGenericParamNames_.insert(gp);
+            }
         }
         if (ms->decl) {
             if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
@@ -10395,12 +10402,23 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             }
         }
         if (baseRef && !baseRef->genericArgs.empty()) {
-            auto* td = dynamic_cast<const ast::TypeDecl*>(targetCls->decl);
-            if (td && td->genericParams.size() == baseRef->genericArgs.size()) {
+            // fix #3143 (§14.1 / §2.5, v0.254): the base's parameter names
+            // through the one both-sources walk. Read off `targetCls->decl`
+            // alone, an IMPORTED generic base installed no substitution, so the
+            // inlined base ctor kept its erased signature: measured on a real
+            // two-module build, `class Child : GBase<Cell>` over an imported
+            // `class GBase<T> ... constructor(owned f: T)` emitted
+            // `call void @bz$…GBase$ctor(ptr, ptr)` against
+            // `bz$…GBase$ctor(ptr, i32)` — "Call parameter type does not match
+            // function signature", the exact ABI mismatch this block exists for.
+            const std::vector<std::string_view> gpNames =
+                sema::genericParamNames(targetCls);
+            if (!gpNames.empty() &&
+                gpNames.size() == baseRef->genericArgs.size()) {
                 std::unordered_map<std::string_view, llvm::Type*> newSubst;
                 std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
-                for (std::size_t gi = 0; gi < td->genericParams.size(); ++gi) {
-                    std::string_view pname = td->genericParams[gi].name;
+                for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+                    std::string_view pname = gpNames[gi];
                     newSubst[pname] = lowerTypeRef(baseRef->genericArgs[gi]);
                     newSema[pname] = baseRef->genericArgs[gi];
                 }
