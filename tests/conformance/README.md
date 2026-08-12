@@ -10,8 +10,11 @@ claims, and this corpus is where they get checked against `bezelc`.
   wired into the gate by `scripts/gate_full_cycle.sh`. Unit tests:
   `test_conformance.py`.
 - **Consumed as**: `manifest.tsv` (TAB-separated: `case-id doc section class
-  expectation notes`) + `cases/<case-id>.bzl` + `preamble.bzl` (stub types
-  spliced into cases whose `notes` field is exactly `preamble`).
+  expectation notes`) + `cases/<case-id>.bzl` + `preamble.bzl` (illustrative stub
+  TYPES) + `env.bzl` (illustrative ambient VALUES and members). The `notes` field
+  is a `;`-separated token list; the tokens the harness acts on are `preamble`,
+  `wrap:mixed`, and `env:<name>[,<name>…]` (see the 2026-08-13 record at the
+  end). Every other token is provenance.
 
 Case ids are `<doc-tag>_<NNNN>` where `NNNN` is the block's position in its
 document **at the extraction that produced the corpus** — ids are stable between
@@ -161,3 +164,102 @@ unit tests, `scripts/check_docs.sh`, and a gate-path smoke of representative
 cases; record oracle identity and counts here. Scratch artifacts for this pass
 (verdicts, derivation table, per-case failure logs) were left in
 `/var/tmp/bezel-scratch/conf-regen/`.
+
+---
+
+## Coverage pass — 2026-08-13 (137 → 178 active)
+
+A pass whose premise was that the corpus's 434 skips were mostly **harness
+artifacts**: 176 `skip:incomplete-fragment`, 127 `skip:signature`/
+`skip:signature-listing`, 69 `mixed`/`syntax-snippet`/`elided`/`ebnf-grammar`,
+against only ~58 genuine (`blocked-on-#NNNN`, `not-implemented`,
+`stdlib-unresolved`). **The premise was mostly wrong, and the measurement is the
+useful part of this record.** Every skipped case was compiled under four
+strategies (the existing cascade, the cascade plus `preamble.bzl`, the new mixed
+wrap, and the mixed wrap plus preamble) against a `bezelc` built at this tree.
+23 of 434 flipped. The rest fail for reasons that are properties of the doc
+block, not of the harness:
+
+| original label | n | what the compiler actually says |
+|---|---|---|
+| `skip:incomplete-fragment` | 176 | **160 unbound names** (146 `unresolved identifier`, 14 `unresolved type name`) — prose-context locals and helpers. 4 generic-arity mismatches vs a built-in, 3 missing members on a preamble stub, 3 name collisions, 3 parse errors, 3 misc. |
+| `skip:signature`+`-listing` | 112 | 50 **parse** errors (a bodyless `constructor`/`operator` is not in the grammar), 36 `does not implement inherited abstract member` (a bodyless method in a *class* is an abstract member; the class is concrete), 6 `const` without initializer, 10 unresolved meta-names (`T`, `U`, `TFrom`), 10 misc. |
+| `skip:mixed` | 36 | 8 flipped on the new wrap; of the rest, 9 unbound names, 6 parse, 3 abstract-member, 3 unresolved types, 7 misc. |
+| `syntax-snippet`/`elided`/`ebnf` | 33 | parse errors throughout — these blocks are grammar text and syntax schemata, not Bezel. |
+
+So the corpus's skips are overwhelmingly **genuine**: a signature listing cannot
+be compiled without synthesizing bodies, and synthesizing bodies would mutate
+what the document says. The one large class that *is* reachable is the unbound
+names, and `env.bzl` reaches it a case at a time.
+
+### What shipped
+
+1. **`wrap:mixed`** — the composite wrap. `classify_wrap` dispatches the whole
+   block on its first line, so a block mixing top-level declarations with
+   top-level statements could never compile. `split_top_level_items` /
+   `classify_top_level_item` / `wrap_mixed` sort the block's items into imports /
+   module declarations / class members / statements and emit all four in one
+   file. Lossless by construction (unit-pinned): **enclosing scaffolding only**,
+   no token of the document is rewritten, reordered within its group, or dropped.
+2. **`env.bzl`** — ambient bindings, the value-level counterpart of
+   `preamble.bzl`. `//@ <local|member|type> <name>` entries, opted into per case
+   with `notes: env:a,b`. A missing anchor or unknown name FAILS the case
+   (`env-error`) rather than silently doing nothing.
+3. **`notes` is now a `;`-separated token list** (`note_tokens`), exact-match, so
+   a case can carry `wrap:mixed; preamble; env:score` and prose that merely
+   contains a keyword does not switch behaviour on.
+
+### The discipline that makes an `env:` row worth having
+
+An entry's type must be **forced by the fragment's own text**, with the
+derivation recorded beside it. This is not fussiness. An auto-solver written to
+size the bucket "solved" 74 of the 176 by trying spellings until the compiler
+stopped complaining, and its solutions were riding on accept-anything holes —
+which is how this pass found two silent-accepts:
+
+- **#3153** — a call on a non-callable value (`int`/`string` local, parameter,
+  static field) compiles and the call is silently **dropped**. Found because the
+  solver bound `DoWork` to `int` in spec_0275/0276 and `DoWork();` compiled.
+- **#3155** — `x?.M` **never resolves the member**: any name on any receiver
+  compiles and yields an empty/zero value, so an adjacent `??` is not taken
+  either. Plain `x.M` on the same receiver is correctly rejected. Found because
+  the solver bound `user` to `int` in guide1_0015 and `user?.Name` compiled.
+
+Every shipped entry is **anti-vacuity proven**: substituting a wrong-typed
+binding turns every row that opted into it red (17 of 18 rows; spec_0110 is the
+deliberate exception — §18.7 interpolates any type, so what that row checks is
+the `$@"…{user}…"` form itself).
+
+### Counts
+
+| | before this pass | after |
+|---|---|---|
+| manifest rows | 571 | 571 |
+| active (`error`/`fragment`/`program`) | 137 | **178** |
+| skip | 434 | **393** |
+| `skip:incomplete-fragment` | 176 | 158 |
+| unit tests (`test_conformance.py`) | 61 | 82 |
+
+**A counting correction.** The v0.247 record above reports 567 rows / 138 active
+/ 429 skip. The file holds **571** rows (`awk -F'\t' 'NR>1' manifest.tsv | wc -l`),
+571 case files, and the sweep counted **137** active before this pass. The
+manifest↔cases bijection is intact; it is the recorded totals that were off by
+four. Use the measured numbers.
+
+### Where the next increment is
+
+- **`skip:incomplete-fragment` (158)** is still the largest class and still the
+  most reachable one: extend `env.bzl` an entry at a time, deriving each type
+  from the fragment's text and proving it by mutation. Roughly 100 distinct
+  names remain; the ones needing a *typed helper object* (a `Reading` with a
+  `Celsius`, a `parser` with `TryParse`) want a preamble stub as well.
+- **Rows whose ambient is a called helper are blocked on #3153**, and rows whose
+  ambient is a `?.` receiver on #3155 — binding those today would produce rows
+  that pass because of the hole. Revisit when they close.
+- **The `error` class is still exit-code-only** (25 rows): any non-zero exit
+  passes, so an error row can pass on an unrelated diagnostic. A `diag:<substr>`
+  expectation would make those rows non-vacuous and would let the reject-demo
+  blocks currently sitting in the residual (`ambiguous call to …`, `bare throw;`)
+  become live `error` rows.
+- **The signature classes stay skipped on evidence**, not assumption: their
+  blocks are API sketches whose bodies the documents deliberately elide.
