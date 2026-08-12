@@ -109,11 +109,15 @@ additive feature catch-up, in that order.
     disposition per 0091 §5.
 21. ⏳ **[#3087](https://github.com/s8lap/bezel-lang/issues/3087)** — the v0.250 marked named
     slot (proposal 0092): the optional `move` in `NamedSlot`, the per-slot admission checks and
-    six-entry rejection taxonomy, and the name-keyed payload-transfer lowering. **After #3056
+    rejection taxonomy, and the name-keyed payload-transfer lowering. **After #3056
     and with/behind [#1409](https://github.com/s8lap/bezel-lang/issues/1409)** — there is no
     shipped named-slot parser to amend, so this lands as part of (or immediately after) the
-    named-destructure implementation itself. [#3094](https://github.com/s8lap/bezel-lang/issues/3094)'s
-    eventual ruling gates only its move-only-value-payload liftable, not the v1.
+    named-destructure implementation itself. [#3094](https://github.com/s8lap/bezel-lang/issues/3094)
+    **resolved at v0.251** (2026-08-12): the marked named slot now covers **move-only value
+    payload fields** too (condition (ii) widened; the taxonomy's move-only rejection arm
+    retired) — implement the admission per spec §19.3/§35.5, v0.251. The positional/borrowing
+    move-only-payload semantics ride the owning-match tracker
+    [#2045](https://github.com/s8lap/bezel-lang/issues/2045) stage 3, not this item.
 
 ## Standing notes for the run
 
