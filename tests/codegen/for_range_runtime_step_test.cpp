@@ -11,18 +11,22 @@
 #include "test_harness.hpp"
 using bezel::test::runAot;
 namespace { int run(const std::string& p){ auto r=runAot(p); return r.ran?r.exitCode:-999; } }
-// §16.4 (#1623): a computed step of zero must raise ArgumentException at
-// GetEnumerator time. Wrap the step-0 statement in try/catch ArgumentException
-// — returns 0 when raised (pass), 7 otherwise (fail). Without the codegen guard
-// the counted loop never advances (induction adds 0) and hangs, so this helper
+// §16.4 (v0.242, #3052 — was #1623): a computed step of zero raises
+// `OverflowException` **at the range expression**. (Through v0.241 it was
+// `ArgumentException` at `GetEnumerator` time; the fault type and site both
+// moved with the revision — see range_step_construction_3052_test.cpp for the
+// rule's own tests, including the never-iterated case only the new site
+// catches.) Wrap the step-0 statement in try/catch OverflowException —
+// returns 0 when raised (pass), 7 otherwise (fail). Without the guard the
+// counted loop never advances (induction adds 0) and hangs, so this helper
 // only terminates under the fix.
 namespace {
-int expectsArgThrow(const std::string& stmt) {
+int expectsStepZeroThrow(const std::string& stmt) {
     return run(
         "module M; class C public static method Main(): int "
         "  var ok: int := 7; "
         "  try " + stmt + " "
-        "  catch var e: ArgumentException => do ok := 0; end "
+        "  catch var e: OverflowException => do ok := 0; end "
         "  end; "
         "  return ok; "
         "end Main; end C;");
@@ -52,23 +56,25 @@ BEZEL_TEST(for_range_runtime_step, constant_step_unchanged) {
         "  return sum; end Main; end C;"), 30);
 }
 
-// §16.4 (#1623): a COMPUTED step of zero is admitted at construction and raises
-// ArgumentException at GetEnumerator time. The compiler-optimized counted loop
-// (§16.5) bypasses the IEnumerable protocol and must replicate the check, else
-// the induction adds 0 and the loop never terminates. Inline-literal form:
-// `for var i in 0..10 step z` with z = 0 (lowerRangeFor inline-range path).
+// §16.4 (v0.242): a COMPUTED step of zero faults at the range expression. In
+// the inline-literal `for` form the range expression IS the loop's iterable,
+// so the fault site is the loop header — the same place the pre-v0.242
+// `ArgumentException` guard stood; only the exception type moved. The
+// compiler-optimized counted loop (§16.5) still must carry the check, else the
+// induction adds 0 and the loop never terminates.
 BEZEL_TEST(for_range_runtime_step, range_step_zero_inline_raises_16_4) {
-    BEZEL_EXPECT_EQ(expectsArgThrow(
+    BEZEL_EXPECT_EQ(expectsStepZeroThrow(
         "var z: int := 0; var touched: int := 0; "
         "for var i in 0..10 step z do touched := i; end;"), 0);
 }
 
-// §16.4 (#1623): the exact issue repro — a Range VARIABLE carrying a computed
-// step-0, iterated via the optimized counted loop (lowerRangeFor Range-struct
-// path). `var r := 0..10 step z; for var i in r` with z = 0 raises
-// ArgumentException (was: an emitted infinite loop / process hang).
+// §16.4 (v0.242): the #1623 repro — a Range VARIABLE carrying a computed
+// step-0. The fault now happens at the `var r := 0..10 step z` line (the range
+// EXPRESSION), so the `for` is never reached; before v0.242 it happened at the
+// `for` (GetEnumerator time), and before #1623 not at all (an emitted infinite
+// loop / process hang). The catch is what both revisions observe.
 BEZEL_TEST(for_range_runtime_step, range_var_step_zero_raises_16_4) {
-    BEZEL_EXPECT_EQ(expectsArgThrow(
+    BEZEL_EXPECT_EQ(expectsStepZeroThrow(
         "var z: int := 0; var r := 0..10 step z; var touched: int := 0; "
         "for var i in r do touched := i; end;"), 0);
 }

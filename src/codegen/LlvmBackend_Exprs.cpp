@@ -744,6 +744,24 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             stepV = s->getType() == i64()
                         ? s
                         : builder_.CreateSExt(s, i64(), "range.step");
+            // §16.4 (v0.242, #3052), verbatim: "A step of zero is rejected
+            // **at construction**: … evaluating a range expression whose
+            // computed step is zero raises `OverflowException` at the
+            // expression." This is THE construction site for a `Range<T>`
+            // value, and §16.4 continues: "Range expressions are the sole
+            // producer of `Range<T>` values … so no `Range<T>` value with a
+            // zero step can exist." The guard therefore replaces — not
+            // supplements — the pre-v0.242 `GetEnumerator`-time
+            // `ArgumentException`, which this revision deletes: the fault is
+            // strictly earlier and strictly more programs fault (a
+            // constructed-but-never-iterated zero-step range now faults).
+            //
+            // A CONSTANT zero step never reaches here (sema rejects it at
+            // compile time), so the guard's compare folds away for every
+            // constant step and costs one predicted branch otherwise.
+            emitGuardThrow(builder_.CreateICmpEQ(stepV, builder_.getInt64(0),
+                                                 "range.step0"),
+                           "OverflowException");
         }
         // flags: bit 0 = IsEndInclusive; bit 1 = startOpen; bit 2 = endOpen.
         uint8_t flags = 0;

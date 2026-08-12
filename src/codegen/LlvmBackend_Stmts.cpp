@@ -4569,16 +4569,20 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "rfv.body", currentFn_);
         auto* incBB  = llvm::BasicBlock::Create(llvm_, "rfv.inc",  currentFn_);
         auto* endBB  = llvm::BasicBlock::Create(llvm_, "rfv.end",  currentFn_);
-        // §16.4 (v0.183, #1623): a computed step of zero raises ArgumentException
-        // at GetEnumerator time. The compiler-optimized counted loop bypasses the
-        // IEnumerable protocol (§16.5 "Compiler optimization") and must keep
-        // observable behavior identical, so replicate the check here — otherwise a
-        // step-0 Range variable enters a counted loop that never advances (the
-        // induction adds 0) and hangs. A stepless range stores step=1 (see the
-        // RangeExpr-in-value-position lowering), so this only fires for an explicit
-        // computed step-0.
-        emitGuardThrow(builder_.CreateICmpEQ(step, builder_.getInt32(0), "rfv.step0"),
-                       "ArgumentException");
+        // §16.4 (v0.242, #3052): the pre-v0.242 `ArgumentException` guard that
+        // stood here — the at-`GetEnumerator` half of the three-way zero-step
+        // limbo — is DELETED with the rule that required it. The step is now
+        // validated where the `Range<T>` value is CONSTRUCTED (the range
+        // expression; see the RangeExpr-in-value-position lowering in
+        // LlvmBackend_Exprs.cpp), and §16.4 states the consequence normatively:
+        // "Range expressions are the sole producer of `Range<T>` values (the
+        // record is compiler-intrinsic and declares no constructor, §16.3;
+        // §17.7's closed-constructor-surface rule …), so no `Range<T>` value
+        // with a zero step can exist." §16.3 relies on the same fact ("No
+        // operation needs a zero-step case: a `Range<T>` value with a zero step
+        // cannot exist, §16.4"). A step-0 range reaching this loop is therefore
+        // unconstructible, and re-checking here would reintroduce exactly the
+        // GetEnumerator-time behavior the revision removed.
         builder_.CreateBr(condBB);
 
         builder_.SetInsertPoint(condBB);
@@ -4646,15 +4650,17 @@ bool Emitter::lowerRangeFor(const ast::ForStmt& fs) {
             // above (previously this case bailed to the "not implemented" catch-all).
             if (s->getType() != lo->getType())
                 s = builder_.CreateSExtOrTrunc(s, lo->getType());
-            // §16.4 (v0.183, #1623): a computed step of zero raises ArgumentException
-            // at GetEnumerator time. The constant-step-0 case is handled above
-            // (cs && cs->isZero()); a RUNTIME step-0 reaches here and must raise
-            // instead of entering the counted loop, which would add 0 forever and
-            // hang. The optimized counted loop must keep GetEnumerator's observable
-            // behavior (§16.5 "Compiler optimization").
+            // §16.4 (v0.242, #3052): the range EXPRESSION is right here — the
+            // inline `lo..hi step s` of a `for` header — so this IS the
+            // construction site, and a computed zero step raises
+            // `OverflowException` "at the expression" (the fault type of the
+            // revision's joint checked-posture ruling; through v0.241 it was
+            // `ArgumentException` deferred to `GetEnumerator`). The
+            // constant-step-0 case never reaches here (sema rejects it, and
+            // the `cs && cs->isZero()` early return above declines anyway).
             emitGuardThrow(builder_.CreateICmpEQ(
                                s, llvm::ConstantInt::get(lo->getType(), 0), "rf.step0"),
-                           "ArgumentException");
+                           "OverflowException");
             llvm::Value* stepNeg = builder_.CreateICmpSLT(
                 s, llvm::ConstantInt::get(lo->getType(), 0), "rf.desc");
             // #1243 §21.4: hidden counter + body-visible var (per rfv path above).

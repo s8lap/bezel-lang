@@ -8640,27 +8640,37 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         if (re->lo) visitExpr(*re->lo);
         if (re->hi) visitExpr(*re->hi);
         if (re->step) visitExpr(*re->step);
-        // §16.4 (#1628): "A literal step of zero is a compile error; a
-        // computed step of zero is admitted at construction and raises
-        // ArgumentException at GetEnumerator()." The literal/computed
-        // boundary is the same compile-time-constant fold already used a few
-        // lines up this section for the direction/sign-mismatch warning
-        // ("both endpoints and step are constants or constant after
-        // folding") — foldIntConstExprTC resolves an integer literal, unary
-        // +/-/~, const-arithmetic, and a `const` identifier reference, which
-        // is exactly the set of forms LLVM also collapses to a ConstantInt
-        // during lowering (the `cs->isZero()` check in
-        // Emitter::lowerRangeFor, LlvmBackend_Stmts.cpp). A non-constant
-        // (runtime-computed) step folds to nullopt and is left alone here —
-        // that case is guarded at runtime by #1623's emitGuardThrow.
+        // §16.4 (v0.242, #3052 — was #1628), verbatim: "A step of zero is
+        // rejected **at construction**: a literal (or constant-folded) step of
+        // zero is a compile error at the range expression, and evaluating a
+        // range expression whose computed step is zero raises
+        // `OverflowException` at the expression."
+        //
+        // The literal/constant-folded boundary is the same compile-time
+        // constant fold already used a few lines up this section for the
+        // direction/sign-mismatch warning ("both endpoints and step are
+        // constants or constant after folding") — foldIntConstExprTC resolves
+        // an integer literal, unary +/-/~, const-arithmetic, and a `const`
+        // identifier reference, which is exactly the set of forms LLVM also
+        // collapses to a ConstantInt during lowering (the `cs->isZero()`
+        // check in Emitter::lowerRangeFor, LlvmBackend_Stmts.cpp).
+        //
+        // A non-constant (runtime-computed) step folds to nullopt and is left
+        // alone here — that case is the construction-site emitGuardThrow in
+        // codegen. So does a step expression carrying its OWN constant fault:
+        // §17.14 evaluation faults make foldIntConst DECLINE (a constant
+        // out-of-domain shift count, §6.5/#3045; a constant `x / 0`), so
+        // `step (1 << 64)` is reported as the shift fault it is and never
+        // misread here as a zero step.
         if (re->step) {
             if (auto stepV = foldIntConstExprTC(*re->step); stepV && *stepV == 0)
                 ctx_.diagnostics().report(
                     Severity::Error, re->step->span.begin,
                     "a range step of zero is a compile error (§16.4) when "
-                    "the step is a compile-time constant — a step whose "
-                    "value is only known at runtime is still permitted, and "
-                    "raises `ArgumentException` at `GetEnumerator()` if it "
+                    "the step is a compile-time constant, including after "
+                    "constant folding — a step whose value is only known at "
+                    "runtime is still permitted, and raises "
+                    "`OverflowException` at the range expression if it "
                     "evaluates to zero");
         }
         // fix #499 / §9.8: give the RangeExpr itself a Range-named type so
