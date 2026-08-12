@@ -2931,9 +2931,13 @@ bool MethodOwnership::isBorrowBearingRecordImpl(
         const common::RecordSubstEnv* env) const {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
-    const auto* decl =
-        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
-    if (!decl || decl->kind != ast::TypeDeclKind::Record) return false;
+    // fix #3145 (§2.8.3 rule 4, v0.252): symbol-side, exactly as its #1595
+    // lockstep partner common::isBorrowBearingRecordCommon. Both used to cast
+    // `->decl` and walk the AST, which is null for an import — so BOTH answered
+    // "not borrow-bearing" for every imported record and §9.7's reject never
+    // fired across a module boundary.
+    const sema::TypeSymbol* ts = rt->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record) return false;
     // #1611: a record TypeRef already being visited on this call chain
     // (reached only through a self- or mutually-referential STATIC field,
     // since an instance-field cycle is already rejected earlier by
@@ -2944,44 +2948,23 @@ bool MethodOwnership::isBorrowBearingRecordImpl(
     // §9.7 / §30.1 (#2145): this instantiation's substitution environment for
     // the field walk below (empty → declaration-site behaviour).
     common::RecordSubstEnv myEnv;
-    common::seedRecordSubstEnv(*decl, *rt, env, myEnv);
+    common::seedRecordSubstEnv(*ts, *rt, env, myEnv);
     const common::RecordSubstEnv* fieldEnv =
         myEnv.map.empty() ? nullptr : &myEnv;
 
-    const bool carrying = [&]() -> bool {
-        // Positional record fields (§9.1) — never static, so no exclusion
-        // needed.
-        for (const ast::Param& f : decl->positionalFields) {
-            if (!f.type) continue;
-            if (recordFieldIsBorrowCarrying(ctx_.resolvedType(*f.type), seen,
-                                            fieldEnv))
-                return true;
-        }
-        // Body-record reference fields (§9.2).
-        for (const auto& m : decl->members) {
-            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
-                // §9.2 (v0.182) / #1611: "Static members are ignored... The
-                // same static-member exemption applies wherever this
-                // membership rule is reused" — a static field is per-TYPE
-                // storage, not part of any instance's own layout, so it
-                // neither qualifies nor disqualifies a record's
-                // borrow-bearing-ness (and, being legally self- or mutually-
-                // referential per the §9.2 `Origin` pattern, must not be
-                // walked as if it were instance storage). Mirrors
-                // Resolver::recordValueContainsSelf's own static exclusion
-                // (TypeResolution_Checks.cpp). // per §9.2, §9.7
-                bool isStatic = false;
-                for (std::string_view mod : fd->modifiers)
-                    if (mod == "static") { isStatic = true; break; }
-                if (isStatic) continue;
-                if (fd->type &&
-                    recordFieldIsBorrowCarrying(ctx_.resolvedType(*fd->type),
-                                                seen, fieldEnv))
-                    return true;
-            }
-        }
-        return false;
-    }();
+    // §9.1 positional fields and §9.2 body fields in one walk. The `static`
+    // exclusion moved INTO sema::anyRecordStorageField and is unchanged in
+    // substance: §9.2 (v0.182) / #1611 — "Static members are ignored… The same
+    // static-member exemption applies wherever this membership rule is reused"
+    // — a static field is per-TYPE storage, not part of any instance's layout,
+    // so it neither qualifies nor disqualifies a record's borrow-bearing-ness
+    // (and, being legally self- or mutually-referential per the §9.2 `Origin`
+    // pattern, must not be walked as if it were instance storage). Positional
+    // fields carry no modifiers and are never static. // per §9.2, §9.7
+    const bool carrying = sema::anyRecordStorageField(
+        ts, ctx_, [&](const sema::Symbol*, const sema::TypeRef* ft) {
+            return ft && recordFieldIsBorrowCarrying(ft, seen, fieldEnv);
+        });
     // PATH semantics, not visited-set memoization: un-mark on exit so a
     // SIBLING field can re-classify the same field TypeRef under its OWN
     // substitution env — one shared `NRec<X>` node reached through both
@@ -3311,16 +3294,21 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
         // the null-source ACCEPT recognizer. A builtin span view (typeIsSpan —
         // no user Record decl, no positional fields) keeps the conservative
         // every-arg check: we have no field info to gate on. // per §9.7
-        const ast::TypeDecl* recordDecl = nullptr;
+        // fix #3145 (§9.7 / §2.8.3 rule 4, v0.252): symbol-side, so the per-field
+        // gate below is reached for an imported record too. Through `->decl`
+        // `recordDecl` stayed null for every import, which left the escape check
+        // on its conservative every-argument path — not unsound here, but it
+        // means the field-level ACCEPT (a non-borrow-carrying field) was never
+        // granted across a module boundary either.
+        const sema::TypeSymbol* recordTs = nullptr;
         common::RecordSubstEnv recordEnv;
         const common::RecordSubstEnv* fieldEnv = nullptr;
         std::function<bool(const sema::TypeRef*)> isBorrowCarryingField;
         if (!typeIsSpan && rt->declaration) {
-            const auto* decl =
-                dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
-            if (decl && decl->kind == ast::TypeDeclKind::Record) {
-                recordDecl = decl;
-                common::seedRecordSubstEnv(*decl, *rt, /*incoming=*/nullptr,
+            const sema::TypeSymbol* ts = rt->declaration;
+            if (ts->kind == ast::TypeDeclKind::Record) {
+                recordTs = ts;
+                common::seedRecordSubstEnv(*ts, *rt, /*incoming=*/nullptr,
                                            recordEnv);
                 fieldEnv = recordEnv.map.empty() ? nullptr : &recordEnv;
                 isBorrowCarryingField = [&](const sema::TypeRef* ft) -> bool {
@@ -3380,16 +3368,20 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
         // arg sat at source index 0 of a value-typed field index would slip
         // past the walker (under-reject / UAF). The named-arg lookup below
         // matches sema's §22.5 binding (bindArgsToParams) and the codegen.
-        std::vector<const ast::CallArgument*> fieldArg(
-            recordDecl ? recordDecl->positionalFields.size() : 0, nullptr);
-        if (recordDecl) {
+        // fix #3145: the positional-field list is symbol-side, so the §22.5
+        // binding below works for an imported record too. Name and declared
+        // type both come off the FieldSymbol.
+        const std::vector<const sema::Symbol*> posFields =
+            sema::recordPositionalFieldSymbols(recordTs);
+        std::vector<const ast::CallArgument*> fieldArg(posFields.size(),
+                                                       nullptr);
+        if (recordTs) {
             bool allPositional = true;
             for (const auto& a : ne->args)
                 if (!a.name.empty()) { allPositional = false; break; }
             if (allPositional) {
                 std::size_t argIdx = 0;
-                for (std::size_t fi = 0;
-                     fi < recordDecl->positionalFields.size(); ++fi) {
+                for (std::size_t fi = 0; fi < posFields.size(); ++fi) {
                     if (argIdx < ne->args.size() && ne->args[argIdx].value)
                         fieldArg[fi] = &ne->args[argIdx];
                     ++argIdx;
@@ -3398,9 +3390,8 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
                 for (std::size_t ai = 0; ai < ne->args.size(); ++ai) {
                     const ast::CallArgument& a = ne->args[ai];
                     if (a.name.empty()) break;  // mixed: sema rejects
-                    for (std::size_t fi = 0;
-                         fi < recordDecl->positionalFields.size(); ++fi) {
-                        if (recordDecl->positionalFields[fi].name == a.name) {
+                    for (std::size_t fi = 0; fi < posFields.size(); ++fi) {
+                        if (posFields[fi]->name == a.name) {
                             fieldArg[fi] = &a;
                             break;
                         }
@@ -3408,23 +3399,21 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
                 }
             }
         }
-        if (recordDecl) {
+        if (recordTs) {
             // Iterate the BOUND field, not the source position. A field that
             // is non-borrow-carrying (an int, an enum, …) holds a value, not
             // a borrow — the arg bound to it cannot be a borrow's source.
-            for (std::size_t fi = 0;
-                 fi < recordDecl->positionalFields.size(); ++fi) {
-                const ast::Param& f = recordDecl->positionalFields[fi];
-                if (f.type &&
-                    !isBorrowCarryingField(ctx_.resolvedType(*f.type)))
-                    continue;
+            for (std::size_t fi = 0; fi < posFields.size(); ++fi) {
+                const sema::TypeRef* ft =
+                    sema::storageComponentType(posFields[fi], ctx_);
+                if (ft && !isBorrowCarryingField(ft)) continue;
                 const ast::CallArgument* a =
                     (fi < fieldArg.size()) ? fieldArg[fi] : nullptr;
                 if (!a || !a->value) continue;
                 if (checkArg(*a->value)) return;
             }
         } else {
-            // builtin span (no recordDecl) — conservative: every arg is
+            // builtin span (no record symbol) — conservative: every arg is
             // potentially a borrow source, so check each verbatim.
             for (std::size_t i = 0; i < ne->args.size(); ++i) {
                 const ast::CallArgument& a = ne->args[i];
@@ -8239,15 +8228,23 @@ void MethodOwnership::checkRecordFromTemporary(const ast::NewExpr& ne) {
         ne.type ? ctx_.resolvedType(*ne.type) : ctx_.exprType(ne);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return;
-    const auto* decl =
-        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
-    if (!decl || decl->kind != ast::TypeDeclKind::Record) return;
+    // fix #3145 (§9.7 / §2.8.3 rule 4, v0.252): THE reject this family exists
+    // for. Reading the field list through `->decl` made it null for every
+    // imported record, so this returned before checking anything and the
+    // dangling-borrow diagnostic never fired across a module boundary — an
+    // accepted program the spec requires be rejected. Measured: the identical
+    // `new Holder(new Res(1), 7)` is rejected when `Holder` is declared locally
+    // and compiles clean when it is imported.
+    const sema::TypeSymbol* ts = rt->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record) return;
     // Positional records (§9.1): argument i binds to positional field i.
-    const auto& fields = decl->positionalFields;
+    const std::vector<const sema::Symbol*> fields =
+        sema::recordPositionalFieldSymbols(ts);
     for (std::size_t i = 0; i < ne.args.size() && i < fields.size(); ++i) {
-        const ast::Param& f = fields[i];
-        if (!f.type) continue;
-        if (!fieldTypeIsBorrowCarrying(ctx_.resolvedType(*f.type))) continue;
+        const sema::Symbol* f = fields[i];
+        const sema::TypeRef* ft = sema::storageComponentType(f, ctx_);
+        if (!ft) continue;
+        if (!fieldTypeIsBorrowCarrying(ft)) continue;
         const ast::Expr* arg = ne.args[i].value.get();
         if (!arg || !exprIsTemporary(*arg)) continue;
         // §9.7 null-source form: a `null` argument stores no borrow (the field
@@ -8257,7 +8254,7 @@ void MethodOwnership::checkRecordFromTemporary(const ast::NewExpr& ne) {
             Severity::Error, ne.span.begin,
             std::string("a borrow-bearing record may not be constructed from a "
                         "temporary bound to its borrow-carrying field `") +
-            std::string(f.name) +
+            std::string(f->name) +
             "` — the temporary's lifetime ends at this construction "
             "expression, so the record would immediately outlive that borrow's "
             "source (a dangling borrow); bind the source to a named local whose "

@@ -620,8 +620,13 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
 // the type is not resolvable (an imported member with no local ast::Type node
 // and no side-table entry) — the caller then treats the component conservatively
 // as admissible.
-static const TypeRef* storageComponentType(const Symbol* m,
-                                           const SemaContext& ctx) {
+//
+// fix #3145: no longer `static`. It is declared in sema/Symbol.hpp because it is
+// the ONE accessor that consults both sources, and being file-local is exactly
+// why two more copies grew elsewhere (Sendability.cpp's lambda, and
+// OwnershipFacts.cpp's raw AST walk, which simply saw nothing for an import).
+const TypeRef* storageComponentType(const Symbol* m,
+                                    const SemaContext& ctx) {
     if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
         // §9.1 positional field: type rides on the Param.
         if (fs->posParam && fs->posParam->type)
@@ -637,6 +642,43 @@ static const TypeRef* storageComponentType(const Symbol* m,
         return ctx.importedMemberType(m);
     }
     return nullptr;
+}
+
+// fix #3145 (§9.1 / §9.2 / §2.8.3 rule 4, v0.252): the symbol-side storage-field
+// walk. See the contract in sema/Symbol.hpp.
+//
+// `static` is excluded because a static field is per-TYPE storage, not part of a
+// VALUE — the same exclusion Resolver::recordValueContainsSelf and the AST walk
+// this replaces both make. Positional fields carry no modifiers and are never
+// static, so one filtered loop over `members` is exactly equivalent to the old
+// "positionalFields, then non-static body FieldDecls" pair.
+bool anyRecordStorageField(
+    const TypeSymbol* ts, const SemaContext& ctx,
+    const std::function<bool(const Symbol*, const TypeRef*)>& pred) {
+    if (!ts) return false;
+    for (Symbol* m : ts->members) {
+        const auto* fs = dynamic_cast<const FieldSymbol*>(m);
+        if (!fs) continue;  // methods / ctors / consts / properties: not a field
+        bool isStatic = false;
+        for (std::string_view mod : fs->modifiers)
+            if (mod == "static") { isStatic = true; break; }
+        if (isStatic) continue;
+        if (pred(m, storageComponentType(m, ctx))) return true;
+    }
+    return false;
+}
+
+// fix #3145: the indexed view. `posParam != nullptr` is the positional marker on
+// BOTH sides — a real `ast::Param` locally, a synthetic one on import (#2516) —
+// and `members` preserves declaration order on both, so filtering keeps
+// positional field i at index i.
+std::vector<const Symbol*> recordPositionalFieldSymbols(const TypeSymbol* ts) {
+    std::vector<const Symbol*> out;
+    if (!ts) return out;
+    for (Symbol* m : ts->members)
+        if (auto* fs = dynamic_cast<const FieldSymbol*>(m))
+            if (fs->posParam) out.push_back(m);
+    return out;
 }
 
 // §9.2 v0.158 admissible-component-type predicate (one recursive rule, applied

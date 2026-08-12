@@ -13,6 +13,7 @@
 // duration of compilation.
 
 #include <cstdint>
+#include <functional>  // #3145: anyRecordStorageField's predicate
 #include <memory>
 #include <string>
 #include <string_view>
@@ -543,6 +544,49 @@ struct ExternDeclSymbol : Symbol {
     // The originating extern method declaration (for its return type).
     const ast::ExternDecl* externDecl = nullptr;
 };
+
+// §9.1 / §9.2 / §2.8.3 rule 4 — THE record-storage accessors, symbol-side.
+//
+// fix #3145 (family F10 of umbrella #3152). Every §9.7 / §9.2 field walk used to
+// go through `dynamic_cast<const ast::TypeDecl*>(ts->decl)` and then iterate
+// `decl->positionalFields` + `decl->members`. `ModuleLoader` never assigns
+// `Symbol::decl` for an imported type, so those walks saw NO fields at all for
+// an import and every predicate built on them answered the empty-walk default.
+// For §9.7 that default is "not borrow-bearing", which silently disabled an
+// ownership-SOUNDNESS reject across module boundaries.
+//
+// The symbol table carries the fields on both sides. A positional field is a
+// `FieldSymbol` locally (SymbolCollection.cpp, `posParam` -> the real
+// `ast::Param`) and on import too (#2516, `posParam` -> a synthetic `ast::Param`
+// with a null `type`, kept precisely so the positional/body distinction survives
+// without an AST). So `TypeSymbol::members` is a complete storage list either
+// way, and these two accessors are the ONE way to read it.
+
+// Resolve a record storage component (a §9.1 positional field, a body field, or
+// an auto-property) to its declared type, CONSULTING BOTH SOURCES in order:
+// the positional `Param`'s type, then the body `FieldDecl` / `PropertyDecl`'s
+// type, then the importer's `fieldTypes_` side table via
+// `SemaContext::importedMemberType`. Null when the type is not resolvable —
+// callers treat that conservatively.
+//
+// This was `static` in SymbolCollection.cpp, which is why Sendability.cpp grew a
+// second copy as a local lambda and OwnershipFacts.cpp a third as a raw AST
+// walk. It is declared here so there is one.
+const TypeRef* storageComponentType(const Symbol* m, const SemaContext& ctx);
+
+// True when `pred(field, fieldType)` holds for ANY of `ts`'s §9.1/§9.2 storage
+// FIELDS — positional and body alike, `static` fields excluded (per-TYPE
+// storage, not per-value; mirrors Resolver::recordValueContainsSelf). Field
+// order is declaration order. Auto-properties are deliberately NOT included:
+// the §9.7 walk this serves has always been fields-only, and widening it here
+// would be a silent semantic change riding on a plumbing fix.
+bool anyRecordStorageField(
+    const TypeSymbol* ts, const SemaContext& ctx,
+    const std::function<bool(const Symbol*, const TypeRef*)>& pred);
+
+// `ts`'s §9.1 positional fields, in declaration order — the indexed view, for
+// the sites that pair constructor argument i with positional field i.
+std::vector<const Symbol*> recordPositionalFieldSymbols(const TypeSymbol* ts);
 
 // §9.2 / §22.9: a member is an *auto-property* (`Name: T;`, optionally with an
 // initializer, no accessor bodies / arrow getter) — backed by compiler-

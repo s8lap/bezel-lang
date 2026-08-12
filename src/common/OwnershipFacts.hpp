@@ -456,6 +456,10 @@ struct RecordSubstEnv {
 // (`Outer<T>` wrapping `Inner<T>`) resolve to the outermost concrete argument.
 // Leaves `out` empty for a non-generic record or an uninstantiated use (no
 // genericArgs) — the declaration-site conservative behaviour. // per §9.7 #2145
+// fix #3145 (§2.8.3 rule 4, v0.252): the symbol-side overload. Prefer it — it is
+// correct for an imported type, where the AST overload has no decl to be given.
+void seedRecordSubstEnv(const sema::TypeSymbol& ts, const sema::TypeRef& rt,
+                        const RecordSubstEnv* incoming, RecordSubstEnv& out);
 void seedRecordSubstEnv(const ast::TypeDecl& decl, const sema::TypeRef& rt,
                         const RecordSubstEnv* incoming, RecordSubstEnv& out);
 

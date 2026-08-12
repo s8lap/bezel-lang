@@ -773,44 +773,38 @@ bool isBorrowBearingRecordCommon(
     std::unordered_set<const ast::TypeDecl*>* choiceSeen) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
-    const auto* decl =
-        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
-    if (!decl || decl->kind != ast::TypeDeclKind::Record) return false;
+    // fix #3145 (§2.8.3 rule 4, v0.252): the record test and the field walk both
+    // come off the TypeSymbol. This used to cast `rt->declaration->decl` to an
+    // `ast::TypeDecl` and walk THAT — null for every imported type, so the walk
+    // ran over no fields at all and the function returned its empty-walk default,
+    // "not borrow-bearing". §9.7's dangling-borrow REJECT is built on this
+    // predicate, so it silently did not fire across a module boundary: an
+    // accepted program that the spec requires be rejected. Measured — the same
+    // `new Holder(new Res(1), 7)` is rejected when `Holder` is local and compiles
+    // clean when it is imported.
+    const sema::TypeSymbol* ts = rt->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record) return false;
     if (!seen.insert(rt).second) return false;
 
     // §9.7 / §30.1 (#2145): this instantiation's substitution environment for
-    // the field walk below (empty → declaration-site behaviour).
+    // the field walk below (empty → declaration-site behaviour). The symbol
+    // overload reads `TypeSymbol::genericParams`, which carries the parameter
+    // names on both sides.
     RecordSubstEnv myEnv;
-    seedRecordSubstEnv(*decl, *rt, env, myEnv);
+    seedRecordSubstEnv(*ts, *rt, env, myEnv);
     const RecordSubstEnv* fieldEnv = myEnv.map.empty() ? nullptr : &myEnv;
 
-    const bool carrying = [&]() -> bool {
-        // Positional record fields (§9.1) — never static, so no exclusion
-        // needed.
-        for (const ast::Param& f : decl->positionalFields) {
-            if (!f.type) continue;
-            if (recordFieldTypeIsBorrowCarryingCommon(
-                    ctx.resolvedType(*f.type), ctx, seen, fieldEnv, choiceSeen))
-                return true;
-        }
-        // Body-record reference fields (§9.2); static fields are per-TYPE
-        // storage and excluded (mirrors Resolver::recordValueContainsSelf's
-        // own exclusion).
-        for (const auto& m : decl->members) {
-            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.get())) {
-                bool isStatic = false;
-                for (std::string_view mod : fd->modifiers)
-                    if (mod == "static") { isStatic = true; break; }
-                if (isStatic) continue;
-                if (fd->type &&
-                    recordFieldTypeIsBorrowCarryingCommon(
-                        ctx.resolvedType(*fd->type), ctx, seen, fieldEnv,
-                        choiceSeen))
-                    return true;
-            }
-        }
-        return false;
-    }();
+    // §9.1 positional fields and §9.2 body fields in one walk — they are all
+    // FieldSymbols on both sides, and `static` is excluded inside the helper
+    // (positional fields are never static, so this is exactly the old pair of
+    // loops). The field's declared type comes from `storageComponentType`, the
+    // one accessor that consults the positional Param, then the body FieldDecl,
+    // then the importer's side table.
+    const bool carrying = sema::anyRecordStorageField(
+        ts, ctx, [&](const sema::Symbol*, const sema::TypeRef* ft) {
+            return ft && recordFieldTypeIsBorrowCarryingCommon(
+                             ft, ctx, seen, fieldEnv, choiceSeen);
+        });
     // PATH semantics, not visited-set memoization: un-mark on exit so a
     // SIBLING field can re-classify the same field TypeRef under its OWN
     // substitution env — one shared `NRec<X>` node reached through both
@@ -902,6 +896,25 @@ std::string_view bareReturnHead(const ast::MethodDecl& md) {
 }
 
 }  // namespace
+
+// fix #3145 (§9.7 / §30.1 / §2.8.3 rule 4, v0.252): the SYMBOL-side seeding.
+// `TypeSymbol::genericParams` carries the parameter names on both sides (they
+// are `GenericParamSymbol`s, whose `name` is the Symbol's own), so this needs no
+// AST and no new metadata — the audit's family F6 records the same for the other
+// 22 generic-parameter readers. Semantics are otherwise identical to the AST
+// overload below, including the arity-mismatch behaviour.
+void seedRecordSubstEnv(const sema::TypeSymbol& ts, const sema::TypeRef& rt,
+                        const RecordSubstEnv* incoming, RecordSubstEnv& out) {
+    if (ts.genericParams.empty() || rt.genericArgs.empty()) return;
+    const std::size_t n =
+        std::min(ts.genericParams.size(), rt.genericArgs.size());
+    for (std::size_t i = 0; i < n; ++i) {
+        const sema::TypeRef* arg = rt.genericArgs[i];
+        const sema::Symbol* gp = ts.genericParams[i];
+        if (!arg || !gp) continue;
+        out.map.emplace(gp->name, resolveRecordFieldSubst(arg, incoming));
+    }
+}
 
 void seedRecordSubstEnv(const ast::TypeDecl& decl, const sema::TypeRef& rt,
                         const RecordSubstEnv* incoming, RecordSubstEnv& out) {
