@@ -322,6 +322,7 @@ spec_0319	spec	A7-Expressions	skip	n/a	blocked-on-#3056 (docs-ahead: move-marker
 spec_0320	spec	A8-Constants-and-literals	skip	n/a	skip:ebnf-grammar
 spec_0321	spec	owned-and-overload-resolution	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683; hand-added v0.250 — also docs-ahead on #3086: the owned pair itself rejects at HEAD pre-lift); also docs-ahead on #3056 (the identifier-operand move w)
 spec_0322	spec	193-Patterns	skip	n/a	blocked-on-#1409 (docs-ahead: named destructure v0.224 incl. the v0.250 marked slot, #3087; hand-added v0.250)
+spec_0323	spec	The-owning-match	skip	n/a	skip:mixed (top-level decls + statements; no single wrap; cf. #683; hand-added v0.251 — also docs-ahead on #2045 stage 3/#3094: the owning match itself and the move-only-value-payload transfer; label static per R7, no probe this train — no oracle binary in the docs lane)
 guide1_0000	guide1	1-The-two-declarations-you-will-actually-type	fragment	compiles	preamble
 guide1_0001	guide1	1-The-two-declarations-you-will-actually-type	fragment	compiles	preamble
 guide1_0002	guide1	3-Borrowing-the-default-for-just-let-me-use-it	skip	n/a	skip:incomplete-fragment
