@@ -42,6 +42,45 @@ static std::string owningRenameHint(std::string_view name) {
     return std::string();
 }
 
+// fix #3147 (§14.4 / §28.5 / §2.8.3 rule 4, v0.252; family F12 of the
+// imported-symbol seam #3152): the name of the BARE type parameter that is the
+// declared type of the `owned` field `fs` — `T` or `T?` — or "" when `fs` is
+// not an `owned` field, or its type is not a single-part name.
+//
+// Both sources in ONE place, which is the whole point: a LOCAL body field's
+// type is on its `ast::FieldDecl`; an IMPORTED body field has no AST node at
+// all (`ModuleLoader` never assigns `Symbol::decl`) and its reconstructed
+// TypeRef rides `SemaContext::importedMemberType`. A bare type parameter has no
+// TypeSymbol on either side — `Loader::lookupNamed` cannot resolve `T` — so the
+// imported spelling is a Named TypeRef with a null declaration whose
+// `importedName` is the parameter name.
+//
+// A POSITIONAL / primary-constructor field is deliberately NOT this check's
+// subject: `posParam` marks it on both sides (an imported one carries a
+// synthetic `ast::Param`, #2516), and the AST walk this replaced iterated
+// `ast::FieldDecl` members only, so skipping it keeps the local answer
+// identical.
+static std::string_view ownedBareTypeParamOfField(const FieldSymbol& fs,
+                                                  const SemaContext& ctx) {
+    bool isOwned = false;
+    for (std::string_view md : fs.modifiers)
+        if (md == "owned") { isOwned = true; break; }
+    if (!isOwned) return {};
+    if (fs.posParam) return {};  // §9.1 / §22.10 positional field — see above
+    if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs.decl)) {
+        if (!fd->type || !fd->type->name || fd->type->name->parts.size() != 1)
+            return {};
+        return fd->type->name->parts.back();
+    }
+    const TypeRef* ft = ctx.importedMemberType(&fs);
+    if (!ft || ft->kind != TypeRef::Kind::Named || ft->declaration) return {};
+    std::string_view n = ft->importedName;
+    // A qualified head (`Dep.Thing`) is not a type-parameter spelling; the local
+    // branch rejects it via `parts.size() != 1` and this is the same rejection.
+    if (n.empty() || n.find('.') != std::string_view::npos) return {};
+    return n;
+}
+
 int Resolver::builtinTypeArity(std::string_view n) {
     if (n == "Type" || n == "IDisposable" || n == "IAsyncDisposable" ||
         n == "Subscription" || n == "CancellationToken" ||
@@ -1919,49 +1958,59 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         // instantiation site (paralleling the §14.4 owning-collection element
         // check and the `[N owned]T` rule of spec L1946). Fires for every
         // spelling — typed local / field / parameter / `new` — like §14.4.
+        //
+        // fix #3147 (§2.8.3 rule 4, v0.252; family F12 of the imported-symbol
+        // seam #3152): this walk used to run over the DECLARING type's
+        // `ast::TypeDecl` member list. `tsym` here is the type at a USE site, so
+        // it is routinely IMPORTED — and `ModuleLoader` never assigns
+        // `Symbol::decl` for an imported type, so the whole check was skipped
+        // across a module boundary. MEASURED on a0b655e with a real two-module
+        // build: `public class HolderO<T> where T: class` carrying
+        // `public owned f: T?` in the DEPENDENCY admitted `HolderO<string>` in
+        // the importer with NO diagnostic at any severity, while the identical
+        // declarations compiled as ONE module produced the §28.5 reject below.
+        //
+        // The walk is now over `tsym->members` — FieldSymbols, which BOTH sides
+        // populate — and the field's declared type comes from
+        // `ownedBareTypeParamOfField`, which reads the local `ast::FieldDecl`
+        // and the imported `SemaContext::importedMemberType` in ONE place.
         if (tsym->kind == ast::TypeDeclKind::Class) {
-            if (auto* gtd = dynamic_cast<const ast::TypeDecl*>(tsym->decl)) {
-                for (const auto& mem : gtd->members) {
-                    auto* fd = dynamic_cast<const ast::FieldDecl*>(mem.get());
-                    if (!fd || !fd->type || !fd->type->name) continue;
-                    bool isOwned = false;
-                    for (const auto& md : fd->modifiers)
-                        if (md == "owned") { isOwned = true; break; }
-                    if (!isOwned) continue;
-                    // The field's type must be a bare type parameter of tsym
-                    // (`T` or `T?`); a concrete or composite type carries its own
-                    // §28.5 field check at the declaration.
-                    if (fd->type->name->parts.size() != 1) continue;
-                    std::string_view pn = fd->type->name->parts.back();
-                    std::size_t pIdx = tsym->genericParams.size();
-                    for (std::size_t i = 0; i < tsym->genericParams.size(); ++i)
-                        if (tsym->genericParams[i] &&
-                            tsym->genericParams[i]->name == pn) {
-                            pIdx = i;
-                            break;
-                        }
-                    if (pIdx >= ref.genericArgs.size()) continue;
-                    const TypeRef* arg = ref.genericArgs[pIdx];
-                    const char* badKind = nullptr;
-                    if (arg && arg->kind == TypeRef::Kind::Primitive &&
-                        arg->primitive == PrimitiveType::String)
-                        badKind = "`string`";
-                    else if (arg && arg->kind == TypeRef::Kind::Function)
-                        badKind = "a function value";
-                    if (badKind) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, t.span.begin,
-                            std::string("`") + std::string(tsym->name) +
-                            "` may not be instantiated with " + badKind +
-                            " for type parameter `" + std::string(pn) +
-                            "`: it is the type of the `owned` field `" +
-                            std::string(fd->name) +
-                            "`, and only class or interface types may be "
-                            "`owned` \xE2\x80\x94 `string` and function values "
-                            "are runtime-managed and carry no disposal "
-                            "obligation (\xC2\xA7""28.5 / \xC2\xA7""28.9); use a "
-                            "class-typed argument.");
+            for (const Symbol* mem : tsym->members) {
+                auto* fs = dynamic_cast<const FieldSymbol*>(mem);
+                if (!fs) continue;
+                // The field's type must be a bare type parameter of tsym
+                // (`T` or `T?`); a concrete or composite type carries its own
+                // §28.5 field check at the declaration.
+                std::string_view pn = ownedBareTypeParamOfField(*fs, ctx_);
+                if (pn.empty()) continue;
+                std::size_t pIdx = tsym->genericParams.size();
+                for (std::size_t i = 0; i < tsym->genericParams.size(); ++i)
+                    if (tsym->genericParams[i] &&
+                        tsym->genericParams[i]->name == pn) {
+                        pIdx = i;
+                        break;
                     }
+                if (pIdx >= ref.genericArgs.size()) continue;
+                const TypeRef* arg = ref.genericArgs[pIdx];
+                const char* badKind = nullptr;
+                if (arg && arg->kind == TypeRef::Kind::Primitive &&
+                    arg->primitive == PrimitiveType::String)
+                    badKind = "`string`";
+                else if (arg && arg->kind == TypeRef::Kind::Function)
+                    badKind = "a function value";
+                if (badKind) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t.span.begin,
+                        std::string("`") + std::string(tsym->name) +
+                        "` may not be instantiated with " + badKind +
+                        " for type parameter `" + std::string(pn) +
+                        "`: it is the type of the `owned` field `" +
+                        std::string(fs->name) +
+                        "`, and only class or interface types may be "
+                        "`owned` \xE2\x80\x94 `string` and function values "
+                        "are runtime-managed and carry no disposal "
+                        "obligation (\xC2\xA7""28.5 / \xC2\xA7""28.9); use a "
+                        "class-typed argument.");
                 }
             }
         }

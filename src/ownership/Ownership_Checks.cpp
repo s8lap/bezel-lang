@@ -4493,69 +4493,42 @@ void MethodOwnership::checkThrowOperandNotBorrowed(const ast::Expr& operand) {
 // #430 addresses the observable symptom at the escape site.
 // ---------------------------------------------------------------------------
 
-// §31.2.4 / #811 (v0.162): true when `n` names a built-in exception type.
-// Mirrors isBuiltinExceptionTypeName in ExprTypecheck_Exprs.cpp (kept in sync).
-static bool ownershipIsBuiltinExceptionName(std::string_view n) {
-    return n == "Exception"              ||
-           n == "ArgumentException"      ||
-           n == "ArgumentNullException"  ||
-           // stdlib §2.5/§4.4 (v0.183, #1396).
-           n == "ArgumentOutOfRangeException" ||
-           n == "ArithmeticException"    ||
-           n == "OverflowException"      ||
-           n == "DivideByZeroException"  ||
-           n == "InvalidOperationException" ||
-           n == "NotImplementedException"   ||
-           n == "NullReferenceException"    ||
-           n == "IndexOutOfRangeException"  ||
-           n == "KeyNotFoundException"      ||
-           n == "MatchFailureException"     ||
-           n == "OperationCanceledException"||
-           n == "TypeInitializationException" ||
-           n == "FormatException"           ||
-           n == "StackOverflowException"    ||
-           n == "TimeoutException"          ||
-           n == "IOException"               ||
-           n == "FileNotFoundException"     ||
-           n == "DirectoryNotFoundException"||
-           n == "EndOfStreamException"      ||
-           n == "PathTooLongException"      ||
-           // §22.16 (v0.203, #2053): clause-violation exception type.
-           n == "ContractViolationException";
-}
-
-// §31.2.4 / #811 (v0.162): true when `rt` is a built-in exception type or a
-// user class that (transitively) derives from one. Mirrors
-// inheritsBuiltinException in ExprTypecheck_Exprs.cpp.
+// fix #3147 (§31.2.4 / §31.4 / §2.8.3 rule 4, v0.252; family F11 of the
+// imported-symbol seam #3152): true when `rt` is a built-in exception type or a
+// user class that (transitively) derives from one.
+//
+// Both halves of this used to stop dead at the module boundary. The ancestor
+// walk read each level's `ast::TypeDecl` base list and advanced only through an
+// ancestor that HAD one — and `ModuleLoader` never assigns `Symbol::decl` for an
+// imported type, so an imported exception subclass answered "not an exception
+// class" here. MEASURED on a0b655e with a real two-module build: with
+// `public class WrapExc: Exception` in the DEPENDENCY, `return new WrapExc(ex)`
+// from a catch arm in the importer was REJECTED — "caught exception `ex` may not
+// be passed to a constructor of an object that escapes the catch arm (§31.1 /
+// #430)" — while the identical program in one module compiled and ran. The
+// §31.2.4/#811 cause-position carve is exactly what that reject exists to be
+// skipped by, and it was skipped only for local exception classes.
+//
+// `sema::builtinExceptionBaseOf` (#2950) is the accessor whose own header states
+// the requirement verbatim: "the walk must not require an ancestor to have an
+// `ast::TypeDecl` (an imported one never does)". Using it also retires this
+// file's hand-rolled name list, which claimed to mirror a predicate in
+// ExprTypecheck_Exprs.cpp that no longer exists and had drifted five names
+// behind `common::kBuiltinExceptionHierarchy` (DisposedAccessException,
+// ChannelClosedException, ChannelFullException, DomainFaultedException,
+// SerializationException). The registry table is now the single source for both
+// halves, so they cannot answer differently about the same name.
 static bool ownershipIsExceptionClassRef(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
     if (!rt->declaration) {
-        // Builtin exceptions have no sema TypeDecl — match by name.
+        // Builtin exceptions have no user TypeSymbol — match by name.
         if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
-            return ownershipIsBuiltinExceptionName(rt->astNode->name->parts.back());
+            return common::isBuiltinExceptionName(rt->astNode->name->parts.back());
         if (!rt->importedName.empty())
-            return ownershipIsBuiltinExceptionName(rt->importedName);
+            return common::isBuiltinExceptionName(rt->importedName);
         return false;
     }
-    for (const sema::TypeSymbol* cur = rt->declaration; cur;) {
-        if (cur->kind != ast::TypeDeclKind::Class) return false;
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl)) {
-            for (const auto& bt : td->baseTypes) {
-                if (!bt || !bt->name || bt->name->parts.empty()) continue;
-                if (ownershipIsBuiltinExceptionName(bt->name->parts.back()))
-                    return true;
-            }
-        }
-        const sema::TypeSymbol* next = nullptr;
-        for (const sema::TypeSymbol* b : cur->baseTypes) {
-            if (b && b->kind == ast::TypeDeclKind::Class && b->decl) {
-                next = b;
-                break;
-            }
-        }
-        cur = next;
-    }
-    return false;
+    return !sema::builtinExceptionBaseOf(rt->declaration).empty();
 }
 
 sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(

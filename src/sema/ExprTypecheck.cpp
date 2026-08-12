@@ -5848,16 +5848,25 @@ bool ExprTC::typeTestGenericInstantiationImpossible(const TypeRef* scrutTy,
 // set is exhaustive over all runtime values that pass the erased class-tag
 // type-test. (The `!abstract` guard is what excluded the retired `sealed
 // abstract` pair, which was module-inheritable for the same reason.)
+//
+// fix #3147 (§2.8.3 rule 4, v0.252; family F14 of the imported-symbol seam
+// #3152): this used to scan the modifier list of `d`'s `ast::TypeDecl` by hand.
+// `ModuleLoader` never assigns `Symbol::decl` for an imported type, so an
+// imported `sealed class` read as NON-final and the §19.3/§5.1/§12.9
+// exhaustiveness reasoning above was silently given up across a module
+// boundary. MEASURED on a0b655e with a real two-module build: with
+// `public sealed class BoxF<T>: IBoxF<T>` in the DEPENDENCY, the wrong-
+// instantiation binding pattern `var x: BoxF<string>` against an `IBoxF<int>`
+// scrutinee compiled CLEAN, while the identical program in one module was
+// rejected ("its generic instantiation can never match a value of the scrutinee
+// interface type"). `TypeSymbol::modifiers` is populated on both sides
+// (SymbolCollection locally, ModuleLoader.cpp:329/:2437 for an import), and
+// `typeSymbolHasModifier` / `typeIsAbstractOrClosed` (Symbol.hpp, v0.242/#3052)
+// are where the `closed`-subsumes-`abstract` rule is stated once — the
+// hand-rolled scan was also outside that rule.
 static bool isFinalClass(const TypeSymbol* d) {
     if (!d || d->kind != ast::TypeDeclKind::Class) return false;
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(d->decl);
-    if (!td) return false;
-    bool sealed = false, abstract = false;
-    for (std::string_view m : td->modifiers) {
-        if (m == "sealed") sealed = true;
-        else if (m == "abstract") abstract = true;
-    }
-    return sealed && !abstract;
+    return typeSymbolHasModifier(d, "sealed") && !typeIsAbstractOrClosed(d);
 }
 
 // §19.3/§5.1/§12.9 (v0.197, #1920): see the header comment. BFS the ancestor
