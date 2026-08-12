@@ -70,6 +70,33 @@ SYMBOL_DECL = re.compile(r'->\s*decl\s*$|\.\s*decl\s*$')
 TYPE_SYMBOL = re.compile(r'->\s*declaration\s*$|\btypeSymbol\s*$|\bts\s*$|\bsym\s*$')
 
 
+# ---------------------------------------------------------------------------
+# SANCTIONED ACCESSORS (#3152). The audit's deliverable was "a checker that flags
+# a new AST-only classification read outside a SANCTIONED HELPER" — the first
+# implementation had no such concept, and the omission showed up immediately: the
+# F6 lane's whole point was to build ONE accessor (src/sema/GenericParams.hpp),
+# and that accessor MUST read the AST, because consulting both sources is what it
+# is for. With no allowlist the lane had to reach for `--update --force`, i.e. the
+# escape hatch built to be hard to use. Every future family would have done the
+# same, which trains people around the ratchet — the exact failure mode the
+# comment-stripping fix was also about.
+#
+# So a sanctioned accessor's reads are counted SEPARATELY, and the check inverts
+# for them: a sanctioned accessor with ZERO AST reads is an ERROR, because it
+# cannot be consulting both sources. The list is deliberately short and each entry
+# names the ONE question it answers; adding to it is a visible, reviewable act.
+# GRANULARITY IS PER FILE, so only a file that is NOTHING BUT accessors may be
+# listed. `SymbolCollection.cpp` is deliberately NOT here even though it holds
+# `storageComponentType`: it is a 6-read collection pass, and exempting the file
+# would exempt five unrelated reads along with the one that deserves it. One
+# legitimate read inside a big file simply stays in the ratchet — a fixed cost
+# that never grows, which is all the ratchet asks.
+SANCTIONED = {
+    'src/sema/GenericParams.hpp':
+        'generic parameter names / arity / variance (F6, #3143)',
+}
+
+
 def strip_comments(text):
     """Blank out // and /* */ comments, preserving length and newlines.
 
@@ -144,8 +171,30 @@ def scan(root):
 def counts(sites):
     out = {}
     for path, _, _ in sites:
+        if path in SANCTIONED:
+            continue  # counted separately — see SANCTIONED
         out[path] = out.get(path, 0) + 1
     return out
+
+
+def sanctioned_report(sites):
+    """-> (lines, ok). A sanctioned accessor with no AST read is an error."""
+    have = {}
+    for path, _, _ in sites:
+        if path in SANCTIONED:
+            have[path] = have.get(path, 0) + 1
+    lines, ok = [], True
+    for path, what in sorted(SANCTIONED.items()):
+        n = have.get(path, 0)
+        if not pathlib.Path(ROOT / path).exists():
+            continue  # not in this tree (e.g. reviewing an older ref)
+        if n == 0:
+            ok = False
+            lines.append('  SANCTIONED %s has ZERO AST reads — it cannot be '
+                         'consulting both sources (%s)' % (path, what))
+        else:
+            lines.append('  sanctioned %-38s %d read(s)  [%s]' % (path, n, what))
+    return lines, ok
 
 
 def read_baseline():
@@ -297,7 +346,10 @@ def main():
               % (len(c1), len(cur1), len(c2)))
         return 0
 
+    sanc_lines, sanc_ok = sanctioned_report(c1)
     bad = compare('class1', cur1, base1) + compare('class2', cur2, base2)
+    if not sanc_ok:
+        bad += [l.strip() for l in sanc_lines if 'ZERO' in l]
     total1, total2 = len(c1), len(c2)
     want1 = sum(base1.values())
     if bad:
@@ -309,8 +361,11 @@ def main():
         print('docs/proposals/imported-symbol-audit-2026-08-13.md §4 for the four')
         print('accessors that already do this correctly.')
         return 1 if a.strict else 0
-    print('check_imported_symbol_reads: clean - %d class-1 read(s) (baseline %d), '
-          '%d class-2 (#3150)' % (total1, want1, total2))
+    for l in sanc_lines:
+        print(l)
+    print('check_imported_symbol_reads: clean - %d class-1 read(s) outside the '
+          'sanctioned accessors (baseline %d), %d class-2 (#3150)'
+          % (total1 - sum(1 for p, _, _ in c1 if p in SANCTIONED), want1, total2))
     return 0
 
 
