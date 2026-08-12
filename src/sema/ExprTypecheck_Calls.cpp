@@ -3828,8 +3828,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // Exception` giving a Named TypeRef with no user
                     // TypeSymbol).
                     //
-                    // #2311 — THE SPAN-FAMILY `ToString` GAP, and why this is a
-                    // deferral rather than a ruling.
+                    // #2311 — THE SPAN-FAMILY `ToString` GAP. ⚠ HISTORY: the
+                    // narrative below describes the #2311 DEFERRAL, which
+                    // #2661's ruling has since resolved in favour of the §8.5
+                    // default (v0.241, PR #3043; the §8.5 universality sentence
+                    // and the stdlib §4.14 note). It is kept because it records
+                    // why an outright REJECTION was wrong, which is the thing a
+                    // future reader is most likely to re-attempt. The code below
+                    // no longer diagnoses — see the fix #2661 note at the
+                    // `isDeferredSpanRecv` branch.
                     //
                     // The four buffer/array-backed spans (§4.14/§4.15) declare
                     // no `ToString` of their own and none is lowered, so the
@@ -3939,20 +3946,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // form is caught: an `IReadOnlySpan<T>` receiver satisfies
                     // `isIfaceRecv`, which would otherwise type it `string` and
                     // hand it to vtable dispatch.
+                    // fix #2661 (spec §8.5, v0.252): the #2311 deferral above is
+                    // RESOLVED — §8.5 now states the universality outright
+                    // ("The defaults above are generated for **every** type of
+                    // the applicable kind, wherever declared — user modules and
+                    // the standard library alike … the span records are purely
+                    // user-level Bezel, standard language features throughout"),
+                    // so the span family carries the positional-record default
+                    // and this call TYPES and LOWERS like any other record's.
+                    // The diagnostic is gone; the early return stays, because
+                    // it is what keeps an `IReadOnlySpan<T>` receiver out of the
+                    // `isIfaceRecv` arm below — that arm hands the receiver to
+                    // ordinary vtable dispatch, which for a boxed span is
+                    // §4.16's `bvt$spanbox` and must go through the span
+                    // renderer this fix installs in its slot 3, not through a
+                    // user-class thunk lookup.
+                    //
+                    // ⚠ `isDeferredSpanRecv` deliberately does NOT include
+                    // `ReadOnlyStringSpan` (§3.3): it declares its own
+                    // materializing `ToString`, so §8.5's default does not apply
+                    // to it and it must keep falling through to its own member
+                    // block. `isStringSpanRecv` above is that exclusion.
                     if (isDeferredSpanRecv) {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
-                        ctx_.diagnostics().report(
-                            Severity::Error, ce.span.begin,
-                            std::string("`ToString()` on `") +
-                            std::string(spanHead) +
-                            "` is not yet implemented (stdlib \xC2\xA7""4.14/"
-                            "\xC2\xA7""4.15, spec \xC2\xA7""8.5); deferred "
-                            "pending the ruling in #2661 on whether the span "
-                            "family gets the \xC2\xA7""8.5 positional-record "
-                            "default. Materialize explicitly instead — e.g. "
-                            "`ToArray()` (\xC2\xA7""4.14) — or use "
-                            "`ReadOnlyStringSpan`, which declares its own "
-                            "`ToString` (\xC2\xA7""3.3)");
                         return;
                     }
                     if (isObjectRecv || isIfaceRecv || isNamedClassRecv ||

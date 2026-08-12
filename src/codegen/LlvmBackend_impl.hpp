@@ -2372,10 +2372,24 @@ private:
     // §4.16 / §8.6 (#970): per-element-LLVM-type span box vtable. A span
     // value boxed into IReadOnlySpan<T> uses this vtable + a synthesized itable.
     // Keyed by the concrete element LLVM type (i32 for int, ptr for string, etc.)
-    // so each element-specialization shares one vtable even when the four span
-    // names differ.  Populated lazily by ensureSpanBoxVtable().
-    std::unordered_map<llvm::Type*, llvm::GlobalVariable*> spanBoxVtables_;
-    llvm::GlobalVariable* ensureSpanBoxVtable(llvm::Type* elemTy);
+    // so each element-specialization shares one vtable.
+    //
+    // fix #2661 (spec §8.5, v0.252): the key now ALSO carries the boxed span's
+    // declared HEAD name. Slot 3 (`kToStringSlot`) used to be left NULL —
+    // #2311's measured SIGSEGV, "pc points to the zero page", on the receiver
+    // shape §8.6 calls canonical ("passing a span to a parameter of type
+    // `IReadOnlySpan<TElement>`"). Filling it means the vtable now carries a
+    // rendering whose head is `Span` / `ReadOnlySpan` / `ArraySpan` /
+    // `ReadOnlyArraySpan`, which the four names DO differ in, so they can no
+    // longer share one vtable per element type. The head is known at every
+    // creation site (the box is minted at the coercion, from the concrete span
+    // TypeRef), so the boxed rendering equals the unboxed one by construction.
+    //
+    // Populated lazily by ensureSpanBoxVtable().
+    std::map<std::pair<llvm::Type*, std::string>, llvm::GlobalVariable*>
+        spanBoxVtables_;
+    llvm::GlobalVariable* ensureSpanBoxVtable(llvm::Type* elemTy,
+                                              std::string_view head);
 
     // fix #2804 (§8.6 "Boxing of inline arrays", v0.240): per-`[N]T` box
     // descriptor + box vtable, minted on demand. Unlike every other boxable
@@ -3391,6 +3405,32 @@ private:
     // first — this function does not re-check it.
     llvm::Value* emitChoiceToString(llvm::Value* val,
                                     const sema::TypeSymbol* choiceTy);
+    // fix #2661 (spec §8.5, v0.252): the §8.5 POSITIONAL-RECORD default for the
+    // standard library's span records — "The defaults above are generated for
+    // **every** type of the applicable kind, wherever declared — user modules
+    // and the standard library alike." `spanVal` is the shared
+    // `bz.arrayspan` value { ptr source, i32 start, i32 length }; `head` is the
+    // declared head name, which selects the component name §4.14/§4.15 declare
+    // (`Buffer: OwningBuffer<T>` for Span/ReadOnlySpan, `Source: Array<T>` for
+    // ArraySpan/ReadOnlyArraySpan). Returns a fresh +1 string.
+    llvm::Value* emitSpanToString(llvm::Value* spanVal, std::string_view head);
+    // fix #2661 (spec §8.5, v0.252): the §8.5 AUTO-EQUALITY BODY-RECORD default
+    // for `Range<T>` (stdlib §9.8) — "`Range<T>` (a compiler-intrinsic body
+    // record, stdlib §9.8) carries the auto-equality body-record default of the
+    // bullet above, rendering its auto-properties." `rangeVal` is the
+    // `bz.range` value { i64 start, i64 end, i64 step, i8 flags }. Returns a
+    // fresh +1 string.
+    //
+    // `elemTy` is the instantiation's element type (`rt->genericArgs[0]`), and
+    // it is REQUIRED for correctness, not decoration: §8.5 says "Each component
+    // renders as its own `ToString` renders it", and stdlib §9.8 types the
+    // `Start`/`End` components `T?`. `Range<char>` must therefore render
+    // characters, not code points, and `Range<ulong>` must render unsigned.
+    // Null (or a non-primitive/unresolved argument) falls back to `long`, which
+    // is exact for every signed integer T and for the unsigned ones below
+    // `long.MaxValue`.
+    llvm::Value* emitRangeToString(llvm::Value* rangeVal,
+                                   const sema::TypeRef* elemTy);
     // §8.5: enum ToString → the type's qualified name (the spec default for
     // enums; member-name formatting is left to user code via Type.EnumNames).
     // §8.3: enum GetHashCode → the underlying integer value.
@@ -5169,10 +5209,11 @@ private:
     // predicate ("Imported positional records (no ast::TypeDecl — only
     // hasPositionalFields flag)"), and sema's copies read both. The codegen
     // copies read only the AST decl, which classified an imported `record
-    // Pt(X: int, Y: int)` as a BODY record: MEASURED across a real two-module
-    // build, `p.ToString()` rendered "Dep.Pt" (a QUALIFIED record head, which
-    // §8.5 forbids outright) while the boxed and interpolated spellings of the
-    // same value in the same program rendered "Pt(X: 1, Y: 2)" and "Pt".
+    // Pt(X: int, Y: int)` as a BODY record: MEASURED on f1175c6 across a real
+    // two-module build, `p.ToString()` rendered "Dep.Pt" (a QUALIFIED record
+    // head, which §8.5 forbids outright) while the boxed and interpolated
+    // spellings of the same value in the same program rendered
+    // "Pt(X: 1, Y: 2)" and "Pt".
     //
     // One predicate, every caller, so the two sources cannot be read apart
     // again. Mirrors `sema::isAutoEqualityBearingBodyRecord`'s own guard

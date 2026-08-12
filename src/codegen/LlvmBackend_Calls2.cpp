@@ -2532,8 +2532,8 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
     // classified as an ineligible BODY record and took the name-only arm below,
     // rendering a QUALIFIED RECORD HEAD ("Dep.Pt"), which §8.5 forbids
     // ("positional-record and auto-equality formatting keeps the **unqualified**
-    // head"). MEASURED across a real two-module build on the parent commit: this
-    // site answered "Dep.Pt" while the boxed spelling of the same value answered
+    // head"). MEASURED across a real two-module build on f1175c6: this site
+    // answered "Dep.Pt" while the boxed spelling of the same value answered
     // "Pt(X: 1, Y: 2)" and the interpolated one answered "Pt".
     bool autoBearing = recordIsAutoBearing(ts);
 
