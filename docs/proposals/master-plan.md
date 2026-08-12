@@ -98,7 +98,19 @@
 
 **(d) Tracking-issue states at close.** Two closed: **#3053** (zero compiler work — the check_docs derivation check was the train's own deliverable) and **#3060** (the §30.5/A7 seam, resolved by train E's docs). The rest — **#3044/#3045/#3046/#3047/#3049/#3050/#3051/#3052/#3054/#3055/#3056** — are open as labeled (`bug`, the #2654 spec-ahead-of-impl convention) catch-up trackers, and **#3048** is open as the design-validation lane feeding Train F; all are sequenced, with the three recorded ordering constraints and the no-soundness-grade classification, by the run-sequence page above.
 
-**(e) Two owner-queued open questions** (recorded at v0.246, question-only — not ruled; they queue for the owner now that Train E has landed): **(E-f1)** the §22.6 owned-overloading ban / stdlib Try-pair naming — `M(move x)` vs `M(x)` is now call-site-distinct with no declaration-token ambiguity left, satisfying the ban's own carve-out criterion; **(E-f2)** the §3.14 named-destructure no-transfer liftable — the unified marker gives named slots a natural transfer spelling for the first time (0090 carries it as gap G5). Both are recorded in the rationale beside their home records (§3.10, §3.14).
+**(e) Two owner-queued open questions** (recorded at v0.246, question-only — not ruled; they queue for the owner now that Train E has landed): **(E-f1)** the §22.6 owned-overloading ban / stdlib Try-pair naming — `M(move x)` vs `M(x)` is now call-site-distinct with no declaration-token ambiguity left, satisfying the ban's own carve-out criterion; **(E-f2)** the §3.14 named-destructure no-transfer liftable — the unified marker gives named slots a natural transfer spelling for the first time (0090 carries it as gap G5). Both are recorded in the rationale beside their home records (§3.10, §3.14). *(Both closed at v0.250 — row (f) below.)*
+
+### 1·Δ·F. Ledger delta 2026-08-12 (docs v0.246 → v0.250): Train F and the Train E follow-on train
+
+**(a) Graduated (`superseded`) — three proposals across two trains** (per-train detail in the v0.249 and v0.250 changelog entries; graduations docs-only at landing, compiler catch-up sequenced by [`catchup-run-sequence-2026-08-12.md`](catchup-run-sequence-2026-08-12.md)); v0.247/v0.248 were the guide-revalidation and spec-example-defect revisions (changelog entries; no proposal ledger movement):
+
+| # | Proposal | Graduated | Impl trackers (compiler catch-up) |
+|---|---|---|---|
+| 0082 | Pattern A scoped bind (Train F; owner-ruled 2026-08-11, C1/C2/C3 gates passed) | v0.249 | #3048 (production trigger; the conditional-producer predicate; the Q4 teaching diagnostics; #3074 ordered first — the `const` mis-accept) |
+| 0091 | Owned-overload lift (E-f1 executed; resolved 2026-08-12 under the owner's delegation, all questions as recommended) | v0.250 | #3086 — **after #3056**: the applicability filter, the erasure-guard clash, the reworded §22.6 diagnostics, the `WhenAll`/`WhenEach` recognition re-keying (47 name-keyed `src/` sites + the runtime symbol), the 49 gtest `*Owned` helper-line renames |
+| 0092 | Named-destructure transfer (E-f2 executed; resolved 2026-08-12 under the owner's delegation, all questions as recommended) | v0.250 | #3087 — after #3056, with/behind #1409 (no shipped named-slot parser exists); the move-only-value-payload gap is spec defect #3094 |
+
+**(b) The E-f1/E-f2 questions of row (e) are closed** — resolved 2026-08-12 under the owner's delegation ("Please work to resolve all questions the right way as you see fit. Once resolved, graduate both proposals into the docs"), all fifteen questions as recommended; the rulings and their reasoning live in rationale §3.10 (the lift record) and §3.14 (the marked-slot record), the migration in the v0.250 changelog entry. #3086/#3087 join the R0-adjacent catch-up sequence behind #3056 (items 20–21 of the run-sequence page).
 
 ### 1a. Accepted (delegated) — owner-blessed, schedulable now (14)
 

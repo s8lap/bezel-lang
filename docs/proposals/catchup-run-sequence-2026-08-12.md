@@ -90,13 +90,29 @@ additive feature catch-up, in that order.
     Starts when Train D (v0.245) merges. ([#3053](https://github.com/s8lap/bezel-lang/issues/3053)
     is doc-structural — **zero compiler work**.)
 
-## Phase 4 — the big respell, deliberately last
+## Phase 4 — the big respell, deliberately last (+ the v0.250 items sequenced behind it, added 2026-08-12)
 
 19. ⏳ **[#3056](https://github.com/s8lap/bezel-lang/issues/3056)** — the `move`/`owned`
     marker unification (~633 test lines + parser/sema). **Only after** Train E (v0.246) merges
     AND phase 0's #3049 migration is in. Resolves the
     [#3060](https://github.com/s8lap/bezel-lang/issues/3060) §30.5/A7 seam (cite it at landing).
     Last because every earlier phase's tests would otherwise be respelled twice.
+20. ⏳ **[#3086](https://github.com/s8lap/bezel-lang/issues/3086)** — the v0.250 owned-overload
+    lift (proposal 0091): the four-clause applicability filter, the §11.3 erasure-guard clash
+    narrowing, the reworded §22.6 diagnostic family, and the `WhenAll`/`WhenEach` recognition
+    re-keying (name → name + parameter classification; 47 name-keyed `src/` sites plus the
+    `bz_task_when_all_owned` runtime-symbol surface). **Only after #3056** — resolution keys on
+    the marker the respell installs. The test-corpus `*Owned` helper renames (49 gtest lines at
+    v0.250) live **here**, not in the docs train: the compiler recognizes the helpers by name,
+    so renaming tests ahead of the re-keying breaks them for nothing. Seven-file §22.6 lit-test
+    disposition per 0091 §5.
+21. ⏳ **[#3087](https://github.com/s8lap/bezel-lang/issues/3087)** — the v0.250 marked named
+    slot (proposal 0092): the optional `move` in `NamedSlot`, the per-slot admission checks and
+    six-entry rejection taxonomy, and the name-keyed payload-transfer lowering. **After #3056
+    and with/behind [#1409](https://github.com/s8lap/bezel-lang/issues/1409)** — there is no
+    shipped named-slot parser to amend, so this lands as part of (or immediately after) the
+    named-destructure implementation itself. [#3094](https://github.com/s8lap/bezel-lang/issues/3094)'s
+    eventual ruling gates only its move-only-value-payload liftable, not the v1.
 
 ## Standing notes for the run
 

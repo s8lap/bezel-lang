@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — drafted 2026-08-12 (owner-directed, the Train E follow-on questions); adversarial-gate fixes applied 2026-08-12 (parse-commitment claim corrected; v1 confined to `owned` payloads; §7.2 re-argued; Q3 restated; multi-slot specified) |
+| **Status** | superseded — graduated v0.250 (resolved 2026-08-12 under the owner's delegation, all questions as recommended; impl catch-up #3086 / #3087) |
 | **Tracking issue** | [#3087](https://github.com/s8lap/bezel-lang/issues/3087) |
 | **Target module(s)** | **spec** — §19.3 (*Named destructuring* gains the marked-slot form; in the *Named-slot bindings and ownership* paragraph, the "a named slot never transfers" sentence narrows to unmarked slots **and** the paragraph's closing remedy sentence — "A program that wants an owned payload transferred writes the positional destructure." — widens to name both spellings), §35.5 (*Case patterns* bullet 3 amended, **including its closing repeat** of that remedy sentence — "a program wanting the payload transferred writes the positional destructure" — the same narrowing; one clause in the owning-match section), §19.6 (one parenthetical: a marked slot is an irrefutable binding), Appendix A.7 (`NamedSlot` gains the optional `"move"` prefix), Appendix C.7 (one invariant row). **rationale** — §3.14's v0.246 note resolves (pointer to the decision record). **guides** — Guide 3 gains the by-name extraction example at graduation. **No stdlib change. No new tokens** (`move` is reserved, Appendix B.1). |
 | **Written against** | spec/stdlib v0.249 |

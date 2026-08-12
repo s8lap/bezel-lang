@@ -28,10 +28,12 @@ public class Task
   // For non-class T (value types, string, runtime-managed reference types).
   public static method WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>;
 
-  // For class T. Aggregates OwningTask<T> results into an owned array of owned elements.
-  // The caller transfers ownership of the input array (and its tasks) to WhenAllOwned;
+  // For class T: the owning WhenAll overload (v0.250 — the parameter type
+  // distinguishes it; the call site is Task.WhenAll(move tasks)).
+  // Aggregates OwningTask<T> results into an owned array of owned elements.
+  // The caller transfers ownership of the input array (and its tasks);
   // the returned task produces an owned OwningArray<T>.
-  public static method WhenAllOwned<T>(
+  public static method WhenAll<T>(
     owned tasks: OwningArray<OwningTask<T>>
   ): OwningTask<OwningArray<T>> where T: class;
 

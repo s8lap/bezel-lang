@@ -1,4 +1,4 @@
-public static async method WhenAllOwned<T>(
+public static async method WhenAll<T>(
   owned tasks: OwningArray<OwningTask<T>>
 ): OwningTask<OwningArray<T>> where T: class
   using var taskArray := move tasks;                  // owned param adopted (transfer marker); disposes at end
@@ -9,4 +9,4 @@ public static async method WhenAllOwned<T>(
                                                       //   context, satisfying §30.5
   end;
   return results;                                     // ownership transfers to caller
-end WhenAllOwned;
+end WhenAll;
