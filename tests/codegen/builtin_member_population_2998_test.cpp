@@ -168,14 +168,20 @@ const std::vector<BuiltinCase>& registryCases() {
         {"ExceptionInfo",                   "import System.Threading; ", "var e := new ExceptionInfo(\"t\", \"m\", \"s\");", "e"},
 
         // ── Value types (stdlib §2.5/§2.6/§10) ────────────────────────────
+        // Guid / IntPtr / UIntPtr use their DECLARED producers (stdlib §2.6,
+        // §10.0), not `new`. §17.7 (v0.241, #2994) gives builtins a closed
+        // constructor surface, so `new Guid()` / `new IntPtr(0)` are now
+        // rejected in sema -- which would satisfy this test's `!r.ran` oracle
+        // BEFORE the bogus-member call is ever reached, making the row pass
+        // vacuously and stop proving anything about #2998's discriminator.
         {"DateTime",                        "", "var v := new DateTime(2024, 1, 2);", "v"},
         {"TimeSpan",                        "", "var v := new TimeSpan(100);", "v"},
         {"DateOnly",                        "", "var v := new DateOnly(2024, 1, 2);", "v"},
         {"TimeOnly",                        "", "var v := new TimeOnly(12, 0, 0);", "v"},
-        {"Guid",                            "", "var v := new Guid();", "v"},
+        {"Guid",                            "", "var v := Guid.Empty;", "v"},
         {"Boolean",                         "", "var v: Boolean := false;", "v"},
-        {"IntPtr",                          "", "var v := new IntPtr(0);", "v"},
-        {"UIntPtr",                         "", "var v := new UIntPtr(0);", "v"},
+        {"IntPtr",                          "", "var v := IntPtr.Zero;", "v"},
+        {"UIntPtr",                         "", "var v := UIntPtr.Zero;", "v"},
 
         // ── §32.5 FFI buffer classes ──────────────────────────────────────
         {"CString",                         "", "var v := new CString(\"hi\");", "v"},
