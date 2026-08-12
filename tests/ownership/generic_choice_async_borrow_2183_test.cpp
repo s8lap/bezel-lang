@@ -47,7 +47,7 @@ BEZEL_TEST(generic_choice_async_borrow_2183, value_arg_async_param_runs_accepted
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
 
-// §35.7 / §35.4.3: a value-like `Opt<int>` is auto-equality-bearing and
+// §35.7 / §35.4.3: a value-like `Opt<int>` is auto-hashable and
 // hashable-admissible, so it is a valid Dictionary key (keys hash+compare by
 // tag + active payload) — exactly the stdlib `Result<int, string>` precedent,
 // now available to a user generic choice at a value instantiation. Two distinct

@@ -3,10 +3,10 @@
 // reference as a `%bz.string`.
 //
 // WHAT THE DOCUMENTS REQUIRE.  stdlib §4.8 (v0.158): "`K` must be
-// **equality-bearing** (spec §3.6/§8.3) — enforced at the instantiation site
+// **hashable** (spec §3.6/§8.3) — enforced at the instantiation site
 // per §3.6 rule 2: a `Dictionary<K, V>` (or `OwningDictionary<K, V>`) whose
-// `K` is a record that is neither auto-equality-bearing nor declares user
-// equality is rejected".  Spec §3.6's equality-bearing row admits every type
+// `K` is a record that is neither auto-hashable nor declares user
+// equality is rejected".  Spec §3.6's hashable row admits every type
 // except an ineligible record or choice, and sema's own `isEqualityBearing`
 // says so verbatim — "class (reference identity), interface, enum — all bear
 // consistent Equals/GetHashCode" — so a class-keyed dictionary is legal and
@@ -172,7 +172,7 @@ BEZEL_TEST(dict_class_key_2773,
         "  return sum + cnt;")), 32);   // 30 + 2
 }
 
-// spec §3.6 admits an interface as equality-bearing; stdlib §4.8 makes it a
+// spec §3.6 admits an interface as hashable; stdlib §4.8 makes it a
 // legal `K`.
 BEZEL_TEST(dict_class_key_2773, dictionary_interface_key_spec_3_6) {
     BEZEL_EXPECT_EQ(run(main_(kShape,

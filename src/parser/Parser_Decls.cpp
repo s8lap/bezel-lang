@@ -2873,7 +2873,7 @@ std::vector<ast::GenericConstraint> Parser::parseGenericConstraints() {
             // `hashable` are contextual (App. B.2) so the lexer produces
             // Identifier tokens. `sendable` names the §30.14 sendable
             // derived-property constraint; `hashable` names the §3.6
-            // equality-bearing derived-property constraint (the keyword names
+            // hashable derived-property constraint (the keyword names
             // the capability site, the property keeps its §3.6 name) —
             // v0.214, §14.2 "Derived-property constraints".
             if (consumeKeyword("class")) {

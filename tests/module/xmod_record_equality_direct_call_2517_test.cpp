@@ -1,9 +1,9 @@
 // fix #2517 (§9.2, v0.236): pin the §9.2 use-site gate for direct
 // `.Equals(Object?)`/`.Equals(T)`/`.GetHashCode()` calls on an IMPORTED
-// non-auto-equality-bearing body record.
+// non-auto-hashable body record.
 //
 // The §9.2 use-site gate at `src/sema/ExprTypecheck_Calls.cpp` (the
-// `is not available on record ... it is not auto-equality-bearing (§9.2/§9.3)`
+// `is not available on record ... it is not auto-hashable (§9.2/§9.3)`
 // error) was nested INSIDE the `else if (targetType->kind == Record || Enum
 // || Choice)` branch — reached only when `targetType->decl != nullptr` (a
 // local AST TypeDecl). For IMPORTED records, `targetType->decl == nullptr`
@@ -17,7 +17,7 @@
 // records (and choices per §35.7). Sibling structural defect of #2374
 // (`astNode`-gated gate) and #2516 (positional/combined-form classifier).
 //
-// The fix's own diagnostic-text assertion (`is not auto-equality-bearing`)
+// The fix's own diagnostic-text assertion (`is not auto-hashable`)
 // is what discriminates a genuine §9.2 reject from a crash / silent no-op:
 // per the lane protocol, `runAot`'s `WIFSIGNALED` path synthesizes an
 // `Error` diagnostic for a runtime SIGSEGV too, so a coarse `rejects()`
@@ -151,7 +151,7 @@ bool compileSingleCaptureErr2517(const std::string& src, std::string& err) {
 // discriminator (per the lane protocol, a crash / SIGSEGV also triggers a
 // `runAot`-level `Error` — assert on the actual diagnostic wording).
 bool hasAutoEqError2517(const std::string& err) {
-    return err.find("is not auto-equality-bearing") != std::string::npos;
+    return err.find("is not auto-hashable") != std::string::npos;
 }
 
 // §9.2 disqualifier: a body-only record with an EXPLICIT public field. The
@@ -278,11 +278,11 @@ BEZEL_TEST(xmod_record_equality_direct_call_2517,
 // ===========================================================================
 // T5 — POSITIVE CONTROL (regression guard against over-rejection): an
 // IMPORTED body-only record with ONLY an auto-property (no disqualifying
-// field) IS auto-equality-bearing — `.Equals(...)` compiles without the
+// field) IS auto-hashable — `.Equals(...)` compiles without the
 // §9.2 use-site error. This proves T1/T2's reject is the field-disqualifier
 // firing, not a blanket rejection of imported body records. (The
 // cross-module construction gap #2434/#2467 may emit `internal:` diagnostics
-// here, but the §9.2 `auto-equality-bearing` message must be ABSENT — sema
+// here, but the §9.2 `auto-hashable` message must be ABSENT — sema
 // accepted `.Equals`.)
 // ===========================================================================
 BEZEL_TEST(xmod_record_equality_direct_call_2517,

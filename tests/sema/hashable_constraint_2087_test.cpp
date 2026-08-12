@@ -1,8 +1,8 @@
 // Spec-derived regression tests for issue #2087 — the §14.2 "Derived-property
 // constraints" admitted-set entry `where T: hashable` (v0.214). The keyword
 // names the capability site (hash-container keys/elements); the property keeps
-// its §3.6 name, **equality-bearing**. Satisfaction is decided per instantiation
-// by the §3.6 equality-bearing computation (isEqualityBearing) — the SAME
+// its §3.6 name, **hashable**. Satisfaction is decided per instantiation
+// by the §3.6 hashable computation (isEqualityBearing) — the SAME
 // evaluation the §3.6 rule-2 hash-container-key check and the use-site `=`/`<>`
 // equality error perform; the constraint "adds no second definition of the
 // property" (§14.2). One diagnostic — the constraint failure at the
@@ -15,19 +15,19 @@
 //   - the type-instantiation site (Resolver::checkOneConstraint in
 //     TypeResolution_Checks.cpp).
 //
-// The admitted set (§3.6 equality-bearing row, v0.214, corrected in v0.215):
+// The admitted set (§3.6 hashable row, v0.214, corrected in v0.215):
 //   ACCEPT: every primitive/string, enum, class, interface, function value,
 //           inline array; a positional/combined record; an auto-equality-
 //           bearing body record; a record declaring user equality; a value-like
-//           auto-equality-bearing choice (§35.7).
-//   REJECT: a body record that is neither auto-equality-bearing nor declares
+//           auto-hashable choice (§35.7).
+//   REJECT: a body record that is neither auto-hashable nor declares
 //           user equality; a positional record whose fields fall outside the
 //           §9.2 admissible-component rule; an owning choice; a borrow-bearing
 //           choice (§35.7 — class-typed payloads are outside the admissible-
 //           component rule, exactly as class-typed record fields are).
 //
 // Authority: spec §14.2 "Derived-property constraints" (v0.214) + Appendix B.2
-// (contextual keyword) + §3.6 equality-bearing property (v0.214/v0.215) + §9.2/
+// (contextual keyword) + §3.6 hashable property (v0.214/v0.215) + §9.2/
 // §9.3 (records) + §35.7 (choices). The reject diagnostic *text* (component
 // path) is pinned by the lit track (tests/lit/sema/hashable_constraint_2087*).
 
@@ -73,9 +73,9 @@ bool hasHashableConstraintError(const SemaResult& r) {
 
 }  // namespace
 
-// ─── ACCEPT: every admitted equality-bearing category (no false positives) ───
+// ─── ACCEPT: every admitted hashable category (no false positives) ───
 
-// §14.2 / §3.6: a primitive value type (`int`) is equality-bearing. The
+// §14.2 / §3.6: a primitive value type (`int`) is hashable. The
 // constraint is satisfied at the method-call site.
 BEZEL_TEST(hashable_constraint_2087, method_call_int_accepted_spec_3_6) {
     auto r = parseSemaAll(
@@ -89,7 +89,7 @@ BEZEL_TEST(hashable_constraint_2087, method_call_int_accepted_spec_3_6) {
     BEZEL_EXPECT_FALSE(hasConstraintError(r));
 }
 
-// §14.2 / §3.6: `string` is equality-bearing.
+// §14.2 / §3.6: `string` is hashable.
 BEZEL_TEST(hashable_constraint_2087, method_call_string_accepted_spec_3_6) {
     auto r = parseSemaAll(
         "module M; "
@@ -102,7 +102,7 @@ BEZEL_TEST(hashable_constraint_2087, method_call_string_accepted_spec_3_6) {
     BEZEL_EXPECT_FALSE(hasConstraintError(r));
 }
 
-// §14.2 / §3.6: an enum is equality-bearing (value type with consistent
+// §14.2 / §3.6: an enum is hashable (value type with consistent
 // Equals/GetHashCode).
 BEZEL_TEST(hashable_constraint_2087, method_call_enum_accepted_spec_3_6) {
     auto r = parseSemaAll(
@@ -117,7 +117,7 @@ BEZEL_TEST(hashable_constraint_2087, method_call_enum_accepted_spec_3_6) {
     BEZEL_EXPECT_FALSE(hasConstraintError(r));
 }
 
-// §14.2 / §3.6: a class is equality-bearing (reference identity — consistent
+// §14.2 / §3.6: a class is hashable (reference identity — consistent
 // Equals/GetHashCode). Both a sealed and an open class qualify.
 BEZEL_TEST(hashable_constraint_2087, method_call_class_accepted_spec_3_6) {
     auto r = parseSemaAll(
@@ -132,7 +132,7 @@ BEZEL_TEST(hashable_constraint_2087, method_call_class_accepted_spec_3_6) {
     BEZEL_EXPECT_FALSE(hasConstraintError(r));
 }
 
-// §14.2 / §3.6: an interface is equality-bearing (reference identity).
+// §14.2 / §3.6: an interface is hashable (reference identity).
 BEZEL_TEST(hashable_constraint_2087, method_call_interface_accepted_spec_3_6) {
     auto r = parseSemaAll(
         "module M; "
@@ -147,7 +147,7 @@ BEZEL_TEST(hashable_constraint_2087, method_call_interface_accepted_spec_3_6) {
 }
 
 // §14.2 / §9.1: a positional record synthesizes structural equality over its
-// (admissible) fields → equality-bearing.
+// (admissible) fields → hashable.
 BEZEL_TEST(hashable_constraint_2087,
            method_call_positional_record_accepted_spec_9_1) {
     auto r = parseSemaAll(
@@ -162,8 +162,8 @@ BEZEL_TEST(hashable_constraint_2087,
     BEZEL_EXPECT_FALSE(hasConstraintError(r));
 }
 
-// §14.2 / §9.2: an auto-equality-bearing body record (every member an
-// auto-property of an admissible component type) is equality-bearing.
+// §14.2 / §9.2: an auto-hashable body record (every member an
+// auto-property of an admissible component type) is hashable.
 BEZEL_TEST(hashable_constraint_2087,
            method_call_auto_eq_body_record_accepted_spec_9_2) {
     auto r = parseSemaAll(
@@ -183,9 +183,9 @@ BEZEL_TEST(hashable_constraint_2087,
     BEZEL_EXPECT_FALSE(hasConstraintError(r));
 }
 
-// §14.2 / §25.2: a record OUTSIDE the auto-equality-bearing set (a class-typed
+// §14.2 / §25.2: a record OUTSIDE the auto-hashable set (a class-typed
 // field makes it non-auto-eq) that DECLARES custom equality (`operator =`/`<>`
-// with `Equals(T)`/`GetHashCode`) is equality-bearing.
+// with `Equals(T)`/`GetHashCode`) is hashable.
 BEZEL_TEST(hashable_constraint_2087,
            method_call_user_declared_equality_record_accepted_spec_25_2) {
     auto r = parseSemaAll(
@@ -208,7 +208,7 @@ BEZEL_TEST(hashable_constraint_2087,
     BEZEL_EXPECT_FALSE(hasHashableConstraintError(r));
 }
 
-// §14.2 / §35.7: a value-like auto-equality-bearing choice is equality-bearing.
+// §14.2 / §35.7: a value-like auto-hashable choice is hashable.
 BEZEL_TEST(hashable_constraint_2087,
            method_call_value_like_choice_accepted_spec_35_7) {
     auto r = parseSemaAll(
@@ -224,7 +224,7 @@ BEZEL_TEST(hashable_constraint_2087,
 }
 
 // §14.2 / §35.7: a payload-free choice is value-like (no payloads) → auto-
-// equality-bearing → equality-bearing.
+// hashable → hashable.
 BEZEL_TEST(hashable_constraint_2087,
            method_call_payload_free_choice_accepted_spec_35_7) {
     auto r = parseSemaAll(
@@ -258,9 +258,9 @@ BEZEL_TEST(hashable_constraint_2087,
 
 // ─── REJECT: excluded categories draw the §14.2 constraint diagnostic ────────
 
-// §14.2 / §9.2: a BODY record that is neither auto-equality-bearing (a
+// §14.2 / §9.2: a BODY record that is neither auto-hashable (a
 // class-typed field makes it borrow-bearing, §9.7) nor declares user equality
-// is NOT equality-bearing → rejected at the method-call site naming `hashable`.
+// is NOT hashable → rejected at the method-call site naming `hashable`.
 BEZEL_TEST(hashable_constraint_2087,
            method_call_non_auto_eq_body_record_rejected_spec_9_2) {
     auto r = parseSemaAll(
@@ -281,7 +281,7 @@ BEZEL_TEST(hashable_constraint_2087,
 
 // §14.2 / §9.3: a POSITIONAL record whose fields fall outside the §9.2
 // admissible-component rule (a class-typed field) does not synthesize equality
-// → NOT equality-bearing → rejected at the method-call site.
+// → NOT hashable → rejected at the method-call site.
 BEZEL_TEST(hashable_constraint_2087,
            method_call_inadmissible_positional_record_rejected_spec_9_3) {
     auto r = parseSemaAll(
@@ -298,7 +298,7 @@ BEZEL_TEST(hashable_constraint_2087,
 }
 
 // §14.2 / §35.7: an owning choice (an `owned` class payload, §35.4.1) is NOT
-// value-like auto-equality-bearing → rejected at the method-call site.
+// value-like auto-hashable → rejected at the method-call site.
 BEZEL_TEST(hashable_constraint_2087,
            method_call_owning_choice_rejected_spec_35_7) {
     auto r = parseSemaAll(
@@ -316,7 +316,7 @@ BEZEL_TEST(hashable_constraint_2087,
 }
 
 // §14.2 / §35.7: a borrow-bearing choice (a plain class payload, §35.4.2) is
-// NOT value-like auto-equality-bearing → rejected at the method-call site.
+// NOT value-like auto-hashable → rejected at the method-call site.
 BEZEL_TEST(hashable_constraint_2087,
            method_call_borrow_bearing_choice_rejected_spec_35_7) {
     auto r = parseSemaAll(
@@ -334,7 +334,7 @@ BEZEL_TEST(hashable_constraint_2087,
 
 // §14.2 type-instantiation site: `Registry<Holder>` against
 // `class Registry<K> where K: hashable` is rejected (a positional record whose
-// class-typed field leaves it non-equality-bearing, §9.3).
+// class-typed field leaves it non-hashable, §9.3).
 BEZEL_TEST(hashable_constraint_2087,
            type_inst_inadmissible_positional_record_rejected_spec_9_3) {
     auto r = parseSemaAll(
@@ -443,7 +443,7 @@ BEZEL_TEST(hashable_constraint_2087,
 // §14.2: "an unconstrained parameter never acquires it." `Registry2<K>` has NO
 // `where K: hashable` clause; its interior `Dictionary<K, int>` therefore
 // carries its own §3.6 rule-2 per-instantiation obligation, which fires when
-// `Registry2<Holder>` binds K to a non-equality-bearing record. (The reject is
+// `Registry2<Holder>` binds K to a non-hashable record. (The reject is
 // the interior hash-container-key diagnostic, not the §14.2 constraint one —
 // there is no constraint here to subsume it.)
 BEZEL_TEST(hashable_constraint_2087,
@@ -462,7 +462,7 @@ BEZEL_TEST(hashable_constraint_2087,
     bool sawInteriorReject = false;
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.severity == bezel::Severity::Error &&
-            d.message.find("requires an equality-bearing") != std::string::npos &&
+            d.message.find("requires a hashable") != std::string::npos &&
             d.message.find("Holder") != std::string::npos)
             sawInteriorReject = true;
     BEZEL_EXPECT_TRUE(sawInteriorReject);

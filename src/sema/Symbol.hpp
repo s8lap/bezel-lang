@@ -125,7 +125,7 @@ struct TypeSymbol : Symbol {
     // positional record (a record declared with a `(field...)` positional
     // parameter list). Carried as a flag on the TypeSymbol so that imported
     // positional records — which have no ast::TypeDecl (ts->decl is null) —
-    // still pass the §9.2 auto-equality-bearing check in
+    // still pass the §9.2 auto-hashable check in
     // ExprTypecheck_Exprs.cpp. For LOCAL records the check reads this flag
     // or falls back to the ast::TypeDecl; for IMPORTED records only this
     // flag is available.
@@ -562,7 +562,7 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
                                         const SemaContext& ctx);
 
 // §9.2 (v0.158) auto-equality eligibility for a *body record* (a record with
-// no positional fields). Returns true iff the record is "auto-equality-bearing":
+// no positional fields). Returns true iff the record is "auto-hashable":
 // every member is an auto-property whose type is an **admissible component
 // type**, a method, an expression-bodied or block-form (computed) property, a
 // constructor, or a non-equality operator overload — and the record declares no
@@ -572,7 +572,7 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
 // auto-properties.
 //
 // Admissible component types (one recursive rule, §9.2 v0.158): a primitive,
-// enum, or `string`; another auto-equality-bearing record; `T?` where T is
+// enum, or `string`; another auto-hashable record; `T?` where T is
 // admissible; a non-owning inline array `[N]T`/`[N]T?` with admissible element.
 // A class/interface/`Object`/function/owning-inline-array component makes the
 // record ineligible.
@@ -597,7 +597,7 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
 // value, a `string`, a runtime-managed type, or (transitively) a value-like
 // record or choice, with no `owned`-marked payload and no borrow-carrying
 // payload — v0.200, #2044). The §9.2 admissible-component list now includes
-// "a value-like choice that is itself auto-equality-bearing" — applying the
+// "a value-like choice that is itself auto-hashable" — applying the
 // recursive rule to every case's payload fields. Borrow-bearing and owning
 // choices are not admissible in any component (class-typed payloads are
 // outside the rule, exactly as class-typed record fields are — §9.7 / §35.7).
@@ -607,7 +607,7 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
 // carry over to a choice — a choice has no instance storage beyond its
 // case-payload fields, so equality is purely per-payload. v0.210 cites
 // §35.7 directly: every payload field of every case must be a §9.2
-// admissible component type, with "another auto-equality-bearing choice"
+// admissible component type, with "another auto-hashable choice"
 // admitted to the recursive rule.
 //
 // Returns false for non-choice types and for choices whose classification
@@ -615,7 +615,7 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
 //
 // #2047: `inst` is the concrete instantiation TypeRef (with genericArgs) when
 // known, so §28.1 per-instantiation erasure of `owned` payload markers applies
-// (`Result<int, string>` — markers erased — is auto-equality-bearing). Null
+// (`Result<int, string>` — markers erased — is auto-hashable). Null
 // judges against the bare template (a non-generic choice, or a nested-payload
 // recursive call where no instantiation is available).
 bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
@@ -625,26 +625,26 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
 // §9.2/§8.4: does this type declare its own equality member, i.e. an
 // `operator =` / `operator <>` overload, or an `Equals` / `GetHashCode`
 // method? Per §9.2 "Authors who want explicit equality on a record outside
-// the auto-equality-bearing set declare `=` and `<>` overloads … along with
+// the auto-hashable set declare `=` and `<>` overloads … along with
 // `Equals(Object?)`, `Equals(T)`, and `GetHashCode` overrides." Such a record
-// is *not* auto-equality-bearing, yet `=`/`<>`/`.Equals`/`.GetHashCode` are
+// is *not* auto-hashable, yet `=`/`<>`/`.Equals`/`.GetHashCode` are
 // valid on it (they dispatch to the user's member), so it must be excluded
 // from the §9.2 non-auto-equality compile error. Returns false for null.
 bool recordHasUserDeclaredEquality(const TypeSymbol* rec);
 
-// §3.6 / §8.3 (v0.158, #1338): the **equality-bearing** derived type property —
+// §3.6 / §8.3 (v0.158, #1338): the **hashable** derived type property —
 // the classification a hash-container key/element must satisfy (`Dictionary<K,V>`
 // / `OwningDictionary<K,V>` keys, `Set<T>` / `OwningSet<T>` elements). Per §3.6's
-// table: "every type except a record that is neither auto-equality-bearing nor
+// table: "every type except a record that is neither auto-hashable nor
 // declares user equality (`operator =`/`<>` with `Equals(T)`/`GetHashCode` per
 // the §25.2 co-declaration rule)". So every primitive, string, enum, class,
-// interface, function value, and inline array is equality-bearing; a record is
-// equality-bearing iff it is positional/combined (§9.1 always synthesizes
-// equality), is an auto-equality-bearing body record (§9.2), or declares
-// `operator =`/`<>`. A null or unresolved type is treated as equality-bearing
+// interface, function value, and inline array is hashable; a record is
+// hashable iff it is positional/combined (§9.1 always synthesizes
+// equality), is an auto-hashable body record (§9.2), or declares
+// `operator =`/`<>`. A null or unresolved type is treated as hashable
 // (conservative — never over-rejects at an instantiation site).
-// v0.214 (#2087): a **choice** is equality-bearing iff it is value-like
-// auto-equality-bearing (§35.7); owning and borrow-bearing choices are not,
+// v0.214 (#2087): a **choice** is hashable iff it is value-like
+// auto-hashable (§35.7); owning and borrow-bearing choices are not,
 // decided by the same §35.4 classifier the use-site `=`/`<>` error consults.
 bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx);
 
@@ -652,11 +652,11 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx);
 // return a component-path fragment naming the offending type + the §3.6/§9.2/
 // §35.7 structural reason, shaped to APPEND after the flat `where T: hashable`
 // constraint-failure diagnostic's §14.2 citation, e.g.
-//   ": record `Bad` is neither auto-equality-bearing (§9.2) nor declares custom
+//   ": record `Bad` is neither auto-hashable (§9.2) nor declares custom
 //     equality (…, §25.2)"
-//   ": choice `Handle` is owning (§35.7), not value-like auto-equality-bearing"
-// The equality-bearing property surfaces its failure at the top-level type (a
-// non-auto-equality-bearing record, or a non-value-like choice), so the path is
+//   ": choice `Handle` is owning (§35.7), not value-like auto-hashable"
+// The hashable property surfaces its failure at the top-level type (a
+// non-auto-hashable record, or a non-value-like choice), so the path is
 // the offending type itself — the analog of sendableFailureComponentPath at the
 // detail level §3.6 supports for this property. Returns empty (caller keeps the
 // flat message) for any type outside that record/choice failure shape.

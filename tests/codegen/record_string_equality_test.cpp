@@ -295,9 +295,9 @@ BEZEL_TEST(codegen_record_str_eq, nullable_string_field_roundtrip_spec_9_1) {
 
 // §9.3 (v0.158, #1383): a positional record whose positional field is a
 // class type (`Inner?` — a reference type, not admissible per §9.2) is no
-// longer equality-bearing. Using `=` / `GetHashCode` / `ToString` on it is a
+// longer hashable. Using `=` / `GetHashCode` / `ToString` on it is a
 // compile error at the use site (the same use-site-error discipline as a
-// non-auto-equality-bearing body record). The codegen null-guard for nullable
+// non-auto-hashable body record). The codegen null-guard for nullable
 // reference fields (`string?`, which IS admissible) is covered by
 // nullable_string_field_roundtrip_spec_9_1 above.
 BEZEL_TEST(codegen_record_str_eq, nullable_class_field_eq_is_compile_error_spec_9_3) {

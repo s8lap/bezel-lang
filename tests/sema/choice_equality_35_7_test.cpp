@@ -2,7 +2,7 @@
 // hashing, and the use-site compile error on `=`/`<>`/Equals/GetHashCode
 // for non-value-like choices.
 //
-// §35.7: "A choice that is NOT auto-equality-bearing — any borrow-bearing
+// §35.7: "A choice that is NOT auto-hashable — any borrow-bearing
 // or owning choice (class-typed payloads are outside the admissible-
 // component rule, exactly as class-typed record fields are), and any
 // value-like choice with an inadmissible payload — draws §9.2's use-site
@@ -13,9 +13,9 @@
 // These tests exercise both halves of §35.7: the classification-driven rule
 // (a non-value-like choice rejects `=`/`<>` and direct Equals/GetHashCode),
 // and the recursive per-payload admissibility rule for value-like choices
-// (§35.7's "auto-equality-bearing when every payload field is §9.2-admissible"
+// (§35.7's "auto-hashable when every payload field is §9.2-admissible"
 // — a value-like choice with an inadmissible payload, e.g. a function-typed
-// payload, is NOT auto-equality-bearing and draws the same use-site error;
+// payload, is NOT auto-hashable and draws the same use-site error;
 // #2110, v0.226). The use-site `=`/`<>` check routes through the same
 // isAutoEqualityBearingChoice predicate that drives isEqualityBearing, the
 // §14.2 `where T: hashable` constraint, and checkHashContainerKeys.
@@ -66,7 +66,7 @@ bool lacksErrDiagWith(const bezel::test::SemaResult& r,
 BEZEL_TEST(choice_equality_35_7,
            spec_35_7_value_like_choice_equality_no_35_7_error) {
     // §35.7 first paragraph: a value-like choice with admissible payloads
-    // is auto-equality-bearing. The §35.7 use-site error does NOT fire
+    // is auto-hashable. The §35.7 use-site error does NOT fire
     // for `=` over a value-like choice.
     auto r = semaAll(
         "module M; choice Opt Some(value: int), None; end Opt; "
@@ -132,7 +132,7 @@ BEZEL_TEST(choice_equality_35_7,
 
 // --- §35.7 REJECT: value-like choice with an inadmissible payload (#2110) ----
 // The recursive half of §35.7: a value-like choice whose case payload fails
-// the §9.2 admissible-component rule is NOT auto-equality-bearing, and `=`/
+// the §9.2 admissible-component rule is NOT auto-hashable, and `=`/
 // `<>` draw the same use-site error as a non-value-like choice. The function
 // type `() -> int` is classification-neutral per §35.4 (the choice stays
 // value-like), yet is outside the §9.2 admissible-component list, so it is
@@ -175,7 +175,7 @@ BEZEL_TEST(choice_equality_35_7,
            spec_35_7_valuelike_admissible_payload_still_allows_equality_2110) {
     // §35.7 (v0.226, #2110): the recursive rule rejects ONLY the inadmissible-
     // payload case — a value-like choice whose payload IS a §9.2 admissible
-    // component (int) remains auto-equality-bearing, and `=` stays allowed.
+    // component (int) remains auto-hashable, and `=` stays allowed.
     // The §35.7 use-site error does NOT fire.
     auto r = semaAll(
         "module M; "
@@ -222,7 +222,7 @@ BEZEL_TEST(choice_equality_35_7,
 // payload (#2110) -----------------------------------------------------------
 // The recursive half of §35.7 on the DIRECT-CALL path: a value-like choice
 // whose case payload fails the §9.2 admissible-component rule is NOT auto-
-// equality-bearing, so direct `.Equals()`/`.GetHashCode()` draw the same use-
+// hashable, so direct `.Equals()`/`.GetHashCode()` draw the same use-
 // site error as on a non-value-like choice. The function type `() -> int` is
 // classification-neutral per §35.4 (the choice stays value-like), yet outside
 // the §9.2 admissible-component list. v0.226, #2110.
@@ -265,7 +265,7 @@ BEZEL_TEST(choice_equality_35_7,
 BEZEL_TEST(choice_equality_35_7,
            spec_35_7_value_like_choice_allows_direct_equals_call) {
     // §35.7: a value-like choice with admissible payloads is auto-
-    // equality-bearing — direct Equals/GetHashCode are allowed. The
+    // hashable — direct Equals/GetHashCode are allowed. The
     // §35.7 use-site error does NOT fire.
     auto r = semaAll(
         "module M; choice Opt Some(value: int), None; end Opt; "

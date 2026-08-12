@@ -1,6 +1,6 @@
 // Sema — issue #3019 (the `?.` use-site-check twin of #2982/#2964). The DOT
 // form (`.`) correctly REJECTS `.Equals(...)` / `.GetHashCode()` on a record /
-// choice that is not auto-equality-bearing with "it is not auto-equality-bearing
+// choice that is not auto-hashable with "it is not auto-hashable
 // (§9.2/§9.3)" / "(§35.7)" (the use-site gate in resolveMemberAccess, #2517).
 // The `?.` form COMPILED PAST sema — no diagnostic at any severity — and then
 // CRASHED codegen:
@@ -11,7 +11,7 @@
 //
 // MEASURED on 332c1b5 (HEAD): `b?.Equals(a)` / `b?.GetHashCode()` on a
 // `HasField?` receiver (HasField is a body record with a non-auto field → not
-// auto-equality-bearing) compiled with NO sema error and aborted codegen with
+// auto-hashable) compiled with NO sema error and aborted codegen with
 // the verifier error above (no binary); the DOT twins `a.Equals(a)` /
 // `a.GetHashCode()` on a non-nullable `HasField` correctly drew the §9.2 use-
 // site error. The `?.` family commits (c24534c #2990, 66d11f3 #2982, 332c1b5
@@ -33,7 +33,7 @@
 // and calls it from BOTH resolveMemberAccess (the `.` form) and
 // resolveNullCondMember (the `?.` form), so the two forms enforce the ONE
 // check — the one fact the compiler already computes for "is this record /
-// choice auto-equality-bearing" (isPositionalRecordEqualityBearing /
+// choice auto-hashable" (isPositionalRecordEqualityBearing /
 // isAutoEqualityBearingBodyRecord / recordHasUserDeclaredEquality /
 // isAutoEqualityBearingChoice — the SAME predicates isEqualityBearing, the
 // `where T: hashable` §14.2 check, and checkHashContainerKeys use). §7.5: a
@@ -47,7 +47,7 @@
 // (record auto-equality + the use-site compile error on `.Equals` /
 // `.GetHashCode` for a non-bearing record), §35.7 (the same rule for choices),
 // §8.1/§8.3 (Equals/GetHashCode are the universal Object surface, available
-// only on auto-equality-bearing records/choices or via user `=`/`<>`).
+// only on auto-hashable records/choices or via user `=`/`<>`).
 // v0.240.
 //
 // Every case drives the REAL `bezelc` AOT path via runAot. For a diagnostic
@@ -91,13 +91,13 @@ bool rejectsAotWith(const std::string& program, std::string_view needle) {
 bool noAutoEqError(const std::string& program) {
     auto r = runAot(program);
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.message.find("is not auto-equality-bearing") != std::string::npos)
+        if (d.message.find("is not auto-hashable") != std::string::npos)
             return false;
     }
     return true;
 }
 
-// A body record with a non-auto explicit field → NOT auto-equality-bearing
+// A body record with a non-auto explicit field → NOT auto-hashable
 // (the explicit field is a disqualifier per §9.2, exactly the shape the lit
 // suite sema_record_equality__ineligible_equals_call_diagnosed_spec_8_3 uses).
 const char* kNonBearingRecord =
@@ -105,7 +105,7 @@ const char* kNonBearingRecord =
     "private _cache: int := 0; "
     "public constructor(x: int) X := x; end constructor; end HasField; ";
 
-// An auto-property-only body record → auto-equality-bearing (§9.2: an
+// An auto-property-only body record → auto-hashable (§9.2: an
 // auto-property of an admissible type is participating storage; no
 // disqualifier). `.Equals`/`.GetHashCode` are available on it.
 const char* kBearingRecord =
@@ -118,7 +118,7 @@ const char* kNonBearingChoice =
     "class K public constructor() end constructor; end K; "
     "choice Box Some(value: K), None; end Box; ";
 
-// A value-like choice with an admissible (int) payload → auto-equality-bearing
+// A value-like choice with an admissible (int) payload → auto-hashable
 // (§35.7).
 const char* kBearingChoice =
     "choice Opt Some(value: int), None; end Opt; ";
@@ -139,7 +139,7 @@ std::string wrap(const std::string& prelude, const std::string& body) {
 // `?.Equals(...)` on a non-bearing record — the issue's exact case. Without
 // the fix: compiles past sema, crashes codegen (IR verifier); the §9.2 message
 // is ABSENT, so this test fails. With the fix: rejected at the call site with
-// "it is not auto-equality-bearing (§9.2/§9.3)".
+// "it is not auto-hashable (§9.2/§9.3)".
 BEZEL_TEST(codegen_nullcond_equality_usesite_3019,
            nullcond_equals_on_non_bearing_record_rejected_spec_9_2) {
     BEZEL_EXPECT_TRUE(rejectsAotWith(
@@ -147,7 +147,7 @@ BEZEL_TEST(codegen_nullcond_equality_usesite_3019,
              "var a: HasField := new HasField(1); "
              "var b: HasField? := new HasField(1); "
              "_ := b?.Equals(a); "),
-        "is not auto-equality-bearing"));
+        "is not auto-hashable"));
 }
 
 // `?.GetHashCode()` on a non-bearing record — the GetHashCode twin of the
@@ -158,12 +158,12 @@ BEZEL_TEST(codegen_nullcond_equality_usesite_3019,
         wrap(kNonBearingRecord,
              "var b: HasField? := new HasField(1); "
              "_ := b?.GetHashCode(); "),
-        "is not auto-equality-bearing"));
+        "is not auto-hashable"));
 }
 
 // `?.Equals(...)` on a borrow-bearing choice — §35.7 twin. Without the fix:
 // bypasses sema, crashes codegen; with it: rejected with "it is not auto-
-// equality-bearing (§35.7) — the choice is borrow-bearing".
+// hashable (§35.7) — the choice is borrow-bearing".
 BEZEL_TEST(codegen_nullcond_equality_usesite_3019,
            nullcond_equals_on_borrow_choice_rejected_spec_35_7) {
     BEZEL_EXPECT_TRUE(rejectsAotWith(
@@ -171,7 +171,7 @@ BEZEL_TEST(codegen_nullcond_equality_usesite_3019,
              "var a: Box := Box.None; "
              "var b: Box? := Box.None; "
              "_ := b?.Equals(a); "),
-        "is not auto-equality-bearing"));
+        "is not auto-hashable"));
 }
 
 // `?.GetHashCode()` on a borrow-bearing choice — the GetHashCode twin.
@@ -181,12 +181,12 @@ BEZEL_TEST(codegen_nullcond_equality_usesite_3019,
         wrap(kNonBearingChoice,
              "var b: Box? := Box.None; "
              "_ := b?.GetHashCode(); "),
-        "is not auto-equality-bearing"));
+        "is not auto-hashable"));
 }
 
 // ===========================================================================
 // Controls — PASS both ways (pre-empt). The gate must NOT fire on a type that
-// IS auto-equality-bearing (false-reject guard), and the `.` form's own reject
+// IS auto-hashable (false-reject guard), and the `.` form's own reject
 // must remain intact (regression guard for the helper extraction).
 // ===========================================================================
 
@@ -239,5 +239,5 @@ BEZEL_TEST(codegen_nullcond_equality_usesite_3019,
         wrap(kNonBearingRecord,
              "var a: HasField := new HasField(1); "
              "_ := a.Equals(a); "),
-        "is not auto-equality-bearing"));
+        "is not auto-hashable"));
 }

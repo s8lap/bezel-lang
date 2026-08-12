@@ -16687,7 +16687,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // a Record (positional or body-form — `emitRecordToString` is the same
     // function for both, and mints exactly one final rc=1 accumulator
     // regardless of field-declaration style, confirmed by tracing its field
-    // loop, LlvmBackend_String.cpp), and (#2479) an auto-equality-bearing
+    // loop, LlvmBackend_String.cpp), and (#2479) an auto-hashable
     // Choice (`emitChoiceToString`, LlvmBackend_String.cpp — the SAME
     // per-case-mints-a-fresh-accumulator shape, and the SAME "a sentinel-
     // literal payload-free case is still safe to recognize as a producer"
@@ -16967,7 +16967,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
         }
     }
     // #2065 / §8.5 / §9.1 / §9.2 / §4.6 / §28.9 (v0.204): the SYNTHESIZED
-    // `ToString()` on a positional or auto-equality-bearing body record is a
+    // `ToString()` on a positional or auto-hashable body record is a
     // +1 string PRODUCER. It lowers in lowerValueSemMethodOn to emitRecordToString
     // (LlvmBackend_String.cpp), which builds `"TypeName(Field: value, …)"` via a
     // chain of emitStringConcat calls; the FINAL concatenation mints the fresh
@@ -16992,7 +16992,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     //     when no user-defined ToString override resolves on the record (a user
     //     override is a resolved MethodSymbol handled by isUserMethodStringReturnCall
     //     below — which already recognizes a user-method string return as +1).
-    //   * Only an auto-bearing record (positional OR auto-equality-bearing body)
+    //   * Only an auto-bearing record (positional OR auto-hashable body)
     //     qualifies: the dispatcher returns the type-name STRING LITERAL (a pooled
     //     immortal sentinel, NOT +1) for an ineligible body record's ToString
     //     (§8.5), so the +1 recognition must NOT fire there — the literal-binding
@@ -17027,7 +17027,7 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     }
                     // #2479 / §35.7 (mirrors the Record recognizer just above,
                     // same shape as #2065): a CONCRETE choice receiver's
-                    // `.ToString()`, when auto-equality-bearing, dispatches
+                    // `.ToString()`, when auto-hashable, dispatches
                     // through lowerValueSemMethodOn to emitChoiceToString —
                     // for a payload-BEARING active case this always mints a
                     // fresh rc=1 heap string via at least one emitStringConcat

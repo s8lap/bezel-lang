@@ -180,7 +180,7 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // fix #2516 (§9.2/§2.8.3 rule 3): isPositional is part of a Field's
     // signature identity — a library changing a field from positional to
     // body (or vice versa) changes the cross-module contract (positional
-    // fields are §9.2 record-equality-bearing; body fields are not), so it
+    // fields are §9.2 auto-hashable; body fields are not), so it
     // must fold into the semantic hash the same way hasSetter/
     // isAutoProperty/hasGetter/isEventStatic/isEventAsync do above, or a
     // consumer's staleness check cannot see the change (§2.8.3 rule 3).

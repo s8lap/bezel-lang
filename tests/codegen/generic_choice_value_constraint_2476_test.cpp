@@ -163,10 +163,10 @@ BEZEL_TEST(generic_choice_value_constraint_2476,
 // record crash the instant #2476's classification fix alone landed
 // (confirmed during this fix's own development). #2476 closed that crash
 // with a clean "declared but not yet implemented" diagnostic (tracked
-// #2479); #2479 has since been implemented for the auto-equality-bearing
+// #2479); #2479 has since been implemented for the auto-hashable
 // case `Color` is (see generic_bare_typeparam_tostring_choice_2479_test.cpp
 // for the full regression suite, including the diagnostic that remains for
-// the non-auto-equality-bearing classification #2479 left undecided) — so
+// the non-auto-hashable classification #2479 left undecided) — so
 // this call now dispatches to the real §35.7 format instead of erroring.
 // Value-correct, not just clean compile: a payload-free case formats as
 // `"TypeName.CaseName"`.

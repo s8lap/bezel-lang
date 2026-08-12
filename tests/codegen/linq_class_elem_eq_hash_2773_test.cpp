@@ -4,11 +4,11 @@
 //
 // WHAT THE DOCUMENTS REQUIRE.  stdlib §5 ("Key and equality contracts",
 // v0.195) states that "`Distinct`, `Union`, `Intersect`, `Except`, `Contains`,
-// and `ToSet` require **equality-bearing** `T` … enforced at the operator's
+// and `ToSet` require **hashable** `T` … enforced at the operator's
 // instantiation site exactly as for `Set<T>`/`Dictionary<K, V>`", and spec
-// §3.6's equality-bearing row admits "every type except (a) a record that is
-// neither auto-equality-bearing nor declares user equality, and (b) a choice
-// that is not value-like auto-equality-bearing" — so a CLASS and an INTERFACE
+// §3.6's hashable row admits "every type except (a) a record that is
+// neither auto-hashable nor declares user equality, and (b) a choice
+// that is not value-like auto-hashable" — so a CLASS and an INTERFACE
 // are admitted element types and these operators must work on them.
 //
 // What equality then MEANS is spec §8.3's table — for a class, "Reference
@@ -158,7 +158,7 @@ BEZEL_TEST(linq_class_elem_eq_hash_2773,
         "  return d.Length;")), 2);
 }
 
-// spec §3.6 (equality-bearing admits an interface) + §8.3: a statically
+// spec §3.6 (hashable admits an interface) + §8.3: a statically
 // INTERFACE-typed element is the shape the #2768 family keeps re-acquiring.
 // `Sq` overrides nothing, so the three references stay distinct.
 BEZEL_TEST(linq_class_elem_eq_hash_2773,
@@ -254,7 +254,7 @@ BEZEL_TEST(linq_class_elem_eq_hash_2773,
 }
 
 // The record element (issue D6's path) is untouched by this fix and must stay
-// structural: two equal `Pt(1)` collapse (spec §9.2 auto-equality-bearing).
+// structural: two equal `Pt(1)` collapse (spec §9.2 auto-hashable).
 BEZEL_TEST(linq_class_elem_eq_hash_2773,
            record_element_stays_structural_spec_9_2) {
     BEZEL_EXPECT_EQ(run(main_(

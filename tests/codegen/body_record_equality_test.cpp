@@ -4,11 +4,11 @@
 // and `ToString` over its auto-properties (and only its auto-properties) when
 // every member of the record is one of: an auto-property …; a method or
 // expression-bodied property …; an overload of a non-equality operator; a
-// constructor. Such a record is said to be auto-equality-bearing." The
+// constructor. Such a record is said to be auto-hashable." The
 // participating components are the auto-properties in declaration order; the
 // synthesized members reuse the positional-record machinery over that set.
 //
-// §9.2 "A body record is NOT auto-equality-bearing … when it contains: an
+// §9.2 "A body record is NOT auto-hashable … when it contains: an
 // explicit field declaration … " and (§8.5) when it declares its own `Equals`
 // / `GetHashCode` / `ToString`. An ineligible body record gets the type-name
 // default for ToString (§8.5) and no auto equality.
@@ -132,7 +132,7 @@ BEZEL_TEST(codegen_body_record, string_auto_property_spec_9_2) {
 }
 
 // §9.2: a non-equality operator overload does not disqualify a body record —
-// it remains auto-equality-bearing (Equals/ToString are synthesized).
+// it remains auto-hashable (Equals/ToString are synthesized).
 BEZEL_TEST(codegen_body_record, non_equality_operator_eligible_spec_9_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -184,7 +184,7 @@ BEZEL_TEST(codegen_body_record, manual_equals_tostring_type_name_spec_8_5) {
 }
 
 // §9.2 / §8.5: a body record with an explicit field declaration (storage that
-// is not an auto-property) is NOT auto-equality-bearing — its ToString is the
+// is not an auto-property) is NOT auto-hashable — its ToString is the
 // type-name default. The auto-property still reads correctly (storage layout
 // includes both the field and the auto-property).
 BEZEL_TEST(codegen_body_record, explicit_field_ineligible_spec_9_2) {

@@ -479,7 +479,7 @@ BEZEL_TEST(linq_gaps, todict_record_value_indexed_read_738) {
         "end Main; end C;"), 30);
 }
 
-// #1692 / stdlib §5: ToDictionary's TKey may be ANY equality-bearing type, not
+// #1692 / stdlib §5: ToDictionary's TKey may be ANY hashable type, not
 // just `int` — including `string` (returned by an un-annotated lambda, e.g. a
 // string-interpolation key). buildLinqTrampoline's kind-2 "key" trampoline
 // hardcoded an `i32` return for the key-selector closure call regardless of

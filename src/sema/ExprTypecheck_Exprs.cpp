@@ -4458,7 +4458,7 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 // §9.3 (v0.158, #1383): positional/combined-form records are no
                 // longer unconditionally skipped. A positional record whose
                 // fields fall outside the admissible-component rule gets the same
-                // use-site error as a non-auto-equality-bearing body record (§9.3
+                // use-site error as a non-auto-hashable body record (§9.3
                 // "use-site-error discipline"). For LOCAL records the flag lives
                 // on the ast::TypeDecl; for IMPORTED records (no ast node) it
                 // lives on TypeSymbol itself (issue #501 fix).
@@ -4475,15 +4475,15 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                         Severity::Error, be.span.begin,
                         "`" + std::string(op) + "` is not available on record `" +
                         std::string(ts->name) +
-                        "`: it is not auto-equality-bearing (§9.2/§9.3). Declare"
+                        "`: it is not auto-hashable (§9.2/§9.3). Declare"
                         " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
-                        " or simplify the record to an auto-equality-bearing form.");
+                        " or simplify the record to an auto-hashable form.");
                     break;
                 }
             }
             // §35.7 (v0.200, #2045; v0.226, #2110): a choice draws §9.2's
             // use-site compile error on `=`/`<>` exactly when it is NOT
-            // auto-equality-bearing — i.e. any borrow-bearing or owning choice,
+            // auto-hashable — i.e. any borrow-bearing or owning choice,
             // AND any value-like choice whose case payload fails the §9.2
             // admissible-component rule (§35.7's recursive clause: "any
             // value-like choice with an inadmissible payload"). The predicate
@@ -4497,7 +4497,7 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             if (ts && ts->kind == ast::TypeDeclKind::Choice) {
                 // §35.7 / §28.1 (#2047): classify at the operand's INSTANTIATION
                 // so `Result<int, string>` is value-like (the `owned` markers
-                // erase over int/string) — hence auto-equality-bearing — while
+                // erase over int/string) — hence auto-hashable — while
                 // `Result<Connection, string>` stays owning. The operand's
                 // resolved type carries the concrete generic args; fall back to a
                 // bare declaration ref for a non-generic choice / missing type.
@@ -4519,7 +4519,7 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     if (verdict &&
                         *verdict != common::ChoiceClassification::ValueLike) {
                         reason =
-                            std::string("it is not auto-equality-bearing "
+                            std::string("it is not auto-hashable "
                                         "(§35.7) — the choice is ") +
                             (*verdict == common::ChoiceClassification::Owning
                                  ? "owning"
@@ -4527,11 +4527,11 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                             ", and a non-value-like choice carries no "
                             "value equality";
                     } else {
-                        // Value-like yet still not auto-equality-bearing:
+                        // Value-like yet still not auto-hashable:
                         // a case payload failed the §9.2 admissible-component
                         // rule (§35.7's recursive clause).
                         reason =
-                            "it is not auto-equality-bearing (§35.7): the "
+                            "it is not auto-hashable (§35.7): the "
                             "choice is value-like but a case payload is not "
                             "an admissible equality component (§9.2)";
                     }

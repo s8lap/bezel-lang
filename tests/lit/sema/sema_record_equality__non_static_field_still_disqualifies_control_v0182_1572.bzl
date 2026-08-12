@@ -8,5 +8,5 @@
 
 module M; record HasNonStaticField public property X: int; public Cache: int := 0; public constructor(x: int) X := x; end constructor; end HasNonStaticField; class C public method M() var a := new HasNonStaticField(1); var b := new HasNonStaticField(1); _ := a = b; end M; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: `=` is not available on record `HasNonStaticField`: it is not auto-equality-bearing
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: `=` is not available on record `HasNonStaticField`: it is not auto-hashable
 // CHECK-SAME: (§9.2/§9.3)

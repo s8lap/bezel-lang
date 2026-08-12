@@ -160,7 +160,7 @@ BEZEL_TEST(pure_residuals_2061,
 // =========================================================================
 // §22.15 "Members classified by rule" (#2061, item 2) — synthesized record
 // members (Equals/GetHashCode/ToString) are pure-classified iff the record
-// class is auto-equality-bearing (every field's dispatch target is pure).
+// class is auto-hashable (every field's dispatch target is pure).
 // =========================================================================
 
 // §22.15: a call from a pure body to a positional record's synthesized
@@ -211,9 +211,9 @@ BEZEL_TEST(pure_residuals_2061,
 }
 
 // §22.15: a call from a pure body to a body record's synthesized
-// `GetHashCode` — admitted when the body record is auto-equality-bearing
+// `GetHashCode` — admitted when the body record is auto-hashable
 // (every auto-property is a pure-admissible component type — the
-// auto-equality-bearing form uses `public property X: T;` declarations).
+// auto-hashable form uses `public property X: T;` declarations).
 BEZEL_TEST(pure_residuals_2061,
            pure_calls_body_record_gethashcode_accepted_spec_22_15) {
     auto r = parseSemaAll(
@@ -233,11 +233,11 @@ BEZEL_TEST(pure_residuals_2061,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §22.15: a non-positional, non-equality-bearing record — synthesized
+// §22.15: a non-positional, non-hashable record — synthesized
 // members exist but the synthesized body's purity is not provable (a
 // class-typed field's virtual `Equals` disqualifies). The pure-body
 // checker reports a §22.15 violation. The sema-level §9.2/§9.3 separate
-// check (which rejects `.Equals` on a non-equality-bearing record) also
+// check (which rejects `.Equals` on a non-hashable record) also
 // fires — either diagnostic is sufficient.
 BEZEL_TEST(pure_residuals_2061,
            pure_calls_non_equality_bearing_record_gethashcode_rejected_spec_22_15) {
@@ -256,13 +256,13 @@ BEZEL_TEST(pure_residuals_2061,
 // =========================================================================
 // §22.15 "Members classified by rule" (#2061, item 2) — record construction
 // `new R(args)` from a pure body. Admitted for positional records whose
-// synthesized ctor is pure-classified (record is auto-equality-bearing) and
+// synthesized ctor is pure-classified (record is auto-hashable) and
 // for body records with a `pure`-declared ctor.
 // =========================================================================
 
 // §22.15: positional record construction from a pure body — admitted
 // (positional records' synthesized positional ctors are pure-classified
-// when the record is auto-equality-bearing; here every field is an int,
+// when the record is auto-hashable; here every field is an int,
 // which is always admissible, so the classification is pure).
 BEZEL_TEST(pure_residuals_2061,
            pure_body_constructs_positional_record_accepted_spec_22_15) {

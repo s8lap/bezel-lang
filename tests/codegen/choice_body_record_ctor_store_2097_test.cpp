@@ -128,7 +128,7 @@ BEZEL_TEST(codegen_choice_body_record_ctor_store_2097,
 }
 
 // §9.2 / §35.7 / §3.6 — Dictionary key: a body record whose stored field is a
-// value-like choice is equality-bearing and usable as a hash-container key. The
+// value-like choice is hashable and usable as a hash-container key. The
 // boxed-equality path must observe the tag the ctor stored: inserting under a
 // Green(7) key and looking it up returns the value.
 BEZEL_TEST(codegen_choice_body_record_ctor_store_2097,

@@ -1,8 +1,8 @@
 // Codegen — issue #2503: a bare-`T` STRING INTERPOLATION hole (`$"{val}"`,
 // `val: T where T: value`) substituted with a struct-typed record/choice
 // produced a SILENT WRONG VALUE instead of #2479's diagnostic (for a
-// non-auto-equality-bearing choice) or the §35.7/§9.1 default rendering
-// (for an auto-equality-bearing choice / record).
+// non-auto-hashable choice) or the §35.7/§9.1 default rendering
+// (for an auto-hashable choice / record).
 //
 // Root cause (traced mechanically — NOT the cause #2503's own text
 // proposed): the issue text attributed the bug to `emitValueToString`'s
@@ -37,7 +37,7 @@
 // a Record or Choice dispatches through the SAME "For struct" logic a
 // concrete-typed operand already uses (the user-ToString-override lookup,
 // `emitRecordToString`, `emitChoiceToString`, and — for a choice that is
-// NOT auto-equality-bearing (§35.7 defines no ToString default for that
+// NOT auto-hashable (§35.7 defines no ToString default for that
 // classification) — the pre-existing #2479/#2476 diagnostic). This closes
 // the same "one enforcement point" gap #2503 asked for, inside the block
 // that already held the concrete-case enforcement, rather than adding a
@@ -90,7 +90,7 @@ const char* kNonAutoEqBearing =
     "class Widget end Widget; "
     "choice Holder Empty, Filled(item: Widget); end Holder; ";
 const char* kNonAeqDiag =
-    "member `ToString` on a choice that is not auto-equality-bearing";
+    "member `ToString` on a choice that is not auto-hashable";
 
 }  // namespace
 
@@ -118,7 +118,7 @@ BEZEL_TEST(generic_bare_typeparam_tostring_interp_2503,
     BEZEL_EXPECT_TRUE(hasError(program, "#2479"));
 }
 
-// ── The auto-equality-bearing counterpart: §35.7's real default
+// ── The auto-hashable counterpart: §35.7's real default
 //    ("TypeName.CaseName(field1: value1, …)") must actually render through
 //    the bare-T interpolation hole, not vanish. FAILS before the fix
 //    (`s == ""`, hole silently dropped); PASSES after (correct §35.7

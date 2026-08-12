@@ -102,7 +102,7 @@ BEZEL_TEST(generic_bare_typeparam_tostring_record_2469,
     BEZEL_EXPECT_EQ(run(program), 42);
 }
 
-// ── Body record, auto-equality-bearing (§9.2 / §8.5) ────────────────────────
+// ── Body record, auto-hashable (§9.2 / §8.5) ────────────────────────
 
 // An eligible body record (only auto-properties + a property-initializing
 // constructor) substituted for T: the §9.2/§8.5 auto-ToString format applies
@@ -130,13 +130,13 @@ BEZEL_TEST(generic_bare_typeparam_tostring_record_2469,
     BEZEL_EXPECT_EQ(runAotOut(program), "Pt(X: 7, Y: 8)");
 }
 
-// A body record with an explicit field is NOT auto-equality-bearing (§9.2:
-// "A body record is not auto-equality-bearing … when it contains: an
+// A body record with an explicit field is NOT auto-hashable (§9.2:
+// "A body record is not auto-hashable … when it contains: an
 // explicit field declaration"), so its §8.5 ToString default is the type's
 // qualified name, not the property-listing form — asserted through the SAME
 // generic-substitution path to pin that `lowerValueSemMethodOn`'s existing
 // `!autoBearing` branch (LlvmBackend_Calls2.cpp) is reached correctly here
-// too, not just the auto-equality-bearing one above.
+// too, not just the auto-hashable one above.
 BEZEL_TEST(generic_bare_typeparam_tostring_record_2469,
            body_record_non_auto_equality_substitution_type_name_default) {
     const std::string program =

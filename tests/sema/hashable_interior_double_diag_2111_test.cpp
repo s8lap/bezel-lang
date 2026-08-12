@@ -5,7 +5,7 @@
 //
 // Today (pre-fix), a generic TYPE that both (a) carries `where K: hashable`
 // and (b) uses K as an interior hash-container key (`Dictionary<K, …>`)
-// produces TWO diagnostics for a non-equality-bearing instantiation: the
+// produces TWO diagnostics for a non-hashable instantiation: the
 // §14.2 constraint failure (Resolver::checkOneConstraint) AND the interior
 // §3.6-rule-2 hash-container-key failure (Resolver::checkHashContainerKeys
 // pass 2). The spec says the constraint diagnostic should REPLACE the
@@ -18,7 +18,7 @@
 // diagnostic — included here as a soundness guard against over-suppression.
 //
 // Authority: spec §14.2 "Derived-property constraints" (v0.214) + §3.6
-// equality-bearing property. The interior reject text is pinned by the lit
+// hashable property. The interior reject text is pinned by the lit
 // track; here we assert presence/absence of the two diagnostic shapes.
 
 #include <string>
@@ -55,13 +55,13 @@ bool hasHashableConstraintError(const SemaResult& r) {
 }
 
 // True iff the interior §3.6/§8.3 hash-container-key diagnostic was reported
-// ("`Dictionary` requires an equality-bearing key type, but the type argument
-// … is not equality-bearing (§3.6/§8.3)"). This is the diagnostic §14.2 says
+// ("`Dictionary` requires a hashable key type, but the type argument
+// … is not hashable (§3.6/§8.3)"). This is the diagnostic §14.2 says
 // the constraint failure REPLACES for a `where K: hashable`-constrained param.
 bool hasInteriorHashKeyError(const SemaResult& r) {
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.severity == bezel::Severity::Error &&
-            d.message.find("requires an equality-bearing") != std::string::npos)
+            d.message.find("requires a hashable") != std::string::npos)
             return true;
     return false;
 }
@@ -71,7 +71,7 @@ bool hasInteriorHashKeyError(const SemaResult& r) {
 // ─── THE BUG: a constrained interior Dictionary<K,…> double-diagnosed ────────
 
 // §14.2 (v0.214): `Registry<K> where K: hashable` whose body uses K as an
-// interior `Dictionary<K, int>` key, instantiated with a NON-equality-bearing
+// interior `Dictionary<K, int>` key, instantiated with a NON-hashable
 // record (`Holder` — a positional record over a class-typed field, §9.3),
 // draws the §14.2 constraint failure at the instantiation site. The interior
 // §3.6-rule-2 check is SUBSUMED: per §14.2 "one diagnostic … replaces the
@@ -104,7 +104,7 @@ BEZEL_TEST(hashable_interior_double_diag_2111,
 // §14.2 / §9.1: the same constrained interior shape with a HASHABLE concrete
 // argument (`Point` — a positional record over admissible components) draws
 // NEITHER diagnostic: the constraint is satisfied and the interior key is
-// equality-bearing. Confirms the fix does not introduce false positives.
+// hashable. Confirms the fix does not introduce false positives.
 BEZEL_TEST(hashable_interior_double_diag_2111,
            constrained_interior_dictionary_hashable_arg_no_diag_spec_14_2) {
     auto r = parseSemaAll(
@@ -125,7 +125,7 @@ BEZEL_TEST(hashable_interior_double_diag_2111,
 
 // §14.2: "an unconstrained parameter never acquires [the property]." A generic
 // `Registry2<K>` with NO `where K: hashable` clause carries its own interior
-// §3.6-rule-2 obligation for `Dictionary<K, int>`; with a non-equality-bearing
+// §3.6-rule-2 obligation for `Dictionary<K, int>`; with a non-hashable
 // `Holder` it MUST still fire the interior diagnostic. The fix suppresses the
 // interior check ONLY when a `hashable` constraint is present on that exact
 // param, so this case is unaffected — silently dropping it would be a

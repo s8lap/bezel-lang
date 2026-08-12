@@ -3010,15 +3010,15 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
             return emitEnumToString(val, ts);
         // #2479 / §35.7: a choice-typed field/interpolation-hole formats by
         // the §35.7 discriminant+payload format when the choice is auto-
-        // equality-bearing — mirrors the record recursion just above
+        // hashable — mirrors the record recursion just above
         // (`emitRecordToString`'s reachability precondition already
         // guarantees any Choice-typed FIELD it recurses into is itself
-        // auto-equality-bearing, per §9.2/§35.7's recursive admissible-
+        // auto-hashable, per §9.2/§35.7's recursive admissible-
         // component rule: an ineligible body record's ToString never
         // iterates fields at all, LlvmBackend_Calls2.cpp's `!autoBearing`
         // early return). A bare top-level choice-typed interpolation hole
         // (`$"{c}"`) carries no such precondition, so the check is real
-        // here, not defensive: for a non-auto-equality-bearing choice this
+        // here, not defensive: for a non-auto-hashable choice this
         // falls through to the generic fallback below (a struct value hits
         // neither the pointer nor the integer/float checks, landing on the
         // final `lowerStringLiteral("\"\"", false)` — an empty string,
@@ -3424,9 +3424,9 @@ llvm::Value* Emitter::emitRecordToString(llvm::Value* recVal,
 }
 
 // §35.7 (#2479): build `"TypeName.CaseName(field1: value1, …)"` for the
-// ACTIVE case of an auto-equality-bearing choice, or `"TypeName.CaseName"`
+// ACTIVE case of an auto-hashable choice, or `"TypeName.CaseName"`
 // for a payload-free case — the exact format §35.7 specifies. Callers are
-// responsible for confirming the choice is auto-equality-bearing first
+// responsible for confirming the choice is auto-hashable first
 // (via `sema::isAutoEqualityBearingChoice`, mirroring how a caller must
 // confirm value-likeness before `emitChoiceEquality`/`emitChoiceHashCode`);
 // this function does not re-check it, matching those two siblings.

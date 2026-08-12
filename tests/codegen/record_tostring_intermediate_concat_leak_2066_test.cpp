@@ -1,7 +1,7 @@
 // Codegen / runtime — §9.1 / §9.2 / §4.6 / §28.9 (#2066): the SYNTHESIZED
 // record ToString's INTERMEDIATE concat buffers must be released mid-chain.
 //
-// §9.1 / §9.2 / §8.5 (v0.204): a positional or auto-equality-bearing body
+// §9.1 / §9.2 / §8.5 (v0.204): a positional or auto-hashable body
 // record's ToString yields the synthesized form `"TypeName(Field: value, …)"`.
 // `Emitter::emitRecordToString` (src/codegen/LlvmBackend_String.cpp) builds it
 // by chaining `emitStringConcat` calls: an accumulator starts at the literal

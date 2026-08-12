@@ -1,6 +1,6 @@
 // Sema — §35.7 / §3.6 / §14.2 (v0.210/v0.214, #2083 × #2087 merged rule):
 // `isEqualityBearing` for a CHOICE applies the RECURSIVE §35.7 rule — a choice
-// is equality-bearing iff it is value-like AND every payload field of every
+// is hashable iff it is value-like AND every payload field of every
 // case is a §9.2 admissible component ("this same list applied to every case's
 // payload fields"). The pre-merge #2087 commit used the §35.4 classification
 // ALONE, which over-admitted a value-like choice with an inadmissible payload
@@ -47,7 +47,7 @@ bool hasErrDiagWith(const SemaResult& r, std::string_view needle) {
 // ─── #2110 KEY-POSITION HALF (fixed by the merged recursive rule) ────────────
 
 // §3.6 rule 2 / §35.7: a VALUE-LIKE choice with a FUNCTION-TYPED payload is
-// NOT equality-bearing under the recursive rule (a function value is outside
+// NOT hashable under the recursive rule (a function value is outside
 // the §9.2 admissible-component list) → rejected as a Dictionary key. The
 // pre-merge classification-only rule admitted it (the #2110 repro shape).
 BEZEL_TEST(choice_recursive_equality_rule_2083_2087,
@@ -59,7 +59,7 @@ BEZEL_TEST(choice_recursive_equality_rule_2083_2087,
         "  var d := new Dictionary<Holder, int>(); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "requires an equality-bearing"));
+    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "requires a hashable"));
     // The reason clause is the value-like-specific one (not the wrong
     // "borrow-bearing" wording the pre-amendment reasonClause produced).
     BEZEL_EXPECT_TRUE(hasErrDiagWith(
@@ -78,7 +78,7 @@ BEZEL_TEST(choice_recursive_equality_rule_2083_2087,
         "  var d := new Dictionary<Boxy, int>(); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "requires an equality-bearing"));
+    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "requires a hashable"));
 }
 
 // §14.2 / §35.7: the SAME choice fails `where T: hashable` — the constraint
@@ -106,7 +106,7 @@ BEZEL_TEST(choice_recursive_equality_rule_2083_2087,
 // ─── NO OVER-REJECT: admissible-payload value-like choices stay accepted ─────
 
 // §3.6 / §35.7: a value-like choice whose payloads are all admissible (string,
-// int) IS equality-bearing under the recursive rule — Dictionary key accepted
+// int) IS hashable under the recursive rule — Dictionary key accepted
 // (the recursive tightening must not over-reject the admitted set).
 BEZEL_TEST(choice_recursive_equality_rule_2083_2087,
            spec_3_6_v210_string_payload_choice_dictionary_key_accepted) {
@@ -117,7 +117,7 @@ BEZEL_TEST(choice_recursive_equality_rule_2083_2087,
         "  var d := new Dictionary<Msg, int>(); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "requires an equality-bearing"));
+    BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "requires a hashable"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 

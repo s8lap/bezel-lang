@@ -3357,7 +3357,7 @@ private:
     // §35.7 (#2479): "TypeName.CaseName(field1: value1, …)" / "TypeName.
     // CaseName" over the choice struct's active case, mirroring
     // emitChoiceEquality/emitChoiceHashCode's tag-switch shape. Callers must
-    // confirm auto-equality-bearing (sema::isAutoEqualityBearingChoice)
+    // confirm auto-hashable (sema::isAutoEqualityBearingChoice)
     // first — this function does not re-check it.
     llvm::Value* emitChoiceToString(llvm::Value* val,
                                     const sema::TypeSymbol* choiceTy);
@@ -12084,7 +12084,7 @@ private:
                                           unsigned idx);
 
     // issue #343 / §9.1 / §9.2: if `ref` itself resolves to an
-    // equality-bearing record type (positional or auto-equality body record),
+    // hashable record type (positional or auto-equality body record),
     // return its TypeSymbol; otherwise null. Used to route a record *element*
     // sequence (e.g. lazy LINQ Distinct) through structural equality.
     const sema::TypeSymbol* recordTypeOfRef(const sema::TypeRef* ref);
@@ -12108,7 +12108,7 @@ private:
     // issues D3 / D8 / §4.8 / §4.10: a Dictionary<K,V> key (idx=0) or Set<T>
     // element (idx=0) needs the generic-key runtime variant (bz_dict_*_gen)
     // when K/T is NOT a string-key-fast-path type. For dictionaries the
-    // string key keeps the fast path; every other equality-bearing key
+    // string key keeps the fast path; every other hashable key
     // (int/long/bool/char/enum/double/float, or a record) goes generic.
     // For sets the array backing cannot dedup (§4.10), so ALL element types go
     // generic — including string elements. `isSet` selects the set rule.
@@ -12263,7 +12263,7 @@ private:
     }
 
     // issues D3 / D8 / §8.3: build C-ABI trampolines over an ARBITRARY
-    // equality-bearing value type's hash / equality for the generic dict/set
+    // hashable value type's hash / equality for the generic dict/set
     // runtime variant. Generalizes buildRecord*Trampoline from records to
     // primitives, enums, and strings. `ty` is the key/element TypeRef; the
     // runtime stores `byteSize` raw bytes per key (8 for a string pointer or a

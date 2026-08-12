@@ -5,11 +5,11 @@
 // payload) compare equal; the equality hashes per §35.7's "case discriminant
 // mixed in first, then per-payload" rule.
 //
-// §9.3 (combined form): positional/combined records are equality-bearing when
+// §9.3 (combined form): positional/combined records are hashable when
 // every positional field and every body auto-property is an admissible
 // component type. With v0.210's widened admissible list (choices included),
 // `record Wrap(C: Color)` over a value-like choice `Color` is admitted as
-// auto-equality-bearing.
+// auto-hashable.
 //
 // NB: body records (`record Wrap { public property C: Color }`) hitting the
 // SAME field-ctor store path through the auto-property setter have a separate
@@ -85,8 +85,8 @@ BEZEL_TEST(codegen_choice_component_record_equality_v210_2083,
 }
 
 // §9.2 / §35.7 — HashCode invariant: equal-by-hash-container inspection.
-// §3.6 / §8.3 requires the key type to be equality-bearing, and a
-// value-like choice IS equality-bearing per §35.7. Distinct cases should
+// §3.6 / §8.3 requires the key type to be hashable, and a
+// value-like choice IS hashable per §35.7. Distinct cases should
 // produce distinct hashes (the discriminant is mixed in first).
 BEZEL_TEST(codegen_choice_component_record_equality_v210_2083,
            spec_9_3_v210_positional_record_different_choice_different_hash) {
@@ -102,7 +102,7 @@ BEZEL_TEST(codegen_choice_component_record_equality_v210_2083,
 }
 
 // §9.3 / §35.7 — POSITIONAL record with a NESTED choice component. The
-// §35.7 recursive rule admits "another auto-equality-bearing choice" as a
+// §35.7 recursive rule admits "another auto-hashable choice" as a
 // payload field type, so the inner choice's GetHashCode is folded into
 // the outer choice's fold, which is folded into the record's fold.
 BEZEL_TEST(codegen_choice_component_record_equality_v210_2083,
@@ -121,7 +121,7 @@ BEZEL_TEST(codegen_choice_component_record_equality_v210_2083,
 }
 
 // §9.2 / §35.7 — Dictionary key: a value-like choice (here, a positional
-// record holding one) is equality-bearing per §35.7, so it satisfies the
+// record holding one) is hashable per §35.7, so it satisfies the
 // §3.6 / §8.3 `Dictionary<K, V>` key contract. The exercise is from the
 // runtime: insert via two keys, look up via the first, expect the value
 // that maps from it. Uses the boxed equality (the spec's hash-container

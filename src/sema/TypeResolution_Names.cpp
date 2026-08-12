@@ -1569,8 +1569,8 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // element instantiation (`Dictionary`/`OwningDictionary` key K,
                 // `Set`/`OwningSet` element T) so checkHashContainerKeys can
                 // verify — after all member types are resolved — that it is
-                // equality-bearing. Deferred (not checked inline) because a
-                // record key's auto-equality-bearing property depends on the
+                // hashable. Deferred (not checked inline) because a
+                // record key's auto-hashable property depends on the
                 // record's own members, which may resolve after this site.
                 std::string_view hashRole;
                 if (first == "Set" || first == "OwningSet")

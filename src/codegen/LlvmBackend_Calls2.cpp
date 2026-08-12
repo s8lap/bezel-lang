@@ -2331,9 +2331,9 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     // substituted bare-T ToString call compiled clean — the exact
     // "narrowing alone is unsafe" lesson #2465 already paid for on this
     // same block of code. `lowerValueSemMethodOn`'s own Choice branch now
-    // implements the real §35.7 format for an auto-equality-bearing choice
+    // implements the real §35.7 format for an auto-hashable choice
     // and keeps a clean diagnostic (rather than a crash) for the
-    // undecided non-auto-equality-bearing case — see that branch (~line
+    // undecided non-auto-hashable case — see that branch (~line
     // 2186) for the full citation, so there is no need to special-case
     // Choice separately here any more than Record/Enum are.
     if (isToString &&
@@ -2463,7 +2463,7 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         if (!recv->getType()->isStructTy()) return nullptr;
         if (isToString) {
             // #2479 (§35.7/§8.5): a real default exists ONLY for an
-            // auto-equality-bearing choice — the same classification §35.7
+            // auto-hashable choice — the same classification §35.7
             // already gates `=`/`<>`/`Equals`/`GetHashCode` on (value-like,
             // every payload an admissible component type). For any other
             // classification (borrow-bearing, owning, or value-like with an
@@ -2481,8 +2481,8 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
                 return emitChoiceToString(recv, ts);
             ctx_.diagnostics().report(
                 Severity::Error, call.span.begin,
-                "member `ToString` on a choice that is not auto-equality-"
-                "bearing (borrow-bearing, owning, or a value-like choice "
+                "member `ToString` on a choice that is not auto-hashable "
+                "(borrow-bearing, owning, or a value-like choice "
                 "with an inadmissible payload, language spec "
                 "\xC2\xA7""35.7) has no compiler-defined default; declare "
                 "a plain `ToString(): string` member to replace it "
@@ -2520,7 +2520,7 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
 
     // §9.1 / §9.2: a positional / combined-form record always carries the
     // synthesized value-semantics members (the §9.1 package). A *body* record
-    // carries them only when it is auto-equality-bearing (§9.2); an ineligible
+    // carries them only when it is auto-hashable (§9.2); an ineligible
     // body record gets the type-name default for ToString (§8.5) and no auto
     // equality.
     bool positional = false;

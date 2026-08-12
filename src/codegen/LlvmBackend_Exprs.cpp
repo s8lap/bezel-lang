@@ -670,14 +670,14 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             // §35.7's open question (see lowerValueSemMethodOn's
                             // Choice/ToString branch for the full citation):
                             // no compiler-defined default exists for a choice
-                            // that is not auto-equality-bearing. Diagnose
+                            // that is not auto-hashable. Diagnose
                             // rather than silently rendering the misleading
                             // bare type name (indistinguishable from a real
                             // implemented default) or crashing.
                             ctx_.diagnostics().report(
                                 Severity::Error, part.expr->span.begin,
                                 "member `ToString` on a choice that is not "
-                                "auto-equality-bearing (borrow-bearing, "
+                                "auto-hashable (borrow-bearing, "
                                 "owning, or a value-like choice with an "
                                 "inadmissible payload, language spec "
                                 "\xC2\xA7""35.7) has no compiler-defined "

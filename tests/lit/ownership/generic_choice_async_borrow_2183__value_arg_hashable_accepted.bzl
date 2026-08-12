@@ -2,7 +2,7 @@
 //
 // §35.7 / §35.4.3 (v0.226, issue #2183): a DIRECT classification pin for the
 // instantiation-aware borrow leg. `Opt<int>` is value-like at this instantiation
-// (§35.4.3), hence auto-equality-bearing and hashable-admissible (§35.7) — like
+// (§35.4.3), hence auto-hashable and hashable-admissible (§35.7) — like
 // the stdlib `Result<int, string>`. Before the fix, the borrow leg answered the
 // bare-`T` payload conservatively (borrow-bearing) at EVERY instantiation, so
 // `Opt<int>` failed `where T: hashable`. This pins the correction: a concrete

@@ -21,7 +21,7 @@
 //   * §28.1 per-instantiation erasure: `Result<int, string>` is value-like
 //     (both `owned` markers erase over int / string), so an ordinary value /
 //     borrow argument is accepted (the stdlib `ParsePort` pattern), it is
-//     equality-bearing, and usable as a Dictionary key.
+//     hashable, and usable as a Dictionary key.
 //   * §35.4 owning instantiation: `Result<C, string>` disposes the active
 //     case's owned CLASS payload exactly once and never the `string` payload
 //     (which erased), leak- and double-free-clean (runAotChecked / ASan).
@@ -174,7 +174,7 @@ BEZEL_TEST(codegen_result_2047, spec_28_1_owned_payload_erased_param_return) {
         "return acc;"), 6);
 }
 
-// --- §35.7 equality (value-like auto-equality-bearing) ---------------------
+// --- §35.7 equality (value-like auto-hashable) ---------------------
 
 // §35.7 / §28.1: `Result<int, string>` is value-like, hence AUTO-EQUALITY-
 // BEARING — `=` / `<>` are available. Equal Ok payloads compare equal; a

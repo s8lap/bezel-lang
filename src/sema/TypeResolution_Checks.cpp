@@ -1,7 +1,7 @@
 #include "sema/TypeResolution_impl.hpp"
 
 #include "common/BuiltinRegistry.hpp"
-#include "common/OwnershipFacts.hpp"  // classifyChoiceType — §35.7 equality-bearing choice edge (#2087)
+#include "common/OwnershipFacts.hpp"  // classifyChoiceType — §35.7 hashable choice edge (#2087)
 
 #include "sema/ConstFold.hpp"
 #include "sema/EnumValues.hpp"  // enumHasZeroConstant — §17.11 default(E) (#3044)
@@ -1942,22 +1942,22 @@ void Resolver::checkEqualityCoDeclaration() {
 }
 
 // §3.6 / §8.3 (v0.158, #1338): a `Dictionary<K,V>` / `OwningDictionary<K,V>` key
-// (K) and a `Set<T>` / `OwningSet<T>` element (T) must be **equality-bearing**.
+// (K) and a `Set<T>` / `OwningSet<T>` element (T) must be **hashable**.
 // The sites are recorded during name resolution (resolveNamed) and validated
 // here — after every member type is resolved — because a record key's
-// auto-equality-bearing property depends on the record's own members being
+// auto-hashable property depends on the record's own members being
 // resolved, which may happen after the container annotation is visited (§3.6
 // rule 2: per-instantiation, at the instantiation site).
 //
 // #1384: a second pass handles sites where the key was a generic type parameter
 // (conservatively accepted in the generic body — no constraint surface exists to
-// require equality-bearing). When the enclosing generic is concretely
-// instantiated with a non-equality-bearing type, the per-instantiation check
+// require hashable). When the enclosing generic is concretely
+// instantiated with a non-hashable type, the per-instantiation check
 // fires at the hash-container annotation site (§3.6 rule 2).
 void Resolver::checkHashContainerKeys() {
     std::unordered_set<const ast::Type*> reported;
 
-    // §3.6/§8.3: the two non-equality-bearing shapes are (a) a record that
+    // §3.6/§8.3: the two non-hashable shapes are (a) a record that
     // neither synthesizes nor declares equality (#1338) and (b) — v0.210/
     // v0.214, #2083/#2087 — a choice that is not value-like auto-equality-
     // bearing (§35.7: owning / borrow-bearing, or value-like with a payload
@@ -1969,26 +1969,26 @@ void Resolver::checkHashContainerKeys() {
         if (d && d->kind == ast::TypeDeclKind::Choice) {
             auto v = common::classifyChoiceType(keyRef, ctx_);
             if (v && *v == common::ChoiceClassification::ValueLike)
-                // Value-like yet not equality-bearing: the RECURSIVE §35.7
+                // Value-like yet not hashable: the RECURSIVE §35.7
                 // rule rejected a case payload (function/Object/etc.).
                 return "it is a choice that is value-like but has a case "
                        "payload outside the \xC2\xA7""9.2 admissible-component "
                        "rule (\xC2\xA7""35.7), so it is not "
-                       "auto-equality-bearing. Restructure the payload, or "
-                       "use an equality-bearing key type.";
+                       "auto-hashable. Restructure the payload, or "
+                       "use a hashable key type.";
             const char* cat =
                 (v && *v == common::ChoiceClassification::Owning)
                     ? "owning"
                     : "borrow-bearing";
             return std::string("it is a choice that is ") + cat +
-                   " (\xC2\xA7""35.7), not value-like auto-equality-bearing. "
+                   " (\xC2\xA7""35.7), not value-like auto-hashable. "
                    "Restructure it to a value-like choice, or declare custom "
                    "equality.";
         }
-        return "it is a record that is neither auto-equality-bearing "
+        return "it is a record that is neither auto-hashable "
                "(\xC2\xA7""9.2) nor declares custom equality (`operator =`/`<>` "
                "with `Equals(T)` and `override GetHashCode`, \xC2\xA7""25.2). "
-               "Give it an auto-equality-bearing form, or declare custom "
+               "Give it an auto-hashable form, or declare custom "
                "equality.";
     };
 
@@ -2003,9 +2003,9 @@ void Resolver::checkHashContainerKeys() {
             Severity::Error,
             s.site ? s.site->span.begin : SourceLocation{},
             std::string("`") + std::string(s.container) +
-            "` requires an equality-bearing " + std::string(s.property) +
+            "` requires a hashable " + std::string(s.property) +
             " type, but the type argument " + keyName +
-            " is not equality-bearing (\xC2\xA7""3.6/\xC2\xA7""8.3): " +
+            " is not hashable (\xC2\xA7""3.6/\xC2\xA7""8.3): " +
             reasonClause(s.keyRef));
     }
 
@@ -2013,7 +2013,7 @@ void Resolver::checkHashContainerKeys() {
     // type parameter. isEqualityBearing returns true conservatively for unresolved
     // generic params (no concrete type is known at the declaration site), so those
     // sites pass pass 1. Here we walk concrete instantiations of the enclosing
-    // type to check whether the bound type is equality-bearing.
+    // type to check whether the bound type is hashable.
     //
     // §14.2 "Derived-property constraints" (#2111): "the per-instantiation
     // re-check for those interior uses is subsumed by the constraint, and one
@@ -2074,7 +2074,7 @@ void Resolver::checkHashContainerKeys() {
             TypeRef* concreteKey = inst.argRefs[paramIdx];
             if (!concreteKey || concreteKey->kind == TypeRef::Kind::Error) continue;
             if (isEqualityBearing(concreteKey, ctx_)) continue;
-            // Concrete key is not equality-bearing — report at the hash-container
+            // Concrete key is not hashable — report at the hash-container
             // annotation site (§3.6 rule 2 per-instantiation discipline).
             if (s.site && !reported2.insert(s.site).second) continue;
             const TypeSymbol* rec = concreteKey->declaration;
@@ -2084,9 +2084,9 @@ void Resolver::checkHashContainerKeys() {
                 Severity::Error,
                 s.site ? s.site->span.begin : SourceLocation{},
                 std::string("`") + std::string(s.container) +
-                "` requires an equality-bearing " + std::string(s.property) +
+                "` requires a hashable " + std::string(s.property) +
                 " type, but the type argument " + keyName +
-                " is not equality-bearing (\xC2\xA7""3.6/\xC2\xA7""8.3): " +
+                " is not hashable (\xC2\xA7""3.6/\xC2\xA7""8.3): " +
                 reasonClause(concreteKey));
         }
     }
@@ -5686,7 +5686,7 @@ void Resolver::checkOneConstraint(const ast::Type& t,
     }
     if (item.kind == "hashable") {
         // §14.2 "Derived-property constraints" (v0.214, #2087): the constraint
-        // names the §3.6 **equality-bearing** derived-property (the keyword
+        // names the §3.6 **hashable** derived-property (the keyword
         // names the capability site — hash-container keys/elements — while the
         // property keeps its §3.6 name). Satisfaction is decided per
         // instantiation, after substitution, by the property's defining
@@ -6590,7 +6590,7 @@ void Resolver::checkVarianceMarkerScope() {
 //   - Primitive types (bool, char, the integer types, float, double, decimal)
 //   - string
 //   - An enum type
-//   - A positional record or auto-equality-bearing body record that itself
+//   - A positional record or auto-hashable body record that itself
 //     declares ISerializable/IDeserializable (recursive eligibility)
 //   - A class with a `serialized tree`/`graph`/`cyclic` clause (§9.8 v0.136)
 //   - A nullable T? whose T is an eligible component type
@@ -7364,13 +7364,13 @@ void Resolver::checkSerializationEligibility() {
                 }
             }
             if (!foundError) {
-                // §9.8/§9.2: a body record must also be auto-equality-bearing
+                // §9.8/§9.2: a body record must also be auto-hashable
                 // for synthesis to apply (same membership conditions as §9.2).
-                // If it is not auto-equality-bearing AND doesn't have hand-written
+                // If it is not auto-hashable AND doesn't have hand-written
                 // Serialize/Deserialize, the synthesis cannot proceed.
-                // (We don't require auto-equality-bearing for synthesis per the
+                // (We don't require auto-hashable for synthesis per the
                 // spec wording; we require the §9.8 body-record conditions which
-                // are the same as §9.2 "auto-equality-bearing" conditions. The
+                // are the same as §9.2 "auto-hashable" conditions. The
                 // spec says "under exactly the auto-equality membership conditions"
                 // so treat them identically.)
                 // Note: we only report this if there are actually auto-properties

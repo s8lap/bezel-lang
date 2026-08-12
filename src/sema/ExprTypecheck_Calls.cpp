@@ -2703,7 +2703,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 } else if (item.kind == "hashable") {
                                     // §14.2 "Derived-property constraints"
                                     // (v0.214, #2087): names the §3.6
-                                    // equality-bearing derived-property.
+                                    // hashable derived-property.
                                     // Satisfaction runs through the shared
                                     // isEqualityBearing computation — the same
                                     // evaluation the type-instantiation site
@@ -17580,11 +17580,11 @@ TypeRef* ExprTC::builtinValueMemberType(const TypeRef* recvTy,
 // #3019 (§9.2/§9.3/§35.7): the use-site gate shared by the `.` form
 // (resolveMemberAccess) and the `?.` form (resolveNullCondMember) for a direct
 // `.Equals(...)`/`.GetHashCode()` (or `?.Equals(...)`/`?.GetHashCode()`) call
-// on a record/choice that is not auto-equality-bearing and declares no user
+// on a record/choice that is not auto-hashable and declares no user
 // `=`/`<>` overloads. Extracted from resolveMemberAccess (#2517 hoisted it out
 // of the null-decl branch) so both access forms enforce the ONE check — the
 // one fact the compiler already computes for "is this record/choice auto-
-// equality-bearing" (isPositionalRecordEqualityBearing /
+// hashable" (isPositionalRecordEqualityBearing /
 // isAutoEqualityBearingBodyRecord / recordHasUserDeclaredEquality /
 // isAutoEqualityBearingChoice — the SAME predicates isEqualityBearing, the
 // `where T: hashable` §14.2 check, and checkHashContainerKeys use). No-op when
@@ -17601,7 +17601,7 @@ void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
     if (targetType->kind == ast::TypeDeclKind::Record) {
         // §9.2 (v0.156)/§9.3 (v0.158, #1383): a direct `.Equals(...)`/
         // `.GetHashCode()` on a body / combined-form record that is not
-        // auto-equality-bearing and declares no explicit `=`/`<>` overloads is
+        // auto-hashable and declares no explicit `=`/`<>` overloads is
         // a compile error. The `positional` flag uses `hasPositionalFields`
         // first (covers imported records per #501), then falls back to the
         // local `ast::TypeDecl` for any record that has one.
@@ -17618,15 +17618,15 @@ void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
                 "`." + std::string(member) +
                 "` is not available on record `" +
                 std::string(targetType->name) +
-                "`: it is not auto-equality-bearing (§9.2/§9.3). Declare"
+                "`: it is not auto-hashable (§9.2/§9.3). Declare"
                 " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
-                " or simplify the record to an auto-equality-bearing"
+                " or simplify the record to an auto-hashable"
                 " form.");
         }
     } else if (targetType->kind == ast::TypeDeclKind::Choice) {
         // §35.7 (v0.200, #2045; v0.226, #2110): a choice rejects direct
         // `.Equals(...)`/`.GetHashCode()` at the call site when it is NOT
-        // auto-equality-bearing — any borrow-bearing or owning choice, AND any
+        // auto-hashable — any borrow-bearing or owning choice, AND any
         // value-like choice whose case payload fails the §9.2 admissible-
         // component rule. Mirrors the record gate above (and `=`/`<>`,
         // isEqualityBearing §3.6, `where T: hashable` §14.2,
@@ -17640,7 +17640,7 @@ void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
             if (verdict &&
                 *verdict != common::ChoiceClassification::ValueLike) {
                 reason =
-                    std::string("it is not auto-equality-bearing "
+                    std::string("it is not auto-hashable "
                                 "(§35.7) — the choice is ") +
                     (*verdict == common::ChoiceClassification::Owning
                          ? "owning"
@@ -17649,7 +17649,7 @@ void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
                     "value equality";
             } else {
                 reason =
-                    "it is not auto-equality-bearing (§35.7): the "
+                    "it is not auto-hashable (§35.7): the "
                     "choice is value-like but a case payload is not "
                     "an admissible equality component (§9.2)";
             }
@@ -17715,7 +17715,7 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         // through the shared checkEqualityMemberUseSite gate (the one fact the
         // compiler already computes for "is this record/choice auto-equality-
         // bearing") so a `r?.Equals(...)` / `r?.GetHashCode()` on a
-        // non-auto-equality-bearing record/choice is rejected at the call site,
+        // non-auto-hashable record/choice is rejected at the call site,
         // not silently compiled into a codegen crash (IR verification: "Basic
         // Block ... does not have a terminator"). The `.` form applies this
         // gate in resolveMemberAccess; before #3019 the `?.` form (a

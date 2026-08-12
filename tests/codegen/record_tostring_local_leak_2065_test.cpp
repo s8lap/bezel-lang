@@ -3,7 +3,7 @@
 // `var` local (`var s := r.ToString();`) must have its single +1 producer
 // reference decremented at the local's scope-end release.
 //
-// §8.5 / §9.1 / §9.2 (v0.204): a positional or auto-equality-bearing body
+// §8.5 / §9.1 / §9.2 (v0.204): a positional or auto-hashable body
 // record's ToString is the synthesized `"TypeName(Field: value, …)"` form —
 // a method-call RESULT.
 //
@@ -27,7 +27,7 @@
 // ctor-arg leak).
 //
 // THE FIX. `isPlusOneStringProducer` now has an arm that recognizes a no-arg
-// `ToString()` on a Named RECORD receiver (positional OR auto-equality-bearing
+// `ToString()` on a Named RECORD receiver (positional OR auto-hashable
 // body — exactly the shapes lowerValueSemMethodOn routes to emitRecordToString,
 // which mints a fresh rc=1 heap string per §9.1). With the recognition, the
 // local is classified as a +1 producer: the bind TRANSFERS the single

@@ -127,7 +127,7 @@ bool compileImportCaptureErr2516(const std::string& libSrc,
 }
 
 bool hasAutoEqError2516(const std::string& err) {
-    return err.find("is not auto-equality-bearing") != std::string::npos;
+    return err.find("is not auto-hashable") != std::string::npos;
 }
 
 // Single-module twin of the imported tests (T3 / T8): compile one source
@@ -189,7 +189,7 @@ const char* kPurePositionalLib2516 =
 
 // Combined-form with only a static body field: the static field is ignored
 // (§9.2 v0.182 #1572: it carries no instance storage), so `=`/`<>` should
-// still be auto-equality-bearing both locally and cross-module.
+// still be auto-hashable both locally and cross-module.
 const char* kCombinedFormStaticBodyLib2516 =
     "module RecLib2516Static; "
     "public record RecStatic2516 "
@@ -294,12 +294,12 @@ BEZEL_TEST(xmod_record_combined_form_equality_2516,
 
 // ===========================================================================
 // T4 — POSITIVE CONTROL (regression guard against over-rejection): an
-// IMPORTED pure-positional record (no body field) IS auto-equality-bearing
+// IMPORTED pure-positional record (no body field) IS auto-hashable
 // — `=` compiles without the §9.2 use-site error. This proves T1/T2's
 // reject is the body-field disqualifier firing, not a blanket rejection of
 // imported positional records. The cross-module construction gap #2434/
 // #2467 may emit `internal:` diagnostics here, but the §9.2
-// `auto-equality-bearing` message must be ABSENT — sema accepted `=`.
+// `auto-hashable` message must be ABSENT — sema accepted `=`.
 // ===========================================================================
 BEZEL_TEST(xmod_record_combined_form_equality_2516,
            imported_pure_positional_equals_accepted_control) {
@@ -320,7 +320,7 @@ BEZEL_TEST(xmod_record_combined_form_equality_2516,
 
 // ===========================================================================
 // T5 — POSITIVE CONTROL: an IMPORTED combined-form record with ONLY a static
-// body field (`public static _cache`) is auto-equality-bearing (the static
+// body field (`public static _cache`) is auto-hashable (the static
 // body field carries no instance storage — §9.2 v0.182 / #1572). Pin: a
 // combined-form record with body members but no disqualifying non-static
 // body field must compile `=` cross-module, otherwise #2516's fix would
@@ -345,7 +345,7 @@ BEZEL_TEST(xmod_record_combined_form_equality_2516,
 
 // ===========================================================================
 // T6 — POSITIVE CONTROL: an IMPORTED combined-form record with ONLY an
-// admissible auto-property body is auto-equality-bearing. Pin: a body
+// admissible auto-property body is auto-hashable. Pin: a body
 // auto-property is not a disqualifier per §9.2, and the importer
 // correctly carries the auto-property's admissibility through the
 // `fieldTypes_` side table so the §9.2 use-site gate stays clean.

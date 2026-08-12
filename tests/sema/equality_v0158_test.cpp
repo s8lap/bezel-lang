@@ -2,7 +2,7 @@
 //
 // Authorities:
 //  - §9.2 (v0.158) "Auto-generated equality" — the admissible-component-type
-//    rule (a primitive/enum/`string`; another auto-equality-bearing record;
+//    rule (a primitive/enum/`string`; another auto-hashable record;
 //    `T?` where T is admissible; a non-owning inline array `[N]T`/`[N]T?` with
 //    admissible element) and the ToString narrowing (an `override ToString`
 //    alone no longer disqualifies auto-equality; `override Equals`/`GetHashCode`
@@ -12,8 +12,8 @@
 //    declaring type must also declare `Equals(T)` and — on a record,
 //    `override GetHashCode`; on an enum, a plain `GetHashCode` (§10.5: enum
 //    members never carry `override`).
-//  - §3.6 / §8.3 (v0.158) equality-bearing — a `Dictionary<K,V>` key and a
-//    `Set<T>` element must be equality-bearing; enforced at the instantiation
+//  - §3.6 / §8.3 (v0.158) hashable — a `Dictionary<K,V>` key and a
+//    `Set<T>` element must be hashable; enforced at the instantiation
 //    site (§3.6 rule 2).
 
 #include "sema/ExprTypecheck.hpp"
@@ -32,10 +32,10 @@ bezel::test::SemaResult parseSema(std::string_view src) {
     return r;
 }
 
-// The §9.2 use-site error on a non-auto-equality-bearing record.
+// The §9.2 use-site error on a non-auto-hashable record.
 bool hasNotAutoEqError(const bezel::test::SemaResult& r) {
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("auto-equality-bearing") != std::string::npos)
+        if (d.message.find("auto-hashable") != std::string::npos)
             return true;
     return false;
 }
@@ -48,10 +48,10 @@ bool hasCoDeclError(const bezel::test::SemaResult& r) {
     return false;
 }
 
-// The §3.6/§8.3 equality-bearing instantiation error.
+// The §3.6/§8.3 hashable instantiation error.
 bool hasEqualityBearingError(const bezel::test::SemaResult& r) {
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("is not equality-bearing") != std::string::npos)
+        if (d.message.find("is not hashable") != std::string::npos)
             return true;
     return false;
 }
@@ -61,7 +61,7 @@ bool hasEqualityBearingError(const bezel::test::SemaResult& r) {
 // ─── §9.2 v0.158: admissible component types ────────────────────────────────
 
 // §9.2: `T?` where T is admissible (`int?`) is an admissible component — the
-// body record is auto-equality-bearing, so `=` is accepted.
+// body record is auto-hashable, so `=` is accepted.
 BEZEL_TEST(equality_v0158, nullable_primitive_component_accepted_spec_9_2) {
     auto r = parseSema(
         "module M; "
@@ -109,7 +109,7 @@ BEZEL_TEST(equality_v0158, inline_array_nullable_element_accepted_spec_9_2) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §9.2: another auto-equality-bearing record is an admissible component
+// §9.2: another auto-hashable record is an admissible component
 // (recursive rule).
 BEZEL_TEST(equality_v0158, nested_auto_eq_record_component_accepted_spec_9_2) {
     auto r = parseSema(
@@ -127,7 +127,7 @@ BEZEL_TEST(equality_v0158, nested_auto_eq_record_component_accepted_spec_9_2) {
 }
 
 // §9.2: a class-typed auto-property is NOT an admissible component (a reference
-// type) — the record is not auto-equality-bearing, so `=` is a compile error.
+// type) — the record is not auto-hashable, so `=` is a compile error.
 BEZEL_TEST(equality_v0158, class_component_rejected_spec_9_2) {
     auto r = parseSema(
         "module M; "
@@ -152,7 +152,7 @@ BEZEL_TEST(equality_v0158, object_component_rejected_spec_9_2) {
     BEZEL_EXPECT_TRUE(hasNotAutoEqError(r));
 }
 
-// §9.2: a non-auto-equality-bearing record component makes the OUTER record
+// §9.2: a non-auto-hashable record component makes the OUTER record
 // ineligible too (the recursive rule fails for the inner record because it has
 // an explicit field).
 BEZEL_TEST(equality_v0158, nested_non_eq_record_component_rejected_spec_9_2) {
@@ -322,23 +322,23 @@ BEZEL_TEST(equality_v0158, codecl_enum_satisfied_with_plain_gethashcode_spec_25_
     BEZEL_EXPECT_FALSE(hasCoDeclError(r));
 }
 
-// ─── §3.6 / §8.3 v0.158: equality-bearing hash-container keys (#1338) ────────
+// ─── §3.6 / §8.3 v0.158: hashable hash-container keys (#1338) ────────
 
-// §3.6/§8.3: an `int` key is equality-bearing — `Dictionary<int, int>` accepted.
+// §3.6/§8.3: an `int` key is hashable — `Dictionary<int, int>` accepted.
 BEZEL_TEST(equality_v0158, dict_int_key_accepted_spec_3_6) {
     auto r = parseSema(
         "module M; class C public method M(d: Dictionary<int, int>) end M; end C;");
     BEZEL_EXPECT_FALSE(hasEqualityBearingError(r));
 }
 
-// §3.6/§8.3: a `string` key is equality-bearing.
+// §3.6/§8.3: a `string` key is hashable.
 BEZEL_TEST(equality_v0158, dict_string_key_accepted_spec_3_6) {
     auto r = parseSema(
         "module M; class C public method M(d: Dictionary<string, int>) end M; end C;");
     BEZEL_EXPECT_FALSE(hasEqualityBearingError(r));
 }
 
-// §3.6/§8.3: an enum key is equality-bearing.
+// §3.6/§8.3: an enum key is hashable.
 BEZEL_TEST(equality_v0158, dict_enum_key_accepted_spec_3_6) {
     auto r = parseSema(
         "module M; enum Color Red, Green; end Color; "
@@ -346,7 +346,7 @@ BEZEL_TEST(equality_v0158, dict_enum_key_accepted_spec_3_6) {
     BEZEL_EXPECT_FALSE(hasEqualityBearingError(r));
 }
 
-// §3.6/§8.3: a class key is equality-bearing (reference identity is a consistent
+// §3.6/§8.3: a class key is hashable (reference identity is a consistent
 // Equals/GetHashCode).
 BEZEL_TEST(equality_v0158, dict_class_key_accepted_spec_3_6) {
     auto r = parseSema(
@@ -356,7 +356,7 @@ BEZEL_TEST(equality_v0158, dict_class_key_accepted_spec_3_6) {
 }
 
 // §3.6/§8.3: a positional record key (always synthesizes equality, §9.1) is
-// equality-bearing.
+// hashable.
 BEZEL_TEST(equality_v0158, dict_positional_record_key_accepted_spec_3_6) {
     auto r = parseSema(
         "module M; record Point(x: int, y: int); "
@@ -364,7 +364,7 @@ BEZEL_TEST(equality_v0158, dict_positional_record_key_accepted_spec_3_6) {
     BEZEL_EXPECT_FALSE(hasEqualityBearingError(r));
 }
 
-// §3.6/§8.3: an auto-equality-bearing body record key is equality-bearing.
+// §3.6/§8.3: an auto-hashable body record key is hashable.
 BEZEL_TEST(equality_v0158, dict_autoeq_body_record_key_accepted_spec_3_6) {
     auto r = parseSema(
         "module M; "
@@ -376,8 +376,8 @@ BEZEL_TEST(equality_v0158, dict_autoeq_body_record_key_accepted_spec_3_6) {
     BEZEL_EXPECT_FALSE(hasEqualityBearingError(r));
 }
 
-// §3.6/§8.3: a body record that is neither auto-equality-bearing (it has an
-// explicit field) nor declares user equality is NOT equality-bearing — a
+// §3.6/§8.3: a body record that is neither auto-hashable (it has an
+// explicit field) nor declares user equality is NOT hashable — a
 // `Dictionary<K, V>` key of that type is rejected at the instantiation site.
 BEZEL_TEST(equality_v0158, dict_non_eq_record_key_rejected_spec_3_6) {
     auto r = parseSema(
@@ -413,7 +413,7 @@ BEZEL_TEST(equality_v0158, set_int_element_accepted_spec_3_6) {
 }
 
 // §3.6/§8.3: a record that overloads `=`/`<>` (with co-declared members) DOES
-// declare user equality — it is equality-bearing and accepted as a Set element.
+// declare user equality — it is hashable and accepted as a Set element.
 BEZEL_TEST(equality_v0158, set_user_equality_record_element_accepted_spec_3_6) {
     auto r = parseSema(
         "module M; "
@@ -464,7 +464,7 @@ BEZEL_TEST(equality_v0158, positional_class_field_equals_call_rejected_spec_9_3)
 }
 
 // §9.3: a combined-form record (positional fields + body) with a class-typed
-// positional field is not auto-equality-bearing — `=` is a compile error.
+// positional field is not auto-hashable — `=` is a compile error.
 BEZEL_TEST(equality_v0158, combined_class_positional_field_rejected_spec_9_3) {
     auto r = parseSema(
         "module M; "
@@ -477,7 +477,7 @@ BEZEL_TEST(equality_v0158, combined_class_positional_field_rejected_spec_9_3) {
 }
 
 // §9.3: a combined-form record with only admissible positional fields and a
-// trivial body is auto-equality-bearing — `=` is accepted.
+// trivial body is auto-hashable — `=` is accepted.
 BEZEL_TEST(equality_v0158, combined_admissible_fields_eq_accepted_spec_9_3) {
     auto r = parseSema(
         "module M; "
@@ -488,7 +488,7 @@ BEZEL_TEST(equality_v0158, combined_admissible_fields_eq_accepted_spec_9_3) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §9.3: a positional record with a class-typed field is NOT equality-bearing,
+// §9.3: a positional record with a class-typed field is NOT hashable,
 // so it is rejected as a Dictionary key.
 BEZEL_TEST(equality_v0158, positional_class_field_dict_key_rejected_spec_9_3) {
     auto r = parseSema(
@@ -518,13 +518,13 @@ BEZEL_TEST(equality_v0158, nested_positional_non_admissible_rejects_outer_spec_9
 
 // §3.6 rule 2 / #1384: when a hash container is used inside a generic type
 // body with a type parameter as the key, the site is CONSERVATIVELY accepted
-// (no constraint surface for equality-bearing exists). The check fires
-// per-instantiation: a concrete instantiation with a non-equality-bearing key
+// (no constraint surface for hashable exists). The check fires
+// per-instantiation: a concrete instantiation with a non-hashable key
 // is rejected at the instantiation site.
 BEZEL_TEST(equality_v0158, dict_generic_param_key_concrete_bad_instantiation_spec_3_6) {
     auto r = parseSema(
         "module M; "
-        // Inner non-equality-bearing body record
+        // Inner non-hashable body record
         "record Bad "
         "  public property Id: int; "
         "  private _cache: int := 0; "

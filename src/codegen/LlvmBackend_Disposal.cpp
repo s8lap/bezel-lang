@@ -3360,7 +3360,7 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     // scalar/string value stores no box (the value is inttoptr'd or is the pointer
     // itself) — both return null here, so the value box is never freed twice.
     // The record check mirrors the encode's broad test (any record declaration,
-    // equality-bearing or not), NOT the narrower recordTypeOfRef, so it matches
+    // hashable or not), NOT the narrower recordTypeOfRef, so it matches
     // every boxed value exactly.
     // issue #539 / §7: nullable value types ({i8,T} tagged structs) are also
     // heap-boxed by encodeValue; their boxes must be freed at Clear/scope-end too.

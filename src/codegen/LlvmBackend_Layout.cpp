@@ -4948,7 +4948,7 @@ llvm::Value* Emitter::emitValueEquality(llvm::Value* l, llvm::Value* r,
     }
     // §9.2 v0.210 (#2083) / §35.7: a value-like choice component — the
     // declared type is a Named with declaration's kind == Choice and the
-    // choice is auto-equality-bearing — must compare by active-case then
+    // choice is auto-hashable — must compare by active-case then
     // per-case payload. The bit-level fallback below would compare *all*
     // payload slots regardless of the active case, which is unsound: the
     // inactive-case payload slots are `undef` in a freshly constructed

@@ -186,7 +186,7 @@ BEZEL_TEST(owning_dictionary_determinism_2055,
 BEZEL_TEST(owning_dictionary_determinism_2055,
            record_keys_cross_run_deterministic) {
     // OwningDictionary<Coord, Box> — Coord is a positional record (auto-
-    // equality-bearing per §9.1), so it routes through the generic-key path.
+    // hashable per §9.1), so it routes through the generic-key path.
     // OwningDictionary requires V: class, so Box plays the value. The key
     // set is built so consecutive Coords land in distinct hash buckets.
     const char* src =

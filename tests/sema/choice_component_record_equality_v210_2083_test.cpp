@@ -1,10 +1,10 @@
 // Spec-derived sema tests for §9.2 / §9.3 / §35.7 (v0.210, #2083): a value-
-// like auto-equality-bearing choice component makes the enclosing record
-// auto-equality-bearing. Mirrors the §9.2 admissible-component-type widening
+// like auto-hashable choice component makes the enclosing record
+// auto-hashable. Mirrors the §9.2 admissible-component-type widening
 // that v0.210 formalized for choices in record / record positional fields.
 //
 // §9.2 (v0.210): the admissible-component-type list now includes
-// "a value-like choice that is itself auto-equality-bearing (§35.7 —
+// "a value-like choice that is itself auto-hashable (§35.7 —
 // recursively, this same list applied to every case's payload fields)".
 // Before v0.210 the list was the §9.2 v0.158 set (primitives / enums / string
 // / record / T? / inline-array), and a choice in a component position was
@@ -57,7 +57,7 @@ bool lacksErrDiagWith(const bezel::test::SemaResult& r,
 // --- §9.2 v0.210 ACCEPT: body record with a value-like choice component -----
 
 // §9.2: a body-only record whose auto-property is a value-like auto-equality-
-// bearing choice component is auto-equality-bearing. `=` over the record is
+// bearing choice component is auto-hashable. `=` over the record is
 // accepted at the use site (no §9.2 compile error). The participating rule
 // covers both payload-free cases (e.g. Red, Blue) and payload cases (e.g.
 // Green(value: int)).
@@ -75,13 +75,13 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
         "  var w2 := new Wrap(Color.Red); "
         "  if w1 = w2 then return 1; else return 0; end; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "is not auto-equality-bearing"));
+    BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "is not auto-hashable"));
     BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "is not available on record"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // §9.3 / §9.2 (combined form): a POSITIONAL record whose positional field is
-// a value-like auto-equality-bearing choice is auto-equality-bearing (§9.3
+// a value-like auto-hashable choice is auto-hashable (§9.3
 // "eligibility of the combined form" → §9.2 admissibility rule, now widened
 // to choices in v0.210).
 BEZEL_TEST(choice_component_record_equality_v210_2083,
@@ -95,14 +95,14 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
         "  var w2 := new Wrap(Color.Green(7)); "
         "  if w1 = w2 then return 1; else return 0; end; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "is not auto-equality-bearing"));
+    BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "is not auto-hashable"));
     BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "is not available on record"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // §35.7: a body record with a value-like choice component may also call
 // `.Equals(other)` / `.GetHashCode()` directly — the §9.2 use-site compile
-// error does NOT fire for an auto-equality-bearing enclosing record.
+// error does NOT fire for an auto-hashable enclosing record.
 BEZEL_TEST(choice_component_record_equality_v210_2083,
            spec_9_2_v210_body_record_value_like_choice_component_allows_direct_equals) {
     auto r = semaAll(
@@ -116,7 +116,7 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
         "  var w := new Wrap(Color.Green(42)); "
         "  if w.Equals(w) then return 1; else return 0; end; "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "is not auto-equality-bearing"));
+    BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "is not auto-hashable"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
@@ -124,9 +124,9 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
 
 // §9.2 v0.210 (per-issue plan, recursive admissibility): a body record whose
 // auto-property is a value-like choice WHOSE cases include another auto-
-// equality-bearing choice payload — the §35.7 "this same list applied to every
+// hashable choice payload — the §35.7 "this same list applied to every
 // case's payload fields" recursion admits the inner choice. Body record is
-// auto-equality-bearing.
+// auto-hashable.
 BEZEL_TEST(choice_component_record_equality_v210_2083,
            spec_9_2_v210_body_record_value_like_nested_choice_component_accepts_eq) {
     auto r = semaAll(
@@ -141,14 +141,14 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
         "  var w := new Wrap(Outer.First(Inner.Valued(7))); "
         "  return (if w.O = Outer.First(Inner.Valued(7)) then 1 else 0); "
         "end Main; end C;");
-    BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "is not auto-equality-bearing"));
+    BEZEL_EXPECT_FALSE(hasErrDiagWith(r, "is not auto-hashable"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // --- §9.2 v0.210 REJECT: enclosing record does NOT inherit equality -------
 //
 // A BORROW-BEARING choice component (class-typed payload, §35.4.2) keeps the
-// enclosing record non-auto-equality-bearing per the §9.2 admissible-component
+// enclosing record non-auto-hashable per the §9.2 admissible-component
 // rule: borrow-bearing choices are NOT admissible (class-typed payload is
 // reference, outside the rule — the same token reject that already applies to
 // a class-typed record field).
@@ -166,11 +166,11 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
         "  var w := new Wrap(Box.None); "
         "  return (if w = w then 1 else 0); "
         "end Main; end D;");
-    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not auto-equality-bearing"));
+    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not auto-hashable"));
 }
 
 // §9.2: an OWNING choice component (an `owned` marker on a class payload
-// per §35.4.1) keeps the enclosing record non-auto-equality-bearing. The
+// per §35.4.1) keeps the enclosing record non-auto-hashable. The
 // choice is not admissible in any record component context; the use-site
 // error fires on `=`/`<>` for the record.
 BEZEL_TEST(choice_component_record_equality_v210_2083,
@@ -187,5 +187,5 @@ BEZEL_TEST(choice_component_record_equality_v210_2083,
         "  var w := new Wrap(Fetched.NotFetched); "
         "  return (if w = w then 1 else 0); "
         "end Main; end D;");
-    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not auto-equality-bearing"));
+    BEZEL_EXPECT_TRUE(hasErrDiagWith(r, "is not auto-hashable"));
 }

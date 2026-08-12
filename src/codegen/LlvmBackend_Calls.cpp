@@ -659,7 +659,7 @@ bool Emitter::isCollectionInterfaceName(const sema::TypeRef* rt) {
 // issue #343 / §4.8: a Dictionary<K,V> key (idx=0) or Set<T> element (idx=0)
 // is a "record key" when the generic arg resolves to a record TypeSymbol that
 // actually carries synthesized GetHashCode/Equals (positional records, or
-// auto-equality-bearing body records — §9.1 / §9.2). For such keys the generic
+// auto-hashable body records — §9.1 / §9.2). For such keys the generic
 // per §14.1 (generics are monomorphized): see the header comment. Build and
 // install `genericSubst_` from the receiver `target`'s concrete instantiation
 // of `parent`, returning the previous map for the caller to restore.
@@ -703,7 +703,7 @@ Emitter::setupReceiverGenericSubst(const ast::Expr* target,
 // runtime variant is used; string and primitive keys keep their fast paths.
 // issue #343 / §9.1 / §9.2: if `ref` resolves to a record type that actually
 // carries synthesized GetHashCode/Equals (a positional record, or an
-// auto-equality-bearing body record), return its TypeSymbol; otherwise null.
+// auto-hashable body record), return its TypeSymbol; otherwise null.
 const sema::TypeSymbol* Emitter::recordTypeOfRef(const sema::TypeRef* ref) {
     if (!ref || ref->kind != sema::TypeRef::Kind::Named || !ref->declaration)
         return nullptr;
@@ -5427,8 +5427,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         const sema::TypeRef* valTy =
             (recvTy && recvTy->genericArgs.size() > 1) ? recvTy->genericArgs[1]
                                                        : nullptr;
-        // Any record value (equality-bearing or not) is an aggregate and must be
-        // boxed — not just the equality-bearing ones recordTypeOfRef accepts.
+        // Any record value (hashable or not) is an aggregate and must be
+        // boxed — not just the hashable ones recordTypeOfRef accepts.
         const sema::TypeSymbol* valRec =
             (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
              valTy->declaration &&

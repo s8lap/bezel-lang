@@ -14,7 +14,7 @@
 // auto-property)" as a disqualifier regardless of the field's visibility.
 //
 // Before #2468 the private field was absent from the importer's `t->members`,
-// so the importer WRONGLY classified the record as auto-equality-bearing — a
+// so the importer WRONGLY classified the record as auto-hashable — a
 // latent false-accept: `=`/`<>` compiled on the imported type even though the
 // exporter's own compilation of the same type already rejected them (§2.8.3
 // rule 4 — a derived type property must be consistent across module
@@ -31,7 +31,7 @@
 // imported `=`/`<>` compiles instead of erroring — the false-accept returns);
 // with the clause present (HEAD) they PASS.
 //
-// Authorities: §9.2 "A body record is not auto-equality-bearing … when it
+// Authorities: §9.2 "A body record is not auto-hashable … when it
 // contains: An explicit field declaration (storage that is not an
 // auto-property)" and "The compile error applies to the `=` and `<>`
 // operators"; §2.8.3 rule 4 (cross-module consistency of derived type
@@ -159,7 +159,7 @@ bool compileSingleCaptureErr2483(const std::string& src, std::string& err) {
 }
 
 bool hasAutoEqError2483(const std::string& err) {
-    return err.find("is not auto-equality-bearing") != std::string::npos;
+    return err.find("is not auto-hashable") != std::string::npos;
 }
 
 // A body-only record with a PRIVATE explicit field — the §9.2 disqualifier
@@ -257,11 +257,11 @@ BEZEL_TEST(xmod_record_private_field_equality_2483,
 // ===========================================================================
 // T4 — POSITIVE CONTROL (regression guard against over-rejection): an
 // IMPORTED body-only record with ONLY an auto-property (no disqualifying
-// field) IS auto-equality-bearing — `=` compiles without the §9.2 use-site
+// field) IS auto-hashable — `=` compiles without the §9.2 use-site
 // error. This proves T1/T2's reject is the field-disqualifier firing, not a
 // blanket rejection of imported body records. (The cross-module construction
 // gap #2434/#2467 may emit `internal:` diagnostics here, but the §9.2
-// `auto-equality-bearing` message must be ABSENT — sema accepted `=`.)
+// `auto-hashable` message must be ABSENT — sema accepted `=`.)
 // ===========================================================================
 BEZEL_TEST(xmod_record_private_field_equality_2483,
            imported_autoproperty_record_equals_accepted_control) {

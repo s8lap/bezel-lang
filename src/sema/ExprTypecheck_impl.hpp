@@ -2224,7 +2224,7 @@ private:
 
     // #3019 (§9.2/§9.3/§35.7): the use-site gate for a direct
     // `.Equals(...)`/`.GetHashCode()` (or `?.Equals(...)`/`?.GetHashCode()`)
-    // call on a record/choice that is not auto-equality-bearing and declares
+    // call on a record/choice that is not auto-hashable and declares
     // no user `=`/`<>` overloads. Shared by the `.` path
     // (resolveMemberAccess) and the `?.` path (resolveNullCondMember) so the
     // two forms enforce the SAME check: §7.5 evaluates the member normally

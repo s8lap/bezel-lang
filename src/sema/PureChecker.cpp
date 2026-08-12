@@ -105,10 +105,10 @@ private:
 
     // §22.15 "Members classified by rule" (#2061, item 2): a record's
     // synthesized Equals/GetHashCode/ToString are pure-classified iff every
-    // field's equality dispatch target is pure (auto-equality-bearing form).
+    // field's equality dispatch target is pure (auto-hashable form).
     // The synthesized-positional-ctor / with-copy forms are matched by
     // `recordConstructionIsPure`. Returns true when the call IS to a
-    // synthesized record member AND the record is auto-equality-bearing
+    // synthesized record member AND the record is auto-hashable
     // (class-identity check); false otherwise. Sets
     // *outIsSynthesizedRecordMember to true when the call resolves to a
     // record-synthesized member regardless of purity (so the caller can
@@ -212,7 +212,7 @@ bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
 
 // §22.15 "Members classified by rule" (#2061, item 2): a record's
 // synthesized Equals/GetHashCode/ToString are pure-classified iff the
-// record class is auto-equality-bearing — every constituent operation
+// record class is auto-hashable — every constituent operation
 // (field read + the dispatched equality/hash/ToString on each field's
 // type) is itself pure. The §9.2/§9.3 admissibility helpers in
 // SymbolCollection.cpp already implement this recursive field rule;
@@ -226,7 +226,7 @@ bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
 // `int GetHashCode()` / `string ToString()`, all fixed signatures).
 //
 // Returns true when the call IS to a record-synthesized member AND the
-// record is auto-equality-bearing. Sets *outIsSynthesizedRecordMember
+// record is auto-hashable. Sets *outIsSynthesizedRecordMember
 // to true when the call resolves to a synthesized record member
 // REGARDLESS of purity, so the caller can distinguish "non-record call —
 // fall through" from "record-synthesized but not pure-classified — report".
@@ -288,7 +288,7 @@ static const ast::ConstructorDecl* findUserCtorByArity(
 // `pure`-declared. The synthesized positional ctor copies args into
 // positional fields — a birth-store, pure for the same reason a pure
 // ctor's field stores are — and is pure-classified iff the record class
-// is auto-equality-bearing. A body record has no synthesized ctor: its
+// is auto-hashable. A body record has no synthesized ctor: its
 // authored ctor of matching arity must carry `pure`. The arity match here
 // is for resolving WHICH user-declared ctor is invoked (a class-identity
 // question per record class); the PURITY of the construction is the
@@ -305,7 +305,7 @@ bool PureBodyWalker::recordConstructionIsPure(const ast::NewExpr& ne) {
     TypeSymbol* rec = rt->declaration;
     if (rec->kind != ast::TypeDeclKind::Record) return false;
     // CLASS-IDENTITY: a positional record has a synthesized ctor whose
-    // purity is the record-class's auto-equality-bearing classification.
+    // purity is the record-class's auto-hashable classification.
     const bool isPositional =
         rec->hasPositionalFields ||
         (dynamic_cast<const ast::TypeDecl*>(rec->decl) &&
@@ -726,7 +726,7 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
             // the receiver's record-class identity (the synthesized
             // member's purity is a class property, NOT an arity match):
             //   - positional record: synthesized Equals/GetHashCode/
-            //     ToString are pure iff the record is auto-equality-bearing
+            //     ToString are pure iff the record is auto-hashable
             //     (every field's dispatch is pure under §22.15 rules 1+
             //     3+6, via the §9.2/§9.3 admissibility helpers).
             //   - non-record calls or unresolved callees of other kinds
@@ -740,11 +740,11 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
                 reportPureViolation(
                     ce->span.begin,
                     "call to a record-synthesized member",
-                    "the receiver record is not auto-equality-bearing — "
+                    "the receiver record is not auto-hashable — "
                     "a class-typed field's virtual dispatch disqualifies "
                     "the synthesized Equals/GetHashCode/ToString; declare "
                     "`=`/`<>` with `pure` overrides, or simplify the "
-                    "record to the auto-equality-bearing form (§22.15 "
+                    "record to the auto-hashable form (§22.15 "
                     "\"Members classified by rule\")");
             }
         } else if (!callTargetIsPure(calleeSym)) {
@@ -813,7 +813,7 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
                 // §22.15 "Members classified by rule" (#2061, item 2):
                 // record construction `new R(args)` is admitted iff the
                 // invoked ctor is compiler-synthesized-pure (positional
-                // record auto-equality-bearing) or `pure`-declared. The
+                // record auto-hashable) or `pure`-declared. The
                 // classification is a class-identity property of the
                 // record, not an arity match — see
                 // recordConstructionIsPure above.
@@ -825,7 +825,7 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
                         "positional form (§22.15 \"Members classified by "
                         "rule\" — declare the ctor `pure`, or drop the "
                         "disqualifying class-typed field so the record is "
-                        "auto-equality-bearing)");
+                        "auto-hashable)");
                 }
             }
         }

@@ -365,7 +365,7 @@ private:
     void checkEqualityCoDeclaration();
     // §3.6 / §8.3 (v0.158, #1338): every recorded `Dictionary<K,V>` /
     // `OwningDictionary<K,V>` key (K) and `Set<T>` / `OwningSet<T>` element (T)
-    // must be equality-bearing (§3.6 rule 2, at the instantiation site).
+    // must be hashable (§3.6 rule 2, at the instantiation site).
     void checkHashContainerKeys();
     // stdlib §4.2 / spec §14.4 (#1327/#1463/#2713): the single authoritative
     // predicate for "may this type be an owning collection's element?".  Returns
@@ -883,10 +883,10 @@ private:
     std::vector<GenericInstantiation> instantiations_;
 
     // §3.6 / §8.3 (v0.158, #1338): one hash-container instantiation site whose
-    // key/element must be equality-bearing. Recorded while resolving a
+    // key/element must be hashable. Recorded while resolving a
     // `Dictionary`/`OwningDictionary`/`Set`/`OwningSet` `Named<...>` annotation;
     // validated by checkHashContainerKeys() after every member type is resolved
-    // (a record key's auto-equality-bearing property depends on the record's own
+    // (a record key's auto-hashable property depends on the record's own
     // members being resolved, which may happen after this site is visited).
     struct HashContainerSite {
         std::string_view container;   // "Dictionary" / "Set" / …

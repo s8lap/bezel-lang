@@ -1,7 +1,7 @@
 // Codegen/sema — issue #2479: `val.ToString()` on a bare-type-parameter `T`
 // substituted with a CHOICE had no codegen at all — a crash-preventing
 // diagnostic (added alongside #2476) stood in for it. This suite implements
-// language spec §35.7's format for the auto-equality-bearing (value-like,
+// language spec §35.7's format for the auto-hashable (value-like,
 // admissible-payload) classification: "the generated ToString produces
 // 'TypeName.CaseName(field1: value1, …)', and 'TypeName.CaseName' for a
 // payload-free case." That format is unambiguous, so it is implemented for
@@ -91,7 +91,7 @@ const char* kNonAutoEqBearing =
     "class Widget end Widget; "
     "choice Holder Empty, Filled(item: Widget); end Holder; ";
 const char* kNonAeqDiag =
-    "member `ToString` on a choice that is not auto-equality-bearing";
+    "member `ToString` on a choice that is not auto-hashable";
 
 }  // namespace
 
@@ -213,7 +213,7 @@ BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
 // ── The undecided classification: §35.7 defines no default, so the
 //    pre-existing diagnostic is KEPT (not a crash, not an invented default) ──
 
-// Direct call on a non-auto-equality-bearing (borrow-bearing) choice.
+// Direct call on a non-auto-hashable (borrow-bearing) choice.
 BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
            non_auto_equality_bearing_direct_call_diagnosed_not_crashed) {
     const std::string program =
@@ -228,7 +228,7 @@ BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
     BEZEL_EXPECT_TRUE(hasError(program, "#2479"));
 }
 
-// Interpolation on a non-auto-equality-bearing choice — the SAME undecided
+// Interpolation on a non-auto-hashable choice — the SAME undecided
 // classification, reached through the separate interpolation dispatch path.
 BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
            non_auto_equality_bearing_interpolation_diagnosed_not_crashed) {
@@ -244,7 +244,7 @@ BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
     BEZEL_EXPECT_TRUE(hasError(program, "#2479"));
 }
 
-// Bare-T generic call on a non-auto-equality-bearing choice substitution.
+// Bare-T generic call on a non-auto-hashable choice substitution.
 BEZEL_TEST(generic_bare_typeparam_tostring_choice_2479,
            non_auto_equality_bearing_bare_t_diagnosed_not_crashed) {
     const std::string program =

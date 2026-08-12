@@ -6,8 +6,8 @@
 //
 // §14.2 (v0.214) / §35.7 (v0.210, #2083 × #2087 merged recursive rule): a
 // VALUE-LIKE choice with a function-typed payload is outside the §9.2
-// admissible-component recursion, so it is not auto-equality-bearing → not
-// equality-bearing (§3.6) → fails `where T: hashable`. The component path
+// admissible-component recursion, so it is not auto-hashable → not
+// hashable (§3.6) → fails `where T: hashable`. The component path
 // names the offending case/payload (the pre-merge classification-only rule
 // over-admitted this shape — the #2110 key-position half).
 

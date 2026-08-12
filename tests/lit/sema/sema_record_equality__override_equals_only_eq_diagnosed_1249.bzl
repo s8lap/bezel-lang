@@ -4,7 +4,7 @@
 //   (BEZEL_TEST sema_record_equality, override_equals_only_eq_diagnosed_1249).
 //
 // §9.2 v0.156 / #1249: a body record with `override Equals` alone (without
-// `operator =`/`<>`) is not auto-equality-bearing — `=` is a compile error.
+// `operator =`/`<>`) is not auto-hashable — `=` is a compile error.
 // (The §8.3 eq+hash pairing error is also expected, but the §9.2 `=` reject
 // is the load-bearing assertion here.)
 

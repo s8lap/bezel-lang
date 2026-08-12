@@ -5,9 +5,9 @@
 //
 // §9.2 v0.156 / #1249: a body record that declares `override Equals`
 // (with its required companion `override GetHashCode`) WITHOUT `operator =`/`<>`
-// is NOT auto-equality-bearing — `=` is a compile error.
+// is NOT auto-hashable — `=` is a compile error.
 
 module M; record R public property V: int; public constructor(v: int) V := v; end constructor; public override method Equals(other: Object?): bool => true; public override method GetHashCode(): int => 0; end R; class C public method M() var a := new R(1); var b := new R(9); _ := a = b; end M; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: `=` is not available on record `R`: it is not auto-equality-bearing
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: `=` is not available on record `R`: it is not auto-hashable
 // CHECK-SAME: (§9.2/§9.3)

@@ -2,8 +2,8 @@
 // (issue #502, §11.3 / §2.5).
 //
 // Bug #501: an imported positional record (e.g. `record Point(x:int, y:int)`)
-//   loses its "positional / auto-equality-bearing" flag in the importer, so
-//   `p = q` is rejected with "not auto-equality-bearing (§9.2)". The fix: carry
+//   loses its "positional / auto-hashable" flag in the importer, so
+//   `p = q` is rejected with "not auto-hashable (§9.2)". The fix: carry
 //   the hasPositionalFields flag through module metadata and set it on the
 //   reconstructed TypeSymbol in ModuleLoader so the §9.2 check in
 //   ExprTypecheck_Exprs.cpp reads it from TypeSymbol directly (not from the
@@ -136,7 +136,7 @@ BEZEL_TEST(xmod_record_nested_501_502, same_module_positional_eq_spec_9_1_9_2) {
 // and using `p = q` on it must NOT produce a diagnostic. Before the fix, the
 // reconstructed TypeSymbol had no AST node, so the §9.2 positional check in
 // ExprTypecheck_Exprs.cpp read a null ast::TypeDecl* and `positional` stayed
-// false, triggering the "not auto-equality-bearing" error.
+// false, triggering the "not auto-hashable" error.
 BEZEL_TEST(xmod_record_nested_501_502, imported_positional_eq_typechecks_clean_spec_9_2) {
     ModuleMetadata dep = buildMetaFor(
         "module PLib; "
@@ -236,7 +236,7 @@ BEZEL_TEST(xmod_record_nested_501_502, imported_positional_eq_unequal_case_spec_
 
 // ─── §9.2 — CONTROL: a body record without user equality still errors cross-mod
 
-// §9.2 / §2.5: a BODY record that is NOT auto-equality-bearing (it has a field
+// §9.2 / §2.5: a BODY record that is NOT auto-hashable (it has a field
 // with an explicit FieldDecl) must STILL produce an error cross-module. The fix
 // for #501 must not accidentally allow body-record `=` without an operator.
 BEZEL_TEST(xmod_record_nested_501_502, imported_body_record_eq_still_errors_spec_9_2) {

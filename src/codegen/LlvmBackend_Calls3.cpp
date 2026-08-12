@@ -224,7 +224,7 @@ llvm::Function* Emitter::buildChoiceEqTrampoline(const sema::TypeSymbol* cho) {
 // return its resolved TypeRef and the per-key byte count.
 //
 //   Dictionary (isSet=false): a string key keeps the bz_dict_*_str fast path
-//     (returns null). Every other equality-bearing key — primitives, enums,
+//     (returns null). Every other hashable key — primitives, enums,
 //     records (§4.8: "K must provide consistent Equals and GetHashCode") — uses
 //     the generic path. The stored key bytes are the key's natural LLVM layout.
 //   Set (isSet=true): the array backing cannot deduplicate (§4.10), so ALL
@@ -370,17 +370,17 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
         eligible = true;  // enum key/element (lowers to i32; value-compared)
     else if (!ty->nullable && ty->kind == K::Named && ty->declaration &&
              ty->declaration->kind == ast::TypeDeclKind::Choice)
-        // §35.7 (#2047): a value-like auto-equality-bearing choice key/element
+        // §35.7 (#2047): a value-like auto-hashable choice key/element
         // (sema rejects a non-value-like one). Stored as the choice struct's
         // bytes; hashed/compared by tag + active payload (build*ChoiceTrampoline).
         eligible = true;
     else if (!isSet && !ty->nullable && hasObjectHeaderEquality(ty))
         // fix #2773 (rows A3/A4) / §3.6 / §8.3 / stdlib §4.8: a DICTIONARY key
         // that carries the §8.3 object header — a class, an interface, or
-        // `Object`. §3.6's equality-bearing row admits "every type except (a) a
-        // record that is neither auto-equality-bearing nor declares user
+        // `Object`. §3.6's hashable row admits "every type except (a) a
+        // record that is neither auto-hashable nor declares user
         // equality, and (b) a choice that is not value-like
-        // auto-equality-bearing", and sema's isEqualityBearing admits a class
+        // auto-hashable", and sema's isEqualityBearing admits a class
         // and an interface as a hash-container key verbatim ("class (reference
         // identity), interface, enum — all bear consistent Equals/
         // GetHashCode"), so the shape is legal and REACHABLE, not latent.
@@ -416,7 +416,7 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
 }
 
 // issues D3 / D8 / §8.3: generic-dict hash trampoline `uint64_t(const void*)`
-// over an arbitrary equality-bearing value type. The runtime stores the key's
+// over an arbitrary hashable value type. The runtime stores the key's
 // natural bytes; the trampoline reinterprets the byte pointer as a pointer to
 // the key's LLVM type, loads the value, and runs the same hash the language
 // uses for the type — emitValueHashCode (§8.3): a string folds its code points
@@ -483,7 +483,7 @@ llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
 }
 
 // issues D3 / D8 / §8.3: generic-dict equality trampoline
-// `bool(const void* a, const void* b)` over an arbitrary equality-bearing value
+// `bool(const void* a, const void* b)` over an arbitrary hashable value
 // type. Loads both keys from their byte pointers and compares them by the
 // language's equality for the type: string content (emitStringEq, §4.6),
 // structural record equality (emitStructEquality, §9.1/§9.2 — consistent with
@@ -685,7 +685,7 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
             // §8.3's reference-identity default). That is exactly the contract
             // stdlib §5 states for these operators — "`Distinct`, `Union`,
             // `Intersect`, `Except`, `Contains`, and `ToSet` require
-            // equality-bearing `T` … exactly as for `Set<T>`" — and `Set<C>`'s
+            // hashable `T` … exactly as for `Set<T>`" — and `Set<C>`'s
             // own membership scan (emitArrayBackedSetInsert) already honours a
             // user `Equals` override and otherwise falls back to reference
             // identity. It is also the safe default for a null/unresolved
@@ -741,7 +741,7 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
         // bz_lazy_orderby / bz_lazy_thenby all read an int64_t key).
         //
         // #1692 / stdlib §5: ToDictionary's TKey is not restricted to `int` —
-        // it can be any equality-bearing type (e.g. `string`), so the caller
+        // it can be any hashable type (e.g. `string`), so the caller
         // now passes the selector's REAL return type as outTy. Hardcoding `i32`
         // here unconditionally called the closure through the wrong function
         // signature for a non-i32 key (a `ptr`-returning string selector),
@@ -855,13 +855,13 @@ llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
 // stdlib §5 Set-like (Union/Intersect/Except): hash trampoline for the
 // membership dict. Matches the runtime's `uint64_t(*)(const void*)` function
 // pointer slot in bz_dict_t. Reuses buildValueHashTrampoline for non-null
-// elemRef (record / scalar / string — all equality-bearing types). Falls back
+// elemRef (record / scalar / string — all hashable types). Falls back
 // to a simple identity hash on the raw element bytes for pointer-sized elements
 // (class pointers) where content equality is reference equality.
 llvm::Function* Emitter::buildLinqHashTrampoline(llvm::Type* elemTy,
                                                   const sema::TypeRef* elemRef,
                                                   const sema::TypeSymbol* elemRec) {
-    // For an equality-bearing value type (record, primitive, enum) reuse the
+    // For a hashable value type (record, primitive, enum) reuse the
     // existing value-hash trampoline (tested path; string hashes by content).
     if (elemRef && (elemRec || (elemRef->kind == sema::TypeRef::Kind::Primitive &&
                                 elemRef->primitive != sema::PrimitiveType::Object)))
@@ -881,7 +881,7 @@ llvm::Function* Emitter::buildLinqHashTrampoline(llvm::Type* elemTy,
     llvm::Value* h = nullptr;
     if (elemTy->isPointerTy()) {
         // fix #2773 / §8.3: a pointer-shaped element that is not an
-        // equality-bearing VALUE type is a class/interface/`Object` reference.
+        // hashable VALUE type is a class/interface/`Object` reference.
         // Its §8.3 hash is the user's `GetHashCode` override when declared,
         // else the ASSIGNED identity hash (bz_obj_identity_hash — "identity
         // hashes are assigned, not derived … never expose addresses"), NOT the
@@ -2054,7 +2054,7 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // issue D6 / §9.1 / §9.2: a record element sequence dedups by its
         // synthesized structural equality (mirroring Set<record>), not an ICmp
         // on the aggregate. recordTypeOfRef is non-null only for an
-        // equality-bearing record element type.
+        // hashable record element type.
         const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
         llvm::Function* eqTramp = buildLinqTrampoline(3, elemTy, nullptr, elemRec,
                                                       elemRef);  // #2773

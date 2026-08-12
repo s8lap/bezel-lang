@@ -133,7 +133,7 @@ BEZEL_TEST(generic_bare_typeparam_tostring_leak_2475,
     BEZEL_EXPECT_EQ(r.exitCode, 40);
 }
 
-// ── Body record substitution (auto-equality-bearing) ─────────────────────
+// ── Body record substitution (auto-hashable) ─────────────────────
 
 // A body record was NOT independently leaking before this fix (traced: its
 // return-through-generic path reaches the identical `isPlusOneStringProducer`
