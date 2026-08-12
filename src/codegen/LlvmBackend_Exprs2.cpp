@@ -7151,7 +7151,22 @@ llvm::Value* Emitter::buildRecordValue(
                 // record construction degraded (measured: `internal: … #2434`,
                 // and `b.U` then read as `null` — §4.7's two values collapsed).
                 // A no-op for every non-`()?` field. // per §4.7
+                //
+                // fix #3098 (follow-up) / §4.7 / §8.6: the `Object` SIBLING of
+                // the same rescue, which the first pass omitted — leaving this
+                // one position disagreeing with the other four #2915 covers.
+                // §4.7: "`var o: Object := ();` is grammatically valid and
+                // produces a boxed `()`", and a record field is a location like
+                // any other, so `new R(1, ())` at an `O: Object` field owes the
+                // box; without it the null `v` took the bail below and the WHOLE
+                // record construction degraded through #2434. Ordered after the
+                // `()?` arm because the two targets are disjoint (a `()?` field
+                // is not an Object/interface target, so `boxForTarget` returns
+                // `v` unchanged for it, and vice versa) — the order cannot
+                // change any outcome, only the reading. Both are gated on `!v`,
+                // so a field that DID lower a value is untouched.
                 if (!v) v = unitValueForTarget(v, fty, fieldArg[i]->value.get());
+                if (!v) v = boxForTarget(v, fty, fieldArg[i]->value.get());
                 if (!v) return nullptr;
                 // CG-nullable: a NULLABLE VALUE field (int?, bool?, …, and a
                 // nullable enum — issue #364) stores the tagged struct {i8

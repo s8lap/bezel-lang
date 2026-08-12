@@ -865,10 +865,24 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
         case sema::TypeRef::Kind::Unit:
             // §4.7: the NON-nullable unit type. `void` is right here and only
             // here — it is what a unit-returning function returns. It is NOT a
-            // valid `alloca`/parameter/struct-member type, so every STORAGE
-            // position substitutes the one-byte placeholder instead
-            // (`unitPlaceholderTy`: `lowerLocalDecl`'s #1619 guard,
-            // `lowerParamType`'s signature substitution).
+            // valid `alloca`/parameter/struct-member type, so a storage position
+            // must substitute the one-byte placeholder (`unitPlaceholderTy`).
+            //
+            // ⚠ WHICH positions do, stated as a LIST rather than as "every one",
+            // because the list is not complete and a reader must not take the
+            // stronger claim on trust (#3098 follow-up review): `lowerLocalDecl`
+            // (the #1619 guard), the method/constructor signature builders and
+            // their imported faces (`lowerParamType` / `lowerParamTypeRef`), the
+            // lambda parameter list, and — structurally, so a missed site is a
+            // placeholder rather than a hardware trap — `entryAlloca` itself.
+            // Five signature-building sites still call the RAW lowerings and
+            // would type a `()` slot `void`: the extern/FFI parameter list and
+            // the static-auto-property global (this file's `declareFunctions` /
+            // static-global loop), the imported indexer's parameter and `value`
+            // lists, and the function-VALUE call's own parameter list
+            // (LlvmBackend_Calls2.cpp — that one is #3137). All are pre-existing
+            // and none is reachable by a program measured so far; `entryAlloca`
+            // keeps each of them out of the SIGILL class regardless.
             //
             // fix #3095 / §4.7: `()?` never reaches here — `isNullableValueTy`
             // at the top of this function claims it first and returns the

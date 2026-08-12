@@ -297,6 +297,63 @@ BEZEL_TEST(unit_optional_signature_3095,
     BEZEL_EXPECT_EQ(3, r.exitCode);
 }
 
+// ── THE RECORD POSITIONAL-ARGUMENT POSITION ───────────────────────────────
+
+BEZEL_TEST(unit_optional_signature_3095,
+           a_nullable_unit_record_field_keeps_both_values_spec_4_7_9_1) {
+    // ⚠ THE ONE POSITION BEYOND #2915's FOUR, and therefore the one that most
+    // needs an EXECUTING oracle rather than a compile-only one: this fix's own
+    // defect class is a silent wrong value, and the lit accept file runs
+    // `%bezelc -c`, which never executes the program.
+    //
+    // MEASURED on 663a68e: a `()?` record FIELD had no representation at all
+    // (`lowerTypeRef` gave it `void`, so the record struct carried a void
+    // member); with the representation in place but no rescue at this site,
+    // `new RU(2, ())` took `buildRecordValue`'s `!v` bail and degraded the WHOLE
+    // record through #2434, so `rb.U` read as `null` — §4.7's two values
+    // collapsed into one.
+    auto r = runAot(
+        "module M; "
+        "record RU(A: int, U: ()?); "
+        "class C "
+        "  public static method Main(): int "
+        "    var ra := new RU(1, null); "
+        "    var rb := new RU(2, ()); "
+        "    var acc: int := 0; "
+        "    if ra.U = null  then acc := acc + 1; end; "
+        "    if rb.U <> null then acc := acc + 2; end; "
+        "    if ra.U <> null then acc := acc + 4; end; "   // must NOT fire
+        "    if rb.U = null  then acc := acc + 8; end; "   // must NOT fire
+        "    return acc * 10 + ra.A + rb.A; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(33, r.exitCode);               // acc == 3, A's == 1 + 2
+}
+
+BEZEL_TEST(unit_optional_signature_3095,
+           an_object_record_field_boxes_a_unit_argument_spec_4_7_8_6) {
+    // The `Object` SIBLING at the same site (#3098 follow-up review): the first
+    // pass added the `()?` rescue here and not `boxForTarget`'s, leaving this
+    // one position disagreeing with the four #2915 covers — `new RO(1, ())` at
+    // an `Object` field degraded the whole record through #2434. §4.7: "`var o:
+    // Object := ();` … produces a boxed `()`", and a record field is a location
+    // like any other; §8.5 renders that box as "()".
+    auto r = runAot(
+        "module M; "
+        "record RO(A: int, O: Object); "
+        "class C "
+        "  public static method Main(): int "
+        "    var ro := new RO(7, ()); "
+        "    Console.WriteLine(ro.O.ToString()); "
+        "    return ro.A; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(7, r.exitCode);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("()") != std::string::npos);
+}
+
 // ── ACCEPT-CONTROLS: the NON-nullable `()` is untouched ────────────────────
 
 BEZEL_TEST(unit_optional_signature_3095,
