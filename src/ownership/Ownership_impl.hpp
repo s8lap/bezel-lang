@@ -10,6 +10,7 @@
 // preserves the encapsulation the previous anonymous-namespace placement
 // gave, while allowing the definitions to live in separately-compiled units.
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -2541,6 +2542,35 @@ private:
     // (§30.5, #1570) — and rejected when true, since the borrow would then
     // escape the full expression that sources it (the classic `var x := await
     // Producer();` rejection). // per §30.5, §28.3
+    // fix #3074 (§30.5 / §30.3 "`.Result` in lockstep", v0.249): the ONE
+    // statement traversal both the await-site check and its `.Result` sibling
+    // run on. `visit(e, bindingValue)` is called once per expression POSITION a
+    // statement holds; nested statements are recursed into here, so neither
+    // caller enumerates statement kinds itself.
+    //
+    // ⚠ THIS FUNCTION IS THE LIST. It exists because the two walks it replaces
+    // each carried their own hand-maintained twelve-arm dispatch, and both were
+    // missing the same three entries — `LocalConstDecl` (so `const cfg := await
+    // Producer();` was silently accepted and dangled, #3074), `CaseStmt` (so no
+    // await in a `case` arm was ever classified) and `IncrementStmt`. Two
+    // independent routes finding two different holes is the signature of a list
+    // that was accumulated rather than derived, so it is derived here, once,
+    // from `ast::Node.hpp`'s statement hierarchy — every `: Stmt` subclass gets
+    // an arm, including the two that hold no expression at all, so that adding a
+    // statement kind without deciding its await behaviour is a visible omission
+    // rather than a silent exemption. Keep the arms in the header's order.
+    //
+    // `bindingValue` is true at exactly the positions whose value flows directly
+    // into a binding or a store and therefore SURVIVES the full expression — a
+    // `var`/`using var` initializer, a `const` initializer, an assignment RHS, a
+    // `return`/`yield return` value. It is false everywhere the value is merely
+    // consumed within the statement (conditions, call arguments, `for` sources,
+    // discards, assignment targets, `case` scrutinees and guards).
+    using StmtExprSiteVisitor =
+        std::function<void(const ast::Expr& e, bool bindingValue)>;
+    void visitStmtExprSites(const ast::Stmt& s,
+                            const StmtExprSiteVisitor& visit);
+
     void checkAwaitSites(const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void checkAwaitSitesStmt(
         const ast::Stmt& s,

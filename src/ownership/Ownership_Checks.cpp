@@ -8539,86 +8539,16 @@ void MethodOwnership::checkResultSites(
 }
 
 void MethodOwnership::checkResultSitesStmt(const ast::Stmt& s) {
-    // §30.5/§28.3 (v0.182, #1570): `bindingValue = true` at exactly the two
-    // positions whose value flows directly into a `var`/`using var` binding
-    // or a store — a LocalDecl initializer and an assignment RHS — so a
-    // `.Result` read whose operand is an unbound producer is rejected there
-    // (the borrow would escape the full expression) and admitted everywhere
-    // else (condition, iterable, discard, bare statement, throw/yield value,
-    // assignment target), where the borrowed result is merely consumed within
-    // the statement. // per §28.3, §30.5
-    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        if (ld->initializer) checkResultSitesExpr(*ld->initializer, true);
-        return;
-    }
-    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
-        if (es->expr) checkResultSitesExpr(*es->expr, false);
-        return;
-    }
-    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
-        if (ds->value) checkResultSitesExpr(*ds->value, false);
-        return;
-    }
-    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-        if (as->value) checkResultSitesExpr(*as->value, true);
-        if (as->target) checkResultSitesExpr(*as->target, false);
-        return;
-    }
-    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        // Unlike `await`, `.Result` has no chained-return admission (see the
-        // header comment) — a `return` is a store into the caller, so it is a
-        // binding position here.
-        if (rs->value) checkResultSitesExpr(*rs->value, true);
-        return;
-    }
-    if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
-        if (th->value) checkResultSitesExpr(*th->value, false);
-        return;
-    }
-    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
-        if (ys->value) checkResultSitesExpr(*ys->value, true);
-        return;
-    }
-    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        if (ifs->ifBranch.condition)
-            checkResultSitesExpr(*ifs->ifBranch.condition, false);
-        for (const auto& bs : ifs->ifBranch.body)
-            if (bs) checkResultSitesStmt(*bs);
-        for (const auto& el : ifs->elifBranches) {
-            if (el.condition) checkResultSitesExpr(*el.condition, false);
-            for (const auto& bs : el.body)
-                if (bs) checkResultSitesStmt(*bs);
-        }
-        for (const auto& bs : ifs->elseBody)
-            if (bs) checkResultSitesStmt(*bs);
-        return;
-    }
-    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        if (ws->condition) checkResultSitesExpr(*ws->condition, false);
-        for (const auto& bs : ws->body)
-            if (bs) checkResultSitesStmt(*bs);
-        return;
-    }
-    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        if (fs->iterable) checkResultSitesExpr(*fs->iterable, false);
-        for (const auto& bs : fs->body)
-            if (bs) checkResultSitesStmt(*bs);
-        return;
-    }
-    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        for (const auto& bs : dob->body)
-            if (bs) checkResultSitesStmt(*bs);
-        return;
-    }
-    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
-        for (const auto& bs : ts->body)
-            if (bs) checkResultSitesStmt(*bs);
-        for (const auto& arm : ts->catches)
-            if (arm.body) checkResultSitesStmt(*arm.body);
-        for (const auto& bs : ts->finallyBody)
-            if (bs) checkResultSitesStmt(*bs);
-        return;
-    }
+    // fix #3074 (§30.3 / §30.5 "`.Result` in lockstep", v0.249): the same single
+    // derived statement enumeration the await-site check uses. This walk was a
+    // verbatim second copy of that list, carrying the identical holes — which is
+    // exactly what §30.5 forbids, since "the admission applies identically to the
+    // completed-task `.Result` read … as await and `.Result` have moved in
+    // lockstep since their temporary machinery was unified". One walk is what
+    // makes the lockstep structural instead of a convention.
+    visitStmtExprSites(s, [&](const ast::Expr& e, bool bindingValue) {
+        checkResultSitesExpr(e, bindingValue);
+    });
 }
 
 void MethodOwnership::checkResultSitesExpr(const ast::Expr& e,
@@ -8754,6 +8684,41 @@ void MethodOwnership::collectOwnedConsumingAwaitsStmt(
     // §30.5 owned-consuming contexts where a Pattern B `await` is the
     // IMMEDIATE value. Recurse into nested blocks so awaits in branches/loops
     // are classified too.
+    //
+    // fix #3074 (v0.249) — THIS LIST MUST STAY IN STEP WITH `visitStmtExprSites`
+    // (the derived statement enumeration the §30.5 CHECK walks). The two are
+    // complements: a Pattern B await the check reaches but this collect misses is
+    // reported as "not in an owned-consuming context" even when it is — a false
+    // REJECT, the failure direction adding an arm to the check alone would
+    // introduce. The full `ast::Node.hpp` statement hierarchy, and this walk's
+    // answer for each:
+    //   LocalDecl        — owned-consuming (`using var`/`await using var`/`var`
+    //                      binding of an await, §30.5). Handled.
+    //   LocalConstDecl   — NOT owned-consuming: §21.1 forbids a `const` local
+    //                      taking an owned production ("the binding never takes a
+    //                      disposal obligation; bind owned values with `using
+    //                      var`"), and §30.5's owned-binding row names `using
+    //                      var`/`await using var`/`var` only. Deliberately absent,
+    //                      so a Pattern B `const c := await Acq();` is rejected by
+    //                      §30.5 as well as §21.1 rather than admitted.
+    //   ExpressionStmt   — owned `owned`-argument positions inside the expression.
+    //                      Handled (collectOwnedConsumingInExpr).
+    //   DiscardStmt      — owned-consuming (§17.13 / #1826). Handled.
+    //   AssignmentStmt   — owned-consuming for an owned storage target. Handled.
+    //   ReturnStmt       — owned-consuming; also records the Pattern A chained
+    //                      slot in returnPositionAwaits_. Handled.
+    //   YieldStmt        — owned-consuming in an owning iterator (§29.2). Handled.
+    //   ThrowStmt        — NOT in §30.5's owned-consuming enumeration; a Pattern B
+    //                      await there stays rejected. Deliberately absent.
+    //   IncrementStmt    — an lvalue path (`a[await …]++`); an await inside it is
+    //                      an operand, never an owned sink. Deliberately absent.
+    //   BreakStmt /
+    //   ContinueStmt     — hold no expression. Nothing to collect.
+    //   IfStmt, WhileStmt, ForStmt, DoEndBlock, TryStmt, CaseStmt — containers:
+    //                      recurse into every nested statement. CaseStmt was
+    //                      MISSING before #3074 (as it was from both check walks),
+    //                      so a `using var x := await Acquire();` inside a `case`
+    //                      arm was invisible here.
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         // `using var x := await ...`, `await using var x := await ...`, and
         // plain `var x := await ...` are all owned-consuming (§30.5: a
@@ -8859,6 +8824,18 @@ void MethodOwnership::collectOwnedConsumingAwaitsStmt(
         collectOwnedConsumingAwaits(ts->finallyBody, out);
         return;
     }
+    // fix #3074 (§30.5, v0.249): the statement-position `case`. Its Block-form
+    // arm bodies are ordinary statements and may hold every owned-consuming
+    // position above — `using var x := await Acquire();` most obviously. Without
+    // this arm the check walk (which now DOES reach a `case` arm) would report
+    // such an await as "not in an owned-consuming context". The Expression-form
+    // arm body is not admitted in statement position (see ast::CaseStmt), so only
+    // `stmts` is walked; a `when` guard is a boolean condition, never an owned
+    // sink.
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        for (const auto& arm : cs->arms) collectOwnedConsumingAwaits(arm.stmts, out);
+        return;
+    }
 }
 
 // §30.5: an `await` passed as an `owned` argument is in an owned-consuming
@@ -8922,93 +8899,171 @@ void MethodOwnership::checkAwaitSites(
         if (s) checkAwaitSitesStmt(*s, consuming);
 }
 
+// fix #3074 (§30.5 / §30.3, v0.249): the ONE derived statement traversal shared
+// by the §30.5 await-site check and its §30.3 `.Result` sibling. See the
+// declaration comment (Ownership_impl.hpp) for why this is a single function
+// rather than two hand-maintained dispatches — in short: both copies carried the
+// same twelve arms and both were missing the same entries, which is what a list
+// that was accumulated rather than derived looks like.
+//
+// The arms below are the COMPLETE `: Stmt` hierarchy of src/ast/Node.hpp, in
+// that header's declaration order. Every kind is listed, including the ones that
+// hold no expression, so a new statement kind cannot be silently exempt.
+void MethodOwnership::visitStmtExprSites(const ast::Stmt& s,
+                                         const StmtExprSiteVisitor& visit) {
+    auto sub = [&](const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+        for (const auto& bs : body)
+            if (bs) visitStmtExprSites(*bs, visit);
+    };
+
+    // (1) LocalDecl — `var`/`using var`/`await using var x := E;`. The
+    // initializer BINDS: its value outlives the full expression, so a Pattern A
+    // await over an unbound producer would escape its source (§30.5).
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        if (ld->initializer) visit(*ld->initializer, true);
+        return;
+    }
+    // (2) LocalConstDecl — `const x := E;`, §21.1's runtime const. A SEPARATE
+    // AST node from LocalDecl, and the one this fix is filed against (#3074):
+    // it was in neither walk, so `const cfg := await Producer();` was accepted
+    // where the `var` spelling is rejected, and the borrow dangled. §30.5 (the
+    // scoped await-bind, "Which binding forms qualify") puts `var` and `const`
+    // in the same row — "a runtime `const` binds values and borrows that carry
+    // no obligation (§21.1), which the await's borrow is; the `const` adds
+    // non-reassignability of `x` only" — so the initializer is a BINDING
+    // position exactly as LocalDecl's is. // per §30.5, §21.1
+    if (auto* lcd = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lcd->value) visit(*lcd->value, true);
+        return;
+    }
+    // (3) ReturnStmt — a store into the caller; binding position. (`return await
+    // Producer()` is separately admitted for Pattern A via returnPositionAwaits_,
+    // the §30.5 chained slot; the flag is irrelevant there but stays true for
+    // consistency with every other binding position.)
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) visit(*rs->value, true);
+        return;
+    }
+    // (4) ExpressionStmt — the value is consumed within the statement and dies
+    // at its K8 boundary: NOT a binding position (this is what admits
+    // `Process(await Producer());`, §30.5).
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        if (es->expr) visit(*es->expr, false);
+        return;
+    }
+    // (5) AssignmentStmt — the RHS is stored (binding position); the TARGET is
+    // an lvalue path whose own subexpressions are merely evaluated.
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->value) visit(*as->value, true);
+        if (as->target) visit(*as->target, false);
+        return;
+    }
+    // (6) ThrowStmt — the operand is consumed by the throw (§31.1); not a
+    // binding.
+    if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (th->value) visit(*th->value, false);
+        return;
+    }
+    // (7) IfStmt — each condition is its own K8 boundary (K8.2) and binds
+    // nothing; the branch bodies are statements.
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition) visit(*ifs->ifBranch.condition, false);
+        sub(ifs->ifBranch.body);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) visit(*el.condition, false);
+            sub(el.body);
+        }
+        sub(ifs->elseBody);
+        return;
+    }
+    // (8) WhileStmt — as IfStmt: the condition is re-evaluated per iteration and
+    // is its own boundary (K8.2).
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) visit(*ws->condition, false);
+        sub(ws->body);
+        return;
+    }
+    // (9) ForStmt — the iteration source and the §30.7 `with <token>` clause are
+    // both evaluated once and bind nothing. (`withExpr` was absent from both
+    // pre-#3074 walks, so an await there was never classified either.)
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) visit(*fs->iterable, false);
+        if (fs->withExpr) visit(*fs->withExpr, false);
+        sub(fs->body);
+        return;
+    }
+    // (10) DoEndBlock — statements only.
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        sub(dob->body);
+        return;
+    }
+    // (11)/(12) BreakStmt / ContinueStmt — a label and a resolved loop offset;
+    // NO expression, so nothing to visit. Listed explicitly (rather than falling
+    // off the end) so the enumeration is provably complete.
+    if (dynamic_cast<const ast::BreakStmt*>(&s) ||
+        dynamic_cast<const ast::ContinueStmt*>(&s))
+        return;
+    // (13) IncrementStmt — `t++` / `t--` (§17.6, statement-only). The target is
+    // an lvalue whose PATH can hold an await (`a[await IndexAsync()]++`); the
+    // borrow is consumed within the statement, so not a binding position.
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) visit(*is->target, false);
+        return;
+    }
+    // (14) DiscardStmt — `_ := E;`. §17.13/§30.5: the discard is itself an
+    // owned-consuming position that disposes at end-of-statement, so the value
+    // does NOT survive the full expression: not a binding position.
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        if (ds->value) visit(*ds->value, false);
+        return;
+    }
+    // (15) YieldStmt — `yield return E;` transfers out of the iterator (§29.2
+    // "Iterator yield ownership"): a store, hence a binding position. `yield
+    // break;` carries no value.
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) visit(*ys->value, true);
+        return;
+    }
+    // (16) TryStmt — body, each catch arm's `when` GUARD and body, and the
+    // finally body. (The guards were absent from both pre-#3074 walks.)
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        sub(ts->body);
+        for (const auto& arm : ts->catches) {
+            if (arm.guard) visit(*arm.guard, false);
+            if (arm.body) visitStmtExprSites(*arm.body, visit);
+        }
+        sub(ts->finallyBody);
+        return;
+    }
+    // (17) CaseStmt — the §A.6 statement-position `case`. Absent from both
+    // pre-#3074 walks entirely, so no await anywhere in a `case` was ever
+    // classified. The scrutinee and each arm's `when` guard are evaluated and
+    // bind nothing; an Expression-form arm body is a value-position expression
+    // (K8.5's arm boundary, not a binding); a Block-form arm body is statements.
+    // The arm PATTERNS hold only constant/type patterns (§35), never an await.
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) visit(*cs->scrutinee, false);
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) visit(*arm.guard, false);
+            if (arm.exprBody) visit(*arm.exprBody, false);
+            sub(arm.stmts);
+        }
+        return;
+    }
+}
+
 void MethodOwnership::checkAwaitSitesStmt(
     const ast::Stmt& s,
     const std::unordered_set<const ast::UnaryExpr*>& consuming) {
-    // Walk every statement's expressions for awaits, and recurse into nested
-    // blocks. Mirrors the structural recursion the other whole-body walks use.
-    //
-    // §30.5/§28.3 (v0.182, #1570): `bindingValue = true` at exactly the two
-    // positions whose value flows directly into a `var`/`using var` binding
-    // or a store — a LocalDecl initializer and an assignment RHS — so a
-    // Pattern A await whose operand is an unbound producer is rejected there
-    // (the borrow would escape the full expression) and admitted everywhere
-    // else, where the awaited borrow is merely consumed within the statement.
-    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        if (ld->initializer)
-            checkAwaitSitesExpr(*ld->initializer, consuming, true);
-        return;
-    }
-    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
-        if (es->expr) checkAwaitSitesExpr(*es->expr, consuming, false);
-        return;
-    }
-    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
-        if (ds->value) checkAwaitSitesExpr(*ds->value, consuming, false);
-        return;
-    }
-    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
-        if (as->value) checkAwaitSitesExpr(*as->value, consuming, true);
-        if (as->target) checkAwaitSitesExpr(*as->target, consuming, false);
-        return;
-    }
-    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
-        // `returnPositionAwaits_` already admits `return await Producer()`
-        // unconditionally (the chained-slot case, §30.5); bindingValue is
-        // irrelevant there but passed as true (a return is a store) for
-        // consistency with every other binding position.
-        if (rs->value) checkAwaitSitesExpr(*rs->value, consuming, true);
-        return;
-    }
-    if (auto* th = dynamic_cast<const ast::ThrowStmt*>(&s)) {
-        if (th->value) checkAwaitSitesExpr(*th->value, consuming, false);
-        return;
-    }
-    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
-        if (ys->value) checkAwaitSitesExpr(*ys->value, consuming, true);
-        return;
-    }
-    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        if (ifs->ifBranch.condition)
-            checkAwaitSitesExpr(*ifs->ifBranch.condition, consuming, false);
-        for (const auto& bs : ifs->ifBranch.body)
-            if (bs) checkAwaitSitesStmt(*bs, consuming);
-        for (const auto& el : ifs->elifBranches) {
-            if (el.condition)
-                checkAwaitSitesExpr(*el.condition, consuming, false);
-            for (const auto& bs : el.body)
-                if (bs) checkAwaitSitesStmt(*bs, consuming);
-        }
-        for (const auto& bs : ifs->elseBody)
-            if (bs) checkAwaitSitesStmt(*bs, consuming);
-        return;
-    }
-    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        if (ws->condition) checkAwaitSitesExpr(*ws->condition, consuming, false);
-        for (const auto& bs : ws->body)
-            if (bs) checkAwaitSitesStmt(*bs, consuming);
-        return;
-    }
-    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        if (fs->iterable) checkAwaitSitesExpr(*fs->iterable, consuming, false);
-        for (const auto& bs : fs->body)
-            if (bs) checkAwaitSitesStmt(*bs, consuming);
-        return;
-    }
-    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        for (const auto& bs : dob->body)
-            if (bs) checkAwaitSitesStmt(*bs, consuming);
-        return;
-    }
-    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
-        for (const auto& bs : ts->body)
-            if (bs) checkAwaitSitesStmt(*bs, consuming);
-        for (const auto& arm : ts->catches)
-            if (arm.body) checkAwaitSitesStmt(*arm.body, consuming);
-        for (const auto& bs : ts->finallyBody)
-            if (bs) checkAwaitSitesStmt(*bs, consuming);
-        return;
-    }
+    // fix #3074 (§30.5, v0.249): the statement enumeration lives in ONE place
+    // (visitStmtExprSites), derived from ast::Node.hpp's statement hierarchy.
+    // This walk used to carry its own twelve-arm copy of it, missing
+    // `LocalConstDecl` and `CaseStmt` — a positive list with holes, so a
+    // statement form nobody listed was silently EXEMPT from §30.5 rather than
+    // loudly rejected.
+    visitStmtExprSites(s, [&](const ast::Expr& e, bool bindingValue) {
+        checkAwaitSitesExpr(e, consuming, bindingValue);
+    });
 }
 
 void MethodOwnership::checkAwaitSitesExpr(
