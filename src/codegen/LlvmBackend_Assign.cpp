@@ -10061,10 +10061,16 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             if (params[idx].modifier == "out owned" &&
                 slotTy == ptrTy() && pt &&
                 pt->kind == sema::TypeRef::Kind::Named && pt->declaration) {
-                if (auto* td = dynamic_cast<const ast::TypeDecl*>(
-                        pt->declaration->decl)) {
-                    if (td->kind == ast::TypeDeclKind::Class ||
-                        td->kind == ast::TypeDeclKind::Interface) {
+                // fix #3142 (§2.8.3 rule 4, v0.252): the kind comes off the
+                // TypeSymbol. Through `->decl` it was null for every imported
+                // type, so an `out owned` DISCARD of an imported class was
+                // neither nulled nor registered in discardOwnedOutSlots_ — the
+                // slot held a produced value nobody disposed. LEAK, cross-module
+                // only, no diagnostic.
+                {
+                    const ast::TypeDeclKind tk = pt->declaration->kind;
+                    if (tk == ast::TypeDeclKind::Class ||
+                        tk == ast::TypeDeclKind::Interface) {
                         builder_.CreateStore(
                             llvm::ConstantPointerNull::get(ptrTy()), scratch);
                         discardOwnedOutSlots_.push_back(scratch);

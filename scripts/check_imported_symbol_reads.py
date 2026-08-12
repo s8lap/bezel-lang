@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""check_imported_symbol_reads.py - ratchet the imported-symbol classification seam.
+
+WHY (umbrella #3152, audit docs/proposals/imported-symbol-audit-2026-08-13.md).
+`ModuleLoader` never assigns `Symbol::decl` for an imported type - there is no
+`ast::TypeDecl` to assign, because the importing compilation has no AST for a
+dependency's types at all (`reconstructTypeSymbol` at ModuleLoader.cpp:325,
+`loadMetadataPass1` at :2433). So
+
+    dynamic_cast<const ast::TypeDecl*>(ts->decl)      // null for EVERY import
+
+is not a null-dereference risk - every site guards. It is a SILENT ANSWER
+CHANGE: the guard's `false` branch is written as "not a positional record" /
+"no `serialized` clause" / "no generic params" / "not borrow-bearing", and each
+of those is a substantive claim that happens to be wrong across a module
+boundary, with no diagnostic. The audit triaged 165 such sites: 96 UNIFY (the
+bugs), 6 NEEDS-AST, 63 ALREADY-CORRECT.
+
+WHAT THIS SCRIPT IS FOR. The audit is a snapshot; this is the ratchet that keeps
+it from being re-earned. Five ad-hoc loader side tables already exist
+(`fieldTypes_`/`returnTypes_`, `constValues_` #328, `propHasGetter_`,
+`propSetterVisibility_` #2415, `propIsAutoStorage_` #2478), each added by its own
+bug, each fixing one consumer and none making the next one correct. Adding a
+sixth is the option that has already failed five times. A COUNT THAT CAN ONLY GO
+DOWN is the cheap structural alternative.
+
+TWO CLASSES ARE DETECTED.
+
+  CLASS 1 - AST-GATED CLASSIFICATION (ratcheted, per file).
+    `dynamic_cast<const ast::TypeDecl*>(<expr>->decl)`. Wrong-but-quiet for an
+    imported symbol. Per-file counts are baselined; a file may go DOWN freely and
+    may never go UP, and a file with no baseline entry may not introduce one.
+    Per-file rather than a single total so that landing one family cannot silently
+    fund a new read somewhere else.
+
+  CLASS 2 - ALWAYS-NULL CAST (hard error, never baselined above its recorded
+    count). A `sema::TypeSymbol*` cast straight to `ast::TypeDecl*`. These are
+    unrelated types, so the cast is null on EVERY path, local and imported alike:
+    the guarded block is dead code that has never once executed. #3150 is the
+    known instance (LlvmBackend_Setup.cpp: #2115's generic-payload substitution
+    has therefore never run).
+
+WHEN A FAMILY LANDS. Counts go down; re-baseline with `--update`, which REFUSES to
+raise a count. Raising one is a deliberate act that needs `--force` and an
+explanation in the commit message.
+
+⚠ CONTROL-RUN BEFORE TRUSTING A GREEN. `--self-test` runs first in the gate phase
+and is not optional. `scripts/check_vacuous_tests.py`'s first draft reported the
+tree clean because its regex matched zero tests; a green from a matcher that
+matched nothing is worth nothing. The fixtures here include the multi-LINE spelling
+of the cast for the same reason - it is how most of the real sites are written.
+
+Usage:  scripts/check_imported_symbol_reads.py [--strict] [--self-test]
+                                               [--update [--force]] [--list]
+"""
+import argparse, pathlib, re, sys, tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+BASELINE = ROOT / 'scripts' / 'imported_symbol_reads.baseline'
+SCAN_DIRS = ('src',)
+SUFFIXES = ('.cpp', '.hpp')
+
+CAST = re.compile(r'dynamic_cast\s*<\s*const\s+ast::TypeDecl\s*\*\s*>\s*\(', re.S)
+# The argument shape that makes it a SYMBOL-side classification read. `.decl` is
+# the member on sema::Symbol; anything else (`&d`, `td.get()`, an ast::Node*) is
+# an ordinary AST cast and is none of this script's business.
+SYMBOL_DECL = re.compile(r'->\s*decl\s*$|\.\s*decl\s*$')
+# Class 2: the argument is a TypeSymbol itself, not its `decl`. `->declaration` is
+# how a sema::TypeRef names its TypeSymbol.
+TYPE_SYMBOL = re.compile(r'->\s*declaration\s*$|\btypeSymbol\s*$|\bts\s*$|\bsym\s*$')
+
+
+def _balanced_arg(text, start):
+    """Return the text between the '(' at start-1 and its matching ')'."""
+    depth, i = 1, start
+    while i < len(text) and depth:
+        if text[i] == '(':
+            depth += 1
+        elif text[i] == ')':
+            depth -= 1
+        i += 1
+    return text[start:i - 1]
+
+
+def scan_text(text, path):
+    """-> (class1_sites, class2_sites); each site is (path, line, arg)."""
+    c1, c2 = [], []
+    for m in CAST.finditer(text):
+        arg = ' '.join(_balanced_arg(text, m.end()).split())
+        line = text.count('\n', 0, m.start()) + 1
+        if SYMBOL_DECL.search(arg):
+            c1.append((path, line, arg))
+        elif TYPE_SYMBOL.search(arg):
+            c2.append((path, line, arg))
+    return c1, c2
+
+
+def scan(root):
+    c1, c2 = [], []
+    for d in SCAN_DIRS:
+        for p in sorted((root / d).rglob('*')):
+            if p.suffix not in SUFFIXES:
+                continue
+            a, b = scan_text(p.read_text(), str(p.relative_to(root)))
+            c1 += a
+            c2 += b
+    return c1, c2
+
+
+def counts(sites):
+    out = {}
+    for path, _, _ in sites:
+        out[path] = out.get(path, 0) + 1
+    return out
+
+
+def read_baseline():
+    if not BASELINE.exists():
+        return {}, {}
+    c1, c2, section = {}, {}, 'class1'
+    for raw in BASELINE.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            if line.startswith('# class2'):
+                section = 'class2'
+            elif line.startswith('# class1'):
+                section = 'class1'
+            continue
+        n, path = line.split(None, 1)
+        (c1 if section == 'class1' else c2)[path] = int(n)
+    return c1, c2
+
+
+def write_baseline(c1, c2):
+    lines = [
+        '# imported_symbol_reads.baseline - the ratchet for umbrella #3152.',
+        '# Regenerate with scripts/check_imported_symbol_reads.py --update after a',
+        '# family lands. A count may only go DOWN; raising one needs --force and an',
+        '# explanation in the commit message. See',
+        '# docs/proposals/imported-symbol-audit-2026-08-13.md for the per-site triage.',
+        '',
+        '# class1: dynamic_cast<const ast::TypeDecl*>(<sym>->decl) - wrong-but-quiet',
+        '#         for an imported symbol.',
+    ]
+    lines += ['%-4d %s' % (n, p) for p, n in sorted(c1.items())]
+    lines += [
+        '',
+        '# class2: a sema::TypeSymbol* cast straight to ast::TypeDecl* - ALWAYS null,',
+        '#         so the guarded block is dead on every path (#3150).',
+    ]
+    lines += ['%-4d %s' % (n, p) for p, n in sorted(c2.items())]
+    BASELINE.write_text('\n'.join(lines) + '\n')
+
+
+def compare(name, cur, base):
+    """-> list of violation strings."""
+    bad = []
+    for path in sorted(cur):
+        have, want = cur[path], base.get(path)
+        if want is None:
+            bad.append('%s: NEW FILE %s introduces %d read(s) - the seam may not '
+                       'grow a new site' % (name, path, have))
+        elif have > want:
+            bad.append('%s: %s has %d read(s), baseline allows %d (+%d)'
+                       % (name, path, have, want, have - want))
+    return bad
+
+
+# ---------------------------------------------------------------------------
+# self-test: the detector must go RED on a known positive before it is allowed to
+# certify anything. Fixtures cover the multi-line spelling, because that is how
+# most real sites are written and it is exactly what a naive regex misses.
+# ---------------------------------------------------------------------------
+FIXTURES = [
+    ('positive_single_line.cpp',
+     'auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);\n', 1, 0),
+    ('positive_multi_line.cpp',
+     'const auto* rtd =\n'
+     '    dynamic_cast<const ast::TypeDecl*>(\n'
+     '        rt->declaration->decl);\n', 1, 0),
+    ('positive_wrapped_call.cpp',
+     'if (auto* td = dynamic_cast<const ast::TypeDecl*>(\n'
+     '        pt->declaration->decl)) {\n', 1, 0),
+    ('class2_always_null.cpp',
+     'auto* d = dynamic_cast<const ast::TypeDecl*>(rt->declaration);\n', 0, 1),
+    ('negative_plain_ast_cast.cpp',
+     'auto* td = dynamic_cast<const ast::TypeDecl*>(&d);\n'
+     'auto* t2 = dynamic_cast<const ast::TypeDecl*>(child.get());\n', 0, 0),
+    ('negative_other_node_type.cpp',
+     'auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);\n', 0, 0),
+]
+
+
+def self_test():
+    ok = True
+    for name, body, want1, want2 in FIXTURES:
+        got1, got2 = scan_text(body, name)
+        good = (len(got1) == want1 and len(got2) == want2)
+        ok = ok and good
+        print('  [%s] %s: expected (%d,%d), got (%d,%d)'
+              % ('ok  ' if good else 'FAIL', name, want1, want2,
+                 len(got1), len(got2)))
+    # A detector that cannot see the real tree is also broken.
+    c1, _ = scan(ROOT)
+    if not c1:
+        ok = False
+        print('  [FAIL] whole-tree scan found ZERO class-1 reads - the matcher is '
+              'matching nothing, which is what a false green looks like')
+    else:
+        print('  [ok  ] whole-tree scan found %d class-1 read(s)' % len(c1))
+    print('check_imported_symbol_reads --self-test: ' + ('PASS' if ok else 'FAIL'))
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--strict', action='store_true',
+                    help='exit 1 on any violation (the gate phase)')
+    ap.add_argument('--self-test', action='store_true')
+    ap.add_argument('--update', action='store_true',
+                    help='rewrite the baseline from the current tree')
+    ap.add_argument('--force', action='store_true',
+                    help='with --update, permit a count to RISE')
+    ap.add_argument('--list', action='store_true', help='print every site')
+    a = ap.parse_args()
+
+    if a.self_test:
+        return self_test()
+
+    c1, c2 = scan(ROOT)
+    cur1, cur2 = counts(c1), counts(c2)
+    base1, base2 = read_baseline()
+
+    if a.list:
+        for path, line, arg in c1:
+            print('class1  %s:%d  %s' % (path, line, arg))
+        for path, line, arg in c2:
+            print('class2  %s:%d  %s' % (path, line, arg))
+
+    if a.update:
+        rises = [v for v in compare('class1', cur1, base1) if base1] + \
+                [v for v in compare('class2', cur2, base2) if base2]
+        if rises and not a.force:
+            print('REFUSING to update: the baseline may only go DOWN.')
+            for v in rises:
+                print('  ' + v)
+            print('Use --force if the rise is deliberate, and say why in the commit.')
+            return 1
+        write_baseline(cur1, cur2)
+        print('baseline updated: %d class-1 read(s) in %d file(s), %d class-2'
+              % (len(c1), len(cur1), len(c2)))
+        return 0
+
+    bad = compare('class1', cur1, base1) + compare('class2', cur2, base2)
+    total1, total2 = len(c1), len(c2)
+    want1 = sum(base1.values())
+    if bad:
+        print('IMPORTED-SYMBOL SEAM: %d violation(s) (#3152)' % len(bad))
+        for v in bad:
+            print('  ' + v)
+        print('\nA new AST-gated classification read answers WRONG for every imported')
+        print('symbol, silently. Read the fact off the sema::TypeSymbol instead - see')
+        print('docs/proposals/imported-symbol-audit-2026-08-13.md §4 for the four')
+        print('accessors that already do this correctly.')
+        return 1 if a.strict else 0
+    print('check_imported_symbol_reads: clean - %d class-1 read(s) (baseline %d), '
+          '%d class-2 (#3150)' % (total1, want1, total2))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

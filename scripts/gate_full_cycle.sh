@@ -354,6 +354,39 @@ if ! python3 scripts/check_vacuous_tests.py --strict \
 fi
 say "vacuous-assertion phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_vacuous.log"))"
 
+# ── IMPORTED-SYMBOL SEAM PHASE (#3152) ─────────────────────────────────────
+# The second source check, and it is here for the same reason as the first: a
+# new `dynamic_cast<const ast::TypeDecl*>(sym->decl)` classification read is
+# invisible to BOTH sharded oracles. It answers correctly for every local
+# symbol — which is what the whole suite is built from — and wrongly only
+# across a module boundary, silently, with no diagnostic. Neither gate.sh pass
+# can see that; a source ratchet can.
+#
+# The count may only go DOWN (a family from the audit landing) and may never go
+# up. --self-test runs first and is not optional, for the reason recorded in
+# check_vacuous_tests: a green from a matcher that matched nothing is worth
+# nothing, and the multi-line spelling of this cast is how most real sites are
+# written.
+say "imported-symbol phase: detector self-test + seam ratchet (#3152)"
+if ! python3 scripts/check_imported_symbol_reads.py --self-test \
+      > "$LOGDIR/${TAG}_seam.log" 2>&1; then
+  say "CYCLE FAILURE: check_imported_symbol_reads SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_seam.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_seam.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_imported_symbol_reads.py --strict \
+      >> "$LOGDIR/${TAG}_seam.log" 2>&1; then
+  say "CYCLE FAILURE: the imported-symbol seam GREW — a new AST-gated"
+  say "  classification read answers wrong for every import (#3152). See"
+  say "  $LOGDIR/${TAG}_seam.log"
+  sed -n '/IMPORTED-SYMBOL SEAM/,$p' "$LOGDIR/${TAG}_seam.log" 2>/dev/null | head -40 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "imported-symbol phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_seam.log"))"
+
 run_until_trustworthy "$LOGDIR/${TAG}_plain.log" "plain" || exit $?
 
 # --full folds whole-suite generated-code AddressSanitizer into the same sharded

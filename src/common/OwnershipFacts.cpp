@@ -116,13 +116,21 @@ bool isFreshOwnedClassProducer(const ast::Expr* e, const sema::SemaContext& ctx,
     if (!producer) return false;
     // The receiver type must be a heap CLASS: records/structs are value types
     // with no heap block or vtable disposer; interfaces/enums are not `new`-of-
-    // class temporaries. A null declaration (builtin not exported as a TypeDecl)
-    // is conservatively excluded — leak, but sound.
+    // class temporaries.
+    //
+    // fix #3142 (§2.8.3 rule 4, v0.252): read the kind off the TypeSymbol, not
+    // through `->decl`. `ModuleLoader` never assigns `Symbol::decl` (there is no
+    // AST for a dependency's types), so the old cast was null for EVERY
+    // imported type and the "conservatively excluded — leak, but sound"
+    // reasoning below it silently applied to every `new ImportedClass()` in
+    // temporary position: no §28.3 disposal obligation was registered and the
+    // object LEAKED. `TypeSymbol::kind` carries the same fact on both sides —
+    // `SymbolCollection::collectTypeDecl` locally, `fromMetaTypeDeclKind` at
+    // ModuleLoader.cpp:327 and :2435 for an import.
     const sema::TypeRef* rt = ctx.exprType(*e);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
-    const auto* rtd = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
-    return rtd && rtd->kind == ast::TypeDeclKind::Class;
+    return rt->declaration->kind == ast::TypeDeclKind::Class;
 }
 
 namespace {

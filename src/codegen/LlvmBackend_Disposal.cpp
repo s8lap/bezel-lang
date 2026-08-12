@@ -2654,9 +2654,16 @@ bool Emitter::freshNewReceiverTempEligible(const ast::Expr* recvExpr,
         valueResult = true;
     } else if (resultTy->kind == sema::TypeRef::Kind::Named &&
                resultTy->declaration) {
-        const auto* td =
-            dynamic_cast<const ast::TypeDecl*>(resultTy->declaration->decl);
-        if (td && td->kind == ast::TypeDeclKind::Enum) valueResult = true;
+        // fix #3142 (§2.8.3 rule 4, v0.252): read the kind off the TypeSymbol,
+        // for BOTH arms below. Through `->decl` it was null for every imported
+        // type, so neither the enum arm nor the #1859 owned-class arm ever fired
+        // for an imported result: the fresh receiver temp was not eligible for
+        // the §15.3 / §28.3 post-call disposal this predicate gates, and leaked.
+        // Converting only one arm would leave the other reading a stale source —
+        // the partial-unification failure the audit warns about (#1462).
+        const ast::TypeDeclKind rk = resultTy->declaration->kind;
+        if (rk == ast::TypeDeclKind::Enum)
+            valueResult = true;
         // fix #1859 / §28.3: a CLASS/INTERFACE result under an ANNOUNCED
         // `owned` return type is a FRESH transfer, not a borrow of the
         // receiver — the declared return type IS the announcement (K1.5 +
@@ -2675,8 +2682,8 @@ bool Emitter::freshNewReceiverTempEligible(const ast::Expr* recvExpr,
         // §28.3's unbound-temporary rule (its only use was as this call's
         // receiver — a borrowing use), independent of what the callee's
         // body happens to do internally.
-        else if (td && (td->kind == ast::TypeDeclKind::Class ||
-                        td->kind == ast::TypeDeclKind::Interface) &&
+        else if ((rk == ast::TypeDeclKind::Class ||
+                  rk == ast::TypeDeclKind::Interface) &&
                  calleeReturnsOwned) {
             valueResult = true;
         }
