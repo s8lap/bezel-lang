@@ -8217,10 +8217,20 @@ static std::string describeStaticValueType(const TypeRef* rt) {
 // the remedy — `()?` remains a well-formed type (§4.7); the rejection is of the
 // operator form, not of the type."
 //
-// THE UNIT ARM OF THE SAME PARAGRAPH IS #2962 and lands in the next commit, as
-// one more branch of THIS function — which is the point of quoting the
-// paragraph whole above: it is one rule with two degenerate targets, and the
-// compiler states it from one predicate so the two can never drift apart.
+// NULLABILITY. `Kind::Unit` is rejected whether or not the ref carries `?`.
+// §7.10 makes `?` idempotent, so `x as ()?` has the same result type `()?` as
+// `x as ()` and carries exactly the same (zero) information — it is the same
+// operator form at the same target, differently spelled, and admitting it would
+// leave open through one extra character precisely the representation hole the
+// ruling closes (#2962: the unit type lowers to LLVM `void`, so there is no
+// `{i8, void}` for the result to be). What §17.4 protects is the TYPE `()?` —
+// `var u: ()? := null;` and `var v: ()? := ();` compile and answer correctly,
+// and nothing here touches them. (`()?` at a SIGNATURE position does not work
+// today for reasons that predate and are independent of this rule: a `()?`
+// PARAMETER crashes the compiler and a `()?` return type is rejected as "no
+// return type" — filed as #3095, no `as` involved.) An inline array has no
+// nullable form to distinguish at all (§15.1), so the same question does not
+// arise on that arm.
 std::string degenerateAsTargetReason(const TypeRef* target) {
     if (!target) return {};
     if (target->kind == TypeRef::Kind::InlineArray) {
@@ -8243,6 +8253,14 @@ std::string degenerateAsTargetReason(const TypeRef* target) {
                  spelled + " := o; end;` (§17.4/§15.1)";
         }
         return s;
+    }
+    if (target->kind == TypeRef::Kind::Unit) {
+        return "`as` requires its result type `T?` to exist and to be "
+               "informative (§17.4), and the unit target `()` has exactly one "
+               "value — so `x as ()` could never carry more information than "
+               "the type test `x is ()` (§12.7), which is the remedy. The type "
+               "`()?` itself remains well-formed (§4.7); it is the operator "
+               "form that is rejected (§17.4/§4.7)";
     }
     return {};
 }

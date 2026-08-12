@@ -18,10 +18,6 @@
 //     check applies **per instantiation**: `x as T` at an inline-array or unit
 //     substitution is rejected at the instantiation site."
 //
-// This commit lands the shared predicate and the #2911 (inline-array) pins; the
-// #2962 (unit) pins are the next commit, in this same file, because they are
-// the same paragraph and the same predicate.
-//
 // WHAT THE COMPILER DID BEFORE THIS FIX — every line measured on 309356e, not
 // inferred, because a rejection that lands on code which compiles today has to
 // be justified by what that code actually produced:
@@ -82,6 +78,17 @@ namespace {
 bool rejectedInlineArrayTarget(const JitResult& r) {
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find("admits no nullable inline-array form") !=
+                std::string::npos &&
+            d.message.find("§17.4") != std::string::npos)
+            return true;
+    return false;
+}
+
+// True iff SOME error diagnostic carries the §17.4 unit arm.
+bool rejectedUnitTarget(const JitResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(
+                "could never carry more information than the type test") !=
                 std::string::npos &&
             d.message.find("§17.4") != std::string::npos)
             return true;
@@ -167,6 +174,43 @@ BEZEL_TEST(sema_as_degenerate_target_2911,
 }
 
 // =====================================================================
+// #2962 — §17.4 / §4.7: the unit arm.
+// =====================================================================
+
+// The measurement #2962 asked for and did not have: sema DID accept this.
+BEZEL_TEST(sema_as_degenerate_target_2962,
+           unit_target_rejected_spec_17_4_4_7) {
+    JitResult r = runAot(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var o: Object := 7; "
+        "    var back := o as (); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(rejectedUnitTarget(r));
+}
+
+// §7.10 makes `?` idempotent, so `x as ()?` is the SAME operator form at the
+// SAME target as `x as ()`, differently spelled — and it compiled clean pre-fix
+// too. Admitting it would leave the whole hole open through one extra
+// character. (What §17.4 protects is the TYPE `()?`; see the accept-control.)
+BEZEL_TEST(sema_as_degenerate_target_2962,
+           nullable_unit_target_rejected_spec_17_4_7_10) {
+    JitResult r = runAot(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var o: Object := 7; "
+        "    var back := o as ()?; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(rejectedUnitTarget(r));
+}
+
+// =====================================================================
 // The remedies the diagnostics NAME must actually work.
 // =====================================================================
 
@@ -236,6 +280,21 @@ BEZEL_TEST(sema_as_degenerate_target_2911,
     BEZEL_EXPECT_TRUE(r.ran);
 }
 
+// §4.7 / §8.6 (#2915): `x is ()` — the unit arm's remedy. Want 1.
+BEZEL_TEST(sema_as_degenerate_target_2962,
+           remedy_is_unit_test_answers_spec_12_7_4_7) {
+    JitResult r = runAot(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var o: Object := (); "
+        "    if o is () then return 1; end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
 // =====================================================================
 // §3.6 rule 2 — the per-instantiation arm.
 // =====================================================================
@@ -263,6 +322,33 @@ BEZEL_TEST(sema_as_degenerate_target_2911,
         "end C;");
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(rejectedInlineArrayTarget(r));
+    BEZEL_EXPECT_TRUE(rejectedAtInstantiationSite(r));
+}
+
+// TYPE-level parameter, unit substitution. Unit satisfies `where T: value`, so
+// no constraint can keep it out; only this rule does. Pre-fix: two #2434
+// "degraded to a zero-initialized value" internal warnings and a clean exit.
+BEZEL_TEST(sema_as_degenerate_target_2962,
+           generic_type_instantiated_at_unit_rejected_spec_3_6_rule_2) {
+    JitResult r = runAot(
+        "module M; "
+        "class Box<T> "
+        "  public constructor() end constructor; "
+        "  public method Probe(o: Object): int "
+        "    var r := o as T; "
+        "    if r <> null then return 1; end; "
+        "    return 0; "
+        "  end Probe; "
+        "end Box; "
+        "class C "
+        "  public static method Main(): int "
+        "    var o: Object := (); "
+        "    using var b := new Box<()>(); "
+        "    return b.Probe(o); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(rejectedUnitTarget(r));
     BEZEL_EXPECT_TRUE(rejectedAtInstantiationSite(r));
 }
 
