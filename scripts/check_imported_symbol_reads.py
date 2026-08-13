@@ -239,8 +239,27 @@ def write_baseline(c1, c2):
     BASELINE.write_text('\n'.join(lines) + '\n')
 
 
-def compare(name, cur, base):
-    """-> list of violation strings."""
+def compare(name, cur, base, stale=True):
+    """-> list of violation strings.
+
+    `stale` selects which of the two invariants to enforce, and the split is not
+    cosmetic — conflating them broke `--update` outright (see below).
+
+      stale=True  (the GATE): the baseline must EQUAL the measured count. Both a
+                  rise (the seam grew) and stale headroom (the file was
+                  regenerated at an older base) are violations.
+      stale=False (--update): only a rise or a new file matters. A count that
+                  went DOWN is the whole point of re-baselining.
+
+    Why the parameter exists: `--update` reuses this function to decide whether a
+    refresh would RAISE anything. When stale headroom became a violation, every
+    reduction started reading as a rise, so on a tree where nine files had all
+    gone down `--update` printed "REFUSING to update: the baseline may only go
+    DOWN" — refusing to lower a count, while saying counts may only be lowered —
+    and pointed at `--force`. That is the third instance today of a check
+    misbehaving on correct work and steering people to the escape hatch, and this
+    time the check was the one added to stop the previous two.
+    """
     bad = []
     for path in sorted(cur):
         have, want = cur[path], base.get(path)
@@ -262,7 +281,7 @@ def compare(name, cur, base):
     # `have > want` test, which never asks whether `want` itself grew. Requiring
     # equality closes it without needing to know what the previous value was.
     for path in sorted(base):
-        if path in SANCTIONED:
+        if not stale or path in SANCTIONED:
             continue
         have, want = cur.get(path, 0), base[path]
         if want > have:
@@ -310,8 +329,32 @@ FIXTURES = [
 ]
 
 
-def self_test():
+COMPARE_CASES = [
+    # (label, cur, base, gate_violations, update_violations)
+    ('exact',        {'a.cpp': 3}, {'a.cpp': 3}, 0, 0),
+    ('rise',         {'a.cpp': 4}, {'a.cpp': 3}, 1, 1),
+    ('stale',        {'a.cpp': 2}, {'a.cpp': 3}, 1, 0),
+    # gate sees TWO (the new file, plus a.cpp now stale at 0); --update sees
+    # only the new file, because staleness is not its business.
+    ('new file',     {'b.cpp': 1}, {'a.cpp': 3}, 2, 1),
+]
+
+
+def self_test_compare():
+    """The gate and --update must disagree about staleness, and only staleness."""
     ok = True
+    for label, cur, base, want_gate, want_upd in COMPARE_CASES:
+        g = len(compare('t', cur, base, stale=True))
+        u = len(compare('t', cur, base, stale=False))
+        good = (g == want_gate and u == want_upd)
+        ok = ok and good
+        print('  [%s] compare/%-8s gate=%d (want %d)  update=%d (want %d)'
+              % ('ok  ' if good else 'FAIL', label, g, want_gate, u, want_upd))
+    return ok
+
+
+def self_test():
+    ok = self_test_compare()
     for name, body, want1, want2 in FIXTURES:
         got1, got2 = scan_text(body, name)
         good = (len(got1) == want1 and len(got2) == want2)
@@ -357,8 +400,8 @@ def main():
             print('class2  %s:%d  %s' % (path, line, arg))
 
     if a.update:
-        rises = [v for v in compare('class1', cur1, base1) if base1] + \
-                [v for v in compare('class2', cur2, base2) if base2]
+        rises = [v for v in compare('class1', cur1, base1, stale=False) if base1] + \
+                [v for v in compare('class2', cur2, base2, stale=False) if base2]
         if rises and not a.force:
             print('REFUSING to update: the baseline may only go DOWN.')
             for v in rises:
