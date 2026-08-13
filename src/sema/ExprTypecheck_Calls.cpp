@@ -12370,6 +12370,239 @@ static bool propertyDeclIsSetOnly(const ast::PropertyDecl* pd) {
     return hasSet && !hasGet;
 }
 
+// fix #3177 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §2.5 / §7.5, v0.254):
+// the two IMPORTED-property access DECLINES, asked once for both member-access
+// spellings. `resolveMemberAccess` (`.`) has carried them since #2884/#2943;
+// `resolveNullCondMember` (`?.`) is a distinct AST node and carried NEITHER, so
+// `g?.P` on an imported generic type compiled clean and produced a junk value
+// (MEASURED on ec6a02f: `(g?.V ?? 99)` on `GBox<int>` printed `1`) while the
+// character-identical `g.P` was loudly refused by the diagnostic below. Once
+// #3177 types the `?.` node the same access would instead reach codegen and
+// fail with an `undefined reference` at link time — so the two spellings must
+// consult ONE decline, not two copies of it. Audit drift-pair #13
+// (docs/proposals/member-symbol-audit-2026-08-13.md §6).
+//
+// `loc` is resolved by the caller (both spellings fall back to the receiver's
+// span when the access node's own span is degenerate, the #1307 pattern).
+void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
+                                                      SourceLocation loc) {
+    if (!ips) return;
+    // fix #2884 (§14.1 / §2.8.3 rule 4 / §2.8.2 clause 1, v0.240,
+    // decline-with-reasons): a property declared on an IMPORTED GENERIC
+    // class or record has NO working access path today, in any spelling
+    // — measured on real two-module builds:
+    //   * computed (arrow/block) property, read or `:=`
+    //         -> `undefined reference to bz$<Lib>.<Cls>$<P>$propget`
+    //            / `$propset` — a hard LINK error that aborts the build.
+    //            `emitExportedProperty{Getters,Setters}` define the stub
+    //            only for a NON-generic type (a generic type's accessor
+    //            is per-instantiation, §2.8.3 rule 4, and the exporter
+    //            cannot name the importer's instantiations), while
+    //            `declareImportedProperty{Getters,Setters}` have no
+    //            generic gate and emit the external reference anyway.
+    //   * AUTO-property, read or `:=`  -> the same link error (the
+    //            #2478 instance-storage path does not engage for a
+    //            generic receiver).
+    //   * VIRTUAL property, read or `:=`  -> SIGSEGV at runtime (the
+    //            vtable slot for the instantiation is not populated;
+    //            filed separately, it is a distinct defect from the
+    //            missing-symbol one).
+    //   * `+=` / `++`  -> the write is SILENTLY DROPPED (#2862's
+    //            lowering declines for a generic parent precisely to
+    //            avoid turning it into the link error above).
+    // Rejecting the access with a sourced diagnostic is strictly better
+    // than all four: it names the shape at the access site instead of
+    // surfacing a mangled symbol from the linker, and it converts the
+    // silently dropped compound write into a loud one. Nothing that
+    // works today is rejected — every listed shape is broken NOW, and
+    // the shapes that are NOT broken are outside this gate: a property
+    // reached through an INTERFACE-typed reference resolves to the
+    // interface's own PropertySymbol (parent kind Interface, excluded
+    // here), a method or field on the same generic class is untouched,
+    // and a LOCAL generic class is not imported.
+    //
+    // This mirrors the #783 gate for an imported generic class's METHOD
+    // ("not yet monomorphized (§14.1 / #783)") in both form and
+    // reasoning; the full fix is importer-side property
+    // monomorphization, which needs the accessor bodies carried in the
+    // artifact the way `methodBodyText`/`ctorBodyText` already carry
+    // method and constructor bodies (#2884, #428 family).
+    if (!ips->isIndexer && ips->parent &&
+        ctx_.isImported(ips->parent) &&
+        !ips->parent->genericParams.empty() &&
+        (ips->parent->kind == ast::TypeDeclKind::Class ||
+         ips->parent->kind == ast::TypeDeclKind::Record)) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "property `" + std::string(ips->name) +
+            "` on the imported generic type `" +
+            std::string(ips->parent->name) +
+            "` is not yet monomorphized (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 "
+            "rule 4 / #2884): a generic type's accessors are not "
+            "exported per instantiation, so this access has no correct "
+            "target — it fails at link time with an `undefined "
+            "reference` to the property's accessor symbol, crashes for "
+            "a virtual property, or silently drops the write for "
+            "`+=`/`++`. Access a field directly, or route through a "
+            "method, until importer-side property monomorphization "
+            "lands");
+    }
+    // fix #2943 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §12.1, v0.240,
+    // NARROWER predicate than the reverted d11e7ca attempt). A property
+    // accessed through an IMPORTED NON-GENERIC INTERFACE-typed reference
+    // on a LAYOUT-MOVING imported generic instantiation has no working
+    // lower path today — the itable slot is filled by
+    // `buildImportedGenericVtable` (LlvmBackend_Setup.cpp ~5640) and the
+    // layout-moving arm deliberately keeps the slot NULL (#2894's
+    // refusal, kept by the #2943 codegen-side partial fix), so the
+    // dispatch faults with a SIGSEGV at runtime on the first call
+    // through the itable. Measured on the fix's parent (real two-module
+    // build, exit 139 = SIGSEGV):
+    //
+    //     `r.W` on `var r: IHas := new GIface<string>()` → exit 139
+    //
+    // The same shape reached DIRECTLY through the implementing class
+    // (`g.W` on a layout-moving imported generic) is #2884's decline
+    // above — the interface arm is the one #2884's predicate
+    // deliberately excludes ("parent kind Interface, excluded here").
+    //
+    // NARROW PREDICATE (§14.1 / §23 — "predicates are precise, not
+    // broad"). The decline fires ONLY when every one of the following
+    // holds:
+    //   (a) the accessed property is declared on the interface, NOT
+    //       inherited from a class or record (parent kind Interface,
+    //       not Class/Record — the converse of #2884's gate);
+    //   (b) the interface is IMPORTED (the slot is filled by the
+    //       imported-generic codegen path, not the local-monomorphize
+    //       path which inlines the body — the latter is OUT OF GATE);
+    //   (c) the interface is NOT generic — a generic interface with a
+    //       T-typed property return is the #2944 family (Lane 1's
+    //       narrower predicate), and a generic interface's INDEXER is
+    //       #2955's separate decline above (this arm is not indexer,
+    //       !ips->isIndexer, mirrored below);
+    //   (d) at least one IMPORTED GENERIC CLASS implementing this
+    //       interface declares >=2 fields whose resolved TypeRef is a
+    //       bare name matching one of the class's own generic
+    //       parameters. THIS IS THE NARROWER PART relative to the
+    //       reverted d11e7ca attempt (which fired on >=1 T-typed
+    //       field). The 2894 T3 maintenance comment (#2894 test,
+    //       layout_moving_instantiation_not_silently_wrong_spec_14_1)
+    //       states the discriminator explicitly: "TWO `T` fields are
+    //       load-bearing, because with a single one the i32
+    //       placeholder and the `ptr` share an 8-byte-aligned slot
+    //       and `_w` lands at the same offset either way". With a
+    //       SINGLE T-typed field the codegen-side
+    //       `instanceLayoutDiffersFromErasedTemplate` returns false
+    //       (layouts match), the itable slot IS filled, and the
+    //       program returns the correct value (2894 T1 = 108 with
+    //       single `_t: T`). The over-rejection there is the bug the
+    //       lane's previous attempt shipped and the gate caught —
+    //       this narrower predicate keeps the 2894 T1 case in the
+    //       accepted set.
+    //
+    // The codegen-side predicate
+    // (`instanceLayoutDiffersFromErasedTemplate`) is an exact layout
+    // check that requires LLVMDataLayout info we do not have at sema
+    // time. The ≥2-T-field count is its narrowest sema-time
+    // approximation: with a single T-typed field, the i32 placeholder
+    // (4 bytes, 4-byte aligned) and the substituted ptr (8 bytes,
+    // 8-byte aligned) share one 8-byte-aligned slot, so `_w` lands
+    // at the same offset either way; with two or more, the second
+    // T-typed field lands at offset 8 in the erased template but
+    // offset 16 in the substituted layout, and the offsets of all
+    // following fields diverge. The decline's over-rejection cost is
+    // a diagnostic at the access site instead of a value, which is
+    // the documented "value vs crash" trade #2884 made.
+    if (!ips->isIndexer && ips->parent &&
+        ctx_.isImported(ips->parent) &&
+        ips->parent->kind == ast::TypeDeclKind::Interface &&
+        ips->parent->genericParams.empty() &&  // NOT (c)'s generic interface
+        // Walk imported symbols; only generic classes implementing
+        // this interface with >=2 T-typed fields trigger the decline
+        // (the ≥2 is the narrower part, see (d) above).
+        [&]() -> bool {
+            bool found = false;
+            for (Symbol* sym : ctx_.importedSymbols()) {
+                auto* t = dynamic_cast<TypeSymbol*>(sym);
+                if (!t || t->kind != ast::TypeDeclKind::Class) continue;
+                if (t->genericParams.empty()) continue;
+                // The class implements this interface?
+                bool impls = false;
+                for (TypeSymbol* base : t->baseTypes) {
+                    if (base == ips->parent) { impls = true; break; }
+                }
+                if (!impls) continue;
+                // Build generic-param NAME → index map for the
+                // implementing class, exactly as #2955 does for the
+                // receiver declaration.
+                std::unordered_map<std::string_view, std::size_t>
+                    gpIndex;
+                for (std::size_t gi = 0;
+                     gi < t->genericParams.size(); ++gi) {
+                    if (auto* gp = dynamic_cast<
+                            const GenericParamSymbol*>(
+                                t->genericParams[gi]))
+                        gpIndex[gp->name] = gi;
+                }
+                if (gpIndex.empty()) continue;
+                // Count T-typed fields (>=2 is the layout-moving
+                // discriminator, per 2894 T3's maintenance comment).
+                std::size_t tFieldCount = 0;
+                for (Symbol* m : t->members) {
+                    auto* fs = dynamic_cast<FieldSymbol*>(m);
+                    if (!fs) continue;
+                    TypeRef* fty = nullptr;
+                    // LOCAL field: ride the AST + resolvedType side
+                    // table (the typechecker resolves the field's
+                    // declared type during typecheck pass S5).
+                    if (auto* fd = dynamic_cast<
+                            const ast::FieldDecl*>(fs->decl)) {
+                        if (fd->type) fty = ctx_.resolvedType(*fd->type);
+                    } else if (!fs->decl) {
+                        // IMPORTED field: there is no
+                        // ast::FieldDecl on the importer side
+                        // (#1488's metadata shape), so ride the
+                        // loader's importedMemberType side table —
+                        // exactly the path the §2.5 / §22.9 (#503)
+                        // member-typing above uses for an imported
+                        // property's return type.
+                        fty = ctx_.importedMemberType(fs);
+                    }
+                    if (!fty ||
+                        fty->kind != TypeRef::Kind::Named ||
+                        fty->declaration) continue;
+                    if (gpIndex.count(fty->headName()) != 0) {
+                        ++tFieldCount;
+                        if (tFieldCount >= 2) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (found) break;
+            }
+            return found;
+        }()) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "property `" + std::string(ips->name) +
+            "` on the imported interface `" +
+            std::string(ips->parent->name) +
+            "` is not yet monomorphized when dispatched through a "
+            "layout-movable imported generic instantiation "
+            "(\xC2\xA7""14.1 / \xC2\xA7""2.8.3 rule 4 / \xC2\xA7""13 / "
+            "\xC2\xA7""23 / #2943): the itable slot the cross-module "
+            "stub fills is fixed at the erased `T -> i32` template "
+            "layout, and an instantiation whose layout moves (its "
+            "class has TWO or more `T`-typed storage slots) keeps "
+            "that slot null so the dispatch faults with a SIGSEGV "
+            "at runtime. Reach the property through a method on "
+            "the concrete receiver, or declare the accessor on a "
+            "non-generic concrete class, until importer-side "
+            "accessor-body monomorphization lands (#428)");
+    }
+}
+
 void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     // per §24.3: the event visibility fence. When the access target resolves
     // to an event member, the producer-side operations (`Raise`, `RaiseAsync`,
@@ -17547,226 +17780,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                          dynamic_cast<MemberSymbol*>(member)
                                              ? dynamic_cast<MemberSymbol*>(member)->parent
                                              : nullptr));
-            // fix #2884 (§14.1 / §2.8.3 rule 4 / §2.8.2 clause 1, v0.240,
-            // decline-with-reasons): a property declared on an IMPORTED GENERIC
-            // class or record has NO working access path today, in any spelling
-            // — measured on real two-module builds:
-            //   * computed (arrow/block) property, read or `:=`
-            //         -> `undefined reference to bz$<Lib>.<Cls>$<P>$propget`
-            //            / `$propset` — a hard LINK error that aborts the build.
-            //            `emitExportedProperty{Getters,Setters}` define the stub
-            //            only for a NON-generic type (a generic type's accessor
-            //            is per-instantiation, §2.8.3 rule 4, and the exporter
-            //            cannot name the importer's instantiations), while
-            //            `declareImportedProperty{Getters,Setters}` have no
-            //            generic gate and emit the external reference anyway.
-            //   * AUTO-property, read or `:=`  -> the same link error (the
-            //            #2478 instance-storage path does not engage for a
-            //            generic receiver).
-            //   * VIRTUAL property, read or `:=`  -> SIGSEGV at runtime (the
-            //            vtable slot for the instantiation is not populated;
-            //            filed separately, it is a distinct defect from the
-            //            missing-symbol one).
-            //   * `+=` / `++`  -> the write is SILENTLY DROPPED (#2862's
-            //            lowering declines for a generic parent precisely to
-            //            avoid turning it into the link error above).
-            // Rejecting the access with a sourced diagnostic is strictly better
-            // than all four: it names the shape at the access site instead of
-            // surfacing a mangled symbol from the linker, and it converts the
-            // silently dropped compound write into a loud one. Nothing that
-            // works today is rejected — every listed shape is broken NOW, and
-            // the shapes that are NOT broken are outside this gate: a property
-            // reached through an INTERFACE-typed reference resolves to the
-            // interface's own PropertySymbol (parent kind Interface, excluded
-            // here), a method or field on the same generic class is untouched,
-            // and a LOCAL generic class is not imported.
-            //
-            // This mirrors the #783 gate for an imported generic class's METHOD
-            // ("not yet monomorphized (§14.1 / #783)") in both form and
-            // reasoning; the full fix is importer-side property
-            // monomorphization, which needs the accessor bodies carried in the
-            // artifact the way `methodBodyText`/`ctorBodyText` already carry
-            // method and constructor bodies (#2884, #428 family).
-            if (!ips->isIndexer && ips->parent &&
-                ctx_.isImported(ips->parent) &&
-                !ips->parent->genericParams.empty() &&
-                (ips->parent->kind == ast::TypeDeclKind::Class ||
-                 ips->parent->kind == ast::TypeDeclKind::Record)) {
-                // The member-access span is empty for some nested spellings
-                // (e.g. `g.P.ToString()`); fall back to the receiver's, exactly
-                // as the `no member` diagnostics above do with nmLoc.
+            // fix #3177: the #2884 / #2943 declines, shared with the `?.`
+            // spelling (see declineUnsupportedImportedPropertyAccess). The
+            // member-access span is empty for some nested spellings (e.g.
+            // `g.P.ToString()`); fall back to the receiver's, exactly as the
+            // `no member` diagnostics above do with nmLoc.
+            {
                 auto loc = ma.span.begin;
                 if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
-                ctx_.diagnostics().report(
-                    Severity::Error, loc,
-                    "property `" + std::string(ips->name) +
-                    "` on the imported generic type `" +
-                    std::string(ips->parent->name) +
-                    "` is not yet monomorphized (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 "
-                    "rule 4 / #2884): a generic type's accessors are not "
-                    "exported per instantiation, so this access has no correct "
-                    "target — it fails at link time with an `undefined "
-                    "reference` to the property's accessor symbol, crashes for "
-                    "a virtual property, or silently drops the write for "
-                    "`+=`/`++`. Access a field directly, or route through a "
-                    "method, until importer-side property monomorphization "
-                    "lands");
-            }
-            // fix #2943 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §12.1, v0.240,
-            // NARROWER predicate than the reverted d11e7ca attempt). A property
-            // accessed through an IMPORTED NON-GENERIC INTERFACE-typed reference
-            // on a LAYOUT-MOVING imported generic instantiation has no working
-            // lower path today — the itable slot is filled by
-            // `buildImportedGenericVtable` (LlvmBackend_Setup.cpp ~5640) and the
-            // layout-moving arm deliberately keeps the slot NULL (#2894's
-            // refusal, kept by the #2943 codegen-side partial fix), so the
-            // dispatch faults with a SIGSEGV at runtime on the first call
-            // through the itable. Measured on the fix's parent (real two-module
-            // build, exit 139 = SIGSEGV):
-            //
-            //     `r.W` on `var r: IHas := new GIface<string>()` → exit 139
-            //
-            // The same shape reached DIRECTLY through the implementing class
-            // (`g.W` on a layout-moving imported generic) is #2884's decline
-            // above — the interface arm is the one #2884's predicate
-            // deliberately excludes ("parent kind Interface, excluded here").
-            //
-            // NARROW PREDICATE (§14.1 / §23 — "predicates are precise, not
-            // broad"). The decline fires ONLY when every one of the following
-            // holds:
-            //   (a) the accessed property is declared on the interface, NOT
-            //       inherited from a class or record (parent kind Interface,
-            //       not Class/Record — the converse of #2884's gate);
-            //   (b) the interface is IMPORTED (the slot is filled by the
-            //       imported-generic codegen path, not the local-monomorphize
-            //       path which inlines the body — the latter is OUT OF GATE);
-            //   (c) the interface is NOT generic — a generic interface with a
-            //       T-typed property return is the #2944 family (Lane 1's
-            //       narrower predicate), and a generic interface's INDEXER is
-            //       #2955's separate decline above (this arm is not indexer,
-            //       !ips->isIndexer, mirrored below);
-            //   (d) at least one IMPORTED GENERIC CLASS implementing this
-            //       interface declares >=2 fields whose resolved TypeRef is a
-            //       bare name matching one of the class's own generic
-            //       parameters. THIS IS THE NARROWER PART relative to the
-            //       reverted d11e7ca attempt (which fired on >=1 T-typed
-            //       field). The 2894 T3 maintenance comment (#2894 test,
-            //       layout_moving_instantiation_not_silently_wrong_spec_14_1)
-            //       states the discriminator explicitly: "TWO `T` fields are
-            //       load-bearing, because with a single one the i32
-            //       placeholder and the `ptr` share an 8-byte-aligned slot
-            //       and `_w` lands at the same offset either way". With a
-            //       SINGLE T-typed field the codegen-side
-            //       `instanceLayoutDiffersFromErasedTemplate` returns false
-            //       (layouts match), the itable slot IS filled, and the
-            //       program returns the correct value (2894 T1 = 108 with
-            //       single `_t: T`). The over-rejection there is the bug the
-            //       lane's previous attempt shipped and the gate caught —
-            //       this narrower predicate keeps the 2894 T1 case in the
-            //       accepted set.
-            //
-            // The codegen-side predicate
-            // (`instanceLayoutDiffersFromErasedTemplate`) is an exact layout
-            // check that requires LLVMDataLayout info we do not have at sema
-            // time. The ≥2-T-field count is its narrowest sema-time
-            // approximation: with a single T-typed field, the i32 placeholder
-            // (4 bytes, 4-byte aligned) and the substituted ptr (8 bytes,
-            // 8-byte aligned) share one 8-byte-aligned slot, so `_w` lands
-            // at the same offset either way; with two or more, the second
-            // T-typed field lands at offset 8 in the erased template but
-            // offset 16 in the substituted layout, and the offsets of all
-            // following fields diverge. The decline's over-rejection cost is
-            // a diagnostic at the access site instead of a value, which is
-            // the documented "value vs crash" trade #2884 made.
-            if (!ips->isIndexer && ips->parent &&
-                ctx_.isImported(ips->parent) &&
-                ips->parent->kind == ast::TypeDeclKind::Interface &&
-                ips->parent->genericParams.empty() &&  // NOT (c)'s generic interface
-                // Walk imported symbols; only generic classes implementing
-                // this interface with >=2 T-typed fields trigger the decline
-                // (the ≥2 is the narrower part, see (d) above).
-                [&]() -> bool {
-                    bool found = false;
-                    for (Symbol* sym : ctx_.importedSymbols()) {
-                        auto* t = dynamic_cast<TypeSymbol*>(sym);
-                        if (!t || t->kind != ast::TypeDeclKind::Class) continue;
-                        if (t->genericParams.empty()) continue;
-                        // The class implements this interface?
-                        bool impls = false;
-                        for (TypeSymbol* base : t->baseTypes) {
-                            if (base == ips->parent) { impls = true; break; }
-                        }
-                        if (!impls) continue;
-                        // Build generic-param NAME → index map for the
-                        // implementing class, exactly as #2955 does for the
-                        // receiver declaration.
-                        std::unordered_map<std::string_view, std::size_t>
-                            gpIndex;
-                        for (std::size_t gi = 0;
-                             gi < t->genericParams.size(); ++gi) {
-                            if (auto* gp = dynamic_cast<
-                                    const GenericParamSymbol*>(
-                                        t->genericParams[gi]))
-                                gpIndex[gp->name] = gi;
-                        }
-                        if (gpIndex.empty()) continue;
-                        // Count T-typed fields (>=2 is the layout-moving
-                        // discriminator, per 2894 T3's maintenance comment).
-                        std::size_t tFieldCount = 0;
-                        for (Symbol* m : t->members) {
-                            auto* fs = dynamic_cast<FieldSymbol*>(m);
-                            if (!fs) continue;
-                            TypeRef* fty = nullptr;
-                            // LOCAL field: ride the AST + resolvedType side
-                            // table (the typechecker resolves the field's
-                            // declared type during typecheck pass S5).
-                            if (auto* fd = dynamic_cast<
-                                    const ast::FieldDecl*>(fs->decl)) {
-                                if (fd->type) fty = ctx_.resolvedType(*fd->type);
-                            } else if (!fs->decl) {
-                                // IMPORTED field: there is no
-                                // ast::FieldDecl on the importer side
-                                // (#1488's metadata shape), so ride the
-                                // loader's importedMemberType side table —
-                                // exactly the path the §2.5 / §22.9 (#503)
-                                // member-typing above uses for an imported
-                                // property's return type.
-                                fty = ctx_.importedMemberType(fs);
-                            }
-                            if (!fty ||
-                                fty->kind != TypeRef::Kind::Named ||
-                                fty->declaration) continue;
-                            if (gpIndex.count(fty->headName()) != 0) {
-                                ++tFieldCount;
-                                if (tFieldCount >= 2) {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (found) break;
-                    }
-                    return found;
-                }()) {
-                auto loc = ma.span.begin;
-                if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
-                ctx_.diagnostics().report(
-                    Severity::Error, loc,
-                    "property `" + std::string(ips->name) +
-                    "` on the imported interface `" +
-                    std::string(ips->parent->name) +
-                    "` is not yet monomorphized when dispatched through a "
-                    "layout-movable imported generic instantiation "
-                    "(\xC2\xA7""14.1 / \xC2\xA7""2.8.3 rule 4 / \xC2\xA7""13 / "
-                    "\xC2\xA7""23 / #2943): the itable slot the cross-module "
-                    "stub fills is fixed at the erased `T -> i32` template "
-                    "layout, and an instantiation whose layout moves (its "
-                    "class has TWO or more `T`-typed storage slots) keeps "
-                    "that slot null so the dispatch faults with a SIGSEGV "
-                    "at runtime. Reach the property through a method on "
-                    "the concrete receiver, or declare the accessor on a "
-                    "non-generic concrete class, until importer-side "
-                    "accessor-body monomorphization lands (#428)");
+                declineUnsupportedImportedPropertyAccess(ips, loc);
             }
         } else if (auto* ec = dynamic_cast<EnumConstantSymbol*>(member)) {
             // §10 (issue #328 FINDING [1]): an IMPORTED enum-constant access
@@ -18118,23 +18140,54 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         checkMemberVisibility(msym, nm.member, nm.span.begin, recvTy);
     }
     ctx_.setExprSymbol(&nm, member);
-    TypeRef* memberTy = nullptr;
-    if (auto* fs = dynamic_cast<FieldSymbol*>(member)) {
-        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-            if (fd->type) memberTy = ctx_.resolvedType(*fd->type);
-        } else if (fs->posParam && fs->posParam->type) {
-            // §9 / #464: positional record field — type lives on the Param,
-            // not on a FieldDecl. resolveNullCondMember previously missed this
-            // path and left memberTy null, so the NullCondMemberExpr's TypeRef
-            // was never set. lowerCoalesce then saw no TypeRef on `b?.x` and
-            // fell through to `return nullptr`, silently producing 0.
-            memberTy = ctx_.resolvedType(*fs->posParam->type);
-        }
-    } else if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
-        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
-            if (pd->type) memberTy = ctx_.resolvedType(*pd->type);
-    }
+    // fix #3177 (§7.5 / §9.1 / §9.2 / §2.5 / §2.8.3 rule 4, v0.254, family M4 of
+    // umbrella #3152): the accessed member's DECLARED TYPE, from the one
+    // both-sources accessor. This block used to read the `ast::FieldDecl` /
+    // `ast::PropertyDecl` off `Symbol::decl` and, failing that, the positional
+    // `Param` — three AST sources and no symbol-side one — so for an IMPORTED
+    // member (whose `decl` is null and whose synthetic `posParam` has a null
+    // `type`, #2516) it produced NO type at all. The `?.` node was then left
+    // untyped and `lowerCoalesce` fell through, so `(h?.N ?? 99)` MEASURED as
+    // `1` on ec6a02f — neither the member's 42 nor the coalesce default — with
+    // no diagnostic at any severity, while the character-identical
+    // single-module twin printed 42. A null receiver measured `0`, not the
+    // `?? 99` default.
+    //
+    // `sema::storageComponentType` is exactly this question and already
+    // consults all three sources in order (positional `Param` type, body
+    // `FieldDecl`/`PropertyDecl` type, then the loader's `importedMemberType`
+    // side table), so `?.` and `.` now answer it from ONE place — audit
+    // drift-pair #13, `resolveMemberAccess` having had an imported arm since
+    // #503 while this function had none.
+    //
+    // The §14.1 substitution mirrors the `.` form verbatim: a generic parent's
+    // `T`-typed member read through `g?.M` was previously typed as the bare
+    // parameter `T`, where `g.M` resolved it against the receiver's concrete
+    // arguments. `substituteMemberType` is a no-op for a non-generic parent.
+    auto* accessedMem = dynamic_cast<MemberSymbol*>(member);
+    TypeRef* memberTy =
+        const_cast<TypeRef*>(storageComponentType(member, ctx_));
     if (!memberTy) return;
+    memberTy = substituteMemberType(memberTy, nm.target.get(),
+                                    accessedMem ? accessedMem->parent : nullptr);
+    if (!memberTy) return;
+    // fix #3177: the #2884 / #2943 declines the `.` spelling has carried since
+    // v0.240. They are NOT new here in substance — `g.P` on an imported generic
+    // type is already refused — but `?.` is a distinct AST node that never
+    // consulted them, so the same access compiled clean and produced a junk
+    // value. Now that the access is typed, leaving the decline out would turn
+    // that junk value into an `undefined reference` at link time instead, which
+    // is precisely what #2884 declined to ship.
+    if (auto* ips = dynamic_cast<PropertySymbol*>(member)) {
+        if (ctx_.isImported(member)) {
+            // The parser does not set a NullCondMemberExpr's own span; fall back
+            // to the receiver's, the #1307 degenerate-callee-span pattern this
+            // function already uses for the equality gate above.
+            SourceLocation dloc = nm.span.begin;
+            if (dloc.line == 0 && nm.target) dloc = nm.target->span.begin;
+            declineUnsupportedImportedPropertyAccess(ips, dloc);
+        }
+    }
     if (memberTy->nullable) {
         ctx_.setExprType(&nm, memberTy);  // already nullable
     } else {

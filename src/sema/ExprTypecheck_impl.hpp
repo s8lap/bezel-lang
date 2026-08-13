@@ -2146,6 +2146,12 @@ private:
     TypeSymbol* memberTargetType(const ast::Expr* target);
 
     void resolveMemberAccess(const ast::MemberAccessExpr& ma);
+    // fix #3177 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §7.5, v0.254): the
+    // #2884 + #2943 imported-property access declines, asked ONCE for both
+    // the `.` and the `?.` spelling (they are distinct AST nodes and only
+    // the first carried them). `loc` is the caller-resolved access site.
+    void declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
+                                                 SourceLocation loc);
 
     // per §14.1/§14.2: substitute a member's declared type against the
     // receiver's concrete generic arguments. When a field/property declared
