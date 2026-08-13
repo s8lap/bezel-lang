@@ -5204,7 +5204,7 @@ private:
     // ⚠ BOTH sources are load-bearing, and reading only the AST one is a live
     // defect. `ModuleLoader` sets `TypeSymbol::hasPositionalFields` for an
     // IMPORTED record and never assigns `TypeSymbol::decl`, so
-    // `dynamic_cast<const ast::TypeDecl*>(ts->decl)` is null for every imported
+    // an `ast::TypeDecl*` cast of `ts->decl` is null for every imported
     // type — SymbolCollection.cpp says so outright at its own copy of this
     // predicate ("Imported positional records (no ast::TypeDecl — only
     // hasPositionalFields flag)"), and sema's copies read both. The codegen

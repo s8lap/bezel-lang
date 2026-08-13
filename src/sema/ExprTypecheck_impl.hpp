@@ -1980,6 +1980,28 @@ private:
     // is deferred, so skip.
     void checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t);
 
+    // fix #3141 (family F3 of umbrella #3152) — §9.1 / §22.5 / §5.1 / §2.8.3
+    // rule 4: the positional-record arm of checkNewExprArgs for a record whose
+    // positional `ast::Param`s do not exist in this compilation (an IMPORTED
+    // record: `ModuleLoader` assigns no `Symbol::decl`, and #2516's synthetic
+    // `Param` carries a null `type`). Applies the SAME two rules the local arm
+    // gets from checkArgsAgainstParams — §22.5 argument-to-field binding, then
+    // §5.1 per-argument assignability — over `recordPositionalFieldSymbols`
+    // (the indexed field list, both sides) and `storageComponentType` (the
+    // declared type, both sides). Named arguments bind by field name exactly as
+    // §22.5 binds them by parameter name.
+    //
+    // ⚠ There is no modifier-based deferral. §22.10 admits only plain and
+    // `owned` in a primary-constructor parameter list, so a modifier changes
+    // neither which field an argument binds to nor that field's type; a
+    // `ref`/`out` argument takes §14.5's exact-match rule instead of §5.1's,
+    // exactly as on the local path. checkImportedNewExprArgs' modifier deferral
+    // is right for IT — an imported CONSTRUCTOR may really declare `ref`/`out`
+    // parameters — and importing it here left `new Named(ref n, 2)` compiling
+    // to a SIGSEGV.
+    void checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
+                                           TypeSymbol* t);
+
     // §7 / stdlib §9.6 (#2315): a primitive `string` receiver's builtin
     // instance methods (IndexOf/Contains/StartsWith/EndsWith/LastIndexOf/
     // Replace/Split/Insert/Substring/...) declare NON-nullable `string`/

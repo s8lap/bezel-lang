@@ -1427,12 +1427,16 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
             // A positional record satisfies new() iff default(R) is well-defined
             // — every field has a well-defined default (§14.2 / §17.11): reject a
             // non-nullable reference field.
-            auto* td = dynamic_cast<const ast::TypeDecl*>(d->decl);
-            if (!td) return false;  // can't verify — defer (decided stays false)
+            //
+            // fix #3141 (family F3 of umbrella #3152, §2.8.3 rule 4): the field
+            // walk is symbol-side. Reaching it through `d->decl` deferred on
+            // EVERY imported record (`decided` stayed false), so a `where T:
+            // new()` bound was silently satisfied by an imported record with a
+            // non-nullable `Object` field that the byte-identical local record
+            // is rejected for (measured both ways).
             decided = true;
-            for (const auto& pf : td->positionalFields) {
-                if (!pf.type) continue;
-                TypeRef* ft = ctx_.resolvedType(*pf.type);
+            for (const Symbol* pf : recordPositionalFieldSymbols(d)) {
+                const TypeRef* ft = storageComponentType(pf, ctx_);
                 if (!ft) { decided = false; return false; }  // can't verify
                 if (ft->nullable) continue;  // nullable field → defaults null
                 if (groundCategorize(ft) == GroundCat::Reference)
@@ -1445,8 +1449,13 @@ bool ExprTC::groundSatisfiesNew(const TypeRef* arg, bool& decided) {
             // constructor, or declares no constructor at all (the implicit
             // default). A non-empty primary param list is a non-parameterless
             // constructor (mirroring Resolver::argSatisfiesNew).
-            auto* td = dynamic_cast<const ast::TypeDecl*>(d->decl);
-            if (td && td->hasPositionalFields && !td->positionalFields.empty()) {
+            //
+            // fix #3141: `hasPositionalFields` is on the TypeSymbol (#501) and
+            // the parameters themselves are FieldSymbols on both sides (#2516),
+            // so an imported primary-constructor class no longer answers "no
+            // primary parameters" and thereby satisfies `new()`.
+            if (d->hasPositionalFields &&
+                !recordPositionalFieldSymbols(d).empty()) {
                 decided = true;
                 return false;  // primary ctor has parameters
             }

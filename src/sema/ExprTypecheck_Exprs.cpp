@@ -3575,10 +3575,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // accepted and miscompiled. Only positional records are
                         // routed here; checkNewExprArgs validates the positional
                         // fields and returns (generic records defer to #428).
-                        if (auto* rtd =
-                                dynamic_cast<const ast::TypeDecl*>(t->decl))
-                            if (rtd->hasPositionalFields)
-                                checkNewExprArgs(*ne, t);
+                        //
+                        // fix #3141 (family F3 of umbrella #3152, §2.8.3 rule 4):
+                        // this gate used to ask the record's `ast::TypeDecl`.
+                        // `ModuleLoader` never assigns `Symbol::decl` for an
+                        // imported type, so the gate was false for EVERY import
+                        // and #1105's arg check — the one that stopped a
+                        // wrong-typed positional argument from being stored into
+                        // a differently-sized field — never ran across a module
+                        // boundary. `hasPositionalFields` is mirrored onto the
+                        // TypeSymbol on both sides (#501), so read it there.
+                        if (t->hasPositionalFields)
+                            checkNewExprArgs(*ne, t);
                     }
                     // §14.1 / §2.5 (#428 phase B): imported generic RECORD
                     // construction is now supported — codegen performs per-
@@ -6667,40 +6675,73 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     ctorDecl->params[posn].type) {
                     primOf(ctorDecl->params[posn].type.get());
                 } else if (ne->type) {
+                    // fix #3141 (family F3 of umbrella #3152, §9.1 / §5.1 /
+                    // §2.8.3 rule 4): the positional field list is read
+                    // SYMBOL-side. This block used to reach it through the
+                    // record's `ast::TypeDecl`, which an imported record never
+                    // has — so no hint was derived across a module boundary and
+                    // `new Wide(3000000000, 5)` for an imported
+                    // `record Wide(U: uint, L: long)` was REJECTED ("integer
+                    // literal does not fit in `int`") while the byte-identical
+                    // local record accepted it. `recordPositionalFieldSymbols`
+                    // is the indexed view of the same list on both sides
+                    // (#2516), and `storageComponentType` resolves a field's
+                    // declared type from the positional `Param`, the body decl,
+                    // or the importer's side table, in that order.
                     if (auto* rt = ctx_.resolvedType(*ne->type))
-                        if (rt->kind == TypeRef::Kind::Named && rt->declaration)
-                            if (auto* td = dynamic_cast<const ast::TypeDecl*>(
-                                    rt->declaration->decl))
-                                if (td->hasPositionalFields &&
-                                    posn < td->positionalFields.size() &&
-                                    td->positionalFields[posn].type) {
-                                    const ast::Type* ft =
-                                        td->positionalFields[posn].type.get();
-                                    // #1052: a generic positional-record field
-                                    // whose declared type is a bare type
-                                    // parameter (`Box<T>(V: T)`) — resolve T to
-                                    // the concrete generic argument of THIS
-                                    // instantiation (`Box<uint>` → uint) so the
-                                    // literal widens to it.
-                                    bool subst = false;
-                                    if (ft->name && ft->name->parts.size() == 1 &&
-                                        !td->genericParams.empty()) {
-                                        for (std::size_t k = 0;
-                                             k < td->genericParams.size(); ++k)
-                                            if (td->genericParams[k].name ==
-                                                    ft->name->parts[0]) {
-                                                if (k < rt->genericArgs.size() &&
-                                                    rt->genericArgs[k] &&
-                                                    rt->genericArgs[k]->kind ==
-                                                        TypeRef::Kind::Primitive)
-                                                    hintPrim =
-                                                        rt->genericArgs[k]->primitive;
-                                                subst = true;
-                                                break;
-                                            }
-                                    }
-                                    if (!subst) primOf(ft);
+                        if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+                            rt->declaration->hasPositionalFields) {
+                            const std::vector<const Symbol*> posFields =
+                                recordPositionalFieldSymbols(rt->declaration);
+                            if (posn < posFields.size()) {
+                                const Symbol* pf = posFields[posn];
+                                const TypeRef* ftr =
+                                    storageComponentType(pf, ctx_);
+                                // #1052: a generic positional-record field whose
+                                // declared type is a bare type parameter
+                                // (`Box<T>(V: T)`) — resolve T to the concrete
+                                // generic argument of THIS instantiation
+                                // (`Box<uint>` → uint) so the literal widens to
+                                // it. The parameter's spelling comes off the
+                                // resolved field type's alias-transparent head,
+                                // falling back to the local `ast::Param`'s own
+                                // name node when the type did not resolve; the
+                                // parameter NAMES are on the TypeSymbol on both
+                                // sides (convertGenericParams).
+                                std::string_view head =
+                                    ftr ? ftr->headName() : std::string_view{};
+                                if (head.empty())
+                                    if (auto* fsy =
+                                            dynamic_cast<const FieldSymbol*>(pf))
+                                        if (fsy->posParam && fsy->posParam->type &&
+                                            fsy->posParam->type->name &&
+                                            fsy->posParam->type->name->parts
+                                                    .size() == 1)
+                                            head = fsy->posParam->type->name
+                                                       ->parts[0];
+                                bool subst = false;
+                                if (!head.empty() &&
+                                    !rt->declaration->genericParams.empty()) {
+                                    for (std::size_t k = 0;
+                                         k < rt->declaration->genericParams.size();
+                                         ++k)
+                                        if (rt->declaration->genericParams[k]
+                                                ->name == head) {
+                                            if (k < rt->genericArgs.size() &&
+                                                rt->genericArgs[k] &&
+                                                rt->genericArgs[k]->kind ==
+                                                    TypeRef::Kind::Primitive)
+                                                hintPrim =
+                                                    rt->genericArgs[k]->primitive;
+                                            subst = true;
+                                            break;
+                                        }
                                 }
+                                if (!subst && ftr &&
+                                    ftr->kind == TypeRef::Kind::Primitive)
+                                    hintPrim = ftr->primitive;
+                            }
+                        }
                 }
                 if (hintPrim == PrimitiveType::Long ||
                     hintPrim == PrimitiveType::ULong ||

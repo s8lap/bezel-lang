@@ -98,15 +98,43 @@ struct CtorFormals {
     // through sema::formalParamModifier / formalParamName, which prefer the
     // ast::ConstructorDecl when it exists and fall back to ParameterSymbol.
     const sema::ConstructorSymbol* ctorSym = nullptr;
+    // fix #3141 (family F3 of umbrella #3152): a class PRIMARY constructor's
+    // parameters, as the FieldSymbols they become. This is the SAME list
+    // `declParams` names for a local class — a local positional FieldSymbol's
+    // `posParam` points into `td->positionalFields` — reached through the
+    // symbol table so that it survives an import, where there is no
+    // `ast::TypeDecl` to index at all (§2.8.3 rule 4).
+    std::vector<const sema::Symbol*> posFields;
 
-    bool valid() const { return declParams || ctorSym; }
+    bool valid() const { return declParams || ctorSym || !posFields.empty(); }
     std::size_t size() const {
         if (declParams) return declParams->size();
+        if (!posFields.empty()) return posFields.size();
         return ctorSym ? sema::formalParamCount(*ctorSym) : 0;
     }
     std::string_view modifier(std::size_t i) const {
         if (declParams) return i < declParams->size() ? (*declParams)[i].modifier
                                                       : std::string_view{};
+        if (!posFields.empty()) {
+            // A positional parameter's `owned` marker lives on the `ast::Param`
+            // locally; the metadata carries a positional field's MODIFIERS only
+            // through `MemberSymbol::modifiers`, which SymbolCollection leaves
+            // empty for a local positional field — so the marker reaches the
+            // wire from neither side and an imported positional field can only
+            // answer "" here (#3164, filed with the fix shape). Consult the
+            // Param when it carries the syntax (#2516's synthetic import Param
+            // has a null `type` and no modifier), then the symbol's own list, so
+            // this reader needs no change once #3164 populates it.
+            if (i >= posFields.size()) return {};
+            if (auto* fs =
+                    dynamic_cast<const sema::FieldSymbol*>(posFields[i])) {
+                if (fs->posParam && fs->posParam->type)
+                    return fs->posParam->modifier;
+                for (std::string_view mod : fs->modifiers)
+                    if (mod == "owned") return mod;
+            }
+            return {};
+        }
         return ctorSym ? sema::formalParamModifier(*ctorSym, i)
                        : std::string_view{};
     }
@@ -114,6 +142,9 @@ struct CtorFormals {
         if (declParams)
             return i < declParams->size() ? (*declParams)[i].name
                                           : std::string_view{};
+        if (!posFields.empty())
+            return i < posFields.size() ? posFields[i]->name
+                                        : std::string_view{};
         return ctorSym ? sema::formalParamName(*ctorSym, i)
                        : std::string_view{};
     }
@@ -140,11 +171,28 @@ CtorFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) {
             return f;
         }
     }
-    if (auto* td = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl)) {
-        if (td->kind == ast::TypeDeclKind::Class && td->hasPositionalFields &&
-            td->positionalFields.size() == nArgs) {
+    // #1627 / fix #3141: a class PRIMARY constructor. `hasPositionalFields` is
+    // mirrored onto the TypeSymbol (#501) and each parameter is a FieldSymbol on
+    // both sides (#2516), so this arm no longer stops at the module boundary.
+    // Where the local `ast::Param` list exists it is still what is handed on —
+    // it is the same list, and it carries the syntax (`owned`, defaults) the
+    // metadata does not.
+    if (rt->declaration->kind == ast::TypeDeclKind::Class &&
+        rt->declaration->hasPositionalFields) {
+        if (auto* td =
+                dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl)) {
+            if (td->positionalFields.size() == nArgs) {
+                CtorFormals f;
+                f.declParams = &td->positionalFields;
+                return f;
+            }
+            return {};
+        }
+        std::vector<const sema::Symbol*> pos =
+            sema::recordPositionalFieldSymbols(rt->declaration);
+        if (pos.size() == nArgs && !pos.empty()) {
             CtorFormals f;
-            f.declParams = &td->positionalFields;
+            f.posFields = std::move(pos);
             return f;
         }
     }
@@ -3004,23 +3052,30 @@ bool MethodOwnership::isNullSourceRecordExpr(const ast::Expr& e) const {
         ne->type ? ctx_.resolvedType(*ne->type) : ctx_.exprType(e);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
-    const auto* decl =
-        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
-    if (!decl || decl->kind != ast::TypeDeclKind::Record) return false;
-    // §9.7 / #2145: the instantiation-site substitution env for this record's
-    // field walk (empty for a non-generic record).
+    const sema::TypeSymbol* recTs = rt->declaration;
+    if (recTs->kind != ast::TypeDeclKind::Record) return false;
+    // fix #3141 (family F3 of umbrella #3152, §9.7 / §2.8.3 rule 4): the field
+    // walk is symbol-side. Reaching it through `->decl` returned "not
+    // null-source" for EVERY imported record, and #3145 had just made
+    // `isBorrowBearingRecord` answer correctly across the boundary — so the two
+    // together FALSE-REJECTED the §9.7 exemption the rule itself names.
+    // Measured on that base: a class field `h: Holder := new Holder(null, 7)`
+    // over `record Holder(r: Res?, tag: int)` compiled and ran when `Holder` was
+    // local, and was rejected with the §9.7 diagnostic when the byte-identical
+    // `Holder` was imported.
     common::RecordSubstEnv env;
-    common::seedRecordSubstEnv(*decl, *rt, /*incoming=*/nullptr, env);
+    common::seedRecordSubstEnv(*recTs, *rt, /*incoming=*/nullptr, env);
     const common::RecordSubstEnv* fieldEnv = env.map.empty() ? nullptr : &env;
     auto isBorrowCarrying = [&](const sema::TypeRef* ft) -> bool {
         std::unordered_set<const sema::TypeRef*> seen;
         return recordFieldIsBorrowCarrying(ft, seen, fieldEnv);
     };
-    const auto& fields = decl->positionalFields;
+    const std::vector<const sema::Symbol*> fields =
+        sema::recordPositionalFieldSymbols(recTs);
     for (std::size_t i = 0; i < ne->args.size() && i < fields.size(); ++i) {
-        const ast::Param& f = fields[i];
-        if (!f.type) continue;
-        if (!isBorrowCarrying(ctx_.resolvedType(*f.type))) continue;
+        const sema::TypeRef* ft = sema::storageComponentType(fields[i], ctx_);
+        if (!ft) continue;
+        if (!isBorrowCarrying(ft)) continue;
         const ast::Expr* arg = ne->args[i].value.get();
         if (!arg) return false;
         if (dynamic_cast<const ast::NullLiteralExpr*>(arg)) continue;

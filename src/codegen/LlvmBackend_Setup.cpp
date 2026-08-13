@@ -10264,25 +10264,33 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             // without this nothing initialized the primary-ctor class — its
             // positional params and field initializers all stayed calloc-zero.
             llvm::StructType* st = classStruct(targetCls);
-            if (auto* td =
-                    dynamic_cast<const ast::TypeDecl*>(targetCls->decl)) {
+            if (targetCls->kind == ast::TypeDeclKind::Class &&
+                targetCls->hasPositionalFields) {
+                // fix #3141 (family F3 of umbrella #3152, §22.8 step 0): the
+                // primary-constructor parameter list is the indexed symbol-side
+                // view. It is the same list `td->positionalFields` names (a
+                // local positional FieldSymbol's `posParam` points into it),
+                // read so the argument-i-to-field-i pairing survives an import,
+                // and so this no longer re-scans `members` per argument. The
+                // flag gates the build so the vector is not materialized for a
+                // class with no primary constructor.
+                const std::vector<const sema::Symbol*> posFields =
+                    sema::recordPositionalFieldSymbols(targetCls);
                 bool allPositional = true;
                 for (const auto& a : call->args)
                     if (!a.name.empty()) { allPositional = false; break; }
-                if (td->kind == ast::TypeDeclKind::Class &&
-                    td->hasPositionalFields && allPositional &&
-                    n == td->positionalFields.size()) {
-                    for (std::size_t pi = 0;
-                         pi < td->positionalFields.size(); ++pi) {
-                        const ast::Param& pf = td->positionalFields[pi];
-                        for (sema::Symbol* mm : targetCls->members) {
-                            auto* fs = dynamic_cast<sema::FieldSymbol*>(mm);
-                            if (!fs || fs->posParam != &pf) continue;
+                if (allPositional && n == posFields.size() &&
+                    !posFields.empty()) {
+                    for (std::size_t pi = 0; pi < posFields.size(); ++pi) {
+                        {  // scope for the per-field bindings below
+                            auto* fs = const_cast<sema::FieldSymbol*>(
+                                static_cast<const sema::FieldSymbol*>(
+                                    posFields[pi]));
                             auto pit = fieldIndex_.find(fs);
-                            if (pit == fieldIndex_.end()) break;
-                            if (!call->args[pi].value) break;
+                            if (pit == fieldIndex_.end()) continue;
+                            if (!call->args[pi].value) continue;
                             llvm::Value* v = lowerExpr(*call->args[pi].value);
-                            if (!v) break;
+                            if (!v) continue;
                             v = coerceNumericToType(
                                 v, st->getElementType(pit->second),
                                 isUnsignedTargetExpr(*call->args[pi].value));
@@ -10301,7 +10309,6 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                             builder_.CreateStore(
                                 v, builder_.CreateStructGEP(st, currentThis_,
                                                             pit->second));
-                            break;
                         }
                     }
                 }
@@ -20896,20 +20903,28 @@ bool Emitter::isFreshRecordConstructionOfExactType(
     if (!nty || nty->kind != sema::TypeRef::Kind::Named ||
         nty->declaration != recTs)
         return false;  // not EXACTLY recTs (a subtype/other type is out of scope)
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(recTs->decl);
-    if (!td || !td->hasPositionalFields) return false;
+    // fix #3141 (family F3 of umbrella #3152, §9.7 / §28.9 / §2.8.3 rule 4):
+    // the positional field list is read symbol-side, so a LOCAL factory
+    // returning an IMPORTED record (`Mk(): ImportedPt return new ImportedPt(…)`)
+    // is no longer disqualified for the sole reason that its `ast::TypeDecl`
+    // does not exist here — that cost a bounded string-field LEAK. Every arm
+    // below stays fail-closed: an unresolvable field type returns false, so the
+    // predicate can only ever admit fewer constructions than it can prove.
+    if (!recTs->hasPositionalFields) return false;
     for (const sema::Symbol* m : recTs->members)
         if (dynamic_cast<const sema::ConstructorSymbol*>(m))
             return false;  // explicit constructor — opaque, disqualifies
-    if (ne->args.size() != td->positionalFields.size()) return false;
+    const std::vector<const sema::Symbol*> posFields =
+        sema::recordPositionalFieldSymbols(recTs);
+    if (posFields.empty()) return false;
+    if (ne->args.size() != posFields.size()) return false;
     for (std::size_t i = 0; i < ne->args.size(); ++i) {
         const ast::CallArgument& arg = ne->args[i];
         if (!arg.name.empty() || !arg.modifier.empty() || arg.isDiscard ||
             !arg.value)
             return false;
-        const ast::Param& pf = td->positionalFields[i];
-        if (!pf.type) return false;
-        const sema::TypeRef* fty = ctx_.resolvedType(*pf.type);
+        const sema::TypeRef* fty =
+            sema::storageComponentType(posFields[i], ctx_);
         if (!fty) return false;
         if (!fty->nullable && fty->kind == sema::TypeRef::Kind::Named &&
             fty->declaration &&

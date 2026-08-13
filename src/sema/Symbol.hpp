@@ -592,7 +592,7 @@ struct ExternDeclSymbol : Symbol {
 // §9.1 / §9.2 / §2.8.3 rule 4 — THE record-storage accessors, symbol-side.
 //
 // fix #3145 (family F10 of umbrella #3152). Every §9.7 / §9.2 field walk used to
-// go through `dynamic_cast<const ast::TypeDecl*>(ts->decl)` and then iterate
+// go through an `ast::TypeDecl*` cast of `ts->decl` and then iterate
 // `decl->positionalFields` + `decl->members`. `ModuleLoader` never assigns
 // `Symbol::decl` for an imported type, so those walks saw NO fields at all for
 // an import and every predicate built on them answered the empty-walk default.

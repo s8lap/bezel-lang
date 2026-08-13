@@ -5535,12 +5535,15 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
             // well-defined — every field has a well-defined default
             // (§14.2 / §17.11). Verify each positional field's resolved type
             // is not a non-nullable reference type.
-            auto* td = dynamic_cast<const ast::TypeDecl*>(d->decl);
-            if (!td) return false;  // defer (decided stays false)
+            //
+            // fix #3141 (family F3 of umbrella #3152, §2.8.3 rule 4): the field
+            // walk is symbol-side. Through `d->decl` it deferred on EVERY
+            // imported record, so `new Holder<ImportedRefRec>()` compiled while
+            // the byte-identical local record was rejected with the §14.2
+            // diagnostic (measured both ways).
             decided = true;
-            for (const auto& pf : td->positionalFields) {
-                if (!pf.type) continue;
-                TypeRef* ft = ctx_.resolvedType(*pf.type);
+            for (const Symbol* pf : recordPositionalFieldSymbols(d)) {
+                const TypeRef* ft = storageComponentType(pf, ctx_);
                 if (!ft) { decided = false; return false; }  // can't verify
                 if (ft->nullable) continue;  // nullable field → defaults null
                 if (categorize(ft) == TypeCategory::Reference) {
@@ -5560,9 +5563,14 @@ bool Resolver::argSatisfiesNew(const TypeRef* arg, bool& decided) {
             // a primary constructor carries its params on the TypeDecl, not a
             // ConstructorSymbol; treat a non-empty primary param list as a
             // non-parameterless constructor.
-            auto* td = dynamic_cast<const ast::TypeDecl*>(d->decl);
-            if (td && td->hasPositionalFields &&
-                !td->positionalFields.empty()) {
+            //
+            // fix #3141: read `hasPositionalFields` off the TypeSymbol (#501)
+            // and the parameters themselves as FieldSymbols (#2516) — through
+            // `d->decl` an imported primary-constructor class answered "no
+            // primary parameters" and so SATISFIED `new()` (measured:
+            // `new Holder<ImportedPBox>()` compiled; the local twin rejected).
+            if (d->hasPositionalFields &&
+                !recordPositionalFieldSymbols(d).empty()) {
                 decided = true;
                 return false;  // primary ctor has parameters
             }

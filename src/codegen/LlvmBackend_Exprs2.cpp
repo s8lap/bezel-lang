@@ -2646,16 +2646,25 @@ void Emitter::prePopulateBasePositionalFields(
     if (!baseTs) return;  // no base class, nothing to do
 
     // Check if the base class has any positional-param fields to populate.
-    auto* baseTd = dynamic_cast<const ast::TypeDecl*>(baseTs->decl);
-    if (!baseTd || !baseTd->hasPositionalFields || baseTd->positionalFields.empty())
-        return;  // base has no primary-ctor params — field inits don't reference them
+    //
+    // fix #3141 (family F3 of umbrella #3152, §11.1 / §22.8 / §2.8.3 rule 4):
+    // this gate used to ask the base's `ast::TypeDecl`, which an IMPORTED base
+    // never has — so the whole pre-population was skipped and the base
+    // subobject's primary-ctor parameters stayed calloc-zero. Measured, with
+    // `class PBox(V: int, W: int)` and `class D(): PBox(5, 6)`: `v=5 w=6` when
+    // PBox was local, `v=0 w=0` when it was imported, compiling clean both
+    // times. The list right below was ALREADY symbol-side; only the gate above
+    // it died at the boundary. `hasPositionalFields` is mirrored onto the
+    // TypeSymbol (#501) and a positional field is a FieldSymbol on both sides
+    // (#2516), so both now read the symbol table.
+    if (!baseTs->hasPositionalFields) return;
 
     // Collect the base's positional FieldSymbols in declaration order.
     std::vector<sema::FieldSymbol*> basePosFields;
-    for (sema::Symbol* m : baseTs->members) {
-        auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
-        if (fs && fs->posParam) basePosFields.push_back(fs);
-    }
+    for (const sema::Symbol* m : sema::recordPositionalFieldSymbols(baseTs))
+        basePosFields.push_back(
+            const_cast<sema::FieldSymbol*>(
+                static_cast<const sema::FieldSymbol*>(m)));
     if (basePosFields.empty()) return;
 
     // Determine the arg values to store into the base's positional fields.
@@ -4942,24 +4951,32 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // object, not the surrounding method's `this`.
         llvm::Value* savedThisForInit = currentThis_;
         currentThis_ = obj;
-        auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
-        if (td && td->kind == ast::TypeDeclKind::Class &&
-            td->hasPositionalFields && !td->positionalFields.empty()) {
+        // fix #3141 (family F3 of umbrella #3152, §22.8 step 0): the primary-
+        // constructor parameter list is the indexed symbol-side view
+        // (`recordPositionalFieldSymbols`), which is the same list `td->
+        // positionalFields` names — a local positional FieldSymbol's `posParam`
+        // points into it — reached so that the pairing of argument i with field
+        // i does not depend on an `ast::TypeDecl`. It also replaces the O(n²)
+        // `posParam == &pf` scan over `members` this used to do per argument.
+        // The flag is checked FIRST so the vector is built only for a
+        // primary-constructor class, not on every `new`.
+        if (t->kind == ast::TypeDeclKind::Class && t->hasPositionalFields) {
+          const std::vector<const sema::Symbol*> posFields =
+              sema::recordPositionalFieldSymbols(t);
+          if (!posFields.empty()) {
             // Only the all-positional case: store each arg value directly into
             // the corresponding primary-ctor-param field slot.
             bool allPositional = true;
             for (const auto& a : ne.args)
                 if (!a.name.empty()) { allPositional = false; break; }
-            if (allPositional &&
-                ne.args.size() == td->positionalFields.size()) {
-                for (std::size_t pi = 0; pi < td->positionalFields.size(); ++pi) {
-                    const ast::Param& pf = td->positionalFields[pi];
-                    for (sema::Symbol* m : t->members) {
-                        auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
-                        if (!fs || fs->posParam != &pf) continue;
+            if (allPositional && ne.args.size() == posFields.size()) {
+                for (std::size_t pi = 0; pi < posFields.size(); ++pi) {
+                    {  // scope for the per-field bindings below
+                        auto* fs = const_cast<sema::FieldSymbol*>(
+                            static_cast<const sema::FieldSymbol*>(posFields[pi]));
                         auto idxIt = fieldIndex_.find(fs);
-                        if (idxIt == fieldIndex_.end()) break;
-                        if (!ne.args[pi].value) break;
+                        if (idxIt == fieldIndex_.end()) continue;
+                        if (!ne.args[pi].value) continue;
                         // issue #597: a positional primary-ctor argument is an
                         // enclosing-scope expression — lower it under the outer
                         // substitution, then restore the new type's subst for
@@ -4994,7 +5011,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         genericSubst_ = std::move(posSubst);
                         genericSubstSemaTy_ = std::move(posSemaTy);
                         currentThis_ = savedThisForArg;
-                        if (!v) break;
+                        if (!v) continue;
                         llvm::Type* fieldTy =
                             st->getElementType(idxIt->second);
                         v = coerceNumericToType(
@@ -5024,10 +5041,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         builder_.CreateStore(
                             v, builder_.CreateStructGEP(
                                    st, obj, idxIt->second));
-                        break;
                     }
                 }
             }
+          }
         }
         // §11.1 / #873: pre-populate base classes' positional-param field slots
         // BEFORE emitInstanceInit so that base field initializers (e.g.

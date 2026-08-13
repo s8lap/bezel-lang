@@ -2770,11 +2770,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         decided = true;
                                         satisfied = false;  // §11.2: not constructible
                                     } else if (argDecl->kind == ast::TypeDeclKind::Class) {
-                                        auto* td = dynamic_cast<const ast::TypeDecl*>(
-                                            argDecl->decl);
+                                        // fix #3141 (family F3 of umbrella
+                                        // #3152, §2.8.3 rule 4): the primary
+                                        // parameter list is read off the
+                                        // TypeSymbol — `hasPositionalFields`
+                                        // (#501) plus the FieldSymbols that
+                                        // survive an import (#2516). Through
+                                        // `argDecl->decl` an imported
+                                        // primary-constructor class looked
+                                        // parameterless and so satisfied
+                                        // `new()` at this call-site re-check.
                                         decided = true;
-                                        if (td && td->hasPositionalFields &&
-                                            !td->positionalFields.empty()) {
+                                        if (argDecl->hasPositionalFields &&
+                                            !recordPositionalFieldSymbols(argDecl)
+                                                 .empty()) {
                                             satisfied = false;  // primary ctor has params
                                         } else {
                                             std::vector<const ConstructorSymbol*> ctors;
@@ -10607,24 +10616,50 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
     // the name) carries those params on the TypeDecl rather than as
     // a ConstructorSymbol, and may combine with chained body
     // constructors. That interaction is deferred — skip such types.
-    if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
-        if (td->hasPositionalFields) {
-            // #1105 / #2203 (§9.1 / §14.1): a RECORD's positional fields ARE
-            // its primary constructor — one argument per field, in declaration
-            // order, no chaining and no per-field defaults. Validate
-            // `new Record(args)` here; skipping generic records used to admit
-            // `new Wrap<string>("x")` for `record Wrap<W>(tag: int)`. Codegen
-            // then stored the 8-byte string pointer into the 4-byte `tag` field,
-            // corrupting the stack. checkArgsAgainstParams substitutes each
-            // field type through the concrete NewExpr target, so generic fields
-            // such as `Box<T>(value: T)` are checked against the instantiated T
-            // while phantom parameters leave unrelated fields unchanged.
-            if (t->kind == ast::TypeDeclKind::Record) {
-                // The positional fields are the constructor's parameter list
-                // (one per field, declaration order). Reuse the same arity +
-                // named-argument binding + per-argument assignability check the
-                // class-constructor / method paths use (checkArgsAgainstParams):
-                // it handles reordered named args (`new Pt(Y := 4, X := 3)`).
+    // ⚠ The deferral is UNCONDITIONAL, so even an unchained
+    // `class PBox(V: int, W: string)` gets no arity and no per-argument type
+    // check: `new PBox(3)` compiles and yields a zero object, and
+    // `new PBox(3, 4)` compiles and SIGSEGVs on the first read of `W` (measured
+    // at a0b655e, in ONE module). That is a LOCAL memory-safety defect, filed
+    // as #3163; it is not what F3 is about and is deliberately left unchanged
+    // here. checkPositionalNewArgsFromSymbols below is the check it wants.
+    //
+    // fix #3141 (family F3 of umbrella #3152, §9.1 / §22.10 / §2.8.3 rule 4):
+    // the GATE is read off the TypeSymbol (`hasPositionalFields`, mirrored on
+    // both sides since #501) instead of the record's `ast::TypeDecl`, which an
+    // imported type never has. That miss is what let `new Pt("hello", 2)` on an
+    // imported `record Pt(X: int, Y: int)` compile clean and store a string
+    // POINTER into a 4-byte int field (measured: `p.X=4434336`), and
+    // `new Named(7, 2)` into a `string` field SEGV at first use — precisely the
+    // corruption class #1105 added this check to stop.
+    if (t->hasPositionalFields) {
+        // #1105 / #2203 (§9.1 / §14.1): a RECORD's positional fields ARE
+        // its primary constructor — one argument per field, in declaration
+        // order, no chaining and no per-field defaults. Validate
+        // `new Record(args)` here; skipping generic records used to admit
+        // `new Wrap<string>("x")` for `record Wrap<W>(tag: int)`. Codegen
+        // then stored the 8-byte string pointer into the 4-byte `tag` field,
+        // corrupting the stack. checkArgsAgainstParams substitutes each
+        // field type through the concrete NewExpr target, so generic fields
+        // such as `Box<T>(value: T)` are checked against the instantiated T
+        // while phantom parameters leave unrelated fields unchanged.
+        if (t->kind == ast::TypeDeclKind::Record) {
+            // The positional fields are the constructor's parameter list
+            // (one per field, declaration order). Reuse the same arity +
+            // named-argument binding + per-argument assignability check the
+            // class-constructor / method paths use (checkArgsAgainstParams):
+            // it handles reordered named args (`new Pt(Y := 4, X := 3)`).
+            //
+            // The two spellings below are ONE list seen from two sides: a local
+            // positional `FieldSymbol`'s `posParam` points into
+            // `td->positionalFields`, so where those `ast::Param`s exist they
+            // carry the syntax §22.5 needs (defaults, modifiers, collection-
+            // literal targets) and the shared path runs unchanged. An imported
+            // record's synthetic `Param` (#2516) has a null `type`, so the same
+            // two rules — §22.5 binding and §5.1 assignability — are applied
+            // over `recordPositionalFieldSymbols` + `storageComponentType`,
+            // which is the accessor that consults both sources.
+            if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl)) {
                 const auto& fields = td->positionalFields;
                 // §5.1 "Constant narrowing" (#738): a record positional
                 // argument initializes a field, so an in-range int
@@ -10638,9 +10673,56 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                     fields, ne.args, ne.span.begin,
                     std::string("`new ") + std::string(t->name) + "`",
                     &ne, t);
+            } else {
+                checkPositionalNewArgsFromSymbols(ne, t);
             }
             return;
         }
+        // A CLASS with a primary constructor. Locally this stays deferred,
+        // exactly as before (#3163 tracks that the deferral is too broad).
+        if (!ctx_.isImported(t)) return;
+        // §22.10 / §2.8.3 rule 4 (#3141): an IMPORTED class's primary
+        // constructor. Only ONE shape here is genuinely unconstructible — a
+        // NON-EMPTY positional list with no explicit constructor to route the
+        // arguments through. Every other shape falls through to
+        // checkImportedNewExprArgs below, which is exactly where it went before
+        // this fix (`t->decl` was null, so this whole block was skipped): an
+        // imported class that declares an explicit constructor ALONGSIDE its
+        // primary one still constructs through the dependency's exported
+        // `bz$<Type>$ctor`, and a zero-parameter primary list (`class C()`)
+        // still wants §22.7's own "implicit default constructor takes 0".
+        bool hasExplicitCtor = false;
+        for (Symbol* m : t->members)
+            if (auto* cs = dynamic_cast<ConstructorSymbol*>(m))
+                if (!cs->isStatic) { hasExplicitCtor = true; break; }
+        if (!hasExplicitCtor && !ne.args.empty() &&
+            !recordPositionalFieldSymbols(t).empty()) {
+            // Until this arm existed the gate above answered "no positional
+            // fields" for the import and control fell through to the §22.7
+            // implicit-default-constructor arm, whose diagnostic ("`new PBox`
+            // has 2 argument(s) but the implicit default constructor takes 0")
+            // names a constructor the class does not have. The construction
+            // itself is NOT yet supported: a dependency exports
+            // `bz$<Type>$init`, which takes only the object, so the positional
+            // parameters have nowhere to ride across and the object would be
+            // left calloc-zero (measured on the sibling base-clause path before
+            // this fix: `D(): PBox(5, 6)` produced `v=0 w=0`). Reject with the
+            // real reason rather than admit a silent-wrong object — see #3162
+            // for the construction work itself.
+            ctx_.diagnostics().report(
+                Severity::Error, ne.span.begin,
+                std::string("`new ") + std::string(t->name) +
+                    "` constructs an IMPORTED class through its primary "
+                    "constructor, which is not yet supported (§22.10 / §2.8.3 "
+                    "rule 4, #3162): a dependency exports only a no-argument "
+                    "initializer for its types, so the positional parameters "
+                    "would be dropped and the object left zero-initialized. "
+                    "Declare an explicit constructor on the exported class, or "
+                    "expose a factory method that returns `owned " +
+                    std::string(t->name) + "`");
+            return;
+        }
+        // fall through to the imported-constructor path below
     }
     std::vector<ConstructorSymbol*> ctors;
     for (Symbol* m : t->members) {
@@ -10852,6 +10934,160 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         cd->params, ne.args, ne.span.begin,
         std::string("`new ") + std::string(t->name) + "`",
         &ne, t);
+}
+
+// fix #3141 (family F3 of umbrella #3152) — §9.1 / §22.5 / §5.1 / §2.8.3 rule 4.
+// See the contract on the declaration in ExprTypecheck_impl.hpp.
+//
+// The binding rules below are bindArgsToParams' rules, applied to the positional
+// FIELD list instead of an `ast::Param` list, with the same diagnostic wording so
+// a cross-module rejection is indistinguishable from the local one. ⚠ That
+// identity is currently held only by the two texts matching — a SECOND COPY of
+// exactly the shape umbrella #3152 exists to remove. Generalizing
+// bindArgsToParams over a formal-list view (the `CtorFormals` idea already in
+// ownership/Ownership_Checks.cpp) is filed as #3173; it is a refactor of a
+// function on every call-site check's hot path, so it is not folded into a fix
+// that already spans 14 sites. §9.1 gives a
+// positional record "a primary constructor whose parameters are the positional
+// fields, in declaration order" and no per-field default syntax, so "unbound" is
+// always an error and there is no defaulted-slot arm to mirror.
+void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
+                                               TypeSymbol* t) {
+    const std::vector<const Symbol*> fields = recordPositionalFieldSymbols(t);
+    if (fields.empty()) return;
+    const std::string desc = std::string("`new ") + std::string(t->name) + "`";
+    // ⚠ There is deliberately NO blanket "an argument carries a modifier ->
+    // defer" guard here. This function opened with one, borrowed from
+    // checkImportedNewExprArgs' posture — where it IS right, because an
+    // imported CONSTRUCTOR may legitimately declare `ref`/`out` parameters that
+    // cross-module overload resolution cannot yet rank. A positional FIELD list
+    // is not that: §22.10 admits only plain and `owned` in a primary-
+    // constructor parameter list, so no modifier changes what field i is or
+    // what type it has, and the §22.5 binding below is modifier-independent by
+    // construction. The guard cost exactly what this fix exists to prevent —
+    // `new Named(ref n, 2)` with `n: int` against an imported
+    // `record Named(Tag: string, N: int)` compiled and SIGSEGV'd, while the
+    // local twin rejected it under §14.5 — i.e. the SAME defect this fix
+    // removes for `new Named(7, 2)`, surviving one added token.
+    std::vector<int> fieldToArg(fields.size(), -1);
+    bool sawNamed = false;
+    std::size_t pos = 0;
+    auto fail = [&](const std::string& msg) {
+        ctx_.diagnostics().report(Severity::Error, ne.span.begin, msg);
+    };
+    for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
+        const ast::CallArgument& a = ne.args[ai];
+        if (a.name.empty()) {
+            if (sawNamed) {
+                fail(desc +
+                     ": a positional argument may not follow a named "
+                     "argument (§22.5 — named arguments come after all "
+                     "positional arguments)");
+                return;
+            }
+            if (pos >= fields.size()) {
+                fail(desc + " supplies " + std::to_string(ne.args.size()) +
+                     " argument(s) but the parameter list has " +
+                     std::to_string(fields.size()) + " (§22.5)");
+                return;
+            }
+            fieldToArg[pos] = static_cast<int>(ai);
+            ++pos;
+        } else {
+            sawNamed = true;
+            std::size_t idx = fields.size();
+            for (std::size_t j = 0; j < fields.size(); ++j)
+                if (fields[j]->name == a.name) { idx = j; break; }
+            if (idx >= fields.size()) {
+                fail(desc + " has no parameter named `" + std::string(a.name) +
+                     "` (§22.5)");
+                return;
+            }
+            if (fieldToArg[idx] != -1) {
+                fail(desc + ": parameter `" + std::string(a.name) +
+                     "` is bound more than once (§22.5)");
+                return;
+            }
+            fieldToArg[idx] = static_cast<int>(ai);
+        }
+    }
+    for (std::size_t j = 0; j < fields.size(); ++j)
+        if (fieldToArg[j] == -1) {
+            fail(desc + ": required parameter `" + std::string(fields[j]->name) +
+                 "` is not supplied (§22.5)");
+            return;
+        }
+    // per §5.1: each bound argument must be assignable to its field's declared
+    // type. `storageComponentType` is the accessor that consults both sources —
+    // the positional `Param`'s type node, then the importer's member-type side
+    // table — so a field whose type did not resolve yields null and is skipped
+    // (conservative: never a false reject).
+    //
+    // per §14.1 (#428 phase B): a field declared at a bare type PARAMETER
+    // (`record GBox<T>(V: T, N: int)`) must be checked against THIS
+    // instantiation's argument, which is what `checkArgsAgainstParams` does for
+    // a local record by substituting through the `NewExpr` target. The
+    // parameter names are on the TypeSymbol on both sides and the arguments are
+    // on the target's resolved TypeRef, so the same substitution is available
+    // here. A nullable spelling of a type parameter (`T?`) defers instead — the
+    // substitution would drop the `?` — as does an instantiation whose argument
+    // did not resolve. Deferral is per-field and never a false reject.
+    const TypeRef* target = ne.type ? ctx_.resolvedType(*ne.type) : nullptr;
+    for (std::size_t j = 0; j < fields.size(); ++j) {
+        const ast::CallArgument& a = ne.args[static_cast<std::size_t>(fieldToArg[j])];
+        if (!a.value || a.isDiscard) continue;
+        TypeRef* ft = const_cast<TypeRef*>(storageComponentType(fields[j], ctx_));
+        if (!ft) continue;
+        if (!t->genericParams.empty()) {
+            const std::string_view head = ft->headName();
+            for (std::size_t k = 0; k < t->genericParams.size(); ++k) {
+                if (t->genericParams[k]->name != head) continue;
+                // The field is declared at type parameter k: substitute this
+                // instantiation's k-th argument. A nullable spelling (`T?`) or
+                // an instantiation whose k-th argument did not resolve leaves
+                // `ft` null, which defers the check for THIS field only.
+                ft = (!ft->nullable && target && k < target->genericArgs.size())
+                         ? target->genericArgs[k]
+                         : nullptr;
+                break;
+            }
+            if (!ft) continue;  // deferred — never a false reject
+        }
+        // per §22.3 / §14.5: a `ref`/`out` argument ALIASES the caller's
+        // location, so its type must match the field's exactly and no §5.1
+        // implicit conversion is admitted. This is the arm the deleted blanket
+        // deferral skipped, and it is the memory-safety half: an `int` local
+        // passed as `ref` to a `string` field is a type-confused alias, which
+        // faulted on first read of the field. Same rule and same wording as the
+        // local path (checkArgsAgainstParams' `am == "ref" || am == "out"`
+        // block), so the two answers are indistinguishable.
+        const std::string_view am = a.modifier;
+        if (am == "ref" || am == "out") {
+            TypeRef* rargTy = ctx_.exprType(*a.value);
+            if (rargTy && !typeRefEqual(rargTy, ft))
+                ctx_.diagnostics().report(
+                    Severity::Error, a.value->span.begin,
+                    std::string("the `") + std::string(am) +
+                        "` argument for parameter `" +
+                        std::string(fields[j]->name) + "` to " + desc +
+                        " does not match the parameter's referent type — "
+                        "a `ref`/`out` argument aliases the caller's "
+                        "location (§22.3), so the type must match exactly and "
+                        "no implicit conversion is admitted (§14.5)");
+            continue;
+        }
+        // The inline-declaration family (`out var`, `out using var`,
+        // `out owned var`) declares a new local whose type is INFERRED FROM the
+        // parameter (§22.4), so it matches by construction — as on the local
+        // path. `owned` / `scoped` still pass a VALUE and fall through to the
+        // same §5.1 check a bare argument gets (#1974).
+        if (am == "out var" || am == "out using var" || am == "out owned var")
+            continue;
+        checkAssignable(ctx_.exprType(*a.value), ft, a.value->span.begin,
+                        std::string("argument `") +
+                            std::string(fields[j]->name) + "` to " + desc,
+                        a.value.get());  // per §7.4 / §27.6 (#1191)
+    }
 }
 
 // §2.2 / §2.5 / §22.7 (issue #328 FINDING [7] B): type-check `new ImportedT(args)`
