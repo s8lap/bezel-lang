@@ -33,10 +33,14 @@ for a GENERIC type, so for a non-generic imported class every member symbol has
 
 | | |
 |---|---|
-| `origin/main` | `ec6a02f` |
+| `origin/main` | `ec6a02f` — plus a **10-commit batch on local `main`, gated but not yet pushed** (Wave A + the class-3 ratchet + this document) |
 | **class 1** (`TypeDecl` symbol-side) | **152 → 51** ✅ all 12 families landed |
 | **class 2** (always-null `TypeSymbol`→`TypeDecl`) | **1 → 0** ✅ (#3150) |
-| **class 3** (member-kind symbol-side) | **301**, newly ratcheted, ~41 of 110 UNIFY sites converted |
+| **class 3** (member-kind symbol-side) | **305**, newly ratcheted, ~41 of 110 UNIFY sites converted |
+
+⚠ The class-3 figure is **305, not the 301** an earlier draft of this table carried: the
+baseline was regenerated after Wave A landed and the file is authoritative over this
+document. Read `scripts/imported_symbol_reads.baseline`, never a number quoted here.
 
 `scripts/check_imported_symbol_reads.py` enforces all three as a **gate phase**. The
 baseline is **EXACT, not a ceiling**: a rise fails, and so does stale headroom, so a
@@ -60,16 +64,22 @@ M1 owned-formals #3176 (+ #3186) · M3 auto-property #3152
 ratchet is for. Three families had already landed unmeasured because the tool watched
 `ast::TypeDecl` only.
 
-**Wave A — in flight.** M13 (conformance witness, 1 site, FALSE ACCEPT/soundness) + M6
-(imported-ABI function maps, 9 sites, CRASH — indirect call to `0x0`); and M2 (owned-return
-channel, 15 sites, the widest silent leak).
+**Wave A — DONE, reviewed, in the unpushed batch.** M2 (owned-return channel, `06568ef`
++ follow-up `47a31f0`), M6 (`726539b`, #3190), M13 (`843e30f`, #3194), plus the review
+follow-up `17fd6a5`. The M6/M13 review `nm`-confirmed the finding that matters most beyond
+this programme: `emitExportedProperty/Indexer{Getters,Setters}` **skip virtual members**, so a
+virtual accessor body is InternalLinkage and a virtual indexer has no exported symbol at all,
+while a virtual method gets an ExternalLinkage `bz$<Class>$<M>`. **#3190, #2837, #3199 and
+#3204 are one asymmetry seen from four call sites** — widen that gate once rather than fixing
+any of them individually.
 
 **Wave D0 — in flight.** The blockers **#3162** and **#2884**. They make M7 (9) and M14 (2)
 untestable, and gate #3183 / #3164 / #3179 / #3170. The lane was asked to establish the
 true dependency graph by measurement, because `#3164-before-#3162` is a *claim*.
 
-**Wave B2 — next.** M4 (13, silent wrong data, #3177) · M5 (8, false rejects, #3178) ·
-M8 (2, purity false accept, #3174). Fold in **#3188** and **#3189**.
+**Wave B2 — in flight (three lanes, 2026-08-14).** M4 (13, silent wrong data, #3177) ·
+M5 (8, false rejects, #3178) · M8 (2, purity false accept, #3174) bundled with **#3188**
+(the `out using var` third copy of #3186's drift) and **#3182**. #3189 landed with Wave A.
 ⚠ **M5 carries a free win**: `MetaParam::hasDefault` is ALREADY on the wire and simply
 dropped by `ModuleLoader::convertParams` — no format change needed.
 
