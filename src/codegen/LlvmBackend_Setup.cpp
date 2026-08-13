@@ -511,12 +511,116 @@ llvm::Value* Emitter::foldImportedConstText(const std::string& text,
     // repro and the common case are literal consts, which are covered.
     const char c0 = text.empty() ? '\0' : text.front();
     if (!((c0 >= '0' && c0 <= '9') || c0 == '+' || c0 == '-')) return nullptr;
+    // fix #3216: split the SIGN off before decoding the magnitude.
+    //
+    // `parseIntLiteral` decodes a grammar-A.8 LEXEME, and A.8 lexemes are
+    // unsigned — `common/IntLiteral.hpp` says so ("the sign of a negative
+    // literal is a separate UnaryExpr") and relies on it to parse the whole
+    // [0, 2^64) range with `strtoull`. But `renderConstExpr` writes a rendered
+    // VALUE, not a lexeme: `:= -3` has no literal arm, folds through
+    // `sema::foldIntConst`, and is exported as `std::to_string(-3)` = "-3"
+    // (#2898's "FOLD, don't render"). The guard above has admitted a leading
+    // sign since it was written, so the magnitude parser was handed "-3", broke
+    // out of its digit loop on the first character, found no digits and returned
+    // **0** — silently, with no diagnostic.
+    //
+    // MEASURED: an imported `public const NEG: int := -3;` read 0 where its
+    // single-module twin reads -3, and an imported `s: short := -3` §22.5
+    // default filled 0 where the twin fills -3.
+    //
+    // Negation is done in the UNSIGNED domain: the magnitude of long.MinValue
+    // is 2^63, which `parseIntLiteral` returns faithfully as a bit pattern but
+    // which has no positive `std::int64_t`, so `-v` on the signed value would be
+    // overflow UB. `~mv + 1` is the same two's-complement result with no signed
+    // arithmetic at all, and it is exactly what the i64 constant needs.
+    const bool negative = (c0 == '-');
+    std::string_view mag = text;
+    if (c0 == '-' || c0 == '+') mag.remove_prefix(1);
+    const std::uint64_t mv =
+        static_cast<std::uint64_t>(parseIntLiteral(mag));
     llvm::Type* ty = rt && rt->kind == sema::TypeRef::Kind::Primitive
                          ? lowerPrimitive(rt->primitive)
                          : i32();
-    return llvm::ConstantInt::get(
-        ty, static_cast<std::uint64_t>(parseIntLiteral(text)),
-        /*isSigned=*/true);
+    return llvm::ConstantInt::get(ty, negative ? (~mv + 1u) : mv,
+                                  /*isSigned=*/true);
+}
+
+// fix #3178 (§22.5, v0.254 — family M5 of umbrella #3152). See the contract on
+// the declaration in LlvmBackend_impl.hpp.
+//
+// The rule is sema's `ExprTC::bindArgsToParams` restated over the imported
+// formal list: positional arguments fill formals in order, a named argument
+// fills the formal of that name, no formal is filled twice, and every formal
+// with no default must end up filled. It is deliberately NOT a third copy of the
+// DIAGNOSTICS — codegen reports nothing here, because sema has already run the
+// real binder over the same `sema::FormalsView` and rejected every shape this
+// declines. The only thing codegen needs is the resulting ORDER.
+std::vector<int> Emitter::importedFormalToArg(
+    const sema::MethodSymbol& ms,
+    const std::vector<ast::CallArgument>& args) {
+    auto identity = [&]() {
+        std::vector<int> ident(args.size());
+        for (std::size_t i = 0; i < args.size(); ++i)
+            ident[i] = static_cast<int>(i);
+        return ident;
+    };
+    const std::size_t n = sema::formalParamCount(ms);
+    // A discard (`out _`) has no ast::Expr to lower and is handled by the
+    // caller's own `!a.value` bail; leave that path exactly as it was.
+    for (const auto& a : args)
+        if (a.isDiscard) return identity();
+    std::vector<int> map(n, -1);
+    std::size_t pos = 0;
+    for (std::size_t ai = 0; ai < args.size(); ++ai) {
+        const ast::CallArgument& a = args[ai];
+        std::size_t idx = n;
+        if (a.name.empty()) {
+            idx = pos++;
+        } else {
+            for (std::size_t j = 0; j < n; ++j)
+                if (sema::formalParamName(ms, j) == a.name) { idx = j; break; }
+        }
+        if (idx >= n || map[idx] != -1) return identity();
+        map[idx] = static_cast<int>(ai);
+    }
+    for (std::size_t j = 0; j < n; ++j)
+        if (map[j] == -1 && !sema::formalParamHasDefault(ms, j))
+            return identity();
+    return map;
+}
+
+llvm::Value* Emitter::importedDefaultArgValue(const sema::MethodSymbol& ms,
+                                              std::size_t pos) {
+    const sema::TypeRef* pt = sema::formalParamResolvedType(ms, pos);
+    const std::string text(sema::formalParamDefaultText(ms, pos));
+    // Backstop, not the gate: sema's `checkImportedCallArity` refuses the
+    // omission for exactly the texts this cannot fold, using the SAME predicate
+    // (`sema::importedDefaultTextIsMaterializable`). Reaching here with an
+    // unusable text means a call path that skipped that check, so say so loudly
+    // — a bare null return would abandon the whole call with no diagnostic.
+    if (!sema::importedDefaultTextIsMaterializable(text)) {
+        ctx_.diagnostics().report(
+            Severity::Error, SourceLocation{},
+            std::string("call to imported `") + std::string(ms.name) +
+                "` omits parameter `" +
+                std::string(sema::formalParamName(ms, pos)) +
+                "`, whose default the dependency's metadata did not carry as a "
+                "compile-time value — pass the argument explicitly (§22.5, "
+                "#3213)");
+        return nullptr;
+    }
+    // `renderConstExpr` writes a null-literal default as the bare word `null`,
+    // which `foldImportedConstText` declines (it folds VALUES, and its integer
+    // arm would otherwise read `null` as 0). §22.5's `:= null` is a legitimate
+    // default for a nullable formal, so it is materialized here at the formal's
+    // own representation — `ptr null` for a reference, the all-zero tagged
+    // struct for a nullable value type — exactly as buildOrderedArgs's #1235 arm
+    // does for the local twin.
+    if (text == "null") {
+        if (pt && isNullableValueTy(pt)) return nullableValueNull(pt);
+        return llvm::ConstantPointerNull::get(ptrTy());
+    }
+    return foldImportedConstText(text, pt);
 }
 
 

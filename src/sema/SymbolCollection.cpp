@@ -134,6 +134,13 @@ std::vector<Symbol*> collectParams(const std::vector<ast::Param>& params,
         // §22.4 (v0.183, #1585): carry the out-nullability postcondition onto
         // the symbol so narrowing and override-match can consult it.
         sym->outNullPostcond = p.outNullPostcond;
+        // fix #3178 / §22.5 (v0.254): carry "declares a default" onto the symbol
+        // for a LOCAL formal too, so `formalParamHasDefault` gives the same
+        // answer whichever source it reaches for. The accessor still prefers the
+        // AST (which carries the default EXPRESSION, not just its presence), so
+        // this is redundancy that makes the two sources agree by construction
+        // rather than a second answer that can drift.
+        sym->hasDefault = (p.defaultValue != nullptr);
         // fix #3037 / §28.3 (v0.240): carry the parameter's own source
         // location onto the symbol. The parser stamps `Param::loc` at the
         // parameter's first token (modifier or name) — `Param` is not an
@@ -623,6 +630,56 @@ const TypeRef* formalParamResolvedType(const ConstructorSymbol& cs,
     if (const ParameterSymbol* p = ctorSymParam(cs, pos))
         return p->resolvedDeclType;
     return nullptr;
+}
+
+// fix #3178 (§22.5 "Optional parameters" / §2.5, v0.254 — family M5 of umbrella
+// #3152). See Symbol.hpp for the contract. Same AST-first order as every other
+// formal accessor; `collectParams` now sets `ParameterSymbol::hasDefault` for a
+// local formal too, so the two sources agree by construction and the order is
+// documentation rather than a tie-break.
+bool formalParamHasDefault(const MethodSymbol& ms, std::size_t pos) {
+    if (const ast::Param* p = methodDeclParam(ms, pos))
+        return p->defaultValue != nullptr;
+    if (const ParameterSymbol* p = methodSymParam(ms, pos)) return p->hasDefault;
+    return false;
+}
+
+bool formalParamHasDefault(const ConstructorSymbol& cs, std::size_t pos) {
+    if (const ast::Param* p = ctorDeclParam(cs, pos))
+        return p->defaultValue != nullptr;
+    if (const ParameterSymbol* p = ctorSymParam(cs, pos)) return p->hasDefault;
+    return false;
+}
+
+// IMPORT-only by construction: a local formal's default is the `ast::Expr` on
+// its `ast::Param`, which every local consumer already lowers directly, so this
+// deliberately returns "" for one rather than re-rendering it as text.
+std::string_view formalParamDefaultText(const MethodSymbol& ms,
+                                        std::size_t pos) {
+    if (methodDeclParam(ms, pos)) return {};
+    if (const ParameterSymbol* p = methodSymParam(ms, pos))
+        return p->defaultText;
+    return {};
+}
+
+std::string_view formalParamDefaultText(const ConstructorSymbol& cs,
+                                        std::size_t pos) {
+    if (ctorDeclParam(cs, pos)) return {};
+    if (const ParameterSymbol* p = ctorSymParam(cs, pos)) return p->defaultText;
+    return {};
+}
+
+// See Symbol.hpp. The admitted set is exactly what `renderConstExpr` emits for a
+// LITERAL: an integer/float literal (possibly signed, and possibly the result of
+// its literal-arithmetic fold), a quoted string, a char literal, `true`/`false`,
+// or `null`. An identifier or `A.B` rendering starts with a letter or `_` and is
+// deliberately excluded — it names something on the EXPORTER's side.
+bool importedDefaultTextIsMaterializable(std::string_view text) {
+    if (text.empty()) return false;
+    if (text == "true" || text == "false" || text == "null") return true;
+    const char c = text.front();
+    return (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '"' ||
+           c == '\'';
 }
 
 // §12 / §31.4 (#595 / #2950): see Symbol.hpp for the contract. Two sources,

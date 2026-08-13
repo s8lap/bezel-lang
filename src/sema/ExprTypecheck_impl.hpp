@@ -1871,10 +1871,23 @@ private:
         // the parameter takes its default (valid only when `ok`).
         std::vector<int> paramToArg;
     };
-    BindResult bindArgsToParams(const std::vector<ast::Param>& params,
+    // fix #3178 / #3173 (§22.5 / §2.5, v0.254): the binder takes a
+    // `sema::FormalsView`, so the SAME rule and the SAME five diagnostic
+    // strings serve a locally declared formal list and an IMPORTED callee's
+    // reconstructed `ParameterSymbol` list. The `std::vector<ast::Param>`
+    // overload is kept for the many callers that already hold one — it just
+    // wraps `FormalsView::of`.
+    BindResult bindArgsToParams(sema::FormalsView params,
                                const std::vector<ast::CallArgument>& args,
                                SourceLocation loc,
                                const std::string& calleeDesc, bool emit);
+    BindResult bindArgsToParams(const std::vector<ast::Param>& params,
+                               const std::vector<ast::CallArgument>& args,
+                               SourceLocation loc,
+                               const std::string& calleeDesc, bool emit) {
+        return bindArgsToParams(sema::FormalsView::of(params), args, loc,
+                                calleeDesc, emit);
+    }
 
     // §5.1: is a value of static type `from` implicitly convertible to
     // `to`? Identity is NOT counted here (that is the "exact" relation,

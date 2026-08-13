@@ -5331,6 +5331,45 @@ private:
     llvm::Value* foldImportedConstText(const std::string& text,
                                        const sema::TypeRef* rt);
 
+    // fix #3178 (§22.5 "Argument binding" / "Optional parameters" / §2.5,
+    // v0.254 — family M5 of umbrella #3152): map an IMPORTED callee's FORMALS
+    // onto this call's arguments.
+    //
+    // Both imported-callee argument loops in LlvmBackend_Calls2.cpp (the `.`
+    // form and the `?.` form) used to walk `call.args` in SOURCE order with a
+    // running parameter index. For an all-positional call that is the same
+    // thing; for a §22.5 NAMED call it is not, and the difference is a MEASURED
+    // silent miscompile: `Sub(b := 3, a := 10)` against
+    // `Sub(a: int, b: int)` printed **-7** across a module boundary where the
+    // character-identical single-module twin prints 7. When the two formals have
+    // different LLVM types the verifier catches it ("Call parameter type does
+    // not match function signature"); when they coincide — the case above —
+    // nothing does.
+    //
+    // Returns `formalParamCount(ms)` entries, `[j] =` the index into `args` that
+    // fills formal `j`, or −1 when formal `j` takes its declared default. Falls
+    // back to the IDENTITY map over `args` (i.e. exactly the previous source-
+    // order behaviour) for any shape it cannot bind — a discard argument, a
+    // positional overflow, an unknown parameter name, a double binding, or an
+    // unfilled required formal. Sema rejects all of those (checkImportedCall-
+    // Arity), so the fallback is a defensive path, not a second policy: it keeps
+    // an error-recovery lowering identical to what it was rather than declining
+    // the call.
+    std::vector<int> importedFormalToArg(
+        const sema::MethodSymbol& ms,
+        const std::vector<ast::CallArgument>& args);
+
+    // The value for an imported formal left to its declared default (§22.5).
+    // The exporter's rendered default literal rides
+    // `ParameterSymbol::defaultText` (fix #3178 carried it off the wire, where
+    // ModuleMetadataBuilder had been writing it all along), and it is
+    // materialized with the SAME `foldImportedConstText` every other imported
+    // textual constant uses — no second evaluator. Null when the text is not a
+    // shape that folds, which declines the call loudly rather than passing an
+    // unsound zero.
+    llvm::Value* importedDefaultArgValue(const sema::MethodSymbol& ms,
+                                         std::size_t pos);
+
     // §2.5 / §22.7 (issue #328 FINDING [7]): the external `bz$<Type>$ctor`
     // function for an IMPORTED type's reconstructed constructor, declared on
     // demand and cached in ctorFns_. The signature is `void(ptr this,

@@ -870,6 +870,39 @@ std::string methodSignatureString(std::string_view name,
     return s;
 }
 
+// fix #3178 (§22.6 / §2.5, v0.254 — family M5 of umbrella #3152): the same
+// signature rendering for a callee held only as a SYMBOL. §22.6's ambiguity and
+// "no applicable overload" diagnostics cite each candidate by signature, and an
+// IMPORTED candidate has no `ast::Param` list to read the spelled type off — so
+// this reaches for the AST node when there is one (byte-identical output to the
+// overload above for a local candidate: the same last-segment spelling) and
+// falls back to the loader's resolved `TypeRef`, rendered by this file's own
+// `typeNameForDiag`, when there is not.
+std::string methodSignatureString(std::string_view name,
+                                  const MethodSymbol& ms) {
+    std::string s(name);
+    s += '(';
+    const std::size_t n = formalParamCount(ms);
+    for (std::size_t j = 0; j < n; ++j) {
+        if (j) s += ", ";
+        std::string_view mod = formalParamModifier(ms, j);
+        if (!mod.empty()) { s += std::string(mod); s += ' '; }
+        if (const ast::Type* at = formalParamDeclType(ms, j)) {
+            if (at->name && !at->name->parts.empty())
+                s += std::string(at->name->parts.back());
+            else
+                s += "?";
+            continue;
+        }
+        if (const TypeRef* rt = formalParamResolvedType(ms, j))
+            s += typeNameForDiag(rt);
+        else
+            s += "?";
+    }
+    s += ')';
+    return s;
+}
+
 // §22.4 / §14.5 / #1303 / #2280: true when `t` still references one of the
 // method's own type parameters — a bare `T` (or `T?`), a `T` nested inside a
 // constructed generic's arguments (`Pair<T, U>`), or an inline-array element
@@ -1068,23 +1101,48 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // arguments can §22.5-bind to, preserving the prior first-wins
     // behavior. For all-positional calls this is the arity match; for
     // named-arg calls it is the first candidate whose binding succeeds.
-    auto canBindTo = [&](const ast::MethodDecl* md) -> bool {
-        return bindArgsToParams(md->params, ce.args, ce.span.begin,
+    // fix #3178 (§22.5 / §2.5, v0.254 — family M5 of umbrella #3152): both
+    // arms used to reach through `dynamic_cast<const ast::MethodDecl*>(→decl)`,
+    // which is null for EVERY member of a non-generic imported class. The
+    // named-argument arm therefore never fired across a module boundary, and
+    // the positional arm's `cand->params.size()` was the only thing that
+    // happened to work. Both now read the formal list through
+    // `sema::FormalsView`, which consults the AST first and the imported
+    // `ParameterSymbol` list second.
+    auto canBindTo = [&](const MethodSymbol& cand) -> bool {
+        return bindArgsToParams(sema::FormalsView::of(cand), ce.args,
+                                ce.span.begin,
                                 /*calleeDesc=*/std::string(), /*emit=*/false)
             .ok;
     };
     auto arityFallback = [&]() -> MethodSymbol* {
-        auto* initMd = dynamic_cast<const ast::MethodDecl*>(initial->decl);
-        if (!hasNamed && initial->params.size() == ce.args.size())
+        // ⚠ DELIBERATELY NOT bind-based for the positional case. §22.6's
+        // defaulted-arity tie-break (v0.181, #1561) prefers an overload that
+        // needs NO default over one that fills one, and this fallback runs
+        // exactly when ranking could not decide — so switching the first pass
+        // from "exact arity" to "binds" would silently reverse #1561's
+        // preference whenever `initial` happens to be the defaulted overload.
+        // The exact-arity pass is kept first and unchanged; a default-admitting
+        // pass runs only AFTER it finds nothing, i.e. only where this used to
+        // give up and return `initial` regardless.
+        if (!hasNamed && sema::formalParamCount(*initial) == ce.args.size())
             return initial;
-        if (hasNamed && initMd && canBindTo(initMd)) return initial;
+        if (hasNamed && canBindTo(*initial)) return initial;
         for (MethodSymbol* cand : overloads) {
             if (!hasNamed) {
-                if (cand->params.size() == ce.args.size()) return cand;
+                if (sema::formalParamCount(*cand) == ce.args.size())
+                    return cand;
             } else {
-                auto* cmd = dynamic_cast<const ast::MethodDecl*>(cand->decl);
-                if (cmd && canBindTo(cmd)) return cand;
+                if (canBindTo(*cand)) return cand;
             }
+        }
+        if (!hasNamed) {
+            // per §22.5: an overload whose remaining formals all declare
+            // defaults binds this positional call too. Reached only when no
+            // exact-arity candidate exists.
+            if (canBindTo(*initial)) return initial;
+            for (MethodSymbol* cand : overloads)
+                if (canBindTo(*cand)) return cand;
         }
         return initial;
     };
@@ -1096,18 +1154,33 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // Each surviving candidate's parameter-ordered argument list is recorded
     // so §22.6 ranking operates on the bound positions (§22.6: tie-breaking
     // applies only after named-argument binding has filtered the candidates).
+    //
+    // fix #3178 (§22.6 / §2.5, v0.254 — family M5 of umbrella #3152): this loop
+    // used to require `dynamic_cast<const ast::MethodDecl*>(cand->decl)` and
+    // `continue` past every candidate that failed it. `ModuleLoader` sets
+    // `MemberSymbol::decl` only where it re-parsed body text for a GENERIC type,
+    // so for a non-generic imported class the cast is null for EVERY candidate
+    // and `cands` was provably always empty — §22.6 ranking did not merely pick
+    // badly across a module boundary, it never ran at all. `arityFallback` then
+    // returned the first same-name symbol in source order and the call was
+    // type-checked against THAT: measured, `OverM12.Pick("s")` against
+    // `Pick(int)` / `Pick(string)` reported a §5.1 conversion failure — a
+    // diagnostic describing a call the user did not write — where the
+    // single-module twin compiles and prints 2.
+    //
+    // The candidate now carries only its SYMBOL; every formal fact below comes
+    // from `sema::formalParam*`, which reads the AST for a local candidate (so a
+    // local overload set ranks exactly as before) and the reconstructed
+    // `ParameterSymbol` list for an imported one.
     std::vector<MethodSymbol*> cands;
-    std::vector<const ast::MethodDecl*> decls;
     std::vector<BindResult> binds;
     for (MethodSymbol* cand : overloads) {
-        auto* md = dynamic_cast<const ast::MethodDecl*>(cand->decl);
-        if (!md) continue;
-        BindResult b = bindArgsToParams(md->params, ce.args, ce.span.begin,
+        BindResult b = bindArgsToParams(sema::FormalsView::of(*cand), ce.args,
+                                        ce.span.begin,
                                         /*calleeDesc=*/std::string(),
                                         /*emit=*/false);
         if (!b.ok) continue;
         cands.push_back(cand);
-        decls.push_back(md);
         binds.push_back(std::move(b));
     }
     if (cands.empty()) return arityFallback();
@@ -1136,21 +1209,21 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     };
     {
         std::vector<MethodSymbol*> fc;
-        std::vector<const ast::MethodDecl*> fd;
         std::vector<BindResult> fb;
         for (std::size_t c = 0; c < cands.size(); ++c) {
             bool ok = true;
-            const auto& params = decls[c]->params;
-            for (std::size_t j = 0; j < params.size() && ok; ++j) {
+            const std::size_t np = sema::formalParamCount(*cands[c]);
+            for (std::size_t j = 0; j < np && ok; ++j) {
                 int ai = binds[c].paramToArg[j];
                 std::string_view argMod =
                     ai >= 0 ? ce.args[static_cast<std::size_t>(ai)].modifier
                             : std::string_view{};
-                if (!refOutMatch(argMod, params[j].modifier)) ok = false;
+                if (!refOutMatch(argMod,
+                                 sema::formalParamModifier(*cands[c], j)))
+                    ok = false;
             }
             if (ok) {
                 fc.push_back(cands[c]);
-                fd.push_back(decls[c]);
                 fb.push_back(std::move(binds[c]));
             }
         }
@@ -1159,15 +1232,16 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             // modifiers — a mandatory keyword is missing or superfluous (§22.3).
             // Build a precise message from the first candidate's first mismatch.
             std::string detail;
-            const auto& params = decls[0]->params;
-            for (std::size_t j = 0; j < params.size(); ++j) {
+            const std::size_t np0 = sema::formalParamCount(*cands[0]);
+            for (std::size_t j = 0; j < np0; ++j) {
                 int ai = binds[0].paramToArg[j];
                 std::string_view argMod =
                     ai >= 0 ? ce.args[static_cast<std::size_t>(ai)].modifier
                             : std::string_view{};
-                if (refOutMatch(argMod, params[j].modifier)) continue;
-                std::string pname(params[j].name);
-                std::string pm(params[j].modifier);
+                std::string_view pmod = sema::formalParamModifier(*cands[0], j);
+                if (refOutMatch(argMod, pmod)) continue;
+                std::string pname(sema::formalParamName(*cands[0], j));
+                std::string pm(pmod);
                 std::string am(argMod);
                 bool paramRefOut = pm == "ref" || pm == "out" || pm == "out owned";
                 if (paramRefOut && am.empty())
@@ -1196,7 +1270,6 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             return initial;  // error emitted; return to avoid a cascade
         }
         cands.swap(fc);
-        decls.swap(fd);
         binds.swap(fb);
     }
     if (cands.size() == 1) return cands[0];
@@ -1267,16 +1340,22 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // module consts); bundling #2986 would risk regressing this fix when the
     // member-const resolver changes.
     for (std::size_t c = 0; c < cands.size(); ++c) {
-        const auto& params = decls[c]->params;
-        for (std::size_t j = 0; j < params.size(); ++j) {
+        const std::size_t np = sema::formalParamCount(*cands[c]);
+        for (std::size_t j = 0; j < np; ++j) {
             int ai = binds[c].paramToArg[j];
             if (ai < 0) {
                 fillsDefault[c] = true;  // defaulted slot — outside ranking.
                 continue;
             }
-            const TypeRef* pt = params[j].type
-                                    ? ctx_.resolvedType(*params[j].type)
-                                    : nullptr;
+            // fix #3178: the formal's resolved type from whichever source has
+            // it — the `ast::Type` node for a locally declared candidate (which
+            // still goes through `ctx_.resolvedType`, so a local overload set
+            // ranks byte-identically to before), the loader's already-resolved
+            // `TypeRef` for an imported one.
+            const ast::Type* at0 = sema::formalParamDeclType(*cands[c], j);
+            const TypeRef* pt =
+                at0 ? ctx_.resolvedType(*at0)
+                    : sema::formalParamResolvedType(*cands[c], j);
             const ast::CallArgument* carg =
                 ce.args[static_cast<std::size_t>(ai)].value
                     ? &ce.args[static_cast<std::size_t>(ai)]
@@ -1313,7 +1392,7 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             argTypeRows[c].push_back(at);
             argIdxRows[c].push_back(ai);
         }
-        candNames[c] = methodSignatureString(initial->name, params);
+        candNames[c] = methodSignatureString(initial->name, *cands[c]);
     }
     // resolveOverload classifies column i of every candidate against a single
     // shared argument-type vector, so each column must correspond to the SAME
@@ -9647,31 +9726,82 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
 // §2.2 / §2.5 / §2.6 step 3 (issue #328 inc 3): type-check a call to an imported
 // method against its reconstructed signature. The imported method carries no
 // ast::Param list; its parameters are ParameterSymbols whose resolved types ride
-// `resolvedDeclType`. Checks the all-positional, single-overload case: argument
-// count (§22.5) and per-argument assignability (§5.1). A named/modifier argument
-// is conservatively skipped (cross-module overload + by-ref binding deferred).
+// `resolvedDeclType`.
+//
+// fix #3178 (§22.5 / §2.5, v0.254 — family M5 of umbrella #3152). This used to
+// be an ARITY-EQUALITY test over `ms->params.size()` guarded by a blanket bail
+// on the first named / modifier / discard argument. Both halves were measured
+// wrong, in opposite directions:
+//
+//   * The equality demanded EXACT arity because `ParameterSymbol` carried no
+//     `hasDefault`, so `OptM14.WithDefault(1)` against
+//     `WithDefault(a: int, b: int := 7)` was a FALSE REJECT — "supplies 1
+//     argument(s) but the parameter list has 2" — while the character-identical
+//     single-module twin compiles and prints 8.
+//
+//   * The bail meant a cross-module call using a NAMED argument was not checked
+//     at all: `One(nosuch := 1)` against `One(x: int)` compiled clean and ran,
+//     the argument silently bound POSITIONALLY (measured: printed 101). §22.5
+//     says a named argument names an existing parameter; nothing enforced that
+//     across the boundary.
+//
+// Both are now the ONE §22.5 binder (`bindArgsToParams`) over a
+// `sema::FormalsView` of the callee symbol — the same rule, the same five
+// diagnostic strings, and the same `ce.span.begin` location the local path
+// reports at, so a cross-module rejection stays indistinguishable from the local
+// one (the property #3141 pins and #3173 exists to keep).
+//
+// WHAT THE PER-ARGUMENT §5.1 CHECK STILL SKIPS, unchanged: a position whose
+// ARGUMENT carries a `ref`/`out` modifier, or is a discard. Those are §22.3's
+// exact-referent-type rule, not §5.1 assignability, and the local path runs them
+// through `checkArgsAgainstParams`; answering them here would be a NEW claim
+// rather than a shared one. The BINDING now covers those calls (arity, parameter
+// names, required-parameter coverage) where before nothing did.
 void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
-    for (const auto& a : ce.args)
-        if (!a.name.empty() || !a.modifier.empty() || a.isDiscard) return;
-    const std::size_t nparams = ms->params.size();
     const std::string desc =
         std::string("call to `") + std::string(ms->name) + "`";
-    if (ce.args.size() != nparams) {
-        ctx_.diagnostics().report(
-            Severity::Error, ce.span.begin,
-            desc + " supplies " + std::to_string(ce.args.size()) +
-                " argument(s) but the parameter list has " +
-                std::to_string(nparams) + " (§22.5)");
-        return;
-    }
+    // §22.5 binding. `emit=true`: this is the only call check an imported callee
+    // gets, so a binding violation must be reported here or nowhere.
+    BindResult b = bindArgsToParams(sema::FormalsView::of(*ms), ce.args,
+                                    ce.span.begin, desc, /*emit=*/true);
+    if (!b.ok) return;  // the binder reported; no cascade
+    const std::size_t nparams = sema::formalParamCount(*ms);
     for (std::size_t j = 0; j < nparams; ++j) {
-        auto* p = dynamic_cast<ParameterSymbol*>(ms->params[j]);
-        if (!p || !p->resolvedDeclType) continue;
-        const ast::CallArgument& a = ce.args[j];
-        if (!a.value) continue;
-        checkAssignable(ctx_.exprType(*a.value), p->resolvedDeclType,
+        const int ai = b.paramToArg[j];
+        // per §22.5: an unbound parameter takes its declared default — there is
+        // no call-site expression to check, and the exporting compilation
+        // already checked the default against the parameter's own type.
+        if (ai < 0) {
+            // …but only a COMPILE-TIME-CONSTANT default survives export (§22.5
+            // permits `DateTime.Now`; `renderConstExpr` renders it as ""), and a
+            // bare identifier is rendered by NAME, which has no importer-side
+            // meaning. Admitting the omission when the value cannot be
+            // reconstructed would turn this loud §22.5 reject into a silent
+            // codegen bail, so the limitation is stated here, at the call site,
+            // with the workaround. Carrying the remaining forms is #3213.
+            if (!sema::importedDefaultTextIsMaterializable(
+                    sema::formalParamDefaultText(*ms, j)))
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    desc + ": parameter `" +
+                        std::string(sema::formalParamName(*ms, j)) +
+                        "` of an imported method declares a default the "
+                        "dependency's metadata did not carry as a compile-time "
+                        "value, so it cannot be materialized here — pass the "
+                        "argument explicitly (§22.5, #3213)");
+            continue;
+        }
+        const ast::CallArgument& a = ce.args[static_cast<std::size_t>(ai)];
+        if (!a.value || a.isDiscard || !a.modifier.empty()) continue;
+        // checkAssignable takes a mutable target (it may re-type an integer
+        // constant in place, §5.1 narrowing); the accessor is const-correct, so
+        // cast back exactly as the previous `p->resolvedDeclType` read handed it
+        // a non-const pointer.
+        auto* pt = const_cast<TypeRef*>(sema::formalParamResolvedType(*ms, j));
+        if (!pt) continue;
+        checkAssignable(ctx_.exprType(*a.value), pt,
                         a.value->span.begin,
-                        desc + ": argument " + std::to_string(j + 1),
+                        desc + ": argument " + std::to_string(ai + 1),
                         a.value.get());  // per §7.4 / §27.6 (#1191)
     }
 }
@@ -9683,7 +9813,7 @@ void ExprTC::checkImportedCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
 // error. Each parameter may be bound at most once; every required (no
 // default) parameter must be bound; an unknown parameter name is an error.
 ExprTC::BindResult ExprTC::bindArgsToParams(
-    const std::vector<ast::Param>& params,
+    sema::FormalsView params,
     const std::vector<ast::CallArgument>& args, SourceLocation loc,
     const std::string& calleeDesc, bool emit) {
     BindResult res;
@@ -9716,7 +9846,7 @@ ExprTC::BindResult ExprTC::bindArgsToParams(
             sawNamed = true;
             std::size_t idx = params.size();
             for (std::size_t j = 0; j < params.size(); ++j)
-                if (params[j].name == a.name) { idx = j; break; }
+                if (params.name(j) == a.name) { idx = j; break; }
             // per §22.5: a named argument names an existing parameter.
             if (idx >= params.size())
                 return fail(calleeDesc + " has no parameter named `" +
@@ -9735,9 +9865,9 @@ ExprTC::BindResult ExprTC::bindArgsToParams(
     // positionally or by name; an unbound optional parameter takes its
     // default.
     for (std::size_t j = 0; j < params.size(); ++j) {
-        if (res.paramToArg[j] == -1 && !params[j].defaultValue)
+        if (res.paramToArg[j] == -1 && !params.hasDefault(j))
             return fail(calleeDesc + ": required parameter `" +
-                        std::string(params[j].name) +
+                        std::string(params.name(j)) +
                         "` is not supplied (§22.5)");
     }
 

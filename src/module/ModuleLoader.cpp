@@ -327,6 +327,18 @@ struct Loader {
             // faithfully repeated the base's `when` clause.
             p->outNullPostcond =
                 static_cast<ast::OutNullWhen>(mp.outNullWhen);
+            // fix #3178 (§22.5 "Optional parameters" / §2.5, v0.254 — family M5
+            // of umbrella #3152): `MetaParam::hasDefault` / `::defaultText` have
+            // been written by ModuleMetadataBuilder and read back by the decoder
+            // since the REC_SCALARS record, and were dropped HERE — the loader
+            // simply never copied them onto the symbol. With no `hasDefault` on
+            // the ParameterSymbol, every symbol-side arity check across a module
+            // boundary had to demand EXACT arity, so an imported method's or
+            // constructor's optional parameter could not be omitted: a measured
+            // false reject of a legal program whose single-module twin compiles
+            // and runs. No metadata format change was needed.
+            p->hasDefault = mp.hasDefault;
+            p->defaultText = ctx.internString(mp.defaultText);
             out.push_back(p);
         }
         return out;

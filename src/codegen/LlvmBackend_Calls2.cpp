@@ -7956,9 +7956,33 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // ast::MethodDecl) the formal param modifier lives on the
             // ParameterSymbol in ms->params.  Mirror buildOrderedArgs: pass the
             // variable's ADDRESS for ref/out params instead of its loaded value.
-            std::size_t pi = 0;
-            for (const auto& a : call.args) {
-                if (!a.value) {
+            //
+            // fix #3178 (§22.5, v0.254 — family M5 of umbrella #3152): mirror
+            // buildOrderedArgs' PLACEMENT too. This loop walked `call.args` in
+            // source order with a running parameter index `pi`, so a §22.5 named
+            // call passed its arguments in the order they were WRITTEN, and read
+            // each formal's `ref`/`out` modifier from the wrong formal as well.
+            // Measured: `Sub(b := 3, a := 10)` on an imported
+            // `Sub(a: int, b: int)` printed -7 where the single-module twin
+            // prints 7 — silent, because both formals lower to i32 so the IR
+            // verifier has nothing to object to. Evaluation stays in SOURCE
+            // order (§28.3: arguments are evaluated eagerly, left to right) and
+            // only the PLACEMENT is by formal, exactly as buildOrderedArgs does
+            // for a local callee.
+            const std::vector<int> formalToArg =
+                importedFormalToArg(*ms, call.args);
+            std::vector<llvm::Value*> ordered(formalToArg.size(), nullptr);
+            std::vector<const ast::Expr*> orderedExprs(formalToArg.size(),
+                                                       nullptr);
+            std::vector<int> argToFormal(call.args.size(), -1);
+            for (std::size_t j = 0; j < formalToArg.size(); ++j)
+                if (formalToArg[j] >= 0)
+                    argToFormal[static_cast<std::size_t>(formalToArg[j])] =
+                        static_cast<int>(j);
+            for (std::size_t ai = 0; ai < call.args.size(); ++ai) {
+                const ast::CallArgument& a = call.args[ai];
+                const int fj = argToFormal[ai];
+                if (!a.value || fj < 0) {
                     if (didPrePass) {
                         genericSubst_ = std::move(preSavedSubst);
                         genericSubstSemaTy_ = std::move(preSavedSema);
@@ -7973,6 +7997,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // Determine the formal parameter's ref/out modifier from the
                 // imported ParameterSymbol; also honour the call-site modifier
                 // (a.modifier carries "ref"/"out" written at the call site).
+                const std::size_t pi = static_cast<std::size_t>(fj);
                 std::string_view formalMod;
                 if (pi < ms->params.size())
                     if (auto* ps =
@@ -8039,9 +8064,26 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         registerFfiExprTemp(tmpSlot, argIsRawBytes);
                     }
                 }
-                args.push_back(v);
-                argExprs.push_back(a.value.get());
-                ++pi;
+                ordered[pi] = v;
+                orderedExprs[pi] = a.value.get();
+            }
+            // per §22.5: a formal left unbound takes its declared default. The
+            // exporter's rendered default rides ParameterSymbol::defaultText
+            // (#3178 carried it off the wire); a text this cannot fold declines
+            // the call loudly rather than passing an unsound zero.
+            for (std::size_t j = 0; j < ordered.size(); ++j) {
+                if (!ordered[j]) ordered[j] = importedDefaultArgValue(*ms, j);
+                if (!ordered[j]) {
+                    if (didPrePass) {
+                        genericSubst_ = std::move(preSavedSubst);
+                        genericSubstSemaTy_ = std::move(preSavedSema);
+                    }
+                    emitAccessorRefArgWriteBacks(accessorRefArgs,
+                                                 /*emit=*/false);
+                    return nullptr;
+                }
+                args.push_back(ordered[j]);
+                argExprs.push_back(orderedExprs[j]);
             }
         }
         // Restore genericSubst_ to original state after the lambda compilation
@@ -11558,12 +11600,27 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         // identical gap, fixed the same way just above). See that fix's
         // comment for the full rationale; `paramTy` is null for the same
         // reason (no ast::Param for an imported callee).
-        std::size_t pi = 0;
-        for (const auto& a : call.args) {
-            if (!a.value) {
+        // fix #3178 (§22.5, v0.254): the `?.` twin of the `.` form's placement
+        // fix just above — evaluate in SOURCE order, place by FORMAL, fill an
+        // omitted optional formal from its exported default. See
+        // `importedFormalToArg` in LlvmBackend_impl.hpp for the contract and the
+        // measured miscompile.
+        const std::vector<int> formalToArg = importedFormalToArg(*ms, call.args);
+        std::vector<llvm::Value*> ordered(formalToArg.size(), nullptr);
+        std::vector<const ast::Expr*> orderedExprs(formalToArg.size(), nullptr);
+        std::vector<int> argToFormal(call.args.size(), -1);
+        for (std::size_t j = 0; j < formalToArg.size(); ++j)
+            if (formalToArg[j] >= 0)
+                argToFormal[static_cast<std::size_t>(formalToArg[j])] =
+                    static_cast<int>(j);
+        for (std::size_t ai = 0; ai < call.args.size(); ++ai) {
+            const ast::CallArgument& a = call.args[ai];
+            const int fj = argToFormal[ai];
+            if (!a.value || fj < 0) {
                 emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
                 return nullptr;
             }
+            const std::size_t pi = static_cast<std::size_t>(fj);
             std::string_view formalMod;
             if (pi < ms->params.size())
                 if (auto* ps =
@@ -11585,9 +11642,17 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                 emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
                 return nullptr;
             }
-            args.push_back(v);
-            argExprs.push_back(a.value.get());
-            ++pi;
+            ordered[pi] = v;
+            orderedExprs[pi] = a.value.get();
+        }
+        for (std::size_t j = 0; j < ordered.size(); ++j) {
+            if (!ordered[j]) ordered[j] = importedDefaultArgValue(*ms, j);
+            if (!ordered[j]) {
+                emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+                return nullptr;
+            }
+            args.push_back(ordered[j]);
+            argExprs.push_back(orderedExprs[j]);
         }
     }
     // per §14.1/§14.2 + §7.5 (issue #1278): install the method-level generic

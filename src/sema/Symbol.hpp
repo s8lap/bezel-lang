@@ -697,6 +697,26 @@ struct ParameterSymbol : Symbol {
     // postcondition copied from the ast::Param. Consulted by the caller-side
     // narrowing (collectNarrowings) and the override modifier-match check.
     ast::OutNullWhen outNullPostcond = ast::OutNullWhen::None;
+    // §22.5 "Optional parameters" / §2.5 (v0.254, #3178 — family M5 of umbrella
+    // #3152): does this formal declare a default (`:= Expr`), and — for an
+    // IMPORTED one — what was the exporter's rendered default text?
+    //
+    // Populated on BOTH sides, so the fact is complete on the symbol rather than
+    // reachable only through the AST: `SymbolCollection::collectParams` sets
+    // `hasDefault` from `ast::Param::defaultValue` for a locally declared
+    // formal, and `ModuleLoader::convertParams` sets both from
+    // `MetaParam::hasDefault` / `MetaParam::defaultText`, which
+    // ModuleMetadataBuilder has exported and the decoder has read back since the
+    // format's REC_SCALARS record — the loader simply dropped them.
+    //
+    // `defaultText` is EMPTY for a local formal on purpose: a local one carries
+    // the real `ast::Expr` on its `ast::Param`, which is strictly better (it can
+    // reference earlier parameters, `default(T)`, etc.). The text is the
+    // import-only fallback, in the same rendered-literal shape as an imported
+    // const's `valueText` (renderConstExpr), and codegen materializes it with
+    // the same `foldImportedConstText` those reads already use.
+    bool hasDefault = false;
+    std::string_view defaultText;
     // Pointer back to the ast::Type for this parameter (the ast::Param
     // itself isn't a Node, so we hold its `type` pointer directly).
     // Null if the parameter has no declared type (lambda params with
@@ -1325,5 +1345,115 @@ const TypeRef* formalParamResolvedType(const ConstructorSymbol& cs,
 // imported EXTENSION methods at :2897), so a locally synthesized decl-less
 // `MethodSymbol` still answers `false` exactly as before.
 bool methodReturnsOwned(const MethodSymbol& ms, const SemaContext& ctx);
+
+// §22.5 "Optional parameters" / §2.5 (v0.254, #3178 — family M5 of umbrella
+// #3152): does formal `pos` declare a default (`:= Expr`)? Same dual sourcing —
+// the `ast::Param`'s `defaultValue` locally, `ParameterSymbol::hasDefault` for
+// an import. `formalParamDefaultText` is the IMPORT-only companion: the
+// exporter's rendered default literal, empty for a local formal (which carries
+// the real expression on its `ast::Param` and needs no text).
+bool formalParamHasDefault(const MethodSymbol& ms, std::size_t pos);
+bool formalParamHasDefault(const ConstructorSymbol& cs, std::size_t pos);
+std::string_view formalParamDefaultText(const MethodSymbol& ms,
+                                        std::size_t pos);
+std::string_view formalParamDefaultText(const ConstructorSymbol& cs,
+                                        std::size_t pos);
+
+// Can an IMPORTED formal's exported default text be materialized at a call site
+// that omits the argument?
+//
+// §22.5 lets a default be NON-CONSTANT (`DateTime.Now`, `TimeSpan.FromSeconds
+// (30)`), but only a compile-time constant survives export:
+// `ModuleMetadataBuilder::renderConstExpr` renders literals (and folds literal
+// integer arithmetic) and returns "" for everything else, and it renders a bare
+// identifier BY NAME — a spelling with no guaranteed meaning on the importing
+// side, which the imported-const reader (`Emitter::foldImportedConstText`)
+// therefore declines rather than silently folding as 0.
+//
+// This is the ONE predicate for that question, so sema's admission and codegen's
+// materialization cannot disagree: without it, sema would accept the omission
+// (`hasDefault` is true) and codegen would then decline the call, turning a loud
+// §22.5 reject into a silent bail. It is a syntactic test over exactly the
+// shapes `renderConstExpr` emits for a literal — a number, a quoted string, a
+// char literal, `true`/`false`, or `null`.
+//
+// Carrying the remaining §22.5 default forms across a module boundary is #3213.
+bool importedDefaultTextIsMaterializable(std::string_view text);
+
+// §22.5 "Argument binding" / §2.5 (v0.254, #3178; the shape #3173 specifies) —
+// ONE view of a callable's formal list, for the code that only needs to BIND
+// arguments to it.
+//
+// The §22.5 binder (`ExprTC::bindArgsToParams`) needs exactly three facts per
+// formal: how many there are, each one's NAME, and whether each one may be left
+// unbound. All three already have both-sources accessors above, but the binder
+// took a `const std::vector<ast::Param>&` — a shape an IMPORTED callee does not
+// have — so every cross-module call-check path had to open-code its own
+// arity-only substitute. #3141 measured what that costs (a second copy of the
+// rule, with five byte-identical diagnostic strings held identical by nothing
+// but two authors typing the same sentence) and filed #3173; #3178 measured the
+// other cost (the imported substitute demanded EXACT arity, so an optional
+// parameter could not be omitted, and it bailed entirely on a named argument,
+// so a cross-module named call was not checked at all).
+//
+// A view rather than a materialized vector: the producers are trivial, the
+// binder is on the hot path of every call-site check, and a copy would be a
+// third place a formal list can be spelled.
+//
+// ⚠ Only the BINDING facts live here. The per-argument §5.1 / §14.5 / §22.3
+// checks genuinely differ between the two sources (the local path resolves an
+// `ast::Type` and runs `substituteMemberType`; the imported one reads an
+// already-resolved `TypeRef`), so they read `formalParam*` directly and are not
+// forced through this view.
+class FormalsView {
+public:
+    FormalsView() = default;
+    // A concrete AST formal list — a locally declared method / constructor /
+    // operator / lambda, or any caller that already holds the `ast::Param`s.
+    static FormalsView of(const std::vector<ast::Param>& params) {
+        FormalsView v;
+        v.params_ = &params;
+        return v;
+    }
+    // A method or constructor SYMBOL. Consults the AST first and the imported
+    // `ParameterSymbol` list second, via the accessors above, so one view
+    // answers for a local and an imported callee alike.
+    static FormalsView of(const MethodSymbol& ms) {
+        FormalsView v;
+        v.ms_ = &ms;
+        return v;
+    }
+    static FormalsView of(const ConstructorSymbol& cs) {
+        FormalsView v;
+        v.cs_ = &cs;
+        return v;
+    }
+
+    std::size_t size() const {
+        if (params_) return params_->size();
+        if (ms_) return formalParamCount(*ms_);
+        if (cs_) return formalParamCount(*cs_);
+        return 0;
+    }
+    std::string_view name(std::size_t i) const {
+        if (params_) return i < params_->size() ? (*params_)[i].name
+                                                : std::string_view{};
+        if (ms_) return formalParamName(*ms_, i);
+        if (cs_) return formalParamName(*cs_, i);
+        return {};
+    }
+    bool hasDefault(std::size_t i) const {
+        if (params_)
+            return i < params_->size() && (*params_)[i].defaultValue != nullptr;
+        if (ms_) return formalParamHasDefault(*ms_, i);
+        if (cs_) return formalParamHasDefault(*cs_, i);
+        return false;
+    }
+
+private:
+    const std::vector<ast::Param>* params_ = nullptr;
+    const MethodSymbol* ms_ = nullptr;
+    const ConstructorSymbol* cs_ = nullptr;
+};
 
 } // namespace bezel::sema
