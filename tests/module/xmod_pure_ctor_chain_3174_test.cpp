@@ -39,17 +39,33 @@
 // T4/T4b (imported base, non-pure DERIVED ctor) are the rows that fail if the
 // new predicate is over-broad.
 //
-// ⚠ #3174's "Related, same function, opposite direction" section is REFUTED,
-// and T5/T6 pin the refutation rather than a fix. It predicted that
+// ⚠ #3174's "Related, same function, opposite direction" section is refuted FOR
+// THE SHAPES T5/T6 USE, and only those. It predicted that
 // `findUserCtorByArity`'s identical null-`decl` skip produces a false REJECT for
 // an imported body record with a `pure` ctor and a false ACCEPT for an imported
-// positional record carrying a shadowing impure ctor. Both were probed against
-// twins and both AGREE across the boundary today, because `ModuleLoader`'s
-// ctor-body re-parse gate admits EVERY record (the exporter carries a record's
-// `ctorBodyText` unconditionally, #2525) — only a non-generic imported CLASS is
-// decl-less. Those rows are therefore regression pins on a currently-correct
-// behaviour, and they are the reason this commit did not convert that function:
-// converting it would widen its ambiguity count with no defect behind it.
+// positional record carrying a shadowing impure ctor. Probed against twins,
+// both AGREE across the boundary — for a constructor whose parameters are
+// primitive, which is what these rows declare.
+//
+// ⚠⚠ THAT IS A SAMPLE, NOT A GENERAL RESULT, and an earlier revision of this
+// comment presented it as one ("both AGREE across the boundary today, because
+// `ModuleLoader`'s ctor-body re-parse gate admits EVERY record"). The gate
+// condition is quoted correctly and #2525 does carry `ctorBodyText` for every
+// record — but ATTACHMENT CAN STILL FAIL. `parseAndAttachCtorBody` runs
+// `resolveTypes` over a synthetic source declaring only the one type, so a
+// constructor naming a SIBLING type does not resolve (#2290 bug 2 / #710) and
+// `decl` stays null. Measured on this tree: `record BodyRec2` with
+// `pure constructor(s: Sib)` is a FALSE REJECT, and a positional record with an
+// impure shadowing ctor naming a sibling is a §22.15 FALSE ACCEPT. **Both
+// defects are live while T5/T6 stay green**, which is exactly why the claim is
+// now scoped. Filed as #3219.
+//
+// The rows below are still correct regression pins on the behaviour they
+// exercise — nothing about their assertions changed. What changed is that they
+// no longer stand in for a general refutation, and they are no longer the
+// reason this commit left `findUserCtorByArity` unconverted: that decline now
+// rests on the narrower ambiguity argument alone (see the comment on the
+// function itself), which #3219 records as weak.
 
 #include <cstdio>
 #include <cstdlib>
@@ -413,9 +429,13 @@ BEZEL_TEST(xmod_pure_ctor_chain_3174,
 // ctor's OWN purity, and does so identically to its single-module twin.
 //
 // `BodyRec`'s ctor is `pure` -> admitted. `ImpureBodyRec`'s is not -> rejected.
-// #3174 predicted a false REJECT of the first; it does not happen, because an
-// imported RECORD's `ConstructorSymbol::decl` IS attached (ModuleLoader
-// re-parses `ctorBodyText`, carried for every record by #2525).
+// #3174 predicted a false REJECT of the first; it does not happen FOR THIS
+// SHAPE, because an imported RECORD's `ConstructorSymbol::decl` is attached
+// here (ModuleLoader re-parses `ctorBodyText`, carried for every record by
+// #2525). It IS attached only when that re-parse succeeds: a ctor naming a
+// sibling type fails to resolve and the false reject #3174 predicted does then
+// occur — #3219. These rows use primitive-parameter ctors and so never reach
+// that path.
 // ===========================================================================
 BEZEL_TEST(xmod_pure_ctor_chain_3174,
            t5_imported_body_record_pure_ctor_admitted_in_pure_body_22_15) {

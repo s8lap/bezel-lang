@@ -622,13 +622,43 @@ eval "$(PYTHONPATH=scripts python3 -m gate.cold evaluate \
   --cache-root "$GATE_CACHE_ROOT" \
   --identity-changed "$identity_changed" --marker-changed "$marker_changed" 2>/dev/null)"
 GATE_COLD=$cold
+# fix #3222: THE CEILING WAS ORACLE-BLIND; THE WORKLOAD IS NOT.
+#
+# `gate.cold` predicts cold/warm from the AOT cache and returns one ceiling,
+# which both oracles then used unchanged. But an ASan pass instruments every
+# generated test program, so its shard workload is roughly TWICE the plain
+# pass's. Measured on the 2026-08-14 Wave-B2 gate, same tree, same box, both
+# cold-predicted at 1800s:
+#
+#     plain shard phase   1018.30s   rc=0   (comfortable)
+#     ASan  shard phase   1915.61s   rc=1   (all 8 codegen shards hit 124)
+#
+# Every codegen shard had completed ~1400 of its ~1478 tests — about 95% — and
+# was killed at the ceiling. That is not a hang and not a real failure; it is a
+# budget calibrated on the cheaper oracle and applied to the dearer one, and it
+# cost a full 32-minute pass plus a re-run. It also mis-reports: a timed-out
+# shard writes no JSON summary, so the headline became "shard-summary MISMATCH"
+# rather than "shard timed out".
+#
+# The asymmetry is what decides the multiplier. This timeout exists to kill a
+# DEADLOCKED shard (`tests/run_parallel.sh:143`). A deadlocked shard is caught
+# just as surely at 2x the ceiling — merely 30 minutes later, once per hang,
+# which is rare. A ceiling set too LOW costs a whole cycle every time the suite
+# grows past it, which is continuous. So the failure costs are wildly asymmetric
+# and the multiplier should be generous rather than snug: 2x, not the 1.06x that
+# would have just cleared this run.
+ASAN_STO_MULT="${BEZEL_ASAN_SHARD_TIMEOUT_MULT:-2}"
+if [ "$ASAN" -eq 1 ]; then
+  ceiling=$(( ceiling * ASAN_STO_MULT ))
+fi
 # A caller's explicit BEZEL_SHARD_TIMEOUT always wins (see GATE_EXPLICIT_STO).
 sto="$GATE_EXPLICIT_STO"; [ -z "$sto" ] && sto=$ceiling
 SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
 core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
 cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
 _sto_label="plain"; [ "$ASAN" -eq 1 ] && _sto_label="ASan"
-echo "   $_sto_label shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n, identity $gate_id_note)"
+_mult_note=""; [ "$ASAN" -eq 1 ] && _mult_note=", x${ASAN_STO_MULT} for ASan (#3222)"
+echo "   $_sto_label shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n, identity $gate_id_note$_mult_note)"
 
 # lit + FileCheck diagnostic track (tests/lit/): drives the REAL bezelc over .bzl
 # files and matches diagnostics with FileCheck. Fast (~0.1s/test, no JIT) and
