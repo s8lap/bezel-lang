@@ -10030,6 +10030,32 @@ void Emitter::emitInstanceInitFunction(const sema::TypeSymbol* ts) {
     // (base sequence then this class's own field initializers, §22.8 step 1+2).
     emitInstanceInit(ts, currentThis_, classStruct(ts));
     if (!hasAnyConstructor(ts)) {
+        // fix #3162 (§22.10 / §22.8 step 1, v0.254): run the base clause's
+        // ARGUMENT pre-population here too, not only at the `new` site.
+        //
+        // `class Derived(A: int, B: int): Base(A)` stores `A` into `Base`'s
+        // own positional-parameter slot so that `Base`'s field initializers
+        // (`Ax2 := A * 2`, run by emitImplicitBase below) read the passed value
+        // rather than the calloc zero. In a single-module build the `new` site
+        // does that (`prePopulateBasePositionalFields`, LlvmBackend_Exprs2.cpp)
+        // — it reads `TypeDecl::primaryBaseCtorArgs`, which is AST-only and
+        // does not cross a module boundary, so an IMPORTER cannot do it. The
+        // dependency can: here `ts->decl` IS the real `ast::TypeDecl`, and
+        // `currentThis_` is the object whose own primary parameters the caller
+        // stored a moment ago (§22.8 step 0). Measured before this line, with
+        // `Base2(A: int) { Ax2 := A * 2 }` and `Derived2(A, B): Base2(A)`:
+        // `new Derived2(5, 6)` printed `total=16 ax2=10` in ONE module and
+        // `total=6 ax2=0` across two — a SILENT wrong value.
+        //
+        // It cannot double-store against the `new`-site call. That call walks
+        // the same chain, but its two argument sources are `TypeDecl::
+        // primaryBaseCtorArgs` and an `ast::ConstructorDecl`'s leading
+        // `base(...)`; both are null for an IMPORTED link, so for every level
+        // this function is responsible for, the `new` site contributed no
+        // values and recursed with an empty list. (And in a single-module build
+        // this whole function is dead code — the in-module `new` inlines
+        // emitInstanceInit directly.)
+        prePopulateBasePositionalFields(ts, currentThis_, {}, nullptr);
         emitImplicitBase(ts, currentThis_);
         emitOwnFieldInit(ts, currentThis_, classStruct(ts));
     }

@@ -958,6 +958,40 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // body distinction across the wire — see isPositional's field
             // comment in ModuleMetadata.hpp.
             out.isPositional = true;
+            // fix #3164 (§22.10 "`owned` parameters and capture" / §22.3 /
+            // §2.8.3 rule 4, v0.254): a §22.10 primary-constructor parameter's
+            // `owned` marker. It rides `ast::Param::modifier` and NOWHERE else
+            // — `SymbolCollection::collectTypeDecl` builds the positional
+            // FieldSymbol without copying it — so `out.modifiers` (assigned
+            // from `m.modifiers` at the top of this function) was empty for
+            // every positional field and the marker reached the wire from
+            // neither side. An importer therefore saw EVERY imported primary-
+            // constructor parameter as a borrow: `CalleeFormals::modifier()`
+            // (Ownership_impl.hpp) could only answer "", so
+            // `new ImportedC(owned r)` drew the spurious "this parameter
+            // position does not take ownership" §22.3 reject while the
+            // unmarked `new ImportedC(r)` recorded no transfer at all — the
+            // #2659 double-free shape, one module further out.
+            //
+            // Only `owned` can appear here: §22.10 admits plain and `owned`
+            // parameters only, and the parser rejects `ref`/`out`/`out owned`/
+            // `scoped` at the primary-ctor parameter list (Parser_Decls.cpp),
+            // so a well-formed program never reaches this line with anything
+            // else. Filtering to `owned` rather than copying the string
+            // verbatim keeps that guarantee local to this line instead of
+            // resting on a check three files away, and keeps the set of
+            // modifiers an imported positional field can carry ENUMERABLE —
+            // see the commit message for the reader-by-reader diff.
+            //
+            // A RECORD's positional field cannot reach this at all:
+            // `parsePositionalFieldList` admits no modifiers (Appendix A.3
+            // `PositionalField ::= Identifier ":" Type SerializedClause?
+            // EqualityClause?`), which is §28.5's "Records may not have `owned`
+            // fields" enforced syntactically. Measured: `record R(owned h: T)`
+            // is a PARSE error, so this is a class-primary-constructor-only
+            // carriage.
+            if (fs->posParam->modifier == "owned")
+                out.modifiers.emplace_back("owned");
             return true;
         }
     }

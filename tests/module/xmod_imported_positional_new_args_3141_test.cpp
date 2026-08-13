@@ -846,17 +846,32 @@ BEZEL_TEST(xmod_imported_positional_new_args_3141,
 }
 
 // ===========================================================================
-// T9 — the DECLINED half, pinned so it cannot regress silently. Constructing an
-// imported class through its §22.10 primary constructor is still rejected
-// (#3162: the dependency exports only a no-argument initializer, so the
-// parameters have nowhere to ride across and the object would be calloc-zero).
-// What changed is the REASON: the pre-fix diagnostic claimed the class had an
-// implicit default constructor taking 0 arguments, which is a constructor
-// `PBox3141` does not have. // per §22.10 / §22.7 / §2.8.3 rule 4
+// T9 — the half #3141 DECLINED, now the half #3162 CONSTRUCTS.
+//
+// #3141 left `new ImportedPBox(3, 4)` rejected — with the right reason, but
+// rejected: the dependency exports only `bz$<Type>$init(ptr)`, so the primary
+// constructor's parameters appeared to have nowhere to ride across. This row
+// pinned that decline so it could not regress silently.
+//
+// fix #3162 (§22.10 / §22.8 step 0, v0.254) makes the construction work, so
+// the row FLIPS from a diagnostic assertion to a VALUE assertion — which is
+// what the decline's own comment said should happen ("Once construction works,
+// the sema gate ... should be replaced by an ordinary §22.5/§5.1 argument
+// check"). The gap was an ORDERING one, not a channel one: §22.8 makes storing
+// the primary parameters the CALLER's step 0, and the exported `init` is steps
+// 1+2 against the object it is handed, so `lowerNew`'s imported arm stores the
+// arguments and then calls it. Nothing new crosses the wire.
+//
+// `Sum()` = 3 + 4 = 7; a calloc-zero object — the outcome the decline existed
+// to prevent — reads 0. The full surface (field initializers reading a primary
+// parameter, `owned` capture, base-clause arguments, the §22.5/§5.1 rejects
+// this now routes through, and the over-rejection controls) lives in
+// tests/module/xmod_imported_primary_ctor_3162_test.cpp.
+// // per §22.10 / §22.8 / §2.8.3 rule 4
 // ===========================================================================
 BEZEL_TEST(xmod_imported_positional_new_args_3141,
-           imported_primary_ctor_class_construction_names_the_real_reason) {
-    auto r = compileImport3141(
+           imported_primary_ctor_class_constructs_3162) {
+    BEZEL_EXPECT_EQ(compileImportAndRun3141(
         kLib,
         "module AppF3_3141k; import DepF3_3141; "
         "public class C "
@@ -864,14 +879,26 @@ BEZEL_TEST(xmod_imported_positional_new_args_3141,
         "    var b := new PBox3141(3, 4); "
         "    return b.Sum(); "
         "  end Main; "
-        "end C;");
-    BEZEL_EXPECT_TRUE(r.dependencyCompiled);
-    BEZEL_EXPECT_FALSE(r.appCompiled);
-    BEZEL_EXPECT_TRUE(has(r.error, "#3162"));
-    BEZEL_EXPECT_TRUE(has(r.error, "§22.10"));
-    // The wrong old reason must be gone: `PBox3141` has a two-parameter primary
-    // constructor, so there is no implicit default constructor to name.
-    BEZEL_EXPECT_FALSE(has(r.error, "implicit default constructor"));
+        "end C;"), 7);
+}
+
+// ===========================================================================
+// T9b — the local twin of T9, byte-identical apart from the module boundary.
+// It passed before #3162 and must still. // per §22.10 / §22.8
+// ===========================================================================
+BEZEL_TEST(xmod_imported_positional_new_args_3141,
+           local_primary_ctor_class_constructs_control) {
+    BEZEL_EXPECT_EQ(compileLocalAndRun3141(
+        "module LocF3_3141k; "
+        "public class PBox3141(V: int, W: int) "
+        "  public method Sum(): int return V + W; end Sum; "
+        "end PBox3141; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var b := new PBox3141(3, 4); "
+        "    return b.Sum(); "
+        "  end Main; "
+        "end C;"), 7);
 }
 
 }  // namespace bezel::module

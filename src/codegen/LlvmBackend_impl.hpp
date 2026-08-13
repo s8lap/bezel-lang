@@ -13364,6 +13364,35 @@ private:
         const std::vector<llvm::Value*>& ctorArgVals,  // already-evaluated ctor args
         const sema::ConstructorSymbol* cs,             // null if no explicit ctor
         bool ctorArgsByRefAbi = false);
+
+    // §22.8 step 0 / §22.10 (fix #3162): store a `new T(args)` call's positional
+    // arguments into `t`'s own primary-constructor parameter field slots.
+    //
+    // This is §22.8's step 0 and it must run BEFORE step 2 (the field
+    // initializers), because an initializer may read a primary parameter
+    // (`public Q: int := V * 2;`). It was inline in `lowerNew`'s LOCAL arm; it
+    // is a method so the IMPORTED arm can run the identical sequence before
+    // calling the dependency's `bz$<Type>$init` (which performs steps 1+2 for a
+    // no-explicit-ctor class). Sharing the body is the point: the string-field
+    // +1 (#1605), the enclosing-scope substitution (#597) and the
+    // enclosing-`this` restore (#2367) are each a defect that was fixed once
+    // here, and a second hand-written copy in the imported arm would be a
+    // second place for them to regress.
+    //
+    // `outerSubst` / `outerSemaTy` — the ENCLOSING generic substitution: an
+    //   argument expression belongs to the caller's scope, not to `t` (#597).
+    // `thisForArgs` — the ENCLOSING `this`, for the same reason (#2367).
+    // No-op unless `t` is a class with a non-empty primary-constructor
+    // parameter list and the call is all-positional with matching arity.
+    void storePrimaryCtorPositionalArgs(
+        const sema::TypeSymbol* t,
+        llvm::Value* obj,
+        llvm::StructType* st,
+        const ast::NewExpr& ne,
+        const std::unordered_map<std::string_view, llvm::Type*>& outerSubst,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>&
+            outerSemaTy,
+        llvm::Value* thisForArgs);
 };
 
 }  // namespace bezel::codegen

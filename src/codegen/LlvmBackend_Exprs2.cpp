@@ -2633,6 +2633,115 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
 //       expressions, and store the results into the base's positional-param slots.
 //   Recurse into the base class so that multi-level chains (B: A(x), A: Root(x))
 //   are handled correctly.
+
+// §22.8 step 0 / §22.10 (fix #3162) — see LlvmBackend_impl.hpp for the
+// contract and for why this is a method rather than two copies.
+void Emitter::storePrimaryCtorPositionalArgs(
+        const sema::TypeSymbol* t,
+        llvm::Value* obj,
+        llvm::StructType* st,
+        const ast::NewExpr& ne,
+        const std::unordered_map<std::string_view, llvm::Type*>& outerSubst,
+        const std::unordered_map<std::string_view, const sema::TypeRef*>&
+            outerSemaTy,
+        llvm::Value* thisForArgs) {
+    // fix #3141 (family F3 of umbrella #3152, §22.8 step 0): the primary-
+    // constructor parameter list is the indexed symbol-side view
+    // (`recordPositionalFieldSymbols`), which is the same list `td->
+    // positionalFields` names — a local positional FieldSymbol's `posParam`
+    // points into it — reached so that the pairing of argument i with field
+    // i does not depend on an `ast::TypeDecl`. It also replaces the O(n^2)
+    // `posParam == &pf` scan over `members` this used to do per argument.
+    // The flag is checked FIRST so the vector is built only for a
+    // primary-constructor class, not on every `new`.
+    if (t->kind != ast::TypeDeclKind::Class || !t->hasPositionalFields)
+        return;
+    const std::vector<const sema::Symbol*> posFields =
+        sema::recordPositionalFieldSymbols(t);
+    if (!posFields.empty()) {
+      // Only the all-positional case: store each arg value directly into
+      // the corresponding primary-ctor-param field slot.
+      bool allPositional = true;
+      for (const auto& a : ne.args)
+          if (!a.name.empty()) { allPositional = false; break; }
+      if (allPositional && ne.args.size() == posFields.size()) {
+          for (std::size_t pi = 0; pi < posFields.size(); ++pi) {
+              {  // scope for the per-field bindings below
+                  auto* fs = const_cast<sema::FieldSymbol*>(
+                      static_cast<const sema::FieldSymbol*>(posFields[pi]));
+                  auto idxIt = fieldIndex_.find(fs);
+                  if (idxIt == fieldIndex_.end()) continue;
+                  if (!ne.args[pi].value) continue;
+                  // issue #597: a positional primary-ctor argument is an
+                  // enclosing-scope expression — lower it under the outer
+                  // substitution, then restore the new type's subst for
+                  // the field-type coercion + store below.
+                  // #2367: likewise for `currentThis_` — #597 fixed the
+                  // generic-substitution half of "enclosing-scope
+                  // expression" but left `currentThis_ = obj` (set above
+                  // for the DIFFERENT purpose of resolving `t`'s OWN
+                  // implicit-field reads, e.g. a chained base-ctor arg
+                  // that names one of `t`'s own primary-ctor params) in
+                  // effect across this evaluation too. An arg expression
+                  // that is itself an implicit-field read of the ENCLOSING
+                  // scope (e.g. `new Leaf(first)` as another class's own
+                  // field initializer, where `first` is the enclosing
+                  // class's primary-ctor param) resolved that read via
+                  // implicitFieldAddr against `obj` — the new, not-yet-
+                  // initialized `t` instance — instead of the enclosing
+                  // object, reading through a pointer sized/typed for `t`
+                  // as if it had the enclosing class's layout (a wrong-
+                  // object GEP; heap-buffer-overflow when `t`'s instance
+                  // is smaller). Restore the enclosing `this`
+                  // (`thisForArgs`) for the evaluation only, mirroring
+                  // the explicit-ctor arg path below (case (b) in its
+                  // comment) which already does this correctly.
+                  llvm::Value* savedThisForArg = currentThis_;
+                  currentThis_ = thisForArgs;
+                  auto posSubst = genericSubst_;
+                  auto posSemaTy = genericSubstSemaTy_;
+                  genericSubst_ = outerSubst;
+                  genericSubstSemaTy_ = outerSemaTy;
+                  llvm::Value* v = lowerExpr(*ne.args[pi].value);
+                  genericSubst_ = std::move(posSubst);
+                  genericSubstSemaTy_ = std::move(posSemaTy);
+                  currentThis_ = savedThisForArg;
+                  if (!v) continue;
+                  llvm::Type* fieldTy =
+                      st->getElementType(idxIt->second);
+                  v = coerceNumericToType(
+                      v, fieldTy,
+                      isUnsignedTargetExpr(*ne.args[pi].value));
+                  // #1605 / §4.6 / §28.9: `fs` is a genuine class
+                  // FieldSymbol (disposed by the generated DisposeCore /
+                  // emitOwnedFieldDisposals like any other string field,
+                  // whether or not the parameter is also read from a body
+                  // position) — so a STRING positional-ctor-param field
+                  // needs its own independent +1 here, exactly like
+                  // lowerStringFieldStore / emitOwnFieldInit give any other
+                  // string field store. Without this, the field ALIASES
+                  // the caller's argument with no reference of its own: if
+                  // the caller later releases its local (e.g. `x += ...`'s
+                  // release-old, or scope-end), the field dangles and
+                  // Dispose() reads/frees already-freed memory (#1605). The
+                  // field is calloc-zeroed (null) before this — no old
+                  // value to release. A fresh +1 producer argument
+                  // (`new Box(a + b)`) is TRANSFERRED (no retain); anything
+                  // else (identifier / field / call) is RETAINED so the
+                  // field's count is independent of the source's.
+                  if (v->getType()->isPointerTy() &&
+                      isStringStorageMember(fs) &&
+                      !isPlusOneStringProducer(ne.args[pi].value.get()))
+                      emitStringRetain(v);
+                  builder_.CreateStore(
+                      v, builder_.CreateStructGEP(
+                             st, obj, idxIt->second));
+              }
+          }
+      }
+    }
+}
+
 void Emitter::prePopulateBasePositionalFields(
         const sema::TypeSymbol* t,
         llvm::Value* obj,
@@ -4934,6 +5043,53 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     const bool importedGenericWithBody =
         importedGenericExplicitCs != nullptr;
     if (ctx_.isImported(t) && !importedGeneric) {
+        // fix #3162 (§22.10 / §22.8 step 0 / §2.8.3 rule 4, v0.254): a
+        // dependency's `bz$<Type>$init` takes only the object, so a §22.10
+        // primary constructor's PARAMETERS have no channel across the module
+        // boundary and `new ImportedPBox(3, 4)` was rejected outright (#3141's
+        // gate) rather than silently producing a zero object.
+        //
+        // No new ABI is needed, because step 0 is the IMPORTER's job anyway.
+        // §22.8 orders construction: step 0 stores the primary parameters into
+        // their field slots, step 1 runs the base chain, step 2 runs the field
+        // initializers. `bz$<Type>$init` is exactly steps 1+2 for a
+        // no-explicit-ctor class (emitInstanceInitFunction: emitInstanceInit +
+        // emitImplicitBase + emitOwnFieldInit) — and it runs them against the
+        // object it is HANDED. So storing the arguments here, before the call,
+        // puts them in place in the order §22.8 requires: a dependency-side
+        // initializer that READS a primary parameter (`public Q: int := V * 2;`)
+        // reads the value stored a moment ago, not the calloc zero.
+        //
+        // The slot indices are the importer's own `fieldIndex_` over
+        // `classStruct(t)`, the same layout the dependency's `init` GEPs
+        // through (§2.8.3 rule 4: ONE runtime type identity), and the same
+        // helper the LOCAL arm below uses — see its declaration comment.
+        //
+        // This is the direct-`new` twin of the base-clause path #3141 fixed:
+        // `class D(): PBox(5, 6)` already stores the base's positional fields
+        // at the derived `new` site and then routes through `bz$<Base>$init`
+        // (`emitImportedBaseFieldInit`, LlvmBackend_Setup.cpp). Same sequence,
+        // one level down.
+        //
+        // `currentThis_` is deliberately NOT set to `obj` here (unlike the
+        // local arm): nothing in this arm resolves `t`'s OWN implicit-field
+        // reads — the dependency's initializers run in the dependency's own
+        // compiled body — so the enclosing `this` is what an argument
+        // expression needs, and it is already current (#2367).
+        //
+        // `!hasAnyConstructor(t)` is the SAME shape #3141's sema gate rejects
+        // and this fix enables, and no other. An imported class that declares
+        // an explicit constructor ALONGSIDE its primary one already
+        // constructs through `bz$<Type>$ctor` below with `ne.args` bound to
+        // THAT constructor's parameters; storing those same arguments into the
+        // primary-parameter fields as well would be a second, unasked-for
+        // write. (The LOCAL arm does exactly that today — the §22.10 combined
+        // form is deferred there, #3163 — but widening the imported arm to
+        // match a deferred local shape is not this fix's business, and keeping
+        // the guard leaves every imported shape that works today bit-identical.)
+        if (!hasAnyConstructor(t))
+            storePrimaryCtorPositionalArgs(t, obj, st, ne, savedSubst,
+                                           savedSemaTy, currentThis_);
         llvm::Function* initFn = declareImportedInit(t);
         builder_.CreateCall(initFn, {obj});
     } else if (importedGenericNoBody || importedGenericWithBody) {
@@ -4960,92 +5116,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // `posParam == &pf` scan over `members` this used to do per argument.
         // The flag is checked FIRST so the vector is built only for a
         // primary-constructor class, not on every `new`.
-        if (t->kind == ast::TypeDeclKind::Class && t->hasPositionalFields) {
-          const std::vector<const sema::Symbol*> posFields =
-              sema::recordPositionalFieldSymbols(t);
-          if (!posFields.empty()) {
-            // Only the all-positional case: store each arg value directly into
-            // the corresponding primary-ctor-param field slot.
-            bool allPositional = true;
-            for (const auto& a : ne.args)
-                if (!a.name.empty()) { allPositional = false; break; }
-            if (allPositional && ne.args.size() == posFields.size()) {
-                for (std::size_t pi = 0; pi < posFields.size(); ++pi) {
-                    {  // scope for the per-field bindings below
-                        auto* fs = const_cast<sema::FieldSymbol*>(
-                            static_cast<const sema::FieldSymbol*>(posFields[pi]));
-                        auto idxIt = fieldIndex_.find(fs);
-                        if (idxIt == fieldIndex_.end()) continue;
-                        if (!ne.args[pi].value) continue;
-                        // issue #597: a positional primary-ctor argument is an
-                        // enclosing-scope expression — lower it under the outer
-                        // substitution, then restore the new type's subst for
-                        // the field-type coercion + store below.
-                        // #2367: likewise for `currentThis_` — #597 fixed the
-                        // generic-substitution half of "enclosing-scope
-                        // expression" but left `currentThis_ = obj` (set above
-                        // for the DIFFERENT purpose of resolving `t`'s OWN
-                        // implicit-field reads, e.g. a chained base-ctor arg
-                        // that names one of `t`'s own primary-ctor params) in
-                        // effect across this evaluation too. An arg expression
-                        // that is itself an implicit-field read of the ENCLOSING
-                        // scope (e.g. `new Leaf(first)` as another class's own
-                        // field initializer, where `first` is the enclosing
-                        // class's primary-ctor param) resolved that read via
-                        // implicitFieldAddr against `obj` — the new, not-yet-
-                        // initialized `t` instance — instead of the enclosing
-                        // object, reading through a pointer sized/typed for `t`
-                        // as if it had the enclosing class's layout (a wrong-
-                        // object GEP; heap-buffer-overflow when `t`'s instance
-                        // is smaller). Restore the enclosing `this`
-                        // (`savedThisForInit`) for the evaluation only, mirroring
-                        // the explicit-ctor arg path below (case (b) in its
-                        // comment) which already does this correctly.
-                        llvm::Value* savedThisForArg = currentThis_;
-                        currentThis_ = savedThisForInit;
-                        auto posSubst = genericSubst_;
-                        auto posSemaTy = genericSubstSemaTy_;
-                        genericSubst_ = savedSubst;
-                        genericSubstSemaTy_ = savedSemaTy;
-                        llvm::Value* v = lowerExpr(*ne.args[pi].value);
-                        genericSubst_ = std::move(posSubst);
-                        genericSubstSemaTy_ = std::move(posSemaTy);
-                        currentThis_ = savedThisForArg;
-                        if (!v) continue;
-                        llvm::Type* fieldTy =
-                            st->getElementType(idxIt->second);
-                        v = coerceNumericToType(
-                            v, fieldTy,
-                            isUnsignedTargetExpr(*ne.args[pi].value));
-                        // #1605 / §4.6 / §28.9: `fs` is a genuine class
-                        // FieldSymbol (disposed by the generated DisposeCore /
-                        // emitOwnedFieldDisposals like any other string field,
-                        // whether or not the parameter is also read from a body
-                        // position) — so a STRING positional-ctor-param field
-                        // needs its own independent +1 here, exactly like
-                        // lowerStringFieldStore / emitOwnFieldInit give any other
-                        // string field store. Without this, the field ALIASES
-                        // the caller's argument with no reference of its own: if
-                        // the caller later releases its local (e.g. `x += ...`'s
-                        // release-old, or scope-end), the field dangles and
-                        // Dispose() reads/frees already-freed memory (#1605). The
-                        // field is calloc-zeroed (null) before this — no old
-                        // value to release. A fresh +1 producer argument
-                        // (`new Box(a + b)`) is TRANSFERRED (no retain); anything
-                        // else (identifier / field / call) is RETAINED so the
-                        // field's count is independent of the source's.
-                        if (v->getType()->isPointerTy() &&
-                            isStringStorageMember(fs) &&
-                            !isPlusOneStringProducer(ne.args[pi].value.get()))
-                            emitStringRetain(v);
-                        builder_.CreateStore(
-                            v, builder_.CreateStructGEP(
-                                   st, obj, idxIt->second));
-                    }
-                }
-            }
-          }
-        }
+        // fix #3141 / #3162 (§22.8 step 0): store the primary-constructor
+        // arguments into their field slots before emitInstanceInit runs the
+        // field initializers, which may read them. The IMPORTED arm above
+        // calls the same helper before `bz$<Type>$init`.
+        storePrimaryCtorPositionalArgs(t, obj, st, ne, savedSubst, savedSemaTy,
+                                       savedThisForInit);
         // §11.1 / #873: pre-populate base classes' positional-param field slots
         // BEFORE emitInstanceInit so that base field initializers (e.g.
         // `_field := v`) can read the value passed via the base(v) chain call

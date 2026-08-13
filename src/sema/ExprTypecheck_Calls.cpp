@@ -10695,29 +10695,48 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                 if (!cs->isStatic) { hasExplicitCtor = true; break; }
         if (!hasExplicitCtor && !ne.args.empty() &&
             !recordPositionalFieldSymbols(t).empty()) {
-            // Until this arm existed the gate above answered "no positional
+            // Until #3141's arm existed the gate above answered "no positional
             // fields" for the import and control fell through to the §22.7
             // implicit-default-constructor arm, whose diagnostic ("`new PBox`
             // has 2 argument(s) but the implicit default constructor takes 0")
-            // names a constructor the class does not have. The construction
-            // itself is NOT yet supported: a dependency exports
-            // `bz$<Type>$init`, which takes only the object, so the positional
-            // parameters have nowhere to ride across and the object would be
-            // left calloc-zero (measured on the sibling base-clause path before
-            // this fix: `D(): PBox(5, 6)` produced `v=0 w=0`). Reject with the
-            // real reason rather than admit a silent-wrong object — see #3162
-            // for the construction work itself.
-            ctx_.diagnostics().report(
-                Severity::Error, ne.span.begin,
-                std::string("`new ") + std::string(t->name) +
-                    "` constructs an IMPORTED class through its primary "
-                    "constructor, which is not yet supported (§22.10 / §2.8.3 "
-                    "rule 4, #3162): a dependency exports only a no-argument "
-                    "initializer for its types, so the positional parameters "
-                    "would be dropped and the object left zero-initialized. "
-                    "Declare an explicit constructor on the exported class, or "
-                    "expose a factory method that returns `owned " +
-                    std::string(t->name) + "`");
+            // named a constructor the class does not have. #3141 replaced that
+            // with an honest decline; the CONSTRUCTION itself stayed
+            // unsupported.
+            //
+            // fix #3162 (§22.10 / §22.8 step 0 / §2.8.3 rule 4, v0.254): it is
+            // supported now, and this is the ordinary §22.5/§5.1 check over the
+            // symbol-side positional list — the SAME call an imported RECORD's
+            // `new` already makes two arms up. The construction gap was never a
+            // classification one: §22.8 makes storing the primary parameters
+            // the CALLER's step 0, and `bz$<Type>$init` is steps 1+2 against
+            // the object it is handed, so `lowerNew`'s imported arm stores the
+            // arguments into their slots and then calls it (see the comment
+            // there). Nothing new crosses the wire.
+            //
+            // ONE shape stays declined, and loudly: a NAMED argument. §22.5
+            // admits `new PBox(W := 4, V := 3)` and this check binds it
+            // correctly, but `storePrimaryCtorPositionalArgs` lowers only the
+            // all-positional form — a named call would compile clean and leave
+            // the object calloc-zero, which is precisely the silent-wrong-object
+            // outcome #3141 declined rather than ship. (Its LOCAL twin is
+            // silently wrong today for the same reason; that is #3163's
+            // deferral, not this fix's to widen.) Filed as its own issue.
+            bool anyNamed = false;
+            for (const auto& a : ne.args)
+                if (!a.name.empty()) { anyNamed = true; break; }
+            if (anyNamed) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ne.span.begin,
+                    std::string("`new ") + std::string(t->name) +
+                        "` binds a NAMED argument to an IMPORTED class's "
+                        "primary constructor, which is not yet supported "
+                        "(§22.5 / §22.10 / §2.8.3 rule 4, #3162): only the "
+                        "all-positional spelling is lowered across a module "
+                        "boundary, and a named one would leave the object "
+                        "zero-initialized. Pass the arguments positionally");
+                return;
+            }
+            checkPositionalNewArgsFromSymbols(ne, t);
             return;
         }
         // fall through to the imported-constructor path below
