@@ -6552,10 +6552,18 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // Track the SYMBOL alongside the decl and fall back to it, using the
         // same "single, else arity match" rule so local behaviour is identical.
         // This mirrors #2657's `formalOutParamType2` exactly, and — unlike the
-        // `out owned var` / `out using var` gates below, which stay unfixed in
-        // #2668 — it switches on NO dormant ownership tracking: a plain
+        // `out owned var` / `out using var` gates below, which #2668 left
+        // unfixed — it switches on NO dormant ownership tracking: a plain
         // `out var` recipient carries no disposal obligation (§22.4 rejects
         // plain `out var` at an `out owned` parameter outright).
+        //
+        // ⚠ UPDATED by #3206: those two gates are no longer unfixed. The
+        // ownership tracking #2668 was waiting on landed (#2659, #3176) and was
+        // measured live — the imported `out owned var` row already drew the
+        // §28.3 auto-drop warning — so both now route through
+        // `formalCtorOutParamType` as well. All three `NewExpr` forms consult
+        // one accessor, as all three `CallExpr` forms consult
+        // `formalOutParamType2` (#2657 / #3186 / #3188).
         const ConstructorSymbol* ctorSym = nullptr;
         if (ne->type) {
             if (auto* rt = ctx_.resolvedType(*ne->type)) {
@@ -6621,11 +6629,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // `ctx_.resolvedType(*ctorDecl->params[posn].type)` lookup
                     // plus the imported-constructor fallback; for a constructor
                     // WITH an ast::ConstructorDecl it returns exactly what this
-                    // condition used to compute. Only the PLAIN `out var` gate
-                    // is changed — the `out owned var` / `out using var` gates
-                    // below keep the old `ctorDecl`-only lookup on purpose (see
-                    // #2668: they additionally switch on dormant ownership
-                    // tracking that no oracle here can validate).
+                    // condition used to compute. In #2668 only the PLAIN
+                    // `out var` gate was changed; fix #3206 moved the
+                    // `out owned var` / `out using var` gates below onto the
+                    // same accessor once the ownership tracking #2668 was
+                    // waiting on had landed (#2659, #3176) and been measured
+                    // live. All three forms now read one accessor.
                     if (TypeRef* formalCtorTy = formalCtorOutParamType(posn)) {
                         lsym->declType = formalCtorTy;
                         // §22.4 / §7.9 (#2409, mirroring #1597's CallExpr
@@ -6669,10 +6678,30 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                     lsym->name = id->name;
                     lsym->decl = id;
-                    if (ctorDecl && posn < ctorDecl->params.size() &&
-                        ctorDecl->params[posn].type) {
-                        lsym->declType = ctx_.resolvedType(
-                            *ctorDecl->params[posn].type);
+                    // fix #3206 (§22.4 / §2.5, v0.254): through
+                    // `formalCtorOutParamType`, the both-sources accessor
+                    // partial-#2668 added ~140 lines above for the plain
+                    // `out var` twin. #2668 left this copy `ctorDecl`-only ON
+                    // PURPOSE — "they additionally switch on dormant ownership
+                    // tracking that no oracle here can validate" — and that
+                    // tracking has since landed (#2659 for constructor formals,
+                    // #3176 for the `out owned` recipient pair). MEASURED on
+                    // ec6a02f: the imported row ALREADY drew the §28.3
+                    // auto-drop warning, so the obligation was armed and only
+                    // the TYPE was missing; the recipient therefore read 0
+                    // where its single-module twin read 211, behind an
+                    // `internal:` #2491 note, and leaked 16 bytes per call
+                    // under LSan (`#1 bz$CtLib.FactO$ctor`).
+                    //
+                    // ⚠ THE WIDENING, EXACTLY: `formalCtorOutParamType` returns
+                    // this same expression verbatim whenever `ctorDecl` is
+                    // non-null, so a constructor WITH a declaration keeps its
+                    // answer bit-for-bit. The one new admission is
+                    // `ctorSym && !ctorDecl` — and `ctorSym` is itself only
+                    // populated under `if (!ctorDecl)` above — i.e. exactly the
+                    // imported non-generic class.
+                    if (TypeRef* formalOwnedTy = formalCtorOutParamType(posn)) {
+                        lsym->declType = formalOwnedTy;
                         // §22.4 / §7.9 (#2409, mirroring #1597's CallExpr
                         // `out owned var` fix): do NOT strip the declared
                         // nullability — same reasoning as the plain `out var`
@@ -6715,10 +6744,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                     lsym->name = id->name;
                     lsym->decl = id;
-                    if (ctorDecl && posn < ctorDecl->params.size() &&
-                        ctorDecl->params[posn].type) {
-                        lsym->declType = ctx_.resolvedType(
-                            *ctorDecl->params[posn].type);
+                    // fix #3206 (§22.4 / §2.5, v0.254): through
+                    // `formalCtorOutParamType`, exactly as its `out owned var`
+                    // sibling immediately above now does — see that block for
+                    // the measurement and for the widening, which is
+                    // character-for-character the same here. With these two the
+                    // SIX inline-`out` recipient sites (three at a `CallExpr`,
+                    // three at a `NewExpr`) are one view per call form: two
+                    // accessors, six callers, no site deciding for itself.
+                    if (TypeRef* formalUsingTy = formalCtorOutParamType(posn)) {
+                        lsym->declType = formalUsingTy;
                         // per §22.4 / §7.9: do NOT strip the declared
                         // nullability — same reasoning as the `out var` /
                         // `out owned var` blocks above.
