@@ -845,6 +845,10 @@ bool isInstanceFieldStorageSymbol(const Symbol* m) {
 bool constructorIsPure(const ConstructorSymbol* cs) {
     if (!cs) return false;
     if (cs->isPure) return true;
+    // SEAM-ACCESSOR: the AST arm of the both-sources ctor-purity predicate. This
+    // read is *supposed* to answer null for an import — that is what the
+    // `cs->isPure` arm above is for — so it is a sanctioned decl read, not an
+    // unconverted one.
     if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
         if (cd->isPure) return true;
     for (std::string_view mod : cs->modifiers)

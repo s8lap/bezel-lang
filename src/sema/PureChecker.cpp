@@ -274,20 +274,34 @@ bool PureBodyWalker::recordSynthesizedCallIsPure(
 //   imported body record, impure ctor, in a pure body   -> REJECTED (twin: REJECTED)
 //   imported positional record + shadowing impure ctor  -> REJECTED (twin: REJECTED)
 //
-// The reason is that `ModuleLoader`'s ctor-body re-parse gate is
-// `kind == Record || (kind == Class && !genericParams.empty())` — so EVERY
-// imported record's `ConstructorSymbol::decl` is attached (the exporter carries
-// `ctorBodyText` for records unconditionally, ModuleMetadataBuilder.cpp, #2525),
-// and this walk sees exactly what it sees for a local record. Only a non-generic
-// imported CLASS is decl-less, and no class reaches here (`rec->kind` is
-// filtered to Record by the sole caller).
+// ⚠ THAT AGREEMENT IS CONDITIONAL, AND THE CONDITION IS NOT ALWAYS MET. An
+// earlier revision of this comment said the re-parse gate
+// (`kind == Record || (kind == Class && !genericParams.empty())`) means "EVERY
+// imported record's `ConstructorSymbol::decl` is attached … and this walk sees
+// exactly what it sees for a local record". The gate condition is right and the
+// exporter does carry `ctorBodyText` for records unconditionally
+// (ModuleMetadataBuilder.cpp, #2525) — but ATTACHMENT CAN STILL FAIL:
+// `parseAndAttachCtorBody` runs `resolveTypes` over a synthetic source that
+// declares only the one type, so a ctor naming a SIBLING type fails to resolve
+// (#2290 bug 2 / #710) and `decl` is left null. The three rows above sampled
+// only ctors with primitive parameters, which is why they agreed.
 //
-// It is therefore left as a decl walk deliberately. Converting it would widen
-// `matching` to count decl-less candidates, which can turn a currently-resolved
-// single match into an ambiguity (`matching == 1` is the return condition) — a
-// silent widening with no defect behind it. If a future change ever leaves an
-// imported record ctor without a decl, convert this to `constructorIsPure` and
-// re-derive the ambiguity rule; do not do it speculatively.
+// Measured on this commit's own tree (per-fix review), with sibling-naming ctors:
+//   * `record BodyRec2` with `pure constructor(s: Sib)` -> FALSE REJECT
+//     ("the invoked constructor is not pure-declared"); the twin compiles.
+//   * `record PosShadow2(A: int)` with an impure shadowing ctor naming a sibling
+//     -> FALSE ACCEPT in a pure body (§22.15 soundness); the twin is rejected.
+// Filed as #3219.
+//
+// The decl walk is still left as-is HERE, but on the narrower ground only:
+// converting it would widen `matching` to count decl-less candidates, which can
+// turn a currently-resolved single match into an ambiguity (`matching == 1` is
+// the return condition). Note that ground is itself weak — `matching` exceeds 1
+// only when a record declares two same-arity constructors, which is already an
+// overload ambiguity — and converting to `constructorIsPure` WOULD fix the false
+// reject, since `applyBehavior` sets `isPure` on every imported ctor. #3219 is
+// where that trade gets decided; it is not a "no defect behind it" case, which
+// is what the earlier comment claimed.
 static const ast::ConstructorDecl* findUserCtorByArity(
     const TypeSymbol* rec, std::size_t arity) {
     const ast::ConstructorDecl* match = nullptr;
