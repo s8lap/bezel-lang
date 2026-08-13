@@ -1220,6 +1220,33 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         if (auto* rt = ctx_.exprType(*cd->value))
                             ctx_.setExprType(&e, rt);
                     }
+                } else if (ctx_.isImported(cms)) {
+                    // fix #3177 (§22.12 / §2.7 / §2.5, v0.254, family M4): the
+                    // IMPORTED arm #3079 did not grow. Both adjacent branches
+                    // in this same `else if` chain got theirs — the FieldSymbol
+                    // one (#2532, 60 lines up) and the PropertySymbol one
+                    // (#2504, 25 lines up) — while a `const` INHERITED FROM AN
+                    // IMPORTED BASE, reached by the §2.7 rule-1 bare spelling,
+                    // still had `cms->decl == nullptr` and so carried no type.
+                    //
+                    // MEASURED on ec6a02f: `Console.WriteLine("k=" +
+                    // K.ToString())` in a class deriving from an imported base
+                    // that declares `public const K: int := 7;` is REJECTED
+                    // with "`+` requires both operands to be `string`" (§4.6) —
+                    // the untyped receiver never reaches the primitive-ToString
+                    // arm — while the character-identical single-module twin
+                    // compiles and prints `k=7`. A false REJECT of a legal
+                    // program, with a diagnostic describing something the user
+                    // did not write.
+                    //
+                    // `ctx_.importedMemberType` is deliberately read directly
+                    // rather than through `sema::storageComponentType`: a
+                    // `const` is not §9.1/§9.2 STORAGE, and that accessor feeds
+                    // record-storage walks (`anyRecordStorageField`,
+                    // Sendability's member census) whose member set must not
+                    // grow. This mirrors the two sibling arms exactly.
+                    if (TypeRef* rt = ctx_.importedMemberType(cms))
+                        ctx_.setExprType(&e, rt);
                 }
             }
             // §12.7: flow narrowing. Inside the controlled block of `if x is T`
