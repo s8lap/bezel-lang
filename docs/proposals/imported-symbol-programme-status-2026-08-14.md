@@ -213,16 +213,23 @@ treated as the stdlib intrinsic) · #3193 (method reference over an imported met
 return type and marker) · #3195 (a plain `var` receiver of a form-2 `scoped` call is never
 disposed — single-module) · #3197 · #3199.
 
-## 6c. The blocker dependency graph, MEASURED (2026-08-14, under review)
+## 6c. The blocker dependency graph, MEASURED (2026-08-14, review COMPLETE)
 
-The graph in §6's "Blockers (fix first)" line was a guess. Measured:
+The graph in §6's "Blockers (fix first)" line was a guess. Measured, and every load-bearing
+row below was **independently re-measured by the per-fix review** in throwaway worktrees:
 
 - **#3164 → #3162 is REAL and stronger than filed. They are ONE commit.** With
   #3162's halves applied and only #3164's carriage disabled: `new Holder(owned r, 20)`
   is a FALSE REJECT (§22.3 makes the marker mandatory, so the constructor is
   uncallable) and `new Holder(r, 20)` compiles clean and **SIGSEGVs** — #2659's double
   free, one module out, against a twin answering 211. **Shipping #3162 alone is a
-  memory-safety REGRESSION, not an incomplete feature.**
+  memory-safety REGRESSION, not an incomplete feature.** ✅ **Independently reproduced
+  by the review** — it patched only the carriage line
+  (`ModuleMetadataBuilder.cpp:1032` → `if (false && …)`), rebuilt `bezelc`, and got
+  exactly the three outcomes above (`rejected / SIGSEGV 139 / 211`), against
+  `211 / rejected / 211` with the line restored. This is the reason the two issues
+  are one commit, and it is the single most important row in this section: a future
+  run tempted to split them should read it first.
 - **#3183 ⊥ #3162 — the gating claim is REFUTED.** #3183 is live TODAY through
   imported RECORDS, which already construct cross-module; #3162 would only have
   extended it to classes.
@@ -241,13 +248,42 @@ The graph in §6's "Blockers (fix first)" line was a guess. Measured:
   branches that all flip) — a lane, not a tail. ⚠ There is a **direct contradiction**
   between #3170's measurement and #2943's gate comment (which asserts a one-`T`-slot
   layout does NOT move). Settle it before touching that threshold again: widening it
-  to ≥1 was already tried and reverted.
+  to ≥1 was already tried and reverted. **Now sharpened and posted to #3170**: the
+  gate's cited evidence ("2894 T1 = 108 with single `_t: T`") **instantiates
+  `GIface2894T1<int>`**, where nothing can move regardless of field count — so it
+  cannot distinguish "one T field is safe" from "an `int` substitution is safe", and
+  it is the second. The review measured a **single**-`T`-field class crashing:
+  `G1<int>` → 107, `G1<string>` → **SIGSEGV 139**, twin 107. The real discriminator
+  is not how many `T` fields but **whether any field follows one whose substituted
+  width/alignment differs from the erased placeholder's** — a type-kind question,
+  answerable at sema time without the LLVM data layout the comment says is missing.
 
 **⚠ #3198 (HIGH) is the general form of #3184 and applies to EVERY additive metadata
 change this programme made:** stale artifacts have no vintage check, so a metadata
 CONTENT change silently reopens the hole it closed — measured as a SIGSEGV. Whoever
 picks this up should treat it as a precondition for trusting any cross-version claim,
-including the byte-identity results recorded above.
+including the byte-identity results recorded above. The review sharpened this too:
+for #3164 the new-reader/old-artifact direction is **strictly worse than the old
+compiler** (the old one rejected the shape; the new one compiles it clean into a
+SIGSEGV), and there is no lever short of #3198's plumbing — a `kSchemaVersion` bump
+does not help (read-older semantics) and the loader **discards the version entirely**,
+so no vintage gate is possible today.
+
+## 6d. Filed from the blockers review (2026-08-14)
+
+- **#3205** — an `owned` primary-constructor parameter that is **never referenced** is
+  silently dropped and leaks 16 bytes (LSan-confirmed; single-module, so pre-existing).
+  §22.10's capture enumeration has three bullets and this is a **fourth case that falls
+  off the end** — the "negative-list ⇒ silently do nothing" shape from the 2026-08-06
+  taxonomy. Filed as a **spec question first** (the section's own words say silently
+  dropping it "would be a leak"), with a recommendation to capture rather than reject.
+- Nits folded into the batch rather than filed: #3164's widening enumeration was short
+  by two readers (`TypeResolution_Names.cpp:66`, `Sendability.cpp:211` — both inert, but
+  *not* by the mechanism the commit stated); #3183's consumer list undercounted by one
+  measured case (`.Length` on an imported inline array was an `internal:` error reported
+  **alongside exit 0**, now 4); and #3164 **falsified a comment in `Sendability.cpp`**
+  that asserted `FieldSymbol::modifiers` is never populated for a positional field —
+  true when written, false the moment the carriage landed.
 
 **Also filed by that lane:** #3196 · #3200 · #3201 (the generic half of #3162, declined
 rather than shipped silently zeroed) · #3202.
