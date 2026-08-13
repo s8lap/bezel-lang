@@ -4145,6 +4145,18 @@ void Resolver::checkAbstractImplementations() {
                 std::unordered_map<std::string_view, const TypeRef*> implSubst;
                 auto csIt = classSubst.find(implClass);
                 if (csIt != classSubst.end()) implSubst = csIt->second;
+                // fix #3194: WHERE a §11.2 conformance diagnostic points. An
+                // IMPORTED witness has no location in THIS compilation —
+                // `Symbol::declLoc` defaults to 0:0 — and a diagnostic at 0:0
+                // names nothing the user can act on (the shape #3178 records
+                // for `checkImportedCallArity`). Point at the local
+                // conformance declaration instead: the class whose
+                // `: Base, IFace` clause is the only thing this module can
+                // change. A LOCAL witness keeps `impl->declLoc` exactly, so no
+                // existing diagnostic moves.
+                const bool implSymIsImported = ctx_.isImported(impl);
+                const SourceLocation implLoc =
+                    implSymIsImported ? t->declLoc : impl->declLoc;
                 auto describeModifier = [](std::string_view m) -> std::string {
                     return m.empty() ? std::string("no modifier")
                                       : ("`" + std::string(m) + "`");
@@ -4155,7 +4167,7 @@ void Resolver::checkAbstractImplementations() {
                     if (!ip || !cp) continue;
                     if (ip->modifier == cp->modifier) continue;
                     ctx_.diagnostics().report(
-                        Severity::Error, impl->declLoc,
+                        Severity::Error, implLoc,
                         std::string("method `") + std::string(name) +
                         "` does not match interface member `" +
                         std::string(name) + "`'s parameter modifier on "
@@ -4191,9 +4203,38 @@ void Resolver::checkAbstractImplementations() {
                 // established for `checkStaticInterfaceConformance`'s twin
                 // loop: from the AST when present, else from
                 // ctx_.importedReturnType/importedReturnOwned (ModuleLoader::
-                // setImportedReturnType). `impl` is always a LOCAL class
-                // member (obligation witnesses only ever come from `t`'s own
-                // module's BFS above), so `implDecl` needs no fallback.
+                // setImportedReturnType).
+                //
+                // fix #3194 (§11.2 / §2.8.2 clause 1 / §2.8.3 rule 4, v0.254;
+                // family M13 of umbrella #3152): the comment that used to end
+                // this paragraph — "`impl` is always a LOCAL class member
+                // (obligation witnesses only ever come from `t`'s own module's
+                // BFS above), so `implDecl` needs no fallback" — WAS FALSE, and
+                // the same false claim is repeated at the head of this loop and
+                // again below the parameter walk. The witness BFS 60 lines above
+                // walks `c->baseTypes`, which CROSSES MODULES, so `impl` is an
+                // IMPORTED MethodSymbol whenever a local class satisfies an
+                // obligation through a method it inherits from an imported base.
+                // The sibling comment in this same function (at the §11.8 static
+                // loop) states the opposite and correct thing.
+                //
+                // With `implDecl` null, all three signature axes silently did
+                // not run. MEASURED, `bezelc -c lib.bzl` then `--import lib.o`,
+                // each against a character-identical single-module twin that
+                // reports the §11.2 error and produces no executable:
+                //   return type  `Get(): int` vs iface `Get(): string`
+                //                -> compiles, then SIGSEGV (an int driven
+                //                   through `bz.string`)
+                //   param  type  `Take(x: int)` vs iface `Take(x: string)`
+                //                -> compiles, returns 225 (a truncated string
+                //                   pointer + 1)
+                //   `owned` ret   `Make(): owned T` vs iface `Make(): T`
+                //                -> compiles, LSan: "Direct leak of 16 byte(s)
+                //                   ... in bz$LibM13.BaseM13$Make"
+                // The audit frames the `owned` bind as unwinnable — dropping
+                // `owned` leaks, tightening it double-disposes. §11.2 gives the
+                // third answer and this restores it: REJECT the mismatch, which
+                // is what the single-module twin already does.
                 const bool imHasAstDecl = (imDecl != nullptr);
                 const ast::Type* imRetNode =
                     imDecl ? imDecl->returnType.get() : nullptr;
@@ -4209,11 +4250,46 @@ void Resolver::checkAbstractImplementations() {
                     if (r && r->kind != TypeRef::Kind::Unit) imRetRef = r;
                     imDeclaresReturn = (imRetRef != nullptr);
                 }
-                const bool implRetOwned = implDecl ? implDecl->returnOwned
-                                                    : false;
-                if (implDecl && imRetOwned != implRetOwned) {
+                // fix #3194: the IMPLEMENTATION side of the same both-sources
+                // derivation the interface side got in #2373 — AST when there
+                // is one, else the loader's `setImportedReturnType` record.
+                //
+                // ⚠ THE GATE IS `implRetKnown`, NOT "always". Widening the old
+                // `implDecl &&` to nothing would newly admit every OTHER
+                // decl-less witness — a local MethodSymbol carrying some non-
+                // `ast::MethodDecl` node, for which `importedReturnOwned`
+                // answers a DEFAULT `false` rather than a fact, and a default
+                // read as a fact is exactly how a fix of this family turns a
+                // false accept into a false reject. `ctx_.isImported(impl)`
+                // (every symbol `SemaContext::makeImportedSymbol` mints is in
+                // that set, including member symbols) is the discriminator
+                // that says a record EXISTS to read; everything else keeps
+                // today's skip, byte for byte.
+                const bool implHasAstDecl = (implDecl != nullptr);
+                const bool implIsImported =
+                    !implHasAstDecl && implSymIsImported;
+                const bool implRetKnown = implHasAstDecl || implIsImported;
+                const bool implRetOwned =
+                    implHasAstDecl ? implDecl->returnOwned
+                                   : (implIsImported
+                                          ? ctx_.importedReturnOwned(impl)
+                                          : false);
+                TypeRef* implRetRef = nullptr;
+                bool implDeclaresReturn = false;
+                if (implHasAstDecl) {
+                    implRetRef = resolvedOf(implDecl->returnType.get());
+                    implDeclaresReturn = (implDecl->returnType.get() != nullptr);
+                } else if (implIsImported) {
+                    TypeRef* r = ctx_.importedReturnType(impl);
+                    // A Unit return is "declares no return type", exactly as a
+                    // null `returnType` node is on the AST side — the same
+                    // normalisation the `im` branch above performs.
+                    if (r && r->kind != TypeRef::Kind::Unit) implRetRef = r;
+                    implDeclaresReturn = (implRetRef != nullptr);
+                }
+                if (implRetKnown && imRetOwned != implRetOwned) {
                     ctx_.diagnostics().report(
-                        Severity::Error, impl->declLoc,
+                        Severity::Error, implLoc,
                         std::string("method `") + std::string(name) +
                         "` does not match interface member `" +
                         std::string(name) + "`'s `owned` return modifier "
@@ -4240,7 +4316,7 @@ void Resolver::checkAbstractImplementations() {
                         implPure = op->isPure;
                 if (imPure && !implPure) {
                     ctx_.diagnostics().report(
-                        Severity::Error, impl->declLoc,
+                        Severity::Error, implLoc,
                         std::string("method `") + std::string(name) +
                         "` implements pure interface member `" +
                         std::string(name) +
@@ -4272,13 +4348,25 @@ void Resolver::checkAbstractImplementations() {
                     // silently skipped this whole parameter-type check (a
                     // false ACCEPT of any parameter-type mismatch) — the
                     // fallback mirrors #2294's established fix for
-                    // `checkStaticInterfaceConformance`'s twin loop. `cp` is
-                    // always a LOCAL class member here (impl candidates only
-                    // ever come from `t`'s own module's BFS above), so only
-                    // the interface side needs the fallback.
+                    // `checkStaticInterfaceConformance`'s twin loop.
+                    //
+                    // fix #3194: the sentence that used to end this paragraph
+                    // — "`cp` is always a LOCAL class member here (impl
+                    // candidates only ever come from `t`'s own module's BFS
+                    // above), so only the interface side needs the fallback"
+                    // — is FALSE for the same reason as its twin above: the
+                    // BFS walks `c->baseTypes` across modules. `cp->declType`
+                    // was therefore null for an inherited-from-imported
+                    // witness, `ct` was null, and this whole parameter-type
+                    // check `continue`d — a false ACCEPT measured as a silent
+                    // wrong value (an `int` formal fed a `string` argument
+                    // through the itable, returning 225). The fallback is the
+                    // SAME one the interface side has carried since #2373,
+                    // written the same way one line up.
                     TypeRef* it = ip->declType ? resolvedOf(ip->declType)
                                                 : ip->resolvedDeclType;
-                    TypeRef* ct = resolvedOf(cp->declType);
+                    TypeRef* ct = cp->declType ? resolvedOf(cp->declType)
+                                                : cp->resolvedDeclType;
                     if (!it || !ct) continue;
                     if (it->kind == TypeRef::Kind::Error ||
                         ct->kind == TypeRef::Kind::Error) continue;
@@ -4295,7 +4383,7 @@ void Resolver::checkAbstractImplementations() {
                     }
                     if (match) continue;
                     ctx_.diagnostics().report(
-                        Severity::Error, impl->declLoc,
+                        Severity::Error, implLoc,
                         std::string("method `") + std::string(name) +
                         "` does not match interface `" +
                         std::string(obl.iface->name) + "`'s member `" +
@@ -4320,10 +4408,18 @@ void Resolver::checkAbstractImplementations() {
                 // null for an imported member, so re-deriving from it (the
                 // pre-fix shape) silently skipped this entire return-type
                 // check for every cross-module obligation.
-                const ast::Type* implRetNode =
-                    implDecl ? implDecl->returnType.get() : nullptr;
-                if (imDeclaresReturn && implRetNode) {
-                    TypeRef* crt = resolvedOf(implRetNode);
+                //
+                // fix #3194: and the same is now true of the IMPLEMENTATION
+                // side. `implRetRef`/`implDeclaresReturn` are derived above
+                // from the AST when there is one and from
+                // ctx_.importedReturnType otherwise, so a witness inherited
+                // from an IMPORTED base is compared instead of skipped. This
+                // axis is the one whose false accept was memory-unsafe:
+                // `Get(): int` satisfying `Get(): string` put an int-returning
+                // function in the itable slot, and the caller drove the
+                // returned 7 through `bz.string` (measured SIGSEGV).
+                if (imDeclaresReturn && implDeclaresReturn) {
+                    TypeRef* crt = implRetRef;
                     if (imRetRef && crt &&
                         imRetRef->kind != TypeRef::Kind::Error &&
                         crt->kind != TypeRef::Kind::Error) {
@@ -4331,7 +4427,7 @@ void Resolver::checkAbstractImplementations() {
                         const TypeRef* crtSub = substTypeRef(crt, implSubst);
                         if (!typesMatch(irtSub, crtSub)) {
                             ctx_.diagnostics().report(
-                                Severity::Error, impl->declLoc,
+                                Severity::Error, implLoc,
                                 std::string("method `") + std::string(name) +
                                 "` does not match interface `" +
                                 std::string(obl.iface->name) + "`'s return "
