@@ -816,6 +816,20 @@ bool isAutoPropertyStorageSymbol(const Symbol* m, const SemaContext& ctx) {
     return ctx.importedPropertyIsAutoStorage(ps);
 }
 
+// §22.15 (v0.254, fix #3174): see the contract in sema/Symbol.hpp. Symbol-side
+// first, AST second, modifier third — the order is immaterial (nothing sets two
+// of them to different answers) but the SET matters: each of the three is the
+// only populated source on some path.
+bool constructorIsPure(const ConstructorSymbol* cs) {
+    if (!cs) return false;
+    if (cs->isPure) return true;
+    if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
+        if (cd->isPure) return true;
+    for (std::string_view mod : cs->modifiers)
+        if (mod == "pure") return true;
+    return false;
+}
+
 // §9.3 (v0.158, #1383): forward declaration for mutual recursion with
 // isAdmissibleComponentType — a positional field's type calls
 // isAdmissibleComponentType recursively, which in turn calls this function

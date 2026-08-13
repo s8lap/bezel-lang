@@ -1027,6 +1027,37 @@ bool isAutoPropertyStorageSymbol(const Symbol* m, const SemaContext& ctx);
 // declaration is the authority that computes the wire bit.
 bool hasAstAutoPropertyDecl(const Symbol* m);
 
+// §22.15 (v0.254, fix #3174 — family M8 of umbrella #3149/#3152): is this
+// constructor `pure`? THE predicate; every §22.15 site that needs a
+// constructor's purity asks here.
+//
+// It consults both sources, symbol-side first: `MemberSymbol::isPure`, which
+// `ModuleLoader::applyBehavior` fills from `MetaMember::isPure` (the exporter
+// writes it from `ast::ConstructorDecl::isPure`, ModuleMetadataBuilder.cpp);
+// then the `ast::ConstructorDecl` when there is one; then the `pure` modifier.
+// The three sources are not redundant — each is the ONLY one populated on some
+// path:
+//
+//   * `isPure` is an IMPORTED-ONLY channel — `SymbolCollection` never sets it
+//     (it does not even copy `cd->modifiers` onto a `ConstructorSymbol`), so it
+//     is `false` for every LOCAL constructor;
+//   * `decl` is null for every constructor of a non-generic IMPORTED CLASS —
+//     `ModuleLoader` re-parses ctor body text only for a generic type or a
+//     record (ModuleLoader.cpp, the `parseAndAttachCtorBody` caller);
+//   * the modifier scan is what `callTargetIsPure` and `throwCarveOutAdmits`
+//     already did and is kept exactly, so no admitted program changes verdict.
+//
+// WHAT THE DEFECT WAS. `PureBodyWalker::checkPureCtorChainPurity` resolved the
+// `base(…)`/`this(…)` chain target to an `ast::ConstructorDecl*` and skipped
+// every candidate whose cast came back null. For a non-generic imported base
+// class that is EVERY candidate, so the loop found nothing and the function's
+// "no matching ctor — admit silently" early-out ran: a local `pure constructor`
+// chaining to an imported IMPURE base constructor compiled clean, while the
+// exporter's own compilation of the character-identical shape rejected it
+// (measured on `ec6a02f`). §22.15: "A pure constructor's `base(…)`/`this(…)`
+// chain target must itself be pure."
+bool constructorIsPure(const ConstructorSymbol* cs);
+
 // §9.3 (v0.158, #1383): true when a positional or combined-form record
 // synthesizes equality — i.e. every positional field's type (and every body
 // auto-property's type for the combined form) is an admissible component type

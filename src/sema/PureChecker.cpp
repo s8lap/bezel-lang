@@ -191,14 +191,11 @@ bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
             if (mod == "pure") return true;
         return false;
     }
-    if (auto* cs = dynamic_cast<ConstructorSymbol*>(calleeSym)) {
-        if (cs->isPure) return true;
-        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
-            if (cd->isPure) return true;
-        for (auto mod : cs->modifiers)
-            if (mod == "pure") return true;
-        return false;
-    }
+    // fix #3174 (§22.15, v0.254): through the one predicate. This site was
+    // already both-sources; it is routed here so the chain-purity site below
+    // cannot drift away from it again.
+    if (auto* cs = dynamic_cast<ConstructorSymbol*>(calleeSym))
+        return constructorIsPure(cs);
     // Property/indexer accessor calls — pure-classification (auto-getter)
     // lands later. For Slice 2, treat as not-yet-pure (admit, since
     // classifying them as impure would reject bodies the spec admits and
@@ -265,6 +262,32 @@ bool PureBodyWalker::recordSynthesizedCallIsPure(
 // set is ambiguous (handled by the overload-resolution pass, not here).
 // The pure-classification rule keys on existence + purity, not on
 // overload tie-breaking.
+//
+// ⚠ THE `if (!cd) continue;` BELOW IS NOT #3174's DEFECT — MEASURED, and #3174
+// predicted otherwise. The issue's "Related, same function, opposite direction"
+// section claimed this skip produces a false REJECT for an imported body record
+// with a `pure` ctor and a false ACCEPT for an imported positional record with
+// a shadowing impure ctor. Both were probed on `ec6a02f` against
+// character-identical single-module twins and both AGREED across the boundary:
+//
+//   imported body record, `pure` ctor, in a pure body   -> accepted (twin: accepted)
+//   imported body record, impure ctor, in a pure body   -> REJECTED (twin: REJECTED)
+//   imported positional record + shadowing impure ctor  -> REJECTED (twin: REJECTED)
+//
+// The reason is that `ModuleLoader`'s ctor-body re-parse gate is
+// `kind == Record || (kind == Class && !genericParams.empty())` — so EVERY
+// imported record's `ConstructorSymbol::decl` is attached (the exporter carries
+// `ctorBodyText` for records unconditionally, ModuleMetadataBuilder.cpp, #2525),
+// and this walk sees exactly what it sees for a local record. Only a non-generic
+// imported CLASS is decl-less, and no class reaches here (`rec->kind` is
+// filtered to Record by the sole caller).
+//
+// It is therefore left as a decl walk deliberately. Converting it would widen
+// `matching` to count decl-less candidates, which can turn a currently-resolved
+// single match into an ambiguity (`matching == 1` is the return condition) — a
+// silent widening with no defect behind it. If a future change ever leaves an
+// imported record ctor without a decl, convert this to `constructorIsPure` and
+// re-derive the ambiguity rule; do not do it speculatively.
 static const ast::ConstructorDecl* findUserCtorByArity(
     const TypeSymbol* rec, std::size_t arity) {
     const ast::ConstructorDecl* match = nullptr;
@@ -366,29 +389,58 @@ void PureBodyWalker::checkPureCtorChainPurity(
     }
     if (!targetClass) return;
     const std::size_t arity = call->args.size();
-    const ast::ConstructorDecl* targetCD = nullptr;
-    int matching = 0;
+    // fix #3174 (§22.15, v0.254 — family M8 of umbrella #3149/#3152): resolve
+    // the chain target to its SYMBOL, not to an `ast::ConstructorDecl*`.
+    //
+    // `ModuleLoader` attaches a re-parsed `ast::ConstructorDecl` only for a
+    // GENERIC type or a RECORD, so for a non-generic imported base class every
+    // candidate's `decl` is null; the old `if (!cd2) continue;` therefore
+    // dropped the entire candidate set and the "no matching ctor" early-out
+    // below admitted the program silently. MEASURED on `ec6a02f`: a local
+    // `pure constructor` chaining `base(n)` to an imported IMPURE base ctor
+    // compiled with exit 0, while the character-identical single-module twin
+    // was rejected with this function's own diagnostic.
+    //
+    // ⚠ THE WIDENING, EXACTLY. `declTarget` keeps the OLD selection verbatim —
+    // last matching candidate that carries an `ast::ConstructorDecl` — and is
+    // preferred whenever it exists, so every program in which the old code
+    // found a target keeps that target and that verdict. `symTarget` is the
+    // strictly larger set (it drops only the `decl != nullptr` filter), and it
+    // is consulted ONLY when the old selection found nothing. So the single new
+    // admission is: "a matching, non-static, non-self constructor SYMBOL with
+    // no attached declaration" — which is exactly the imported non-generic
+    // class, the case this fix exists for. In particular the old code's
+    // last-match-wins tie-break is untouched wherever it had a match to break.
+    const ast::ConstructorDecl* declTarget = nullptr;
+    const ConstructorSymbol* symTarget = nullptr;
     for (Symbol* m : targetClass->members) {
         auto* ct = dynamic_cast<ConstructorSymbol*>(m);
         if (!ct || ct->isStatic) continue;
         if (ct == &cs) continue;  // `this(...)` cannot recurse to itself
         if (ct->params.size() != arity) continue;
-        const auto* cd2 =
-            dynamic_cast<const ast::ConstructorDecl*>(ct->decl);
-        if (!cd2) continue;
-        ++matching;
-        targetCD = cd2;
+        symTarget = ct;
+        if (const auto* cd2 =
+                dynamic_cast<const ast::ConstructorDecl*>(ct->decl))
+            declTarget = cd2;
     }
-    if (!targetCD) {
+    if (!symTarget) {
         // No matching ctor — primary-ctor class chain (no
         // ConstructorSymbol: the parser synthesizes the chain's body),
         // or an arity mismatch already caught by sema. Admit silently:
         // the chain target's purity is provable by the primary-ctor
         // birth-store rule, and an arity mismatch is not a §22.15 defect.
+        //
+        // ⚠ This branch's own comment used to justify an outcome it did not
+        // describe: before #3174 it also ran for every imported base class,
+        // which is neither a primary-ctor chain nor an arity mismatch. It now
+        // means what it says.
         return;
     }
-    (void)matching;
-    if (targetCD->isPure) return;  // chain target is pure — OK
+    if (declTarget) {
+        if (declTarget->isPure) return;  // chain target is pure — OK
+    } else if (constructorIsPure(symTarget)) {
+        return;  // imported chain target is pure — OK
+    }
     reportPureViolation(
         call->span.begin, "constructor chain call",
         std::string(isThisChain ? "this(" : "base(") + "...) target is "
@@ -445,11 +497,9 @@ bool PureBodyWalker::throwCarveOutAdmits(const ast::NewExpr& ne) {
     for (Symbol* m : targetDecl->members) {
         auto* cs = dynamic_cast<ConstructorSymbol*>(m);
         if (!cs) continue;
-        if (cs->isPure) return true;
-        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
-            if (cd->isPure) return true;
-        for (auto mod : cs->modifiers)
-            if (mod == "pure") return true;
+        // fix #3174 (§22.15, v0.254): through the one predicate — same three
+        // sources in the same order this loop already spelled inline.
+        if (constructorIsPure(cs)) return true;
     }
     return false;
 }
