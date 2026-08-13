@@ -539,8 +539,11 @@ namespace {
 // `ast::MethodDecl`) — both carry the same `std::vector<ast::Param> params`, so
 // both are the local source.
 const std::vector<ast::Param>* methodDeclParams(const MethodSymbol& ms) {
+    // SEAM-ACCESSOR: the local source of the formalParam* accessors; the AST arm
+    // is the point of it.
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms.decl))
         return &md->params;
+    // SEAM-ACCESSOR: the operator half of the same question.
     if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms.decl))
         return &od->params;
     return nullptr;
@@ -596,8 +599,13 @@ bool methodReturnsOwned(const MethodSymbol& ms, const SemaContext& ctx) {
     // AST first (it carries the syntax), symbol/side-table second — the same
     // order as the formalParam* accessors above, so a member described by both
     // sources can never get two answers.
+    // SEAM-ACCESSOR: this IS the both-sources accessor for "does it return
+    // owned?" — the AST arm is required, not an offender. Exempted per-site
+    // rather than by whitelisting this file, because only some of
+    // SymbolCollection.cpp's member reads are accessor arms.
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms.decl))
         return md->returnOwned;
+    // SEAM-ACCESSOR: the operator half of the same question.
     if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms.decl))
         return od->returnOwned;
     return ctx.importedReturnOwned(&ms);

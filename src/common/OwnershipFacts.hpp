@@ -107,8 +107,24 @@ bool isNonTrivialDisposeClass(sema::TypeSymbol* decl);
 // Its null is load-bearing in two CONTRADICTORY directions, which is why
 // #3189 did not "fix" it: at `Ownership_Checks.cpp:9665`, `:10162`, `:10203`
 // and `:10357` a null means "there is no user method here, so run the BUILTIN
-// intrinsic rule" (`Select` / `Min` / `Max` / the stdlib string-mint set), and
-// widening it would silently reclassify a user method as an intrinsic. Sites
+// intrinsic rule" (`Select` / `Min` / `Max` / the stdlib string-mint set).
+//
+// ⚠ THE DIRECTION HERE WAS STATED BACKWARDS IN THE FIRST DRAFT, and the error
+// matters because this header is what the next lane reads when deciding whether
+// to fix #3192. It said "widening it would silently reclassify a user method as
+// an intrinsic". Measured, the opposite is true — the CURRENT narrow behaviour
+// is the reclassifier:
+//
+//     imported user  Q.Select(lambda(x: int) => new Res())
+//       -> REJECTED: "lazy `Select` selector ... launders"
+//     character-identical single-module twin        -> BUILDS
+//
+// An imported user method named `Select` is ALREADY being treated as the stdlib
+// intrinsic; that is #3192. So the decision not to unify this predicate stands
+// on its OTHER leg — the four gates read decl PRESENCE, and routing the
+// `owned`-return marker through a presence test is a category error — not on a
+// reclassification risk that runs the other way. As written it argued against
+// #3192's fix on a false premise. Sites
 // that want the `owned`-return FACT must call `calleeReturnsOwned` below,
 // which consults both sources; sites that genuinely need the AST node (a body
 // scan, a generic-parameter list, a modifier list) keep calling this one.

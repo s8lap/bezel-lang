@@ -11284,14 +11284,35 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // pass instead (the first draft) gated on
                     // `producerState == Owned`, which correctly excludes borrows
                     // but is FAR WIDER than this section's `ownedProduced`: it
-                    // also admits unannotated static factories (#1499), IMPORTED
-                    // `owned` returns (#1415 — `ms->decl` is null so the
-                    // `MethodDecl` cast above yields null), extern/FFI (#1718),
+                    // also admits unannotated static factories (#1499),
+                    // extern/FFI (#1718),
                     // function-value calls (#1290), `Deserialize`/`TakeCurrent`
                     // (#1388), Pattern B `await`, operator results (#965), `??`
                     // (#1029), arm-meet (#1661) and `move x` — each reachable
                     // because ExpressionStmt is the parser's general fallback for
-                    // any expression + `;`. Since §21.9's hard error does NOT
+                    // any expression + `;`.
+                    //
+                    // ⚠ #2655's list USED to name "IMPORTED `owned` returns
+                    // (#1415 — `ms->decl` is null so the `MethodDecl` cast above
+                    // yields null)" as one of the excluded cases. #3189 (family
+                    // M2) deliberately made `ownedProduced` admit exactly that
+                    // case, so the clause is removed rather than left standing
+                    // false. It is the SIXTH widening of that change and was not
+                    // in its enumerated five — recorded here because Rule 2 of
+                    // the programme is that every widening is named.
+                    //
+                    // Weighed honestly: this is NOT a new class of violation and
+                    // NOT a double free. The sibling `NewExpr` arm already
+                    // admitted the case on the base (measured: `new Base();` on
+                    // an imported class with a destructor ran the destructor
+                    // before AND after), so the two arms of one rule now agree,
+                    // and the marginal delta for `Fac.Make();` is leak ->
+                    // correct-dispose. But §21.9's hard error still cannot fire
+                    // on it, for a reason independent of M2: an imported class's
+                    // destructor never crosses the wire, so every imported class
+                    // is classified trivial-dispose (#3191). Until that lands,
+                    // the guarantee this paragraph describes rests on #3191, not
+                    // on the cast that used to be here. Since §21.9's hard error does NOT
                     // fire on those, a non-trivial-dispose class could reach the
                     // free and `dynamicDispose` would run its USER DESTRUCTOR at
                     // end of statement — contradicting the §28.9 sentence the fix

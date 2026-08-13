@@ -73,7 +73,8 @@ CAST = re.compile(r'dynamic_cast\s*<\s*const\s+ast::TypeDecl\s*\*\s*>\s*\(', re.
 # TypeDecl half went 152 -> 51 under a ratchet; this half had none.
 MEMBER_CAST = re.compile(
     r'dynamic_cast\s*<\s*const\s+ast::'
-    r'(?:MethodDecl|PropertyDecl|FieldDecl|ConstructorDecl|EventDecl|ConstDecl)'
+    r'(?:MethodDecl|PropertyDecl|FieldDecl|ConstructorDecl|EventDecl|ConstDecl'
+    r'|OperatorDecl)'
     r'\s*\*\s*>\s*\(', re.S)
 # The argument shape that makes it a SYMBOL-side classification read. `.decl` is
 # the member on sema::Symbol; anything else (`&d`, `td.get()`, an ast::Node*) is
@@ -109,6 +110,51 @@ SANCTIONED = {
     'src/sema/GenericParams.hpp':
         'generic parameter names / arity / variance (F6, #3143)',
 }
+
+
+# ---------------------------------------------------------------------------
+# PER-SITE EXEMPTION. `SANCTIONED` is FILE-granular, which cannot express the
+# common case: a both-sources accessor lives in a large file alongside reads that
+# are still offenders. `SymbolCollection.cpp` is the example — 7 class-3 reads, of
+# which only some are accessor arms.
+#
+# A both-sources accessor MUST read the AST; consulting both sources is the whole
+# point of it. So the exemption is written AT THE SITE, carries a reason, and is
+# reviewable in the diff that introduces it:
+#
+#     // SEAM-ACCESSOR: <why this read is the sanctioned one>
+#     if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) ...
+#
+# The marker applies to its own line and the next non-blank one. A marker with no
+# reason after the colon does NOT exempt — an unexplained exemption is the escape
+# hatch this tool exists to avoid, and the F6 lane's `--update --force` showed how
+# fast a hatch becomes the standard move.
+MARKER = re.compile(r'//\s*SEAM-ACCESSOR:\s*\S')
+
+
+def exempt_lines(raw):
+    """1-indexed line numbers exempted by a SEAM-ACCESSOR marker.
+
+    The marker exempts its own line and the next line that is neither blank nor a
+    continuation of the comment. Skipping continuation lines matters: a marker
+    whose reason wraps is the NORMAL case — the first draft of this function
+    stopped at the comment's second line and exempted nothing, which is a check
+    that silently fails open. Bounded to a few lines so a marker cannot drift
+    away from the read it describes and quietly cover a different one.
+    """
+    out, lines = set(), raw.split('\n')
+    for i, ln in enumerate(lines):
+        if not MARKER.search(ln):
+            continue
+        out.add(i + 1)
+        for j in range(i + 1, min(i + 8, len(lines))):
+            s = lines[j].strip()
+            if not s or s.startswith('//'):
+                out.add(j + 1)   # blank or continuation — keep looking
+                continue
+            out.add(j + 1)
+            break
+    return out
 
 
 def strip_comments(text):
@@ -159,10 +205,13 @@ def _balanced_arg(text, start):
 def scan_text(raw, path):
     """-> (class1_sites, class2_sites, class3_sites); site = (path, line, arg)."""
     text = strip_comments(raw)
+    exempt = exempt_lines(raw)
     c1, c2, c3 = [], [], []
     for m in CAST.finditer(text):
         arg = ' '.join(_balanced_arg(text, m.end()).split())
         line = text.count('\n', 0, m.start()) + 1
+        if line in exempt:
+            continue
         if SYMBOL_DECL.search(arg):
             c1.append((path, line, arg))
         elif TYPE_SYMBOL.search(arg):
@@ -170,6 +219,8 @@ def scan_text(raw, path):
     for m in MEMBER_CAST.finditer(text):
         arg = ' '.join(_balanced_arg(text, m.end()).split())
         line = text.count('\n', 0, m.start()) + 1
+        if line in exempt:
+            continue
         if SYMBOL_DECL.search(arg):
             c3.append((path, line, arg))
     return c1, c2, c3
@@ -384,6 +435,32 @@ FIXTURES = [
      'if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {\n', 0, 0, 1),
     ('negative_member_plain_node.cpp',
      'auto* fd = dynamic_cast<const ast::FieldDecl*>(&d);\n', 0, 0, 0),
+    # A marker WITH a reason exempts its own line and the next non-blank one.
+    ('exempt_marker_above.cpp',
+     '// SEAM-ACCESSOR: the both-sources arm; it must read the decl\n'
+     'if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {\n', 0, 0, 0),
+    # A marker whose REASON WRAPS must still reach the read below it — the
+    # first draft stopped at the comment's second line and exempted nothing.
+    ('exempt_marker_multiline_reason.cpp',
+     '// SEAM-ACCESSOR: this is the both-sources accessor and the AST arm\n'
+     '// is required, not an offender.\n'
+     'if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {\n', 0, 0, 0),
+    ('exempt_marker_same_line.cpp',
+     'auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);'
+     '  // SEAM-ACCESSOR: ditto\n', 0, 0, 0),
+    # A marker with NO reason must NOT exempt — an unexplained exemption is the
+    # escape hatch this tool exists to avoid.
+    ('exempt_marker_no_reason.cpp',
+     '// SEAM-ACCESSOR:\n'
+     'auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);\n', 0, 0, 1),
+    # ...and it must not leak past the next statement.
+    ('exempt_marker_does_not_leak.cpp',
+     '// SEAM-ACCESSOR: only the next one\n'
+     'auto* a = dynamic_cast<const ast::MethodDecl*>(ms->decl);\n'
+     'auto* b = dynamic_cast<const ast::MethodDecl*>(ms2->decl);\n', 0, 0, 1),
+    # class 3 now covers the operator half (review nit N3).
+    ('positive_operator_decl.cpp',
+     'auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl);\n', 0, 0, 1),
 ]
 
 
