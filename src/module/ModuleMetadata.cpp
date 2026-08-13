@@ -200,7 +200,14 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // is part of its cross-module contract — renaming it changes the bytes
     // every consumer reads and writes — so it must fold into the semantic hash
     // or a consumer's staleness check cannot see the change.
-    hashStr(h, m.enumWireName);
+    //
+    // GUARDED to match the EMISSION condition at :648. Unconditionally, `hashStr`
+    // hashes the length first, so an empty wire name still perturbed the hash of
+    // every member of every type — measured by review: the `.o` of a module with
+    // no enum at all changed by 46 bytes. Emission and hashing must agree, or the
+    // header hash stops being a function of what was actually written.
+    if (m.kind == MetaMemberKind::EnumConstant && !m.enumWireName.empty())
+        hashStr(h, m.enumWireName);
     hashStr(h, m.valueText);  // §22.12 const value (issue #328 FINDING [3] BUG A)
     // §14 / #662c (schema v5): ctor body source text for generic classes.
     hashStr(h, m.ctorBodyText);

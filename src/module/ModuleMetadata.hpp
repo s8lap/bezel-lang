@@ -679,8 +679,15 @@ struct MetaMember {
     // an enum constant's `serialized "<name>"` RENAME — the string §9.8 writes
     // on the wire for this constant, when it differs from the declared name.
     // Empty when the constant carries no `serialized` clause (the overwhelming
-    // majority), so the emitted bytes are unchanged for every module that does
-    // not use the clause.
+    // majority). ⚠ The EMITTED RECORD is conditional (ModuleMetadata.cpp:648
+    // writes it only for a non-empty EnumConstant), but the SEMANTIC HASH fold
+    // below is not — see `hashMember`, which now guards it to match. An earlier
+    // revision of this comment claimed "the emitted bytes are unchanged for
+    // every module that does not use the clause"; that was measured FALSE by
+    // review — an unconditional `hashStr` hashes the length first, so an empty
+    // string still perturbed the header hash, and the `.o` of a module with no
+    // enum at all differed by 46 bytes from byte 17 onward (the VBR-encoded
+    // hashLo/hashHi shifting everything after it).
     //
     // The constant's VALUE has crossed since #328; only the wire NAME had no
     // channel, and `emitEnumSerialize` / `emitEnumDeserialize` read it off the
