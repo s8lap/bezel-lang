@@ -2,7 +2,7 @@
 // imported-symbol classification seam (umbrella #3152).
 //
 // spec §18.5 (format specs) / §14.2 (generic constraints) / §2.5 (imported
-// declarations) / §2.8.2–§2.8.3 (module artifacts), v0.252. Audit:
+// declarations) / §2.8.2–§2.8.3 (module artifacts), v0.254. Audit:
 // docs/proposals/imported-symbol-audit-2026-08-13.md, family F1.
 //
 // ── THE DEFECT ─────────────────────────────────────────────────────────────
@@ -88,9 +88,19 @@ void writeSource3139(const std::string& path, const std::string& src) {
 
 // The three failure modes are DISTINCT sentinels, because this family's defect
 // IS a false compile reject and the reject arms assert on it directly. Folding
-// "did not compile" together with "did not exit normally" would let a link
-// failure or a SIGSEGV keep a reject arm green — the arm would be asserting
+// "did not compile" together with "did not exit normally" would let a SIGSEGV or
+// a dependency failure keep a reject arm green — the arm would be asserting
 // "something went wrong" rather than "sema rejected it".
+//
+// ⚠ ONE GAP REMAINS, and it is not closable here. An importer LINK failure still
+// maps to kCompileRejected: `Driver::compileFile` returns
+// `CompileResult{false, cc.errorCount + 1}` for a link error exactly as it does
+// for a sema reject (src/driver/Driver.cpp), so the two are indistinguishable to
+// a caller. Constructed and measured:
+// `env PATH=/nonexistent bezelc -o out --import lib.o app.bzl` on a sema-clean
+// program prints "bezelc: link error" and exits 1. Closing it needs a
+// Driver-level discriminator, not a test-side one. The lit track pins the
+// diagnostic TEXT for these arms, which is the real protection.
 //
 // (The reject arms additionally pin the DIAGNOSTIC TEXT, which an exit code
 // cannot carry at all, in the lit/FileCheck track:

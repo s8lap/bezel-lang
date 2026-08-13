@@ -400,7 +400,7 @@ const std::vector<TypeRef*>& nonSymbolBaseRefsOf(const TypeSymbol* t);
 // ⚠ IT IS INVISIBLE TO THE RATCHET, deliberately and inconveniently. It reads
 // `t->decl` WITHOUT a `dynamic_cast<const ast::TypeDecl*>`, so
 // scripts/check_imported_symbol_reads.py does not count it — which means
-// #3139's headline "122 → 111 class-1 reads" slightly OVERSTATES how much of
+// #3139's headline reduction (measured -11 class-1 reads) OVERSTATES how much of
 // the seam is closed: four of the sites it converted still cannot answer for an
 // imported type, they merely now say so in one place instead of eleven. The
 // count is honest about the CASTS removed and optimistic about the SEAM. Do

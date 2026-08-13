@@ -702,6 +702,20 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     // emitted after the invariants. A reader predating it stops at sc[6] and
     // its finishBlock skips the trailing subblocks.
     //
+    // ⚠⚠ READ THIS BEFORE ADDING A 9th SCALAR. This is the first CONDITIONAL
+    // *POSITIONAL* entry in REC_SCALARS, and that makes it different in kind
+    // from #2950's REC_EXC_BASE, which is cited as its template: REC_EXC_BASE is
+    // a separately-CODED record, so its presence is self-describing and its
+    // absence costs nothing. Here, position 7 means "nBuiltinIfaces" ONLY when
+    // the 8th entry was emitted at all. So a future 9th scalar MUST be either
+    //   (a) conditional on the 8th being present, or
+    //   (b) a distinct record code rather than a positional scalar (preferred).
+    // An unconditional 9th entry would land at index 7 for a type with no
+    // built-in interface, and `readTypeDeclBody` would silently read that
+    // foreign value as `nBuiltinIfaces` and then try to read that many
+    // METATYPE_BLOCKs. That is a silent misparse of an artifact, not a build
+    // failure — the worst failure mode this format has.
+    //
     // CONDITIONAL, and it has to be — this is what makes a module whose types
     // declare no built-in interface produce byte-identical metadata, the
     // property #2950's REC_EXC_BASE has and the property the field comment in
@@ -709,7 +723,13 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     // bookkeeping: it widens REC_SCALARS for EVERY type in every module, and
     // (with the matching fold in hashTypeDecl) moves the VBR-encoded hash in
     // the header, which shifts every byte after it. MEASURED before this guard:
-    // a module with no built-in-interface base anywhere went 468 -> 476 bytes.
+    // a module with no built-in-interface base anywhere had its metadata
+    // perturbed. ⚠ The BYTE DELTA is probe-specific — three separate probes gave
+    // 468->476, 720->716 and 672->672 — so do not quote one as if it were the
+    // property. The REPRODUCIBLE property is: with the guards, a module declaring
+    // no built-in interface is BYTE-IDENTICAL to a pre-#3139 build; without them,
+    // the emitted length can match while the CONTENT HASH still differs (verified
+    // by a one-variable A/B that removed only these two guards).
     // `readTypeDeclBody` already tolerates a 7-entry record (`sc.size() >= 8`),
     // so nothing on the read side changes.
     if (!ty.builtinInterfaceBases.empty())
@@ -1340,6 +1360,11 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     std::uint64_t nInvariants = sc.size() >= 7 ? sc[6] : 0;
     // #3139 (additive within v7): 8th scalar = the built-in-interface base
     // count. A blob written before this field has 7 scalars → zero.
+    // #3139. ⚠ `sc[7]` means "nBuiltinIfaces" only because the 8th scalar is the
+    // LAST positional entry and is emitted conditionally (see emitType). If a 9th
+    // unconditional scalar is ever added, THIS LINE reads it as a count and then
+    // tries to read that many METATYPE_BLOCKs — a silent misparse. Any new scalar
+    // must be conditional on the 8th, or carry its own record code.
     std::uint64_t nBuiltinIfaces = sc.size() >= 8 ? sc[7] : 0;
     if (!expectString(r, ty.name)) return false;
     if (!readStringList(r, ty.modifiers)) return false;

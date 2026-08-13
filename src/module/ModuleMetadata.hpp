@@ -815,7 +815,11 @@ struct MetaTypeDecl {
     // field emitted the scalar and folded a zero count unconditionally.
     // MEASURED as a one-variable A/B on the same tree — only these two guards
     // added — over a three-type module declaring no built-in interface
-    // anywhere: `.bezel.meta` 720 -> 716 bytes, and a different content hash.
+    // anywhere is BYTE-IDENTICAL to a pre-#3139 build (verified against 310571d,
+    // c97a49f and c22e34d alike). The byte DELTA quoted by earlier revisions was
+    // probe-specific and is deliberately not repeated here — see the note in
+    // ModuleMetadata.cpp's hashTypeDecl for why a number that does not reproduce
+    // is worse than no number.
     // The scalar widens REC_SCALARS for EVERY type in every module, and the
     // fold moves the VBR-encoded hash in the header, which shifts every byte
     // after it. A hash that moves when nothing was written is not a function
