@@ -119,7 +119,9 @@ plenty of parallelism — the machine is many-core and each TU peaks well under
 the build cage's memory budget: pass `-j16` (or use `cmake --build --preset
 default`, which sets jobs); the bundled scripts default to `-j16`. A clean build
 is ~2 min and a one-file edit→relink is ~1–2s. ⚠ Those two figures were
-measured at ~770 TUs; the tree is now **1,676** (`build/compile_commands.json`),
+measured at ~770 TUs; the tree is now **~1,760** (`python3 -c "import json;
+print(len(json.load(open('build/compile_commands.json'))))"` — 1,756 on
+2026-08-13, and this number drifts every run, so re-measure rather than trust it),
 so treat them as lower bounds. **Do not re-measure by hand** — every gate has
 appended one JSON record per run to `/var/tmp/bezel-scratch/gate-timings/`
 since 2026-07-14, with per-phase timings. Read it with `scripts/gate_trend.sh`
@@ -172,7 +174,14 @@ suite at once. ⚠ **The in-process JIT harness is DEPRECATED, not retired.** An
 earlier revision of this file said "has been retired" while stating 45 lines
 above that "the in-process JIT is unaffected" — both cannot be true, and the
 code settles it: **60 `runJit(` + 3 `runJitChecked(` live call sites remain**
-(measured 2026-08-08; `grep -rn 'runJit(' tests/`). It is a *lenient* oracle —
+(measured 2026-08-08, re-verified 2026-08-13;
+`grep -rn 'runJit(' tests/ --include=*.cpp | grep -v '^tests/support/' | wc -l`
+— the `--include`/`grep -v` matter: the bare `grep -rn 'runJit(' tests/` an earlier
+revision gave here returns **62**, because it also counts the harness's own
+definitions under `tests/support/`. A recipe that does not reproduce the number
+beside it reads as a violated ratchet; it cost one false alarm already, so if you
+find these disagreeing, suspect the recipe before raising the count.)
+It is a *lenient* oracle —
 it skips the ownership/definite-assignment passes and `verifyModule`, so a test
 still on it proves less than its name suggests. **Write new tests on `runAot`
 only**, and port a JIT test whenever you touch one. The count above is the
@@ -246,9 +255,45 @@ worktree.** `scripts/lane_setup.sh` symlinks a lane's `build/` out to
 `/mnt/fast/lane-builds/<name>` (the NVMe), so `git worktree remove` deletes only
 the symlink and **orphans the tree**. That is not theoretical: 68 GB accumulated
 across 54 orphans in four days and had to be cleared by hand (#3005), while this
-file asserted the invariant that says it cannot happen. `gc_scratch.sh` does not
-yet reap them — check `/mnt/fast/lane-builds` when disk is tight, and re-run
-`lane_setup.sh` in a worktree whose `build/` symlink dangles (it now self-repairs).
+file asserted the invariant that says it cannot happen. `gc_scratch.sh` **now
+does** reap them (an earlier revision of this line said it did not — verified
+2026-08-13, it reaped three 3.6 GB trees), but it only reaps trees with no
+matching worktree, so a wave of N live lanes still holds N trees at ~3.6 GB
+each. Watch `df -h /mnt/fast` during a fan-out: five concurrent lanes took it to
+**91%**, and a lane that runs out of disk mid-build fails in ways that look like
+a compiler error. Re-run `lane_setup.sh` in a worktree whose `build/` symlink
+dangles (it now self-repairs).
+
+**Waiting for a gate (this is where coordinator time actually goes).** Two rules,
+both learned expensively:
+
+1. **Never wait on a process pattern.** `until ! pgrep -f '<pat>'` self-matches,
+   because the waiter's own command line contains the pattern. Bracketing
+   (`[p]at`) is NOT a general fix — it only defeats the self-match when the
+   pattern appears solely as grep's argument. Two such loops cost ~3.2 h in the
+   2026-08-12 run, one of them spinning for hours over a gate that had passed.
+2. **Run the gate DETACHED, and wait on identity.** A gate cycle is ~50 min; a
+   harness-tracked background job can be killed at its own timeout, which
+   silently leaves the orphaned shards running and writing to the log — it looks
+   exactly like a gate still in progress. Launch with
+   `setsid nohup scripts/gate_and_push.sh > LOG 2>&1 < /dev/null &`, then wait
+   with `scripts/wait_pid.sh "$BEZEL_GATE_PIDFILE"` (identity, via `kill -0` —
+   it cannot match itself).
+
+`gate_and_push.sh` publishes `$BEZEL_GATE_PIDFILE` (removed at exit) and
+`$BEZEL_GATE_DONEFILE` (the exit status). ⚠ Prefer the PIDFILE: the donefile is
+written from an EXIT trap, so an uncatchable kill produces no marker at all, and
+a donefile-only waiter then hangs forever over a finished gate. That is not
+hypothetical — the marker was **dead on arrival** from the day it was added
+until #3158, because a second `trap … EXIT` later in the same script silently
+replaced the handler (bash keeps exactly one). `scripts/gate/tests/test_gate_and_push_trap.py`
+now fails the build if a second one reappears.
+
+**The tree is FROZEN while a gate runs.** Not just `src/` — a mid-cycle rebuild
+makes a mixed-HEAD gate — but `scripts/` too: bash reads a script lazily by byte
+offset, so editing one mid-run desynchronises the running shell, and restoring
+the original bytes afterwards does NOT save the run. Park edits in
+`/var/tmp/bezel-scratch/<run>/parked/` and re-apply after the gate reports.
 
 **Gating a batch: BOTH oracles, always.** Land with `scripts/gate_and_push.sh`
 — it runs `scripts/gate_full_cycle.sh` (plain, then `--full`), requires each to
