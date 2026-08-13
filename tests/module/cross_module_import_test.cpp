@@ -2574,14 +2574,40 @@ BEZEL_TEST(cross_module_import,
 
 // (20) §28.4 / §28.5 / §14 (#662 foundation C): imported GENERIC class with
 // `owned T` field — Foundation C: ctor body exported + re-parsed → accepted.
-// sema-level check: `new Box<string>("hi")` now compiles without a §14 error.
+//
+// ── THIS TEST WAS REPAIRED (2026-08-13, family F12 of umbrella #3152) ───────
+//
+// It previously declared `constructor(v: T)` storing a BORROW into an `owned`
+// field, and instantiated at `Box<string>`. Both halves are invalid Bezel, and
+// the byte-identical LOCAL program is rejected by this same compiler:
+//
+//   dep source alone   -> "a borrow cannot be stored into an `owned` field …
+//                          a double-free (§28.3 / §28.5 / §28.8)"
+//   Box<string> local  -> "`Box` may not be instantiated with `string` … only
+//                          class or interface types may be `owned` (§28.5/§28.9)"
+//
+// So the test asserted that the IMPORTER accepts what the DEFINING compilation
+// rejects — precisely the divergence §2.8.2 clause 1 forbids, encoded as the
+// expected result. It passed only because the AST-gated `owned` bare-type-param
+// check could not see an imported symbol; #3147 (family F12) closed that, and
+// this test was the one thing that noticed.
+//
+// The FIXTURE was wrong, not the intent. Foundation C is about a generic ctor
+// BODY surviving export and re-parse, so the fixture now uses a shape that is
+// legal on both sides — `owned v: T` consumed into the field, instantiated at a
+// CLASS type — and still exercises exactly that mechanism. Verified: the
+// repaired dep compiles standalone, and the repaired local twin compiles clean.
 BEZEL_TEST(cross_module_import,
            imported_generic_class_owned_tparam_field_accepted_spec_14_662c) {
     ModuleMetadata dep = buildMetaFor(
         "module BoxLib; "
+        "public class Payload "
+        "  public v: int := 0; "
+        "  destructor end destructor; "
+        "end Payload; "
         "public class Box<T> "
         "  private owned _slot: T; "
-        "  public constructor(v: T) "
+        "  public constructor(owned v: T) "
         "    _slot := v; "
         "  end constructor; "
         "  destructor end destructor; "
@@ -2592,7 +2618,7 @@ BEZEL_TEST(cross_module_import,
         "import BoxLib; "
         "public class Program "
         "  public static method Main(): int "
-        "    using var b := new Box<string>(\"hi\"); "  // Foundation C: accepted
+        "    using var b := new Box<Payload>(new Payload()); "
         "    return 1; "
         "  end Main; "
         "end Program;");
