@@ -102,6 +102,28 @@ trap _bezel_gate_signal_done EXIT
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate_and_push: not in a git repo" >&2; exit 2; }
 
+# ── THE TREE MUST BE CLEAN ─────────────────────────────────────────────────
+# A gate VALIDATES THE WORKING TREE but PUSHES HEAD. When they differ, the
+# verdict does not describe what gets pushed — and the difference can be exactly
+# the thing under test. Measured the hard way on 2026-08-13: the ratchet baseline
+# was regenerated after a cherry-pick and left unstaged, so the seam phase read
+# 84 from the tree and passed while HEAD still claimed 95. That push would have
+# handed back 11 units of ratcheted headroom, and the EXACT-baseline rule would
+# only have caught it on the NEXT gate — after the bad state was public.
+#
+# CLAUDE.md already says the tree is frozen during a gate; this makes it
+# enforceable instead of remembered. Untracked files are fine (scratch, new test
+# sources not yet added); only TRACKED modifications block, because those are the
+# ones that make HEAD and the tested tree disagree.
+_dirty="$(git diff --name-only HEAD 2>/dev/null)"
+if [ -n "$_dirty" ]; then
+  echo "gate_and_push: REFUSING — tracked files differ from HEAD:" >&2
+  echo "$_dirty" | sed 's/^/    /' >&2
+  echo "  A gate validates the WORKING TREE but pushes HEAD. Commit or restore" >&2
+  echo "  these first, or the verdict does not describe what would be pushed." >&2
+  exit 65
+fi
+
 # Make scripts/ importable as the `gate` package so `python3 -m gate.serialize`
 # resolves from any cwd. Honor an operator's pre-set PYTHONPATH (e.g. a CI
 # harness that pins one) by appending rather than overwriting.
