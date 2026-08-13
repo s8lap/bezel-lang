@@ -16722,12 +16722,62 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // GetType are NOT affected — the §8.5/§9.1 default ToString remains for
         // every record, and GetType is universal.
         checkEqualityMemberUseSite(targetType, ma.member, ma.span.begin);
+        // §9.8 / issue #550 / fix #3140 (family F2 of umbrella #3152):
+        // `Serialize(s: ISerializer)` and the static `Deserialize(d:
+        // IDeserializer)` are SYNTHESIZED by codegen for a record, enum or
+        // choice that declares `ISerializable` / `IDeserializable`. No
+        // MemberSymbol exists, so sema must not reject the call, and the
+        // static `Deserialize` must be typed as returning the type itself or
+        // `var p2 := Pt.Deserialize(d)` infers nothing.
+        //
+        // ⚠ This lives in a lambda called from BOTH arms of the branch below,
+        // and that is the whole point. It used to be written once, inside the
+        // `decl != nullptr` (LOCAL record/enum/choice) arm — an IMPORTED
+        // record has a null `decl` and so took the BUILT-IN-CLASS arm, which
+        // knows nothing about §9.8. That was invisible while #3139's interlock
+        // rejected the call outright; with the interlock gone it surfaced as
+        // `var p2 := Pt.Deserialize(d)` on an imported record lowering to a
+        // degraded zero with only an "internal:" note (#2491) — measured, and
+        // exactly the silent-wrong-data shape this family exists to remove.
+        // The explicitly-typed spelling `var p2: Pt := …` was unaffected, which
+        // is what made it a typing hole rather than an emitter one.
+        auto typeSynthesizedSerializationMember = [&](std::string_view m) {
+            // Only the static `Deserialize` carries a result type.
+            // `Serialize(s)` returns unit, so its MemberAccessExpr is
+            // deliberately left untyped — codegen intercepts it via
+            // `tryLowerSerializationCall`, which re-checks the conformance
+            // itself through `sema::declaresBuiltinInterface`.
+            if (m != "Deserialize") return;
+            // No `IDeserializable` declared: type nothing, and the "no member"
+            // error fires normally below via `knownCompleteUserType`.
+            if (!declaresBuiltinInterface(targetType, "IDeserializable")) return;
+            // fix #3140 follow-up (§9.8): and no synthesis for a surface the
+            // emitters cannot WRITE — see `serializationSurfaceIsEmittable`.
+            // Distinct from #3139's deleted `t->decl != nullptr` interlock:
+            // this asks the real question of both sources.
+            if (!serializationSurfaceIsEmittable(targetType, ctx_)) return;
+            // §9.8: the synthesized static `Deserialize` returns the type
+            // itself (`Point.Deserialize(d): Point`). Set that on the
+            // MemberAccessExpr so typeCall's `!calleeSym` fallback propagates
+            // it to the CallExpr and `var p2 := …` infers.
+            auto* retTy = ctx_.makeTypeRef();
+            retTy->kind = TypeRef::Kind::Named;
+            retTy->declaration = targetType;
+            ctx_.setExprType(&ma, retTy);
+        };
         // §2.3: built-in class TypeSymbols (Console, Math, Convert, …)
         // have null `decl` and empty members. Assign return types for
         // their known methods so callers can infer the call result type.
         if (!targetType->decl) {
             std::string_view cls = targetType->name;
             const auto& m = ma.member;
+            // fix #3140 (family F2): an IMPORTED record/enum/choice reaches the
+            // built-in-class arm (null `decl`), so its §9.8 synthesized surface
+            // is typed here, through the same lambda the local arm uses.
+            if (targetType->kind == ast::TypeDeclKind::Record ||
+                targetType->kind == ast::TypeDeclKind::Enum ||
+                targetType->kind == ast::TypeDeclKind::Choice)
+                typeSynthesizedSerializationMember(m);
             // §2.2 Math / §2.3 Convert static methods.
             //
             // #1037: Convert and Math are DISTINCT classes with disjoint method
@@ -17034,53 +17084,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 typeTy->declaration = builtinClassSym("Type");
                 ctx_.setExprType(&ma, typeTy);
             } else if (m == "Serialize" || m == "Deserialize") {
-                // §9.8 / issue #550: Serialize(s: ISerializer) and Deserialize
-                // are synthesized by codegen for records/enums that declare
-                // ISerializable / IDeserializable conformance. No MemberSymbol
-                // exists; sema must not reject the call.
-                //
-                // fix #3139 (§9.8 / §2.5, family F1 of #3152): ask the symbol.
-                // This read `ast::TypeDecl::baseTypes` — correct that
-                // ISerializable/IDeserializable never reach
-                // `TypeSymbol::baseTypes`, wrong that the AST is the only other
-                // place they live — and an IMPORTED type has no AST, so `td`
-                // was null and BOTH flags stayed false. MEASURED: a dependency
-                // exporting `record Pt(X: int, Y: int): ISerializable,
-                // IDeserializable` produced "no member `Serialize` on type
-                // `Pt`" / "no member `Deserialize`" in the importer, while the
-                // same declaration compiled locally and round-tripped.
-                //
-                // The §9.8 EMITTERS still read the component list off the
-                // `ast::TypeDecl` (families F2/F3, #3140/#3141), so the
-                // conformance answer is gated on
-                // `serializationSurfaceIsEmittable` until those land — see its
-                // comment in Symbol.hpp for what removing the gate measured as.
-                bool emittable = serializationSurfaceIsEmittable(targetType);
-                bool declaresSer =
-                    emittable &&
-                    declaresBuiltinInterface(targetType, "ISerializable");
-                bool declaresDeser =
-                    emittable &&
-                    declaresBuiltinInterface(targetType, "IDeserializable");
-                if ((m == "Serialize" && declaresSer) ||
-                    (m == "Deserialize" && declaresDeser)) {
-                    // §9.8 / issue #550: Synthesis suppresses "no member".
-                    // For Deserialize the static synthesized method returns the
-                    // record/enum type itself (Point.Deserialize(d): Point).
-                    // Set that return type on the MemberAccessExpr so that
-                    // typeCall's !calleeSym fallback propagates it to the
-                    // CallExpr and `var p2 := T.Deserialize(d)` infers T for p2.
-                    if (m == "Deserialize" && declaresDeser && targetType) {
-                        auto* retTy = ctx_.makeTypeRef();
-                        retTy->kind = TypeRef::Kind::Named;
-                        retTy->declaration = targetType;
-                        ctx_.setExprType(&ma, retTy);
-                    }
-                    // Serialize returns unit (void); leave the MemberAccessExpr
-                    // untyped — codegen intercepts via tryLowerSerializationCall.
-                }
-                // If no conformance was declared the "no member" error will
-                // fire normally below via knownCompleteUserType.
+                // §9.8 / issue #550 / fix #3139 / fix #3140 — the LOCAL arm.
+                // The body is the shared lambda declared above; see it for why
+                // both arms must call one copy.
+                typeSynthesizedSerializationMember(m);
             }
         }
         // issue #414 (§8.1, §11.3, §12.1): diagnose a genuinely-unknown member.
@@ -17150,14 +17157,14 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // boundary and an imported serializable record's `.Serialize(s)` was
         // reported as "no member `Serialize`" (measured).
         //
-        // The CLASS half is deliberately still AST-gated: §9.8 tier 2+ requires
-        // a `serialized` class clause, and that clause has no symbol-side or
-        // metadata channel at all (audit §3). So an imported CLASS keeps
-        // today's conservative "not synthesized" answer rather than being
-        // admitted on conformance alone — which would let a class with no
-        // clause resolve a member codegen would not emit. #3140 (family F2)
-        // adds the clause's channel; when it lands, this `tdSer` read is the
-        // one line to replace.
+        // fix #3140 (family F2 of #3152): the CLASS half asks the symbol. §9.8
+        // tier 2+ requires a synthesized class surface, and that shape now
+        // lives on `TypeSymbol::serializedShape` (written by
+        // checkSerializationEligibility's pre-pass) instead of on the AST
+        // clause. An imported CLASS still answers "no surface" — see
+        // `sema::serializedClassShape` in Symbol.hpp for why that is measured
+        // rather than missing — so its `.Serialize` stays rejected exactly as
+        // before, and #3179 carries the construction work that would change it.
         bool isSerializationSynthesizedMember = false;
         if ((mm == "Serialize" || mm == "Deserialize") && knownCompleteUserType &&
                 (targetType->kind == ast::TypeDeclKind::Record ||
@@ -17167,12 +17174,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // For classes: only synthesized when a serialized-class clause
             // is present (§9.8 tier 2+). Without it the class must hand-write.
             bool classOk = true;
-            if (targetType->kind == ast::TypeDeclKind::Class) {
-                auto* tdSer =
-                    dynamic_cast<const ast::TypeDecl*>(targetType->decl);
-                classOk = tdSer && tdSer->serializedClass != nullptr;
-            }
-            if (classOk && serializationSurfaceIsEmittable(targetType)) {
+            if (targetType->kind == ast::TypeDeclKind::Class)
+                classOk = !serializedClassShape(targetType).empty();
+            // fix #3140 follow-up (§9.8): a surface whose components the
+            // emitters cannot write is not synthesized — the "no member"
+            // diagnostic below is the truthful answer, and it is what the
+            // author can act on. See `serializationSurfaceIsEmittable`.
+            if (classOk && !serializationSurfaceIsEmittable(targetType, ctx_))
+                classOk = false;
+            if (classOk) {
                 std::string_view need = mm == "Serialize" ? "ISerializable"
                                                           : "IDeserializable";
                 isSerializationSynthesizedMember =

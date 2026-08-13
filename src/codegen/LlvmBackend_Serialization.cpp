@@ -68,15 +68,45 @@ static bool hasHandWrittenMethod(const TypeSymbol* ts, std::string_view name) {
     return false;
 }
 
-// Return the wire name for a positional field (either the `serialized "x"` name
-// or the declared identifier).
+// The `serialized` clause on a §35.1 CHOICE-CASE PAYLOAD field.
+//
+// ⚠ fix #3140 (§9.8, family F2 of umbrella #3152): these two used to serve the
+// RECORD path as well, and there they answered "no clause" for every imported
+// component — `ast::Param::serialized` is the AST of a local record only. That
+// is not a benign default: dropping a `serialized skip` writes a component the
+// wire header's count excludes, desynchronising the reader (the defect #1612
+// fixed on the local side), and a `serialized "<name>"` rename written under the
+// declared name is reported by a name-keyed reader as a missing required field.
+// The record path now reads `sema::serializedComponentClause`, which rides
+// `MemberSymbol` on both sides.
+//
+// They survive for the CHOICE path alone: a choice case's payload fields are not
+// members and have no `Symbol` of their own — they are reached through
+// `ChoiceCaseSymbol::caseDecl`, an `ast::` pointer.
+//
+// ⚠ AN EARLIER REVISION OF THIS COMMENT SAID "nothing about an imported
+// choice's case list crosses the boundary at all". That was true when it was
+// written and is now FALSE: family F9 (#3144, `feec091`) landed the case list,
+// and `ModuleLoader` points `caseDecl` at a faithful RECONSTRUCTION of the
+// `ast::ChoiceCase` — including each payload `ast::Param` — so these two helpers
+// now read a real node on both sides rather than a null one on the imported
+// side. Corrected here rather than left standing, because "there is no second
+// source" was the justification for keeping them, and that justification is
+// gone even though the code is now MORE correct than the comment claimed.
+//
+// What has NOT been established is whether a payload `Param`'s `serialized`
+// rename survives that reconstruction — F9 carried the case list, and this
+// lane's tests exercise a payload-free imported choice only. Do NOT assume it
+// does; see the sibling check in `serializationSurfaceIsEmittable`.
+//
+// Do NOT reintroduce these on the RECORD path — there the clause rides
+// `MemberSymbol` and `sema::serializedComponentClause` is the one reader.
 static std::string_view positionalFieldWireName(const ast::Param& pf) {
     if (pf.serialized && !pf.serialized->name.empty())
         return pf.serialized->name;
     return pf.name;
 }
 
-// Returns true iff the positional field is marked `serialized skip`.
 static bool positionalFieldIsSkip(const ast::Param& pf) {
     return pf.serialized && pf.serialized->isSkip;
 }
@@ -130,9 +160,19 @@ static void collectClassComponents(
         sema::SemaContext& ctx,
         std::vector<ClassComponent>& out,
         bool includeBackEdges = false) {
-    if (!ts || !ts->decl) return;
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-    if (!td) return;
+    // fix #3140 (§9.8, family F2 of umbrella #3152): `td` was a BARE GUARD —
+    // no `td->` member was ever read in this function's body — so all it did was
+    // return an EMPTY component list for every imported class, i.e. serialize it
+    // to nothing. The cast is gone; the symbol is all this walk needs.
+    //
+    // Reachability, stated because dropping a guard deserves it: every caller
+    // (emitClassSerialize / emitClassDeserialize / emitPolyClass*) is gated on
+    // `sema::serializedClassShape`, which is empty for every imported class —
+    // see its comment in Symbol.hpp for why that is a measured statement about
+    // cross-module class serialization (#3179) and not a missing channel. So
+    // this function still never runs for an imported class today; what changed
+    // is that it no longer holds a SECOND, independent opinion on the question.
+    if (!ts) return;
 
     for (const Symbol* m : storage) {
         // Find the field index.
@@ -180,16 +220,13 @@ static void collectClassComponents(
                 }
             }
         } else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl)) {
-            if (pd->serialized) {
-                comp.isSkip     = pd->serialized->isSkip;
-                comp.isOptional = pd->serialized->isOptional;
-                if (!pd->serialized->name.empty())
-                    comp.wireName = std::string(pd->serialized->name);
-                else
-                    comp.wireName = comp.declName;
-            } else {
-                comp.wireName = comp.declName;
-            }
+            // fix #3140 (family F2): the clause comes from the SYMBOL, which
+            // SymbolCollection filled from this very `pd->serialized` and
+            // ModuleLoader fills from the wire — one predicate, both sources.
+            const auto clause = sema::serializedComponentClause(m);
+            comp.isSkip     = clause.skip;
+            comp.isOptional = clause.optional;
+            comp.wireName   = std::string(clause.wireName);
             if (pd->type) comp.ty = ctx.resolvedType(*pd->type);
         } else if (fsPos && fsPos->posParam) {
             // §9.8 / #2325: a primary-constructor-parameter-derived field.
@@ -204,13 +241,14 @@ static void collectClassComponents(
             // guard and the eligibility check never disagree.
             if (!fsPos->posParamBodyRef) continue;
             if (!fsPos->posParam->type) continue;
-            // Primary-ctor params carry no `serialized` clause (the grammar
-            // only allows one on a record's PositionalField / a class body
-            // FieldDecl/PropertyDecl — Parser_Decls.cpp), so the wire name is
-            // always the declared identifier.
+            // A CLASS primary-ctor parameter carries no `serialized` clause
+            // (A.4 admits one on a record's PositionalField, an auto-property's
+            // PropertyBody, an EnumConstant and a ChoiceCase — never on a class
+            // primary-ctor parameter), so the accessor's resolved wire name is
+            // the declared identifier here by construction.
             bool isOwned = fsPos->posParam->modifier == "owned";
             comp.isOwned  = isOwned;
-            comp.wireName = comp.declName;
+            comp.wireName = std::string(sema::serializedComponentClause(m).wireName);
             comp.ty = ctx.resolvedType(*fsPos->posParam->type);
 
             // §9.8 tier 3: identify back-edges (non-owned class-typed fields),
@@ -233,8 +271,12 @@ static void collectClassComponents(
                 }
             }
         } else {
-            // Fallback (no decl — e.g. imported field).
-            comp.wireName = comp.declName;
+            // Fallback (no decl — e.g. an imported field). fix #3140: the
+            // clause is available here too, since it rides the symbol.
+            const auto clause = sema::serializedComponentClause(m);
+            comp.isSkip     = clause.skip;
+            comp.isOptional = clause.optional;
+            comp.wireName   = std::string(clause.wireName);
             comp.ty = ctx.importedMemberType(m);
         }
 
@@ -294,8 +336,8 @@ static const TypeSymbol* handledSharedElementClass(const sema::TypeRef* tr) {
     const sema::TypeRef* el = t->genericArgs[0];
     if (el->kind != sema::TypeRef::Kind::Named || !el->declaration) return nullptr;
     if (el->declaration->kind != ast::TypeDeclKind::Class) return nullptr;
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(el->declaration->decl);
-    if (!td || !td->serializedClass) return nullptr;  // element must be synthesizable
+    // fix #3140 (family F2): the element's §9.8 surface, from the symbol.
+    if (sema::serializedClassShape(el->declaration).empty()) return nullptr;
     return el->declaration;
 }
 
@@ -322,8 +364,8 @@ static const TypeSymbol* handledWeakElementClass(const sema::TypeRef* tr) {
     const sema::TypeRef* el = t->genericArgs[0];
     if (el->kind != sema::TypeRef::Kind::Named || !el->declaration) return nullptr;
     if (el->declaration->kind != ast::TypeDeclKind::Class) return nullptr;
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(el->declaration->decl);
-    if (!td || !td->serializedClass) return nullptr;
+    // fix #3140 (family F2): the element's §9.8 surface, from the symbol.
+    if (sema::serializedClassShape(el->declaration).empty()) return nullptr;
     return el->declaration;
 }
 
@@ -356,47 +398,55 @@ static bool isHandledTypeDrivenComponent(const ClassComponent& comp,
 void Emitter::emitRecordSerialize(const TypeSymbol* ts,
                                   llvm::Value* recvVal,
                                   llvm::Value* serPtr) {
-    if (!ts || !ts->decl) return;
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-    if (!td) return;
+    // fix #3140 (§9.8, family F2 of umbrella #3152): this opened with
+    // `if (!ts || !ts->decl) return;` and then walked `ast::TypeDecl`'s
+    // `positionalFields` / each auto-property's `ast::PropertyDecl::serialized`.
+    // `ModuleLoader` never assigns `Symbol::decl` for an imported type, so an
+    // IMPORTED record's Serialize emitted NO BYTES, with no diagnostic at any
+    // severity — sema's §9.8 checks iterate `ctx_.module()->children`, LOCAL
+    // types only, so nothing ever looked. MEASURED on a two-module build with
+    // the classification gate opened and nothing else changed: an imported
+    // `record Pt(X: int, Y: int): ISerializable, IDeserializable` round-tripped
+    // to 0 for an expected 34, and a local `Wrap(P: Pt, N: int)` over it to 5
+    // for an expected 345.
+    if (!ts) return;
+    // fix #3140 follow-up: name this type in the backstop diagnostic.
+    SerializationDiagScope diagScope(this, ts);
 
-    // Collect serialized components (positional fields, skip excluded).
-    std::vector<const ast::Param*> components;
-    if (td->hasPositionalFields) {
-        for (const auto& pf : td->positionalFields)
-            if (!positionalFieldIsSkip(pf))
-                components.push_back(&pf);
-    } else {
-        // Body record: auto-properties in declaration order.
-        // (Handled via collectRecordStorage below — use the same index.)
-        // Nothing to add to `components`; we use the storage vector below.
-    }
-
-    // Collect storage symbols for index mapping.
+    // The storage walk is the SAME one recordStruct lays out, so `mi` below is
+    // both the component index and the struct element index. It is both-sources
+    // already (#2478's `isAutoPropertyStorage`).
     std::vector<const sema::Symbol*> storage;
     collectRecordStorage(ts, storage);
+
+    // §9.8 / #2516: for a record with a positional parameter list, the
+    // serialized components are its POSITIONAL fields; a body member of a
+    // combined-form record is not one. `posParam != nullptr` is the positional
+    // marker on both sides (a real `ast::Param` locally, a synthetic one on
+    // import), so this selects by identity rather than by the index-lockstep the
+    // AST walk used — which silently mispaired a combined-form record, since
+    // SymbolCollection appends the positional fields AFTER the body members.
+    const bool positional = ts->hasPositionalFields;
+    auto isSerializedComponent = [&](const sema::Symbol* m) {
+        if (!positional) return true;
+        const auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+        return fs && fs->posParam != nullptr;
+    };
 
     llvm::Type* voidTy  = llvm::Type::getVoidTy(llvm_);
 
     // BeginObject(field_count)
     // per §9.8: `serialized skip` components are excluded from both the wire
-    // count and the writes. For a positional record, `components` above is
-    // already filtered. For a BODY record, `storage` is the FULL storage set
-    // (skip-marked auto-properties included), so it must be filtered the same
-    // way the write loop below filters it — otherwise the wire header
-    // declares more fields than are actually written, desynchronizing the
-    // reader (fix #1612).
-    int32_t nonSkipCount;
-    if (td->hasPositionalFields) {
-        nonSkipCount = (int32_t)components.size();
-    } else {
-        nonSkipCount = 0;
-        for (const sema::Symbol* sym : storage) {
-            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(sym->decl)) {
-                if (pd->serialized && pd->serialized->isSkip) continue;
-            }
-            ++nonSkipCount;
-        }
+    // count and the writes — the count and the write loop below MUST filter
+    // identically, or the wire header declares more fields than are actually
+    // written and the reader desynchronizes (fix #1612). They now read the same
+    // predicate off the same symbol, which is what makes that structural
+    // instead of a convention held by two copies of one rule.
+    int32_t nonSkipCount = 0;
+    for (const sema::Symbol* sym : storage) {
+        if (!isSerializedComponent(sym)) continue;
+        if (sema::serializedComponentClause(sym).skip) continue;
+        ++nonSkipCount;
     }
     auto* beginFn = declareC("bz_binser_begin_object", voidTy, {ptrTy(), i32()});
     builder_.CreateCall(beginFn, {serPtr, builder_.getInt32(nonSkipCount)});
@@ -405,38 +455,14 @@ void Emitter::emitRecordSerialize(const TypeSymbol* ts,
     emitPendingCheck();
 
     // Per-field: WriteFieldName + Write
-    unsigned storageIdx = 0;
     for (unsigned mi = 0; mi < storage.size(); ++mi) {
         const sema::Symbol* sym = storage[mi];
-        std::string wireName;
-
-        // Determine wire name and skip flag.
-        bool skip = false;
-        if (td->hasPositionalFields) {
-            // Positional fields: find corresponding entry in td->positionalFields.
-            // The storage vector order matches td->positionalFields order.
-            if (storageIdx < td->positionalFields.size()) {
-                const ast::Param& pf = td->positionalFields[storageIdx];
-                if (positionalFieldIsSkip(pf)) { ++storageIdx; continue; }
-                wireName = std::string(positionalFieldWireName(pf));
-                ++storageIdx;
-            } else {
-                ++storageIdx;
-                continue;
-            }
-        } else {
-            // Body record: auto-property; check its PropertyDecl for serialized clause.
-            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(sym->decl)) {
-                if (pd->serialized && pd->serialized->isSkip) continue;
-                if (pd->serialized && !pd->serialized->name.empty())
-                    wireName = std::string(pd->serialized->name);
-                else
-                    wireName = std::string(sym->name);
-            } else {
-                wireName = std::string(sym->name);
-            }
-        }
-        if (skip) continue;
+        if (!isSerializedComponent(sym)) continue;
+        // fix #3140 (family F2): the §9.8 clause — `skip` and the wire name —
+        // from the symbol, for a positional field and an auto-property alike.
+        const auto clause = sema::serializedComponentClause(sym);
+        if (clause.skip) continue;
+        const std::string wireName(clause.wireName);
 
         llvm::Value* fieldVal = builder_.CreateExtractValue(recvVal, {mi});
         const sema::TypeRef* fieldTy = recordMemberTypeResolved(sym);
@@ -684,12 +710,13 @@ void Emitter::emitSerializeField(llvm::Value* val,
         if (fieldTs->kind == ast::TypeDeclKind::Class) {
             // §9.8 tier 2/tier 4: owned class-typed component.
             // `val` is a ptr to the class instance.
-            auto* td = dynamic_cast<const ast::TypeDecl*>(fieldTs->decl);
-            if (td && td->serializedClass) {
+            // fix #3140 (family F2 of #3152): the component class's §9.8
+            // surface and registry, from the symbol.
+            if (!sema::serializedClassShape(fieldTs).empty()) {
                 // §9.8 tier 4: if the class has a polymorphic registry, use
                 // polymorphic dispatch (emitPolyClassSerialize) which reads the
                 // dynamic type from the vtable and writes "$type" + concrete body.
-                if (!td->serializedClass->polyCases.empty())
+                if (!sema::serializedPolyCasesOf(fieldTs).empty())
                     emitPolyClassSerialize(fieldTs, val, serPtr);
                 else
                     emitClassSerialize(fieldTs, val, serPtr);
@@ -698,8 +725,39 @@ void Emitter::emitSerializeField(llvm::Value* val,
         }
     }
 
-    // Fallback: unknown / unsupported type — emit null marker (silent skip).
+    // fix #3140 follow-up (§9.8 / §2.8.3 rule 4): THIS USED TO BE A SILENT SKIP,
+    // and that is the whole defect class. Reaching here means the dispatch above
+    // recognised nothing, so the component contributes ZERO BYTES — while
+    // `emitRecordSerialize`'s header count, computed from the component LIST
+    // rather than from what the dispatch can write, still counts it. The reader
+    // then runs off the end of the object: measured as an imported
+    // `record InlineArr(A: [3]int, N: int)` writing 22 bytes against its local
+    // twin's 50, with an imported-writer/local-reader exchange raising
+    // "Truncated binary input reading int (§2.15)" and an imported-only
+    // round-trip raising NOTHING AT ALL because both halves agreed on the same
+    // wrong form.
+    //
+    // Sema now rejects the one shape known to reach here
+    // (`sema::serializationComponentTypeIsEmittable` — an inline array whose
+    // size did not cross), so this arm should be unreachable. It is a LOUD
+    // backstop rather than a deleted branch precisely because the next carriage
+    // gap must fail the build instead of rediscovering the 22-vs-50 hole. A
+    // diagnostic here is idiomatic for this file: the `Shared<T>`/`Weak<T>`
+    // "not yet implemented in codegen" guards above report the same way.
     (void)val;
+    if (serializationDiagType_) {
+        ctx_.diagnostics().report(
+            Severity::Error, serializationDiagType_->declLoc,
+            "`" + std::string(serializationDiagType_->name) +
+            "`: a \xC2\xA7""9.8 serialized component has a type this compiler "
+            "cannot write to the wire, so it would contribute no bytes while "
+            "the object header still counts it (a desynchronised reader). This "
+            "is a compiler limitation, not a program error \xE2\x80\x94 the "
+            "known case is an inline array `[N]T` reached through an IMPORTED "
+            "declaration, whose size does not cross the module boundary "
+            "(issue #3183); mark the component `serialized skip`, or declare "
+            "the type locally");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -828,12 +886,21 @@ void Emitter::emitEnumSerialize(const TypeSymbol* ts,
 // ---------------------------------------------------------------------------
 llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
                                             llvm::Value* derPtr) {
-    if (!ts || !ts->decl) return nullptr;
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-    if (!td) return nullptr;
+    // fix #3140 (§9.8, family F2 of umbrella #3152): the read twin of
+    // emitRecordSerialize's conversion above — this opened with
+    // `if (!ts || !ts->decl) return nullptr;` and then built its component list
+    // out of `ast::TypeDecl::positionalFields` / each auto-property's
+    // `ast::PropertyDecl::serialized`, neither of which an IMPORTED record has.
+    // It returned null, which `lowerLocalDecl` degrades to a zero-initialized
+    // slot (#2434) — the imported half of the measured `0 for an expected 34`.
+    if (!ts) return nullptr;
+    // fix #3140 follow-up: name this type in the backstop diagnostic.
+    SerializationDiagScope diagScope(this, ts);
     llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
 
-    // Collect serialized components (positional fields, skip excluded).
+    // Collect serialized components. The list is 1:1 with `storage`, and so
+    // with `recordStruct`'s elements: every downstream index (`slots[ci]`,
+    // `st->getElementType(ci)`, the construction loop) assumes that alignment.
     struct Component {
         std::string wireName;   // wire name (serialized "x" or identifier)
         std::string declName;   // declared identifier
@@ -846,41 +913,28 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     std::vector<const sema::Symbol*> storage;
     collectRecordStorage(ts, storage);
 
+    // §9.8 / #2516: see emitRecordSerialize — for a record with a positional
+    // parameter list the serialized components are its POSITIONAL fields, and
+    // `posParam != nullptr` is that marker on both sides. A body member of a
+    // combined-form record keeps a struct slot but stays off the wire, which is
+    // what the AST walk did too (its component list came from
+    // `positionalFields` alone); expressing it as `isSkip` is what keeps the
+    // 1:1 alignment the loops below require.
+    const bool positional = ts->hasPositionalFields;
     unsigned si = 0;
-    if (td->hasPositionalFields) {
-        for (const auto& pf : td->positionalFields) {
-            Component comp;
-            comp.storageIdx  = si;
-            comp.declName    = std::string(pf.name);
-            comp.isSkip      = positionalFieldIsSkip(pf);
-            comp.isOptional  = pf.serialized && pf.serialized->isOptional;
-            comp.wireName    = comp.isSkip ? "" : std::string(positionalFieldWireName(pf));
-            comp.ty          = si < storage.size()
-                ? recordMemberTypeResolved(storage[si]) : nullptr;
-            components.push_back(std::move(comp));
-            ++si;
-        }
-    } else {
-        for (const sema::Symbol* sym : storage) {
-            Component comp;
-            comp.storageIdx = si;
-            comp.declName   = std::string(sym->name);
-            comp.isSkip     = false;
-            comp.isOptional = false;
-            const ast::PropertyDecl* pd =
-                dynamic_cast<const ast::PropertyDecl*>(sym->decl);
-            if (pd && pd->serialized) {
-                comp.isSkip     = pd->serialized->isSkip;
-                comp.isOptional = pd->serialized->isOptional;
-                comp.wireName   = pd->serialized->name.empty()
-                    ? comp.declName : std::string(pd->serialized->name);
-            } else {
-                comp.wireName = comp.declName;
-            }
-            comp.ty = recordMemberTypeResolved(sym);
-            components.push_back(std::move(comp));
-            ++si;
-        }
+    for (const sema::Symbol* sym : storage) {
+        const auto* fs = dynamic_cast<const sema::FieldSymbol*>(sym);
+        const bool isComponent = !positional || (fs && fs->posParam != nullptr);
+        const auto clause = sema::serializedComponentClause(sym);
+        Component comp;
+        comp.storageIdx = si;
+        comp.declName   = std::string(sym->name);
+        comp.isSkip     = !isComponent || clause.skip;
+        comp.isOptional = isComponent && clause.optional;
+        comp.wireName   = comp.isSkip ? "" : std::string(clause.wireName);
+        comp.ty         = recordMemberTypeResolved(sym);
+        components.push_back(std::move(comp));
+        ++si;
     }
 
     // Allocate local slots for each component (using the component's LLVM type).
@@ -1673,10 +1727,11 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
         if (fieldTs->kind == ast::TypeDeclKind::Class) {
             // §9.8 tier 2/tier 4: deserialize a class-typed component.
             // Returns an owned ptr.
-            auto* td = dynamic_cast<const ast::TypeDecl*>(fieldTs->decl);
-            if (td && td->serializedClass) {
+            // fix #3140 (family F2 of #3152): the component class's §9.8
+            // surface and registry, from the symbol.
+            if (!sema::serializedClassShape(fieldTs).empty()) {
                 // §9.8 tier 4: polymorphic base — dispatch via "$type" discriminator.
-                if (!td->serializedClass->polyCases.empty())
+                if (!sema::serializedPolyCasesOf(fieldTs).empty())
                     return emitPolyClassDeserialize(fieldTs, derPtr);
                 return emitClassDeserialize(fieldTs, derPtr);
             }
@@ -2323,10 +2378,10 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
 void Emitter::emitPolyClassSerialize(const TypeSymbol* baseTs,
                                      llvm::Value* objPtr,
                                      llvm::Value* serPtr) {
-    if (!baseTs || !baseTs->decl) return;
-    const auto* baseTd = dynamic_cast<const ast::TypeDecl*>(baseTs->decl);
-    if (!baseTd || !baseTd->serializedClass) return;
-    const auto& polyCases = baseTd->serializedClass->polyCases;
+    // fix #3140 (family F2 of #3152): the base's §9.8 surface and registry,
+    // from the symbol.
+    if (!baseTs || sema::serializedClassShape(baseTs).empty()) return;
+    const auto& polyCases = sema::serializedPolyCasesOf(baseTs);
     if (polyCases.empty()) {
         // No poly cases: just serialize the base type directly (degenerate case).
         emitClassSerialize(baseTs, objPtr, serPtr);
@@ -2346,12 +2401,10 @@ void Emitter::emitPolyClassSerialize(const TypeSymbol* baseTs,
     auto* endBB   = llvm::BasicBlock::Create(llvm_, "poly.ser.end",   currentFn_);
 
     for (const auto& pc : polyCases) {
-        if (!pc.type) continue;
-        const TypeRef* pcTr = ctx_.resolvedType(*pc.type);
-        if (!pcTr || !pcTr->declaration) continue;
-        const TypeSymbol* pcTs = pcTr->declaration;
-        auto* pcTd = dynamic_cast<const ast::TypeDecl*>(pcTs->decl);
-        if (!pcTd || !pcTd->serializedClass) continue;
+        // fix #3140 (family F2 of #3152): the registered case's resolved symbol
+        // and its §9.8 surface, both off the base's symbol-side registry.
+        const TypeSymbol* pcTs = pc.type;
+        if (!pcTs || sema::serializedClassShape(pcTs).empty()) continue;
 
         // Find the concrete type's descriptor in descArray_.
         auto descIt = descArray_.find(pcTs);
@@ -2400,12 +2453,11 @@ void Emitter::emitPolyClassSerialize(const TypeSymbol* baseTs,
 // ---------------------------------------------------------------------------
 llvm::Value* Emitter::emitPolyClassDeserialize(const TypeSymbol* baseTs,
                                                llvm::Value* derPtr) {
-    if (!baseTs || !baseTs->decl)
+    // fix #3140 (family F2 of #3152): the base's §9.8 surface and registry,
+    // from the symbol.
+    if (!baseTs || sema::serializedClassShape(baseTs).empty())
         return llvm::ConstantPointerNull::get(ptrTy());
-    const auto* baseTd = dynamic_cast<const ast::TypeDecl*>(baseTs->decl);
-    if (!baseTd || !baseTd->serializedClass)
-        return llvm::ConstantPointerNull::get(ptrTy());
-    const auto& polyCases = baseTd->serializedClass->polyCases;
+    const auto& polyCases = sema::serializedPolyCasesOf(baseTs);
     if (polyCases.empty())
         return emitClassDeserialize(baseTs, derPtr);
 
@@ -2469,12 +2521,10 @@ llvm::Value* Emitter::emitPolyClassDeserialize(const TypeSymbol* baseTs,
         builder_.CreateStructGEP(strTy, discPtr, 1), "poly.disc.len");
 
     for (const auto& pc : polyCases) {
-        if (!pc.type) continue;
-        const TypeRef* pcTr = ctx_.resolvedType(*pc.type);
-        if (!pcTr || !pcTr->declaration) continue;
-        const TypeSymbol* pcTs = pcTr->declaration;
-        auto* pcTd = dynamic_cast<const ast::TypeDecl*>(pcTs->decl);
-        if (!pcTd || !pcTd->serializedClass) continue;
+        // fix #3140 (family F2 of #3152): the registered case's resolved symbol
+        // and its §9.8 surface, both off the base's symbol-side registry.
+        const TypeSymbol* pcTs = pc.type;
+        if (!pcTs || sema::serializedClassShape(pcTs).empty()) continue;
 
         // Compare discriminator string with this case's literal.
         llvm::Value* litStr = lowerStringLiteral(
@@ -2574,11 +2624,12 @@ void Emitter::emitClassSerialize(const TypeSymbol* ts,
         ~PopSer() { s.erase(t); }
     } popSer{serializeEmitStack_, ts};
 
+    // fix #3140 follow-up: name this type in the backstop diagnostic.
+    SerializationDiagScope diagScope(this, ts);
     // Detect graph mode: true for `serialized graph` and `serialized cyclic`.
-    const auto* td0 = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-    bool isGraphMode = td0 && td0->serializedClass &&
-                       (td0->serializedClass->shape == "graph" ||
-                        td0->serializedClass->shape == "cyclic");
+    // fix #3140 (family F2 of #3152): the derived shape, from the symbol.
+    const std::string_view shape = sema::serializedClassShape(ts);
+    bool isGraphMode = shape == "graph" || shape == "cyclic";
 
     // Ensure classStruct is built and fieldIndex_ is populated.
     llvm::StructType* st = classStruct(ts);
@@ -3034,11 +3085,12 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         ~PopDes() { s.erase(t); }
     } popDes{deserializeEmitStack_, ts};
 
+    // fix #3140 follow-up: name this type in the backstop diagnostic.
+    SerializationDiagScope diagScope(this, ts);
     // Detect graph mode.
-    const auto* td0g = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-    bool isGraphMode = td0g && td0g->serializedClass &&
-                       (td0g->serializedClass->shape == "graph" ||
-                        td0g->serializedClass->shape == "cyclic");
+    // fix #3140 (family F2 of #3152): the derived shape, from the symbol.
+    const std::string_view shapeD = sema::serializedClassShape(ts);
+    bool isGraphMode = shapeD == "graph" || shapeD == "cyclic";
 
     llvm::StructType* st = classStruct(ts);
     llvm::Type* voidTy   = llvm::Type::getVoidTy(llvm_);
@@ -3754,10 +3806,10 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 // §9.8 tier 4: deserialize the inline object body; if the component
                 // type has a polymorphic registry, dispatch via "$type" discriminator.
                 const TypeSymbol* compTs = comp.ty->declaration;
-                auto* compTd = dynamic_cast<const ast::TypeDecl*>(compTs->decl);
+                // fix #3140 (family F2 of #3152): the component's registry,
+                // from the symbol.
                 llvm::Value* childPtr =
-                    (compTd && compTd->serializedClass &&
-                     !compTd->serializedClass->polyCases.empty())
+                    !sema::serializedPolyCasesOf(compTs).empty()
                     ? emitPolyClassDeserialize(compTs, derPtr)
                     : emitClassDeserialize(compTs, derPtr);
                 // Register the constructed object with the tag.
@@ -3918,33 +3970,32 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     // (`Id: int := id;`) — as well as a parameter captured ONLY by a
     // computed property (`property Id: int => id;`) — observes the correct
     // value, exactly as ordinary `new ClassName(...)` construction does.
+    // fix #3140 (family F2 of #3152): the primary-ctor parameter list comes
+    // from `sema::recordPositionalFieldSymbols` (#3141's both-sources indexed
+    // view) rather than from a `dynamic_cast` to `ast::TypeDecl`, so this walk
+    // no longer holds its own opinion on whether the class has one. It is the
+    // last `ts->decl` read this function had.
     bool primaryCtorUsed = false;
-    if (td0g->hasPositionalFields &&
-        td0g->positionalFields.size() == comps.size()) {
+    const std::vector<const Symbol*> primaryParams =
+        sema::recordPositionalFieldSymbols(ts);
+    if (ts->hasPositionalFields && primaryParams.size() == comps.size()) {
         bool allMatch = true;
-        for (const auto& pf : td0g->positionalFields) {
-            if (compByNameLower.find(toLowerAscii(pf.name)) ==
+        for (const Symbol* pfs : primaryParams) {
+            if (compByNameLower.find(toLowerAscii(pfs->name)) ==
                     compByNameLower.end()) {
                 allMatch = false;
                 break;
             }
         }
         if (allMatch) {
-            for (const auto& pf : td0g->positionalFields) {
-                // Find pf's own FieldSymbol (posParam == &pf) for its
-                // struct field index — the primary-ctor param's OWN slot,
-                // which may be a different symbol than the component that
-                // supplies its value (e.g. `Id: int := id;`: component
-                // "Id" supplies the value stored into param `id`'s slot).
-                const Symbol* pfs = nullptr;
-                for (const Symbol* mm : ts->members) {
-                    auto* cfs = dynamic_cast<const sema::FieldSymbol*>(mm);
-                    if (cfs && cfs->posParam == &pf) { pfs = cfs; break; }
-                }
-                if (!pfs) continue;
+            for (const Symbol* pfs : primaryParams) {
+                // `pfs` is the primary-ctor param's OWN FieldSymbol, whose
+                // struct slot may be a different symbol than the component that
+                // supplies its value (e.g. `Id: int := id;`: component "Id"
+                // supplies the value stored into param `id`'s slot).
                 auto fit = fieldIndex_.find(pfs);
                 if (fit == fieldIndex_.end()) continue;
-                auto cit = compByNameLower.find(toLowerAscii(pf.name));
+                auto cit = compByNameLower.find(toLowerAscii(pfs->name));
                 if (cit == compByNameLower.end()) continue;
                 std::size_t ci = cit->second;
                 if (!comps[ci].ty) continue;
@@ -4214,8 +4265,9 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
             if (ts->kind == ast::TypeDeclKind::Class &&
                 declaresConformance(ts, "ISerializable") &&
                 !hasHandWrittenMethod(ts, "Serialize")) {
-                auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-                if (td && td->serializedClass) return true;
+                // fix #3140 (family F2 of #3152): the class's §9.8 surface,
+                // from the symbol.
+                if (!sema::serializedClassShape(ts).empty()) return true;
             }
         }
     }
@@ -4234,8 +4286,9 @@ bool Emitter::isSerializationCall(const ast::CallExpr& call,
             if (ts->kind == ast::TypeDeclKind::Class &&
                 declaresConformance(ts, "IDeserializable") &&
                 !hasHandWrittenMethod(ts, "Deserialize")) {
-                auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-                if (td && td->serializedClass) return true;
+                // fix #3140 (family F2 of #3152): the class's §9.8 surface,
+                // from the symbol.
+                if (!sema::serializedClassShape(ts).empty()) return true;
             }
         }
     }
@@ -4658,10 +4711,10 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                 declaresConformance(ts, "ISerializable") &&
                 !hasHandWrittenMethod(ts, "Serialize")) {
 
-                if (isClass) {
-                    auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-                    if (!td || !td->serializedClass) return nullptr;
-                }
+                // fix #3140 (family F2 of #3152): the class's §9.8 surface,
+                // from the symbol.
+                if (isClass && sema::serializedClassShape(ts).empty())
+                    return nullptr;
 
                 llvm::Value* serArg = lowerExpr(*call.args[0].value);
                 if (!serArg) return nullptr;
@@ -4691,9 +4744,9 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                 } else {
                     // Class: recv is a ptr to the class instance.
                     // §9.8 tier 4: polymorphic base → poly dispatch.
-                    auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-                    if (td && td->serializedClass &&
-                        !td->serializedClass->polyCases.empty())
+                    // fix #3140 (family F2 of #3152): the registry, from the
+                    // symbol.
+                    if (!sema::serializedPolyCasesOf(ts).empty())
                         emitPolyClassSerialize(ts, recv, serArg);
                     else
                         emitClassSerialize(ts, recv, serArg);
@@ -4728,12 +4781,13 @@ llvm::Value* Emitter::tryLowerSerializationCall(const ast::CallExpr& call) {
                         return emitEnumDeserialize(ts, derArg);
                 }
                 if (ts->kind == ast::TypeDeclKind::Class) {
-                    auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-                    if (!td || !td->serializedClass) return nullptr;
+                    // fix #3140 (family F2 of #3152): the class's §9.8 surface
+                    // and registry, from the symbol.
+                    if (sema::serializedClassShape(ts).empty()) return nullptr;
                     llvm::Value* derArg = lowerExpr(*call.args[0].value);
                     if (!derArg) return nullptr;
                     // §9.8 tier 4: polymorphic base → poly dispatch.
-                    if (!td->serializedClass->polyCases.empty())
+                    if (!sema::serializedPolyCasesOf(ts).empty())
                         return emitPolyClassDeserialize(ts, derArg);
                     return emitClassDeserialize(ts, derArg);
                 }

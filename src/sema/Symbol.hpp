@@ -87,6 +87,15 @@ struct ModuleSymbol : Symbol {
 // A.3 ClassDecl / InterfaceDecl / RecordDecl / EnumDecl share TypeSymbol.
 // The §A.3 TypeDeclKind tag distinguishes them (it's a parser-side enum
 // already; we just carry it through).
+// §9.8 tier 4 (#3140, family F2): one entry of a class's `polymorphic(...)`
+// registry — the wire discriminator and the concrete type it selects. Declared
+// ahead of `TypeSymbol` because the symbol carries the resolved list.
+struct TypeSymbol;
+struct SerializedPolyCase {
+    std::string_view discriminator;
+    TypeSymbol* type = nullptr;
+};
+
 struct TypeSymbol : Symbol {
     ast::TypeDeclKind kind = ast::TypeDeclKind::Class;
     ast::Visibility visibility = ast::Visibility::None;
@@ -242,6 +251,15 @@ struct TypeSymbol : Symbol {
     //
     // Read it through the accessors below, never directly.
     std::vector<TypeRef*> nonSymbolBaseRefs;
+    // §9.8 (#3140, family F2 of umbrella #3152): the derived §9.8 wire shape of
+    // this class's synthesized serialization surface, and its tier-4
+    // `polymorphic(...)` registry. Written once, by
+    // `Resolver::checkSerializationEligibility`'s synthesis pre-pass; read only
+    // through `serializedClassShape` / `serializedPolyCasesOf` below, which
+    // carry the note on what an imported class answers and why. Empty for every
+    // non-class kind.
+    std::string serializedShape;
+    std::vector<SerializedPolyCase> serializedPolyCases;
     // #2776 / #3139: true for the synthesized `TypeSymbol`s minted by
     // `SemaContext::builtinInterfaceSym` for the closed set of built-in
     // interfaces that DO get a real declaration. `ModuleLoader` resolves an
@@ -369,46 +387,6 @@ bool inheritsBuiltinInterface(const TypeSymbol* t, std::string_view name);
 // incomplete", and that branch is why they are kept (see the field comment).
 const std::vector<TypeRef*>& nonSymbolBaseRefsOf(const TypeSymbol* t);
 
-// §9.8 (#3139 → #3140/#3141): can codegen actually EMIT the synthesized
-// serialization surface for `t`?
-//
-// This is a deliberately TEMPORARY interlock, and it is separate from the
-// conformance question above on purpose. #3139 gives every consumer a
-// symbol-side answer to "does `t` declare `: ISerializable`", and for an
-// imported type that answer is now yes where it used to be no. But the §9.8
-// EMITTERS — `emitRecordSerialize` / `emitRecordDeserialize` /
-// `emitEnumSerialize` / `emitEnumDeserialize`, and the `serialized "wire-name"`
-// clause they read — still take their component list from the
-// `ast::TypeDecl`, and an imported type has none. Those are families F2
-// (#3140) and F3 (#3141) of the same umbrella and are NOT this fix's to
-// convert.
-//
-// So admitting the surface on conformance alone would replace a truthful
-// reject with SILENTLY WRONG BYTES. MEASURED with the interlock removed: an
-// importer's `Wrap(P: Pt, N: int)` over an imported serializable `Pt`
-// round-tripped to 244 instead of 534 (the imported component serialized to
-// nothing), and `Pt.Serialize(s)` compiled to a degraded zero value. That is
-// the #1462 failure mode — a partial unification that turned a loud defect
-// into a quiet one — which is exactly what the audit's "a family lands whole"
-// rule exists to prevent.
-//
-// The gate therefore keeps §9.8's cross-module behaviour byte-identical to
-// before #3139 while the CHANNEL lands. When #3141 gives the component walk a
-// symbol-side source and #3140 gives the `serialized` clause and wire names
-// theirs, this predicate is the single thing to delete.
-//
-// ⚠ IT IS INVISIBLE TO THE RATCHET, deliberately and inconveniently. It reads
-// `t->decl` WITHOUT a `dynamic_cast<const ast::TypeDecl*>`, so
-// scripts/check_imported_symbol_reads.py does not count it — which means
-// #3139's headline reduction (measured -11 class-1 reads) OVERSTATES how much of
-// the seam is closed: four of the sites it converted still cannot answer for an
-// imported type, they merely now say so in one place instead of eleven. The
-// count is honest about the CASTS removed and optimistic about the SEAM. Do
-// not read the ratchet as a completion metric for family F1 until this is
-// gone.
-inline bool serializationSurfaceIsEmittable(const TypeSymbol* t) {
-    return t != nullptr && t->decl != nullptr;
-}
 
 // §31.4 (v0.240, #2971/#2983/#2984): WHICH member of the §31.4 exception
 // surface a name denotes, for a class whose built-in exception base is
@@ -536,6 +514,29 @@ struct MemberSymbol : Symbol {
     // continue to read their AST declarations during the ordinary passes.
     bool isPure = false;
     std::vector<ContractRecord> contractRecords;
+    // fix #3140 (§9.8, family F2 of umbrella #3152): this storage member's
+    // `serialized` clause — `skip`, `optional`, and the `"<name>"` wire rename.
+    //
+    // The grammar admits the clause on exactly three storage-bearing sites
+    // (A.4 SerializedClause): a record's PositionalField, an auto-property's
+    // PropertyBody, and an EnumConstant (that last one rides
+    // `EnumConstantSymbol::serializedName`, #3140 family F4). It rode
+    // `ast::Param::serialized` / `ast::PropertyDecl::serialized` and NOTHING
+    // else, so every §9.8 emitter recovered it by casting `Symbol::decl` — which
+    // is null for every IMPORTED member — and answered "no clause" for all of
+    // them. Answering "no clause" is not a safe default here: dropping a
+    // `serialized skip` component ADDS it to the wire while the header count
+    // says otherwise, desynchronising the reader, which is the exact defect
+    // #1612 fixed on the local side.
+    //
+    // Populated on BOTH sides (SymbolCollection from the AST, ModuleLoader from
+    // `MetaMember::serializedSkip`/`serializedOptional`/`serializedWireName`),
+    // so `serializedComponentClause` below needs no source switch — the
+    // `builtinExceptionBase` (#2950) / `enumWireName` (#3140 F4) template.
+    // Read them through that accessor, never directly.
+    bool serializedSkip = false;
+    bool serializedOptional = false;
+    std::string_view serializedWireName;  // empty => the DECLARED name
 };
 
 struct FieldSymbol : MemberSymbol {
@@ -842,6 +843,124 @@ std::vector<const Symbol*> recordPositionalFieldSymbols(const TypeSymbol* ts);
 // review nit N2). Case index i is the runtime tag, so the two agreeing is the
 // tag-value contract — not a convenience.
 std::vector<const ChoiceCaseSymbol*> choiceCasesOf(const TypeSymbol* t);
+
+// §9.8 (#3140, family F2 of umbrella #3152): a storage member's `serialized`
+// clause, resolved to what the §9.8 emitters actually need — the wire name is
+// already defaulted to the declared name, so a caller never re-implements
+// "rename if present, else identifier" (three copies of that had drifted).
+struct SerializedComponentClause {
+    bool skip = false;      // `serialized skip`: off the wire entirely
+    bool optional = false;  // `serialized optional`: absence is not a fault
+    std::string_view wireName;  // never empty for a named member
+};
+
+// The ONE way to ask what a §9.1/§9.2 storage member's §9.8 clause says. Reads
+// `MemberSymbol`'s three fields, which SymbolCollection fills from the AST and
+// ModuleLoader fills from the dependency's metadata — so it answers for a LOCAL
+// and an IMPORTED member alike and never touches `Symbol::decl`.
+//
+// ⚠ NOT FOR AN ENUM CONSTANT. The third site A.4 admits the clause on is an
+// `EnumConstant`, and that one already had its own carriage before this fix —
+// `EnumConstantSymbol::serializedName` + `MetaMember::enumWireName`, landed by
+// family F4 (5bbc16a) — read through `sema::enumConstantWireName`
+// (sema/EnumValues.hpp). The two are deliberately NOT merged: folding them
+// would change F4's already-shipped wire field for no behavioural gain. An
+// enum constant therefore leaves `MemberSymbol::serializedWireName` EMPTY and
+// this accessor would answer "the declared name" for it, which is wrong — call
+// `enumConstantWireName` instead. Nothing populates both, so a member is
+// carried by exactly one of the two channels.
+SerializedComponentClause serializedComponentClause(const Symbol* m);
+
+// §9.8 (#3140, family F2): the §9.8 wire SHAPE of a class's synthesized
+// serialization surface — "tree", "graph", "cyclic", or "" for a class that has
+// none (which is every class that does not declare
+// `ISerializable`/`IDeserializable`, and every class whose conformance is fully
+// hand-written).
+//
+// The shape is DERIVED, not declared: the `serialized tree|graph|cyclic` header
+// clause was retired by #703, and `Resolver::checkSerializationEligibility`'s
+// pre-pass now computes the shape from the class's component types. That pass
+// used to write its answer into `ast::TypeDecl::serializedClass->shape` and
+// twelve readers recovered it with `dynamic_cast<const ast::TypeDecl*>`; the
+// answer now lives on the symbol and the AST clause carries only the parser's
+// `polymorphic(...)` registry.
+//
+// ⚠ AN IMPORTED CLASS ALWAYS ANSWERS "" — and that is a MEASURED statement about
+// this compiler, not an oversight of a channel. Cross-module class
+// serialization is not implemented at any level: with the classification gates
+// forced open on a real two-module build, an imported `class Box:
+// ISerializable, IDeserializable`'s own round-trip SIGSEGV'd the program, and a
+// LOCAL class holding an imported serializable class component SIGSEGV'd it too
+// (the component is written as nothing and read back as null). Forcing the
+// codegen arms open as well SIGSEGV'd `bezelc` ITSELF, because
+// `emitClassDeserialize` reconstructs an object by matching the class's
+// CONSTRUCTOR parameter names and then running its field initializers — both of
+// which are `ast::` walks with no cross-module carriage, the same ABI gap #3162
+// records for `new ImportedClass(args)`. So the empty answer keeps today's LOUD
+// reject exactly as it is; issue #3179 carries the construction work, and when
+// it lands the shape gains a `MetaTypeDecl` record and this comment goes away.
+// What this accessor buys today is that the twelve sites stop each deciding it
+// for themselves off a dead pointer.
+std::string_view serializedClassShape(const TypeSymbol* t);
+
+// §9.8 tier 4 (#3140, family F2): the class's `polymorphic("d": T, …)` registry,
+// resolved. Empty for a class with no registry — and, per the note above, for
+// every imported class. The discriminator is the string literal's contents; the
+// type is the registered case's resolved `TypeSymbol` (null when it did not
+// resolve, which is already a diagnosed program).
+const std::vector<SerializedPolyCase>& serializedPolyCasesOf(const TypeSymbol* t);
+
+// §9.8 (#3140 follow-up): can the §9.8 emitters actually WRITE a component of
+// this type — as opposed to §9.8 ADMITTING it?
+//
+// The two questions are not the same, and conflating them is what this
+// predicate exists to stop. `isSerializationEligibleType` answers the spec
+// question ("is this shape in §9.8's admitted list"); this one answers the
+// implementation question ("did enough of the shape survive to lower"). They
+// diverge for exactly one reason today, and it is a CARRIAGE gap, not a spec
+// gap: `ModuleMetadataBuilder::convertType` leaves `MetaType::arraySize` EMPTY
+// for an inline array — "the const-expr evaluator is sema-internal and not
+// threaded to the builder", its own comment says — so `ModuleLoader` cannot
+// reconstruct it either, and `Emitter::lowerTypeRef` falls back to a bare `i32`
+// PLACEHOLDER for an imported `[N]T`.
+//
+// MEASURED (§9.8, two-module build, identical all-zero values so the difference
+// is purely structural): a `record InlineArr(A: [3]int, N: int)` serialized 22
+// bytes when IMPORTED and 50 when declared locally — because
+// `emitSerializeField`'s inline-array arm is a four-conjunct positive guard with
+// NO `else`, and the imported field failed its `val->getType()->isArrayTy()`
+// conjunct (instrumented: `owned=0 elem=<non-null> isArrayTy=0 size=(nil)
+// sizeVal=-1` imported, `isArrayTy=1 sizeVal=3` local). The component silently
+// fell through to the write path's final "emit nothing" fallback while the
+// header count still counted it, so an imported writer and a local reader
+// disagreed by a whole component — and an imported-only round-trip raised
+// NOTHING AT ALL, because both halves agreed on the same wrong form. §9.8's
+// record clause explicitly admits "a non-owning inline array `[N]T`/`[N]T?` of
+// record-admissible element type", so this is an admitted shape, not an edge.
+//
+// ⚠ THE LIST IS "SHAPES WHOSE CARRIAGE IS INCOMPLETE", NOT "SHAPES §9.8
+// ADMITS". Do not grow it into a second copy of the emitter's dispatch — that
+// is the duplicated-predicate failure this umbrella is about. The backstop for
+// a shape NOT listed here is `emitSerializeField`'s fallback, which #3140's
+// follow-up made a LOUD diagnostic precisely so the next carriage gap fails the
+// build instead of writing a different wire form.
+bool serializationComponentTypeIsEmittable(const TypeRef* ty);
+
+// §9.8 (#3140 follow-up): does EVERY §9.8 component of `t` have an emittable
+// shape (per the predicate above), recursively through nested record/choice
+// components?
+//
+// ⚠ THIS IS NOT #3139's DELETED INTERLOCK, which was `t->decl != nullptr` — a
+// dead-pointer read that answered "not emittable" for every imported type. This
+// one asks the real question of both sources and answers TRUE for the imported
+// types that are genuinely fine (which is every shape but the one above).
+//
+// It exists because §9.8's eligibility check has a "trust the nested
+// declaration, it is checked at its own conformance site" posture — and for an
+// IMPORTED type that site NEVER RAN: `Resolver::checkSerializationEligibility`
+// iterates `ctx_.module()->children`, local types only. So "trust" is
+// unbacked across a module boundary, and this walk is what backs it.
+bool serializationSurfaceIsEmittable(const TypeSymbol* t, const SemaContext& ctx);
 
 // §9.2 / §22.9: a member is an *auto-property* (`Name: T;`, optionally with an
 // initializer, no accessor bodies / arrow getter) — backed by compiler-

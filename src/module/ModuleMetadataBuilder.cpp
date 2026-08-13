@@ -869,6 +869,18 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
     out.modifiers = toStrings(m.modifiers);
     out.isPure = hasModifier(m.modifiers, "pure");
     out.name = std::string(m.name);
+    // fix #3140 (§9.8, family F2 of umbrella #3152): the member's `serialized`
+    // clause, taken from the SYMBOL rather than re-derived from whichever AST
+    // node this member happens to have. SymbolCollection already resolved it
+    // once, from `ast::Param::serialized` for a §9.1 positional field and
+    // `ast::PropertyDecl::serialized` for an auto-property — the only two
+    // storage-bearing sites the A.4 grammar admits it on — so reading the symbol
+    // is what keeps the exported wire contract and the local emitters answering
+    // from one place. (An EnumConstant's rename rides `enumWireName`, family F4,
+    // and is filled where the constant is converted.)
+    out.serializedSkip     = m.serializedSkip;
+    out.serializedOptional = m.serializedOptional;
+    out.serializedWireName = std::string(m.serializedWireName);
 
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m.decl)) {
         out.kind = MetaMemberKind::Field;

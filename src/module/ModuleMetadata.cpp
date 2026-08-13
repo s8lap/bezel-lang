@@ -71,7 +71,17 @@ enum RecordCode : unsigned {
     // and either may be absent. Unknown codes are skipRecord()'d, so a reader
     // predating this field is unaffected — no schema bump (see kSchemaVersion).
     REC_EXC_BASE = 9,    // string: §31.4 built-in exception base of a class
-    // 10.. additive; unknown codes are skipRecord()'d by the reader
+    // fix #3140 (§9.8, family F2 of umbrella #3152): MEMBER_BLOCK — a storage
+    // member's `serialized` clause, as `[skip, optional, <wire-name bytes>…]`
+    // under its OWN code. A distinct code rather than an 18th positional scalar
+    // or a third trailing REC_STRING, for the reason emitTypeDecl spells out
+    // for #3139's conditional 8th scalar: a positional entry can only be
+    // unconditional (perturbing every module's bytes and header hash) or
+    // conditional (making the NEXT author's addition a silent misparse), while
+    // a coded record is self-describing, absent when unused, and skipRecord()'d
+    // by every reader this format has had.
+    REC_SER_CLAUSE = 10,
+    // 11.. additive; unknown codes are skipRecord()'d by the reader
     REC_UNKNOWN_FUTURE = 90, // test-only: a record code this reader skips
 };
 
@@ -215,6 +225,24 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // header hash stops being a function of what was actually written.
     if (m.kind == MetaMemberKind::EnumConstant && !m.enumWireName.empty())
         hashStr(h, m.enumWireName);
+    // fix #3140 (§9.8 / §2.8.3 rule 3, family F2): a storage member's
+    // `serialized` clause is part of its cross-module contract — `skip` changes
+    // the wire FIELD COUNT and a rename changes the KEY every consumer reads
+    // and writes — so it must fold into the semantic hash or a consumer's
+    // staleness check cannot see the change.
+    //
+    // ⚠ GUARDED BY THE SAME PREDICATE AS THE EMISSION (emitMember below), and
+    // that is not cosmetic: an UNCONDITIONAL fold hashes a length byte even for
+    // an empty string, which moves the VBR-encoded header hash and so shifts
+    // every byte after it for modules that use no `serialized` clause at all.
+    // That exact defect had to be corrected in this family's own F4 slice
+    // (c97a49f) after review measured it.
+    if (m.serializedSkip || m.serializedOptional ||
+        !m.serializedWireName.empty()) {
+        hashBool(h, m.serializedSkip);
+        hashBool(h, m.serializedOptional);
+        hashStr(h, m.serializedWireName);
+    }
     hashStr(h, m.valueText);  // §22.12 const value (issue #328 FINDING [3] BUG A)
     // §14 / #662c (schema v5): ctor body source text for generic classes.
     hashStr(h, m.ctorBodyText);
@@ -420,7 +448,10 @@ MetaMember::MetaMember(const MetaMember& o)
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
       hasEnumValue(o.hasEnumValue), enumValue(o.enumValue),
-      enumWireName(o.enumWireName) {
+      enumWireName(o.enumWireName),
+      serializedSkip(o.serializedSkip),
+      serializedOptional(o.serializedOptional),
+      serializedWireName(o.serializedWireName) {
     if (o.nestedType)
         nestedType = std::make_unique<MetaTypeDecl>(*o.nestedType);
 }
@@ -441,6 +472,9 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         isOperator = o.isOperator; returnOwned = o.returnOwned;
         hasEnumValue = o.hasEnumValue; enumValue = o.enumValue;
         enumWireName = o.enumWireName;
+        serializedSkip = o.serializedSkip;
+        serializedOptional = o.serializedOptional;
+        serializedWireName = o.serializedWireName;
         nestedType = o.nestedType
             ? std::make_unique<MetaTypeDecl>(*o.nestedType)
             : nullptr;
@@ -489,6 +523,11 @@ bool MetaMember::operator==(const MetaMember& o) const {
            // fix #3140 (§9.8 / §2.8.3 rule 3): the serialized wire name is part
            // of an EnumConstant's identity — see the hashMember comment above.
            enumWireName == o.enumWireName &&
+           // fix #3140 (§9.8 / §2.8.3 rule 3, family F2): the `serialized`
+           // clause is part of a storage member's identity — see hashMember.
+           serializedSkip == o.serializedSkip &&
+           serializedOptional == o.serializedOptional &&
+           serializedWireName == o.serializedWireName &&
            valueText == o.valueText && ctorBodyText == o.ctorBodyText &&
            methodBodyText == o.methodBodyText &&
            fieldInitText == o.fieldInitText &&
@@ -761,6 +800,23 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // `serialized` clause produces byte-identical metadata to before this fix.
     if (m.kind == MetaMemberKind::EnumConstant && !m.enumWireName.empty())
         emitString(w, m.enumWireName);
+    // fix #3140 (§9.8, family F2 of umbrella #3152; schema v7 additive): a
+    // storage member's `serialized` clause, under its OWN record code so it is
+    // independent of the trailing REC_STRINGs above (either may be absent, and
+    // neither can be read as the other, in either order). Emitted ONLY when the
+    // member actually carries a clause, so a module using none is byte-identical
+    // to before this fix — and `hashMember` is guarded by the SAME predicate,
+    // which is the half c97a49f had to correct for this family's F4 slice.
+    if (m.serializedSkip || m.serializedOptional ||
+        !m.serializedWireName.empty()) {
+        llvm::SmallVector<std::uint64_t, 8> sv{
+            m.serializedSkip ? 1u : 0u,
+            m.serializedOptional ? 1u : 0u,
+        };
+        for (char c : m.serializedWireName)
+            sv.push_back(static_cast<std::uint8_t>(c));
+        w.EmitRecord(REC_SER_CLAUSE, sv);
+    }
     // §11.3 (schema v4, issue #502): when kind == NestedType, emit the nested
     // type's full declaration as an embedded TYPE_BLOCK. The trailing
     // finishBlockImpl in readMemberBody skips it for v3 readers (they never
@@ -1475,6 +1531,22 @@ bool readMemberBody(Reader& r, MetaMember& m) {
                     for (std::uint64_t v : vals)
                         caps[capIdx]->push_back(static_cast<char>(v & 0xFF));
                     ++capIdx;
+                    continue;
+                }
+                // fix #3140 (§9.8, family F2): the `serialized` clause, captured
+                // BY CODE — so it is read whatever its position relative to the
+                // trailing body-text strings above, and its absence (a member
+                // with no clause, or any pre-#3140 blob) simply leaves the
+                // fields at "no clause", which is what that dependency's own
+                // compiler produced.
+                if (got.get() == REC_SER_CLAUSE && vals.size() >= 2) {
+                    m.serializedSkip     = vals[0] != 0;
+                    m.serializedOptional = vals[1] != 0;
+                    m.serializedWireName.clear();
+                    m.serializedWireName.reserve(vals.size() - 2);
+                    for (std::size_t vi = 2; vi < vals.size(); ++vi)
+                        m.serializedWireName.push_back(
+                            static_cast<char>(vals[vi] & 0xFF));
                 }
                 continue;
             }

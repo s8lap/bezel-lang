@@ -6773,6 +6773,19 @@ static bool isSerializationEligibleType(
     if (tr->kind == K::InlineArray) {
         if (tr->arrayOwned) return false;
         if (!tr->arrayElement) return false;
+        // fix #3140 follow-up (§9.8 / §15.1 / §2.8.3 rule 4): §9.8 ADMITS "a
+        // non-owning inline array [N]T/[N]T? of record-admissible element
+        // type", but the emitter can only WRITE one whose size survived to
+        // codegen. `ModuleMetadataBuilder` never writes `MetaType::arraySize`,
+        // so an IMPORTED `[N]T` lowers to a bare `i32` placeholder and
+        // `emitSerializeField`'s inline-array arm — a four-conjunct positive
+        // guard with no `else` — silently fell through to writing NOTHING while
+        // the wire header still counted the component. MEASURED: 22 bytes
+        // imported against 50 local for the same all-zero
+        // `record InlineArr(A: [3]int, N: int)`. Rejecting here puts the fault
+        // at the conformance declaration, where the author can act on it,
+        // instead of in the bytes. See `serializationComponentTypeIsEmittable`.
+        if (!serializationComponentTypeIsEmittable(tr)) return false;
         // Codegen restriction (issue #1065 follow-up, filed): the synthesized
         // Deserialize's element-materialization loop (LlvmBackend_Serialization.cpp)
         // constructs the inline array via a raw GEP-store loop that bypasses the
@@ -6850,17 +6863,30 @@ static bool isSerializationEligibleType(
         // "field `P` has a type that is not serialization-eligible" (measured)
         // — for a program whose parts each compile.
         //
-        // Gated on `serializationSurfaceIsEmittable` — codegen's component
-        // walk for THIS record still needs the `ast::TypeDecl` (#3140/#3141),
-        // and admitting the component on conformance alone made the enclosing
-        // record serialize it to nothing (measured: 244 for an expected 534).
-        // See the predicate's comment in Symbol.hpp.
-        if (!serializationSurfaceIsEmittable(ts)) return false;
+        // fix #3140 (family F2 of #3152): #3139's temporary
+        // `serializationSurfaceIsEmittable` interlock is GONE from this arm.
+        // It was here because codegen's component walk for THIS record still
+        // needed the `ast::TypeDecl`, so admitting the component on conformance
+        // alone made the enclosing record serialize it to NOTHING — measured on
+        // a real two-module build as a local `Wrap(P: Pt, N: int)` over an
+        // imported serializable `Pt` round-tripping to 5 for an expected 345,
+        // with no diagnostic at any severity. `emitRecordSerialize` /
+        // `emitRecordDeserialize` now walk `collectRecordStorage` and read each
+        // component's clause through `sema::serializedComponentClause`, which
+        // answers for an imported member, so the reason for the gate is gone;
+        // the same probe now yields 345.
         bool declaredISerializable =
             declaresBuiltinInterface(ts, "ISerializable");
         bool declaredIDeserializable =
             declaresBuiltinInterface(ts, "IDeserializable");
         if (!declaredISerializable && !declaredIDeserializable) return false;
+        // fix #3140 follow-up (§9.8): the "trust it, it is checked at its own
+        // conformance site" posture below is UNBACKED for an imported record —
+        // `Resolver::checkSerializationEligibility` iterates
+        // `ctx_.module()->children`, local types only, so that site never ran
+        // for it. Walk its components for an emittable shape here instead of
+        // trusting a check that did not happen.
+        if (!serializationSurfaceIsEmittable(ts, ctx)) return false;
         visited.insert(ts);
         // Verify the component types of the nested record are themselves eligible.
         // (This is the recursive eligibility: a nested record must be FULLY
@@ -6885,13 +6911,15 @@ static bool isSerializationEligibleType(
     // record equality components.)
     if (ts->kind == ast::TypeDeclKind::Choice) {
         if (visited.count(ts)) return true;  // cycle → assume eligible
-        // fix #3139 — the choice twin of the record arm above; see it for the
-        // measured consequence of the `ast::TypeDecl` gate and for why the
-        // emittability interlock is still in place.
-        if (!serializationSurfaceIsEmittable(ts)) return false;
+        // fix #3139 / fix #3140 — the choice twin of the record arm above; see
+        // it for the measured consequence of the `ast::TypeDecl` gate and for
+        // why the emittability interlock that stood here is now gone.
         bool declSer   = declaresBuiltinInterface(ts, "ISerializable");
         bool declDeser = declaresBuiltinInterface(ts, "IDeserializable");
         if (!declSer && !declDeser) return false;
+        // fix #3140 follow-up — the choice twin of the record arm's component
+        // walk; see it for why "checked at its own site" is unbacked here.
+        if (!serializationSurfaceIsEmittable(ts, ctx)) return false;
         // Only value-like choices are eligible (§9.8 choice subsection).
         TypeRef rt;
         rt.kind = TypeRef::Kind::Named;
@@ -6913,9 +6941,15 @@ static bool isSerializationEligibleType(
     // synthesized class" per §9.8).
     if (ts->kind == ast::TypeDeclKind::Class) {
         if (forRecordComponent) return false;
-        auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-        if (td && td->serializedClass) return true;  // has serialized-class clause
-        return false;
+        // fix #3140 (family F2 of #3152): ask the symbol, not `ts->decl`. For a
+        // LOCAL class the answer is identical — the synthesis pre-pass in
+        // checkSerializationEligibility writes the derived shape onto the
+        // symbol and no longer onto the AST clause. For an IMPORTED class it is
+        // still "no surface", and see `serializedClassShape`'s comment in
+        // Symbol.hpp for why that is a measured statement rather than a gap in
+        // the carriage: cross-module class serialization SIGSEGVs at every
+        // level today (#3179), so this reject is the only correct answer.
+        return !serializedClassShape(ts).empty();
     }
 
     return false;
@@ -7048,11 +7082,11 @@ void Resolver::checkSerializationEligibility() {
         if (!t || t->kind != ast::TypeDeclKind::Class) continue;
         auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
         if (!td) continue;
-        // A clause with a shape already set (a real keyword clause during the
-        // additive transition) is left alone. A clause with only polyCases (set
-        // by the `polymorphic` member clause, no shape) still needs its shape
-        // derived below.
-        if (td->serializedClass && !td->serializedClass->shape.empty()) continue;
+        // fix #3140 (family F2): a shape already derived on the SYMBOL is left
+        // alone (this pass is idempotent and the driver may re-enter it). A
+        // clause with only polyCases — set by the `polymorphic` member clause,
+        // which carries no shape — still needs its shape derived below.
+        if (!serializedClassShape(t).empty()) continue;
         bool wantsIS = declaredConformance(*td, "ISerializable");
         bool wantsID = declaredConformance(*td, "IDeserializable");
         if (!wantsIS && !wantsID) continue;
@@ -7072,6 +7106,8 @@ void Resolver::checkSerializationEligibility() {
         // A polymorphic registry (P6 member clause) also implies the graph shape.
         bool needsGraph = td->serializedClass &&
                           !td->serializedClass->polyCases.empty();
+        // (the AST clause is the parser's own registry — the pre-pass mirrors it
+        //  onto the symbol at the end of this iteration, fix #3140)
         for (const Symbol* m : t->members) {
             auto* fs = dynamic_cast<const FieldSymbol*>(m);
             if (!fs || !fs->decl) continue;
@@ -7103,13 +7139,36 @@ void Resolver::checkSerializationEligibility() {
         }
         static const std::string kGraphShape = "graph";
         static const std::string kTreeShape  = "tree";
-        auto* mutTd = const_cast<ast::TypeDecl*>(td);
-        if (!mutTd->serializedClass) {
-            // No clause yet (no `polymorphic` member): synthesize one.
-            mutTd->serializedClass = std::make_unique<ast::SerializedClassClause>();
+        // fix #3140 (§9.8, family F2 of umbrella #3152): the derived shape now
+        // lands on the SYMBOL, not on `ast::TypeDecl::serializedClass->shape`.
+        //
+        // Twelve readers used to recover it with
+        // `dynamic_cast<const ast::TypeDecl*>(ts->decl)`, and that cast is null
+        // for every IMPORTED type — so each of them independently decided "this
+        // class has no §9.8 surface" off a dead pointer. Writing the symbol and
+        // reading it back through `sema::serializedClassShape` makes it ONE
+        // predicate with one source; the AST clause now carries only the
+        // parser's `polymorphic(...)` registry, mirrored just below.
+        //
+        // Deliberately NOT written to both places: two copies of one fact held
+        // in agreement by nothing is the exact shape the audit's §4 warns about
+        // (and #3168 measured drifting in family F6).
+        t->serializedShape = needsGraph ? kGraphShape : kTreeShape;
+        // §9.8 tier 4: mirror the registry onto the symbol, resolved. The
+        // parser puts the cases on the AST clause and TypeResolution_Names has
+        // already resolved each case's type by the time this pass runs.
+        t->serializedPolyCases.clear();
+        if (td->serializedClass) {
+            for (const auto& pc : td->serializedClass->polyCases) {
+                SerializedPolyCase out;
+                out.discriminator = pc.discriminator;
+                if (pc.type) {
+                    const TypeRef* tr = ctx_.resolvedType(*pc.type);
+                    if (tr) out.type = tr->declaration;
+                }
+                t->serializedPolyCases.push_back(out);
+            }
         }
-        // Set the derived shape (the member clause leaves it empty).
-        mutTd->serializedClass->shape = needsGraph ? kGraphShape : kTreeShape;
     }
 
     for (Symbol* child : ctx_.module()->children) {
@@ -7605,9 +7664,15 @@ void Resolver::checkClassSerializationEligibilityLate() {
         bool wantsID = declaredConformance(*td, "IDeserializable");
         if (!wantsIS && !wantsID) continue;
 
-            if (!td->serializedClass) {
+            // fix #3140 (family F2 of #3152): the shape and the registry now
+            // come from the SYMBOL — see `sema::serializedClassShape`. The AST
+            // clause carries only the parser's `polymorphic(...)` cases, which
+            // the pre-pass mirrors onto `t->serializedPolyCases`.
+            const std::string_view sccShape = serializedClassShape(t);
+            const auto& sccPolyCases = serializedPolyCasesOf(t);
+            if (sccShape.empty()) {
                 // §9.8 v0.141: after the synthesis pre-pass in
-                // checkSerializationEligibility, a class with no clause here
+                // checkSerializationEligibility, a class with no shape here
                 // is fully hand-written (Serialize + Deserialize) — it
                 // satisfies the conformance without synthesis, so there is
                 // nothing to check.
@@ -7726,7 +7791,6 @@ void Resolver::checkClassSerializationEligibilityLate() {
             // error at the registry.  Also: each registered type must be
             // assignable to (a subtype of) the declaring base class (§9.8:
             // "each named type must be assignable to the declaring class").
-            const auto& scc = *td->serializedClass;
             bool polyError = false;
 
             // BFS subtype predicate: is `sub` a subtype of `base`?
@@ -7749,20 +7813,31 @@ void Resolver::checkClassSerializationEligibilityLate() {
                 return false;
             };
 
-            for (const auto& pc : scc.polyCases) {
-                if (!pc.type) continue;
-                const TypeRef* pcTr = ctx_.resolvedType(*pc.type);
-                if (!pcTr || !pcTr->declaration) continue;
-                const TypeSymbol* pcTs = pcTr->declaration;
-                auto* pcTd = dynamic_cast<const ast::TypeDecl*>(pcTs->decl);
-                if (!pcTd || !pcTd->serializedClass) {
+            for (const auto& pc : sccPolyCases) {
+                const TypeSymbol* pcTs = pc.type;
+                if (!pcTs) continue;
+                // fix #3140 (family F2): ask the symbol for the registered
+                // type's §9.8 surface. This cast was null for an IMPORTED
+                // registered type, so the diagnostic below fired naming it and
+                // telling the author to "add a graph-shape clause" to a type
+                // whose source they may not have — the audit's "MISLEADING
+                // diagnostic naming the imported type" row. The verdict is
+                // unchanged (an imported class has no surface — see
+                // `serializedClassShape`), but the advice is now accurate.
+                if (serializedClassShape(pcTs).empty()) {
+                    const bool imported = pcTs->decl == nullptr;
                     ctx_.diagnostics().report(
                         Severity::Error, t->declLoc,
                         "class `" + std::string(t->name) + "` polymorphic "
                         "registry: registered type `" + std::string(pcTs->name) +
-                        "` has no `serialized tree`/`graph`/`cyclic` clause and "
-                        "is not serialization-eligible (§9.8); add a graph-shape "
-                        "clause to the registered type");
+                        (imported
+                             ? "` is IMPORTED, and §9.8 class serialization does "
+                               "not yet cross a module boundary (issue #3179) — "
+                               "register a locally-declared type, or hand-write "
+                               "`Serialize`/`Deserialize`"
+                             : "` has no `serialized tree`/`graph`/`cyclic` "
+                               "clause and is not serialization-eligible (§9.8); "
+                               "add a graph-shape clause to the registered type"));
                     polyError = true;
                     continue;
                 }
@@ -7781,9 +7856,9 @@ void Resolver::checkClassSerializationEligibilityLate() {
 
             // §9.8: each discriminator must be a unique non-empty string literal
             // within the clause.
-            if (!scc.polyCases.empty()) {
+            if (!sccPolyCases.empty()) {
                 std::unordered_set<std::string> seenDiscs;
-                for (const auto& pc : scc.polyCases) {
+                for (const auto& pc : sccPolyCases) {
                     if (pc.discriminator.empty()) {
                         ctx_.diagnostics().report(
                             Severity::Error, t->declLoc,
@@ -7871,7 +7946,7 @@ void Resolver::checkClassSerializationEligibilityLate() {
                     // and resolved from the tag→object table on deserialize.
                     // Under `serialized tree`, aliasing is forbidden (back-edges
                     // violate the tree assertion), so they remain an error there.
-                    if (scc.shape == "tree") {
+                    if (sccShape == "tree") {
                         ctx_.diagnostics().report(
                             Severity::Error, t->declLoc,
                             "class `" + std::string(t->name) + "` (`serialized "
@@ -7888,12 +7963,14 @@ void Resolver::checkClassSerializationEligibilityLate() {
                     const TypeSymbol* beDecl = tr->declaration;
                     if (!beDecl && tr->nullable) beDecl = tr->declaration;
                     if (beDecl) {
-                        auto* beTd = dynamic_cast<const ast::TypeDecl*>(beDecl->decl);
-                        if (!beTd || !beTd->serializedClass) {
+                        // fix #3140 (family F2): the back-edge target's §9.8
+                        // surface, from the symbol. Same conversion, same
+                        // verdict, same reason as the registry arm above.
+                        if (serializedClassShape(beDecl).empty()) {
                             ctx_.diagnostics().report(
                                 Severity::Error, t->declLoc,
                                 "class `" + std::string(t->name) +
-                                "` (`serialized " + std::string(scc.shape) +
+                                "` (`serialized " + std::string(sccShape) +
                                 "`): back-edge field `" + std::string(fieldName) +
                                 "` has type `" + std::string(beDecl->name) +
                                 "` which has no `serialized tree`/`graph`/`cyclic` "
@@ -7983,7 +8060,7 @@ void Resolver::checkClassSerializationEligibilityLate() {
             // method on `this`; (3) let `this` escape; (4) call virtual/abstract.
             // We check rule (2) — calling an instance method on `this` — which is
             // detectable via a simple AST walk.
-            if (scc.shape == "cyclic") {
+            if (sccShape == "cyclic") {
                 // Walk constructor bodies looking for `this.SomeMethod()` calls.
                 for (const Symbol* m : t->members) {
                     auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
@@ -8022,7 +8099,7 @@ void Resolver::checkClassSerializationEligibilityLate() {
             // concrete type's Deserialize; it does NOT invoke any constructor on
             // the base class itself.  Therefore the constructor-matching check
             // does not apply to the declaring base.  Skip it.
-            if (!scc.polyCases.empty()) { /* skip ctor check for poly base */ }
+            if (!sccPolyCases.empty()) { /* skip ctor check for poly base */ }
             else if (!hwD2) {
                 // Helper: fold to lowercase (ASCII).
                 auto toLower = [](std::string_view sv) {
@@ -8154,7 +8231,7 @@ void Resolver::checkClassSerializationEligibilityLate() {
                             Severity::Error, t->declLoc,
                             "class `" + std::string(t->name) + "` declares "
                             "`IDeserializable` (`serialized " +
-                            std::string(scc.shape) +
+                            std::string(sccShape) +
                             "`): no constructor has parameter names matching "
                             "the serialized component set {" + compSet +
                             "} — candidates: " + candidates +
@@ -8171,7 +8248,7 @@ void Resolver::checkClassSerializationEligibilityLate() {
                             Severity::Error, t->declLoc,
                             "class `" + std::string(t->name) + "` declares "
                             "`IDeserializable` (`serialized " +
-                            std::string(scc.shape) +
+                            std::string(sccShape) +
                             "`): more than one constructor matches the serialized "
                             "component set — ambiguous: " + matchList +
                             " (§9.8 v0.136: the unique matching constructor is "

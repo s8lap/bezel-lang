@@ -384,25 +384,30 @@ BEZEL_TEST(xmod_builtin_iface_conformance_3139, local_shadowed_iformattable_stil
 }
 
 // ===========================================================================
-// §9.8 — the interlock this fix deliberately leaves closed
+// §9.8 — the interlock #3139 left closed, and #3140 opened
 // ===========================================================================
 
-// #3139 gives the §9.8 conformance question a symbol-side answer, but the §9.8
-// EMITTERS still take their component list and wire names from the
+// #3139 gave the §9.8 conformance question a symbol-side answer but held the
+// surface shut behind `sema::serializationSurfaceIsEmittable`, because the §9.8
+// EMITTERS still took their component list and wire names from the
 // `ast::TypeDecl` — families F2 (#3140) and F3 (#3141) of the same umbrella.
-// Admitting the surface on conformance alone therefore replaces a truthful
-// reject with SILENTLY WRONG BYTES: measured with the interlock removed, an
-// importer's `Wrap(P: Pt, N: int)` over an imported serializable `Pt`
-// round-tripped to 244 for an expected 534, and `Pt.Serialize(s)` compiled to a
-// degraded zero value. That is the #1462 failure mode, so
-// `sema::serializationSurfaceIsEmittable` keeps §9.8's cross-module behaviour
-// byte-identical to before.
+// Admitting the surface on conformance alone would have replaced a truthful
+// reject with SILENTLY WRONG BYTES: measured with the interlock removed and
+// nothing else changed, an importer's `Wrap(P: Pt, N: int)` over an imported
+// serializable `Pt` round-tripped to 244 for an expected 534, and
+// `Pt.Serialize(s)` compiled to a degraded zero. That is the #1462 failure mode.
 //
-// This arm pins the interlock: it must not be removed WITHOUT the emitters,
-// because doing so flips this case from a reject to a wrong value rather than
-// to a right one. When #3140/#3141 land, this expectation becomes 34 and the
-// predicate is deleted.
-BEZEL_TEST(xmod_builtin_iface_conformance_3139, imported_serialization_surface_still_gated_spec_9_8) {
+// #3140 (family F2) supplied what was missing — `emitRecordSerialize` /
+// `emitRecordDeserialize` now walk `collectRecordStorage` and read each
+// component's `serialized` clause through `sema::serializedComponentClause`,
+// which rides `MemberSymbol` on both sides — and DELETED the interlock. So this
+// arm flips, exactly as its previous revision said it would: from
+// `kCompileRejected3139` to 34, the same value its local twin below has always
+// had. The wider F2 evidence (the `serialized skip`/rename wire-name oracle,
+// its vacuity control, `serialized optional`, the body-record form, and the
+// over-acceptance controls) is in
+// tests/module/xmod_record_serialization_3140_test.cpp.
+BEZEL_TEST(xmod_builtin_iface_conformance_3139, imported_serialization_surface_round_trips_spec_9_8) {
     const char* lib =
         "module LibSer3139; "
         "public record Pt3139(X: int, Y: int): ISerializable, IDeserializable "
@@ -418,13 +423,15 @@ BEZEL_TEST(xmod_builtin_iface_conformance_3139, imported_serialization_surface_s
         "  var p2 := Pt3139.Deserialize(d); "
         "  return p2.X * 10 + p2.Y; "
         "end Main; end C3139; ";
-    BEZEL_EXPECT_EQ(compileImportAndRun3139(lib, app), kCompileRejected3139);
+    BEZEL_EXPECT_EQ(compileImportAndRun3139(lib, app), 34);
 }
 
 // The LOCAL §9.8 round-trip is untouched by any of this — the same declaration
-// and the same body, in one module, still round-trips to 34. This is the arm
-// that would go red if the interlock had been written as a blanket "§9.8 is
-// off" rather than as "only where codegen cannot walk the components".
+// and the same body, in one module, still round-trips to 34. It was the arm
+// that would have gone red if the interlock had been written as a blanket
+// "§9.8 is off"; it is now the differential control proving the imported arm
+// above reaches the SAME value, so the module boundary was the whole
+// difference.
 BEZEL_TEST(xmod_builtin_iface_conformance_3139, control_local_serialization_roundtrip_spec_9_8) {
     const std::string src =
         "module AppSerL3139; import System.Serialization; "

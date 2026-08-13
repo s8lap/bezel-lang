@@ -739,6 +739,64 @@ struct MetaMember {
     // skips the rest of the block, so no schema bump is needed.
     std::string enumWireName;
 
+    // fix #3140 (§9.8, family F2 of umbrella #3152; schema v7 additive): the
+    // member's `serialized` clause — `skip`, `optional`, and the `"<name>"`
+    // wire rename — for the two STORAGE-bearing sites the A.4 grammar admits it
+    // on: a record's positional field (a Field member with `isPositional`) and
+    // an auto-property (a Property member with `isAutoProperty`). The third
+    // site, an EnumConstant, rides `enumWireName` above (family F4) and is
+    // untouched here.
+    //
+    // Nothing about it crossed before: the clause lived on `ast::Param` /
+    // `ast::PropertyDecl` and nowhere else, so the §9.8 emitters recovered it by
+    // casting `Symbol::decl` — null for every imported member — and answered "no
+    // clause" for all of them. "No clause" is NOT the safe default: it puts a
+    // `serialized skip` component back on the wire while the header's field
+    // count still excludes it, desynchronising the reader (the defect #1612
+    // fixed on the local side), and it writes a renamed component under its
+    // declared name, which a name-keyed reader then reports as a missing
+    // required field.
+    //
+    // Carried under its OWN record code (REC_SER_CLAUSE) rather than as a
+    // trailing REC_STRING or an 18th positional scalar. Both alternatives were
+    // rejected for the reason ModuleMetadata.cpp's `emitTypeDecl` states at
+    // length for #3139's 8th scalar: a positional entry can only be added
+    // unconditionally (which perturbs every module's bytes AND its header hash)
+    // or conditionally (which makes the NEXT author's addition a silent
+    // misparse). A distinct code is self-describing, is `skipRecord()`'d by
+    // every reader this format has had, and is emitted ONLY when the member
+    // actually carries a clause — so a module using none is byte-identical.
+    // The hash fold in `hashMember` is guarded by the SAME predicate as the
+    // emission, which is the property #3140's own F4 follow-up (c97a49f) had to
+    // be corrected for.
+    //
+    // ⚠ ABSENT FOR A PRE-#3140 BLOB, AND THAT IS NOT A BENIGN DEFAULT. An
+    // earlier revision of this comment claimed the clause then "reads as `no
+    // clause`, which is exactly the behaviour that dependency's own compiler
+    // produced". MEASURED FALSE: that compiler produced a LOUD REJECT (#3139's
+    // `serializationSurfaceIsEmittable` interlock), not "no clause". A
+    // post-#3140 compiler reading a pre-#3140 artifact therefore puts a
+    // `serialized skip` component BACK on the wire and reads it back, with no
+    // diagnostic at any severity — a wrong VALUE where the old pair produced a
+    // build failure.
+    //
+    // Left as-is rather than version-gated, deliberately and with the exposure
+    // stated: stdlib §2.15 makes the binary format same-build-only, so a
+    // dependency and its consumer are expected to be compiled by one compiler,
+    // and EVERY additive field this format has ever gained shares the property
+    // — including family F4's own `enumWireName` directly above. Gating this
+    // one alone would imply the others are safe, which is the more misleading
+    // artifact. Filed as the residue: see #3184.
+    //
+    // What must NOT survive here is the REASONING. "No clause is what the old
+    // compiler did, so absence is safe" is precisely the negative-list
+    // "not X ⇒ assume Z" shape this whole fix refutes; the correct statement is
+    // that absence is a KNOWN-WRONG answer whose blast radius is bounded by the
+    // format's same-build contract.
+    bool serializedSkip = false;
+    bool serializedOptional = false;
+    std::string serializedWireName;   // empty => the DECLARED name
+
     // NestedType (§11.3, issue #502): when kind == NestedType, this holds
     // the complete MetaTypeDecl for the nested type. Heap-allocated via
     // unique_ptr to break the cyclic MetaMember → MetaTypeDecl → MetaMember

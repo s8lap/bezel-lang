@@ -239,6 +239,15 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
             sym->indexerParams =
                 collectParams(pd->indexerParams, ctx, scope);
         }
+        // fix #3140 (§9.8, family F2 of umbrella #3152): an auto-property's
+        // `serialized` clause — the second of the two storage-bearing sites the
+        // A.4 grammar admits it on — onto the SYMBOL, for the same reason the
+        // positional-field copy in collectTypeDecl gives.
+        if (pd->serialized) {
+            sym->serializedSkip     = pd->serialized->isSkip;
+            sym->serializedOptional = pd->serialized->isOptional;
+            sym->serializedWireName = pd->serialized->name;
+        }
         return sym;
     }
     if (auto* ed = dynamic_cast<const ast::EventDecl*>(&m)) {
@@ -353,6 +362,17 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
             fs->declLoc = (pf.loc.line != 0) ? pf.loc : sym->declLoc;
             fs->posParam = &pf;
             fs->scope = sym->memberScope;
+            // fix #3140 (§9.8, family F2 of umbrella #3152): the positional
+            // field's `serialized` clause, onto the SYMBOL. It rode
+            // `ast::Param::serialized` only, so every §9.8 emitter recovered it
+            // by casting `Symbol::decl` and answered "no clause" for every
+            // imported field — which drops `serialized skip` from the write
+            // loop while the header count still excludes it, the #1612 desync.
+            if (pf.serialized) {
+                fs->serializedSkip     = pf.serialized->isSkip;
+                fs->serializedOptional = pf.serialized->isOptional;
+                fs->serializedWireName = pf.serialized->name;
+            }
             sym->members.push_back(fs);
         }
     }
@@ -763,6 +783,133 @@ bool anyRecordStorageField(
         if (pred(m, storageComponentType(m, ctx))) return true;
     }
     return false;
+}
+
+// fix #3140 (§9.8, family F2 of umbrella #3152): the ONE reader of a storage
+// member's `serialized` clause. Every field it consults is populated on BOTH
+// sides — SymbolCollection from `ast::Param::serialized` /
+// `ast::PropertyDecl::serialized`, ModuleLoader from `MetaMember` — so this
+// answers for an imported member without ever touching `Symbol::decl`, which is
+// null for every one of them.
+//
+// The wire-name default is folded in deliberately. §9.8's rule is "the wire name
+// is the `serialized "<name>"` rename when present, otherwise the declared
+// identifier", and that sentence was written out separately at five sites in
+// LlvmBackend_Serialization.cpp (twice for positional fields, twice for
+// auto-properties, once for choice cases). Returning the resolved name is what
+// stops a sixth copy.
+SerializedComponentClause serializedComponentClause(const Symbol* m) {
+    SerializedComponentClause info;
+    if (!m) return info;
+    info.wireName = m->name;
+    const auto* ms = dynamic_cast<const MemberSymbol*>(m);
+    if (!ms) return info;
+    info.skip     = ms->serializedSkip;
+    info.optional = ms->serializedOptional;
+    if (!ms->serializedWireName.empty()) info.wireName = ms->serializedWireName;
+    return info;
+}
+
+// fix #3140 (§9.8, family F2): see the declaration comment in Symbol.hpp for
+// why an imported class answers "" and what was measured when it did not.
+std::string_view serializedClassShape(const TypeSymbol* t) {
+    if (!t) return {};
+    return t->serializedShape;
+}
+
+const std::vector<SerializedPolyCase>& serializedPolyCasesOf(
+        const TypeSymbol* t) {
+    static const std::vector<SerializedPolyCase> kEmpty;
+    return t ? t->serializedPolyCases : kEmpty;
+}
+
+// fix #3140 follow-up (§9.8): see the declaration comment in Symbol.hpp for the
+// measured 22-vs-50 byte divergence this closes and for why the list is
+// "carriage is incomplete", not "§9.8 admits".
+bool serializationComponentTypeIsEmittable(const TypeRef* ty) {
+    if (!ty) return true;  // unresolved: another check owns it; do not add a
+                           // second opinion here.
+    if (ty->kind == TypeRef::Kind::InlineArray) {
+        if (!ty->arrayElement) return false;
+        // EXACTLY the condition `Emitter::lowerTypeRef` uses before it gives up
+        // and returns the bare `i32` placeholder — stated once, here, so the two
+        // cannot drift: a size that is neither an AST expression (local) nor a
+        // folded value (#734's member-const form) did not survive to codegen.
+        // `ModuleMetadataBuilder` never writes one, so this is false for every
+        // IMPORTED inline array and true for every local one.
+        if (!ty->arraySize && ty->arraySizeValue < 0) return false;
+        return serializationComponentTypeIsEmittable(ty->arrayElement);
+    }
+    return true;
+}
+
+namespace {
+// The recursive half of `serializationSurfaceIsEmittable`. `depth` bounds a
+// pathological nesting chain; the `seen` set bounds a legitimate cycle (§9.8
+// admits a record component whose type is reached again through another
+// record, and the eligibility check treats a cycle as eligible).
+bool surfaceEmittableImpl(const TypeSymbol* t, const SemaContext& ctx,
+                          std::unordered_set<const TypeSymbol*>& seen,
+                          int depth) {
+    if (!t || depth > 16) return true;   // conservative, matching the
+                                         // eligibility walk's own posture
+    if (!seen.insert(t).second) return true;  // cycle: already being checked
+    // §9.8 / §35 (#3140 follow-up): an IMPORTED CHOICE's synthesized surface is
+    // not emittable, and this is MEASURED, not assumed.
+    //
+    // It became reachable only when family F9 (#3144, `feec091`) landed the
+    // case list — before that an imported choice carried its KIND and nothing
+    // else — combined with this family removing #3139's blanket interlock.
+    // Neither lane tested the combination. Measured on a two-module build, with
+    // a `choice Status: ISerializable, IDeserializable Failed(code: int), Ok`:
+    //
+    //   direct `Status.Deserialize(d)` round-trip   IMPORTED exit 0, LOCAL 7
+    //     (plus the #2434 "degraded to a zero-initialized value" note)
+    //   local `record Holder(S: Status, N: int)`    IMPORTED exit 0, LOCAL 8
+    //     — no diagnostic at ANY severity
+    //   case `serialized "hh"` rename oracle        SerializationException
+    //     — the case rename does not cross either
+    //
+    // Two silent-wrong-data paths and one truncated read. So the surface is
+    // rejected here until the emitters can walk an imported choice's cases:
+    // issue #3185. `ctx.isImported` is the symbol-side question — deliberately
+    // NOT a `t->decl` read, which is the dead-pointer shape this umbrella
+    // exists to remove and which the ratchet cannot see.
+    if (t->kind == ast::TypeDeclKind::Choice && ctx.isImported(t)) return false;
+    for (const Symbol* m : t->members) {
+        const auto* fs = dynamic_cast<const FieldSymbol*>(m);
+        const bool isField = fs != nullptr;
+        const bool isAutoProp = isAutoPropertyStorageSymbol(m, ctx);
+        if (!isField && !isAutoProp) continue;
+        if (isField) {
+            bool isStatic = false;
+            for (std::string_view mod : fs->modifiers)
+                if (mod == "static") { isStatic = true; break; }
+            if (isStatic) continue;
+        }
+        // §9.8: a `serialized skip` component is off the wire entirely, so its
+        // shape cannot make the surface unemittable.
+        if (serializedComponentClause(m).skip) continue;
+        const TypeRef* cty = storageComponentType(m, ctx);
+        if (!serializationComponentTypeIsEmittable(cty)) return false;
+        // Recurse into a nested record/choice component: §9.8's eligibility
+        // check trusts such a component as "checked at its own conformance
+        // site", and for an IMPORTED type that site never ran.
+        if (cty && cty->kind == TypeRef::Kind::Named && cty->declaration &&
+            (cty->declaration->kind == ast::TypeDeclKind::Record ||
+             cty->declaration->kind == ast::TypeDeclKind::Choice)) {
+            if (!surfaceEmittableImpl(cty->declaration, ctx, seen, depth + 1))
+                return false;
+        }
+    }
+    return true;
+}
+}  // namespace
+
+bool serializationSurfaceIsEmittable(const TypeSymbol* t,
+                                     const SemaContext& ctx) {
+    std::unordered_set<const TypeSymbol*> seen;
+    return surfaceEmittableImpl(t, ctx, seen, 0);
 }
 
 // fix #3145: the indexed view. `posParam != nullptr` is the positional marker on

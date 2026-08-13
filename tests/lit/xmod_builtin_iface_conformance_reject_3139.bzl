@@ -11,8 +11,8 @@
 // its VALUES in tests/module/xmod_builtin_iface_conformance_3139_test.cpp.
 //
 // WHY THIS FILE EXISTS, over and above the gtest arms. The gtest reject arms
-// can only observe "the importer did not compile". Two of the three rejects
-// below are ones where the WHICH matters and an exit code cannot say it:
+// can only observe "the importer did not compile". The rejects below are ones
+// where the WHICH matters and an exit code cannot say it:
 //
 //   * §14.2 `Min()` — #3139 moves the reject from a downstream #2770 backstop
 //     to the #1198 gate that is supposed to catch it. That gate initialised its
@@ -39,16 +39,19 @@
 //     intended gate" from "still caught by luck downstream"; in company, the
 //     backstop is not even there to be lucky.
 //
-//   * §9.8 — the `serializationSurfaceIsEmittable` interlock. #3139 can now
-//     answer the conformance question for an imported record, but the §9.8
-//     emitters still take their component list and `serialized` wire names
-//     from the `ast::TypeDecl` (#3140/#3141), so admitting the surface would
-//     replace this truthful reject with silently wrong bytes (measured: 244
-//     for an expected 534). Pinning the text is what makes it visible that the
-//     interlock is what is firing, and it must be REMOVED WITH the emitters.
+// ⚠ THE §9.8 ARM THAT USED TO BE THIRD HERE IS GONE, and its removal is the
+// point rather than an omission. It pinned `no member `Serialize` on type
+// `Pt3139`` — #3139's temporary `serializationSurfaceIsEmittable` interlock
+// firing — with the note that it "must be REMOVED WITH the emitters". #3140
+// (family F2) supplied the emitters' symbol-side component walk and the
+// `serialized` clause's wire channel, deleted the interlock, and that call now
+// COMPILES and round-trips. Its accept, with values, is
+// tests/module/xmod_record_serialization_3140_test.cpp; the sibling gtest arm
+// `imported_serialization_surface_still_gated_spec_9_8` flipped from a reject
+// to 34 in the same commit. The §9.8 surface that is still closed is the CLASS
+// one (#3179), pinned in that same #3140 file.
 module AppF1Lit3139;
 import LibF1Lit3139;
-import System.Serialization;
 
 class C3139
   // §18.5 — a format spec on an imported class with NO conformance. This must
@@ -66,16 +69,6 @@ class C3139
     var arr: Array<Plain3139> := [a, b];
     return arr.Min().V();
   end BadMin;
-
-  // §9.8 — the interlock. `Pt3139` DOES declare `: ISerializable,
-  // IDeserializable`, and #3139's channel can see that across the boundary;
-  // the surface stays closed because codegen cannot emit it yet.
-  public static method BadSerialize(): int
-    var p := new Pt3139(3, 4);
-    using var s := new BinarySerializer();
-    p.Serialize(s);
-    return 0;
-  end BadSerialize;
 
   public static method Main(): int
     return 0;
@@ -99,9 +92,3 @@ end C3139;
 // CHECK: Min() without a selector requires the element type to implement IComparable<T>
 // CHECK-SAME: #1198
 // CHECK-SAME: Plain3139 does not implement IComparable<T>
-
-// §9.8 — the interlock. When #3140/#3141 land and
-// `sema::serializationSurfaceIsEmittable` is deleted, THIS is the check that
-// goes red, which is the intended signal: the sibling accept in the gtest file
-// flips from a reject to 34 at the same moment.
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: no member `Serialize` on type `Pt3139`

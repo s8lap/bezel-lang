@@ -492,6 +492,20 @@ struct Loader {
             if (!member) return;
             member->isPure = mm.isPure;
             member->contractRecords = toContractRecords(mm.contracts);
+            // fix #3140 (§9.8, family F2 of umbrella #3152): the §9.8
+            // `serialized` clause. It had NO channel at all, so every §9.8
+            // emitter recovered it by casting `Symbol::decl` — null for every
+            // imported member — and answered "no clause" for all of them, which
+            // put a `serialized skip` component back on the wire while the
+            // header count still excluded it (the #1612 desync) and wrote a
+            // renamed component under its declared name. `applyBehavior` runs
+            // for every reconstructed member kind, so field, auto-property and
+            // any future storage kind pick it up in one place.
+            member->serializedSkip     = mm.serializedSkip;
+            member->serializedOptional = mm.serializedOptional;
+            if (!mm.serializedWireName.empty())
+                member->serializedWireName =
+                    ctx.internString(mm.serializedWireName);
             if (mm.isPure && std::find(member->modifiers.begin(),
                                       member->modifiers.end(), "pure") ==
                                   member->modifiers.end())

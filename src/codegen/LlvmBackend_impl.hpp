@@ -559,6 +559,23 @@ private:
     // (a synthesized Serialize FUNCTION would be required to support it).
     std::unordered_set<const sema::TypeSymbol*> serializeEmitStack_;
     std::unordered_set<const sema::TypeSymbol*> deserializeEmitStack_;
+    // fix #3140 follow-up (§9.8): the type whose synthesized Serialize /
+    // Deserialize is currently being emitted, so `emitSerializeField` /
+    // `emitDeserializeField` — which take a bare `TypeRef` and have no
+    // declaration of their own to point at — can SOURCE the diagnostic they now
+    // raise instead of silently writing nothing. Set by an RAII guard in
+    // emitRecordSerialize / emitRecordDeserialize / emitClassSerialize /
+    // emitClassDeserialize / emitChoiceSerialize / emitChoiceDeserialize.
+    const sema::TypeSymbol* serializationDiagType_ = nullptr;
+    struct SerializationDiagScope {
+        Emitter* e;
+        const sema::TypeSymbol* saved;
+        SerializationDiagScope(Emitter* em, const sema::TypeSymbol* t)
+            : e(em), saved(em->serializationDiagType_) {
+            e->serializationDiagType_ = t;
+        }
+        ~SerializationDiagScope() { e->serializationDiagType_ = saved; }
+    };
     // §8.6: the declared return-type node of the method currently being
     // emitted, so a `return <value>` whose declared return type is
     // Object/interface boxes the value before returning.
