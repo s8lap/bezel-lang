@@ -640,6 +640,34 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
             if (common::isBuiltinExceptionName(bn))
                 tsym->builtinExceptionBase = std::string(bn);
         }
+        // §9.8 / §18.5 / §21.4 / §14.2 (#3139, family F1 of #3152): a declared
+        // base that resolves to NO user TypeSymbol cannot ride the parallel
+        // `baseTypes`/`baseTypeRefs` pair just below — `baseTypes` has nothing
+        // to hold — so the `if (ref->declaration)` guard drops it on the LOCAL
+        // side too, and `MetaTypeDecl::baseTypes` (built from `baseTypeRefs`)
+        // never carried it either. That is every compiler-provided interface:
+        // ISerializable, IDeserializable, IFormattable, IEnumerable<T> and the
+        // §4 collection family. Record it on the symbol, in its own list, where
+        // a local and an imported type can be asked the same question —
+        // exactly what #2950 did for the built-in exception base one block up.
+        // See TypeSymbol::nonSymbolBaseRefs for what a wrong answer measured as.
+        //
+        // The rule is STRUCTURAL — "resolved to something with no user
+        // declaration", i.e. precisely the complement of what the guard below
+        // keeps — rather than a hand-listed set of built-in names, so the two
+        // cannot drift apart. That also means an enum's §10.3 primitive
+        // underlying base and (on an already-erroring program) an unresolved
+        // base land here; both callers of `nonSymbolBaseRefsOf` treat a
+        // non-Named entry as "closure incomplete", which is the behaviour the
+        // AST base walks they replace already had.
+        if (tsym && ref) {
+            bool already = false;
+            for (const TypeRef* seen : tsym->nonSymbolBaseRefs)
+                if (seen == ref) { already = true; break; }
+            if (!already &&
+                !(ref->kind == TypeRef::Kind::Named && ref->declaration))
+                tsym->nonSymbolBaseRefs.push_back(ref);
+        }
         if (tsym && ref && ref->kind == TypeRef::Kind::Named &&
             ref->declaration) {
             tsym->baseTypes.push_back(ref->declaration);

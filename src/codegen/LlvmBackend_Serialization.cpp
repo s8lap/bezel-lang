@@ -45,17 +45,16 @@ static std::string toLowerAscii(std::string_view sv) {
 }
 
 // Test whether a TypeSymbol's base-type list mentions the given name.
+//
+// fix #3139 (§9.8 / §2.5, family F1 of #3152): ask the ONE symbol-side walk
+// (`sema::declaresBuiltinInterface`), not the AST. The `ast::TypeDecl` this
+// read `ts->decl` for is null for EVERY imported type — the importing
+// compilation has no AST for a dependency's types at all — so the `!ts->decl`
+// early-out answered "declares no conformance" for every imported record,
+// enum and class, and §9.8's whole synthesized surface silently switched off
+// across a module boundary.
 static bool declaresConformance(const TypeSymbol* ts, std::string_view name) {
-    if (!ts || !ts->decl) return false;
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-    if (!td) return false;
-    for (const auto& bt : td->baseTypes) {
-        if (!bt) continue;
-        if (bt->name && !bt->name->parts.empty() &&
-            bt->name->parts[0] == name)
-            return true;
-    }
-    return false;
+    return sema::declaresBuiltinInterface(ts, name);
 }
 
 // Test whether a TypeSymbol has a hand-written method of the given name.

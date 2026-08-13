@@ -779,6 +779,60 @@ struct MetaTypeDecl {
     // before (the record is emitted only when non-empty).
     std::string builtinExceptionBase;
 
+    // §9.8 / §18.5 / §21.4 / §14.2 / §2.8.2 (#3139, additive within v7): the
+    // bases this type declares that name a COMPILER-PROVIDED interface with no
+    // user TypeSymbol — `ISerializable`, `IDeserializable`, `IFormattable`,
+    // `IEnumerable<T>` and the rest of the §4 collection family — as types, so
+    // their generic args cross too.
+    //
+    // The same carriage argument as `builtinExceptionBase` above, for a
+    // different fact: `baseTypes` is built from `sema::TypeSymbol::baseTypeRefs`,
+    // and a built-in interface has no user TypeSymbol, so the exporter never
+    // pushed it there either. Without this field the importer had NO channel
+    // for the conformance, and every consumer recovered it by walking
+    // `ast::TypeDecl::baseTypes` — which an imported type does not have.
+    // MEASURED: an exported `record Pt(X: int, Y: int): ISerializable,
+    // IDeserializable` got "no member `Serialize` on type `Pt`" in the importer
+    // while the identical declaration round-tripped locally. §2.8.2 requires
+    // the carriage "must not alter the instantiation's semantics"; a
+    // conformance that exists in one artifact and not the other does exactly
+    // that.
+    //
+    // Only the DIRECT bases are carried; an ancestor chain reconstructs itself
+    // because each exported ancestor carries its own — same as
+    // `builtinExceptionBase`.
+    //
+    // Carried as METATYPE_BLOCKs trailing the invariants, counted by an 8th
+    // entry in TYPE_BLOCK's REC_SCALARS. NO schema bump: a reader predating
+    // this field stops at `sc.size() >= 7`, ignores the extra scalar, and its
+    // `finishBlock` skips the trailing subblocks — the same tolerance rule
+    // stated above kSchemaVersion that #2950 relied on.
+    //
+    // BOTH the 8th scalar AND the `hashTypeDecl` fold are CONDITIONAL on the
+    // list being non-empty, matching #2950's REC_EXC_BASE exactly, so a module
+    // whose types declare no built-in interface produces byte-identical
+    // metadata to before. That is not tidiness: the first revision of this
+    // field emitted the scalar and folded a zero count unconditionally.
+    // MEASURED as a one-variable A/B on the same tree — only these two guards
+    // added — over a three-type module declaring no built-in interface
+    // anywhere: `.bezel.meta` 720 -> 716 bytes, and a different content hash.
+    // The scalar widens REC_SCALARS for EVERY type in every module, and the
+    // fold moves the VBR-encoded hash in the header, which shifts every byte
+    // after it. A hash that moves when nothing was written is not a function
+    // of the artifact's contents, and §2.8.3 rule 3's staleness check is
+    // exactly the consumer that must not be fed that noise.
+    //
+    // What the tolerance claim rests on, verified rather than asserted: the
+    // 4-way old/new reader x old/new artifact matrix over five shapes chosen
+    // for offset-shift risk (a generic class with `IEnumerable<T>` plus a
+    // destructor body, a class with `Exception, IFormattable` bases plus an
+    // invariant, a nested type — i.e. the cases where these new subblocks land
+    // BETWEEN the invariants and the pre-existing trailing REC_STRING /
+    // REC_EXC_BASE). An old reader on a new artifact gives byte-for-byte
+    // identical results and diagnostics; a new reader on an old artifact
+    // degrades exactly to pre-fix.
+    std::vector<MetaType> builtinInterfaceBases;
+
     bool operator==(const MetaTypeDecl&) const;
 };
 

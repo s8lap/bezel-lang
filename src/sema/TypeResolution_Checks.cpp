@@ -6843,16 +6843,23 @@ static bool isSerializationEligibleType(
     // check). Guard against cycles.
     if (ts->kind == ast::TypeDeclKind::Record) {
         if (visited.count(ts)) return true;  // assume eligible (cycle = eligible set)
-        auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-        if (!td) return false;
-        bool declaredISerializable = false;
-        bool declaredIDeserializable = false;
-        for (const auto& bt : td->baseTypes) {
-            if (!bt || !bt->name || bt->name->parts.empty()) continue;
-            auto n = bt->name->parts.back();
-            if (n == "ISerializable")   declaredISerializable = true;
-            if (n == "IDeserializable") declaredIDeserializable = true;
-        }
+        // fix #3139 (§9.8 / §2.5, family F1 of #3152): the conformance comes
+        // from the SYMBOL. The `if (!td) return false` this replaces made every
+        // IMPORTED record component ineligible, so a LOCAL record whose
+        // component type is an imported serializable record was rejected —
+        // "field `P` has a type that is not serialization-eligible" (measured)
+        // — for a program whose parts each compile.
+        //
+        // Gated on `serializationSurfaceIsEmittable` — codegen's component
+        // walk for THIS record still needs the `ast::TypeDecl` (#3140/#3141),
+        // and admitting the component on conformance alone made the enclosing
+        // record serialize it to nothing (measured: 244 for an expected 534).
+        // See the predicate's comment in Symbol.hpp.
+        if (!serializationSurfaceIsEmittable(ts)) return false;
+        bool declaredISerializable =
+            declaresBuiltinInterface(ts, "ISerializable");
+        bool declaredIDeserializable =
+            declaresBuiltinInterface(ts, "IDeserializable");
         if (!declaredISerializable && !declaredIDeserializable) return false;
         visited.insert(ts);
         // Verify the component types of the nested record are themselves eligible.
@@ -6878,15 +6885,12 @@ static bool isSerializationEligibleType(
     // record equality components.)
     if (ts->kind == ast::TypeDeclKind::Choice) {
         if (visited.count(ts)) return true;  // cycle → assume eligible
-        auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-        if (!td) return false;
-        bool declSer = false, declDeser = false;
-        for (const auto& bt : td->baseTypes) {
-            if (!bt || !bt->name || bt->name->parts.empty()) continue;
-            auto n = bt->name->parts.back();
-            if (n == "ISerializable")   declSer   = true;
-            if (n == "IDeserializable") declDeser = true;
-        }
+        // fix #3139 — the choice twin of the record arm above; see it for the
+        // measured consequence of the `ast::TypeDecl` gate and for why the
+        // emittability interlock is still in place.
+        if (!serializationSurfaceIsEmittable(ts)) return false;
+        bool declSer   = declaresBuiltinInterface(ts, "ISerializable");
+        bool declDeser = declaresBuiltinInterface(ts, "IDeserializable");
         if (!declSer && !declDeser) return false;
         // Only value-like choices are eligible (§9.8 choice subsection).
         TypeRef rt;

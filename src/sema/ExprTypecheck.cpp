@@ -3986,15 +3986,17 @@ ExprTC::namedAncestorChain(TypeRef* ty) {
             // TypeSymbols — these are already resolved and transitively walk).
             for (TypeRef* b : cur->declaration->baseTypeRefs)
                 queue.push_back(b);
-            // Visit AST-declared bases (includes built-in bases that have no
-            // TypeSymbol and thus are absent from baseTypeRefs).
-            const auto* astDecl =
-                dynamic_cast<const ast::TypeDecl*>(cur->declaration->decl);
-            if (astDecl) {
-                for (const auto& baseAst : astDecl->baseTypes) {
-                    if (baseAst) queue.push_back(ctx_.resolvedType(*baseAst));
-                }
-            }
+            // fix #3139 (§2.5, family F1 of #3152): plus the declared bases
+            // that have NO TypeSymbol and are therefore absent from
+            // `baseTypeRefs` — the built-in bases. This read the AST base list
+            // for them, which an IMPORTED type does not have, so an imported
+            // node contributed no built-in ancestor at all and a §31.2.1
+            // catch-arm binding over an imported exception subclass could not
+            // find its shared built-in ancestor. `nonSymbolBaseRefsOf` is that
+            // same set on both sides, and the two loops together are still
+            // exactly the declared base list.
+            for (TypeRef* b : nonSymbolBaseRefsOf(cur->declaration))
+                queue.push_back(b);
         } else if (!curName.empty()) {
             // #1621: `cur` is itself a built-in (no TypeSymbol, so no AST base
             // list to walk) — consult the built-in exception hierarchy to keep
@@ -5609,25 +5611,29 @@ bool ExprTC::userTypeImplementsBuiltinIface(TypeRef* from,
         if (!fresh) continue;
         if (curName == builtinBaseName) return true;
         if (cur->declaration) {
-            // User-declared node: walk resolved user bases plus the AST base
-            // list (the only place a builtin base survives).
+            // User-declared node: walk resolved user bases plus the bases that
+            // have no TypeSymbol (the only place a builtin base survives).
+            //
+            // fix #3139 (§2.5, family F1 of #3152): the second list came from
+            // the AST base list, which an IMPORTED type does not have — so an
+            // imported node contributed no builtin base and, with every base it
+            // did see fully modeled, a not-found result became a §5.1 REJECT of
+            // a document-admissible cross-module conformance.
+            // `nonSymbolBaseRefsOf` is the same set on both sides and keeps the
+            // non-Named entries, so the conservative branch below is unchanged.
             for (TypeRef* b : cur->declaration->baseTypeRefs)
                 queue.push_back(b);
-            if (const auto* astDecl =
-                    dynamic_cast<const ast::TypeDecl*>(cur->declaration->decl))
-                for (const auto& baseAst : astDecl->baseTypes) {
-                    if (!baseAst) continue;
-                    TypeRef* br = ctx_.resolvedType(*baseAst);
-                    // An UNRESOLVED base — null, or an Error/non-Named TypeRef
-                    // (already reported elsewhere) — leaves the conformance
-                    // closure incomplete: can't prove absence, so mark unknown
-                    // and don't pile a spurious §5.1 error on the real one.
-                    if (!br || br->kind != TypeRef::Kind::Named) {
-                        sawUnmodeledBuiltinBase = true;
-                        continue;
-                    }
-                    queue.push_back(br);
+            for (TypeRef* br : nonSymbolBaseRefsOf(cur->declaration)) {
+                // An UNRESOLVED base — null, or an Error/non-Named TypeRef
+                // (already reported elsewhere) — leaves the conformance
+                // closure incomplete: can't prove absence, so mark unknown
+                // and don't pile a spurious §5.1 error on the real one.
+                if (!br || br->kind != TypeRef::Kind::Named) {
+                    sawUnmodeledBuiltinBase = true;
+                    continue;
                 }
+                queue.push_back(br);
+            }
         } else if (!curName.empty()) {
             // Builtin interface base. If it is not in the fully-modeled family,
             // its super-closure is unknown — record that so a not-found result
@@ -10365,15 +10371,21 @@ static bool userTypeSupportsForIn(const TypeSymbol* root) {
                 if (ms->name == "GetEnumerator") return true;
         // A builtin IEnumerable-family base carries declaration==null and is
         // therefore dropped from `baseTypes`/`baseTypeRefs` (TypeResolution only
-        // records bases with a resolved TypeSymbol). Recover it from the
-        // SYNTACTIC base list on the AST TypeDecl — this is what makes an
-        // interface that merely EXTENDS IEnumerable<T> (declaring no
-        // GetEnumerator of its own) count as iterable.
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl))
-            for (const auto& bt : td->baseTypes)
-                if (bt && bt->name && !bt->name->parts.empty() &&
-                    isEnumerableFamily(bt->name->parts.back()))
-                    return true;
+        // records bases with a resolved TypeSymbol). Recover it from
+        // `nonSymbolBaseRefs` — this is what makes an interface that merely
+        // EXTENDS IEnumerable<T> (declaring no GetEnumerator of its own) count
+        // as iterable.
+        //
+        // fix #3139 (§21.4 / §2.5, family F1 of #3152): this read the SYNTACTIC
+        // base list on the `ast::TypeDecl`, which an imported type does not
+        // have, so the recovery was local-only. The symbol-side list carries it
+        // on both sides. (The caller's own `ty->declaration->decl` guard means
+        // an imported source is still left to the codegen for-shape handlers
+        // rather than diagnosed here; see the note there.)
+        for (const TypeRef* bt : nonSymbolBaseRefsOf(t))
+            if (bt && bt->kind == TypeRef::Kind::Named &&
+                isEnumerableFamily(bt->headName()))
+                return true;
         // Recurse into user (declaration-bearing) base types.
         for (auto* bt : t->baseTypes)
             if (bt && seen.insert(bt).second) queue.push_back(bt);

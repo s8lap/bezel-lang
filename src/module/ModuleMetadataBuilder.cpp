@@ -1332,6 +1332,27 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // itself, because each exported ancestor carries its own.
     out.builtinExceptionBase = t.builtinExceptionBase;
 
+    // fix #3139 (§9.8 / §18.5 / §21.4 / §2.8.2, family F1 of #3152): the
+    // BUILT-IN INTERFACE bases, which the `baseTypeRefs` loop above cannot
+    // carry for exactly the same structural reason — `ISerializable`,
+    // `IDeserializable`, `IFormattable` and `IEnumerable<T>` have no user
+    // TypeSymbol, so Type Resolution's `if (ref->declaration)` guard drops
+    // them from `baseTypeRefs` on this side too. They decide what an importer
+    // may CALL on the type (§9.8's synthesized `Serialize`/`Deserialize`,
+    // §18.5's format-spec admission, §9.8's component eligibility), so an
+    // importer that cannot see them REJECTS a program this exporter compiles.
+    // Only the DIRECT bases are carried; an ancestor chain reconstructs itself
+    // because each exported ancestor carries its own.
+    //
+    // `nonSymbolBaseRefs` also holds an enum's §10.3 primitive underlying base
+    // and, on an erroring compile, an unresolved base. Neither is a
+    // conformance and neither has a use on the far side (the underlying width
+    // rides `enumUnderlyingType`; an erroring module never gets this far), so
+    // only Named entries cross.
+    for (sema::TypeRef* ifaceRef : t.nonSymbolBaseRefs)
+        if (ifaceRef && ifaceRef->kind == sema::TypeRef::Kind::Named)
+            out.builtinInterfaceBases.push_back(convertType(ifaceRef));
+
     // §22.16 / §2.8.2 (#2054): carry invariant records in base-first order.
     // The record list is declaration-derived; no per-call-site discharge is
     // consulted while emitting an interface.

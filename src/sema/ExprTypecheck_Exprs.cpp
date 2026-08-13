@@ -181,18 +181,17 @@ bool isIntrinsicTemporalOrGuid(std::string_view n) {
 
 // §18.5 (v0.172): does `ts` (transitively) declare `: IFormattable`? IFormattable
 // is a null-declaration builtin interface, so it never lands in `baseTypes`;
-// walk each level's AST base-type list by name, recursing through resolved base
-// classes / user interfaces for the `interface IMyFmt: IFormattable` case.
+// the walk recurses through resolved base classes / user interfaces for the
+// `interface IMyFmt: IFormattable` case.
+//
+// fix #3139 (§18.5 / §2.5, family F1 of #3152): each level's own conformance
+// came from its `ast::TypeDecl` base list, which an IMPORTED type does not
+// have — so an imported `class Money: IFormattable` answered false and a
+// format spec on it was rejected with "`Money` is neither" while the identical
+// local declaration was accepted (measured). `sema::inheritsBuiltinInterface`
+// is the same transitive walk over the symbol, on both sides.
 bool declaresIFormattable(const TypeSymbol* ts) {
-    if (!ts) return false;
-    if (const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
-        for (const auto& bt : td->baseTypes)
-            if (bt && bt->name && !bt->name->parts.empty() &&
-                bt->name->parts.back() == "IFormattable")
-                return true;
-    for (const TypeSymbol* b : ts->baseTypes)
-        if (declaresIFormattable(b)) return true;
-    return false;
+    return inheritsBuiltinInterface(ts, "IFormattable");
 }
 
 // §18.5 / §2.18 (v0.172): may a hole with a real format spec apply to an operand

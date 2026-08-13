@@ -5058,34 +5058,34 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // per §5.1 / §14.2 (#1198): enforce the
                                 // IComparable<T> constraint on class/interface
                                 // elements. String always satisfies it (stdlib
-                                // §9.6). For a user class, scan the AST
-                                // TypeDecl::baseTypes for "IComparable" — we
-                                // use the AST list, not TypeSymbol::baseTypes,
-                                // because the latter skips builtin interface
-                                // bases (IComparable has no user TypeDecl and
-                                // is never inserted into TypeSymbol::baseTypes
-                                // — see comment at ~L7955). Without this check
-                                // sema types the result as T and codegen
-                                // IR-fails (no CompareTo to dispatch through).
+                                // §9.6). Without this check sema types the
+                                // result as T and codegen IR-fails (no
+                                // CompareTo to dispatch through).
+                                //
+                                // fix #3139 (§2.5, family F1 of #3152): ask
+                                // `sema::declaresBuiltinInterface`, which reads
+                                // the SYMBOL. This scanned `ast::TypeDecl::
+                                // baseTypes` because `TypeSymbol::baseTypes`
+                                // was thought to skip builtin interface bases —
+                                // true of ISerializable and friends, but NOT of
+                                // IComparable, which #1115 gives a synthesized
+                                // TypeSymbol and #2776 gives the same identity
+                                // on the imported side. The accessor consults
+                                // both places, so the answer no longer depends
+                                // on an AST an imported element never has: the
+                                // `if (td)` guard left `implIComp` at its
+                                // `true` initialiser for every IMPORTED class,
+                                // i.e. an unconditional ACCEPT of a
+                                // non-conforming element — the over-accept
+                                // whose codegen consequence is the IR-verifier
+                                // failure this check exists to prevent.
                                 bool implIComp = true; // string: always true
+                                // Kept DIRECT, exactly as the base-list scan it
+                                // replaces: only the module boundary changes.
                                 if (elem->kind == TypeRef::Kind::Named &&
-                                    elem->declaration) {
-                                    const auto* td =
-                                        dynamic_cast<const ast::TypeDecl*>(
-                                            elem->declaration->decl);
-                                    if (td) {
-                                        implIComp = false;
-                                        for (const auto& bt : td->baseTypes) {
-                                            if (!bt || !bt->name ||
-                                                bt->name->parts.empty())
-                                                continue;
-                                            if (bt->name->parts.back() ==
-                                                "IComparable") {
-                                                implIComp = true; break;
-                                            }
-                                        }
-                                    }
-                                }
+                                    elem->declaration)
+                                    implIComp = declaresBuiltinInterface(
+                                        elem->declaration, "IComparable");
                                 if (!implIComp) {
                                     ctx_.diagnostics().report(
                                         Severity::Error, ce.span.begin,
@@ -5360,26 +5360,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                   elemTy472->primitive == P::Float ||
                                   elemTy472->primitive == P::Char));
                             // #1195 / §14.2: also accept a class implementing
-                            // IComparable<T>.  Scan the AST baseTypes list for
-                            // "IComparable" (same pattern as Min/Max gate ~L2600).
+                            // IComparable<T>.
+                            //
+                            // fix #3139 (§2.5, family F1 of #3152): the same
+                            // symbol-side accessor as the Min/Max gate above,
+                            // for the same reason — the `if (td)` guard this
+                            // replaces made the answer "no" for every IMPORTED
+                            // class, so `Array<T>.Sort()` over a
+                            // document-admissible cross-module element was
+                            // rejected while the identical local declaration
+                            // was accepted.
                             if (!isComparableElem && elemTy472 &&
                                 elemTy472->kind == TypeRef::Kind::Named &&
                                 elemTy472->declaration &&
                                 elemTy472->declaration->kind ==
-                                    ast::TypeDeclKind::Class) {
-                                const auto* td = dynamic_cast<const ast::TypeDecl*>(
-                                    elemTy472->declaration->decl);
-                                if (td) {
-                                    for (const auto& bt : td->baseTypes) {
-                                        if (!bt || !bt->name ||
-                                            bt->name->parts.empty())
-                                            continue;
-                                        if (bt->name->parts.back() == "IComparable") {
-                                            isComparableElem = true;
-                                            break;
-                                        }
-                                    }
-                                }
+                                    ast::TypeDeclKind::Class &&
+                                declaresBuiltinInterface(
+                                    elemTy472->declaration, "IComparable")) {
+                                isComparableElem = true;
                             }
                             // fix #2768 (stdlib §4.4 / §2.8, spec §14.2,
                             // v0.240): (c) an INTERFACE element that names
@@ -17039,20 +17037,31 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // §9.8 / issue #550: Serialize(s: ISerializer) and Deserialize
                 // are synthesized by codegen for records/enums that declare
                 // ISerializable / IDeserializable conformance. No MemberSymbol
-                // exists; sema must not reject the call.  We check the AST
-                // TypeDecl::baseTypes because TypeSymbol::baseTypes skips the
-                // builtin interface bases (ISerializable / IDeserializable have
-                // no user TypeDecl, so they never appear in TypeSymbol::baseTypes).
-                auto* td = dynamic_cast<const ast::TypeDecl*>(targetType->decl);
-                bool declaresSer = false, declaresDeser = false;
-                if (td) {
-                    for (const auto& bt : td->baseTypes) {
-                        if (!bt || !bt->name || bt->name->parts.empty()) continue;
-                        const auto& n = bt->name->parts.back();
-                        if (n == "ISerializable")   declaresSer  = true;
-                        if (n == "IDeserializable") declaresDeser = true;
-                    }
-                }
+                // exists; sema must not reject the call.
+                //
+                // fix #3139 (§9.8 / §2.5, family F1 of #3152): ask the symbol.
+                // This read `ast::TypeDecl::baseTypes` — correct that
+                // ISerializable/IDeserializable never reach
+                // `TypeSymbol::baseTypes`, wrong that the AST is the only other
+                // place they live — and an IMPORTED type has no AST, so `td`
+                // was null and BOTH flags stayed false. MEASURED: a dependency
+                // exporting `record Pt(X: int, Y: int): ISerializable,
+                // IDeserializable` produced "no member `Serialize` on type
+                // `Pt`" / "no member `Deserialize`" in the importer, while the
+                // same declaration compiled locally and round-tripped.
+                //
+                // The §9.8 EMITTERS still read the component list off the
+                // `ast::TypeDecl` (families F2/F3, #3140/#3141), so the
+                // conformance answer is gated on
+                // `serializationSurfaceIsEmittable` until those land — see its
+                // comment in Symbol.hpp for what removing the gate measured as.
+                bool emittable = serializationSurfaceIsEmittable(targetType);
+                bool declaresSer =
+                    emittable &&
+                    declaresBuiltinInterface(targetType, "ISerializable");
+                bool declaresDeser =
+                    emittable &&
+                    declaresBuiltinInterface(targetType, "IDeserializable");
                 if ((m == "Serialize" && declaresSer) ||
                     (m == "Deserialize" && declaresDeser)) {
                     // §9.8 / issue #550: Synthesis suppresses "no member".
@@ -17132,29 +17141,42 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // §9.8 / issue #550: Serialize and Deserialize are synthesized for
         // records/enums/serialized-tree-classes that declare
         // ISerializable/IDeserializable. They have no MemberSymbol, so we must
-        // not fire "no member" on them.  We check the AST TypeDecl::baseTypes
-        // (TypeSymbol::baseTypes skips builtin interface bases like ISerializable
-        // because they carry no user TypeDecl).
+        // not fire "no member" on them.
+        //
+        // fix #3139 (§9.8 / §2.5, family F1 of #3152): the CONFORMANCE half now
+        // comes from `sema::declaresBuiltinInterface`, which reads the symbol.
+        // It used to come from `ast::TypeDecl::baseTypes` — absent for every
+        // imported type — so this suppression never fired across a module
+        // boundary and an imported serializable record's `.Serialize(s)` was
+        // reported as "no member `Serialize`" (measured).
+        //
+        // The CLASS half is deliberately still AST-gated: §9.8 tier 2+ requires
+        // a `serialized` class clause, and that clause has no symbol-side or
+        // metadata channel at all (audit §3). So an imported CLASS keeps
+        // today's conservative "not synthesized" answer rather than being
+        // admitted on conformance alone — which would let a class with no
+        // clause resolve a member codegen would not emit. #3140 (family F2)
+        // adds the clause's channel; when it lands, this `tdSer` read is the
+        // one line to replace.
         bool isSerializationSynthesizedMember = false;
         if ((mm == "Serialize" || mm == "Deserialize") && knownCompleteUserType &&
                 (targetType->kind == ast::TypeDeclKind::Record ||
                  targetType->kind == ast::TypeDeclKind::Enum ||
                  targetType->kind == ast::TypeDeclKind::Class ||
                  targetType->kind == ast::TypeDeclKind::Choice)) {
-            auto* tdSer = dynamic_cast<const ast::TypeDecl*>(targetType->decl);
-            if (tdSer) {
-                // For classes: only synthesized when a serialized-class clause
-                // is present (§9.8 tier 2+). Without it the class must hand-write.
-                bool classOk = (targetType->kind != ast::TypeDeclKind::Class) ||
-                               (tdSer->serializedClass != nullptr);
-                if (classOk) {
-                    for (const auto& bt : tdSer->baseTypes) {
-                        if (!bt || !bt->name || bt->name->parts.empty()) continue;
-                        const auto& bn = bt->name->parts.back();
-                        if (mm == "Serialize"   && bn == "ISerializable")   { isSerializationSynthesizedMember = true; break; }
-                        if (mm == "Deserialize" && bn == "IDeserializable") { isSerializationSynthesizedMember = true; break; }
-                    }
-                }
+            // For classes: only synthesized when a serialized-class clause
+            // is present (§9.8 tier 2+). Without it the class must hand-write.
+            bool classOk = true;
+            if (targetType->kind == ast::TypeDeclKind::Class) {
+                auto* tdSer =
+                    dynamic_cast<const ast::TypeDecl*>(targetType->decl);
+                classOk = tdSer && tdSer->serializedClass != nullptr;
+            }
+            if (classOk && serializationSurfaceIsEmittable(targetType)) {
+                std::string_view need = mm == "Serialize" ? "ISerializable"
+                                                          : "IDeserializable";
+                isSerializationSynthesizedMember =
+                    declaresBuiltinInterface(targetType, need);
             }
         }
         // §9.8 tier 2: for a `serialized tree/graph/cyclic` class, set the

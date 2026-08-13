@@ -7,6 +7,9 @@
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 
+#include <unordered_set>  // inheritsBuiltinInterface's cycle guard (#3139)
+#include <vector>
+
 namespace bezel::sema {
 
 namespace {
@@ -558,6 +561,52 @@ std::string_view builtinExceptionBaseOf(const TypeSymbol* t) {
         cur = next;
     }
     return {};
+}
+
+// §9.8 / §18.5 / §21.4 / §14.2 (#3139, family F1 of #3152): see Symbol.hpp for
+// the contract. Modelled on `builtinExceptionBaseOf` directly above — a
+// TypeSymbol field, a MetaTypeDecl record, and ONE walk that never requires an
+// `ast::TypeDecl` at any level, because an imported type never has one.
+const std::vector<TypeRef*>& nonSymbolBaseRefsOf(const TypeSymbol* t) {
+    static const std::vector<TypeRef*> kEmpty;
+    return t ? t->nonSymbolBaseRefs : kEmpty;
+}
+
+bool declaresBuiltinInterface(const TypeSymbol* t, std::string_view name) {
+    if (!t || name.empty()) return false;
+    // Source 1 — the built-in interfaces with NO TypeSymbol (ISerializable,
+    // IDeserializable, IFormattable, IEnumerable<T>, …). Local: recorded by
+    // Type Resolution; imported: restored by ModuleLoader from the metadata.
+    // `headName()` is the alias-transparent head and reads `importedName` on
+    // the imported side, so one spelling covers both.
+    for (const TypeRef* b : t->nonSymbolBaseRefs)
+        if (b && b->headName() == name) return true;
+    // Source 2 — the built-in interfaces that DO get a synthesized TypeSymbol
+    // (IComparable, IEquatable, … — SemaContext::isSynthesizedBuiltinInterface
+    // Name) and so ride `baseTypes` on both sides already. The flag, not the
+    // name alone, is the test: a USER interface named `IComparable` is a
+    // different type and must not answer yes (§2.8.3 rule 3 identity).
+    for (const TypeSymbol* b : t->baseTypes)
+        if (b && b->isSynthesizedBuiltinInterface && b->name == name)
+            return true;
+    return false;
+}
+
+bool inheritsBuiltinInterface(const TypeSymbol* t, std::string_view name) {
+    if (!t || name.empty()) return false;
+    // Cycle-guarded BFS over the USER-base closure. An inheritance cycle is
+    // reported by the §12 check but can still survive error recovery into this
+    // walk, and the walk must terminate on one.
+    std::vector<const TypeSymbol*> queue{t};
+    std::unordered_set<const TypeSymbol*> seen{t};
+    for (std::size_t qi = 0; qi < queue.size(); ++qi) {
+        const TypeSymbol* cur = queue[qi];
+        if (!cur) continue;
+        if (declaresBuiltinInterface(cur, name)) return true;
+        for (const TypeSymbol* b : cur->baseTypes)
+            if (b && seen.insert(b).second) queue.push_back(b);
+    }
+    return false;
 }
 
 // §31.4 (v0.240, #2971/#2983/#2984): see Symbol.hpp for the contract and for

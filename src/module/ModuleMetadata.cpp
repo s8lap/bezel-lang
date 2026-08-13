@@ -246,6 +246,25 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
     // that staleness detection must track — a dependency that gains or loses
     // `: Exception` must invalidate every dependent.
     hashStr(h, ty.builtinExceptionBase);
+    // §9.8 / §18.5 / §21.4 (#3139): the built-in-interface conformance set is
+    // public-interface content — a dependency that gains or loses
+    // `: ISerializable` changes what its consumers may call on the type — so it
+    // must fold into the semantic hash or staleness detection cannot see the
+    // change (§2.8.3 rule 3: staleness is an error, not a negotiation).
+    // GUARDED ON EXACTLY THE EMISSION'S CONDITION (emitTypeDecl above). The
+    // hash is a function of what was WRITTEN; folding a zero count for a field
+    // the writer omitted makes it a function of the compiler version instead,
+    // and — because the hash is VBR-encoded into the header — moves every byte
+    // of every artifact for a change that wrote nothing. Same rule, same
+    // shape, as #3140's `enumWireName` fold.
+    //
+    // The encoding stays unambiguous: the count is folded only when it is
+    // NON-ZERO, so "tail absent" and "tail present" cannot produce the same
+    // stream, and this is the last thing folded for a type.
+    if (!ty.builtinInterfaceBases.empty()) {
+        hashU64(h, ty.builtinInterfaceBases.size());
+        for (const MetaType& b : ty.builtinInterfaceBases) hashType(h, b);
+    }
 }
 
 } // namespace
@@ -434,7 +453,8 @@ bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
            invariants == o.invariants &&
            hasPositionalFields == o.hasPositionalFields &&
            dtorBodyText == o.dtorBodyText &&
-           builtinExceptionBase == o.builtinExceptionBase;
+           builtinExceptionBase == o.builtinExceptionBase &&
+           builtinInterfaceBases == o.builtinInterfaceBases;
 }
 
 bool MetaFunction::operator==(const MetaFunction& o) const {
@@ -669,7 +689,7 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     // §9.2 (schema v4, issue #501): add hasPositionalFields as the 6th scalar.
     // v3 readers reject v4 blobs so they never see this; v4 readers tolerate
     // a v3 blob where sc.size() == 5 (hasPositionalFields treated as false).
-    llvm::SmallVector<std::uint64_t, 7> sc{
+    llvm::SmallVector<std::uint64_t, 8> sc{
         static_cast<std::uint64_t>(ty.kind),
         static_cast<std::uint64_t>(ty.visibility),
         ty.genericParams.size(),
@@ -678,6 +698,22 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
         ty.hasPositionalFields ? 1u : 0u,
         ty.invariants.size(),
     };
+    // #3139 (additive): an 8th scalar counts the built-in-interface bases
+    // emitted after the invariants. A reader predating it stops at sc[6] and
+    // its finishBlock skips the trailing subblocks.
+    //
+    // CONDITIONAL, and it has to be — this is what makes a module whose types
+    // declare no built-in interface produce byte-identical metadata, the
+    // property #2950's REC_EXC_BASE has and the property the field comment in
+    // ModuleMetadata.hpp claims. An unconditional 8th entry is not free
+    // bookkeeping: it widens REC_SCALARS for EVERY type in every module, and
+    // (with the matching fold in hashTypeDecl) moves the VBR-encoded hash in
+    // the header, which shifts every byte after it. MEASURED before this guard:
+    // a module with no built-in-interface base anywhere went 468 -> 476 bytes.
+    // `readTypeDeclBody` already tolerates a 7-entry record (`sc.size() >= 8`),
+    // so nothing on the read side changes.
+    if (!ty.builtinInterfaceBases.empty())
+        sc.push_back(ty.builtinInterfaceBases.size());
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, ty.name);
     emitStringList(w, ty.modifiers);
@@ -685,6 +721,10 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     for (const MetaType& b : ty.baseTypes) emitType(w, b);
     for (const MetaMember& m : ty.members) emitMember(w, m);
     for (const MetaContractRecord& c : ty.invariants) emitContract(w, c);
+    // §9.8 / §18.5 / §21.4 (#3139): the built-in-interface bases, counted by
+    // sc[7]. Emitted after the invariants, so every count-driven list a reader
+    // predating this field knows about has already been consumed when it stops.
+    for (const MetaType& b : ty.builtinInterfaceBases) emitType(w, b);
     // §14 / #662c (schema v5): for a GENERIC class, a trailing REC_STRING after
     // the members carries the destructor body source text (empty = no user body).
     // v4 readers encounter finishBlock which skips all trailing content, so this
@@ -1298,6 +1338,9 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     // A v3 blob (read by v4 reader) has only 5 scalars → treat as false.
     if (sc.size() >= 6) ty.hasPositionalFields = sc[5] != 0;
     std::uint64_t nInvariants = sc.size() >= 7 ? sc[6] : 0;
+    // #3139 (additive within v7): 8th scalar = the built-in-interface base
+    // count. A blob written before this field has 7 scalars → zero.
+    std::uint64_t nBuiltinIfaces = sc.size() >= 8 ? sc[7] : 0;
     if (!expectString(r, ty.name)) return false;
     if (!readStringList(r, ty.modifiers)) return false;
     ty.genericParams.resize(nGeneric);
@@ -1315,6 +1358,13 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     ty.invariants.resize(nInvariants);
     for (std::uint64_t i = 0; i < nInvariants; ++i) {
         if (!readContract(r, ty.invariants[i])) return false;
+    }
+    // §9.8 / §18.5 / §21.4 (#3139): the built-in-interface bases, in the same
+    // position the writer put them — after the invariants, before any trailing
+    // record.
+    ty.builtinInterfaceBases.resize(nBuiltinIfaces);
+    for (std::uint64_t i = 0; i < nBuiltinIfaces; ++i) {
+        if (!readType(r, ty.builtinInterfaceBases[i])) return false;
     }
     // §14 / #662c (schema v5): trailing REC_STRING = dtorBodyText for generic
     // classes.  A v4 reader's finishBlock already skips all trailing content,

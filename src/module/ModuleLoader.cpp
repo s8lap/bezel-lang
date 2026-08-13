@@ -380,6 +380,16 @@ struct Loader {
             if (ref->kind == sema::TypeRef::Kind::Named && ref->declaration)
                 t->baseTypes.push_back(ref->declaration);
         }
+        // fix #3139 (§9.8 / §18.5 / §21.4 / §2.8.3 rule 4, family F1 of
+        // #3152): restore the BUILT-IN INTERFACE bases. Without them this
+        // reconstructed symbol answers "declares none" to every conformance
+        // consumer — and because those consumers had no symbol-side channel at
+        // all and read `ast::TypeDecl::baseTypes`, which an imported type does
+        // not have, a program the exporter compiles is REJECTED in the importer
+        // ("no member `Serialize` on type `Pt`", the §18.5 format-spec reject,
+        // the §9.8 component-eligibility reject).
+        for (const MetaType& iface : td.builtinInterfaceBases)
+            t->nonSymbolBaseRefs.push_back(convert(iface));
         for (const MetaMember& mm : td.members) {
             if (sema::Symbol* m = convertMember(mm, *t))
                 t->members.push_back(m);
@@ -2527,6 +2537,9 @@ static void loadMetadataPass2(
             if (ref->kind == sema::TypeRef::Kind::Named && ref->declaration)
                 t->baseTypes.push_back(ref->declaration);
         }
+        // fix #3139 — see the sibling restore in `reconstructTypeSymbol`.
+        for (const MetaType& iface : td.builtinInterfaceBases)
+            t->nonSymbolBaseRefs.push_back(loader.convert(iface));
         for (const MetaMember& mm : td.members) {
             if (sema::Symbol* m = loader.convertMember(mm, *t))
                 t->members.push_back(m);

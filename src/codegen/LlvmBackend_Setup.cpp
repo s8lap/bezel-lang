@@ -21009,17 +21009,12 @@ const sema::TypeSymbol* Emitter::resolveSynthesizedDeserializeCallTarget(
         dynamic_cast<const sema::TypeSymbol*>(ctx_.exprSymbol(*ma->target));
     if (!ts) return nullptr;
     if (!ts->genericParams.empty()) return nullptr;
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-    if (!td) return nullptr;
-    bool declaresIDeserializable = false;
-    for (const auto& bt : td->baseTypes) {
-        if (bt && bt->name && !bt->name->parts.empty() &&
-            bt->name->parts[0] == "IDeserializable") {
-            declaresIDeserializable = true;
-            break;
-        }
-    }
-    if (!declaresIDeserializable) return nullptr;
+    // fix #3139 (§9.8 / §2.5, family F1 of #3152): the conformance question is
+    // asked of the SYMBOL, not of an `ast::TypeDecl` an imported type never
+    // has. The `if (!td) return nullptr` this replaces made every imported
+    // `IDeserializable` record/choice unrecognisable here, so #2448's and
+    // #2428's release-eligibility carves never fired across a module boundary.
+    if (!sema::declaresBuiltinInterface(ts, "IDeserializable")) return nullptr;
     for (const sema::Symbol* m : ts->members) {
         // A hand-written "Deserialize" method suppresses synthesis (§9.8) —
         // its body is not provably a fresh construction, so it must NOT be

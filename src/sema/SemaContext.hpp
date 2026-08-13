@@ -1053,6 +1053,10 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
             }
             ts->members.push_back(ms);
         }
+        // #3139: mark the synthesized identity, so `declaresBuiltinInterface`
+        // can tell a base that names one of these from a USER type of the same
+        // name without a second hand-listed copy of the name set.
+        ts->isSynthesizedBuiltinInterface = true;
         builtinInterfaceCache_[key] = ts;
         return ts;
     }
@@ -1257,6 +1261,8 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
             setResolvedType(rp.ret, primitiveTypeRef(pspec.retPrim, false));
     }
 
+    // #3139: see the sibling assignment in the §11.8 branch above.
+    ts->isSynthesizedBuiltinInterface = true;
     builtinInterfaceCache_[key] = ts;
     return ts;
 }

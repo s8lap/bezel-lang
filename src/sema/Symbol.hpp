@@ -180,6 +180,78 @@ struct TypeSymbol : Symbol {
     // `builtinExceptionBaseOf` below, never directly, so the ancestor walk
     // stays in one place.
     std::string builtinExceptionBase;
+    // §9.8 / §18.5 / §21.4 / §14.2 (#3139, family F1 of #3152): the resolved
+    // TypeRefs of this type's declared bases that carry NO user `TypeSymbol` —
+    // exactly the complement, within the declared base list, of what
+    // `baseTypes`/`baseTypeRefs` can hold. In practice that is the
+    // compiler-provided interfaces (`ISerializable`, `IDeserializable`,
+    // `IFormattable`, `IEnumerable<T>` and the rest of the §4 collection
+    // family), plus an enum's §10.3 primitive underlying type, plus — locally,
+    // on an already-erroring program — a base whose name did not resolve.
+    // Generic args are preserved, so a walk can continue through the built-in
+    // hierarchy from here.
+    //
+    // Why a second list rather than an entry in `baseTypes`/`baseTypeRefs`:
+    // those two are documented as PARALLEL, and a base with no TypeSymbol has
+    // nothing to put in `baseTypes`. `TypeResolution_Names`'s
+    // `if (ref->declaration)` guard therefore drops such a base from BOTH — on
+    // the LOCAL side too — and `MetaTypeDecl::baseTypes` is built from
+    // `baseTypeRefs`, so the fact never reached the wire either. Every consumer
+    // recovered it by walking `ast::TypeDecl::baseTypes` instead, which answers
+    // "declares none" for every IMPORTED type (an imported symbol has no AST at
+    // all). MEASURED on `main` with a two-module build (`bezelc -c lib.bzl` then
+    // `--import lib.o app.bzl`): an exported
+    // `public record Pt(X: int, Y: int): ISerializable, IDeserializable` got
+    // "no member `Serialize` on type `Pt`" in the importer while the identical
+    // declaration compiled and round-tripped to 34 locally; an imported
+    // `: IFormattable` class got the §18.5 "a format spec requires … one
+    // implementing `IFormattable`" reject; and a LOCAL record with an imported
+    // serializable record component got the §9.8 "not serialization-eligible"
+    // reject.
+    //
+    // The membership rule is STRUCTURAL ("the base resolved to something with
+    // no user declaration"), not a hand-listed set of built-in names — the
+    // positive-list shape that has drifted here before (see the name-set
+    // discussion on `builtinExceptionBaseOf`). Keeping the non-Named entries
+    // rather than filtering down to interfaces is deliberate: two closure walks
+    // (`namedAncestorChain`, `userTypeImplementsBuiltinIface`) read the raw AST
+    // base list today and treat a non-Named entry as "closure incomplete — do
+    // not conclude absence", and that conservative branch has to survive the
+    // conversion unchanged.
+    //
+    // ⚠ ONE ASYMMETRY THAT CREATES, stated because it is real and bounded:
+    // only the `Named` entries cross the wire (ModuleMetadataBuilder filters
+    // them — an enum's underlying width rides `enumUnderlyingType`, and a
+    // module with an unresolved base never gets as far as emitting metadata).
+    // So a LOCAL enum's `: long` is in this list and an IMPORTED enum's is not,
+    // and the two conservative branches above therefore read a local enum as
+    // "closure incomplete" and an imported one as complete. Bounded, and never
+    // in the permissive direction for the imported side: both callers are
+    // gated on a builtin BORROWING COLLECTION target
+    // (`builtinBorrowingCollectionFullyModeled`) or on §31.2.1 catch-arm
+    // binding, and an enum is neither, so the difference is unreachable today;
+    // where it were reachable it would make the IMPORTED answer the sharper of
+    // the two. Recorded rather than equalised because carrying an enum's
+    // primitive base a second time, purely to preserve a conservative branch no
+    // caller can observe, would be the more confusing artifact.
+    //
+    // The synthesized-symbol built-in interfaces (`IComparable`, `IEquatable`,
+    // … — SemaContext::isSynthesizedBuiltinInterfaceName) DO get a TypeSymbol
+    // and so ride `baseTypes` on both sides already; `declaresBuiltinInterface`
+    // below consults both places so a caller never has to know which.
+    //
+    // Read it through the accessors below, never directly.
+    std::vector<TypeRef*> nonSymbolBaseRefs;
+    // #2776 / #3139: true for the synthesized `TypeSymbol`s minted by
+    // `SemaContext::builtinInterfaceSym` for the closed set of built-in
+    // interfaces that DO get a real declaration. `ModuleLoader` resolves an
+    // imported occurrence to the very same cached symbol (#2776), so the flag
+    // reads the same on both sides. It is what lets
+    // `declaresBuiltinInterface` tell `: IComparable<T>` apart from a USER
+    // type that happens to be named `IComparable` — the name-only walks it
+    // replaces had no such guard (the same distinction #2950 records for
+    // `Exception`).
+    bool isSynthesizedBuiltinInterface = false;
 };
 
 // §11.7 / §12.5 / §19.6 (v0.242, #3052): the class-shape modifier predicates,
@@ -231,6 +303,112 @@ inline bool typeIsAbstractOrClosed(const TypeSymbol* t) {
 // an ancestor to have an `ast::TypeDecl` (an imported one never does), and why
 // `builtinExceptionBase` is consulted at every level rather than only the first.
 std::string_view builtinExceptionBaseOf(const TypeSymbol* t);
+
+// §9.8 / §18.5 / §21.4 / §14.2 (#3139): the built-in-interface conformance
+// accessors — the ONE place the question "does this type declare built-in
+// interface `name`?" is answered, for a local and an imported symbol alike.
+// See `TypeSymbol::nonSymbolBaseRefs` above for why the fact needs its own
+// carriage and what a wrong answer measured as.
+//
+// They consult BOTH sources rather than switching on which one exists (the
+// audit's rule): `nonSymbolBaseRefs` for the built-in interfaces that have no
+// TypeSymbol, and the `isSynthesizedBuiltinInterface`-flagged entries of
+// `baseTypes` for the ones that do. Neither requires an `ast::TypeDecl` at any
+// level, because an imported symbol never has one.
+//
+//   * `declaresBuiltinInterface` — does `t` name it among its OWN bases?
+//   * `inheritsBuiltinInterface` — does `t`, or any type in its user-base
+//     closure, name it? Cycle-guarded (an inheritance cycle can survive error
+//     recovery into these walks).
+//
+// The empty/null cases answer false.
+//
+// ⚠ THE ANSWER IS BY IDENTITY, NOT BY NAME — and that is a deliberate LOCAL
+// behaviour change, not only a cross-module fix. §2.3 permits a user
+// declaration to shadow an auto-imported library name ("the auto-imported
+// library types … may be shadowed by local declarations under the normal
+// name-resolution rules"), and the AST base-list walks these accessors replace
+// matched on the simple name, so a class implementing a SHADOW was admitted
+// wherever the real built-in would be. §18.5 is explicit that the opt-in is
+// "the auto-imported interface `IFormattable`", so admitting a shadow was an
+// over-accept: measured, a `class Fake: IFormattable` over a locally declared
+// `interface IFormattable` returned 77 from a `$"{f:X}"` hole, and so did a
+// shadow declaring only `Nope()` — with no `ToString(format)` for §18.5's
+// dispatch to call at all. Both now report the §18.5 error. Pinned in
+// tests/lit/builtin_iface_shadow_reject_3139.bzl and in the two
+// `local_shadowed_iformattable_*` arms of
+// tests/module/xmod_builtin_iface_conformance_3139_test.cpp (which also pin
+// that the shadow stays USABLE — §2.3 permits it to exist; only §18.5's
+// admission is denied).
+//
+// The two built-in families reach that identity by DIFFERENT routes, and both
+// are load-bearing:
+//
+//   * the synthesized-symbol family (IComparable, IEquatable, … — they DO get
+//     a TypeSymbol) is separated from a same-named user type by the
+//     `isSynthesizedBuiltinInterface` flag, checked instead of the name;
+//   * the non-symbol family (ISerializable, IFormattable, IEnumerable<T>, …)
+//     is separated structurally: a user-declared base HAS a declaration, so
+//     Type Resolution puts it in `baseTypes`/`baseTypeRefs` and it can never
+//     land in `nonSymbolBaseRefs`, which is the only place this family lives.
+//
+// Same rule, two mechanisms — the same distinction #2950 records for a user
+// class named `Exception`.
+bool declaresBuiltinInterface(const TypeSymbol* t, std::string_view name);
+bool inheritsBuiltinInterface(const TypeSymbol* t, std::string_view name);
+
+// The declared bases of `t` that carry no user `TypeSymbol`, for the two
+// closure walks that must continue THROUGH the built-in hierarchy and so need
+// the resolved TypeRef (generic args included), not just a head name:
+// `namedAncestorChain` and `userTypeImplementsBuiltinIface`. Both already visit
+// `baseTypeRefs` for the declaration-bearing bases; this supplies exactly the
+// ones the parallel-list guard drops, so the two together are the full declared
+// base list on either side of a module boundary — which is what the AST base
+// walk they replace was reaching for. Entries are never null but need not be
+// `Named`; both callers already treat a non-`Named` entry as "closure
+// incomplete", and that branch is why they are kept (see the field comment).
+const std::vector<TypeRef*>& nonSymbolBaseRefsOf(const TypeSymbol* t);
+
+// §9.8 (#3139 → #3140/#3141): can codegen actually EMIT the synthesized
+// serialization surface for `t`?
+//
+// This is a deliberately TEMPORARY interlock, and it is separate from the
+// conformance question above on purpose. #3139 gives every consumer a
+// symbol-side answer to "does `t` declare `: ISerializable`", and for an
+// imported type that answer is now yes where it used to be no. But the §9.8
+// EMITTERS — `emitRecordSerialize` / `emitRecordDeserialize` /
+// `emitEnumSerialize` / `emitEnumDeserialize`, and the `serialized "wire-name"`
+// clause they read — still take their component list from the
+// `ast::TypeDecl`, and an imported type has none. Those are families F2
+// (#3140) and F3 (#3141) of the same umbrella and are NOT this fix's to
+// convert.
+//
+// So admitting the surface on conformance alone would replace a truthful
+// reject with SILENTLY WRONG BYTES. MEASURED with the interlock removed: an
+// importer's `Wrap(P: Pt, N: int)` over an imported serializable `Pt`
+// round-tripped to 244 instead of 534 (the imported component serialized to
+// nothing), and `Pt.Serialize(s)` compiled to a degraded zero value. That is
+// the #1462 failure mode — a partial unification that turned a loud defect
+// into a quiet one — which is exactly what the audit's "a family lands whole"
+// rule exists to prevent.
+//
+// The gate therefore keeps §9.8's cross-module behaviour byte-identical to
+// before #3139 while the CHANNEL lands. When #3141 gives the component walk a
+// symbol-side source and #3140 gives the `serialized` clause and wire names
+// theirs, this predicate is the single thing to delete.
+//
+// ⚠ IT IS INVISIBLE TO THE RATCHET, deliberately and inconveniently. It reads
+// `t->decl` WITHOUT a `dynamic_cast<const ast::TypeDecl*>`, so
+// scripts/check_imported_symbol_reads.py does not count it — which means
+// #3139's headline "122 → 111 class-1 reads" slightly OVERSTATES how much of
+// the seam is closed: four of the sites it converted still cannot answer for an
+// imported type, they merely now say so in one place instead of eleven. The
+// count is honest about the CASTS removed and optimistic about the SEAM. Do
+// not read the ratchet as a completion metric for family F1 until this is
+// gone.
+inline bool serializationSurfaceIsEmittable(const TypeSymbol* t) {
+    return t != nullptr && t->decl != nullptr;
+}
 
 // §31.4 (v0.240, #2971/#2983/#2984): WHICH member of the §31.4 exception
 // surface a name denotes, for a class whose built-in exception base is
