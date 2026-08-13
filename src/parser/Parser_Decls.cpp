@@ -1594,7 +1594,27 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
     }
     field->type = parseType();
     if (consumePunctuator(":=")) {
+        // fix #2856 follow-up (v0.254): stamp the field initializer's span at
+        // parse time, so the wire-side `fieldInitText` extractor in
+        // ModuleMetadataBuilder.cpp:982 reads the FULL initializer expression
+        // (including any `(` opening punctuator) — not just the inner
+        // postfix's span. For an immediately-invoked lambda
+        // `(lambda(x: int) => x + 1)(6)` as a field initializer, the postfix
+        // CallExpr's span.begin is at `lambda` (per #3214's diagnostics rule
+        // that the call span starts at the callee, NOT the call's opening
+        // punctuator); without this stamping, the wire text would be
+        // `lambda(x: int) => x + 1)(6)` — missing the opening `(` — and
+        // re-parse would reject it ("the initializer text failed to
+        // re-parse", §2.8.2 reject path, #2351). `initLoc` is captured here
+        // before the inner postfix can move `current_` and overwrite it.
+        const SourceLocation initLoc = current_.location;
         field->initializer = parseExpression();
+        if (field->initializer) {
+            field->initializer->span.begin = initLoc;
+            // span.end is already set by the inner-most expression; do not
+            // overwrite — the closing `)` of a call IS the end of the
+            // initializer expression.
+        }
     }
     if (!consumePunctuator(";")) {
         // v0.217 (§27.3, #2101): retired `(params) => body` spelling in a
