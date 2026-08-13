@@ -198,13 +198,25 @@ bool forEachStorageMember(const TypeSymbol* ts, const SemaContext& ctx,
             // that reads only one silently gets "not owned" for the other
             // (bc0edd5's warning on `anyRecordStorageField`, earned by this
             // very walk): `MemberDecl::modifiers` for a body field or
-            // auto-property, `ast::Param::modifier` for a positional one —
-            // `FieldSymbol::modifiers` is never populated for a positional
-            // field. Read both. Today only the record arm can reach the
-            // positional branch and §9.7 forbids an `owned` record field, so
-            // this changes no verdict; it is here so that whoever makes
-            // positional storage reachable from the class arm does not have to
-            // rediscover the split.
+            // auto-property, `ast::Param::modifier` for a positional one.
+            // Read both.
+            //
+            // ⚠ This comment used to add "`FieldSymbol::modifiers` is never
+            // populated for a positional field". That was true when written and
+            // is FALSE as of #3164: the metadata builder now exports an
+            // IMPORTED positional field's `owned` marker into
+            // `MetaMember::modifiers`, and the loader interns it straight onto
+            // `FieldSymbol::modifiers`. So for an imported positional field
+            // BOTH spellings are populated and they agree; for a local one only
+            // `posParam` is. The `posParam` branch is taken first either way,
+            // which is why no verdict moved — but the invariant the old
+            // sentence stated no longer holds, and a later reader relying on it
+            // would be wrong.
+            //
+            // Today only the record arm can reach the positional branch and
+            // §9.7 forbids an `owned` record field, so this changes no verdict;
+            // it is here so that whoever makes positional storage reachable
+            // from the class arm does not have to rediscover the split.
             if (posParam) {
                 sm.isOwned = posParam->modifier == "owned";
             } else {
