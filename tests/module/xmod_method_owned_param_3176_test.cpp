@@ -24,9 +24,22 @@
 //     A DOUBLE FREE.
 //
 //   * `Sink.Take(owned r)` — the marker was reported spurious ("this parameter
-//     position does not take ownership"). A FALSE REJECT of the spelling §22.3
-//     makes MANDATORY on a named owned binding. So across a module boundary
-//     there was no correct way to write the call at all.
+//     position does not take ownership"). A FALSE REJECT.
+//
+// ⚠ CORRECTED (review of #3176): an earlier draft of this header, and the
+// commit body, said "there was no correct way to write the call at all". That
+// is FALSE and the review measured it: `Sink.Take(move r)` — the spelling
+// v0.254 §22.3 actually mandates, "the caller writes the transfer marker at the
+// call site: `M(move x)`" — compiled at b88252b, ran to 211 with exactly one
+// disposal, ASan+LSan clean. Only the LEGACY `owned` spelling was
+// false-rejected.
+//
+// The accurate statement is narrower and more interesting: the compiler's own
+// diagnostic still emits the v0.169 advice `write 'M(owned r)'`, and THAT
+// advice was rejected across a module boundary. A user who followed the
+// compiler had no correct way to write the call; a user who followed the spec
+// did. Worth keeping precisely because "the tool's guidance disagrees with the
+// tool" is a defect class that no test asserts on.
 //
 // MEASURED PRE-FIX on `main` @ b88252b, with `build/bezelc -c lib.bzl -o lib.o`
 // then `build/bezelc --import lib.o app.bzl`:

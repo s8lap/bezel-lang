@@ -7036,10 +7036,16 @@ void MethodOwnership::collectCondOutOwnedRecipients(
     if (!args) return;
     // Resolve the callee's parameter list (a USER `out owned` formal), mirroring
     // markOutOwnedArgs; builtin owned-OUT collection methods are matched by
-    // builtinOutOwnedArg below. Deliberately still AST-only, in lockstep with
-    // markOutOwnedArgs — see #3176's measurement note there; these two gate the
-    // same fact from opposite ends and must never disagree, so they move
-    // together or not at all.
+    // builtinOutOwnedArg below.
+    //
+    // ⚠ This paragraph used to end "Deliberately still AST-only, in lockstep
+    // with markOutOwnedArgs … so they move together or not at all". They DID
+    // move together — in #3176, both to the symbol-side resolver — so that
+    // sentence was false from the moment the code beneath it changed, and it
+    // sat directly above the `fix #3176` note contradicting it. Corrected
+    // rather than deleted, because an auditor reading this seam would have
+    // taken the wrong answer from it: a comment asserting a property its own
+    // code lacks is the defect class this whole family exists to remove.
     // fix #3176: the same resolver markOutOwnedArgs uses, so the if-condition
     // demotion and the post-call Owned marking cannot disagree about whether an
     // IMPORTED callee's formal is `out owned`. (They did: both read `ms->decl`,
@@ -12039,6 +12045,20 @@ bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
     // its captured source.
     if (ne) {
         const CalleeFormals formals = resolveCtorParams(*ne, ctx_);
+        // fix #3176 (review nit 4): EXCLUDE a class primary constructor, the
+        // same exclusion `verifiedCallBoundedFormalAt` carries for §28.14.
+        // The symbol-side view is WIDER than the `ast::ConstructorDecl` cast it
+        // replaced — that cast never matched a primary ctor, which has no
+        // ConstructorDecl node — so without this the arm newly admits one.
+        //
+        // It is inert TODAY only because §22.10 rejects `scoped` on a
+        // primary-ctor parameter at its declaration. That is not a safe thing
+        // to lean on: the spec labels that bound "Recorded v1 bound; liftable".
+        // If it is ever lifted this arm starts returning true for a primary-ctor
+        // positional, and at the call-bounded check a `true` SUPPRESSES the
+        // diagnostic — a silent soundness widening, arriving from a spec change
+        // nobody would think to re-audit here. // per §22.10, §28.14
+        if (formals.primaryCtor) return false;
         return formals.valid() && argPos < formals.size() &&
                formals.modifier(argPos) == "scoped";
     }
