@@ -7865,24 +7865,35 @@ void Resolver::checkClassSerializationEligibilityLate() {
             // by the guard below — a silent accept of exactly the #2364 shape
             // this guard exists to refuse.
             //
-            // ⚠ The FieldSymbol arm below still reads `ast::FieldDecl`, so an
-            // imported plain FIELD is still missed here. That is the separate
-            // `ast::FieldDecl` half of the same seam (#3149), not this family;
-            // filed rather than half-fixed, because the modifier read it needs
-            // (`static`) has no symbol-side channel that this lane measured.
+            // fix #3182 (§9.8 / §22.8 / §2.8.2 clause 1): the FIELD arm now
+            // asks the STORAGE predicate too. It used to read
+            // `dynamic_cast<const ast::FieldDecl*>(fs->decl)`, null for every
+            // imported member, and fall through to "no own storage" for
+            // anything but a captured positional parameter — so an imported
+            // base's plain BODY FIELD slipped past this guard exactly as an
+            // imported auto-property did before #3152. MEASURED: a local
+            // `class D: ImportedBase, ISerializable, IDeserializable` whose
+            // base carries a single `private _v: int := 41;` COMPILED AND RAN
+            // (exit 9) while its character-identical single-module twin was
+            // correctly rejected. The field really is there — #2456 carries
+            // private instance fields across for layout — so this was a
+            // classification error, not a missing channel.
+            //
+            // ⚠ THE WIDENING, EXACTLY. Locally NOTHING changes: the `static`
+            // test moves from `ast::FieldDecl::modifiers` to
+            // `FieldSymbol::modifiers`, which SymbolCollection sets to that same
+            // vector, and every local FieldSymbol has either a `decl` or a
+            // `posParam`, so the new "anything else is storage" arm is
+            // unreachable locally. The single new admission is a decl-less,
+            // non-static, non-positional field — the imported body field this
+            // fixes. An imported class's captured primary-ctor parameter is
+            // still NOT counted (`posParamBodyRef` does not cross); that
+            // residual is #3179/#2893's, and widening the positional arm here
+            // would change imported RECORDS too.
             auto classHasOwnStorage = [this](const TypeSymbol* cls) -> bool {
                 for (const Symbol* m : cls->members) {
-                    auto* fs = dynamic_cast<const FieldSymbol*>(m);
-                    if (fs) {
-                        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-                        if (fd) {
-                            bool isStat = false;
-                            for (auto mod : fd->modifiers)
-                                if (mod == "static") { isStat = true; break; }
-                            if (!isStat) return true;
-                        } else if (fs->posParam && fs->posParamBodyRef) {
-                            return true;
-                        }
+                    if (dynamic_cast<const FieldSymbol*>(m)) {
+                        if (isInstanceFieldStorageSymbol(m)) return true;
                         continue;
                     }
                     if (isAutoPropertyStorageSymbol(m, ctx_)) return true;

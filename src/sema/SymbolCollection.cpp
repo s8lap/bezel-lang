@@ -816,6 +816,28 @@ bool isAutoPropertyStorageSymbol(const Symbol* m, const SemaContext& ctx) {
     return ctx.importedPropertyIsAutoStorage(ps);
 }
 
+// §9.1 / §9.2 / §22.8 (v0.254, fix #3182): see the contract in sema/Symbol.hpp.
+//
+// The three arms in order, and what each one used to be:
+//   * `static` -> not instance storage. Was read off `ast::FieldDecl::modifiers`;
+//     `FieldSymbol::modifiers` IS that same vector locally
+//     (SymbolCollection.cpp copies it) and is filled from the wire on import, so
+//     the test is unchanged for a local field and now answers for an imported
+//     one. A §9.1 positional field carries NO modifiers on either side and is
+//     never static, so it falls through this arm exactly as before.
+//   * a positional field -> storage iff the primary-ctor parameter was captured
+//     (#2325's `posParamBodyRef`). Unchanged.
+//   * anything else -> instance storage. This is the arm that changed: it used
+//     to require an `ast::FieldDecl`, which is null for every import.
+bool isInstanceFieldStorageSymbol(const Symbol* m) {
+    const auto* fs = dynamic_cast<const FieldSymbol*>(m);
+    if (!fs) return false;
+    for (std::string_view mod : fs->modifiers)
+        if (mod == "static") return false;
+    if (fs->posParam) return fs->posParamBodyRef;
+    return true;
+}
+
 // §22.15 (v0.254, fix #3174): see the contract in sema/Symbol.hpp. Symbol-side
 // first, AST second, modifier third — the order is immaterial (nothing sets two
 // of them to different answers) but the SET matters: each of the three is the

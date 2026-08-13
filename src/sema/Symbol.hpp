@@ -1027,6 +1027,46 @@ bool isAutoPropertyStorageSymbol(const Symbol* m, const SemaContext& ctx);
 // declaration is the authority that computes the wire bit.
 bool hasAstAutoPropertyDecl(const Symbol* m);
 
+// §9.1 / §9.2 / §22.8 (v0.254, fix #3182 — umbrella #3149/#3152): is `m`
+// INSTANCE FIELD storage — a non-`static` body field, or a §9.1 positional
+// parameter captured into a field? The FIELD twin of
+// `isAutoPropertyStorageSymbol`, and the same both-sources contract: it answers
+// for a LOCAL and an IMPORTED field alike and never touches `Symbol::decl`.
+//
+// It needs no new wire bit. Both sides already populate `FieldSymbol`:
+// `SymbolCollection` copies `ast::FieldDecl::modifiers` onto the symbol, and
+// `ModuleLoader` sets `modifiers` from `MetaMember::modifiers` — so the
+// `static` test is a symbol read on both. The positional discrimination is
+// #2516's synthetic `posParam`, which the loader already reconstructs.
+//
+// WHAT THE DEFECT WAS. `Resolver::checkClassSerializationEligibilityLate`'s
+// `classHasOwnStorage` asked `dynamic_cast<const ast::FieldDecl*>(fs->decl)`
+// and, on a null cast, fell through to "no own storage" unless the field was a
+// captured positional parameter. That cast is null for EVERY imported field, so
+// an imported base carrying a plain body field reported no storage and #2364's
+// guard — which refuses `IDeserializable` over a base with storage, because the
+// synthesized `Deserialize` does not construct the base subobject — did not
+// fire. MEASURED: `class D: ImportedBase, ISerializable, IDeserializable` with
+// `private _v: int := 41;` on the base COMPILED AND RAN, while its
+// character-identical single-module twin was rejected. Private instance fields
+// DO cross the boundary (#2456 carries them for layout), so the storage is
+// really there; only the classification was wrong.
+//
+// ⚠ NOT "does this member contribute to §9.8's wire form". This is the §22.8
+// instance-LAYOUT question — "does this level of the hierarchy carry storage of
+// its own" — which is why `static` is excluded (process-global, no instance
+// footprint) and visibility is not consulted at all (a `private` field occupies
+// a slot exactly as a `public` one does; that is #2456's whole point).
+//
+// ⚠ AN IMPORTED CLASS'S CAPTURED PRIMARY-CONSTRUCTOR PARAMETER STILL ANSWERS
+// FALSE, and that is a KNOWN residual, not an oversight of this predicate:
+// `ModuleLoader` synthesizes the `posParam` (#2516) but nothing sets
+// `posParamBodyRef`, so the flag is false for every import. Widening the
+// positional arm to "posParam ⟹ storage" would change the answer for imported
+// RECORDS too, which is a different question with different consumers. The
+// primary-constructor carriage is #3179/#2893's work.
+bool isInstanceFieldStorageSymbol(const Symbol* m);
+
 // §22.15 (v0.254, fix #3174 — family M8 of umbrella #3149/#3152): is this
 // constructor `pure`? THE predicate; every §22.15 site that needs a
 // constructor's purity asks here.
