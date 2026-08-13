@@ -5337,10 +5337,10 @@ const sema::PropertySymbol* Emitter::classIndexerImplementing(
 //     vtable slot (`if (propGetSlot_.count(ps)) continue;`), i.e. precisely
 //     the virtual ones, so those maps are EMPTY for this shape.
 // The slot kept its `ConstantPointerNull` initialiser and every dispatch
-// called address 0x0. MEASURED on this fix's parent, four spellings, all
+// called address 0x0. MEASURED on this fix's parent, five spellings, all
 // SIGSEGV/139 against a character-identical single-module twin that answers
 // correctly: `d.P` on the concrete derived type (8), `b.P` through a
-// base-typed reference (8), `b.P := 30; b.P` (30), `i.P` through a LOCAL
+// base-typed reference (8), `b.P := 30; b.P` (35), `i.P` through a LOCAL
 // interface the derived class implements (8), and the indexer twin `b[7]`
 // (107). A virtual METHOD inherited the same way was already CORRECT (42) —
 // a method has an ExternalLinkage `bz$<Class>$<M>` symbol, which is exactly
@@ -5488,7 +5488,7 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
         // direct-call stub either (emitExportedIndexerGetters skips
         // isVirtualIndexer). Pass D therefore left the vtable slot
         // ConstantPointerNull and `b[7]` called 0x0 (measured: SIGSEGV where
-        // the single-module twin answers 107). Deliberately NOT
+        // the single-module twin answers 110). Deliberately NOT
         // `importedIndexerGetterFns_`: for a virtual indexer that holds
         // #2545's receiver-vptr wrapper, which in its own slot recurses.
         llvm::Function* fwd =

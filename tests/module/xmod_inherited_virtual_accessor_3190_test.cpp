@@ -430,7 +430,7 @@ BEZEL_TEST(xmod_inherited_virtual_accessor_3190,
 // LOCAL class derives from `BMid3190`. The forward must resolve through
 // `vt$<BMid3190>`, the class that owns the resolved implementation — reading
 // the abstract root's slot instead would reintroduce the identical crash.
-// `11 + 22 + 2003` = 2036, truncated to 244 by the 8-bit exit status; the twin
+// `11 + 2003` = 2014, truncated to 222 by the 8-bit exit status; the twin
 // run is what makes that truncation harmless (both sides truncate alike).
 // ===========================================================================
 BEZEL_TEST(xmod_inherited_virtual_accessor_3190,

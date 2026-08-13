@@ -4226,8 +4226,13 @@ void Resolver::checkAbstractImplementations() {
                 //                -> compiles, then SIGSEGV (an int driven
                 //                   through `bz.string`)
                 //   param  type  `Take(x: int)` vs iface `Take(x: string)`
-                //                -> compiles, returns 225 (a truncated string
-                //                   pointer + 1)
+                //                -> compiles and returns a GARBAGE INT from a
+                //                   truncated string pointer. ⚠ The exact value is
+                //                   LAYOUT-DEPENDENT — this lane measured 225, the
+                //                   review measured 241 stably on a byte-identical
+                //                   repro. Do not quote it as a constant; what is
+                //                   invariant is that it is garbage and the twin
+                //                   rejects.
                 //   `owned` ret   `Make(): owned T` vs iface `Make(): T`
                 //                -> compiles, LSan: "Direct leak of 16 byte(s)
                 //                   ... in bz$LibM13.BaseM13$Make"

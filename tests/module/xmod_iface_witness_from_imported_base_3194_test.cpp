@@ -43,7 +43,7 @@
 //   return type   `Get(): int` vs iface `Get(): string`   §11.2 error compiles,
 //                                                                     SIGSEGV
 //   param type    `Take(x: int)` vs `Take(x: string)`     §11.2 error compiles,
-//                                                                     returns 225
+//                                                                     returns a garbage int (225 here, 241 under review — layout-dependent)
 //   `owned` ret   `Make(): owned T` vs iface `Make(): T`  §11.2 error compiles,
 //                                                                     LSan: 16-byte
 //                                                                     direct leak
