@@ -61,6 +61,20 @@ SCAN_DIRS = ('src',)
 SUFFIXES = ('.cpp', '.hpp')
 
 CAST = re.compile(r'dynamic_cast\s*<\s*const\s+ast::TypeDecl\s*\*\s*>\s*\(', re.S)
+# CLASS 3 — the MEMBER half of the same seam (#3149). `ModuleLoader` sets
+# `MemberSymbol::decl` only where it re-parsed body text for a GENERIC type, so
+# for a non-generic imported class EVERY member symbol has `decl == nullptr` and
+# `PropertySymbol::decl` is never set at all. These casts therefore answer the
+# same silent "no" across a module boundary that class 1 does.
+#
+# Added 2026-08-14 because three MemberSymbol families landed while the ratchet
+# watched only `ast::TypeDecl` — each lane correctly reported "the count will not
+# move", which is exactly the state in which a seam regrows unmeasured. The
+# TypeDecl half went 152 -> 51 under a ratchet; this half had none.
+MEMBER_CAST = re.compile(
+    r'dynamic_cast\s*<\s*const\s+ast::'
+    r'(?:MethodDecl|PropertyDecl|FieldDecl|ConstructorDecl|EventDecl|ConstDecl)'
+    r'\s*\*\s*>\s*\(', re.S)
 # The argument shape that makes it a SYMBOL-side classification read. `.decl` is
 # the member on sema::Symbol; anything else (`&d`, `td.get()`, an ast::Node*) is
 # an ordinary AST cast and is none of this script's business.
@@ -143,9 +157,9 @@ def _balanced_arg(text, start):
 
 
 def scan_text(raw, path):
-    """-> (class1_sites, class2_sites); each site is (path, line, arg)."""
+    """-> (class1_sites, class2_sites, class3_sites); site = (path, line, arg)."""
     text = strip_comments(raw)
-    c1, c2 = [], []
+    c1, c2, c3 = [], [], []
     for m in CAST.finditer(text):
         arg = ' '.join(_balanced_arg(text, m.end()).split())
         line = text.count('\n', 0, m.start()) + 1
@@ -153,19 +167,25 @@ def scan_text(raw, path):
             c1.append((path, line, arg))
         elif TYPE_SYMBOL.search(arg):
             c2.append((path, line, arg))
-    return c1, c2
+    for m in MEMBER_CAST.finditer(text):
+        arg = ' '.join(_balanced_arg(text, m.end()).split())
+        line = text.count('\n', 0, m.start()) + 1
+        if SYMBOL_DECL.search(arg):
+            c3.append((path, line, arg))
+    return c1, c2, c3
 
 
 def scan(root):
-    c1, c2 = [], []
+    c1, c2, c3 = [], [], []
     for d in SCAN_DIRS:
         for p in sorted((root / d).rglob('*')):
             if p.suffix not in SUFFIXES:
                 continue
-            a, b = scan_text(p.read_text(), str(p.relative_to(root)))
+            a, b, c = scan_text(p.read_text(), str(p.relative_to(root)))
             c1 += a
             c2 += b
-    return c1, c2
+            c3 += c
+    return c1, c2, c3
 
 
 def counts(sites):
@@ -202,7 +222,7 @@ class BaselineConflict(Exception):
 
 
 def _parse_baseline(text):
-    c1, c2, section = {}, {}, 'class1'
+    c1, c2, c3, section = {}, {}, {}, 'class1'
     for raw in text.splitlines():
         line = raw.strip()
         # A merge-conflicted baseline used to reach int() and die with an
@@ -226,21 +246,23 @@ def _parse_baseline(text):
         if not line or line.startswith('#'):
             if line.startswith('# class2'):
                 section = 'class2'
+            elif line.startswith('# class3'):
+                section = 'class3'
             elif line.startswith('# class1'):
                 section = 'class1'
             continue
         n, path = line.split(None, 1)
-        (c1 if section == 'class1' else c2)[path] = int(n)
-    return c1, c2
+        {'class1': c1, 'class2': c2, 'class3': c3}[section][path] = int(n)
+    return c1, c2, c3
 
 
 def read_baseline():
     if not BASELINE.exists():
-        return {}, {}
+        return {}, {}, {}
     return _parse_baseline(BASELINE.read_text())
 
 
-def write_baseline(c1, c2):
+def write_baseline(c1, c2, c3):
     lines = [
         '# imported_symbol_reads.baseline - the ratchet for umbrella #3152.',
         '# Regenerate with scripts/check_imported_symbol_reads.py --update after a',
@@ -258,6 +280,15 @@ def write_baseline(c1, c2):
         '#         so the guarded block is dead on every path (#3150).',
     ]
     lines += ['%-4d %s' % (n, p) for p, n in sorted(c2.items())]
+    lines += [
+        '',
+        '# class3: dynamic_cast<const ast::{Method,Property,Field,Constructor,',
+        '#         Event,Const}Decl*>(<sym>->decl) - the MEMBER half of the seam',
+        '#         (#3149). MemberSymbol::decl is null for a non-generic import and',
+        '#         PropertySymbol::decl is never set at all, so these answer the same',
+        '#         silent "no" across a module boundary.',
+    ]
+    lines += ['%-4d %s' % (n, p) for p, n in sorted(c3.items())]
     BASELINE.write_text('\n'.join(lines) + '\n')
 
 
@@ -321,33 +352,38 @@ def compare(name, cur, base, stale=True):
 # ---------------------------------------------------------------------------
 FIXTURES = [
     ('positive_single_line.cpp',
-     'auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);\n', 1, 0),
+     'auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);\n', 1, 0, 0),
     ('positive_multi_line.cpp',
      'const auto* rtd =\n'
      '    dynamic_cast<const ast::TypeDecl*>(\n'
-     '        rt->declaration->decl);\n', 1, 0),
+     '        rt->declaration->decl);\n', 1, 0, 0),
     ('positive_wrapped_call.cpp',
      'if (auto* td = dynamic_cast<const ast::TypeDecl*>(\n'
-     '        pt->declaration->decl)) {\n', 1, 0),
+     '        pt->declaration->decl)) {\n', 1, 0, 0),
     ('class2_always_null.cpp',
-     'auto* d = dynamic_cast<const ast::TypeDecl*>(rt->declaration);\n', 0, 1),
+     'auto* d = dynamic_cast<const ast::TypeDecl*>(rt->declaration);\n', 0, 1, 0),
     ('negative_plain_ast_cast.cpp',
      'auto* td = dynamic_cast<const ast::TypeDecl*>(&d);\n'
-     'auto* t2 = dynamic_cast<const ast::TypeDecl*>(child.get());\n', 0, 0),
+     'auto* t2 = dynamic_cast<const ast::TypeDecl*>(child.get());\n', 0, 0, 0),
     ('negative_other_node_type.cpp',
-     'auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);\n', 0, 0),
+     'auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);\n', 0, 0, 1),  # now COUNTED
     # A prose mention is not a cast — line and block form alike.
     ('negative_line_comment.cpp',
      '// dynamic_cast<const ast::TypeDecl*>(ts->decl) is wrong for an import\n',
-     0, 0),
+     0, 0, 0),
     ('negative_block_comment.cpp',
      '/* explains dynamic_cast<const ast::TypeDecl*>(ts->decl) at length */\n',
-     0, 0),
+     0, 0, 0),
     # ...but a real cast on the SAME line as a comment still counts, so the
     # exemption cannot be used to hide one.
     ('positive_code_beside_comment.cpp',
      'auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);  // see #3152\n',
-     1, 0),
+     1, 0, 0),
+    # class 3: a member-kind cast on a symbol's decl (#3149).
+    ('positive_member_property.cpp',
+     'if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {\n', 0, 0, 1),
+    ('negative_member_plain_node.cpp',
+     'auto* fd = dynamic_cast<const ast::FieldDecl*>(&d);\n', 0, 0, 0),
 ]
 
 
@@ -377,21 +413,22 @@ def self_test_compare():
 
 def self_test():
     ok = self_test_compare()
-    for name, body, want1, want2 in FIXTURES:
-        got1, got2 = scan_text(body, name)
-        good = (len(got1) == want1 and len(got2) == want2)
+    for name, body, want1, want2, want3 in FIXTURES:
+        got1, got2, got3 = scan_text(body, name)
+        good = (len(got1) == want1 and len(got2) == want2 and len(got3) == want3)
         ok = ok and good
-        print('  [%s] %s: expected (%d,%d), got (%d,%d)'
-              % ('ok  ' if good else 'FAIL', name, want1, want2,
-                 len(got1), len(got2)))
+        print('  [%s] %s: expected (%d,%d,%d), got (%d,%d,%d)'
+              % ('ok  ' if good else 'FAIL', name, want1, want2, want3,
+                 len(got1), len(got2), len(got3)))
     # A detector that cannot see the real tree is also broken.
-    c1, _ = scan(ROOT)
-    if not c1:
+    c1, _, c3 = scan(ROOT)
+    if not c1 or not c3:
         ok = False
         print('  [FAIL] whole-tree scan found ZERO class-1 reads - the matcher is '
               'matching nothing, which is what a false green looks like')
     else:
-        print('  [ok  ] whole-tree scan found %d class-1 read(s)' % len(c1))
+        print('  [ok  ] whole-tree scan found %d class-1 and %d class-3 read(s)'
+              % (len(c1), len(c3)))
     print('check_imported_symbol_reads --self-test: ' + ('PASS' if ok else 'FAIL'))
     return 0 if ok else 1
 
@@ -411,11 +448,13 @@ def main():
     if a.self_test:
         return self_test()
 
-    c1, c2 = scan(ROOT)
-    cur1, cur2 = counts(c1), counts(c2)
-    base1, base2 = read_baseline()
+    c1, c2, c3 = scan(ROOT)
+    cur1, cur2, cur3 = counts(c1), counts(c2), counts(c3)
+    base1, base2, base3 = read_baseline()
 
     if a.list:
+        for path, line, arg in c3:
+            print('class3  %s:%d  %s' % (path, line, arg))
         for path, line, arg in c1:
             print('class1  %s:%d  %s' % (path, line, arg))
         for path, line, arg in c2:
@@ -423,20 +462,22 @@ def main():
 
     if a.update:
         rises = [v for v in compare('class1', cur1, base1, stale=False) if base1] + \
-                [v for v in compare('class2', cur2, base2, stale=False) if base2]
+                [v for v in compare('class2', cur2, base2, stale=False) if base2] + \
+                [v for v in compare('class3', cur3, base3, stale=False) if base3]
         if rises and not a.force:
             print('REFUSING to update: the baseline may only go DOWN.')
             for v in rises:
                 print('  ' + v)
             print('Use --force if the rise is deliberate, and say why in the commit.')
             return 1
-        write_baseline(cur1, cur2)
-        print('baseline updated: %d class-1 read(s) in %d file(s), %d class-2'
-              % (len(c1), len(cur1), len(c2)))
+        write_baseline(cur1, cur2, cur3)
+        print('baseline updated: %d class-1 in %d file(s), %d class-2, %d class-3 in %d file(s)'
+              % (len(c1), len(cur1), len(c2), len(c3), len(cur3)))
         return 0
 
     sanc_lines, sanc_ok = sanctioned_report(c1)
-    bad = compare('class1', cur1, base1) + compare('class2', cur2, base2)
+    bad = (compare('class1', cur1, base1) + compare('class2', cur2, base2) +
+           compare('class3', cur3, base3))
     if not sanc_ok:
         bad += [l.strip() for l in sanc_lines if 'ZERO' in l]
     total1, total2 = len(c1), len(c2)
@@ -453,8 +494,10 @@ def main():
     for l in sanc_lines:
         print(l)
     print('check_imported_symbol_reads: clean - %d class-1 read(s) outside the '
-          'sanctioned accessors (baseline %d), %d class-2 (#3150)'
-          % (total1 - sum(1 for p, _, _ in c1 if p in SANCTIONED), want1, total2))
+          'sanctioned accessors (baseline %d), %d class-2 (#3150), '
+          '%d class-3 member reads (#3149)'
+          % (total1 - sum(1 for p, _, _ in c1 if p in SANCTIONED), want1, total2,
+             len(c3)))
     return 0
 
 

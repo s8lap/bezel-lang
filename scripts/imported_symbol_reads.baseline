@@ -22,3 +22,35 @@
 
 # class2: a sema::TypeSymbol* cast straight to ast::TypeDecl* - ALWAYS null,
 #         so the guarded block is dead on every path (#3150).
+
+# class3: dynamic_cast<const ast::{Method,Property,Field,Constructor,
+#         Event,Const}Decl*>(<sym>->decl) - the MEMBER half of the seam
+#         (#3149). MemberSymbol::decl is null for a non-generic import and
+#         PropertySymbol::decl is never set at all, so these answer the same
+#         silent "no" across a module boundary.
+20   src/codegen/LlvmBackend_Assign.cpp
+25   src/codegen/LlvmBackend_Calls2.cpp
+2    src/codegen/LlvmBackend_Disposal.cpp
+9    src/codegen/LlvmBackend_Exprs.cpp
+7    src/codegen/LlvmBackend_Exprs2.cpp
+3    src/codegen/LlvmBackend_Layout.cpp
+8    src/codegen/LlvmBackend_Serialization.cpp
+55   src/codegen/LlvmBackend_Setup.cpp
+4    src/codegen/LlvmBackend_Stmts.cpp
+2    src/codegen/LlvmBackend_String.cpp
+19   src/codegen/LlvmBackend_impl.hpp
+1    src/common/OwnershipFacts.cpp
+3    src/module/ModuleLoader.cpp
+7    src/module/ModuleMetadataBuilder.cpp
+5    src/ownership/Ownership.cpp
+5    src/ownership/Ownership_Checks.cpp
+1    src/sema/DefiniteAssignment.cpp
+1    src/sema/EntryPoint.cpp
+12   src/sema/ExprTypecheck.cpp
+22   src/sema/ExprTypecheck_Calls.cpp
+17   src/sema/ExprTypecheck_Exprs.cpp
+9    src/sema/PureChecker.cpp
+5    src/sema/StaticInitCycles.cpp
+6    src/sema/SymbolCollection.cpp
+48   src/sema/TypeResolution_Checks.cpp
+5    src/sema/TypeResolution_Names.cpp
