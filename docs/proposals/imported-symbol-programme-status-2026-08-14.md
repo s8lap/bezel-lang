@@ -203,6 +203,45 @@ treated as the stdlib intrinsic) · #3193 (method reference over an imported met
 return type and marker) · #3195 (a plain `var` receiver of a form-2 `scoped` call is never
 disposed — single-module) · #3197 · #3199.
 
+## 6c. The blocker dependency graph, MEASURED (2026-08-14, under review)
+
+The graph in §6's "Blockers (fix first)" line was a guess. Measured:
+
+- **#3164 → #3162 is REAL and stronger than filed. They are ONE commit.** With
+  #3162's halves applied and only #3164's carriage disabled: `new Holder(owned r, 20)`
+  is a FALSE REJECT (§22.3 makes the marker mandatory, so the constructor is
+  uncallable) and `new Holder(r, 20)` compiles clean and **SIGSEGVs** — #2659's double
+  free, one module out, against a twin answering 211. **Shipping #3162 alone is a
+  memory-safety REGRESSION, not an incomplete feature.**
+- **#3183 ⊥ #3162 — the gating claim is REFUTED.** #3183 is live TODAY through
+  imported RECORDS, which already construct cross-module; #3162 would only have
+  extended it to classes.
+- **#3179's stated blocker is partly refuted** — the primary-ctor parameters DO have
+  somewhere to ride (§22.8 makes step 0 the caller's, and `bz$<Type>$init` is steps
+  1+2 against the object it is handed). Its real remaining work is the §9.8 wire shape
+  and tier-4 polymorphic-registry carriage, not the construction ABI.
+- **#3162's "ABI gap" framing is wrong** — no new symbol or wire field was needed. It
+  was an ORDERING gap.
+- **#3164's own record example is not legal Bezel**: `record R(owned h: T)` is a PARSE
+  error (Appendix A.3 admits no modifiers on positional fields — §28.5's "records may
+  not have `owned` fields", enforced syntactically). It is a class-primary-constructor
+  concern only, so its latency claim holds.
+- **#2884 is CLOSED as a decline-with-reasons.** The real work is **#2893** (carry
+  `propertyBodyText`, ~380 lines mirroring the method-body path, 7 `!pd` fallback
+  branches that all flip) — a lane, not a tail. ⚠ There is a **direct contradiction**
+  between #3170's measurement and #2943's gate comment (which asserts a one-`T`-slot
+  layout does NOT move). Settle it before touching that threshold again: widening it
+  to ≥1 was already tried and reverted.
+
+**⚠ #3198 (HIGH) is the general form of #3184 and applies to EVERY additive metadata
+change this programme made:** stale artifacts have no vintage check, so a metadata
+CONTENT change silently reopens the hole it closed — measured as a SIGSEGV. Whoever
+picks this up should treat it as a precondition for trusting any cross-version claim,
+including the byte-identity results recorded above.
+
+**Also filed by that lane:** #3196 · #3200 · #3201 (the generic half of #3162, declined
+rather than shipped silently zeroed) · #3202.
+
 ## 7. What "done" means
 
 Not "110 → 0". The honest target:
