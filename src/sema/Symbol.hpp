@@ -1169,4 +1169,43 @@ std::string_view formalParamName(const ConstructorSymbol& cs, std::size_t pos);
 // Arity of the constructor's formal list, same dual sourcing.
 std::size_t formalParamCount(const ConstructorSymbol& cs);
 
+// §22.3 / §2.5 (v0.254, #3176 — family M1 of umbrella #3152): the same three
+// accessors for a METHOD's formal list. A `MethodSymbol` covers an ordinary
+// method, a free function, an extension method and an `operator` overload; the
+// local source is the `ast::MethodDecl` (or `ast::OperatorDecl`) `params`, and
+// the IMPORTED source is the reconstructed `ParameterSymbol` list on
+// `MethodSymbol::params`, which ModuleLoader populates from `MetaParam` for
+// every imported method (class members at ModuleLoader.cpp:524, extension
+// members at :2891) — `MemberSymbol::decl` is set only where the loader
+// re-parsed body text for a GENERIC type, so for a non-generic imported class
+// every method's `decl` is null.
+//
+// #3176 is #2659's defect on the method path, and it is measured: an unmarked
+// call to an imported `owned` formal recorded no move, so the caller's binding
+// stayed Owned and was auto-dropped after the callee had already disposed it —
+// `AddressSanitizer: heap-use-after-free`, freed in the callee, read in `main`.
+// The marked spelling `M(owned r)` was rejected as spurious at the same time,
+// so across a module boundary there was no correct way to write the call.
+//
+// Both sources are consulted in the same order as the constructor overloads —
+// AST first (it carries the syntax), the symbol list second — so a member both
+// of them describe can never get two answers. Returns "" / 0 out of range.
+std::string_view formalParamModifier(const MethodSymbol& ms, std::size_t pos);
+std::string_view formalParamName(const MethodSymbol& ms, std::size_t pos);
+std::size_t formalParamCount(const MethodSymbol& ms);
+
+// The declared TYPE of method formal `pos`, resolved. §28.14's call-bounded and
+// deferred-activation gates ask "is this formal function-typed", which needs a
+// type and not just a modifier. The local source is the `ast::Type` node (the
+// caller resolves it through `SemaContext`); the imported source is
+// `ParameterSymbol::resolvedDeclType`. `formalParamDeclType` returns the
+// syntactic node (null for an import), `formalParamResolvedType` the already-
+// resolved imported one (null for a local).
+const ast::Type* formalParamDeclType(const MethodSymbol& ms, std::size_t pos);
+const TypeRef* formalParamResolvedType(const MethodSymbol& ms, std::size_t pos);
+const ast::Type* formalParamDeclType(const ConstructorSymbol& cs,
+                                     std::size_t pos);
+const TypeRef* formalParamResolvedType(const ConstructorSymbol& cs,
+                                       std::size_t pos);
+
 } // namespace bezel::sema

@@ -85,72 +85,71 @@ namespace {
 //     the callee also disposes it. A DOUBLE FREE (observed: SIGSEGV on the
 //     plain AOT path, the second disposal loading a vtable pointer out of
 //     already-`free`d memory).
-// `CtorFormals` therefore abstracts over the three sources a constructor's
-// formal list can have, and is written in the shape of the shared accessor
-// #2374 proposes (`sema::formalParamModifier`), which it calls for the two
-// ConstructorSymbol-backed sources.
-struct CtorFormals {
-    // Local: a user `constructor(...)`'s params, or a class PRIMARY
-    // constructor's positionalFields (#1627 — those live on the TypeDecl and
-    // are never a ConstructorSymbol member).
-    const std::vector<ast::Param>* declParams = nullptr;
-    // Imported (or local-with-decl): the resolved ConstructorSymbol. Read
-    // through sema::formalParamModifier / formalParamName, which prefer the
-    // ast::ConstructorDecl when it exists and fall back to ParameterSymbol.
-    const sema::ConstructorSymbol* ctorSym = nullptr;
-    // fix #3141 (family F3 of umbrella #3152): a class PRIMARY constructor's
-    // parameters, as the FieldSymbols they become. This is the SAME list
-    // `declParams` names for a local class — a local positional FieldSymbol's
-    // `posParam` points into `td->positionalFields` — reached through the
-    // symbol table so that it survives an import, where there is no
-    // `ast::TypeDecl` to index at all (§2.8.3 rule 4).
-    std::vector<const sema::Symbol*> posFields;
+// `CalleeFormals` therefore abstracts over every source a CALLEE's formal list
+// can have, and is written in the shape of the shared accessor #2374 proposes
+// (`sema::formalParamModifier`), which it calls for the symbol-backed sources.
+//
+// fix #3176 (§22.3 / §2.5, v0.254 — family M1 of umbrella #3152): this view was
+// `CtorFormals` and covered the constructor path only, because that is the path
+// #2659 measured. The METHOD path had the identical defect and five separately
+// written copies of the identical walk, each spelling
+// `dynamic_cast<const ast::MethodDecl*>(ms->decl)` inline and each therefore
+// answering "this callee has no formals at all" for every non-generic imported
+// method. Measured on the same shape #2659 measured: `SinkI.Take(r)` where
+// `Take(owned r: ResI)` lives in an imported module compiled clean and died with
+// `AddressSanitizer: heap-use-after-free` (freed in the callee, read back in
+// `main`), while the character-identical single-module twin was REJECTED with
+// the §22.3 "this call consumes `r`" diagnostic. The marked spelling
+// `Take(owned r)` was rejected as spurious at the same time, so the boundary
+// admitted the unsound spelling and refused the sound one.
+//
+// The many copies are why this is ONE view and not N fallbacks: they answer the
+// same question (which formal is at argument position i, and what modifier does
+// it carry) for the owned-IN sink (recordMovesInArgs / isImplicitOwned /
+// calleeArgIsOwnedSink), the `scoped` admission gate (scopedFormalAt), the
+// §28.14 plain-reference and plain-function-slot gates
+// (deferredActivationArgIsPlainRefParam / …PlainFuncSlot /
+// verifiedCallBoundedFormalAt) and the catch-borrow propagation
+// (borrowSourceForExpr). A fallback added to one of them and not the others is
+// exactly the #1462 partial state CLAUDE.md warns about, so they move together.
+//
+// The `out owned` RECIPIENT pair (markOutOwnedArgs / collectCondOutOwnedRecipients)
+// is the one deliberate exception, and it is an exception in the SAME direction
+// for both members — see the measurement note at markOutOwnedArgs' caller in
+// recordMovesIn. Arming it today does not free the leak it targets (the
+// recipient local of an imported `out owned` formal has no resolved type, so
+// codegen cannot lower a disposal of it) and does add a false reject.
 
-    bool valid() const { return declParams || ctorSym || !posFields.empty(); }
-    std::size_t size() const {
-        if (declParams) return declParams->size();
-        if (!posFields.empty()) return posFields.size();
-        return ctorSym ? sema::formalParamCount(*ctorSym) : 0;
-    }
-    std::string_view modifier(std::size_t i) const {
-        if (declParams) return i < declParams->size() ? (*declParams)[i].modifier
-                                                      : std::string_view{};
-        if (!posFields.empty()) {
-            // A positional parameter's `owned` marker lives on the `ast::Param`
-            // locally; the metadata carries a positional field's MODIFIERS only
-            // through `MemberSymbol::modifiers`, which SymbolCollection leaves
-            // empty for a local positional field — so the marker reaches the
-            // wire from neither side and an imported positional field can only
-            // answer "" here (#3164, filed with the fix shape). Consult the
-            // Param when it carries the syntax (#2516's synthetic import Param
-            // has a null `type` and no modifier), then the symbol's own list, so
-            // this reader needs no change once #3164 populates it.
-            if (i >= posFields.size()) return {};
-            if (auto* fs =
-                    dynamic_cast<const sema::FieldSymbol*>(posFields[i])) {
-                if (fs->posParam && fs->posParam->type)
-                    return fs->posParam->modifier;
-                for (std::string_view mod : fs->modifiers)
-                    if (mod == "owned") return mod;
-            }
-            return {};
-        }
-        return ctorSym ? sema::formalParamModifier(*ctorSym, i)
-                       : std::string_view{};
-    }
-    std::string_view name(std::size_t i) const {
-        if (declParams)
-            return i < declParams->size() ? (*declParams)[i].name
-                                          : std::string_view{};
-        if (!posFields.empty())
-            return i < posFields.size() ? posFields[i]->name
-                                        : std::string_view{};
-        return ctorSym ? sema::formalParamName(*ctorSym, i)
-                       : std::string_view{};
-    }
-};
+// The view itself lives in Ownership_impl.hpp (namespace scope) because
+// `MethodOwnership::markOutOwnedArgsCore` takes it.
 
-CtorFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) {
+// fix #3176: the CALLEE-expression twin of `resolveCtorParams` — the one place
+// a call's formal list is recovered from its resolved callee symbol. Every site
+// that used to open-code `dynamic_cast<const ast::MethodDecl*>(ms->decl)` /
+// `dynamic_cast<const ast::ConstructorDecl*>(cs->decl)` goes through this, so
+// none of them can answer "no formals" for an imported callee while another
+// answers correctly.
+//
+// A ChoiceCaseSymbol callee keeps its own arm at the call sites that need the
+// §28.1 per-instantiation erasure oracle (which needs the `ast::Param` itself,
+// not just its modifier); the payload list is handed on as `declParams` so the
+// modifier/name/arity questions have one answer here too.
+CalleeFormals resolveCalleeParams(const ast::Expr* callee,
+                                  const sema::SemaContext& ctx) {
+    CalleeFormals f;
+    if (!callee) return f;
+    sema::Symbol* sym = ctx.exprSymbol(*callee);
+    if (auto* ms = dynamic_cast<const sema::MethodSymbol*>(sym))
+        f.methSym = ms;
+    else if (auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(sym))
+        f.ctorSym = cs;
+    else if (auto* cc = dynamic_cast<const sema::ChoiceCaseSymbol*>(sym)) {
+        if (cc->caseDecl) f.declParams = &cc->caseDecl->payload;
+    }
+    return f;
+}
+
+CalleeFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) {
     if (!ne.type) return {};
     const sema::TypeRef* rt = ctx.resolvedType(*ne.type);
     if (!rt || !rt->declaration) return {};
@@ -163,7 +162,7 @@ CtorFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) {
         if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
             if (cs->isStatic) continue;  // §22.7: not part of the call surface
             if (sema::formalParamCount(*cs) != nArgs) continue;
-            CtorFormals f;
+            CalleeFormals f;
             if (auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
                 f.declParams = &d->params;
             else
@@ -182,8 +181,9 @@ CtorFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) {
         if (auto* td =
                 dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl)) {
             if (td->positionalFields.size() == nArgs) {
-                CtorFormals f;
+                CalleeFormals f;
                 f.declParams = &td->positionalFields;
+                f.primaryCtor = true;
                 return f;
             }
             return {};
@@ -191,8 +191,9 @@ CtorFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) {
         std::vector<const sema::Symbol*> pos =
             sema::recordPositionalFieldSymbols(rt->declaration);
         if (pos.size() == nArgs && !pos.empty()) {
-            CtorFormals f;
+            CalleeFormals f;
             f.posFields = std::move(pos);
+            f.primaryCtor = true;
             return f;
         }
     }
@@ -217,32 +218,22 @@ CtorFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) {
 // matches. Returns `params.size()` when a named argument matches no parameter
 // (an already-diagnosed §22.5 error) — every caller treats an out-of-range
 // index exactly as it treats a positional overflow (not an owned sink).
+// §22.5 (v0.184, #1973 / #2659): the parameter slot argument `argIdx` binds to.
+// A named argument `name := value` binds the formal NAMED `name`, wherever it
+// sits, so an owned/borrow classification keyed on the source position
+// mis-reads a reordered call.
+//
+// fix #3176: there is now ONE overload, over `CalleeFormals`. The
+// `std::vector<ast::Param>` twin this replaces was identical apart from where a
+// formal's name came from, and its last caller went through the view.
 std::size_t boundParamIndex(const std::vector<ast::CallArgument>& args,
-                            std::size_t argIdx,
-                            const std::vector<ast::Param>& params) {
+                            std::size_t argIdx, const CalleeFormals& params) {
     const ast::CallArgument& a = args[argIdx];
     if (a.name.empty()) {
         // Positional: its parameter slot is the count of positional arguments
         // before it (for a well-formed call — positionals precede named args —
         // this equals argIdx; counting stays correct even for an already-
         // diagnosed positional-after-named ordering).
-        std::size_t slot = 0;
-        for (std::size_t k = 0; k < argIdx; ++k)
-            if (args[k].name.empty()) ++slot;
-        return slot;
-    }
-    for (std::size_t j = 0; j < params.size(); ++j)
-        if (params[j].name == a.name) return j;
-    return params.size();
-}
-
-// #2659: the same §22.5 binding over a resolved CONSTRUCTOR formal list, which
-// may be imported (no ast::Param to index). Identical rule; the only difference
-// is where the formal's name comes from.
-std::size_t boundParamIndex(const std::vector<ast::CallArgument>& args,
-                            std::size_t argIdx, const CtorFormals& params) {
-    const ast::CallArgument& a = args[argIdx];
-    if (a.name.empty()) {
         std::size_t slot = 0;
         for (std::size_t k = 0; k < argIdx; ++k)
             if (args[k].name.empty()) ++slot;
@@ -307,7 +298,7 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         // owned params — including a class PRIMARY constructor's `owned` params,
         // which live on the TypeDecl, not a ConstructorSymbol member (#1627) —
         // and an IMPORTED constructor's, which live on ParameterSymbols (#2659).
-        const CtorFormals ctorParams = resolveCtorParams(*ne, ctx_);
+        const CalleeFormals ctorParams = resolveCtorParams(*ne, ctx_);
         // §28.13 / stdlib §2.16 (#603): `new Shared<T>(value)` is a builtin
         // type with no user ConstructorDecl. Its sole constructor takes an
         // `owned value: T` at position 0 (per stdlib §2.16). Detect this so
@@ -455,15 +446,17 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         // self-pass). Uses the ctorParams-taking overload since a NewExpr
         // has no "callee" Expr to resolve a parameter list from.
         //
-        // #2659 scoping note: this passes only the ast-backed formals, so an
-        // IMPORTED constructor's `out owned` recipient is still not marked —
-        // exactly as before this fix (resolveCtorParams returned null for every
-        // imported ctor, so nothing here changes for that shape). Extending it
-        // means threading CtorFormals through markOutOwnedArgsCore and arming
-        // the §28.3 owned-OUT dataflow for a cross-module shape no oracle here
-        // can check for a leak or a double-dispose, so it is left to #2668's
-        // out-owned family rather than done blind. Filed, not silently skipped.
-        markOutOwnedArgs(ne->args, ctorParams.declParams);
+        // fix #3176 (closing #2687(b)): the whole resolved formal list, not
+        // just its ast-backed arm. #2659 deliberately passed
+        // `ctorParams.declParams` here and recorded why — threading the view
+        // through markOutOwnedArgsCore arms the §28.3 owned-OUT dataflow for a
+        // cross-module shape "no oracle here can check for a leak or a
+        // double-dispose". That oracle now exists: a two-module build under
+        // `--sanitize=address` with `detect_leaks=1`, measured on the METHOD
+        // twin of this shape (see markOutOwnedArgs' callee overload). The
+        // constructor and method forms are armed together so neither is left as
+        // the #1462 partial state.
+        markOutOwnedArgs(ne->args, ctorParams);
         return;
     }
 }
@@ -471,26 +464,26 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
 void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& args,
                        const ast::Expr* callee) {
     // Resolve callee parameter list for implicit ownership transfer check.
-    const ast::MethodDecl*     calleeMethod = nullptr;
-    const ast::ConstructorDecl* calleeCtor  = nullptr;
-    const sema::ChoiceCaseSymbol* calleeChoiceCase = nullptr;
-    if (callee) {
-        sema::Symbol* sym = ctx_.exprSymbol(*callee);
-        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
-            calleeMethod = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-        } else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym)) {
-            calleeCtor = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-        } else if (auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(sym)) {
-            // §35.3 / §35.4 (v0.200, #2045 stage 3): a CHOICE-CASE construction
-            // (`Opt.Some(value)`, `Outcome.Fetched(value)`) carries its payload
-            // fields in `caseDecl->payload` — each Param's `modifier` slot holds
-            // the optional `owned` marker the case declaration wrote. Wire the
-            // payload list as the parameter list so the §22.3 owned-marker check
-            // below sees the case payload's modifier and admits the call-site
-            // `owned` marker on `owned` payload fields (the §35.3 + §28.1 form).
-            calleeChoiceCase = cc;
-        }
-    }
+    //
+    // fix #3176 (§22.3 / §2.5, v0.254): through `resolveCalleeParams`, so an
+    // IMPORTED method's formals are read off its `ParameterSymbol` list. This
+    // arm used to be `dynamic_cast<const ast::MethodDecl*>(ms->decl)`, null for
+    // every non-generic imported method, which left `params` null, `userOwned`
+    // false and `markMovedByName` unreached — the caller kept the obligation the
+    // callee had already discharged (measured heap-use-after-free; see the
+    // CalleeFormals header).
+    //
+    // §35.3 / §35.4 (v0.200, #2045 stage 3): a CHOICE-CASE construction
+    // (`Opt.Some(value)`, `Outcome.Fetched(value)`) carries its payload fields
+    // in `caseDecl->payload` — each Param's `modifier` slot holds the optional
+    // `owned` marker the case declaration wrote. `resolveCalleeParams` hands
+    // that payload list on as the formal list, so the §22.3 owned-marker check
+    // below sees the case payload's modifier; the symbol itself is kept because
+    // the §28.1 erasure oracle below needs the `ast::Param`, not its modifier.
+    const CalleeFormals formals = resolveCalleeParams(callee, ctx_);
+    const sema::ChoiceCaseSymbol* calleeChoiceCase =
+        callee ? dynamic_cast<sema::ChoiceCaseSymbol*>(ctx_.exprSymbol(*callee))
+               : nullptr;
     std::size_t pos = 0;
     for (const auto& a : args) {
         if (!a.value) { ++pos; continue; }
@@ -506,19 +499,13 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         // direction (the argument RECEIVES ownership, marked Owned post-call by
         // markOutOwnedArgs) — NOT an owned-IN sink; only a plain `owned` formal
         // consumes the argument here.
-        const std::vector<ast::Param>* params = nullptr;
-        if (calleeMethod)  params = &calleeMethod->params;
-        if (calleeCtor)    params = &calleeCtor->params;
-        if (calleeChoiceCase && calleeChoiceCase->caseDecl)
-            params = &calleeChoiceCase->caseDecl->payload;
         // §22.5 (v0.184, #1973): classify by the BOUND parameter's modifier, not
         // the source position — a named argument `name := value` binds the
         // parameter NAMED `name`, so a reordered owned/borrow call maps correctly.
         const std::size_t boundPos =
-            params ? boundParamIndex(args, pos, *params) : pos;
-        bool userOwned =
-            params && boundPos < params->size() &&
-            (*params)[boundPos].modifier == "owned";
+            formals.valid() ? boundParamIndex(args, pos, formals) : pos;
+        bool userOwned = formals.valid() && boundPos < formals.size() &&
+                         formals.modifier(boundPos) == "owned";
         // §28.1 per-instantiation erasure (#2047): an `owned` marker on a CHOICE
         // CASE payload whose type, AT THIS INSTANTIATION, is value-like or
         // runtime-managed (`Result<int, string>.Ok(value)` — `owned value: T`
@@ -537,8 +524,10 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
             const sema::TypeRef* inst = nullptr;
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
                 if (ma->target) inst = ctx_.exprType(*ma->target);
+            const std::vector<ast::Param>& payload =
+                calleeChoiceCase->caseDecl->payload;
             const sema::TypeRef* ft = common::substitutedChoicePayloadType(
-                (*params)[boundPos], chDecl, inst, ctx_);
+                payload[boundPos], chDecl, inst, ctx_);
             if (!common::ownedMarkerActiveOnInstantiatedType(ft, ctx_))
                 userOwned = false;
         }
@@ -634,14 +623,11 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
                      std::size_t pos, const ast::Expr* callee) {
     if (!callee) return false;
     sema::Symbol* sym = ctx_.exprSymbol(*callee);
-    const ast::MethodDecl*     md = nullptr;
-    const ast::ConstructorDecl* cd = nullptr;
-    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
-        md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-    else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym))
-        cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-    const std::vector<ast::Param>* params =
-        md ? &md->params : (cd ? &cd->params : nullptr);
+    // fix #3176: one resolver, shared with recordMovesInArgs — this arm used to
+    // open-code the `ms->decl` / `cs->decl` casts and so answered "not an owned
+    // sink" for every imported callee, the negative-list shape of the 2026-08-06
+    // taxonomy (silent accept).
+    //
     // §35.3 / §35.4 (v0.200, #2045 stage 3): a CHOICE-CASE construction
     // (`Opt.Some(value)`, `Outcome.Fetched(value)`) is callable via its
     // ChoiceCaseSymbol, which carries its payload fields in `caseDecl->payload`
@@ -651,21 +637,15 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
     // call-site `owned` marker is admitted there, exactly as it is on a
     // user `owned` parameter. Without this, every owning-choice construction
     // rejects the `owned` marker the spec admits on `owned` payload fields
-    // (§35.3 + §28.1).
-    if (!params) {
-        if (auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(sym)) {
-            if (!cc->caseDecl) return false;
-            params = &cc->caseDecl->payload;
-        } else {
-            return false;
-        }
-    }
+    // (§35.3 + §28.1). resolveCalleeParams supplies that payload list.
+    const CalleeFormals formals = resolveCalleeParams(callee, ctx_);
+    if (!formals.valid()) return false;
     // §22.5 (v0.184, #1973): resolve the BOUND parameter (named-arg binding),
     // not the source position — a reordered `owned`/borrow named-arg call
     // otherwise mis-classifies the consume. See boundParamIndex.
-    const std::size_t boundPos = boundParamIndex(args, pos, *params);
-    if (boundPos >= params->size()) return false;
-    const std::string_view mod = (*params)[boundPos].modifier;
+    const std::size_t boundPos = boundParamIndex(args, pos, formals);
+    if (boundPos >= formals.size()) return false;
+    const std::string_view mod = formals.modifier(boundPos);
     // §28.3 / §28.11 (#860): only a plain `owned` formal is an owned-IN
     // consuming sink (the argument is consumed by the call). An `out owned`
     // formal is the owned-OUT direction — the argument local RECEIVES
@@ -679,13 +659,14 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
     // is NOT an owned-IN sink — a value/borrow argument is accepted. Only a
     // payload whose instantiated type is an owning heap reference stays a sink.
     if (auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(sym)) {
+        if (!cc->caseDecl) return false;
         // fix #3144 — the choice's SYMBOL; see the twin in recordMovesInArgs.
         const sema::TypeSymbol* chDecl = cc->parent;
         const sema::TypeRef* inst = nullptr;
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
             if (ma->target) inst = ctx_.exprType(*ma->target);
         const sema::TypeRef* ft = common::substitutedChoicePayloadType(
-            (*params)[boundPos], chDecl, inst, ctx_);
+            cc->caseDecl->payload[boundPos], chDecl, inst, ctx_);
         if (!common::ownedMarkerActiveOnInstantiatedType(ft, ctx_))
             return false;
     }
@@ -1268,7 +1249,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         // Without this fallback a NAMED owned local passed to an `owned` primary-
         // ctor parameter (`new Holder(x)`) is never marked moved-from, so both
         // the caller and the constructed object dispose it (double-free).
-        const CtorFormals ctorParams = resolveCtorParams(*ne, ctx_);
+        const CalleeFormals ctorParams = resolveCtorParams(*ne, ctx_);
         std::size_t pos = 0;
         for (const auto& a : ne->args) {
             if (!a.value) { ++pos; continue; }
@@ -2198,16 +2179,22 @@ bool MethodOwnership::calleeArgIsOwnedSink(
         const ast::Expr* callee, const std::vector<ast::CallArgument>& args,
         std::size_t argIdx) {
     // Resolve the callee's declared parameter list — the SAME navigation
-    // recordMovesInArgs uses (MethodSymbol/ConstructorSymbol -> decl -> params).
-    sema::Symbol* sym = callee ? ctx_.exprSymbol(*callee) : nullptr;
-    const std::vector<ast::Param>* params = nullptr;
-    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
-        if (const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-            params = &md->params;
-    } else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym)) {
-        if (const auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
-            params = &cd->params;
-    }
+    // recordMovesInArgs uses, now literally the same resolver (fix #3176). The
+    // two must never disagree: this one gates the §28.3 in-closure consume
+    // reject and the other one records the move, so an imported callee seen as
+    // "no formals" here left a closure free to consume a captured owned binding
+    // the enclosing scope still disposes.
+    //
+    // The CHOICE-CASE arm the resolver also supplies is deliberately NOT used
+    // here: recordMovesInArgs and isImplicitOwned both refine an `owned` choice
+    // payload by §28.1 per-instantiation erasure, and that oracle is not
+    // replicated in this function. Consuming the payload list without it would
+    // over-report an erased payload. That omission is a pre-existing drift and
+    // is not import-related, so #3176 leaves it exactly where it was rather
+    // than half-closing it.
+    const CalleeFormals resolved = resolveCalleeParams(callee, ctx_);
+    const CalleeFormals formals =
+        (resolved.methSym || resolved.ctorSym) ? resolved : CalleeFormals{};
     // §22.5 (v0.184, #1973): classify by the BOUND parameter (named-arg
     // binding), not the source position — a reordered `owned`/borrow named-arg
     // call inside a closure must map to the same parameter recordMovesInArgs
@@ -2215,13 +2202,13 @@ bool MethodOwnership::calleeArgIsOwnedSink(
     // directions: over-reject a sound borrow, miss a consume → UAF). See
     // boundParamIndex.
     const std::size_t boundPos =
-        params ? boundParamIndex(args, argIdx, *params) : argIdx;
+        formals.valid() ? boundParamIndex(args, argIdx, formals) : argIdx;
     // Only a plain `owned` formal CONSUMES the argument (an `out owned` formal
     // writes it — recordMovesInArgs' twin note). Builtin owned-sink positions
     // (Domain.Spawn, channel Send, …) have no AST decl and are covered by
     // builtinOwnedSinkArg, exactly as the main owned-sink classification does.
-    const bool userOwned = params && boundPos < params->size() &&
-                           (*params)[boundPos].modifier == "owned";
+    const bool userOwned = formals.valid() && boundPos < formals.size() &&
+                           formals.modifier(boundPos) == "owned";
     return userOwned || builtinOwnedSinkArg(callee, argIdx);
 }
 
@@ -2320,7 +2307,7 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
         // Transfer into a constructor `owned` parameter — MARKED
         // `new Holder(owned r)` and UNMARKED `new Holder(r)` alike (#1958).
         if (insideLambda) {
-            const CtorFormals ctorParams = resolveCtorParams(*ne, ctx_);
+            const CalleeFormals ctorParams = resolveCtorParams(*ne, ctx_);
             std::size_t pos = 0;
             for (const auto& a : ne->args) {
                 // §22.5 (v0.184, #1973): the BOUND ctor parameter (named-arg
@@ -3798,27 +3785,20 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
             !rt->declaration->isValueBuiltin &&
             rt->declaration->kind == ast::TypeDeclKind::Class) {
             // Resolve the constructor to identify owned vs non-owned params.
-            const ast::ConstructorDecl* cd2 = nullptr;
-            {
-                std::size_t nArgs = ne->args.size();
-                for (sema::Symbol* m : rt->declaration->members) {
-                    if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
-                        auto* d = dynamic_cast<const ast::ConstructorDecl*>(
-                            cs->decl);
-                        if (d && d->params.size() == nArgs) {
-                            cd2 = d;
-                            break;
-                        }
-                    }
-                }
-            }
+            // fix #3176: through resolveCtorParams, which #2659 already taught
+            // to match an IMPORTED constructor. This copy still open-coded
+            // `d && d->params.size() == nArgs`, so it never matched one, and
+            // carve-out (d) — "owned positions are exempt, checkOwnedArgSource
+            // handles them" — silently did not apply cross-module.
+            const CalleeFormals ctorFormals = resolveCtorParams(*ne, ctx_);
             std::size_t pos = 0;
             for (const ast::CallArgument& a : ne->args) {
                 if (!a.value) { ++pos; continue; }
+                const std::string_view formalMod =
+                    (ctorFormals.valid() && pos < ctorFormals.size())
+                        ? ctorFormals.modifier(pos) : std::string_view{};
                 const bool paramIsOwned =
-                    cd2 && pos < cd2->params.size() &&
-                    (cd2->params[pos].modifier == "owned" ||
-                     cd2->params[pos].modifier == "out owned");
+                    formalMod == "owned" || formalMod == "out owned";
                 if (!paramIsOwned) {
                     const auto* id =
                         dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
@@ -4599,7 +4579,7 @@ sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
     // params — including a class PRIMARY constructor's params (§22.10, #1627),
     // which live on the TypeDecl rather than a ConstructorSymbol member; without
     // this an `owned` primary-ctor position would be misclassified as non-owned.
-    const CtorFormals ctorParams = resolveCtorParams(ne, ctx_);
+    const CalleeFormals ctorParams = resolveCtorParams(ne, ctx_);
     // §31.2.4 / #811 (v0.162): when the CONSTRUCTED type is itself an
     // exception, an exception-typed argument is the CAUSE position of the
     // snapshot-chaining constructor — "ex borrowed for the ctor call; snapshot
@@ -6896,15 +6876,26 @@ void MethodOwnership::markOutOwnedArgs(
     // Resolve the callee's parameter list so a USER method's `out owned`
     // formal is recognised (the built-in collections have no AST declaration
     // and are handled by builtinOutOwnedArg below).
-    const std::vector<ast::Param>* params = nullptr;
-    if (callee) {
-        sema::Symbol* sym = ctx_.exprSymbol(*callee);
-        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
-            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-                params = &md->params;
-        }
-    }
-    markOutOwnedArgsCore(args, params, callee);
+    //
+    //
+    // fix #3176 / #3186 (§28.3 / §22.4 / §2.5, v0.254): through the shared
+    // view. This arm was `dynamic_cast<const ast::MethodDecl*>(ms->decl)`, null
+    // for every non-generic imported method, so an IMPORTED
+    // `Make(out owned r: T)`'s recipient never entered `states_` — no §28.3
+    // auto-drop, no scope-end disposal, MEASURED at 16 bytes leaked per call
+    // against a single-module twin that leaks nothing. The #2429 mechanism, one
+    // boundary over, and the residual #2687(b) filed against #2659.
+    //
+    // ⚠ ORDER MATTERS, and it is why #2659 was right to defer this. Arming the
+    // obligation is only correct once the recipient HAS A TYPE: with the
+    // pre-#3186 `out owned var` handler the recipient's declType was null, so
+    // codegen could lower no disposal at all — the leak survived the arming AND
+    // a §28.3 "borrow returned would outlive its source" false reject appeared
+    // on the untyped member read. Both halves were measured in that order. With
+    // #3186 in the same batch the imported build now reports the same §28.3
+    // auto-drop warning as its single-module twin, returns the same value, and
+    // is LeakSanitizer-clean.
+    markOutOwnedArgsCore(args, resolveCalleeParams(callee, ctx_), callee);
 }
 
 // §28.3 / §22.4 (issue #2429): the constructor-call overload — see the
@@ -6914,14 +6905,14 @@ void MethodOwnership::markOutOwnedArgs(
 // resolveCtorParams into `ctorParams`).
 void MethodOwnership::markOutOwnedArgs(
         const std::vector<ast::CallArgument>& args,
-        const std::vector<ast::Param>* params) {
+        const CalleeFormals& params) {
     markOutOwnedArgsCore(args, params, /*callee=*/nullptr);
 }
 
 // §28.3 / §28.11 / §22.4 (issue #860, #2429): shared core. See the header.
 void MethodOwnership::markOutOwnedArgsCore(
         const std::vector<ast::CallArgument>& args,
-        const std::vector<ast::Param>* params,
+        const CalleeFormals& params,
         const ast::Expr* callee) {
     std::size_t pos = 0;
     for (const auto& a : args) {
@@ -6932,9 +6923,8 @@ void MethodOwnership::markOutOwnedArgsCore(
         // does not always reject it, so keying off the modifier alone would
         // over-fire on a value-typed `out`
         // (e.g. `Stack<int>.TryPop(out var item)`, no disposal obligation).
-        const bool userOutOwned =
-            params && pos < params->size() &&
-            (*params)[pos].modifier == "out owned";
+        const bool userOutOwned = params.valid() && pos < params.size() &&
+                                  params.modifier(pos) == "out owned";
         const bool builtinOutOwned = builtinOutOwnedArg(callee, pos);
         if (userOutOwned || builtinOutOwned) {
             if (auto* id =
@@ -7046,14 +7036,17 @@ void MethodOwnership::collectCondOutOwnedRecipients(
     if (!args) return;
     // Resolve the callee's parameter list (a USER `out owned` formal), mirroring
     // markOutOwnedArgs; builtin owned-OUT collection methods are matched by
-    // builtinOutOwnedArg below.
-    const std::vector<ast::Param>* params = nullptr;
-    if (callee) {
-        sema::Symbol* sym = ctx_.exprSymbol(*callee);
-        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
-            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-                params = &md->params;
-    }
+    // builtinOutOwnedArg below. Deliberately still AST-only, in lockstep with
+    // markOutOwnedArgs — see #3176's measurement note there; these two gate the
+    // same fact from opposite ends and must never disagree, so they move
+    // together or not at all.
+    // fix #3176: the same resolver markOutOwnedArgs uses, so the if-condition
+    // demotion and the post-call Owned marking cannot disagree about whether an
+    // IMPORTED callee's formal is `out owned`. (They did: both read `ms->decl`,
+    // both answered "no", and the two wrongs cancelled into a silent leak.
+    // Fixing only one would have left a spurious "dropped" report on the false
+    // edge instead — the #1462 shape exactly.)
+    const CalleeFormals params = resolveCalleeParams(callee, ctx_);
     std::size_t pos = 0;
     for (const auto& a : *args) {
         if (!a.value) { ++pos; continue; }
@@ -7061,8 +7054,8 @@ void MethodOwnership::collectCondOutOwnedRecipients(
         // inline `out owned var` / `out using var` forms are collected by
         // collectOutOwnedVarSyms; an `out using var` is implicitly discharged.
         if (a.modifier == "out") {
-            const bool userOutOwned = params && pos < params->size() &&
-                                      (*params)[pos].modifier == "out owned";
+            const bool userOutOwned = params.valid() && pos < params.size() &&
+                                      params.modifier(pos) == "out owned";
             if (userOutOwned || builtinOutOwnedArg(callee, pos)) {
                 if (auto* id =
                         dynamic_cast<const ast::IdentifierExpr*>(a.value.get()))
@@ -8954,7 +8947,7 @@ void MethodOwnership::collectOwnedConsumingInExpr(
         // `new T(owned await ...)` — a ctor `owned` param argument. §22.10
         // (#1627): resolve a class PRIMARY constructor's params too (they live on
         // the TypeDecl, not a ConstructorSymbol member — see resolveCtorParams).
-        const CtorFormals ctorParams = resolveCtorParams(*ne, ctx_);
+        const CalleeFormals ctorParams = resolveCtorParams(*ne, ctx_);
         std::size_t pos = 0;
         for (const auto& a : ne->args) {
             if (a.value) {
@@ -9422,18 +9415,16 @@ bool MethodOwnership::isUnboundOwnedTempArg(const ast::Expr& arg) {
 // position." // per §28.3, §28.8, §29.8, §30.14
 bool MethodOwnership::deferredActivationArgIsPlainRefParam(
     const ast::CallExpr& ce, std::size_t pos) const {
-    if (!ce.callee) return false;
-    sema::Symbol* sym = ctx_.exprSymbol(*ce.callee);
-    const std::vector<ast::Param>* params = nullptr;
-    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
-        if (const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-            params = &md->params;
-    } else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym)) {
-        if (const auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
-            params = &cd->params;
-    }
-    if (!params || pos >= params->size()) return false;
-    return (*params)[pos].modifier != "owned";
+    // fix #3176: through the shared view. The comment above reasons that an
+    // UNRESOLVED formal list means a stdlib builtin, "which OWNs it" — sound
+    // for a builtin, but an imported USER method landed in the same bucket
+    // because `ms->decl` is null for it, so §28.3's deferred-activation reject
+    // silently did not run across a module boundary. With the view, "no formal
+    // list" once again means what the comment says it means.
+    const CalleeFormals formals = resolveCalleeParams(ce.callee.get(), ctx_);
+    if (!formals.methSym && !formals.ctorSym) return false;  // scope unchanged
+    if (pos >= formals.size()) return false;
+    return formals.modifier(pos) != "owned";
 }
 
 // #1818 (§28.3 v0.196): true when a captured LOCAL is a live owned obligation
@@ -9598,18 +9589,13 @@ void MethodOwnership::deferredActivationCaptureSources(
 // deliberately out of scope here. // per §28.14 v0.196
 bool MethodOwnership::deferredActivationArgIsPlainFuncSlot(
     const ast::CallExpr& ce, std::size_t pos) const {
-    if (!ce.callee) return false;
-    sema::Symbol* sym = ctx_.exprSymbol(*ce.callee);
-    const std::vector<ast::Param>* params = nullptr;
-    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym)) {
-        if (const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-            params = &md->params;
-    } else if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(sym)) {
-        if (const auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
-            params = &cd->params;
-    }
-    if (!params || pos >= params->size()) return false;
-    return (*params)[pos].modifier.empty();
+    // fix #3176: through the shared view, for the same reason as its sibling
+    // above — the two gate the same §28.14 rule from opposite ends and must not
+    // disagree about an imported callee's formals.
+    const CalleeFormals formals = resolveCalleeParams(ce.callee.get(), ctx_);
+    if (!formals.methSym && !formals.ctorSym) return false;  // scope unchanged
+    if (pos >= formals.size()) return false;
+    return formals.modifier(pos).empty();
 }
 
 // #1818 T9 (§28.14 `scoped`-field read-out bar, v0.196): true when `e` reads a
@@ -12043,28 +12029,30 @@ bool MethodOwnership::scopedFormalAt(const ast::Expr* callee,
                                      const ast::NewExpr* ne,
                                      std::size_t argPos) {
     // Constructor form: match the ctor by arg count (as recordMovesIn does).
+    //
+    // fix #3176: both arms go through the shared resolvers. Each open-coded its
+    // own `d && d->params.size() == nArgs` / `ms->decl` walk, which does not
+    // merely mis-answer for an imported callee — it never MATCHES one, so
+    // `checkScopedAdmission` (which this gate arms) never ran across a module
+    // boundary at all: a `scoped` formal's capture-set, declared-before and
+    // freeze regime were all unenforced, and a stored callback could outlive
+    // its captured source.
     if (ne) {
-        if (!ne->type) return false;
-        const sema::TypeRef* rt = ctx_.resolvedType(*ne->type);
-        if (!rt || !rt->declaration) return false;
-        for (sema::Symbol* m : rt->declaration->members) {
-            if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
-                auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-                if (d && d->params.size() == ne->args.size()) {
-                    return argPos < d->params.size() &&
-                           d->params[argPos].modifier == "scoped";
-                }
-            }
-        }
-        return false;
+        const CalleeFormals formals = resolveCtorParams(*ne, ctx_);
+        return formals.valid() && argPos < formals.size() &&
+               formals.modifier(argPos) == "scoped";
     }
     if (!callee) return false;
-    // User method: the resolved MethodSymbol's AST params carry the modifier.
-    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*callee))) {
-        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-            return argPos < md->params.size() &&
-                   md->params[argPos].modifier == "scoped";
-        }
+    // User method: the resolved MethodSymbol's formals carry the modifier.
+    // A negative here FALLS THROUGH to the builtin arms below rather than
+    // returning — the pre-#3176 code reached them whenever `ms->decl` was not
+    // an ast::MethodDecl, and a stdlib `scoped` position whose callee happens to
+    // resolve to a MethodSymbol must keep its answer.
+    {
+        const CalleeFormals formals = resolveCalleeParams(callee, ctx_);
+        if (formals.methSym && argPos < formals.size() &&
+            formals.modifier(argPos) == "scoped")
+            return true;
     }
     // Builtin: TaskScope.Spawn(scoped body: () -> Task) — stdlib §6.10.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
@@ -13419,33 +13407,39 @@ bool MethodOwnership::verifiedCallBoundedFormalAt(const ast::Expr* callee,
     // user-authored method/constructor (its body runs this same pre-pass),
     // its modifier is empty, and its declared type is a function type.
     // // per §28.14, v0.177
-    auto paramIsPlainFunction = [&](const ast::Param& p) {
-        if (!p.modifier.empty() || !p.type) return false;
-        if (p.type->kind == ast::TypeKind::Function) return true;
-        const sema::TypeRef* rt = ctx_.resolvedType(*p.type);
+    //
+    // fix #3176: both arms through the shared resolvers, and the "is it
+    // function-typed" test off the view's own type accessors — an imported
+    // formal has no `ast::Type` node at all, only an already-resolved
+    // `ParameterSymbol::resolvedDeclType`, which is why asking for the syntax
+    // answered "not call-bounded" for every cross-module callee.
+    auto formalIsPlainFunction = [&](const CalleeFormals& f, std::size_t i) {
+        if (!f.modifier(i).empty()) return false;
+        if (const ast::Type* t = f.declType(i)) {
+            if (t->kind == ast::TypeKind::Function) return true;
+            const sema::TypeRef* rt = ctx_.resolvedType(*t);
+            return rt && rt->kind == sema::TypeRef::Kind::Function;
+        }
+        const sema::TypeRef* rt = f.resolvedType(i);
         return rt && rt->kind == sema::TypeRef::Kind::Function;
     };
     if (ne) {
-        if (!ne->type) return false;
-        const sema::TypeRef* rt = ctx_.resolvedType(*ne->type);
-        if (!rt || !rt->declaration) return false;
-        for (sema::Symbol* m : rt->declaration->members) {
-            if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
-                auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-                if (d && d->params.size() == ne->args.size())
-                    return argPos < d->params.size() &&
-                           paramIsPlainFunction(d->params[argPos]);
-            }
-        }
-        return false;
+        const CalleeFormals formals = resolveCtorParams(*ne, ctx_);
+        // ⚠ A class PRIMARY constructor is excluded, as it was before #3176:
+        // its parameter becomes a FIELD, so the object RETAINS a plain
+        // function-typed one and the §28.14 call-bounded guarantee — "the
+        // callee-side pre-pass rejects every retention" — does not hold for it.
+        // resolveCtorParams unifies the primary and declared forms for the
+        // owned-sink question (#1627/#3141), which is right there and wrong
+        // here; this is the one consumer that must tell them apart.
+        return formals.valid() && !formals.primaryCtor &&
+               argPos < formals.size() &&
+               formalIsPlainFunction(formals, argPos);
     }
     if (!callee) return false;
-    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*callee))) {
-        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-            return argPos < md->params.size() &&
-                   paramIsPlainFunction(md->params[argPos]);
-    }
-    return false;
+    const CalleeFormals formals = resolveCalleeParams(callee, ctx_);
+    return formals.methSym && argPos < formals.size() &&
+           formalIsPlainFunction(formals, argPos);
 }
 
 void MethodOwnership::reportCallBounded(SourceLocation loc,

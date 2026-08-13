@@ -530,6 +530,79 @@ std::size_t formalParamCount(const ConstructorSymbol& cs) {
     return cs.params.size();
 }
 
+// fix #3176 (§22.3 / §2.5, v0.254 — family M1 of umbrella #3152): the METHOD
+// twin of the constructor accessors above. See Symbol.hpp for the contract and
+// for the measured heap-use-after-free that motivates it.
+namespace {
+// The AST formal list of a locally declared method. `MethodSymbol` also backs
+// `operator` overloads, whose decl is an `ast::OperatorDecl` (not derived from
+// `ast::MethodDecl`) — both carry the same `std::vector<ast::Param> params`, so
+// both are the local source.
+const std::vector<ast::Param>* methodDeclParams(const MethodSymbol& ms) {
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms.decl))
+        return &md->params;
+    if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms.decl))
+        return &od->params;
+    return nullptr;
+}
+
+const ast::Param* methodDeclParam(const MethodSymbol& ms, std::size_t pos) {
+    const std::vector<ast::Param>* ps = methodDeclParams(ms);
+    if (!ps || pos >= ps->size()) return nullptr;
+    return &(*ps)[pos];
+}
+
+const ParameterSymbol* methodSymParam(const MethodSymbol& ms, std::size_t pos) {
+    if (pos >= ms.params.size()) return nullptr;
+    return dynamic_cast<const ParameterSymbol*>(ms.params[pos]);
+}
+} // namespace
+
+std::string_view formalParamModifier(const MethodSymbol& ms, std::size_t pos) {
+    if (const ast::Param* p = methodDeclParam(ms, pos)) return p->modifier;
+    if (const ParameterSymbol* p = methodSymParam(ms, pos)) return p->modifier;
+    return {};
+}
+
+std::string_view formalParamName(const MethodSymbol& ms, std::size_t pos) {
+    if (const ast::Param* p = methodDeclParam(ms, pos)) return p->name;
+    if (const ParameterSymbol* p = methodSymParam(ms, pos)) return p->name;
+    return {};
+}
+
+std::size_t formalParamCount(const MethodSymbol& ms) {
+    if (const std::vector<ast::Param>* ps = methodDeclParams(ms))
+        return ps->size();
+    return ms.params.size();
+}
+
+const ast::Type* formalParamDeclType(const MethodSymbol& ms, std::size_t pos) {
+    if (const ast::Param* p = methodDeclParam(ms, pos)) return p->type.get();
+    if (const ParameterSymbol* p = methodSymParam(ms, pos)) return p->declType;
+    return nullptr;
+}
+
+const TypeRef* formalParamResolvedType(const MethodSymbol& ms,
+                                       std::size_t pos) {
+    if (const ParameterSymbol* p = methodSymParam(ms, pos))
+        return p->resolvedDeclType;
+    return nullptr;
+}
+
+const ast::Type* formalParamDeclType(const ConstructorSymbol& cs,
+                                     std::size_t pos) {
+    if (const ast::Param* p = ctorDeclParam(cs, pos)) return p->type.get();
+    if (const ParameterSymbol* p = ctorSymParam(cs, pos)) return p->declType;
+    return nullptr;
+}
+
+const TypeRef* formalParamResolvedType(const ConstructorSymbol& cs,
+                                       std::size_t pos) {
+    if (const ParameterSymbol* p = ctorSymParam(cs, pos))
+        return p->resolvedDeclType;
+    return nullptr;
+}
+
 // §12 / §31.4 (#595 / #2950): see Symbol.hpp for the contract. Two sources,
 // exactly like the constructor-formal helpers above: the LOCAL source is the
 // `ast::TypeDecl`'s base-type list; the IMPORTED source is

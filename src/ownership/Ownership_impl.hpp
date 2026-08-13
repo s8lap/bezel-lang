@@ -31,6 +31,125 @@ struct RecordSubstEnv;  // §9.7/#2145 instantiation-site substitution env
 
 namespace bezel::ownership {
 
+// §22.10 / §22.3 / §2.5 (#1627, #2659, #3176): a resolved CALLEE's formal list,
+// abstracted over every source one can have — a local `ast::Param` vector (a
+// user constructor, a method, an `operator`, a class primary constructor's
+// positional fields, a choice case's payload), a `ConstructorSymbol`, or a
+// `MethodSymbol`. Ownership_Checks.cpp holds the full derivation and the two
+// resolvers (`resolveCtorParams` / `resolveCalleeParams`); the definition lives
+// here because `MethodOwnership::markOutOwnedArgsCore` takes it.
+//
+// The point of the view is that NO consumer open-codes
+// `dynamic_cast<const ast::MethodDecl*>(sym->decl)` — that cast is null for
+// every non-generic imported member, so each open-coded copy silently answered
+// "this callee has no formals" across a module boundary. #2659 measured that as
+// a double free on the constructor path; #3176 measured it again on the method
+// path (`AddressSanitizer: heap-use-after-free`) plus a leaked `out owned`
+// recipient. Every accessor here consults the AST source first and the symbol
+// source second, so a member both of them describe can never get two answers.
+struct CalleeFormals {
+    // Local: a user `constructor(...)`'s params, or a class PRIMARY
+    // constructor's positionalFields (#1627 — those live on the TypeDecl and
+    // are never a ConstructorSymbol member).
+    const std::vector<ast::Param>* declParams = nullptr;
+    // Imported (or local-with-decl): the resolved ConstructorSymbol. Read
+    // through sema::formalParamModifier / formalParamName, which prefer the
+    // ast::ConstructorDecl when it exists and fall back to ParameterSymbol.
+    const sema::ConstructorSymbol* ctorSym = nullptr;
+    // fix #3176: the resolved MethodSymbol — an ordinary method, a free
+    // function, an extension method or an `operator`. Read through the
+    // MethodSymbol overloads of the same accessors, which prefer the
+    // ast::MethodDecl / ast::OperatorDecl when it exists and fall back to the
+    // reconstructed ParameterSymbol list, which is all an imported method has.
+    const sema::MethodSymbol* methSym = nullptr;
+    // fix #3141 (family F3 of umbrella #3152): a class PRIMARY constructor's
+    // parameters, as the FieldSymbols they become. This is the SAME list
+    // `declParams` names for a local class — a local positional FieldSymbol's
+    // `posParam` points into `td->positionalFields` — reached through the
+    // symbol table so that it survives an import, where there is no
+    // `ast::TypeDecl` to index at all (§2.8.3 rule 4).
+    std::vector<const sema::Symbol*> posFields;
+    // True when the formals came from a class PRIMARY constructor rather than a
+    // declared `constructor(...)`. The distinction matters for exactly one
+    // consumer: a primary-ctor parameter BECOMES A FIELD, so a plain
+    // function-typed one is RETAINED by the constructed object and is therefore
+    // not a §28.14 "verified call-bounded" position. Every other consumer
+    // deliberately treats the two alike — that unification is what #1627 and
+    // #3141 are.
+    bool primaryCtor = false;
+
+    bool valid() const {
+        return declParams || ctorSym || methSym || !posFields.empty();
+    }
+    std::size_t size() const {
+        if (declParams) return declParams->size();
+        if (!posFields.empty()) return posFields.size();
+        if (ctorSym) return sema::formalParamCount(*ctorSym);
+        return methSym ? sema::formalParamCount(*methSym) : 0;
+    }
+    std::string_view modifier(std::size_t i) const {
+        if (declParams) return i < declParams->size() ? (*declParams)[i].modifier
+                                                      : std::string_view{};
+        if (!posFields.empty()) {
+            // A positional parameter's `owned` marker lives on the `ast::Param`
+            // locally; the metadata carries a positional field's MODIFIERS only
+            // through `MemberSymbol::modifiers`, which SymbolCollection leaves
+            // empty for a local positional field — so the marker reaches the
+            // wire from neither side and an imported positional field can only
+            // answer "" here (#3164, filed with the fix shape). Consult the
+            // Param when it carries the syntax (#2516's synthetic import Param
+            // has a null `type` and no modifier), then the symbol's own list, so
+            // this reader needs no change once #3164 populates it.
+            if (i >= posFields.size()) return {};
+            if (auto* fs =
+                    dynamic_cast<const sema::FieldSymbol*>(posFields[i])) {
+                if (fs->posParam && fs->posParam->type)
+                    return fs->posParam->modifier;
+                for (std::string_view mod : fs->modifiers)
+                    if (mod == "owned") return mod;
+            }
+            return {};
+        }
+        if (ctorSym) return sema::formalParamModifier(*ctorSym, i);
+        return methSym ? sema::formalParamModifier(*methSym, i)
+                       : std::string_view{};
+    }
+    std::string_view name(std::size_t i) const {
+        if (declParams)
+            return i < declParams->size() ? (*declParams)[i].name
+                                          : std::string_view{};
+        if (!posFields.empty())
+            return i < posFields.size() ? posFields[i]->name
+                                        : std::string_view{};
+        if (ctorSym) return sema::formalParamName(*ctorSym, i);
+        return methSym ? sema::formalParamName(*methSym, i)
+                       : std::string_view{};
+    }
+    // fix #3176: the formal's declared type, for the §28.14 gates that ask
+    // "is this formal function-typed" rather than "what modifier does it
+    // carry". Returns the syntactic node when a source carries one and the
+    // already-resolved TypeRef otherwise (an imported formal has no
+    // `ast::Type`), so a caller resolves `declType` through SemaContext and
+    // falls back to `resolvedType`. Never both non-null for one formal.
+    const ast::Type* declType(std::size_t i) const {
+        if (declParams) return i < declParams->size()
+                                   ? (*declParams)[i].type.get() : nullptr;
+        if (!posFields.empty()) {
+            if (i >= posFields.size()) return nullptr;
+            if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(posFields[i]))
+                return fs->posParam ? fs->posParam->type.get() : nullptr;
+            return nullptr;
+        }
+        if (ctorSym) return sema::formalParamDeclType(*ctorSym, i);
+        return methSym ? sema::formalParamDeclType(*methSym, i) : nullptr;
+    }
+    const sema::TypeRef* resolvedType(std::size_t i) const {
+        if (declParams || !posFields.empty()) return nullptr;
+        if (ctorSym) return sema::formalParamResolvedType(*ctorSym, i);
+        return methSym ? sema::formalParamResolvedType(*methSym, i) : nullptr;
+    }
+};
+
 // Per-method ownership analyzer.
 //
 // Slice O3a: the analysis runs as a forward dataflow over the method
@@ -2448,7 +2567,7 @@ private:
     // end-of-scope check — a silent leak, no diagnostic at all).
     // // per §28.3, §22.4
     void markOutOwnedArgs(const std::vector<ast::CallArgument>& args,
-                          const std::vector<ast::Param>* params);
+                          const CalleeFormals& params);
 
     // Shared implementation for both markOutOwnedArgs overloads above.
     // `callee` is threaded through only for builtinOutOwnedArg's dispatch
@@ -2457,7 +2576,7 @@ private:
     // false for every arg — no builtin type is constructed via `new` with an
     // out-owned recipient. // per §28.3, §28.11, §22.4, issue #2429
     void markOutOwnedArgsCore(const std::vector<ast::CallArgument>& args,
-                              const std::vector<ast::Param>* params,
+                              const CalleeFormals& params,
                               const ast::Expr* callee);
 
     // §28.3 / §28.11 (#1466, #1407): scan an if/elif CONDITION expression for
