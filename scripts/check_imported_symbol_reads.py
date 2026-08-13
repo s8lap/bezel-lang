@@ -508,8 +508,8 @@ def self_test():
         print('  [FAIL] whole-tree scan found ZERO class-1 reads - the matcher is '
               'matching nothing, which is what a false green looks like')
     else:
-        print('  [ok  ] whole-tree scan found %d class-1 and %d class-3 read(s)'
-              % (len(c1), len(c3)))
+        print('  [ok  ] whole-tree scan found %d class-1 (incl. sanctioned) and '
+              '%d class-3 read(s)' % (len(c1), len(c3)))
     print('check_imported_symbol_reads --self-test: ' + ('PASS' if ok else 'FAIL'))
     return 0 if ok else 1
 
@@ -552,8 +552,17 @@ def main():
             print('Use --force if the rise is deliberate, and say why in the commit.')
             return 1
         write_baseline(cur1, cur2, cur3)
+        # Report the numbers that were WRITTEN, not the raw scan. `c1` counts the
+        # sanctioned-accessor reads too, so printing len(c1) said "52 class-1"
+        # beside a file recording 51 - a one-line discrepancy that reads like a
+        # bug in the ratchet and costs the next lane an investigation.
+        n1 = sum(cur1.values())
+        sanc = len(c1) - n1
         print('baseline updated: %d class-1 in %d file(s), %d class-2, %d class-3 in %d file(s)'
-              % (len(c1), len(cur1), len(c2), len(c3), len(cur3)))
+              % (n1, len(cur1), len(c2), sum(cur3.values()), len(cur3)))
+        if sanc:
+            print('  (%d further class-1 read(s) live in sanctioned accessors and are '
+                  'deliberately not baselined)' % sanc)
         return 0
 
     sanc_lines, sanc_ok = sanctioned_report(c1)
