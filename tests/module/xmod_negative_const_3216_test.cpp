@@ -1,5 +1,5 @@
-// fix #3216 (§22.12 "Constants" / §2.5 "Dependency resolution" / §2.8.3 rule 4;
-// v0.254) — an IMPORTED negative integer constant read 0.
+// fix #3216 (§22.12 const rules / §22.5 default-arg materialization / §2.5
+// dependency resolution; v0.254) — an IMPORTED negative integer constant read 0.
 //
 // WHAT THE DEFECT WAS. The wire was right and the reader dropped the sign.
 //
