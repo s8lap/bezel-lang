@@ -193,3 +193,49 @@ BEZEL_TEST(choice_value_like_string_payload_2115,
     BEZEL_EXPECT_TRUE(r.ran);        // pre-fix (no gate): ASan UAF on h.TextLen() → ran=false
     BEZEL_EXPECT_EQ(r.exitCode, 0);  // post-fix (gate): c excluded, no UAF, len = 4
 }
+
+// ===========================================================================
+// #3150 / #3144 review nit N1 — THE GENERIC ARM, which no test had.
+//
+// `LlvmBackend_Setup.cpp`'s `valueLikeChoiceLocalMintsStringPayload` decided
+// #2115's substitution with
+//
+//     dynamic_cast<const ast::TypeDecl*>(rt->declaration)
+//
+// casting a `sema::TypeSymbol*` to an `ast::TypeDecl*`. Those are unrelated
+// hierarchies and a TypeSymbol is only ever built by `makeSymbol<TypeSymbol>`,
+// so no complete object can derive from both: the cast was **always null, on
+// every path, local and imported alike**. #2115's generic-payload substitution
+// had therefore NEVER ONCE EXECUTED — the guarded block was dead from the day
+// it was written, and the file's five existing arms are all non-generic, so
+// nothing noticed.
+//
+// #3144 replaced the dead cast with the symbol-side case list. That made the
+// path live for the first time, which is a BEHAVIOUR change and needs a
+// behavioural pin — the ratchet's "class-2 count is now 0" pins the code SHAPE
+// only. This arm is that pin, and it is a purely LOCAL program: the defect was
+// never import-specific, which is why it survived a cross-module audit.
+//
+// Measured on this base: pre-fix `AddressSanitizer: 3590 byte(s) leaked in 200
+// allocation(s)`, rc=1; post-fix clean, rc=0. // per §35.4 / §28.9, v0.254
+// ===========================================================================
+BEZEL_TEST(choice_value_like_string_payload_2115,
+           spec_35_4_generic_value_like_payload_released_3150) {
+    JitResult r = runAotAsanNoLeak(
+        "module M; "
+        "choice Opt<T> Some(v: T), None; end Opt; "
+        "class C public static method Main(): int "
+        "  var i := 0; "
+        "  var n := 0; "
+        "  while i < 100 do "
+        "    i := i + 1; "
+        "    var o := Opt<string>.Some($\"v{i}\"); "   // +1 string as a GENERIC payload
+        "    n := n + (case o of Some(var s) => s.Length, _ => 0); "
+        "  end while; "
+        "  if n > 0 then return 0; end; "
+        "  return 1; "
+        "end Main; end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);        // pre-fix: LSan reports the leak → ran=false
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}

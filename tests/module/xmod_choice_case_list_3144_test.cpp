@@ -575,12 +575,19 @@ std::string sendLocal3144(const char* choiceTy, const char* ctor) {
 
 BEZEL_TEST(xmod_choice_case_list_3144,
            imported_value_like_choice_satisfies_sendable_constraint_35_12) {
+    // fix #3144 (review nit N5): `err` was declared, captured, and never
+    // asserted on. Rather than delete it — this is the ACCEPT arm of the
+    // over-rejection control, and the thing worth pinning is that it accepts
+    // for the right reason — assert the stderr is free of the §35.12 rejection
+    // its sibling arm expects. Without this, the arm would still pass if the
+    // program were accepted while emitting an unrelated diagnostic.
     std::string err;
     const int r = compileImportAndRun3144(
         sendLib3144(), sendImporter3144("SendOk", "SendOk.Num(1)"), "sendok",
         &err);
     BEZEL_EXPECT_TRUE(r != kDepFailed3144);
     BEZEL_EXPECT_EQ(r, 1);
+    BEZEL_EXPECT_TRUE(err.find("is not sendable") == std::string::npos);
     // The LOCAL twin: accepted before the fix too — that is what made the
     // imported rejection a divergence rather than a rule.
     BEZEL_EXPECT_EQ(compileAndRun3144(sendLocal3144("SendOk", "SendOk.Num(1)"),

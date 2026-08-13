@@ -1138,7 +1138,11 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
     // admits "another auto-hashable choice" via its K::Named/Choice
     // branch (v0.210, #2083).
     for (const ChoiceCaseSymbol* ccs : choiceCasesOf(ch)) {
-        if (!ccs->caseDecl) continue;
+        // fix #3144 (review nit N3): a case we cannot inspect must not be
+        // skipped — skipping asserts "contributes no inadmissible payload"
+        // about a case never examined. Not auto-equality-bearing is the safe
+        // answer. // per §9.2 / §9.3
+        if (!ccs->caseDecl) return false;
         for (const auto& pf : ccs->caseDecl->payload) {
             if (!pf.type) continue;  // unresolved → skip (defensive)
             const TypeRef* ft =

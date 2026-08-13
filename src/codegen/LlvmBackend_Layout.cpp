@@ -1941,15 +1941,19 @@ llvm::StructType* Emitter::recordStruct(const sema::TypeSymbol* t) {
 // live alongside other members of the choice TypeSymbol (§35.1, collected
 // in SymbolCollection.cpp). Defined here (next to choiceStruct) since the
 // layout and the case-index contract are inseparable.
+// fix #3144 (review nit N2): FORWARDS to `sema::choiceCasesOf`. This was a
+// character-for-character copy of that walk, and the two agreeing IS the
+// tag-value contract — case index i is the runtime tag, so a divergence would
+// not be a slow path, it would be sema and codegen disagreeing about what a
+// tag means. `sema/Symbol.hpp` even documented the duplication ("the identical
+// walk on the codegen side") rather than removing it.
+//
+// That is this programme's own headline defect (#3152): one question answered
+// in two places, drifting silently. Keeping the member function is deliberate —
+// ~20 call sites read better unqualified, and a forwarder cannot drift.
 std::vector<const sema::ChoiceCaseSymbol*> Emitter::choiceCasesOf(
         const sema::TypeSymbol* choiceTy) {
-    std::vector<const sema::ChoiceCaseSymbol*> out;
-    if (!choiceTy) return out;
-    for (const sema::Symbol* m : choiceTy->members) {
-        if (auto* cc = dynamic_cast<const sema::ChoiceCaseSymbol*>(m))
-            out.push_back(cc);
-    }
-    return out;
+    return sema::choiceCasesOf(choiceTy);
 }
 
 const sema::ChoiceCaseSymbol* Emitter::choiceCaseByName(

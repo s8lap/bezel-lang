@@ -838,7 +838,9 @@ std::vector<const Symbol*> recordPositionalFieldSymbols(const TypeSymbol* ts);
 // `ChoiceCaseSymbol::caseDecl`, which `SymbolCollection` points at the real
 // `ast::ChoiceCase` and `ModuleLoader` points at a faithful reconstruction
 // (#3144) — one predicate, one source, no per-side variant to keep in step.
-// `Emitter::choiceCasesOf` is the identical walk on the codegen side.
+// `Emitter::choiceCasesOf` FORWARDS here (it was a duplicate until #3144's
+// review nit N2). Case index i is the runtime tag, so the two agreeing is the
+// tag-value contract — not a convenience.
 std::vector<const ChoiceCaseSymbol*> choiceCasesOf(const TypeSymbol* t);
 
 // §9.2 / §22.9: a member is an *auto-property* (`Name: T;`, optionally with an

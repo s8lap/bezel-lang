@@ -484,7 +484,15 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
             const common::RecordSubstEnv* fieldEnv =
                 env.map.empty() ? nullptr : &env;
             for (const ChoiceCaseSymbol* ccs : cases) {
-                if (!ccs->caseDecl) continue;
+                // fix #3144 (review nit N3): a case we cannot inspect must NOT
+                // be skipped. `continue` here reads "this case contributes no
+                // non-sendable payload" — a substantive claim about a case we
+                // did not look at, and the negative-list shape the audit names
+                // as one of its three failure modes. Unreachable today (both
+                // ChoiceCaseSymbol constructors set caseDecl), but the fail-safe
+                // one layer up at :369 was just REPLACED by a real check, so
+                // this is now the last line of defence. // per §35.12
+                if (!ccs->caseDecl) return false;
                 for (const auto& pf : ccs->caseDecl->payload) {
                     if (!pf.type) continue;
                     const TypeRef* ft = ctx.resolvedType(*pf.type);
@@ -956,6 +964,14 @@ std::string sendableFailureComponentPath(const TypeRef* rt, SemaContext& ctx) {
         const common::RecordSubstEnv* fieldEnv =
             env.map.empty() ? nullptr : &env;
         for (const ChoiceCaseSymbol* ccs : choiceCasesOf(decl)) {
+            // fix #3144 (review nit N3): `continue` is CORRECT here, unlike in
+            // the decision-making siblings. This function EXPLAINS a verdict
+            // `isSendableType` has already reached — it builds the §35.12
+            // component path for the diagnostic. Skipping a case it cannot
+            // inspect costs message specificity, not soundness, and returning
+            // "" would claim there is no offending component at all. The
+            // accept-direction hazard the sibling comment describes applies to
+            // predicates that DECIDE; this one only narrates. // per §35.12
             if (!ccs->caseDecl) continue;
             for (const auto& pf : ccs->caseDecl->payload) {
                 if (!pf.type) continue;
