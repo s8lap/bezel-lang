@@ -4661,6 +4661,18 @@ private:
                                           const sema::PropertySymbol* iimpl,
                                           bool isSet);
 
+    // fix #3190 (§12.1/§12.5/§23/§23.4/§2.8.2 clause 1/§2.8.3 rule 4,
+    // v0.254): the vtable/itable-slot function for a VIRTUAL property or
+    // indexer accessor whose most-derived implementation lives on an IMPORTED
+    // base class — an internal thunk forwarding through the dependency's own
+    // `vt$<Owner>` slot. Returns nullptr for every other shape (local accessor,
+    // non-virtual import, abstract, static, non-public or generic owner), so
+    // the three builders that call it keep their exact prior answers there.
+    // See the .cpp definition for the measurement and for why the
+    // `importedIndexer{Getter,Setter}Fns_` map is NOT the right source.
+    llvm::Function* importedVirtualAccessorSlotFn(
+        const sema::PropertySymbol* ps, bool isSet);
+
     // §22.9: the block-form setter accessor of the property `target` names,
     // or null (auto-properties have backing storage and use the normal
     // store path; a non-property target is not one). Used to run a custom

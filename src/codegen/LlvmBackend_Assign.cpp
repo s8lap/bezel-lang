@@ -4576,6 +4576,21 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
             propAccessorFns_[key] = git->second;
             return git->second;
         }
+        // fix #3190 (§12.5/§23/§2.8.2 clause 1, v0.254): the map above is
+        // populated by declareImportedPropertyGetters/-Setters, which SKIP any
+        // property carrying a vtable slot (`if (propGetSlot_.count(ps))
+        // continue;`) — i.e. every VIRTUAL one. So a virtual property
+        // INHERITED and not overridden from an imported base found nothing
+        // here, Pass D left its vtable/itable slot ConstantPointerNull, and
+        // `d.P` / `b.P` / `i.P` all called 0x0 (measured: SIGSEGV where the
+        // single-module twin answers 8). Forward through the exporter's own
+        // `vt$<Owner>` slot instead; see importedVirtualAccessorSlotFn for why
+        // that is the right function and why reusing the imported-ABI map
+        // would recurse.
+        if (llvm::Function* fwd = importedVirtualAccessorSlotFn(ps, isSet)) {
+            propAccessorFns_[key] = fwd;
+            return fwd;
+        }
         return nullptr;
     }
 
@@ -5304,6 +5319,154 @@ const sema::PropertySymbol* Emitter::classIndexerImplementing(
 }
 
 
+// fix #3190 (§12.1 / §12.5 / §23 "Properties" / §23.4 "Indexers" /
+// §2.8.2 clause 1 / §2.8.3 rule 4, v0.254): the vtable/itable-slot function
+// for a VIRTUAL property or indexer accessor whose most-derived
+// implementation is declared on an IMPORTED base class.
+//
+// THE SHAPE, and why every existing fallback misses it. `buildVtable`'s
+// Pass D (LlvmBackend_Setup.cpp) resolves a slot's accessor with
+// `classPropertyByName` / `classIndexerMatching`, both of which walk
+// `baseClassOf` ACROSS the module boundary, so `impl` can be an imported
+// `PropertySymbol` — which never carries an `ast::PropertyDecl`. The three
+// builders then had nothing to return:
+//   * `ensureIndexerGetterFn`/`-SetterFn` returned nullptr outright;
+//   * `ensurePropertyAccessorFn` fell back to `importedPropGetterFns_`/
+//     `importedPropSetterFns_` (#2387/#2400) — but
+//     `declareImportedProperty{Getters,Setters}` skip any property that HAS a
+//     vtable slot (`if (propGetSlot_.count(ps)) continue;`), i.e. precisely
+//     the virtual ones, so those maps are EMPTY for this shape.
+// The slot kept its `ConstantPointerNull` initialiser and every dispatch
+// called address 0x0. MEASURED on this fix's parent, four spellings, all
+// SIGSEGV/139 against a character-identical single-module twin that answers
+// correctly: `d.P` on the concrete derived type (8), `b.P` through a
+// base-typed reference (8), `b.P := 30; b.P` (30), `i.P` through a LOCAL
+// interface the derived class implements (8), and the indexer twin `b[7]`
+// (107). A virtual METHOD inherited the same way was already CORRECT (42) —
+// a method has an ExternalLinkage `bz$<Class>$<M>` symbol, which is exactly
+// the asymmetry: `ensurePropertyAccessorFn` names the real accessor body
+// `bz$<Class>$<Prop>$propget` with INTERNAL linkage, and
+// `emitExportedProperty/Indexer{Getters,Setters}` all skip virtual members,
+// so the dependency object exports NO symbol for it (`nm`-confirmed).
+//
+// WHAT IT INSTALLS. The dependency's `vt$<Owner>` global IS ExternalLinkage
+// and is ALREADY declared in the importer (LlvmBackend_Setup.cpp, for the
+// §8.6 string discriminator). Since the local class does not override, the
+// function its slot needs is byte-identically the one the exporter put in
+// `vt$<Owner>[slot]`. So this emits a small internal forwarding thunk with
+// the accessor's own ABI that loads that slot and calls it. No new metadata,
+// no new exported symbol, and no new assumption: the slot INDEX is
+// `propGetSlot_`/`propSetSlot_`, the same index #2545's wrapper already GEPs
+// and the same one Pass D already uses.
+//
+// ⚠ IT MUST NOT REUSE `importedIndexer{Getter,Setter}Fns_`. For a VIRTUAL
+// indexer that map holds #2545's dispatch wrapper, which loads the vptr OFF
+// THE RECEIVER — installing it in the receiver's own vtable slot is unbounded
+// recursion, not a fix. That is why this resolves through `vt$<Owner>` (a
+// fixed global) rather than through the object.
+//
+// Narrower than #2837, deliberately: that issue needs a NON-virtual entry
+// point so `base[i]` can bypass an override, which this thunk cannot give it
+// (it forwards to whatever the base's own slot holds, which is the correct
+// answer here and the wrong one there).
+llvm::Function* Emitter::importedVirtualAccessorSlotFn(
+        const sema::PropertySymbol* ps, bool isSet) {
+    if (!ps) return nullptr;
+    // A LOCAL accessor has a body to emit; only a decl-less (imported) one
+    // reaches here. `ps->decl` is checked directly rather than via a
+    // PropertyDecl cast so a symbol carrying some OTHER decl node also
+    // declines (it is not a shape this thunk can describe).
+    if (ps->decl) return nullptr;
+    const sema::TypeSymbol* owner = ps->parent;
+    if (!owner || owner->kind != ast::TypeDeclKind::Class) return nullptr;
+    // `vt$<Owner>` is ExternalLinkage only under declareVtables' own export
+    // gate (public + non-generic — a generic's vtable is per-instantiation and
+    // internal in the exporter). Outside it there is no symbol to name, so
+    // decline and keep today's null slot rather than mint an unresolvable
+    // relocation in an initialized global.
+    if (owner->visibility != ast::Visibility::Public) return nullptr;
+    if (!owner->genericParams.empty()) return nullptr;
+    if (isStaticProperty(ps)) return nullptr;  // no `this`, no vtable slot
+    // An `abstract` accessor has NO body in the exporter either, so
+    // `vt$<Owner>`'s own slot is null: forwarding through it would relocate
+    // the identical crash rather than fix it. §12.5 says the override fills
+    // the slot, and an override is LOCAL (it has an `ast::PropertyDecl`), so
+    // this branch is never the one that should answer for an abstract member.
+    for (auto mod : ps->modifiers)
+        if (mod == "abstract") return nullptr;
+    const auto& slotMap = isSet ? propSetSlot_ : propGetSlot_;
+    auto slotIt = slotMap.find(ps);
+    // No slot ⇒ NOT virtual ⇒ the #2387/#2400/#2414 direct-call ABI owns this
+    // member and the maps above already answer for it. Declining here is what
+    // keeps the two routes from installing different functions for one shape.
+    if (slotIt == slotMap.end()) return nullptr;
+    const unsigned slot = slotIt->second;
+
+    // The accessor ABI, from the reconstructed side tables — identical to the
+    // one declareImportedIndexerGetters builds (§23: get/set share the
+    // declared type; the index parameters ride between `this` and `value`).
+    // `indexerParams` is empty for a named property, so one loop covers both.
+    sema::TypeRef* mt = ctx_.importedMemberType(ps);
+    llvm::Type* valTy = mt ? lowerTypeRef(mt) : nullptr;
+    if (!valTy) return nullptr;
+    std::vector<llvm::Type*> paramTys;
+    paramTys.push_back(ptrTy());  // `this`
+    for (sema::Symbol* p : ps->indexerParams) {
+        auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+        sema::TypeRef* pt = pps ? pps->resolvedDeclType : nullptr;
+        llvm::Type* plt = pt ? lowerTypeRef(pt) : nullptr;
+        if (!plt) return nullptr;
+        paramTys.push_back(plt);
+    }
+    if (isSet) paramTys.push_back(valTy);
+    auto* fnTy = llvm::FunctionType::get(
+        isSet ? llvm::Type::getVoidTy(llvm_) : valTy, paramTys, false);
+
+    // The owner + slot pair names this thunk uniquely (a getter and a setter
+    // never share a slot), so the module itself is the memo — no twelfth side
+    // table.
+    std::string name =
+        "bz$" + mangledTypeName(owner) + "$vtfwd$" + std::to_string(slot);
+    if (auto* existing = module_->getFunction(name)) return existing;
+
+    std::string vtName = "vt$" + mangledTypeName(owner);
+    llvm::GlobalVariable* vt = module_->getNamedGlobal(vtName);
+    if (!vt) {
+        // Same zero-length-array declaration shape declareVtables uses for an
+        // imported class's vtable: the element count is the exporter's
+        // virtual-slot count, unknown here and irrelevant — the global is only
+        // ever GEP'd as an array of `ptr`.
+        vt = new llvm::GlobalVariable(
+            *module_, llvm::ArrayType::get(ptrTy(), 0), /*isConstant=*/true,
+            llvm::GlobalValue::ExternalLinkage, /*init=*/nullptr, vtName);
+    }
+
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::GlobalValue::InternalLinkage, name, module_.get());
+    auto* savedFn = currentFn_;
+    auto savedBB = builder_.GetInsertBlock();
+    auto savedBBOffset =
+        savedBB ? builder_.GetInsertPoint() : decltype(savedBB->begin()){};
+    currentFn_ = fn;
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entry);
+    llvm::Value* slotPtr =
+        builder_.CreateGEP(ptrTy(), vt, {builder_.getInt32(slot)});
+    llvm::Value* target = builder_.CreateLoad(ptrTy(), slotPtr, "vtfwd");
+    std::vector<llvm::Value*> callArgs;
+    for (auto& a : fn->args()) callArgs.push_back(&a);
+    if (isSet) {
+        builder_.CreateCall(fnTy, target, callArgs);
+        builder_.CreateRetVoid();
+    } else {
+        builder_.CreateRet(builder_.CreateCall(fnTy, target, callArgs));
+    }
+    currentFn_ = savedFn;
+    if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
+    return fn;
+}
+
+
 // #730 / §23.4 / §13: emit a standalone `T get(ptr this, idx...)` for a class's
 // concrete indexer getter, used to fill the itable slot for interface-typed
 // indexer dispatch. Block-bodied getters reuse ensureIndexerBlockGetter (same
@@ -5318,7 +5481,21 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
     auto cached = indexerGetterFns_.find(idxKey);
     if (cached != indexerGetterFns_.end()) return cached->second;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-    if (!pd) return nullptr;
+    if (!pd) {
+        // fix #3190 (§23.4/§12.1/§2.8.2 clause 1, v0.254): the INDEXER twin of
+        // the ensurePropertyAccessorFn fallback — an imported indexer has no
+        // AST body to build, and for a VIRTUAL one there is no exported
+        // direct-call stub either (emitExportedIndexerGetters skips
+        // isVirtualIndexer). Pass D therefore left the vtable slot
+        // ConstantPointerNull and `b[7]` called 0x0 (measured: SIGSEGV where
+        // the single-module twin answers 107). Deliberately NOT
+        // `importedIndexerGetterFns_`: for a virtual indexer that holds
+        // #2545's receiver-vptr wrapper, which in its own slot recurses.
+        llvm::Function* fwd =
+            importedVirtualAccessorSlotFn(ps, /*isSet=*/false);
+        if (fwd) indexerGetterFns_[idxKey] = fwd;
+        return fwd;
+    }
 
     // Select the getter body form (mirrors lowerIndexerGet).
     const ast::Expr* getterExpr = nullptr;
@@ -5466,7 +5643,19 @@ llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
     auto cached = indexerSetterFns_.find(idxKey);
     if (cached != indexerSetterFns_.end()) return cached->second;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-    if (!pd) return nullptr;
+    if (!pd) {
+        // fix #3190: the SETTER twin of the getter fallback just above — same
+        // shape, same reason, same measurement (`b[5] := 42` through an
+        // inherited imported VIRTUAL indexer SIGSEGV'd). The `propSetSlot_`
+        // lookup inside the helper is itself the "does a setter exist" gate:
+        // buildVtable only assigns a set slot when `propertyHasSetter(ps)`,
+        // which for an imported symbol already reads
+        // ctx_.importedPropertyHasSetter (#2400/#2406).
+        llvm::Function* fwd =
+            importedVirtualAccessorSlotFn(ps, /*isSet=*/true);
+        if (fwd) indexerSetterFns_[idxKey] = fwd;
+        return fwd;
+    }
 
     const ast::Expr* setterExpr = nullptr;
     const std::vector<std::unique_ptr<ast::Stmt>>* setterStmts = nullptr;
