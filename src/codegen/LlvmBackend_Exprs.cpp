@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "common/OwnershipFacts.hpp"  // fix #3189: calleeReturnsOwned — the M2 owned-return channel
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
 #include <limits>
@@ -6643,27 +6644,24 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 // (1) a bare `new ClassType(...)` operand.
                 if (dynamic_cast<const ast::NewExpr*>(e)) return true;
                 // (2) a chained owned-returning operator result.
+                //
+                // fix #3189 (family M2 of umbrella #3152): this arm is drift #5
+                // of the audit — it sat THIRTEEN LINES above its own already-
+                // fixed sibling (3) and read the AST decl only, so an imported
+                // operator's intermediate temporary was never disposed. Both
+                // arms now go through the one both-sources accessor.
                 if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
                     auto* ms = dynamic_cast<sema::MethodSymbol*>(
                         ctx_.exprSymbol(*be));
-                    auto* od = (ms && ms->isOperator)
-                        ? dynamic_cast<const ast::OperatorDecl*>(ms->decl)
-                        : nullptr;
-                    return od && od->returnOwned;
+                    return ms && ms->isOperator &&
+                           sema::methodReturnsOwned(*ms, ctx_);
                 }
                 // (3) an `owned`-returning method/function call result. The
                 // owned-return flag lives on the MethodDecl, or (imported, no
                 // AST decl) in SemaContext::importedReturnOwned_. A borrow
                 // return must NOT be disposed, so require the owned flag.
-                if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
-                    if (!call->callee) return false;
-                    auto* ms = dynamic_cast<sema::MethodSymbol*>(
-                        ctx_.exprSymbol(*call->callee));
-                    if (!ms) return false;
-                    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-                    return (md && md->returnOwned) ||
-                           (!md && ctx_.importedReturnOwned(ms));
-                }
+                if (auto* call = dynamic_cast<const ast::CallExpr*>(e))
+                    return common::calleeReturnsOwned(*call, ctx_);
                 return false;
             };
             // Soundness guard: if THIS operator's parameter is `owned` (it
@@ -6671,10 +6669,28 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             // must NOT be disposed here — that would double-free. A normal
             // operator takes borrows, so paramConsumes is false and the
             // temporary is disposed exactly once.
-            auto* opmDecl = dynamic_cast<const ast::OperatorDecl*>(opm->decl);
+            //
+            // fix #3189 (family M2 of umbrella #3152): the guard reads the
+            // formals through `sema::formalParamModifier` (#3176's both-sources
+            // accessor) rather than through `opm->decl`, which is null for an
+            // IMPORTED operator and made `paramConsumes` answer `false` for
+            // every formal of one.
+            //
+            // ⚠ MEASURED INERT, and the honest statement is worth keeping: the
+            // change fixes NO live double free, because §25.2 (v0.254) rejects
+            // `ref`/`out`/`owned`/`scoped` on an operator PARAMETER outright —
+            // *"operands are received as plain borrows … the return slot's
+            // optional `owned` is the sole ownership annotation on operators"*.
+            // The probe that would have exercised it (`operator +(owned a,
+            // b)`) does not compile, in either module. So `paramConsumes` is
+            // false for every well-formed program whichever source it reads.
+            // It moves anyway because it is the guard that stands between arm
+            // (2)'s new imported-operator admission and a double free: leaving
+            // it keyed on a null decl would make the ONE thing protecting this
+            // widening depend on a fact the imported side cannot see, and the
+            // §25.2 bound is the only reason that is currently harmless.
             auto paramConsumes = [&](std::size_t i) -> bool {
-                if (!opmDecl || i >= opmDecl->params.size()) return false;
-                std::string_view m = opmDecl->params[i].modifier;
+                std::string_view m = sema::formalParamModifier(*opm, i);
                 return m == "owned" || m == "out owned";
             };
             if (res) {

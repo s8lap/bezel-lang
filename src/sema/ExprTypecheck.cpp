@@ -9512,16 +9512,12 @@ bool ExprTC::exprIsOwnedProducerOfNonTrivialDisposeClass(
     if (dynamic_cast<const ast::NewExpr*>(&e)) {
         ownedProduced = true;
     } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
-        if (ce->callee) {
-            if (auto* sym = ctx_.exprSymbol(*ce->callee)) {
-                if (auto* ms = dynamic_cast<MethodSymbol*>(sym)) {
-                    if (auto* md =
-                            dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-                        ownedProduced = md->returnOwned;
-                    }
-                }
-            }
-        }
+        // fix #3189 (family M2 of umbrella #3152): the both-sources marker
+        // read. Through `ms->decl` this answered `false` for every method of a
+        // non-generic imported class, so a §22.5 default-value expression
+        // calling an imported owned-returning factory escaped the check its
+        // single-module twin fails.
+        ownedProduced = common::calleeReturnsOwned(*ce, ctx_);
     }
     if (!ownedProduced) return false;
     const TypeRef* t = ctx_.exprType(e);
@@ -11078,12 +11074,29 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 ownedProduced = true;
             } else if (auto* ce =
                            dynamic_cast<const ast::CallExpr*>(es->expr.get())) {
-                if (ce->callee)
-                    if (auto* sym = ctx_.exprSymbol(*ce->callee))
-                        if (auto* ms = dynamic_cast<MethodSymbol*>(sym))
-                            if (auto* md = dynamic_cast<const ast::MethodDecl*>(
-                                    ms->decl))
-                                ownedProduced = md->returnOwned;
+                // fix #3189 (§21.9, v0.254 — family M2 of umbrella #3152): the
+                // both-sources marker read. Through `ms->decl` this answered
+                // `false` for every method of a non-generic imported class, so
+                // `Lib.Make(1);` as a bare statement was inspected by NEITHER
+                // arm of this section: no diagnostic, and no reclaim either.
+                // Measured, that spelling leaked 3200 bytes in 200 allocations
+                // under LSan; it is now reclaimed exactly as `new
+                // ImportedCell(1);` as a bare statement already was on this
+                // base — the NewExpr arm above and this one now agree.
+                //
+                // ⚠ The §21.9 DIAGNOSTIC still does not fire for an imported
+                // NON-trivial-dispose class, and that is a SECOND, independent
+                // defect (#3191) which this change does not close and must not
+                // be read as closing: the exporter drops the destructor
+                // entirely (`ModuleMetadataBuilder` skips `DestructorSymbol`,
+                // no wire bit replaces it), so the walk below misclassifies
+                // EVERY imported class as trivial-dispose. That is reachable
+                // with no `owned` return anywhere — measured on `new Derived();`
+                // where `Derived` is LOCAL and its base is imported — so it is
+                // not this family's to fix, and papering over it here would
+                // over-reject every imported trivial-dispose class whose twin
+                // compiles.
+                ownedProduced = common::calleeReturnsOwned(*ce, ctx_);
                 // §21.9 (#832): a builtin owning-collection DRAIN — Pop /
                 // Dequeue / PopFirst / PopLast / PopAt / PopValue on an Owned*
                 // collection — returns `owned T` but has no user MethodDecl, so

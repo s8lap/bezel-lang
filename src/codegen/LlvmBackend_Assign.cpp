@@ -1,4 +1,5 @@
 #include "codegen/LlvmBackend_impl.hpp"
+#include "common/OwnershipFacts.hpp"  // fix #3189: calleeReturnsOwned — the M2 owned-return channel
 
 namespace bezel::codegen {
 
@@ -10513,18 +10514,23 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         } else if (auto* be = dynamic_cast<const ast::BinaryExpr*>(av)) {
             // #1019: an owned-returning operator result (`a + b` with
             // `operator +(...): owned Cell`) is a fresh owned class temporary too.
+            //
+            // fix #3189 (family M2 of umbrella #3152): both-sources marker read.
+            // `ms->isOperator` is the both-sources spelling of the old
+            // `dynamic_cast<ast::OperatorDecl*>(ms->decl) != nullptr`, so the
+            // gate stays exactly as narrow. The CALLEE here is always LOCAL
+            // (this runs inside buildOrderedArgs, reached only with a
+            // `md->params` / `cd->params` list), but the ARGUMENT may be an
+            // imported producer — `f(Lib.Make())`, `f(a + b)` — and that is the
+            // case both arms answered `false` for.
             if (auto* sym = ctx_.exprSymbol(*be))
                 if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
-                    if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl))
-                        if (od->returnOwned) isOwnedTempArg = true;
+                    if (ms->isOperator && sema::methodReturnsOwned(*ms, ctx_))
+                        isOwnedTempArg = true;
         } else if (auto* ce = dynamic_cast<const ast::CallExpr*>(av)) {
             // #1019: a call to a user method declared `owned`-return produces a
             // fresh owned class temporary (`f(Make())` with `Make(): owned Cell`).
-            if (ce->callee)
-                if (auto* sym = ctx_.exprSymbol(*ce->callee))
-                    if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
-                        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-                            if (md->returnOwned) isOwnedTempArg = true;
+            if (common::calleeReturnsOwned(*ce, ctx_)) isOwnedTempArg = true;
         }
         if (isOwnedTempArg && !disposeStack_.empty() &&
             v->getType()->isPointerTy() &&

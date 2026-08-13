@@ -7790,9 +7790,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                     call.callee.get()))
                 recvTempExpr = ma->target.get();
-            bool recvCalleeReturnsOwned = false;
-            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-                recvCalleeReturnsOwned = md->returnOwned;
+            // fix #3189 (family M2 of umbrella #3152): both-sources marker
+            // read. This flag only ever WIDENS eligibility (it enables
+            // freshNewReceiverTempEligible's #1859 class/interface-result arm);
+            // through `ms->decl` it was false for every method of a non-generic
+            // imported class, so an owned-returning imported callee on a fresh
+            // receiver temp left that receiver un-disposed on the unwind edge.
+            const bool recvCalleeReturnsOwned =
+                sema::methodReturnsOwned(*ms, ctx_);
             recvUnwindSlot = registerFreshNewReceiverTempUnwind(
                 recvTempExpr, recv, ctx_.exprType(call), recvCalleeReturnsOwned);
         }
@@ -8745,9 +8750,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // no borrow of the receiver (see disposeFreshNewReceiverTemp's own
         // comment). `ms->decl` is this call's callee MethodDecl (already
         // resolved above), not the receiver-producing call's.
-        bool calleeReturnsOwned = false;
-        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-            calleeReturnsOwned = md->returnOwned;
+        // fix #3189 (family M2 of umbrella #3152): both-sources marker read —
+        // the NORMAL-path twin of the unwind registration above, and it MUST
+        // move with it: registration and reclaim share one eligibility
+        // predicate (freshNewReceiverTempEligible), so converting only one
+        // would make them disagree about which temporaries are covered.
+        const bool calleeReturnsOwned = sema::methodReturnsOwned(*ms, ctx_);
         disposeFreshNewReceiverTemp(recvExpr, args[0], ctx_.exprType(call),
                                     calleeReturnsOwned, recvUnwindSlot);
     }

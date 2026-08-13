@@ -80,15 +80,30 @@ bool isNonTrivialDisposeClass(sema::TypeSymbol* decl) {
 
 const ast::MethodDecl* calleeMethodDecl(const ast::CallExpr& call,
                                         const sema::SemaContext& ctx) {
-    // The callee → MethodSymbol → user MethodDecl navigation that both
-    // consumers use to reach the `returnOwned` authority.  A null callee, a
+    // The callee → MethodSymbol → user MethodDecl navigation.  A null callee, a
     // callee with no MethodSymbol (a builtin, or a call through a value /
     // function), or a MethodSymbol with no AST MethodDecl (an imported method —
     // §28.10 / #707) all yield null.
+    //
+    // fix #3189 (family M2 of umbrella #3152): this NO LONGER doubles as the
+    // route to `returnOwned` — see the header. Its remaining callers either
+    // dereference the node (a body scan, a modifier list, a generic-parameter
+    // list) or use its null as "no user method here, run the builtin rule",
+    // and those two readings cannot both be widened.
     if (!call.callee) return nullptr;
     auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee));
     if (!ms) return nullptr;
     return dynamic_cast<const ast::MethodDecl*>(ms->decl);
+}
+
+bool calleeReturnsOwned(const ast::CallExpr& call,
+                        const sema::SemaContext& ctx) {
+    // fix #3189 (§28.1 / §28.3 / §2.5, v0.254 — family M2 of umbrella #3152):
+    // the both-sources route to the `owned`-return marker. See the header.
+    if (!call.callee) return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee));
+    if (!ms) return false;
+    return sema::methodReturnsOwned(*ms, ctx);
 }
 
 bool isFreshOwnedClassProducer(const ast::Expr* e, const sema::SemaContext& ctx,
@@ -97,9 +112,20 @@ bool isFreshOwnedClassProducer(const ast::Expr* e, const sema::SemaContext& ctx,
     // return `owned T` — both transfer a fresh +1 the caller solely owns. A
     // call WITHOUT an `owned` return transfers no ownership: its result is a
     // BORROW (e.g. `return this.field`), and reclaiming it would free a value
-    // owned elsewhere (use-after-free). `returnOwned` (ast::MethodDecl) is the
-    // sound discriminator. A variable / field / `this` / property receiver is
+    // owned elsewhere (use-after-free). `returnOwned` is the sound
+    // discriminator. A variable / field / `this` / property receiver is
     // neither a NewExpr nor a call, so it is never a fresh producer.
+    //
+    // fix #3189 (§28.1/§28.3, v0.254, family M2 of umbrella #3152): the marker
+    // is read through `calleeReturnsOwned`, which consults the imported
+    // side table as well as the AST decl. The old
+    // `calleeMethodDecl(*call, ctx)->returnOwned` answered "not a producer"
+    // for EVERY method of a non-generic imported class, so the dozen codegen
+    // disposal sites this predicate gates emitted no reclaim: measured,
+    // `Lib.Make(i).v` in a 200-iteration loop leaked 3200 bytes in 200
+    // allocations under LSan while its character-identical single-module twin
+    // was clean. Nothing else disposes those temporaries — the leak IS the
+    // proof there is no second owner to double-free.
     //
     // `resolveParam` is the documented shared resolver hook (see header); the
     // weakest-copy shape does not resolve the receiver type-parameter, so the
@@ -110,8 +136,7 @@ bool isFreshOwnedClassProducer(const ast::Expr* e, const sema::SemaContext& ctx,
     if (dynamic_cast<const ast::NewExpr*>(e)) {
         producer = true;
     } else if (auto* call = dynamic_cast<const ast::CallExpr*>(e)) {
-        if (const ast::MethodDecl* md = calleeMethodDecl(*call, ctx))
-            producer = md->returnOwned;
+        producer = calleeReturnsOwned(*call, ctx);
     }
     if (!producer) return false;
     // The receiver type must be a heap CLASS: records/structs are value types

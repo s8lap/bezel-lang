@@ -589,6 +589,20 @@ const TypeRef* formalParamResolvedType(const MethodSymbol& ms,
     return nullptr;
 }
 
+// fix #3189 (§28.1 / §28.3 / §2.5, v0.254 — family M2 of umbrella #3152): THE
+// both-sources reader of a method's `owned` return marker. See Symbol.hpp for
+// the contract and for the four measured cross-module defects it closes.
+bool methodReturnsOwned(const MethodSymbol& ms, const SemaContext& ctx) {
+    // AST first (it carries the syntax), symbol/side-table second — the same
+    // order as the formalParam* accessors above, so a member described by both
+    // sources can never get two answers.
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms.decl))
+        return md->returnOwned;
+    if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms.decl))
+        return od->returnOwned;
+    return ctx.importedReturnOwned(&ms);
+}
+
 const ast::Type* formalParamDeclType(const ConstructorSymbol& cs,
                                      std::size_t pos) {
     if (const ast::Param* p = ctorDeclParam(cs, pos)) return p->type.get();

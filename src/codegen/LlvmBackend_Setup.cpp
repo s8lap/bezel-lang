@@ -14862,9 +14862,15 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(ld->initializer.get())) {
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
                 ctx_.exprSymbol(*ld->initializer))) {
-            auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl);
+            // fix #3189 (family M2 of umbrella #3152): both-sources marker
+            // read; `ms->isOperator` is the both-sources spelling of the old
+            // `dynamic_cast<ast::OperatorDecl*>(ms->decl) != nullptr`, so the
+            // gate stays exactly as narrow. An IMPORTED operator's `decl` is
+            // null, so this arm never fired cross-module and the owned
+            // operator result was neither unwind-disposed nor reclaimed on an
+            // explicit `r.Dispose()`.
             const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
-            if (od && od->returnOwned &&
+            if (ms->isOperator && sema::methodReturnsOwned(*ms, ctx_) &&
                 (isClassOrInterfaceRef(initTy) ||
                  isClassOrInterfaceRef(resolveTypeParamRef(initTy)))) {
                 if (initTy && initTy->kind == sema::TypeRef::Kind::Named &&
@@ -14905,11 +14911,19 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
                 auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
                 // §28.10 / #707: for imported methods ms->decl is null (the
                 // ModuleLoader attaches no AST MethodDecl); the owned-return
-                // flag lives in SemaContext::importedReturnOwned_.  Fall back
-                // to that when md is absent — but ONLY when importedReturnOwned
-                // is true (a borrow return must NOT be disposed).
-                bool isOwned = (md && md->returnOwned) ||
-                               (!md && ctx_.importedReturnOwned(ms));
+                // flag lives in SemaContext::importedReturnOwned_, consulted
+                // when the AST decl is absent — but ONLY when it is true (a
+                // borrow return must NOT be disposed).
+                //
+                // fix #3189 (family M2 of umbrella #3152): that hand-rolled
+                // disjunction is now `sema::methodReturnsOwned`, byte-for-byte
+                // the same decision on this path. It was one of only three
+                // copies that HAD the fallback, against a dozen that did not —
+                // drift #6 of the audit is literally this expression present at
+                // `:14918` and absent at its sibling 40 lines above. `md` stays
+                // live below for the #1499 static-factory body scan, which
+                // genuinely needs the AST node.
+                bool isOwned = sema::methodReturnsOwned(*ms, ctx_);
                 // §11.8 / §28.7 (#1425 sub-item 3): `total := T.Zero()` /
                 // `T.Method()` through a static-interface constraint has a
                 // BARE-type-parameter static return (`declaration == nullptr`
@@ -21394,10 +21408,11 @@ bool Emitter::isUnboundOwnedBorrowingArrayCallExpr(const ast::Expr* e) const {
     // result). The callee symbol is keyed on the CallExpr's `callee` node.
     auto* call = dynamic_cast<const ast::CallExpr*>(e);
     if (!call || !call->callee) return false;
-    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call->callee));
-    if (!ms) return false;
-    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-    return md && md->returnOwned;
+    // fix #3189 (family M2 of umbrella #3152): the both-sources marker read.
+    // An imported `method M(): owned Array<T>` answered `false` here, so the
+    // unbound borrowing-array temporary's `bz_array_free` was never emitted
+    // and the backing leaked once per call.
+    return common::calleeReturnsOwned(*call, ctx_);
 }
 
 
@@ -24537,9 +24552,14 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
         if (dynamic_cast<const ast::BinaryExpr*>(ld->initializer.get())) {
             if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
                     ctx_.exprSymbol(*ld->initializer))) {
-                auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl);
+                // fix #3189 (family M2 of umbrella #3152): both-sources marker
+                // read, `ms->isOperator` standing in for the old decl-kind
+                // cast. Measured: `using var c := a + b` over an IMPORTED
+                // `operator +(): owned Cell` left the result AND the
+                // intermediate live (live count 2) where the single-module
+                // twin returned to 0.
                 const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
-                if (od && od->returnOwned &&
+                if (ms->isOperator && sema::methodReturnsOwned(*ms, ctx_) &&
                     (isClassOrInterfaceRef(initTy) ||
                      isClassOrInterfaceRef(resolveTypeParamRef(initTy))))
                     return true;
@@ -24573,9 +24593,13 @@ bool Emitter::usingVarOwnsClassObjectDynamically(const ast::LocalDecl* ld) {
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(
                     ctx_.exprSymbol(*call->callee));
                 if (ms) {
+                    // fix #3189 (family M2 of umbrella #3152): the
+                    // hand-rolled both-sources disjunction is now
+                    // `sema::methodReturnsOwned` — the same decision, in one
+                    // place. `md` stays live below for the #1499 static-factory
+                    // body scan, which genuinely needs the AST node.
                     auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
-                    bool isOwned = (md && md->returnOwned) ||
-                                   (!md && ctx_.importedReturnOwned(ms));
+                    bool isOwned = sema::methodReturnsOwned(*ms, ctx_);
                     // §28.10 / §14.2 (sweep #6): the return type may be a bare
                     // generic type PARAMETER `T` (declaration==null), e.g.
                     // `Make(): owned T` in a generic class. isClassOrInterfaceRef

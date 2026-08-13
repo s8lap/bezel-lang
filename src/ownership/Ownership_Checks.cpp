@@ -12207,10 +12207,19 @@ MethodOwnership::ScopedBound MethodOwnership::scopedBoundingLocal(
     // carry `returnOwned`; the builtin `Subscribe`/`Register` return
     // `owned Subscription` (stdlib §2.11 / §6.5 / §6.1). `.Add` returns unit,
     // so it never satisfies forms 2/3 and falls to form 4 below.
+    //
+    // fix #3189 (family M2 of umbrella #3152): read the marker through the
+    // both-sources accessor. `ms->decl` is null for a method of a non-generic
+    // IMPORTED class, so `ownedReturn` was false for every cross-module callee
+    // and forms 2/3 could never resolve — measured as a FALSE REJECT of
+    // `using var sub := imported.Subscribe(lambda() => Touch(b));` whose
+    // character-identical single-module twin compiles clean. (#3176 made this
+    // newly REACHABLE by teaching `scoped`-formal detection to read the symbol,
+    // so the §28.14 admission now runs for imported callees — and rejected
+    // them.)
     bool ownedReturn = false;
     if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*callee)))
-        if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
-            ownedReturn = md->returnOwned;
+        ownedReturn = sema::methodReturnsOwned(*ms, ctx_);
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
         if ((ma->member == "Subscribe" || ma->member == "Register") &&
             builtinScopedCallbackFormal(callee, 0))

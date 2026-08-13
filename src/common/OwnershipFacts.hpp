@@ -101,10 +101,33 @@ bool isNonTrivialDisposeClass(sema::TypeSymbol* decl);
 // Shared shape-recognition: if the callee of `call` resolves to a user
 // `ast::MethodDecl` (a MethodSymbol whose `decl` is a MethodDecl), return it;
 // null otherwise (unresolved overload, a builtin with no MethodSymbol, or a
-// call through a value/function).  Both consumers reach the `returnOwned`
-// authority through this one navigation.
+// call through a value/function).
+//
+// ⚠ THIS PREDICATE'S SUBJECT IS DECL PRESENCE, NOT THE `owned` RETURN.
+// Its null is load-bearing in two CONTRADICTORY directions, which is why
+// #3189 did not "fix" it: at `Ownership_Checks.cpp:9665`, `:10162`, `:10203`
+// and `:10357` a null means "there is no user method here, so run the BUILTIN
+// intrinsic rule" (`Select` / `Min` / `Max` / the stdlib string-mint set), and
+// widening it would silently reclassify a user method as an intrinsic. Sites
+// that want the `owned`-return FACT must call `calleeReturnsOwned` below,
+// which consults both sources; sites that genuinely need the AST node (a body
+// scan, a generic-parameter list, a modifier list) keep calling this one.
 const ast::MethodDecl* calleeMethodDecl(const ast::CallExpr& call,
                                         const sema::SemaContext& ctx);
+
+// §28.1 / §28.3 "Producers" / §2.5 (v0.254, #3189 — family M2 of umbrella
+// #3152): does the callee of `call` declare an `owned` return? THE shared
+// navigation to the `returnOwned` authority, replacing the
+// `calleeMethodDecl(...)->returnOwned` idiom at every site whose subject is
+// the marker rather than the AST node. Both sources are consulted through
+// `sema::methodReturnsOwned` (see sema/Symbol.hpp), so an imported callee —
+// whose `MemberSymbol::decl` is null for every non-generic imported type —
+// answers with the exporter's declared marker instead of a silent `false`.
+//
+// False for a null callee, a callee with no `MethodSymbol` (a builtin, or a
+// call through a value / function), and any method whose return is unmarked.
+bool calleeReturnsOwned(const ast::CallExpr& call,
+                        const sema::SemaContext& ctx);
 
 // EXPRESSION-SHAPE producer classification (#1039 / #1053 — the weakest of the
 // four historic copies): a literal `new T(...)` or a call to a method declared

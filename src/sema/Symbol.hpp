@@ -1208,4 +1208,51 @@ const ast::Type* formalParamDeclType(const ConstructorSymbol& cs,
 const TypeRef* formalParamResolvedType(const ConstructorSymbol& cs,
                                        std::size_t pos);
 
+// §28.1 "Where the `owned` modifier can appear" / §28.3 "Producers" / §2.5
+// "Dependency resolution" (v0.254, #3189 — family M2 of umbrella #3152):
+// does this method's DECLARED RETURN carry the `owned` marker?
+//
+// This is the single most consumed ownership fact in the compiler: it is the
+// sound discriminator between "this call transfers a fresh +1 the caller must
+// dispose" and "this call hands back a BORROW that reclaiming would
+// use-after-free". Fifteen sites across sema, the ownership pass and codegen
+// asked it, and every one of them asked it as
+//
+//     dynamic_cast<const ast::MethodDecl*>(ms->decl)->returnOwned
+//
+// `ModuleLoader` sets `MemberSymbol::decl` only where it re-parsed exported
+// body text for a GENERIC type, so for a method of any non-generic imported
+// class that cast is null and each site took its `false` branch — which is not
+// "unknown" but the substantive claim "returns nothing owned". Measured on a
+// real two-module build (`bezelc -c lib.bzl` then `--import lib.o app.bzl`),
+// against character-identical single-module twins:
+//
+//   * `Lib.Make(1);` as a bare statement — the twin is a hard §21.9 error,
+//     the imported spelling compiles silently and leaks 3200 bytes in 200
+//     allocations under LSan;
+//   * `Lib.Make(i).v` as an unbound receiver temporary — the twin is clean,
+//     the imported spelling leaks 3200 bytes in 200 allocations;
+//   * `using var c := a + b` over an imported `operator +(): owned Cell` —
+//     the twin's live-object count returns to 0, the imported spelling leaves
+//     2 objects live (the intermediate and the result);
+//   * `using var sub := imported.Subscribe(lambda…)` — the twin compiles, the
+//     imported spelling is a §28.14 FALSE REJECT (#3189).
+//
+// BOTH AST decl kinds are consulted. A `MethodSymbol` also backs an `operator`
+// overload, whose decl is an `ast::OperatorDecl` — a sibling of
+// `ast::MethodDecl`, not a subclass — and both carry `returnOwned`. Reading
+// only one kind is how drift #5 of the audit arose (two arms of ONE lambda,
+// thirteen lines apart, disagreeing about the same fact).
+//
+// The sources are consulted in the AST-then-symbol order the `formalParam*`
+// accessors above use, so a member both sources describe can never get two
+// answers: for an imported GENERIC type the loader sets BOTH `decl` (body
+// re-parse) and the `returnOwned` wire bit, and the AST answer wins — i.e.
+// this accessor changes NOTHING for that case. `SemaContext::
+// importedReturnOwned` is populated only by `ModuleLoader` (via
+// `setImportedReturnType`, for class members at ModuleLoader.cpp:531 and for
+// imported EXTENSION methods at :2897), so a locally synthesized decl-less
+// `MethodSymbol` still answers `false` exactly as before.
+bool methodReturnsOwned(const MethodSymbol& ms, const SemaContext& ctx);
+
 } // namespace bezel::sema

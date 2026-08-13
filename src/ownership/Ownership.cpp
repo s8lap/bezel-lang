@@ -4105,19 +4105,29 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
     // `owned`-returning operator on a value type is impossible — §9.7 forbids
     // record destructors). The operands stay borrowed, so there is no double-free.
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        // fix #3189 (family M2 of umbrella #3152): read the marker through the
+        // both-sources accessor. `ms->decl` is null for an operator of a
+        // non-generic IMPORTED class, so the cast answered "not owned" and the
+        // result fell through to Borrowed — measured: `using var c := a + b`
+        // over an imported `operator +(): owned Cell` left 2 objects live
+        // where the single-module twin's live count returned to 0.
+        // `ms->isOperator` is the both-sources spelling of the old
+        // `dynamic_cast<ast::OperatorDecl*>(ms->decl) != nullptr`: it is set
+        // exactly for an OperatorDecl locally (SymbolCollection.cpp:200) and
+        // from the wire bit on import (ModuleLoader.cpp:522), so the gate stays
+        // exactly as narrow as it was.
         if (auto* sym = ctx_.exprSymbol(*be))
             if (auto* ms = dynamic_cast<sema::MethodSymbol*>(sym))
-                if (auto* od = dynamic_cast<const ast::OperatorDecl*>(ms->decl))
-                    if (od->returnOwned)
-                        if (const sema::TypeRef* rt = ctx_.exprType(e))
-                            if (rt->kind == sema::TypeRef::Kind::Named &&
-                                rt->declaration &&
-                                (rt->declaration->kind ==
-                                     ast::TypeDeclKind::Class ||
-                                 rt->declaration->kind ==
-                                     ast::TypeDeclKind::Interface) &&
-                                !rt->declaration->isValueBuiltin)
-                                return OwnershipState::Owned;
+                if (ms->isOperator && sema::methodReturnsOwned(*ms, ctx_))
+                    if (const sema::TypeRef* rt = ctx_.exprType(e))
+                        if (rt->kind == sema::TypeRef::Kind::Named &&
+                            rt->declaration &&
+                            (rt->declaration->kind ==
+                                 ast::TypeDeclKind::Class ||
+                             rt->declaration->kind ==
+                                 ast::TypeDeclKind::Interface) &&
+                            !rt->declaration->isValueBuiltin)
+                            return OwnershipState::Owned;
         // #1029 / §28.3: built-in `??` (NullCoalescing) with an Owned-producing
         // RHS. The caller owns whichever branch's value is taken: LHS non-null →
         // ownership transfers from the LHS (codegen nulls the LHS slot); LHS null
