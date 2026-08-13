@@ -36,7 +36,7 @@ for a GENERIC type, so for a non-generic imported class every member symbol has
 | `origin/main` | `ec6a02f` — plus a **10-commit batch on local `main`, gated but not yet pushed** (Wave A + the class-3 ratchet + this document) |
 | **class 1** (`TypeDecl` symbol-side) | **152 → 51** ✅ all 12 families landed |
 | **class 2** (always-null `TypeSymbol`→`TypeDecl`) | **1 → 0** ✅ (#3150) |
-| **class 3** (member-kind symbol-side) | **305**, newly ratcheted, ~41 of 110 UNIFY sites converted |
+| **class 3** (member-kind symbol-side) | **305 → 295** (M4 −7, M8/#3188/#3206/#3182 −3) |
 
 ⚠ The class-3 figure is **305, not the 301** an earlier draft of this table carried: the
 baseline was regenerated after Wave A landed and the file is authoritative over this
@@ -77,9 +77,23 @@ any of them individually.
 untestable, and gate #3183 / #3164 / #3179 / #3170. The lane was asked to establish the
 true dependency graph by measurement, because `#3164-before-#3162` is a *claim*.
 
-**Wave B2 — in flight (three lanes, 2026-08-14).** M4 (13, silent wrong data, #3177) ·
-M5 (8, false rejects, #3178) · M8 (2, purity false accept, #3174) bundled with **#3188**
-(the `out using var` third copy of #3186's drift) and **#3182**. #3189 landed with Wave A.
+**Wave B2 — M4 and M8 LANDED (reviewed); M5 still out.** M4 (#3177) landed as five
+commits `6d55962..8828f45`; M8 (#3174) + #3188 + #3206 + #3182 landed as `2be3b0c..3f1a4bd`.
+M5 (#3178) is the one still in flight. #3189 landed with Wave A.
+
+Two things Wave B2 established that outlive it:
+
+1. **The audit's site counts are approximate and its verdicts are samples.** M4 had 16 sites,
+   not 13, and TWO audited rows were refuted by measurement (`LlvmBackend_String.cpp:2596/:2627`
+   — the reading is right, the predicted consequence does not occur). M8's lane refuted its
+   issue's "opposite direction" section, and then the REVIEW refuted the refutation: it held
+   only for constructors with primitive parameters, because a ctor naming a sibling type fails
+   the synthetic-source re-parse (#3219). **Two levels of refutation on one claim** is the
+   clearest evidence yet for the verify-first rule.
+2. **#3188 was filed as "the third copy" and is the FOURTH OF SIX.** The lane measured the two
+   it was not told about, both broken identically (0 instead of 211, plus a 16-byte leak), fixed
+   them as #3206, and collapsed all six behind two accessors. When an issue says "the Nth copy",
+   treat N as a lower bound and go count.
 ⚠ **M5 carries a free win**: `MetaParam::hasDefault` is ALREADY on the wire and simply
 dropped by `ModuleLoader::convertParams` — no format change needed.
 
