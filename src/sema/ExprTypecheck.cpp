@@ -1056,17 +1056,31 @@ static RigidInv matchLeafRigid(
 // non-null (the nullable pre-image's non-`new`-exclusion is why this runs BEFORE
 // clause (b), which would otherwise EXEMPT a `new`-constrained non-`new` non-null
 // pre-image while the nullable pre-image still inhabits).
+//
+// fix #3146 (§2.8.3 rule 4, v0.252; family F13 of umbrella #3152): this used to
+// read the constraint list off `leaf->decl`'s `ast::TypeDecl`, which is null for
+// every imported type, so an imported leaf answered "no notnull/class/value/type
+// bound" whatever it declared. It now reads `GenericParamSymbol::constraints`,
+// which SymbolCollection and ModuleLoader both populate.
+//
+// ⚠ NOT reachable across a module boundary TODAY, and this is not the site that
+// keeps it so: §19.6's closed-set leaf walk enumerates `ctx_.symbols()`, which
+// by construction excludes every imported symbol (SemaContext.hpp:225), so an
+// imported `closed` hierarchy has an EMPTY leaf set and the whole census never
+// runs. Filed as #3167. Converted here anyway because the family lands whole and
+// this would otherwise be a wrong answer waiting to become live the moment
+// #3167 closes.
 static bool leafParamExcludesNullable(const TypeSymbol* leaf,
                                       std::string_view param) {
     if (!leaf) return false;
-    if (auto* td = dynamic_cast<const ast::TypeDecl*>(leaf->decl)) {
-        for (const auto& gc : td->genericConstraints) {
-            if (gc.typeParam != param) continue;
-            for (const auto& item : gc.items)
-                if (item.kind == "notnull" || item.kind == "class" ||
-                    item.kind == "value" || item.kind == "type")
-                    return true;  // §14.2: all imply non-null Y
-        }
+    for (const Symbol* gpSym : leaf->genericParams) {
+        auto* gp = dynamic_cast<const GenericParamSymbol*>(gpSym);
+        if (!gp || gp->name != param) continue;
+        for (const auto& item : gp->constraints)
+            if (item.kind == "notnull" || item.kind == "class" ||
+                item.kind == "value" || item.kind == "type")
+                return true;  // §14.2: all imply non-null Y
+        return false;
     }
     return false;
 }
@@ -1528,7 +1542,7 @@ bool ExprTC::leafSolutionViolatesScalarConstraint(
     // Apply ONE scalar constraint item to a ground argument; true iff it is
     // PROVABLY violated (the §14.2 reported-violation conditions of
     // Resolver::checkOneConstraint, restricted to the ground/decidable cases).
-    auto violates = [&](const ast::ConstraintItem& item,
+    auto violates = [&](const GenericParamConstraint& item,
                         const TypeRef* arg) -> bool {
         if (!arg || !isFullyGroundTypeRef(arg))
             return false;  // non-ground (rigid) σ component — s6, never dropped here
@@ -1555,8 +1569,13 @@ bool ExprTC::leafSolutionViolatesScalarConstraint(
             // the ground σ(Y)). The census prohibition holds structurally — a
             // free param never reaches this filter, and isSubtype is used only on
             // ground σ(Y), never to enumerate a bound's conformers.
-            if (!item.typeArg) return false;  // malformed — keep
-            TypeRef* bound = ctx_.resolvedType(*item.typeArg);
+            // fix #3146: an IMPORTED bound arrives already resolved from the
+            // artifact; a LOCAL one is the AST node, resolved as before.
+            TypeRef* bound = item.importedBound;
+            if (!bound) {
+                if (!item.astBound) return false;  // malformed — keep
+                bound = ctx_.resolvedType(*item.astBound);
+            }
             bool decided = false;
             bool ok = groundSatisfiesTypeBound(arg, bound, decided);
             return decided && !ok;  // provably outside the bound ⇒ σ drops out
@@ -1582,15 +1601,21 @@ bool ExprTC::leafSolutionViolatesScalarConstraint(
     while (cur) {
         if (!seen.insert(cur).second) break;  // cycle guard
         // (b): this decl's own scalar where-constraints against the ground args.
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl)) {
-            for (const auto& gc : td->genericConstraints) {
-                auto ai = argSubst.find(gc.typeParam);
-                if (ai == argSubst.end() || !ai->second)
-                    continue;  // param not solved to a ground type — keep
-                for (const auto& item : gc.items)
-                    if (violates(item, ai->second))
-                        return true;  // provable violation ⇒ σ drops out
-            }
+        //
+        // fix #3146 (§2.8.3 rule 4; family F13 of umbrella #3152): read from
+        // `GenericParamSymbol::constraints` rather than the `ast::TypeDecl`,
+        // which is null for every imported level of the chain. Same ⚠ as
+        // `leafParamExcludesNullable` above: not reachable across a module
+        // boundary until #3167 closes, converted so the family lands whole.
+        for (const Symbol* gpSym : cur->genericParams) {
+            auto* gp = dynamic_cast<const GenericParamSymbol*>(gpSym);
+            if (!gp) continue;
+            auto ai = argSubst.find(gp->name);
+            if (ai == argSubst.end() || !ai->second)
+                continue;  // param not solved to a ground type — keep
+            for (const auto& item : gp->constraints)
+                if (violates(item, ai->second))
+                    return true;  // provable violation ⇒ σ drops out
         }
         if (cur == root) break;
         // Advance to the single class base, composing the substitution level by

@@ -5613,9 +5613,38 @@ std::string argSpelling(const ast::Type* argAst) {
 
 }  // namespace
 
+// §14.2 (fix #3146): when `item` is a type bound whose bound is a BARE
+// single-part name — the shape a `where T: U` type-PARAMETER bound takes — the
+// name; otherwise "".
+//
+// Both sources, one predicate. A LOCAL bound is the AST node, and a bare name is
+// a `QualifiedName` with exactly one part. An IMPORTED bound is a resolved
+// TypeRef, and a type PARAMETER is precisely the case `Loader::lookupNamed`
+// cannot resolve — a Named ref with a null declaration whose `importedName`
+// holds the spelling. A qualified imported head (`Dep.Thing`) is rejected here
+// for the same reason the local branch rejects `parts.size() != 1`: it is not a
+// type-parameter spelling. The caller still checks that the name really is one
+// of the declaring type's parameters, so a non-parameter bound falls through to
+// the ordinary type-bound check exactly as before.
+static std::string_view constraintBoundBareName(
+    const GenericParamConstraint& item) {
+    if (item.kind != "type") return {};
+    if (item.astBound) {
+        if (!item.astBound->name || item.astBound->name->parts.size() != 1)
+            return {};
+        return item.astBound->name->parts.back();
+    }
+    const TypeRef* b = item.importedBound;
+    if (!b || b->kind != TypeRef::Kind::Named || b->declaration) return {};
+    if (!b->genericArgs.empty()) return {};  // `IFoo<T>`, not a bare parameter
+    std::string_view n = b->importedName;
+    if (n.empty() || n.find('.') != std::string_view::npos) return {};
+    return n;
+}
+
 void Resolver::checkOneConstraint(const ast::Type& t,
                                   std::string_view paramName,
-                                  const ast::ConstraintItem& item,
+                                  const GenericParamConstraint& item,
                                   const ast::Type* argAst, TypeRef* arg,
                                   Scope* boundScope) {
     const std::string param(paramName);
@@ -5713,13 +5742,17 @@ void Resolver::checkOneConstraint(const ast::Type& t,
     if (item.kind == "type") {
         // §14.2: a type-bound (class or interface). Implies non-null T —
         // a nullable argument never satisfies it.
-        if (!item.typeArg) return;
-        TypeRef* bound = ctx_.resolvedType(*item.typeArg);
+        //
+        // fix #3146: an IMPORTED bound arrives already resolved (the loader
+        // built it from the artifact's MetaType); a LOCAL one is still the
+        // unresolved AST node, resolved on demand below because an
+        // instantiation site may be visited before the declaring type's own
+        // constraint clause.
+        TypeRef* bound = item.importedBound;
         if (!bound) {
-            // Not yet resolved (forward-declared generic type instantiated
-            // before its own constraint clause was visited). Resolve on
-            // demand in the declaring type's scope.
-            bound = resolveType(*item.typeArg, boundScope);
+            if (!item.astBound) return;
+            bound = ctx_.resolvedType(*item.astBound);
+            if (!bound) bound = resolveType(*item.astBound, boundScope);
         }
         if (!bound || bound->kind == TypeRef::Kind::Error) return;  // defer
         // #1867 / §14.2 clause 5 + §28.2/§9.7: a PRIMITIVE argument against
@@ -5804,10 +5837,30 @@ void Resolver::checkOneConstraint(const ast::Type& t,
 void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
                                        const std::vector<TypeRef*>& argRefs,
                                        Scope* scope) {
-    // Constraints live on the declaring TypeDecl's `where` clauses, keyed by
-    // type-parameter name. Build name → constraint-items map.
+    // fix #3146 (§14.2 / §2.8.3 rule 4, v0.252 — family F13 of umbrella #3152).
+    // This used to open by casting `tsym->decl` to an `ast::TypeDecl` and
+    // returning when it was null or carried no `where` clause. `tsym` is the
+    // DECLARING type, so for `Dep.Registry<K>` it is imported and the cast is
+    // always null — EVERY §14.2 constraint on EVERY imported generic type went
+    // unchecked at every instantiation site, silently. MEASURED on 558c27c with
+    // a real two-module build: `class BoxC<T> where T: class` exported from a
+    // dependency admitted `BoxC<int>` in the importer with no diagnostic, while
+    // the identical declarations in ONE module reported "type argument `int`
+    // does not satisfy the constraint `where T: class` (§14.2)".
+    //
+    // The constraints are now read off `GenericParamSymbol::constraints`, which
+    // SymbolCollection re-keys from the declaring node's `where` clauses and
+    // ModuleLoader rebuilds from `MetaGenericParam` — one representation, both
+    // sources. `td` survives for ONE residual use below (see the
+    // recordDeferredNested call).
+    if (!tsym) return;
     auto* td = dynamic_cast<const ast::TypeDecl*>(tsym->decl);
-    if (!td || td->genericConstraints.empty()) return;
+    bool anyConstraint = false;
+    for (Symbol* gpSym : tsym->genericParams) {
+        auto* gp = dynamic_cast<GenericParamSymbol*>(gpSym);
+        if (gp && !gp->constraints.empty()) { anyConstraint = true; break; }
+    }
+    if (!anyConstraint) return;
 
     // Reconstruct a lookup scope for resolving constraint type-bounds on
     // demand: module-scope names plus the declaring type's own generic-param
@@ -5842,69 +5895,70 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
         // owning type (Box), and re-check it after the whole pass once every
         // instantiation site is known (checkDeferredNestedConstraints).
         if (isGenericParamRef(*argAst, scope)) {
-            recordDeferredNested(*argAst, *gp, *td, t);
+            // ⚠ RESIDUAL (fix #3146): the deferred-nested machinery is still
+            // AST-shaped — `recordDeferredNested` reads the declaring node's
+            // `where` clauses to enqueue an obligation it re-checks after the
+            // pass. When `tsym` is IMPORTED there is no such node, so a nested
+            // obligation `C<W>` whose inner type `C` comes from a dependency is
+            // still not recorded (unchanged from before this fix — the whole
+            // function used to return here). Converting it needs the obligation
+            // record and its visited-set key to become symbol-shaped too, which
+            // is a separate change from this family's three reader sites; the
+            // DIRECT check below now runs for an imported `tsym` either way.
+            if (td) recordDeferredNested(*argAst, *gp, *td, t);
             continue;
         }
         if (arg->kind == TypeRef::Kind::Error) continue;
 
-        // Find the constraint clause(s) for this parameter name.
-        for (const auto& gc : td->genericConstraints) {
-            if (gc.typeParam != gp->name) continue;
-            // The `is owned` / `is not owned` modifier-constraint form is
-            // historical (removed in v0.97, §14.4) and carries no
-            // instantiation-time obligation here; skip it.
-            if (!gc.modifierConstraint.empty()) continue;
-            for (const auto& item : gc.items) {
-                // §14.2 type-parameter bound (`where T: U`): the bound names
-                // another generic parameter of `tsym`, so checkOneConstraint
-                // defers on it (the bound's TypeRef has no declaration). Verify
-                // it here where the sibling parameter's substitution is in hand:
-                // T's substitution must be non-nullable and assignable to U's.
-                if (item.kind == "type" && item.typeArg && item.typeArg->name &&
-                    item.typeArg->name->parts.size() == 1) {
-                    std::string_view boundParam =
-                        item.typeArg->name->parts.back();
-                    std::size_t ui = tsym->genericParams.size();
-                    for (std::size_t k = 0; k < tsym->genericParams.size(); ++k)
-                        if (tsym->genericParams[k] &&
-                            tsym->genericParams[k]->name == boundParam) {
-                            ui = k;
-                            break;
-                        }
-                    if (ui < argRefs.size() && argRefs[ui]) {
-                        TypeRef* uSubst = argRefs[ui];
-                        if (arg->nullable) {
-                            // §14.2: `where T: U` implies non-null T.
-                            ctx_.diagnostics().report(
-                                Severity::Error, t.span.begin,
-                                std::string("type argument `") +
-                                argSpelling(argAst) +
-                                "` does not satisfy the constraint `where " +
-                                std::string(gp->name) + ": " +
-                                std::string(boundParam) + "` (§14.2)");
-                        } else if (uSubst->kind == TypeRef::Kind::Named &&
-                                   uSubst->declaration &&
-                                   arg->kind == TypeRef::Kind::Named &&
-                                   arg->declaration) {
-                            // Both substitutions are user types: route through
-                            // the ordering-safe recheck (a base set may still be
-                            // mid-population at this instantiation site).
-                            if (!argSatisfiesTypeBound(arg, uSubst))
-                                deferredTypeBoundFailures_.push_back(
-                                    DeferredTypeBoundFailure{
-                                        t.span.begin, std::string(gp->name),
-                                        std::string(uSubst->declaration->name),
-                                        argSpelling(argAst), arg, uSubst});
-                        }
-                        // else: a substitution that is not a user declaration
-                        // (primitive/builtin/param) → defer (no diagnostic),
-                        // matching checkOneConstraint's conservatism.
-                        continue;
+        // fix #3146: the parameter's own constraints, from the SYMBOL — the one
+        // representation SymbolCollection and ModuleLoader both populate.
+        for (const GenericParamConstraint& item : gp->constraints) {
+            // §14.2 type-parameter bound (`where T: U`): the bound names
+            // another generic parameter of `tsym`, so checkOneConstraint
+            // defers on it (the bound's TypeRef has no declaration). Verify
+            // it here where the sibling parameter's substitution is in hand:
+            // T's substitution must be non-nullable and assignable to U's.
+            std::string_view boundParam = constraintBoundBareName(item);
+            if (!boundParam.empty()) {
+                std::size_t ui = tsym->genericParams.size();
+                for (std::size_t k = 0; k < tsym->genericParams.size(); ++k)
+                    if (tsym->genericParams[k] &&
+                        tsym->genericParams[k]->name == boundParam) {
+                        ui = k;
+                        break;
                     }
+                if (ui < argRefs.size() && argRefs[ui]) {
+                    TypeRef* uSubst = argRefs[ui];
+                    if (arg->nullable) {
+                        // §14.2: `where T: U` implies non-null T.
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("type argument `") +
+                            argSpelling(argAst) +
+                            "` does not satisfy the constraint `where " +
+                            std::string(gp->name) + ": " +
+                            std::string(boundParam) + "` (§14.2)");
+                    } else if (uSubst->kind == TypeRef::Kind::Named &&
+                               uSubst->declaration &&
+                               arg->kind == TypeRef::Kind::Named &&
+                               arg->declaration) {
+                        // Both substitutions are user types: route through
+                        // the ordering-safe recheck (a base set may still be
+                        // mid-population at this instantiation site).
+                        if (!argSatisfiesTypeBound(arg, uSubst))
+                            deferredTypeBoundFailures_.push_back(
+                                DeferredTypeBoundFailure{
+                                    t.span.begin, std::string(gp->name),
+                                    std::string(uSubst->declaration->name),
+                                    argSpelling(argAst), arg, uSubst});
+                    }
+                    // else: a substitution that is not a user declaration
+                    // (primitive/builtin/param) → defer (no diagnostic),
+                    // matching checkOneConstraint's conservatism.
+                    continue;
                 }
-                checkOneConstraint(t, gp->name, item, argAst, arg,
-                                   &boundScope);
             }
+            checkOneConstraint(t, gp->name, item, argAst, arg, &boundScope);
         }
     }
 }
@@ -6043,7 +6097,14 @@ void Resolver::checkDeferredNestedConstraints() {
             // module names for type-bound resolution here.
             Scope boundScope;
             boundScope.parent = &boundModule;
-            checkOneConstraint(*p.innerSite, p.innerParamName, *p.item,
+            // fix #3146: the deferred-nested record is still AST-shaped (see
+            // the ⚠ RESIDUAL note in checkGenericConstraints), so build the
+            // symbol-shaped view at this one boundary rather than keeping a
+            // second overload of the checker.
+            GenericParamConstraint view;
+            view.kind = p.item->kind;
+            view.astBound = p.item->typeArg.get();
+            checkOneConstraint(*p.innerSite, p.innerParamName, view,
                                boundAst, bound, &boundScope);
         }
     }

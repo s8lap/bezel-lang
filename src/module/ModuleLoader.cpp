@@ -312,6 +312,37 @@ struct Loader {
             g->name = ctx.internString(mg.name);
             g->variance = ctx.internString(mg.variance);
             g->scope = scope;
+            // fix #3146 (§14.2 / §2.8.3 rule 4, v0.252 — family F13 of umbrella
+            // #3152): the constraint payload the metadata builder has exported
+            // on every MetaGenericParam since #1579/v0.182 was read off the
+            // wire HERE and thrown away, because GenericParamSymbol carried
+            // only name/variance. `ast::TypeDecl::genericConstraints` was then
+            // the only source, and it is null for every imported type — so
+            // EVERY §14.2 constraint on EVERY imported generic type went
+            // unchecked at every instantiation site, silently.
+            //
+            // MEASURED on 558c27c with a real two-module build: an exported
+            // `class BoxC<T> where T: class` instantiated `BoxC<int>` in the
+            // importer compiled clean, while the identical declarations in one
+            // module reported "type argument `int` does not satisfy the
+            // constraint `where T: class` (§14.2)".
+            for (const std::string& sc : mg.specialConstraints) {
+                // §14.4: the builder folds the historical `where T is owned` /
+                // `is not owned` modifier form into this same list. It carries
+                // no instantiation-time obligation, and the LOCAL populator
+                // (SymbolCollection::collectGenericParams) drops it, so drop it
+                // here too or the two sides would not agree.
+                if (sc == "owned" || sc == "not owned") continue;
+                sema::GenericParamConstraint c;
+                c.kind = ctx.internString(sc);
+                g->constraints.push_back(c);
+            }
+            for (const MetaType& ct : mg.constraintTypes) {
+                sema::GenericParamConstraint c;
+                c.kind = "type";  // the ast::ConstraintItem kind for a bound
+                c.importedBound = convert(ct);
+                g->constraints.push_back(c);
+            }
             out.push_back(g);
         }
         return out;

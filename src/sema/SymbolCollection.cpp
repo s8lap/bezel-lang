@@ -77,9 +77,18 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
 
 // A.3 GenericParam: register one symbol per declared parameter in the
 // given scope.
+//
+// fix #3146 (§14.2, v0.252 — family F13 of umbrella #3152): `constraints` is
+// the declaring node's `where` clauses, which are keyed by parameter NAME
+// (`ast::GenericConstraint::typeParam`). Re-keying them onto the parameter
+// SYMBOL here is the load-bearing half of the fix: it is what lets the three
+// §14.2 readers ask the parameter rather than the declaring `ast::TypeDecl`,
+// which is null for every imported type. Null for a declaration with no
+// `where` clause at all.
 std::vector<Symbol*> collectGenericParams(
     const std::vector<ast::GenericParam>& params,
-    SemaContext& ctx, ScopeId scope) {
+    SemaContext& ctx, ScopeId scope,
+    const std::vector<ast::GenericConstraint>* constraints = nullptr) {
     std::vector<Symbol*> out;
     out.reserve(params.size());
     for (const auto& p : params) {
@@ -87,6 +96,22 @@ std::vector<Symbol*> collectGenericParams(
         sym->name = p.name;
         sym->variance = p.variance;
         sym->scope = scope;
+        if (constraints) {
+            for (const ast::GenericConstraint& gc : *constraints) {
+                if (gc.typeParam != p.name) continue;
+                // §14.4: the historical `where T is owned` / `is not owned`
+                // form carries no instantiation-time obligation; every reader
+                // skipped such a clause, and its `items` are empty anyway.
+                if (!gc.modifierConstraint.empty()) continue;
+                for (const ast::ConstraintItem& ci : gc.items) {
+                    if (ci.kind.empty()) continue;
+                    GenericParamConstraint c;
+                    c.kind = ci.kind;
+                    c.astBound = ci.typeArg.get();  // null for a scalar kind
+                    sym->constraints.push_back(c);
+                }
+            }
+        }
         out.push_back(sym);
     }
     return out;
@@ -155,7 +180,8 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->declLoc = md->span.begin;  // fix #2418
         sym->scope = scope;
         sym->genericParams =
-            collectGenericParams(md->genericParams, ctx, scope);
+            collectGenericParams(md->genericParams, ctx, scope,
+                                 &md->genericConstraints);
         sym->params = collectParams(md->params, ctx, scope);
         return sym;
     }
@@ -291,7 +317,8 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
     // scope, not in the outer type's enclosing scope).
     sym->memberScope = ctx.newScope();
     sym->genericParams =
-        collectGenericParams(td.genericParams, ctx, sym->memberScope);
+        collectGenericParams(td.genericParams, ctx, sym->memberScope,
+                             &td.genericConstraints);
     for (const auto& m : td.members) {
         if (!m) continue;
         if (auto* member = collectMember(*m, *sym, ctx)) {
@@ -375,7 +402,8 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
         sym->scope = parentScope;
         const ScopeId aliasScope = ctx.newScope();
         sym->genericParams =
-            collectGenericParams(alias->genericParams, ctx, aliasScope);
+            collectGenericParams(alias->genericParams, ctx, aliasScope,
+                                 &alias->genericConstraints);
         return sym;
     }
     if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&decl)) {

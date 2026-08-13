@@ -304,10 +304,47 @@ struct TypeAliasSymbol : Symbol {
     std::vector<Symbol*> genericParams;
 };
 
+// §14.2 (v0.252, fix #3146 — family F13 of umbrella #3152): ONE `where T: …`
+// constraint item, in the form BOTH sources can produce.
+//
+// Unlike the other families in that umbrella the data was never missing: the
+// artifact has carried `MetaGenericParam::constraintTypes` /
+// `specialConstraints` since #1579/v0.182. `ModuleLoader::convertGenericParams`
+// read them off the wire and threw them away, because `GenericParamSymbol` had
+// nowhere to put them — so `ast::TypeDecl::genericConstraints` was the only
+// source, and it is null for every imported type.
+struct GenericParamConstraint {
+    // The `ast::ConstraintItem` kinds — "class" / "value" / "notnull" / "new" /
+    // "type" — plus the §14.2 derived-property spellings ("sendable",
+    // "hashable"). The historical `where T is owned` / `is not owned` modifier
+    // form (§14.4, removed in v0.97) carries no instantiation-time obligation
+    // and is NOT recorded here: the readers skipped a clause whose
+    // `modifierConstraint` was non-empty, and the metadata builder folds that
+    // spelling into `specialConstraints`, so both populators filter it out.
+    std::string_view kind;
+    // kind == "type": the bound. A LOCAL parameter carries the unresolved AST
+    // node — resolved on demand in the declaring type's scope, exactly as
+    // before, because an instantiation site may be visited before the
+    // declaring type's own constraint clause. An IMPORTED parameter carries
+    // the TypeRef the loader already built from the artifact's MetaType. At
+    // most one is non-null.
+    const ast::Type* astBound = nullptr;
+    TypeRef* importedBound = nullptr;
+};
+
 // A.3 GenericParam (`Variance? Identifier`). Lives in the parent type or
 // method's scope and is looked up like a local name.
 struct GenericParamSymbol : Symbol {
     std::string_view variance; // "in", "out", or empty
+    // §14.2 (#3146): this parameter's own constraints, in declaration order.
+    // Populated by SymbolCollection::collectGenericParams from the declaring
+    // node's `where` clauses and by ModuleLoader::convertGenericParams from
+    // `MetaGenericParam`. ⚠ The imported side cannot preserve the INTERLEAVING
+    // of a mixed clause (`where T: class, IFoo`) because the wire splits the
+    // two into separate vectors: the special items come first, then the type
+    // bounds. Only the ORDER OF DIAGNOSTICS can differ, since every reader
+    // either any-matches or reports each violated item independently.
+    std::vector<GenericParamConstraint> constraints;
 };
 
 // A.4 Member subkinds. Each carries the visibility + modifier prefix and a

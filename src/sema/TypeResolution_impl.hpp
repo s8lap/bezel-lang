@@ -698,9 +698,11 @@ private:
     // notnull / new() / a type-bound) against type argument `arg` (resolved)
     // for the type parameter named `paramName`. `t` supplies the diagnostic
     // span; `argAst` is the argument's AST node (for its spelling);
-    // `boundScope` resolves a type-bound constraint's bound on demand.
+    // `boundScope` resolves a LOCAL type-bound constraint's bound on demand
+    // (an imported bound arrives already resolved — see
+    // `sema::GenericParamConstraint`, fix #3146).
     void checkOneConstraint(const ast::Type& t, std::string_view paramName,
-                            const ast::ConstraintItem& item,
+                            const GenericParamConstraint& item,
                             const ast::Type* argAst, TypeRef* arg,
                             Scope* boundScope);
 
