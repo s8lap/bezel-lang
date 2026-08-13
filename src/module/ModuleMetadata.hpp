@@ -560,7 +560,7 @@ struct MetaMember {
     // ONLY that storage-layout gap (`collectInstanceStorage`/
     // `collectRecordStorage`'s new `isAutoPropertyStorageSymbol` fallback,
     // LlvmBackend_impl.hpp) — the many OTHER call sites of
-    // `hasAstAutoPropertyDecl`/`hasAstAutoPropertyDecl` (definite assignment,
+    // `hasAstAutoPropertyDecl` / `isAutoPropertyStorageSymbol` (definite assignment,
     // ownership/disposal, sendability, serialization eligibility, pattern
     // destructuring — audited during #2478's investigation, ~30 sites) are
     // NOT touched by this fix and remain separately filed follow-up work;
@@ -582,7 +582,8 @@ struct MetaMember {
     // TypeResolution_Checks.cpp ~2680). Storage consumers are UNAFFECTED
     // because `sema/Symbol.hpp`'s `isAutoPropertyStorageSymbol` helper still
     // filters `ps->isIndexer` explicitly before consulting this side table
-    // (line ~3599), so an imported Auto-body indexer never appears in
+    // (see `isAutoPropertyStorageSymbol` in sema/Symbol.hpp), so an imported
+    // Auto-body indexer never appears in
     // `collectInstanceStorage`/`collectRecordStorage`. The
     // `sema::hasAstAutoPropertyDecl` predicate itself is deliberately LEFT
     // UNCHANGED (still excludes indexers) — its many call sites (definite

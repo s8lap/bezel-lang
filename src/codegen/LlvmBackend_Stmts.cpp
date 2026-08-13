@@ -6936,7 +6936,8 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // then disposed a source it does not own. CONFIRMED live heap-use-after-
     // free (a second `for x in h.Prop` read the source through the same,
     // now-freed, pointer the first loop's erroneous disposal reclaimed).
-    // isAutoPropertyStorageSymbol (Emitter, LlvmBackend_impl.hpp) is the SAME
+    // isAutoPropertyStorageSymbol (sema/Symbol.hpp — the Emitter copy was
+    // DELETED by #3152's unification) is the SAME
     // predicate #2478 already built for the storage-layout family: local
     // decl-based check first (byte-for-byte unchanged), wire-carried fallback
     // for a decl-null imported Property.

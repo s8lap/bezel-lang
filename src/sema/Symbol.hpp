@@ -1012,9 +1012,13 @@ bool isAutoPropertyStorageSymbol(const Symbol* m, const SemaContext& ctx);
 // EVERY imported member (ModuleLoader has no AST for a dependency's types), so
 // this answers `false` for an imported auto-property — a silent wrong answer,
 // not a null-deref. It is named for what it tests so no caller reaches for it
-// meaning the other thing (it was `isAutoPropertySymbol`, and fifteen of its
-// sixteen callers wanted `isAutoPropertyStorageSymbol`; five of those
-// mis-answers were measured, #3152).
+// meaning the other thing (it was `isAutoPropertySymbol`; NINE of its sixteen
+// callers wanted `isAutoPropertyStorageSymbol` — the other six are the
+// legitimately AST-only sites listed below, and #3152's review corrected an
+// earlier "fifteen of sixteen" here. Six of the nine mis-answers were measured:
+// §9.5 `with`, §22.7 read, §22.7 write, §22.8 initializer (silent wrong data,
+// and a SEGV for a `string` property), §9.8 conformance (silent accept), and
+// §9.2 auto-equality).
 //
 // Legitimate callers are only: the both-sources predicate above; a site that
 // goes on to dereference the `ast::PropertyDecl` it just proved present; a

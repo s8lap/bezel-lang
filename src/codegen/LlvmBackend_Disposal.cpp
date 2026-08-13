@@ -1019,8 +1019,15 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // gate that also excludes an imported property (`recordMemberType`'s
     // property arm has no decl-null fallback), so the release still does not
     // fire — instrumented on a two-module build of an imported generic with a
-    // `string` auto-property: `isAutoPropertyStorageSymbol=1, isStringStorage=0`, and
-    // 200 construct/dispose iterations under `detect_leaks=1` reported nothing.
+    // `string` auto-property: `isAutoPropertyStorageSymbol=1, isStringStorage=0`.
+    //
+    // ⚠ The accompanying "200 iterations under detect_leaks=1 reported nothing"
+    // is WEAKER EVIDENCE THAN IT LOOKS, and #3152's review said so: a clean LSan
+    // run is equally consistent with a member that never receives a `+1` at all.
+    // The review could not reproduce the leak on the named shape — with the
+    // property ASSIGNED IN THE CONSTRUCTOR it SEGVs both before and after (a
+    // separate, pre-existing defect). So read this as "no leak was observed",
+    // not "the path was proven inert".
     // The reason to convert anyway is that the imbalance runs the other way:
     // the RETAIN half (`isStringFieldLvalue`, #2504) is already both-sources and
     // does NOT depend on `recordMemberType`. So the day that second gate gains

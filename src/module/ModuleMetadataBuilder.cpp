@@ -1112,7 +1112,8 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // check (`checkPropertyOverrideSignatureMatch`,
             // TypeResolution_Checks.cpp ~2680). Storage consumers are
             // UNAFFECTED — `sema/Symbol.hpp`'s `isAutoPropertyStorageSymbol`
-            // helper still filters `ps->isIndexer` explicitly (line ~3599)
+            // helper still filters `ps->isIndexer` explicitly
+            // (`isAutoPropertyStorageSymbol`, sema/Symbol.hpp)
             // before consulting this side table, so an imported Auto-body
             // indexer never appears in `collectInstanceStorage`/
             // `collectRecordStorage`. The `!prop->isIndexer` exclusion was

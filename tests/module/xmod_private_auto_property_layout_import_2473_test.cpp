@@ -462,11 +462,21 @@ BEZEL_TEST(xmod_private_auto_property_layout_import_2473,
         "  end Main; "
         "end C2473T7;");
     if (r == -2) return;  // dependency toolchain unavailable — skip
-    // Must compile+link+run (not -1); the value is 0, not 7, due to the
-    // pre-existing generic-class instance-initializer-replay gap that
-    // affects plain fields identically — NOT a #2473 regression.
+    // UPDATED 2026-08-13 (#3152, the auto-property storage unification): this
+    // asserted 0, and its justification was measurably FALSE — and was false
+    // when it was written. It claimed the generic-class initializer-replay gap
+    // "affects plain fields identically"; it does not. The plain-field twin of
+    // this exact shape (`private _w: int := 7;`) returned 7 BEFORE the fix as
+    // well as after. The field half replayed and the auto-property half did
+    // not, and this test froze the broken half while asserting the two agreed.
+    //
+    // `emitOwnFieldInit` decided "is this member auto-property storage?" with
+    // an AST read that is null for every imported member, so an imported
+    // generic's auto-property initializer never ran. 7 is the correct value:
+    // it is what the character-identical SINGLE-MODULE twin returns, which is
+    // what §2.8.2 clause 1 requires of the importer.
     BEZEL_EXPECT_TRUE(r >= 0);
-    BEZEL_EXPECT_EQ(r, 0);
+    BEZEL_EXPECT_EQ(r, 7);
 }
 
 // ===========================================================================
