@@ -432,7 +432,46 @@ llvm::Value* Emitter::constMemberValue(const ast::Expr& e) {
     auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(ctx_.exprSymbol(e));
     if (!cs) return nullptr;
     auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
-    if (cd && cd->value) return lowerExpr(*cd->value);
+    if (cd && cd->value) {
+        llvm::Value* v = lowerExpr(*cd->value);
+        if (!v) return nullptr;
+        // fix #3217 (§4.2 / §5.1, v0.254): a negative integer literal
+        // initializer is folded at the literal's natural width — §4.2 typed
+        // an unsuffixed `-40` literal as `int`, and lowerUnary's §6.1 fold
+        // emits `-40` as `i32` (== 0xFFFFFFD8). When the const member is
+        // declared at a WIDER integer width (`long`, `ulong`), the §5.1
+        // implicit conversion ("constant narrowing" — a compile-time
+        // constant converts to any integer type whose range contains its
+        // value) must be performed HERE, sign-aware. Without this, the `i32
+        // -40` reaches an `i64` consumer and reads 4294967256 — LLVM global
+        // init coercion / a later CreateZExt widens unsigned, so the negative
+        // sign is dropped. Sext the source (always signed — the literal's
+        // natural type is `int`) to the const's declared width. The
+        // unsigned-target case (-40 → ulong) is rejected by sema because
+        // -40 does not fit ulong's range, so we never reach here for it.
+        const sema::TypeRef* ct = ctx_.exprType(e);
+        if (ct && ct->kind == sema::TypeRef::Kind::Primitive) {
+            llvm::Type* wantTy = lowerPrimitive(ct->primitive);
+            llvm::Type* gotTy = v->getType();
+            if (wantTy != gotTy && wantTy->isIntegerTy() &&
+                gotTy->isIntegerTy() &&
+                wantTy->getIntegerBitWidth() >
+                    gotTy->getIntegerBitWidth()) {
+                if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(v)) {
+                    // Re-materialize the integer at the target type, preserving
+                    // the SIGN of the source: getSExtValue reads the source as
+                    // signed (so the high bit is treated as sign), and
+                    // ConstantInt::getSigned builds a target-width signed
+                    // constant of the same value. This is exactly a sext for
+                    // a compile-time-constant source.
+                    v = llvm::ConstantInt::getSigned(
+                        llvm::cast<llvm::IntegerType>(wantTy),
+                        ci->getSExtValue());
+                }
+            }
+        }
+        return v;
+    }
     // §22.12 (issue #328 FINDING [3] BUG A): an IMPORTED const has no AST decl —
     // its compile-time value was carried textually in the dependency metadata.
     // A class-level const initializer "must be a compile-time-constant
