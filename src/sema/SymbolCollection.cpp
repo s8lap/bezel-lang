@@ -690,11 +690,12 @@ std::string builtinExceptionSurfaceList(std::string_view builtinBase) {
     return out;
 }
 
-// §9.2 / §22.9: see Symbol.hpp. An auto-property is a non-static, non-indexer
-// property declared in the auto form (`Name: T;` — no expression body, no
-// accessor block). Mirrors codegen's isAutoProperty so both layers classify
-// storage identically.
-bool isAutoPropertySymbol(const Symbol* m) {
+// §9.2 / §22.9: see Symbol.hpp. The AST-ONLY half — a non-static, non-indexer
+// property whose `ast::PropertyDecl` declares the auto form (`Name: T;` — no
+// expression body, no accessor block). Answers `false` for every IMPORTED
+// property, because `ps->decl` is null there; that is why the storage question
+// is asked through `isAutoPropertyStorageSymbol` below and not through this.
+bool hasAstAutoPropertyDecl(const Symbol* m) {
     auto* ps = dynamic_cast<const PropertySymbol*>(m);
     if (!ps || ps->isIndexer) return false;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
@@ -705,13 +706,13 @@ bool isAutoPropertySymbol(const Symbol* m) {
     return true;
 }
 
-// §9.2 / §22.9 / §2.8.2 clause 1 (umbrella #3152): see Symbol.hpp. The
-// both-sources twin of the predicate above — the declaration when the symbol
-// has one, the #2478 wire bit when it does not. Consulting both is the point:
-// switching on which source EXISTS is how the same question came to have two
-// answers on the two sides of a module boundary.
+// §9.2 / §22.9 / §2.8.2 clause 1 (umbrella #3152): see Symbol.hpp. The one
+// storage predicate — the declaration when the symbol has one, the #2478 wire
+// bit when it does not. Consulting both is the point: switching on which source
+// EXISTS is how the same question came to have two answers on the two sides of
+// a module boundary. codegen calls this directly; there is no `Emitter` copy.
 bool isAutoPropertyStorageSymbol(const Symbol* m, const SemaContext& ctx) {
-    if (isAutoPropertySymbol(m)) return true;
+    if (hasAstAutoPropertyDecl(m)) return true;
     auto* ps = dynamic_cast<const PropertySymbol*>(m);
     if (!ps || ps->isIndexer) return false;
     // A property that HAS a declaration was already answered above; only a
@@ -1062,7 +1063,16 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
     for (const Symbol* m : rec->members) {
         // An auto-property is the participating storage — eligible only when its
         // declared type is an admissible component type (§9.2 v0.158).
-        if (isAutoPropertySymbol(m)) {
+        //
+        // fix #3152 (§9.2/§2.8.2 clause 1): the STORAGE predicate. This is the
+        // "correct predicate fed by an empty source" shape — with the AST-only
+        // one, an IMPORTED body record's auto-properties all fell through to
+        // the `dynamic_cast<PropertySymbol*>` arm below, which reads them as
+        // computed and non-disqualifying, so this function checked NO
+        // components and returned `true`. A body record whose auto-property is
+        // class-typed then got `=` across a module boundary that §9.2 rejects
+        // in a single module.
+        if (isAutoPropertyStorageSymbol(m, ctx)) {
             if (!isAdmissibleComponentType(storageComponentType(m, ctx), ctx, 0))
                 return false;
             continue;
@@ -1155,7 +1165,9 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
             continue;
         }
         // Body auto-property of combined form: type must be admissible.
-        if (isAutoPropertySymbol(m)) {
+        // fix #3152: the STORAGE predicate — the combined-form twin of the
+        // same empty-source defect in isAutoEqualityBearingBodyRecord above.
+        if (isAutoPropertyStorageSymbol(m, ctx)) {
             if (!isAdmissibleComponentType(storageComponentType(m, ctx), ctx, 0))
                 return false;
             continue;

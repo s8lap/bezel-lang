@@ -9497,7 +9497,24 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
     for (const sema::Symbol* m : t->members) {
         auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
         if (fs && !isStaticField(fs)) { storage.push_back(m); continue; }
-        if (isAutoProperty(m)) { storage.push_back(m); continue; }
+        // fix #3152 (§9.2/§22.8 step 2/§2.8.2 clause 1): the STORAGE predicate,
+        // not the AST-only `hasAstAutoPropertyDecl`. `t` IS an imported
+        // TypeSymbol here — measured: an imported GENERIC class monomorphized
+        // by `lowerNew` reaches this function with `t->decl == nullptr` (an
+        // imported NON-generic one does not; it replays its initializers
+        // through the exporter's own `bz$<Type>$init`, #2452). With the
+        // AST-only predicate the imported auto-property never entered
+        // `storage`, so the two `m->decl == nullptr` replay branches below —
+        // written FOR imported members (#2874's parsed-expr side table, #2524's
+        // constant fold) — were dead for auto-properties while working for
+        // fields. MEASURED: an imported `class Box<T>` with
+        // `property W: int := 42;` and `private _f: int := 7;` returned 7 where
+        // its character-identical single-module twin returned 49 — silent wrong
+        // DATA, the field replayed and the auto-property read its §7.9 default.
+        if (sema::isAutoPropertyStorageSymbol(m, ctx_)) {
+            storage.push_back(m);
+            continue;
+        }
         if (auto* es = dynamic_cast<const sema::EventSymbol*>(m)) {
             // fix #2421 (§24/§2.8.2): eventIsStatic (decl-null fallback) —
             // an event on an IMPORTED base class was silently omitted from
@@ -12061,7 +12078,8 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         srcIsNamedOwner = true;
                     } else if (auto* ps =
                                    dynamic_cast<sema::PropertySymbol*>(sym)) {
-                        srcIsNamedOwner = isAutoPropertyStorage(ps);
+                        srcIsNamedOwner =
+                            sema::isAutoPropertyStorageSymbol(ps, ctx_);
                     }
                 }
                 v = wrapUserClassAsIEnumerable(v, initTR->declaration, declTR,
@@ -13240,7 +13258,8 @@ const sema::TypeSymbol* Emitter::rawUserClassInBuiltinInterfaceSlot(
                 dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
                 *outSrcIsNamedOwner = true;
             } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
-                *outSrcIsNamedOwner = isAutoPropertyStorage(ps);
+                *outSrcIsNamedOwner =
+                    sema::isAutoPropertyStorageSymbol(ps, ctx_);
             }
         }
     }
@@ -13542,7 +13561,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                             if (gma->member == "GetAsyncEnumerator" &&
                                     gma->target) {
                                 // fix #2485 (§9.2/§22.8/§29.8, v0.235):
-                                // isAutoPropertyStorage — the manual-protocol
+                                // isAutoPropertyStorageSymbol — the manual-protocol
                                 // `.GetAsyncEnumerator()` twin of the sibling
                                 // fixes above; an imported auto-property
                                 // receiver was misclassified as unnamed, so
@@ -13560,7 +13579,9 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                                         srcIsNamed = true;
                                     } else if (auto* ps = dynamic_cast<
                                                    sema::PropertySymbol*>(sym)) {
-                                        srcIsNamed = isAutoPropertyStorage(ps);
+                                        srcIsNamed =
+                                            sema::isAutoPropertyStorageSymbol(
+                                                ps, ctx_);
                                     }
                                 }
                                 if (srcIsNamed) {
@@ -17570,16 +17591,16 @@ bool Emitter::isStringFieldLvalue(const ast::Expr& target) {
     if (!sym) return false;
     if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym))
         return fs->parent && fs->parent->kind == ast::TypeDeclKind::Class;
-    // fix #2504 (§23/§2.8.2): isAutoProperty is DECL-DEPENDENT (always false
+    // fix #2504 (§23/§2.8.2): hasAstAutoPropertyDecl is DECL-DEPENDENT (always false
     // for an imported PropertySymbol whose decl is null); use the
-    // storage-layout fallback isAutoPropertyStorage (#2478's pattern) so a
+    // storage-layout fallback isAutoPropertyStorageSymbol (#2478's pattern) so a
     // bare-identifier assignment target resolving to an IMPORTED base
     // auto-property is recognized as field storage and lowerStringFieldStore
     // runs its retain-new/release-old. The issue's own drafted widening had
     // "zero effect" ONLY because the upstream sema type resolution (now fixed
     // in ExprTypecheck_Exprs.cpp) bailed first at isStringExprType — both
     // halves are required.
-    if (isAutoPropertyStorage(sym)) {
+    if (sema::isAutoPropertyStorageSymbol(sym, ctx_)) {
         auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
         return ms && ms->parent && ms->parent->kind == ast::TypeDeclKind::Class;
     }
@@ -18719,12 +18740,26 @@ struct StringEscapeWalker {
             // code and cannot capture `this`, so it stays a safe read and
             // the record remains eligible. Mirrors the receiver treatment
             // the string walk doesn't need.
+            //
+            // fix #3152: the STORAGE predicate (here and in the `?.` twin
+            // below). "Runs no user code" is a property of the auto form, not
+            // of which module declared it, so the site's own reasoning already
+            // covers an imported member. Behaviour-neutral TODAY by
+            // measurement — the enclosing walk is gated on
+            // `isRecordWithStringFieldsTypeRef` and
+            // `isProvablyFreshRecordFactoryMethod`, both of which currently
+            // exclude an imported record, so no imported symbol reaches this
+            // line and no regression test can pin it. Converted rather than
+            // left because nothing STRUCTURALLY keeps an imported symbol out
+            // (unlike the `ctx_.module()->children` walks, which require
+            // `t->decl`), and because the wrong answer here is the wrong
+            // answer to this family's question.
             bool recSafe = true;
             if (recordFieldReleaseMode && isTargetIdent(m->target.get())) {
                 sema::Symbol* sym = ctx.exprSymbol(*m);
                 bool storageRead =
                     (dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) ||
-                    (sym && sema::isAutoPropertySymbol(sym));
+                    (sym && sema::isAutoPropertyStorageSymbol(sym, ctx));
                 if (!storageRead) recSafe = false;
             }
             expr(m->target.get(), /*safeRead=*/recSafe);
@@ -18739,7 +18774,7 @@ struct StringEscapeWalker {
                 sema::Symbol* sym = ctx.exprSymbol(*m);
                 bool storageRead =
                     (dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) ||
-                    (sym && sema::isAutoPropertySymbol(sym));
+                    (sym && sema::isAutoPropertyStorageSymbol(sym, ctx));
                 if (!storageRead) recSafe = false;
             }
             expr(m->target.get(), /*safeRead=*/recSafe);
@@ -19582,7 +19617,9 @@ bool Emitter::isClosureFieldLvalue(const ast::Expr& target) {
     if (!sym) return false;
     if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym))
         return fs->parent && fs->parent->kind == ast::TypeDeclKind::Class;
-    if (isAutoPropertyStorage(sym)) {  // fix #2504: imported auto-property (decl-dependent isAutoProperty)
+    // fix #2504: an imported auto-property (decl-null, so the AST-only
+    // hasAstAutoPropertyDecl misses it) is still class field storage.
+    if (sema::isAutoPropertyStorageSymbol(sym, ctx_)) {
         auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
         return ms && ms->parent && ms->parent->kind == ast::TypeDeclKind::Class;
     }
@@ -19690,7 +19727,9 @@ bool Emitter::isBoxFieldLvalue(const ast::Expr& target,
     if (!sym) return false;
     if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym))
         return fs->parent && fs->parent->kind == ast::TypeDeclKind::Class;
-    if (isAutoPropertyStorage(sym)) {  // fix #2504: imported auto-property (decl-dependent isAutoProperty)
+    // fix #2504: an imported auto-property (decl-null, so the AST-only
+    // hasAstAutoPropertyDecl misses it) is still class field storage.
+    if (sema::isAutoPropertyStorageSymbol(sym, ctx_)) {
         auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
         return ms && ms->parent && ms->parent->kind == ast::TypeDeclKind::Class;
     }
@@ -24163,10 +24202,15 @@ void Emitter::collectBoxStorageFields() {
         if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
 
         // Collect candidate fields: Object/interface typed instance fields.
+        // #3152: the AST-ONLY predicate is correct HERE, not an oversight —
+        // the loop above iterates `ctx_.symbols()`, which holds only the module
+        // being compiled (`importedSymbols_` is a separate list, SemaContext.hpp
+        // :225), so `ts` is always local and every member of it has a decl. The
+        // two answers coincide; the AST-only one says so.
         std::vector<const sema::Symbol*> candidates;
         for (const sema::Symbol* m : ts->members) {
             bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
-            if (!isField && !isAutoProperty(m)) continue;
+            if (!isField && !sema::hasAstAutoPropertyDecl(m)) continue;
             if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
             const sema::TypeRef* ft = recordMemberType(m);
             if (!ft || !isObjectOrInterfaceTarget(ft)) continue;

@@ -543,8 +543,8 @@ struct MetaMember {
     // a field (§9.2's "auto-property PropertySymbol, backed by compiler-
     // generated storage like a field") — but the importer has no
     // ast::PropertyDecl to derive this from (ModuleLoader.cpp's Property
-    // case never reconstructs one), and `sema::isAutoPropertySymbol`/
-    // `Emitter::isAutoProperty` are DECL-DEPENDENT (`dynamic_cast<const
+    // case never reconstructs one), and `sema::hasAstAutoPropertyDecl`/
+    // `sema::hasAstAutoPropertyDecl` are DECL-DEPENDENT (`dynamic_cast<const
     // ast::PropertyDecl*>(ps->decl)`), so they always return `false` for an
     // imported PropertySymbol regardless of the exporter's real shape.
     // Confirmed as a live memory-safety hazard (not merely inferred):
@@ -558,9 +558,9 @@ struct MetaMember {
     // (the same failure class #2456 fixed for a PRIVATE plain field, here
     // triggered by ANY-visibility auto-property instead). This bit closes
     // ONLY that storage-layout gap (`collectInstanceStorage`/
-    // `collectRecordStorage`'s new `isAutoPropertyStorage` fallback,
+    // `collectRecordStorage`'s new `isAutoPropertyStorageSymbol` fallback,
     // LlvmBackend_impl.hpp) — the many OTHER call sites of
-    // `isAutoPropertySymbol`/`isAutoProperty` (definite assignment,
+    // `hasAstAutoPropertyDecl`/`hasAstAutoPropertyDecl` (definite assignment,
     // ownership/disposal, sendability, serialization eligibility, pattern
     // destructuring — audited during #2478's investigation, ~30 sites) are
     // NOT touched by this fix and remain separately filed follow-up work;
@@ -569,7 +569,7 @@ struct MetaMember {
     // and a double-free-adjacent disposal miscount) into one unreviewed
     // change.
     //
-    // Computed once by the exporter mirroring `sema::isAutoPropertySymbol`'s
+    // Computed once by the exporter mirroring `sema::hasAstAutoPropertyDecl`'s
     // own predicate (Auto bodyKind, non-static). Since fix #2523
     // (§12.1/§12.5, v0.236, sibling of #2478), the bit is also set for
     // INDEXERS in Auto body form (e.g. `abstract property [i]: T;`, the
@@ -580,13 +580,13 @@ struct MetaMember {
     // "is the base in §12.5 shorthand form" for the abstract-indexer
     // override check (`checkPropertyOverrideSignatureMatch`,
     // TypeResolution_Checks.cpp ~2680). Storage consumers are UNAFFECTED
-    // because `LlvmBackend_impl.hpp`'s `isAutoPropertyStorage` helper still
+    // because `sema/Symbol.hpp`'s `isAutoPropertyStorageSymbol` helper still
     // filters `ps->isIndexer` explicitly before consulting this side table
     // (line ~3599), so an imported Auto-body indexer never appears in
     // `collectInstanceStorage`/`collectRecordStorage`. The
-    // `sema::isAutoPropertySymbol` predicate itself is deliberately LEFT
+    // `sema::hasAstAutoPropertyDecl` predicate itself is deliberately LEFT
     // UNCHANGED (still excludes indexers) — its many call sites (definite
-    // assignment, record equality, ARC, the codegen `isAutoProperty`
+    // assignment, record equality, ARC, the codegen `hasAstAutoPropertyDecl`
     // consumers) treat the predicate as "real storage member", which an
     // indexer isn't; only this wire-bit repurposes it. A pre-#2478 blob has
     // no 13th scalar; the reader defaults this to `false` — the SAME

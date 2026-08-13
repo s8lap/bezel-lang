@@ -1097,7 +1097,7 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // declared in AUTO form (a real instance-storage member, §9.2) so
             // the importer's `collectInstanceStorage`/`collectRecordValue`
             // storage-layout walk can classify it correctly — mirroring
-            // `sema::isAutoPropertySymbol`'s own predicate (Auto bodyKind,
+            // `sema::hasAstAutoPropertyDecl`'s own predicate (Auto bodyKind,
             // non-static) so the wire-carried classification and the local-decl
             // classification agree by construction. See `out.isAutoProperty`'s
             // field comment in ModuleMetadata.hpp for the full rationale and
@@ -1111,7 +1111,7 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // "is in §12.5 shorthand form" for the abstract-indexer override
             // check (`checkPropertyOverrideSignatureMatch`,
             // TypeResolution_Checks.cpp ~2680). Storage consumers are
-            // UNAFFECTED — `LlvmBackend_impl.hpp`'s `isAutoPropertyStorage`
+            // UNAFFECTED — `sema/Symbol.hpp`'s `isAutoPropertyStorageSymbol`
             // helper still filters `ps->isIndexer` explicitly (line ~3599)
             // before consulting this side table, so an imported Auto-body
             // indexer never appears in `collectInstanceStorage`/
@@ -1119,7 +1119,7 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // only here because #2478 thought of the bit in pure-storage
             // terms; the #2523 reuse re-derives the same Auto-bodyKind/non-
             // static predicate at a SEMANTIC level (§12.5 abstract shorthand
-            // = get-only, regardless of storage). `sema::isAutoPropertySymbol`
+            // = get-only, regardless of storage). `sema::hasAstAutoPropertyDecl`
             // itself is deliberately LEFT UNCHANGED (still excludes indexers)
             // — its many call sites (definite assignment, record equality,
             // ARC) treat the predicate as "real storage member", which an
@@ -1436,14 +1436,17 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         // auto-property subtype of storage member; #2478 closed the
         // IMPORTER-SIDE classification but presupposed the PropertySymbol
         // exists in `t->members` at all, which for a private/internal
-        // auto-property it did not). `sema::isAutoPropertySymbol` excludes
+        // auto-property it did not). `sema::hasAstAutoPropertyDecl` excludes
         // indexers and static auto-properties, so this matches ONLY instance-
         // storage auto-properties — the storage members
         // `collectInstanceStorage`/`collectRecordStorage`
-        // (LlvmBackend_impl.hpp) count via `isAutoPropertyStorage` (#2478's
-        // importer-side wire-bit fallback). On the EXPORTER side (here) the
-        // decl is always present, so the decl-based predicate is exact.
-        bool isAutoPropStorage = !isMethod && sema::isAutoPropertySymbol(ms);
+        // (LlvmBackend_impl.hpp) count via `sema::isAutoPropertyStorageSymbol`
+        // (sema/Symbol.hpp), whose importer-side arm is the #2478 wire bit this
+        // very line computes. On the EXPORTER side (here) the decl is always
+        // present, so the AST-only predicate is exact — and it is also the
+        // right one to call: this is the authority the wire bit records, so
+        // reading the bit back here would be circular (#3152).
+        bool isAutoPropStorage = !isMethod && sema::hasAstAutoPropertyDecl(ms);
         bool exported = isExportedMember(member->visibility, inInterface);
         // For generic classes, also include private/internal METHODS so the
         // importer's ctor/dtor body re-parsing can resolve self-calls (#695).
@@ -1549,7 +1552,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         // already excludes static auto-properties, so `!isStaticFieldMember`
         // is redundant for that arm but kept for the plain-field path; an
         // indexer (PropertySymbol with `isIndexer`) is excluded by
-        // `isAutoPropertySymbol` and never reaches this gate.
+        // `hasAstAutoPropertyDecl` and never reaches this gate.
         bool includeForLayout = (isField || isAutoPropStorage) &&
             !exported && !isStaticFieldMember &&
             (t.kind == ast::TypeDeclKind::Class ||

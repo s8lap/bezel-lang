@@ -107,7 +107,7 @@ struct StorageMember {
 //     transfer closure. This is a DELIBERATE narrowing, forced by the collapse
 //     rather than chosen alongside it: the only both-sources auto-property
 //     predicate available is non-static on BOTH sides (the #2478 wire bit
-//     mirrors `isAutoPropertySymbol`, which excludes statics), so a static
+//     mirrors `hasAstAutoPropertyDecl`, which excludes statics), so a static
 //     auto-property could not have been kept without a new wire bit — and
 //     keeping static FIELDS while dropping static auto-properties would leave
 //     the predicate incoherent in a way neither former copy was.

@@ -975,13 +975,53 @@ bool isAutoPropertySymbol(const Symbol* m);
 // no AST for a dependency's types), so it answers "not auto-property storage"
 // for an imported auto-property — a silent wrong answer, not a null-deref.
 // This one asks the same question of whichever source the symbol has: the
+// §9.2 / §22.9 / §2.8.2 clause 1 (umbrella #3152): "is this member
+// auto-property STORAGE?" — a non-static, non-indexer property in the auto
+// form (`Name: T;`, optionally with an initializer, no accessor bodies / arrow
+// getter), backed by compiler-generated storage exactly like a field.
+//
+// This is THE predicate. It consults whichever source the symbol has: the
 // declaration when there is one, else the `MetaMember::isAutoProperty` wire bit
 // #2478 published as `ctx.importedPropertyIsAutoStorage`. Both sources compute
-// the SAME predicate (Auto body form, non-indexer, non-static — the exporter
-// mirrors `isAutoPropertySymbol` when it sets the bit), so the two agree by
-// construction. Mirrors codegen's `Emitter::isAutoPropertyStorage` for sema
-// consumers, minus that helper's deliberate interface-property widening.
+// the SAME rule (the exporter mirrors `hasAstAutoPropertyDecl` when it sets the
+// bit), so they agree by construction. Codegen calls this one too — there is no
+// `Emitter` copy; #3152's whole lesson is that a second spelling of one question
+// is how the two sides of a module boundary came to disagree.
+//
+// fix #2931 (§11.2/§23.1, v0.240) — an INTERFACE property is classified `true`
+// here, DELIBERATELY. It is spelled `property P: T;`, which the parser records
+// as `PropertyBodyKind::Auto` for the interface arm exactly as for a class
+// auto-property. The exclusion belongs one level down, in codegen's
+// `storageMemberOf` — see the comment there. This predicate has a SECOND family
+// of consumers that read it as "is a read of this member a NAMED borrow rather
+// than a freshly produced value?" (the disposal classification:
+// `sourceIsNamedOwner` in lowerIEnumerableBuiltinFor and its async twin,
+// `srcIsNamedOwner` in the using/await paths). Flipping an interface property
+// to `false` would reclassify `for x in iface.Prop` from "borrow, do not
+// dispose" to "fresh value, dispose it" — the heap-use-after-free direction,
+// and precisely the misclassification #2485 fixed in the other direction. The
+// static interface type cannot tell an auto-property implementation (a borrow)
+// from a computed one (a fresh value), so `true` stays as the leak-over-UAF
+// conservative answer.
 bool isAutoPropertyStorageSymbol(const Symbol* m, const SemaContext& ctx);
+
+// §9.2 / §22.9: the AST-ONLY half of the predicate above — "does this symbol
+// carry an `ast::PropertyDecl` that declares an auto-property?"
+//
+// ⚠ This is NOT "is this auto-property storage". `Symbol::decl` is null for
+// EVERY imported member (ModuleLoader has no AST for a dependency's types), so
+// this answers `false` for an imported auto-property — a silent wrong answer,
+// not a null-deref. It is named for what it tests so no caller reaches for it
+// meaning the other thing (it was `isAutoPropertySymbol`, and fifteen of its
+// sixteen callers wanted `isAutoPropertyStorageSymbol`; five of those
+// mis-answers were measured, #3152).
+//
+// Legitimate callers are only: the both-sources predicate above; a site that
+// goes on to dereference the `ast::PropertyDecl` it just proved present; a
+// declaration-site walk over `ctx.module()->children` (which requires
+// `t->decl`, so no imported symbol reaches it); and the EXPORTER, where the
+// declaration is the authority that computes the wire bit.
+bool hasAstAutoPropertyDecl(const Symbol* m);
 
 // §9.3 (v0.158, #1383): true when a positional or combined-form record
 // synthesizes equality — i.e. every positional field's type (and every body

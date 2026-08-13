@@ -721,7 +721,7 @@ struct Loader {
                 // because `collectInstanceStorage`/`collectRecordStorage`
                 // (LlvmBackend_impl.hpp) must know this to lay out an
                 // imported type's storage correctly — the decl-dependent
-                // `sema::isAutoPropertySymbol` always returns false here
+                // `sema::hasAstAutoPropertyDecl` always returns false here
                 // (no ast::PropertyDecl crosses the boundary).
                 propIsAutoStorage_[p] = mm.isAutoProperty;
                 // fix #2467 (§9.2/§2.5, v0.235): mirror the Field case's
@@ -2930,7 +2930,7 @@ static void loadMetadataPass2(
         ctx.setImportedPropertySetterVisibility(m, sv);
     // fix #2478 (§9.2/§22.8): publish imported property AUTO-storage
     // classification so collectInstanceStorage/collectRecordStorage's
-    // isAutoPropertyStorage fallback (LlvmBackend_impl.hpp) can lay out an
+    // isAutoPropertyStorageSymbol fallback (sema/Symbol.hpp) can lay out an
     // imported type's storage correctly.
     for (auto& [m, isAuto] : loader.propIsAutoStorage_)
         ctx.setImportedPropertyIsAutoStorage(m, isAuto);

@@ -480,12 +480,13 @@ public:
     // in AUTO form (a real instance-storage member, §9.2) — MetaMember::
     // isAutoProperty (see its field comment in ModuleMetadata.hpp for the
     // full rationale and the confirmed live memory-safety hazard this
-    // closes). `sema::isAutoPropertySymbol`/`Emitter::isAutoProperty` are
-    // decl-dependent and always return `false` for an imported PropertySymbol
-    // (no ast::PropertyDecl crosses the module boundary); THIS side table is
-    // the wire-carried fallback `collectInstanceStorage`/
-    // `collectRecordStorage`'s `isAutoPropertyStorage` helper
-    // (LlvmBackend_impl.hpp) consults for a decl-null Property. Absent
+    // closes). `sema::hasAstAutoPropertyDecl` is decl-dependent and always
+    // returns `false` for an imported PropertySymbol (no ast::PropertyDecl
+    // crosses the module boundary); THIS side table is the wire-carried
+    // fallback that the one storage predicate
+    // `sema::isAutoPropertyStorageSymbol` (sema/Symbol.hpp — called by
+    // `collectInstanceStorage`/`collectRecordStorage` and by sema alike)
+    // consults for a decl-null Property. Absent
     // (never set — any non-property import, or a property imported from a
     // pre-#2478 blob with no 13th MEMBER_BLOCK scalar) defaults to `false`
     // — the SAME "not storage" behavior already exhibited today, not a new

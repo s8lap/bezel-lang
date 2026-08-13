@@ -4750,9 +4750,9 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
                                              {blockThis});
                 emitPendingCheck();
             }
-        } else if (isAutoPropertyStorage(ps)) {
-            // fix #2478 (§9.2/§22.8): isAutoPropertyStorage, not the bare
-            // decl-dependent isAutoProperty — an imported auto-property
+        } else if (sema::isAutoPropertyStorageSymbol(ps, ctx_)) {
+            // fix #2478 (§9.2/§22.8): isAutoPropertyStorageSymbol, not the bare
+            // decl-dependent hasAstAutoPropertyDecl — an imported auto-property
             // referenced as a FUNCTION VALUE (`var f := obj.Prop;`, §27.6)
             // fell through to the `llvm::Constant::getNullValue` default
             // below without this, silently yielding a permanently-0 thunk.
@@ -4769,7 +4769,7 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
             // non-auto COMPUTED property (an arrow-getter or block-form
             // getter with no ast::PropertyDecl to drive computedGetterOf/
             // blockGetterOf above, and no storage slot for
-            // isAutoPropertyStorage's branch either) referenced as a
+            // isAutoPropertyStorageSymbol's branch either) referenced as a
             // FUNCTION VALUE fell through every branch above straight to
             // the `getNullValue` default below — silently yielding a
             // thunk that always returns 0, never calling anything.
@@ -4914,8 +4914,8 @@ llvm::Value* Emitter::buildPropertyClosureCell(llvm::Function* thunk,
 
 sema::MemberSymbol* Emitter::storageMemberOf(sema::Symbol* sym) {
     if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym)) return fs;
-    // fix #2478 (§9.2/§22.8): isAutoPropertyStorage, not the bare
-    // decl-dependent isAutoProperty — this is the central GEP-address
+    // fix #2478 (§9.2/§22.8): isAutoPropertyStorageSymbol, not the bare
+    // decl-dependent hasAstAutoPropertyDecl — this is the central GEP-address
     // resolution function for a plain member-access read/write
     // (fieldAddr/implicitFieldAddr and their callers below), so leaving it
     // on the decl-dependent predicate meant an imported auto-property's
@@ -4925,7 +4925,7 @@ sema::MemberSymbol* Emitter::storageMemberOf(sema::Symbol* sym) {
     // wrong path (confirmed: `b.W` on an imported record with `public
     // property W: int := 42;` still read `0` post-layout-fix until this
     // line was widened too — the layout fix alone was necessary but not
-    // sufficient). See isAutoPropertyStorage's own comment
+    // sufficient). See isAutoPropertyStorageSymbol's own comment
     // (LlvmBackend_impl.hpp) for the full rationale and scope boundary.
     // fix #2931 (§11.2/§23.1/§22.3/§12.1, v0.240): a property DECLARED IN AN
     // INTERFACE has NO backing storage — not in the interface (never
@@ -4940,11 +4940,11 @@ sema::MemberSymbol* Emitter::storageMemberOf(sema::Symbol* sym) {
     //
     // The two forms are SPELLED IDENTICALLY (`property P: T;`) and the parser
     // records both as `PropertyBodyKind::Auto` (Parser_Decls.cpp, the
-    // interface arm's "simple signature form"), so `isAutoProperty` answers
+    // interface arm's "simple signature form"), so `hasAstAutoPropertyDecl` answers
     // TRUE for an interface property — and so does the exporter's wire bit
     // (`ModuleMetadataBuilder.cpp`: `out.isAutoProperty = pd->bodyKind ==
     // Auto`), which is how an IMPORTED interface property reached the same
-    // wrong answer through `isAutoPropertyStorage`'s decl-null fallback. Both
+    // wrong answer through `isAutoPropertyStorageSymbol`'s decl-null fallback. Both
     // sources meet at this one line, so excluding here covers the local and
     // the cross-module spelling alike.
     //
@@ -4972,13 +4972,13 @@ sema::MemberSymbol* Emitter::storageMemberOf(sema::Symbol* sym) {
     // Block`) and so was never classified as storage.
     //
     // SCOPE: only the ADDRESS-resolution question is answered here.
-    // `isAutoPropertyStorage` deliberately keeps its `true` for an interface
+    // `isAutoPropertyStorageSymbol` deliberately keeps its `true` for an interface
     // property — see its own comment for the disposal-classification consumers
     // that would turn a borrow into a use-after-free if it flipped.
     if (auto* ip = dynamic_cast<sema::PropertySymbol*>(sym))
         if (ip->parent && ip->parent->kind == ast::TypeDeclKind::Interface)
             return nullptr;
-    if (isAutoPropertyStorage(sym))
+    if (sema::isAutoPropertyStorageSymbol(sym, ctx_))
         return dynamic_cast<sema::PropertySymbol*>(sym);
     return nullptr;
 }

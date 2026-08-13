@@ -5603,7 +5603,13 @@ llvm::Function* Emitter::indexerItableAccessor(const sema::TypeSymbol* ts,
 
 const ast::PropertyAccessor* Emitter::computedSetterOf(const ast::Expr& target) {
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(target));
-    if (!ps || ps->isIndexer || isAutoProperty(ps)) return nullptr;
+    // #3152: the AST-ONLY predicate is the right one HERE — this function
+    // returns an `ast::PropertyAccessor*` out of `pd->accessors`, so a symbol
+    // with no `ast::PropertyDecl` has nothing to return and the next line says
+    // so. Asking the storage question instead would change which of two
+    // `nullptr` returns an imported property takes, and nothing else.
+    if (!ps || ps->isIndexer || sema::hasAstAutoPropertyDecl(ps))
+        return nullptr;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd || pd->bodyKind != ast::PropertyBodyKind::Block) return nullptr;
     for (const auto& acc : pd->accessors) {
@@ -6224,7 +6230,7 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
     //     pointer or aggregate (#2474/#2489 carry the same guard).
     // An imported AUTO-property is direct instance STORAGE in the importing
     // module's layout (#2478 widened `storageMemberOf` to
-    // `isAutoPropertyStorage` precisely so `lvalueAddr`/`fieldAddr` resolve its
+    // `isAutoPropertyStorageSymbol` precisely so `lvalueAddr`/`fieldAddr` resolve its
     // slot), so the established path already reads and writes it correctly —
     // MEASURED: `b.A++` / `b.A += 4` on an imported auto-property give the
     // right answer both before and after this fix. Declining keeps that path,
@@ -6232,7 +6238,7 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
     // and its different ARC discipline (§23.1/§28.9). This is the "do not widen
     // past the measured defect" line: the dropped write is the BLOCK-form
     // property, whose accessors are the only way in.
-    if (isAutoPropertyStorage(ps)) return false;
+    if (sema::isAutoPropertyStorageSymbol(ps, ctx_)) return false;
     if (!ps->parent) return false;
     if (ps->parent->kind != ast::TypeDeclKind::Class &&
         ps->parent->kind != ast::TypeDeclKind::Record) return false;

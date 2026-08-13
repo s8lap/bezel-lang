@@ -8556,7 +8556,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 continue;
             }
             if (auto* ps = dynamic_cast<PropertySymbol*>(mem)) {
-                if (!isAutoPropertySymbol(ps)) {
+                // fix #3152 (§9.5/§9.2/§2.8.2 clause 1): the STORAGE predicate.
+                // §9.5 makes "has backing storage" the `with`-target rule, and
+                // the AST-only predicate answered `false` for every IMPORTED
+                // auto-property, so `r with(A := 40)` on an imported record was
+                // rejected as "a computed property" while its character-
+                // identical single-module twin returned 42. MEASURED.
+                if (!isAutoPropertyStorageSymbol(ps, ctx_)) {
                     // #878: computed (expression-bodied) property has no
                     // backing storage and is not a valid with target.
                     ctx_.diagnostics().report(

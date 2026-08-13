@@ -1018,6 +1018,13 @@ void Resolver::checkTypeAccessorVisibility(TypeSymbol* t) {
     }
 }
 
+// #3152: every `hasAstAutoPropertyDecl` in this function is the AST-ONLY
+// predicate on purpose. The walk is over `ctx_.module()->children` and each
+// arm requires the member's own `ast::PropertyDecl` (it reads `pd->type` to
+// classify the declared type), so no imported symbol reaches it and the two
+// predicates coincide. Contrast `classHasOwnStorage` in
+// `checkClassSerializationEligibilityLate`, which climbs `t->baseTypes` and
+// therefore DOES leave the module — that one asks the storage question.
 void Resolver::checkRecordRestrictions() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {
@@ -1159,7 +1166,7 @@ void Resolver::checkRecordRestrictions() {
             // (`property Name: T;`) are storage-bearing fields too; reject
             // an owning-classified choice type at the property declaration.
             if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
-                if (isAutoPropertySymbol(ps)) {
+                if (hasAstAutoPropertyDecl(ps)) {
                     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                     if (pd && pd->type) {
                         const TypeRef* rt = ctx_.resolvedType(*pd->type);
@@ -3207,7 +3214,7 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         // property OR indexer with a real `set` arm keeps the builder bit
         // (the local path accepts that exotic shape, and so does this one).
         // Before #2523 the metadata bit was property-only
-        // (`isAutoProperty` excluded indexers, #2478), so an abstract
+        // (`hasAstAutoPropertyDecl` excluded indexers, #2478), so an abstract
         // indexer could only be detected via the coarse `base->isIndexer`
         // branch — which incorrectly fired for an exotic abstract BLOCK-
         // form indexer with an explicit `set` arm too, false-rejecting the
@@ -7065,6 +7072,14 @@ static bool positionalFieldIsSkip(const ast::Param& pf) {
     return pf.serialized && pf.serialized->isSkip;
 }
 
+// #3152: the `hasAstAutoPropertyDecl` calls in this function and in
+// `checkClassSerializationEligibilityLate` below are the AST-ONLY predicate on
+// purpose. Both walk `ctx_.module()->children` and both skip any `t` with no
+// `ast::TypeDecl` (`if (!td) continue;`), so `t` is always a LOCAL declaration
+// and every member of it has a decl; two of the four arms go straight on to
+// read `pd->serialized` besides. The ONE walk in this family that does leave
+// the module is `classHasOwnStorage` (it climbs `t->baseTypes`), and that one
+// asks `isAutoPropertyStorageSymbol` — see its own comment.
 void Resolver::checkSerializationEligibility() {
     if (!ctx_.module()) return;
 
@@ -7449,7 +7464,7 @@ void Resolver::checkSerializationEligibility() {
         } else {
             // Body record: check auto-properties.
             for (const Symbol* m : t->members) {
-                if (!isAutoPropertySymbol(m)) continue;
+                if (!hasAstAutoPropertyDecl(m)) continue;
                 auto* ps = dynamic_cast<const PropertySymbol*>(m);
                 if (!ps) continue;
                 auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
@@ -7551,7 +7566,7 @@ void Resolver::checkSerializationEligibility() {
                 }
             } else {
                 for (const Symbol* m : t->members) {
-                    if (!isAutoPropertySymbol(m)) continue;
+                    if (!hasAstAutoPropertyDecl(m)) continue;
                     compNamesLower.insert(toLower(m->name));
                     compNamesOrig.push_back(std::string(m->name));
                 }
@@ -7736,7 +7751,25 @@ void Resolver::checkClassSerializationEligibilityLate() {
             // (mirroring collectInstanceStorage's own recursion) checking
             // each level's OWN fields/auto-properties/captured posParams —
             // any single level with storage is disqualifying.
-            auto classHasOwnStorage = [](const TypeSymbol* cls) -> bool {
+            //
+            // fix #3152 (§9.8/§2.8.2 clause 1): the auto-property arm asks the
+            // STORAGE predicate. Unlike every other walk in this function, this
+            // one leaves the module being compiled — it climbs `t->baseTypes`,
+            // so `cls` is an IMPORTED TypeSymbol whenever the base lives in a
+            // dependency, and the AST-only predicate reported "no own storage"
+            // for every imported auto-property. MEASURED: a local
+            // `class D: ImportedBase, ISerializable, IDeserializable` whose base
+            // carries a single `property W: int := 41;` COMPILED AND RAN, while
+            // its character-identical single-module twin was correctly rejected
+            // by the guard below — a silent accept of exactly the #2364 shape
+            // this guard exists to refuse.
+            //
+            // ⚠ The FieldSymbol arm below still reads `ast::FieldDecl`, so an
+            // imported plain FIELD is still missed here. That is the separate
+            // `ast::FieldDecl` half of the same seam (#3149), not this family;
+            // filed rather than half-fixed, because the modifier read it needs
+            // (`static`) has no symbol-side channel that this lane measured.
+            auto classHasOwnStorage = [this](const TypeSymbol* cls) -> bool {
                 for (const Symbol* m : cls->members) {
                     auto* fs = dynamic_cast<const FieldSymbol*>(m);
                     if (fs) {
@@ -7751,7 +7784,7 @@ void Resolver::checkClassSerializationEligibilityLate() {
                         }
                         continue;
                     }
-                    if (isAutoPropertySymbol(m)) return true;
+                    if (isAutoPropertyStorageSymbol(m, ctx_)) return true;
                 }
                 return false;
             };
@@ -8024,7 +8057,7 @@ void Resolver::checkClassSerializationEligibilityLate() {
                     continue;
                 }
                 // Auto-properties (PropertySymbol with auto backing).
-                if (!isAutoPropertySymbol(m)) continue;
+                if (!hasAstAutoPropertyDecl(m)) continue;
                 auto* ps = dynamic_cast<const PropertySymbol*>(m);
                 if (!ps) continue;
                 auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
@@ -8141,7 +8174,7 @@ void Resolver::checkClassSerializationEligibilityLate() {
                         compNamesOrig.push_back(std::string(fd->name));
                         continue;
                     }
-                    if (!isAutoPropertySymbol(m)) continue;
+                    if (!hasAstAutoPropertyDecl(m)) continue;
                     auto* ps = dynamic_cast<const PropertySymbol*>(m);
                     if (!ps) continue;
                     // Include skip-marked auto-properties: skip means "don't

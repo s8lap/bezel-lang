@@ -4874,8 +4874,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // (struct slot 3) rather than a second disposeStack_
                         // registration.
                         // fix #2485 (§9.2/§22.8/§29.11, v0.235):
-                        // isAutoPropertyStorage, not the bare decl-dependent
-                        // sema::isAutoPropertySymbol — an imported
+                        // isAutoPropertyStorageSymbol, not the bare decl-dependent
+                        // sema::hasAstAutoPropertyDecl — an imported
                         // auto-property `.GetEnumerator()` receiver was
                         // misclassified as an unnamed temporary, so
                         // `ownsSrc` came back true and the wrapper disposed
@@ -4893,7 +4893,9 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 srcIsNamedOwner = true;
                             } else if (auto* ps = dynamic_cast<
                                            sema::PropertySymbol*>(sym)) {
-                                srcIsNamedOwner = isAutoPropertyStorage(ps);
+                                srcIsNamedOwner =
+                                    sema::isAutoPropertyStorageSymbol(
+                                        ps, ctx_);
                             }
                         }
                         llvm::Value* wrapped = wrapUserClassAsIEnumerable(
@@ -5477,8 +5479,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // the comment above), so the source frame must be
                         // disposed here or it leaks.
                         // fix #2485 (§9.2/§22.8/§29.11, v0.235):
-                        // isAutoPropertyStorage, not the bare decl-dependent
-                        // sema::isAutoPropertySymbol — see the sibling fix a
+                        // isAutoPropertyStorageSymbol, not the bare decl-dependent
+                        // sema::hasAstAutoPropertyDecl — see the sibling fix a
                         // few hundred lines up in this same file (the
                         // wrapUserClassAsIEnumerable receiver classification)
                         // for the confirmed heap-use-after-free this
@@ -5494,7 +5496,9 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             } else if (auto* ps =
                                            dynamic_cast<sema::PropertySymbol*>(
                                                sym)) {
-                                sourceIsNamed = isAutoPropertyStorage(ps);
+                                sourceIsNamed =
+                                    sema::isAutoPropertyStorageSymbol(
+                                        ps, ctx_);
                             }
                         }
                         // fix #2376 adversarial self-pass (a): do NOT dispose

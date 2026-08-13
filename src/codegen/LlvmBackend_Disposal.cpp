@@ -1002,11 +1002,37 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // value holds its OWN +1 (#429 borrow-retain), so this release never dangles
     // it (no UAF). A RECORD has no disposer (§9.7) and its string fields are
     // borrows (§9) — never reached here.
+    //
+    // fix #3152 (§9.2/§2.8.2 clause 1): this walk and the two below classify
+    // through `sema::isAutoPropertyStorageSymbol`, not the AST-only
+    // `hasAstAutoPropertyDecl` they used to. `ts` IS an imported TypeSymbol on
+    // the `emitSpecializedDisposer` / `emitSpecializedBaseDisposerCore` paths
+    // (an imported GENERIC class monomorphized here — measured, `ts->decl` is
+    // null there), so the AST-only predicate answered `false` for every
+    // imported auto-property while `collectInstanceStorage` — already on the
+    // both-sources predicate since #2478 — had given that same member a
+    // `fieldIndex_` slot. One member list, two answers.
+    //
+    // MEASURED, and worth recording because it decides the DIRECTION of this
+    // change: converting these three is a no-op today. `isStringStorageMember`
+    // / `isClosureStorageMember` / `boxStorageFields_` are a SECOND, independent
+    // gate that also excludes an imported property (`recordMemberType`'s
+    // property arm has no decl-null fallback), so the release still does not
+    // fire — instrumented on a two-module build of an imported generic with a
+    // `string` auto-property: `isAutoPropertyStorageSymbol=1, isStringStorage=0`, and
+    // 200 construct/dispose iterations under `detect_leaks=1` reported nothing.
+    // The reason to convert anyway is that the imbalance runs the other way:
+    // the RETAIN half (`isStringFieldLvalue`, #2504) is already both-sources and
+    // does NOT depend on `recordMemberType`. So the day that second gate gains
+    // its fallback, an unconverted walk retains without releasing — a leak —
+    // whereas a converted one is balanced. This is the ordering #2874's own
+    // comment warns about, taken in the safe direction.
     {
         llvm::StructType* sst = classStruct(ts);
         for (const sema::Symbol* m : ts->members) {
             bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
-            if (!isField && !isAutoProperty(m)) continue;
+            if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
+                continue;
             if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
             if (!isStringStorageMember(m)) continue;
             unsigned idx = fieldIndex_[m];
@@ -1034,7 +1060,8 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         llvm::StructType* cst = classStruct(ts);
         for (const sema::Symbol* m : ts->members) {
             bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
-            if (!isField && !isAutoProperty(m)) continue;
+            if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
+                continue;  // fix #3152 — see the string walk above
             if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
             if (!isClosureStorageMember(m)) continue;
             unsigned idx = fieldIndex_[m];
@@ -1070,7 +1097,8 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         llvm::StructType* bst = classStruct(ts);
         for (const sema::Symbol* m : ts->members) {
             bool isField = dynamic_cast<const sema::FieldSymbol*>(m) != nullptr;
-            if (!isField && !isAutoProperty(m)) continue;
+            if (!isField && !sema::isAutoPropertyStorageSymbol(m, ctx_))
+                continue;  // fix #3152 — see the string walk above
             if (fieldIndex_.find(m) == fieldIndex_.end()) continue;
             if (!isBoxStorageMember(m)) continue;
             unsigned idx = fieldIndex_[m];

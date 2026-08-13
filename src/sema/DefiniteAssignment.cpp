@@ -1777,8 +1777,16 @@ private:
             out = name;
             return true;
         }
+        // fix #3152 (§22.7 rule 1 / §2.8.2 clause 1): the STORAGE predicate.
+        // `this.X` in a constructor body resolves to an IMPORTED PropertySymbol
+        // whenever X is inherited from a base class in another module, and the
+        // AST-only predicate answered `false` for every one of those — so the
+        // store fell through to `visitExpr`, which reads it as a computed-
+        // property setter invocation and gates it as an observation. MEASURED:
+        // `this.W := 5;` on an imported base's auto-property was rejected under
+        // §22.7 while its single-module twin ran and returned 7.
         if (auto* ps = dynamic_cast<PropertySymbol*>(sym))
-            if (!ps->isIndexer && isAutoPropertySymbol(ps)) {
+            if (!ps->isIndexer && isAutoPropertyStorageSymbol(ps, ctx_)) {
                 out = name;
                 return true;
             }
@@ -1834,8 +1842,12 @@ private:
         // invocation) is the observation rule 1 describes. Do not recurse into
         // the callee (its receiver is `this`/`base`, already accounted for as
         // a non-observing read); just visit the call arguments.
+        // fix #3152: the STORAGE predicate — an IMPORTED function-typed
+        // auto-property invoked as `this.F(...)` is the same field-read-then-
+        // invoke shape as a local one, and the AST-only predicate called it a
+        // method-on-`this` observation.
         if (dynamic_cast<FieldSymbol*>(calleeSym) ||
-            isAutoPropertySymbol(calleeSym)) {
+            isAutoPropertyStorageSymbol(calleeSym, ctx_)) {
             for (const auto& a : ce.args) visitCallArg(a);
             return true;
         }
@@ -1864,7 +1876,14 @@ private:
         bool viaBase = isNamedIdent(*ma.target, "base");
         if (!viaThis && !viaBase) return false;
         if (auto* ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(ma))) {
-            if (!ps->isIndexer && !isAutoPropertySymbol(ps)) {
+            // fix #3152 (§22.7 rule 1 / §2.8.2 clause 1): the STORAGE
+            // predicate. MEASURED — `var t := base.W;` on an imported base's
+            // auto-property, read before a local non-nullable field is
+            // assigned, was rejected as "cannot observe `this` (property `W`)"
+            // while its character-identical single-module twin compiled and
+            // ran. An auto-property read is backing storage, not an accessor
+            // invocation, wherever it was declared.
+            if (!ps->isIndexer && !isAutoPropertyStorageSymbol(ps, ctx_)) {
                 bool reported = checkVirtualDispatch(ps, viaBase, ma.span.begin,
                                                      ma.member);
                 if (!reported)
