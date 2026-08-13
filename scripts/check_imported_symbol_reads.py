@@ -197,11 +197,9 @@ def sanctioned_report(sites):
     return lines, ok
 
 
-def read_baseline():
-    if not BASELINE.exists():
-        return {}, {}
+def _parse_baseline(text):
     c1, c2, section = {}, {}, 'class1'
-    for raw in BASELINE.read_text().splitlines():
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith('#'):
             if line.startswith('# class2'):
@@ -212,6 +210,12 @@ def read_baseline():
         n, path = line.split(None, 1)
         (c1 if section == 'class1' else c2)[path] = int(n)
     return c1, c2
+
+
+def read_baseline():
+    if not BASELINE.exists():
+        return {}, {}
+    return _parse_baseline(BASELINE.read_text())
 
 
 def write_baseline(c1, c2):
@@ -246,6 +250,26 @@ def compare(name, cur, base):
         elif have > want:
             bad.append('%s: %s has %d read(s), baseline allows %d (+%d)'
                        % (name, path, have, want, have - want))
+    # STALE HEADROOM is a violation too (#3152). The baseline is EXACT, not a
+    # ceiling: after `--update` every entry equals the measured count, so an entry
+    # ABOVE it can only mean the file was regenerated at an older base and is
+    # carrying headroom an earlier family already ratcheted away.
+    #
+    # This is the hole that let family F6 through: its baseline was regenerated
+    # before F10 landed and would have restored +5 units across three files it
+    # does not even touch. `--update` refuses to RAISE, but that guards only the
+    # --update path — a stale file committed on a branch sailed straight past a
+    # `have > want` test, which never asks whether `want` itself grew. Requiring
+    # equality closes it without needing to know what the previous value was.
+    for path in sorted(base):
+        if path in SANCTIONED:
+            continue
+        have, want = cur.get(path, 0), base[path]
+        if want > have:
+            bad.append('%s: %s baseline claims %d read(s) but the tree has %d — '
+                       'STALE HEADROOM (+%d). The baseline is exact, not a '
+                       'ceiling: re-run --update on the merged tree.'
+                       % (name, path, want, have, want - have))
     return bad
 
 
