@@ -164,6 +164,45 @@ column**)
 
 ---
 
+## 6b. Live findings from the 2026-08-14 lanes (pre-review, recorded so they are not lost)
+
+**⚠ THE MEMBER AUDIT'S REACHABILITY COLUMN IS WRONG FOR M6, IN BOTH DIRECTIONS** (M6 lane,
+measured; under review). The audit says "reachable YES for a non-virtual imported base
+indexer; the virtual sub-shape also needs #2837's ABI". Measured: the **non-virtual** shape
+is ALREADY CORRECT (#2414/#2449) and the **virtual** shape crashes TODAY with no new ABI —
+SIGSEGV 139 on six ordinary spellings. It is also **not indexer-specific**: the
+named-property twin at `ensurePropertyAccessorFn`, which Appendix A marks
+**ALREADY-CORRECT (guarded)** citing #2387/#2400, crashes identically, because
+`declareImportedProperty{Getters,Setters}` skip anything with a vtable slot. Filed #3190.
+
+**`Stmts.cpp:7411` is NOT reachable** — `lowerIEnumerableFor` bails on a null `getEnumDecl`
+first, so `for var x in importedColl` is a loud NYI and a test written against that site
+today would be **vacuous**. The audit's §2 M15 "inconclusive" note is likewise refuted: the
+single-module twin failed for an unrelated reason (#1779), so the boundary IS isolable, and
+isolating it found a real crash (#3197).
+
+**★ ONE ASYMMETRY, THREE CALL SITES — the highest-leverage item currently known.**
+`emitExportedProperty/Indexer{Getters,Setters}` all skip virtual members, so an accessor
+body has **InternalLinkage** in the dependency (`nm`-confirmed) while a virtual method gets
+an ExternalLinkage `bz$<Class>$<M>`. **#3190, #2837 and #3199 are that one gate seen from
+three places.** Fixing the export gate once would collapse all three, and would change the
+sequencing of the remaining waves — worth settling before Wave C/D.
+
+**M2's refutation found a second, wider defect.** Fixing the `owned`-return channel closes
+the leak but does NOT make §21.9's diagnostic fire, because **an imported class's destructor
+never crosses the wire, so every imported class is classified trivial-dispose** — reachable
+with no `owned` anywhere (`new Derived();`, `Derived` local, base imported). Filed #3191.
+
+**M13 is worse than "false accept"**: return-type mismatch → SIGSEGV; param-type mismatch →
+**225** from a truncated string pointer; a dropped `owned` return → a 16-byte LSan leak.
+§11.2 supplies the third answer the audit's "both directions are wrong" bind needs — reject
+the conformance, which is what the local twin already does. Filed #3194.
+
+**Also filed by these lanes:** #3192 (an imported user method named `Select`/`Min`/`Max`
+treated as the stdlib intrinsic) · #3193 (method reference over an imported method loses
+return type and marker) · #3195 (a plain `var` receiver of a form-2 `scoped` call is never
+disposed — single-module) · #3197 · #3199.
+
 ## 7. What "done" means
 
 Not "110 → 0". The honest target:
