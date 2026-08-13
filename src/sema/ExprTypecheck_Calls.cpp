@@ -18174,13 +18174,6 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     // `T`-typed member read through `g?.M` was previously typed as the bare
     // parameter `T`, where `g.M` resolved it against the receiver's concrete
     // arguments. `substituteMemberType` is a no-op for a non-generic parent.
-    auto* accessedMem = dynamic_cast<MemberSymbol*>(member);
-    TypeRef* memberTy =
-        const_cast<TypeRef*>(storageComponentType(member, ctx_));
-    if (!memberTy) return;
-    memberTy = substituteMemberType(memberTy, nm.target.get(),
-                                    accessedMem ? accessedMem->parent : nullptr);
-    if (!memberTy) return;
     // fix #3177: the #2884 / #2943 declines the `.` spelling has carried since
     // v0.240. They are NOT new here in substance — `g.P` on an imported generic
     // type is already refused — but `?.` is a distinct AST node that never
@@ -18188,6 +18181,15 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     // value. Now that the access is typed, leaving the decline out would turn
     // that junk value into an `undefined reference` at link time instead, which
     // is precisely what #2884 declined to ship.
+    //
+    // ORDERING (fix #3177 review follow-up): this runs BEFORE the type is
+    // resolved, and unconditionally, because that is what the `.` spelling
+    // does — `resolveMemberAccess` sets the type with a plain
+    // `if (TypeRef* rt = …) setExprType(…)` and never returns early, so its
+    // declines fire whether or not a type was recoverable. Gating the decline
+    // on a resolved type would silently skip it for exactly the case where the
+    // side table has no entry — leaving the junk value AND no diagnostic, the
+    // #3177 symptom the decline exists to prevent.
     if (auto* ips = dynamic_cast<PropertySymbol*>(member)) {
         if (ctx_.isImported(member)) {
             // The parser does not set a NullCondMemberExpr's own span; fall back
@@ -18198,6 +18200,13 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             declineUnsupportedImportedPropertyAccess(ips, dloc);
         }
     }
+    auto* accessedMem = dynamic_cast<MemberSymbol*>(member);
+    TypeRef* memberTy =
+        const_cast<TypeRef*>(storageComponentType(member, ctx_));
+    if (!memberTy) return;
+    memberTy = substituteMemberType(memberTy, nm.target.get(),
+                                    accessedMem ? accessedMem->parent : nullptr);
+    if (!memberTy) return;
     if (memberTy->nullable) {
         ctx_.setExprType(&nm, memberTy);  // already nullable
     } else {
