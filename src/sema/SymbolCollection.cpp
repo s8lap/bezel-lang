@@ -769,6 +769,18 @@ bool anyRecordStorageField(
 // BOTH sides — a real `ast::Param` locally, a synthetic one on import (#2516) —
 // and `members` preserves declaration order on both, so filtering keeps
 // positional field i at index i.
+// §35.1 (fix #3144, family F9 of #3152) — see the contract on the declaration
+// in Symbol.hpp. Declaration order is the tag order; `members` preserves it on
+// both sides (SymbolCollection appends cases last, ModuleLoader mirrors that).
+std::vector<const ChoiceCaseSymbol*> choiceCasesOf(const TypeSymbol* t) {
+    std::vector<const ChoiceCaseSymbol*> out;
+    if (!t) return out;
+    for (const Symbol* m : t->members)
+        if (auto* cc = dynamic_cast<const ChoiceCaseSymbol*>(m))
+            out.push_back(cc);
+    return out;
+}
+
 std::vector<const Symbol*> recordPositionalFieldSymbols(const TypeSymbol* ts) {
     std::vector<const Symbol*> out;
     if (!ts) return out;
@@ -1109,11 +1121,13 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
     if (!verdict) return true;
     if (*verdict != common::ChoiceClassification::ValueLike)
         return false;
-    // Defensive: classification succeeded, so the AST is present; if it were
-    // somehow missing we cannot walk payloads — accept on the ValueLike
-    // classification verdict alone (same conservative posture as above).
-    auto* td = dynamic_cast<const ast::TypeDecl*>(ch->decl);
-    if (!td) return true;
+    // fix #3144 (family F9 of umbrella #3152): the payload walk is SYMBOL-side.
+    // It read `dynamic_cast<const ast::TypeDecl*>(ch->decl)` and returned
+    // `true` when that was null — which it is for EVERY imported choice — so an
+    // imported value-like choice was declared auto-equality-bearing with its
+    // payload types never examined once. That is an over-ACCEPT, and the audit
+    // records the site as blocked on precisely this channel; with the cases on
+    // the wire it is a real check.
     // Every case: every payload field, at THIS instantiation, must be a §9.2
     // admissible component type. #2047 / §28.1: an `owned` marker on a value-
     // like/runtime-managed payload (the only case that reaches here — the
@@ -1123,11 +1137,12 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
     // recursive `isAdmissibleComponentType` drives the body-record rule and
     // admits "another auto-hashable choice" via its K::Named/Choice
     // branch (v0.210, #2083).
-    for (const auto& cc : td->choiceCases) {
-        for (const auto& pf : cc.payload) {
+    for (const ChoiceCaseSymbol* ccs : choiceCasesOf(ch)) {
+        if (!ccs->caseDecl) continue;
+        for (const auto& pf : ccs->caseDecl->payload) {
             if (!pf.type) continue;  // unresolved → skip (defensive)
             const TypeRef* ft =
-                common::substitutedChoicePayloadType(pf, td, rt, ctx);
+                common::substitutedChoicePayloadType(pf, ch, rt, ctx);
             if (!isAdmissibleComponentType(ft, ctx, 0))
                 return false;
         }

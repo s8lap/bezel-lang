@@ -264,6 +264,26 @@ public:
         return raw;
     }
 
+    // fix #3144 (§35.1 / §35.3 / §35.4, family F9 of umbrella #3152): allocate
+    // a synthetic ast::ChoiceCase for an imported ChoiceCaseSymbol — the exact
+    // shape of #2516's `makeImportedParam` above, for the exact same reason.
+    // `ChoiceCaseSymbol::caseDecl` is where BOTH sides keep a case's payload
+    // list (91 reads across sema, ownership and codegen), so reconstructing the
+    // node the imported symbol points at is what makes the imported and local
+    // answers come from ONE predicate rather than two that must be kept in
+    // step. The case's own payload `ast::Param`s (and their `ast::Type` nodes)
+    // live inside it by value; the resolved type of each payload node is
+    // published through `setResolvedType`, so `ctx.resolvedType(*pf.type)` —
+    // what every payload consumer already calls — answers for an imported case
+    // exactly as it does for a local one. Kept alive by `importedChoiceCases_`,
+    // which outlives every symbol that references it.
+    ast::ChoiceCase* makeImportedChoiceCase() {
+        auto owned = std::make_unique<ast::ChoiceCase>();
+        ast::ChoiceCase* raw = owned.get();
+        importedChoiceCases_.push_back(std::move(owned));
+        return raw;
+    }
+
     // Register an imported, exported top-level TypeSymbol under its module's
     // §2.1 dotted name. One module may export many types.
     void registerImportedType(const std::string& moduleName, TypeSymbol* t) {
@@ -682,6 +702,11 @@ private:
     // td.positionalFields[i]). The Params live at least as long as the
     // FieldSymbols that reference them.
     std::vector<std::unique_ptr<ast::Param>> importedParams_;
+    // fix #3144 (§35.1, family F9 of #3152): synthetic ast::ChoiceCase nodes
+    // attached to imported ChoiceCaseSymbols (see makeImportedChoiceCase). They
+    // own their payload Params and those Params' ast::Type nodes, so this one
+    // vector keeps the whole reconstructed case alive.
+    std::vector<std::unique_ptr<ast::ChoiceCase>> importedChoiceCases_;
     std::unordered_map<std::string, std::vector<TypeSymbol*>> importedByModule_;
     // §26 / §2.5 (#735): imported extension blocks, keyed by defining module.
     std::unordered_map<std::string, std::vector<ExtensionSymbol*>>

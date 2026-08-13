@@ -43,7 +43,14 @@ enum BlockID : unsigned {
     METATYPE_BLOCK = 15, // one MetaType (a signature type, possibly nested)
     CONTRACT_BLOCK = 16, // one MetaContractRecord (§22.16 / #2054)
     EXTENSION_BLOCK = 17, // one MetaExtension (§26 / #735)
-    // 17.. reserved for future additive subblocks (a reader skips unknown ids)
+    // §35.1 (#3144): one MetaChoiceCase / one MetaChoicePayloadField. These
+    // ride as TRAILING subblocks of TYPE_BLOCK with no count scalar — see the
+    // ⚠ block in emitTypeDecl for why a 9th positional scalar was not an
+    // option — so they are self-describing and every reader this format has
+    // ever had SkipBlock()s them.
+    CHOICE_CASE_BLOCK = 18,    // one MetaChoiceCase (§35.1 / #3144)
+    CHOICE_PAYLOAD_BLOCK = 19, // one MetaChoicePayloadField (§35.1 / #3144)
+    // 20.. reserved for future additive subblocks (a reader skips unknown ids)
     UNKNOWN_FUTURE_BLOCK = 99, // test-only: a subblock id this reader skips
 };
 
@@ -265,6 +272,34 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
         hashU64(h, ty.builtinInterfaceBases.size());
         for (const MetaType& b : ty.builtinInterfaceBases) hashType(h, b);
     }
+    // §35.1 / §35.4 (#3144): the case list is the choice's LAYOUT and its
+    // classification input — adding, removing, renaming or re-typing a case or
+    // a payload field changes what every consumer lays out and disposes — so it
+    // is public-interface content staleness detection must track (§2.8.3 rule
+    // 3). GUARDED ON EXACTLY THE EMISSION'S CONDITION (emitTypeDecl above), the
+    // same rule #3139 and #3140 state: the hash is a function of what was
+    // WRITTEN, and folding a zero count for a field the writer omitted moves
+    // the VBR-encoded header hash — and with it every byte after it — for a
+    // change that wrote nothing. The count is folded only when NON-ZERO, so
+    // "tail absent" and "tail present" cannot produce the same stream.
+    if (!ty.choiceCases.empty()) {
+        hashU64(h, ty.choiceCases.size());
+        for (const MetaChoiceCase& cc : ty.choiceCases) {
+            hashStr(h, cc.name);
+            hashBool(h, cc.hasSerialized);
+            hashStr(h, cc.serializedName);
+            hashU64(h, cc.payload.size());
+            for (const MetaChoicePayloadField& pf : cc.payload) {
+                hashStr(h, pf.name);
+                hashStr(h, pf.modifier);
+                hashBool(h, pf.hasSerialized);
+                hashBool(h, pf.serializedSkip);
+                hashBool(h, pf.serializedOptional);
+                hashStr(h, pf.serializedName);
+                hashType(h, pf.type);
+            }
+        }
+    }
 }
 
 } // namespace
@@ -346,6 +381,20 @@ bool MetaGenericParam::operator==(const MetaGenericParam& o) const {
     return name == o.name && variance == o.variance &&
            constraintTypes == o.constraintTypes &&
            specialConstraints == o.specialConstraints;
+}
+
+bool MetaChoicePayloadField::operator==(const MetaChoicePayloadField& o) const {
+    return name == o.name && modifier == o.modifier && type == o.type &&
+           hasSerialized == o.hasSerialized &&
+           serializedSkip == o.serializedSkip &&
+           serializedOptional == o.serializedOptional &&
+           serializedName == o.serializedName;
+}
+
+bool MetaChoiceCase::operator==(const MetaChoiceCase& o) const {
+    return name == o.name && payload == o.payload &&
+           hasSerialized == o.hasSerialized &&
+           serializedName == o.serializedName;
 }
 
 bool MetaParam::operator==(const MetaParam& o) const {
@@ -454,7 +503,9 @@ bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
            hasPositionalFields == o.hasPositionalFields &&
            dtorBodyText == o.dtorBodyText &&
            builtinExceptionBase == o.builtinExceptionBase &&
-           builtinInterfaceBases == o.builtinInterfaceBases;
+           builtinInterfaceBases == o.builtinInterfaceBases &&
+           // §35.1 (#3144): the case list is part of a choice's identity.
+           choiceCases == o.choiceCases;
 }
 
 bool MetaFunction::operator==(const MetaFunction& o) const {
@@ -546,6 +597,42 @@ void emitGeneric(llvm::BitstreamWriter& w, const MetaGenericParam& g) {
     emitString(w, g.variance);
     emitStringList(w, g.specialConstraints);
     for (const MetaType& c : g.constraintTypes) emitType(w, c);
+    w.ExitBlock();
+}
+
+// §35.1 / §A.3 `CaseField` (#3144): one choice-case payload field. Everything
+// inside this block is UNCONDITIONAL — the block itself only exists for a
+// choice, so no non-choice module pays a byte for it (the conditionality that
+// matters lives at the TYPE_BLOCK level, see emitTypeDecl).
+void emitChoicePayloadField(llvm::BitstreamWriter& w,
+                            const MetaChoicePayloadField& pf) {
+    w.EnterSubblock(CHOICE_PAYLOAD_BLOCK, 4);
+    llvm::SmallVector<std::uint64_t, 4> sc{
+        pf.hasSerialized ? 1u : 0u,
+        pf.serializedSkip ? 1u : 0u,
+        pf.serializedOptional ? 1u : 0u,
+    };
+    w.EmitRecord(REC_SCALARS, sc);
+    emitString(w, pf.name);
+    emitString(w, pf.modifier);
+    emitString(w, pf.serializedName);
+    emitType(w, pf.type);
+    w.ExitBlock();
+}
+
+// §35.1 (#3144): one choice case. Declaration order is the case's TAG value, so
+// the emission order is the wire contract.
+void emitChoiceCase(llvm::BitstreamWriter& w, const MetaChoiceCase& cc) {
+    w.EnterSubblock(CHOICE_CASE_BLOCK, 4);
+    llvm::SmallVector<std::uint64_t, 2> sc{
+        cc.payload.size(),
+        cc.hasSerialized ? 1u : 0u,
+    };
+    w.EmitRecord(REC_SCALARS, sc);
+    emitString(w, cc.name);
+    emitString(w, cc.serializedName);
+    for (const MetaChoicePayloadField& pf : cc.payload)
+        emitChoicePayloadField(w, pf);
     w.ExitBlock();
 }
 
@@ -757,6 +844,15 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     // produces byte-identical metadata to before.
     if (!ty.builtinExceptionBase.empty())
         emitStringAs(w, REC_EXC_BASE, ty.builtinExceptionBase);
+    // §35.1 (#3144): the choice's cases, as trailing CHOICE_CASE_BLOCKs with NO
+    // count scalar. Emitted LAST, after both trailing capture records, so an
+    // OLD reader's finishBlock sees the dtorBodyText REC_STRING and the
+    // REC_EXC_BASE record in exactly the positions it did before and then
+    // SkipBlock()s subblock ids it does not know — its result is byte-for-byte
+    // what it was. Emitted only for a choice (the list is empty for every other
+    // kind), which — with the matching guard in hashTypeDecl — is what keeps a
+    // module with no choice BYTE-IDENTICAL to a pre-#3144 build.
+    for (const MetaChoiceCase& cc : ty.choiceCases) emitChoiceCase(w, cc);
     w.ExitBlock();
 }
 
@@ -1031,9 +1127,20 @@ bool enterSubblock(Reader& r, unsigned wantId) {
 // carry either, both (in either order), or neither, and a reader predating a
 // coded record simply skips it. That independence is the point — the trailing
 // REC_STRING convention can only ever express ONE optional string per block.
+//
+// §35.1 (#3144): `choiceCases` is the third, subblock-keyed capture — the FIRST
+// two are record-keyed and so structurally cannot express a repeated,
+// count-less list. When it is non-null, every trailing CHOICE_CASE_BLOCK is
+// entered and appended IN ORDER (declaration order is the case's tag value);
+// when it is null — every caller but readTypeDeclBody — the block is
+// SkipBlock()'d exactly as an unknown subblock id always was, which is also
+// precisely what a reader predating this field does.
+bool readChoiceCaseBody(Reader& r, MetaChoiceCase& cc);  // fwd (#3144)
+
 bool finishBlockImpl(Reader& r, std::string* captureString,
                      unsigned capturedCode = 0,
-                     std::string* codedCapture = nullptr) {
+                     std::string* codedCapture = nullptr,
+                     std::vector<MetaChoiceCase>* choiceCases = nullptr) {
     while (true) {
         unsigned id = 0;
         Next n = nextEntry(r, id);
@@ -1070,6 +1177,13 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
             continue;
         }
         if (n == Next::SubBlock) {
+            // §35.1 (#3144): a trailing choice case, when the caller wants them.
+            if (choiceCases != nullptr && id == CHOICE_CASE_BLOCK) {
+                if (r.cursor.EnterSubBlock(CHOICE_CASE_BLOCK)) return false;
+                choiceCases->emplace_back();
+                if (!readChoiceCaseBody(r, choiceCases->back())) return false;
+                continue;
+            }
             if (r.cursor.SkipBlock()) return false;
             continue;
         }
@@ -1148,6 +1262,38 @@ bool readParamBody(Reader& r, MetaParam& p) {
 bool readParam(Reader& r, MetaParam& p) {
     if (!enterSubblock(r, PARAM_BLOCK)) return false;
     return readParamBody(r, p);
+}
+
+// §35.1 / §A.3 `CaseField` (#3144): one choice-case payload field. The caller
+// has already entered CHOICE_PAYLOAD_BLOCK.
+bool readChoicePayloadFieldBody(Reader& r, MetaChoicePayloadField& pf) {
+    llvm::SmallVector<std::uint64_t, 4> sc;
+    if (!expectScalars(r, sc) || sc.size() < 3) return false;
+    pf.hasSerialized = sc[0] != 0;
+    pf.serializedSkip = sc[1] != 0;
+    pf.serializedOptional = sc[2] != 0;
+    if (!expectString(r, pf.name)) return false;
+    if (!expectString(r, pf.modifier)) return false;
+    if (!expectString(r, pf.serializedName)) return false;
+    if (!readType(r, pf.type)) return false;
+    return finishBlock(r);
+}
+
+// §35.1 (#3144): one choice case. The caller has already entered
+// CHOICE_CASE_BLOCK.
+bool readChoiceCaseBody(Reader& r, MetaChoiceCase& cc) {
+    llvm::SmallVector<std::uint64_t, 2> sc;
+    if (!expectScalars(r, sc) || sc.size() < 2) return false;
+    const std::uint64_t nPayload = sc[0];
+    cc.hasSerialized = sc[1] != 0;
+    if (!expectString(r, cc.name)) return false;
+    if (!expectString(r, cc.serializedName)) return false;
+    cc.payload.resize(nPayload);
+    for (std::uint64_t i = 0; i < nPayload; ++i) {
+        if (!enterSubblock(r, CHOICE_PAYLOAD_BLOCK)) return false;
+        if (!readChoicePayloadFieldBody(r, cc.payload[i])) return false;
+    }
+    return finishBlock(r);
 }
 
 bool readContractBody(Reader& r, MetaContractRecord& c) {
@@ -1400,9 +1546,15 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     // whatever order the two records appear in — the layout fact must survive
     // for every class, and the dtorBodyText string only ever exists for a
     // generic one.
+    //
+    // §35.1 (#3144): the trailing CHOICE_CASE_BLOCKs, captured by SUBBLOCK ID
+    // and in emission order (which is the tag order). They carry no count
+    // scalar — see the ⚠ block in emitTypeDecl for why a 9th positional scalar
+    // was not an option — so "absent" and "empty" are the same read, which is
+    // correct: a pre-#3144 artifact and a non-choice both have no cases.
     return finishBlockImpl(
         r, !ty.genericParams.empty() ? &ty.dtorBodyText : nullptr,
-        REC_EXC_BASE, &ty.builtinExceptionBase);
+        REC_EXC_BASE, &ty.builtinExceptionBase, &ty.choiceCases);
 }
 
 bool readTypeDecl(Reader& r, MetaTypeDecl& ty) {

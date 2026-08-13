@@ -661,12 +661,19 @@ bool isReferenceTypeForRecordField(const sema::TypeRef* rt) {
 // `choiceSeen` (#2159) is the shared cycle guard for the record↔choice mutual
 // recursion §9.7 transitivity opens (a record field of choice type consults the
 // choice classifier, whose payloads may recurse back into a record): the set of
-// choice TypeDecls on the CURRENT classification path. Null at a pure-record
+// choice TYPE SYMBOLS on the CURRENT classification path. Null at a pure-record
 // entry point (no choice frame open yet).
+//
+// fix #3144 (family F9 of #3152): the guard is keyed on `sema::TypeSymbol`, not
+// on `ast::TypeDecl`. An IMPORTED choice has no `ast::TypeDecl` at all, so a
+// TypeDecl-keyed path set could not even represent it — every imported frame
+// would have hashed to the same null key and the guard would have fired on the
+// FIRST nested imported choice, silently reporting it value-like. The TypeSymbol
+// is the one identity both sides have.
 bool isBorrowBearingRecordCommon(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& seen, const RecordSubstEnv* env,
-    std::unordered_set<const ast::TypeDecl*>* choiceSeen = nullptr);
+    std::unordered_set<const sema::TypeSymbol*>* choiceSeen = nullptr);
 
 // The §35.4 choice-classification core (defined below near classifyChoiceType),
 // forward-declared here so the record field walk can consult it for a Choice-
@@ -675,7 +682,7 @@ bool isBorrowBearingRecordCommon(
 std::optional<ChoiceClassification> classifyChoiceCore(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     const RecordSubstEnv* env,
-    std::unordered_set<const ast::TypeDecl*>& choiceSeen);
+    std::unordered_set<const sema::TypeSymbol*>& choiceSeen);
 
 // §28.1 (v0.226, #2130): the file-local `owned`-marker erasure oracle impl,
 // forward-declared here so classifyChoiceCore's owning leg can thread its
@@ -683,7 +690,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
 // typed payload opens. Defined alongside classifyChoiceCore below.
 bool ownedMarkerActiveOnInstantiatedTypeImpl(
     const sema::TypeRef* ft, const sema::SemaContext& ctx,
-    std::unordered_set<const ast::TypeDecl*>& choiceSeen);
+    std::unordered_set<const sema::TypeSymbol*>& choiceSeen);
 
 // §9.7's borrow-carrying-field kinds, applied to one resolved field type in
 // the substitution environment `env` (which governs `ft`'s OWN bare-parameter
@@ -693,7 +700,7 @@ bool ownedMarkerActiveOnInstantiatedTypeImpl(
 bool recordFieldTypeIsBorrowCarryingCommon(
     const sema::TypeRef* ft, const sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& seen, const RecordSubstEnv* env,
-    std::unordered_set<const ast::TypeDecl*>* choiceSeen = nullptr) {
+    std::unordered_set<const sema::TypeSymbol*>* choiceSeen = nullptr) {
     if (!ft) return false;
     // §9.7 transitivity / §4.14 / §4.15 (#2127): a builtin span VIEW field
     // (Span / ReadOnlySpan / ArraySpan / ReadOnlyArraySpan) carries a borrow
@@ -746,7 +753,7 @@ bool recordFieldTypeIsBorrowCarryingCommon(
             // choices are move-only and may not be a record field — rejected
             // separately), so only the borrow-bearing verdict matters here.
             if (ft->declaration->kind == ast::TypeDeclKind::Choice) {
-                std::unordered_set<const ast::TypeDecl*> localChoiceSeen;
+                std::unordered_set<const sema::TypeSymbol*> localChoiceSeen;
                 auto& cs = choiceSeen ? *choiceSeen : localChoiceSeen;
                 auto cls = classifyChoiceCore(ft, ctx, env, cs);
                 return cls && *cls == ChoiceClassification::BorrowBearing;
@@ -770,7 +777,7 @@ bool recordFieldTypeIsBorrowCarryingCommon(
 bool isBorrowBearingRecordCommon(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     std::unordered_set<const sema::TypeRef*>& seen, const RecordSubstEnv* env,
-    std::unordered_set<const ast::TypeDecl*>* choiceSeen) {
+    std::unordered_set<const sema::TypeSymbol*>* choiceSeen) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return false;
     // fix #3145 (§2.8.3 rule 4, v0.252): the record test and the field walk both
@@ -987,7 +994,7 @@ namespace {
 bool payloadFieldTypeIsMoveOnly(
     const sema::TypeRef* ft,
     const sema::SemaContext& ctx,
-    std::unordered_set<const ast::TypeDecl*>& seen) {
+    std::unordered_set<const sema::TypeSymbol*>& seen) {
     if (!ft) return false;
     // §15.3: an owning inline array is a move-only value type. We do NOT
     // require `arraySizeValue >= 0` here (unlike MethodOwnership::
@@ -1003,12 +1010,17 @@ bool payloadFieldTypeIsMoveOnly(
     // Transitively another owning choice — recurse via the public helper's
     // core (below), seeding `seen` so a choice-value cycle (already
     // rejected by §35.1 but defended here) terminates.
-    const auto* decl =
-        dynamic_cast<const ast::TypeDecl*>(ft->declaration->decl);
-    if (!decl || !seen.insert(decl).second) return false;
+    //
+    // fix #3144 (family F9 of #3152): the case walk is SYMBOL-side. It read
+    // `dynamic_cast<const ast::TypeDecl*>(ft->declaration->decl)`, which is
+    // null for every imported type, so a nested IMPORTED owning-choice payload
+    // answered "not move-only" — the choice above it was then classified
+    // value-like and its owned payloads were never disposed.
+    if (!seen.insert(ft->declaration).second) return false;
     // Walk the nested choice's cases' payloads.
-    for (const auto& cc : decl->choiceCases) {
-        for (const auto& pf : cc.payload) {
+    for (const sema::ChoiceCaseSymbol* ccs : sema::choiceCasesOf(ft->declaration)) {
+        if (!ccs->caseDecl) continue;
+        for (const auto& pf : ccs->caseDecl->payload) {
             if (!pf.type) continue;
             const sema::TypeRef* pft = ctx.resolvedType(*pf.type);
             // Owning-marker on a nested payload slot: §28.1 admits `owned`
@@ -1032,7 +1044,7 @@ bool payloadFieldTypeIsMoveOnly(
 bool payloadFieldTypeIsBorrowCarrying(
     const sema::TypeRef* ft,
     const sema::SemaContext& ctx,
-    std::unordered_set<const ast::TypeDecl*>& choiceSeen,
+    std::unordered_set<const sema::TypeSymbol*>& choiceSeen,
     const RecordSubstEnv* env) {
     if (!ft) return false;
     switch (ft->kind) {
@@ -1095,20 +1107,48 @@ bool payloadFieldTypeIsBorrowCarrying(
 }
 
 // §35.4 (v0.200, #2045; env-threaded v0.226, #2183): the classification core.
-// `choiceSeen` is the shared CHOICE-decl PATH guard (also threaded through the
+// `choiceSeen` is the shared CHOICE PATH guard (also threaded through the
 // record walk for the §9.7 record↔choice mutual recursion, #2159). `env` is the
 // optional incoming substitution env for `rt`'s own bare-parameter arguments.
+//
+// fix #3144 (family F9 of umbrella #3152): the whole walk is SYMBOL-side. It
+// used to open with
+//
+//     const auto* decl = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
+//     if (!decl) return std::nullopt;
+//
+// which is null for EVERY imported type, so this answered `nullopt` — "not a
+// choice at all" — for every imported choice. That is the audit's third
+// taxonomy shape: not a wrong predicate, but a correct predicate fed an EMPTY
+// SOURCE. MEASURED consequence (two-module build, LSan, 200 iterations): 199 of
+// 200 `owned` payloads of an imported owning choice were never disposed, while
+// the identical program in one module leaked nothing.
 std::optional<ChoiceClassification> classifyChoiceCore(
     const sema::TypeRef* rt, const sema::SemaContext& ctx,
     const RecordSubstEnv* env,
-    std::unordered_set<const ast::TypeDecl*>& choiceSeen) {
+    std::unordered_set<const sema::TypeSymbol*>& choiceSeen) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration)
         return std::nullopt;
     if (rt->declaration->kind != ast::TypeDeclKind::Choice)
         return std::nullopt;
-    const auto* decl =
-        dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl);
-    if (!decl) return std::nullopt;
+    const sema::TypeSymbol* decl = rt->declaration;
+    const std::vector<const sema::ChoiceCaseSymbol*> cases =
+        sema::choiceCasesOf(decl);
+    // §35.1: "A choice declares at least one case." A Choice-kinded symbol with
+    // ZERO cases is therefore not a well-formed choice — it is a choice this
+    // compilation cannot see the cases of. Two shapes reach here: a STALE
+    // dependency artifact compiled before #3144 put the case list on the wire,
+    // and a local declaration that failed to parse (already diagnosed).
+    //
+    // Answer `nullopt` — "no verdict" — rather than letting the empty walk fall
+    // through to ValueLike. This is the exact conservative degradation the
+    // pre-#3144 code produced for every imported choice, so a stale artifact
+    // keeps its old (safe) behaviour rather than acquiring a NEW wrong answer:
+    // `Sendability.cpp`'s §35.12 gate reads a ValueLike verdict as "now walk the
+    // payloads", and with no payloads to walk that would silently answer
+    // SENDABLE for an owning choice whose payloads were never examined. A reject
+    // is recoverable; a data race is not.
+    if (cases.empty()) return std::nullopt;
 
     // #2159 cycle guard (PATH semantics): a choice already being classified on
     // the current path — reached only through a record↔choice value cycle,
@@ -1140,10 +1180,11 @@ std::optional<ChoiceClassification> classifyChoiceCore(
         // the recursive descent is gone before the borrow leg runs. The
         // move-only leg keeps its OWN accumulator (`owningSeen` never recurses
         // into a record and shares no path with the borrow leg).
-        std::unordered_set<const ast::TypeDecl*> owningSeen;
+        std::unordered_set<const sema::TypeSymbol*> owningSeen;
         owningSeen.insert(decl);
-        for (const auto& cc : decl->choiceCases) {
-            for (const auto& pf : cc.payload) {
+        for (const sema::ChoiceCaseSymbol* ccs : cases) {
+            if (!ccs->caseDecl) continue;
+            for (const auto& pf : ccs->caseDecl->payload) {
                 if (!pf.type) continue;
                 if (pf.modifier == "owned") {
                     if (ownedMarkerActiveOnInstantiatedTypeImpl(
@@ -1160,8 +1201,9 @@ std::optional<ChoiceClassification> classifyChoiceCore(
         // §35.4.2: BORROW-BEARING — any case has a plain (unmarked) borrow-
         // carrying payload field under §9.7's definition, classified AT THIS
         // instantiation via `fieldEnv` (#2183).
-        for (const auto& cc : decl->choiceCases) {
-            for (const auto& pf : cc.payload) {
+        for (const sema::ChoiceCaseSymbol* ccs : cases) {
+            if (!ccs->caseDecl) continue;
+            for (const auto& pf : ccs->caseDecl->payload) {
                 if (!pf.type) continue;
                 if (pf.modifier == "owned") continue;
                 if (payloadFieldTypeIsBorrowCarrying(ctx.resolvedType(*pf.type),
@@ -1192,7 +1234,7 @@ std::optional<ChoiceClassification> classifyChoiceCore(
 // frames re-classify under their own env (the #2145 diamond).
 bool ownedMarkerActiveOnInstantiatedTypeImpl(
     const sema::TypeRef* ft, const sema::SemaContext& ctx,
-    std::unordered_set<const ast::TypeDecl*>& choiceSeen) {
+    std::unordered_set<const sema::TypeSymbol*>& choiceSeen) {
     if (!ft) return true;  // unknown → conservative (owning)
     switch (ft->kind) {
         case sema::TypeRef::Kind::InlineArray:
@@ -1246,12 +1288,12 @@ bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
     // recursion (an `owned` payload whose type is a choice) consults the
     // file-local impl directly with the classifier's threaded `choiceSeen`,
     // which is where the #2130 cycle guard fires. // per §28.1, #2130
-    std::unordered_set<const ast::TypeDecl*> choiceSeen;
+    std::unordered_set<const sema::TypeSymbol*> choiceSeen;
     return ownedMarkerActiveOnInstantiatedTypeImpl(ft, ctx, choiceSeen);
 }
 
 const sema::TypeRef* substitutedChoicePayloadType(
-    const ast::Param& pf, const ast::TypeDecl* decl, const sema::TypeRef* rt,
+    const ast::Param& pf, const sema::TypeSymbol* decl, const sema::TypeRef* rt,
     const sema::SemaContext& ctx) {
     if (!pf.type) return nullptr;
     const sema::TypeRef* ftTemplate = ctx.resolvedType(*pf.type);
@@ -1262,13 +1304,22 @@ const sema::TypeRef* substitutedChoicePayloadType(
     // payloads are returned as resolved (their own kind decides owning/value —
     // an `owned Array<T>` field is owning by Array being a class, no inner-arg
     // substitution needed for the classification).
+    //
+    // fix #3144 (family F9 of #3152): `decl` is the choice's `TypeSymbol`, not
+    // its `ast::TypeDecl`. Every caller reached the TypeDecl by
+    // `dynamic_cast<...>(choiceTy->decl)`, null for every imported choice, so
+    // an imported generic choice's bare-parameter payloads were never
+    // substituted — `Result<Connection, string>.Ok` classified on the raw `T`.
+    // `TypeSymbol::genericParams` carries the same names on both sides (#3145's
+    // `seedRecordSubstEnv` overload rests on the same fact), so the substitution
+    // is now decidable cross-module.
     if (decl && rt && !decl->genericParams.empty() &&
         rt->genericArgs.size() == decl->genericParams.size() &&
         ftTemplate->kind == sema::TypeRef::Kind::Named &&
         !ftTemplate->declaration) {
         const std::string_view h = ftTemplate->headName();
         for (std::size_t i = 0; i < decl->genericParams.size(); ++i)
-            if (decl->genericParams[i].name == h)
+            if (decl->genericParams[i] && decl->genericParams[i]->name == h)
                 return rt->genericArgs[i];
     }
     return ftTemplate;
@@ -1283,7 +1334,7 @@ std::optional<ChoiceClassification> classifyChoiceType(
     // recursion). `env` (default null) supplies substitutions for `rt`'s own
     // bare-parameter arguments when this choice is a component of an enclosing
     // generic type (#2183). Concrete `rt->genericArgs` are threaded regardless.
-    std::unordered_set<const ast::TypeDecl*> choiceSeen;
+    std::unordered_set<const sema::TypeSymbol*> choiceSeen;
     return classifyChoiceCore(rt, ctx, env, choiceSeen);
 }
 

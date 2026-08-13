@@ -527,10 +527,13 @@ void MethodOwnership::recordMovesInArgs(const std::vector<ast::CallArgument>& ar
         // payload whose instantiated type is an owning heap reference stays an
         // owned sink. Recover the instantiation from the callee's target type.
         if (userOwned && calleeChoiceCase && calleeChoiceCase->caseDecl) {
-            const ast::TypeDecl* chDecl = nullptr;
-            if (auto* cts = dynamic_cast<sema::TypeSymbol*>(
-                    calleeChoiceCase->parent))
-                chDecl = dynamic_cast<const ast::TypeDecl*>(cts->decl);
+            // fix #3144 (family F9 of #3152): the choice's SYMBOL. This was
+            // `dynamic_cast<const ast::TypeDecl*>(cts->decl)`, null for every
+            // imported choice, so the §28.1 erasure oracle below classified an
+            // imported generic case's `owned T` payload without its
+            // instantiation. (`MemberSymbol::parent` is already a TypeSymbol —
+            // the old spelling went through it only to reach `->decl`.)
+            const sema::TypeSymbol* chDecl = calleeChoiceCase->parent;
             const sema::TypeRef* inst = nullptr;
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
                 if (ma->target) inst = ctx_.exprType(*ma->target);
@@ -676,9 +679,8 @@ bool MethodOwnership::isImplicitOwned(const std::vector<ast::CallArgument>& args
     // is NOT an owned-IN sink — a value/borrow argument is accepted. Only a
     // payload whose instantiated type is an owning heap reference stays a sink.
     if (auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(sym)) {
-        const ast::TypeDecl* chDecl = nullptr;
-        if (auto* cts = dynamic_cast<sema::TypeSymbol*>(cc->parent))
-            chDecl = dynamic_cast<const ast::TypeDecl*>(cts->decl);
+        // fix #3144 — the choice's SYMBOL; see the twin in recordMovesInArgs.
+        const sema::TypeSymbol* chDecl = cc->parent;
         const sema::TypeRef* inst = nullptr;
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
             if (ma->target) inst = ctx_.exprType(*ma->target);
@@ -3153,10 +3155,15 @@ bool MethodOwnership::isNullSourceChoiceExpr(const ast::Expr& e) const {
     // recordFieldIsBorrowCarrying's lookup so a `Opt<T>` payload field whose
     // `T` is a borrow-typed class resolves through it here, mirroring #2159
     // for records).
-    const ast::TypeDecl* chDecl = nullptr;
-    if (auto* chTs =
-            dynamic_cast<sema::TypeSymbol*>(cc->parent))
-        chDecl = dynamic_cast<const ast::TypeDecl*>(chTs->decl);
+    //
+    // fix #3144 (family F9 of #3152): the choice's SYMBOL. This read was
+    // `dynamic_cast<const ast::TypeDecl*>(chTs->decl)`, null for every
+    // imported choice, so the env stayed EMPTY and an imported generic
+    // choice's bare-parameter payloads were classified at the declaration
+    // template instead of at the instantiation. It is the SECOND AST-gated
+    // read in this function — the audit's F9 table lists only the `caseDecl`
+    // one, which the case-list channel fixes on its own (reported on #3168).
+    const sema::TypeSymbol* chDecl = cc->parent;
     common::RecordSubstEnv env;
     // The choice kind's static type of the case construction; used as the
     // carrier for `rt`'s own generic arguments. Best-effort: the resolved

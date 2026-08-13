@@ -827,6 +827,20 @@ bool anyRecordStorageField(
 // the sites that pair constructor argument i with positional field i.
 std::vector<const Symbol*> recordPositionalFieldSymbols(const TypeSymbol* ts);
 
+// §35.1 / §35.4 / §2.8.2 clause 1 (fix #3144, family F9 of umbrella #3152):
+// `t`'s choice cases in DECLARATION ORDER — which is the case's tag value, so
+// the order is a semantic contract, not a convenience. Empty when `t` is null
+// or is not a choice.
+//
+// It is a plain walk of `t->members`, so it needs no `ast::TypeDecl` at any
+// level and answers identically for a local and an imported choice. That is the
+// whole point: every consumer of a case's payload reaches it through
+// `ChoiceCaseSymbol::caseDecl`, which `SymbolCollection` points at the real
+// `ast::ChoiceCase` and `ModuleLoader` points at a faithful reconstruction
+// (#3144) — one predicate, one source, no per-side variant to keep in step.
+// `Emitter::choiceCasesOf` is the identical walk on the codegen side.
+std::vector<const ChoiceCaseSymbol*> choiceCasesOf(const TypeSymbol* t);
+
 // §9.2 / §22.9: a member is an *auto-property* (`Name: T;`, optionally with an
 // initializer, no accessor bodies / arrow getter) — backed by compiler-
 // generated storage, exactly like a field. Indexers and static properties are

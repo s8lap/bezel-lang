@@ -6,24 +6,20 @@
 
 # class1: dynamic_cast<const ast::TypeDecl*>(<sym>->decl) - wrong-but-quiet
 #         for an imported symbol.
-2    src/codegen/LlvmBackend_Disposal.cpp
 1    src/codegen/LlvmBackend_Exprs2.cpp
 19   src/codegen/LlvmBackend_Serialization.cpp
 5    src/codegen/LlvmBackend_Setup.cpp
 1    src/codegen/LlvmBackend_impl.hpp
-2    src/common/OwnershipFacts.cpp
 4    src/module/ModuleMetadataBuilder.cpp
-4    src/ownership/Ownership_Checks.cpp
+1    src/ownership/Ownership_Checks.cpp
 1    src/sema/EnumValues.hpp
 7    src/sema/ExprTypecheck.cpp
 6    src/sema/ExprTypecheck_Calls.cpp
 7    src/sema/ExprTypecheck_Exprs.cpp
 4    src/sema/PureChecker.cpp
-2    src/sema/Sendability.cpp
-6    src/sema/SymbolCollection.cpp
+5    src/sema/SymbolCollection.cpp
 12   src/sema/TypeResolution_Checks.cpp
 1    src/sema/TypeResolution_Names.cpp
 
 # class2: a sema::TypeSymbol* cast straight to ast::TypeDecl* - ALWAYS null,
 #         so the guarded block is dead on every path (#3150).
-1    src/codegen/LlvmBackend_Setup.cpp

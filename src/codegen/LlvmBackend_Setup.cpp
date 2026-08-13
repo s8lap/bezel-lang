@@ -15184,10 +15184,20 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     // generic `Error("x" + "y")` payload is classified non-string (the bare
     // `E` doesn't have `kind==Primitive && primitive==String`), so the +1
     // producer it carries is never registered for release — the leak #2115
-    // ships with a generic gap. Same `choiceDecl` cast the owning-choice emit
-    // (LlvmBackend_Disposal.cpp) and the §9.7 ownership checks use.
-    const auto* choiceDecl =
-        dynamic_cast<const ast::TypeDecl*>(rt->declaration);
+    // ships with a generic gap.
+    //
+    // fix #3150 / #3144 (family F9 of #3152): this line WAS
+    //
+    //     dynamic_cast<const ast::TypeDecl*>(rt->declaration)
+    //
+    // — a cast of a `sema::TypeSymbol*` to an unrelated `ast::TypeDecl*`, which
+    // yields null ALWAYS, for local types too (its own comment claimed it was
+    // "the same `choiceDecl` cast the owning-choice emit uses", and the two
+    // sibling sites spell it `choiceTy->decl`, which is a different expression).
+    // So the #2115 generic-payload substitution below has never once executed.
+    // `substitutedChoicePayloadType` now takes the SYMBOL, which is both the
+    // correct value here and the one an imported choice also has.
+    const sema::TypeSymbol* choiceDecl = rt->declaration;
     // The initializer must be a choice-case construction. A value flowing from
     // any other source (a call returning a choice, a field/param read) is
     // conservatively rejected: the payload's ownership cannot be proved at this

@@ -548,8 +548,14 @@ bool ownedMarkerActiveOnInstantiatedType(const sema::TypeRef* ft,
 // returned as resolved. Returns null when `pf` has no type. When `rt` carries no
 // generic args (the uninstantiated template), the declared type is returned
 // unchanged, so a template classifies conservatively.
+//
+// `decl` is the choice's `sema::TypeSymbol` (fix #3144, family F9 of #3152). It
+// was the `ast::TypeDecl`, which every caller obtained by
+// `dynamic_cast<const ast::TypeDecl*>(choiceTy->decl)` — null for every
+// IMPORTED choice — so the substitution silently did not happen across a module
+// boundary. The parameter NAMES this reads live on the TypeSymbol on both sides.
 const sema::TypeRef* substitutedChoicePayloadType(
-    const ast::Param& pf, const ast::TypeDecl* decl, const sema::TypeRef* rt,
+    const ast::Param& pf, const sema::TypeSymbol* decl, const sema::TypeRef* rt,
     const sema::SemaContext& ctx);
 
 // §28.3 *Bare-type-parameter returns* (v0.194, #1801). True when `md`'s

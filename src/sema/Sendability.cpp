@@ -447,19 +447,29 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
             if (!verdict) return false;  // defensive — unresolved
             if (*verdict != common::ChoiceClassification::ValueLike)
                 return false;  // borrow-bearing or owning → not sendable
-            const auto* td =
-                dynamic_cast<const ast::TypeDecl*>(decl->decl);
-            // §35.12 / §2.8.2 clause 1 (#3144, family F9): no AST means an
-            // IMPORTED choice, whose CASE LIST does not cross the wire at all —
-            // so the per-payload recursion below cannot run and this verdict is
-            // unbacked. Answer NOT sendable rather than "trust the value-like
-            // verdict": the line is unreachable today only because
-            // `classifyChoiceType` returns nullopt for every imported choice
-            // (caught by the `!verdict` guard two lines up), and the moment F9
-            // gives that classifier a symbol-side path this becomes a silent
-            // ACCEPT for a choice whose payloads were never examined. A reject
-            // is the recoverable direction; a data race is not.
-            if (!td) return false;
+            // §35.12 / §2.8.2 clause 1 (#3144, family F9): this walk WAS
+            //
+            //     const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl);
+            //     if (!td) return false;   // fail-safe: unbacked verdict
+            //
+            // — a deliberate fail-safe added earlier in this run, because an
+            // imported choice's case list did not cross the wire at all and the
+            // per-payload recursion below therefore could not run. It is now a
+            // REAL CHECK: `choiceCasesOf` reads the cases off the symbol, which
+            // both a local and an imported choice carry, so an imported
+            // value-like choice is examined payload by payload exactly as a
+            // local one is. The conservative default is gone because the fact it
+            // was standing in for is now available — which is the only good
+            // reason to remove one.
+            //
+            // The fail-safe direction is still covered, one layer up: a choice
+            // whose cases this compilation cannot see (a STALE pre-#3144
+            // dependency artifact) makes `classifyChoiceType` answer `nullopt`
+            // — §35.1 requires at least one case, so zero cases means "unknown",
+            // not "value-like with nothing in it" — and the `!verdict` guard
+            // above already returns NOT sendable for that. So this walk never
+            // runs on an empty case list.
+            const auto cases = choiceCasesOf(decl);
 
             // §35.11 / §35.12 (v0.226, #2211): #2183 made the §35.4
             // classifier instantiation-aware, but this payload recursion still
@@ -470,11 +480,12 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
             // unchanged; the finite nested form `Opt<Opt<int>>` still reaches its
             // concrete leaf without a declaration-keyed recursion shortcut.
             common::RecordSubstEnv env;
-            common::seedRecordSubstEnv(*td, *rt, /*incoming=*/nullptr, env);
+            common::seedRecordSubstEnv(*decl, *rt, /*incoming=*/nullptr, env);
             const common::RecordSubstEnv* fieldEnv =
                 env.map.empty() ? nullptr : &env;
-            for (const auto& cc : td->choiceCases) {
-                for (const auto& pf : cc.payload) {
+            for (const ChoiceCaseSymbol* ccs : cases) {
+                if (!ccs->caseDecl) continue;
+                for (const auto& pf : ccs->caseDecl->payload) {
                     if (!pf.type) continue;
                     const TypeRef* ft = ctx.resolvedType(*pf.type);
                     ft = common::resolveRecordFieldSubst(ft, fieldEnv).ty;
@@ -933,30 +944,27 @@ std::string sendableFailureComponentPath(const TypeRef* rt, SemaContext& ctx) {
         if (!verdict) return {};
         if (*verdict != common::ChoiceClassification::ValueLike)
             return {};  // category-level — flat reason
-        // #3144/F9 twin of the property walk's guard above — but here the
-        // fail-safe answer is the EMPTY path: this function only decorates an
-        // already-failed verdict with a component name, so returning nothing
-        // falls back to the flat §30.14 diagnostic and can never admit
-        // anything. It stays as-is deliberately.
-        const auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl);
-        if (!td) return {};
-
+        // #3144/F9 twin of the sendability walk above: the cases come off the
+        // SYMBOL, so an imported choice's failing payload is NAMED in the
+        // diagnostic instead of falling back to the flat §30.14 reason.
+        //
         // §35.11 / §35.12 (#2211): mirror the property walk above so a failed
         // generic payload diagnostic names the instantiated type (`Object`),
         // not the declaration template's bare parameter (`T`).
         common::RecordSubstEnv env;
-        common::seedRecordSubstEnv(*td, *rt, /*incoming=*/nullptr, env);
+        common::seedRecordSubstEnv(*decl, *rt, /*incoming=*/nullptr, env);
         const common::RecordSubstEnv* fieldEnv =
             env.map.empty() ? nullptr : &env;
-        for (const auto& cc : td->choiceCases) {
-            for (const auto& pf : cc.payload) {
+        for (const ChoiceCaseSymbol* ccs : choiceCasesOf(decl)) {
+            if (!ccs->caseDecl) continue;
+            for (const auto& pf : ccs->caseDecl->payload) {
                 if (!pf.type) continue;
                 const TypeRef* ft = ctx.resolvedType(*pf.type);
                 ft = common::resolveRecordFieldSubst(ft, fieldEnv).ty;
                 if (!ft) continue;
                 if (!isSendableType(ft, ctx)) {
                     std::string_view pName =
-                        !pf.name.empty() ? pf.name : cc.name;
+                        !pf.name.empty() ? pf.name : ccs->name;
                     return std::string(kPrefix) + "payload `" +
                            std::string(pName) + "` of type `" +
                            typeDisplayName(ft) +

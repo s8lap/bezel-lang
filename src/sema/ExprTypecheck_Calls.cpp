@@ -17714,6 +17714,27 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 et->declaration = ec->parent;
                 ctx_.setExprType(&ma, et);
             }
+        } else if (auto* cc = dynamic_cast<ChoiceCaseSymbol*>(member)) {
+            // §35.3 (fix #3144, family F9 of umbrella #3152): the CHOICE-CASE
+            // twin of the enum-constant arm immediately above, and it exists for
+            // the same reason — an imported member returns from this block, so
+            // the general `else if (dynamic_cast<ChoiceCaseSymbol*>(member) &&
+            // targetType)` arm further down never runs for one.
+            //
+            // MEASURED before this arm (with the case list already crossing):
+            // `var q := Msg.Quiet;` left `q` untyped, so codegen's
+            // `choiceTypeOf` found no choice for the scrutinee and every arm of
+            // `case q of Quiet => …` fell through to the #1847 "not supported by
+            // the backend" reject — while `var q: Msg := Msg.Quiet;` and the
+            // identical program in one module both compiled. The payload CALL
+            // form (`Msg.Code(41)`) was unaffected: it is typed by `typeCall`,
+            // not here, which is why only the payload-FREE spelling diverged.
+            if (cc->parent) {
+                TypeRef* ct = ctx_.makeTypeRef();
+                ct->kind = TypeRef::Kind::Named;
+                ct->declaration = cc->parent;
+                ctx_.setExprType(&ma, ct);
+            }
         }
         return;
     }

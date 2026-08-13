@@ -1238,6 +1238,47 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
 
 // Append the enum constants of `td` to `out.members` with their underlying
 // values per §10.1 (implicit from 0) / §10.2 (explicit + continuation).
+// §35.1 / §35.3 / §35.4 (fix #3144, family F9 of umbrella #3152): export the
+// choice's CASES. The walk is SYMBOL-side (`t.members` → `ChoiceCaseSymbol`),
+// not `td->choiceCases`, so the exporter and every consumer read one list in
+// one order — the same order `choiceCasesOf` gives codegen, which is the tag
+// order. The per-case payload comes off `cc->caseDecl` (never null on this
+// side: SymbolCollection points it at the real `ast::ChoiceCase`).
+//
+// Before this, `MetaTypeDeclKind::Choice` crossed and the cases did not, so an
+// importer laid the choice out as `{ i32 }` (tag only) against the exporter's
+// full `{ i32, payload0, payload1, … }` — a silent ABI mismatch measured as a
+// SEGV inside the dependency's own compiled function. See the field comment on
+// `MetaTypeDecl::choiceCases`.
+void appendChoiceCases(const sema::TypeSymbol& t, sema::SemaContext& ctx,
+                       MetaTypeDecl& out) {
+    for (const sema::Symbol* m : t.members) {
+        const auto* cc = dynamic_cast<const sema::ChoiceCaseSymbol*>(m);
+        if (!cc || !cc->caseDecl) continue;
+        MetaChoiceCase mc;
+        mc.name = std::string(cc->name);
+        // §A.3: the `serialized` clause on a case admits the RENAME form only.
+        if (cc->caseDecl->serialized) {
+            mc.hasSerialized = true;
+            mc.serializedName = std::string(cc->caseDecl->serialized->name);
+        }
+        for (const ast::Param& pf : cc->caseDecl->payload) {
+            MetaChoicePayloadField mp;
+            mp.name = std::string(pf.name);
+            mp.modifier = std::string(pf.modifier);  // "" or "owned" (§28.1)
+            mp.type = convertAstType(pf.type.get(), ctx);
+            if (pf.serialized) {
+                mp.hasSerialized = true;
+                mp.serializedSkip = pf.serialized->isSkip;
+                mp.serializedOptional = pf.serialized->isOptional;
+                mp.serializedName = std::string(pf.serialized->name);
+            }
+            mc.payload.push_back(std::move(mp));
+        }
+        out.choiceCases.push_back(std::move(mc));
+    }
+}
+
 void appendEnumConstants(const ast::TypeDecl& td, MetaTypeDecl& out) {
     std::int64_t next = 0;  // §10.1: declaration order from zero
     for (const ast::EnumConstant& ec : td.enumConstants) {
@@ -1550,6 +1591,13 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
             appendEnumConstants(*td, out);
         }
     }
+
+    // §35.1 (fix #3144, family F9 of #3152): the choice's cases + payloads.
+    // `convertMember` returns false for a ChoiceCaseSymbol (it is not one of
+    // the MetaMemberKind shapes), so the symbol walk above filtered them out —
+    // exactly as it filters EnumConstantSymbols, and re-added here for the same
+    // reason.
+    if (t.kind == ast::TypeDeclKind::Choice) appendChoiceCases(t, ctx, out);
 
     // §14 / #662c: for a GENERIC class, extract the destructor body source text
     // so the importer can run user destructor side-effects (#662 foundation C).

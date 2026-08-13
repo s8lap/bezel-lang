@@ -358,6 +358,47 @@ struct MetaContractRecord {
     bool operator==(const MetaContractRecord&) const;
 };
 
+// §35.1 / §35.3 / §35.4 (fix #3144, family F9 of umbrella #3152; additive
+// within v7): one payload field of one choice case — `owned`? Identifier ":"
+// Type SerializedClause?, per §A.3 `CaseField`. Mirrors the `ast::Param` the
+// LOCAL side keeps in `ast::ChoiceCase::payload`, by value.
+//
+// A choice's payload fields are its ENTIRE instance storage (§35.1: "a choice's
+// instance storage *is* its cases' payloads"), so this is not descriptive
+// metadata — it is the type's LAYOUT, exactly as `builtinExceptionBase` is a
+// class's §31.4 header. See MetaTypeDecl::choiceCases for the measured
+// consequence of it not crossing.
+struct MetaChoicePayloadField {
+    std::string name;
+    // "" or "owned" (§28.1's payload marker; §35.1 admits no other modifier on
+    // a case field).
+    std::string modifier;
+    MetaType type;
+    // §9.8 / §A.3 SerializedClause on the field. `hasSerialized` distinguishes
+    // "no clause" from "a clause with an empty rename" — the two differ for
+    // `serialized skip` / `serialized optional`, which carry no name.
+    bool hasSerialized = false;
+    bool serializedSkip = false;
+    bool serializedOptional = false;
+    std::string serializedName;
+
+    bool operator==(const MetaChoicePayloadField&) const;
+};
+
+// §35.1 (fix #3144): one case of a choice, in declaration order — the order IS
+// the case's tag value (LlvmBackend_Layout.cpp's `choiceCasesOf`), so the
+// vector's order is part of the wire contract, not a convenience.
+struct MetaChoiceCase {
+    std::string name;
+    std::vector<MetaChoicePayloadField> payload;  // empty = payload-free case
+    // §9.8: the case's `serialized "<name>"` rename (the only clause form §A.3
+    // admits on a case). `hasSerialized` as above.
+    bool hasSerialized = false;
+    std::string serializedName;
+
+    bool operator==(const MetaChoiceCase&) const;
+};
+
 
 // The member kinds of a type's public surface (§9-§12, §22-§25). Numeric
 // values are part of the wire format.
@@ -836,6 +877,48 @@ struct MetaTypeDecl {
     // identical results and diagnostics; a new reader on an old artifact
     // degrades exactly to pre-fix.
     std::vector<MetaType> builtinInterfaceBases;
+
+    // §35.1 / §35.3 / §35.4 / §2.8.2 / §2.8.3 rule 4 (fix #3144, family F9 of
+    // umbrella #3152; additive within v7): the choice's CASES in declaration
+    // order, with their payload fields. Empty for every non-choice kind.
+    //
+    // Until this field existed, `MetaTypeDeclKind::Choice` crossed and the case
+    // list did not (the enum's own comment said so: "the case-list itself is not
+    // yet serialized"). So an imported choice arrived carrying `kind == Choice`
+    // and ZERO cases — a correct predicate fed an empty source, the third shape
+    // of the 2026-08-06 taxonomy: `classifyChoiceCore` returned `nullopt`, the
+    // §35.4 owning-payload disposal never ran, and `ModuleLoader` built no
+    // `ChoiceCaseSymbol` at all, so `Outcome.Fetched` did not even resolve.
+    //
+    // MEASURED on 137f58f (two-module build, `bezelc -c lib.bzl -o lib.o` then
+    // `bezelc --import lib.o app.bzl`) the failure is NOT the leak the triage
+    // predicted — it is a silent ABI MISMATCH, the #2950 class:
+    //
+    //     exporter  %choice.Outcome = type { i32, { ptr }, { i8 }, { i32 } }
+    //     importer  %choice.Outcome = type { i32 }
+    //
+    // A choice is a VALUE type returned by value, so the importer's 4-byte
+    // reading put the return in a register while the exporter's compiled
+    // function wrote through a hidden sret pointer that the importer never
+    // passed — `AddressSanitizer: SEGV on unknown address 0x8 ... WRITE` inside
+    // the dependency's own `MakeFetched`. §2.8.2's carriage requirement is
+    // explicit that an implementation "must not alter the instantiation's
+    // semantics"; two different layouts for one type do exactly that.
+    //
+    // Carried as trailing CHOICE_CASE_BLOCK subblocks of TYPE_BLOCK, one per
+    // case, with NO count scalar — the subblocks are self-describing, which is
+    // what ModuleMetadata.cpp's ⚠ block above `emitTypeDecl`'s 8th scalar asks
+    // a new field to be ("a distinct record code rather than a positional
+    // scalar (preferred)"): a 9th positional scalar would be read as #3139's
+    // `nBuiltinIfaces` by any artifact whose type declares no built-in
+    // interface, and the reader would then try to read that many
+    // METATYPE_BLOCKs — a silent misparse. A reader predating this field
+    // `SkipBlock`s the unknown subblock id.
+    //
+    // BOTH the emission AND the `hashTypeDecl` fold are conditional on the list
+    // being non-empty (#3139/#2950's rule), so a module with no choice produces
+    // BYTE-IDENTICAL metadata to before — verified as a one-variable A/B.
+    std::vector<MetaChoiceCase> choiceCases;
 
     bool operator==(const MetaTypeDecl&) const;
 };

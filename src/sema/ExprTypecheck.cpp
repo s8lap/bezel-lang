@@ -2700,14 +2700,31 @@ TypeRef* ExprTC::substituteGenericCaseFieldType(
         // TypeResolution_Names.cpp:1308 deliberately nulls the declaration so
         // sema slices distinguish "unresolved-but-parameter" from real Named
         // types). Match by NAME against the choice's `genericParams`.
-        if (sub->kind == TypeRef::Kind::Named && !sub->declaration &&
-            sub->astNode && sub->astNode->name &&
-            !sub->astNode->name->parts.empty() &&
+        //
+        // fix #3144 (family F9 of #3152): the bare-parameter HEAD is read from
+        // whichever source the TypeRef has. A locally-resolved payload carries
+        // `astNode`; an IMPORTED one carries `importedName` and no astNode at
+        // all (ModuleLoader has no AST for a dependency's types), so the
+        // astNode-only read below silently declined to substitute and
+        // `case g of Some(x)` bound `x` at the bare `T` — MEASURED as a false
+        // reject, "the arms of a `case` expression have no common type (§20)",
+        // on `Opt<int>.Some(3)` from an imported generic choice whose local
+        // twin compiles. The qualified-name exclusion is preserved on both
+        // legs: only a single-part head can name a type parameter.
+        std::string_view subHead;
+        if (sub->astNode && sub->astNode->name &&
             sub->astNode->name->parts.size() == 1) {
+            subHead = sub->astNode->name->parts.front();
+        } else if (!sub->astNode && !sub->importedName.empty() &&
+                   sub->importedName.find('.') == std::string_view::npos) {
+            subHead = sub->importedName;
+        }
+        if (sub->kind == TypeRef::Kind::Named && !sub->declaration &&
+            !subHead.empty()) {
             for (std::size_t i = 0; i < params.size(); ++i) {
                 if (auto* gp = dynamic_cast<const GenericParamSymbol*>(
                         params[i])) {
-                    if (gp->name == sub->astNode->name->parts.front()) {
+                    if (gp->name == subHead) {
                         TypeRef* rep = args[i];
                         if (!rep) return const_cast<TypeRef*>(sub);
                         if (sub->nullable && !rep->nullable) {

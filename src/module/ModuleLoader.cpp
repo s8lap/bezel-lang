@@ -348,6 +348,89 @@ struct Loader {
         return out;
     }
 
+    // fix #3144 (§35.1 / §35.3 / §35.4, family F9 of umbrella #3152): rebuild
+    // the choice's CASES as `ChoiceCaseSymbol`s pointing at synthetic
+    // `ast::ChoiceCase` nodes — the #2516 `posParam` pattern, applied to the
+    // one fact a choice cannot be laid out, classified, matched or disposed
+    // without.
+    //
+    // WHY a reconstructed node rather than a sixth loader side table: a case's
+    // payload is read through `ChoiceCaseSymbol::caseDecl` at 91 sites across
+    // sema, ownership and codegen — layout (`choiceCasePayloadStruct`),
+    // §35.4 classification (`classifyChoiceCore`), §35.5 matching, §35.3
+    // payload binding, §28.1 owned-marker erasure, scope-end disposal. A side
+    // table would fix whichever consumer motivated it and leave the other
+    // ninety reading an empty list, which is precisely the failure the five
+    // existing loader side tables each repeated. Pointing the imported symbol
+    // at a faithful node makes the imported and local answers come from ONE
+    // predicate, which is the audit's own rule for this seam.
+    //
+    // The reconstruction is FAITHFUL, not partial: name, payload field names,
+    // the §28.1 `owned` marker, each payload's resolved type (published via
+    // `setResolvedType`, so `ctx.resolvedType(*pf.type)` answers), and the §9.8
+    // `serialized` clauses on both the case and its fields. A field omitted
+    // here would not degrade — it would make every consumer confidently answer
+    // the declaration's opposite, which is the defect this fixes.
+    void convertChoiceCases(const MetaTypeDecl& td, sema::TypeSymbol& t) {
+        for (const MetaChoiceCase& mc : td.choiceCases) {
+            ast::ChoiceCase* cd = ctx.makeImportedChoiceCase();
+            cd->name = ctx.internString(mc.name);
+            if (mc.hasSerialized) {
+                cd->serialized = std::make_unique<ast::SerializedClause>();
+                cd->serialized->name = ctx.internString(mc.serializedName);
+            }
+            for (const MetaChoicePayloadField& mp : mc.payload) {
+                ast::Param p;
+                p.name = ctx.internString(mp.name);
+                p.modifier = ctx.internString(mp.modifier);  // "" / "owned"
+                p.type = makePayloadTypeNode(mp.type);
+                if (mp.hasSerialized) {
+                    p.serialized = std::make_unique<ast::SerializedClause>();
+                    p.serialized->isSkip = mp.serializedSkip;
+                    p.serialized->isOptional = mp.serializedOptional;
+                    p.serialized->name = ctx.internString(mp.serializedName);
+                }
+                cd->payload.push_back(std::move(p));
+            }
+            auto* cs = ctx.makeImportedSymbol<sema::ChoiceCaseSymbol>();
+            cs->name = ctx.internString(mc.name);
+            cs->parent = &t;
+            cs->caseDecl = cd;
+            cs->scope = t.memberScope;
+            cs->declLoc = t.declLoc;
+            // Declaration order IS the tag value, and `choiceCasesOf` reads
+            // `members` in order — so appending in `td.choiceCases` order is
+            // what makes the importer's tags agree with the exporter's.
+            t.members.push_back(cs);
+        }
+    }
+
+    // fix #3144: the synthetic `ast::Type` node a reconstructed payload field
+    // points at. Consumers reach a payload's type ONLY through
+    // `ctx.resolvedType(*pf.type)` (codegen's `lowerType(const ast::Type*)` is
+    // itself just that lookup), so the node's job is to be a stable KEY with a
+    // resolved entry; the syntactic head is filled in for diagnostics and for
+    // `TypeRef::headName`'s astNode leg.
+    std::unique_ptr<ast::Type> makePayloadTypeNode(const MetaType& mt) {
+        auto node = std::make_unique<ast::Type>();
+        node->nullable = mt.nullable;
+        switch (mt.kind) {
+            case TypeKind::Unit: node->kind = ast::TypeKind::Unit; break;
+            case TypeKind::InlineArray:
+                node->kind = ast::TypeKind::InlineArray;
+                node->arrayOwned = mt.arrayOwned;
+                break;
+            case TypeKind::Function: node->kind = ast::TypeKind::Function; break;
+            default: node->kind = ast::TypeKind::Named; break;
+        }
+        if (node->kind == ast::TypeKind::Named && !mt.namedName.empty()) {
+            node->name = std::make_unique<ast::QualifiedName>();
+            node->name->parts.push_back(ctx.internString(mt.namedName));
+        }
+        ctx.setResolvedType(node.get(), convert(mt));
+        return node;
+    }
+
     // Reconstruct a full TypeSymbol from a MetaTypeDecl (used for nested types,
     // §11.3 / issue #502). The reconstructed TypeSymbol lives in `parent`'s
     // member scope and has its own fresh member scope for its own members.
@@ -394,6 +477,10 @@ struct Loader {
             if (sema::Symbol* m = convertMember(mm, *t))
                 t->members.push_back(m);
         }
+        // fix #3144 (§35.1, family F9 of #3152): the choice's cases, appended
+        // after the other members exactly as SymbolCollection::collectTypeDecl
+        // appends them locally.
+        convertChoiceCases(td, *t);
         return t;
     }
 
@@ -2544,6 +2631,10 @@ static void loadMetadataPass2(
             if (sema::Symbol* m = loader.convertMember(mm, *t))
                 t->members.push_back(m);
         }
+        // fix #3144 — see the sibling call in `reconstructTypeSymbol`. Pass 2,
+        // not pass 1: a payload's type may name a sibling or another
+        // dependency's type, so every shell must already be registered.
+        loader.convertChoiceCases(td, *t);
         // (registration moved to pass 1 for order-independent by-name binding.)
     }
 

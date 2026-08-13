@@ -2120,8 +2120,11 @@ void Emitter::emitOwningChoiceActiveCaseDisposal(
     // instantiation's substitution so the specialized payload struct is used and
     // each owned field's instantiated type is decidable for §28.1 erasure.
     RecordSubstGuard choiceSubst(this, choiceRef);
-    const auto* choiceDecl =
-        dynamic_cast<const ast::TypeDecl*>(choiceTy->decl);
+    // fix #3144 (family F9 of #3152): the SYMBOL, not
+    // `dynamic_cast<const ast::TypeDecl*>(choiceTy->decl)` — which is null for
+    // every imported choice, so the §28.1 per-instantiation payload
+    // substitution below silently did not run across a module boundary.
+    const sema::TypeSymbol* choiceDecl = choiceTy;
     auto cases = choiceCasesOf(choiceTy);
     if (cases.empty()) return;
     // The choice struct is { i32 tag, case0_payload, case1_payload, … }
@@ -2240,8 +2243,11 @@ void Emitter::emitValueLikeChoiceActiveCaseStrRelease(
     // would otherwise fail an ICmp assertion). Same guard the owning-choice emit
     // and choiceStruct consult.
     RecordSubstGuard choiceSubst(this, choiceRef);
-    const auto* choiceDecl =
-        dynamic_cast<const ast::TypeDecl*>(choiceTy->decl);
+    // fix #3144 (family F9 of #3152): the SYMBOL, not
+    // `dynamic_cast<const ast::TypeDecl*>(choiceTy->decl)` — which is null for
+    // every imported choice, so the §28.1 per-instantiation payload
+    // substitution below silently did not run across a module boundary.
+    const sema::TypeSymbol* choiceDecl = choiceTy;
     auto cases = choiceCasesOf(choiceTy);
     if (cases.empty()) return;
     llvm::StructType* st = choiceStruct(choiceTy);
