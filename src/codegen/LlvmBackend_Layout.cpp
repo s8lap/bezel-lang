@@ -1334,7 +1334,26 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // N is an IntLiteralExpr, or a folded compile-time size (#734:
             // arraySizeValue, set by sema for a member-`const` size); element
             // type recurses.
-            if (!rt->arrayElement || !rt->arraySize) return i32();
+            // fix #3183 (§15.1 / §2.8.3 rule 4, v0.254): admit a size that
+            // survived as a FOLDED VALUE with no AST node behind it — which is
+            // every IMPORTED inline array, whose `arraySizeValue` the loader now
+            // restores from the metadata. The old guard demanded the `ast::Expr`
+            // and so gave up before ever reaching the `arraySizeValue` arm
+            // fifteen lines below, returning the bare `i32` placeholder: a
+            // 4-byte layout against the exporter's `N * sizeof(elem)`, measured
+            // as an ASan stack-buffer-overflow on construction.
+            //
+            // These two lines are now EXACTLY
+            // `sema::serializationComponentTypeIsEmittable`'s condition
+            // (SymbolCollection.cpp), whose comment already claimed to state
+            // that condition "once, here, so the two cannot drift". They HAD
+            // drifted — harmlessly, only because no importer ever set
+            // `arraySizeValue` — and #3183 is what makes the difference
+            // observable. A size that is neither an AST expression nor a folded
+            // value still falls to the placeholder, which is what keeps an
+            // unfoldable size failing loudly rather than silently.
+            if (!rt->arrayElement) return i32();
+            if (!rt->arraySize && rt->arraySizeValue < 0) return i32();
             llvm::Type* elem = lowerTypeRef(rt->arrayElement);
             // fix #2936: decode the lexeme with the ONE literal parser. This
             // was `std::stoull(text)` — base 10 — so `[0x5]int` became a

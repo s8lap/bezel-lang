@@ -1,6 +1,7 @@
 #include "module/ModuleLoader.hpp"
 
 #include <algorithm>
+#include <cstdlib>   // std::strtoll (fix #3183)
 #include <memory>
 #include <string>
 #include <string_view>
@@ -221,15 +222,43 @@ struct Loader {
                     ref->genericArgs.push_back(convert(ga));
                 break;
             }
-            case TypeKind::InlineArray:
+            case TypeKind::InlineArray: {
                 ref->kind = sema::TypeRef::Kind::InlineArray;
                 ref->arrayOwned = mt.arrayOwned;
                 if (!mt.children.empty())
                     ref->arrayElement = convert(mt.children.front());
-                // arraySize (a const expr) is not reconstructed — see the .hpp
-                // deferred note; an imported inline-array field/return is a
-                // declaration the importer can name but not yet lower.
+                // fix #3183 (§15.1 / §2.8.3 rule 4, v0.254): restore N.
+                //
+                // This used to read "arraySize (a const expr) is not
+                // reconstructed … an imported inline-array field/return is a
+                // declaration the importer can name but not yet lower" — and
+                // "not yet lower" was the optimistic reading: `lowerTypeRef`
+                // did not refuse, it returned a bare `i32` PLACEHOLDER, so an
+                // imported `[3]int` component was laid out in 4 bytes against
+                // the exporter's 12 and constructing the type was a measured
+                // stack-buffer-overflow (see the builder's comment).
+                //
+                // `ModuleMetadataBuilder` now writes the FOLDED size as
+                // decimal, so nothing is re-evaluated here: no const-expr
+                // evaluator, no importer-side scope, no identifiers. Only a
+                // well-formed positive decimal is accepted; anything else
+                // (including the empty string an OLD artifact carries, and the
+                // deliberate omission for a size the exporter could not fold)
+                // leaves `arraySizeValue` at -1, which is the condition
+                // `sema::serializationComponentTypeIsEmittable` and
+                // `Emitter::lowerTypeRef` both key on to fail LOUDLY.
+                if (!mt.arraySize.empty()) {
+                    const std::string& s = mt.arraySize;
+                    bool allDigits = true;
+                    for (char c : s)
+                        if (c < '0' || c > '9') { allDigits = false; break; }
+                    if (allDigits && s.size() <= 18) {
+                        long long n = std::strtoll(s.c_str(), nullptr, 10);
+                        if (n > 0) ref->arraySizeValue = n;
+                    }
+                }
                 break;
+            }
             case TypeKind::Function: {
                 ref->kind = sema::TypeRef::Kind::Function;
                 ref->funcReturnOwned = mt.funcReturnOwned;

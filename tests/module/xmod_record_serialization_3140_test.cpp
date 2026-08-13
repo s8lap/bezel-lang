@@ -685,22 +685,39 @@ BEZEL_TEST(xmod_record_serialization_3140,
 // the build instead of rediscovering this.
 // ===========================================================================
 
-// T12 — an imported record with a `[3]int` component: REJECTED, not written at
-// a different width. // per §9.8 (inline-array component) / §15.1
+// T12 — an imported record with a `[3]int` component ROUND-TRIPS, at the SAME
+// WIDTH as its local twin.
+//
+// fix #3183 (§15.1 / §2.8.3 rule 4, v0.254) carries the folded size, so this
+// row flips from "rejected, not miswritten" to a value-and-width assertion —
+// which is what T13's own comment prescribed ("if a later change opens the
+// imported path without fixing the carriage, T12 goes red while this stays
+// green"). Both are green now, and the width is asserted on BOTH sides: 50
+// bytes here, 50 in T13, against the 22 the imported path measured before the
+// carriage. Equal values with unequal bytes is exactly what a round-trip on its
+// own cannot see, which is why the count is still checked explicitly.
+// // per §9.8 (inline-array component) / §15.1 / §2.8.3 rule 4
 BEZEL_TEST(xmod_record_serialization_3140,
-           imported_inline_array_component_is_rejected_not_miswritten) {
+           imported_inline_array_component_round_trips_at_the_local_width) {
     int r = compileImportAndRunF2(
         kDepF2,
         "module AppF2k_3140; import DepF2_3140; import System.Serialization; "
         "public class ProgF2 public static method Main(): int "
-        "  var a: [3]int := [0, 0, 0]; "
-        "  var v := new InlineArrF2(a, 0); "
+        "  var a: [3]int := [7, 8, 9]; "
+        "  var v := new InlineArrF2(a, 5); "
         "  using var s := new BinarySerializer(); "
         "  v.Serialize(s); "
-        "  return 0; "
+        "  using var b := s.ToBytes(); "
+        "  if b.Count <> 50 then return 1; end if; "   // T13's local width
+        "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
+        "  var v2 := InlineArrF2.Deserialize(d); "
+        "  if v2.N <> 5 then return 2; end if; "
+        "  if v2.A[0] <> 7 then return 3; end if; "
+        "  if v2.A[2] <> 9 then return 4; end if; "
+        "  return 50; "
         "end Main; end ProgF2;");
     if (r == -2) return;
-    BEZEL_EXPECT_EQ(r, kImporterRejected);
+    BEZEL_EXPECT_EQ(r, 50);
 }
 
 // T13 — ★ THE OVER-REJECTION CONTROL, and the WIRE-WIDTH pin. The same
@@ -738,17 +755,35 @@ BEZEL_TEST(xmod_record_serialization_3140,
 // component must therefore be rejected at ITS declaration.
 // // per §9.8 ("every serialized component is itself serialization-eligible")
 BEZEL_TEST(xmod_record_serialization_3140,
-           local_record_over_imported_record_with_inline_array_is_rejected) {
+           local_record_over_imported_record_with_inline_array_round_trips) {
+    // fix #3183: the nested component is emittable now, so the recursion
+    // ADMITS it. Kept as a recursion test rather than deleted — it is the only
+    // row that reaches an imported nested record through a LOCAL conformance
+    // site — and upgraded from "does it reject" to a round-trip THROUGH the
+    // nested value, so it still fails loudly if the recursion ever starts
+    // trusting a component the emitter cannot write.
     int r = compileImportAndRunF2(
         kDepF2,
         "module AppF2l_3140; import DepF2_3140; import System.Serialization; "
         "public record OuterF2(P: InlineArrF2, N: int)"
         ": ISerializable, IDeserializable end OuterF2; "
         "public class ProgF2 public static method Main(): int "
-        "  return 0; "
+        "  var a: [3]int := [7, 8, 9]; "
+        "  var inner := new InlineArrF2(a, 5); "
+        "  var o := new OuterF2(inner, 11); "
+        "  using var s := new BinarySerializer(); "
+        "  o.Serialize(s); "
+        "  using var b := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
+        "  var o2 := OuterF2.Deserialize(d); "
+        "  if o2.N <> 11 then return 1; end if; "
+        "  if o2.P.N <> 5 then return 2; end if; "
+        "  if o2.P.A[0] <> 7 then return 3; end if; "
+        "  if o2.P.A[2] <> 9 then return 4; end if; "
+        "  return 42; "
         "end Main; end ProgF2;");
     if (r == -2) return;
-    BEZEL_EXPECT_EQ(r, kImporterRejected);
+    BEZEL_EXPECT_EQ(r, 42);
 }
 
 // T15 — ★ OVER-REJECTION CONTROL for the `serialized skip` carve-out. §9.8 puts
@@ -758,38 +793,48 @@ BEZEL_TEST(xmod_record_serialization_3140,
 // rejecting every inline array everywhere. // per §9.8 (`serialized skip`)
 BEZEL_TEST(xmod_record_serialization_3140,
            imported_record_with_skipped_inline_array_still_round_trips) {
-    // ⚠ NARROWED 2026-08-13 after the ASan oracle caught this arm's original
-    // form. It CONSTRUCTED the imported record — `new InlineSkipF2(a, 5)` — and
-    // that construction is a **stack-buffer-overflow** today:
+    // ⚠ HISTORY, kept because it is the reason this row has the shape it has.
+    // On 2026-08-13 this arm was NARROWED to stop constructing the value, after
+    // the ASan oracle caught its original form: `new InlineSkipF2(a, 5)` was a
+    // **stack-buffer-overflow**,
     //
     //   WRITE of size 12 at ... offset 43 in frame #0 main
     //     This frame has 1 object(s):
     //       [32, 40) '' <== Memory access at offset 43 overflows this variable
     //
-    // An 8-byte slot taking a 12-byte write. The importer sizes the local from
-    // the placeholder layout (`i32` + `int`) because `ModuleMetadataBuilder`
-    // never sends `MetaType::arraySize`, while the constructor stores the real
-    // `[3]int` + `int`. That is #3183 — a LAYOUT defect, entirely independent of
-    // the §9.8 wire question this file is about. `serialized skip` correctly
-    // keeps the component off the wire; it says nothing about the struct.
-    //
-    // The plain oracle passes it (the overflowing write lands in stack nothing
-    // reads afterwards), so only `BEZEL_AOT_FORCE_SANITIZE=address` sees it —
+    // an 8-byte slot taking a 12-byte write. The importer sized the local from
+    // the PLACEHOLDER layout (`i32` + `int`) because `ModuleMetadataBuilder`
+    // never sent `MetaType::arraySize`, while the constructor stored the real
+    // `[3]int` + `int`. That was #3183 — a LAYOUT defect, entirely independent
+    // of the §9.8 wire question this file is about: `serialized skip` correctly
+    // keeps the component off the WIRE and says nothing about the STRUCT. The
+    // plain oracle passed it (the overflowing write landed in stack nothing
+    // read afterwards), so only `BEZEL_AOT_FORCE_SANITIZE=address` saw it —
     // #2633's point that the two oracles are different rather than ordered.
     //
-    // So this arm now pins what #3140 actually owns: that a `serialized skip`
-    // inline-array component does NOT make the record ineligible, i.e. the
-    // eligibility gate this family added is not over-broad. It deliberately
-    // stops short of constructing the value. The round-trip half returns when
-    // #3183 lands — and this comment is the instruction to restore it.
-    // The importer IMPORTS the record (so the eligibility gate runs over its
-    // declaration) but never CONSTRUCTS it, which is what steps around #3183.
-    // If the gate this family added were over-broad, the importer would fail to
-    // compile and this returns -1 rather than 66.
+    // fix #3183 (§15.1 / §2.8.3 rule 4, v0.254) carries the folded size, so the
+    // construction is sound and the ROUND-TRIP HALF IS RESTORED, as the
+    // narrowing comment instructed. The row's own subject is unchanged: a
+    // `serialized skip` inline-array component must not make the record
+    // ineligible (the eligibility gate must not be over-broad). It now proves
+    // that by exercising the record rather than by merely importing it —
+    // `A` stays off the wire (the value read back is the §7.9 default, not 7)
+    // while `N` crosses.
     int r = compileImportAndRunF2(
         kDepF2,
-        "module AppF2m_3140; import DepF2_3140; "
+        "module AppF2m_3140; import DepF2_3140; import System.Serialization; "
         "public class ProgF2 public static method Main(): int "
+        "  var a: [3]int := [7, 8, 9]; "
+        "  var v := new InlineSkipF2(a, 5); "
+        "  if v.A[0] <> 7 then return 1; end if; "     // constructed correctly
+        "  if v.A[2] <> 9 then return 2; end if; "
+        "  using var s := new BinarySerializer(); "
+        "  v.Serialize(s); "
+        "  using var b := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
+        "  var v2 := InlineSkipF2.Deserialize(d); "
+        "  if v2.N <> 5 then return 3; end if; "       // the on-wire component
+        "  if v2.A[0] <> 0 then return 4; end if; "    // `skip`: NOT on the wire
         "  return 66; "
         "end Main; end ProgF2;");
     if (r == -2) return;

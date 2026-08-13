@@ -162,14 +162,53 @@ MetaType convertType(const sema::TypeRef* ref) {
                 t.genericArgs.push_back(convertType(arg));
             return t;
         case sema::TypeRef::Kind::InlineArray:
-            // §15: [N]T / [N owned]T. The size is a compile-time constant
-            // expression; the schema carries it textually (the loader
-            // re-evaluates it). We leave it empty here — the const-expr
-            // evaluator is sema-internal and not threaded to the builder — and
-            // record only the element + ownership, which is the type-level shape
-            // a downstream importer needs.
+            // §15: [N]T / [N owned]T.
+            //
+            // fix #3183 (§15.1 / §2.8.3 rule 4, v0.254): carry N. This arm used
+            // to leave `arraySize` empty — "the const-expr evaluator is
+            // sema-internal and not threaded to the builder" — recording only
+            // the element and ownership. It does not need to be threaded:
+            // `TypeResolution` has ALREADY folded every foldable size onto
+            // `TypeRef::arraySizeValue` (#734, TypeResolution_Names.cpp), so the
+            // number is sitting on the very TypeRef this function is converting.
+            //
+            // WHAT THE OMISSION COST. `Emitter::lowerTypeRef` falls back to a
+            // bare `i32` for a size it cannot see, so an importer laid out an
+            // imported `[3]int` field in FOUR bytes where the exporter laid out
+            // twelve. Measured under `--sanitize=address` on a real two-module
+            // build of `record InlineArr(A: [3]int, N: int)`:
+            //
+            //   AddressSanitizer: stack-buffer-overflow
+            //   WRITE of size 12 at 0x... — 8-byte object at [128, 136)
+            //
+            // i.e. constructing the imported record overruns its own storage.
+            // §2.8.3 rule 4 requires one runtime type identity for a type across
+            // the boundary, and a 4-vs-12-byte component is not one.
+            //
+            // The size is TEXTUAL on the wire by schema (`MetaType::arraySize`
+            // is a `std::string`), and this writes the folded DECIMAL rather
+            // than the source lexeme deliberately: the lexeme would make the
+            // loader re-run a const-expr evaluator over identifiers that mean
+            // nothing in the importer's scope (`[Limits.Max]int`), which is the
+            // very coupling the original comment declined. A decimal is closed.
+            //
+            // An UNFOLDABLE size stays uncarried (`arraySizeValue < 0`), so the
+            // shape that cannot be lowered keeps failing loudly rather than
+            // acquiring a wrong number — `sema::serializationComponentType-
+            // IsEmittable` and `lowerTypeRef` both key on exactly this
+            // condition.
+            //
+            // Not a schema change: the field is emitted (`emitString`) and
+            // parsed unconditionally today and already folds into
+            // `semanticHash` (ModuleMetadata.cpp:114), so emission and the hash
+            // fold move together by construction. Populating it DOES change the
+            // hash for any module with an inline array — intended, the size is
+            // part of the type's identity — so dependants must be rebuilt
+            // (#3198 is the missing enforcement of that).
             t.kind = TypeKind::InlineArray;
             t.arrayOwned = ref->arrayOwned;
+            if (ref->arraySizeValue >= 0)
+                t.arraySize = std::to_string(ref->arraySizeValue);
             t.children.push_back(convertType(ref->arrayElement));
             return t;
         case sema::TypeRef::Kind::Function:
