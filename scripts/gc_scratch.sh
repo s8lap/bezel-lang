@@ -141,21 +141,51 @@ if [ "$DO_BUILDS" = 1 ]; then
     mountpoint -q "$(dirname "$LB_ROOT")" 2>/dev/null || LB_MOUNT_OK=0
   fi
   if [ -d "$LB_ROOT" ] && [ "$LB_MOUNT_OK" = 1 ]; then
-    live_wts="$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null \
-                  | awk '/^worktree /{n=split($2,p,"/"); print p[n]}')"
+    # fix #3213: lane_setup.sh now names the tree `<basename>-<8-hex path
+    # digest>`, because two worktrees sharing a basename used to share ONE build
+    # tree and clobber each other's binaries mid-run. Match BOTH spellings: the
+    # digest form for anything created since, and the bare basename so trees
+    # predating the change are still recognised as live rather than reaped out
+    # from under a running lane. Computed in bash, not inside awk — the awk form
+    # needs four levels of nested quoting to shell out for cksum, which is a
+    # cost with no benefit here.
+    live_wts=""
+    while read -r _wtpath; do
+      [ -n "$_wtpath" ] || continue
+      _b="$(basename "$_wtpath")"
+      _dg="$(printf '%s' "$_wtpath" | cksum | awk '{printf "%08x", $1}')"
+      live_wts="$live_wts$_b
+$_b-$_dg
+"
+    done <<EOF_WTS
+$(git -C "$REPO_ROOT" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print $2}')
+EOF_WTS
     for d in "$LB_ROOT"/*; do
       [ -d "$d" ] || continue
       base="$(basename "$d")"
       # (1) still a registered worktree?
       if printf '%s\n' "$live_wts" | grep -qxF "$base"; then continue; fi
       # (1b) the backref lane_setup.sh writes, if present, is authoritative
-      if [ -r "$d/.lane-worktree" ] && [ -d "$(cat "$d/.lane-worktree" 2>/dev/null)" ]; then continue; fi
+      _owner="$(cat "$d/.lane-worktree" 2>/dev/null || true)"
+      if [ -n "$_owner" ] && [ -d "$_owner" ]; then continue; fi
+      # A backref naming a directory that NO LONGER EXISTS is positive evidence
+      # of an orphan, not merely absence of evidence — so the 24h floor below,
+      # which exists to protect a tree whose worktree is still being set up,
+      # does not apply. Measured 2026-08-14: six such trees held 18.7 GB while
+      # /mnt/fast sat at 95%, all under the floor and therefore un-reapable, and
+      # had to be cleared by hand. A lane that runs out of disk mid-build fails
+      # in ways that look like a compiler error, so this is a correctness lever
+      # and not only a housekeeping one.
+      _proven_orphan=0
+      [ -n "$_owner" ] && [ ! -d "$_owner" ] && _proven_orphan=1
       # (2) any live process working inside it?
       if ls -l /proc/*/cwd 2>/dev/null | grep -qF -- "$d"; then
         tag "KEEP (live process cwd inside): $d"; continue
       fi
-      # (3) age floor
-      if [ -n "$(find "$d" -maxdepth 0 -mmin "-$LB_AGE_MIN" 2>/dev/null)" ]; then continue; fi
+      # (3) age floor — shortened when (1b) PROVED the owner is gone
+      _floor="$LB_AGE_MIN"
+      [ "$_proven_orphan" = 1 ] && _floor="${BEZEL_LANE_BUILD_ORPHAN_AGE_MIN:-120}"
+      if [ -n "$(find "$d" -maxdepth 0 -mmin "-$_floor" 2>/dev/null)" ]; then continue; fi
       # (4) shaped like a build tree?
       if [ ! -e "$d/CMakeCache.txt" ]; then
         tag "KEEP (not a configured build tree — refusing to guess): $d"; continue

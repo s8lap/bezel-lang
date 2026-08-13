@@ -19,7 +19,22 @@ FAST_ROOT="${BEZEL_LANE_BUILD_ROOT:-/mnt/fast/lane-builds}"
 # Resolve the worktree root from git, not $PWD, so it works from a subdir.
 WT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "[lane_setup] not inside a git worktree — skipping (build stays local)"; exit 0; }
-NAME="$(basename "$WT")"
+# fix #3213: KEY THE BUILD DIR ON THE FULL PATH, NOT THE BASENAME.
+#
+# This was `NAME="$(basename "$WT")"`. Two worktrees whose directories share a
+# basename — trivially easy, since throwaway review worktrees get names like
+# `lane`, `wt`, `tmp` — then symlink build/ to the SAME /mnt/fast tree and
+# silently share it. Measured 2026-08-14: two live worktrees both named `lane`
+# shared one build tree, and one agent's `agent_check.sh` removed the other's
+# test binaries mid-run, producing an `env: … No such file or directory`
+# failure that looks exactly like a broken test. A shared build tree between
+# two agents is a correctness hazard, not just a slowdown: each reconfigure
+# and each stale-binary removal is invisible cross-talk.
+#
+# The basename stays as a readable prefix so `ls /mnt/fast/lane-builds` is
+# still navigable; an 8-hex digest of the ABSOLUTE path makes it unique.
+_wt_digest="$(printf '%s' "$WT" | cksum | awk '{printf "%08x", $1}')"
+NAME="$(basename "$WT")-$_wt_digest"
 
 # fix #3008: GUARD ON THE MOUNT, NOT ON THE DIRECTORY.
 #
@@ -46,6 +61,24 @@ if [ ! -d "$FAST_ROOT" ]; then
 fi
 
 TARGET="$FAST_ROOT/$NAME"
+
+# fix #3213 (migration): a worktree set up before the digest existed has a warm
+# tree at the OLD basename-only path. Adopt it by rename rather than orphaning a
+# multi-GB configured build tree and rebuilding from cold — but ONLY when its
+# backref names THIS worktree. A basename-only directory whose backref names
+# someone else (or that has no backref at all) is exactly the collision this fix
+# is about, so it is left alone for the reaper instead of being claimed.
+_legacy="$FAST_ROOT/$(basename "$WT")"
+if [ "$_legacy" != "$TARGET" ] && [ -d "$_legacy" ] && [ ! -d "$TARGET" ]; then
+  if [ -r "$_legacy/.lane-worktree" ] && \
+     [ "$(cat "$_legacy/.lane-worktree" 2>/dev/null)" = "$WT" ]; then
+    if mv "$_legacy" "$TARGET" 2>/dev/null; then
+      echo "[lane_setup] adopted legacy build tree $_legacy -> $TARGET"
+    fi
+  else
+    echo "[lane_setup] $_legacy exists but is not ours (no matching backref) — not adopting"
+  fi
+fi
 
 if [ -L "$WT/build" ]; then
   # fix #3005: REPAIR A DANGLING LINK — this early return used to refuse to fix
