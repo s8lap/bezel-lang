@@ -5820,10 +5820,25 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     lsym->name = id->name;
                     lsym->decl = id;
                     // Infer type from the callee's `out owned T` parameter.
-                    if (calleeMd2 && pos2 < calleeMd2->params.size() &&
-                        calleeMd2->params[pos2].type) {
-                        lsym->declType = ctx_.resolvedType(
-                            *calleeMd2->params[pos2].type);
+                    //
+                    // fix #3186 (§22.4 / §2.5, v0.254): through
+                    // `formalOutParamType2`, the both-sources accessor #2657
+                    // already added ~140 lines above for the PLAIN `out var`
+                    // twin. This copy was never migrated, so it stayed
+                    // `calleeMd2`-only — null for every non-generic imported
+                    // method — and an `out owned var` recipient of an imported
+                    // callee got NO declType at all. Measured consequences, all
+                    // from that one null: `made.Nope` on a member that does not
+                    // exist drew no §11.3/§12.1 diagnostic (the single-module
+                    // twin says `no member Nope on type ResOo5`); `made.V` read
+                    // back 0 where the twin reads 9, behind an `internal:`
+                    // #2491/#2434 note; and codegen could lower no disposal of
+                    // it, leaking 16 bytes per call under LSan against a clean
+                    // twin. It also BLOCKED the `out owned` half of #3176: with
+                    // the recipient untyped, arming the §28.3 obligation freed
+                    // nothing and added a false reject.
+                    if (TypeRef* formalTy2 = formalOutParamType2(pos2)) {
+                        lsym->declType = formalTy2;
                         // §22.4 / §7.9 (#1597): keep the `out owned T?`
                         // parameter's declared nullability — mirrors the
                         // plain `out var` fix just above (same reasoning: the
