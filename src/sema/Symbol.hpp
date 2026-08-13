@@ -391,6 +391,13 @@ struct EnumConstantSymbol : MemberSymbol {
     // codegen still derives values from the AST in computeEnumValues(); this
     // field is the cross-module carrier. Defaults to 0 when not set.
     std::int64_t value = 0;
+    // fix #3140 (§9.8, family F4 of umbrella #3152): the constant's
+    // `serialized "<name>"` RENAME, or empty when it carries no clause — in
+    // which case §9.8's wire name is the declared name. Unlike `value` above
+    // this is populated on BOTH sides (SymbolCollection from the
+    // `ast::EnumConstant`, ModuleLoader from `MetaMember::enumWireName`), so
+    // `enumConstantWireName` (EnumValues.hpp) needs no source switch at all.
+    std::string_view serializedName;
 };
 
 // §35 (v0.200, #2044): a choice case — payload-free (`NotModified`) or

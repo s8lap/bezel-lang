@@ -100,4 +100,36 @@ inline std::optional<bool> enumHasZeroConstant(const TypeSymbol& e) {
     return enumDeclaresValue(e, 0);
 }
 
+// §9.8 (v0.252, fix #3140 — family F4 of umbrella #3152): the string §9.8 puts
+// on the wire for enum constant `c` — its `serialized "<name>"` rename when
+// declared, else its declared name.
+//
+// Unlike `enumDeclaredValues` above this needs no source switch: `serializedName`
+// is populated on BOTH sides (SymbolCollection from the `ast::EnumConstant`,
+// ModuleLoader from `MetaMember::enumWireName`), so there is nothing here that
+// can answer differently for a local and an imported enum. That is the point —
+// the §9.8 emitters previously read the clause off the AST and an imported enum
+// has none, so an imported enum component was written as no bytes at all.
+inline std::string_view enumConstantWireName(const EnumConstantSymbol& c) {
+    return c.serializedName.empty() ? c.name : c.serializedName;
+}
+
+// §9.8 (v0.252, fix #3140): an enum's constants in DECLARATION order, each with
+// its §9.8 wire name — the list the synthesized Serialize/Deserialize walk.
+//
+// Declaration order is the member order on the TypeSymbol, which both sides
+// build in source order (SymbolCollection walks `td.enumConstants`;
+// ModuleMetadataBuilder::appendEnumConstants writes them in the same order and
+// ModuleLoader reconstructs them in the order it reads them). §10.2's
+// shared-value rule wants the FIRST-declared name for a duplicated value, which
+// a first-match chain over this order delivers.
+inline std::vector<std::pair<const EnumConstantSymbol*, std::string_view>>
+enumConstantWireNames(const TypeSymbol& e) {
+    std::vector<std::pair<const EnumConstantSymbol*, std::string_view>> out;
+    for (const Symbol* m : e.members)
+        if (auto* ec = dynamic_cast<const EnumConstantSymbol*>(m))
+            out.emplace_back(ec, enumConstantWireName(*ec));
+    return out;
+}
+
 }  // namespace bezel::sema

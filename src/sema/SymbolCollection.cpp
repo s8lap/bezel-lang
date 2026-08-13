@@ -336,6 +336,11 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
         // back to the enclosing TypeDecl's location only when unpopulated.
         esym->declLoc = (ec.loc.line != 0) ? ec.loc : sym->declLoc;
         esym->scope = sym->memberScope;
+        // fix #3140 (§9.8): the `serialized "<name>"` rename, on the SYMBOL so
+        // the §9.8 emitters read one field for a local and an imported enum
+        // alike (the imported half is ModuleLoader's MetaMember::enumWireName).
+        if (ec.serialized && !ec.serialized->name.empty())
+            esym->serializedName = ec.serialized->name;
         sym->members.push_back(esym);
     }
     // §35 (v0.200, #2044): choice cases live alongside members, like enum

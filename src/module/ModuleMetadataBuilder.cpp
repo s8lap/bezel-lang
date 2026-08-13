@@ -1265,6 +1265,13 @@ void appendEnumConstants(const ast::TypeDecl& td, MetaTypeDecl& out) {
         }
         m.hasEnumValue = known;
         m.enumValue = value;
+        // fix #3140 (§9.8, family F4 of umbrella #3152): the constant's
+        // `serialized "<name>"` rename — the string §9.8 puts on the wire. The
+        // VALUE has crossed since #328; the wire NAME had no channel at all, so
+        // `emitEnumSerialize` read it off the `ast::EnumConstant` and an
+        // imported enum (which has no AST) serialized to nothing.
+        if (ec.serialized && !ec.serialized->name.empty())
+            m.enumWireName = std::string(ec.serialized->name);
         out.members.push_back(std::move(m));
     }
 }

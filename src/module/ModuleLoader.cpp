@@ -484,6 +484,16 @@ struct Loader {
                 // when it could not (a non-literal const-expr initializer) the
                 // value stays 0, matching the metadata's default.
                 if (mm.hasEnumValue) e->value = mm.enumValue;
+                // fix #3140 (§9.8, family F4 of umbrella #3152): the §9.8 wire
+                // NAME. The VALUE above has crossed since #328, but the wire
+                // name had no channel at all, so `emitEnumSerialize` read it
+                // off the `ast::EnumConstant` — which an imported enum does not
+                // have — and an imported enum component serialized to NOTHING.
+                // Empty when the constant carries no `serialized` clause (and
+                // for a pre-#3140 dependency blob), which is exactly §9.8's
+                // "the wire name is the declared name".
+                if (!mm.enumWireName.empty())
+                    e->serializedName = ctx.internString(mm.enumWireName);
                 applyBehavior(e);
                 return e;
             }

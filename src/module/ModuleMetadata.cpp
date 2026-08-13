@@ -196,6 +196,11 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     hashBool(h, m.returnOwned);
     hashBool(h, m.hasEnumValue);
     hashU64(h, static_cast<std::uint64_t>(m.enumValue));
+    // fix #3140 (§9.8 / §2.8.3 rule 3): an enum constant's serialized wire name
+    // is part of its cross-module contract — renaming it changes the bytes
+    // every consumer reads and writes — so it must fold into the semantic hash
+    // or a consumer's staleness check cannot see the change.
+    hashStr(h, m.enumWireName);
     hashStr(h, m.valueText);  // §22.12 const value (issue #328 FINDING [3] BUG A)
     // §14 / #662c (schema v5): ctor body source text for generic classes.
     hashStr(h, m.ctorBodyText);
@@ -339,7 +344,8 @@ MetaMember::MetaMember(const MetaMember& o)
       contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
-      hasEnumValue(o.hasEnumValue), enumValue(o.enumValue) {
+      hasEnumValue(o.hasEnumValue), enumValue(o.enumValue),
+      enumWireName(o.enumWireName) {
     if (o.nestedType)
         nestedType = std::make_unique<MetaTypeDecl>(*o.nestedType);
 }
@@ -359,6 +365,7 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
         hasEnumValue = o.hasEnumValue; enumValue = o.enumValue;
+        enumWireName = o.enumWireName;
         nestedType = o.nestedType
             ? std::make_unique<MetaTypeDecl>(*o.nestedType)
             : nullptr;
@@ -404,6 +411,9 @@ bool MetaMember::operator==(const MetaMember& o) const {
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
+           // fix #3140 (§9.8 / §2.8.3 rule 3): the serialized wire name is part
+           // of an EnumConstant's identity — see the hashMember comment above.
+           enumWireName == o.enumWireName &&
            valueText == o.valueText && ctorBodyText == o.ctorBodyText &&
            methodBodyText == o.methodBodyText &&
            fieldInitText == o.fieldInitText &&
@@ -630,6 +640,13 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // byte-identical metadata to before this fix.
     if (m.kind == MetaMemberKind::Field && !m.fieldInitText.empty())
         emitString(w, m.fieldInitText);
+    // fix #3140 (§9.8 / §10, schema v7 additive): for an EnumConstant member
+    // carrying a `serialized "<name>"` rename, a second trailing REC_STRING
+    // holds the wire name. Emitted ONLY when non-empty, exactly as
+    // methodBodyText/fieldInitText are — a module whose enums use no
+    // `serialized` clause produces byte-identical metadata to before this fix.
+    if (m.kind == MetaMemberKind::EnumConstant && !m.enumWireName.empty())
+        emitString(w, m.enumWireName);
     // §11.3 (schema v4, issue #502): when kind == NestedType, emit the nested
     // type's full declaration as an embedded TYPE_BLOCK. The trailing
     // finishBlockImpl in readMemberBody skips it for v3 readers (they never
@@ -1219,6 +1236,14 @@ bool readMemberBody(Reader& r, MetaMember& m) {
         // present) is the static field's initializer EXPRESSION source text.
         else if (m.kind == MetaMemberKind::Field)
             caps[1] = &m.fieldInitText;
+        // fix #3140 (§9.8 / §10): an EnumConstant member's second trailing
+        // REC_STRING (when present) is its `serialized "<name>"` wire rename.
+        // Absent for a constant with no clause and for any pre-#3140 blob, in
+        // which case enumWireName stays empty and the DECLARED name is the wire
+        // name — which is exactly §9.8's rule for an unrenamed constant, so a
+        // stale dependency degrades to the correct answer rather than a guess.
+        else if (m.kind == MetaMemberKind::EnumConstant)
+            caps[1] = &m.enumWireName;
         int capIdx = 0;
         while (true) {
             unsigned id = 0;

@@ -675,6 +675,22 @@ struct MetaMember {
     bool hasEnumValue = false;
     std::int64_t enumValue = 0;
 
+    // fix #3140 (§9.8 / §10, family F4 of umbrella #3152; schema v7 additive):
+    // an enum constant's `serialized "<name>"` RENAME — the string §9.8 writes
+    // on the wire for this constant, when it differs from the declared name.
+    // Empty when the constant carries no `serialized` clause (the overwhelming
+    // majority), so the emitted bytes are unchanged for every module that does
+    // not use the clause.
+    //
+    // The constant's VALUE has crossed since #328; only the wire NAME had no
+    // channel, and `emitEnumSerialize` / `emitEnumDeserialize` read it off the
+    // `ast::EnumConstant` — which an imported enum does not have. Carried as
+    // the SECOND trailing REC_STRING of an EnumConstant member, the same
+    // additive slot Constructor/Method/Field already use for their body texts;
+    // a reader predating this field stops at the first trailing string and
+    // skips the rest of the block, so no schema bump is needed.
+    std::string enumWireName;
+
     // NestedType (§11.3, issue #502): when kind == NestedType, this holds
     // the complete MetaTypeDecl for the nested type. Heap-allocated via
     // unique_ptr to break the cyclic MetaMember → MetaTypeDecl → MetaMember

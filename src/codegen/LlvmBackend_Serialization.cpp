@@ -15,6 +15,7 @@
 #include "codegen/LlvmBackend_impl.hpp"
 
 #include "ast/Node.hpp"
+#include "sema/EnumValues.hpp"  // fix #3140: enumConstantWireNames — §9.8
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 
@@ -81,13 +82,10 @@ static bool positionalFieldIsSkip(const ast::Param& pf) {
     return pf.serialized && pf.serialized->isSkip;
 }
 
-// Return the wire name for an enum constant.  May be overridden via
-// `serialized "..."` on the EnumConstant node.
-static std::string_view enumConstWireName(const ast::EnumConstant& ec) {
-    if (ec.serialized && !ec.serialized->name.empty())
-        return ec.serialized->name;
-    return ec.name;
-}
+// fix #3140: the wire name for an enum constant used to be read here off the
+// `ast::EnumConstant` node, which an IMPORTED enum does not have. It is now
+// `sema::enumConstantWireName` (sema/EnumValues.hpp), reading a symbol field
+// both SymbolCollection and ModuleLoader populate.
 
 // §9.8 choice serialization (v0.200): the `$case` discriminator value written for
 // a choice case — the case's `serialized "<name>"` rename if present, else its
@@ -727,12 +725,27 @@ void Emitter::emitSerializeField(llvm::Value* val,
 // encoded name matching no declared member) is untouched — that fault is about
 // the *input*, not about a value of the enum type.
 // ---------------------------------------------------------------------------
+// fix #3140 (§9.8 / §2.8.3 rule 4, v0.252; family F4 of umbrella #3152): this
+// used to bail out on `!ts->decl` and then iterate the `ast::TypeDecl`'s
+// `enumConstants` for the wire name. `ModuleLoader` never assigns
+// `Symbol::decl` for an imported type, so for an IMPORTED enum the function
+// returned immediately and wrote NOTHING — no bytes, no diagnostic.
+//
+// MEASURED on 558c27c with a real two-module build: a LOCAL
+// `record Holder(C: ColorE, N: int): ISerializable, IDeserializable` whose `C`
+// component is an IMPORTED enum round-tripped `ColorE.Green` back as the wrong
+// value (the program exited 2, its "C did not round-trip" code), while the
+// identical declarations compiled as ONE module round-tripped and exited 0.
+// Silent wrong DATA, which is the worst-shaped failure mode in the audit.
+//
+// Both facts now come off the symbol: the VALUE from `enumValue_` (which
+// computeEnumValues fills for local and imported enums alike, #328), and the
+// wire NAME from `sema::enumConstantWireNames` — a channel the artifact did not
+// carry at all before this fix (`MetaMember::enumWireName`).
 void Emitter::emitEnumSerialize(const TypeSymbol* ts,
                                 llvm::Value* enumVal,
                                 llvm::Value* serPtr) {
-    if (!ts || !ts->decl) return;
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-    if (!td) return;
+    if (!ts) return;
     llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
 
     // §10.3 (#740): compare at the enum's underlying width — truncating a
@@ -749,17 +762,10 @@ void Emitter::emitEnumSerialize(const TypeSymbol* ts,
     // enumValue_ (computeEnumValues()) covers local and imported enums alike;
     // §10.3 (#740) keeps the full 64-bit value (a `: long` member exceeds i32).
     std::vector<std::pair<std::string, std::int64_t>> entries;
-    for (const auto& ec : td->enumConstants) {
-        for (const Symbol* m : ts->members) {
-            if (m->name != ec.name) continue;
-            if (dynamic_cast<const EnumConstantSymbol*>(m)) {
-                auto it = enumValue_.find(m);
-                if (it != enumValue_.end())
-                    entries.emplace_back(std::string(enumConstWireName(ec)),
-                                         it->second);
-            }
-            break;
-        }
+    for (const auto& [ec, wireName] : sema::enumConstantWireNames(*ts)) {
+        auto it = enumValue_.find(ec);
+        if (it != enumValue_.end())
+            entries.emplace_back(std::string(wireName), it->second);
     }
     if (entries.empty()) return;  // no declared constants — nothing to write
 
@@ -1687,11 +1693,14 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
 // Reads a string from the deserializer and maps it to a declared enum constant.
 // Returns an i32 value.  Raises SerializationException if no match.
 // ---------------------------------------------------------------------------
+//
+// fix #3140 (§9.8 / §2.8.3 rule 4, v0.252; family F4 of umbrella #3152): the
+// read half of the same defect — for an IMPORTED enum this returned a constant
+// `i32 0` without consuming the wire string at all. See emitEnumSerialize's
+// header for the measurement.
 llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
                                           llvm::Value* derPtr) {
-    if (!ts || !ts->decl) return builder_.getInt32(0);
-    const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-    if (!td) return builder_.getInt32(0);
+    if (!ts) return builder_.getInt32(0);
     llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
 
     // Read the string.
@@ -1710,21 +1719,12 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
     auto* cmpFn = declareC("bz_string_compare", i32(),
                            {ptrTy(), i64(), ptrTy(), i64(), i32()});
 
-    for (const auto& ec : td->enumConstants) {
-        int64_t ordinal = 0;
-        bool found = false;
-        for (const Symbol* m : ts->members) {
-            if (m->name == ec.name) {
-                if (dynamic_cast<const EnumConstantSymbol*>(m)) {
-                    auto it = enumValue_.find(m);
-                    if (it != enumValue_.end()) { ordinal = it->second; found = true; }
-                }
-                break;
-            }
-        }
-        if (!found) continue;
+    for (const auto& [ec, wire] : sema::enumConstantWireNames(*ts)) {
+        auto it = enumValue_.find(ec);
+        if (it == enumValue_.end()) continue;
+        const std::int64_t ordinal = it->second;
 
-        std::string wireName = std::string(enumConstWireName(ec));
+        std::string wireName = std::string(wire);
         llvm::Value* litStr  = lowerStringLiteral(
             std::string("\"") + wireName + "\"", false);
 
