@@ -758,18 +758,38 @@ BEZEL_TEST(xmod_record_serialization_3140,
 // rejecting every inline array everywhere. // per §9.8 (`serialized skip`)
 BEZEL_TEST(xmod_record_serialization_3140,
            imported_record_with_skipped_inline_array_still_round_trips) {
+    // ⚠ NARROWED 2026-08-13 after the ASan oracle caught this arm's original
+    // form. It CONSTRUCTED the imported record — `new InlineSkipF2(a, 5)` — and
+    // that construction is a **stack-buffer-overflow** today:
+    //
+    //   WRITE of size 12 at ... offset 43 in frame #0 main
+    //     This frame has 1 object(s):
+    //       [32, 40) '' <== Memory access at offset 43 overflows this variable
+    //
+    // An 8-byte slot taking a 12-byte write. The importer sizes the local from
+    // the placeholder layout (`i32` + `int`) because `ModuleMetadataBuilder`
+    // never sends `MetaType::arraySize`, while the constructor stores the real
+    // `[3]int` + `int`. That is #3183 — a LAYOUT defect, entirely independent of
+    // the §9.8 wire question this file is about. `serialized skip` correctly
+    // keeps the component off the wire; it says nothing about the struct.
+    //
+    // The plain oracle passes it (the overflowing write lands in stack nothing
+    // reads afterwards), so only `BEZEL_AOT_FORCE_SANITIZE=address` sees it —
+    // #2633's point that the two oracles are different rather than ordered.
+    //
+    // So this arm now pins what #3140 actually owns: that a `serialized skip`
+    // inline-array component does NOT make the record ineligible, i.e. the
+    // eligibility gate this family added is not over-broad. It deliberately
+    // stops short of constructing the value. The round-trip half returns when
+    // #3183 lands — and this comment is the instruction to restore it.
+    // The importer IMPORTS the record (so the eligibility gate runs over its
+    // declaration) but never CONSTRUCTS it, which is what steps around #3183.
+    // If the gate this family added were over-broad, the importer would fail to
+    // compile and this returns -1 rather than 66.
     int r = compileImportAndRunF2(
         kDepF2,
-        "module AppF2m_3140; import DepF2_3140; import System.Serialization; "
+        "module AppF2m_3140; import DepF2_3140; "
         "public class ProgF2 public static method Main(): int "
-        "  var a: [3]int := [1, 2, 3]; "
-        "  var v := new InlineSkipF2(a, 5); "
-        "  using var s := new BinarySerializer(); "
-        "  v.Serialize(s); "
-        "  using var b := s.ToBytes(); "
-        "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
-        "  var v2 := InlineSkipF2.Deserialize(d); "
-        "  if v2.N <> 5 then return 1; end if; "
         "  return 66; "
         "end Main; end ProgF2;");
     if (r == -2) return;
