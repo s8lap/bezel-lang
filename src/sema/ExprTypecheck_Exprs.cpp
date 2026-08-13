@@ -8588,38 +8588,50 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     continue;
                 }
                 // Auto-property: check replacement value type (§5.1, #875).
+                //
+                // fix #3177 (§9.5 / §5.1 / §2.5, v0.254, family M4): the target
+                // type through the ONE both-sources accessor. Reading it off
+                // `ast::PropertyDecl` alone left `fieldTy` null for every
+                // IMPORTED auto-property, so `checkAssignable` was SKIPPED
+                // ENTIRELY and §5.1 went unenforced across the boundary. This
+                // became live when #3152 fixed the storage gate 30 lines above
+                // (`isAutoPropertyStorageSymbol`) — until then the imported
+                // auto-property was rejected as "computed" before reaching
+                // here, which is exactly the LATENT-to-LIVE transition the
+                // audit's Appendix A row for this site predicted.
+                //
+                // MEASURED on ec6a02f (positional twin, same defect):
+                // `r with(A := "oops")` on an imported record compiled clean
+                // and printed `A=4438432|B=0` — a `string` pointer read back as
+                // the `int` component — while the single-module twin was
+                // rejected with the §5.1 diagnostic.
                 if (ia.value) {
                     TypeRef* valTy = ctx_.exprType(*ia.value);
-                    if (auto* pd =
-                            dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
-                        if (pd->type) {
-                            TypeRef* fieldTy = ctx_.resolvedType(*pd->type);
-                            checkAssignable(
-                                valTy, fieldTy, valLoc,
-                                "replacement value for `" +
-                                std::string(ia.name) + "`",
-                                ia.value.get());
-                        }
-                    }
+                    if (const TypeRef* fieldTy = storageComponentType(ps, ctx_))
+                        checkAssignable(
+                            valTy, const_cast<TypeRef*>(fieldTy), valLoc,
+                            "replacement value for `" +
+                            std::string(ia.name) + "`",
+                            ia.value.get());
                 }
                 continue;
             }
             if (auto* fs = dynamic_cast<FieldSymbol*>(mem)) {
                 // Valid field target: check replacement value type (§5.1, #875).
+                //
+                // fix #3177 (§9.5 / §5.1 / §9.1 / §2.5, v0.254, family M4): the
+                // §9.1 positional twin of the auto-property arm above, and it
+                // failed for the SAME reason plus one more — an imported
+                // positional field's `posParam` is non-null with a NULL `type`
+                // (#2516), so neither source answered and `checkAssignable` was
+                // skipped. MEASURED: `new RposP9(1, 2) with(A := "oops")` on an
+                // imported record compiled clean, exit 0, and printed
+                // `A=4438432|B=0`.
                 if (ia.value) {
                     TypeRef* valTy = ctx_.exprType(*ia.value);
-                    TypeRef* fieldTy = nullptr;
-                    if (fs->posParam && fs->posParam->type) {
-                        fieldTy = ctx_.resolvedType(*fs->posParam->type);
-                    } else if (auto* fd =
-                                   dynamic_cast<const ast::FieldDecl*>(
-                                       fs->decl)) {
-                        if (fd->type)
-                            fieldTy = ctx_.resolvedType(*fd->type);
-                    }
-                    if (fieldTy)
+                    if (const TypeRef* fieldTy = storageComponentType(fs, ctx_))
                         checkAssignable(
-                            valTy, fieldTy, valLoc,
+                            valTy, const_cast<TypeRef*>(fieldTy), valLoc,
                             "replacement value for `" +
                             std::string(ia.name) + "`",
                             ia.value.get());
