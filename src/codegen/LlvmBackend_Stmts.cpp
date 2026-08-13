@@ -7123,18 +7123,37 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
         !findMethodByName(ts, "GetEnumerator")) {
         sema::MethodSymbol* uniqueGetEnum = nullptr;
         bool ambiguous = false;
-        for (const auto& sym : ctx_.symbols()) {
-            auto* cand = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-            if (!cand || cand->kind != ast::TypeDeclKind::Class) continue;
+        // fix #3197 / §29.2 / §2.8.2 (v0.254): also walk
+        // `ctx_.importedSymbols()` — a class declared in a separate module
+        // that is imported here was NEVER considered as a candidate
+        // implementer, so the unique-implementer devirtualization below
+        // would conclude "no implementer compiled" and return false (the
+        // NYI fallthrough), instead of devirtualizing to the imported
+        // class and proceeding through the (now-fixed) enumerator-
+        // discovery path. The `ge != nullptr` gate answers correctly for
+        // an imported method because `declareImportedFunctions` populates
+        // an external-linkage stub under `methodFns_[ms]`.
+        auto considerCandidate = [&](const sema::TypeSymbol* cand) {
+            if (!cand || cand->kind != ast::TypeDeclKind::Class) return;
             std::vector<const sema::TypeSymbol*> supers;
             collectTypeAndBases(cand, supers);
             bool implementsIface = false;
             for (auto* s : supers) if (s == ts) { implementsIface = true; break; }
-            if (!implementsIface) continue;
+            if (!implementsIface) return;
             sema::MethodSymbol* ge = findMethodByName(cand, "GetEnumerator");
-            if (!ge) continue;  // abstract implementer with no compiled body
+            if (!ge) return;  // abstract implementer with no compiled body
             if (!uniqueGetEnum) uniqueGetEnum = ge;
-            else if (uniqueGetEnum != ge) { ambiguous = true; break; }
+            else if (uniqueGetEnum != ge) { ambiguous = true; }
+        };
+        for (const auto& sym : ctx_.symbols()) {
+            considerCandidate(dynamic_cast<const sema::TypeSymbol*>(sym.get()));
+            if (ambiguous) break;
+        }
+        if (!ambiguous) {
+            for (const sema::Symbol* sym : ctx_.importedSymbols()) {
+                considerCandidate(dynamic_cast<const sema::TypeSymbol*>(sym));
+                if (ambiguous) break;
+            }
         }
         // #1779 / §21.4 / §29.2: when MULTIPLE classes implement the interface
         // with DISTINCT `GetEnumerator` methods (truly polymorphic), no single
@@ -7173,9 +7192,24 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // the builtin `IEnumerator<T>` (null declaration). We need the concrete
     // class that implements it — search all compiled TypeSymbols for a class
     // whose base types include a name starting with "IEnumerator".
+    //
+    // fix #3197 / §29.1 / §29.2 / §29.11 / §2.8.2 (v0.254): when
+    // `getEnumSym` is an IMPORTED MethodSymbol, `getEnumSym->decl` is null
+    // (`MemberSymbol::decl` is null for imports — the loader does not
+    // re-parse body text for non-generic classes). The loader does record
+    // the return type on the side table (`ctx_.importedReturnType`); reuse
+    // it. Mirrors the parallel change in `wrapUserClassAsIEnumerable`
+    // (LlvmBackend_Assign.cpp), and is the reason the `for var x in
+    // importedColl` direct spelling at the issue's Shape B reaches the
+    // §29.11 enumerator vtable when the cross-module class implements
+    // IEnumerable<T>.
     auto* getEnumDecl = dynamic_cast<const ast::MethodDecl*>(getEnumSym->decl);
-    if (!getEnumDecl || !getEnumDecl->returnType) return false;
-    auto* enumTyRef = ctx_.resolvedType(*getEnumDecl->returnType);
+    sema::TypeRef* enumTyRef = nullptr;
+    if (getEnumDecl && getEnumDecl->returnType) {
+        enumTyRef = ctx_.resolvedType(*getEnumDecl->returnType);
+    } else {
+        enumTyRef = ctx_.importedReturnType(getEnumSym);
+    }
     if (!enumTyRef) return false;
 
     // Try to get the concrete TypeSymbol from the return type's declaration.
@@ -7218,13 +7252,32 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
         if (structurallyIsEnumerator(ts)) {
             enumTs = const_cast<sema::TypeSymbol*>(ts);
         } else {
+            // fix #3197 / §29.1 / §29.11 (v0.254): walk imported symbols too
+            // — the same fix as `wrapUserClassAsIEnumerable`'s
+            // (LlvmBackend_Assign.cpp). `ctx_.symbols()` excludes imported
+            // symbols by construction (`makeImportedSymbol` keeps them
+            // out), so a class declared in a separate module was NEVER
+            // considered as the enumerator class; `enumTs` stayed null and
+            // this handler bailed to the §21.4 NYI. The
+            // `methodFns_.count(ms)` gate above already answers correctly
+            // for an imported method: `declareImportedFunctions` populates
+            // an external-linkage `llvm::Function` for every imported
+            // MethodSymbol under `methodFns_[ms]`.
+            auto scanSymbols = [&](const sema::Symbol* symPtr) -> bool {
+                auto* candidate = dynamic_cast<const sema::TypeSymbol*>(symPtr);
+                if (!candidate || candidate->kind != ast::TypeDeclKind::Class)
+                    return false;
+                if (candidate == ts) return false;  // skip the iterable itself
+                if (!structurallyIsEnumerator(candidate)) return false;
+                enumTs = const_cast<sema::TypeSymbol*>(candidate);
+                return true;
+            };
             for (const auto& sym : ctx_.symbols()) {
-                auto* candidate = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-                if (!candidate || candidate->kind != ast::TypeDeclKind::Class) continue;
-                if (candidate == ts) continue;  // skip the iterable itself
-                if (structurallyIsEnumerator(candidate)) {
-                    enumTs = const_cast<sema::TypeSymbol*>(candidate);
-                    break;
+                if (scanSymbols(sym.get())) break;
+            }
+            if (!enumTs) {
+                for (const sema::Symbol* sym : ctx_.importedSymbols()) {
+                    if (scanSymbols(sym)) break;
                 }
             }
         }
@@ -7409,6 +7462,17 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             curVal = emitMethodCall(currentSym, curArgs, false);
         } else if (currentPropSym) {
             // Property-form Current — evaluate the getter with enumObj2 as this.
+            //
+            // fix #3197 / §23 / §29.11 (v0.254): for an IMPORTED enumerator
+            // class, `currentPropSym->decl` is null (PropertySymbol::decl is
+            // never set for imports). The cross-module ABI is the `$propget`
+            // stub declared by `declareImportedPropertyGetters`
+            // (LlvmBackend_Setup.cpp ~L2633), which populates
+            // `importedPropGetterFns_[ps]` — and it engages for this shape:
+            // the `Current` here is non-virtual and class-parented, so
+            // neither of `declareImportedPropertyGetters`' two skips
+            // (virtual, interface-parented) applies. Mirrors the parallel
+            // change in `wrapUserClassAsIEnumerable` (LlvmBackend_Assign.cpp).
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(currentPropSym->decl);
             if (pd) {
                 // Save/restore currentThis_.
@@ -7445,6 +7509,25 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                     }
                 }
                 currentThis_ = savedThis;
+            } else {
+                // Imported enumerator class — call the cross-module
+                // `$propget` stub. `declareImportedPropertyGetters` has
+                // declared it as `bz$<Class>$<Current>$propget(ptr %this)
+                // -> T`, which is the ABI the exporter emits in
+                // `emitExportedPropertyGetters`. The stub call is the only
+                // sound option here: there is no local block/expression
+                // getter (the imported PropertySymbol carries no body), so
+                // the `pd` branch above cannot resolve it.
+                auto curIt = importedPropGetterFns_.find(currentPropSym);
+                if (curIt != importedPropGetterFns_.end()) {
+                    llvm::Function* getterFn = curIt->second;
+                    auto* fnTy = getterFn->getFunctionType();
+                    curVal = builder_.CreateCall(fnTy, getterFn, {enumObj2});
+                    // §31.1/§31.2 (FINDING [4]): a throw inside the
+                    // imported getter must propagate, not be swallowed —
+                    // check the pending flag like a method call.
+                    emitPendingCheck();
+                }
             }
         }
         if (curVal) {

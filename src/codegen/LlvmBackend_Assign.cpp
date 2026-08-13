@@ -9380,6 +9380,19 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
 // Returns src unchanged if GetEnumerator() or the enumerator class cannot be
 // resolved; the caller falls back to the raw pointer (which will misfire at
 // runtime, but that's no worse than before this fix).
+//
+// fix #3197 / §29.1 / §29.2 / §29.11 / §2.8.2 (v0.254): the original code
+// took `getEnumSym->decl` (an AST MethodDecl) and bailed to `return src`
+// when the cast was null — which it always is for an IMPORTED MethodSymbol
+// (`MemberSymbol::decl` is null for imports; the loader does not re-parse
+// body text for non-generic classes, see the imported-symbol programme
+// handoff §1). The result was a SILENT SIGSEGV (exit 139) when the
+// §29.11 enumerator vtable was driven through the raw class instance. The
+// fix: when `getEnumDecl` is null, take the return type from
+// `ctx_.importedReturnType(getEnumSym)` — the loader records it; and let
+// the structural `MoveNext` + `Current` scan walk `importedSymbols()` too.
+// The `methodFns_.count(ms)` gate already answers correctly for an
+// imported method (declareImportedFunctions populates it).
 llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
                                                   const sema::TypeSymbol* srcTs,
                                                   const sema::TypeRef* iEnumTy,
@@ -9390,8 +9403,14 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
 
     // 2. Find the concrete enumerator TypeSymbol (same logic as lowerIEnumerableFor).
     auto* getEnumDecl = dynamic_cast<const ast::MethodDecl*>(getEnumSym->decl);
-    if (!getEnumDecl || !getEnumDecl->returnType) return src;
-    auto* enumTyRef = ctx_.resolvedType(*getEnumDecl->returnType);
+    sema::TypeRef* enumTyRef = nullptr;
+    if (getEnumDecl && getEnumDecl->returnType) {
+        enumTyRef = ctx_.resolvedType(*getEnumDecl->returnType);
+    } else {
+        // Imported MethodSymbol — no AST decl. The loader recorded the
+        // return type on the side table; reuse it.
+        enumTyRef = ctx_.importedReturnType(getEnumSym);
+    }
     if (!enumTyRef) return src;
     auto* enumTs = (enumTyRef->kind == sema::TypeRef::Kind::Named)
                    ? enumTyRef->declaration : nullptr;
@@ -9443,14 +9462,33 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
             // Not self-implementing: scan all OTHER compiled TypeSymbols for a
             // class with MoveNext + Current (the two-class idiom, e.g. a
             // separate `IntRangeEnum` alongside `IntRange`).
-            for (const auto& sym : ctx_.symbols()) {
-                auto* cand = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-                if (!cand || cand->kind != ast::TypeDeclKind::Class) continue;
-                if (cand == srcTs) continue;
+            //
+            // fix #3197 / §29.1 / §29.11 (v0.254): `ctx_.symbols()` excludes
+            // imported symbols by construction (`makeImportedSymbol` keeps
+            // them out) — so a class declared in a separate module that is
+            // imported here was NEVER considered as the enumerator class,
+            // and `enumTs` stayed null. Then `if (!enumTs) return src;`
+            // returned the raw, unwrapped instance — the §29.11 enumerator
+            // vtable was driven through it, and the runtime SIGSEGV'd.
+            // Walk `ctx_.importedSymbols()` in the same pass. The
+            // `methodFns_.count(ms)` gate above already answers correctly
+            // for an imported method: `declareImportedFunctions`
+            // (LlvmBackend_Setup.cpp ~L2038) populates an external-linkage
+            // `llvm::Function` for every imported MethodSymbol under
+            // `methodFns_[ms]`, regardless of whether the body is locally
+            // known.
+            auto scanSymbols = [&](const sema::Symbol* symPtr) -> void {
+                auto* cand = dynamic_cast<const sema::TypeSymbol*>(symPtr);
+                if (!cand || cand->kind != ast::TypeDeclKind::Class) return;
+                if (cand == srcTs) return;
                 if (structurallyIsEnumerator(cand)) {
                     enumTs = const_cast<sema::TypeSymbol*>(cand);
-                    break;
                 }
+            };
+            for (const auto& sym : ctx_.symbols()) scanSymbols(sym.get());
+            if (!enumTs) {
+                for (const sema::Symbol* sym : ctx_.importedSymbols())
+                    scanSymbols(sym);
             }
         }
     }
@@ -9479,6 +9517,15 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
         auto curIt = methodFns_.find(currentMethodSym);
         if (curIt != methodFns_.end()) currentFn = curIt->second;
     } else if (currentPropSym) {
+        // fix #3197 / §23 / §29.11 (v0.254): for an IMPORTED enumerator
+        // class, `currentPropSym->decl` is null (PropertySymbol::decl is
+        // never set for imports, see the imported-symbol programme handoff
+        // §1). The cross-module ABI is the `$propget` stub declared by
+        // `declareImportedPropertyGetters` (LlvmBackend_Setup.cpp ~L2633),
+        // which populates `importedPropGetterFns_[ps]` — and it engages for
+        // this shape: the `Current` here is non-virtual and class-parented,
+        // so neither of `declareImportedPropertyGetters`' two skips
+        // (virtual, interface-parented) applies.
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(currentPropSym->decl);
         if (pd) {
             if (const ast::PropertyAccessor* acc = blockGetterOf(currentPropSym)) {
@@ -9488,6 +9535,9 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
                 if (!propRetTy) propRetTy = elemTy;
                 currentFn = ensureExprGetterThunk(currentPropSym, ge, propRetTy);
             }
+        } else {
+            auto curIt = importedPropGetterFns_.find(currentPropSym);
+            if (curIt != importedPropGetterFns_.end()) currentFn = curIt->second;
         }
     }
     if (!currentFn) return src;
