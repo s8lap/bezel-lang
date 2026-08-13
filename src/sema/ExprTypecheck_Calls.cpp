@@ -10721,6 +10721,35 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // outcome #3141 declined rather than ship. (Its LOCAL twin is
             // silently wrong today for the same reason; that is #3163's
             // deferral, not this fix's to widen.) Filed as its own issue.
+            // A GENERIC imported class stays declined too, and this guard is
+            // load-bearing: `lowerNew` routes an imported GENERIC to the #662
+            // Foundation A/C arm (`emitInstanceInit`, monomorphized in the
+            // importer), NOT to the `bz$<Type>$init` arm this fix taught to
+            // perform §22.8 step 0 — a generic has no exported per-type `init`
+            // symbol at all. Admitting it here therefore compiled clean and
+            // produced a ZERO OBJECT: measured for
+            // `class GBox<T>(V: int, W: int)`, `new GBox<int>(3, 4)` printed
+            // `sum=0 v=0 w=0` against the single-module twin's `sum=7 v=3 w=4`.
+            // That is precisely the silent-wrong-object outcome #3141 declined
+            // rather than ship, so the decline is kept for this shape and the
+            // capability filed separately. (Found by testing the whole surface
+            // the accept path opened, not just the shape #3162 names.)
+            if (!t->genericParams.empty()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ne.span.begin,
+                    std::string("`new ") + std::string(t->name) +
+                        "` constructs an IMPORTED GENERIC class through its "
+                        "primary constructor, which is not yet supported "
+                        "(§22.10 / §14.1 / §2.8.3 rule 4, #3162): a generic "
+                        "type exports no per-type initializer — its "
+                        "construction is monomorphized in the importer — so "
+                        "the positional parameters would be dropped and the "
+                        "object left zero-initialized. Declare an explicit "
+                        "constructor on the exported class, or expose a "
+                        "factory method that returns `owned " +
+                        std::string(t->name) + "`");
+                return;
+            }
             bool anyNamed = false;
             for (const auto& a : ne.args)
                 if (!a.name.empty()) { anyNamed = true; break; }
@@ -10736,6 +10765,18 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                         "zero-initialized. Pass the arguments positionally");
                 return;
             }
+            // ⚠ One known imprecision, measured and filed as #3202: a §22.10
+            // primary parameter may carry a DEFAULT (`class DefBox(A: int,
+            // B: int := 9)` — the parser routes a class's primary list through
+            // `parseParamList`), and no default crosses the wire for a
+            // positional field, so an under-supplied `new DefBox(1)` is
+            // reported here as "required parameter `B` is not supplied", which
+            // is false of `B`. It is still an improvement on both neighbours:
+            // pre-#3162 the same call was rejected outright, and the LOCAL twin
+            // silently answers a ZERO OBJECT today (#3163 + #3202). The
+            // remedy is carriage, not a reworded string — this check is shared
+            // with imported RECORDS, where §9.1 gives no per-field default and
+            // the message is exactly right.
             checkPositionalNewArgsFromSymbols(ne, t);
             return;
         }

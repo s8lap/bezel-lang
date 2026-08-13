@@ -261,6 +261,16 @@ const char* kDecls3162 =
     "    return Ax2 + B; "
     "  end Total; "
     "end Derived2; "
+    // A GENERIC primary-constructor class. `lowerNew` routes an imported
+    // generic to #662's Foundation A/C arm (monomorphized in the importer),
+    // which has no `bz$<Type>$init` and performs no step 0 — so this shape
+    // stays DECLINED cross-module while working locally (T13/T13b).
+    "public class GBox<T>(V: int, W: int) "
+    "  public _t: T; "
+    "  public method Sum(): int "
+    "    return V + W; "
+    "  end Sum; "
+    "end GBox; "
     // Over-rejection control: an EXPLICIT constructor, which already
     // constructed cross-module through `bz$<Type>$ctor` before this fix.
     "public class ExplicitBox "
@@ -734,6 +744,60 @@ BEZEL_TEST(xmod_imported_primary_ctor_3162,
     int r = compileAndRun3162(src);
     if (r == kDepUnavailable3162) return;
     BEZEL_EXPECT_EQ(r, 230);
+}
+
+// ===========================================================================
+// T13 — §14.1 / §22.10: an imported GENERIC class's primary constructor stays
+// DECLINED, and the decline is load-bearing.
+//
+// ⚠ THIS ROW EXISTS BECAUSE THE FIX ITSELF OPENED IT. #3141's blanket decline
+// covered generic and non-generic imports alike; replacing it with the ordinary
+// §22.5 check admitted BOTH, and only the non-generic half acquired a lowering.
+// `lowerNew` routes an imported generic to #662's Foundation A/C arm
+// (`emitInstanceInit`, monomorphized in the importer) — a generic exports no
+// per-type `bz$<Type>$init` symbol at all — so the arm that now performs §22.8
+// step 0 is never reached. MEASURED with the guard absent:
+//
+//     new GBox<int>(3, 4)   two-module -> compiles CLEAN, `sum=0 v=0 w=0`
+//                           twin       -> `sum=7 v=3 w=4`
+//
+// a silent zero object, which is exactly what #3141 declined rather than ship.
+// Found by exercising the whole surface the accept path opened rather than the
+// one shape #3162 names.
+// ===========================================================================
+BEZEL_TEST(xmod_imported_primary_ctor_3162,
+           t13_imported_generic_primary_ctor_declined_with_reason_14_1) {
+    const std::string body =
+        "  public static method Main(): int "
+        "    using var b := new GBox<int>(3, 4); "
+        "    return b.Sum(); "
+        "  end Main;";
+    std::string diag;
+    int r = compileImportAndRun3162(lib3162("TD"), app3162("TD", body), &diag);
+    if (r == kDepUnavailable3162) return;
+    BEZEL_EXPECT_EQ(r, kRejected3162);
+    BEZEL_EXPECT_TRUE(mentions3162(
+        diag, "constructs an IMPORTED GENERIC class through its primary "
+              "constructor"));
+    BEZEL_EXPECT_TRUE(mentions3162(diag, "#3162"));
+}
+
+// ===========================================================================
+// T13b — the twin, which proves the decline is a CROSS-MODULE limitation and
+// not a rejection of the language shape: the identical declaration in one
+// module constructs and answers 7. Without this row the guard above could be
+// satisfied by rejecting a generic primary constructor outright.
+// ===========================================================================
+BEZEL_TEST(xmod_imported_primary_ctor_3162,
+           t13b_twin_generic_primary_ctor_in_one_module_14_1) {
+    const std::string body =
+        "  public static method Main(): int "
+        "    using var b := new GBox<int>(3, 4); "
+        "    return b.Sum(); "
+        "  end Main;";
+    int r = compileAndRun3162(twin3162("TDL", body));
+    if (r == kDepUnavailable3162) return;
+    BEZEL_EXPECT_EQ(r, 7);
 }
 
 }  // namespace bezel::module
