@@ -1991,6 +1991,8 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                                     "expected member name after '.'");
                 break;
             }
+            // fix #3214 (v0.254): see NullCondMemberExpr branch below.
+            SourceLocation suffixBegin = head->span.begin;
             auto access = std::make_unique<ast::MemberAccessExpr>();
             access->target = std::move(head);
             access->member = current_.text;
@@ -2019,6 +2021,8 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                         "expected '>' to close method type-argument list");
                 }
             }
+            access->span.begin = suffixBegin;
+            access->span.end = current_.location;
             head = std::unique_ptr<ast::Expr>(access.release());
         } else if (consumePunctuator("?.")) {
             if (current_.kind != TokenKind::Identifier) {
@@ -2026,6 +2030,12 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                                     "expected member name after '?.'");
                 break;
             }
+            // fix #3214 (v0.254): every postfix-suffix node carries a span
+            // [target.begin, current_.location-after-suffix], so diagnostics
+            // keyed on the new node's span (call, index, member, null-cond
+            // variants — 100+ sites in ExprTypecheck_Calls.cpp alone) report
+            // the call/member/index site instead of 0:0.
+            SourceLocation suffixBegin = head->span.begin;
             auto a = std::make_unique<ast::NullCondMemberExpr>();
             a->target = std::move(head);
             a->member = current_.text;
@@ -2056,8 +2066,12 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                         "expected '>' to close method type-argument list");
                 }
             }
+            a->span.begin = suffixBegin;
+            a->span.end = current_.location;
             head = std::unique_ptr<ast::Expr>(a.release());
         } else if (consumePunctuator("(")) {
+            // fix #3214 (v0.254): see NullCondMemberExpr branch above.
+            SourceLocation suffixBegin = head->span.begin;
             auto call = std::make_unique<ast::CallExpr>();
             call->callee = std::move(head);
             call->args = parseArgList();
@@ -2065,8 +2079,12 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                 diagnostics_.report(Severity::Error, current_.location,
                                     "expected ')' to close call argument list");
             }
+            call->span.begin = suffixBegin;
+            call->span.end = current_.location;
             head = std::unique_ptr<ast::Expr>(call.release());
         } else if (consumePunctuator("?(")) {
+            // fix #3214 (v0.254): see NullCondMemberExpr branch above.
+            SourceLocation suffixBegin = head->span.begin;
             auto call = std::make_unique<ast::NullCondCallExpr>();
             call->callee = std::move(head);
             call->args = parseArgList();
@@ -2075,8 +2093,12 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                     Severity::Error, current_.location,
                     "expected ')' to close '?(' argument list");
             }
+            call->span.begin = suffixBegin;
+            call->span.end = current_.location;
             head = std::unique_ptr<ast::Expr>(call.release());
         } else if (consumePunctuator("[")) {
+            // fix #3214 (v0.254): see NullCondMemberExpr branch above.
+            SourceLocation suffixBegin = head->span.begin;
             auto idx = std::make_unique<ast::IndexExpr>();
             idx->target = std::move(head);
             // §A.7 PrimarySuffix `[ ArgList ]` — share the call-arg grammar
@@ -2089,10 +2111,16 @@ std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head)
                 diagnostics_.report(Severity::Error, current_.location,
                                     "expected ']' to close index list");
             }
+            idx->span.begin = suffixBegin;
+            idx->span.end = current_.location;
             head = std::unique_ptr<ast::Expr>(idx.release());
         } else if (consumePunctuator("!")) {
+            // fix #3214 (v0.254): see NullCondMemberExpr branch above.
+            SourceLocation suffixBegin = head->span.begin;
             auto bang = std::make_unique<ast::PostfixBangExpr>();
             bang->operand = std::move(head);
+            bang->span.begin = suffixBegin;
+            bang->span.end = current_.location;
             head = std::unique_ptr<ast::Expr>(bang.release());
         } else if (isKeyword("with") &&
                    (!disableWithSuffix_ ||
