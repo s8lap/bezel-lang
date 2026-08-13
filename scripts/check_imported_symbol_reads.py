@@ -197,10 +197,32 @@ def sanctioned_report(sites):
     return lines, ok
 
 
+class BaselineConflict(Exception):
+    pass
+
+
 def _parse_baseline(text):
     c1, c2, section = {}, {}, 'class1'
     for raw in text.splitlines():
         line = raw.strip()
+        # A merge-conflicted baseline used to reach int() and die with an
+        # unhandled `ValueError: invalid literal for int() with base 10: '<<<<<<<'`
+        # — a traceback where the answer is one sentence. It happens on EVERY
+        # multi-family merge, because two lanes that both re-baselined always
+        # conflict here, so this is the common case, not an edge case.
+        if line.startswith(('<<<<<<<', '=======', '>>>>>>>')):
+            raise BaselineConflict(
+                'scripts/imported_symbol_reads.baseline has unresolved merge '
+                'conflict markers.\n'
+                '  Resolve by taking the CURRENT branch\'s version (the ratchet '
+                'is a floor, so the lower\n'
+                '  counts are the right ones), then re-run with --update to make '
+                'it exact:\n'
+                '      git checkout --ours scripts/imported_symbol_reads.baseline\n'
+                '      python3 scripts/check_imported_symbol_reads.py --update\n'
+                '  Do NOT hand-merge the counts: --update measures the merged '
+                'tree, which is the\n'
+                '  only source that can be right.')
         if not line or line.startswith('#'):
             if line.startswith('# class2'):
                 section = 'class2'
@@ -437,4 +459,8 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BaselineConflict as e:
+        print('IMPORTED-SYMBOL SEAM: %s' % e)
+        sys.exit(1)
