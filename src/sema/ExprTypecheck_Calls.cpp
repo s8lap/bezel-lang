@@ -12717,18 +12717,28 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // another thread between the null check and the use (TOCTOU).
                 // Copy the field to a local first and narrow the local.
                 if (!isSimpleVar && tsym) {
-                    TypeRef* fieldType = nullptr;
-                    if (auto* fs = dynamic_cast<FieldSymbol*>(tsym)) {
-                        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-                        if (fd && fd->type)
-                            fieldType = ctx_.resolvedType(*fd->type);
-                        else if (fs->posParam && fs->posParam->type)
-                            fieldType = ctx_.resolvedType(*fs->posParam->type);
-                    } else if (auto* ps = dynamic_cast<PropertySymbol*>(tsym)) {
-                        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-                        if (pd && pd->type)
-                            fieldType = ctx_.resolvedType(*pd->type);
-                    }
+                    // fix #3177 (§7.4 / §2.5, v0.254, family M4): the storage
+                    // member's declared type, through the ONE both-sources
+                    // accessor. This gate used to read the `ast::FieldDecl` /
+                    // `ast::PropertyDecl` off `Symbol::decl` (plus the
+                    // positional `Param`), so for a member INHERITED FROM AN
+                    // IMPORTED BASE it saw no type at all, `fieldType` stayed
+                    // null, and the §7.4 TOCTOU gate simply did not fire.
+                    // MEASURED on ec6a02f: `_f.Length` where `_f` is a
+                    // `protected _f: string?` inherited from an IMPORTED base
+                    // COMPILED CLEAN and the program died with SIGSEGV (exit
+                    // 139) on the null dereference, while the
+                    // character-identical single-module twin was correctly
+                    // rejected with the §7.4 diagnostic. A false ACCEPT, not a
+                    // missing warning.
+                    //
+                    // ⚠ COUPLED with `ExprTC::fieldTypeOf` (ExprTypecheck.cpp),
+                    // which mints the §7.4 narrowing key this gate then
+                    // consults: widening the gate WITHOUT widening the key
+                    // minting would turn the false accept into a FALSE REJECT
+                    // of `if (_f <> null)` over an imported `readonly` field.
+                    // The two are changed in the same commit.
+                    const TypeRef* fieldType = storageComponentType(tsym, ctx_);
                     if (fieldType && fieldType->nullable) {
                         // §7.4 (v0.214, #2085/#2116): a nullable `readonly`
                         // field — instance or static — narrows (it has no

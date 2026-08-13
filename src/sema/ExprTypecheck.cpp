@@ -8459,12 +8459,21 @@ bool ExprTC::isReadonlyField(const FieldSymbol* fs) {
 // (ctx_.resolvedType is a const map lookup; it creates nothing).
 TypeRef* ExprTC::fieldTypeOf(const FieldSymbol* fs) {
     if (!fs) return nullptr;
-    if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-        if (fd->type) return ctx_.resolvedType(*fd->type);
-    }
-    if (fs->posParam && fs->posParam->type)
-        return ctx_.resolvedType(*fs->posParam->type);
-    return nullptr;
+    // fix #3177 (§7.4 / §2.5, v0.254, family M4): the ONE both-sources
+    // accessor, so an IMPORTED field (whose `decl` is null and whose #2516
+    // synthetic `posParam` carries a null `type`) resolves to its declared type
+    // through the loader's side table instead of answering "no type".
+    //
+    // ⚠ THIS IS THE MINTING HALF OF A COUPLED PAIR. The consuming half is the
+    // §7.4 TOCTOU gate in ExprTypecheck_Calls.cpp (`resolveMemberAccess`'s
+    // bare-identifier branch), which only demands a narrowing fact once it can
+    // see that the field's type IS nullable. Widening the gate alone converts
+    // that gap's false ACCEPT (measured: SIGSEGV on `_f.Length` over an
+    // imported base's `string?`) into a false REJECT of the legal
+    // `if (_f <> null) … _f.Length …` over an imported `readonly` field,
+    // because no key would ever be minted for it here. Both were changed
+    // together; neither may be reverted alone.
+    return const_cast<TypeRef*>(storageComponentType(fs, ctx_));
 }
 
 // §7.4 (v0.214, #2085/#2116): recognize a trackable nullable `readonly`-field
