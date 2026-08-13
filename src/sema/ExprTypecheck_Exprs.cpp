@@ -6021,10 +6021,39 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     // handler just above; without this the recipient's declType
                     // stayed null and every member read on it lowered to a
                     // default value (the #1304 wrong-value bug).
-                    if (calleeMd2 && pos2 < calleeMd2->params.size() &&
-                        calleeMd2->params[pos2].type) {
-                        lsym->declType = ctx_.resolvedType(
-                            *calleeMd2->params[pos2].type);
+                    //
+                    // fix #3188 (§22.4 / §2.5, v0.254): through
+                    // `formalOutParamType2`, the both-sources accessor #2657
+                    // added for the plain `out var` twin and #3186 wired into
+                    // the `out owned var` twin. This was the THIRD copy of the
+                    // same question and the last one still `calleeMd2`-only —
+                    // null for every non-generic imported method, so an
+                    // `out using var` recipient of an imported callee got NO
+                    // declType at all. MEASURED on ec6a02f against a
+                    // character-identical single-module twin: exit **0 instead
+                    // of 211** behind an `internal: return-value expression
+                    // failed to lower … #2491` note, plus a **16-byte LSan leak
+                    // per call** (`Direct leak of 16 byte(s) in 1 object(s) …
+                    // #1 bz$UsLib.Fact$Make`) against a clean twin — the
+                    // untyped recipient is a recipient codegen can lower no
+                    // disposal for.
+                    //
+                    // ⚠ THE WIDENING, EXACTLY. `formalOutParamType2` returns
+                    // the OLD expression verbatim whenever `calleeMd2` is
+                    // non-null (same index, same `ctx_.resolvedType`, same
+                    // null-on-missing), so every callee WITH an
+                    // `ast::MethodDecl` keeps its answer bit-for-bit. The only
+                    // new admission is `calleeMs2 && !calleeMd2` →
+                    // `ParameterSymbol::resolvedDeclType`, which is reachable
+                    // only for a callee that resolved to a `MethodSymbol`
+                    // carrying no `MethodDecl`: the imported non-generic
+                    // method. A BUILTIN Try* callee resolves to no
+                    // `MethodSymbol` at all, so `calleeMs2` is null, the
+                    // accessor still returns null, and the builtin derivation
+                    // below runs exactly as before — the row this handler
+                    // exists for is untouched.
+                    if (TypeRef* formalUsingTy2 = formalOutParamType2(pos2)) {
+                        lsym->declType = formalUsingTy2;
                         // §28.1 / §22.4 (v0.196, #1860): resolve a GENERIC
                         // method's formal `out owned T` through the RECEIVER's
                         // concrete generic args (incl. a CLASS-generic
