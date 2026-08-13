@@ -189,6 +189,30 @@ struct TypeSymbol : Symbol {
     // `builtinExceptionBaseOf` below, never directly, so the ancestor walk
     // stays in one place.
     std::string builtinExceptionBase;
+    // §3.6 / §28.9 / §21.9 / §2.8.2 (fix #3191, family M2 of umbrella #3152):
+    // the §3.6 trivial-dispose verdict for an IMPORTED type, INVERTED — true
+    // when the exporter computed this class to be NON-trivial-dispose.
+    //
+    // Set ONLY by `ModuleLoader`, from `MetaTypeDecl::nonTrivialDispose`. A LOCAL
+    // type leaves it false and is classified by the ordinary structural walk in
+    // `common::isNonTrivialDisposeClass` — which is why this is not a general
+    // "is this class non-trivial-dispose" cache and must never be read as one.
+    // Read it only through that walk, which consults it PER LEVEL so a local
+    // class deriving from an imported base is decided correctly.
+    //
+    // Why the verdict needs a channel at all: a class's destructor is not part
+    // of its exported member list (§13.3 — `Dispose()` is the public surface, and
+    // there is no `MetaMemberKind::Destructor`), so the structural walk's
+    // `DestructorSymbol` scan found nothing on any non-generic imported class and
+    // answered "trivial-dispose" for all of them. §2.8.2 requires the artifact
+    // interface to carry the §3.6 derived properties as computed verdicts for
+    // exactly this reason: they are "computed from structure the public surface
+    // does not show — private fields, destructor presence".
+    //
+    // FALSE IS NOT "KNOWN TRIVIAL" — it is "absent or trivial". An artifact
+    // written before this field carries no verdict, so a false here must fall
+    // through to the structural walk rather than short-circuit it.
+    bool importedNonTrivialDispose = false;
     // §9.8 / §18.5 / §21.4 / §14.2 (#3139, family F1 of #3152): the resolved
     // TypeRefs of this type's declared bases that carry NO user `TypeSymbol` —
     // exactly the complement, within the declared base list, of what

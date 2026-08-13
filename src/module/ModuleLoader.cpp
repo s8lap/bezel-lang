@@ -496,6 +496,14 @@ struct Loader {
         // built-in base" to every layout consumer and the §31.4 header is
         // dropped on the importing side only.
         t->builtinExceptionBase = td.builtinExceptionBase;
+        // fix #3191 (§3.6 / §28.9 / §21.9 / §2.8.2, family M2 of #3152): replay
+        // the exporter's §3.6 trivial-dispose verdict. Without it this
+        // reconstructed symbol has no `DestructorSymbol` (the destructor is not
+        // an exported member, §13.3) and so answers "trivial-dispose" to §21.9's
+        // bare-discard reject, §22.5's default-value check and the §28.3
+        // auto-drop gate alike. Absent in a pre-#3191 artifact → stays false →
+        // exactly the pre-fix behaviour.
+        t->importedNonTrivialDispose = td.nonTrivialDispose;
         t->invariantContracts = toContractRecords(td.invariants);
         t->genericParams = convertGenericParams(td.genericParams, t->memberScope);
         for (const MetaType& base : td.baseTypes) {
@@ -2643,6 +2651,12 @@ static void loadMetadataPass1(
         // itself, not of any resolvable base symbol — nothing about it needs
         // the other dependencies' shells to exist yet.
         t->builtinExceptionBase = td.builtinExceptionBase;
+        // fix #3191 (§3.6 / §28.9 / §2.8.2, family M2 of #3152): the §3.6
+        // trivial-dispose verdict, replayed here for the same reason as the
+        // exception base above — it is a property of the class itself, computed
+        // by the exporter (which can see the destructor), and needs no other
+        // dependency's shell to exist yet. See the sibling site's comment.
+        t->importedNonTrivialDispose = td.nonTrivialDispose;
         t->invariantContracts = toContractRecords(td.invariants);
         // #1488 / §2.8.3 rule 3: this type's declaring-module identity, as
         // reconstructed from the dependency's own metadata — the far side of

@@ -979,6 +979,69 @@ struct MetaTypeDecl {
     // BYTE-IDENTICAL metadata to before — verified as a one-variable A/B.
     std::vector<MetaChoiceCase> choiceCases;
 
+    // §3.6 / §28.9 / §21.9 / §2.8.2 (fix #3191, family M2 of umbrella #3152;
+    // additive within v7): the type's TRIVIAL-DISPOSE verdict, inverted — true
+    // when this class is NOT trivial-dispose (§28.9: "no destructor, no `owned`
+    // fields of non-trivial-dispose type, no owning-inline-array fields,
+    // trivial-dispose base", §3.6's table). False for every non-class kind.
+    //
+    // §2.8.2 names this carriage as a REQUIREMENT, not an optimization: the
+    // artifact interface must carry "the **derived type properties** (§3.6):
+    // carried as computed verdicts for non-generic public types", and states
+    // exactly why — "These properties are computed from structure the public
+    // surface does not show — private fields, destructor presence — yet §3.6
+    // rule 3 makes them part of the public contract, and rules dispatch on them
+    // at the consumer: … trivial-dispose (§28.9) …. An interface that omitted
+    // them would force the consumer to either reject imported types at those
+    // rules or guess." This field is that carriage for trivial-dispose; the
+    // consumer was guessing, and guessing "trivial".
+    //
+    // The DESTRUCTOR is the leg that structurally could not cross. A class's
+    // destructor is deliberately NOT a `MetaMember` — `convertMember` skips it
+    // ("§13.3: not part of the public surface — Dispose() is") — and there is no
+    // `MetaMemberKind::Destructor` to hold it. So `common::isNonTrivialDisposeClass`,
+    // which decides the property by scanning `sema::TypeSymbol::members` for a
+    // `DestructorSymbol`, found none on ANY non-generic imported class and
+    // answered "trivial-dispose" for all of them. (The `owned`-FIELD leg does
+    // cross — `ModuleLoader` interns `FieldSymbol::modifiers` — so it was only
+    // the destructor that was invisible.)
+    //
+    // MEASURED at cf84884 (two-module build, `bezelc -c lib.bzl -o lib.o` then
+    // `bezelc --import lib.o app.bzl`), with NO `owned` marker anywhere in
+    // either module and no generics: for a `public class Res` declaring a
+    // destructor and a local `class Derived: Res`, the statement `new Derived(1);`
+    // is a §21.9 HARD ERROR ("this expression produces an owned value that
+    // requires disposal (a non-trivial-dispose class …)") in the
+    // character-identical SINGLE-MODULE twin, and COMPILES SILENTLY across the
+    // module boundary. §2.8.2's carriage requirement is explicit that an
+    // implementation "must not alter the instantiation's semantics"; a hard
+    // error that fires in one artifact and not the other does exactly that.
+    //
+    // The COMPUTED VERDICT crosses, not the raw destructor-presence bit, because
+    // that is what §2.8.2's sentence above asks for and because it makes the
+    // consumer's answer independent of which legs of §28.9's definition happen
+    // to be reconstructible on the far side. The base-chain leg still composes
+    // the ordinary way: a LOCAL class deriving from an imported base is decided
+    // by the walk reaching that base's carried verdict, exactly as
+    // `builtinExceptionBase` carries only the DIRECT base and lets the ancestor
+    // chain reconstruct itself.
+    //
+    // Carried as its own REC_DISPOSE_VERDICT record inside TYPE_BLOCK — the
+    // "distinct record code rather than a positional scalar (preferred)" that
+    // ModuleMetadata.cpp's ⚠ block above `emitTypeDecl`'s 8th scalar asks a new
+    // field to be. A 9th positional scalar would be read as #3139's
+    // `nBuiltinIfaces` by any artifact whose type declares no built-in
+    // interface, a silent misparse. NO schema bump: an unknown record code is
+    // `skipRecord()`'d by every reader this format has ever had.
+    //
+    // BOTH the emission AND the `hashTypeDecl` fold are conditional on the
+    // verdict being TRUE (#2950/#3139/#3144's rule), so a module containing only
+    // trivial-dispose types produces BYTE-IDENTICAL metadata to before. A new
+    // reader on an OLD artifact sees no record, leaves this false, and degrades
+    // exactly to pre-fix behaviour — which is why `false` must mean "absent or
+    // trivial" and never "known trivial".
+    bool nonTrivialDispose = false;
+
     bool operator==(const MetaTypeDecl&) const;
 };
 

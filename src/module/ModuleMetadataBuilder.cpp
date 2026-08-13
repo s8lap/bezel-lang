@@ -12,6 +12,7 @@
 
 #include "ast/Node.hpp"
 #include "common/IntLiteral.hpp"
+#include "common/OwnershipFacts.hpp"
 #include "lexer/Lexer.hpp"
 #include "sema/ConstFold.hpp"
 #include "sema/SemaContext.hpp"
@@ -1458,6 +1459,28 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // block. Only the DIRECT base is carried; an ancestor chain reconstructs
     // itself, because each exported ancestor carries its own.
     out.builtinExceptionBase = t.builtinExceptionBase;
+
+    // fix #3191 (§3.6 / §28.9 / §21.9 / §2.8.2, family M2 of umbrella #3152):
+    // the §3.6 TRIVIAL-DISPOSE verdict, which the member list structurally
+    // cannot carry. `convertMember` skips the destructor outright (§13.3: not
+    // part of the public surface — `Dispose()` is) and there is no
+    // `MetaMemberKind::Destructor`, so the importer's structural walk found no
+    // `DestructorSymbol` on ANY non-generic imported class and classified every
+    // one of them trivial-dispose.
+    //
+    // §2.8.2 requires this: the artifact interface carries "the **derived type
+    // properties** (§3.6): carried as computed verdicts for non-generic public
+    // types", because they are "computed from structure the public surface does
+    // not show — private fields, destructor presence", and omitting them "would
+    // force the consumer to either reject imported types at those rules or
+    // guess."
+    //
+    // The exporter is the side that CAN see it: here `t.members` still holds the
+    // `DestructorSymbol`, so the shared predicate gives the true verdict. Only
+    // the class kinds have one — the predicate's walk is over class members and
+    // base classes — and it is a pure read of `t`, which is why the parameter is
+    // `const` (see OwnershipFacts.hpp).
+    out.nonTrivialDispose = common::isNonTrivialDisposeClass(&t);
 
     // fix #3139 (§9.8 / §18.5 / §21.4 / §2.8.2, family F1 of #3152): the
     // BUILT-IN INTERFACE bases, which the `baseTypeRefs` loop above cannot

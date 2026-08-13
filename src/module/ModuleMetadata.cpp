@@ -81,7 +81,15 @@ enum RecordCode : unsigned {
     // a coded record is self-describing, absent when unused, and skipRecord()'d
     // by every reader this format has had.
     REC_SER_CLAUSE = 10,
-    // 11.. additive; unknown codes are skipRecord()'d by the reader
+    // fix #3191 (§3.6 / §28.9 / §21.9 / §2.8.2, family M2 of umbrella #3152):
+    // TYPE_BLOCK — the §3.6 trivial-dispose verdict, INVERTED, as a single
+    // scalar under its OWN code. Emitted only when TRUE, so an artifact whose
+    // types are all trivial-dispose is byte-identical to before. A distinct code
+    // for the reason the ⚠ block above `emitTypeDecl`'s 8th scalar states: a 9th
+    // positional scalar would be read as #3139's `nBuiltinIfaces`, a silent
+    // misparse. Absent (an OLD artifact) reads as false — pre-fix behaviour.
+    REC_DISPOSE_VERDICT = 11,
+    // 12.. additive; unknown codes are skipRecord()'d by the reader
     REC_UNKNOWN_FUTURE = 90, // test-only: a record code this reader skips
 };
 
@@ -328,6 +336,16 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
             }
         }
     }
+    // §3.6 / §28.9 / §2.8.3 rule 3 (#3191): the trivial-dispose verdict is
+    // public-interface content staleness detection must track. §3.6 rule 3 says
+    // so in as many words — "adding a destructor flips trivial-dispose … is a
+    // breaking change for clients relying on it, exactly as a signature change
+    // is" — and the flip changes whether a client's `new Dep();` statement is a
+    // §21.9 hard error, so a dependent compiled against the old verdict is
+    // stale. GUARDED ON EXACTLY THE EMISSION'S CONDITION (emitTypeDecl above):
+    // folding a `false` the writer never wrote would move the VBR-encoded header
+    // hash of every artifact for a change that wrote nothing.
+    if (ty.nonTrivialDispose) hashBool(h, true);
 }
 
 } // namespace
@@ -544,7 +562,11 @@ bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
            builtinExceptionBase == o.builtinExceptionBase &&
            builtinInterfaceBases == o.builtinInterfaceBases &&
            // §35.1 (#3144): the case list is part of a choice's identity.
-           choiceCases == o.choiceCases;
+           choiceCases == o.choiceCases &&
+           // §3.6 rule 3 (#3191): the trivial-dispose verdict is part of the
+           // public contract, so two metadata values differing only in it are
+           // NOT equal — this operator backs the round-trip tests.
+           nonTrivialDispose == o.nonTrivialDispose;
 }
 
 bool MetaFunction::operator==(const MetaFunction& o) const {
@@ -909,6 +931,15 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     // kind), which — with the matching guard in hashTypeDecl — is what keeps a
     // module with no choice BYTE-IDENTICAL to a pre-#3144 build.
     for (const MetaChoiceCase& cc : ty.choiceCases) emitChoiceCase(w, cc);
+    // §3.6 / §28.9 / §21.9 (#3191): the trivial-dispose verdict, inverted, under
+    // its own record code. Emitted only when TRUE — the #2950/#3139/#3144 rule —
+    // so a module whose types are all trivial-dispose (the overwhelming majority)
+    // produces byte-identical metadata to before. Position is immaterial to
+    // correctness because the code is self-describing and every reader this
+    // format has had `skipRecord()`s an unknown one; it is emitted LAST so the
+    // trailing capture records above keep the exact positions they had.
+    if (ty.nonTrivialDispose)
+        w.EmitRecord(REC_DISPOSE_VERDICT, llvm::ArrayRef<std::uint64_t>{1});
     w.ExitBlock();
 }
 
@@ -1196,7 +1227,8 @@ bool readChoiceCaseBody(Reader& r, MetaChoiceCase& cc);  // fwd (#3144)
 bool finishBlockImpl(Reader& r, std::string* captureString,
                      unsigned capturedCode = 0,
                      std::string* codedCapture = nullptr,
-                     std::vector<MetaChoiceCase>* choiceCases = nullptr) {
+                     std::vector<MetaChoiceCase>* choiceCases = nullptr,
+                     bool* disposeVerdict = nullptr) {
     while (true) {
         unsigned id = 0;
         Next n = nextEntry(r, id);
@@ -1206,12 +1238,24 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
             return true;
         }
         if (n == Next::Record) {
-            if (captureString != nullptr || codedCapture != nullptr) {
+            if (captureString != nullptr || codedCapture != nullptr ||
+                disposeVerdict != nullptr) {
                 // Read this record; capture it if it is one we are waiting for.
                 llvm::SmallVector<std::uint64_t, 32> vals;
                 auto got = r.cursor.readRecord(id, vals);
                 if (!got) { llvm::consumeError(got.takeError()); return false; }
                 const unsigned code = got.get();
+                // §3.6 / §28.9 (#3191): the trivial-dispose verdict, a single
+                // scalar rather than a string payload, so it is captured here
+                // rather than through the `dst` byte-copy below. Absent — an
+                // artifact written before this field, or a type that is
+                // trivial-dispose — leaves the caller's `false` untouched, which
+                // is exactly the pre-fix reading.
+                if (disposeVerdict != nullptr && code == REC_DISPOSE_VERDICT) {
+                    *disposeVerdict = !vals.empty() && vals[0] != 0;
+                    disposeVerdict = nullptr;
+                    continue;
+                }
                 std::string* dst = nullptr;
                 if (captureString != nullptr && code == REC_STRING) {
                     dst = captureString;
@@ -1624,9 +1668,16 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     // scalar — see the ⚠ block in emitTypeDecl for why a 9th positional scalar
     // was not an option — so "absent" and "empty" are the same read, which is
     // correct: a pre-#3144 artifact and a non-choice both have no cases.
+    // fix #3191 (§3.6 / §28.9 / §21.9 / §2.8.2, family M2 of #3152):
+    // REC_DISPOSE_VERDICT = the §3.6 trivial-dispose verdict, inverted. Captured
+    // by CODE like REC_EXC_BASE, so order relative to the other trailing records
+    // is immaterial. Absent means false — an old artifact, or a trivial-dispose
+    // type — which is the pre-fix reading and the safe one (see the field
+    // comment: `false` must never mean "known trivial").
     return finishBlockImpl(
         r, !ty.genericParams.empty() ? &ty.dtorBodyText : nullptr,
-        REC_EXC_BASE, &ty.builtinExceptionBase, &ty.choiceCases);
+        REC_EXC_BASE, &ty.builtinExceptionBase, &ty.choiceCases,
+        &ty.nonTrivialDispose);
 }
 
 bool readTypeDecl(Reader& r, MetaTypeDecl& ty) {

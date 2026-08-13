@@ -96,7 +96,14 @@ using TypeParamResolver =
 //
 // Cycle-guarded (mirrors the #1624 precedent) so a malformed base-type graph
 // that survives error recovery cannot hang the compiler.
-bool isNonTrivialDisposeClass(sema::TypeSymbol* decl);
+//
+// fix #3191: the parameter is `const` because the exporter
+// (`ModuleMetadataBuilder::convertTypeDecl`) must compute this verdict from a
+// `const sema::TypeSymbol&` to put it on the wire. The body was already a pure
+// read of its argument — the paragraph above says so — so this only makes the
+// existing contract expressible in the type. Every pre-existing caller passes a
+// non-const `TypeSymbol*`, which converts implicitly.
+bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl);
 
 // Shared shape-recognition: if the callee of `call` resolves to a user
 // `ast::MethodDecl` (a MethodSymbol whose `decl` is a MethodDecl), return it;

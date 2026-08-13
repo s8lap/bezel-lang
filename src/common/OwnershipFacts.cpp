@@ -28,14 +28,50 @@ namespace bezel::common {
 // line of classification logic changed, so every existing sema consumer keeps
 // byte-identical behaviour and the ownership pass's §28.3 auto-drop gate now
 // shares this single copy.
-bool isNonTrivialDisposeClass(sema::TypeSymbol* decl) {
+bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl) {
     bool reject = false;
     std::unordered_set<const sema::TypeSymbol*> visitedBase;
     const std::size_t kMaxWalk = 4096;  // defensive; base chains are shallow
     std::size_t walked = 0;
-    for (sema::TypeSymbol* cur = decl; cur && !reject;) {
+    for (const sema::TypeSymbol* cur = decl; cur && !reject;) {
         if (++walked > kMaxWalk) break;
         if (!visitedBase.insert(cur).second) break;  // cycle guard (#1624)
+        // fix #3191 (§3.6 / §28.9 / §21.9 / §2.8.2, family M2 of umbrella
+        // #3152): an IMPORTED class's carried §3.6 verdict, consulted BEFORE the
+        // member scan below — because for an imported class that scan cannot
+        // succeed. A class's destructor is deliberately not part of the exported
+        // member list (`convertMember`: "§13.3: not part of the public surface —
+        // Dispose() is", and there is no `MetaMemberKind::Destructor`), and
+        // `ModuleLoader` builds a `DestructorSymbol` on exactly one path — the
+        // generic body re-parse. So EVERY non-generic imported class scanned as
+        // "no destructor" and this function answered trivial-dispose for all of
+        // them, whatever they declared.
+        //
+        // §2.8.2 requires the artifact interface to carry the §3.6 derived type
+        // properties as "computed verdicts for non-generic public types",
+        // naming trivial-dispose among them and stating the consequence of
+        // omitting them: the consumer must "either reject imported types at
+        // those rules or guess". The verdict is now carried
+        // (MetaTypeDecl::nonTrivialDispose) and replayed by ModuleLoader, so the
+        // question this function asks has an answer on the imported side rather
+        // than a default.
+        //
+        // Checked PER LEVEL, not once at `decl`, which is what makes the
+        // reachable shape work: a LOCAL `class Derived: Res` over an imported
+        // `Res` has no destructor and no `owned` field of its own, so the
+        // verdict must be found when the walk REACHES `Res`. The carried verdict
+        // is itself the full recursive answer for the imported type, so the walk
+        // is finished the moment it fires.
+        //
+        // Note the asymmetry this deliberately does NOT introduce: a `false`
+        // verdict never short-circuits. Absent (a pre-#3191 artifact) and
+        // "genuinely trivial" are the same read, and both must fall through to
+        // the member scan, which still decides correctly for a local type and
+        // degrades to exactly the pre-fix answer for a stale imported one.
+        if (cur->importedNonTrivialDispose) {
+            reject = true;
+            break;
+        }
         for (sema::Symbol* m : cur->members) {
             if (dynamic_cast<sema::DestructorSymbol*>(m)) {
                 reject = true;

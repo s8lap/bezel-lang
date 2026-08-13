@@ -11199,6 +11199,43 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     for (TypeSymbol* cur = t->declaration; cur && !reject;) {
                         if (++walked > kMaxWalk) break;              // §21.9 walk must terminate
                         if (!visitedBase.insert(cur).second) break;  // cycle guard (#1624)
+                        // fix #3191 (§3.6 / §28.9 / §2.8.2, family M2 of #3152):
+                        // an IMPORTED class's carried §3.6 trivial-dispose
+                        // verdict, consulted PER LEVEL before the member scan —
+                        // because for an imported class that scan cannot
+                        // succeed. The destructor is not an exported member
+                        // (§13.3: `Dispose()` is the public surface, and there
+                        // is no `MetaMemberKind::Destructor`), so this walk found
+                        // no `DestructorSymbol` on ANY non-generic imported class
+                        // and this diagnostic could not fire across a module
+                        // boundary. MEASURED at cf84884: `new Derived(1);` over a
+                        // local `class Derived: Res` with an imported `Res`
+                        // declaring a destructor is a hard error in the
+                        // character-identical single-module twin and compiled
+                        // SILENTLY two modules out.
+                        //
+                        // ⚠ THIS IS A FOURTH INDEPENDENT COPY of §28.9's
+                        // classification (`common::isNonTrivialDisposeClass`,
+                        // `Ownership.cpp`'s §28.3 gate, `PureChecker.cpp`'s
+                        // `isTrivialDisposeClass`, and this one). Fixing the
+                        // shared copy alone did NOT make this diagnostic fire —
+                        // verified by measurement, not assumed — which is the
+                        // duplicated-predicate defect class in miniature.
+                        // Collapsing them is #2666's subject and is deliberately
+                        // NOT attempted here; a follow-up records that this
+                        // verdict must be added to any copy #2666 leaves behind.
+                        //
+                        // Per level, not once at the head, so a LOCAL class
+                        // deriving from an imported base is decided when the walk
+                        // REACHES that base. A false verdict never
+                        // short-circuits: absent (a pre-#3191 artifact) and
+                        // genuinely-trivial read alike and both fall through to
+                        // the member scan, which keeps `trivialDisposeProducer`
+                        // meaning exactly what #2655's stamp below says it means.
+                        if (cur->importedNonTrivialDispose) {
+                            reject = true;
+                            break;
+                        }
                         for (Symbol* m : cur->members) {
                             if (dynamic_cast<DestructorSymbol*>(m)) {
                                 reject = true;
