@@ -9041,6 +9041,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 entrySynthFnTy->funcReturn =
                                     ctx_.resolvedType(*md->returnType);
                                 entrySynthFnTy->funcReturnOwned = md->returnOwned;
+                            } else if (!md &&
+                                       ctx_.importedReturnType(entryMs)) {
+                                // fix #3193 (§27.6 / §30.14, v0.254): an
+                                // IMPORTED entry method has no ast::MethodDecl;
+                                // the cast is null so the synthesized Function
+                                // TypeRef would silently fall through to unit
+                                // and drop the `owned` marker. Pull the return
+                                // type from the loader's side table and the
+                                // marker from the #3189 shared accessor — the
+                                // two halves move together so we never
+                                // announce owned transfer on a unit-typed slot.
+                                entrySynthFnTy->funcReturn =
+                                    ctx_.importedReturnType(entryMs);
+                                entrySynthFnTy->funcReturnOwned =
+                                    sema::methodReturnsOwned(*entryMs, ctx_);
                             } else {
                                 auto* unit = ctx_.makeTypeRef();
                                 unit->kind = TypeRef::Kind::Unit;
@@ -12479,6 +12494,18 @@ void ExprTC::resolveExtensionMember(const ast::MemberAccessExpr& ma,
         if (md && md->returnType) {
             ft->funcReturn = ctx_.resolvedType(*md->returnType);
             ft->funcReturnOwned = md->returnOwned;
+        } else if (!md && ctx_.importedReturnType(ms)) {
+            // fix #3193 (§27.6 / §26.1, v0.254): extension methods are bound
+            // the same way as a class method — an IMPORTED extension method
+            // has no ast::MethodDecl, so without this fall-through the formed
+            // Function TypeRef would drop the return type AND the `owned`
+            // marker. Pull the return type from the loader's side table and
+            // the marker from the #3189 shared accessor — the two halves
+            // move together so we never announce owned transfer on a
+            // unit-typed slot. The two local arms above (#3189's predicate)
+            // were rewritten the same way for the same defect class.
+            ft->funcReturn = ctx_.importedReturnType(ms);
+            ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
         } else {
             auto* unit = ctx_.makeTypeRef();
             unit->kind = TypeRef::Kind::Unit;
@@ -17981,6 +18008,49 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ct->declaration = cc->parent;
                 ctx_.setExprType(&ma, ct);
             }
+        } else if (auto* ims = dynamic_cast<MethodSymbol*>(member)) {
+            // fix #3193 (§27.6 / §28.1 / §28.3 / §2.5, v0.254): method-reference
+            // formation over an IMPORTED method. Without this branch the
+            // bare-method-access spell `var f := Cell.MakeIt` (an imported
+            // static) leaves the MemberAccessExpr with no Function TypeRef at
+            // all — the local formation site below would have set one, but the
+            // `isImported` early return cuts it off — so the function-call type
+            // system can neither pick the right return type nor see the `owned`
+            // marker. The result, on the typical shape, is a §28.3
+            // borrow-lifetime FALSE REJECT (`return got` where `got := c.V`
+            // borrows `c`); on the shorter form it is the `internal:
+            // lowerLocalDecl` diagnostic from #2434 with a silent no-allocate.
+            // The explicit-target-type spelling `var f: (int) -> owned Cell :=
+            // Cell.MakeIt;` already worked because the LHS type ascription
+            // rescued the formation — this closes the last gap.
+            //
+            // The shape is the same both-sources pattern #3189 established for
+            // the `owned` marker, and the three local formation sites below
+            // (the static-via-call method-reference path, the extension-method
+            // path, and the Domain.Spawn entry type) carry the same fallback.
+            // The TYPE half and the OWNED half move together: we never
+            // announce owned transfer on a unit-typed slot.
+            auto* ft = ctx_.makeTypeRef();
+            ft->kind = TypeRef::Kind::Function;
+            for (auto* psym : ims->params) {
+                auto* par = dynamic_cast<ParameterSymbol*>(psym);
+                if (!par) continue;
+                TypeRef::FuncParam fp;
+                fp.modifier = par->modifier;
+                fp.name = par->name;
+                if (par->declType)
+                    fp.type = ctx_.resolvedType(*par->declType);
+                ft->funcParams.push_back(fp);
+            }
+            if (TypeRef* rt = ctx_.importedReturnType(ims)) {
+                ft->funcReturn = rt;
+                ft->funcReturnOwned = sema::methodReturnsOwned(*ims, ctx_);
+            } else {
+                auto* unit = ctx_.makeTypeRef();
+                unit->kind = TypeRef::Kind::Unit;
+                ft->funcReturn = unit;
+            }
+            ctx_.setExprType(&ma, ft);
         }
         return;
     }
@@ -18089,6 +18159,25 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (md && md->returnType) {
             ft->funcReturn = ctx_.resolvedType(*md->returnType);
             ft->funcReturnOwned = md->returnOwned;
+        } else if (!md && ctx_.importedReturnType(ms)) {
+            // fix #3193 (§27.6 / §28.1 / §28.3 §2.5, v0.254): method-reference
+            // formation over an IMPORTED method. The cast here is null for any
+            // non-generic imported class (ModuleLoader sets `decl` only where
+            // it re-parsed exported body text for a GENERIC type), so without
+            // this fall-through the formed Function TypeRef would silently
+            // become `() -> ()` and the `owned` marker would be dropped. That
+            // shows up as a §28.3 borrow-lifetime FALSE REJECT on the typical
+            // shape, or as the `internal: lowerLocalDecl` diagnostic from
+            // #2434 with a silent no-allocate on the shorter form. Pull the
+            // return type from the loader's side table and the marker from the
+            // #3189 shared accessor (`methodReturnsOwned`) — the two halves
+            // move together so we never announce owned transfer on a
+            // unit-typed slot. The explicit-target-type spelling
+            // `var f: (int) -> owned Cell := Cell.MakeIt;` already worked
+            // because the type ascription rescued the formation; this closes
+            // the last gap.
+            ft->funcReturn = ctx_.importedReturnType(ms);
+            ft->funcReturnOwned = sema::methodReturnsOwned(*ms, ctx_);
         } else {
             auto* unit = ctx_.makeTypeRef();
             unit->kind = TypeRef::Kind::Unit;
