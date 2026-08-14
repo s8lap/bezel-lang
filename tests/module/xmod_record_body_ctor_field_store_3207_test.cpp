@@ -306,6 +306,33 @@ const char* kLocalInitDecls3207 =
     "  end constructor; "
     "end InitRec;";
 
+// fix #3130 — #3207's test fixture all uses `this.X := x` (this.-qualified
+// property stores) on a `readonly` auto-property. The bare-identifier
+// birth-store `Age := a` (§22.15) on a NON-`readonly` auto-property is the
+// shape of #3130's repro — and exercises TWO distinct fixes:
+//   * #3208's birth-store predicate extension (sema §22.15): accepts the
+//     bare-identifier property write on a PropertySymbol root the same way
+//     it accepts the `this.`-qualified spelling.
+//   * #3207's property-stub + remap arm (codegen §9.2/§2.5): makes the
+//     cross-module body-storage write land, not silently no-op.
+// Either fix regressing independently would fail T4 here — the existing
+// T1/T2/T3 all use `readonly` + `this.X`, so they would not catch a
+// #3208 regression. T4 pins the combination.
+const char* kLib3130 =
+    "module BrLib3130; "
+    "public record Pt(X: int, Y: int); "
+    "public record Person "
+    "  public property Age: int; "
+    "  public constructor(a: int) Age := a; end constructor; "
+    "end Person;";
+
+const char* kLocalDecls3130 =
+    "public record Pt(X: int, Y: int); "
+    "public record Person "
+    "  public property Age: int; "
+    "  public constructor(a: int) Age := a; end constructor; "
+    "end Person;";
+
 std::string appSource3207(const std::string& body, const std::string& tag) {
     return "module BrApp3207" + tag + "; import BrLib3207; " + body;
 }
@@ -316,6 +343,10 @@ std::string appSourceTwo3207(const std::string& body, const std::string& tag) {
 
 std::string appSourceInit3207(const std::string& body, const std::string& tag) {
     return "module BrApp3207" + tag + "; import BrLib3207Init; " + body;
+}
+
+std::string appSource3130(const std::string& body, const std::string& tag) {
+    return "module BrApp3130" + tag + "; import BrLib3130; " + body;
 }
 
 std::string sameModuleProgram3207(const std::string& body, const std::string& tag) {
@@ -330,6 +361,11 @@ std::string sameModuleProgramTwo3207(const std::string& body,
 std::string sameModuleProgramInit3207(const std::string& body,
                                       const std::string& tag) {
     return "module Ctl3207" + tag + "; " + std::string(kLocalInitDecls3207) + " " + body;
+}
+
+std::string sameModuleProgram3130(const std::string& body,
+                                  const std::string& tag) {
+    return "module Ctl3130" + tag + "; " + std::string(kLocalDecls3130) + " " + body;
 }
 
 // std::string findAll3207(const std::string& hay, const std::string& needle) —
@@ -503,6 +539,96 @@ BEZEL_TEST(xmod_record_body_ctor_field_store_3207,
         "t3b");
     BEZEL_EXPECT_EQ(r.rc, 0);
     BEZEL_EXPECT_TRUE(contains3207(r.stdout_text, "r.X=42"));
+}
+
+// ===========================================================================
+// T4 — fix #3130 (§9.2 / §2.8.3 rule 4 / §14.1, v0.252). The exact
+// headline from the issue: an imported body record whose authored ctor uses
+// the BARE-IDENTIFIER birth-store (§22.15: `Age := a` rather than
+// `this.Age := a`) on a NON-`readonly` auto-property, plus a positional
+// record in the same dependency (the differential control from the issue).
+//
+// Pre-fix output (measured on cf4f786, the issue's commit):
+//   IMPORTED -> exit 0
+//     Age member:  0          <- WRONG (should be 41)
+//     ToString:    Person(Age: 0)
+//     Pt.X member: 7          <- positional control: correct
+//     Pt ToString: Pt(X: 7, Y: 8)
+// Post-fix (this T4): the imported row must match the twin row exactly:
+//
+//   Age member:  41
+//   ToString:    Person(Age: 41)
+//   Pt.X member: 7
+//   Pt ToString: Pt(X: 7, Y: 8)
+//
+// Two fixes must BOTH be live for T4 to pass:
+//   * #3208 (sema §22.15, v0.254): bare-identifier property write in a pure
+//     ctor body is admitted the same as `this.Age := a`. Without #3208 the
+//     ctor body is rejected at sema with "no member `Age` in birth-store
+//     position" and the program never compiles.
+//   * #3207 (codegen §9.2/§2.5, v0.254): cross-module re-parse of
+//     `ctorBodyText` over the synthetic single-type source emits Property
+//     stubs and remaps the fresh PropertySymbol to the imported one, so the
+//     body-storage store lands in the imported recordStruct's slot. Without
+//     #3207 the body's `Age := a` is silently dropped and `q.Age` reads 0.
+//
+// The T1/T2/T3 pairs above all use `this.X := x` on a `readonly`
+// auto-property — they would catch a #3207 regression but would silently
+// pass if #3208 regressed. T4 pins the combination.
+// ===========================================================================
+BEZEL_TEST(xmod_record_body_ctor_field_store_3207,
+           t4_3130_imported_bare_identifier_birth_store_lands_9_2_22_15) {
+    RunResult3207 r = runImported3207(
+        kLib3130,
+        appSource3130(
+            "public class C3130T4 "
+            "  public static method Main(): int "
+            "    var q := new Person(41); "
+            "    Console.WriteLine(\"Age member:  \" + q.Age.ToString()); "
+            "    Console.WriteLine(\"ToString:    \" + q.ToString()); "
+            "    var p := new Pt(7, 8); "
+            "    Console.WriteLine(\"Pt.X member: \" + p.X.ToString()); "
+            "    Console.WriteLine(\"Pt ToString: \" + p.ToString()); "
+            "    return 0; "
+            "  end Main; "
+            "end C3130T4;",
+            "T4"),
+        "t4");
+    if (r.rc == -2) return;  // no toolchain for the dependency
+    BEZEL_EXPECT_EQ(r.rc, 0);
+    BEZEL_EXPECT_TRUE(contains3207(r.stdout_text, "Age member:  41"));
+    BEZEL_EXPECT_TRUE(contains3207(r.stdout_text, "ToString:    Person(Age: 41)"));
+    BEZEL_EXPECT_TRUE(contains3207(r.stdout_text, "Pt.X member: 7"));
+    BEZEL_EXPECT_TRUE(contains3207(r.stdout_text, "Pt ToString: Pt(X: 7, Y: 8)"));
+}
+
+// T4b — the SAME-MODULE twin of T4 (control). Both halves of the pair are
+// required: T4 alone would pass on a §22.15 acceptance bug that always
+// compiles, T4b alone would pass on a §9.2 enforcement bug rather than a
+// cross-module claim. Together they pin "the importer agrees with the twin"
+// for the bare-identifier birth-store shape.
+BEZEL_TEST(xmod_record_body_ctor_field_store_3207,
+           t4b_3130_same_module_bare_identifier_birth_store_lands) {
+    RunResult3207 r = runSingleModule3207(
+        sameModuleProgram3130(
+            "public class C3130T4b "
+            "  public static method Main(): int "
+            "    var q := new Person(41); "
+            "    Console.WriteLine(\"Age member:  \" + q.Age.ToString()); "
+            "    Console.WriteLine(\"ToString:    \" + q.ToString()); "
+            "    var p := new Pt(7, 8); "
+            "    Console.WriteLine(\"Pt.X member: \" + p.X.ToString()); "
+            "    Console.WriteLine(\"Pt ToString: \" + p.ToString()); "
+            "    return 0; "
+            "  end Main; "
+            "end C3130T4b;",
+            "T4b"),
+        "t4b");
+    BEZEL_EXPECT_EQ(r.rc, 0);
+    BEZEL_EXPECT_TRUE(contains3207(r.stdout_text, "Age member:  41"));
+    BEZEL_EXPECT_TRUE(contains3207(r.stdout_text, "ToString:    Person(Age: 41)"));
+    BEZEL_EXPECT_TRUE(contains3207(r.stdout_text, "Pt.X member: 7"));
+    BEZEL_EXPECT_TRUE(contains3207(r.stdout_text, "Pt ToString: Pt(X: 7, Y: 8)"));
 }
 
 }  // namespace bezel::module
