@@ -46,6 +46,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
 
 namespace {
@@ -87,7 +88,7 @@ int compileAndRunCrossModule(const std::string& libSrc,
     dep.objectPath   = lObj.path;
     std::vector<bezel::Dependency> deps{dep};
 
-    bezel::CompileResult rm = driver.compileFile(mSrc.path, mExe.path, deps);
+    bezel::CompileResult rm = bezel::test::compileFileForTest(driver, mSrc.path, mExe.path, deps);
     if (!rm.success) return -1;
 
     int status = std::system(mExe.path.c_str());

@@ -67,6 +67,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -112,7 +113,7 @@ bool compileImportCaptureErr2549(const std::string& bSrc,
         d.metadataPath = aObj;
         d.objectPath = aObj;
         deps.push_back(d);
-        success = driver.compileFile(bSrc, bExe, deps).success;
+        success = bezel::test::compileFileForTest(driver, bSrc, bExe, deps).success;
     }
     std::fflush(stderr);
     std::cerr.flush();
@@ -180,7 +181,7 @@ int compileImportAndRun2549(const std::string& libSrc,
     d.metadataPath = aObj.path;
     d.objectPath = aObj.path;
     deps.push_back(d);
-    if (!driver.compileFile(bSrc.path, bExe.path, deps).success) return -1;
+    if (!bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps).success) return -1;
     int status = std::system(bExe.path.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 }
@@ -206,7 +207,7 @@ bool compileLocalReject2549(const std::string& src, std::string& err) {
     if (fd >= 0) ::dup2(fd, STDERR_FILENO);
     {
         bezel::Driver driver;
-        success = driver.compileFile(srcFile.path, exeFile.path, {}).success;
+        success = bezel::test::compileFileForTest(driver, srcFile.path, exeFile.path, {}).success;
     }
     std::fflush(stderr);
     std::cerr.flush();
@@ -230,7 +231,7 @@ int compileLocalAndRun2549(const std::string& src) {
     TempFile2549 exeFile((dir / stem).string());
     writeSource2549(srcFile.path, src);
     bezel::Driver driver;
-    if (!driver.compileFile(srcFile.path, exeFile.path, {}).success) return -1;
+    if (!bezel::test::compileFileForTest(driver, srcFile.path, exeFile.path, {}).success) return -1;
     int status = std::system(exeFile.path.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 }

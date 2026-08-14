@@ -108,6 +108,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -154,7 +155,7 @@ int compileImportAndRun2545(const std::string& libSrc,
     d.metadataPath = aObj.path;
     d.objectPath = aObj.path;
     deps.push_back(d);
-    if (!driver.compileFile(bSrc.path, bExe.path, deps).success) return -1;
+    if (!bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps).success) return -1;
     int status = std::system(bExe.path.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 }
@@ -281,7 +282,7 @@ BEZEL_TEST(xmod_abstract_class_indexer_dispatch_2545,
                     "    return b[5]; "
                     "  end Main; "
                     "end C;");
-    BEZEL_EXPECT_TRUE(driver.compileFile(src.path, exe.path, {}).success);
+    BEZEL_EXPECT_TRUE(bezel::test::compileFileForTest(driver, src.path, exe.path, {}).success);
     int status = std::system(exe.path.c_str());
     int r = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
     BEZEL_EXPECT_EQ(r, 5);
@@ -391,7 +392,7 @@ BEZEL_TEST(xmod_abstract_class_indexer_dispatch_2545,
     d.metadataPath = aObj.path;
     d.objectPath = aObj.path;
     deps.push_back(d);
-    bool ok = driver.compileFile(bSrc.path, bExe.path, deps).success;
+    bool ok = bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps).success;
     BEZEL_EXPECT_TRUE(ok);
 }
 

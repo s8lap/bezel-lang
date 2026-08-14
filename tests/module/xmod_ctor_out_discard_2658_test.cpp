@@ -144,6 +144,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -263,7 +264,7 @@ int runImported2658(const std::string& mainBody, const std::string& moduleTag,
             ::dup2(sink, STDERR_FILENO);
             ::close(sink);
         }
-        compiled = driver.compileFile(bSrc.path, bExe.path, deps).success;
+        compiled = bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps).success;
         std::fflush(stderr);
         if (saved >= 0) {
             ::dup2(saved, STDERR_FILENO);
@@ -274,7 +275,7 @@ int runImported2658(const std::string& mainBody, const std::string& moduleTag,
         ss << in.rdbuf();
         *capturedStderr = ss.str();
     } else {
-        compiled = driver.compileFile(bSrc.path, bExe.path, deps).success;
+        compiled = bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps).success;
     }
     if (!compiled) return -1;
     int status = std::system(bExe.path.c_str());

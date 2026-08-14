@@ -22,6 +22,7 @@
 #include <sys/wait.h>
 
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
 
 namespace {
@@ -51,7 +52,7 @@ int importRun1225(const std::string& bSrc, const std::string& bExe,
     d.metadataPath = aObj;
     d.objectPath = aObj;
     deps.push_back(d);
-    if (!driver.compileFile(bSrc, bExe, deps).success) return -1;
+    if (!bezel::test::compileFileForTest(driver, bSrc, bExe, deps).success) return -1;
     int status = std::system(bExe.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 }

@@ -56,6 +56,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -98,7 +99,7 @@ bool compileImportCaptureErr3145(const std::string& bSrc,
         d.metadataPath = aObj;
         d.objectPath = aObj;
         deps.push_back(d);
-        success = driver.compileFile(bSrc, bExe, deps).success;
+        success = bezel::test::compileFileForTest(driver, bSrc, bExe, deps).success;
     }
     std::fflush(stderr);
     std::cerr.flush();
@@ -159,7 +160,7 @@ bool compileLocalCaptureErr3145(const std::string& src, std::string& err) {
     if (fd >= 0) ::dup2(fd, STDERR_FILENO);
     {
         bezel::Driver driver;
-        success = driver.compileFile(srcFile.path, exeFile.path, {}).success;
+        success = bezel::test::compileFileForTest(driver, srcFile.path, exeFile.path, {}).success;
     }
     std::fflush(stderr);
     std::cerr.flush();

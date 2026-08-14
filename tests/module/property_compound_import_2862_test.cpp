@@ -56,6 +56,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -99,7 +100,7 @@ int compileImportAndRun2862(const std::string& libSrc,
     d.metadataPath = aObj.path;
     d.objectPath = aObj.path;
     deps.push_back(d);
-    if (!driver.compileFile(bSrc.path, bExe.path, deps).success) return -1;
+    if (!bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps).success) return -1;
     int status = std::system(bExe.path.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 }

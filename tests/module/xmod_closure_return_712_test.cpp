@@ -39,6 +39,7 @@
 #include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
 #include "lexer/Lexer.hpp"
+#include "support/driver_run_support.hpp"
 #include "module/ModuleLoader.hpp"
 #include "module/ModuleMetadata.hpp"
 #include "module/ModuleMetadataBuilder.hpp"
@@ -113,7 +114,7 @@ static int compileImportAndRun712(
     d.metadataPath = aObj;
     d.objectPath   = aObj;
     deps.push_back(d);
-    bezel::CompileResult r = driver.compileFile(bSrc, bExe, deps);
+    bezel::CompileResult r = bezel::test::compileFileForTest(driver, bSrc, bExe, deps);
     if (!r.success) return -1;
     int status = std::system(bExe.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
@@ -379,7 +380,7 @@ BEZEL_TEST(xmod_closure_return_712, c2_single_module_baseline_lsan_28_9) {
     writeSource712(srcFile.path, singleSrc);
 
     bezel::Driver driver;
-    bezel::CompileResult r = driver.compileFile(srcFile.path, exeFile.path, {});
+    bezel::CompileResult r = bezel::test::compileFileForTest(driver, srcFile.path, exeFile.path, {});
     if (r.success) {
         int status = std::system(exeFile.path.c_str());
         int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;

@@ -105,6 +105,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -230,14 +231,14 @@ int runImported3178(const std::string& body, const std::string& tag,
             ::dup2(sink, STDERR_FILENO);
             ::close(sink);
         }
-        compiled = driver.compileFile(bSrc.path, bExe.path, deps).success;
+        compiled = bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps).success;
         std::fflush(stderr);
         if (saved >= 0) { ::dup2(saved, STDERR_FILENO); ::close(saved); }
         std::ifstream in(bErr.path);
         capturedStderr->assign((std::istreambuf_iterator<char>(in)),
                                std::istreambuf_iterator<char>());
     } else {
-        compiled = driver.compileFile(bSrc.path, bExe.path, deps).success;
+        compiled = bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps).success;
     }
     if (!compiled) return -1;
     if (!std::ifstream(bExe.path).good()) return -1;
@@ -274,14 +275,14 @@ int runSingleModule3178(const std::string& src, const std::string& tag,
             ::dup2(sink, STDERR_FILENO);
             ::close(sink);
         }
-        compiled = driver.compileFile(sSrc.path, sExe.path, {}).success;
+        compiled = bezel::test::compileFileForTest(driver, sSrc.path, sExe.path, {}).success;
         std::fflush(stderr);
         if (saved >= 0) { ::dup2(saved, STDERR_FILENO); ::close(saved); }
         std::ifstream in(sErr.path);
         capturedStderr->assign((std::istreambuf_iterator<char>(in)),
                                std::istreambuf_iterator<char>());
     } else {
-        compiled = driver.compileFile(sSrc.path, sExe.path, {}).success;
+        compiled = bezel::test::compileFileForTest(driver, sSrc.path, sExe.path, {}).success;
     }
     if (!compiled) return -1;
     if (!std::ifstream(sExe.path).good()) return -1;

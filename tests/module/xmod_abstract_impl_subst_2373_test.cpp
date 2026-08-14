@@ -75,6 +75,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -125,7 +126,7 @@ bool compileImportCaptureErr2373(const std::string& bSrc,
         d.metadataPath = aObj;
         d.objectPath = aObj;
         deps.push_back(d);
-        success = driver.compileFile(bSrc, bExe, deps).success;
+        success = bezel::test::compileFileForTest(driver, bSrc, bExe, deps).success;
     }
     std::fflush(stderr);
     std::cerr.flush();
@@ -164,7 +165,7 @@ int compileImportAndRun2373(const std::string& libSrc,
     d.metadataPath = aObj.path;
     d.objectPath = aObj.path;
     deps.push_back(d);
-    if (!driver.compileFile(bSrc.path, bExe.path, deps).success) return -1;
+    if (!bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps).success) return -1;
     int status = std::system(bExe.path.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 }
@@ -190,7 +191,7 @@ bool compileImportSucceeds2373(const std::string& libSrc,
     d.metadataPath = aObj.path;
     d.objectPath = aObj.path;
     deps.push_back(d);
-    return driver.compileFile(bSrc.path, bExe.path, deps).success;
+    return bezel::test::compileFileForTest(driver, bSrc.path, bExe.path, deps).success;
 }
 
 }  // namespace
