@@ -2328,6 +2328,163 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     ncPhi->addIncoming(ncAccessVal, ncAccessEnd);
                     return ncPhi;
                 }
+                // fix #3209 (§7.5 / §23.2 / §2.5, v0.254): the IMPORTED,
+                // non-virtual, non-interface, NON-AUTO-STORAGE computed-property
+                // getter. The local computed-getter path above (the #3015 block)
+                // routes through `computedGetterOf` / `blockGetterOf`, both
+                // AST-only — for an imported PropertySymbol, `ps->decl` is null
+                // (ModuleLoader never assigns it; there is no AST on the importer
+                // side), so BOTH return null and the `if (ncGetter || ncBlockAcc)`
+                // gate never fires. `ncIsVirtual` was already set false above
+                // (declareImportedPropertyGetters also skips virtual / interface
+                // / indexer — LlvmBackend_Setup.cpp:2776-2804 — so the imported
+                // stub is only populated for the shape we are now handling).
+                //
+                // The `.` form has the same import fallback for the computed-
+                // property path, via `importedPropGetterFns_[ps]` at ~L5296-L5405
+                // (the §2.5/§23 arm added by #2504 for the bare-identifier twin
+                // of this shape). Add the SAME fallback here: call the external
+                // getter stub with the null-checked receiver and lift the result
+                // to nullable exactly as the local block-form-getter branch
+                // above does.
+                //
+                // Auto-storage is gated out via `isAutoPropertyStorageSymbol`
+                // (the both-sources predicate — see SymbolCollection.cpp:866).
+                // For an IMPORTED auto-property, `storageMemberOf` below resolves
+                // the backing FieldSymbol correctly (#2478's wire-bit fallback),
+                // so the lower direct-field path lifts the slot value to nullable
+                // itself. Routing that case here would (a) call a getter stub
+                // `bz$<C>$<P>$propget` that `emitExportedPropertyGetters`
+                // deliberately does NOT emit for an auto-property (it has no
+                // body to wrap), and (b) lose the direct-field read's null-lift.
+                // A local auto-property, in turn, has an `ast::PropertyDecl` and
+                // IS the `ncBlockAcc`/`ncGetter` case above — the AST arms reach
+                // it before this one can.
+                //
+                // A NON-nullable generic (sema #2884 decline — `q?.P` on a
+                // nullable generic receiver) is rejected at sema, so no extra
+                // generic-substitution gate is needed here. A virtual / interface
+                // / indexer import is filtered by declareImportedPropertyGetters
+                // itself, so the find below cannot return a non-existent stub.
+                else if (!ncIsVirtual && !ncGetter && !ncBlockAcc) {
+                    if (!sema::isAutoPropertyStorageSymbol(ncPropSym, ctx_)) {
+                        auto ncIgit = importedPropGetterFns_.find(ncPropSym);
+                        if (ncIgit != importedPropGetterFns_.end()) {
+                            llvm::Value* obj = lowerExpr(*nm->target);
+                            if (!obj || !obj->getType()->isPointerTy())
+                                return nullptr;
+                            // fix #2474 (§9.2/§23.1/§23.2): a record receiver
+                            // lowers to a by-value struct, not a heap pointer,
+                            // but `declareImportedPropertyGetters` declares the
+                            // stub unconditionally as `T get(ptr %this)`. Mirror
+                            // the `.`-form sibling's spill-to-slot (MemberAccess
+                            // Expr arm ~L5377-L5384) — aggregate receiver,
+                            // non-Enum (the Enum exemption matches the sibling
+                            // path's own gate verbatim, and an Enum's exported
+                            // property getter stub is gated the same way).
+                            if (!obj->getType()->isPointerTy() &&
+                                obj->getType()->isAggregateType()) {
+                                bool ncIEnumRcv =
+                                    ncPropSym->parent &&
+                                    ncPropSym->parent->kind ==
+                                        ast::TypeDeclKind::Enum;
+                                if (!ncIEnumRcv) {
+                                    llvm::AllocaInst* tmp =
+                                        entryAlloca(obj->getType());
+                                    builder_.CreateStore(obj, tmp);
+                                    obj = tmp;
+                                }
+                            }
+                            if (!obj->getType()->isPointerTy()) return nullptr;
+                            auto* ncIEntryBB = builder_.GetInsertBlock();
+                            auto* ncIAccessBB = llvm::BasicBlock::Create(
+                                llvm_, "ncpropimp.access", currentFn_);
+                            auto* ncIEndBB = llvm::BasicBlock::Create(
+                                llvm_, "ncpropimp.end", currentFn_);
+                            llvm::Value* ncIIsNull = builder_.CreateICmpEQ(
+                                obj, llvm::ConstantPointerNull::get(ptrTy()));
+                            builder_.CreateCondBr(
+                                ncIIsNull, ncIEndBB, ncIAccessBB);
+                            builder_.SetInsertPoint(ncIAccessBB);
+                            // fix #2816 / §28.3 (v0.240): the temporary's
+                            // disposal must be registered at its production so
+                            // the imported getter's throw edge (emitPendingCheck
+                            // below) unwinds through it. Mirrors the `.`-form
+                            // twin at MemberAccessExpr ~L5385-L5405.
+                            llvm::AllocaInst* ncIRecvUnwind =
+                                registerFreshNewReceiverTempUnwind(
+                                    nm->target.get(), obj,
+                                    ctx_.exprType(e),
+                                    /*calleeReturnsOwned=*/false);
+                            llvm::Value* ncRaw = builder_.CreateCall(
+                                ncIgit->second->getFunctionType(),
+                                ncIgit->second, {obj});
+                            // §31.1/§31.2: a throw out of the imported getter
+                            // leaves the pending-exception global set; the
+                            // caller must test it and route to the enclosing
+                            // unwind target. Without this, the throw is
+                            // swallowed and `ncRaw` is a garbage value (the
+                            // exact twin of #3015's `ncBlockAcc` branch).
+                            emitPendingCheck();
+                            // Lift the getter result to the §7.5 (always-nullable)
+                            // result — SAME logic as the `ncBlockAcc` branch
+                            // above: a reference result is a pointer (null when
+                            // the receiver is null); a value result wraps into
+                            // the tagged {i8 hasValue; T} struct; a result
+                            // already nullable passes through with the receiver's
+                            // edge.
+                            const sema::TypeRef* ncIResultTy = ctx_.exprType(e);
+                            bool ncIRef = ncRaw->getType()->isPointerTy();
+                            bool ncINullableMem = !ncIRef && ncIResultTy &&
+                                isNullableValueTy(ncIResultTy) &&
+                                ncRaw->getType() ==
+                                    nullableValueStructTy(ncIResultTy);
+                            llvm::Type* ncIResTy = ncIRef
+                                ? static_cast<llvm::Type*>(ptrTy())
+                                : (ncINullableMem
+                                       ? ncRaw->getType()
+                                       : static_cast<llvm::Type*>(
+                                             llvm::StructType::get(
+                                                 llvm_,
+                                                 {nullablePrimHasValTy(),
+                                                  ncRaw->getType()})));
+                            llvm::Value* ncIAccessVal;
+                            if (ncIRef || ncINullableMem) {
+                                ncIAccessVal = ncRaw;
+                            } else {
+                                ncIAccessVal = builder_.CreateInsertValue(
+                                    llvm::UndefValue::get(ncIResTy),
+                                    llvm::ConstantInt::get(
+                                        nullablePrimHasValTy(), 1),
+                                    {0u});
+                                ncIAccessVal = builder_.CreateInsertValue(
+                                    ncIAccessVal, ncRaw, {1u});
+                            }
+                            auto* ncIAccessEnd = builder_.GetInsertBlock();
+                            builder_.CreateBr(ncIEndBB);
+                            builder_.SetInsertPoint(ncIEndBB);
+                            llvm::Value* ncINullVal = ncIRef
+                                ? static_cast<llvm::Value*>(
+                                      llvm::ConstantPointerNull::get(ptrTy()))
+                                : static_cast<llvm::Value*>(
+                                      llvm::ConstantAggregateZero::get(
+                                          ncIResTy));
+                            auto* ncIPhi = builder_.CreatePHI(ncIResTy, 2);
+                            ncIPhi->addIncoming(ncINullVal, ncIEntryBB);
+                            ncIPhi->addIncoming(
+                                ncIAccessVal, ncIAccessEnd);
+                            // fix #2751 / §28.3 (v0.240): the IMPORTED `?.`-
+                            // form getter spelling — the same reclaim as the
+                            // `.`-form sibling path (~L5396-L5405).
+                            if (!diverged_)
+                                disposeFreshNewReceiverTemp(
+                                    nm->target.get(), obj, ctx_.exprType(e),
+                                    /*calleeReturnsOwned=*/false,
+                                    ncIRecvUnwind);
+                            return ncIPhi;
+                        }
+                    }
+                }
             }
         }
         // fix #3016 (§7.5 / §12.1 / §13 / §23, v0.240): the VIRTUAL / INTERFACE
