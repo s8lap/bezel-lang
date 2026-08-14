@@ -8710,6 +8710,119 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             }
         }
     }
+    // fix #3195 / §28.14 (the SCOPED PASSIVE case) / §28.9 / §27.5: a `scoped`
+    // function-typed parameter MAY store the callback (§28.14), but only if the
+    // callee body actually references the parameter — a `Subscribe(scoped h: () -> ())`
+    // whose body is `=> new Sub()` never reads `h`, so the +1 closure producer
+    // passed in is caller-owned through-and-through and the cell (40 bytes) +
+    // its env block (8 bytes) leak per call (LSan, on the issue's exact repro).
+    //
+    // WHY THE CALLER MAY DROP IT HERE. §28.14 ("The callee may store the
+    // callback") makes storage a MAY, not a MUST; when the callee body
+    // provably does NOT reference the parameter, no `scoped` field write can
+    // have occurred — `MethodOwnership::scopedFormalAt` rejects every sink
+    // other than a direct non-owned `scoped` field of the bounding object, and
+    // such a write would require the parameter's identifier in the body. We
+    // confirm by walking the callee's body for any `IdentifierExpr` whose name
+    // matches `p.name`; a hit proves a real reference (a call-invocation
+    // `h()` reads through the cell's function pointer without +1, so it does
+    // NOT transfer ownership — but we conservatively bail on ANY hit because a
+    // a body that invokes `h` may also store it elsewhere via forwarding, and
+    // the leak is the safe direction (a UAF is not). So we arm only when the
+    // body has zero references to the parameter — the common `=> new R()`
+    // ignore-handler shape, where storage is provably absent.
+    //
+    // Same exclusions as the call-bounded arm above: not async, not sync iter,
+    // declared return not a frame, and the substituted result type not a frame
+    // / lazy-query sentinel / function value. A deferred-activation callee
+    // legitimately retains the callback past the call in its frame — its
+    // frame-residence retain is the +1 that drops in the iterator's
+    // emitIteratorMethod / async iterator's emitFreeAndReturn — so a release
+    // here would be a double-free of the live frame's reference. // per
+    // §28.14, §28.9, §27.5
+    std::vector<llvm::Value*> scopedClosureArgs;
+    if (auto* mdSc = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        // Re-derive the deferred-activation gates identically to the call-
+        // bounded arm above so the two arms never disagree on what counts as a
+        // frame.
+        auto headIsDeferredFrameSc = [](std::string_view h) {
+            return h == "IEnumerable" || h == "IEnumerator" ||
+                   h == "IAsyncEnumerable" || h == "IAsyncEnumerator" ||
+                   h == "IOwningEnumerable" || h == "IOwningEnumerator" ||
+                   h == "IOwningAsyncEnumerable" ||
+                   h == "IOwningAsyncEnumerator" || h == "Task" ||
+                   h == "OwningTask";
+        };
+        const bool isSyncIterCalleeSc =
+            mdSc->bodyKind == ast::MethodBodyKind::Block &&
+            containsYield(mdSc->stmts);
+        bool declaredReturnOkSc = false;
+        if (!mdSc->returnType) {
+            declaredReturnOkSc = true;
+        } else if (mdSc->returnType->kind == ast::TypeKind::Named &&
+                   mdSc->returnType->name &&
+                   mdSc->returnType->name->parts.size() == 1) {
+            std::string_view synHead = mdSc->returnType->name->parts.front();
+            bool isTypeParam = false;
+            for (const auto& gp : mdSc->genericParams)
+                if (gp.name == synHead) { isTypeParam = true; break; }
+            if (!isTypeParam && ms->parent)
+                for (const sema::Symbol* gp : ms->parent->genericParams)
+                    if (gp && gp->name == synHead) { isTypeParam = true; break; }
+            std::string_view head = synHead;
+            if (const sema::TypeRef* drt =
+                    ctx_.resolvedType(*mdSc->returnType)) {
+                if (drt->kind == sema::TypeRef::Kind::Function)
+                    isTypeParam = true;  // closure-returning — bail
+                else if (drt->kind == sema::TypeRef::Kind::Named &&
+                         !drt->headName().empty())
+                    head = drt->headName();
+            }
+            declaredReturnOkSc = !isTypeParam && !headIsDeferredFrameSc(head);
+        }
+        bool callResultOkSc = true;
+        if (mdSc->returnType) {
+            const sema::TypeRef* rt = ctx_.exprType(call);
+            if (!rt || rt->kind == sema::TypeRef::Kind::Function) {
+                callResultOkSc = false;
+            } else if (rt->kind == sema::TypeRef::Kind::Named) {
+                if (!rt->declaration && !rt->astNode && !rt->genericArgs.empty() &&
+                    rt->importedName.empty())
+                    callResultOkSc = false;
+                else if (headIsDeferredFrameSc(rt->headName()))
+                    callResultOkSc = false;
+            }
+        }
+        if (!isAsyncMethod(ms) && !isSyncIterCalleeSc && declaredReturnOkSc &&
+            callResultOkSc && argExprs.size() == args.size() &&
+            args.size() >= mdSc->params.size() &&
+            args.size() - mdSc->params.size() <= 1) {
+            const std::size_t off = args.size() - mdSc->params.size();
+            for (std::size_t pi = 0; pi < mdSc->params.size(); ++pi) {
+                const ast::Param& p = mdSc->params[pi];
+                if (p.modifier != "scoped") continue;
+                if (!p.type || p.type->kind != ast::TypeKind::Function) continue;
+                // Body-references check: bail at any hit (the conservative
+                // direction — leak, not UAF).
+                std::vector<const ast::IdentifierExpr*> bodyRefs;
+                if (mdSc->bodyKind == ast::MethodBodyKind::Expression &&
+                    mdSc->exprBody) {
+                    collectClosureArgBodyIdentifiers(*mdSc->exprBody, bodyRefs);
+                } else if (mdSc->bodyKind == ast::MethodBodyKind::Block) {
+                    for (const auto& st : mdSc->stmts)
+                        if (st) collectClosureArgBodyIdentifiers(*st, bodyRefs);
+                }
+                bool referenced = false;
+                for (const ast::IdentifierExpr* id : bodyRefs) {
+                    if (id->name == p.name) { referenced = true; break; }
+                }
+                if (referenced) continue;
+                const std::size_t ai = off + pi;
+                if (argExprs[ai] && isPlusOneClosureProducer(argExprs[ai]))
+                    scopedClosureArgs.push_back(args[ai]);
+            }
+        }
+    }
     // fix #1073 / #2305 release site (2/2) — the EXCEPTION/UNWIND edge.
     // Install the cleanup as `unwindTarget_` for the duration of the call only,
     // so every unwind edge `emitMethodCall` emits (the callee's propagate, a
@@ -8723,19 +8836,32 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // async), and the call-bounded arm excludes BOTH (`!isSyncIterCallee` drops
     // the sync iterators, `!isAsyncMethod(ms)` drops every async callee, async
     // iterators included) — so combining them
-    // never double-releases. See Emitter::closureArgUnwindCleanup for the
+    // never double-releases. fix #3195 EXTENDS this to a THIRD vector:
+    // `scopedClosureArgs` (closures passed to a `scoped` parameter whose
+    // callee body does not reference the parameter, so the callee provably
+    // did not store it). The three vectors are pairwise disjoint — the
+    // sync-iter arm requires an iterator callee (sync, or async per #2609),
+    // the call-bounded arm requires `p.modifier.empty()`, and the scoped arm
+    // requires `p.modifier == "scoped"` — so combining them never
+    // double-releases. See Emitter::closureArgUnwindCleanup for the
     // exactly-once argument.
     llvm::BasicBlock* savedClArgUnwind = unwindTarget_;
-    if (!syncIterClosureArgs.empty() || !callBoundedClosureArgs.empty()) {
+    if (!syncIterClosureArgs.empty() || !callBoundedClosureArgs.empty() ||
+        !scopedClosureArgs.empty()) {
         std::vector<llvm::Value*> allClosureArgs;
         allClosureArgs.reserve(syncIterClosureArgs.size() +
-                               callBoundedClosureArgs.size());
+                               callBoundedClosureArgs.size() +
+                               scopedClosureArgs.size());
         allClosureArgs.insert(allClosureArgs.end(),
                               syncIterClosureArgs.begin(),
                               syncIterClosureArgs.end());
         allClosureArgs.insert(allClosureArgs.end(),
                               callBoundedClosureArgs.begin(),
                               callBoundedClosureArgs.end());
+        // fix #3195: also release on the unwind edge.
+        allClosureArgs.insert(allClosureArgs.end(),
+                              scopedClosureArgs.begin(),
+                              scopedClosureArgs.end());
         unwindTarget_ = closureArgUnwindCleanup(allClosureArgs);
     }
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs,
@@ -8748,6 +8874,10 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // producer's evaluation and here, so it runs exactly once per evaluation
         // of the call and is mutually exclusive with the unwind cleanup above.
         for (llvm::Value* cl : callBoundedClosureArgs) emitClosureRelease(cl);
+        // fix #3195: the same NORMAL-return release for the scoped arm —
+        // the producer's +1 on a closure passed to a `scoped` parameter
+        // whose callee provably doesn't store it.
+        for (llvm::Value* cl : scopedClosureArgs) emitClosureRelease(cl);
     }
     // Record the concrete subst that drives the RESULT local's layout so that
     // lowerLocalDecl can associate it with the result's local variable.
@@ -9308,6 +9438,141 @@ bool Emitter::deriveDescendantGenericSubst(
         above = level;
     }
     return true;
+}
+
+
+// fix #3195 / §28.14: walk an arbitrary AST node collecting every bare
+// `IdentifierExpr` it contains. Used by the `scoped`-passive release arm in
+// emitMethodCall to test whether a `scoped` function-typed parameter is
+// referenced ANYWHERE in the callee body — a hit proves the parameter is used
+// (and so the release is conservatively bailed on). The walk matches the
+// `Ownership_Checks.cpp::collectIdentifiersIn` shape one-for-one — same AST
+// coverage, same descent, so the two walkers cannot disagree on what counts
+// as a reference.
+void Emitter::collectClosureArgBodyIdentifiers(
+    const ast::Node& n,
+    std::vector<const ast::IdentifierExpr*>& out) const {
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&n)) {
+        out.push_back(id);
+        return;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&n)) {
+        if (ma->target) collectClosureArgBodyIdentifiers(*ma->target, out);
+        return;
+    }
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&n)) {
+        if (nm->target) collectClosureArgBodyIdentifiers(*nm->target, out);
+        return;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&n)) {
+        if (ce->callee) collectClosureArgBodyIdentifiers(*ce->callee, out);
+        for (const auto& a : ce->args)
+            if (a.value) collectClosureArgBodyIdentifiers(*a.value, out);
+        return;
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&n)) {
+        if (nc->callee) collectClosureArgBodyIdentifiers(*nc->callee, out);
+        for (const auto& a : nc->args)
+            if (a.value) collectClosureArgBodyIdentifiers(*a.value, out);
+        return;
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&n)) {
+        if (ix->target) collectClosureArgBodyIdentifiers(*ix->target, out);
+        for (const auto& a : ix->indices)
+            if (a.value) collectClosureArgBodyIdentifiers(*a.value, out);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&n)) {
+        if (be->left) collectClosureArgBodyIdentifiers(*be->left, out);
+        if (be->right) collectClosureArgBodyIdentifiers(*be->right, out);
+        return;
+    }
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&n)) {
+        if (un->operand) collectClosureArgBodyIdentifiers(*un->operand, out);
+        return;
+    }
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&n)) {
+        for (const auto& a : ne->args)
+            if (a.value) collectClosureArgBodyIdentifiers(*a.value, out);
+        return;
+    }
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&n)) {
+        if (th->operand) collectClosureArgBodyIdentifiers(*th->operand, out);
+        return;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(&n)) {
+        if (cd->condition) collectClosureArgBodyIdentifiers(*cd->condition, out);
+        if (cd->thenValue) collectClosureArgBodyIdentifiers(*cd->thenValue, out);
+        if (cd->elseValue) collectClosureArgBodyIdentifiers(*cd->elseValue, out);
+        return;
+    }
+    // Stmt-side walks. The function walks statements that can wrap a value:
+    // LocalDecl / ExpressionStmt / AssignmentStmt / ReturnStmt / ThrowStmt /
+    // IfStmt / WhileStmt / ForStmt. Compound statements (DoEndBlock, CaseStmt,
+    // TryStmt, etc.) are NOT walked here — a `scoped` parameter referenced
+    // inside such a block would still be detected by the expression descent
+    // over its inner statements; only an IdentifierExpr can name a parameter,
+    // and any compound statement holding one descends to that IdentifierExpr
+    // through some expression child.
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&n)) {
+        if (ld->initializer)
+            collectClosureArgBodyIdentifiers(*ld->initializer, out);
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&n)) {
+        if (lc->value) collectClosureArgBodyIdentifiers(*lc->value, out);
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&n)) {
+        if (es->expr) collectClosureArgBodyIdentifiers(*es->expr, out);
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&n)) {
+        if (as->target) collectClosureArgBodyIdentifiers(*as->target, out);
+        if (as->value) collectClosureArgBodyIdentifiers(*as->value, out);
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&n)) {
+        if (rs->value) collectClosureArgBodyIdentifiers(*rs->value, out);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&n)) {
+        if (ts->value) collectClosureArgBodyIdentifiers(*ts->value, out);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&n)) {
+        if (ifs->ifBranch.condition)
+            collectClosureArgBodyIdentifiers(*ifs->ifBranch.condition, out);
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) collectClosureArgBodyIdentifiers(*bs, out);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition)
+                collectClosureArgBodyIdentifiers(*el.condition, out);
+            for (const auto& bs : el.body)
+                if (bs) collectClosureArgBodyIdentifiers(*bs, out);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) collectClosureArgBodyIdentifiers(*bs, out);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&n)) {
+        if (ws->condition)
+            collectClosureArgBodyIdentifiers(*ws->condition, out);
+        for (const auto& bs : ws->body)
+            if (bs) collectClosureArgBodyIdentifiers(*bs, out);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&n)) {
+        if (fs->iterable)
+            collectClosureArgBodyIdentifiers(*fs->iterable, out);
+        if (fs->withExpr)
+            collectClosureArgBodyIdentifiers(*fs->withExpr, out);
+        for (const auto& bs : fs->body)
+            if (bs) collectClosureArgBodyIdentifiers(*bs, out);
+        return;
+    }
+    // Other expression / statement forms carry no identifier that could be
+    // a method parameter reference (literals, type expressions, etc.).
 }
 
 

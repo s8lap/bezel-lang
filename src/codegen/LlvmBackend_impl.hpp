@@ -10627,6 +10627,18 @@ private:
     // eligibility.
     bool isPlusOneClosureProducer(const ast::Expr* init) const;
 
+    // fix #3195 / §28.14: walk an expression or statement collecting every
+    // bare `IdentifierExpr` (a method/parameter/local reference) it contains,
+    // so the #3195 release arm can test whether a `scoped` parameter is
+    // referenced ANYWHERE in the callee body — a hit proves the parameter is
+    // used (and so we conservatively bail on the release; a body that doesn't
+    // reference the parameter provably cannot have stored it in a `scoped`
+    // field, because that requires the identifier). Used by the scoped-passive
+    // release arm in LlvmBackend_Calls2.cpp.
+    void collectClosureArgBodyIdentifiers(
+        const ast::Node& n,
+        std::vector<const ast::IdentifierExpr*>& out) const;
+
     // #422 / #2960 / §8.6 / §28.9: the set of `var` Object/interface
     // LocalDecl nodes PROVABLY eligible for managed box release. A candidate
     // either starts with a known +1 box or receives one through plain `:=`, and
