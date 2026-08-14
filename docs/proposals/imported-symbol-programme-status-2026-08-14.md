@@ -33,7 +33,7 @@ for a GENERIC type, so for a non-generic imported class every member symbol has
 
 | | |
 |---|---|
-| `origin/main` | `226aca1` — **10-commit batch PUSHED**, gate cycle 5 GREEN (plain + ASan trustworthy-green, conformance 178/0/393) |
+| `origin/main` | `ddf41f2` — **6-commit batch PUSHED**, gate cycle 6 GREEN (plain attempt 8 trustworthy-green, ASan attempt 1 trustworthy-green, conformance 178/0/393) |
 | **class 1** (`TypeDecl` symbol-side) | **152 → 51** ✅ all 12 families landed |
 | **class 2** (always-null `TypeSymbol`→`TypeDecl`) | **1 → 0** ✅ (#3150) |
 | **class 3** (member-kind symbol-side) | **305 → 292** (M4 −7, M8/#3188/#3206/#3182 −3, #3178 tooling −3) |
@@ -124,8 +124,21 @@ Two things Wave B2 established that outlive it:
 ⚠ **M5 carries a free win**: `MetaParam::hasDefault` is ALREADY on the wire and simply
 dropped by `ModuleLoader::convertParams` — no format change needed.
 
-**Wave C.** M11 const folding (6, OOB via malformed element GEP) · M9 initializers not
-replayed (3).
+**Wave C — LANDED.** M9 initializers not replayed (3 sites) — **#3218** `imported?.ClassTypedField`
+drops (classStruct retry on the `?.` GEP lookup mirroring the `.` form's precedent at
+`LlvmBackend_Layout.cpp:5799`), **#3209** `imported?.ComputedProperty` drops (parallel
+`importedPropGetterFns_` arm in the `?.` member-access lowering, gated on
+`!isAutoPropertyStorageSymbol`). **#3223** (sister to #3191, `isTrivialDisposeClass` consults the
+carried `importedNonTrivialDispose` verdict on the throw carve-out — the 4th independent copy of
+§28.9's classification). **#3219** (decl-less widening of `findUserCtorByArity`, gated on
+`matching > 0` precedence). **#3221** (the schema tail: 18th scalar `posParamBodyRef` carried
+across the wire so #2364's §9.8 base-with-storage guard fires on an imported base whose storage
+is a captured primary-ctor parameter — predicate arm stays narrow: `if (fs->posParam) return
+fs->posParamBodyRef;`, NOT widened). 5 commits `7ff67d9..ddf41f2`, all 5 per-fix reviews PASS.
+
+M11 const folding (6, OOB via malformed element GEP) did NOT yet ship; the picks drained
+the lower-blocks first because the `?.` family is at risk of being re-broken by every
+adjacent change to property lowering. **Wave D** now picks up M11 + the next blocks.
 
 **Wave D.** M7 (9) and M14 (2), once D0 lifts their blockers.
 
