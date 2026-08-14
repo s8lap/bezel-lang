@@ -9282,21 +9282,60 @@ void MethodOwnership::checkAwaitSitesExpr(
 // codegen rather than factored out (see those sites' own "must match" cross-
 // reference comments). The interface/Task-family names mirror
 // isAdmittedAsyncReturnType (TypeResolution_Checks.cpp) and awaitTaskKind
-// (this file) — a Named, non-nullable, single-part-name TypeRef whose head
-// is one of the listed identifiers. // per §28.3, §29.3, §29.11, §30.1
+// (this file) — a Named, non-nullable TypeRef whose head is one of the
+// listed identifiers.
+//
+// fix #3187 / §28.3 (v0.254): the pre-#3187 implementation required an AST
+// node AND a single-part name; that AST-only lookup silently classified
+// every imported `IEnumerable<T>`/`IAsyncEnumerable<T>`/Task-family call
+// result as "not a deferred-activation call", so §28.3's reject was dead
+// across a module boundary (the silent soundness widening this commit
+// ships). The head-name lookup now resolves across all carrying channels
+// the TypeRef may be represented by — AST, `importedName`, and the
+// declaration-side `name` — mirroring isTaskFamily's
+// (checkBorrowingTaskArrayLiteral below) cross-channel lookup. // per §28.3,
+//                                                              §29.3,
+//                                                              §29.11,
+//                                                              §30.1, v0.254
 bool MethodOwnership::isDeferredActivationCallResult(
     const ast::Expr& callResult) const {
     const sema::TypeRef* rt = ctx_.exprType(callResult);
     if (!rt) return false;
+    // §29.11 lazy-query sentinel: a locally-synthesized Named TypeRef with
+    // no declaration and no AST (the LINQ operators mint it directly). The
+    // `!importedName.empty()` guard keeps this arm for the local-lazy-query
+    // case — the imported-reconstruction case is handled by the head-name
+    // lookup below, which recognises the same shape via `importedName`.
     if (rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
         !rt->astNode && !rt->genericArgs.empty() && rt->importedName.empty()) {
         return true;  // §29.11 lazy-query sentinel
     }
     if (rt->kind != sema::TypeRef::Kind::Named || rt->nullable) return false;
-    if (!rt->astNode || !rt->astNode->name ||
-        rt->astNode->name->parts.size() != 1)
-        return false;
-    std::string_view head = rt->headName();
+    // fix #3187 / §28.3 (v0.254): resolve the head name across all the
+    // channels a TypeRef may be represented by — the AST node
+    // (locally-written types), `importedName` (cross-module TypeRefs
+    // reconstructed from metadata, where no AST exists), and the
+    // declaration-side `name` (Builtin-only). The pre-#3187 implementation
+    // required an AST node AND a single-part name; that AST-only lookup
+    // silently classified every imported IEnumerable<T>/IAsyncEnumerable<T>/
+    // Task-family call result as "not a deferred-activation call", so §28.3's
+    // reject was dead across a module boundary — exactly the silent soundness
+    // widening the issue pins. Mirror isTaskFamily's (Ownership_Checks.cpp
+    // below, in checkBorrowingTaskArrayLiteral) cross-channel head lookup
+    // — the same defect class, the same fix shape. The `parts.size() != 1`
+    // guard is also removed; `headName()` already returns `parts[0]` for
+    // multi-part names and Bezel's name grammar has no qualified builtins,
+    // so the guard was defensive belt-and-suspenders that never fired.
+    std::string_view head;
+    if (rt->astNode && rt->astNode->name &&
+        !rt->astNode->name->parts.empty()) {
+        head = rt->headName();
+    } else if (!rt->importedName.empty()) {
+        head = rt->importedName;
+    } else if (rt->declaration && !rt->declaration->decl) {
+        head = rt->declaration->name;
+    }
+    if (head.empty()) return false;
     return head == "IEnumerable" || head == "IEnumerator" ||
            head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
            head == "IOwningEnumerable" || head == "IOwningEnumerator" ||

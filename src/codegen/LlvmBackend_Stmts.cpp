@@ -6729,14 +6729,32 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         // identifier always holds a proper vtable-backed wrapper object.
         // Richer interfaces (IReadOnlyList etc.) also support indexer access
         // and are NOT wrapped; they keep the array-backed protocol.
+        //
+        // fix #3187 / §29.2 (v0.254): the pre-#3187 `rt->astNode` guard
+        // excluded every TypeRef reconstructed from cross-module metadata
+        // (no AST exists for an imported builtin interface). An imported
+        // `IEnumerable<T>`-typed local holding a yield-iterator result
+        // (the dominant cross-module shape, the issue's Shape B) was then
+        // classified as array-backed, the bz_array_len read landed at the
+        // iterator frame's state-index offset (= 8, after the vtable
+        // pointer), initially 0 → `0 < 0` false, body never runs, exit 0
+        // (the "yields NOTHING" symptom the issue pins). Resolve the head
+        // across AST and importedName — both channels the n-computation
+        // above (line ~6666) already handles for the iterable expression
+        // itself, so the same widening here keeps the iterable-EXPRESSION
+        // and the local-DECL sites in lockstep (a misclassification on one
+        // side would be exactly the inconsistent-state defect class the
+        // #552/#1177/#2154 wrapper-invariants document).
         auto checkPureIEnumerable = [&](sema::TypeRef* rt) -> bool {
             if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
             if (rt->declaration) return false;  // user class → handled by checkNamed
-            if (!rt->astNode || !rt->astNode->name ||
-                rt->astNode->name->parts.empty())
-                return false;
-            return rt->headName() == "IEnumerable" ||
-                   rt->headName() == "IOwningEnumerable";
+            std::string_view head;
+            if (rt->astNode && rt->astNode->name &&
+                !rt->astNode->name->parts.empty())
+                head = rt->headName();
+            else if (!rt->importedName.empty())
+                head = rt->importedName;
+            return head == "IEnumerable" || head == "IOwningEnumerable";
         };
         if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym)) {
             if (par->declType) {
