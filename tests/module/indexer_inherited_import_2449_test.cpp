@@ -38,19 +38,6 @@
 // a stub for one — accepting it here would trade #2449's false reject for a
 // false ACCEPT of a program still unwireable (T4 below pins this).
 //
-// ★ FOLLOW-UP (fix #3204, v0.254): the VIRTUAL / OVERRIDE half of the
-// exclusion is now lifted. Fix #3190 added a vtable-forward thunk
-// (`importedVirtualAccessorSlotFn`, LlvmBackend_Assign.cpp:5372) that
-// emits a small forwarder loading `vt$<Owner>` and tail-calling the
-// slot — so the itable slot gets a real function instead of
-// `ConstantPointerNull`. T4 below is updated to pin the remaining
-// ABSTRACT case (the only reject path that survives: an abstract
-// member has no body in the exporter, its vtable slot is legitimately
-// null, and the forwarder would forward into the same null-call crash
-// #2438 exists to prevent). The newly-accepted virtual/override
-// shape is its own regression test in
-// tests/module/xmod_inherited_virtual_indexer_iface_3204_test.cpp.
-//
 // CONFOUND NOTE (found and filed separately as #2452, NOT this fix's
 // scope): a LOCAL class deriving from an IMPORTED base does not currently
 // run the base's field initializers or constructor — `_v := 10` on an
@@ -58,7 +45,7 @@
 // instance. This is a general cross-module CONSTRUCTION defect, unrelated
 // to indexers/interfaces (confirmed to affect a plain inherited METHOD call
 // with no indexer or interface involved at all). It does NOT undermine this
-// fix's own tests: T1/T4 below use a getter body that returns a value
+// fix's own tests: T1/T3/T4 below use a getter body that returns a value
 // INDEPENDENT of any base instance field (mirrors
 // xmod_itable_prop_inherited_import_2387_test.cpp's own T1, which uses the
 // identical `=> 1` state-independent pattern for exactly this reason); T2
@@ -67,11 +54,10 @@
 // still a mechanical proof that both the setter AND the getter dispatch
 // through the SAME real storage on the imported base instance.
 //
-// SCOPE: mirrors #2414's own scope boundary — the non-generic indexer
-// shape is covered for both the non-virtual direct-call ABI (#2414)
-// and the virtual vtable-forward ABI (#3190 + #3204). A generic
-// imported base, or an indexer overloaded by arity ACROSS the
-// CLASS+ARITY-keyed cross-module ABI (#2414's own documented
+// SCOPE: mirrors #2414's own scope boundary — only the NON-VIRTUAL,
+// non-generic indexer shape is covered (matching declareImportedIndexerGetters
+// /-Setters' own gates). A generic imported base, or an indexer overloaded by
+// arity ACROSS the CLASS+ARITY-keyed cross-module ABI (#2414's own documented
 // simplification), are not exercised here.
 
 #include <cstdio>
@@ -307,27 +293,21 @@ BEZEL_TEST(indexer_inherited_import_2449,
 }
 
 // ===========================================================================
-// T4 — REJECT control: an ABSTRACT indexer on an imported base is the
-// remaining reject path. As of fix #3204 the earlier "virtual / override
-// inherited from an imported base" case is no longer a reject (the
-// vtable-forward thunk #3190 added makes it wireable through the itable
-// slot, and the new behaviour is pinned by
-// tests/module/xmod_inherited_virtual_indexer_iface_3204_test.cpp). The
-// ABSTRACT case, by contrast, has no body in the exporter, so its own
-// `vt$<Owner>` slot is legitimately null and the forwarder would forward
-// into the same null-call crash #2438/#2442 exist to prevent — the
-// sema gate has to reject it. Pin that the narrowness survives here.
+// T4 — REJECT control: a VIRTUAL indexer on an imported base is deliberately
+// EXCLUDED from #2449's wireability gate (dispatches through a vtable slot,
+// not the direct-call cross-module ABI this fix reuses; #2414's own
+// declareImportedIndexerGetters/-Setters never declare a stub for one
+// either). Must stay a "does not implement" reject, NOT a false accept of a
+// program codegen still cannot wire (which would reintroduce the null-itable-
+// slot SIGSEGV #2438/#2442 exist to prevent).
 // ===========================================================================
 BEZEL_TEST(indexer_inherited_import_2449,
-           abstract_imported_base_indexer_stays_rejected_11_2_23_4) {
+           virtual_imported_base_indexer_stays_rejected_not_falsely_accepted) {
     std::string err;
     bool success = compileImportCaptureErr2449(
         "module IdxBaseLib2449T4; "
-        "public abstract class Base2449T4 "
-        "  public abstract property [i: int]: int "
-        "    get; "
-        "    set; "
-        "  end; "
+        "public class Base2449T4 "
+        "  public virtual property [i: int]: int => 100 + i; "
         "end Base2449T4;",
         "module App2449T4; import IdxBaseLib2449T4; "
         "public interface IBox2449T4 "

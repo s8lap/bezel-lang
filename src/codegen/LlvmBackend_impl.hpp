@@ -2665,31 +2665,11 @@ private:
     // LlvmBackend_Setup.cpp, which resolves the actual function once a
     // candidate passes this gate). `findIndexer` (LlvmBackend_Assign.cpp)
     // is the sole caller.
-    //
-    // #3204 (§11.2 / §23.4 / §2.8.2 clause 1 / §2.8.3 rule 4, v0.254): the
-    // VIRTUAL / OVERRIDE half of the exclusion is now lifted. Fix #3190
-    // added a vtable-forward thunk (`importedVirtualAccessorSlotFn`,
-    // LlvmBackend_Assign.cpp:5372) that emits a small forwarder for an
-    // imported virtual / override accessor — it loads the
-    // `vt$<Owner>` slot and tail-calls it, so the itable-slot gets a
-    // real function instead of `ConstantPointerNull`. The sema mirror
-    // (`candWireable`, TypeResolution_Checks.cpp) is widened identically
-    // in this commit, so the sema gate and the codegen resolver agree
-    // on which candidates are wireable. Abstract stays excluded: an
-    // abstract member has no body in the exporter, so its own
-    // `vt$<Owner>` slot is legitimately null and the forwarder would
-    // forward into the same null-call crash #2438 exists to prevent at
-    // the sema gate. An interface-declared indexer is still excluded
-    // too (interfaces themselves don't satisfy interface obligations
-    // through class receivers).
     bool indexerCandidateWireable(const sema::PropertySymbol* ps) const {
         if (!ps) return false;
         if (dynamic_cast<const ast::PropertyDecl*>(ps->decl)) return true;
         if (ps->decl) return false;  // defensive: not a PropertyDecl either
-        for (auto mod : ps->modifiers)
-            if (mod == "abstract") return false;
-        return !(ps->parent &&
-                 ps->parent->kind == ast::TypeDeclKind::Interface);
+        return !isVirtualIndexer(ps);
     }
 
     // #481 / §23: does this property declare a setter? An auto-property without
@@ -5379,19 +5359,6 @@ private:
         const sema::MethodSymbol& ms,
         const std::vector<ast::CallArgument>& args);
 
-    // fix #3215 (§22.5 "Optional parameters and named arguments" / §2.5
-    // "Dependency resolution" — the CONSTRUCTOR twin of #3178; v0.254): an
-    // IMPORTED ctor's arguments placed by formal. Mirrors the
-    // MethodSymbol overload above: `[j] =` the index into `args` that fills
-    // formal `j`, or −1 when formal `j` takes its declared default; falls back
-    // to the identity map for shapes the binder can't handle. The same read
-    // — `formalParamCount` / `formalParamName` / `formalParamHasDefault` —
-    // handles AST and imported sources, so this is the constructor twin of
-    // the binding #3178 measured for the method path.
-    std::vector<int> importedFormalToArg(
-        const sema::ConstructorSymbol& cs,
-        const std::vector<ast::CallArgument>& args);
-
     // The value for an imported formal left to its declared default (§22.5).
     // The exporter's rendered default literal rides
     // `ParameterSymbol::defaultText` (fix #3178 carried it off the wire, where
@@ -5401,12 +5368,6 @@ private:
     // shape that folds, which declines the call loudly rather than passing an
     // unsound zero.
     llvm::Value* importedDefaultArgValue(const sema::MethodSymbol& ms,
-                                         std::size_t pos);
-
-    // fix #3215 (§22.5 / §2.5, v0.254): the ConstructorSymbol twin of the
-    // method's default-value materializer above. Same `foldImportedConstText`
-    // pipe; null on an unrenderable default.
-    llvm::Value* importedDefaultArgValue(const sema::ConstructorSymbol& cs,
                                          std::size_t pos);
 
     // §2.5 / §22.7 (issue #328 FINDING [7]): the external `bz$<Type>$ctor`
@@ -9842,57 +9803,16 @@ private:
                 return -1;
             };
             for (auto* cs : candidates) {
-                // fix #3215 (§22.6 / §2.5, v0.254 — the constructor twin of
-                // #3178): the local-AST path here used
-                // `dynamic_cast<ast::ConstructorDecl*>(cs->decl)` to read
-                // each candidate's parameter TYPES, returning null for an
-                // imported ctor and `continue`'ing past it. The
-                // over-loaded `class Over` repro measured in the issue
-                // (`ctorForArgs` ignoring the string overload entirely)
-                // came from that gate. Both sources are now consulted via
-                // `sema::formalParamResolvedType` (resolved `TypeRef`) —
-                // an `ast::Type` (and `cd->params`) for a local, a
-                // reconstructed `ParameterSymbol::resolvedDeclType` for an
-                // import.
-                //
-                // ParameterSymbol::resolvedDeclType is populated ONLY for
-                // an IMPORTED parameter — the importer writes it from
-                // MetaParam.type via `convert()` (ModuleLoader.cpp:319) —
-                // NOT for a LOCAL parameter (whose type lives on the
-                // `ast::Param` and is read via `ctx_.resolvedType`).
-                // `formalParamResolvedType` returns null for a local
-                // parameter (the sym-param-side accessor is import-only),
-                // so the discriminator MUST fall back to the AST type
-                // when the resolved type is null. Without the fallback,
-                // every LOCAL candidate would be skipped (paramTy null
-                // → `continue`) and the overload set would fall through
-                // to the first-in-source-order "no perfect type match"
-                // return — the very bug this fix closes for an imported
-                // callee would reopen for a local one.
-                const std::size_t np =
-                    sema::formalParamCount(*cs);
-                if (np != args.size()) continue;
-                // Resolve each candidate's parameter types up front, in
-                // either source's terms, so the per-argument loop below
-                // has them ready.
-                std::vector<const sema::TypeRef*> paramTys(np, nullptr);
-                if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
-                    for (std::size_t pi = 0; pi < np; ++pi)
-                        if (cd->params[pi].type)
-                            paramTys[pi] = ctx_.resolvedType(*cd->params[pi].type);
-                }
-                for (std::size_t pi = 0; pi < np; ++pi)
-                    if (!paramTys[pi])
-                        paramTys[pi] = sema::formalParamResolvedType(*cs, pi);
+                auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                if (!cd || cd->params.size() != args.size()) continue;
                 bool match = true;
                 for (std::size_t pi = 0; pi < args.size() && match; ++pi) {
-                    if (!args[pi].value) continue;
-                    const sema::TypeRef* paramTy = paramTys[pi];
-                    if (!paramTy) continue;  // unknown → defer
+                    if (!args[pi].value || !cd->params[pi].type) continue;
                     auto* argTy = ctx_.exprType(*args[pi].value);
                     bool argIsNull = dynamic_cast<const ast::NullLiteralExpr*>(
                         args[pi].value.get()) != nullptr;
                     int argCls = argIsNull ? 3 : typeClass(argTy);
+                    auto* paramTy = ctx_.resolvedType(*cd->params[pi].type);
                     int paramCls = typeClass(paramTy);
                     // Both known: must agree. Unknown means any match.
                     if (argCls != -1 && paramCls != -1 && argCls != paramCls)
@@ -9906,43 +9826,8 @@ private:
         for (sema::Symbol* m : cls->members) {
             auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
             if (!cs || cs->isStatic) continue;
-            // fix #3215 (§22.5 / §2.5, v0.254): the original `cd &&
-            // argsCanFill(cd->params, args)` ast-only branch skipped an
-            // imported ctor (`cd == nullptr`) even when its
-            // `ParameterSymbol`-side formals admitted the call. The
-            // symbol-side analogue (`sema::FormalsView::of(*cs)`) admits
-            // either source's formals, so the binder-driven path now
-            // takes the place of the AST-only branch entirely. The AST
-            // arm is kept as a fast path for the local case (which all
-            // other #3178 sites already use), but the IMPORTED arm is
-            // the new third path — required for `new OptT(2)` against
-            // `constructor(a, b := 5)` to find the right (and only)
-            // candidate and emit the imported-ctor call rather than
-            // silently degrading to a zero-initialized instance (#2658).
             auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
             if (cd && argsCanFill(cd->params, args)) return cs;
-            // IMPORTED side: the `ParameterSymbol`-led binder answers for
-            // any shape (positional, optional omitted, named) — but only
-            // when the bind succeeded and produced AT LEAST ONE formal
-            // placement (an omitted-only call binds; an empty arg list
-            // and a non-empty default-leaving bind both pass through
-            // here). For an imported ctor with no AST, the
-            // `cd == nullptr` short-circuit above omitted it; this is the
-            // fall-through path that picks it up.
-            if (!cd) {
-                std::vector<int> bind =
-                    importedFormalToArg(*cs, args);
-                // importedFormalToArg returns the IDENTITY map for any
-                // shape it cannot bind (a discard, an unknown name, a
-                // double binding, an unfilled required). Every one of
-                // those is something sema rejected upstream; the
-                // identity map says "as far as codegen knows, the args
-                // DO fit", which is the right fail-safe answer here.
-                const std::size_t np = sema::formalParamCount(*cs);
-                if (np == 0 && args.empty()) return cs;
-                if (!bind.empty() && bind.size() == np)
-                    return cs;
-            }
         }
         return nullptr;
     }

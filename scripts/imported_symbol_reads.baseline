@@ -33,7 +33,7 @@
 #         PropertySymbol::decl is never set at all, so these answer the same
 #         silent "no" across a module boundary.
 19   src/codegen/LlvmBackend_Assign.cpp
-25   src/codegen/LlvmBackend_Calls2.cpp
+23   src/codegen/LlvmBackend_Calls2.cpp
 2    src/codegen/LlvmBackend_Disposal.cpp
 8    src/codegen/LlvmBackend_Exprs.cpp
 7    src/codegen/LlvmBackend_Exprs2.cpp
@@ -51,7 +51,7 @@
 1    src/sema/DefiniteAssignment.cpp
 1    src/sema/EntryPoint.cpp
 10   src/sema/ExprTypecheck.cpp
-14   src/sema/ExprTypecheck_Calls.cpp
+15   src/sema/ExprTypecheck_Calls.cpp
 18   src/sema/ExprTypecheck_Exprs.cpp
 10   src/sema/PureChecker.cpp
 5    src/sema/StaticInitCycles.cpp

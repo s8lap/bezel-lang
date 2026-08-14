@@ -10987,119 +10987,25 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // §22.5 named-argument binding filters the candidate set first.
         // Collect the candidates this call's arguments can bind to (§22.5)
         // and record each binding so ranking operates on the bound positions.
-        // fix #3215 (§22.5 / §22.6, v0.254 — the constructor twin of #3178):
-        // this loop used to require `dynamic_cast<const ast::ConstructorDecl*>
-        // (cs->decl)` and `continue` past every candidate that failed it.
-        // For a locally declared class every candidate has the decl, so the
-        // local overload path above this line never broke; the imported twin
-        // never reached this code at all (`if (ctx_.isImported(t))` returned
-        // to `checkImportedNewExprArgs` before this block ran). After this
-        // fix's widening the local and imported paths share this filtering
-        // routine, and the read goes through `sema::FormalsView` so a
-        // candidate's formal list is consulted by symbol-side accessor —
-        // AST for a local, the reconstructed `ParameterSymbol` list for an
-        // import — rather than the `decl` cast that was null on one side.
-        std::vector<ConstructorSymbol*> candSyms;
+        std::vector<const ast::ConstructorDecl*> decls;
         std::vector<BindResult> binds;
         for (ConstructorSymbol* cs : ctors) {
-            BindResult b = bindArgsToParams(sema::FormalsView::of(*cs), ne.args,
-                                            ne.span.begin,
+            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            if (!cd) continue;
+            BindResult b = bindArgsToParams(cd->params, ne.args, ne.span.begin,
                                             /*calleeDesc=*/std::string(),
                                             /*emit=*/false);
             if (!b.ok) continue;
-            candSyms.push_back(cs);
+            decls.push_back(cd);
             binds.push_back(std::move(b));
         }
-        if (candSyms.empty()) return;  // no bindable ctor — defer (no check)
-        if (candSyms.size() == 1) {
-            // fix #3215 (§22.5, v0.254): single surviving candidate. The
-            // local twin drove the §22.3 modifier-mismatch check and the
-            // §22.5/§5.1 assignability check from `decls[0]->params` and a
-            // `checkArgsAgainstParams(params, …)` that took an
-            // `ast::Param`-list. The imported twin has no `ast::Param`
-            // list, so this code now drives both checks from the SYMBOL —
-            // a `sema::FormalsView::of(*cs)` for the bind done above plus
-            // a per-argument §22.3 / §5.1 pass that reads each formal's
-            // resolved type off the imported `ParameterSymbol`. The two
-            // paths agree by construction when both sources are present.
-            ConstructorSymbol* cs = candSyms[0];
-            const std::size_t np = sema::formalParamCount(*cs);
-            for (std::size_t j = 0; j < np; ++j) {
-                int ai = binds[0].paramToArg[j];
-                if (ai < 0) continue;  // default-filled at the codegen side
-                std::string_view argMod =
-                    ne.args[static_cast<std::size_t>(ai)].modifier;
-                std::string_view paramMod =
-                    sema::formalParamModifier(*cs, j);
-                if (argMod != paramMod) {
-                    // §22.3 mismatch — surface a single error per call, not
-                    // per-argument, mirroring emitModifierMismatch's style.
-                    // For the imported twin the modifier check is loose:
-                    // param "" accepts any; param "ref" needs "ref"; param
-                    // "out"/"out owned" needs an `out`-family argument.
-                    auto isOut = [](std::string_view m) {
-                        return m == "out" || m == "out var" ||
-                               m == "out using var" || m == "out owned var";
-                    };
-                    bool argRef = argMod == "ref", argOut = isOut(argMod);
-                    bool paramRef = paramMod == "ref";
-                    bool paramOut = paramMod == "out" ||
-                                    paramMod == "out owned";
-                    bool ok = paramRef ? argRef
-                              : paramOut ? argOut
-                                         : (!argRef && !argOut);
-                    if (!ok) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, ne.span.begin,
-                            std::string("call to `new ") +
-                                std::string(t->name) +
-                                "` has a call-site `ref`/`out` mismatch "
-                                "(§22.3)");
-                        return;
-                    }
-                }
-                // §5.1 assignability for the bound argument.
-                const ast::CallArgument& a =
-                    ne.args[static_cast<std::size_t>(ai)];
-                if (!a.value) continue;
-                // fix #3215 (§22.5 / §2.5, v0.254 — NEEDS-FIX follow-up):
-                // the parameter's resolved type is read in BOTH sources —
-                // AST first (a local `ctor`'s `ast::Param::type` resolved
-                // through the `NewExpr`'s `t` substitution, so a generic
-                // position like `ctor(x: T)` against `new T-box<int>(3)`
-                // comes out as `int`, not `T`), then the import-side
-                // `ParameterSymbol::resolvedDeclType` for an imported ctor
-                // whose `decl` is null. Without the AST leg, a LOCAL
-                // candidate's parameter type reads null here, the §5.1
-                // assignability check is silently skipped, and an int arg
-                // against `ctor(a: byte)` accepts silently — the
-                // positive-list-missing defect class. The same shape is
-                // mirrored at the overload-resolution branch below and in
-                // codegen's `ctorForArgs` for symmetry.
-                const TypeRef* pt = nullptr;
-                if (const ast::Type* at = sema::formalParamDeclType(*cs, j))
-                    pt = substituteMemberType(ctx_.resolvedType(*at),
-                                              &ne, t);
-                if (!pt) pt = sema::formalParamResolvedType(*cs, j);
-                // Per #2985: a §5.1 constant-narrowing pass (a `3` against
-                // a `byte` parameter) is delegated to checkAssignable below
-                // — same pattern as the resolveMethodOverload arm above.
-                if (pt && a.modifier.empty()) {
-                    (void)narrowIntConstantToTarget(
-                        a.value.get(), ctx_.exprType(*a.value),
-                        const_cast<TypeRef*>(pt));
-                }
-                if (pt)
-                    checkAssignable(ctx_.exprType(*a.value),
-                                    const_cast<TypeRef*>(pt),
-                                    a.value->span.begin,
-                                    std::string("argument `") +
-                                        std::string(sema::formalParamName(
-                                            *cs, j)) +
-                                        "` to `new " +
-                                        std::string(t->name) + "`",
-                                    a.value.get());  // per §7.4 / §27.6 (#1191)
-            }
+        if (decls.empty()) return;  // no bindable ctor — defer (no check)
+        if (decls.size() == 1) {
+            if (emitModifierMismatch(decls[0]->params, binds[0])) return;
+            checkArgsAgainstParams(
+                decls[0]->params, ne.args, ne.span.begin,
+                std::string("`new ") + std::string(t->name) + "`",
+                &ne, t);
             return;
         }
         // A call-site modifier on an argument is outside §22.6's ranking;
@@ -11109,46 +11015,26 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // Build the per-candidate parameter-type and bound argument-type rows
         // (parameter order, defaulted slots dropped — they carry no ranking
         // pressure), exactly as resolveMethodOverload does for §22.5 calls.
-        // fix #3215: every candidate's parameter type is read from
-        // `sema::formalParamResolvedType` (imported-aware) rather than from
-        // `params[j].type` — the imported twin has no `ast::Type` on a
-        // `ParameterSymbol`.
-        std::vector<std::vector<const TypeRef*>> paramTypes(candSyms.size());
-        std::vector<std::vector<const TypeRef*>> argTypeRows(candSyms.size());
-        std::vector<std::vector<int>> argIdxRows(candSyms.size());
-        std::vector<std::string> candNames(candSyms.size());
+        std::vector<std::vector<const TypeRef*>> paramTypes(decls.size());
+        std::vector<std::vector<const TypeRef*>> argTypeRows(decls.size());
+        std::vector<std::vector<int>> argIdxRows(decls.size());
+        std::vector<std::string> candNames(decls.size());
         // §22.6 defaulted-arity tie-break (v0.181, #1561): does candidate c's
         // binding leave any parameter to be filled by its declared default?
-        std::vector<bool> fillsDefault(candSyms.size(), false);
-        for (std::size_t c = 0; c < candSyms.size(); ++c) {
-            const std::size_t np = sema::formalParamCount(*candSyms[c]);
-            for (std::size_t j = 0; j < np; ++j) {
+        std::vector<bool> fillsDefault(decls.size(), false);
+        for (std::size_t c = 0; c < decls.size(); ++c) {
+            const auto& params = decls[c]->params;
+            for (std::size_t j = 0; j < params.size(); ++j) {
                 int ai = binds[c].paramToArg[j];
                 if (ai < 0) {
                     fillsDefault[c] = true;
                     continue;
                 }
-                // fix #3215 (§22.5 / §22.6, v0.254 — NEEDS-FIX follow-up):
-                // the parameter's resolved type is read in BOTH sources
-                // — AST first (a local `ctor`'s `ast::Param::type` resolved
-                // through the `NewExpr`'s `t` substitution), then the
-                // import-side `ParameterSymbol::resolvedDeclType` for an
-                // imported ctor whose `decl` is null. Without the AST leg,
-                // every local candidate's parameter type is null in this
-                // ranking row, `resolveOverload` is invoked on
-                // `paramTypes[c]` of all-null entries, and a float-vs-int /
-                // int-vs-long equal-conversion `new` that should report
-                // "no overload" / "ambiguous" reports neither — silent
-                // acceptance. Mirrors the same-site-of-#3178 pattern the
-                // single-candidate branch above and codegen's `ctorForArgs`
-                // were both updated to follow.
-                const TypeRef* pt = nullptr;
-                if (const ast::Type* at =
-                        sema::formalParamDeclType(*candSyms[c], j))
-                    pt = substituteMemberType(ctx_.resolvedType(*at),
-                                              &ne, t);
-                if (!pt)
-                    pt = sema::formalParamResolvedType(*candSyms[c], j);
+                TypeRef* pt = params[j].type
+                                  ? substituteMemberType(
+                                        ctx_.resolvedType(*params[j].type),
+                                        &ne, t)
+                                  : nullptr;
                 const ast::CallArgument* carg =
                     ne.args[static_cast<std::size_t>(ai)].value
                         ? &ne.args[static_cast<std::size_t>(ai)]
@@ -11162,8 +11048,7 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                 if (carg && carg->value && pt && carg->modifier.empty()) {
                     (void)narrowIntConstantToTarget(
                         carg->value.get(),
-                        ctx_.exprType(*carg->value),
-                        const_cast<TypeRef*>(pt));
+                        ctx_.exprType(*carg->value), pt);
                 }
                 paramTypes[c].push_back(pt);
                 argTypeRows[c].push_back(
@@ -11172,42 +11057,14 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                         : nullptr);
                 argIdxRows[c].push_back(ai);
             }
-            // Render the candidate signature from the SYMBOL side — both
-            // local and imported, via formalParamDeclType (an ast::Type for
-            // a local; null for an import, which the renderer handles).
-            // The emitted text is for DIAGNOSTIC-only consumption — both
-            // the §22.6 ambiguous-call and the §22.6 unreachable messages
-            // surface it — so a coarse `headName` rendering is enough. The
-            // codegen lowering and the per-argument §5.1 checks NEVER read
-            // this string.
-            std::string sig;
-            sig += "(";
-            for (std::size_t j = 0; j < np; ++j) {
-                if (j) sig += ", ";
-                std::string_view mod = sema::formalParamModifier(*candSyms[c], j);
-                if (!mod.empty()) { sig += std::string(mod); sig += ' '; }
-                if (const ast::Type* at = sema::formalParamDeclType(
-                        *candSyms[c], j)) {
-                    if (at->name && !at->name->parts.empty())
-                        sig += std::string(at->name->parts.back());
-                    else
-                        sig += "?";
-                    continue;
-                }
-                if (const TypeRef* rt = sema::formalParamResolvedType(
-                        *candSyms[c], j))
-                    sig += typeNameForDiag(rt);
-                else
-                    sig += "?";
-            }
-            sig += ")";
-            candNames[c] = std::string("new ") + std::string(t->name) + sig;
+            candNames[c] = std::string("new ") + std::string(t->name) +
+                           methodSignatureString("", params);
         }
         // resolveOverload uses one shared argument vector across candidates,
         // so each column must be the same call argument for every candidate;
         // fall back if the bound shapes diverge (uncommon for ctor overloads).
         const std::vector<const TypeRef*>& argTypes = argTypeRows[0];
-        for (std::size_t c = 0; c < candSyms.size(); ++c) {
+        for (std::size_t c = 0; c < decls.size(); ++c) {
             if (argIdxRows[c].size() != argIdxRows[0].size()) return;
             for (std::size_t i = 0; i < argIdxRows[c].size(); ++i)
                 if (argIdxRows[c][i] != argIdxRows[0][i]) return;
@@ -11421,20 +11278,15 @@ void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
     }
 }
 
-// §2.2 / §2.5 / §22.7 / §22.5 / §22.6 (issue #328 FINDING [7] B; #3215): type-
-// check `new ImportedT(args)` against the imported type's reconstructed
-// constructor signatures. The imported ctors carry no ast::ConstructorDecl;
-// their parameters are ParameterSymbols whose resolved types ride
-// `resolvedDeclType`, with the exporter's `hasDefault` / `defaultText` carried
-// off the wire (#3178). The same §22.5 binding (`bindArgsToParams` over a
-// `sema::FormalsView`) and the same §22.6 candidate filtering + ranking the
-// local twin (#3178's twin, lines ~10985 onwards) already use runs here too:
-// every candidate is consulted through its SYMBOL-side formal list, with the
-// blank bail on a named / modifier / discard argument and the `ctors.size()
-// != 1 → return` shortcut removed. A call-site modifier on an argument still
-// falls through to the overload-resolution deferral that the local twin
-// already takes (#2364/#952), so the only NEW behaviour is admission of the
-// shapes #3215 measured false rejects and silent miscompiles for.
+// §2.2 / §2.5 / §22.7 (issue #328 FINDING [7] B): type-check `new ImportedT(args)`
+// against the imported type's reconstructed constructor signatures. The imported
+// ctors carry no ast::ConstructorDecl; their parameters are ParameterSymbols whose
+// resolved types ride `resolvedDeclType`. Checks the all-positional case: with no
+// explicit ctor the implicit default (0 args) applies (§22.7); with a single
+// reconstructed ctor, argument count (§22.5) and per-argument assignability
+// (§5.1) are checked. Multiple imported ctors (overloads) and named/modifier
+// arguments are conservatively skipped (cross-module ctor overload resolution is
+// deferred, as for imported method calls).
 void ExprTC::checkImportedNewExprArgs(
     const ast::NewExpr& ne, TypeSymbol* t,
     const std::vector<ConstructorSymbol*>& ctors) {
@@ -11524,134 +11376,26 @@ void ExprTC::checkImportedNewExprArgs(
                     "takes 0 (§22.7)");
         return;
     }
-    // fix #3215 (§22.5 / §22.6, v0.254): the imported-ctor cousin of the
-    // method-binding fix #3178. Three pre-fix defects, all removed here:
-    //   1. The blanket bail on a named/modifier/discard argument at the line
-    //      that was here before this fix (`return` on the first such argument)
-    //      made every cross-module NAMED `new` skip the bind step. The M5
-    //      umbrella (#3152) measured the method twin and the same shape
-    //      applies here — admitting a named argument needs the bind arm.
-    //   2. The exact-arity check `ne.args.size() != nparams` rejected any
-    //      optional-parameter omission; `cs->params.size()` was the imported
-    //      ctor's parameter count, no `hasDefault` consulted.
-    //   3. `if (ctors.size() != 1) return;` skipped §22.6 overload
-    //      resolution over an imported ctor SET. The LOCAL twin (lines
-    //      ~10985+) already routes multiple ctors through `bindArgsToParams`
-    //      + §22.6 ranking. This fix gives the imported twin the SAME path.
-    //
-    // A call-site MODIFIER on an argument still falls through to whatever the
-    // local twin does (a deferral — overload resolution can't see a `ref`/
-    // `out` keyword; that's #952/#2364 territory and is NOT widened here).
-    // A discard also defers (same reason).
+    // A named/modifier argument is outside this conservative check.
+    for (const auto& a : ne.args)
+        if (!a.name.empty() || !a.modifier.empty() || a.isDiscard) return;
+    if (ctors.size() != 1) return;  // imported ctor overloads deferred
+    ConstructorSymbol* cs = ctors[0];
+    const std::size_t nparams = cs->params.size();
     const std::string desc =
         std::string("`new ") + std::string(t->name) + "`";
-    // Collect bindable candidates. Every candidate's formal list comes from
-    // its SYMBOL (`sema::FormalsView::of(cs)`) so an imported ctor — which has
-    // no `ast::ConstructorDecl` — sits on the same path as a local one.
-    std::vector<ConstructorSymbol*> cands;
-    std::vector<BindResult> binds;
-    for (ConstructorSymbol* cs : ctors) {
-        BindResult b = bindArgsToParams(sema::FormalsView::of(*cs), ne.args,
-                                        ne.span.begin,
-                                        /*calleeDesc=*/std::string(),
-                                        /*emit=*/false);
-        if (!b.ok) continue;
-        cands.push_back(cs);
-        binds.push_back(std::move(b));
-    }
-    // No candidate binds — fall back to the same arity-only first-wins the
-    // local twin takes when bindArgsToParams is silent. For an imported ctor
-    // the usual reason is a NAMED argument that names no parameter on this
-    // type (the local twin reports the rejection from the single-candidate
-    // path; here we delegate to it explicitly because cands is empty).
-    if (cands.empty()) {
-        // Try the FIRST ctor's view to emit a §22.5 diagnostic that names the
-        // problem; bindArgsToParams's standard text serves a local and an
-        // imported callee identically (the call below evaluates with
-        // emit=true so the user gets the same wording the local twin shows).
-        if (!ctors.empty()) {
-            bindArgsToParams(sema::FormalsView::of(*ctors[0]), ne.args,
-                             ne.span.begin, desc, /*emit=*/true);
-        }
+    if (ne.args.size() != nparams) {
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            desc + " has " + std::to_string(ne.args.size()) +
+                " argument(s) but the parameter list has " +
+                std::to_string(nparams) + " (§22.5)");
         return;
     }
-    // A call-site MODIFIER / DISCARD is outside §22.6's worked ranking —
-    // defer (no check). Mirrors the local twin at lines ~11013.
-    for (const auto& a : ne.args)
-        if (!a.modifier.empty() || a.isDiscard) return;
-    // Pick a candidate. For ONE bindable ctor that IS the answer; for
-    // MULTIPLE bindable ctors we discriminate by argument type using the SAME
-    // `typeClass` ladder the codegen `ctorForArgs` (LlvmBackend_impl.hpp)
-    // uses, so `new Over("s")` picks the string-ctor and `new Over(7)` picks
-    // the int-ctor (the §22.6 worked example). Where NO candidate's
-    // parameter types match the args semantically (e.g. a `string` arg against
-    // every int ctor) we fall back to first-bindable so the per-argument
-    // §5.1 check has a ctor to run against.
-    auto typeClass = [&](const TypeRef* tr) -> int {
-        if (!tr) return -1;
-        if (tr->nullable) return 3;
-        if (tr->kind == TypeRef::Kind::Named) return 3;
-        if (tr->kind == TypeRef::Kind::Function) return 3;
-        if (tr->kind != TypeRef::Kind::Primitive) return -1;
-        using P = PrimitiveType;
-        switch (tr->primitive) {
-            case P::Bool: return 0;
-            case P::Char: case P::Int: case P::Long: case P::Byte:
-            case P::SByte: case P::Short: case P::UShort: case P::UInt:
-            case P::ULong: return 1;
-            case P::Float: case P::Double: case P::Decimal: return 2;
-            case P::String: return 3;
-            default: return -1;
-        }
-    };
-    auto matchesCall = [&](std::size_t c) -> bool {
-        const std::size_t np = sema::formalParamCount(*cands[c]);
-        for (std::size_t j = 0; j < np; ++j) {
-            const int ai = binds[c].paramToArg[j];
-            if (ai < 0) continue;  // default-filled
-            const ast::CallArgument& a =
-                ne.args[static_cast<std::size_t>(ai)];
-            if (!a.value) continue;
-            const TypeRef* paramTy =
-                sema::formalParamResolvedType(*cands[c], j);
-            if (!paramTy) return false;
-            TypeRef* argTy = ctx_.exprType(*a.value);
-            bool argIsNull = dynamic_cast<const ast::NullLiteralExpr*>(
-                a.value.get()) != nullptr;
-            int argCls = argIsNull ? 3 : typeClass(argTy);
-            int paramCls = typeClass(paramTy);
-            if (argCls != -1 && paramCls != -1 && argCls != paramCls)
-                return false;
-        }
-        return true;
-    };
-    std::size_t chosen = 0;
-    if (cands.size() > 1) {
-        std::vector<std::size_t> matched;
-        for (std::size_t c = 0; c < cands.size(); ++c)
-            if (matchesCall(c)) matched.push_back(c);
-        if (matched.empty()) {
-            // No candidate's parameter types match — fall back to first-
-            // bindable so §5.1 error fires against that one.
-        } else if (matched.size() == 1) {
-            chosen = matched[0];
-        } else {
-            // §22.6's first-by-source-order tie-break would normally resolve
-            // this; defer (do not type-check) and let codegen's
-            // `ctorForArgs`'s same discrimination decide, since it has the
-            // SAME shape and would emit an unambiguous-error if so.
-            return;
-        }
-    }
-    ConstructorSymbol* cs = cands[chosen];
-    const BindResult& b = binds[chosen];
-    for (std::size_t j = 0; j < b.paramToArg.size(); ++j) {
-        const int ai = b.paramToArg[j];
-        if (ai < 0) continue;  // left to its declared default — codegen fills
+    for (std::size_t j = 0; j < nparams; ++j) {
         auto* p = dynamic_cast<ParameterSymbol*>(cs->params[j]);
         if (!p || !p->resolvedDeclType) continue;
-        const ast::CallArgument& a =
-            ne.args[static_cast<std::size_t>(ai)];
+        const ast::CallArgument& a = ne.args[j];
         if (!a.value) continue;
         checkAssignable(ctx_.exprType(*a.value), p->resolvedDeclType,
                         a.value->span.begin,
@@ -12847,8 +12591,8 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
             "method, until importer-side property monomorphization "
             "lands");
     }
-    // fix #2943 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §12.1, v0.240)
-    // and fix #3170 (the one-`T`-slot case #2943 missed). A property
+    // fix #2943 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §12.1, v0.240,
+    // NARROWER predicate than the reverted d11e7ca attempt). A property
     // accessed through an IMPORTED NON-GENERIC INTERFACE-typed reference
     // on a LAYOUT-MOVING imported generic instantiation has no working
     // lower path today — the itable slot is filled by
@@ -12856,11 +12600,10 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
     // layout-moving arm deliberately keeps the slot NULL (#2894's
     // refusal, kept by the #2943 codegen-side partial fix), so the
     // dispatch faults with a SIGSEGV at runtime on the first call
-    // through the itable. Measured on #3170's parent (real two-module
+    // through the itable. Measured on the fix's parent (real two-module
     // build, exit 139 = SIGSEGV):
     //
-    //     `r.W` on `var r: IHas := new G<string>()` → exit 139
-    //     (one `T`-typed field `_t: T;` followed by `_w: int`)
+    //     `r.W` on `var r: IHas := new GIface<string>()` → exit 139
     //
     // The same shape reached DIRECTLY through the implementing class
     // (`g.W` on a layout-moving imported generic) is #2884's decline
@@ -12881,37 +12624,39 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
     //       narrower predicate), and a generic interface's INDEXER is
     //       #2955's separate decline above (this arm is not indexer,
     //       !ips->isIndexer, mirrored below);
-    //   (d) some IMPORTED GENERIC CLASS implementing this interface
-    //       declares a `T`-typed storage slot followed in declaration
-    //       order by at least one non-`T`-typed storage slot. THIS IS
-    //       THE #3170 WIDENING relative to #2943 (which fired only on
-    //       >=2 T-typed fields, missing the one-T-field layout-moving
-    //       case). The shape `_t: T; _w: int` IS layout-moving the
-    //       moment T widens past i32: the erased template has `_w` at
-    //       offset 8, the spec layout has `_w` at offset 16, and the
-    //       dispatch through the itable reads garbage — measured as a
-    //       SIGSEGV on #3170's parent (the comment's earlier
-    //       "single `_t: T` shares an 8-byte-aligned slot" reasoning
-    //       was wrong; the measured offsets on `_w` are 8 vs 16, not
-    //       identical).
+    //   (d) at least one IMPORTED GENERIC CLASS implementing this
+    //       interface declares >=2 fields whose resolved TypeRef is a
+    //       bare name matching one of the class's own generic
+    //       parameters. THIS IS THE NARROWER PART relative to the
+    //       reverted d11e7ca attempt (which fired on >=1 T-typed
+    //       field). The 2894 T3 maintenance comment (#2894 test,
+    //       layout_moving_instantiation_not_silently_wrong_spec_14_1)
+    //       states the discriminator explicitly: "TWO `T` fields are
+    //       load-bearing, because with a single one the i32
+    //       placeholder and the `ptr` share an 8-byte-aligned slot
+    //       and `_w` lands at the same offset either way". With a
+    //       SINGLE T-typed field the codegen-side
+    //       `instanceLayoutDiffersFromErasedTemplate` returns false
+    //       (layouts match), the itable slot IS filled, and the
+    //       program returns the correct value (2894 T1 = 108 with
+    //       single `_t: T`). The over-rejection there is the bug the
+    //       lane's previous attempt shipped and the gate caught —
+    //       this narrower predicate keeps the 2894 T1 case in the
+    //       accepted set.
     //
-    // OVER-REJECTION COST. The sema gate has no view of the concrete
-    // type argument at the access site (the static type is the
-    // interface), so the predicate is a whole-program over-
-    // approximation: it fires for every shape where SOME instantiation
-    // moves the layout, which is every T field followed by a concrete
-    // field. 2894 T1 (`GIface2894T1<int>` with `_t: T; _w: int`,
-    // instantiated at `T = int`) used to be accepted because the
-    // substituted layout matches the erased template at `int`, so the
-    // dispatch was correct; it is now declined, mirroring the
-    // documented "value vs crash" trade #2884 made for the direct-
-    // class path. The over-rejection is strictly better than the
-    // silent crash it replaces; the residual is the same #2893 /
-    // #428 importer-side accessor-body monomorphization work that
-    // #2884 and #2943 deferred. The codegen-side predicate
-    // (`instanceLayoutDiffersFromErasedTemplate`) is the exact per-
-    // instantiation check; it requires LLVMDataLayout info we do not
-    // have at sema time.
+    // The codegen-side predicate
+    // (`instanceLayoutDiffersFromErasedTemplate`) is an exact layout
+    // check that requires LLVMDataLayout info we do not have at sema
+    // time. The ≥2-T-field count is its narrowest sema-time
+    // approximation: with a single T-typed field, the i32 placeholder
+    // (4 bytes, 4-byte aligned) and the substituted ptr (8 bytes,
+    // 8-byte aligned) share one 8-byte-aligned slot, so `_w` lands
+    // at the same offset either way; with two or more, the second
+    // T-typed field lands at offset 8 in the erased template but
+    // offset 16 in the substituted layout, and the offsets of all
+    // following fields diverge. The decline's over-rejection cost is
+    // a diagnostic at the access site instead of a value, which is
+    // the documented "value vs crash" trade #2884 made.
     if (!ips->isIndexer && ips->parent &&
         ctx_.isImported(ips->parent) &&
         ips->parent->kind == ast::TypeDeclKind::Interface &&
@@ -12944,43 +12689,8 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
                         gpIndex[gp->name] = gi;
                 }
                 if (gpIndex.empty()) continue;
-                // fix #3170 (one-`T`-slot widening of #2943's predicate).
-                // The discriminator is "this class has at least one
-                // T-typed storage slot" — ANY T field widens the layout
-                // at SOME instantiation, and the codegen-side
-                // `instanceLayoutDiffersFromErasedTemplate` returns
-                // true for that instantiation, so the itable slot
-                // stays null and the dispatch faults. The count is
-                // independent of position (concrete first / T first /
-                // mixed — #2943 T5 pins the position-independence):
-                // one T field is enough at `T = string` (`_t: T` at
-                // offset 4 vs offset 8 shifts the whole struct), and
-                // two or more T fields compound the shift at every
-                // non-int T.
-                //
-                // The sema gate has no view of the concrete type
-                // argument at the access site (the static type is the
-                // interface), so the predicate is a whole-program
-                // over-approximation: it fires for every shape where
-                // SOME instantiation moves the layout, which is every
-                // shape with at least one T field. 2894 T1
-                // (`GIface2894T1<int>` with `_t: T; _w: int`,
-                // instantiated at `T = int`) is the control case
-                // whose passing the #2943 comment cites — at `T =
-                // int` the substituted layout IS identical to the
-                // erased template (i32 -> i32), so the dispatch is
-                // safe today. It is now declined here, mirroring the
-                // documented "value vs crash" trade #2884 made for
-                // the direct-class path. The over-rejection is
-                // strictly better than the silent crash it replaces;
-                // the residual is the same #2893 / #428 importer-side
-                // accessor-body monomorphization work that #2884 and
-                // #2943 deferred. The d11e7ca attempt (which fired on
-                // >=1 T-typed fields) shipped this same over-
-                // rejection cost and was reverted by the gate for a
-                // narrower reason (no test pinned the one-`T`-slot
-                // case); #3170's regression test makes that cost
-                // explicit.
+                // Count T-typed fields (>=2 is the layout-moving
+                // discriminator, per 2894 T3's maintenance comment).
                 std::size_t tFieldCount = 0;
                 for (Symbol* m : t->members) {
                     auto* fs = dynamic_cast<FieldSymbol*>(m);
@@ -13007,7 +12717,7 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
                         fty->declaration) continue;
                     if (gpIndex.count(fty->headName()) != 0) {
                         ++tFieldCount;
-                        if (tFieldCount >= 1) {
+                        if (tFieldCount >= 2) {
                             found = true;
                             break;
                         }
@@ -13025,16 +12735,15 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
             "` is not yet monomorphized when dispatched through a "
             "layout-movable imported generic instantiation "
             "(\xC2\xA7""14.1 / \xC2\xA7""2.8.3 rule 4 / \xC2\xA7""13 / "
-            "\xC2\xA7""23 / #2943 / #3170): the itable slot the "
-            "cross-module stub fills is fixed at the erased `T -> "
-            "i32` template layout, and an instantiation whose "
-            "layout moves (its class has a `T`-typed storage slot "
-            "followed by a non-`T`-typed one) keeps that slot null "
-            "so the dispatch faults with a SIGSEGV at runtime. "
-            "Reach the property through a method on the concrete "
-            "receiver, or declare the accessor on a non-generic "
-            "concrete class, until importer-side accessor-body "
-            "monomorphization lands (#2893 / #428)");
+            "\xC2\xA7""23 / #2943): the itable slot the cross-module "
+            "stub fills is fixed at the erased `T -> i32` template "
+            "layout, and an instantiation whose layout moves (its "
+            "class has TWO or more `T`-typed storage slots) keeps "
+            "that slot null so the dispatch faults with a SIGSEGV "
+            "at runtime. Reach the property through a method on "
+            "the concrete receiver, or declare the accessor on a "
+            "non-generic concrete class, until importer-side "
+            "accessor-body monomorphization lands (#428)");
     }
 }
 

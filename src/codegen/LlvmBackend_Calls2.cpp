@@ -2920,69 +2920,7 @@ llvm::Value* Emitter::lowerEventHandlerClosure(const ast::Expr* handlerExpr,
 
 std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
-    // fix #3225 (§24.3 / §24.5 / §2.5, v0.254): the §24 raise-syntax BARE-CALL
-    // form `Ev(payload)` — the shorthand for `this.Ev.Raise(payload)` inside
-    // the declaring class — parses as a CallExpr whose callee is a bare
-    // IdentifierExpr pointing to the EventSymbol, with no MemberAccessExpr
-    // wrapper. Before this fix, tryLowerEventCall only recognized the
-    // `.Subscribe`/`.Raise`/etc. member-access callee shape; the bare form
-    // fell through to ordinary dispatch, where the EventSymbol callee had no
-    // matching arm and the whole Raise was silently dropped (subscribed
-    // handler never fired). Per §24.3, the bare-call form is shorthand for
-    // `this.Ev.Raise(payload)` — ALWAYS Raise (or RaiseAsync for an `async
-    // event`), with the implicit `this` as the receiver. eventSourcePtr's
-    // IdentifierExpr arm already loads the receiver as `currentThis_`, so
-    // reusing it gets the correct backing EventSource<T> pointer for the
-    // direct class event (the §24.1 backing-field load on the implicit-this
-    // receiver). Only the DIRECT local-event form needs this interception;
-    // an imported event goes through the MemberAccessExpr path (the
-    // ModuleLoader-reconstructed EventSymbol has no ast::EventDecl and is
-    // NEVER reached as a bare callee — interface-side calls are written
-    // `i.Ready.Raise(...)`).
-    if (!ma) {
-        if (auto* idCallee =
-                dynamic_cast<const ast::IdentifierExpr*>(call.callee.get())) {
-            if (const sema::EventSymbol* bareEs = eventSymbolOf(*idCallee)) {
-                if (dynamic_cast<const ast::EventDecl*>(bareEs->decl)) {
-                    llvm::Value* src = eventSourcePtr(*idCallee);
-                    if (!src) return std::nullopt;
-                    // §24.5: gate payload lowering on the event's payload TYPE,
-                    // not on the call args being non-empty (mirrors the
-                    // isRaise/isRaiseAsync block in dispatchEventMethods above —
-                    // `Raise()` and `Raise(())` are equivalent and must dispatch
-                    // identically; #737).
-                    const sema::TypeRef* payload = eventPayloadType(bareEs);
-                    const bool hasPayload =
-                        payload && payload->kind != sema::TypeRef::Kind::Unit;
-                    llvm::Value* payloadLL = nullptr;
-                    llvm::Type* payloadTy = nullptr;
-                    if (hasPayload && !call.args.empty() && call.args[0].value) {
-                        payloadLL = lowerExpr(*call.args[0].value);
-                        if (!payloadLL)
-                            return std::optional<llvm::Value*>(nullptr);
-                        payloadTy = payloadLL->getType();
-                    }
-                    if (auto* ed = dynamic_cast<const ast::EventDecl*>(
-                            bareEs->decl)) {
-                        if (ed->isAsync) {
-                            // §24.5 / §30: RaiseAsync returns a Task* (awaited
-                            // by the caller). emitAsyncEventRaise calls each
-                            // handler, awaits each synchronously, and returns
-                            // an already-done Task carrying either success or
-                            // the first fault.
-                            llvm::Value* task = emitAsyncEventRaise(
-                                src, payloadLL, payloadTy);
-                            return std::optional<llvm::Value*>(task);
-                        }
-                    }
-                    emitEventRaise(src, payloadLL, payloadTy);
-                    return std::optional<llvm::Value*>(nullptr);
-                }
-            }
-        }
-        return std::nullopt;
-    }
-    if (!ma->target) return std::nullopt;
+    if (!ma || !ma->target) return std::nullopt;
 
     // §24.3 / §24.5: dispatch a recognized event method (Subscribe/Add/Remove/
     // Raise/RaiseAsync) against a bz_event_source_t* (`src`) whose payload type

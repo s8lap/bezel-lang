@@ -567,91 +567,22 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
 // already proven non-null by the caller's guard — which is also its runtime
 // moved-from test. The caller nulls the slot afterwards, unchanged.
 //
-// fix #3157 (§29.8 / §30.1, v0.254): #3125's "Task ⇒ task protocol, anything
-// else ⇒ vtable" fallback left every OTHER vtable-less built-in class to the
-// same wild-jump shape (a `bz_random_t` / `bz_channel_t` / `bz_string_builder_t`
-// has no Bezel vtable at word 0 — word 0 is seed bytes / opaque payload — so
-// "load vtable, call slot 2" reads struct bytes and indirect-jumps into
-// garbage). MEASURED at 6da66d4 on each of Random, Channel<int>, StringBuilder:
-// SIGSEGV in bz$async$SinkAsync$Resume under generated-code ASan, identical
-// signature to the #3125 Task-fault; `rax` holds `0xd673470553fada15`, the
-// four seed bytes interpreted as a pointer.
-//
-// This function is the ONE routing decision shared by the three frame emitters
-// (#3125 settled this) — `#emitAsyncOwnedParamAutoDispose` (plain async), the
-// async iterator's Dispose sweep (both LlvmBackend_Async.cpp), and the sync
-// iterator's owned-param sweep (LlvmBackend_Iterators.cpp). So widening it
-// here closes ALL three populations at the same call site.
-//
-// ROUTING. The classifier below is informed — every arm names a PRECISE class
-// (verified by `common::isVtableLessBuiltinClassName` or a vtable
-// declaration), not a negative list:
-//   (1) Task / Task<T> / OwningTask<T>          → `emitTaskDisposal`
-//       (#3125).
-//   (2) Any other vtable-less built-in class    → `emitVtablelessBuiltinRelease`,
-//       the same per-name release the explicit `x.Dispose()` lowering and the
-//       `using var` scope-exit path consult (#2967 / #2921 / #2973). Adding a
-//       new vtable-less builtin to that function (next to the release it must
-//       agree with) is the single place this fix has to be kept in sync. If a
-//       vtable-less builtin has no arm there yet, an `internal:` warning is
-//       raised and the slot is left untouched — the same #2992 "leak before
-//       wild-jump" trade the `using var` chain makes, applied here too.
-//   (3) Recognised class (user class / builtin exception / imported user
-//       class) — has a real vtable, vtable dispatch is correct
-//       (`emitDisposeAndReclaim`).
-//   (4) Anything else (a primitive, a borrow-only record, an alias into
-//       case (3), etc.) — `internal:` WARNING. Not the silent vtable jump.
-//
-// NEGATIVE LIST AVOIDANCE. The previous shape — "not a task ⇒ vtable" — IS the
-// category defect the inline comment above warned about: every population this
-// fix didn't explicitly name silently took the wild-jump path. Arms (2)/(3)/(4)
-// together enumerate the three shapes an `owned` capture's declared type can
-// take, so the negative list's silent-fail mode is gone; a future built-in
-// either enters (2) (after its arm lands) or hits the (2)-no-arm warning.
-// // per §29.8 / §30.1, fix #3157
+// Deliberately NOT widened here: an `owned` parameter of any OTHER vtable-less
+// built-in class (a collection, `TaskCompletionSource<T>`, `Shared<T>`, …) has
+// the same wild-dispatch shape. Each needs its own release protocol, not this
+// one, and lumping them in under a "not a task ⇒ vtable" negative list is the
+// category defect this fix exists to remove. Measured, not assumed: with this
+// fix applied an `owned r: Random` / `Channel<T>` / `StringBuilder` parameter
+// still SEGVs in bz$async$SinkAsync$Resume. Filed as #3157 rather than guessed
+// at — and #3157 records that the DEFAULT is the wrong way round here: an
+// unrecognised name should raise a loud `internal:` note (the #2992 shape)
+// rather than take a silent vtable jump. // per §29.8, §30.1, §30.5
 void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
-    // (1) Task family — emitted by #3125.
     if (const sema::TypeRef* taskTy = taskFamilyTypeFromParam(p)) {
         emitTaskDisposal(taskTy, obj);
         return;
     }
-    // (2) Any other vtable-less built-in class. `builtinTypeName` sees BOTH the
-    // direct TypeRef shape and the import/alias-resolved shape (#2997);
-    // `isVtableLessBuiltinClassName` is the same subtraction used to short-
-    // circuit the explicit-Dispose chain (#2969) — two established predicates,
-    // brought together here so the frame path matches them.
-    const sema::TypeRef* pt = paramTypeOf(p);
-    std::string_view bn = pt ? builtinTypeName(pt) : std::string_view{};
-    if (!bn.empty() && common::isVtableLessBuiltinClassName(bn)) {
-        if (emitVtablelessBuiltinRelease(bn, obj)) return;
-        // No release arm yet for this name — emit a loud `internal:`, do NOT
-        // fall through to the wild vtable jump the previous default did.
-        ctx_.diagnostics().report(
-            Severity::Warning, p->declLoc,
-            std::string("internal: emitOwnedParamCaptureDispose: vtable-less "
-                        "built-in class '") + std::string(bn) +
-                "' has no release arm; update emitVtablelessBuiltinRelease "
-                "and the slot will be reclaimed");
-        return;
-    }
-    // (3) Recognised class — has a vtable; `emitDisposeAndReclaim` is correct.
-    // Catches user classes (local and imported) AND built-in exceptions (whose
-    // `builtinVtable_` slot #3191 reads through). `pt->declaration` is set for
-    // all three populations and is deliberately the discriminator (the import
-    // alias / case (2) take the vtable-less path above, never this one).
-    if (pt && pt->kind == sema::TypeRef::Kind::Named && pt->declaration) {
-        emitDisposeAndReclaim(obj);
-        return;
-    }
-    // (4) Anything unrecognised — LOUD `internal:` warning, do NOT take the
-    // silent vtable jump. The fix's premise is that the default must invert:
-    // a path the existing classifier can answer takes its answer; a path it
-    // cannot answer MUST surface the question, not paper over it.
-    ctx_.diagnostics().report(
-        Severity::Warning, p->declLoc,
-        "internal: emitOwnedParamCaptureDispose: unrecognised owned parameter "
-        "type; no Task arm, no vtable-less built-in arm, no recognised class "
-        "declaration");
+    emitDisposeAndReclaim(obj);
 }
 
 
@@ -2072,73 +2003,6 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     // §6.6 / §30.11 / #974: the four-step TCS release (see emitTcsRelease).
     if (bn == "TaskCompletionSource" || bn == "OwningTaskCompletionSource") {
         emitTcsRelease(recv);
-        return true;
-    }
-    // §30.15 (#600 phase c): a Channel<T>. Dispose via bz_channel_dispose
-    // (closes, faults pending receivers with ChannelClosedException, disposes
-    // undelivered items in reverse order per §28.11, frees the struct). The
-    // CCE vtable is read from `builtinVtable_` (set up by
-    // setupBuiltinExceptions); may be null if Channel<T> reaches this path
-    // before setup — bz_channel_dispose tolerates a null second argument
-    // (verified in the runtime).
-    if (bn == "Channel") {
-        llvm::Value* cceVt = llvm::ConstantPointerNull::get(ptrTy());
-        {   auto vit = builtinVtable_.find("ChannelClosedException");
-            if (vit != builtinVtable_.end()) cceVt = vit->second;
-        }
-        auto* fn = declareC("bz_channel_dispose",
-                            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-        builder_.CreateCall(fn, {recv, cceVt});
-        return true;
-    }
-    // §30.15: a ChannelSender<T>. bz_channel_sender_release decrements the
-    // sender count (may close the channel if it reaches zero).
-    if (bn == "ChannelSender") {
-        callVoid("bz_channel_sender_release", {recv});
-        return true;
-    }
-    // §8.1 / #646: a Stopwatch — a `bz_stopwatch_t*` freed via
-    // bz_stopwatch_free (null-safe). Same release the `using var` arm emits.
-    if (bn == "Stopwatch") {
-        callVoid("bz_stopwatch_free", {recv});
-        return true;
-    }
-    // §6.2 / #647: a Mutex. bz_mutex_dispose marks disposed and drops the
-    // Mutex object's core ref. Idempotent per §28.2 (the disposed flag
-    // prevents double-release). Null-safe (handles Mutex?).
-    if (bn == "Mutex") {
-        callVoid("bz_mutex_dispose", {recv});
-        return true;
-    }
-    // §6.2 / #647: a Lock (owned guard returned by Mutex.Acquire /
-    // TryAcquire). bz_lock_release checks the released flag, null-safe.
-    if (bn == "Lock") {
-        callVoid("bz_lock_release", {recv});
-        return true;
-    }
-    // §6.3 / #647: a Semaphore. bz_semaphore_dispose marks disposed and drops
-    // the Semaphore object's core ref. Idempotent.
-    if (bn == "Semaphore") {
-        callVoid("bz_semaphore_dispose", {recv});
-        return true;
-    }
-    // §6.3 / #647: a SemaphoreToken (owned permit). bz_semaphore_token_release
-    // checks the released flag, null-safe.
-    if (bn == "SemaphoreToken") {
-        callVoid("bz_semaphore_token_release", {recv});
-        return true;
-    }
-    // #463: a CancellationTokenSource. bz_cts_dispose signals all tokens and
-    // frees the source. Idempotent (signalled flag prevents double-signal).
-    if (bn == "CancellationTokenSource") {
-        callVoid("bz_cts_dispose", {recv});
-        return true;
-    }
-    // stdlib §7.2 / #645: a FileStream — a `bz_filestream_t*` disposed via
-    // bz_filestream_dispose (flush + close the OS handle, free the wrapper).
-    // Null-safe (a failed open stores null).
-    if (bn == "FileStream") {
-        callVoid("bz_filestream_dispose", {recv});
         return true;
     }
     // §2.11 / §24.4: disposing a Subscription removes the handler from its

@@ -5494,50 +5494,44 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     return ps->modifier;
             return {};
         };
-        // fix #3215 (§22.5 "Optional parameters and named arguments" / §2.5,
-        // v0.254 — the constructor twin of #3178): the imported-`new` arm
-        // admitted only positional / no-modifier / no-discard arguments and
-        // required EXACT arity. The three pre-fix defects measured in the
-        // issue ALL flow from this loop:
-        //   * a NAMED argument set `allPositional = false` and skipped the
-        //     ctor call entirely (silent wrong answer).
-        //   * an optional-parameter omission (`ne.args.size() <
-        //     cs->params.size()`) failed the arity gate.
-        //   * an `out _` discard against a non-`out` formal is REJECTED
-        //     here (kept) and a NAMED/`out owned`/by-value `owned`/`scoped`
-        //     argument is REJECTED here (kept) — the same multi-defect
-        //     conflation the §22.6 ctor overload discriminator shares.
-        //
-        // The replacement mirrors lowerCall's imported-method path (#3178):
-        // each arg is evaluated in SOURCE order (§28.3) but PLACED in the
-        // formal slot `importedFormalToArg` returns, an omitted optional
-        // formal is filled by `importedDefaultArgValue`, and the modifier
-        // check reads each formal's modifier off the IMPORTED
-        // `ParameterSymbol` rather than the AI-indexed cast above (which is
-        // only right when every formal was supplied positionally at the
-        // matching AI).
-        //
-        // The narrow admission below is unchanged: a `ref`/`out` modifier is
-        // still passed through (the bracket / lvalueAddr paths), a discard
-        // against an `out` formal still allocates a scratch slot, and the
-        // `owned` marker guard from #2659 still fires. Every other gate
-        // moves to `formalToArg`-driven placement.
-        const std::vector<int> formalToArg =
-            cs ? importedFormalToArg(*cs, ne.args)
-               : std::vector<int>(cs ? sema::formalParamCount(*cs) : 0, -1);
-        // Each formal slot's modifier — read off the IMPORTED
-        // `ParameterSymbol` (the AST decl is null for an import). Used by
-        // the per-argument loop below instead of the AI-keyed
-        // `importedFormalMod` above (which is wrong whenever any NAMED
-        // argument reorders the AI map onto the formal map).
-        const std::size_t nparams = cs ? sema::formalParamCount(*cs) : 0;
-        // fix #2658: whether the `bz$T$ctor` call was actually emitted.
-        // Every path out of the block below that does NOT emit it produces
-        // an object whose constructor body never ran — a silent wrong
-        // answer — so the residual is reported rather than dropped (see
-        // the guard after it).
+        bool allPositional = true;
+        for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
+            const auto& a = ne.args[ai];
+            if (!a.name.empty()) { allPositional = false; break; }
+            if (a.isDiscard) {
+                if (importedFormalMod(ai) != "out")
+                    { allPositional = false; break; }
+                continue;
+            }
+            // fix #2659 (§22.3 "Parameter modifiers" / §28.8, v0.237): the
+            // by-value `owned` CALL-SITE MARKER against an `owned` formal is
+            // admitted. It has to be: §22.3 makes the marker MANDATORY on a
+            // named owned binding ("Omitting the marker on a named owned
+            // binding is a compile error naming the fix"), so with the ownership
+            // half of #2659 fixed — an imported `owned` formal is finally SEEN
+            // as an owned sink — this is the ONLY spelling that reaches codegen
+            // for `new ImportedT(owned r)`. Leaving it out would trade the old
+            // false reject for a silently default-initialized instance plus a
+            // leaked argument, which is worse.
+            //
+            // Lowering is identical to a plain positional argument: `owned` is
+            // by VALUE, `isByRefMod("owned")` is false, so the loop below takes
+            // its `lowerExpr` path and passes the same pointer a borrow would.
+            // The only extra obligation is #1918's transfer bookkeeping (null
+            // the caller's slot at the "call about to run" point), performed
+            // explicitly at the call below since this hand-rolled path does not
+            // use buildOrderedArgs. `scoped` stays excluded — it is a different
+            // (lifetime, not transfer) obligation and is filed, not guessed at.
+            if (!a.modifier.empty() && !isByRefMod(a.modifier) &&
+                !(a.modifier == "owned" && importedFormalMod(ai) == "owned"))
+                { allPositional = false; break; }
+        }
+        // fix #2658: whether the `bz$T$ctor` call was actually emitted. Every
+        // path out of the block below that does NOT emit it produces an object
+        // whose constructor body never ran — a silent wrong answer — so the
+        // residual is reported rather than dropped (see the guard after it).
         bool emittedImportedCtorCall = false;
-        if (cs && formalToArg.size() == nparams && !formalToArg.empty()) {
+        if (cs && allPositional && ne.args.size() == cs->params.size()) {
             llvm::Function* ctorFn = declareImportedCtor(cs);
             std::vector<llvm::Value*> args;
             args.push_back(obj);
@@ -5560,72 +5554,52 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // bracket fires only for indexer slots / properties — the §22.3
             // shapes that have no address to alias.
             std::vector<AccessorRefArg> accessorRefArgs;
-            // fix #3215 (§22.5 "Optional parameters and named arguments" /
-            // §2.5, v0.254 — the constructor twin of #3178): placement by
-            // FORMAL, evaluated in SOURCE order. `ordered[pi]` carries the
-            // lowered value for formal `pi`; a -1 entry means the formal
-            // takes its declared default. Mirrors the imported-method twin
-            // in lowerCall (LlvmBackend_Calls2.cpp ~6444-6687); the only
-            // constructor-specific items below are the discards — the only
-            // shape whose lowering differs — and the discards do NOT use
-            // the formalToArg placement (an `out _` has no formal slot to
-            // land in; it allocates a throwaway scratch slot).
-            std::vector<llvm::Value*> ordered(nparams, nullptr);
-            std::vector<int> argToFormal(ne.args.size(), -1);
-            for (std::size_t j = 0; j < formalToArg.size(); ++j)
-                if (formalToArg[j] >= 0)
-                    argToFormal[static_cast<std::size_t>(formalToArg[j])] =
-                        static_cast<int>(j);
             for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
-                const ast::CallArgument& a = ne.args[ai];
-                const int fj = argToFormal[ai];
-                // A discard takes the scratch path below — see the
-                // `if (a.isDiscard)` arm. A -1 fj means the binder mapped
-                // this argument to NO formal (a NAMED arg with an unknown
-                // name, etc.). `importedFormalToArg` returns the identity
-                // map in that case, but #3215 wants a LOUD rejection here
-                // rather than a silent wrong call. If we're here and fj<0
-                // for a named arg with no matching formal, the binder
-                // bailed — we never reach this point for that case
-                // because `ctorForArgs` already failed, so the `cs == null`
-                // branch handled it. Just defend.
-                if (fj < 0) continue;
-                const std::size_t pi = static_cast<std::size_t>(fj);
-                // Look up this formal's modifier on the IMPORTED
-                // `ParameterSymbol`. The pre-fix loop keyed on the AI
-                // (AI 0 ↔ formal 0, etc.), which is wrong when NAMED
-                // arguments reorder the placement.
-                std::string_view formalMod;
-                if (pi < cs->params.size())
-                    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
-                            cs->params[pi]))
-                        formalMod = ps->modifier;
                 // fix #2658 (§17.13 "The discard `_`", v0.236): an `out _`
-                // DISCARD has no destination lvalue — the parser leaves
-                // `value` null with `isDiscard` set, so it MUST be handled
-                // before the `!value` guard below. §17.13: "`out _` does
-                // not introduce a variable; the receiving slot is
-                // internal to the compiler and is not observable."
+                // DISCARD has no destination lvalue — the parser leaves `value`
+                // null with `isDiscard` set, so it MUST be handled before the
+                // `!value` guard below (that guard is what made
+                // `new ImportedT(…, out _)` abort the whole call and emit no
+                // ctor at all, #2658). §17.13: "`out _` does not introduce a
+                // variable; the receiving slot is internal to the compiler and
+                // is not observable. The argument is type-inferred from the
+                // parameter's declared type." So: allocate a throwaway scratch
+                // of the FORMAL's type and pass its address.
                 //
                 // The type comes from the imported
-                // `ParameterSymbol::resolvedDeclType`.
+                // `ParameterSymbol::resolvedDeclType` — the same field
+                // `declareImportedCtor` builds the callee's own signature from,
+                // so the scratch and the formal cannot disagree on width (the
+                // #2639/#2629 wild-write lesson). This mirrors buildOrderedArgs'
+                // #1301 block (LlvmBackend_Assign.cpp:7657), which reads the
+                // ast::Param instead because its callee has a decl.
                 //
-                // ⚠ THE ZERO-STORE GOES IN THE ENTRY BLOCK, NOT HERE.
-                // `entryAlloca` (LlvmBackend_impl.hpp:2029-2033) hoists
-                // the alloca to the function's entry block, so in a LOOP
-                // every iteration shares ONE slot. A store emitted here
-                // — inside the loop body — would re-null that slot on
-                // each iteration, wiping the pointer the previous
-                // iteration left there BEFORE the callee's release-of-
-                // prior on `n := …` could consume it, leaking one object
-                // per iteration. (The same warning applies to the named
-                // placement fix above — covered by #3215 testing.)
-                if (a.isDiscard) {
-                    if (formalMod != "out") { ok = false; break; }
+                // ⚠ THE ZERO-STORE GOES IN THE ENTRY BLOCK, NOT HERE. This is
+                // the placement `ensureOutVarSlots` already measured and split
+                // on — see its comment at LlvmBackend_Calls2.cpp:1685-1697 and
+                // the entry-block store it emits at :1702-1704. `entryAlloca`
+                // (LlvmBackend_impl.hpp:2029-2033) hoists the alloca to the
+                // function's entry block, so in a LOOP every iteration shares
+                // ONE slot. A store emitted here — inside the loop body — would
+                // re-null that slot on each iteration, wiping the pointer the
+                // previous iteration left there BEFORE the callee's
+                // release-of-prior on `n := …` (LlvmBackend_Calls2.cpp:1660-1668)
+                // could consume it, leaking one object per iteration. That path
+                // measured 5 objects / 195 B leaked on a 5-iteration loop versus
+                // 1 / 39 B for the entry-block store. Nothing needs a
+                // per-iteration reset here, because unlike a real `out var`
+                // recipient a discard carries NO §7.9 default-value promise —
+                // §17.13 says the slot is "not observable", so no program can
+                // read it and no iteration can observe the leftover. Store once,
+                // next to the alloca, purely so the first call never sees
+                // garbage. (Pre-fix nothing was written at all — no call was
+                // emitted — so a call-site store would be a NEWLY reachable
+                // leak, not a pre-existing one.)
+                if (ne.args[ai].isDiscard) {
                     llvm::Type* scratchTy = nullptr;
-                    if (pi < cs->params.size())
+                    if (ai < cs->params.size())
                         if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
-                                cs->params[pi]))
+                                cs->params[ai]))
                             if (ps->resolvedDeclType)
                                 scratchTy = lowerTypeRef(ps->resolvedDeclType);
                     if (!scratchTy) { ok = false; break; }
@@ -5634,79 +5608,67 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                            std::next(scratch->getIterator()));
                     init.CreateStore(
                         llvm::Constant::getNullValue(scratchTy), scratch);
-                    ordered[pi] = scratch;
+                    args.push_back(scratch);
                     continue;
                 }
-                if (!a.value) { ok = false; break; }
+                if (!ne.args[ai].value) { ok = false; break; }
+                // Determine the formal parameter's ref/out modifier from the
+                // imported ConstructorSymbol (mirrors lowerCall's imported-
+                // method arg path).
+                std::string_view formalMod = importedFormalMod(ai);
                 llvm::Value* v = nullptr;
-                if (isByRefMod(formalMod) || isByRefMod(a.modifier)) {
-                    // §22.3 alias path: a true-alias location — local,
-                    // field, static, §15.1 inline-array element — has an
-                    // address the callee can write through directly.
+                if (isByRefMod(formalMod) || isByRefMod(ne.args[ai].modifier)) {
+                    // §22.3 alias path: a true-alias location — local, field,
+                    // static, §15.1 inline-array element — has an address the
+                    // callee can write through directly.
                     llvm::Type* et = nullptr;
-                    v = lvalueAddr(*a.value, et);
-                    // §22.3 bracket path: an indexer slot or property
-                    // has no address to alias; emit copy-IN and record
-                    // the copy-OUT for after the call. Mirrors
-                    // lowerCall's own imported-method fallback
-                    // (LlvmBackend_Calls2.cpp).
+                    v = lvalueAddr(*ne.args[ai].value, et);
+                    // §22.3 bracket path: an indexer slot or property has no
+                    // address to alias; emit copy-IN and record the copy-OUT
+                    // for after the call. Mirrors lowerCall's own imported-
+                    // method fallback (LlvmBackend_Calls2.cpp).
                     if (!v && (formalMod == "ref" || formalMod == "out")) {
                         llvm::Type* paramTy = nullptr;
-                        if (pi + 1 < fnTy->getNumParams())
-                            paramTy = fnTy->getParamType(pi + 1);
+                        if (ai + 1 < fnTy->getNumParams())
+                            paramTy = fnTy->getParamType(ai + 1);
                         v = emitAccessorRefArgCopyIn(
-                            *a.value, paramTy,
+                            *ne.args[ai].value, paramTy,
                             /*isOut=*/formalMod == "out",
                             accessorRefArgs);
                     }
                 } else {
-                    v = lowerExpr(*a.value);
+                    v = lowerExpr(*ne.args[ai].value);
                 }
                 if (!v) { ok = false; break; }
                 // fix #2809 / §28.3 *Unbound owned temporaries* + §32.6
-                // (v0.240): the FFI-buffer temporary reclaim for an
-                // IMPORTED callee — `new ImportedT(CString.From(s))`. The
-                // reclaim predicate is unchanged (the callee takes the
-                // ownership for `owned`-side parameters; a plain borrow
-                // returning through `cs->params` needs the temp reclaimed
-                // here). The placement now keys on the FORMAL's modifier,
-                // not AI, which is what the NAMED/optional twin needs.
+                // (v0.240): the third argument-building site that needed the
+                // FFI-buffer temporary's reclaim — `new ImportedT(
+                // CString.From(s))`. Like lowerCall's imported-method arm, this
+                // path is hand-rolled because an imported ctor has no
+                // reconstructed AST (`buildOrderedArgs` cannot run), so it
+                // missed the registration the in-module ctor gets for free.
+                // Measured before this: 17 B leaked per construction.
+                // Same predicate, same `owned`-transfer exclusion (the callee
+                // takes the obligation, §28.3 transfer — reclaiming here would
+                // double-free).
                 if (!isByRefMod(formalMod) &&
-                    !isByRefMod(a.modifier) &&
-                    a.modifier != "owned" && formalMod != "owned") {
+                    !isByRefMod(ne.args[ai].modifier) &&
+                    ne.args[ai].modifier != "owned" && formalMod != "owned") {
                     bool argIsRawBytes = false;
-                    if (isFfiBufferFactoryCall(*a.value, argIsRawBytes)) {
+                    if (isFfiBufferFactoryCall(*ne.args[ai].value,
+                                               argIsRawBytes)) {
                         auto* tmpSlot = entryAllocaNullPtr();
                         builder_.CreateStore(v, tmpSlot);
                         registerFfiExprTemp(tmpSlot, argIsRawBytes);
                     }
                 }
-                // §5.1: widen an int argument to a wider numeric
-                // parameter, as the in-module ctor-call path does, so
-                // the ABI matches.
-                if (pi + 1 < fnTy->getNumParams())
+                // §5.1: widen an int argument to a wider numeric parameter, as
+                // the in-module ctor-call path does, so the ABI matches.
+                if (ai + 1 < fnTy->getNumParams())
                     v = coerceNumericToType(
-                        v, fnTy->getParamType(pi + 1),
-                        isUnsignedTargetExpr(*a.value));
-                ordered[pi] = v;
-            }
-            // fix #3215 (§22.5 / §2.5, v0.254): a formal left to its
-            // declared default — `new ImportedT(a)` against
-            // `constructor(a: int, b: int := 5)` is the issue's
-            // reproduction 1 — is filled from its exported default text
-            // through `importedDefaultArgValue`. The same predicate the
-            // method twin enforces (`importedDefaultTextIsMaterializable`)
-            // gates the omission in sema; reaching here means the
-            // materializer either folds the text or surfaces a `did not
-            // carry as a compile-time value` error (#3213 follow-up).
-            for (std::size_t j = 0; j < ordered.size(); ++j) {
-                if (!ordered[j]) ordered[j] = importedDefaultArgValue(*cs, j);
-                if (!ordered[j]) { ok = false; break; }
-            }
-            // Push per-formal in formal order to the ctor-fn-arg list.
-            for (std::size_t j = 0; j < ordered.size(); ++j) {
-                if (!ordered[j]) { ok = false; break; }
-                args.push_back(ordered[j]);
+                        v, fnTy->getParamType(ai + 1),
+                        isUnsignedTargetExpr(*ne.args[ai].value));
+                args.push_back(v);
             }
             unwindTarget_ = savedArgUT;
             if (ok && args.size() == ctorFn->arg_size()) {
@@ -5721,26 +5683,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // same placement and the same eligibility test buildOrderedArgs
                 // applies via `nullTransferredOwned`; this hand-rolled imported
                 // path never calls buildOrderedArgs, so it is done here.
-                //
-                // fix #3215 (§22.5 / §2.5, v0.254): the pre-fix version
-                // keyed on AI — `importedFormalMod(ai)` read the modifier
-                // for the AI-th formal — and missed any NAMED-argument
-                // reorder. The placement now keys on the FORMAL via
-                // `argToFormal[ai]` (the inverse of formalToArg), so a
-                // reordered NAMED call still nulls the right caller's
-                // slot.
                 for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
                     const auto& a = ne.args[ai];
-                    if (!a.value || a.isDiscard) continue;
-                    const int fj = argToFormal[ai];
-                    if (fj < 0) continue;
-                    std::string_view formalMod;
-                    const std::size_t pi = static_cast<std::size_t>(fj);
-                    if (pi < cs->params.size())
-                        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
-                                cs->params[pi]))
-                            formalMod = ps->modifier;
-                    if (a.modifier == "owned" || formalMod == "owned")
+                    if (a.value && !a.isDiscard &&
+                        (a.modifier == "owned" ||
+                         importedFormalMod(ai) == "owned"))
                         nullTransferredOwnedLocalSlot(a.value.get());
                 }
                 builder_.CreateCall(ctorFn, args);
