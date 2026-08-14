@@ -674,9 +674,30 @@ std::string_view formalParamDefaultText(const ConstructorSymbol& cs,
 // its literal-arithmetic fold), a quoted string, a char literal, `true`/`false`,
 // or `null`. An identifier or `A.B` rendering starts with a letter or `_` and is
 // deliberately excluded — it names something on the EXPORTER's side.
+//
+// fix #3213 (§22.5 / §2.5, v0.254): two more shapes are admitted here.
+//
+//   * `default(T)` — the textual rendering a `:= default(T)` default-value
+//     expression carries. The importer materializes it as the zero value of the
+//     FORMAL PARAMETER's resolved type (`MetaParam::type`, on the wire since
+//     the format's REC_SCALARS record), so the literal T spelling in the text
+//     is decorative — its only role is the "default(" prefix that identifies
+//     this shape to the importer. Mirrors the local-twin codegen path
+//     (LlvmBackend_Assign.cpp:10867), which lowers `default(T)` via
+//     `Constant::getNullValue(lowerType(p.type))`.
+//
+//   * `:= C.K` / `:= SomeConst` const refs — FOLDED by `renderConstExpr` to
+//     their constant value before this predicate ever sees them, so the
+//     resulting text is a literal that is already admitted by the rules below.
+//     No change to the predicate's recognized literal shapes — only the
+//     "FOLD, don't render" change to the producer, in `renderConstExpr`.
 bool importedDefaultTextIsMaterializable(std::string_view text) {
     if (text.empty()) return false;
     if (text == "true" || text == "false" || text == "null") return true;
+    // fix #3213: the `default(T)` shape. Admitted by prefix so the importer
+    // can recognize the family without a separate wire bit; the actual
+    // materialization is from the formal's own type, not the text's T.
+    if (text.size() >= 8 && text.compare(0, 8, "default(") == 0) return true;
     const char c = text.front();
     return (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '"' ||
            c == '\'';

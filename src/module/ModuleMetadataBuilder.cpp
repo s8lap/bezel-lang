@@ -249,9 +249,19 @@ MetaType convertAstType(const ast::Type* astType, sema::SemaContext& ctx) {
 // the expression is not a shape we render here — the schema fields are
 // advisory (the loader re-parses them for named/optional-arg reproduction), so
 // an empty rendering is a safe fallback, not a correctness gap.
-std::string renderConstExpr(const ast::Expr* e);
+//
+// `ctx`, when non-null, is consulted to FOLD `IdentifierExpr` /
+// `MemberAccessExpr` const references (`SomeConst`, `C.K`) to their initializer
+// value rather than rendering them by NAME — fix #3213 (§22.5 / §2.5, v0.254).
+// A name has no importer-side meaning (the same reason `foldImportedConstText`
+// declines a name today, and the same argument #2898 made for literal
+// arithmetic). The ctx-aware path is a no-op for every call site that has no
+// SemaContext in scope (e.g. enum value rendering), so the legacy behavior is
+// preserved.
+std::string renderConstExpr(const ast::Expr* e,
+                            sema::SemaContext* ctx = nullptr);
 
-std::string renderConstExpr(const ast::Expr* e) {
+std::string renderConstExpr(const ast::Expr* e, sema::SemaContext* ctx) {
     if (e == nullptr) return "";
     if (auto* i = dynamic_cast<const ast::IntLiteralExpr*>(e))
         return std::string(i->text);
@@ -265,10 +275,56 @@ std::string renderConstExpr(const ast::Expr* e) {
         return b->value ? "true" : "false";
     if (dynamic_cast<const ast::NullLiteralExpr*>(e))
         return "null";
+    // fix #3213 (§22.5 / §2.5, v0.254): a `:= default(T)` default-value
+    // expression crosses the module boundary as the canonical `default(T)`
+    // text. The importer recognizes this shape (sema::
+    // importedDefaultTextIsMaterializable admits `default(`) and materializes
+    // it as `Constant::getNullValue(lowerType(formalParamType))` — exactly the
+    // path the local-twin codegen takes (LlvmBackend_Assign.cpp:10867 — the
+    // same `getNullValue(lowerType(...))` arm). The T written here is the
+    // DECLARED default's type spelling, but the importer does NOT consult it:
+    // it materializes from the FORMAL PARAMETER's resolved type
+    // (MetaParam::type, which is already on the wire), so a same-named shadow
+    // on the importer side cannot silently change the value. The T is
+    // nevertheless carried so `importedDefaultTextIsMaterializable` can admit
+    // it by prefix without a separate wire bit, and so an error message can
+    // quote the declared shape.
+    if (auto* de = dynamic_cast<const ast::DefaultExpr*>(e)) {
+        std::string typeName;
+        if (de->type && de->type->name && !de->type->name->parts.empty())
+            typeName = std::string(de->type->name->parts.back());
+        else
+            typeName = "T";  // §17.11 rejects `default(<unresolved>)`; be robust.
+        return "default(" + typeName + ")";
+    }
+    // fix #3213 (§22.5 / §2.5, v0.254): a `:= SomeConst` / `:= C.K` const
+    // reference is FOLDED to its value (the constant's own initializer
+    // expression) rather than rendered BY NAME. Folding is recursive —
+    // transitive const refs unwrap to a literal — and reuses the literal arms
+    // above for the leaf. Only `ConstMemberSymbol` is folded here: a
+    // §22.12-compatible const initializer is itself a compile-time constant
+    // expression, and the const's `ast::ConstDecl::value` IS that expression,
+    // so we have exactly the thing `renderConstExpr` already knows how to
+    // render. A name has no importer-side meaning: the same reason
+    // `foldImportedConstText` declines a name today, and the same argument
+    // #2898 made for literal arithmetic (folded, not rendered).
+    //
+    // Gated on `ctx` so this arm is a no-op for the legacy call sites that
+    // pass nullptr (enum value text, const member `valueText` for a const
+    // whose initializer is itself a literal — already covered by the literal
+    // arms, so the recursion terminates in one step).
+    if (ctx != nullptr) {
+        sema::Symbol* sym = ctx->exprSymbol(*e);
+        if (auto* cms = dynamic_cast<sema::ConstMemberSymbol*>(sym)) {
+            if (auto* cd = dynamic_cast<const ast::ConstDecl*>(cms->decl)) {
+                if (cd->value) return renderConstExpr(cd->value.get(), ctx);
+            }
+        }
+    }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e))
         return std::string(id->name);
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
-        std::string base = renderConstExpr(ma->target.get());
+        std::string base = renderConstExpr(ma->target.get(), ctx);
         if (base.empty()) return "";
         return base + "." + std::string(ma->member);
     }
@@ -843,14 +899,20 @@ std::vector<MetaParam> convertParams(const std::vector<sema::Symbol*>& params,
 }
 
 // Fill §22.5 default-value text on a converted parameter list from the AST
-// Param list (the symbol list parallels the AST param list in order).
+// Param list (the symbol list parallels the AST param list in order). The
+// `ctx` is forwarded to `renderConstExpr` so the ctx-aware arms for
+// `default(T)` and `:= C.K` const references (#3213, v0.254) can resolve the
+// expression's symbol — the legacy sites that do not need resolution pass
+// `nullptr` and see the old literal-only behavior.
 void fillParamDefaults(std::vector<MetaParam>& out,
-                       const std::vector<ast::Param>& astParams) {
+                       const std::vector<ast::Param>& astParams,
+                       sema::SemaContext* ctx) {
     const std::size_t n = std::min(out.size(), astParams.size());
     for (std::size_t i = 0; i < n; ++i) {
         if (astParams[i].defaultValue) {
             out[i].hasDefault = true;
-            out[i].defaultText = renderConstExpr(astParams[i].defaultValue.get());
+            out[i].defaultText =
+                renderConstExpr(astParams[i].defaultValue.get(), ctx);
         }
     }
 }
@@ -1074,7 +1136,7 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             out.genericParams = convertGenericParams(
                 meth->genericParams, md->genericConstraints, ctx);
             out.params = convertParams(meth->params, ctx);
-            fillParamDefaults(out.params, md->params);
+            fillParamDefaults(out.params, md->params, &ctx);
             std::vector<sema::Symbol*> contractGenerics;
             if (meth->parent) {
                 contractGenerics.insert(contractGenerics.end(),
@@ -1109,7 +1171,7 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             out.type = convertAstType(od->returnType.get(), ctx);
             out.returnOwned = od->returnOwned;
             out.params = convertParams(meth->params, ctx);
-            fillParamDefaults(out.params, od->params);
+            fillParamDefaults(out.params, od->params, &ctx);
         }
         return true;
     }
@@ -1118,7 +1180,7 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
         out.params = convertParams(ctor->params, ctx);
         if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.decl)) {
             out.isPure = cd->isPure;
-            fillParamDefaults(out.params, cd->params);
+            fillParamDefaults(out.params, cd->params, &ctx);
             std::vector<sema::Symbol*> contractGenerics;
             if (ctor->parent) {
                 contractGenerics.insert(contractGenerics.end(),
@@ -1153,7 +1215,7 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             out.type = convertAstType(pd->type.get(), ctx);
             if (prop->isIndexer) {
                 out.params = convertParams(prop->indexerParams, ctx);
-                fillParamDefaults(out.params, pd->indexerParams);
+                fillParamDefaults(out.params, pd->indexerParams, &ctx);
             }
             // fix #2467 (§9.2/§2.5, v0.235): carry an instance AUTO-PROPERTY's
             // constant-foldable initializer (`property X: T := v;`) textually,

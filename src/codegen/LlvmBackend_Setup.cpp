@@ -659,6 +659,19 @@ llvm::Value* Emitter::importedDefaultArgValue(const sema::MethodSymbol& ms,
         if (pt && isNullableValueTy(pt)) return nullableValueNull(pt);
         return llvm::ConstantPointerNull::get(ptrTy());
     }
+    // fix #3213 (§22.5 / §2.5, v0.254): a `:= default(T)` default-value
+    // expression crosses the boundary as the canonical `default(T)` text.
+    // Materialize it as the zero value of the FORMAL PARAMETER's resolved type
+    // — `MetaParam::type` is on the wire since the format's REC_SCALARS record,
+    // so the importer has the exact type to lower, and the T spelling in the
+    // text is decorative. Mirrors the local-twin codegen path
+    // (LlvmBackend_Assign.cpp:10867), which is also `getNullValue(lowerType(…))`
+    // for a `DefaultExpr`, so a same-module call and an imported call produce
+    // the same lowered zero value (§2.8.3 rule 4).
+    if (text.size() >= 8 && text.compare(0, 8, "default(") == 0) {
+        if (pt) return llvm::Constant::getNullValue(lowerTypeRef(pt));
+        return llvm::Constant::getNullValue(i32());
+    }
     return foldImportedConstText(text, pt);
 }
 
