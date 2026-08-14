@@ -289,60 +289,61 @@ bool PureBodyWalker::recordSynthesizedCallIsPure(
 // The pure-classification rule keys on existence + purity, not on
 // overload tie-breaking.
 //
-// ⚠ THE `if (!cd) continue;` BELOW IS NOT #3174's DEFECT — MEASURED, and #3174
-// predicted otherwise. The issue's "Related, same function, opposite direction"
-// section claimed this skip produces a false REJECT for an imported body record
-// with a `pure` ctor and a false ACCEPT for an imported positional record with
-// a shadowing impure ctor. Both were probed on `ec6a02f` against
-// character-identical single-module twins and both AGREED across the boundary:
+// fix #3219 (§22.15, v0.254): the candidate walk used to `continue` on any
+// `ConstructorSymbol` whose `decl` was null — fine for a local record, but
+// FAILS for an imported record whose ctor names a SIBLING type:
+// `parseAndAttachCtorBody` re-runs `resolveTypes` over a synthetic source that
+// declares only the one type (#2290 bug 2 / #710), so a sibling-naming ctor's
+// `decl` is left null and this walk would drop it silently. The drop produced
+// two measured defects:
 //
-//   imported body record, `pure` ctor, in a pure body   -> accepted (twin: accepted)
-//   imported body record, impure ctor, in a pure body   -> REJECTED (twin: REJECTED)
-//   imported positional record + shadowing impure ctor  -> REJECTED (twin: REJECTED)
+//   * a body record with a `pure` ctor naming a sibling  — FALSE REJECT
+//     (the ctor is `pure` but the walk misses it, so `recordConstructionIsPure`
+//      returns false and §22.15 fires).
+//   * a positional record with an impure shadowing ctor naming a sibling —
+//     FALSE ACCEPT (§22.15 soundness: the synthesized positional ctor's
+//     auto-hashable classification is used instead of the impure user-declared
+//     shadow).
 //
-// ⚠ THAT AGREEMENT IS CONDITIONAL, AND THE CONDITION IS NOT ALWAYS MET. An
-// earlier revision of this comment said the re-parse gate
-// (`kind == Record || (kind == Class && !genericParams.empty())`) means "EVERY
-// imported record's `ConstructorSymbol::decl` is attached … and this walk sees
-// exactly what it sees for a local record". The gate condition is right and the
-// exporter does carry `ctorBodyText` for records unconditionally
-// (ModuleMetadataBuilder.cpp, #2525) — but ATTACHMENT CAN STILL FAIL:
-// `parseAndAttachCtorBody` runs `resolveTypes` over a synthetic source that
-// declares only the one type, so a ctor naming a SIBLING type fails to resolve
-// (#2290 bug 2 / #710) and `decl` is left null. The three rows above sampled
-// only ctors with primitive parameters, which is why they agreed.
+// (For the positional case, an arity-mismatch with the synthesized positional
+// ctor also fails the §22.5 arity check at the call site — `checkNewExprArgs`
+// does not consult user-declared ctors on a positional record — so the second
+// shape is now unreachable for the positional case. The widening below closes
+// it wherever it IS reachable, e.g. body records, future shapes that route
+// through this walk.)
 //
-// Measured on this commit's own tree (per-fix review), with sibling-naming ctors:
-//   * `record BodyRec2` with `pure constructor(s: Sib)` -> FALSE REJECT
-//     ("the invoked constructor is not pure-declared"); the twin compiles.
-//   * `record PosShadow2(A: int)` with an impure shadowing ctor naming a sibling
-//     -> FALSE ACCEPT in a pure body (§22.15 soundness); the twin is rejected.
-// Filed as #3219.
+// The widening is GATED: when any decl-attached candidate of matching arity
+// exists, the decl-attached path takes precedence so every program the old
+// code answered keeps that answer. When all decl-attached candidates are
+// absent, the symbol-side reading (`constructorIsPure`) is consulted;
+// `applyBehavior` sets `cs->isPure` on every imported ctor (ModuleLoader.cpp,
+// family M8). The single new admission is: "a matching, non-static ctor
+// SYMBOL with no attached declaration".
 //
-// The decl walk is still left as-is HERE, but on the narrower ground only:
-// converting it would widen `matching` to count decl-less candidates, which can
-// turn a currently-resolved single match into an ambiguity (`matching == 1` is
-// the return condition). Note that ground is itself weak — `matching` exceeds 1
-// only when a record declares two same-arity constructors, which is already an
-// overload ambiguity — and converting to `constructorIsPure` WOULD fix the false
-// reject, since `applyBehavior` sets `isPure` on every imported ctor. #3219 is
-// where that trade gets decided; it is not a "no defect behind it" case, which
-// is what the earlier comment claimed.
-static const ast::ConstructorDecl* findUserCtorByArity(
+// The matching concern that previously kept this walk unconverted — widening
+// could turn a single resolved match into an ambiguity — is real but narrow:
+// `matching` exceeds 1 only when a record declares two same-arity ctors,
+// which is already an overload ambiguity.
+static const ConstructorSymbol* findUserCtorByArity(
     const TypeSymbol* rec, std::size_t arity) {
-    const ast::ConstructorDecl* match = nullptr;
     int matching = 0;
+    const ConstructorSymbol* declMatch = nullptr;
+    int symMatching = 0;
+    const ConstructorSymbol* symMatch = nullptr;
     for (Symbol* m : rec->members) {
         auto* cs = dynamic_cast<ConstructorSymbol*>(m);
         if (!cs || cs->isStatic) continue;
         if (cs->params.size() != arity) continue;
-        const auto* cd =
-            dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-        if (!cd) continue;
-        ++matching;
-        match = cd;
+        if (dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
+            ++matching;
+            declMatch = cs;
+        } else {
+            ++symMatching;
+            symMatch = cs;
+        }
     }
-    return matching == 1 ? match : nullptr;
+    if (matching > 0) return matching == 1 ? declMatch : nullptr;
+    return symMatching == 1 ? symMatch : nullptr;
 }
 
 // §22.15 "Members classified by rule" (#2061, item 2): record construction
@@ -374,7 +375,7 @@ bool PureBodyWalker::recordConstructionIsPure(const ast::NewExpr& ne) {
         (dynamic_cast<const ast::TypeDecl*>(rec->decl) &&
          dynamic_cast<const ast::TypeDecl*>(rec->decl)->hasPositionalFields);
     const std::size_t arity = ne.args.size();
-    const ast::ConstructorDecl* userCtor =
+    const ConstructorSymbol* userCtor =
         findUserCtorByArity(rec, arity);
     if (isPositional) {
         // When a user declared a ctor with matching arity, it shadows the
@@ -382,13 +383,13 @@ bool PureBodyWalker::recordConstructionIsPure(const ast::NewExpr& ne) {
         // Otherwise the synthesized positional ctor is invoked — its
         // purity follows from the record's CLASS identity, not from any
         // arity-specific check.
-        if (userCtor) return userCtor->isPure;
+        if (userCtor) return constructorIsPure(userCtor);
         return isPositionalRecordEqualityBearing(rec, ctx_);
     }
     // Body record: there is no synthesized ctor, so the invoked user-
     // declared ctor must be `pure`-declared.
     if (!userCtor) return false;
-    return userCtor->isPure;
+    return constructorIsPure(userCtor);
 }
 
 // §22.15 "Pure constructors" (#2061, item 1): a pure ctor's explicit
