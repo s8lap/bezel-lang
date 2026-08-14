@@ -146,6 +146,32 @@ bool PureBodyWalker::isTrivialDisposeClass(TypeSymbol* decl) const {
     for (TypeSymbol* cur = decl; cur;) {
         if (++walked > kMaxWalk) break;
         if (!visited.insert(cur).second) break;
+        // fix #3223 (§22.15 / §28.9 / §2.8.2, v0.254 — sister to #3191): an
+        // IMPORTED class's carried §3.6 verdict, consulted BEFORE the member
+        // scan below — because for an imported class that scan cannot succeed.
+        // A class's destructor is deliberately not part of the exported member
+        // list (§13.3 — `Dispose()` is the public surface, and there is no
+        // `MetaMemberKind::Destructor`), and `ModuleLoader` builds a
+        // `DestructorSymbol` on exactly one path — the generic body re-parse.
+        // So EVERY non-generic imported class scanned as "no destructor" and
+        // this function answered trivial-dispose for all of them, whatever
+        // they declared. `TypeSymbol::importedNonTrivialDispose` carries the
+        // exporter's verdict (`MetaTypeDecl::nonTrivialDispose`, set by
+        // #3191), so the structural walk has an answer on the imported side
+        // rather than a default. Per level, not once at `decl`, so a LOCAL
+        // `class Derived: Res` over an imported `Res` is decided when the
+        // walk REACHES `Res`. A `false` verdict never short-circuits — absent
+        // (a pre-#3191 artifact) and genuinely-trivial read alike, and both
+        // must fall through to the member scan, which keeps the local-class
+        // answer correct for both fresh and stale imports.
+        //
+        // This is the FOURTH independent copy of §28.9's classification
+        // (alongside `common::isNonTrivialDisposeClass`, `Ownership.cpp`'s
+        // §28.3 gate, and `ExprTypecheck.cpp`'s §21.9 walk). #3191 fixed
+        // three; PureChecker's walker was not in scope for that issue's
+        // verify-first and surfaced separately here. Collapsing all four is
+        // #2666's subject and is deliberately not attempted.
+        if (cur->importedNonTrivialDispose) return false;
         for (Symbol* m : cur->members) {
             if (dynamic_cast<DestructorSymbol*>(m)) return false;
             auto* fs = dynamic_cast<FieldSymbol*>(m);
