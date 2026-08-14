@@ -1431,6 +1431,37 @@ static std::string buildSyntheticClassSource(
         for (const std::string& mod : mm.modifiers) src += " " + mod;
         src += " " + mm.name + " : " + metaTypeToSourceText(mm.type) + ";\n";
     }
+    // fix #3207 (§9.2 / §2.5, v0.254): property STUBS so an AUTHORED ctor
+    // body that names a sibling body-storage member (`this.X := v;` where
+    // `X` is an auto-property) can resolve `this.X` in the fresh context.
+    // Without a stub, the synthetic BodyRec has no `X` member, `this.X` is
+    // rejected at sema with "no member `X` on type `BodyRec`", and the body's
+    // PropertySymbol binding is never created — so the remap loop has nothing
+    // to remap, the body silently keeps no field-store symbol, and codegen's
+    // storageMemberOf resolves the access against the wrong struct
+    // (`fieldIndex_` is keyed on the imported type, the symbol is keyed on
+    // the synthetic re-parse type — two distinct PropertySymbols whose
+    // indices coincide only by luck, and the store silently lands at the
+    // wrong address). Mirrors the Field stub above: a one-line
+    // `public [readonly] property NAME: TYPE;` declaration per MetaMember of
+    // kind Property (the same wire bit #2478 reads on the importer side). A
+    // computed property's accessor bodies are NOT carried — re-parsing
+    // accessor bodies in the synthetic single-type context fails on
+    // sibling-type references (#710/#2290) — but the bare `property NAME: T;`
+    // declaration is enough for a ctor body to NAME the property; reads
+    // dispatch through `importedPropGetterFns_` / `-Setters` (the existing
+    // cross-module path), writes are rejected by the read-only modifier
+    // upstream, exactly as for any read-only imported property.
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Property) continue;
+        if (mm.type == MetaType{}) continue;
+        src += "  " + metaVisibilityToKeyword(mm.visibility);
+        for (const std::string& mod : mm.modifiers) src += " " + mod;
+        src += " property " + mm.name + " : " + metaTypeToSourceText(mm.type);
+        if (!mm.valueText.empty())
+            src += " := " + mm.valueText;
+        src += ";\n";
+    }
     // §14/#662c / #695: stub method declarations so self-calls in the ctor body
     // resolve to a MethodSymbol in the fresh context (remapped to the imported
     // MethodSymbol by parseAndAttachCtorBody).  Operator methods are skipped —
@@ -1556,6 +1587,51 @@ static bool parseAndAttachCtorBody(
         }
     }
 
+    // fix #3207 (§9.2 / §2.5, v0.254): build a name→imported-PropertySymbol
+    // map keyed on the wire bit `mm.isAutoProperty` (#2478). The companion of
+    // the buildSyntheticClassSource property stubs above: a stub creates a
+    // fresh PropertySymbol in the synthetic context; this map is what the
+    // remap loop below uses to redirect every `this.X` reference (and any
+    // `this[i] := v` for a property-name indexer the wire carried as
+    // Property) at the fresh symbol back to the IMPORTED PropertySymbol so
+    // codegen's `storageMemberOf` / `fieldIndex_` / `recordStruct` are keyed
+    // on the imported type — the same struct whose `slot` is being filled by
+    // `buildRecordValue`. Without this remap the fresh symbol's parent is the
+    // synthetic BodyRec (a separate LLVM StructType), and `fieldAddr` builds
+    // a fresh recordStruct for it on the fly; the GEP lands at the right
+    // byte offset for `{i32}` storage but the store and the load use
+    // DIFFERENT struct-type metadata, and LLVM's optimizer folds the
+    // mismatch away (measured: `r.X` reads back 0 after `r := new BodyRec(7)`,
+    // even though the ctor's `Console.WriteLine("ctor ran with " + x)` runs
+    // with the right argument). Gated on `isAutoProperty` because a
+    // COMPUTED property's fresh decl carries accessor bodies the existing
+    // inlined-getter/setter path relies on — those bodies cannot be re-parsed
+    // faithfully in the single-type synthetic context (#710/#2290), and
+    // gating by `mm.isAutoProperty` is exactly the predicate #2478 already
+    // ships for the layout side. A computed property in the ctor body reads
+    // through `importedPropGetterFns_` (the cross-module getter stub),
+    // unchanged from before this fix.
+    //
+    // The wire bit is read off `td.members` directly rather than
+    // `mainCtx.importedPropertyIsAutoStorage_` because publish-to-context
+    // happens at the END of loadMetadataPass2 and this function is called
+    // mid-pass — the context side-table is not yet populated. The wire bit
+    // is the same source #2478 reads from on the exporter side; reading it
+    // here is the same gate, observed one function call earlier.
+    std::unordered_map<std::string_view, sema::Symbol*> importedAutoPropStorage;
+    {
+        std::size_t importedIdx = 0;
+        for (const MetaMember& mmItem : td.members) {
+            if (mmItem.kind != MetaMemberKind::Property) continue;
+            if (importedIdx >= importedType.members.size()) break;
+            sema::Symbol* sym = importedType.members[importedIdx++];
+            auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
+            if (!ps || ps->isIndexer || sym->name.empty()) continue;
+            if (mmItem.isAutoProperty)
+                importedAutoPropStorage[sym->name] = sym;
+        }
+    }
+
     // Build index→ParameterSymbol map for the imported ctor.
     const std::vector<sema::Symbol*>& importedParams = importedCs->params;
 
@@ -1574,6 +1650,27 @@ static bool parseAndAttachCtorBody(
             // Field reference: find same-named field in importedType.
             auto it = importedFields.find(freshSym->name);
             if (it != importedFields.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        } else if (auto* freshPs = dynamic_cast<sema::PropertySymbol*>(freshSym)) {
+            // fix #3207 (§9.2 / §2.5, v0.254): remap an auto-property
+            // reference (a `this.X` read or `this.X := v` write) inside the
+            // re-parsed body to the IMPORTED PropertySymbol. The ctor body's
+            // symbols were populated by the synthetic re-parse above, where
+            // `X` resolves against the SYNTHETIC BodyRec — a different
+            // PropertySymbol (different `parent`, different `decl`) than the
+            // one whose struct `slot` is being filled by `buildRecordValue`.
+            // `isAutoPropertyStorageSymbol` (the gate above) is true for the
+            // fresh symbol too — its freshly-parsed PropertyDecl has
+            // bodyKind == Auto — so codegen's `storageMemberOf` accepts it as
+            // storage, but `fieldIndex_` is keyed on the IMPORTED symbol and
+            // the synthetic symbol is absent, so `fieldAddr` builds a fresh
+            // recordStruct on the fly under the wrong struct identity and
+            // the field store/load never observe each other. Remap by name to
+            // the imported symbol so codegen uses the imported struct
+            // throughout. See buildSyntheticClassSource's property-stub arm
+            // above for the matching wire-bit side.
+            auto it = importedAutoPropStorage.find(freshPs->name);
+            if (it != importedAutoPropStorage.end())
                 mainCtx.setExprSymbol(expr, it->second);
         } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
             // fix #2839: a LAMBDA parameter is declared inside the body and has
