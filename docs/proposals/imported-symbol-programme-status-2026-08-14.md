@@ -33,7 +33,7 @@ for a GENERIC type, so for a non-generic imported class every member symbol has
 
 | | |
 |---|---|
-| `origin/main` | `cf84884` — plus a **9-commit batch on local `main`, plain gate PASSED, ASan phase in flight** (Wave B2 final + #3191 + #3191 follow-up) |
+| `origin/main` | `226aca1` — **10-commit batch PUSHED**, gate cycle 5 GREEN (plain + ASan trustworthy-green, conformance 178/0/393) |
 | **class 1** (`TypeDecl` symbol-side) | **152 → 51** ✅ all 12 families landed |
 | **class 2** (always-null `TypeSymbol`→`TypeDecl`) | **1 → 0** ✅ (#3150) |
 | **class 3** (member-kind symbol-side) | **305 → 292** (M4 −7, M8/#3188/#3206/#3182 −3, #3178 tooling −3) |
