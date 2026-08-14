@@ -33,14 +33,41 @@ for a GENERIC type, so for a non-generic imported class every member symbol has
 
 | | |
 |---|---|
-| `origin/main` | `ec6a02f` — plus a **10-commit batch on local `main`, gated but not yet pushed** (Wave A + the class-3 ratchet + this document) |
+| `origin/main` | `cf84884` — plus a **9-commit batch on local `main`, plain gate PASSED, ASan phase in flight** (Wave B2 final + #3191 + #3191 follow-up) |
 | **class 1** (`TypeDecl` symbol-side) | **152 → 51** ✅ all 12 families landed |
 | **class 2** (always-null `TypeSymbol`→`TypeDecl`) | **1 → 0** ✅ (#3150) |
-| **class 3** (member-kind symbol-side) | **305 → 295** (M4 −7, M8/#3188/#3206/#3182 −3) |
+| **class 3** (member-kind symbol-side) | **305 → 292** (M4 −7, M8/#3188/#3206/#3182 −3, #3178 tooling −3) |
 
 ⚠ The class-3 figure is **305, not the 301** an earlier draft of this table carried: the
 baseline was regenerated after Wave A landed and the file is authoritative over this
 document. Read `scripts/imported_symbol_reads.baseline`, never a number quoted here.
+
+### #3191 family — landed + follow-up
+
+**#3191 (commit `43d6abc`)**: an imported class's destructor never crossed the wire, so every
+imported class was classified trivial-dispose — making §21.9's hard-error never fire cross-module.
+Fix added `MetaTypeDecl::nonTrivialDispose` (encoder side) and `TypeSymbol::importedNonTrivialDispose`
+(decoder side), reusing the existing inheritance walk.
+
+**⚠ FIRST GATE CAUGHT AN OVER-FIRE on 43d6abc**: `xmod_owned_return_channel_3189.t2` flipped
+to FAIL because §21.9's reject was firing on `Cell.MakeIt(i);` (a CALL expression) — but #3189
+DOCUMENTED that the call path is reclaimed by `disposeOwnedValue`, not §21.9's hard-error gate.
+**This was a width mismatch in the §21.9 walk, not in the carrier.** Root cause: the §21.9
+walk fired the reject whenever `cur->importedNonTrivialDispose` was set on the *expression*,
+without distinguishing NEW from CALL.
+
+**#3191 follow-up (commit `0bb85f1`)**: gate the §21.9 reject fire on the SOURCE EXPRESSION
+being a `NewExpr` (via `dynamic_cast<const ast::NewExpr*>`). CALL expressions always reclaim
+through `disposeOwnedValue` per #3189's design intent. T10 test (`t10_new_vs_call_boundary_3191`)
+pins the boundary: `new Cell(1)` rejects (NEW → §21.9 hard error); `Cell.MakeIt(1)` runs clean
+(CALL → reclaim).
+
+**★ RULE (now earned):** *When you add a wire carrier that makes a §-section's hard-error gate
+fire on imported types, the §-section's AST predicate still owns the firing condition. The carrier
+only supplies the verdict that predicate would have asked the local symbol for.* In this case,
+§21.9's predicate is "the discard is a NEW of a non-trivial-dispose class"; the carrier supplies
+"is this imported class non-trivial-dispose?" — the predicate, not the carrier, decides what
+counts as a NEW.
 
 `scripts/check_imported_symbol_reads.py` enforces all three as a **gate phase**. The
 baseline is **EXACT, not a ceiling**: a rise fails, and so does stale headroom, so a
