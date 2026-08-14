@@ -2503,6 +2503,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         } else {
             if (!ms || !ms->parent) return nullptr;
             auto idxIt = fieldIndex_.find(ms);
+            // fix #3218 (§7.5 / §2.5, v0.254): a `?.` on a CLASS-TYPED FIELD of
+            // an IMPORTED receiver silently dropped the enclosing statement
+            // (exit 0, `internal: … #3079`), masked whenever an earlier `.`-form
+            // access to the same field had already forced `classStruct` to run.
+            // `fieldIndex_` is populated lazily by `classStruct`'s FIRST call for
+            // `ms->parent`; `declareVtables` runs it up-front for every LOCAL
+            // class but never for an imported one, so an imported class's struct
+            // is built only when the FIRST access reaches this lookup. The `.`
+            // spelling (`fieldAddr`, line ~5799) already retries `classStruct`
+            // on a missing entry, exactly the #2474 discipline; this `?.` arm
+            // did not. Apply the same retry here so `q?.F` on an imported
+            // `class.F` produces the same `?.` lowering as the local twin.
+            if (idxIt == fieldIndex_.end()) {
+                classStruct(ms->parent);
+                idxIt = fieldIndex_.find(ms);
+            }
             if (idxIt == fieldIndex_.end()) return nullptr;
             st = classStruct(ms->parent);
             memIdx = idxIt->second;
