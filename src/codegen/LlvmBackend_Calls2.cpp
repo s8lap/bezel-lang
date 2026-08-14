@@ -4132,6 +4132,28 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 continue;
             }
             llvm::Value* v = lowerExpr(*a.value);
+            // fix #3137 / §4.7 / §27.1: the function-VALUE invoke path builds
+            // its arguments in its own loop — NOT through `buildOrderedArgs`,
+            // so it never reaches the `unitValueForTarget` / placeholder-byte
+            // rescue #3095 / #2915 added there. Apply the SAME rescue so a `()`
+            // or `()?` argument to a function value lowers the same way the
+            // method/constructor path does: a present `()?` literal becomes
+            // the `{i8 1, i8 0}` optional; a `()` literal becomes the inert
+            // placeholder byte the callee's signature has a slot for.
+            // Same formal-resolution pattern as buildOrderedArgs's rescue
+            // (L10532–10547): the formal may be a bare `T` that resolves to
+            // `()` or `()?` through the callee's monomorphization.
+            if (!v && pi < rt->funcParams.size()) {
+                const sema::TypeRef* formal0 =
+                    resolveTypeParamRef(rt->funcParams[pi].type);
+                llvm::Value* uv = unitValueForTarget(v, formal0, a.value.get());
+                if (uv != v) {
+                    v = uv;
+                } else if (formal0 && formal0->kind == sema::TypeRef::Kind::Unit
+                                 && !formal0->nullable) {
+                    v = llvm::ConstantInt::get(unitPlaceholderTy(), 0);
+                }
+            }
             if (!v) return nullptr;
             args.push_back(v);
         }
@@ -4200,8 +4222,18 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 allArgTys.push_back(ptrTy());
                 continue;
             }
-            llvm::Type* declared =
-                rt->funcParams[pi].type ? lowerTypeRef(rt->funcParams[pi].type) : i32();
+            // fix #3137 / §4.7 / §27.1: `lowerParamTypeRef` — same
+            // `void`→`unitPlaceholderTy()` substitution the method/constructor
+            // signature builders (`methodFnType` ~L12127) make, so a `()`
+            // parameter on the function-value type matches the placeholder
+            // byte the rescue above supplied as the operand. Without this the
+            // call's declared arg type would be `void` (invalid for a function
+            // parameter on this libLLVM build) and the closure's declared
+            // signature would be the inert byte — a structural mismatch the
+            // callee never recovers from.
+            llvm::Type* declared = rt->funcParams[pi].type
+                                      ? lowerParamTypeRef(rt->funcParams[pi].type)
+                                      : i32();
             // CG-generic: if declared resolved to i32 (unresolved generic T):
             // 1. Try callee's localGenericSubst_ to resolve the generic param name.
             // 2. If still i32, upgrade to ptr if the actual arg is a pointer.
@@ -7978,6 +8010,90 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         genericSubst_ = std::move(preSubst);
                         genericSubstSemaTy_ = std::move(preSema);
                         didPrePass = true;
+                    }
+                }
+                // fix #3137 / §14.1: an EXPLICIT call-site type argument that
+                // resolves a generic formal `T` to `()` or `()?` — `Id<()>(())`
+                // etc. — must reach the unit-rescue in `buildOrderedArgs`, which
+                // keys on the FORMAL's resolved type via `resolveTypeParamRef`
+                // (see the Assign.cpp companion change). That requires the
+                // active monomorphization (`genericSubstSemaTy_["T"]`) to be
+                // installed BEFORE buildOrderedArgs runs, but the pre-pass
+                // above is gated on `hasLambdaArg` (it ran for lambda-bearing
+                // calls because its purpose was pre-resolving a lambda's return
+                // type inside `lowerLambda`). Widen the gate to also fire when
+                // ANY explicit type arg substitutes a generic parameter to a
+                // unit-shaped type — i.e. when the type-arg's resolved sema
+                // type is `()` or `()?`. For an int type arg the call-site's
+                // narrowing of the formal `T?` to `int?` (preserving
+                // nullability, the path #885/#886 already established) is
+                // what `nullableTypeParamConcrete` rebuilds later in
+                // `applyMethodGenericSubst`; installing `int` here would
+                // strip that nullability and break `GetVal<int>(null, 42)`
+                // (#885/#886). Targeting ONLY unit substitutions keeps that
+                // path untouched for non-unit cases.
+                if (!hasLambdaArg) {
+                    const std::vector<std::unique_ptr<ast::Type>>* callTAs =
+                        nullptr;
+                    if (auto* callMa =
+                            dynamic_cast<const ast::MemberAccessExpr*>(
+                                call.callee.get()))
+                        callTAs = &callMa->typeArgs;
+                    else if (auto* callId =
+                                 dynamic_cast<const ast::IdentifierExpr*>(
+                                     call.callee.get()))
+                        callTAs = &callId->typeArgs;
+                    bool hasUnitTypeArg = false;
+                    if (callTAs) {
+                        for (std::size_t gi = 0;
+                             gi < callTAs->size(); ++gi) {
+                            if (!(*callTAs)[gi]) continue;
+                            sema::TypeRef* concreteArg =
+                                ctx_.resolvedType(*(*callTAs)[gi]);
+                            if (!concreteArg) continue;
+                            if (concreteArg->kind ==
+                                    sema::TypeRef::Kind::Unit &&
+                                (concreteArg->nullable ||
+                                 !concreteArg->nullable)) {
+                                // `()` OR `()?` both qualify; the widening is
+                                // safe for both because #3095 itself only
+                                // touches those shapes (other nullable unit
+                                // cases like nullable-record are not in
+                                // scope for this monomorphization widening).
+                                hasUnitTypeArg = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (hasUnitTypeArg) {
+                        std::unordered_map<std::string_view, llvm::Type*>
+                            preSubst = genericSubst_;
+                        std::unordered_map<std::string_view,
+                                           const sema::TypeRef*>
+                            preSema = genericSubstSemaTy_;
+                        for (std::size_t gi = 0;
+                             gi < md->genericParams.size() &&
+                             gi < callTAs->size(); ++gi) {
+                            std::string_view pname =
+                                md->genericParams[gi].name;
+                            if (preSubst.count(pname)) continue;
+                            if (!(*callTAs)[gi]) continue;
+                            sema::TypeRef* concreteArg =
+                                ctx_.resolvedType(*(*callTAs)[gi]);
+                            if (!concreteArg) continue;
+                            llvm::Type* lt = lowerTypeRef(concreteArg);
+                            preSubst[pname] = lt;
+                            preSema[pname] = concreteArg;
+                        }
+                        if (preSubst != genericSubst_) {
+                            if (!didPrePass) {
+                                preSavedSubst = genericSubst_;
+                                preSavedSema  = genericSubstSemaTy_;
+                                didPrePass = true;
+                            }
+                            genericSubst_ = std::move(preSubst);
+                            genericSubstSemaTy_ = std::move(preSema);
+                        }
                     }
                 }
             }

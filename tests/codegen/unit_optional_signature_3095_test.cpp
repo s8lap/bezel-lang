@@ -446,3 +446,169 @@ BEZEL_TEST(unit_optional_signature_3095,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(85, r.exitCode);           // (42 * 2) + 1
 }
+
+// ── #3137 — TWO POSITIONS LEFT OUT OF #3095 ───────────────────────────────
+//
+// #3137 (re-opened against the #3095 fix, which gave the unit type a slot at
+// every NAMED-METHOD / CONSTRUCTOR argument position): the function-VALUE invoke
+// path builds its arguments in `emitClosureCall`'s own loop, not through
+// `buildOrderedArgs`, and a generic method call passes its specialization's
+// parameter type through a raw Named `T` (not `Kind::Unit`) until the active
+// monomorphization is consulted. Both reach the same defect class — a `()`
+// argument silently degrades to `internal:` — and both share the same §4.7 /
+// §14.2 / §27.1 authority.
+//
+// The fix at each site is a copy of #3095's rescue plus the matching formal-
+// type substitution the call signature's LLVM-IR argument declares: the call
+// emits a placeholder byte (or a `{i8 1, i8 0}` optional), so the function
+// type it builds for the invoke MUST declare that same slot — `lowerTypeRef`
+// would answer `void`, which is not a valid LLVM parameter type. The
+// signature-shape change uses `lowerParamTypeRef`, exactly as `methodFnType`
+// does at the same position for the named-method path.
+
+// ── (1) FUNCTION-VALUE CALL WITH A UNIT ARGUMENT ───────────────────────────
+
+BEZEL_TEST(unit_optional_signature_3137,
+           a_function_value_invocation_with_a_plain_unit_arg_runs_spec_4_7_27_1) {
+    // The issue's own repro, lifted verbatim. Pre-#3137: #3079 — the
+    // argument's `lowerExpr` returned null and the whole statement emitted
+    // nothing (not even the line terminator), exit 0 with no output.
+    // Post-#3137: the rescue populates the placeholder byte the function-
+    // value type's signature was rewritten to match, and `Console.WriteLine`
+    // emits `6`.
+    auto r = runAot(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var f: (()) -> int := lambda (u: ()) => 6; "
+        "    Console.WriteLine(f(())); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(0, r.exitCode);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("6") != std::string::npos);
+}
+
+BEZEL_TEST(unit_optional_signature_3137,
+           a_function_value_invocation_with_a_nullable_unit_literal_arg_runs_spec_4_7_27_1) {
+    // The `()?` side of #3137 — the present literal `()` at a `()?` function-
+    // value parameter. `unitValueForTarget` supplies the `{i8 1, i8 0}` here
+    // too; the callee's `if u = null then return 1` must NOT fire.
+    auto r = runAot(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var f: (()?) -> int := lambda (u: ()?) => do "
+        "      if u = null then return 1; end; "
+        "      return 2; "
+        "    end; "
+        "    Console.WriteLine(f(())); "
+        "    return 7; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(7, r.exitCode);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("2") != std::string::npos);
+}
+
+BEZEL_TEST(unit_optional_signature_3137,
+           a_function_value_invocation_with_a_nullable_unit_null_arg_runs_spec_4_7_27_1) {
+    // The other §4.7 value, the `null` literal. Confirms the rescue did not
+    // erase the distinction: this prints `1`, the previous prints `2`.
+    auto r = runAot(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var f: (()?) -> int := lambda (u: ()?) => do "
+        "      if u = null then return 1; end; "
+        "      return 2; "
+        "    end; "
+        "    Console.WriteLine(f(null)); "
+        "    return 7; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(7, r.exitCode);
+    BEZEL_EXPECT_TRUE(r.stdoutText.find("1") != std::string::npos);
+}
+
+BEZEL_TEST(unit_optional_signature_3137,
+           a_nullable_unit_local_through_a_function_value_keeps_both_values_spec_4_7_27_1) {
+    // The third shape the issue's body quotes as ALREADY-WORKING (a `()?`-
+    // typed local works because `unitValueForTarget` is keyed on the source's
+    // sema type) — pinned so the rescue cannot over-reach and mishandle a
+    // bound `()?` source.
+    auto r = runAot(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var f: (()?) -> int := lambda (u: ()?) => do "
+        "      if u = null then return 1; end; "
+        "      return 2; "
+        "    end; "
+        "    var v: ()? := (); "
+        "    var w: ()? := null; "
+        "    var acc: int := 0; "
+        "    if f(v) = 2 then acc := acc + 1; end; "
+        "    if f(w) = 1 then acc := acc + 2; end; "
+        "    return acc; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(3, r.exitCode);
+}
+
+// ── (2) A GENERIC METHOD MONOMORPHIZED AT `()` ──────────────────────────────
+
+BEZEL_TEST(unit_optional_signature_3137,
+           a_generic_method_instantiated_at_unit_runs_spec_4_7_14_2) {
+    // §14.2's `where T: value` admitted-substitutions row lists "the unit
+    // type", so `Id<()>(())` is a sanctioned instantiation. Pre-#3137: the
+    // argument's `lowerExpr` returned null and the formal was a bare `Named T`
+    // (not `Kind::Unit`), so #3095's rescue — keyed on `formal0->kind == Unit`
+    // — did not fire; #1386 ICE.
+    auto r = runAot(
+        "module M; "
+        "class C "
+        "  public static method Id<T>(x: T): int where T: value "
+        "    return 3; "
+        "  end Id; "
+        "  public static method Main(): int "
+        "    return C.Id<()>(()); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(3, r.exitCode);
+}
+
+// (A `T = ()?` substitution where the formal is `T?` and the substitution
+// is `()?` is not a target for this fix — sema's `where T: value` admits only
+// the non-nullable form, so `Take<()?>(...)` is rejected at sema and never
+// reaches codegen. The nullable-unit rescue is exercised via the function-
+// value tests above (`f(()?)` at a `()?` parameter); no separate `()?` generic
+// instantiation is reachable.)
+
+// ── ACCEPT-CONTROL: NON-UNIT GENERIC SUBSTITUTIONS STILL WORK ──────────────
+
+BEZEL_TEST(unit_optional_signature_3137,
+           non_unit_generic_substitutions_at_a_call_argument_are_unchanged_spec_14_2) {
+    // The over-reach control: the same `T`-keyed rescue must not change the
+    // value-type path #3095 already covered. `T = int` lowers normally and
+    // the call returns 41; `T = ()` (the shape this fix adds) ALSO returns 41
+    // (the same body, same constant). If the predicate were dropped instead of
+    // widened, the int branch would start emitting the unit placeholder and
+    // the program would miscompile.
+    auto r = runAot(
+        "module M; "
+        "class C "
+        "  public static method Id<T>(x: T): int where T: value "
+        "    return 41; "
+        "  end Id; "
+        "  public static method Main(): int "
+        "    return C.Id<int>(40) + C.Id<()>(()); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(82, r.exitCode);           // 41 + 41
+}

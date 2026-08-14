@@ -10531,6 +10531,33 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         // #1386 ICE below still fires for the cases it was written for.
         if (!v && params[idx].type) {
             sema::TypeRef* formal0 = ctx_.resolvedType(*params[idx].type);
+            // fix #3137 / §4.7: a generic parameter `T` monomorphized at the
+            // call site to `()` or `()?` (per §14.2's `where T: value` admitted-
+            // substitutions row) arrives here as a bare `Named T` — `formal0`'s
+            // `kind` is `Named`, NOT `Unit`. Resolve through the active
+            // monomorphization (the #2901 mechanism `boxForTarget` also uses
+            // on its target side, ~L3042) so the `Kind::Unit` /
+            // `isNullableUnitTy` tests below see the concrete unit type and the
+            // rescue fires. The pre-pass that installs the substitution for a
+            // unit-substituted explicit type arg (see LlvmBackend_Calls2.cpp
+            // ~L7934) is itself targeted to unit-shaped substitutions only —
+            // it stays a no-op for any other type, so the existing
+            // (#885/#886) `GetVal<int>(null, 42)` path that depends on the
+            // `T?` formal staying bare until `applyMethodGenericSubst` runs
+            // is untouched.
+            if (formal0) {
+                if (formal0->kind == sema::TypeRef::Kind::Named &&
+                    !formal0->declaration && formal0->nullable) {
+                    // `T?` with an active `T → <concrete>` substitution:
+                    // preserve nullability (resolveTypeParamRef strips it).
+                    sema::TypeRef concrHolder;
+                    if (nullableTypeParamConcrete(formal0, concrHolder))
+                        formal0 = &concrHolder;
+                } else {
+                    formal0 = const_cast<sema::TypeRef*>(
+                        resolveTypeParamRef(formal0));
+                }
+            }
             // fix #3095 (§4.7, v0.252): the two OTHER unit-source targets a
             // call argument can have, both of which demand a real operand
             // because the callee's signature has a slot for them.
