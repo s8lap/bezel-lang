@@ -1221,9 +1221,7 @@ static void checkClassInvariants(SemaContext& ctx, const TypeSymbol& t) {
 bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
     (void)src;
     if (!ctx.module()) return !ctx.diagnostics().hasErrors();
-    // Walk every type's members (top-level + nested). Extension methods and
-    // their expression-bodied properties live as extension members and are
-    // visited separately below.
+    // Walk every type's members (top-level + nested).
     std::vector<TypeSymbol*> types;
     for (Symbol* child : ctx.module()->children) {
         if (auto* t = dynamic_cast<TypeSymbol*>(child)) types.push_back(t);
@@ -1282,6 +1280,36 @@ bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
                                  /*isConstructor=*/true);
                 w.checkExpr(fd->initializer.get());
             }
+        }
+    }
+    // §22.15 (fix #3175, v0.254): extension blocks (`extension T`) live at
+    // module scope as `ExtensionSymbol`s, NOT inside a `TypeSymbol`'s members
+    // (§A.3, SymbolCollection.cpp:439; Symbol.hpp:793). A `pure` extension
+    // method or expression-bodied extension property carries the same
+    // purity obligation as a class member — the body MUST satisfy the §22.15
+    // closed-list rules, and the import-side artifact carries the `isPure`
+    // bit (`ModuleMetadataBuilder.cpp:870` writes it from the member's
+    // modifiers with no body check behind it). The earlier
+    // `checkPureBodies` did not iterate extension blocks; the comment that
+    // asserted it did (former line 1224) was the cause. Run the same
+    // `checkOneMember` path used for class members. `ExtensionSymbol` is
+    // only ever created by `collectMember` from a local `ast::ExtensionDecl`
+    // (SymbolCollection.cpp:440) — there is no import path that synthesizes
+    // one, so imported-extension handling is a non-issue. Per the issue's
+    // "fix shape" note: the receiver-form distinction (by-value for value/
+    // primitive extended types, by-pointer for class extended types) is
+    // `MethodSymbol::extensionDecl`'s concern at codegen — `checkOneMember`
+    // works on the body's AST and does not depend on `parent`.
+    std::vector<ExtensionSymbol*> extensions;
+    for (Symbol* child : ctx.module()->children) {
+        if (auto* e = dynamic_cast<ExtensionSymbol*>(child))
+            extensions.push_back(e);
+    }
+    for (ExtensionSymbol* ext : extensions) {
+        for (Symbol* m : ext->members) {
+            auto* mem = dynamic_cast<MemberSymbol*>(m);
+            if (!mem) continue;
+            checkOneMember(ctx, *mem);
         }
     }
     return !ctx.diagnostics().hasErrors();
