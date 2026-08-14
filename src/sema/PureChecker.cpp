@@ -180,7 +180,7 @@ bool PureBodyWalker::isTrivialDisposeClass(TypeSymbol* decl) const {
                 if (fs->parent &&
                     fs->parent->kind == ast::TypeDeclKind::Class &&
                     fs->posParam->modifier == "owned" &&
-                    fs->posParamBodyRef && !fs->posParamInitRef)
+                    !fs->posParamInitRef)
                     return false;
                 continue;
             }

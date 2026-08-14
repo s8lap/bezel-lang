@@ -80,10 +80,16 @@ bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl) {
             auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
             if (!fs) continue;
             if (fs->posParam) {
+                // fix #3205 (§22.10 v0.254): mirror the codegen
+                // isCapturedOwnedPrimaryParam predicate widening — gate on
+                // `!posParamInitRef` only, so a NEVER-referenced `owned`
+                // primary-ctor parameter is also counted as non-trivial-
+                // dispose storage here. See the codegen predicate's comment
+                // for the four-case truth table.
                 if (fs->parent &&
                     fs->parent->kind == ast::TypeDeclKind::Class &&
                     fs->posParam->modifier == "owned" &&
-                    fs->posParamBodyRef && !fs->posParamInitRef) {
+                    !fs->posParamInitRef) {
                     reject = true;
                     break;
                 }

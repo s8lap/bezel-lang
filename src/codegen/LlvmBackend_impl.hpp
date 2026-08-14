@@ -8071,21 +8071,66 @@ private:
     // from the AST. The declaration pointer on the TypeRef is the TypeSymbol*
     // resolved at load time; importedName covers the case where lookupNamed
     // returned null (generic-param fields and builtin types — §2.5).
-    // §22.10 (v0.180): an `owned` CLASS primary-constructor parameter captured
-    // into a compiler-generated `owned` private field. The `owned` modifier
-    // rides `posParam->modifier` (not `fs->modifiers`), and disposal applies
-    // only to a *captured* parameter — one referenced in a body position and
-    // NOT in any initializer position (posParamBodyRef && !posParamInitRef). A
-    // parameter consumed by an owned-field initializer (the §11.1
-    // `ResourceHolder` pattern) is disposed by that explicit field, so disposing
-    // the capture slot too would double-free; the conservative "no initializer
-    // reference" gate keeps the capture slot the sole owner. The typechecker
-    // sets the two flags (ExprTypecheck_Exprs.cpp).
+    // fix #3205 (§22.10 v0.254): an `owned` CLASS primary-constructor
+    // parameter that is *consumed* by the implementation routes through a
+    // compiler-generated `owned` private field. Consuming = "the parameter's
+    // value would not otherwise be disposed" — i.e. never consumed by an
+    // owned-field initializer or by the inheritance clause's base call
+    // (`!posParamInitRef`); either a body-position reference
+    // (`posParamBodyRef`) OR zero references at all leaves the value with
+    // nowhere to go but the generated capture field, which the generated
+    // `Dispose()` (§28.4) walks exactly like an explicit `owned` field. The
+    // `owned` modifier rides `posParam->modifier` (NOT `fs->modifiers`), so a
+    // plain positional parameter never reaches this line.
+    //
+    // The pre-#3205 predicate gated on `posParamBodyRef && !posParamInitRef`,
+    // a positive-list shape drawn from §22.10's "Referenced in a body
+    // position" / "Referenced only in field initializers" cases. The case
+    // §22.10's enumeration does NOT name — a parameter referenced NOWHERE —
+    // fell through the negative list and `isOwnedReferenceField` then
+    // rejected the slot too, so `emitOwnedFieldDisposals` never walked the
+    // slot. The `+1` value flowed through the parameter, found no field to
+    // own it, and the generated Dispose had no slot to walk; the value
+    // leaked. Confirmed LSan-measured on `8b7e458`: a
+    // `class UnusedL(owned r: ResL, tag: int) end UnusedL;` with
+    // `using var u := new UnusedL(new ResL(5), 200);` leaked 16 byte(s)
+    // (the ResL block).
+    //
+    // Widening this predicate to `!posParamInitRef` is the minimal-change
+    // fix that closes the leak:
+    //   * body ref only            (posParamBodyRef=true,  posParamInitRef=false)
+    //     → captured (post-fix same as pre-fix)
+    //   * init ref only            (posParamBodyRef=false, posParamInitRef=true)
+    //     → NOT captured (the initializer consumed the value; ResourceHolder
+    //       pattern)
+    //   * both                     (posParamBodyRef=true,  posParamInitRef=true)
+    //     → NOT captured (pre-fix: same. Both-eaten still triggers the §22.10
+    //       compile-error-per-spec case, but the errror itself is a separate
+    //       item still tracked in #1594 — the predicate is just the capture
+    //       arm of the rule)
+    //   * NEITHER                  (posParamBodyRef=false, posParamInitRef=false)
+    //     → captured (post-fix; the fix)
+    //
+    // The same predicate mirrors in sema (`ExprTypecheck.cpp` trivial-dispose
+    // classifier, `PureChecker.cpp` pure-classifier, `OwnershipFacts.cpp`)
+    // carry the same widdening, since the trivial-dispose derivation must
+    // agree with disposal — a captured slot is non-trivial-dispose because
+    // its generated dispose MUST run to release the captured value.
+    //
+    // §22.10's enumeration does not name the `NEITHER` case — it lists the
+    // three REFERENCE shapes (initializer / body / both, with the third a
+    // compile error). Reading the section's parenthetical "Silently dropping
+    // the parameter would be a leak under §11.1's ownership-transfer clause
+    // and Appendix C.3's disposed-exactly-once invariant" alongside the
+    // enumeration: the unreferenced case is the implementation's "Silently
+    // dropping" surface, and the spec's intent excludes it. The §22.10
+    // enumeration gap is filed as a spec amendment candidate (gh issue,
+    // parent #3205).
     static bool isCapturedOwnedPrimaryParam(const sema::FieldSymbol* fs) {
         return fs->posParam && fs->parent &&
                fs->parent->kind == ast::TypeDeclKind::Class &&
                fs->posParam->modifier == "owned" &&
-               fs->posParamBodyRef && !fs->posParamInitRef;
+               !fs->posParamInitRef;
     }
 
     // §22.10 (v0.180) / #1594: the resolved declared type of a captured `owned`

@@ -11283,6 +11283,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             // for the posParam case; sema has no access to that
                             // codegen predicate, so the equivalent check is
                             // reproduced here directly on the FieldSymbol.
+                            //
+                            // fix #3205 (§22.10 v0.254): the posParam arm
+                            // gates on `!posParamInitRef` only, dropping the
+                            // pre-fix `posParamBodyRef` requirement, so an
+                            // `owned` primary-ctor parameter REFERENCED
+                            // NOWHERE is captured-and-disposed (no silent leak)
+                            // and the class is non-trivial-dispose. See the
+                            // codegen predicate's comment for the four-case
+                            // truth table and the spec enumeration gap.
                             auto* fs = dynamic_cast<FieldSymbol*>(m);
                             if (!fs) continue;
                             if (fs->posParam) {
@@ -11290,7 +11299,6 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                     fs->parent->kind ==
                                         ast::TypeDeclKind::Class &&
                                     fs->posParam->modifier == "owned" &&
-                                    fs->posParamBodyRef &&
                                     !fs->posParamInitRef) {
                                     reject = true;
                                     break;
