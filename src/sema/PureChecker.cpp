@@ -620,6 +620,30 @@ void PureBodyWalker::checkAssignmentTarget(const ast::Expr& target) {
             "birth-store admits only fields of `this`)");
         return;
     }
+    if (auto* ps = dynamic_cast<PropertySymbol*>(rootSym)) {
+        // §22.15 birth-store rule (fix #3208): the rule is stated over the
+        // target ROOT, not over its spelling — `this.N := n;` and `N := n;`
+        // are the same store (§2.7), and the spec admits both spellings of
+        // a property write under the same rationale (the property's backing
+        // storage is a field of `this`). The previous birth-store arm
+        // recognised only FieldSymbol roots, so the bare property spelling
+        // fell through to the "not a frame-local" reject even though the
+        // `this.`-qualified spelling was silently admitted via the
+        // unresolved-root branch above. Admit the PropertySymbol root under
+        // the same gate the FieldSymbol arm uses.
+        if (isConstructor_) {
+            bool isStatic = false;
+            for (auto mod : ps->modifiers)
+                if (mod == "static") isStatic = true;
+            if (!isStatic) return;
+        }
+        reportPureViolation(
+            target.span.begin, "assignment",
+            std::string("the target root `") + std::string(ps->name) +
+            "` is a property (a store outside the frame; pure-constructor "
+            "birth-store admits only properties of `this`)");
+        return;
+    }
     reportPureViolation(
         target.span.begin, "assignment",
         "the target root is not a frame-local of this body");
