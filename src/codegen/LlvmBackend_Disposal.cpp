@@ -630,8 +630,9 @@ void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
             Severity::Warning, p->declLoc,
             std::string("internal: emitOwnedParamCaptureDispose: vtable-less "
                         "built-in class '") + std::string(bn) +
-                "' has no release arm; update emitVtablelessBuiltinRelease "
-                "and the slot will be reclaimed");
+                "' has no release arm; the slot is left un-reclaimed "
+                "(a bounded leak) — extend emitVtablelessBuiltinRelease to "
+                "reclaim it; #3157");
         return;
     }
     // (3) Recognised class — has a vtable; `emitDisposeAndReclaim` is correct.
@@ -651,7 +652,7 @@ void Emitter::emitOwnedParamCaptureDispose(sema::Symbol* p, llvm::Value* obj) {
         Severity::Warning, p->declLoc,
         "internal: emitOwnedParamCaptureDispose: unrecognised owned parameter "
         "type; no Task arm, no vtable-less built-in arm, no recognised class "
-        "declaration");
+        "declaration; the slot is left un-reclaimed (a bounded leak) — #3157");
 }
 
 

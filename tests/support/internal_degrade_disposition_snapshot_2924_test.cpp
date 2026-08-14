@@ -231,6 +231,30 @@ const Entry kWarningDegrades[] = {
      "narrowest of the three dispositions in this table, and the reason this "
      "is a Warning while branches (a)/(b) escalate. Tracked for the residual "
      "sites (ordinary call arguments, the `?.` twin) as #3105."},
+
+    {"src/codegen/LlvmBackend_Disposal.cpp", "#3157",
+     Disposition::WrongValue,
+     "the owned-capture arm (2) 'no release arm yet' alarm in "
+     "emitOwnedParamCaptureDispose — the slot is LEFT UN-RECLAIMED rather "
+     "than substituted, so no zero/null lands in a pointer slot. Mirror of "
+     "#2992 above (same leak-not-crash shape): the alarm is a compiler-bug "
+     "report whose harm is a bounded leak at frame teardown, never a "
+     "dereference fed garbage. The previous default DID manufacture a value "
+     "(the wild vtable jump into seed/opaque bytes) — that path is exactly "
+     "what #3157's arm split removed, so this Warning is the replacement "
+     "for the SEGV that used to ship silently."},
+
+    {"src/codegen/LlvmBackend_Disposal.cpp", "#3157",
+     Disposition::WrongValue,
+     "the owned-capture arm (4) 'unrecognised type' alarm in "
+     "emitOwnedParamCaptureDispose — same leak-not-substitute shape as the "
+     "(2) alarm above and the #2992 twin: the slot is left un-reclaimed, no "
+     "zero/null is manufactured, no pointer slot is fed garbage. The "
+     "population this can fire on is now small by construction (#3157's "
+     "arms (1)/(2)/(3) cover Task, every other vtable-less built-in, and "
+     "every recognised class — local, imported, and built-in exception — "
+     "so what reaches (4) is a primitive, a borrow-only record, or an alias "
+     "into (3), none of which an `owned` capture can legitimately declare)."},
 };
 
 // How many of these can hand a user a memory-unsafe binary. Pinned as its own
