@@ -1102,13 +1102,16 @@ bool hasAstAutoPropertyDecl(const Symbol* m);
 // footprint) and visibility is not consulted at all (a `private` field occupies
 // a slot exactly as a `public` one does; that is #2456's whole point).
 //
-// ⚠ AN IMPORTED CLASS'S CAPTURED PRIMARY-CONSTRUCTOR PARAMETER STILL ANSWERS
-// FALSE, and that is a KNOWN residual, not an oversight of this predicate:
-// `ModuleLoader` synthesizes the `posParam` (#2516) but nothing sets
-// `posParamBodyRef`, so the flag is false for every import. Widening the
-// positional arm to "posParam ⟹ storage" would change the answer for imported
-// RECORDS too, which is a different question with different consumers. The
-// primary-constructor carriage is #3179/#2893's work.
+// ⚠ AN IMPORTED CLASS'S CAPTURED PRIMARY-CONSTRUCTOR PARAMETER answers TRUE
+// when (and only when) the parameter was captured into a body field on the
+// exporter's side — the `posParamBodyRef` flag now rides the wire as
+// `MetaMember::posParamBodyRef` (the 18th trailing scalar, additive within
+// v7 — same shape as `isPositional` at #2516 / 17th scalar), and
+// `ModuleLoader`'s `convertMember` FieldSymbol arm sets it back on the
+// imported symbol. fix #3221. The records side is unchanged: a §9.1 record
+// positional field has no body references and `posParamBodyRef` is
+// structurally false on both sides, so the `posParam && posParamBodyRef`
+// arm returns false for every imported record as it did before.
 bool isInstanceFieldStorageSymbol(const Symbol* m);
 
 // §22.15 (v0.254, fix #3174 — family M8 of umbrella #3149/#3152): is this

@@ -640,6 +640,27 @@ struct Loader {
                 if (mm.isPositional) {
                     auto* p = ctx.makeImportedParam();
                     f->posParam = p;
+                    // fix #3221 (§22.10/§9.8/§2.8.3 rule 4, v0.254): the
+                    // captured-vs-not flag. The synthetic `posParam` above
+                    // (#2516) is the positional vs body distinction; the
+                    // §22.10 capture enumeration (a body-referenced
+                    // parameter becomes a private instance field) is a
+                    // SEPARATE flag, `posParamBodyRef`, that #2325 computes
+                    // locally and nothing in the loader previously bridged.
+                    // Without it the importer's
+                    // `isInstanceFieldStorageSymbol` (fix #3182) answers
+                    // FALSE on every imported captured parameter, and an
+                    // imported base whose only storage is a captured primary-
+                    // ctor parameter slips past #2364's base-with-storage
+                    // guard. The bit rides as the 18th trailing scalar in
+                    // MEMBER_BLOCK (the same additive shape isPositional
+                    // rides in), and a pre-#3221 blob reads as `false` —
+                    // matching the dependency's own pre-fix behavior. A
+                    // record's positional field cannot reach this: their
+                    // parameters have no body references and
+                    // `posParamBodyRef` is structurally false on both sides.
+                    if (mm.posParamBodyRef)
+                        f->posParamBodyRef = true;
                 }
                 applyBehavior(f);
                 return f;

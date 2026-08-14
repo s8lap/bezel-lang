@@ -7886,10 +7886,19 @@ void Resolver::checkClassSerializationEligibilityLate() {
             // `posParam`, so the new "anything else is storage" arm is
             // unreachable locally. The single new admission is a decl-less,
             // non-static, non-positional field — the imported body field this
-            // fixes. An imported class's captured primary-ctor parameter is
-            // still NOT counted (`posParamBodyRef` does not cross); that
-            // residual is #3179/#2893's, and widening the positional arm here
-            // would change imported RECORDS too.
+            // fixes.
+            //
+            // fix #3221 closes the residual the #3182 commit message named:
+            // an imported class's CAPTURED primary-ctor parameter (the §22.10
+            // capture enumeration: `posParamBodyRef == true` on the exporter)
+            // now crosses the wire as `MetaMember::posParamBodyRef` (the 18th
+            // trailing scalar), and the loader's `convertMember` FieldSymbol
+            // arm sets it back on the imported symbol — so the
+            // `if (fs->posParam) return fs->posParamBodyRef;` arm answers
+            // correctly on both sides. Widening the positional arm to "posParam
+            // ⟹ storage" was the wrong widening (it would have flipped the
+            // answer for imported RECORDS too); the correct widening was the
+            // one-bit wire carrier this fix lands.
             auto classHasOwnStorage = [this](const TypeSymbol* cls) -> bool {
                 for (const Symbol* m : cls->members) {
                     if (dynamic_cast<const FieldSymbol*>(m)) {

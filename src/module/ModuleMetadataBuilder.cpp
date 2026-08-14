@@ -1032,6 +1032,35 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // carriage.
             if (fs->posParam->modifier == "owned")
                 out.modifiers.emplace_back("owned");
+            // fix #3221 (§22.10 "primary-constructor parameters and capture"
+            // / §9.8 / §2.8.3 rule 4, v0.254): a §22.10 primary-ctor
+            // parameter that is referenced in a body position (ExprTypecheck
+            // sets `fs->posParamBodyRef`) is captured into a synthetic private
+            // instance field of the same name (#2325's capture enumeration).
+            // That synthetic field IS §22.8 instance storage, so the importer's
+            // `isInstanceFieldStorageSymbol` predicate (the FIELD twin of
+            // `isAutoPropertyStorageSymbol`, fix #3182) must count it — which
+            // asks `fs->posParamBodyRef`. Without this bit the importer
+            // answers FALSE on every imported captured parameter, and an
+            // imported base whose only storage is a captured primary-ctor
+            // parameter slips past #2364's base-with-storage guard exactly
+            // the way a plain body field did before #3152/#3182. MEASURED on
+            // `226aca1`: a `class Base(v: int); public property V: int => v;
+            // end Base;` base imported by a derived `class D: Base,
+            // ISerializable, IDeserializable` COMPILED AND RAN (exit 9) while
+            // its character-identical single-module twin was rejected with
+            // #2364. The carriage mirrors isPositional (#2516, the 17th
+            // scalar) — the same "the loader already reconstructs posParam,
+            // just bridge the bit" mechanism.
+            //
+            // Records cannot reach this: their positional fields carry no
+            // modifiers AND no body references — `record R(x: int)` declares
+            // `x` only in the parameter list, never in a body, so the local
+            // `posParamBodyRef` stays false; even if it were ever true,
+            // records have no instance fields beyond the positional ones, so
+            // the answer is structurally the same. Measured: `record
+            // R(v: int)` local compilation emits `posParamBodyRef = false`.
+            out.posParamBodyRef = fs->posParamBodyRef;
             return true;
         }
     }

@@ -886,6 +886,15 @@ bool isAutoPropertyStorageSymbol(const Symbol* m, const SemaContext& ctx) {
 //     (#2325's `posParamBodyRef`). Unchanged.
 //   * anything else -> instance storage. This is the arm that changed: it used
 //     to require an `ast::FieldDecl`, which is null for every import.
+//
+// fix #3221 (§22.10/§9.8): the positional arm's `posParamBodyRef` now crosses
+// the wire (MetaMember::posParamBodyRef, the 18th trailing scalar, additive
+// within v7 — same shape as isPositional), so an imported class's captured
+// primary-ctor parameter answers TRUE here when its exporter captured it
+// (i.e. referenced the parameter in a body position per §22.10). Locally
+// nothing changes — the `posParamBodyRef` ExprTypecheck sets has always been
+// the answer this arm asks — and an imported record's positional field is
+// unchanged because records' positional fields have no body references.
 bool isInstanceFieldStorageSymbol(const Symbol* m) {
     const auto* fs = dynamic_cast<const FieldSymbol*>(m);
     if (!fs) return false;

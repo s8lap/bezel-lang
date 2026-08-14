@@ -210,6 +210,15 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // isAutoProperty/hasGetter/isEventStatic/isEventAsync do above, or a
     // consumer's staleness check cannot see the change (§2.8.3 rule 3).
     hashBool(h, m.isPositional);
+    // fix #3221 (§22.10/§2.8.3 rule 3): posParamBodyRef is part of a §22.10
+    // primary-ctor parameter Field's signature identity — a library changing
+    // a captured parameter to non-captured (or vice versa) changes the
+    // cross-module layout contract (a captured parameter is a private
+    // instance field of storage; a non-captured parameter is just a
+    // constructor argument). It must fold into the semantic hash the same
+    // way isPositional does above or a consumer's staleness check cannot
+    // see the change (§2.8.3 rule 3).
+    hashBool(h, m.posParamBodyRef);
     hashU64(h, m.contracts.size());
     for (const MetaContractRecord& c : m.contracts) hashContract(h, c);
     hashType(h, m.type);
@@ -462,6 +471,7 @@ MetaMember::MetaMember(const MetaMember& o)
       setterVisibility(o.setterVisibility), isAutoProperty(o.isAutoProperty),
       hasGetter(o.hasGetter), isEventStatic(o.isEventStatic),
       isEventAsync(o.isEventAsync), isPositional(o.isPositional),
+      posParamBodyRef(o.posParamBodyRef),
       contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
@@ -485,6 +495,7 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         isAutoProperty = o.isAutoProperty; hasGetter = o.hasGetter;
         isEventStatic = o.isEventStatic; isEventAsync = o.isEventAsync;
         isPositional = o.isPositional;
+        posParamBodyRef = o.posParamBodyRef;
         contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
@@ -534,6 +545,10 @@ bool MetaMember::operator==(const MetaMember& o) const {
            // fix #2516 (§9.2/§2.8.3 rule 3): isPositional is part of a
            // Field's signature identity — see the hashMember comment above.
            isPositional == o.isPositional &&
+           // fix #3221 (§22.10/§2.8.3 rule 3): posParamBodyRef is part of a
+           // §22.10 primary-ctor parameter Field's signature identity — see
+           // the hashMember comment above.
+           posParamBodyRef == o.posParamBodyRef &&
            contracts == o.contracts &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
@@ -762,7 +777,11 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // is a 17th trailing scalar — same additive shape; a pre-#2516 reader's
     // `sc.size() < 8` gate never looks past index 7, so it too is unaffected.
     // See the isPositional field comment in ModuleMetadata.hpp.
-    llvm::SmallVector<std::uint64_t, 17> sc{
+    // fix #3221 (§22.10/§9.8/§2.8.3 rule 4): posParamBodyRef is an 18th
+    // trailing scalar — same additive shape; a pre-#3221 reader's `sc.size()
+    // < 18` gate never looks past index 17, so it is unaffected. See the
+    // posParamBodyRef field comment in ModuleMetadata.hpp.
+    llvm::SmallVector<std::uint64_t, 18> sc{
         static_cast<std::uint64_t>(m.kind),
         static_cast<std::uint64_t>(m.visibility),
         m.isOperator ? 1u : 0u,
@@ -780,6 +799,7 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         m.isEventStatic ? 1u : 0u,
         m.isEventAsync ? 1u : 0u,
         m.isPositional ? 1u : 0u,
+        m.posParamBodyRef ? 1u : 0u,
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, m.name);
@@ -1471,6 +1491,12 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     // A pre-#2516 blob has at most 16 scalars; isPositional defaults to `false`
     // — see the field comment in ModuleMetadata.hpp.
     m.isPositional = sc.size() >= 17 && sc[16] != 0;
+    // fix #3221 (§22.10/§9.8/§2.8.3 rule 4): 18th scalar. A pre-#3221 blob
+    // has at most 17 scalars; posParamBodyRef defaults to `false` — see the
+    // field comment in ModuleMetadata.hpp (this is exactly the silent-accept
+    // direction the bug measured, so a stale dependency degrades to its own
+    // pre-fix behavior rather than guessing).
+    m.posParamBodyRef = sc.size() >= 18 && sc[17] != 0;
     if (!expectString(r, m.name)) return false;
     if (!readStringList(r, m.modifiers)) return false;
     if (!readType(r, m.type)) return false;

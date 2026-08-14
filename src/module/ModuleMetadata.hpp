@@ -703,6 +703,38 @@ struct MetaMember {
     // across recompilation). Ignored for every kind but Field.
     bool isPositional = false;
 
+    // §22.10 / §9.8 / §2.8.3 rule 4 (fix #3221, additive within v7 — same
+    // shape as isPositional above): for a §22.10 primary-constructor parameter
+    // whose positional FieldSymbol has `posParamBodyRef == true` (the parameter
+    // is referenced in a *body* position — method body, property accessor,
+    // constructor body — §22.10's capture enumeration), the parameter is
+    // captured into a synthetic private field of the same name. That synthetic
+    // field IS §22.8 instance storage, so #2364's base-with-storage guard
+    // (`Resolver::checkClassSerializationEligibilityLate`'s `classHasOwnStorage`
+    // walk, fix #3182's `isInstanceFieldStorageSymbol`) must count it.
+    //
+    // It used to answer FALSE on every import: `ModuleLoader` synthesizes the
+    // `posParam` (#2516, the positional vs body distinction above) but NOTHING
+    // set `posParamBodyRef`, so an imported base whose only storage was a
+    // captured positional parameter slipped past #2364's guard. MEASURED on
+    // `226aca1`:
+    //
+    //   base = `class Base(v: int); public property V: int => v; end Base;`
+    //   twin  -> REJECTED, #2364's diagnostic ("carries its own serialized
+    //            storage")
+    //   import-> COMPILED CLEAN, exited 9 — silent accept of exactly the
+    //            shape #2364 exists to refuse
+    //
+    // The storage really is there — #2325's capture enumeration records it as
+    // a private instance field — so this was a classification error over a
+    // channel that did not cross. Carried as the 18th trailing scalar, exactly
+    // as isPositional is the 17th: a pre-#3221 blob defaults to `false`,
+    // which is the SAME "never captured" classification a stale dependency
+    // already exhibits today (its captured primary-ctor parameters silently
+    // counted as no storage, so the #2364 guard slipped on the same shape).
+    // Ignored for every kind but Field.
+    bool posParamBodyRef = false;
+
     // §22.16 / §2.8.2: clauses in declaration order. For a `when` form from
     // §22.4 the builder emits the equivalent static-ensures record here.
     std::vector<MetaContractRecord> contracts;
