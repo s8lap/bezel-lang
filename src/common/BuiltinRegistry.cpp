@@ -228,6 +228,38 @@ constexpr std::array<std::string_view, 2> kPositionalCtorOnlyBuiltinRecords = {
     "ReadOnlyStringSpan",
 };
 
+// fix #3136 (§17.7 "Standard-library builtins have a closed constructor
+// surface", v0.241; §31.4; stdlib §3.3): the DECLARED POSITIONAL ARITY of each
+// arm-2 record. The original `kPositionalCtorOnlyBuiltinRecords` above carries
+// the membership set #2994 grew; this table carries the matching arity so the
+// sema arm can reject "2-arg" and "4-arg" lists as well as the parameterless
+// one #2994 already rejected. Both current entries declare THREE fields, but
+// the table is per-record rather than a single constant so a future arm-2
+// record with a different declared arity does not force a literal update at
+// the call site.
+//
+// The arity is the count of DECLARED FIELDS, which is the count of POSITIONAL
+// PARAMETERS the doc declares for the record's positional primary constructor
+// (§9.1): "A record's positional constructor takes its field names as
+// parameter names." A named-argument list is still arity-equal (the names
+// resolve against the same field set, #3098), so this arity is the right
+// number to compare `ne.args.size()` against for the §17.7 rejection.
+// per §17.7 / §31.4 / stdlib §3.3
+struct PositionalCtorOnlyBuiltinRecord {
+    std::string_view name;
+    std::size_t arity;
+};
+constexpr std::array<PositionalCtorOnlyBuiltinRecord, 2>
+kPositionalCtorOnlyBuiltinRecordArities = {{
+    // §31.4: `public record ExceptionInfo(TypeName: string, Message: string,
+    // StackTrace: string);` — three declared positional fields.
+    {"ExceptionInfo", 3},
+    // stdlib §3.3: `public record ReadOnlyStringSpan(Source: string,
+    // Start: int, Length: int): IReadOnlySpan<char>` — three declared
+    // positional fields.
+    {"ReadOnlyStringSpan", 3},
+}};
+
 // #2921 / #2923: the reserved built-in INTERFACE heads — the subset of
 // `isReservedBuiltinTypeName` whose runtime value may be a USER class (a user
 // type may declare `class MyList: IEnumerable<int>`, and an
@@ -368,6 +400,18 @@ bool isNoConstructorBuiltin(std::string_view n) {
 bool isPositionalCtorOnlyBuiltinRecord(std::string_view n) {
     return contains(kPositionalCtorOnlyBuiltinRecords, n);
 }  // per §17.7 / §31.4 / stdlib §3.3 — only the undeclared `new T()` is rejected
+
+// fix #3136 (§17.7, v0.241): the DECLARED arity of each arm-2 record, or 0
+// when `n` is not in the set. The 0 sentinel lets a single call site express
+// both the membership test and the arity check (`if (auto a = ...; a &&
+// ne.args.size() != a)`), avoiding a hand-rolled "check `is...Only` and then
+// look up arity" two-step. The header carries the full rationale; the comment
+// here names the contract only.
+std::size_t positionalCtorArityOfBuiltinRecord(std::string_view n) {
+    for (const auto& r : kPositionalCtorOnlyBuiltinRecordArities)
+        if (r.name == n) return r.arity;
+    return 0;
+}  // per §17.7 / §31.4 / stdlib §3.3
 
 // #2921 / #2923 / §8.1 / §8.5 / §28.2 / §28.9: the reserved built-in CLASSES —
 // every reserved name that is not an interface head. Their runtime values are

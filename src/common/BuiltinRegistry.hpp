@@ -179,6 +179,33 @@ bool isNoConstructorBuiltin(std::string_view n);
 // per §17.7 / §31.4 / stdlib §3.3
 bool isPositionalCtorOnlyBuiltinRecord(std::string_view n);
 
+// fix #3136 (§17.7 "Standard-library builtins have a closed constructor
+// surface", v0.241; §31.4; stdlib §3.3): the DECLARED POSITIONAL ARITY of each
+// arm-2 record — `ExceptionInfo`'s `(TypeName, Message, StackTrace)` and
+// `ReadOnlyStringSpan`'s `(Source, Start, Length)`. Both are 3, but the table
+// is per-record (rather than a constant) so a future arm-2 record whose
+// declared arity differs (e.g. a two-field or four-field builtin positional
+// record) carries its own arity without growing the call site.
+//
+// §17.7: "the constructor surface is exactly what that document declares —
+// `new T(...)` resolves only against a declared constructor, never against a
+// compiler-supplied fallback." A two-argument or four-argument list resolves
+// against NEITHER (the doc declares exactly three), so sema must reject it the
+// same way it rejects the parameterless form (#2994). #3098 grew codegen's
+// `lowerNew` arm to construct the 3-arg form, but the arity check has never
+// been in sema; the wrong-arity call used to fall through to
+// `lowerLocalDecl`'s #2434 zero-init fallback — a record of NULL strings,
+// the #2922 class.
+//
+// Returns the declared arity, or 0 when `n` is not in the arm-2 set (so a
+// caller tests membership on `isPositionalCtorOnlyBuiltinRecord` first and
+// uses the returned arity as a positive-list check on `ne.args.size()`; 0
+// never matches a real argument list, which keeps the call site a single
+// `if (auto a = positionalCtorArityOfBuiltinRecord(n); a && ne.args.size()
+// != a)` shape).
+// per §17.7 / §31.4 / stdlib §3.3
+std::size_t positionalCtorArityOfBuiltinRecord(std::string_view n);
+
 // #2921 / #2923 / §8.1 / §8.5 / §28.2 / §28.9: is `n` a reserved built-in
 // **class** whose runtime value carries NO Bezel vtable at word 0?
 //

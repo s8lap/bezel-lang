@@ -251,18 +251,22 @@ BEZEL_TEST(builtin_record_positional_ctor_3098,
 }
 
 BEZEL_TEST(builtin_record_positional_ctor_3098,
-           a_wrong_arity_positional_list_is_not_silently_constructed_spec_17_7) {
+           a_wrong_arity_positional_list_is_rejected_at_sema_spec_17_7) {
     // §17.7: "the constructor surface is exactly what that document declares".
-    // Neither record declares a 2-argument constructor, so the new arm must
-    // DECLINE such a list rather than construct from it — the property asserted
-    // is that no supplied argument reaches the value.
+    // Neither record declares a 2-argument constructor, so a wrong-arity list
+    // must be DECLINED rather than constructed from. Pre-#3136 the program
+    // below compiled and reached the value through the #2434 zero-init
+    // fallback (a record of NULL strings); #3136 grew sema's §17.7 arm to
+    // check the DECLARED ARITY, so the program now fails to compile with the
+    // §17.7 wording rather than reaching the value at all — the property
+    // stronger than this test originally asserted (which only required the
+    // supplied arguments to not reach the value, not the program to fail).
     //
-    // ⚠ What the program then DOES is the pre-existing #2434 degrade (a located
-    // `internal: … (degraded to a zero-initialized value)` Warning and an empty
-    // value) — unchanged by this fix and NOT this file's subject. Sema does not
-    // check a builtin's positional-constructor ARITY at all, which is a
-    // separate §17.7 residual filed on its own; asserting a rejection here
-    // would claim a property the tree does not have.
+    // Full behavioural grid for the new arity rejection lives in
+    // tests/codegen/builtin_record_positional_ctor_arity_3136_test.cpp; this
+    // test stays here so the #3098 family owns the spelled-out behaviour at
+    // every wrong arity and the flip from "degrades silently" to "rejected
+    // at sema" cannot drift unnoticed.
     auto r = runAot(
         "module M; class C public static method Main(): int "
         "  Console.WriteLine(\"<start>\"); "
@@ -271,11 +275,15 @@ BEZEL_TEST(builtin_record_positional_ctor_3098,
         "  Console.WriteLine(\"<end>\"); "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("<start>") != std::string::npos);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("<end>") != std::string::npos);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("AAA") == std::string::npos);
-    BEZEL_EXPECT_TRUE(r.stdoutText.find("BBB") == std::string::npos);
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool hasSec = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("is not a declared constructor of") !=
+                std::string::npos &&
+            d.message.find("\xC2\xA7""17.7") != std::string::npos)
+            hasSec = true;
+    BEZEL_EXPECT_TRUE(hasSec);
 }
 
 // ── THE ACCESS-TIME GUARD stdlib §4.14 PROMISES ─────────────────────────

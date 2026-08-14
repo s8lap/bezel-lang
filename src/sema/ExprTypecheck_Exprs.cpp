@@ -839,15 +839,69 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
             "fallback). Use " + producers + " (\xC2\xA7""17.7)");
         return;
     }
-    if (common::isPositionalCtorOnlyBuiltinRecord(n) && ne.args.empty()) {
-        ctx_.diagnostics().report(
-            Severity::Error, ne.span.begin,
-            "`new " + n + "()` is not a declared constructor of `" + n +
-            "` — its only declared constructor is its positional primary "
-            "constructor, so the parameterless form is rejected exactly as it "
-            "would be for an identically-shaped user record; supply every "
-            "positional field, or obtain the value from the standard-library "
-            "producer that yields it (\xC2\xA7""17.7)");
+    if (common::isPositionalCtorOnlyBuiltinRecord(n)) {
+        // fix #3136 (language spec §17.7 "Standard-library builtins have a
+        // closed constructor surface", v0.241; §31.4; stdlib §3.3): the
+        // declared arity of the record's only constructor — three for both
+        // `ExceptionInfo` and `ReadOnlyStringSpan`. §17.7 reads, verbatim,
+        // "the constructor surface is exactly what that document declares —
+        // `new T(...)` resolves only against a declared constructor, never
+        // against a compiler-supplied fallback." The pre-fix arm only checked
+        // the parameterless form (#2994), so `new ExceptionInfo("a", "b")`
+        // (2 args) and `new ReadOnlyStringSpan("s", 1, 3, 5)` (4 args) sailed
+        // past sema and reached codegen, which had no arm for them — they
+        // fell through to `lowerLocalDecl`'s #2434 zero-init fallback, a
+        // record of NULL strings, the #2922 class. Reading the result through
+        // a concatenation (a `+ e.TypeName + …`) crashed with SIGSEGV. This
+        // arm grows the same wording: ANY argument list that does not match
+        // the declared arity is rejected here with the §17.7 diagnostic, so
+        // the codegen arm #3098 grew is reached only by the spelling the doc
+        // declares.
+        //
+        // The diagnostic keeps the parameterless wording VERBATIM (the "exactly
+        // as for an identically-shaped user record" rule #2994 introduced —
+        // the §2935 lesson: a diagnostic that only says "no constructor" leaves
+        // the reader to find the spelling that does exist) so the
+        // tests/lit/builtin_closed_ctor_surface_reject_2994.bzl CHECK-DAG
+        // pins keep matching, and adds an arity-equal sentence for the
+        // non-zero wrong-arity case so the reader sees the expected count.
+        const std::size_t arity =
+            common::positionalCtorArityOfBuiltinRecord(n);
+        if (ne.args.size() != arity) {
+            const std::string arityWord = arity == 1
+                ? "1 positional field"
+                : std::to_string(arity) + " positional fields";
+            std::string detail;
+            if (ne.args.empty()) {
+                // Parameterless: keep #2994's wording VERBATIM so the lit
+                // FileCheck pin keeps matching. (Sub-string search is
+                // sufficient because the lit CHECK-DAG uses `{{...}}` regex
+                // for the middle, but the leading ``new T()`` and trailing
+                // ``(§17.7)`` are anchored literals.)
+                ctx_.diagnostics().report(
+                    Severity::Error, ne.span.begin,
+                    "`new " + n + "()` is not a declared constructor of `" +
+                    n + "` — its only declared constructor is its positional "
+                    "primary constructor, so the parameterless form is "
+                    "rejected exactly as it would be for an "
+                    "identically-shaped user record; supply every "
+                    "positional field, or obtain the value from the "
+                    "standard-library producer that yields it (\xC2\xA7""17.7)");
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, ne.span.begin,
+                    "`new " + n + "(...)` is not a declared constructor of `" +
+                    n + "` — its only declared constructor is its positional "
+                    "primary constructor, which takes " + arityWord +
+                    ", so the supplied " + std::to_string(ne.args.size()) +
+                    (ne.args.size() == 1 ? " argument" : " arguments") +
+                    " do not match it (rejected exactly as it would be for "
+                    "an identically-shaped user record; supply every "
+                    "positional field, or obtain the value from the "
+                    "standard-library producer that yields it) (\xC2\xA7"
+                    "17.7)");
+            }
+        }
     }
 }
 
