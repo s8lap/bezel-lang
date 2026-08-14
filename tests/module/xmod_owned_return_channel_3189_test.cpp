@@ -607,4 +607,54 @@ BEZEL_TEST(xmod_owned_return_channel_3189, t9_imported_using_var_disposes_once_2
     BEZEL_EXPECT_EQ(run3189(localApp3189(prog), false, "t9l"), 0);
 }
 
+// ===========================================================================
+// T10 — fix #3191 follow-up boundary control (§21.9 / §3.6 / §28.9, v0.254).
+// The same imported class with a destructor is exercised through BOTH the CALL
+// and the NEW path:
+//   - as a CALL:   `Cell.MakeIt(i);`  — bare-discard RECLAIMS (T2 pins this)
+//   - as a NEW:    `new Cell(1);`     — bare-discard is a §21.9 hard error
+//                                    (pinned by xmod_destructor_carriage_3191.T2)
+//
+// The §21.9 walk reads `TypeSymbol::importedNonTrivialDispose` to fire the
+// reject — a carrier that #3191 added — but ONLY on the NEW arm. The CALL
+// arm is reclaimed via `disposeOwnedValue` per #3189's design intent. This
+// row pins the boundary in a SINGLE test so a future reader cannot satisfy
+// one side by accidently removing the gate in src/sema/ExprTypecheck.cpp.
+// The `expected: -1 / discard-error` leg asserts the NEW arm fires; the
+// `expected: 0` leg asserts the CALL arm reclaims. Both legs use the same
+// library so a single regression in either direction fails the row.
+// ===========================================================================
+BEZEL_TEST(xmod_owned_return_channel_3189, t10_new_vs_call_boundary_3191) {
+    // NEW arm: `new Cell(1);` as a bare-discard statement of an imported
+    // class with a destructor — the §21.9 hard error MUST fire. This is the
+    // #3191 case the wire-side carrier exists to fix; it must stay
+    // rejected even after this follow-up.
+    const std::string progNew =
+        "public class Program "
+        "  public static method Main(): int "
+        "    new Cell(1); "
+        "    return 0; "
+        "  end Main; "
+        "end Program;";
+    std::string newErr;
+    int newR = run3189(importedApp3189(progNew), true, "t10n", &newErr);
+    if (newR == -2) return;  // no toolchain — SKIP
+    BEZEL_EXPECT_EQ(newR, -1);
+    BEZEL_EXPECT_TRUE(hasDiscardError3189(newErr));
+
+    // CALL arm: `Cell.MakeIt(1);` as a bare-discard of an imported CALL
+    // returning owned Cell — the bare-discard MUST reclaim. This is the
+    // #3189 path; the #3191 carrier's NEW-only gate is what preserves it
+    // on the imported side. count must be 0 (destructor ran).
+    const std::string progCall =
+        "public class Program "
+        "  public static method Main(): int "
+        "    Cell.MakeIt(1); "
+        "    return Cell.GetN(); "
+        "  end Main; "
+        "end Program;";
+    int callR = run3189(importedApp3189(progCall), true, "t10c");
+    BEZEL_EXPECT_EQ(callR, 0);
+}
+
 }  // namespace bezel::module

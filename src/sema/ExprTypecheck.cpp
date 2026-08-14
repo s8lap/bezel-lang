@@ -11232,7 +11232,31 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         // genuinely-trivial read alike and both fall through to
                         // the member scan, which keeps `trivialDisposeProducer`
                         // meaning exactly what #2655's stamp below says it means.
-                        if (cur->importedNonTrivialDispose) {
+                        //
+                        // fix #3191 follow-up (§21.9, v0.254 — same family M2):
+                        // GATE the reject fire on the source expression being a
+                        // NEW (not a CALL). The CALL path (`Cell.MakeIt(i);`
+                        // where `Cell` is the imported non-trivial-dispose
+                        // producer) is reclaimed by `disposeOwnedValue` per
+                        // #3189's design intent — the §21.9 hard error does NOT
+                        // fire on those, see the long ⚠ comment at the call
+                        // site — so the imported-carrier verdict is read for
+                        // NEW only. The NEW path (`new ImportedCell();`, or
+                        // `new Derived();` over a local `Derived: Res` with
+                        // `Res` imported declaring a destructor — #3191's
+                        // measured shape) is the §21.9 hard-error target and
+                        // fires the wire-side verdict on every level of the
+                        // walk. Without this gate, #3191's wire-side carrier
+                        // breaks the §21.9 reclaim path: a regression
+                        // measurable on
+                        // `xmod_owned_return_channel_3189.t2_imported_bare_discard`
+                        // (count reads 7, expected 0). With it, both #3189's
+                        // reclaim and #3191's NEW-rejection are preserved on
+                        // their respective cases. The CALL gate is the
+                        // boundary; the carrier stays on the wire for the NEW
+                        // arm and for any other consumer that wants it.
+                        if (cur->importedNonTrivialDispose &&
+                            dynamic_cast<const ast::NewExpr*>(es->expr.get())) {
                             reject = true;
                             break;
                         }
