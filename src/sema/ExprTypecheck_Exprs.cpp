@@ -6407,18 +6407,26 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // than being rejected — mirroring the variable-initializer hint
                 // (#184). Reset to None for any other parameter type so a too-
                 // large literal for an `int` parameter still rejects.
+                //
+                // fix #3220 (§5.1 / §22.5 / §2.5, v0.254): the hint source is
+                // the both-sources accessor `formalOutParamType2` (the same one
+                // #2657 / #3186 / #3188 use to type `out var` recipients across
+                // a module boundary), not the AST `calleeMd2->params[pos].type`
+                // directly. Pre-fix the AST arm answered null for every imported
+                // callee (ModuleLoader.cpp:337-346), so the hint was never
+                // derived for `H.TakeU(3000000000)` against an imported
+                // `TakeU(u: uint)` — the literal was rejected ("does not fit in
+                // `int`") while the byte-identical local twin widened and ran.
+                // Same widening, same answer, both sources — exactly the
+                // recipient-typing fix's pattern, just consulted for §5.1 here.
                 PrimitiveType savedArgHint = currentLiteralWideningHint_;
                 currentLiteralWideningHint_ = PrimitiveType::None;
-                if (calleeMd2 && pos2 < calleeMd2->params.size() &&
-                    calleeMd2->params[pos2].type) {
-                    if (auto* prt = ctx_.resolvedType(
-                            *calleeMd2->params[pos2].type)) {
-                        if (prt->kind == TypeRef::Kind::Primitive &&
-                            (prt->primitive == PrimitiveType::Long ||
-                             prt->primitive == PrimitiveType::ULong ||
-                             prt->primitive == PrimitiveType::UInt))
-                            currentLiteralWideningHint_ = prt->primitive;
-                    }
+                if (TypeRef* prt = formalOutParamType2(pos2)) {
+                    if (prt->kind == TypeRef::Kind::Primitive &&
+                        (prt->primitive == PrimitiveType::Long ||
+                         prt->primitive == PrimitiveType::ULong ||
+                         prt->primitive == PrimitiveType::UInt))
+                        currentLiteralWideningHint_ = prt->primitive;
                 }
                 // fix #2543 (§23, v0.236): exempt a `ref`/`out` argument
                 // operand from the bare-read-of-write-only-indexer gate
@@ -6504,17 +6512,52 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // those used to leak through to codegen's #1386 fallback.
             {
                 std::string_view formalMod;
-                if (calleeMd2) {
-                    std::size_t pidx = pos2;
+                // fix #3220 (§22.3 / §22.4 / §2.5, v0.254): the both-sources
+                // version of this read; pre-fix AST-only, the AST arm is null
+                // for every imported callee (`ModuleLoader` reconstructs the
+                // `ParameterSymbol` list but not an `ast::MethodDecl`), so
+                // `formalMod` stayed empty and the `out owned` gate in
+                // `checkRefOutOperandCategory` was bypassed — the imported
+                // callee silently accepted `Make(out <existing-local>)` (§22.4
+                // violation, fixed per §22.4) and leaked through to codegen's
+                // #1386 fallback. #3189's `formalParamModifier` (the unified
+                // accessor in SymbolCollection.cpp:571-575) consults the AST
+                // first then the `ParameterSymbol::modifier` field; for a
+                // non-generic imported class member the loader populated
+                // `ParameterSymbol::modifier` from the `MetaParam` wire bit
+                // (#3176), so the imported arm answers the real modifier.
+                //
+                // ⚠ THIS FIX STARTS REJECTING PROGRAMS THAT COMPILED TODAY.
+                // Per §22.4 an `out owned` formal may only receive an inline
+                // `out using var` / `out owned var` declaration; every other
+                // shape (a pre-existing local, an indexer slot, a property) is
+                // a compile error. The new behaviour matches the local twin,
+                // which was already rejecting; the imported callee now agrees.
+                // Named-argument lookup mirrors the AST arm: walk the local
+                // `ast::Param` list when one exists, otherwise the symbol
+                // list, to derive `pidx` (the position the modifier then
+                // answers for).
+                std::size_t pidx = pos2;
+                if (calleeMs2) {
                     if (!a.name.empty()) {
-                        for (std::size_t j = 0; j < calleeMd2->params.size(); ++j)
-                            if (calleeMd2->params[j].name == a.name) {
-                                pidx = j;
-                                break;
-                            }
+                        if (calleeMd2) {
+                            for (std::size_t j = 0;
+                                 j < calleeMd2->params.size(); ++j)
+                                if (calleeMd2->params[j].name == a.name) {
+                                    pidx = j;
+                                    break;
+                                }
+                        } else {
+                            for (std::size_t j = 0;
+                                 j < calleeMs2->params.size(); ++j)
+                                if (calleeMs2->params[j]->name == a.name) {
+                                    pidx = j;
+                                    break;
+                                }
+                        }
                     }
-                    if (pidx < calleeMd2->params.size())
-                        formalMod = calleeMd2->params[pidx].modifier;
+                    formalMod =
+                        sema::formalParamModifier(*calleeMs2, pidx);
                 }
                 checkRefOutOperandCategory(a, formalMod);
             }
@@ -6820,19 +6863,20 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // parameter, or a positional-record field), so a literal > int.MaxValue
             // widens instead of being rejected. Reset to None otherwise so a too-
             // large literal for an `int` field still rejects.
+            // fix #3220 (§5.1 / §22.5 / §2.5, v0.254): the explicit-ctor-parameter
+            // arm reads through `formalCtorOutParamType` (the both-sources accessor
+            // #3206 uses for the inline-`out` recipients above), not the AST
+            // `ctorDecl->params[posn].type` directly — pre-fix the AST arm answered
+            // null for every imported constructor and the widening hint was never
+            // derived. The record-positional-field arm below was already symbol-side
+            // via #3141.
             PrimitiveType savedNewHint = currentLiteralWideningHint_;
             currentLiteralWideningHint_ = PrimitiveType::None;
             {
                 PrimitiveType hintPrim = PrimitiveType::None;
-                auto primOf = [&](const ast::Type* ty) {
-                    if (ty)
-                        if (auto* prt = ctx_.resolvedType(*ty))
-                            if (prt->kind == TypeRef::Kind::Primitive)
-                                hintPrim = prt->primitive;
-                };
-                if (ctorDecl && posn < ctorDecl->params.size() &&
-                    ctorDecl->params[posn].type) {
-                    primOf(ctorDecl->params[posn].type.get());
+                if (TypeRef* prt = formalCtorOutParamType(posn)) {
+                    if (prt->kind == TypeRef::Kind::Primitive)
+                        hintPrim = prt->primitive;
                 } else if (ne->type) {
                     // fix #3141 (family F3 of umbrella #3152, §9.1 / §5.1 /
                     // §2.8.3 rule 4): the positional field list is read
