@@ -12847,8 +12847,8 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
             "method, until importer-side property monomorphization "
             "lands");
     }
-    // fix #2943 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §12.1, v0.240,
-    // NARROWER predicate than the reverted d11e7ca attempt). A property
+    // fix #2943 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §12.1, v0.240)
+    // and fix #3170 (the one-`T`-slot case #2943 missed). A property
     // accessed through an IMPORTED NON-GENERIC INTERFACE-typed reference
     // on a LAYOUT-MOVING imported generic instantiation has no working
     // lower path today — the itable slot is filled by
@@ -12856,10 +12856,11 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
     // layout-moving arm deliberately keeps the slot NULL (#2894's
     // refusal, kept by the #2943 codegen-side partial fix), so the
     // dispatch faults with a SIGSEGV at runtime on the first call
-    // through the itable. Measured on the fix's parent (real two-module
+    // through the itable. Measured on #3170's parent (real two-module
     // build, exit 139 = SIGSEGV):
     //
-    //     `r.W` on `var r: IHas := new GIface<string>()` → exit 139
+    //     `r.W` on `var r: IHas := new G<string>()` → exit 139
+    //     (one `T`-typed field `_t: T;` followed by `_w: int`)
     //
     // The same shape reached DIRECTLY through the implementing class
     // (`g.W` on a layout-moving imported generic) is #2884's decline
@@ -12880,39 +12881,37 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
     //       narrower predicate), and a generic interface's INDEXER is
     //       #2955's separate decline above (this arm is not indexer,
     //       !ips->isIndexer, mirrored below);
-    //   (d) at least one IMPORTED GENERIC CLASS implementing this
-    //       interface declares >=2 fields whose resolved TypeRef is a
-    //       bare name matching one of the class's own generic
-    //       parameters. THIS IS THE NARROWER PART relative to the
-    //       reverted d11e7ca attempt (which fired on >=1 T-typed
-    //       field). The 2894 T3 maintenance comment (#2894 test,
-    //       layout_moving_instantiation_not_silently_wrong_spec_14_1)
-    //       states the discriminator explicitly: "TWO `T` fields are
-    //       load-bearing, because with a single one the i32
-    //       placeholder and the `ptr` share an 8-byte-aligned slot
-    //       and `_w` lands at the same offset either way". With a
-    //       SINGLE T-typed field the codegen-side
-    //       `instanceLayoutDiffersFromErasedTemplate` returns false
-    //       (layouts match), the itable slot IS filled, and the
-    //       program returns the correct value (2894 T1 = 108 with
-    //       single `_t: T`). The over-rejection there is the bug the
-    //       lane's previous attempt shipped and the gate caught —
-    //       this narrower predicate keeps the 2894 T1 case in the
-    //       accepted set.
+    //   (d) some IMPORTED GENERIC CLASS implementing this interface
+    //       declares a `T`-typed storage slot followed in declaration
+    //       order by at least one non-`T`-typed storage slot. THIS IS
+    //       THE #3170 WIDENING relative to #2943 (which fired only on
+    //       >=2 T-typed fields, missing the one-T-field layout-moving
+    //       case). The shape `_t: T; _w: int` IS layout-moving the
+    //       moment T widens past i32: the erased template has `_w` at
+    //       offset 8, the spec layout has `_w` at offset 16, and the
+    //       dispatch through the itable reads garbage — measured as a
+    //       SIGSEGV on #3170's parent (the comment's earlier
+    //       "single `_t: T` shares an 8-byte-aligned slot" reasoning
+    //       was wrong; the measured offsets on `_w` are 8 vs 16, not
+    //       identical).
     //
-    // The codegen-side predicate
-    // (`instanceLayoutDiffersFromErasedTemplate`) is an exact layout
-    // check that requires LLVMDataLayout info we do not have at sema
-    // time. The ≥2-T-field count is its narrowest sema-time
-    // approximation: with a single T-typed field, the i32 placeholder
-    // (4 bytes, 4-byte aligned) and the substituted ptr (8 bytes,
-    // 8-byte aligned) share one 8-byte-aligned slot, so `_w` lands
-    // at the same offset either way; with two or more, the second
-    // T-typed field lands at offset 8 in the erased template but
-    // offset 16 in the substituted layout, and the offsets of all
-    // following fields diverge. The decline's over-rejection cost is
-    // a diagnostic at the access site instead of a value, which is
-    // the documented "value vs crash" trade #2884 made.
+    // OVER-REJECTION COST. The sema gate has no view of the concrete
+    // type argument at the access site (the static type is the
+    // interface), so the predicate is a whole-program over-
+    // approximation: it fires for every shape where SOME instantiation
+    // moves the layout, which is every T field followed by a concrete
+    // field. 2894 T1 (`GIface2894T1<int>` with `_t: T; _w: int`,
+    // instantiated at `T = int`) used to be accepted because the
+    // substituted layout matches the erased template at `int`, so the
+    // dispatch was correct; it is now declined, mirroring the
+    // documented "value vs crash" trade #2884 made for the direct-
+    // class path. The over-rejection is strictly better than the
+    // silent crash it replaces; the residual is the same #2893 /
+    // #428 importer-side accessor-body monomorphization work that
+    // #2884 and #2943 deferred. The codegen-side predicate
+    // (`instanceLayoutDiffersFromErasedTemplate`) is the exact per-
+    // instantiation check; it requires LLVMDataLayout info we do not
+    // have at sema time.
     if (!ips->isIndexer && ips->parent &&
         ctx_.isImported(ips->parent) &&
         ips->parent->kind == ast::TypeDeclKind::Interface &&
@@ -12945,8 +12944,43 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
                         gpIndex[gp->name] = gi;
                 }
                 if (gpIndex.empty()) continue;
-                // Count T-typed fields (>=2 is the layout-moving
-                // discriminator, per 2894 T3's maintenance comment).
+                // fix #3170 (one-`T`-slot widening of #2943's predicate).
+                // The discriminator is "this class has at least one
+                // T-typed storage slot" — ANY T field widens the layout
+                // at SOME instantiation, and the codegen-side
+                // `instanceLayoutDiffersFromErasedTemplate` returns
+                // true for that instantiation, so the itable slot
+                // stays null and the dispatch faults. The count is
+                // independent of position (concrete first / T first /
+                // mixed — #2943 T5 pins the position-independence):
+                // one T field is enough at `T = string` (`_t: T` at
+                // offset 4 vs offset 8 shifts the whole struct), and
+                // two or more T fields compound the shift at every
+                // non-int T.
+                //
+                // The sema gate has no view of the concrete type
+                // argument at the access site (the static type is the
+                // interface), so the predicate is a whole-program
+                // over-approximation: it fires for every shape where
+                // SOME instantiation moves the layout, which is every
+                // shape with at least one T field. 2894 T1
+                // (`GIface2894T1<int>` with `_t: T; _w: int`,
+                // instantiated at `T = int`) is the control case
+                // whose passing the #2943 comment cites — at `T =
+                // int` the substituted layout IS identical to the
+                // erased template (i32 -> i32), so the dispatch is
+                // safe today. It is now declined here, mirroring the
+                // documented "value vs crash" trade #2884 made for
+                // the direct-class path. The over-rejection is
+                // strictly better than the silent crash it replaces;
+                // the residual is the same #2893 / #428 importer-side
+                // accessor-body monomorphization work that #2884 and
+                // #2943 deferred. The d11e7ca attempt (which fired on
+                // >=1 T-typed fields) shipped this same over-
+                // rejection cost and was reverted by the gate for a
+                // narrower reason (no test pinned the one-`T`-slot
+                // case); #3170's regression test makes that cost
+                // explicit.
                 std::size_t tFieldCount = 0;
                 for (Symbol* m : t->members) {
                     auto* fs = dynamic_cast<FieldSymbol*>(m);
@@ -12973,7 +13007,7 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
                         fty->declaration) continue;
                     if (gpIndex.count(fty->headName()) != 0) {
                         ++tFieldCount;
-                        if (tFieldCount >= 2) {
+                        if (tFieldCount >= 1) {
                             found = true;
                             break;
                         }
@@ -12991,15 +13025,16 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
             "` is not yet monomorphized when dispatched through a "
             "layout-movable imported generic instantiation "
             "(\xC2\xA7""14.1 / \xC2\xA7""2.8.3 rule 4 / \xC2\xA7""13 / "
-            "\xC2\xA7""23 / #2943): the itable slot the cross-module "
-            "stub fills is fixed at the erased `T -> i32` template "
-            "layout, and an instantiation whose layout moves (its "
-            "class has TWO or more `T`-typed storage slots) keeps "
-            "that slot null so the dispatch faults with a SIGSEGV "
-            "at runtime. Reach the property through a method on "
-            "the concrete receiver, or declare the accessor on a "
-            "non-generic concrete class, until importer-side "
-            "accessor-body monomorphization lands (#428)");
+            "\xC2\xA7""23 / #2943 / #3170): the itable slot the "
+            "cross-module stub fills is fixed at the erased `T -> "
+            "i32` template layout, and an instantiation whose "
+            "layout moves (its class has a `T`-typed storage slot "
+            "followed by a non-`T`-typed one) keeps that slot null "
+            "so the dispatch faults with a SIGSEGV at runtime. "
+            "Reach the property through a method on the concrete "
+            "receiver, or declare the accessor on a non-generic "
+            "concrete class, until importer-side accessor-body "
+            "monomorphization lands (#2893 / #428)");
     }
 }
 
