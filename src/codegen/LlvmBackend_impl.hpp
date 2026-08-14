@@ -2665,11 +2665,31 @@ private:
     // LlvmBackend_Setup.cpp, which resolves the actual function once a
     // candidate passes this gate). `findIndexer` (LlvmBackend_Assign.cpp)
     // is the sole caller.
+    //
+    // #3204 (§11.2 / §23.4 / §2.8.2 clause 1 / §2.8.3 rule 4, v0.254): the
+    // VIRTUAL / OVERRIDE half of the exclusion is now lifted. Fix #3190
+    // added a vtable-forward thunk (`importedVirtualAccessorSlotFn`,
+    // LlvmBackend_Assign.cpp:5372) that emits a small forwarder for an
+    // imported virtual / override accessor — it loads the
+    // `vt$<Owner>` slot and tail-calls it, so the itable-slot gets a
+    // real function instead of `ConstantPointerNull`. The sema mirror
+    // (`candWireable`, TypeResolution_Checks.cpp) is widened identically
+    // in this commit, so the sema gate and the codegen resolver agree
+    // on which candidates are wireable. Abstract stays excluded: an
+    // abstract member has no body in the exporter, so its own
+    // `vt$<Owner>` slot is legitimately null and the forwarder would
+    // forward into the same null-call crash #2438 exists to prevent at
+    // the sema gate. An interface-declared indexer is still excluded
+    // too (interfaces themselves don't satisfy interface obligations
+    // through class receivers).
     bool indexerCandidateWireable(const sema::PropertySymbol* ps) const {
         if (!ps) return false;
         if (dynamic_cast<const ast::PropertyDecl*>(ps->decl)) return true;
         if (ps->decl) return false;  // defensive: not a PropertyDecl either
-        return !isVirtualIndexer(ps);
+        for (auto mod : ps->modifiers)
+            if (mod == "abstract") return false;
+        return !(ps->parent &&
+                 ps->parent->kind == ast::TypeDeclKind::Interface);
     }
 
     // #481 / §23: does this property declare a setter? An auto-property without

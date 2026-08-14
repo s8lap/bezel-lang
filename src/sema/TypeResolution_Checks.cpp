@@ -4880,13 +4880,26 @@ void Resolver::checkAbstractImplementations() {
             };
             // #2449: mirrors codegen's indexerCandidateWireable exactly —
             // see the block comment above for why.
+            // #3204 (§11.2 / §23.4 / §2.8.3 rule 4, v0.254): the
+            // `virtual`/`override` exclusion is no longer complete. Fix
+            // #3190 added a vtable-forward thunk
+            // (`importedVirtualAccessorSlotFn`, LlvmBackend_Assign.cpp)
+            // that emits a small forwarder for an imported virtual / override
+            // indexer — the forwarder loads the `vt$<Owner>` slot and
+            // tail-calls it, so the itable slot gets a real function
+            // instead of `ConstantPointerNull`. Abstract is still rejected:
+            // an abstract member has no body in the exporter, so its own
+            // `vt$<Owner>` slot is legitimately null and the forwarder
+            // would forward into the same null-call crash #2438 exists to
+            // prevent at this sema gate (the forwarder guards the same
+            // `abstract` exclusion; mirrors the codegen mirror at
+            // `indexerCandidateWireable`, updated in this same commit).
             auto candWireable = [](PropertySymbol* cand) -> bool {
                 if (dynamic_cast<const ast::PropertyDecl*>(cand->decl))
                     return true;  // local
                 if (cand->decl) return false;  // defensive
                 for (auto mod : cand->modifiers)
-                    if (mod == "virtual" || mod == "override" ||
-                        mod == "abstract")
+                    if (mod == "abstract")
                         return false;
                 return !(cand->parent &&
                          cand->parent->kind == ast::TypeDeclKind::Interface);

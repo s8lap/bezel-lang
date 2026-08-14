@@ -5778,6 +5778,24 @@ llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
 // a miss (defensive) falls through to null, installing a null itable slot
 // — sound (matches #2438's existing "missing implementation" contract),
 // not silently wrong.
+//
+// #3204 (§11.2 / §23.4 / §2.8.2 clause 1 / §2.8.3 rule 4, v0.254): the
+// IMPORTED branch now consults `ensureIndexerGetterFn`/`-SetterFn` FIRST,
+// which already covers an imported virtual / override candidate by
+// returning the vtable-forward thunk #3190 added
+// (`importedVirtualAccessorSlotFn`, the function that loads the
+// `vt$<Owner>` slot and tail-calls it). The original `importedIndexer
+// GetterFns_`/`-SetterFns_` map lookup is kept as the non-virtual
+// fallback — those maps are populated ONLY by #2414's direct-call ABI
+// declarators, which skip virtual members. The two are mutually
+// exclusive at the codegen layer (the same predicate in
+// `importedVirtualAccessorSlotFn` and in `declareImportedIndexerGetters`
+// is the same "is there a vtable slot?" check), so this function
+// resolves the correct ABI for each shape and rejects only the
+// ABSTRACT shape (the forwarder's own `abstract` guard declines — its
+// slot is null — and the direct-call declarator's skip list excludes
+// it too). A miss on both branches (defensive) still falls through to
+// null, matching #2438's existing "missing implementation" contract.
 llvm::Function* Emitter::indexerItableAccessor(const sema::TypeSymbol* ts,
                                                const sema::PropertySymbol* iimpl,
                                                bool isSet) {
@@ -5785,6 +5803,15 @@ llvm::Function* Emitter::indexerItableAccessor(const sema::TypeSymbol* ts,
     if (dynamic_cast<const ast::PropertyDecl*>(iimpl->decl))
         return isSet ? ensureIndexerSetterFn(ts, iimpl)
                      : ensureIndexerGetterFn(ts, iimpl);
+    // #3204: try the vtable-forward thunk route first (handles virtual /
+    // override imported candidates — see #3190). Fall through to the
+    // direct-call ABI lookup for non-virtual imported candidates (the
+    // #2449 path). Both routes return null for an abstract candidate,
+    // which is the sema-correct "does not implement" outcome.
+    if (llvm::Function* fwd = isSet ? ensureIndexerSetterFn(ts, iimpl)
+                                      : ensureIndexerGetterFn(ts, iimpl)) {
+        return fwd;
+    }
     auto& map = isSet ? importedIndexerSetterFns_ : importedIndexerGetterFns_;
     auto it = map.find(iimpl);
     return it != map.end() ? it->second : nullptr;
