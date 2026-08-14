@@ -1979,32 +1979,52 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     // method `?.` are deferred.
     if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(&e)) {
         if (!nm->target) return nullptr;
-        // §7.5 / issue #416: `b?.V` on a NULLABLE RECORD. The target lowers to
-        // the tagged {i8 hasValue; <record payload>} struct, not a pointer, so
-        // the reference-member path below is bypassed. If hasValue is false the
-        // result is null; otherwise extract the payload field and lift it to the
+        // §7.5 / issue #416: `b?.V` on a (NULLABLE) RECORD. The target lowers to
+        // either the tagged {i8 hasValue; <record payload>} struct (nullable,
+        // #416) or the bare by-value payload (non-nullable, #3210). The
+        // reference-member path below is bypassed because the receiver is a
+        // value not a pointer. If the receiver is null the result is null;
+        // otherwise extract the payload field and lift it to the
         // (always-nullable) result type of §7.5 — a value-typed field wraps into
         // its tagged `T?`, a reference-typed field stays a (possibly-null) ptr.
+        // For a NON-NULLABLE record (§7.5, v0.254 — the receiver cannot be null,
+        // so the result is always hasValue=true) the receiver's `nv` IS the
+        // payload and `hasVal` is the constant i1 1; the result lift collapses
+        // to the same wrap the nullable branch builds on a present value.
         if (auto* tt = ctx_.exprType(*nm->target)) {
-            if (isNullableRecordTy(tt)) {
+            if (tt->kind == sema::TypeRef::Kind::Named && tt->declaration &&
+                tt->declaration->kind == ast::TypeDeclKind::Record) {
+                bool ncRcvNullable = tt->nullable;
                 llvm::Value* nv = lowerExpr(*nm->target);
                 if (!nv || !nv->getType()->isStructTy()) return nullptr;
                 auto* ms = storageMemberOf(ctx_.exprSymbol(e));
                 if (!ms || !ms->parent) return nullptr;
-                // issue #462 / §7.5 / §14.1: for a GENERIC nullable record
-                // (`Box<int>?` / `Box<string>?`) install the receiver's concrete
-                // type args so fieldIndex_ is registered against — and the field
-                // type resolves under — the SPECIALIZED record struct (the same
-                // layout the nullable wrapper's payload uses). recordStruct(ms's
-                // parent) re-registers fieldIndex_ for this instantiation; without
-                // it the placeholder layout's index/type is used. A no-op for a
-                // non-generic nullable record.
+                // issue #462 / §7.5 / §14.1: for a GENERIC record (nullable or
+                // not — `Box<int>?` / `Box<int>`) install the receiver's
+                // concrete type args so fieldIndex_ is registered against — and
+                // the field type resolves under — the SPECIALIZED record
+                // struct (the same layout the nullable wrapper's payload uses).
+                // recordStruct(ms->parent) re-registers fieldIndex_ for this
+                // instantiation; without it the placeholder layout's
+                // index/type is used. A no-op for a non-generic record.
                 RecordSubstGuard ncSubst(this, tt);
                 recordStruct(ms->parent);  // register specialized fieldIndex_
                 auto idxIt = fieldIndex_.find(ms);
                 if (idxIt == fieldIndex_.end()) return nullptr;
-                llvm::Value* hasVal = nullablePrimHasValue(nv);       // i1
-                llvm::Value* payload = nullablePrimValue(nv);         // record
+                // Nullable: nv is the tagged {hasValue, payload}; extract both.
+                // Non-nullable (#3210): nv IS the payload; hasValue is implicitly
+                // true per §7.5 (a non-nullable receiver cannot be null), so
+                // every branch below consumes a constant i1 1.
+                llvm::Value* hasVal;
+                llvm::Value* payload;
+                if (ncRcvNullable) {
+                    hasVal = nullablePrimHasValue(nv);
+                    payload = nullablePrimValue(nv);
+                } else {
+                    hasVal = llvm::ConstantInt::get(
+                        builder_.getInt1Ty(), 1);
+                    payload = nv;
+                }
                 llvm::Value* fieldVal =
                     builder_.CreateExtractValue(payload, {idxIt->second});
                 // Lift the field value to the §7.5 (always-nullable) result. Sema
@@ -2019,7 +2039,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 const sema::TypeRef* fieldTy = recordMemberTypeResolved(ms);
                 if (fieldVal->getType()->isPointerTy()) {
                     // Reference-typed field → null when the receiver is null,
-                    // else the field pointer.
+                    // else the field pointer. (For non-nullable #3210 `hasVal`
+                    // is the constant 1, so the select is dead and `fieldVal`
+                    // is returned directly — the optimizer collapses it.)
                     return builder_.CreateSelect(
                         hasVal, fieldVal,
                         llvm::ConstantPointerNull::get(ptrTy()));
@@ -2028,6 +2050,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     fieldVal->getType()->isStructTy()) {
                     // Field already nullable: AND its own hasValue with the
                     // receiver's so a null receiver yields null.
+                    // (Non-nullable #3210: `hasVal` is constant 1, so the AND
+                    // collapses to `innerHas`.)
                     llvm::Value* innerHas = nullablePrimHasValue(fieldVal);
                     llvm::Value* combined = builder_.CreateAnd(hasVal, innerHas);
                     return builder_.CreateInsertValue(
@@ -2036,7 +2060,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         {0u});
                 }
                 // Value-typed (non-nullable) field → tagged {hasValue, fieldVal},
-                // with the receiver's run-time hasValue tag.
+                // with the receiver's run-time hasValue tag. (#3210:
+                // `hasVal` is constant 1.)
                 auto* nst = llvm::StructType::get(
                     llvm_, {nullablePrimHasValTy(), fieldVal->getType()});
                 llvm::Value* res = builder_.CreateInsertValue(
