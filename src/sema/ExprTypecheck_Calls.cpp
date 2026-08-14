@@ -11475,9 +11475,23 @@ TypeRef* ExprTC::eventHandlerPayloadType(const ast::Expr* callee) {
         return nullptr;
     auto* es = dynamic_cast<EventSymbol*>(ctx_.exprSymbol(*ma->target));
     if (es) {
-        auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
-        if (!ed || !ed->type) return nullptr;  // no-payload → unit (no param)
-        return ctx_.resolvedType(*ed->type);
+        if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
+            if (!ed->type) return nullptr;  // no-payload → unit (no param)
+            return ctx_.resolvedType(*ed->type);
+        }
+        // fix #3211 (§24.3/§2.5, v0.254): imported event — `decl` is null
+        // because ModuleLoader never reconstructs an ast::EventDecl for an
+        // imported member (mirrors the #503/#2414 Property/Indexer
+        // limitation; the wire side carries the type in MetaMember::type →
+        // ModuleLoader::fieldTypes_, published via ctx.setImportedMemberType).
+        // A Unit type — the exporter's encoding of an omitted `: T` — means
+        // a no-payload event → null, matching the local `!ed->type` path and
+        // codegen's own #2421 `Emitter::eventPayloadType` fallback
+        // (LlvmBackend_Calls2.cpp:2667).
+        if (es->decl != nullptr) return nullptr;  // non-EventDecl decl
+        TypeRef* rt = ctx_.importedMemberType(es);
+        if (!rt || rt->kind == TypeRef::Kind::Unit) return nullptr;
+        return rt;
     }
     // §6.5 / §24.3 (#1610): a Subscribe/Add/Remove on a value held in a local,
     // parameter, or field of static type EventSource<T>/AsyncEventSource<T>
