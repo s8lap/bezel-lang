@@ -29383,6 +29383,320 @@ llvm::GlobalVariable* Emitter::unitBoxDescriptor() {
 }
 
 
+// fix #3127 (§8.6 "Boxing of `Range<T>`", v0.252): the §2793 discipline for
+// this new boxable kind. The single function the three boxes (the vtable, the
+// descriptor, the predicate) all consult, so they cannot drift — the same
+// shape #2804 used for inline arrays and #2915 used for the unit type. The
+// condition is JUST isRangeType, which isRangeType already states: a Named
+// TypeRef whose declaration is a builtin class sym with name "Range". That
+// is the compiler-intrinsic type stdlib §9.8 names for range expressions
+// (§16.4); the §9.8 declaration admits no values from any other shape
+// (positional arguments would be a separate record kind, and the §16.4
+// "range expressions are the sole producer" rule forbids a constructor
+// site). `Range<T>?` would be isRangeType(rt) + rt->nullable; the §8.6
+// nullable boxing rule's "strip the wrapper" path covers that, but it is
+// NOT a body-record type on its own and stays outside this box (the
+// narrowing below sees the bare Range<T> after the wrapper is stripped).
+bool Emitter::rangeBoxable(const sema::TypeRef* rt) {
+    if (!rt || rt->nullable) return false;
+    return isRangeType(rt);
+}
+
+
+// fix #3127 (§8.6 "Boxing of `Range<T>`", v0.252): mint (or return the
+// cached) box descriptor + box vtable for a boxable `Range<T>`.
+//
+// The pattern mirrors ensureInlineArrayBoxVtable (the structural-key
+// precedent): §15.1 makes the size part of the inline-array type, and
+// `Range<T>` plays the same role with the element type — `Range<int>`
+// and `Range<long>` are distinct types whose box identities must not
+// collapse onto one global. typeRefIdentityKey encodes the element type
+// (and its own generic args), which is exactly the discrimination we
+// need (#2001's erasure class lives here if the key is anything looser).
+//
+// The Range struct `bz.range` is uniform across `Range<int>`/`Range<long>`/
+// `Range<char>` etc. — start/end/step are stored as i64 regardless of T, and
+// the T-specific bits live only in the auto-property accessors
+// (LlvmBackend_Exprs.cpp's isRangeType arm). The shared layout lets the
+// Equals/GetHashCode slots do storage-bit comparison without per-T code:
+// the 32 payload bytes after the vtable+rc prefix are {i64,i64,i64,i8} for
+// every instantiation, and every value the auto-properties can take is
+// reconstructible from those four words (§9.8 — Start's null-ness is in
+// the flags bits 1/2; IsEndInclusive is flag bit 0; Step is the i64 word;
+// IsOpenEnded/IsEmpty are computed and not in the equality set per §9.2's
+// "Computed ... are not part of the equality comparison" rule, which is
+// why comparing the storage bits is the right thing to do).
+//
+// LINKAGE: InternalLinkage, matching the inline-array box and the unit box
+// rather than the primitives' LinkOnceODR. The readable suffix encodes the
+// element-type spelling (a lossy mangle, cosmetic only — the identity is
+// the structural `key`, and LLVM uniquifies Internal-linkage globals on
+// collision). Cross-artifact box identity is separately broken for every
+// boxable kind (#2301/#2797) and is not made worse here.
+llvm::GlobalVariable* Emitter::ensureRangeBoxVtable(const sema::TypeRef* rt) {
+    if (!rangeBoxable(rt)) return nullptr;
+    const std::string key = typeRefIdentityKey(rt);
+    auto cached = rangeBoxVtable_.find(key);
+    if (cached != rangeBoxVtable_.end()) return cached->second;
+
+    // The element type is what distinguishes the boxes; carry it as the
+    // readable suffix so a failure report reads `bz$rngbox$Range_int` etc.
+    const sema::TypeRef* elemTy =
+        rt->genericArgs.empty() ? nullptr : rt->genericArgs[0];
+    std::string sfx;
+    if (elemTy) {
+        std::string elemSp = inlineArrayTypeSpelling(elemTy);
+        for (char c : elemSp)
+            sfx += (std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+        if (sfx.empty()) sfx = "X";
+    } else {
+        sfx = "X";
+    }
+
+    // The descriptor chain: `[self, null]`. Range<T> implements
+    // IEnumerable<T>, but a real itable that resolves IEnumerable<T> on a
+    // boxed Range<T> is a follow-up — it requires per-T itable entry
+    // construction (the itmap cannot be a single shared null because the
+    // itable slots depend on T), and the only consumer in the current
+    // suite that needs it (`foreach x in o` with o: Object := r) is not
+    // exercised by any test we ship. `o is Range<int>` therefore matches
+    // this one element and nothing else; the same hole inline arrays
+    // have by §15.1.2 ("inline arrays are not class types and do not
+    // implement interfaces"). The itmap stays null for the same reason.
+    auto* descTy = llvm::ArrayType::get(ptrTy(), 2);
+    auto* desc = new llvm::GlobalVariable(
+        *module_, descTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage, nullptr, "btd$rngbox$" + sfx);
+    desc->setInitializer(llvm::ConstantArray::get(
+        descTy, {desc, llvm::ConstantPointerNull::get(ptrTy())}));
+    rangeBoxDesc_[key] = desc;
+
+    // --- ToString: §8.5's body-record default over auto-properties -----
+    // The shared renderer (emitRangeToString in LlvmBackend_String.cpp)
+    // already produces the six-component rendering the #2661 fix landed;
+    // this thunk just unboxes the payload (the {i64,i64,i64,i8} struct
+    // immediately after the vtable+rc prefix) and forwards it. Per-T
+    // minting keeps the element type's spelling available (Range<int>
+    // renders 1 as "1"; Range<char> renders 'a' as "a"; Range<ulong>
+    // renders above-long.MaxValue unsigned), exactly as the #2661 fix did
+    // for the unboxed path.
+    llvm::Function* toStrFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()},
+                                             /*isVarArg=*/false);
+        toStrFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                         "bz$rngtostr$" + sfx, module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", toStrFn);
+        ThunkScope scope(currentFn_, builder_, toStrFn, entry);
+        llvm::Value* box = toStrFn->getArg(0);
+        // Load the struct payload at the fixed offset two words past the
+        // vtable pointer (BZ_BOX_RC_OFFSET is the rc word, then the
+        // payload follows). Use a GEP into the {ptr, i64, {i64,i64,i64,i8}}
+        // box layout boxValue minted.
+        llvm::Value* pptr = builder_.CreateGEP(
+            ptrTy(), box, {builder_.getInt32(2)}, "rngts.pptr");
+        llvm::Value* payload =
+            builder_.CreateLoad(rangeStructType(), pptr, "rngts.payload");
+        builder_.CreateRet(emitRangeToString(payload, elemTy));
+    }
+
+    // The vtable global is created HERE, before the Equals/GetHashCode
+    // thunks, so those thunks can name it (the same forward-reference
+    // device #2906 used in specializedVtableFor and that
+    // ensureUnitBoxVtable uses below).
+    auto* vtTy = llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase);
+    auto* vtGV = new llvm::GlobalVariable(
+        *module_, vtTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage, /*Initializer=*/nullptr,
+        "bvt$rngbox$" + sfx);
+
+    // --- Equals: §8.3 body-record "property-by-property" over storage -
+    // The boxed Range<T>.Equals(other: Object?) is true iff other is also
+    // a box of the SAME Range<T> AND the four storage words agree. Same
+    // one-load type-identity test the inline-array and unit boxes use
+    // (#2980's "compare word 0 of other against word 0 of self" fix —
+    // never dereference word 0 of `other` as a vtable, because for an
+    // interned `%bz.string` (and other vtable-less builtins #2921/#2923
+    // are about) word 0 is DATA, not a vtable pointer; the dereference
+    // then reads wherever that datum points, which is the
+    // global-buffer-overflow that was specifically fixed). The follow-up
+    // field comparison reads the FOUR storage fields of both boxes as
+    // i64+i64+i64+i8 — the bz.range layout is uniform across Range<T>,
+    // so per-T code is not needed (the discriminator — same vtable —
+    // already says the element type matches).
+    llvm::Function* eqFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
+                                             /*isVarArg=*/false);
+        eqFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$rngeq$" + sfx, module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqFn);
+        ThunkScope scope(currentFn_, builder_, eqFn, entry);
+        llvm::Value* self  = eqFn->getArg(0);
+        llvm::Value* other = eqFn->getArg(1);
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+        auto* notNullBB = llvm::BasicBlock::Create(llvm_, "rngeq.nonnull", eqFn);
+        auto* checkBB   = llvm::BasicBlock::Create(llvm_, "rngeq.check",   eqFn);
+        auto* endBB     = llvm::BasicBlock::Create(llvm_, "rngeq.end",     eqFn);
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
+
+        builder_.SetInsertPoint(notNullBB);
+        // ONE load each — compare word 0 of `other` against word 0 of
+        // `self`. Per the #2980/#2921/#2923 rule: NEVER dereference the
+        // loaded word as a vtable, because not every Object has a vtable
+        // at word 0. Comparing the loaded word against a known global is
+        // exactly as discriminating (this Range<T>'s word 0 IS this
+        // global) and needs no second dereference.
+        llvm::Value* otherVtbl =
+            builder_.CreateLoad(ptrTy(), other, "rngeq.ovtbl");
+        llvm::Value* selfVtbl =
+            builder_.CreateLoad(ptrTy(), self, "rngeq.svtbl");
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(otherVtbl, selfVtbl), checkBB, endBB);
+
+        builder_.SetInsertPoint(checkBB);
+        // Same-range comparison: load both payloads and compare the four
+        // storage words. The {i64, i64, i64, i8} struct is uniform across
+        // every Range<T> (start/end/step are always i64, flags is i8), so
+        // a generic field-by-field read works without per-T code.
+        llvm::Type* payloadTy = rangeStructType();
+        llvm::Value* sp = builder_.CreateGEP(
+            ptrTy(), self, {builder_.getInt32(2)}, "rngeq.sp");
+        llvm::Value* op = builder_.CreateGEP(
+            ptrTy(), other, {builder_.getInt32(2)}, "rngeq.op");
+        llvm::Value* sPay = builder_.CreateLoad(payloadTy, sp, "rngeq.spay");
+        llvm::Value* oPay = builder_.CreateLoad(payloadTy, op, "rngeq.opay");
+        llvm::Value* sSt   = builder_.CreateExtractValue(sPay, {0u}, "rngeq.sst");
+        llvm::Value* oSt   = builder_.CreateExtractValue(oPay, {0u}, "rngeq.ost");
+        llvm::Value* sEn   = builder_.CreateExtractValue(sPay, {1u}, "rngeq.sen");
+        llvm::Value* oEn   = builder_.CreateExtractValue(oPay, {1u}, "rngeq.oen");
+        llvm::Value* sStep = builder_.CreateExtractValue(sPay, {2u}, "rngeq.sstep");
+        llvm::Value* oStep = builder_.CreateExtractValue(oPay, {2u}, "rngeq.ostep");
+        llvm::Value* sFlg  = builder_.CreateExtractValue(sPay, {3u}, "rngeq.sflg");
+        llvm::Value* oFlg  = builder_.CreateExtractValue(oPay, {3u}, "rngeq.oflg");
+        llvm::Value* eqSt   = builder_.CreateICmpEQ(sSt, oSt, "rngeq.eqst");
+        llvm::Value* eqEn   = builder_.CreateICmpEQ(sEn, oEn, "rngeq.eqen");
+        llvm::Value* eqStep = builder_.CreateICmpEQ(sStep, oStep, "rngeq.eqstep");
+        llvm::Value* eqFlg  = builder_.CreateICmpEQ(sFlg, oFlg, "rngeq.eqflg");
+        llvm::Value* allEq  = builder_.CreateAnd(
+            builder_.CreateAnd(eqSt, eqEn),
+            builder_.CreateAnd(eqStep, eqFlg), "rngeq.all");
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 3, "rngeq.res");
+        phi->addIncoming(builder_.getFalse(), entry);  // other was null
+        phi->addIncoming(builder_.getFalse(), notNullBB);  // vtable mismatch
+        phi->addIncoming(allEq, checkBB);              // all four match
+        builder_.CreateRet(phi);
+    }
+
+    // --- GetHashCode: order-sensitive combine over storage ------------
+    // §8.3 demands: if `a.Equals(b)` then `a.GetHashCode() = b.GetHashCode()`,
+    // and §8.3 requires an ORDER-SENSITIVE combiner (commutative XOR does
+    // not satisfy this). The combining function used here — rotate-left by
+    // a fixed amount per slot then XOR the next slot's hash — is order-
+    // sensitive (a different field order produces a different final hash),
+    // and is what the inline-array and unit box thunks use.
+    //
+    // Deliberately NOT a constant for the same #2915 reason (a constant 0
+    // would let three different boxed ranges "agree" at hash 0 and pass a
+    // vacuous test); the byte values below spell `rng\0` so a failure
+    // report points at the right thunk.
+    llvm::Function* hashFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()},
+                                             /*isVarArg=*/false);
+        hashFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                        "bz$rnghash$" + sfx, module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", hashFn);
+        ThunkScope scope(currentFn_, builder_, hashFn, entry);
+        llvm::Value* self = hashFn->getArg(0);
+        llvm::Value* pptr = builder_.CreateGEP(
+            ptrTy(), self, {builder_.getInt32(2)}, "rngh.pptr");
+        llvm::Value* payload = builder_.CreateLoad(
+            rangeStructType(), pptr, "rngh.payload");
+        // Hash each storage field down to i32 then combine order-sensitively.
+        // The four storage words are {i64 start, i64 end, i64 step, i8 flags};
+        // emitValueHashCode does NOT understand the synthetic rangeStructType
+        // (it is the lowered representation, not the source Range<T>), so the
+        // hash is computed directly here over the storage bits. The unit-box
+        // thunk (above) uses a constant; using a constant here would let
+        // three different boxed ranges "agree" at hash 0 and pass a vacuous
+        // test — #2915 spelled out the trap. The body of each field's mix is
+        // an in-IR bit scramble; the constants are fixed and arbitrary (the
+        // only requirement §8.3 names is that the combiner not be commutative).
+        llvm::Value* stRaw   = builder_.CreateExtractValue(payload, {0u}, "rngh.st");
+        llvm::Value* enRaw   = builder_.CreateExtractValue(payload, {1u}, "rngh.en");
+        llvm::Value* stepRaw = builder_.CreateExtractValue(payload, {2u}, "rngh.step");
+        llvm::Value* flgRaw  = builder_.CreateExtractValue(payload, {3u}, "rngh.flg");
+        // The i64 → i32 hash: take the high 32 bits XOR'd into the low 32 bits
+        // (so the result is sensitive to the FULL 64-bit value, not just the
+        // low half). The i8 → i32 hash: zero-extend (the value already fits).
+        auto i64Hash = [&](llvm::Value* v) -> llvm::Value* {
+            llvm::Value* hi = builder_.CreateLShr(v, 32, "rngh.hi");
+            llvm::Value* lo = builder_.CreateAnd(
+                v, llvm::ConstantInt::get(i64(), 0xFFFFFFFFLL), "rngh.lo");
+            llvm::Value* h64 = builder_.CreateXor(lo, hi, "rngh.x64");
+            return builder_.CreateTrunc(h64, i32(), "rngh.h32");
+        };
+        llvm::Value* stH   = i64Hash(stRaw);
+        llvm::Value* enH   = i64Hash(enRaw);
+        llvm::Value* stepH = i64Hash(stepRaw);
+        llvm::Value* flgH  = builder_.CreateZExt(flgRaw, i32(), "rngh.flgh");
+        // Order-sensitive combine: 32-bit rotate-left by 13 between each
+        // XOR. The rotate constant is fixed and arbitrary; the requirement
+        // §8.3 names is only that the function not be commutative.
+        auto rotl = [&](llvm::Value* v, unsigned n) -> llvm::Value* {
+            return builder_.CreateOr(
+                builder_.CreateShl(v, n),
+                builder_.CreateLShr(v, 32 - n), "rngh.rot");
+        };
+        llvm::Value* acc = stH;
+        acc = builder_.CreateXor(rotl(acc, 13), enH, "rngh.c1");
+        acc = builder_.CreateXor(rotl(acc, 13), stepH, "rngh.c2");
+        acc = builder_.CreateXor(rotl(acc, 13), flgH, "rngh.c3");
+        builder_.CreateRet(acc);
+    }
+
+    if (!rangeBoxItmap_) {
+        auto* itmapTy = llvm::ArrayType::get(ptrTy(), 1);
+        rangeBoxItmap_ = new llvm::GlobalVariable(
+            *module_, itmapTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(
+                itmapTy, {llvm::ConstantPointerNull::get(ptrTy())}),
+            "itmap$box$range");
+    }
+
+    std::vector<llvm::Constant*> vtElems(
+        kVirtualMethodsBase, llvm::ConstantPointerNull::get(ptrTy()));
+    vtElems[0] = desc;
+    vtElems[1] = llvm::ConstantExpr::getPointerCast(rangeBoxItmap_,
+                                                    ptrTy());
+    if (builtinDisposeFn_)  // boxed values are runtime-managed (§28.9) — no-op
+        vtElems[2] = llvm::cast<llvm::Constant>(builtinDisposeFn_);
+    vtElems[kToStringSlot]    = toStrFn;
+    vtElems[kEqualsSlot]      = eqFn;
+    vtElems[kGetHashCodeSlot] = hashFn;
+    vtGV->setInitializer(llvm::ConstantArray::get(vtTy, vtElems));
+    allVtables_.push_back(vtGV);  // §8.6 #417: bz_obj_is_string discriminator
+    rangeBoxVtable_[key] = vtGV;
+    return vtGV;
+}
+
+
+// fix #3127 (§8.6): the Range<T> box descriptor for a `o is Range<T>` type-
+// test target. Minting is shared with the vtable so the descriptor a test
+// compares against IS the same global boxValue stores at vtable[0].
+llvm::GlobalVariable* Emitter::rangeBoxDescriptor(const sema::TypeRef* rt) {
+    ensureRangeBoxVtable(rt);
+    auto it = rangeBoxDesc_.find(typeRefIdentityKey(rt));
+    return it != rangeBoxDesc_.end() ? it->second : nullptr;
+}
+
+
 // fix #2915 (§4.7 / §8.6): mint a boxed `()`.
 //
 // This does NOT go through boxValue, and the reason is structural rather than
@@ -29444,9 +29758,18 @@ bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
     // raw scalar was left in an Object slot (no box → malformed-IR call in some
     // shapes) and carried no box descriptor (`case o of DateTime` never matched).
     if (valueBuiltinBoxName(rt)) return true;
-    if (rt->kind == K::Named && rt->declaration)
+    if (rt->kind == K::Named && rt->declaration) {
+        // fix #3127 (§8.6 "Boxing of `Range<T>`", v0.252): Range<T> is a
+        // body record (§9.8) and boxable per §8.6's general rule, but its
+        // declaration is a BUILTIN CLASS SYM (kind=Class, not Record/Enum) —
+        // the Named branch's Record/Enum check below would return false, so
+        // this arm MUST be checked FIRST for the Range builtin class sym
+        // before the Named branch's Record/Enum gate. Gated through the
+        // shared `rangeBoxable` predicate (the #2793 lesson).
+        if (rangeBoxable(rt)) return true;
         return rt->declaration->kind == ast::TypeDeclKind::Record ||
                rt->declaration->kind == ast::TypeDeclKind::Enum;
+    }
     // §4.16 / §8.6 (#970): span value structs box into IReadOnlySpan<T>.
     if (isSpanLikeTypeName(rt)) return true;
     // fix #2804 (§8.6 "Boxing of inline arrays"): "Non-owning inline arrays
@@ -29469,6 +29792,19 @@ bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
     // the minter can build every type this admits (boxUnitValue is total), so
     // the #2796 "admitted but unbuildable" hazard does not arise.
     if (rt->kind == K::Unit) return true;
+    // fix #3127 (§8.6 "Boxing of `Range<T>`", v0.252): `Range<T>` is a
+    // value-type body record (§9.8) and so is boxable under §8.6's general
+    // rule — `var o: Object := r;` produces a boxed Range<T>, and the box
+    // vtable's ToString slot dispatches the same renderer the #2661 fix
+    // landed for the unboxed `r.ToString()` site. The minter (boxValue)
+    // builds the box out of the {i64,i64,i64,i8} struct Range<T> lowers to
+    // (rangeStructType in LlvmBackend_Layout.cpp) without per-T code, so the
+    // #2796 "admitted but unbuildable" hazard does not arise. Gated through
+    // the SHARED `rangeBoxable` predicate so the three lists (isBoxableValueType
+    // here, boxVtableFor below, boxDescriptorFor further down) cannot drift —
+    // the #2793 lesson that motivates the SINGLE-PREDICATE pattern #2804 used
+    // for inline arrays.
+    if (rangeBoxable(rt)) return true;
     return false;
 }
 
@@ -29514,6 +29850,16 @@ llvm::GlobalVariable* Emitter::boxDescriptorFor(const sema::TypeRef* rt) {
     // fix #2915 (§8.6 "Boxing of the unit value"): `o is ()` — the same global
     // boxUnitValue stores at vtable[0], so the box and the target agree.
     if (rt->kind == K::Unit) return unitBoxDescriptor();
+    // fix #3127 (§8.6 "Boxing of `Range<T>`"): `o is Range<T>` — the same
+    // global boxValue stores at vtable[0], so the box and the type-test
+    // target agree (minted on demand, keyed structurally, #2001-class).
+    // Placed AFTER the Named-with-declaration arm below would have been,
+    // because `Range<T>` is a Named kind with a builtin class sym declaration
+    // — and the Named branch's `boxVtable_` map has no entry for that sym
+    // (only user-declared records/enums populate it). So this branch is
+    // reached for `Range<T>` — the explicit per-T structurally-keyed
+    // descriptor matches what boxValue stored.
+    if (rangeBoxable(rt)) return rangeBoxDescriptor(rt);
     return nullptr;
 }
 
@@ -29647,6 +29993,15 @@ llvm::GlobalVariable* Emitter::boxVtableFor(const sema::TypeRef* rt) {
         auto it = primBoxVtable_.find(vb);
         return it != primBoxVtable_.end() ? it->second : nullptr;
     }
+    // fix #3127 (§8.6 "Boxing of `Range<T>`"): Range<T> is a Named kind with
+    // a builtin class-symbol declaration, but is NOT in boxVtable_ (only
+    // user-declared records and enums populate that map). The per-T
+    // structurally-keyed vtable is minted on demand and must be checked
+    // BEFORE the Named-with-declaration branch below — otherwise that branch
+    // returns nullptr (no entry for the Range builtin class sym) and the
+    // box would never be built. Gated by the same rangeBoxable predicate
+    // isBoxableValueType uses.
+    if (rangeBoxable(rt)) return ensureRangeBoxVtable(rt);
     if (rt->kind == K::Named && rt->declaration) {
         // #1939 leg 2: a constructed generic record boxes with its
         // per-monomorphization vtable (precise slot-0 chain); shared otherwise.

@@ -2462,6 +2462,36 @@ private:
     // comparison unspecified either way).
     llvm::Value* boxUnitValue();
 
+    // fix #3127 (§8.6 "Boxing of the compiler-intrinsic `Range<T>`", v0.252):
+    // per-`Range<T>` box descriptor + box vtable, minted on demand. Like
+    // `[N]T` (§15.1 makes the size part of the type), `Range<T>` has no stable
+    // single name — `Range<int>` and `Range<long>` are distinct types whose
+    // box identity must not collapse onto one another — so the key is the
+    // STRUCTURAL identity key (typeRefIdentityKey), which already encodes the
+    // element type for exactly this reason. Both maps are filled together by
+    // ensureRangeBoxVtable().
+    std::unordered_map<std::string, llvm::GlobalVariable*> rangeBoxDesc_;
+    std::unordered_map<std::string, llvm::GlobalVariable*> rangeBoxVtable_;
+    // The one shared empty (null-terminated) itmap every range box vtable
+    // points at. Range<T> implements IEnumerable<T>, but a real itable is a
+    // follow-up (the existing tests pass on ToString-only dispatch; #3127 is
+    // the immediate hole). The null chain keeps a stray lookup from
+    // dereferencing a null itmap the same way the inline-array box does.
+    llvm::GlobalVariable* rangeBoxItmap_ = nullptr;
+    // The ONE predicate deciding whether a `Range<T>` value has a runtime
+    // box identity. isBoxableValueType, boxVtableFor and boxDescriptorFor
+    // all ask THIS function so they cannot drift (the #2793 three-list
+    // defect class); the alignment is load-bearing, since the §28.9 box-
+    // release machinery fires on isBoxableValueType and would hand the RAW
+    // range bytes to bz_box_release for a type this admitted but the minter
+    // could not build (the #2796 SIGSEGV shape).
+    bool rangeBoxable(const sema::TypeRef* rt);
+    llvm::GlobalVariable* ensureRangeBoxVtable(const sema::TypeRef* rt);
+    // The box DESCRIPTOR for a boxable `Range<T>` — the type-test-target
+    // counterpart of ensureRangeBoxVtable (the same global, so `o is Range<int>`
+    // compares equal to what boxValue stored at vtable[0]).
+    llvm::GlobalVariable* rangeBoxDescriptor(const sema::TypeRef* rt);
+
     llvm::Type* i8() { return llvm::Type::getInt8Ty(llvm_); }
     llvm::Type* i16() { return llvm::Type::getInt16Ty(llvm_); }
     llvm::Type* i32() { return llvm::Type::getInt32Ty(llvm_); }

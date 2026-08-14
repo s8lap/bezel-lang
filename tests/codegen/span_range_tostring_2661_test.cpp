@@ -555,3 +555,102 @@ BEZEL_TEST(span_range_tostring_2661, control_range_members_still_work) {
         "  return 0; ")),
         "127");
 }
+
+// ---------------------------------------------------------------------------
+// #3127 (spec §8.6 / §8.5, v0.252; stdlib §9.8): a BOXED Range<T> —
+// `var o: Object := r; o.ToString()` — must produce the same rendering the
+// unboxed `r.ToString()` produces above. The pre-fix code path went through
+// `boxValue` → `boxVtableFor(srcTy)`; `Range<T>` had no arm in any of the
+// three box predicates (#2793's drift hazard — the predicate, the vtable
+// minter, and the descriptor minter must agree) and `boxVtableFor` returned
+// nullptr, so `boxValue` returned the raw `{i64,i64,i64,i8}` struct where
+// the `Object` slot expected a pointer. The compiled program exited 0 with
+// no output, indistinguishable from a #2661-style "statement silently
+// dropped". #3127's fix wires the range box vtable, descriptor, and
+// predicate through the SAME `rangeBoxable` (the #2793 fix) so the three
+// cannot drift, and the vtable's ToString slot forwards to the same
+// `emitRangeToString` the unboxed path uses. The two programs below are
+// the same pair #2661 wrote for the unboxed path, re-tested through the
+// boxed path; both renderings must agree.
+// ---------------------------------------------------------------------------
+
+// §8.6 / §8.5 / §18.5: `o.ToString()` on a boxed Range<int> renders all six
+// auto-properties in §9.8's declaration order — the EXACT same text
+// `r.ToString()` produces (the unboxed test above), so the boxed and
+// unboxed answers cannot disagree. Pre-fix this prints nothing and exits
+// 0; the assertion fails on stdout-text mismatch rather than on a crash,
+// so the regression file names the bug rather than the failure mode.
+BEZEL_TEST(span_range_tostring_2661, boxed_range_object_tostring_renders) {
+    BEZEL_EXPECT_EQ(runAotOut(plain(
+        "  var r := 1..<3; "
+        "  var o: Object := r; "
+        "  Console.WriteLine(o.ToString()); "
+        "  return 0; ")),
+        "Range(Start: 1, End: 3, Step: 1, IsEndInclusive: False, "
+        "IsOpenEnded: False, IsEmpty: False)");
+}
+
+// §18.5: the §18.5 hole is defined to invoke `ToString` implicitly, so the
+// boxed-range interpolation must render the same text the boxed call
+// renders — and both must render the same text the unboxed call renders.
+// The `if i = e` guard is what makes this a real agreement test: a
+// silently-broken `o.ToString()` would also return `""`, `""` would equal
+// itself, and the test would pass vacuously against the wrong output.
+BEZEL_TEST(span_range_tostring_2661, boxed_range_interpolation_agrees_with_call) {
+    BEZEL_EXPECT_EQ(runAotOut(plain(
+        "  var r := 1..<3; "
+        "  var o: Object := r; "
+        "  var i := $\"{o}\"; "
+        "  var c := o.ToString(); "
+        "  var u := r.ToString(); "
+        "  Console.WriteLine((if i = c then \"I=C\" else \"I!=C\")); "
+        "  Console.WriteLine((if c = u then \"C=U\" else \"C!=U\")); "
+        "  if i = c then "
+        "    if c = u then Console.WriteLine(\"AGREE\"); "
+        "    else Console.WriteLine(\"DISAGREE\"); "
+        "    end; "
+        "  else Console.WriteLine(\"DISAGREE\"); "
+        "  end; "
+        "  return 0; ")),
+        "I=C\nC=U\nAGREE");
+}
+
+// `Range<char>` first-class (§16.3): the element-type handling the boxed
+// path mints per-T for must propagate through ToString, so the boxed
+// rendering of `Range<char>` names the endpoints as characters — not as
+// the integer code points the unsigned-8 stored value also represents.
+// Pre-fix the print was empty (the box path was the no-op), and the test
+// would have read against `Range(Start: 97, End: 122, ...)` — the same
+// wrong-shape failure the unboxed version had before #2661.
+BEZEL_TEST(span_range_tostring_2661, boxed_range_char_object_tostring_renders_chars) {
+    BEZEL_EXPECT_EQ(runAotOut(plain(
+        "  var r: Range<char> := 'a'..'z'; "
+        "  var o: Object := r; "
+        "  Console.WriteLine(o.ToString()); "
+        "  return 0; ")),
+        "Range(Start: a, End: z, Step: 1, IsEndInclusive: True, "
+        "IsOpenEnded: False, IsEmpty: False)");
+}
+
+// §8.6 / #422: a boxed Range<T> is +1 at the boxing site and released at
+// scope end by the §28.9 placement machinery. The render is itself +1
+// (each emitStringConcat), so the consumer must discharge it; this test
+// exercises 20 round trips through the boxed ToString to surface any
+// leak in either direction (LSan would catch the box-leak half; the
+// string-leak half is the #2661 control already pinned). The exit-0
+// success line keeps the test from passing vacuously on a crash.
+BEZEL_TEST(span_range_tostring_2661, boxed_range_renders_are_leak_free) {
+    auto r = runAotChecked(plain(
+        "  var i := 0; "
+        "  while i < 20 do "
+        "    i := i + 1; "
+        "    var r := 1..<3; "
+        "    var o: Object := r; "
+        "    var s: string := o.ToString(); "
+        "    if s.Length < 1 then return 7; end; "
+        "  end while; "
+        "  return 0; "));
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}

@@ -2872,6 +2872,15 @@ llvm::Value* Emitter::tryOpaqueSlotBuiltinRender(llvm::Value* val,
     if (reassignedOpaqueLocals_.count(ld)) return nullptr;
     const sema::TypeRef* srcRt = ctx_.exprType(*ld->initializer);
     if (!isVtableLess(srcRt)) return nullptr;
+    // fix #3127 (§8.6 / §8.5): `Range<T>` IS in `kNonHeapReservedBuiltins`
+    // (so `isVtableLessBuiltinClassName` answers true), but #3127 gave it a
+    // real Bezel vtable (Range is now boxable per §8.6, dispatch through
+    // vtable[kToStringSlot]). The §2968 #2923 helper bypasses the dispatch —
+    // it would return the literal type name "Range" — exactly the wrong
+    // rendering #3127 exists to fix. Decline the helper for any Range
+    // initializer so the interp falls through to lowerObjectToString →
+    // vtable[kToStringSlot] → emitRangeToString.
+    if (rangeBoxable(srcRt)) return nullptr;
     // The receiver retains NOTHING (the literal has a sentinel rc), so this
     // is a pure replacement of the broken `lowerObjectToString` call site —
     // no memory obligation added for the renderer.
