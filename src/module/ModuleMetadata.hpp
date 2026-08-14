@@ -202,6 +202,34 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // (ExprTypecheck.cpp) for the consuming side.
 inline constexpr std::uint32_t kSchemaVersion = 7;
 
+// §2.5 / §2.8.2 (issue #3198, v0.254): the producer's content-revision
+// stamp. A 32-bit integer the producer stamps in every artifact's header
+// record; the loader compares it against its own stamp and rejects the
+// artifact (with a diagnostic naming the dependency and the remedy — rebuild
+// it) if they differ.
+//
+// This is a SECOND axis of versioning orthogonally to `kSchemaVersion`. The
+// schema version is reserved for changes that alter the wire format's meaning
+// in a way an old reader cannot survive (issue #328's read-older rule, the
+// Java .class model). The producer content revision is reserved for changes
+// in WHAT THE WRITER WRITES — every commit that adds a new metadata field, a
+// new fold into the semantic hash, a new modifier-rendering, etc., must bump
+// it. Without the stamp, an additive content change is LOADED SILENTLY by a
+// new compiler reading an old artifact: the new field's hash fold is missing,
+// the new modifier's readers hit the "absent" branch, and the importer
+// makes a wrong call about ownership, layout, or disposal — exactly the
+// silent-acceptance failure shape the issue measures.
+//
+// The stamp is ABSENT (hdr.size() < 5 → reads as 0) on any artifact written
+// before this field landed, which is precisely the rejection we want — a
+// recompile-the-world migration (§2.8.5 disclaims ABI stability across
+// recompilation, so the cost is a build-time inconvenience, not a
+// compatibility trap). A new reader given an old artifact rejects it with
+// a diagnostic naming the dependency; an old reader given a new artifact
+// silently ignores the 5th field (the existing reader's `hdr.size() < 4`
+// gate never looks past index 3).
+inline constexpr std::uint32_t kProducerContentRevision = 1;
+
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
 
 // §3 type kinds, as they appear in a serialized signature. Mirrors
@@ -1227,5 +1255,22 @@ std::optional<std::uint64_t> readSemanticHash(
 // .class forward-compat model): a current reader must skip what it does not
 // recognise and still decode the known content. Not used outside tests.
 std::vector<std::uint8_t> serializeWithUnknownExtras(const ModuleMetadata& md);
+
+// §2.5 / §2.8.2 (issue #3198, v0.254): the producer's content-revision
+// stamp, read from the blob's header record without fully decoding the body.
+// std::nullopt on bad magic or a truncated header. The loader uses this to
+// reject a dependency whose producer stamp differs from
+// `kProducerContentRevision` — a stale artifact whose content does not match
+// what this compiler produces.
+std::optional<std::uint32_t> readProducerContentRevision(
+    const std::vector<std::uint8_t>& bytes);
+
+// Test-only: serialize with a CUSTOM producer content-revision stamp. Used
+// by the #3198 regression tests to forge a "stale" artifact (stamp !=
+// kProducerContentRevision) and verify the loader's rejection path. The
+// production writer (serialize / serializeWithUnknownExtras) always stamps
+// kProducerContentRevision — there is no other call site.
+std::vector<std::uint8_t> serializeWithProducerRevision(const ModuleMetadata& md,
+                                                       std::uint32_t stamp);
 
 } // namespace bezel::module

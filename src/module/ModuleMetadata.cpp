@@ -1020,19 +1020,30 @@ void emitConstant(llvm::BitstreamWriter& w, const MetaConstant& c) {
 
 // Shared writer body: emits the whole MODULE_BLOCK. When `withUnknownExtras`,
 // also emits an unknown record code + an unknown subblock id to exercise the
-// reader's skip-unknown path (issue #328 forward-compat test).
+// reader's skip-unknown path (issue #328 forward-compat test). The
+// `producerRevision` is the producer's content-revision stamp; the production
+// serializers pass `kProducerContentRevision`, and the test-only
+// `serializeWithProducerRevision` passes a custom value to forge a stale
+// artifact for the #3198 regression test.
 std::vector<std::uint8_t> serializeImpl(const ModuleMetadata& md,
-                                        bool withUnknownExtras) {
+                                        bool withUnknownExtras,
+                                        std::uint32_t producerRevision) {
     llvm::SmallVector<char, 0> buffer;
     {
         llvm::BitstreamWriter w(buffer);
         w.EnterSubblock(MODULE_BLOCK, 4);
 
-        // Header record first (issue #328: magic + schema version + hash).
+        // Header record first (issue #328: magic + schema version + hash; issue
+        // #3198: producer content-revision stamp). The stamp is the 5th value
+        // — additive, no schema bump (the existing reader's `hdr.size() < 4`
+        // gate never looks past index 3, so a stamp-bearing blob is read by
+        // an old reader exactly as a stamp-less one was). See the constant's
+        // comment in ModuleMetadata.hpp for the rejection semantics.
         std::uint64_t hash = semanticHash(md);
-        llvm::SmallVector<std::uint64_t, 4> hdr{
+        llvm::SmallVector<std::uint64_t, 5> hdr{
             kMetadataMagic, kSchemaVersion,
-            hash & 0xFFFFFFFFu, (hash >> 32) & 0xFFFFFFFFu};
+            hash & 0xFFFFFFFFu, (hash >> 32) & 0xFFFFFFFFu,
+            producerRevision};
         w.EmitRecord(REC_HEADER, hdr);
 
         if (withUnknownExtras) {
@@ -1089,11 +1100,21 @@ std::vector<std::uint8_t> serializeImpl(const ModuleMetadata& md,
 } // namespace
 
 std::vector<std::uint8_t> serialize(const ModuleMetadata& md) {
-    return serializeImpl(md, /*withUnknownExtras=*/false);
+    return serializeImpl(md, /*withUnknownExtras=*/false, kProducerContentRevision);
 }
 
 std::vector<std::uint8_t> serializeWithUnknownExtras(const ModuleMetadata& md) {
-    return serializeImpl(md, /*withUnknownExtras=*/true);
+    return serializeImpl(md, /*withUnknownExtras=*/true, kProducerContentRevision);
+}
+
+// §2.5 / §2.8.2 (issue #3198, v0.254): test-only writer that takes an explicit
+// producer stamp. Used by the #3198 regression test to forge a "stale" artifact
+// (stamp != kProducerContentRevision) and verify the loader's rejection path.
+// Production callers always go through `serialize` / `serializeWithUnknownExtras`,
+// which stamp `kProducerContentRevision` — there is no other call site.
+std::vector<std::uint8_t> serializeWithProducerRevision(const ModuleMetadata& md,
+                                                       std::uint32_t stamp) {
+    return serializeImpl(md, /*withUnknownExtras=*/false, stamp);
 }
 
 // --- Deserialize ------------------------------------------------------------
@@ -1795,13 +1816,16 @@ bool readExtension(Reader& r, MetaExtension& ext) {
 
 // Validate magic + read the header record. Positions the cursor inside the
 // MODULE_BLOCK, just after the header record. Reports the schema version + hash
-// via out-params. Returns false on bad magic / newer schema / malformed input.
-bool readHeader(Reader& r, std::uint32_t& version, std::uint64_t& hash) {
+// + producer content-revision stamp via out-params. Returns false on bad magic
+// / newer schema / malformed input. The stamp is 0 on any artifact written
+// before the field landed (hdr.size() < 5) — see #3198.
+bool readHeader(Reader& r, std::uint32_t& version, std::uint64_t& hash,
+                std::uint32_t& producerRevision) {
     // The bitstream has no 4-byte file magic of its own here (we don't write
     // the LLVM 'BC' wrapper); the MODULE_BLOCK's HEADER record carries our
     // magic. Enter the top-level MODULE_BLOCK first.
     if (!enterSubblock(r, MODULE_BLOCK)) return false;
-    llvm::SmallVector<std::uint64_t, 4> hdr;
+    llvm::SmallVector<std::uint64_t, 5> hdr;
     // The header is the first record; skip-unknown still applies (a future
     // schema might prepend records, though current writers do not).
     while (true) {
@@ -1817,6 +1841,17 @@ bool readHeader(Reader& r, std::uint32_t& version, std::uint64_t& hash) {
     // (it cannot guarantee correct interpretation). Equal/older is accepted.
     if (version > kSchemaVersion) return false;
     hash = (hdr[2] & 0xFFFFFFFFu) | ((hdr[3] & 0xFFFFFFFFu) << 32);
+    // §2.5 / §2.8.2 (issue #3198, v0.254): the producer content-revision
+    // stamp is the 5th header value (additive — no schema bump, an old reader
+    // silently ignores it). Absent (hdr.size() < 5) reads as 0, which is the
+    // sentinel for "stale artifact" — `kProducerContentRevision` is always >=
+    // 1, so a stamp of 0 fails the loader's vintage check. The semantic hash
+    // is folded AFTER the stamp (see semanticHash) so the hash covers the
+    // stamp value too — a "stale hash" not only differs from the current
+    // hash, but ALSO covers the stamp value embedded in the header.
+    producerRevision = hdr.size() >= 5
+        ? static_cast<std::uint32_t>(hdr[4])
+        : 0u;
     return true;
 }
 
@@ -1827,7 +1862,8 @@ std::optional<ModuleMetadata> deserialize(
     Reader r(bytes);
     std::uint32_t version = 0;
     std::uint64_t headerHash = 0;
-    if (!readHeader(r, version, headerHash)) return std::nullopt;
+    std::uint32_t producerRevision = 0;
+    if (!readHeader(r, version, headerHash, producerRevision)) return std::nullopt;
 
     ModuleMetadata md;
     // Module name.
@@ -1880,7 +1916,8 @@ std::optional<std::uint32_t> readSchemaVersion(
     Reader r(bytes);
     std::uint32_t version = 0;
     std::uint64_t hash = 0;
-    if (!readHeader(r, version, hash)) return std::nullopt;
+    std::uint32_t producerRevision = 0;
+    if (!readHeader(r, version, hash, producerRevision)) return std::nullopt;
     return version;
 }
 
@@ -1889,8 +1926,26 @@ std::optional<std::uint64_t> readSemanticHash(
     Reader r(bytes);
     std::uint32_t version = 0;
     std::uint64_t hash = 0;
-    if (!readHeader(r, version, hash)) return std::nullopt;
+    std::uint32_t producerRevision = 0;
+    if (!readHeader(r, version, hash, producerRevision)) return std::nullopt;
     return hash;
+}
+
+// §2.5 / §2.8.2 (issue #3198, v0.254): the producer's content-revision stamp,
+// read from the blob's header record without fully decoding the body. The
+// loader compares it against `kProducerContentRevision` and rejects the
+// dependency if they differ — the vintage check that the issue demands. A
+// 0 return value means "stamp absent" (an artifact written before this field
+// landed) — the loader's check is then "any 0 != kProducerContentRevision =>
+// reject", which is the recompile-the-world migration we want.
+std::optional<std::uint32_t> readProducerContentRevision(
+    const std::vector<std::uint8_t>& bytes) {
+    Reader r(bytes);
+    std::uint32_t version = 0;
+    std::uint64_t hash = 0;
+    std::uint32_t producerRevision = 0;
+    if (!readHeader(r, version, hash, producerRevision)) return std::nullopt;
+    return producerRevision;
 }
 
 } // namespace bezel::module

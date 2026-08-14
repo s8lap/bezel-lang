@@ -3149,6 +3149,27 @@ std::optional<ModuleMetadata> loadDependency(const std::string& artifactPath,
     std::optional<std::vector<std::uint8_t>> bytes =
         readMetadataSection(artifactPath);
     if (!bytes) return std::nullopt;
+    // §2.5 / §2.8.2 (issue #3198, v0.254): vintage check the producer
+    // content-revision stamp BEFORE deserialize. A stale artifact (an old
+    // build of this compiler, or a future build, or any artifact written
+    // before the field landed) carries a stamp that does not equal
+    // kProducerContentRevision — and the silent-acceptance shape the issue
+    // measures (the consumer wrongly reads "owned" as missing, the layout
+    // truncation, the disposal miscount) is exactly what would happen if
+    // we let an old producer's bytes into the importer. The check is cheap
+    // (a header read, no body decode) and rejects BEFORE any symbols are
+    // imported into the SemaContext.
+    std::optional<std::uint32_t> stamp = readProducerContentRevision(*bytes);
+    if (!stamp) return std::nullopt;
+    if (*stamp != kProducerContentRevision) {
+        if (diag)
+            *diag = "dependency artifact '" + artifactPath +
+                    "' was built by a compiler with a different metadata "
+                    "content revision (got " + std::to_string(*stamp) +
+                    ", expected " + std::to_string(kProducerContentRevision) +
+                    "); rebuild the dependency (§2.5 / §2.8.2)";
+        return std::nullopt;
+    }
     std::optional<ModuleMetadata> md = deserialize(*bytes);
     if (!md) return std::nullopt;
     // §2.8.4 rule 4 (issue #1733, v0.188): "Presenting an executable artifact as
@@ -3196,6 +3217,25 @@ bool loadDependencies(const std::vector<std::string>& artifactPaths,
         std::optional<std::vector<std::uint8_t>> bytes =
             readMetadataSection(path);
         if (!bytes) {
+            if (failedPath) *failedPath = path;
+            return false;
+        }
+        // §2.5 / §2.8.2 (issue #3198, v0.254): vintage check via the producer
+        // content-revision stamp (see loadDependency for the rationale). A
+        // stale artifact is rejected before deserialize, exactly as a
+        // bad-magic or executable artifact is.
+        std::optional<std::uint32_t> stamp = readProducerContentRevision(*bytes);
+        if (!stamp) {
+            if (failedPath) *failedPath = path;
+            return false;
+        }
+        if (*stamp != kProducerContentRevision) {
+            if (diag)
+                *diag = "dependency artifact '" + path +
+                        "' was built by a compiler with a different metadata "
+                        "content revision (got " + std::to_string(*stamp) +
+                        ", expected " + std::to_string(kProducerContentRevision) +
+                        "); rebuild the dependency (§2.5 / §2.8.2)";
             if (failedPath) *failedPath = path;
             return false;
         }

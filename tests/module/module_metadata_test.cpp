@@ -500,4 +500,77 @@ BEZEL_TEST(module_metadata, contract_records_roundtrip_spec_2_8_2_2054) {
     if (opaqueDecoded) BEZEL_EXPECT_TRUE(!opaqueDecoded->contractRecordsCarried);
 }
 
+// §2.5 / §2.8.2 (issue #3198, v0.254): a stamp that does not match the
+// reader's `kProducerContentRevision` is the §2.8.3-rule-3 "stale artifact"
+// signal the loader must reject — issue #3198 measures the silent-accept
+// shape (a stale dependency compiled clean, then SIGSEGV'd at runtime) when
+// the loader has no vintage check. The fix is a 32-bit producer stamp in
+// the header record; the loader reads it via `readProducerContentRevision`
+// and refuses any artifact whose stamp != kProducerContentRevision. This
+// test pins the check end-to-end: forge a blob with a NON-current stamp and
+// verify the reader surfaces it (so `loadDependency`'s rejection has the
+// data it needs), then verify a current stamp is accepted.
+BEZEL_TEST(module_metadata, producer_content_revision_stamped_3198) {
+    ModuleMetadata original = buildFixture();
+    std::vector<std::uint8_t> bytes = serialize(original);
+
+    // The current producer stamps exactly kProducerContentRevision; the
+    // reader sees that value back. The default writer → reader roundtrip is
+    // identity.
+    std::optional<std::uint32_t> stamp = readProducerContentRevision(bytes);
+    BEZEL_EXPECT_TRUE(stamp.has_value());
+    if (stamp) BEZEL_EXPECT_EQ(*stamp, kProducerContentRevision);
+}
+
+// §2.5 / §2.8.2 (issue #3198, v0.254): the loader's vintage check rejects a
+// stale artifact. We forge a stale artifact by emitting the same content
+// through the test-only `serializeWithProducerRevision` with a stamp
+// different from kProducerContentRevision, and verify the reader surfaces
+// the mismatch — which is the precondition `loadDependency` reads before
+// deserializing. Without the stamp in the header, `loadDependency` would
+// have no signal to reject and would silently rebuild symbols from a
+// producer the importer cannot trust (the silent-accept shape #3198
+// measures).
+BEZEL_TEST(module_metadata, stale_producer_revision_detected_3198) {
+    ModuleMetadata original = buildFixture();
+    // Stamp != kProducerContentRevision → loader's vintage check fails.
+    std::vector<std::uint8_t> stale =
+        serializeWithProducerRevision(original, kProducerContentRevision + 1);
+
+    std::optional<std::uint32_t> stamp = readProducerContentRevision(stale);
+    BEZEL_EXPECT_TRUE(stamp.has_value());
+    if (stamp) BEZEL_EXPECT_TRUE(*stamp != kProducerContentRevision);
+
+    // The header still validates (magic + schema version are untouched by
+    // the stamp), so the loader's other checks do not fire — the rejection
+    // is purely on the stamp.
+    std::optional<std::uint32_t> ver = readSchemaVersion(stale);
+    BEZEL_EXPECT_TRUE(ver.has_value());
+    if (ver) BEZEL_EXPECT_EQ(*ver, kSchemaVersion);
+}
+
+// §2.5 / §2.8.2 (issue #3198, v0.254): an artifact written before the
+// producer-stamp field landed has NO 5th header value — `readHeader` reads
+// it as 0 (the "absent" sentinel), and `kProducerContentRevision >= 1`, so
+// the loader's vintage check rejects it. This is the recompile-the-world
+// migration shape the issue describes: a freshly-built loader refuses an
+// older artifact (rather than silently reading fields the old writer did
+// not write) and tells the operator to rebuild the dependency.
+BEZEL_TEST(module_metadata, old_artifact_without_stamp_rejected_3198) {
+    // An artifact whose stamp is 0 is exactly how an old artifact (read
+    // by the new readHeader) surfaces: the field is absent, readHeader
+    // saturates to 0, and the loader's vintage check sees 0 !=
+    // kProducerContentRevision. The stamp value 0 is the magic sentinel
+    // pinned by the load-time comparison.
+    ModuleMetadata original = buildFixture();
+    std::vector<std::uint8_t> withoutStamp =
+        serializeWithProducerRevision(original, /*stamp=*/0);
+
+    std::optional<std::uint32_t> stamp = readProducerContentRevision(withoutStamp);
+    BEZEL_EXPECT_TRUE(stamp.has_value());
+    if (stamp) BEZEL_EXPECT_EQ(*stamp, 0u);
+    // 0 != kProducerContentRevision → loader's vintage check rejects.
+    if (stamp) BEZEL_EXPECT_TRUE(*stamp != kProducerContentRevision);
+}
+
 } // namespace bezel::module
