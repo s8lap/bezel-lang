@@ -3739,12 +3739,41 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
                         return OwnershipState::Borrowed;
                     // Path B: TypeResolution left declaration null; read the
                     // type name from the ast::Type to recognise value builtins.
+                    // fix #3134 / §17.7 (§28.3 / §8.7): the value-shaped built-in
+                    // names (`JsonOptions`, `ExceptionInfo`, `ReadOnlyStringSpan`,
+                    // `Range`, the span shapes, …) are records / value structs
+                    // (§9 — no disposal obligation), and §17.7 specifies the
+                    // reference behaviour for the two records that have a
+                    // positional-ctor-only surface: "exactly as for an
+                    // identically-shaped user record". The user-record twin
+                    // classifies Borrowed via the (rt->declaration &&
+                    // kind != Class/Interface) branch above, so the value-shaped
+                    // built-in twin MUST also classify Borrowed — otherwise a
+                    // `var j := new JsonOptions(...)` fires the §28.3 auto-drop
+                    // note on a value with nothing to dispose (j.Dispose() is not
+                    // even a member; §8.7 enumerates records as not implementing
+                    // IDisposable). The predicate used here is the EXACT one
+                    // codegen's #2974 `unconstructedBuiltinNewName` gate uses
+                    // (`common::isReservedBuiltinTypeName(n) &&
+                    // !common::isHeapPointerReferenceBuiltin(n)`,
+                    // LlvmBackend_Setup.cpp:11660-11661): a reserved built-in
+                    // name that is NOT a heap-pointer reference is, by the
+                    // BuiltinRegistry snapshot, the value-shaped half — the
+                    // same population the snapshot pins. The `new DateTime(...)`
+                    // positive control was already Borrowed via the legacy name
+                    // list this replaces; widening to the snapshot-pinned set
+                    // makes `JsonOptions` / `ExceptionInfo` /
+                    // `ReadOnlyStringSpan` / `Range` / `Span` / `ReadOnlySpan`
+                    // / `ArraySpan` / `ReadOnlyArraySpan` / `CString` / `WString`
+                    // / `RawBytes` / `IntPtr` / `UIntPtr` / `OwningBuffer` —
+                    // every member of `kNonHeapReservedBuiltins` — uniformly
+                    // Borrowed, exactly like the user-record twin.
+                    // (per §17.7, §28.3, §8.7 — fix #3134, v0.252)
                     if (!rt->declaration && rt->astNode && rt->astNode->name &&
                         rt->astNode->name->parts.size() == 1) {
                         std::string_view n = rt->headName();
-                        if (n == "DateTime" || n == "TimeSpan" ||
-                            n == "Guid"     || n == "CancellationToken" ||
-                            n == "DateOnly" || n == "TimeOnly")  // per §2.5 / #1357
+                        if (common::isReservedBuiltinTypeName(n) &&
+                            !common::isHeapPointerReferenceBuiltin(n))
                             return OwnershipState::Borrowed;
                     }
                 }
