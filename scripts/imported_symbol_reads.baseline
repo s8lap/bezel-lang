@@ -32,7 +32,7 @@
 #         (#3149). MemberSymbol::decl is null for a non-generic import and
 #         PropertySymbol::decl is never set at all, so these answer the same
 #         silent "no" across a module boundary.
-19   src/codegen/LlvmBackend_Assign.cpp
+20   src/codegen/LlvmBackend_Assign.cpp
 27   src/codegen/LlvmBackend_Calls2.cpp
 2    src/codegen/LlvmBackend_Disposal.cpp
 8    src/codegen/LlvmBackend_Exprs.cpp
