@@ -4122,8 +4122,46 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 // loader stashed the operator's resolved return type keyed on
                 // the symbol; use it. Mirrors the imported-regular-method
                 // fallback in ExprTypecheck_Calls.cpp.
-                if (auto* rt = ctx_.importedReturnType(opm))
+                if (auto* rt = ctx_.importedReturnType(opm)) {
+                    // §25 / §14.1 (#3159, v0.254): the GENERIC arm above
+                    // substitutes the parent's type parameters from a concrete
+                    // operand instantiation; the IMPORTED arm here was returning
+                    // the loader's bare-parametric `Vec<T>` shape unchanged. With
+                    // the result type left at `Vec<T>`, the BinaryExpr is typed
+                    // as a different specialization than the operands
+                    // (`Vec<string>`), so:
+                    //   * `r := p + q` infers `r: Vec<T>` and `r.a` is the bare
+                    //     parametric — the subsequent `string + r.a` falls into
+                    //     the §4.6 mixed-string diagnostic on a perfectly legal
+                    //     `+` overload, not the "operator not defined" diagnostic
+                    //     the user actually violated;
+                    //   * when no downstream string is involved, codegen
+                    //     instantiates the call against `Vec<T>` while
+                    //     `p`/`q` are `Vec<string>`, producing two distinct
+                    //     record layouts ($spec0 vs $spec1) at the LLVM call site
+                    //     and a "Call parameter type does not match function
+                    //     signature" IR-verification failure (§3.2).
+                    // Reapply the same parent-param substitution as the generic
+                    // local arm so the imported operator's result is the
+                    // concrete operand's `Vec<string>`, not the bare-parametric
+                    // `Vec<T>`. Mirrors substituteMemberType's #597/#361 reader.
+                    if (opm->parent &&
+                        !opm->parent->genericParams.empty()) {
+                        auto isParentInst = [&](const ast::Expr* e) -> bool {
+                            TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+                            return t && t->kind == TypeRef::Kind::Named &&
+                                   t->declaration == opm->parent &&
+                                   !t->genericArgs.empty();
+                        };
+                        const ast::Expr* recv =
+                            isParentInst(be.left.get())  ? be.left.get()
+                            : isParentInst(be.right.get()) ? be.right.get()
+                                                           : nullptr;
+                        if (recv)
+                            rt = substituteMemberType(rt, recv, opm->parent);
+                    }
                     ctx_.setExprType(&be, rt);
+                }
             }
             return;
         }
