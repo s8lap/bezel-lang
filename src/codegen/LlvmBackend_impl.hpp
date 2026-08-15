@@ -6786,6 +6786,100 @@ private:
     // kind of declared location that triggers boxing of a value-typed source?
     bool isObjectOrInterfaceTarget(const sema::TypeRef* target);
 
+    // fix #3120 (§12.7 / §8.6 / §17.4, v0.252): a CONCRETE non-nullable
+    // VALUE type whose `#3120` static-decision branch may answer `x is T` at
+    // codegen — primitive (non-string/non-Object), record, enum, value-builtin
+    // (DateTime/TimeSpan/DateOnly/TimeOnly/Guid), inline array (non-nullable,
+    // non-owning — the move-only `[N owned]T` is a §15.3 move-only and is not
+    // a static-decision candidate the same way the others are), and unit.
+    //
+    // EXCLUDES: a nullable value type (handled by the existing §12.7/§7
+    // nullable branch above — its `hasValue` is the answer); a reference
+    // location (`Object` / interface — the operand would lower to a pointer and
+    // never reach the non-pointer branch); a function TypeRef (reference type
+    // per §3.1/§5.1, would also lower to ptr); and a bare type parameter
+    // (Named with `declaration == nullptr`, the #490 unspecialized generic-
+    // template body that is never executed and for which `reportDroppedTest`
+    // deliberately stays silent — warning there would fire on dead code).
+    static bool concreteValueTypeOperand(const sema::TypeRef* rt) {
+        if (!rt) return false;
+        using K = sema::TypeRef::Kind;
+        if (rt->nullable) return false;       // nullable value → existing branch
+        switch (rt->kind) {
+            case K::Primitive:
+                // `string` and `Object` are reference types per §4.6 / §8.1.
+                return rt->primitive != sema::PrimitiveType::String &&
+                       rt->primitive != sema::PrimitiveType::Object;
+            case K::Unit:
+                return true;                   // () is a value type, §4.7
+            case K::InlineArray:
+                // Move-only `[N owned]T` boxes via §8.6's move-only exclusion
+                // and is never the operand of a static-decision candidate the
+                // way non-owning inline arrays are. The size-only comparison
+                // below still yields the correct answer for it (the runtime
+                // tag is irrelevant for a value-typed operand), so admit it.
+                return true;
+            case K::Named:
+                // A bare type parameter (`T` in `Box<T>`) has no declaration;
+                // the unspecialized body never executes (issue #490), so its
+                // `is`/`as` has no concrete answer to produce. A Named value
+                // type is a record/enum/value-builtin — the kinds `isBoxable
+                // ValueType` covers (with the range builtin class sym, #3127)
+                // and the §8.6 general-record/enum/value-builtin rules.
+                return rt->declaration != nullptr;
+            default:
+                return false;                  // Function / Error / unclassified
+        }
+    }
+
+    // fix #3120 (§12.7 / §8.6 / §17.4, v0.252): SHALLOW TypeRef identity, the
+    // relation a non-nullable VALUE-type operand's static `is T` decides on.
+    // Two concrete value types are identical when their kinds agree AND the
+    // kind-specific identity field matches: same primitive PrimitiveType, same
+    // Named declaration (records / enums / value-builtins), same Unit kind,
+    // same inline-array shape (ownedness + folded size + element base, per
+    // #2001's "size N is part of the type" rule, §15.1). Nullable is excluded
+    // at the call site (concreteValueTypeOperand). Type parameters / Function
+    // / Error / Object / String never reach this predicate (the call site
+    // gates on concreteValueTypeOperand on the operand only — the target
+    // `rt` is the type-test target, which is checked as-is and compared
+    // structurally: e.g. an interface target vs a value-typed operand is
+    // never identical here, so `int is IFoo` answers false).
+    static bool staticTypeIdentical(const sema::TypeRef* a,
+                                    const sema::TypeRef* b) {
+        if (!a || !b) return a == b;
+        if (a->kind != b->kind) return false;
+        using K = sema::TypeRef::Kind;
+        if (a->kind == K::Primitive) return a->primitive == b->primitive;
+        if (a->kind == K::Unit) return true;
+        if (a->kind == K::Named) {
+            // Two declaration-ful Named type refs are identical exactly when
+            // they name the same declaration. A declaration-less Named type
+            // ref (an imported / builtin synthetic head) is matched on its
+            // `importedName` / `astNode->name` head as a stable substitute;
+            // concrete value types the user spells (records, value-builtins,
+            // builtin class syms) all resolve through `declaration`, which is
+            // what the target of an `is T` test reaches.
+            if (a->declaration && b->declaration)
+                return a->declaration == b->declaration;
+            return false;  // mixed or both declarationless — a generic-
+                           // template shape that does not reach here; default
+                           // to non-equal to keep the static decision local.
+        }
+        if (a->kind == K::InlineArray) {
+            // §15.1: size N is part of the type. Ownedness distinguishes
+            // (`[N]T` vs `[N owned]T`); size distinguishes when both fold to
+            // the same N (the #2001 rule); element identity recurses into
+            // staticTypeIdentical.
+            if (a->arrayOwned != b->arrayOwned) return false;
+            if (a->arraySizeValue >= 0 && b->arraySizeValue >= 0 &&
+                a->arraySizeValue != b->arraySizeValue)
+                return false;
+            return staticTypeIdentical(a->arrayElement, b->arrayElement);
+        }
+        return false;
+    }
+
     // fix #3090 (§12.7 / §8.6, v0.252): the §12.7 flow-narrowed VALUE type of an
     // identifier read, or nullptr when this read is not one.
     //

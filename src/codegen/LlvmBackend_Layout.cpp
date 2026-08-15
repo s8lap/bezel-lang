@@ -2702,6 +2702,46 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             if (te.op == "is") return hasVal;
             if (te.op == "is not") return builder_.CreateNot(hasVal);
         }
+        // fix #3120 (§12.7 / §8.6 / §17.4, v0.252): a CONCRETE non-nullable
+        // VALUE-type operand (a primitive / record / enum / value-builtin /
+        // inline array / unit whose sema type is not a type parameter) lowers
+        // here to a non-pointer value. There is no runtime tag to consult — a
+        // non-boxed value type has exactly one static type — so the test is
+        // decided STATICALLY at the operand's declared type: target type
+        // identical to the operand type → `true`; otherwise → `false`. §12.7:
+        // "`is T` tests whether a value is an instance of `T`", and a `Pt` is
+        // an instance of `Pt`. The `concreteValueTypeOperand` predicate
+        // excludes the generic-template shape (operand type is a bare type
+        // parameter — Named with declaration == nullptr, the #490 / #2775
+        // unspecialized body that is never executed) so a type-parameter
+        // operand keeps its pre-#3120 silent-drop and `reportDroppedTest`
+        // still gates on the reference-location shape.
+        if (operandTy && concreteValueTypeOperand(operandTy)) {
+            const bool sameTy = staticTypeIdentical(operandTy, rt);
+            if (te.op == "is") return builder_.getInt1(sameTy);
+            if (te.op == "is not") return builder_.getInt1(!sameTy);
+            if (te.op == "as") {
+                // §17.4: `x as T` produces `T?` — a wrapped copy on a
+                // compatible unbox, `null` otherwise. The operand is already
+                // the value (no box to unbox); a successful match wraps it as
+                // {i8 1, value}; a mismatch is the all-zero `null`. The
+                // boxed-by-target direction (line ~2779) handles the more
+                // general Object/interface operand; this arm covers the
+                // concrete-value-typed operand where the match is decided at
+                // the operand's static type.
+                if (sameTy) {
+                    auto* st = nullableValueStructTy(rt);
+                    llvm::Value* wrapped = llvm::UndefValue::get(st);
+                    wrapped = builder_.CreateInsertValue(
+                        wrapped, builder_.getInt8(1), 0, "as.hasv");
+                    wrapped = builder_.CreateInsertValue(
+                        wrapped, obj, 1, "as.wrap");
+                    return wrapped;
+                }
+                return nullableValueNull(rt);
+            }
+            return nullptr;
+        }
         // #2775: sema already typed this operand as `Object` or an interface —
         // both REFERENCE locations — so a non-pointer lowered value here is by
         // construction a codegen invariant violation: some producer failed to
