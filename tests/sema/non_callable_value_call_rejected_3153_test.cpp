@@ -221,3 +221,29 @@ BEZEL_TEST(sema_non_callable_value_call_rejected_3153,
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// fix #3153 amend (§27.7 + §27.2): a VOID-returning function-typed LOCAL
+// (the §27.2 expression-body lambda whose body is a void intrinsic call,
+// `var log := lambda(msg: string) => Console.WriteLine(msg); log("x");`)
+// must still be accepted. The original #3153 patch's `else if
+// (loc->declType)` arm at the LocalSymbol branch was over-broad — for a
+// void-returning lambda the declType has `kind == Function` but a null
+// `funcReturn`, so the original `&& loc->declType->funcReturn` guard let
+// it fall through, and the new reject arm then incorrectly emitted
+// "cannot call a value of type `(fn ...)`". The amend splits the three
+// cases: kind==Function with non-null funcReturn -> set exprType; kind==
+// Function with null funcReturn -> accept (void lambda); anything else
+// -> §27.7 reject.
+BEZEL_TEST(sema_non_callable_value_call_rejected_3153,
+           void_returning_lambda_call_accepted_spec_27_7_27_2) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method M(): int "
+        "    var log := lambda(msg: string) => Console.WriteLine(msg); "
+        "    log(\"hello\"); "
+        "    return 0; "
+        "  end M; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

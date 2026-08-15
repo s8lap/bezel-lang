@@ -3354,33 +3354,51 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // function's declared return type to the CallExpr so that downstream
     // expressions (e.g. `var x := f(n)`) are typed correctly.
     if (auto* loc = dynamic_cast<LocalSymbol*>(calleeSym)) {
-        if (loc->declType && loc->declType->kind == TypeRef::Kind::Function &&
-            loc->declType->funcReturn)
-            ctx_.setExprType(&ce, loc->declType->funcReturn);
-        // fix #3153 (§27.7, v0.255): a non-function-typed local callee is NOT
-        // callable. `let x := 42; x();` used to compile and silently DROP the
-        // call (codegen's lowerLocalDecl then degraded the slot to a zero value,
-        // #2434). The method/constructor/extern/builtin-instance callee paths
-        // above already rejected or returned; here we are reached only when the
-        // callee is a value-side LocalSymbol — so any non-Function declType is
-        // genuinely non-callable. Emit one diagnostic; skip when declType is
-        // null so an unresolved local's own diagnostic (DA / type-resolution) is
-        // the only message.
-        else if (loc->declType)
+        if (loc->declType && loc->declType->kind == TypeRef::Kind::Function) {
+            // fix #3153 amend: a void-returning function-typed local has
+            // `kind == Function` but a null `funcReturn` (#678 / §27.2 — the
+            // expression-body lambda `(msg: string) => Console.WriteLine(msg)`
+            // has `funcReturn == nullptr` because the body is a void
+            // intrinsic call). The original `&& loc->declType->funcReturn`
+            // guard let those calls fall through; the #3153 patch's `else
+            // if (loc->declType)` arm then incorrectly rejected them with
+            // "cannot call a value of type `(fn ...)`". Distinguish:
+            //   kind==Function && funcReturn != null  -> set CallExpr type
+            //   kind==Function && funcReturn == null  -> void lambda; accept
+            //   anything else resolved                 -> §27.7 reject
+            //   declType null                          -> defer
+            if (loc->declType->funcReturn)
+                ctx_.setExprType(&ce, loc->declType->funcReturn);
+        } else if (loc->declType) {
+            // fix #3153 (§27.7, v0.255): a non-function-typed local callee is
+            // NOT callable. `let x := 42; x();` used to compile and silently
+            // DROP the call (codegen's lowerLocalDecl then degraded the slot
+            // to a zero value, #2434). The method/constructor/extern/builtin-
+            // instance callee paths above already rejected or returned; here
+            // we are reached only when the callee is a value-side LocalSymbol
+            // — so any non-Function declType is genuinely non-callable.
+            // Emit one diagnostic; skip when declType is null so an
+            // unresolved local's own diagnostic (DA / type-resolution) is
+            // the only message.
             ctx_.diagnostics().report(
                 Severity::Error, ce.span.begin,
                 "cannot call a value of type `" +
                 typeNameForDiag(loc->declType) +
                 "` — only function-typed values are callable (§27.7)");
+        }
     } else if (auto* par = dynamic_cast<ParameterSymbol*>(calleeSym)) {
         TypeRef* prt = par->declType ? ctx_.resolvedType(*par->declType) : nullptr;
-        if (prt && prt->kind == TypeRef::Kind::Function && prt->funcReturn)
-            ctx_.setExprType(&ce, prt->funcReturn);
-        else if (prt)  // #3153: see LocalSymbol branch above
+        if (prt && prt->kind == TypeRef::Kind::Function) {
+            // see LocalSymbol branch above (#3153 amend: void-returning
+            // function-typed parameter is still callable)
+            if (prt->funcReturn)
+                ctx_.setExprType(&ce, prt->funcReturn);
+        } else if (prt) {  // #3153: see LocalSymbol branch above
             ctx_.diagnostics().report(
                 Severity::Error, ce.span.begin,
                 "cannot call a value of type `" + typeNameForDiag(prt) +
                 "` — only function-typed values are callable (§27.7)");
+        }
     } else if (dynamic_cast<FieldSymbol*>(calleeSym)) {
         // #1138 / §27.7: a call through a function-typed FIELD (`h._fn()` where
         // `_fn: () -> Pt`). The local/parameter branches above miss a FieldSymbol
@@ -3390,13 +3408,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         // field reads folded to 0. Propagate the callee's resolved function
         // return type (the field read is already typed as the function type).
         if (TypeRef* ft = ce.callee ? ctx_.exprType(*ce.callee) : nullptr) {
-            if (ft->kind == TypeRef::Kind::Function && ft->funcReturn)
-                ctx_.setExprType(&ce, ft->funcReturn);
-            else  // #3153: see LocalSymbol branch above
+            if (ft->kind == TypeRef::Kind::Function) {
+                // see LocalSymbol branch above (#3153 amend: void-returning
+                // function-typed field is still callable)
+                if (ft->funcReturn)
+                    ctx_.setExprType(&ce, ft->funcReturn);
+            } else {  // #3153: see LocalSymbol branch above
                 ctx_.diagnostics().report(
                     Severity::Error, ce.span.begin,
                     "cannot call a value of type `" + typeNameForDiag(ft) +
                     "` — only function-typed values are callable (§27.7)");
+            }
         }
     }
     // #1093 / §5.1: a call THROUGH a function-typed value (a delegate local /
