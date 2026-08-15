@@ -4296,11 +4296,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 return sb;
             }
             if (colName == "Random") {
-                int64_t seed = 0;
                 if (!ne.args.empty() && ne.args[0].value) {
                     llvm::Value* sv = lowerExpr(*ne.args[0].value);
-                    if (sv && sv->getType()->isIntegerTy(64))
-                        seed = 0;  // pass dynamic seed below
+                    // §5.1 v0.254 / stdlib §2.7 / #3154: the constructor
+                    // parameter is `seed: long`, so an int-typed argument
+                    // (int literal, int local, int expression) must be
+                    // sign-extended to i64 before the `bz_random_alloc(i64)`
+                    // call. The earlier code checked the type and discarded
+                    // the outcome (assigned a never-read local), so a wider
+                    // `i32` value was passed where `i64` was expected and the
+                    // LLVM module verifier rejected the call.
+                    if (sv && !sv->getType()->isIntegerTy(64))
+                        sv = builder_.CreateSExt(sv, i64());
                     auto* allocFn = declareC("bz_random_alloc", ptrTy(), {i64()});
                     return builder_.CreateCall(allocFn, {sv ? sv : builder_.getInt64(0)});
                 }
