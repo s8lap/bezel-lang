@@ -10821,25 +10821,88 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             }
             return;
         }
-        // A CLASS with a primary constructor. Locally this stays deferred,
-        // exactly as before (#3163 tracks that the deferral is too broad).
-        if (!ctx_.isImported(t)) return;
-        // §22.10 / §2.8.3 rule 4 (#3141): an IMPORTED class's primary
-        // constructor. Only ONE shape here is genuinely unconstructible — a
-        // NON-EMPTY positional list with no explicit constructor to route the
-        // arguments through. Every other shape falls through to
-        // checkImportedNewExprArgs below, which is exactly where it went before
-        // this fix (`t->decl` was null, so this whole block was skipped): an
-        // imported class that declares an explicit constructor ALONGSIDE its
-        // primary one still constructs through the dependency's exported
-        // `bz$<Type>$ctor`, and a zero-parameter primary list (`class C()`)
-        // still wants §22.7's own "implicit default constructor takes 0".
+        // A CLASS with a primary constructor. Locally this used to stay
+        // deferred, exactly as before — but the deferral was UNCONDITIONAL
+        // (see the long ⚠ above; #3163), so even an unchained
+        // `class PBox(V: int, W: string)` got no arity and no per-argument
+        // type check, and `new PBox(3, 4)` SEGFAULTed on the first read of
+        // `W` while `new PBox(3)` silently answered a zero object (measured
+        // locally at this commit).
+        //
+        // fix #3163 (§22.10 / §22.5 / §5.1, v0.254): when the class has no
+        // explicit constructor whose arity matches the call's, the primary
+        // ctor IS the constructor (§22.10) and the §22.5/§5.1 check the
+        // record arm runs above is the check that should run here too. The
+        // codegen already routes `new C(5)` on `class C(x: int)` +
+        // `constructor() this(99)` to the primary ctor path (it does so
+        // today via silent deferral); the candidate-set question is
+        // preserved by only running the check when no explicit ctor has
+        // matching arity — `new C()` on the same class still routes to the
+        // 0-arg explicit ctor as before, and so does every `new C(...)`
+        // whose arity matches an explicit ctor's.
+        //
+        // ⚠ MERGE NOTE (#3196 ⨯ #3163): #3163's loud NAMED-argument decline
+        // (the `if (anyNamed)` decline inside the unconditional local-
+        // deferral block) is REMOVED here by #3196. The §22.5 binder
+        // (`checkPositionalNewArgsFromSymbols`) is still called for the
+        // LOCAL primary-only case (the new `else if (!ctx_.isImported(t) &&
+        // !recordPositionalFieldSymbols(t).empty())` branch below) — that
+        // call serves #3163's slot (the wrong-arity / wrong-typed reject)
+        // AND #3196's slot (the side-table publication, since
+        // `checkPositionalNewArgsFromSymbols` calls `setNewExprPositionalBinding`
+        // as part of its work). Both halves of the silent-zero defect are
+        // closed: the named-shape now lowers (T5) and the wrong-arity /
+        // wrong-typed case is now rejected loudly (T1/T2/T3/T4). The
+        // visible difference from #3163's standalone fix is that the named
+        // shape is no longer declined — the §22.5 binding routes it through
+        // the side table, the codegen reads it, and the object is built
+        // correctly.
         bool hasExplicitCtor = false;
         for (Symbol* m : t->members)
             if (auto* cs = dynamic_cast<ConstructorSymbol*>(m))
                 if (!cs->isStatic) { hasExplicitCtor = true; break; }
-        if (!hasExplicitCtor && !ne.args.empty() &&
-            !recordPositionalFieldSymbols(t).empty()) {
+        if (hasExplicitCtor && !ctx_.isImported(t)) {
+            // Combined primary+explicit-ctor on a LOCAL class: defer (the
+            // pre-#3196 posture). The lowering path handles the construction
+            // through `storePrimaryCtorPositionalArgs` (positional pairing
+            // against the symbol-side primary-fields list — what the
+            // pre-#3196 codegen did). Pinning this is what preserves
+            // `tests/codegen/class_primary_ctor_serialization_2325_test.cpp`'s
+            // `primary_ctor_match_with_extra_explicit_ctor_uses_primary_…`,
+            // whose `new Widget(5)` against `class Widget(id: int)` PLUS a
+            // 2-arg `constructor(id: int, note: string) this(id);` MUST fall
+            // through the local pre-#3196 codegen path: falling into the
+            // general ctors path below would make the 1-arg call a §22.5
+            // reject against the 2-param explicit ctor. The combined
+            // shape's binding (the explicit ctor's params + the primary
+            // ctor's params both bind on this call site) is #3163's wider
+            // work — out of scope here; the load-bearing deferral here is
+            // what preserves #2362 + #2325's tests.
+            //
+            // For the IMPORTED side (combined with explicit ctor) the pre-
+            // #3196 path also fell through to general ctors, and the same
+            // shape is handled by `checkImportedNewExprArgs` below — we
+            // keep that fall-through to preserve the existing import-side
+            // behavior (don't widen it here either).
+            return;
+        } else if (!ctx_.isImported(t) && !recordPositionalFieldSymbols(t).empty()) {
+            // LOCAL primary-only (no explicit ctor with matching arity): run
+            // the §22.5 check via `checkPositionalNewArgsFromSymbols`. This
+            // is the slot that closes BOTH halves of the silent-zero defect:
+            //   - #3196's side: the same function publishes the §22.5 binding
+            //     on the SemaContext side table via `setNewExprPositionalBinding`,
+            //     consumed by codegen as `newExprPositionalBinding(ne)`. The
+            //     named-shape and correctly-typed positional case now lower
+            //     correctly (the loud anyNamed decline is gone; see T5).
+            //   - #3163's side: a wrong-arity / wrong-typed call is rejected
+            //     loudly with the §22.5 / §5.1 diagnostic instead of silently
+            //     zero-initializing the object (the T1/T2/T3/T4 behaviour).
+            // The IMPORTED arm below catches the same shape and runs the
+            // same check via `checkPositionalNewExprArgs` — keep this
+            // branch LOCAL-only so the import-side path is unchanged.
+            checkPositionalNewArgsFromSymbols(ne, t);
+            return;
+        } else if (!ne.args.empty() && !recordPositionalFieldSymbols(t).empty()) {
             // Until #3141's arm existed the gate above answered "no positional
             // fields" for the import and control fell through to the §22.7
             // implicit-default-constructor arm, whose diagnostic ("`new PBox`
