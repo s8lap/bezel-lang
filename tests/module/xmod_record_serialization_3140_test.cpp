@@ -75,11 +75,14 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <sys/wait.h>
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "module/ModuleMetadata.hpp"
+#include "module/ModuleMetadataBuilder.hpp"  // kMetadataSectionName
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
 
@@ -141,6 +144,137 @@ int compileAndRunF2(const std::string& src) {
         return -1;
     int status = std::system(aExe.path.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+}
+
+// fix #3184 (§2.5 / §2.8.3 / §9.8 / §2.15, v0.252): a dependency artifact
+// that pre-dates the producer-stamp field (issue #3198, v0.254) is rejected
+// by the loader BEFORE any member's `serialized` clause is decoded, so the
+// silent-acceptance shape the issue measures — a `serialized skip` member
+// silently read as "no clause", so the importer happily puts it back on the
+// wire and reads it back, with no diagnostic at any severity — never happens.
+//
+// What this pins end-to-end:
+//   1. The .bezel.meta section of the dep's `.o` is round-tripped via
+//      dumpSection / deserialize / serializeWithProducerRevision(0).
+//   2. objcopy --update-section replaces the section in a COPY of the `.o`,
+//      so the forged copy is byte-equivalent to a real pre-#3198 artifact.
+//   3. An app that imports the forged copy must NOT build — `loadDependency`
+//      surfaces the §2.5 vintage diagnostic and returns nullopt.
+//
+// Without #3198's loadDependency rejection path, the importer would silently
+// accept the forged copy and emit the `serialized skip` member on the wire —
+// the §9.8 silent-data-corruption shape #3184 measures on a two-module build.
+//
+// `forgeFailed` (return value) is true iff the objcopy forge or the dep
+// build itself failed (toolchain unavailability). A separate `buildResult`
+// carries the app build's CompileResult, where `success == true` is the
+// silent-accept symptom we want to fail the test on.
+struct ForgeOutcome3184 {
+    bool forgeFailed;
+    bezel::CompileResult appBuild;
+};
+ForgeOutcome3184 forgeStaleDepAndTryBuild3184(const std::string& libSrc,
+                                               const std::string& appSrc) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bz3184_" + std::to_string(std::rand());
+    TempFileF2 depSrc((dir / (stem + "_dep.bzl")).string());
+    TempFileF2 depObj((dir / (stem + "_dep.o")).string());
+    TempFileF2 forgedObj((dir / (stem + "_dep_forged.o")).string());
+    TempFileF2 sectionFile((dir / (stem + "_forged.bin")).string());
+    TempFileF2 appSrcFile((dir / (stem + "_app.bzl")).string());
+    TempFileF2 appExe((dir / stem).string());
+    writeSourceF2(depSrc.path, libSrc);
+
+    // 1. Build the dep to an object — `compileObject` is what
+    //    `compileImportAndRunF2` itself uses, so the dep's `.o` carries the
+    //    same `.bezel.meta` section the loader reads.
+    {
+        bezel::Driver driver;
+        if (!driver.compileObject(depSrc.path, depObj.path).success)
+            return {true, {false, 1}};
+    }
+    if (!std::ifstream(depObj.path).good()) return {true, {false, 1}};
+
+    // 2. Dump the dep's .bezel.meta section via objcopy.
+    auto dumpSection = [](const std::string& objPath,
+                          const std::string& section) {
+        auto tmpDir = std::filesystem::temp_directory_path();
+        std::string out =
+            (tmpDir / ("bezel_meta_dump_" + std::to_string(std::rand()) + ".bin"))
+                .string();
+        std::string cmd = "objcopy --dump-section " + section + "=" + out +
+                          " " + objPath + " /dev/null 2>/dev/null";
+        std::vector<std::uint8_t> bytes;
+        if (std::system(cmd.c_str()) == 0) {
+            std::ifstream in(out, std::ios::binary);
+            if (in) {
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                std::string s = ss.str();
+                bytes.assign(s.begin(), s.end());
+            }
+        }
+        std::remove(out.c_str());
+        return bytes;
+    };
+    std::vector<std::uint8_t> origSection =
+        dumpSection(depObj.path, kMetadataSectionName);
+    if (origSection.empty()) return {true, {false, 1}};
+
+    // 3. Re-serialize with producer stamp 0 — the exact shape a pre-#3198
+    //    artifact would have after the current readHeader saturates the
+    //    absent 5th header value to 0.
+    std::optional<bezel::module::ModuleMetadata> md =
+        bezel::module::deserialize(origSection);
+    if (!md) return {true, {false, 1}};
+    std::vector<std::uint8_t> forgedSection =
+        bezel::module::serializeWithProducerRevision(*md, /*stamp=*/0u);
+
+    // Sanity-check: the forged section's stamp is 0 and reads as
+    // != kProducerContentRevision — exactly the vintage check's predicate.
+    std::optional<std::uint32_t> stamp =
+        bezel::module::readProducerContentRevision(forgedSection);
+    if (!stamp) return {true, {false, 1}};
+    if (*stamp == bezel::module::kProducerContentRevision)
+        return {true, {false, 1}};
+
+    // 4. Write the forged section bytes to a temp file for objcopy's
+    //    --update-section to consume.
+    {
+        std::ofstream out(sectionFile.path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(forgedSection.data()),
+                  static_cast<std::streamsize>(forgedSection.size()));
+    }
+
+    // 5. Copy the original dep `.o` to the forged path, then replace the
+    //    .bezel.meta section in place. The copy is byte-equivalent to a
+    //    real artifact whose metadata section was written by a pre-#3198
+    //    producer (no stamp field, the metadata content unchanged).
+    {
+        std::ifstream src(depObj.path, std::ios::binary);
+        std::ofstream dst(forgedObj.path, std::ios::binary);
+        dst << src.rdbuf();
+    }
+    std::string updateCmd = "objcopy --update-section " +
+                            std::string(kMetadataSectionName) + "=" +
+                            sectionFile.path + " " + forgedObj.path +
+                            " 2>/dev/null";
+    if (std::system(updateCmd.c_str()) != 0) return {true, {false, 1}};
+
+    // 6. Build the app with the forged dep as a dependency. The loader's
+    //    vintage check must reject before any symbols are imported, so the
+    //    build returns success=false with the §2.5 diagnostic naming the
+    //    dependency and the producer-stamp mismatch.
+    writeSourceF2(appSrcFile.path, appSrc);
+    bezel::Driver driver;
+    bezel::Dependency d;
+    d.metadataPath = forgedObj.path;
+    d.objectPath = forgedObj.path;
+    std::vector<bezel::Dependency> deps;
+    deps.push_back(d);
+    return {false, bezel::test::compileFileForTest(
+        driver, appSrcFile.path, appExe.path, deps)};
 }
 
 // A program the importer must REJECT: -1 from the helper above means the
@@ -924,6 +1058,52 @@ BEZEL_TEST(xmod_record_serialization_3140,
         "  if h2.N <> 5 then return 2; end if; "
         "  return (case h2.S of Failed(var c) => c, Ok => 99); "
         "end Main; end ProgF2;"), 8);
+}
+
+// ===========================================================================
+// T19 — ★ THE STALE-ARTIFACT TWIN for the §9.8 `serialized skip` surface.
+// // per §2.5 / §2.8.3 / §9.8 / §2.15 (issue #3184, v0.252)
+//
+// A pre-#3198 artifact's `serialized skip` member reads back as "no clause"
+// (REC_SER_CLAUSE absent → mm.serializedSkip stays false), and the importer
+// would happily serialize that member on the wire where the source had marked
+// it off-the-wire. Issue #3184 is the silent-data-corruption shape that
+// results, measured as EXIT=3 where the correct answer is 79 with no
+// diagnostic at any severity. Issue #3198 (v0.254) added the producer
+// content-revision stamp and a vintage check in `loadDependency` that
+// rejects any artifact whose stamp differs from `kProducerContentRevision`;
+// a pre-#3198 artifact's stamp reads as 0, which is != 1, so the artifact
+// is rejected BEFORE any member's `serialized` clause is decoded.
+//
+// This test is the END-TO-END pinning of that path on the §9.8 surface:
+// it builds a real dep, forges a pre-#3198 artifact by replacing its
+// .bezel.meta section with one stamped 0, then verifies the importer's
+// build fails. Without the vintage check, the build would succeed and the
+// run-time exit code would be 3 (the #3184 measured symptom), not 79.
+// ===========================================================================
+BEZEL_TEST(xmod_record_serialization_3140,
+           stale_artifact_with_serialized_skip_rejected_3184) {
+    // The dep carries a `serialized skip` clause on `RnF2.B` and
+    // `BodyF2.Q`, so the forged artifact's metadata describes a member
+    // whose `serialized skip` clause the loader's pre-fix read silently
+    // decodes as "no clause". T1's app is the existing §9.8 round-trip
+    // oracle — it would print 79 (the correct answer) on a fresh dep,
+    // and 3 (the #3184 measured symptom) on a silent-accept dep.
+    ForgeOutcome3184 outcome = forgeStaleDepAndTryBuild3184(
+        kDepF2,
+        "module AppF2p_3184; import DepF2_3140; "
+        "public class ProgF2 public static method Main(): int "
+        "  return 79; "
+        "end Main; end ProgF2;");
+    // The forge itself failed (toolchain unavailability, e.g. objcopy
+    // missing) — skip the assertion rather than treat it as a regression
+    // on the loader's vintage check.
+    if (outcome.forgeFailed) return;
+    // The build MUST fail: the loader rejects the forged artifact with
+    // the §2.5 vintage diagnostic before any symbols are imported.
+    // success==true would be the silent-accept shape #3184 measures
+    // (EXIT=3 instead of 79, with no diagnostic at any severity).
+    BEZEL_EXPECT_FALSE(outcome.appBuild.success);
 }
 
 }  // namespace bezel::module
