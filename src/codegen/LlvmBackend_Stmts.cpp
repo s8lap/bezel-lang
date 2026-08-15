@@ -1715,13 +1715,43 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // propagate to. // per §30.5 kind 2, v0.254
             if (const auto* awaitUE =
                     dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
-                if (awaitUE->op == "await" && awaitUE->operand &&
-                    (dynamic_cast<const ast::CallExpr*>(awaitUE->operand.get()) !=
-                         nullptr ||
-                     chainedReturnOwnedTaskSource(*awaitUE->operand) != nullptr ||
-                     chainedReturnOwnedTaskParamSource(*awaitUE->operand) !=
-                         nullptr)) {
-                    asyncChainedReturn_ = true;
+                if (awaitUE->op == "await" && awaitUE->operand) {
+                    // §30.5 kind 2 (chained) — see the chainedReturnOwnedTaskSource
+                    // comment above for the full derivation. An anonymous
+                    // producer, an OWNED LOCAL source, OR an OWNED PARAMETER
+                    // source (#3126) transfers the source task into the outer
+                    // task's chained slot.
+                    if (dynamic_cast<const ast::CallExpr*>(
+                            awaitUE->operand.get()) != nullptr ||
+                        chainedReturnOwnedTaskSource(*awaitUE->operand) != nullptr ||
+                        chainedReturnOwnedTaskParamSource(*awaitUE->operand) !=
+                            nullptr) {
+                        asyncChainedReturn_ = true;
+                    }
+                    // fix #3125: §30.5 Pattern A **kind 3** — every other
+                    // Pattern A `Task<T:class>` source this body does NOT own
+                    // (a plain parameter, an `owned` field of `this` read
+                    // without `move`, a borrow field, an owning-collection
+                    // slot, a borrowing-iteration variable, an admitted static
+                    // task field/property, a §28.10 borrow PIN
+                    // `using var t2 := task;` — registered no `d.task`, so
+                    // this body never owned the frame, etc.). §30.5 says the
+                    // outer task's teardown disposes nothing on this link —
+                    // the source's owner keeps disposing the source task
+                    // transitively. Without this flag the `else if (v &&
+                    // asyncPatternAResultDisposer_)` arm below fires and
+                    // attaches the kind-1 disposer, giving the borrowed
+                    // result TWO owners — heap-use-after-free + double free.
+                    // Mutual exclusion with kind 2 is structural: the three
+                    // predicates (chainedReturnOwnedTaskSource,
+                    // chainedReturnOwnedTaskParamSource, and
+                    // chainedReturnBorrowedTaskSource) are asked of the same
+                    // operand and share patternAResultDisposerFor as their
+                    // Pattern-A source of truth, so only one can fire on any
+                    // given site.
+                    else if (chainedReturnBorrowedTaskSource(*awaitUE->operand)) {
+                        asyncBorrowedReturn_ = true;
+                    }
                 }
             }
         }
@@ -1828,6 +1858,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // source-task free; we must reset before any possible re-entry).
         bool chainedReturn = asyncChainedReturn_;
         asyncChainedReturn_ = false;
+        // fix #3125: §30.5 Pattern A **kind 3** twin — `return await <borrowed
+        // source>`. Same read-and-clear pattern as the chained-return flag: it
+        // is set by the detection block above (see fix #3096 / #3129 in the
+        // chained-return detection comment), survives only long enough for
+        // lowerAwait to read it and for this return-statement site to route it
+        // to emitAsyncPatternAResultDecision, then is reset.
+        bool borrowedReturn = asyncBorrowedReturn_;
+        asyncBorrowedReturn_ = false;
         if (diverged_) return true;  // CG40: the value expression threw
         // #2491 (return-path twin of #2434): a return statement's value
         // expression was present but failed to lower — either lowerExpr
@@ -2060,6 +2098,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // uses it to call bz_task_set_chained on the outer task. // per
                 // §30.5 kind 2, v0.252
                 fr.chainedAsyncReturn = chainedReturn;
+                // fix #3125 / §30.5 Pattern A kind 3: same propagation, twin of
+                // the chained flag above, for `return await <borrowed source>`
+                // routed through a `finally`. The terminal mode-5 site asks
+                // emitAsyncPatternAResultDecision to skip the kind-1 disposer
+                // attach — the source's owner keeps disposing the source task
+                // (transitively disposing the result), and the outer task's
+                // teardown disposes nothing. The two flags are mutually
+                // exclusive on the same return-statement site (one operand,
+                // one answer).
+                fr.borrowedAsyncReturn = borrowedReturn;
                 builder_.CreateStore(builder_.getInt32(5), fr.exitModSlot);
                 builder_.CreateBr(fr.finNormalBB);
                 return true;
@@ -2126,7 +2174,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // bz_task_complete notifies continuations that may free the outer task
             // on a racing thread and any chained/disposer call AFTER complete would
             // touch freed memory. // per §30.5 kind 1 + kind 2, v0.252
-            emitAsyncPatternAResultDecision(chainedReturn);
+            // fix #3125: pass borrowedReturn too — see emitAsyncPatternAResultDecision.
+            emitAsyncPatternAResultDecision(chainedReturn, borrowedReturn);
             emitAsyncComplete(v);
             builder_.CreateRetVoid();
             return true;
@@ -3357,13 +3406,30 @@ bool Emitter::lowerOwningInlineArrayReassign(const ast::Expr& target,
 // only on the no-finally branch of the ReturnStmt handler, so a return routed
 // through a `try/finally` skipped both arms (no chained source, no disposer).
 // This helper is the single predicate-with-several-readers shape: emit one of
-// the two pre-emitAsyncComplete calls based on `chainedReturn`. Called from
-// (a) the ReturnStmt no-finally branch and (b) lowerTry's mode-5 terminal
-// dispatch, so the decision reaches emitAsyncComplete on every Pattern A exit.
-// MUST run BEFORE emitAsyncComplete: bz_task_complete notifies continuations
-// that may free the outer task on a racing thread, so any attachment chained
-// AFTER complete would touch freed memory. // per §30.5 kind 1 + kind 2, v0.252
-void Emitter::emitAsyncPatternAResultDecision(bool chainedReturn) {
+// the two pre-emitAsyncComplete calls based on `chainedReturn` (and skip both
+// for `borrowedReturn`, fix #3125). Called from (a) the ReturnStmt no-finally
+// branch and (b) lowerTry's mode-5 terminal dispatch, so the decision reaches
+// emitAsyncComplete on every Pattern A exit. MUST run BEFORE emitAsyncComplete:
+// bz_task_complete notifies continuations that may free the outer task on a
+// racing thread, so any attachment chained AFTER complete would touch freed
+// memory. // per §30.5 kind 1 + kind 2 + kind 3, v0.252 + v0.254
+void Emitter::emitAsyncPatternAResultDecision(bool chainedReturn,
+                                               bool borrowedReturn) {
+    // fix #3125: §30.5 Pattern A **kind 3** — `return await <borrowed source>`.
+    // The outer task's teardown disposes nothing on this link (the source's
+    // owner keeps disposing the source task, transitively disposing the
+    // result). This is structurally a NO-OP, so neither the chained-slot call
+    // nor the kind-1 disposer attach runs. `chainedReturn` and `borrowedReturn`
+    // are mutually exclusive on the same return-statement site — both are
+    // derived from the same operand by predicates that share
+    // patternAResultDisposerFor as their Pattern-A source of truth — but the
+    // BORROWED check has higher priority here because it is the more
+    // conservative answer: kind 1 attaching a disposer to a borrow is the bug,
+    // so even if a stale `chainedReturn` reached this site (it cannot, but
+    // defensively), kind 3 wins and disposes nothing.
+    if (borrowedReturn) {
+        return;
+    }
     if (chainedReturn) {
         // §30.5 / #1332 (v0.162): Pattern A chained return — chain the source
         // task (set by emitAwaitSuspend into asyncPendingTaskField_ and NOT freed
@@ -3909,6 +3975,11 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // (further below) needs the flag to decide whether to call
         // bz_task_set_chained on the outer task at the terminal emitAsyncComplete.
         bool myChainedAsyncRet = finallyStack_.back().chainedAsyncReturn;
+        // fix #3125: kind-3 BORROWED twin — the same finally's frame carries
+        // the borrowed-return flag (set by the same ReturnStmt site, on the
+        // same routed edge). The terminal mode-5 dispatch reads it to ask
+        // emitAsyncPatternAResultDecision to skip the kind-1 disposer attach.
+        bool myBorrowedAsyncRet = finallyStack_.back().borrowedAsyncReturn;
         // Pop the frame — outer frames (if any) are now at back().
         finallyStack_.pop_back();
         if (!finallyBodyStack_.empty()) finallyBodyStack_.pop_back();
@@ -4124,6 +4195,14 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // // per §30.5 kind 2, v0.252
                 outerFr->chainedAsyncReturn =
                     outerFr->chainedAsyncReturn || myChainedAsyncRet;
+                // fix #3125: kind-3 BORROWED twin of the chained flag above.
+                // Mutually exclusive with chainedAsyncReturn on the same
+                // ReturnStmt site (both are derived from the same operand by
+                // predicates sharing patternAResultDisposerFor) — propagating
+                // both is harmless because emitAsyncPatternAResultDecision
+                // asks borrowedReturn FIRST.
+                outerFr->borrowedAsyncReturn =
+                    outerFr->borrowedAsyncReturn || myBorrowedAsyncRet;
                 builder_.CreateBr(outerFr->finNormalBB);
             } else {
                 // fix #1567 / §29.7/§28.10 (v0.182): no enclosing finally —
@@ -4141,7 +4220,10 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // of the no-enclosing-finally branch into this helper so BOTH
                 // exit edges — the direct branch and this routed edge — apply
                 // it identically. // per §30.5 kind 1 + kind 2, v0.252
-                emitAsyncPatternAResultDecision(myChainedAsyncRet);
+                // fix #3125: pass the borrowed-return flag too — see
+                // emitAsyncPatternAResultDecision. The kind-3 BORROWED case
+                // is a NO-OP (no chained-slot, no disposer).
+                emitAsyncPatternAResultDecision(myChainedAsyncRet, myBorrowedAsyncRet);
                 emitAsyncComplete(rv);
                 builder_.CreateRetVoid();
             }

@@ -904,13 +904,72 @@ sema::ParameterSymbol* Emitter::chainedReturnOwnedTaskParamSource(
     if (!patternAResultDisposerFor(taskTy)) return nullptr;   // (1)
     return ps;
 }
-// Not admitted here, and each is its own filed defect rather than an oversight:
-// every kind-3 BORROWED source (a plain borrow parameter, a `using var` pin, a
-// field read, a static task field) — which needs the kind-1 disposer SKIPPED
-// rather than a chain established — a third state this two-valued function
-// cannot express (#3126's *borrow* half, the next filed defect; the *move-out*
-// half is this fix). Returning null for those leaves their codegen exactly as
-// it was.
+// Not admitted here:
+//   - every kind-3 BORROWED source (a plain borrow parameter, a `using var` pin,
+//     a field read, a static task field, etc.) — fixed by `chainedReturnBorrowed
+//     TaskSource` below (#3125), a sibling predicate that admits every Pattern A
+//     source this body does NOT own.
+//   - an `owned` PARAMETER source — fixed by `chainedReturnOwnedTaskParamSource`
+//     (#3126), a sibling predicate that admits exactly that row and suppresses
+//     the §30.1 frame auto-drop on the chained edge.
+//
+// fix #3125: §30.5 Pattern A **kind 3** — `return await <borrowed source>`.
+//
+//   "When the source is a **borrow** — an admitted static task field or
+//    property, an `owned` field of `this` read without `move`, an owning-
+//    collection slot, a borrowing-iteration variable, or any other admitted
+//    borrowed operand — no ownership transfers: the outer task's result
+//    slot records a **borrow through the source task**, and the outer task's
+//    teardown disposes **nothing** on that link."
+//
+// Companion to chainedReturnOwnedTaskSource (kind 2): that one returns non-null
+// only when the body OWNS the source's frame; this one returns true only when
+// the body has a BORROW of a Pattern A source — i.e. the operand's static type
+// is a `Task<T:class>` the body does not own. Mutual exclusion is what makes
+// the same return-statement site able to call exactly one of three arms
+// (kind 1 disposer attach / kind 2 chain / kind 3 dispose-nothing) without
+// any overlap.
+//
+// Both predicates MUST agree on what "Pattern A" means, so they share the
+// single source of truth — patternAResultDisposerFor. Asking it directly is
+// what keeps this from drifting away from chainedReturnOwnedTaskSource's
+// decision (which itself asks it the same way). The two complementary
+// predicates therefore cover exactly the rows where an `await` inside a
+// `Task<T:class>`-returning async method can appear:
+//
+//   chainedReturnOwnedTaskSource:   CallExpr (anonymous producer)        → kind 2
+//                                  IdentifierExpr + owns-the-frame local → kind 2
+//                                  (Owned parameter source: still unfixed #3126/#3157.)
+//
+//   chainedReturnBorrowedTaskSource: anything else whose type is Pattern A → kind 3
+//   (this function)
+//
+// Everything else (Task<value/string/runtime-managed> T, or OwningTask<T>):
+// the `else if (asyncPatternAResultDisposer_)` arm in
+// emitAsyncPatternAResultDecision is null, so no kind-1 disposer attaches —
+// either because there is no result to dispose (value/string/runtime-managed)
+// or because the await itself takes ownership (OwningTask<T>, Pattern B).
+//
+// Note the deliberate asymmetry: chainedReturnOwnedTaskSource returns the
+// `LocalDecl*` because chainedReturnOwnedTaskSource's caller uses it to NULL
+// the source's slot at scope-end deferral (Stmts.cpp ~2075). This function
+// only needs a yes/no — the kind-3 path emits nothing on the outer task at
+// all, so there is no source-slot to coordinate with.
+bool Emitter::chainedReturnBorrowedTaskSource(const ast::Expr& operand) {
+    const sema::TypeRef* ty = ctx_.exprType(operand);
+    if (!patternAResultDisposerFor(ty)) return false;  // not Pattern A
+    // Anonymous producer — kind 2 chained (handled by chainedReturnOwnedTaskSource).
+    if (dynamic_cast<const ast::CallExpr*>(&operand)) return false;
+    // Owned named local — kind 2 chained (handled by chainedReturnOwnedTaskSource).
+    if (chainedReturnOwnedTaskSource(operand)) return false;
+    // Everything else whose type is Pattern A is a borrow: a plain (non-owned)
+    // parameter, an `owned` field of `this` read without `move`, a borrow
+    // field, an owning-collection slot, a borrowing-iteration variable, an
+    // admitted static task field/property, a §28.10 borrow PIN
+    // (`using var t2 := task;` — registered no `d.task`, so this body never
+    // owned the frame), or any other admitted borrowed operand.
+    return true;
+}
 
 
 void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,

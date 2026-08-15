@@ -4319,6 +4319,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
       lastCallGenericSubst_(std::move(e.lastCallGenericSubst_)),
       inlinedAccessorEnd_(e.inlinedAccessorEnd_),
       asyncChainedReturn_(e.asyncChainedReturn_),
+      asyncBorrowedReturn_(e.asyncBorrowedReturn_),
       pendingOwnedParams_(std::move(e.pendingOwnedParams_)),
       pendingArgsDisposal_(std::move(e.pendingArgsDisposal_)),
       genericSubstSemaTy_(e.genericSubstSemaTy_) {   // COPY: inherited, not cleared
@@ -4354,6 +4355,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     e.lastCallGenericSubst_.clear();
     e.inlinedAccessorEnd_        = nullptr;
     e.asyncChainedReturn_        = false;
+    e.asyncBorrowedReturn_       = false;
     e.pendingOwnedParams_.clear();
     e.pendingArgsDisposal_.reset();
     // genericSubstSemaTy_ is intentionally left as-is (see the note above):
@@ -4393,6 +4395,7 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
     e_.lastCallGenericSubst_      = std::move(lastCallGenericSubst_);
     e_.inlinedAccessorEnd_        = inlinedAccessorEnd_;
     e_.asyncChainedReturn_        = asyncChainedReturn_;
+    e_.asyncBorrowedReturn_       = asyncBorrowedReturn_;
     e_.pendingOwnedParams_        = std::move(pendingOwnedParams_);
     e_.pendingArgsDisposal_       = std::move(pendingArgsDisposal_);
     e_.genericSubstSemaTy_        = std::move(genericSubstSemaTy_);

@@ -1633,6 +1633,15 @@ private:
         // finally site at the ReturnStmt edge that set the exit mode to 5 sets
         // this only when the source was a §30.5-kind-2 chained operand.
         bool chainedAsyncReturn = false;
+        // fix #3125: §30.5 Pattern A **kind 3** twin of the above — a
+        // `return await <borrowed source>` routed through this finally must
+        // STILL skip the kind-1 disposer attach on the eventual
+        // emitAsyncComplete (the outer task's teardown disposes nothing).
+        // Mutually exclusive with chainedAsyncReturn — both are set by the
+        // same ReturnStmt site and read by the same mode-5 dispatch — but
+        // the two predicates ask different questions (owned vs. borrowed),
+        // so they cannot share a bit. See emitAsyncPatternAResultDecision.
+        bool borrowedAsyncReturn = false;
         // §21.5 (v0.201, #2051): labeled `break`/`continue` that CROSS this
         // finally to reach an OUTER loop. The fixed modes 0-6 name only the
         // innermost-loop break/continue (mode 2/3), so a labeled jump to an
@@ -9282,17 +9291,31 @@ private:
     // *Chaining from a scope-bound source*, MOVE-OUT HALF (v0.254): the
     // `ParameterSymbol` of the `owned` parameter a `return await <operand>`
     // chains FROM, when this async body OWNS that parameter's task frame.
-    // Null for every kind-3 BORROWED source (a non-`owned` parameter), for a
-    // non-`Task` parameter (no borrow is produced, so the parameter's ordinary
-    // §30.1 frame auto-drop is already correct), and for a non-Pattern-A task
-    // (`Task<value/string/runtime-managed T>` → no borrow; `OwningTask<T>` →
-    // Pattern B, await takes the result, kind 1 owns it). The caller pairs it
-    // with `chainedReturnOwnedTaskSource` — a kind-2 source is one OR the
-    // other — and suppresses the §30.1 auto-drop on the chained edge via
+    // Null for every kind-3 BORROWED source (a non-`owned` parameter — see
+    // chainedReturnBorrowedTaskSource below), for a non-`Task` parameter (no
+    // borrow is produced, so the parameter's ordinary §30.1 frame auto-drop is
+    // already correct), and for a non-Pattern-A task (`Task<value/string/
+    // runtime-managed T>` → no borrow; `OwningTask<T>` → Pattern B, await takes
+    // the result, kind 1 owns it). The caller pairs it with
+    // `chainedReturnOwnedTaskSource` — a kind-2 source is one OR the other —
+    // and suppresses the §30.1 auto-drop on the chained edge via
     // `nullStateMachineOwnedParamCapture` (§29.8 / §30.1 (#973a)). Definition
     // + rationale in LlvmBackend_Async.cpp beside chainedReturnOwnedTaskSource.
     sema::ParameterSymbol* chainedReturnOwnedTaskParamSource(
         const ast::Expr& operand);
+    // fix #3125: kind-3 BORROWED twin of chainedReturnOwnedTaskSource — returns
+    // true iff `operand` is an awaited source whose static type is a Pattern A
+    // `Task<T:class>` but which this body does NOT own (a plain parameter, an
+    // `owned` field of `this`, a borrow field, an owning-collection slot, a
+    // borrowing-iteration variable, an admitted static task field/property, a
+    // §28.10 borrow PIN, or any other admitted borrowed operand). Per §30.5
+    // kind 3 the outer task's teardown disposes nothing on this link. Mutually
+    // exclusive with `chainedReturnOwnedTaskSource` AND with
+    // `chainedReturnOwnedTaskParamSource` — all three predicates share
+    // `patternAResultDisposerFor` as their Pattern-A source of truth. Definition
+    // (with the asymmetry rationale) in LlvmBackend_Async.cpp beside
+    // chainedReturnOwnedTaskSource.
+    bool chainedReturnBorrowedTaskSource(const ast::Expr& operand);
 
     // #2279 (§30.5 Pattern A, v0.236): when the result type of a Pattern A
     // `Task<T:class>` is itself an INTRINSIC COLLECTION (Array<T> / Set<T> /
@@ -9351,7 +9374,8 @@ private:
     // MUST run BEFORE emitAsyncComplete: bz_task_complete notifies
     // continuations that may free the outer task on a racing thread, so any
     // attachment chained AFTER complete would touch freed memory.
-    void emitAsyncPatternAResultDecision(bool chainedReturn);
+    void emitAsyncPatternAResultDecision(bool chainedReturn,
+                                         bool borrowedReturn);
 
     // §30.13 (#439-followup): free the heap spill area pointed to from the
     // frame's spill-ptr field (asyncSpillPtrField_), if present. Emitted on each
@@ -9615,6 +9639,7 @@ private:
         std::unordered_map<std::string_view, llvm::Type*> lastCallGenericSubst_;
         llvm::BasicBlock*    inlinedAccessorEnd_;
         bool                 asyncChainedReturn_;   // #2731 item 1
+        bool                 asyncBorrowedReturn_;   // #3125
         // --- root-scope registration channels (#2731 item 3) ---
         std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>>
                              pendingOwnedParams_;
@@ -9698,6 +9723,19 @@ private:
     // free the source task immediately (it will be chained to the outer task).
     // Reset to false after lowerExpr returns in lowerStmt.
     bool asyncChainedReturn_ = false;
+    // fix #3125: §30.5 Pattern A **kind 3** — `return await <borrowed source>`,
+    // where the source is a borrow the body does NOT own (a plain parameter,
+    // a field read, a static field, a borrowing iteration variable, an
+    // owning-collection slot, a `using var t := source` pin, etc.). Per §30.5
+    // the outer task's teardown disposes nothing — the source's owner keeps
+    // disposing the source task (transitively disposing the result). When the
+    // only difference from kind 1 is the kind of operand, this flag fires so
+    // emitAsyncPatternAResultDecision can SKIP the kind-1 disposer attach.
+    // Mutually exclusive with asyncChainedReturn_ (kind 2 is the body-owns-
+    // the-source twin) — see chainedReturnBorrowedTaskSource, the one
+    // function that decides "Pattern A borrow". Reset to false after
+    // lowerExpr returns in lowerStmt, like its kind-2 twin.
+    bool asyncBorrowedReturn_ = false;
     // §30.1 (#1521): the current plain (non-iterator) async method's frame,
     // published by emitAsyncMethod right after buildStateMachineFrame so
     // emitAsyncOwnedParamAutoDispose can walk frame.captures from EVERY
