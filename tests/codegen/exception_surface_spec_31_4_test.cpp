@@ -111,11 +111,16 @@ BEZEL_TEST(codegen_exc_surface, cause_chain_single_count_spec_811) {
 }
 
 // The snapshot copies the cause's TYPE NAME (outermost cause first).
+// Post-#3119: built-in exception classes render as "System.<Name>" per
+// §8.5/§2.13 — the same module-path-qualified rendering the stdlib defines
+// for `Type.FullName`. #811's BY-SNAPSHOT ruling still pins the property
+// (the cause's TypeName IS captured); only the exact rendering string
+// moved to the qualified form.
 BEZEL_TEST(codegen_exc_surface, cause_chain_typename_spec_811) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var e := new Exception(\"outer\", new ArgumentException(\"inner\")); "
-        "  if e.CauseChain[0].TypeName = \"ArgumentException\" then return 1; end; "
+        "  if e.CauseChain[0].TypeName = \"System.ArgumentException\" then return 1; end; "
         "  return 0; "
         "end Main; end C;"), 1);
 }
