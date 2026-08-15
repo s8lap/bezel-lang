@@ -22774,6 +22774,60 @@ struct BoxEscapeWalker {
                static_cast<const void*>(loc->decl) == target;
     }
 
+    // Inline of Emitter::isObjectOrInterfaceTarget — the walker does not have
+    // an Emitter handle. §8.6: Object or an interface-declared Named type are
+    // the boxing-target shapes. Used by every §12.7-narrowed-read predicate
+    // below (LocalDecl / BinaryExpr / walkArgs), so it lives once at struct
+    // scope rather than being re-inlined per arm.
+    static bool isBoxingTarget(const sema::TypeRef* t) {
+        if (!t) return false;
+        using K = sema::TypeRef::Kind;
+        using P = sema::PrimitiveType;
+        if (t->kind == K::Primitive)
+            return t->primitive == P::Object;
+        if (t->kind == K::Named && t->declaration)
+            return t->declaration->kind == ast::TypeDeclKind::Interface;
+        return false;
+    }
+
+    // §12.7 / §8.6 / §28.9 / #3116 (post-#3200, v0.254): a BARE IDENTIFIER
+    // whose declared type is Object/interface (so it MAY be §12.7-narrowed)
+    // and whose CURRENT resolved expression type is a NON-Object/interface
+    // value type is a NON-CONSUMING READ — the codegen side
+    // (`narrowedBoxPayloadAddr` / `unboxNarrowedRead`, #3090) reads the box's
+    // PAYLOAD BYTES, never the wrapper. The widening from the existing
+    // type-test operand / null comparison / direct method call / console
+    // arg safe-read set matches the LocalDecl arm's `narrowedRead` just
+    // below — both look at the resolved type at this program point, not
+    // just the declared type, so a read OUTSIDE a narrowed block still
+    // classifies as escape. Mirrors `Emitter::narrowedIdentDeclaredType` but
+    // inlined because the walker has no Emitter handle (and because the
+    // walker only needs the Boolean answer, not the resolved narrowed
+    // type). fix #3116 measured: `if o is int then Console.WriteLine(o + 1);`
+    // in a 20-iteration loop leaked 480 B / 20 objects (24-byte `int`
+    // boxes); the LocalDecl copy-out twin leaked 24 B (or 32 B for `[3]int`)
+    // per iteration, and an ordinary call argument `Take(o)` in the same
+    // block leaked 24 B.
+    bool isNarrowedRead(const ast::Expr* e) const {
+        if (!e) return false;
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return false;
+        sema::Symbol* sym = ctx.exprSymbol(*id);
+        const sema::TypeRef* idDeclTy = nullptr;
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            idDeclTy = ls->declType;
+        } else if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+            idDeclTy = ps->resolvedDeclType
+                ? ps->resolvedDeclType
+                : (ps->declType ? ctx.resolvedType(*ps->declType) : nullptr);
+        } else {
+            return false;
+        }
+        if (!idDeclTy || !isBoxingTarget(idDeclTy)) return false;
+        const sema::TypeRef* nt = ctx.exprType(*id);
+        return nt && !isBoxingTarget(nt);
+    }
+
     // fix #2865 (§8.6/§28.9/§28.3, v0.240): call ARGUMENTS. Every position is
     // an escape (a plain parameter may be `owned`, and the callee could retain)
     // EXCEPT the value argument of `Console.Write`/`Console.WriteLine` and its
@@ -22785,11 +22839,26 @@ struct BoxEscapeWalker {
     // Console.WriteLine(o);` in a 20-iteration loop leaked 480 bytes in 20
     // objects. The relaxation cannot double-release: the console lowering does
     // not release a box argument (that is exactly why the shape leaked).
+    //
+    // fix #3116 (§12.7 / §8.6 / §28.9, v0.254) widens the safe-read set with
+    // `isNarrowedRead`: a §12.7-narrowed identifier passed as an ordinary
+    // call argument (`Take(o)` inside `if o is int then`) is a NON-CONSUMING
+    // READ — the codegen side reads the box's PAYLOAD and passes a value-type
+    // copy to the callee, the box wrapper stays uniquely held by `o`, and the
+    // §28.9 scope-end release is correct. Without the widening, `Take(o)`
+    // classifies as an escape and the release is suppressed — 24 B / iteration
+    // (one `int` box). The narrowing is the same shape `is`/`as` already
+    // admits, so the predicate mirrors it (LocalSymbol / ParameterSymbol,
+    // declared Object/interface, resolved non-Object/interface at this point).
+    // Inside a lambda the safe-read is suppressed — captured borrows live in
+    // the env, which outlives the producing scope.
     void walkArgs(const ast::Expr* callee,
                   const std::vector<ast::CallArgument>& args) {
         for (std::size_t i = 0; i < args.size(); ++i) {
             bool safe = args[i].name.empty() && args[i].modifier.empty() &&
-                        isConsoleNonRetainingArg(callee, i) && !inLambda;
+                        (isConsoleNonRetainingArg(callee, i) ||
+                         isNarrowedRead(args[i].value.get())) &&
+                        !inLambda;
             expr(args[i].value.get(), safe);
         }
     }
@@ -22813,6 +22882,18 @@ struct BoxEscapeWalker {
         // `o = null` / `o <> null`: a null comparison reads only. A comparison
         // against a NON-null operand is treated as an escape (defensive: it could
         // be `o = somethingThatAliases`); only the literal-null forms are safe.
+        //
+        // fix #3116 (§12.7 / §8.6 / §28.9, v0.254) widens the OTHER-operands
+        // arm (`o + 1`, `1 + o`, `o < other`, …) to admit a §12.7-narrowed
+        // identifier as the operand: the binary lowering reads the box's
+        // PAYLOAD, never the wrapper, so the box stays uniquely held by `o`
+        // and the §28.9 scope-end release is correct. Without the widening,
+        // `o + 1` inside `if o is int then` classified as an escape and the
+        // release was suppressed — 480 B / 20 iterations measured (24 B per
+        // `int` box). The narrowing predicate mirrors the LocalDecl arm and
+        // walkArgs: bare identifier, declared Object/interface, resolved
+        // non-Object/interface at this program point (so a read OUTSIDE the
+        // narrowed block still classifies as escape).
         if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
             if (b->op == "=" || b->op == "<>") {
                 bool lNull = dynamic_cast<const ast::NullLiteralExpr*>(
@@ -22823,10 +22904,8 @@ struct BoxEscapeWalker {
                 expr(b->right.get(), /*safeRead=*/lNull);
                 return;
             }
-            // Any other binary op on an Object operand is unusual; treat both
-            // operands as escapes (conservative).
-            expr(b->left.get(), /*safeRead=*/false);
-            expr(b->right.get(), /*safeRead=*/false);
+            expr(b->left.get(), /*safeRead=*/isNarrowedRead(b->left.get()));
+            expr(b->right.get(), /*safeRead=*/isNarrowedRead(b->right.get()));
             return;
         }
         // A bare member access on a boxed Object. The CallExpr arm below
@@ -23086,47 +23165,24 @@ struct BoxEscapeWalker {
                 const sema::TypeRef* declTy = ctx.resolvedType(*ld->type);
                 const sema::TypeRef* initTy =
                     ctx.exprType(*ld->initializer);
-                // Inline of Emitter::isObjectOrInterfaceTarget — the walker
-                // does not have an Emitter handle. §8.6: Object or an
-                // interface-declared Named type are the boxing-target shapes.
-                auto isBoxingTarget = [](const sema::TypeRef* t) {
-                    if (!t) return false;
-                    using K = sema::TypeRef::Kind;
-                    using P = sema::PrimitiveType;
-                    if (t->kind == K::Primitive)
-                        return t->primitive == P::Object;
-                    if (t->kind == K::Named && t->declaration)
-                        return t->declaration->kind ==
-                               ast::TypeDeclKind::Interface;
-                    return false;
-                };
+                // §8.6: Object or an interface-declared Named type are the
+                // boxing-target shapes (the shared `isBoxingTarget` defined
+                // at struct scope; #3116 lifted the LocalDecl-arm copy into
+                // a single helper used by all three narrowed-read arms).
                 if (declTy && initTy &&
                     !isBoxingTarget(declTy) &&
                     !isBoxingTarget(initTy)) {
                     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
                             ld->initializer.get())) {
-                        sema::Symbol* sym = ctx.exprSymbol(*id);
-                        // Both LocalSymbol and ParameterSymbol carry the
-                        // declared type (#3090's narrowedIdentDeclaredType
-                        // admits both; sema's narrowFromTypeTest narrows
-                        // both; a parameter is "the original variable" per
-                        // §12.7 just as a local is). Pick whichever the
-                        // symbol happens to be.
-                        const sema::TypeRef* idDeclTy = nullptr;
-                        if (auto* ls =
-                                dynamic_cast<sema::LocalSymbol*>(sym)) {
-                            idDeclTy = ls->declType;
-                        } else if (auto* ps =
-                                dynamic_cast<sema::ParameterSymbol*>(sym)) {
-                            idDeclTy = ps->resolvedDeclType
-                                ? ps->resolvedDeclType
-                                : (ps->declType
-                                    ? ctx.resolvedType(*ps->declType)
-                                    : nullptr);
-                        }
-                        if (idDeclTy && isBoxingTarget(idDeclTy)) {
-                            narrowedRead = true;
-                        }
+                        // The identifier's declared type being Object/
+                        // interface — checked via the same `isNarrowedRead`
+                        // the BinaryExpr / walkArgs arms use — is the
+                        // "currently narrowed at this program point" gate:
+                        // sema's narrowFromTypeTest narrows the LOCAL or
+                        // PARAMETER carrier (§12.7's "Narrowing applies to
+                        // the original variable"), and a parameter is "the
+                        // original variable" per §12.7 just as a local is.
+                        narrowedRead = isNarrowedRead(ld->initializer.get());
                     }
                 }
             }
