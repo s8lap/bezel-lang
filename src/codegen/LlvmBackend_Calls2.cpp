@@ -8177,10 +8177,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // (a.modifier carries "ref"/"out" written at the call site).
                 const std::size_t pi = static_cast<std::size_t>(fj);
                 std::string_view formalMod;
-                if (pi < ms->params.size())
+                const sema::TypeRef* formalTy = nullptr;
+                if (pi < ms->params.size()) {
                     if (auto* ps =
-                            dynamic_cast<sema::ParameterSymbol*>(ms->params[pi]))
+                            dynamic_cast<sema::ParameterSymbol*>(ms->params[pi])) {
                         formalMod = ps->modifier;
+                        formalTy = ps->resolvedDeclType;
+                    }
+                }
                 bool byRef = isByRefMod(a.modifier) || isByRefMod(formalMod);
                 llvm::Value* v;
                 if (byRef) {
@@ -8223,6 +8227,34 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     emitAccessorRefArgWriteBacks(accessorRefArgs,
                                                  /*emit=*/false);
                     return nullptr;
+                }
+                // fix #3133 / §7.2 / §2.5 (v0.252): an imported method's
+                // formal parameter is a `sema::TypeRef*` (resolvedDeclType),
+                // not an `ast::Type` node, so the CG-nullable block
+                // buildOrderedArgs runs against `params[idx].type` does NOT
+                // fire here — confirmation on issue #3133: a cross-module
+                // call with a nullable value-type parameter (`int?`,
+                // `bool?`, `long?`, `record?`, `Guid?`, …) passes the bare
+                // scalar / record / `ptr null` and `verifyModule` rejects the
+                // shape mismatch (`{ i8, T }` declared, `T` or `ptr null`
+                // supplied). Mirror the same three lines from
+                // buildOrderedArgs exactly: a `null` literal becomes the
+                // all-zero `{i8 0, T 0}` (nullableValueNull); a bare T
+                // becomes `{i8 1, T}` (wrapNullableValue); a value already
+                // shaped is left alone. No-op for ref/out (the `byRef` arm
+                // passes an address, which the callee receives as a pointer
+                // and never a tagged struct).
+                if (!byRef && formalTy && isNullableValueTy(formalTy)) {
+                    auto* expectedSt = nullableValueStructTy(formalTy);
+                    if (v->getType() != expectedSt) {
+                        if (v->getType()->isPointerTy() &&
+                            llvm::isa<llvm::ConstantPointerNull>(v)) {
+                            v = nullableValueNull(formalTy);
+                        } else if (v->getType() ==
+                                   expectedSt->getElementType(1)) {
+                            v = wrapNullableValue(formalTy, v);
+                        }
+                    }
                 }
                 // fix #2809 / §28.3 *Unbound owned temporaries* + §32.6
                 // (v0.240): the IMPORTED-callee twin of the registration
@@ -12065,10 +12097,14 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             }
             const std::size_t pi = static_cast<std::size_t>(fj);
             std::string_view formalMod;
-            if (pi < ms->params.size())
+            const sema::TypeRef* formalTy = nullptr;
+            if (pi < ms->params.size()) {
                 if (auto* ps =
-                        dynamic_cast<sema::ParameterSymbol*>(ms->params[pi]))
+                        dynamic_cast<sema::ParameterSymbol*>(ms->params[pi])) {
                     formalMod = ps->modifier;
+                    formalTy = ps->resolvedDeclType;
+                }
+            }
             bool byRef = isByRefMod(a.modifier) || isByRefMod(formalMod);
             llvm::Value* v;
             if (byRef) {
@@ -12084,6 +12120,26 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             if (!v) {
                 emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
                 return nullptr;
+            }
+            // fix #3133 / §7.2 / §2.5 (v0.252): the `?.` twin of the `.`
+            // form's nullable-VALUE wrap above. Same three-line mirror of
+            // buildOrderedArgs's CG-nullable block — a `null` literal
+            // becomes the all-zero `{i8 0, T 0}` struct, a bare T becomes
+            // `{i8 1, T}`, an already-shaped value is left alone. The
+            // cross-module receiver is provably non-null by the time we
+            // reach this loop (the `callBB` entry branch null-tests it),
+            // so the argument list itself always evaluates.
+            if (!byRef && formalTy && isNullableValueTy(formalTy)) {
+                auto* expectedSt = nullableValueStructTy(formalTy);
+                if (v->getType() != expectedSt) {
+                    if (v->getType()->isPointerTy() &&
+                        llvm::isa<llvm::ConstantPointerNull>(v)) {
+                        v = nullableValueNull(formalTy);
+                    } else if (v->getType() ==
+                               expectedSt->getElementType(1)) {
+                        v = wrapNullableValue(formalTy, v);
+                    }
+                }
             }
             ordered[pi] = v;
             orderedExprs[pi] = a.value.get();
