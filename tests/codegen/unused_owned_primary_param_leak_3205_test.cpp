@@ -219,3 +219,90 @@ BEZEL_TEST(codegen_unused_owned_primary_param_leak_3205,
     BEZEL_EXPECT_FALSE(r.ran);
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());  // confirm not just _n leaking
 }
+
+// =====================================================================
+// #3205 — REGRESSION GUARD (E): an `owned` primary-ctor parameter consumed
+// by the INHERITANCE CLAUSE'S BASE CALL (not by a field initializer, not by
+// a body) flows through to the base class's capture field and is disposed
+// exactly once. The base call is visited with `inFieldInitializer_ == true`
+// (per §22.10 v0.180 — initializer-or-base-call, treated identically), so
+// `posParamInitRef` is set and the derived class does NOT capture `r`
+// (ResourceHolder-equivalent: the base call consumes the value). The base
+// class's parameter `v` is itself unreferenced in Base (no body, no field
+// initializers, no base call of its own) and is therefore captured by #3205;
+// disposal of the derived instance disposes the base subobject, which
+// disposes `v` (the original `r`). LSan-clean + `ResL._n == 1`.
+//
+// Pins down the case #3224 names as an open question for spec authors:
+// "Should case 1's 'initializer consumes it' rule cover the BASE CALL
+// variant?". The implementation already covers it (because
+// `inFieldInitializer_` covers both initializer positions and the base call
+// — see ExprTypecheck.cpp:8845 the base-call visit block), but the case has
+// no direct regression coverage. Pre-#3205 the same shape would have leaked
+// the same way probe A did, IF Base's `v` had been unreferenced AND the
+// predicate had been `posParamBodyRef && !posParamInitRef` — but the base
+// case is structurally different (the derived class's `r` IS captured by
+// the predicate gate on `posParamInitRef` — `posParamBodyRef` is false but
+// `!posParamInitRef` is also false because the base call sets
+// `posParamInitRef`). Probe E thus tests the BASE-CALL-INIT-REF path that
+// `!posParamInitRef` correctly recognizes as "consumed by another mechanism,
+// no separate capture needed": Derived has no capture slot; the value is
+// transferred to Base's `v` and disposed there. #3205's widening has zero
+// effect on this case (it was already correctly NOT captured pre-fix), but
+// pinning the case down guards the §22.10 enumeration reading and the
+// inFieldInitializer_-covers-base-call invariant against regression.
+// =====================================================================
+BEZEL_TEST(codegen_unused_owned_primary_param_leak_3205,
+           base_call_consumed_owned_primary_param_disposed_via_base_capture_spec_22_10) {
+    // per §22.10 (v0.254) — initializer-or-base-call, treated identically.
+    JitResult r = runAotChecked(
+        std::string("module M; ") + kRes +
+        "public class BaseL(owned v: ResL) end BaseL; "
+        "public class DerivedL(owned r: ResL): BaseL(r) end DerivedL; "
+        "class C public static method Main(): int "
+        "  do using var u := new DerivedL(new ResL(5)); end; "
+        "  return ResL._n; "
+        "end Main; end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);            // LSan-clean (no leak through the base call)
+    BEZEL_EXPECT_EQ(r.exitCode, 1);      // ResL disposed exactly once (via BaseL's capture)
+}
+
+// =====================================================================
+// #3205 — REGRESSION GUARD (F): an `owned` primary-ctor parameter consumed
+// by the base call is correctly NOT captured in the derived class, and the
+// §21.9 bare-discard path therefore does NOT fire on the derived class
+// itself (it has no owned members — `r` was consumed by the base call). The
+// base class IS non-trivial-dispose (its captured `v` makes it so), but
+// bare-statement discard of the DERIVED class is rejected per §21.9 only
+// when the derived class itself carries the disposal obligation. The
+// derived class here transfers ownership to the base; a bare-statement
+// `new DerivedL(new ResL(7));` is then a derived-level leak of the base's
+// `v` slot: the derived instance is dropped without calling Dispose, so the
+// generated base-subobject Dispose never runs, so `v` (the original `r`) is
+// never disposed.
+//
+// This pins down the §22.10 / §21.9 interaction: the base call's consumption
+// moves the obligation to the base subobject, so the derived class's §21.9
+// reject fires on the base's behalf. Pre-#3205 the same shape (the probe-D
+// case) silently compiled; post-#3205 the §21.9 reject fires here too
+// because the BASE class is non-trivial-dispose — and a derived class whose
+// only disposal obligation is its base subobject's Dispose inherits that
+// non-triviality through the base-walk in the trivial-dispose classifier
+// (ExprTypecheck.cpp:11421 the cur->baseTypes walk).
+// =====================================================================
+BEZEL_TEST(codegen_unused_owned_primary_param_leak_3205,
+           bare_discard_of_base_call_consumed_owned_param_rejected_spec_21_9) {
+    // per §22.10 / §21.9 — base call consumes r; bare-discard of DerivedL leaks
+    // the base subobject's v; reject fires.
+    auto r = runAot(
+        std::string("module M; ") + kRes +
+        "public class BaseL2(owned v: ResL) end BaseL2; "
+        "public class DerivedL2(owned r: ResL): BaseL2(r) end DerivedL2; "
+        "class C public static method Main(): int "
+        "  new DerivedL2(new ResL(7)); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(r.ran);
+}
