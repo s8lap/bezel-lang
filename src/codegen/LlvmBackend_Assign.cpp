@@ -1562,6 +1562,62 @@ bool Emitter::rejectImportedVirtualBaseIndexer(
     return true;
 }
 
+// fix #3199 (§12.3 / §23 / §2.8.2, v0.254) — the named-property twin of
+// `rejectImportedVirtualBaseIndexer` (#2832) immediately above. See the header
+// for the contract and the ABI mechanism.
+//
+// `base.P` on an IMPORTED VIRTUAL base property:
+//   * an IMPORTED property has no ast::PropertyDecl (#2414: ModuleLoader
+//     reconstructs no AST), so every accessor call must go through
+//     `importedPropGetterFns_` / `-SetterFns_`; and
+//   * for a VIRTUAL imported property what sits in those maps is nothing:
+//     `emitExportedPropertyGetters`/`-Setters` (LlvmBackend_Setup.cpp) skip
+//     a virtual property ("Skip virtual/override/abstract/static — they have
+//     other dispatch paths"), so the exporter emits no
+//     `bz$<Class>$<Prop>$propget` symbol for it at all
+//     (confirmed by `nm` on a lib object: lowercase `t`, InternalLinkage).
+//     `declareImportedPropertyGetters`/`-Setters` correspondingly skip it
+//     (`if (propGetSlot_.count(ps)) continue;`).
+//
+// Calling the vtable-slot accessor for `base.P` would run the OVERRIDE
+// (the imported virtual accessor dispatches through the vtable, and the
+// derived override shares that slot — the same shape #2832 rejects for the
+// indexer form). MEASURED cross-module on HEAD: `base.P` returned -1 (the
+// #2491 zero/null degradation) where 8 is correct — no compile error, only
+// an `internal:` diagnostic that does not fail the build; the WRITE
+// half (`base.P := 7`) silently dropped, leaving `_v` untouched
+// (measured exit 3 where 7 is correct).
+//
+// Report instead of emitting it: a clean compile error beats a silent wrong
+// value. The ABI addition that would make it work is the property analog of
+// #2837's fix direction — out of scope for this interim reject, which matches
+// the indexer twin's own interim (#2832) exactly.
+//
+// The imported NON-virtual case is untouched and correct (measured through
+// `base.P`, `this.P`, and a derived override of a non-virtual imported base
+// property): its entry point IS the direct `bz$…$propget` stub that
+// `emitExportedPropertyGetters` defines and `declareImportedPropertyGetters`
+// declares.
+bool Emitter::rejectImportedVirtualBaseProperty(
+    const ast::MemberAccessExpr& ma, const sema::PropertySymbol* ps) {
+    if (!ps) return false;
+    if (dynamic_cast<const ast::PropertyDecl*>(ps->decl)) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get());
+    if (!id || id->name != "base") return false;
+    if (!isVirtualProperty(ps)) return false;
+    ctx_.diagnostics().report(
+        Severity::Error, ma.span.begin,
+        "cannot lower `base." + std::string(ps->name) +
+            "` against the imported virtual property on `" +
+            std::string(ps->parent ? ps->parent->name : "") +
+            "` — §12.3 requires the base class's own implementation, but the "
+            "cross-module property ABI exports a direct entry point only for "
+            "a NON-virtual property, so the only imported entry available "
+            "dispatches virtually and would run the override "
+            "(§12.3/§23/§2.8.2) — #3199");
+    return true;
+}
+
 llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
@@ -6332,6 +6388,17 @@ bool Emitter::lowerImportedPropertySet(const ast::Expr& target,
     if (!ma || !ma->target) return false;
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
     if (!ps || ps->isIndexer) return false;
+    // fix #3199 (§12.3 / §23 / §2.8.2, v0.254): reject `base.P := v` on an
+    // IMPORTED VIRTUAL base property with a clean §12.3 error, the write twin
+    // of the indexer reject (#2832) and the read path added at
+    // `LlvmBackend_Exprs.cpp` ~5524. Pre-fix this function silently dropped
+    // the write (the imported virtual property has no entry in
+    // `importedPropSetterFns_`, so the `count` check below declined it without
+    // any diagnostic and the caller's lvalueAddr fallback couldn't resolve a
+    // PropertySymbol — measured `base.P := 7` left `_v` at 3 where 7 is
+    // correct). Checked here, BEFORE the `value` lowering (the #2204
+    // discipline), so a rejected target never double-evaluates it.
+    if (rejectImportedVirtualBaseProperty(*ma, ps)) return false;
     // fix #2885: the STATIC map is the second admissible shape — same #2204
     // discipline (a pure symbol-shape check with no side effects BEFORE
     // `value` is lowered, so a non-matching target never double-evaluates it).
@@ -6382,6 +6449,21 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
     // — reaches here. Explicit rather than implied, so this can never
     // shadow the local path if the caller order ever changes.
     if (dynamic_cast<const ast::PropertyDecl*>(ps->decl)) return false;
+    // fix #3199 (§12.3 / §23 / §2.8.2, v0.254): reject `base.P += v` /
+    // `base.P++` on an IMPORTED VIRTUAL base property with a clean §12.3
+    // error, the compound/incr twin of the plain-`:=` reject just above and
+    // the read path's twin in `LlvmBackend_Exprs.cpp`. Pre-fix this branch
+    // silently dropped the compound / increment too: the vtable-slot gate
+    // below declined without a diagnostic, and the callers' generic
+    // lvalueAddr fallback cannot resolve a PropertySymbol. Mirrors the
+    // indexer twin (#2832), whose `rejectImportedVirtualBaseIndexer` is
+    // called from `lowerIndexerCompound` (LlvmBackend_Assign.cpp ~2867).
+    // MUST come BEFORE the vtable-slot decline below: that decline handles
+    // `this.P OP= v` (virtual dispatch is correct there), so an ordering
+    // that put the §12.3 reject AFTER it would silently drop the increment
+    // spell — measured `base.P++` compiled cleanly on HEAD with only an
+    // `internal:` warning and runtime `_v` left at 3 where 4 is correct.
+    if (rejectImportedVirtualBaseProperty(*ma, ps)) return false;
     // An imported VIRTUAL / INTERFACE property dispatches through its vtable
     // or itable slot (#2858 for the increment spelling, #481 for the compound
     // one) and must not be bound statically here. Both callers try those

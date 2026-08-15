@@ -4396,6 +4396,21 @@ private:
     bool rejectImportedVirtualBaseIndexer(const ast::IndexExpr& ix,
                                           const sema::PropertySymbol* ps);
 
+    // fix #3199 (§12.3 / §23 / §2.8.2, v0.254): the named-property twin of
+    // `rejectImportedVirtualBaseIndexer` — an IMPORTED VIRTUAL PROPERTY
+    // accessed through `base`. The property analog of the indexer hole:
+    // `emitExportedPropertyGetters`/`-Setters` (LlvmBackend_Setup.cpp) skip
+    // a virtual property, so the dependency object exports no
+    // `bz$<Class>$<Prop>$propget` for it; the importer-side
+    // `declareImportedPropertyGetters`/`-Setters` skip it too
+    // (`if (propGetSlot_.count(ps)) continue;`). The `base.P` lowering then
+    // finds nothing in `importedPropGetterFns_` / `-SetterFns_` and falls
+    // through to #2491's zero/null degradation — a silent wrong value where
+    // §12.3 requires the base class's own implementation. Report cleanly
+    // instead, mirroring the indexer reject exactly.
+    bool rejectImportedVirtualBaseProperty(
+        const ast::MemberAccessExpr& ma, const sema::PropertySymbol* ps);
+
     // §22.10: emit the getter of an indexer property via inline body.
     // Returns the loaded value, or null if no indexer applies.
     llvm::Value* lowerIndexerGet(const ast::IndexExpr& ix);

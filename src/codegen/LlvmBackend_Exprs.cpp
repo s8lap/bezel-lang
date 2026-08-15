@@ -5498,6 +5498,18 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // declareImportedPropertyGetters.
         if (auto* ps =
                 dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma))) {
+            // fix #3199 (§12.3 / §23 / §2.8.2, v0.254): the imported-virtual
+            // base-property read twin of #2832's `rejectImportedVirtualBase
+            // Indexer`. Pre-fix, `base.P` on an imported VIRTUAL base property
+            // fell through this whole block with `importedPropGetterFns_.find
+            // (ps) == end()` (declareImportedPropertyGetters skips virtual
+            // properties), reached the #2491 zero/null degradation, and
+            // returned the wrong value silently — the issue's own repro
+            // measured -1 where 8 is correct, with only an `internal:`
+            // diagnostic that does not fail the build. The indexer twin
+            // (#2832) rejects this shape with a clean §12.3 error; the
+            // property analog must do the same.
+            if (rejectImportedVirtualBaseProperty(*ma, ps)) return nullptr;
             // fix #2885 (§22.12/§22.13/§2.8.2 clause 1/§23, v0.240): an
             // imported STATIC property reads through its own no-`this` stub.
             // `ma->target` names a TYPE here, so the receiver lowering below
