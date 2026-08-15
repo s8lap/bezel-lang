@@ -1670,17 +1670,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // lowerStmt will chain the source task to the outer task after the await.
         // (v0.252 / fix #3096: `<source>` is an anonymous producer CALL *or* an
         // OWNED named task local — see the widening note on the inner `if`.)
-        // Guard: no finally in flight (the finally path's emitAsyncComplete call would
-        // need separate chaining, deferred; in that case fall back to normal free).
-        // ⚠ #3129: that fallback is now known to be WRONG rather than merely
-        // conservative — a `return await <source>` routed through a `finally`
-        // reaches NEITHER the chained-slot branch NOR the kind-1 disposer arm
-        // below (both live in the *no enclosing finally* branch), so the outer
-        // task records neither of §30.5's kinds and the source's scope end frees
-        // a result the caller still borrows. Filed, not fixed here.
+        // §30.5 / #1332 (v0.162): detect `return await <source>` with a pointer-typed
+        // result inside an async method — Pattern A chained return. If detected, set
+        // asyncChainedReturn_ so lowerAwait does NOT free the source task immediately;
+        // lowerStmt will chain the source task to the outer task after the await.
+        // (v0.252 / fix #3096: `<source>` is an anonymous producer CALL *or* an
+        // OWNED named task local — see the widening note on the inner `if`.)
+        // fix #3129 / §30.5 Pattern A: the detection runs UNCONDITIONALLY now —
+        // even when an enclosing `finally` is in flight — because the routed-
+        // through-finally edge MUST also land in §30.5's kind 2 (chained slot)
+        // and the post-finally dispatch in lowerTry is the place that calls
+        // bz_task_set_chained. The earlier `&& finallyStack_.empty()` gate left
+        // that edge as a silent nothing — neither kind — so the source's scope
+        // end freed a result the caller still borrows. The flag is recorded on
+        // the FinallyFrame at the routing site below so it survives to lowerTry's
+        // mode-5 dispatch.
         // Guard: asyncResultTy_ is a pointer type (class/string, not int/bool/struct).
         if (rs->value && smKind_ == SuspendKind::Await && smStateStruct_ &&
-            asyncResultTy_ && asyncResultTy_->isPointerTy() && finallyStack_.empty()) {
+            asyncResultTy_ && asyncResultTy_->isPointerTy()) {
             // fix #3096 / §30.5 kind 2 *Chaining from a scope-bound source*
             // (v0.252): the CallExpr test was the WHOLE gate, so
             // `using var task := P(); return await task;` — the very shape
@@ -1697,6 +1704,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // chainedReturnOwnedTaskSource admits exactly the OWNED named
             // sources; a kind-3 BORROWED source stays out, because no transfer
             // is possible there (§30.5 kind 3).
+            //
+            // fix #3129: the same predicate also feeds fr.chainedAsyncReturn on
+            // the finally-routed edge below (a `return await <source>` inside
+            // a `try/finally` must STILL chain). // per §30.5 kind 2, v0.252
             if (const auto* awaitUE =
                     dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
                 if (awaitUE->op == "await" && awaitUE->operand &&
@@ -1987,9 +1998,50 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // that touched it, a use-after-dispose.
             if (!finallyStack_.empty()) {
                 auto& fr = finallyStack_.back();
+                // fix #3129 / §30.5 Pattern A kind 2: deferral on the routed-
+                // through-finally edge. The post-finally mode-5 dispatch (lowerTry)
+                // calls bz_task_set_chained for the outer task when the source's
+                // local is itself the owner (no move occurs; §30.5 *Chaining from
+                // a scope-bound source*). The deferral is per-EDGE, exactly like
+                // the no-finally branch: null the source's local slot immediately
+                // before emitDisposalsInRange, so the body's scope-end disposal
+                // sees a null task pointer (emitDisposals' `task.faf` arm skips
+                // it). The pointer itself survives in the frame's pending-task
+                // slot (lowerAwait wrote it there and lowerTry's mode-5 reads it
+                // back), so the eventual bz_task_set_chained finds it. // per
+                // §30.5 kind 2 deferral, v0.252
+                if (chainedReturn && rs->value) {
+                    if (const auto* awaitUE =
+                            dynamic_cast<const ast::UnaryExpr*>(
+                                rs->value.get())) {
+                        if (awaitUE->op == "await" && awaitUE->operand) {
+                            if (const ast::LocalDecl* srcLd =
+                                    chainedReturnOwnedTaskSource(
+                                        *awaitUE->operand)) {
+                                auto sit = locals_.find(srcLd);
+                                if (sit != locals_.end()) {
+                                    llvm::Type* sety = nullptr;
+                                    llvm::Value* saddr =
+                                        boxedStorage(sit->second, sety);
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(
+                                            ptrTy()),
+                                        saddr);
+                                }
+                            }
+                        }
+                    }
+                }
                 emitDisposalsInRange(fr.disposeDepthAtEntry, disposeStack_.size());
                 if (v && fr.asyncRetSlot)
                     builder_.CreateStore(v, fr.asyncRetSlot);
+                // fix #3129 / §30.5 Pattern A: record on the FinallyFrame that
+                // this async-return exit is kind-2 chained. The mode-5 dispatch
+                // in lowerTry propagates this flag through each finally along
+                // the path; the terminal mode-5 site (no enclosing finally)
+                // uses it to call bz_task_set_chained on the outer task. // per
+                // §30.5 kind 2, v0.252
+                fr.chainedAsyncReturn = chainedReturn;
                 builder_.CreateStore(builder_.getInt32(5), fr.exitModSlot);
                 builder_.CreateBr(fr.finNormalBB);
                 return true;
@@ -2036,61 +2088,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             }
             // No enclosing finally: dispose all live scopes, then complete.
             emitAllDisposals();
-            // §30.5 / #1332 (v0.162): Pattern A chained return — chain the source
-            // task (set by emitAwaitSuspend into asyncPendingTaskField_ and NOT freed
-            // because asyncChainedReturn_ suppressed bz_task_free) to the outer task
-            // BEFORE bz_task_complete. This ordering is required: bz_task_complete
-            // notifies continuations which may immediately free the outer task on a
-            // racing thread; calling bz_task_set_chained AFTER complete would be a
-            // UAF on the outer task pointer.
-            if (chainedReturn) {
-                // Load source task from the pending-task frame slot (still alive:
-                // freeTaskAfter=false kept it from being reclaimed in emitAwaitSuspend).
-                llvm::Value* pendField = builder_.CreateStructGEP(
-                    smStateStruct_, smSelf_, asyncPendingTaskField_);
-                llvm::Value* sourceTask =
-                    builder_.CreateLoad(ptrTy(), pendField, "chain.src");
-                // Load outer task pointer (set at async-method entry).
-                llvm::Value* otField = builder_.CreateStructGEP(
-                    smStateStruct_, smSelf_, asyncOuterTaskField_);
-                llvm::Value* outerTask =
-                    builder_.CreateLoad(ptrTy(), otField, "chain.outer");
-                // Transfer source-task lifetime ownership to the outer task's chained
-                // slot: bz_task_free(outer) will recursively free source when done.
-                auto* setChainedFn = declareC(
-                    "bz_task_set_chained", llvm::Type::getVoidTy(llvm_),
-                    {ptrTy(), ptrTy()});
-                builder_.CreateCall(setChainedFn, {outerTask, sourceTask});
-            } else if (v && asyncPatternAResultDisposer_) {
-                // §30.5 / #1503: Pattern A (Task<T:class>) NON-chained return —
-                // the async body produced a FRESH owned value, so the task owns
-                // the result directly (§30.5: "the task owns the result and its
-                // destructor disposes it directly"). Attach the per-T disposer
-                // to the outer task BEFORE bz_task_complete, same race-safety
-                // ordering as the chained-slot branch above (a continuation may
-                // free the task the instant it completes). bz_task_free
-                // consults this field whenever it eventually runs — whether the
-                // task is already settled at that point (an already-done `using
-                // var` scope-end / anonymous-await reclaim) or still running
-                // (the fire-and-forget completion continuation) — so both the
-                // "already done" and "still running at disposal time" cases in
-                // §30.5's "Disposing an unconsumed OwningTask<T>" text (which
-                // applies here by the same logic, even though that subsection
-                // is written for Pattern B) are covered by one mechanism. A
-                // borrow taken via a later `await`/`.Result` read does NOT
-                // consume/null the slot for Pattern A (only Pattern B's
-                // bz_task_take_result does that), so the result is disposed
-                // exactly once whether or not it was ever borrowed.
-                llvm::Value* otField = builder_.CreateStructGEP(
-                    smStateStruct_, smSelf_, asyncOuterTaskField_);
-                llvm::Value* outerTask =
-                    builder_.CreateLoad(ptrTy(), otField, "patterna.outer");
-                auto* setDisposerFn = declareC(
-                    "bz_task_set_result_disposer", llvm::Type::getVoidTy(llvm_),
-                    {ptrTy(), ptrTy()});
-                builder_.CreateCall(setDisposerFn,
-                                    {outerTask, asyncPatternAResultDisposer_});
-            }
+            // fix #3129 / §30.5 Pattern A: hoist the §30.5 kind 1 / kind 2 decision
+            // out of the *no enclosing finally* branch into a helper called from
+            // BOTH the direct branch and lowerTry's mode-5 dispatch, so a Pattern A
+            // return routed through a `finally` no longer falls off the end of the
+            // kind table. Same race-safety ordering as before: BOTH the chained-slot
+            // and the disposer attach BEFORE emitAsyncComplete, because
+            // bz_task_complete notifies continuations that may free the outer task
+            // on a racing thread and any chained/disposer call AFTER complete would
+            // touch freed memory. // per §30.5 kind 1 + kind 2, v0.252
+            emitAsyncPatternAResultDecision(chainedReturn);
             emitAsyncComplete(v);
             builder_.CreateRetVoid();
             return true;
@@ -3317,6 +3324,75 @@ bool Emitter::lowerOwningInlineArrayReassign(const ast::Expr& target,
 }
 
 
+// fix #3129 / §30.5 Pattern A: the §30.5 kind-1 / kind-2 decision used to live
+// only on the no-finally branch of the ReturnStmt handler, so a return routed
+// through a `try/finally` skipped both arms (no chained source, no disposer).
+// This helper is the single predicate-with-several-readers shape: emit one of
+// the two pre-emitAsyncComplete calls based on `chainedReturn`. Called from
+// (a) the ReturnStmt no-finally branch and (b) lowerTry's mode-5 terminal
+// dispatch, so the decision reaches emitAsyncComplete on every Pattern A exit.
+// MUST run BEFORE emitAsyncComplete: bz_task_complete notifies continuations
+// that may free the outer task on a racing thread, so any attachment chained
+// AFTER complete would touch freed memory. // per §30.5 kind 1 + kind 2, v0.252
+void Emitter::emitAsyncPatternAResultDecision(bool chainedReturn) {
+    if (chainedReturn) {
+        // §30.5 / #1332 (v0.162): Pattern A chained return — chain the source
+        // task (set by emitAwaitSuspend into asyncPendingTaskField_ and NOT freed
+        // because asyncChainedReturn_ suppressed bz_task_free) to the outer task
+        // BEFORE bz_task_complete. This ordering is required: bz_task_complete
+        // notifies continuations which may immediately free the outer task on a
+        // racing thread; calling bz_task_set_chained AFTER complete would be a
+        // UAF on the outer task pointer.
+        // Load source task from the pending-task frame slot (still alive:
+        // freeTaskAfter=false kept it from being reclaimed in emitAwaitSuspend).
+        llvm::Value* pendField = builder_.CreateStructGEP(
+            smStateStruct_, smSelf_, asyncPendingTaskField_);
+        llvm::Value* sourceTask =
+            builder_.CreateLoad(ptrTy(), pendField, "chain.src");
+        // Load outer task pointer (set at async-method entry).
+        llvm::Value* otField = builder_.CreateStructGEP(
+            smStateStruct_, smSelf_, asyncOuterTaskField_);
+        llvm::Value* outerTask =
+            builder_.CreateLoad(ptrTy(), otField, "chain.outer");
+        // Transfer source-task lifetime ownership to the outer task's chained
+        // slot: bz_task_free(outer) will recursively free source when done.
+        auto* setChainedFn = declareC(
+            "bz_task_set_chained", llvm::Type::getVoidTy(llvm_),
+            {ptrTy(), ptrTy()});
+        builder_.CreateCall(setChainedFn, {outerTask, sourceTask});
+    } else if (asyncPatternAResultDisposer_) {
+        // §30.5 / #1503: Pattern A (Task<T:class>) NON-chained return —
+        // the async body produced a FRESH owned value, so the task owns
+        // the result directly (§30.5: "the task owns the result and its
+        // destructor disposes it directly"). Attach the per-T disposer
+        // to the outer task BEFORE bz_task_complete, same race-safety
+        // ordering as the chained-slot branch above (a continuation may
+        // free the task the instant it completes). bz_task_free
+        // consults this field whenever it eventually runs — whether the
+        // task is already settled at that point (an already-done `using
+        // var` scope-end / anonymous-await reclaim) or still running
+        // (the fire-and-forget completion continuation) — so both the
+        // "already done" and "still running at disposal time" cases in
+        // §30.5's "Disposing an unconsumed OwningTask<T>" text (which
+        // applies here by the same logic, even though that subsection
+        // is written for Pattern B) are covered by one mechanism. A
+        // borrow taken via a later `await`/`.Result` read does NOT
+        // consume/null the slot for Pattern A (only Pattern B's
+        // bz_task_take_result does that), so the result is disposed
+        // exactly once whether or not it was ever borrowed.
+        llvm::Value* otField = builder_.CreateStructGEP(
+            smStateStruct_, smSelf_, asyncOuterTaskField_);
+        llvm::Value* outerTask =
+            builder_.CreateLoad(ptrTy(), otField, "patterna.outer");
+        auto* setDisposerFn = declareC(
+            "bz_task_set_result_disposer", llvm::Type::getVoidTy(llvm_),
+            {ptrTy(), ptrTy()});
+        builder_.CreateCall(setDisposerFn,
+                            {outerTask, asyncPatternAResultDisposer_});
+    }
+}
+
+
 bool Emitter::lowerTry(const ast::TryStmt& trys) {
     bool hasFin = trys.hasFinally;
     // §30.9 / §31.2 (#438): in an async state machine, an `await` inside a catch
@@ -3797,6 +3873,13 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // below emits a case per entry.
         std::vector<FinallyFrame::LabeledRoute> myLabeledRoutes =
             std::move(finallyStack_.back().labeledRoutes);
+        // fix #3129 / §30.5 Pattern A kind 2: snapshot the chained-return flag
+        // this finally's frame carries — captured at the ReturnStmt site that
+        // routed through this finally (see the ReturnStmt branch at the head of
+        // this file). The frame is about to be popped, and the mode-5 dispatch
+        // (further below) needs the flag to decide whether to call
+        // bz_task_set_chained on the outer task at the terminal emitAsyncComplete.
+        bool myChainedAsyncRet = finallyStack_.back().chainedAsyncReturn;
         // Pop the frame — outer frames (if any) are now at back().
         finallyStack_.pop_back();
         if (!finallyBodyStack_.empty()) finallyBodyStack_.pop_back();
@@ -4002,6 +4085,16 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                         builder_.CreateLoad(asyncResultTy_, asyncRetSlot);
                     builder_.CreateStore(rv, outerFr->asyncRetSlot);
                 }
+                // fix #3129 / §30.5 Pattern A kind 2: propagate the chained
+                // flag through each finally along the route. Any finally along
+                // the path that ran a non-chained `return` would have written
+                // its own mode-5 site with chainedAsyncReturn=false, but the
+                // innermost ReturnStmt that routed here is the only producer of
+                // mode 5 in the first place, so myChainedAsyncRet is the
+                // single source of truth for THIS async-return edge.
+                // // per §30.5 kind 2, v0.252
+                outerFr->chainedAsyncReturn =
+                    outerFr->chainedAsyncReturn || myChainedAsyncRet;
                 builder_.CreateBr(outerFr->finNormalBB);
             } else {
                 // fix #1567 / §29.7/§28.10 (v0.182): no enclosing finally —
@@ -4011,6 +4104,15 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 llvm::Value* rv = (asyncRetSlot && asyncResultTy_)
                     ? builder_.CreateLoad(asyncResultTy_, asyncRetSlot)
                     : nullptr;
+                // fix #3129 / §30.5 Pattern A: the terminal site for an
+                // async-return routed through a `finally` is the SAME one
+                // that calls emitAsyncComplete — and §30.5 requires that
+                // bz_task_set_chained (kind 2) or bz_task_set_result_disposer
+                // (kind 1) attach BEFORE complete. Hoist the decision out
+                // of the no-enclosing-finally branch into this helper so BOTH
+                // exit edges — the direct branch and this routed edge — apply
+                // it identically. // per §30.5 kind 1 + kind 2, v0.252
+                emitAsyncPatternAResultDecision(myChainedAsyncRet);
                 emitAsyncComplete(rv);
                 builder_.CreateRetVoid();
             }

@@ -1623,6 +1623,16 @@ private:
         // carries the value across the finally for exit mode 5; null for a
         // valueless `return` / a `Task` method / a non-async frame.
         llvm::AllocaInst* asyncRetSlot = nullptr;
+        // fix #3129 / §30.5 Pattern A kind 2: a `return await <source>` routed
+        // through this finally must STILL chain the source task onto the outer
+        // task on the eventual emitAsyncComplete — the post-finally mode-5
+        // dispatch applies the same chained-slot / disposer decision the direct
+        // branch makes. The ReturnStmt site records the decision here (carried
+        // through chained mode-5 dispatches in lowerTry) so the terminal case
+        // knows whether to call bz_task_set_chained. Initially false; the
+        // finally site at the ReturnStmt edge that set the exit mode to 5 sets
+        // this only when the source was a §30.5-kind-2 chained operand.
+        bool chainedAsyncReturn = false;
         // §21.5 (v0.201, #2051): labeled `break`/`continue` that CROSS this
         // finally to reach an OUTER loop. The fixed modes 0-6 name only the
         // innermost-loop break/continue (mode 2/3), so a labeled jump to an
@@ -9300,6 +9310,18 @@ private:
     // the outer-task pointer from the frame and calls bz_task_complete. Requires
     // the sm*_ async state to be live (smKind_ == Await).
     void emitAsyncComplete(llvm::Value* value);
+
+    // fix #3129 / §30.5 Pattern A: emit ONE of two pre-complete calls — the
+    // kind-2 chained slot (bz_task_set_chained) when chainedReturn is true,
+    // else the kind-1 per-T disposer (bz_task_set_result_disposer) when an
+    // asyncPatternAResultDisposer_ is set. The two arms are mutually
+    // exclusive. Called from both the ReturnStmt site (no enclosing finally)
+    // AND from lowerTry's mode-5 dispatch (finally-routed async-return), so
+    // the §30.5 decision reaches emitAsyncComplete on every exit edge.
+    // MUST run BEFORE emitAsyncComplete: bz_task_complete notifies
+    // continuations that may free the outer task on a racing thread, so any
+    // attachment chained AFTER complete would touch freed memory.
+    void emitAsyncPatternAResultDecision(bool chainedReturn);
 
     // §30.13 (#439-followup): free the heap spill area pointed to from the
     // frame's spill-ptr field (asyncSpillPtrField_), if present. Emitted on each
