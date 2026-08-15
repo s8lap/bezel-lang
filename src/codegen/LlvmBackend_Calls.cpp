@@ -440,13 +440,19 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             releaseRender = true;   // a fresh +1 concat accumulator
         } else if (argTy->kind == sema::TypeRef::Kind::Named &&
                    argTy->declaration) {
-            // Named type (class/record) — call ToString() via virtual
-            // dispatch if the type has a ToString method, else fall back
-            // to a type-name placeholder string.
+            // Named type (class/record/choice/enum) — call ToString() via virtual
+            // dispatch if the type has a user ToString method; otherwise dispatch
+            // on §8.5's KIND-specific default: records get the field listing
+            // (#3118), choices get the §35.7 case head (when auto-hashable), and
+            // classes/enums/other body records fall back to the type-name
+            // placeholder per §8.5.
             auto* ts = argTy->declaration;
-            // Find a 'ToString()' method walking the inheritance chain.
-            // ToString() may be declared on a base class (e.g. Shape)
-            // and inherited by the concrete type (Circle).
+            // Find a user 'ToString()' method walking the inheritance chain.
+            // A user ToString may be declared on a base class (e.g. Shape) and
+            // inherited by the concrete type (Circle); a record's default
+            // ToString is SYNTHESIZED (not a MethodSymbol) so it is invisible
+            // here, and a record receiver with no user override must take the
+            // KIND-specific dispatch below.
             sema::MethodSymbol* toStr = nullptr;
             for (auto* cur = ts; cur && !toStr;) {
                 for (auto* sym : cur->members) {
@@ -468,14 +474,85 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
                 // Emit the method call (virtual if overriding, static otherwise).
                 std::vector<llvm::Value*> args{arg};
                 strPtr = emitMethodCall(toStr, args, false);
+            } else if (ts->kind == ast::TypeDeclKind::Record &&
+                       recordIsAutoBearing(ts)) {
+                // fix #3118 (§8.5 / §9.1 / §9.2 / stdlib §2.1, v0.252): a
+                // positional or auto-equality body record reaches this arm
+                // whenever the type has no user `ToString()` MethodSymbol
+                // (records' default ToString is synthesized, not declared).
+                // Previously fell to the class/enum type-name branch and
+                // rendered only the bare head — silently dropping the §8.5
+                // field listing the explicit `p.ToString()` and the §18.5
+                // interpolation hole already render correctly. Delegate to
+                // the SAME `emitRecordToString` `lowerValueSemMethodOn` and
+                // the §18.5 interpolation chain both reach, so the three
+                // spellings of one §8.5 answer cannot diverge again (the
+                // shape #2913 / #2969 already showed).
+                //
+                // The receiver must be a STRUCT VALUE: `emitRecordToString`
+                // walks storage members via `CreateExtractValue`, which
+                // requires a struct-typed operand. The argument lowered
+                // above may still be a pointer (e.g. a `new Pt(1,2)` heap
+                // slot), so load it first — the same load pattern
+                // `lowerValueSemMethodOn` already uses for a record's
+                // directly-typed `.ToString()` call.
+                //
+                // §14.1 (#462 / #2047): for a GENERIC record receiver
+                // (`Box<string>`), install the substitution so the
+                // specialized struct is loaded and `T`-typed fields resolve
+                // to their concrete type under the active subst. A no-op
+                // for a non-generic record.
+                RecordSubstGuard recSubst(this, argTy);
+                llvm::StructType* rst = recordStruct(ts);
+                if (!rst) return false;
+                llvm::Value* recVal = arg->getType()->isPointerTy()
+                    ? builder_.CreateLoad(rst, arg, "wln.rec.l")
+                    : arg;
+                if (!recVal->getType()->isStructTy()) return false;
+                strPtr = emitRecordToString(recVal, ts);
+                if (!strPtr) return false;
+                // fix #3118 / #2066 / §4.6 / §28.9 (v0.252): emitRecordToString
+                // returns a FRESH +1 producer (its `acc` chain is a series of
+                // `emitStringConcat` results, each rc=1; the final accumulator
+                // is the bound +1). The same discharge discipline the nullable-
+                // value branch above and the explicit `p.ToString()` call apply.
+                // A `releaseRender = false` here leaks one rc=1 string per
+                // `Console.WriteLine(p)` for an auto-bearing record — measured
+                // as a fresh per-call leak in the leak gate.
+                releaseRender = true;
+            } else if (ts->kind == ast::TypeDeclKind::Choice &&
+                       sema::isAutoEqualityBearingChoice(ts, ctx_, argTy)) {
+                // §35.7 (v0.210, #2083 rework finding 2) — #2479 follow-up
+                // surfaced via #3118: a CHOICE receiver with no user
+                // ToString override, auto-hashable, takes the synthesized
+                // `"TypeName.CaseName(field: value, ...)"` rendering
+                // `emitChoiceToString` produces. The direct `.ToString()`
+                // call (lowerValueSemMethodOn), the §18.5 interpolation
+                // hole, and the nested-field formatting chain (via
+                // emitValueToString) all reach it; `Console.WriteLine(c)`
+                // was the FOURTH spelling, and the only one that fell to
+                // the type-name branch — the same "N places, one rule"
+                // shape #3118 documents for records. Same discharge as
+                // the record arm above.
+                llvm::StructType* cst = choiceStruct(ts);
+                if (!cst) return false;
+                llvm::Value* choiceVal = arg->getType()->isPointerTy()
+                    ? builder_.CreateLoad(cst, arg, "wln.ch.l")
+                    : arg;
+                if (!choiceVal->getType()->isStructTy()) return false;
+                strPtr = emitChoiceToString(choiceVal, ts);
+                if (!strPtr) return false;
+                releaseRender = true;
             } else {
                 // No ToString override — use type name as placeholder string.
                 // fix #2934 (§8.5, v0.252): this arm is reached by a CLASS, an
-                // ENUM and a RECORD receiver alike (the gate above is only
-                // "Named with a declaration"), and §8.5 renders those three
-                // differently — the first two qualified, a record head not.
-                // `spec85NameOnlyDefaultSpelling` is the one predicate that
-                // knows the split; do not inline a `ts->name` here again.
+                // ENUM, a body record that is NOT auto-equality-bearing, and a
+                // choice that is NOT auto-hashable alike (the gate above is
+                // only "Named with a declaration and not the record/choice
+                // KIND-specific cases above"), and §8.5 renders those
+                // QUALIFIED — `spec85NameOnlyDefaultSpelling` is the one
+                // predicate that knows the split; do not inline a `ts->name`
+                // here again.
                 strPtr = lowerStringLiteral(
                     std::string("\"") + spec85NameOnlyDefaultSpelling(ts) +
                         "\"",
@@ -486,7 +563,10 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             // leaks its rendered string once per call. That is the BOUNDED
             // direction and is out of this fix's scope (measured and filed
             // separately); the branch is listed here so the omission reads as a
-            // decision rather than an oversight.
+            // decision rather than an oversight. The record/choice arms above
+            // ARE discharged (`releaseRender = true`) — they return a fresh
+            // +1 producer (emitRecordToString / emitChoiceToString), not a
+            // method-call result on an externally-owned receiver.
         }
     }
     // issue #420: fall back on the lowered VALUE's LLVM type when the sema
