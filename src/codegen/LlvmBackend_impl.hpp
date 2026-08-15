@@ -9278,6 +9278,21 @@ private:
     // teardown. Definition (with the two asked-not-re-derived predicates it
     // rests on) in LlvmBackend_Async.cpp beside patternAResultDisposerFor.
     const ast::LocalDecl* chainedReturnOwnedTaskSource(const ast::Expr& operand);
+    // fix #3126 / §30.5 "Pattern A result slots are of three kinds", kind 2 —
+    // *Chaining from a scope-bound source*, MOVE-OUT HALF (v0.254): the
+    // `ParameterSymbol` of the `owned` parameter a `return await <operand>`
+    // chains FROM, when this async body OWNS that parameter's task frame.
+    // Null for every kind-3 BORROWED source (a non-`owned` parameter), for a
+    // non-`Task` parameter (no borrow is produced, so the parameter's ordinary
+    // §30.1 frame auto-drop is already correct), and for a non-Pattern-A task
+    // (`Task<value/string/runtime-managed T>` → no borrow; `OwningTask<T>` →
+    // Pattern B, await takes the result, kind 1 owns it). The caller pairs it
+    // with `chainedReturnOwnedTaskSource` — a kind-2 source is one OR the
+    // other — and suppresses the §30.1 auto-drop on the chained edge via
+    // `nullStateMachineOwnedParamCapture` (§29.8 / §30.1 (#973a)). Definition
+    // + rationale in LlvmBackend_Async.cpp beside chainedReturnOwnedTaskSource.
+    sema::ParameterSymbol* chainedReturnOwnedTaskParamSource(
+        const ast::Expr& operand);
 
     // #2279 (§30.5 Pattern A, v0.236): when the result type of a Pattern A
     // `Task<T:class>` is itself an INTRINSIC COLLECTION (Array<T> / Set<T> /

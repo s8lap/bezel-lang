@@ -843,14 +843,74 @@ const ast::LocalDecl* Emitter::chainedReturnOwnedTaskSource(
     if (!patternAResultDisposerFor(taskTy)) return nullptr;   // (1)
     return taskLocalOwnsFrame(ld) ? ld : nullptr;             // (2)
 }
+// fix #3126 (§30.5 "Pattern A result slots are of three kinds", kind 2 —
+// *Chaining from a scope-bound source*, MOVE-OUT HALF, v0.254): the
+// `ParameterSymbol` of the `owned` parameter a `return await <operand>` chains
+// FROM. The sibling of `chainedReturnOwnedTaskSource` for parameters — a kind 2
+// source is one or the other, never both, because an identifier resolves to
+// exactly one symbol kind.
+//
+// §30.5 kind 2 (move-out half): "When the source of `return await <source>`
+// is an `owned` parameter of the enclosing async method, the transfer into the
+// chained slot is an ordinary §28.3 **move-out** of the parameter: it is
+// thereby moved out, so §30.1's dispose-at-terminal-state rule for not-moved-
+// out `owned` parameters does not apply to it — the outer task's teardown
+// disposes the chained task instead."
+//
+// Two predicates are ASKED rather than re-derived, mirroring the local arm so
+// the two agree:
+//   (1) `taskFamilyTypeFromParam` + `patternAResultDisposerFor` — the same
+//       Task-family + Pattern-A classification. A non-`Task` parameter, a
+//       `Task<value/string/runtime-managed T>` parameter (no borrow), or an
+//       `OwningTask<T>` parameter (Pattern B — await takes the result, kind 1
+//       owns it) is NOT chainable.
+//   (2) The parameter is an `owned` parameter (a borrow parameter would be
+//       §30.5 kind 3, no transfer possible). The ownership pass sets
+//       `iteratorAutoDispose` for every `owned` parameter whose body never
+//       discharges it on any path; the chained-edge suppression below (via
+//       `nullStateMachineOwnedParamCapture`) is the per-edge "moved-out"
+//       flag — null-guarded in `emitAsyncOwnedParamAutoDispose` (#3125) —
+//       that converts that undischarged flag into the §30.5 move-out half
+//       specifically on this return edge, exactly as the local arm's nulled
+//       local-slot does.
+//
+// THE DEFECT fixed here (#3126). Pre-fix the kind-2 move-out half was never
+// detected for an `owned` parameter source — this function returned null — so
+// `lowerStmt(ReturnStmt)` kept the kind-1 disposer attach path. The outer task
+// then OWNED the borrowed result through BOTH the §30.1 auto-drop (which now
+// correctly routes Task-family to `bz_task_free` after #3125, freeing the
+// chained Cell) AND the kind-1 per-`T` disposer (attached to the outer task
+// at the same return site), so the outer task's destructor freed the SAME Cell
+// a second time — measured on the §30.5 kind 2 repro as
+// `heap-use-after-free in bz$async$Main$Resume`, freed by the #1503 per-T
+// disposer. After #3125's routing fix removed the wild-jump, the SEGV went
+// away but the semantic double-owner remained; this fix removes the second
+// owner by chaining the parameter (kind 2) and nulling its frame slot, so the
+// outer task owns the source task transitively and the §30.1 auto-drop no
+// longer fires for this parameter on this edge.
+//
+// Returns null for every kind-3 BORROWED source (a plain non-`owned`
+// parameter — its frame slot is never in this auto-drop set, and chaining it
+// would dispose a frame the body never owned); this is recorded and not a
+// defect. // per §30.5 kind 2, v0.254
+sema::ParameterSymbol* Emitter::chainedReturnOwnedTaskParamSource(
+    const ast::Expr& operand) {
+    const auto* id = dynamic_cast<const ast::IdentifierExpr*>(&operand);
+    if (!id) return nullptr;
+    auto* ps = dynamic_cast<sema::ParameterSymbol*>(ctx_.exprSymbol(*id));
+    if (!ps || ps->modifier != "owned") return nullptr;
+    const sema::TypeRef* taskTy = taskFamilyTypeFromParam(ps);
+    if (!taskTy) return nullptr;
+    if (!patternAResultDisposerFor(taskTy)) return nullptr;   // (1)
+    return ps;
+}
 // Not admitted here, and each is its own filed defect rather than an oversight:
-// an `owned` PARAMETER source — kind 2's move-out half, whose suppression is the
-// §30.1 frame auto-drop rather than a local's slot, and which SEGVs today
-// because that auto-drop disposes a `Task` through class-vtable dispatch
-// (#3125); and every kind-3 BORROWED source, which needs the kind-1 disposer
-// SKIPPED rather than a chain established — a third state this two-valued
-// function cannot express (#3126). Returning null for both leaves their codegen
-// exactly as it was.
+// every kind-3 BORROWED source (a plain borrow parameter, a `using var` pin, a
+// field read, a static task field) — which needs the kind-1 disposer SKIPPED
+// rather than a chain established — a third state this two-valued function
+// cannot express (#3126's *borrow* half, the next filed defect; the *move-out*
+// half is this fix). Returning null for those leaves their codegen exactly as
+// it was.
 
 
 void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,

@@ -1708,12 +1708,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // fix #3129: the same predicate also feeds fr.chainedAsyncReturn on
             // the finally-routed edge below (a `return await <source>` inside
             // a `try/finally` must STILL chain). // per §30.5 kind 2, v0.252
+            // fix #3126: also admit the `owned` PARAMETER source
+            // (chainedReturnOwnedTaskParamSource) — kind 2's move-out half —
+            // so the chained-return detection covers the SAME row the
+            // chained-edge suppression below and #3129's fr.chainedAsyncReturn
+            // propagate to. // per §30.5 kind 2, v0.254
             if (const auto* awaitUE =
                     dynamic_cast<const ast::UnaryExpr*>(rs->value.get())) {
                 if (awaitUE->op == "await" && awaitUE->operand &&
                     (dynamic_cast<const ast::CallExpr*>(awaitUE->operand.get()) !=
                          nullptr ||
-                     chainedReturnOwnedTaskSource(*awaitUE->operand) != nullptr)) {
+                     chainedReturnOwnedTaskSource(*awaitUE->operand) != nullptr ||
+                     chainedReturnOwnedTaskParamSource(*awaitUE->operand) !=
+                         nullptr)) {
                     asyncChainedReturn_ = true;
                 }
             }
@@ -2010,6 +2017,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // slot (lowerAwait wrote it there and lowerTry's mode-5 reads it
                 // back), so the eventual bz_task_set_chained finds it. // per
                 // §30.5 kind 2 deferral, v0.252
+                // fix #3126 (§30.5 kind 2, v0.254): for the MOVE-OUT HALF —
+                // the `owned` PARAMETER source — the dispensation targets the
+                // FRAME capture slot, not a local slot. nullStateMachineOwnedParamCapture
+                // nulls that frame slot so emitAsyncOwnedParamAutoDispose's
+                // null-guard skips this parameter on this edge (the §30.1
+                // auto-drop would otherwise double-dispose a Cell the chained
+                // task already owns transitively).
                 if (chainedReturn && rs->value) {
                     if (const auto* awaitUE =
                             dynamic_cast<const ast::UnaryExpr*>(
@@ -2028,6 +2042,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                             ptrTy()),
                                         saddr);
                                 }
+                            } else if (chainedReturnOwnedTaskParamSource(
+                                           *awaitUE->operand)) {
+                                nullStateMachineOwnedParamCapture(
+                                    awaitUE->operand.get());
                             }
                         }
                     }
@@ -2082,6 +2100,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                     llvm::ConstantPointerNull::get(ptrTy()),
                                     saddr);
                             }
+                        } else if (chainedReturnOwnedTaskParamSource(
+                                       *awaitUE->operand)) {
+                            // fix #3126 (§30.5 kind 2, v0.254): the
+                            // MOVE-OUT HALF — `return await <owned
+                            // parameter>`. The dispensation targets the
+                            // FRAME capture slot (the §30.1 auto-drop
+                            // reads it), not a local slot. Nulling it
+                            // here is the per-edge "moved-out" flag for
+                            // the §30.5 move-out half.
+                            nullStateMachineOwnedParamCapture(
+                                awaitUE->operand.get());
                         }
                     }
                 }
