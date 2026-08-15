@@ -5092,16 +5092,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // `Array<T>`/`OwningArray<T>` are documented as `public
                 // class` with no ToString override, so the §8.5 default
                 // ("the type's qualified name") is the FIXED, compile-
-                // time-constant literal "Array"/"OwningArray" -- the same
-                // reasoning as DrainedEntry's literal just above, except
-                // these two ARE genuinely heap-allocated (`bz_array_t*`,
-                // unlike DrainedEntry's value-struct), so unlike
-                // DrainedEntry they could in principle dispatch through a
-                // real identity-based mechanism too -- but there is no
-                // vtable slot for them to dispatch through either (they
-                // are not object-model class instances; #2458's crash was
-                // exactly this kind of wild dispatch on a declaration-less
-                // type with no matching vtable shape), and the literal is
+                // time-constant literal — the same reasoning as
+                // DrainedEntry's literal just above, except these two ARE
+                // genuinely heap-allocated (`bz_array_t*`, unlike
+                // DrainedEntry's value-struct), so unlike DrainedEntry
+                // they could in principle dispatch through a real
+                // identity-based mechanism too — but there is no vtable
+                // slot for them to dispatch through either (they are not
+                // object-model class instances; #2458's crash was exactly
+                // this kind of wild dispatch on a declaration-less type
+                // with no matching vtable shape), and the literal is
                 // simpler, cheaper, and equally correct per §8.5's
                 // "qualified name" default having no runtime dependency.
                 // #2457 slice 2 (stdlib §4.11; language spec §8.5): the same
@@ -5113,23 +5113,49 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 // kArrayBackedCollections, the same registry Array/
                 // OwningArray are in), so the §8.5 default is equally a
                 // fixed, compile-time-constant literal here.
+                //
+                // fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1 + rule
+                // 3): the literal is now the QUALIFIED module path with
+                // the rule 3 generic-args tail (e.g.
+                // "System.Collections.Generic.Array<int>" for `Array<int>`),
+                // not the bare identifier. The TypeRef is in hand at this
+                // site, so the rendering recurses on `genericArgs` through
+                // `spec85TypeRefQualifiedName`. The six names cover the
+                // bz_array_t*-backed generic collections whose explicit-
+                // `.ToString()` call site has no MethodSymbol and would
+                // otherwise reach the vtable-dispatch fallthrough.
                 if (recvTy && recvTy->kind == K::Named &&
                         !recvTy->declaration && recvTy->astNode &&
                         recvTy->astNode->name &&
                         !recvTy->astNode->name->parts.empty()) {
                     std::string_view arn = recvTy->headName();
-                    if (arn == "Array")
-                        return lowerStringLiteral("\"Array\"", false);
-                    if (arn == "OwningArray")
-                        return lowerStringLiteral("\"OwningArray\"", false);
-                    if (arn == "Stack")
-                        return lowerStringLiteral("\"Stack\"", false);
-                    if (arn == "OwningStack")
-                        return lowerStringLiteral("\"OwningStack\"", false);
-                    if (arn == "Queue")
-                        return lowerStringLiteral("\"Queue\"", false);
-                    if (arn == "OwningQueue")
-                        return lowerStringLiteral("\"OwningQueue\"", false);
+                    if (arn == "Array" || arn == "OwningArray" ||
+                        arn == "Stack" || arn == "OwningStack" ||
+                        arn == "Queue" || arn == "OwningQueue") {
+                        std::string_view mod =
+                            common::builtinClassModulePathOf(arn);
+                        std::string rendered = mod.empty()
+                                                   ? std::string(arn)
+                                                   : (std::string(mod) + "." +
+                                                      std::string(arn));
+                        // Rule 3: append "<arg1, arg2, …>" for the
+                        // generic instantiation. The TypeRef carries the
+                        // substitution args (`Array<int>` carries `<int>`,
+                        // etc.); recursing on each gives the §2.13 rule-2
+                        // keyword spelling for primitives.
+                        if (!recvTy->genericArgs.empty()) {
+                            rendered += "<";
+                            for (std::size_t i = 0;
+                                 i < recvTy->genericArgs.size(); ++i) {
+                                if (i) rendered += ", ";
+                                rendered += spec85TypeRefQualifiedName(
+                                    recvTy->genericArgs[i]);
+                            }
+                            rendered += ">";
+                        }
+                        return lowerStringLiteral(
+                            std::string("\"") + rendered + "\"", false);
+                    }
                 }
                 bool isObjectRecv =
                     recvTy && recvTy->kind == K::Primitive &&

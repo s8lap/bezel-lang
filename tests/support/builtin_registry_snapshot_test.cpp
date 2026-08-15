@@ -526,3 +526,87 @@ BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3
     })
         BEZEL_EXPECT_FALSE(isDisposableBuiltinHeadName(n));
 }
+
+// fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1): the qualified module
+// path every reserved built-in class renders under. Pinned here so an
+// accidental add/drop/rename is caught mechanically. The 14 keyword-aliased
+// primitives (§3.4) and the built-in INTERFACE heads (§2.13 rule 1
+// deliberately does not name them) stay OUT — they render lowercase or
+// not at all, respectively.
+BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
+    static constexpr std::array<std::string_view, 77> kSnapshot = {
+        // §2 System — §2.5/§2.6 value-builtins whose box thunk renders the
+        // type-name literal (fix #3119 (a)).
+        "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid",
+        // §2.17 — built-in EXCEPTIONS, all in `System`.
+        "Exception", "ArgumentException", "ArgumentNullException",
+        "ArgumentOutOfRangeException", "ArithmeticException", "OverflowException",
+        "DivideByZeroException", "InvalidOperationException",
+        "DisposedAccessException", "NotImplementedException",
+        "NullReferenceException", "IndexOutOfRangeException",
+        "KeyNotFoundException", "MatchFailureException",
+        "OperationCanceledException", "TypeInitializationException",
+        "FormatException", "StackOverflowException", "ChannelClosedException",
+        "ChannelFullException", "DomainFaultedException",
+        "SerializationException", "TimeoutException", "IOException",
+        "FileNotFoundException", "DirectoryNotFoundException",
+        "EndOfStreamException", "PathTooLongException",
+        "ContractViolationException",
+        // §2.16 — Shared/Weak.
+        "Shared", "Weak",
+        // §2.7 — Random.
+        "Random",
+        // §3 System.Text — StringBuilder.
+        "StringBuilder",
+        // §4 System.Collections.Generic — collections.
+        "Array", "OwningArray", "Stack", "OwningStack", "Queue", "OwningQueue",
+        "Set", "OwningSet", "SortedSet", "Dictionary", "OwningDictionary",
+        "SortedDictionary", "LinkedList", "OwningLinkedList",
+        "LinkedListNode", "OwningBuffer",
+        // §6 System.Threading — sync, atomics, channels, nursery, etc.
+        "Mutex", "Lock", "Semaphore", "SemaphoreToken", "Atomic",
+        "AtomicInteger", "TaskCompletionSource", "OwningTaskCompletionSource",
+        "TaskScope", "CancellationToken", "CancellationTokenSource",
+        "Channel", "ChannelSender", "Domain",
+        // §7 System.IO — FileStream.
+        "FileStream",
+        // §8 System.Diagnostics — Stopwatch.
+        "Stopwatch",
+        // §2.15 — concrete serializers.
+        "BinarySerializer", "BinaryDeserializer", "JsonSerializer",
+        "JsonDeserializer",
+        // §24.3 — event sources.
+        "EventSource", "AsyncEventSource",
+        // §2.11 — Subscription.
+        "Subscription",
+    };
+    for (auto n : kSnapshot)
+        BEZEL_EXPECT_TRUE(builtinClassModulePathOf(n).size() > 0);
+    // Keyword aliases and interface heads deliberately OUT — see comment
+    // above and the stdlib §2.13 rule 1 + rule 2 contract.
+    for (std::string_view n : {
+        "bool", "byte", "sbyte", "short", "ushort", "int", "uint", "long",
+        "ulong", "float", "double", "decimal", "char", "string",
+        "IEnumerable", "IEnumerator", "ICollection", "IList",
+        "ISerializer", "IDeserializer", "IEvent", "IAsyncEvent",
+    })
+        BEZEL_EXPECT_TRUE(builtinClassModulePathOf(n).empty());
+}
+
+// fix #3119 (spec §3.4; stdlib §2.13 rule 2, v0.252): the 14 keyword-aliased
+// built-in types (spec §3.4). Per stdlib §2.13 rule 2 they render lowercase
+// in BOTH `Name` and `FullName`. Pinned here so a missed entry surfaces as
+// a test failure rather than a silently-qualified rendering.
+BEZEL_TEST(builtin_registry_snapshot, keyword_alias_builtin_set) {
+    static constexpr std::array<std::string_view, 14> kSnapshot = {
+        "bool", "byte", "sbyte", "short", "ushort", "int", "uint",
+        "long", "ulong", "float", "double", "decimal", "char", "string",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isKeywordAliasBuiltinName(n));
+    // Near-neighbours that must stay OUT: the reserved PascalCase aliases
+    // (`Boolean`, `Int32`, …), the non-keyword classes (`int` ≠ `Integer`),
+    // and any non-keyword name.
+    for (std::string_view n : {"Boolean", "Int32", "String", "Integer",
+                               "int32", "object", "Int", "Char", ""})
+        BEZEL_EXPECT_FALSE(isKeywordAliasBuiltinName(n));
+}

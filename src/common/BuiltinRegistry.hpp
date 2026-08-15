@@ -326,4 +326,44 @@ std::string_view builtinExceptionParentOf(std::string_view name);
 // and so is not caught by a `declaration`-gated class/interface test (§19.5).
 bool isBuiltinExceptionName(std::string_view name);
 
+// fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1): the QUALIFIED module
+// path a reserved built-in CLASS renders under in §8.5's name-only default and
+// stdlib §2.13's `Type.FullName` rule 1. Returns the stdlib module path
+// (e.g. "System.Threading" for `Mutex`, "System.Collections.Generic" for
+// `Array`), or an empty string_view when `name` is not a reserved built-in
+// class. Keyword-aliased primitives and built-in interface heads return empty
+// here; their renderings are governed by rule 2 (keyword lowercase) and
+// rule 1 (interfaces do not render their own name) respectively.
+//
+// Read by the eight §8.5 emission sites through the `spec85QualifiedTypeName`
+// / `spec85TypeRefQualifiedName` helpers — adding a reserved built-in class
+// means editing the table in BuiltinRegistry.cpp, NOT every site. // per
+// §8.5 / stdlib §2.13 rule 1, fix #3119
+std::string_view builtinClassModulePathOf(std::string_view name);
+
+// fix #3119 (spec §3.4; stdlib §2.13 rule 2, v0.252): true when `name` is one
+// of the 14 keyword-aliased built-in types — `string` plus the 13 primitive
+// value-type keywords (`bool`, `byte`, `sbyte`, `short`, `ushort`, `int`,
+// `uint`, `long`, `ulong`, `float`, `double`, `decimal`, `char`). Per stdlib
+// §2.13 rule 2, these render as their lowercase keyword in BOTH `Name` and
+// `FullName`; the keyword is the canonical name, a recorded exception to
+// qualification. Membership is a NEGATIVE test (a name not here is not a
+// keyword alias), so a missed entry silently renders qualified — caught by a
+// regression test rather than a runtime symptom. // per §3.4 / stdlib §2.13
+// rule 2, fix #3119
+bool isKeywordAliasBuiltinName(std::string_view n);
+
+// fix #3119 (stdlib §2.13 rule 2 / rule 3, v0.252): the SOURCE SPELLING of a
+// `PrimitiveType` — the lowercase keyword per §3.4 (`bool`, `int`, `string`,
+// …), matching what `primitiveSpelling` in sema emits for diagnostics and
+// matching stdlib §2.13 rule 2's `Name` rendering for primitives. Returns
+// `<unknown>` for an unrecognised `PrimitiveType` so a regression surfaces
+// as a visibly-bogus name rather than silent empty rendering. `Object` is the
+// only non-lowercase spelling: it has no lowercase keyword (§3.4) and is the
+// root class for builtin-class purposes; render it as `Object` for clarity
+// when it appears inside a generic instantiation's args (a `Object`-typed
+// argument never appears in a `Dictionary<…, Object>` per the spec, but the
+// rendering is still well-defined).
+std::string_view primitiveBuiltinSpelling(int primitive);
+
 }  // namespace bezel::common

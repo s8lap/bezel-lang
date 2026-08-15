@@ -466,7 +466,10 @@ BEZEL_TEST(span_range_tostring_2661, control_builtin_exception_tostring_works) {
         "  end; "
         "  return 0; "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(out.find("EXN[ArgumentException]") != std::string::npos);
+    // fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1): the rendered name
+    // is the QUALIFIED module path "System.ArgumentException", not the bare
+    // identifier "ArgumentException".
+    BEZEL_EXPECT_TRUE(out.find("EXN[System.ArgumentException]") != std::string::npos);
 }
 
 // §8.5: a user positional record's default `ToString` — the shape the deferral

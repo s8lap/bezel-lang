@@ -4766,8 +4766,22 @@ void Emitter::setupBuiltinExceptions() {
             llvm::IRBuilder<> tb(bb);
             // lowerStringLiteral returns a constant global pointer (no builder
             // use), so we can return it directly.
+            //
+            // fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1): render the
+            // exception's QUALIFIED module path ("System.<Name>") rather than
+            // the bare identifier. Every exception in the stdlib hierarchy
+            // table is in `System` (stdlib §2.17 cross-reference), so the
+            // `common::builtinClassModulePathOf` lookup is the single
+            // authority for it. The exception class names do not pass through
+            // any kind-parametrised spelling here — exception types carry no
+            // generic parameters in the current stdlib — so the rule-3 (b)
+            // generic-args rendering is not in scope at this site.
+            std::string_view mod = common::builtinClassModulePathOf(name);
+            std::string rendered = mod.empty()
+                                       ? std::string(name)
+                                       : (std::string(mod) + "." + std::string(name));
             llvm::Value* nameStr = lowerStringLiteral(
-                std::string("\"") + name + "\"", false);
+                std::string("\"") + rendered + "\"", false);
             tb.CreateRet(nameStr);
         }
         std::vector<llvm::Constant*> v = {
@@ -27673,6 +27687,13 @@ struct ThunkScope {
 // default (§8.5 "the type's qualified name"). This exists so vtable slot 3 is a
 // valid function (a null slot would fault if `Object.ToString()` is dispatched on
 // a boxed value-builtin). Signature is the vtable-uniform `ptr(ptr this)`.
+//
+// fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1): render the QUALIFIED
+// module path ("System.DateTime", "System.Guid", …) rather than the bare
+// identifier. The `common::builtinClassModulePathOf` lookup is the single
+// authority for the qualified rendering — see its BuiltinRegistry.cpp comment
+// for which entries it covers. No generic-args rendering at this site: the
+// boxed value-builtins in this revision carry no generic parameters.
 llvm::Constant* Emitter::valueBuiltinBoxToStringThunk(const char* name) {
     auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
     auto* thunk = llvm::Function::Create(
@@ -27681,8 +27702,12 @@ llvm::Constant* Emitter::valueBuiltinBoxToStringThunk(const char* name) {
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
         ThunkScope scope(currentFn_, builder_, thunk, entry);
+        std::string_view mod = common::builtinClassModulePathOf(name);
+        std::string rendered = mod.empty()
+                                   ? std::string(name)
+                                   : (std::string(mod) + "." + std::string(name));
         builder_.CreateRet(
-            lowerStringLiteral(std::string("\"") + name + "\"", false));
+            lowerStringLiteral(std::string("\"") + rendered + "\"", false));
     }
     return thunk;
 }

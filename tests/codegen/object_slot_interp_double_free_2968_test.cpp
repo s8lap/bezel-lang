@@ -78,8 +78,14 @@ std::string prog(const std::string& mainBody, const std::string& prelude = "") {
 
 // ---------------------------------------------------------------------------
 // THE DEFECT ITSELF. §8.5 "For classes: the type's qualified name" — an
-// `Object`-typed slot holding a `Mutex` renders "Mutex". On ec4ab7d this
-// printed "val=" and aborted with a double free (exit 134).
+// `Object`-typed slot holding a `Mutex` renders the qualified module path
+// ("System.Threading.Mutex"). On ec4ab7d this printed "val=" and aborted
+// with a double free (exit 134).
+//
+// fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1): the rendered name is
+// the QUALIFIED module path, not the bare identifier (#2934 covered the
+// `TypeSymbol::moduleName`-populated half; #3119 covers the synthetic-
+// builtin half whose `moduleName` is empty by construction).
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_object_slot_interp_double_free_2968,
            object_slot_holding_builtin_renders_runtime_type_name_8_5) {
@@ -87,7 +93,7 @@ BEZEL_TEST(codegen_object_slot_interp_double_free_2968,
         out(prog("using var mx := new Mutex(); "
                  "var o: Object := mx; "
                  "Console.WriteLine($\"val={o}\");")),
-        std::string("val=Mutex"));
+        std::string("val=System.Threading.Mutex"));   // #3119: was "val=Mutex"
 }
 
 // The same receiver TWICE in one interpolation, with literal text around and
@@ -99,12 +105,16 @@ BEZEL_TEST(codegen_object_slot_interp_double_free_2968,
         out(prog("using var mx := new Mutex(); "
                  "var o: Object := mx; "
                  "Console.WriteLine($\"a{o}b{o}c\");")),
-        std::string("aMutexbMutexc"));
+        std::string("aSystem.Threading.MutexbSystem.Threading.Mutexc"));   // #3119
 }
 
 // stdlib §4.4: a heap ARRAY in an `Object` slot — §8.1 names `Array<T>`
 // explicitly in the sentence quoted in the header, so it reaches `Object` as
 // itself and hits the identical vtable-less premise violation.
+//
+// fix #3119 (stdlib §2.13 rule 1 + rule 3): rendering is the QUALIFIED
+// module path WITH the generic-args tail — "System.Collections.Generic.Array<int>"
+// for `Array<int>`.
 BEZEL_TEST(codegen_object_slot_interp_double_free_2968,
            object_slot_holding_array_renders_name_8_1) {
     BEZEL_EXPECT_EQ(
@@ -112,7 +122,7 @@ BEZEL_TEST(codegen_object_slot_interp_double_free_2968,
                  "a.Add(10); a.Add(20); "
                  "var o: Object := a; "
                  "Console.WriteLine($\"val={o}\");")),
-        std::string("val=Array"));
+        std::string("val=System.Collections.Generic.Array<int>"));   // #3119: was "val=Array"
 }
 
 // ---------------------------------------------------------------------------
@@ -150,7 +160,7 @@ BEZEL_TEST(codegen_object_slot_interp_double_free_2968,
         out(prog("using var mx := new Mutex(); "
                  "var o: Object? := mx; "
                  "Console.WriteLine($\"val={o}\");")),
-        std::string("val=Mutex"));
+        std::string("val=System.Threading.Mutex"));   // #3119: was "val=Mutex"
 }
 
 // The null arm of the same slot must still render the literal "null" — the

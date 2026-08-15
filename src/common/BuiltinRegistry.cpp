@@ -1,5 +1,7 @@
 #include "common/BuiltinRegistry.hpp"
 
+#include "sema/TypeRef.hpp"   // PrimitiveType (for primitiveBuiltinSpelling, fix #3119)
+
 #include <algorithm>
 #include <array>
 
@@ -561,5 +563,220 @@ bool isBuiltinExceptionName(std::string_view name) {
         if (edge.name == name) return true;
     return false;
 }
+
+// fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1): the QUALIFIED module
+// path every reserved BUILT-IN TYPE renders under in §8.5's name-only default
+// and stdlib §2.13's `Type.FullName` rule 1. Each entry pairs the simple
+// builtin name with the stdlib module path it belongs to per the stdlib's
+// section structure (System, System.Text, System.Collections.Generic,
+// System.Collections.Linq, System.Threading, System.IO, System.Diagnostics).
+//
+// The table covers BOTH reserved built-in CLASSES (the §8.5 default's named
+// population: `Mutex`, `Array`, `Exception`, …) AND reserved built-in VALUE
+// TYPES whose box-thunk name-only default is the §8.5 class case (the
+// DateTime/Guid/… family in `System` — their box vtable's slot-3 default is
+// the type-name literal). Stdlib §2.13 rule 1's "renders every named
+// component qualified by its declaring module path" applies to both.
+//
+// **Deliberately ABSENT from this table**:
+//   - The 14 KEYWORD-ALIASED primitive value types and `string` (spec §3.4:
+//     `bool`, `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`,
+//     `ulong`, `float`, `double`, `decimal`, `char`, `string`). Per stdlib
+//     §2.13 rule 2 ("the keyword-aliased types … render as their lowercase
+//     keyword in BOTH properties"), these are NOT qualified — they render
+//     lowercase (`int`, `string`, …). The keyword is the canonical name, a
+//     recorded exception to qualification.
+//   - The reserved built-in INTERFACE heads (`IEnumerable`, `IList`, …,
+//     `IReadOnlyList`, `IEvent`, `ISerializer`, etc.). §8.5's name-only
+//     default never names an interface — a class-typed receiver's default is
+//     the runtime CLASS's name, and a generic-instantiation head renders as
+//     the head itself (rule 3's "<args>" suffix is the only addition).
+//
+// The lookup is the single authority for the module path of a builtin name;
+// the eight §8.5 emission sites (`emitVtablelessBuiltinToString`, the
+// `bz$extostr$<name>` exception thunks, `valueBuiltinBoxToStringThunk`, the
+// box thunk slot-3 default, the class-slot-3 thunk default, the enum default,
+// the `classToStringThunk` shared default, and the #2457/#2458/#2459 call-
+// site literals) read through it so the spelling stays one literal.
+//
+// Adding a builtin means editing this table INSTEAD of the eight sites, plus
+// a snapshot row in tests/support/builtin_registry_snapshot_test.cpp — the
+// same #1414 pattern.
+struct BuiltinClassModulePath {
+    std::string_view name;
+    std::string_view modulePath;
+};
+constexpr std::array<BuiltinClassModulePath, 77> kBuiltinClassModulePaths = {{
+    // stdlib §2 (System) — the §2.5/§2.6 temporal/identity value types are
+    // value-shaped (§3.1) but their BOX thunk (`valueBuiltinBoxToStringThunk`)
+    // is in the §8.5 default path, so they belong here too.
+    {"DateTime", "System"},
+    {"TimeSpan", "System"},
+    {"DateOnly", "System"},
+    {"TimeOnly", "System"},
+    {"Guid", "System"},
+    // stdlib §2.17 (#1621): built-in EXCEPTIONS — all live in `System` per
+    // the stdlib's section structure. Each renders as "System.<Name>".
+    {"Exception", "System"},
+    {"ArgumentException", "System"},
+    {"ArgumentNullException", "System"},
+    {"ArgumentOutOfRangeException", "System"},
+    {"ArithmeticException", "System"},
+    {"OverflowException", "System"},
+    {"DivideByZeroException", "System"},
+    {"InvalidOperationException", "System"},
+    {"DisposedAccessException", "System"},
+    {"NotImplementedException", "System"},
+    {"NullReferenceException", "System"},
+    {"IndexOutOfRangeException", "System"},
+    {"KeyNotFoundException", "System"},
+    {"MatchFailureException", "System"},
+    {"OperationCanceledException", "System"},
+    {"TypeInitializationException", "System"},
+    {"FormatException", "System"},
+    {"StackOverflowException", "System"},
+    {"ChannelClosedException", "System"},
+    {"ChannelFullException", "System"},
+    {"DomainFaultedException", "System"},
+    {"SerializationException", "System"},
+    {"TimeoutException", "System"},
+    {"IOException", "System"},
+    {"FileNotFoundException", "System"},
+    {"DirectoryNotFoundException", "System"},
+    {"EndOfStreamException", "System"},
+    {"PathTooLongException", "System"},
+    {"ContractViolationException", "System"},
+    // stdlib §2.16 (§28.13): Shared<T>, Weak<T> — class heads in `System`.
+    {"Shared", "System"},
+    {"Weak", "System"},
+    // stdlib §2.4: Environment — a static class (no name-only default; §8.5
+    // is silent on static classes — listed here only for completeness, not
+    // consulted).
+    // stdlib §2.20: Result<T, E> — a class-shaped generic in `System`.
+    // Not in the §8.5 default path (its declaration carries a ToString
+    // override per the stdlib doc).
+    // stdlib §2.7: Random — vtable-less built-in class.
+    {"Random", "System"},
+    // stdlib §3.1 / §3.2 (System.Text): StringBuilder, Encoding concrete
+    // subclasses. Encoding concrete subclasses (ASCII/UTF8/…) are
+    // implementation-internal and do not surface as user-named types; they
+    // are not in this table.
+    {"StringBuilder", "System.Text"},
+    // stdlib §4 (System.Collections.Generic) — collections and dicts.
+    {"Array", "System.Collections.Generic"},
+    {"OwningArray", "System.Collections.Generic"},
+    {"Stack", "System.Collections.Generic"},
+    {"OwningStack", "System.Collections.Generic"},
+    {"Queue", "System.Collections.Generic"},
+    {"OwningQueue", "System.Collections.Generic"},
+    {"Set", "System.Collections.Generic"},
+    {"OwningSet", "System.Collections.Generic"},
+    {"SortedSet", "System.Collections.Generic"},
+    {"Dictionary", "System.Collections.Generic"},
+    {"OwningDictionary", "System.Collections.Generic"},
+    {"SortedDictionary", "System.Collections.Generic"},
+    {"LinkedList", "System.Collections.Generic"},
+    {"OwningLinkedList", "System.Collections.Generic"},
+    {"LinkedListNode", "System.Collections.Generic"},
+    {"OwningBuffer", "System.Collections.Generic"},
+    // stdlib §4.18 (#1414): DictionaryEntry, DrainedEntry — synthetic
+    // TypeRefs (no astNode, importedName-keyed); not reachable from a written
+    // type annotation and therefore not in §8.5's default path.
+    // stdlib §6 (System.Threading): the §6.2/§6.3 sync primitives, §6.4
+    // atomics, §6.6 task-completion sources, §6.10 nursery, §30.15 channels.
+    {"Mutex", "System.Threading"},
+    {"Lock", "System.Threading"},
+    {"Semaphore", "System.Threading"},
+    {"SemaphoreToken", "System.Threading"},
+    {"Atomic", "System.Threading"},
+    {"AtomicInteger", "System.Threading"},
+    {"TaskCompletionSource", "System.Threading"},
+    {"OwningTaskCompletionSource", "System.Threading"},
+    {"TaskScope", "System.Threading"},
+    {"CancellationToken", "System.Threading"},
+    {"CancellationTokenSource", "System.Threading"},
+    {"Channel", "System.Threading"},
+    {"ChannelSender", "System.Threading"},
+    {"Domain", "System.Threading"},
+    // stdlib §7 (System.IO): FileStream.
+    {"FileStream", "System.IO"},
+    // stdlib §8 (System.Diagnostics): Stopwatch.
+    {"Stopwatch", "System.Diagnostics"},
+    // stdlib §2.15 (#687): concrete serializers/deserializers; class heads
+    // under `System` (the serialization vocab in §2.14 is interfaces).
+    {"BinarySerializer", "System"},
+    {"BinaryDeserializer", "System"},
+    {"JsonSerializer", "System"},
+    {"JsonDeserializer", "System"},
+    // §24.3 (#1536): EventSource / AsyncEventSource / IEvent / IAsyncEvent —
+    // the class heads go under `System`, the interface heads are out.
+    {"EventSource", "System"},
+    {"AsyncEventSource", "System"},
+    // §2.11 (#2190): Subscription — a class head under `System`.
+    {"Subscription", "System"},
+}};
+
+// fix #3119: lookup the qualified module path for a reserved built-in name
+// (class or value-type whose box-thunk default is the §8.5 case). Returns
+// an empty string_view when `name` is NOT in the table — callers test
+// `!result.empty()` rather than `find != end` to keep one chokepoint and one
+// spelling.
+//
+// Keyword-aliased primitives (`int`, `string`, etc.) and built-in INTERFACE
+// heads deliberately return empty here; those renderings are governed by
+// stdlib §2.13 rule 2 (keyword lowercase) and rule 1 (interfaces do not
+// render their own name — a class-typed receiver's default is the runtime
+// class's name) respectively, not by this module-path lookup.
+std::string_view builtinClassModulePathOf(std::string_view name) {
+    for (const auto& e : kBuiltinClassModulePaths)
+        if (e.name == name) return e.modulePath;
+    return {};
+}  // per §8.5 / stdlib §2.13 rule 1, fix #3119 — reserved built-in type → module path
+
+// fix #3119: the 14 keyword-aliased built-in types (spec §3.4) — `string`
+// plus the 13 primitive value-type keywords. Per stdlib §2.13 rule 2, they
+// render as their lowercase keyword in BOTH `Name` and `FullName`; the
+// keyword IS the canonical name, a recorded exception to qualification.
+// Membership is a negative test (a name NOT here is not a keyword alias)
+// so a missed entry silently renders qualified, which a regression test
+// catches before any user-visible log line.
+constexpr std::array<std::string_view, 14> kKeywordAliasBuiltinNames = {
+    "bool", "byte", "sbyte", "short", "ushort", "int", "uint",
+    "long", "ulong", "float", "double", "decimal", "char", "string",
+};
+
+bool isKeywordAliasBuiltinName(std::string_view n) {
+    return contains(kKeywordAliasBuiltinNames, n);
+}  // per stdlib §2.13 rule 2 / spec §3.4, fix #3119
+
+// fix #3119: the lowercase source spelling of a `PrimitiveType`. Mirrors
+// `primitiveSpelling` in `sema/ExprTypecheck_Exprs.cpp` (kept private to
+// sema; this is the codegen-side read for stdlib §2.13 rule 3's generic-
+// arg rendering, which needs to spell a `Primitive` type argument as its
+// keyword). `Object` is the only non-lowercase spelling — §3.4 reserves
+// no keyword for `Object`, and §2.13 rule 2's "lowercase keyword" wording
+// applies only to the 14 keyword-aliased entries.
+std::string_view primitiveBuiltinSpelling(int primitive) {
+    using P = sema::PrimitiveType;
+    switch (static_cast<P>(primitive)) {
+        case P::Bool:    return "bool";
+        case P::Char:    return "char";
+        case P::String:  return "string";
+        case P::Byte:    return "byte";
+        case P::SByte:   return "sbyte";
+        case P::Short:   return "short";
+        case P::UShort:  return "ushort";
+        case P::Int:     return "int";
+        case P::UInt:    return "uint";
+        case P::Long:    return "long";
+        case P::ULong:   return "ulong";
+        case P::Float:   return "float";
+        case P::Double:  return "double";
+        case P::Decimal: return "decimal";
+        case P::Object:  return "Object";
+        case P::None:    return "<none>";
+    }
+    return "<unknown>";
+}  // per stdlib §2.13 rule 2 / §3.4, fix #3119
 
 }  // namespace bezel::common

@@ -91,9 +91,11 @@ std::string prog(const std::string& mainBody, const std::string& prelude = "") {
 // §8.5 "For classes: the type's qualified name" — the hole renders the
 // RUNTIME type's qualified name. The static type is `IList<int>` (a built-in
 // interface head); the runtime value is `Array<int>`, a built-in class with
-// no `ToString` override, so §8.5 says the rendering is "Array". On 09ed9ca
-// this program printed "val=" and aborted with "free(): invalid pointer"
-// (exit 134) — the interface-head half of #2923.
+// no `ToString` override, so §8.5 says the rendering is the qualified
+// module path with the §2.13 rule 3 generic-args tail:
+// "System.Collections.Generic.Array<int>" (fix #3119; was "Array").
+// On 09ed9ca this program printed "val=" and aborted with
+// "free(): invalid pointer" (exit 134) — the interface-head half of #2923.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_interp_iface_head_vtableless_2969,
            ilist_hole_renders_runtime_type_name_8_5) {
@@ -101,7 +103,7 @@ BEZEL_TEST(codegen_interp_iface_head_vtableless_2969,
         out(prog("using var e: IList<int> := new Array<int>(2); "
                  "e.Add(10); e.Add(20); "
                  "Console.WriteLine($\"val={e}\");")),
-        std::string("val=Array"));
+        std::string("val=System.Collections.Generic.Array<int>"));   // #3119
 }
 
 // The same receiver TWICE in one interpolation — the shape that escalated to
@@ -109,11 +111,17 @@ BEZEL_TEST(codegen_interp_iface_head_vtableless_2969,
 // here (the interface-head half reads through the same corrupted path).
 BEZEL_TEST(codegen_interp_iface_head_vtableless_2969,
            ilist_two_holes_no_use_after_free_18_5) {
+    // fix #3119: `Array<int>` renders as the QUALIFIED module path with the
+    // rule 3 generic-args tail (38-char head + 5-char "<int>" = 41 twice
+    // + 4 inter-hole chars "a...b...c" between — see the prose at the top
+    // of this section).
     BEZEL_EXPECT_EQ(
         out(prog("using var e: IList<int> := new Array<int>(2); "
                  "e.Add(1); e.Add(2); "
                  "Console.WriteLine($\"a{e}b{e}c\");")),
-        std::string("aArraybArrayc"));
+        std::string(
+            "aSystem.Collections.Generic.Array<int>"
+            "bSystem.Collections.Generic.Array<int>c"));   // #3119
 }
 
 // stdlib §4.8: `Dictionary<K,V>` is the other built-in collection that the
@@ -182,12 +190,15 @@ BEZEL_TEST(codegen_interp_iface_head_vtableless_2969,
 // residual.
 BEZEL_TEST(codegen_interp_iface_head_vtableless_2969,
            concrete_alias_widened_to_ilist_renders_name_8_5) {
+    // fix #3119: widened alias of a vtable-less builtin renders the
+    // qualified module path with the rule 3 generic-args tail —
+    // "System.Collections.Generic.Array<int>" (was "Array").
     BEZEL_EXPECT_EQ(
         out(prog("using var a := new Array<int>(2); "
                  "a.Add(10); a.Add(20); "
                  "using var e: IList<int> := a; "
                  "Console.WriteLine($\"val={e}\");")),
-        std::string("val=Array"));
+        std::string("val=System.Collections.Generic.Array<int>"));   // #3119
 }
 
 // A USER class declaring `IEnumerable<int>` (stdlib §4.3 lists it among the

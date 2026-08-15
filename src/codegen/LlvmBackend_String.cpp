@@ -2719,9 +2719,40 @@ llvm::Value* Emitter::emitVtablelessBuiltinToString(llvm::Value* val,
         return builder_.CreateCall(
             declareC("bz_jser_to_string", ptrTy(), {ptrTy()}), {val},
             "jser.str");
-    // §8.5: "For classes: the type's qualified name."
-    return lowerStringLiteral(std::string("\"") + std::string(bn) + "\"",
-                              false);
+    // §8.5: "For classes: the type's qualified name" — pinned by spec §8.5
+    // to stdlib §2.13's `Type.FullName` rendering ("The default and `FullName`
+    // are one rendering contract, not two", #2934). fix #3119: this site is
+    // the ONE §8.5 emission that has the FULL `TypeRef` in hand — pass it
+    // through `spec85TypeRefQualifiedName`, which resolves (a) the module
+    // path of a reserved built-in class via `common::BuiltinRegistry` (so
+    // `Mutex` becomes "System.Threading.Mutex"), and (b) stdlib §2.13 rule
+    // 3's generic type-arg rendering (so `Array<int>` becomes
+    // "System.Collections.Generic.Array<int>"). A builtin name the
+    // module-path table does not know (`bn` is the simple head) renders
+    // through the head lookup with no `<args>` — the table lookup is the
+    // only place the module path lives, so a missing entry surfaces as the
+    // bare head, not a wrong rendering.
+    std::string_view mod = common::builtinClassModulePathOf(bn);
+    std::string rendered;
+    if (rt && !rt->genericArgs.empty()) {
+        // Generic instantiation: the FULL §2.13 rule 3 rendering, recursing
+        // on the type arguments. `bn` is the head; the table supplies the
+        // module path; the generic args come from the TypeRef.
+        rendered = std::string(mod.empty() ? "" : mod);
+        if (!rendered.empty()) rendered += ".";
+        rendered += std::string(bn);
+        rendered += "<";
+        for (std::size_t i = 0; i < rt->genericArgs.size(); ++i) {
+            if (i) rendered += ", ";
+            rendered += spec85TypeRefQualifiedName(rt->genericArgs[i]);
+        }
+        rendered += ">";
+    } else if (!mod.empty()) {
+        rendered = std::string(mod) + "." + std::string(bn);
+    } else {
+        rendered = std::string(bn);
+    }
+    return lowerStringLiteral(std::string("\"") + rendered + "\"", false);
 }
 
 

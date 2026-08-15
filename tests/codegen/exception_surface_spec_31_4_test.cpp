@@ -201,7 +201,9 @@ BEZEL_TEST(codegen_exc_surface, wrap_and_rethrow_in_catch_arm_spec_31_2_4) {
         "  if pn = \"size\" then ok := ok + 1; end; "
         "  if cnt > 0 then ok := ok + 10; end; "
         "  if msg = \"bad arg\" then ok := ok + 100; end; "
-        "  if tn = \"ArgumentException\" then ok := ok + 1; end; "
+        // fix #3119: CauseChain[0].TypeName snapshot is now the QUALIFIED
+        // module path — "System.ArgumentException" (was "ArgumentException").
+        "  if tn = \"System.ArgumentException\" then ok := ok + 1; end; "
         "  return ok; "  // 112 = all four
         "end Main; end C;"), 112);
 }
@@ -230,7 +232,7 @@ BEZEL_TEST(codegen_exc_surface, user_subclass_wrap_rethrow_spec_31_2_4) {
         "  catch e2: Exception => "
         "    tn := e2.CauseChain[0].TypeName; "
         "  end; "
-        "  if tn = \"InvalidOperationException\" then return 5; end; "
+        "  if tn = \"System.InvalidOperationException\" then return 5; end; "   // #3119
         "  return 0; "
         "end Main; end C;"), 5);
 }

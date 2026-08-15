@@ -367,6 +367,13 @@ BEZEL_TEST(array_unresolved_member_2457, legit_call_form_methods_value_correct) 
 }
 
 // ToString: implemented as the fixed literal, VALUE-correct.
+//
+// fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1 + rule 3): the literal
+// is the QUALIFIED module path with the §2.13 rule 3 generic-args tail, so
+// `Array<int>` returns "System.Collections.Generic.Array<int>" (not "Array")
+// and `OwningArray<Res>` returns "System.Collections.Generic.OwningArray<Res>"
+// (the Res arg recurses through `spec85TypeRefQualifiedName`, rendering as
+// its user-declared qualified name "M.Res").
 BEZEL_TEST(array_unresolved_member_2457, tostring_implemented_array_literal) {
     const std::string program =
         "module M; "
@@ -375,7 +382,7 @@ BEZEL_TEST(array_unresolved_member_2457, tostring_implemented_array_literal) {
         "  a.Add(5); "
         "  var s := a.ToString(); "
         "  a.Dispose(); "
-        "  return (if s = \"Array\" then 42 else 1); "
+        "  return (if s = \"System.Collections.Generic.Array<int>\" then 42 else 1); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 42);
 }
@@ -391,7 +398,7 @@ BEZEL_TEST(array_unresolved_member_2457, tostring_implemented_owningarray_litera
         "  a.Add(new Res(1)); "
         "  var s := a.ToString(); "
         "  a.Dispose(); "
-        "  return (if s = \"OwningArray\" then 42 else 1); "
+        "  return (if s = \"System.Collections.Generic.OwningArray<M.Res>\" then 42 else 1); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 42);
 }

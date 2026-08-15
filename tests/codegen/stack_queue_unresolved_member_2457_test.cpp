@@ -590,6 +590,12 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_owningstack_drain_and_try_f
 }
 
 // ToString: implemented as the fixed literal, VALUE-correct.
+//
+// fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1 + rule 3): the literal
+// is the QUALIFIED module path with the §2.13 rule 3 generic-args tail —
+// `Stack<int>` → "System.Collections.Generic.Stack<int>",
+// `OwningStack<Res>` (Res is module M) →
+// "System.Collections.Generic.OwningStack<M.Res>", etc.
 BEZEL_TEST(stack_queue_unresolved_member_2457, tostring_implemented_stack_literal) {
     const std::string program =
         "module M; "
@@ -597,7 +603,7 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, tostring_implemented_stack_litera
         "  var s := new Stack<int>(); "
         "  s.Push(5); "
         "  var t := s.ToString(); "
-        "  return (if t = \"Stack\" then 42 else 1); "
+        "  return (if t = \"System.Collections.Generic.Stack<int>\" then 42 else 1); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 42);
 }
@@ -609,7 +615,7 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, tostring_implemented_queue_litera
         "  var q := new Queue<int>(); "
         "  q.Enqueue(5); "
         "  var t := q.ToString(); "
-        "  return (if t = \"Queue\" then 42 else 1); "
+        "  return (if t = \"System.Collections.Generic.Queue<int>\" then 42 else 1); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 42);
 }
@@ -624,7 +630,7 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, tostring_implemented_owningstack_
         "  var s := new OwningStack<Res>(); "
         "  s.Push(new Res(1)); "
         "  var t := s.ToString(); "
-        "  return (if t = \"OwningStack\" then 42 else 1); "
+        "  return (if t = \"System.Collections.Generic.OwningStack<M.Res>\" then 42 else 1); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 42);
 }
@@ -639,7 +645,7 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, tostring_implemented_owningqueue_
         "  var q := new OwningQueue<Res>(); "
         "  q.Enqueue(new Res(1)); "
         "  var t := q.ToString(); "
-        "  return (if t = \"OwningQueue\" then 42 else 1); "
+        "  return (if t = \"System.Collections.Generic.OwningQueue<M.Res>\" then 42 else 1); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 42);
 }

@@ -113,7 +113,9 @@ BEZEL_TEST(collection_universal_member_narrowing_2465,
 // original #2465 filing's own repro), then (after #2465 landed) a clean
 // placeholder reject. Now implemented (#2457 slice 2, see above): the §8.5
 // default for a `public class` with no ToString override is the type's
-// qualified name — the fixed literal "Stack".
+// qualified name — fix #3119 makes the literal the QUALIFIED module path
+// with the §2.13 rule 3 generic-args tail:
+// "System.Collections.Generic.Stack<int>" (was "Stack").
 BEZEL_TEST(collection_universal_member_narrowing_2465,
            stack_tostring_now_implemented_value_correct) {
     const std::string program =
@@ -123,7 +125,7 @@ BEZEL_TEST(collection_universal_member_narrowing_2465,
         "  s.Push(1); "
         "  var x := s.ToString(); "
         "  s.Dispose(); "
-        "  return (if x = \"Stack\" then 42 else 1); "
+        "  return (if x = \"System.Collections.Generic.Stack<int>\" then 42 else 1); "
         "end Main; end C;";
     BEZEL_EXPECT_EQ(run(program), 42);
 }
@@ -156,6 +158,10 @@ BEZEL_TEST(collection_universal_member_narrowing_2465,
 BEZEL_TEST(collection_universal_member_narrowing_2465,
            reject_generalizes_across_the_registry) {
     // Queue<T> (#2457 slice 2): now implemented, not rejected.
+    //
+    // fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1 + rule 3): the literal
+    // is the QUALIFIED module path with the §2.13 rule 3 generic-args tail
+    // — "System.Collections.Generic.Queue<int>" (was "Queue").
     {
         const std::string program =
             "module M; "
@@ -164,7 +170,7 @@ BEZEL_TEST(collection_universal_member_narrowing_2465,
             "  q.Enqueue(1); "
             "  var x := q.ToString(); "
             "  q.Dispose(); "
-            "  return (if x = \"Queue\" then 42 else 1); "
+            "  return (if x = \"System.Collections.Generic.Queue<int>\" then 42 else 1); "
             "end Main; end C;";
         BEZEL_EXPECT_EQ(run(program), 42);
     }

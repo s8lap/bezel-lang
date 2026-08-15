@@ -148,7 +148,9 @@ BEZEL_TEST(codegen_exception_surface_2971,
                   "  Console.WriteLine(\"n=\" + s.CauseChain.Count.ToString()); "
                   "  Console.WriteLine(\"m=\" + s.CauseChain[0].Message); "
                   "  Console.WriteLine(\"t=\" + s.CauseChain[0].TypeName); "),
-        "n=1\nm=root\nt=Exception"));
+        // fix #3119: CauseChain[0].TypeName snapshot is now the QUALIFIED
+        // module path — "System.Exception" (was "Exception").
+        "n=1\nm=root\nt=System.Exception"));
 }
 
 // §31.4 "empty when no cause" — the same access on a subclass built through the

@@ -123,7 +123,13 @@ BEZEL_TEST(codegen_base_exception_surface_2983,
         "  Console.WriteLine(\"t=\" + l.Ct()); "
         "  return 0; "
         "end Main; end C;",
-        "st=[]\nn=1\nm=root\nt=Exception"));
+        "st=[]\n"
+        "n=1\n"
+        "m=root\n"
+        // fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1): the
+        // CauseChain[0].TypeName snapshot is the QUALIFIED module path —
+        // "System.Exception" (was "Exception").
+        "t=System.Exception"));
 }
 
 // §31.4 declares `ParamName` on `ArgumentException`, so `base.ParamName`

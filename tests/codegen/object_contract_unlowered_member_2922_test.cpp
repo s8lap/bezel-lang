@@ -300,19 +300,22 @@ BEZEL_TEST(object_contract_unlowered_member_2922,
 
 BEZEL_TEST(object_contract_unlowered_member_2922,
            array_tostring_still_returns_qualified_name_spec_8_5) {
-    // §8.5: "For classes: the type's qualified name" — #2457 slice 1
-    // implements this as the literal "Array", so `.Length` is 5.
+    // §8.5: "For classes: the type's qualified name" — fix #3119 (stdlib
+    // §2.13 rule 1 + rule 3): the literal is now the QUALIFIED module path
+    // with the rule 3 generic-args tail —
+    // "System.Collections.Generic.Array<int>", length 37 (was 5, "Array").
     auto r = runAot(toStringThenLength("new Array<int>(4, 0)"));
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(5, r.exitCode);
+    BEZEL_EXPECT_EQ(37, r.exitCode);   // #3119: was 5
 }
 
 BEZEL_TEST(object_contract_unlowered_member_2922,
            stack_tostring_still_returns_qualified_name_spec_8_5) {
-    // #2457 slice 2's receiver — likewise the literal "Stack", length 5.
+    // fix #3119: Stack<int> renders as
+    // "System.Collections.Generic.Stack<int>", length 37 (was 5, "Stack").
     auto r = runAot(toStringThenLength("new Stack<int>()"));
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(5, r.exitCode);
+    BEZEL_EXPECT_EQ(37, r.exitCode);   // #3119: was 5
 }
 
 BEZEL_TEST(object_contract_unlowered_member_2922,

@@ -87,12 +87,20 @@ std::string prog(const std::string& mainBody, const std::string& prelude = "") {
 // §8.5 "For classes: the type's qualified name" — the hole renders the built-in
 // class's name. On f069645 this program printed "val=" and aborted with
 // "free(): double free detected in tcache 2" (exit 134).
+//
+// fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1): the rendered name is
+// the QUALIFIED module path (`System.Threading.Mutex`, `System.Random`, …),
+// not the bare identifier (`Mutex`, `Random`, …). #2934's fix delivered the
+// module-path half for every type that carries a `TypeSymbol::moduleName`;
+// the residual for synthetic builtins (`ts->decl == nullptr`, `moduleName`
+// empty) lived until #3119 added the `common::builtinClassModulePathOf`
+// table and routed the eight §8.5 emission sites through it.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_interp_vtableless_builtin_2923, mutex_hole_renders_type_name_8_5) {
     BEZEL_EXPECT_EQ(
         out(prog("using var x := new Mutex(); "
                  "Console.WriteLine($\"val={x}\");")),
-        std::string("val=Mutex"));
+        std::string("val=System.Threading.Mutex"));   // #3119: was "val=Mutex"
 }
 
 // The same receiver TWICE in one interpolation — the shape that escalated to
@@ -102,7 +110,7 @@ BEZEL_TEST(codegen_interp_vtableless_builtin_2923, mutex_two_holes_no_use_after_
     BEZEL_EXPECT_EQ(
         out(prog("using var x := new Mutex(); "
                  "Console.WriteLine($\"a{x}b{x}c\");")),
-        std::string("aMutexbMutexc"));
+        std::string("aSystem.Threading.MutexbSystem.Threading.Mutexc"));   // #3119
 }
 
 // stdlib §3: `Random` is a class; §8.5's class default applies. Under ASan on
@@ -111,7 +119,7 @@ BEZEL_TEST(codegen_interp_vtableless_builtin_2923, random_hole_renders_type_name
     BEZEL_EXPECT_EQ(
         out(prog("using var r := new Random(); "
                  "Console.WriteLine($\"[{r}]\");")),
-        std::string("[Random]"));
+        std::string("[System.Random]"));   // #3119: was "[Random]"
 }
 
 // ---------------------------------------------------------------------------
@@ -142,21 +150,31 @@ BEZEL_TEST(codegen_interp_vtableless_builtin_2923, stringbuilder_hole_equals_exp
 // The interpolation hole and the explicit `.ToString()` call are two spellings
 // of ONE §8.5 rule and must not disagree. `Array<T>`'s explicit call already
 // answered "Array" (the #2457 slice); the hole crashed. Pin them equal.
+//
+// fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1 + rule 3): both spellings
+// render the QUALIFIED module path WITH the §2.13 rule 3 generic-args tail —
+// "System.Collections.Generic.Array<int>" for `Array<int>` and
+// "System.Collections.Generic.Dictionary<string, int>" for
+// `Dictionary<string, int>`. The (b) half of #3119 (the rule 3 rendering)
+// applies at this site: `emitVtablelessBuiltinToString` is the one §8.5
+// emission that has the `TypeRef` in hand, so it routes the rendering
+// through `spec85TypeRefQualifiedName`, which recurses on `genericArgs`.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(codegen_interp_vtableless_builtin_2923, array_hole_agrees_with_explicit_tostring_8_5) {
     BEZEL_EXPECT_EQ(
         out(prog("using var a := new Array<int>(2); "
                  "var viaCall := a.ToString(); "
                  "Console.WriteLine($\"{a}|{viaCall}\");")),
-        std::string("Array|Array"));
+        std::string("System.Collections.Generic.Array<int>|System.Collections.Generic.Array<int>"));   // #3119: was "Array|Array"
 }
 
-// A generic built-in renders its head name, exactly as the explicit call does.
+// A generic built-in renders the qualified module path AND its generic args,
+// exactly as the explicit call does.
 BEZEL_TEST(codegen_interp_vtableless_builtin_2923, dictionary_hole_renders_type_name_8_5) {
     BEZEL_EXPECT_EQ(
         out(prog("using var d := new Dictionary<string, int>(); "
                  "Console.WriteLine($\"{d}\");")),
-        std::string("Dictionary"));
+        std::string("System.Collections.Generic.Dictionary<string, int>"));   // #3119: was "Dictionary"
 }
 
 // ---------------------------------------------------------------------------

@@ -5206,6 +5206,219 @@ private:
         return ts->moduleName + "." + std::string(ts->name);
     }
 
+    // fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1 + rule 2): the module
+    // path component of §8.5's qualified-name default for a reserved BUILT-IN
+    // CLASS — `ts->moduleName` is empty for a synthetic builtin (built by
+    // `SemaContext::builtinClassSym`, no ast::TypeDecl), so #2934's helper above
+    // renders the bare name (e.g. "Mutex"). This consults the module-path table
+    // in `common::BuiltinRegistry` instead, returning "System.Threading" for
+    // `Mutex`, "System.Collections.Generic" for `Array`, etc., or an empty
+    // string_view when `ts->name` is not a reserved built-in class.
+    //
+    // Keyword-aliased primitives (`int`, `string`, …) and built-in INTERFACE
+    // heads deliberately return empty here; their renderings are governed by
+    // stdlib §2.13 rule 2 (keyword lowercase) and rule 1 (interfaces do not
+    // render their own name) respectively. The §8.5 keyword-alias spelling is
+    // the keyword itself (e.g. "int"), and an interface head has no name-only
+    // default — a class-typed receiver's default is the runtime class's name.
+    //
+    // ⚠ NOT a stand-alone §8.5 helper: every caller composes it with
+    // `spec85QualifiedTypeName`'s `moduleName + "." + name` join, so the
+    // spelling stays one literal across all eight §8.5 emission sites.
+    static std::string_view spec85BuiltinModuleName(const sema::TypeSymbol* ts) {
+        if (!ts) return {};
+        // `ts->moduleName` is the user-side path for declared classes
+        // (#1488); a synthetic builtin (`ts->decl == nullptr`, the shape
+        // `SemaContext::builtinClassSym` builds) has an empty `moduleName`,
+        // so the table below is the only authority for it. An IMPORTED user
+        // class has `ts->decl == nullptr` BUT a populated `moduleName`
+        // (#2997), and the `moduleName.empty()` guard above routes THAT
+        // shape through `spec85QualifiedTypeName`'s ordinary user-class
+        // path — never through this lookup.
+        if (!ts->moduleName.empty()) return {};
+        // `name` is the simple identifier; for a generic INSTANTIATION the
+        // head symbol's `name` is the declaration's bare name ("Array",
+        // "Dictionary", …), which is what the table keys on.
+        std::string_view n(ts->name);
+        // Keyword aliases and interface heads have no module path here.
+        if (common::isKeywordAliasBuiltinName(n)) return {};
+        return common::builtinClassModulePathOf(n);
+    }
+
+    // fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1): the `Type.FullName`
+    // rendering for a reserved built-in class — the `<module>.<name>` form
+    // the table in `common::BuiltinRegistry` supplies. Returns "Mutex" (the
+    // bare identifier) when `ts->name` is NOT in the table, preserving
+    // behavior identical to #2934 for every name that does not yet have a
+    // module-path entry. Callers that need the FULL contract (§8.5 name-only
+    // defaults for classes, enums, and non-auto-equality body records)
+    // continue to go through `spec85QualifiedTypeName`, which now consults
+    // this lookup for the synthetic-builtin population.
+    static std::string spec85BuiltinQualifiedName(const sema::TypeSymbol* ts) {
+        if (!ts) return "";
+        std::string_view mod = spec85BuiltinModuleName(ts);
+        if (mod.empty()) return std::string(ts->name);
+        return std::string(mod) + "." + std::string(ts->name);
+    }
+
+    // fix #3119 (stdlib §2.13 rule 3, v0.252; §8.5's class/enum/body-record
+    // default renders per rule 3 — "a generic instantiation renders the head
+    // followed by `<`, its arguments joined by `", "`, and `>`, each argument
+    // rendered recursively in the same property's form"): the QUALIFIED `Name`
+    // / `FullName` rendering of a `TypeRef`, recursing on `genericArgs`. For a
+    // generic INSTANTIATION `Array<int>` this is "Array<int>"; for a keyword
+    // alias argument `int` it is the keyword "int"; for a user-declared class
+    // argument `G<T>` it is "Module.G" with the inner `<T>` recursing.
+    //
+    // The five §2.13 rule families are handled here:
+    //   * Named (rule 1, rule 2, rule 3): module-qualified head; keyword-
+    //     aliased primitives render lowercase; generic instantiations add
+    //     "<arg1, arg2, …>" with each arg recursing.
+    //   * Nullable: rule 4's trailing "?" (inside a composite's identity
+    //     per the nullability paragraph — a top-level nullable `T?` is
+    //     reified to `T`, §17.10, but a `T?` inside `<…>` is part of
+    //     identity and renders here).
+    //   * InlineArray (rule 4): "[N]T" / "[N owned]T?" with the element
+    //     recursing.
+    //   * Function (rule 5): "(A, B) -> R" — components recurse; the
+    //     function type itself has no module of its own, so Name and
+    //     FullName differ only through the components.
+    //   * Unit (rule 6): "()".
+    //
+    // Out of scope for #3119's first cut: the vtable-slot-3 / box-thunk /
+    // enum-default emission sites have only a `TypeSymbol`, not a `TypeRef`
+    // (the issue's "(b) plumbing" paragraph) — those calls fall through to
+    // `spec85QualifiedTypeName(ts)` and render the bare head name (no
+    // generic args), which the issue acknowledges as a follow-up requiring
+    // per-instantiation thunks or a TypeRef threaded to the body emitter.
+    static std::string spec85TypeRefQualifiedName(const sema::TypeRef* rt) {
+        if (!rt) return "";
+        using K = sema::TypeRef::Kind;
+        switch (rt->kind) {
+            case K::Named: {
+                // The head name: prefer the declaration's name (handles the
+                // builtin-class case via `spec85BuiltinModuleName`); fall
+                // back to the astNode's head when the declaration is null
+                // (transparent alias, aliasResolvedHead, importedName, …).
+                std::string head;
+                std::string_view mod;
+                if (rt->declaration) {
+                    head = std::string(rt->declaration->name);
+                    // #2934 user-class path: `declaration->moduleName` is
+                    // populated for a real (local or imported) TypeSymbol,
+                    // and is empty for a synthetic builtin (sema-built).
+                    // `spec85BuiltinModuleName` is the table lookup that
+                    // fills the empty case via `common::BuiltinRegistry`.
+                    if (!rt->declaration->moduleName.empty())
+                        mod = rt->declaration->moduleName;
+                    else
+                        mod = spec85BuiltinModuleName(rt->declaration);
+                } else {
+                    // No declaration: keyword-aliased primitive, transparent
+                    // alias, or imported-name fallback. The keyword alias
+                    // renders lowercase per §2.13 rule 2; everything else
+                    // uses the resolved head name as-is.
+                    std::string_view n = !rt->aliasResolvedHead.empty()
+                                              ? rt->aliasResolvedHead
+                                          : !rt->importedName.empty()
+                                              ? rt->importedName
+                                          : rt->headName();
+                    if (common::isKeywordAliasBuiltinName(n)) {
+                        // Rule 2: keyword IS the canonical name, in BOTH
+                        // Name and FullName — render the keyword directly.
+                        // Generic args on a keyword-aliased primitive
+                        // (`Array<int>`) are the HEAD's args, not the
+                        // keyword's; this case has none (`int` has no
+                        // generic parameters, and the spec erases
+                        // top-level nullability at reification).
+                        return std::string(n);
+                    }
+                    head = std::string(n);
+                    // fix #3119 (stdlib §2.13 rule 1): a synthetic
+                    // builtin (`declaration == nullptr`) used as a
+                    // GENERIC ARGUMENT (e.g. `Dictionary<string,
+                    // Array<int>>`) still carries its module path. The
+                    // declaration is null on this shape (no user
+                    // TypeSymbol), so `spec85BuiltinModuleName(ts)` —
+                    // which takes a `TypeSymbol*` — does not apply
+                    // directly; consult the same `common::BuiltinRegistry`
+                    // table by the resolved head name. The keyword-
+                    // alias branch above already returned, so a non-empty
+                    // `n` here is a reserved built-in CLASS head (or a
+                    // user class through the imported-name path, which
+                    // is non-empty in `common::builtinClassModulePathOf`
+                    // and is the same spelling the local-side fix uses).
+                    mod = common::builtinClassModulePathOf(n);
+                }
+                std::string r = mod.empty() ? head : (std::string(mod) + "." + head);
+                // Rule 3: a generic INSTANTIATION renders "<arg1, arg2, …>".
+                // Top-level nullability is erased at reification (the
+                // contract this rendering implements), so we never add a
+                // trailing "?" here for a top-level nullable form — that
+                // shape is unreachable (sema rejects `typeof(T?)` and
+                // `GetType()` over a null is undefined). Nullability INSIDE
+                // a composite IS part of identity and renders.
+                if (!rt->genericArgs.empty()) {
+                    r += "<";
+                    for (std::size_t i = 0; i < rt->genericArgs.size(); ++i) {
+                        if (i) r += ", ";
+                        r += spec85TypeRefQualifiedName(rt->genericArgs[i]);
+                    }
+                    r += ">";
+                }
+                return r;
+            }
+            case K::InlineArray: {
+                // Rule 4: "[N]T" or "[N owned]T?". The element TypeRef
+                // recurses through this helper, so a "[N]List<int>" element
+                // renders as "[N]List<int>".
+                std::string r;
+                r += "[";
+                r += std::to_string(rt->arraySizeValue);
+                if (rt->arrayOwned) r += " owned";
+                r += "]";
+                if (rt->arrayElement) r += spec85TypeRefQualifiedName(rt->arrayElement);
+                if (rt->nullable) r += "?";
+                return r;
+            }
+            case K::Function: {
+                // Rule 5: "(A, B) -> R" — components joined by ", " with
+                // one space around "->"; modifiers (`owned`/borrow kinds) as
+                // written; unit is "()"; function type has no module of its
+                // own (Name and FullName differ only through components).
+                std::string r = "(";
+                for (std::size_t i = 0; i < rt->funcParams.size(); ++i) {
+                    if (i) r += ", ";
+                    r += spec85TypeRefQualifiedName(rt->funcParams[i].type);
+                }
+                r += ") -> ";
+                r += spec85TypeRefQualifiedName(rt->funcReturn);
+                return r;
+            }
+            case K::Unit:
+                return "()";   // Rule 6.
+            case K::Primitive: {
+                // §2.13 rule 2 + rule 3: a primitive type argument renders
+                // as its lowercase keyword (`int`, `string`, …). The
+                // primitive TypeRef carries the kind as an enum (`primitive`,
+                // `nullable`); the keyword spelling is `common::
+                // primitiveBuiltinSpelling` (mirrors the sema-private
+                // `primitiveSpelling`). Nullability INSIDE a composite is
+                // part of identity and renders as a trailing `?` — a
+                // top-level nullable form is reified to its underlying type
+                // (§17.10), so this surface is unreachable in the top-
+                // level position; inside `<…>` it can appear.
+                std::string rp = std::string(common::primitiveBuiltinSpelling(
+                    static_cast<int>(rt->primitive)));
+                if (rt->nullable) rp += "?";
+                return rp;
+            }
+            case K::Error:
+                return "";
+        }
+        return "";
+    }
+
     // fix #2934 (spec §8.5, v0.252; stdlib §2.13 `Type.FullName`): the ONE
     // spelling §8.5's three *name-only* `ToString` defaults render — for
     // classes, for enums, and for body records that do NOT satisfy the §9.2
@@ -5236,14 +5449,33 @@ private:
     // by SymbolCollection (from the enclosing ModuleDecl) and imported ones by
     // ModuleLoader (from ModuleMetadata::moduleName), the #1488 invariant — so
     // the empty-string fallback covers only the synthetic builtin TypeSymbols
-    // (`ts->decl == nullptr`), which have no module to name. The remaining
-    // builtin-class residual (a reserved built-in class rendering "Mutex"
-    // rather than "System.Threading.Mutex", and stdlib §2.13 rule 3's
-    // type-argument rendering, neither of which any table in this compiler can
-    // supply today) is recorded in #3119, not guessed at here.
+    // (`ts->decl == nullptr`), which have no module to name.
+    //
+    // fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1): for that synthetic
+    // builtin population, the rendering now resolves the qualified module path
+    // through the table in `common::BuiltinRegistry` — a reserved built-in
+    // class renders as "System.Threading.Mutex" (not "Mutex"). Keyword-aliased
+    // primitives (`int`, `string`, …) and built-in interface heads fall
+    // through to the bare `ts->name` (keyword aliases are already lowercase;
+    // interface heads do not render their own name under §8.5's name-only
+    // default — a class-typed receiver's default is the runtime class's
+    // name, not the static interface head's). Stdlib §2.13 rule 3's generic
+    // type-arg rendering remains a follow-up (#3119 (b)): this helper takes a
+    // `TypeSymbol*` and a generic INSTANTIATION's type arguments live on the
+    // `TypeRef*`, not the symbol; the (b) sites that have the TypeRef in hand
+    // consult `spec85TypeRefQualifiedName` above.
     static std::string spec85QualifiedTypeName(const sema::TypeSymbol* ts) {
         if (!ts) return "";
-        if (ts->moduleName.empty()) return std::string(ts->name);
+        if (ts->moduleName.empty()) {
+            // Synthetic builtin population — the table lookup fills the
+            // module path for a reserved built-in class; everything else
+            // (keyword aliases, interface heads, imported user classes with
+            // a populated moduleName are not in this branch) keeps the
+            // pre-#3119 bare-name fallback.
+            std::string_view mod = spec85BuiltinModuleName(ts);
+            if (mod.empty()) return std::string(ts->name);
+            return std::string(mod) + "." + std::string(ts->name);
+        }
         return ts->moduleName + "." + std::string(ts->name);
     }
 
