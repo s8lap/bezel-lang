@@ -71,6 +71,19 @@ const Entry kAstKeyedTables[] = {
     {"exprExtBindings_",
      "NOT carried, and proven UNREACHABLE: a body naming an extension method "
      "declines reconstruction at #783's gate before this table is consulted"},
+    {"newExprPositionalBindings_",
+     "NOT carried, and proven UNREACHABLE: a §22.5 binding's keys are "
+     "NewExpr nodes for `new T(args)` call SITES, which by §2.5/§2.8.3 rule 4 "
+     "live in the IMPORTER's AST — every `new ImportedT(args)` is in the "
+     "importer's body, and every reparse path (`parseAndAttach*` for "
+     "method/ctor/dtor/field-init) re-parses DEPENDENCY bodies, not the "
+     "importer's. A `new T()` inside a re-parsed body is always a §22.5/§22.10 "
+     "call on a LOCAL class (whose binding would never have shipped through "
+     "this table's `setNewExprPositionalBinding`) — it is published only by "
+     "`checkNewExprArgs`, which runs only after the importer has resolved the "
+     "type. The fresh-context reparse for an imported generic body's inner "
+     "class cannot have a reachable #3196 binding. (fix #3196: SemaContext.hpp "
+     "setNewExprPositionalBinding.)"},
 };
 
 // Locate the repo root from this translation unit's own path:

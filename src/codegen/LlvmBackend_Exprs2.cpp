@@ -2672,36 +2672,90 @@ void Emitter::storePrimaryCtorPositionalArgs(
       // (`fs->posParam->defaultText` string, the textualised default the
       // encoder shipped via #3202's REC_POSPARAM_DEFAULT) are the two
       // channels through which a default reaches this site.
+      // fix #3196 (§22.5 "Optional parameters and named arguments" /
+      // §22.10 "primary constructors" / §22.8 step 0, v0.254): read the
+      // §22.5 BINDING sema published on the `SemaContext` side table via
+      // `checkPositionalNewArgsFromSymbols` →
+      // `SemaContext::setNewExprPositionalBinding`. The pre-#3196 path
+      // paired `ne.args[pi]` with field `pi` positionally, which silently
+      // zeroed every slot on a NAMED call (`new PBox(W := 4, V := 3)`
+      // would store `4` into V's slot and `3` into W's slot) — the
+      // silent-wrong-object outcome #3141 declined rather than ship, and
+      // was also the silent-wrong OBJECT on the LOCAL side (#3163). #3196
+      // closes both halves by reading the same `fieldToArg` sema resolved,
+      // so there is exactly one §22.5 binding body in the compiler.
       //
-      // The named-argument shape is still declined here: `new PBox(W := 4,
-      // V := 3)` was the second of #3162's two declines (the first being
-      // GENERIC imported), and the same defect — only the all-positional
-      // form is lowered across a module boundary — applies. The NAMED arm
-      // already bypasses the store loop today (it fails `allPositional`),
-      // so keeping the same gate here just preserves the pre-fix decline
-      // while unbreaking the under-supplied POSITIONAL case.
-      bool allPositional = true;
-      for (const auto& a : ne.args)
-          if (!a.name.empty()) { allPositional = false; break; }
-      if (allPositional && ne.args.size() <= posFields.size()) {
-          for (std::size_t pi = 0; pi < posFields.size(); ++pi) {
+      // The binding is published by:
+      //   - #3162's IMPORTED-class-with-primary-ctor arm (no explicit ctor,
+      //     non-empty args) — runs `checkPositionalNewArgsFromSymbols`.
+      //   - #3196's twin: LOCAL class-with-primary-ctor + no explicit ctor
+      //     + non-empty args (was previously deferred outright by
+      //     `if (!ctx_.isImported(t)) return;` at sema line ~10824, so the
+      //     local twin was the silent-wrong-object side; that deferral is
+      //     gone now too).
+      //   - the LOCAL-record-with-positional-fields check
+      //     `checkArgsAgainstParams`, and the IMPORTED-record twin
+      //     `checkPositionalNewArgsFromSymbols` (records don't call THIS
+      //     helper, so the publication is a benign side-effect for them).
+      //
+      // When the binding IS NOT published (legacy / paths sema has not
+      // reached — among them, #3163's combined "primary ctor + explicit
+      // ctor" deferral), fall back to position-i pairing and require all
+      // positional. The named arm of that legacy path was loud-rejected
+      // upstream by sema's existing `bindArgsToParams` paths / #3162's now-
+      // removed `anyNamed` decline, so the silent-zero-fallback it's
+      // guarding against is not reachable today from a semantically-
+      // accepted `new` site — keeping the guard preserves that posture.
+      const std::vector<int>* bindingPtr = ctx_.newExprPositionalBinding(ne);
+      if (!bindingPtr) {
+          bool allPositional = true;
+          for (const auto& a : ne.args)
+              if (!a.name.empty()) { allPositional = false; break; }
+          if (!allPositional || ne.args.size() > posFields.size())
+              return;  // named-without-binding or oversupplied — every
+                       // field stays calloc-zero, the pre-#3196 posture.
+      }
+      for (std::size_t pi = 0; pi < posFields.size(); ++pi) {
               {  // scope for the per-field bindings below
                   auto* fs = const_cast<sema::FieldSymbol*>(
                       static_cast<const sema::FieldSymbol*>(posFields[pi]));
                   auto idxIt = fieldIndex_.find(fs);
                   if (idxIt == fieldIndex_.end()) continue;
-                  // The argument expression to lower: supplied positionally
-                  // when present, the parameter's `:= Expr` default
-                  // otherwise. `ne.args[pi].value` is null both when the
-                  // slot is omitted AND when it is `out _`-shaped — but the
-                  // latter never reaches this site (a positional primary-
-                  // ctor parameter admits plain and `owned` only, §22.10,
-                  // so no `out` slot can bind here). A `null` value at
-                  // this line therefore means "omitted, fill from default".
+                  // The argument index this slot binds to:
+    //   - From the §22.5 binding sema published, when present
+    //     (`bindingPtr != null`): `argIdx` is the call-site argument index
+    //     that names this slot, or -1 for an OMITTED slot (a defaulted
+    //     parameter the call left blank; the next branch fills it).
+    //   - From the position-i legacy pairing (no binding published):
+    //     `argIdx == pi` for the first `ne.args.size()` fields, and -1
+    //     for the trailing slots the call did not supply.
+    // The other arms of the per-field logic use `argIdx` rather than
+    // `pi` to find the value to lower, so a named call (`new PBox(W := 4,
+    // V := 3)` → `argIdx[0] = 1, argIdx[1] = 0`) lowers `ne.args[1].value`
+    // (which is `4`) for field 0 and `ne.args[0].value` (which is `3`) for
+    // field 1 — the same mapping sema accepted. The pre-#3196 positional
+    // pairing `ne.args[pi]` swapped V and W, leaving both stored wrong.
+    int argIdx;
+    if (bindingPtr) {
+        argIdx = (pi < bindingPtr->size()) ? (*bindingPtr)[pi] : -1;
+    } else {
+        argIdx = (pi < ne.args.size()) ? static_cast<int>(pi) : -1;
+    }
+                  // The argument expression to lower: supplied (by the §22.5
+                  // binding) when the slot has a bound arg, the parameter's
+                  // `:= Expr` default otherwise. `ne.args[argIdx].value`
+                  // is null both when the slot is omitted AND when it is
+                  // `out _`-shaped — but the latter never reaches this site
+                  // (a positional primary-ctor parameter admits plain and
+                  // `owned` only, §22.10, so no `out` slot can bind here).
+                  // A `null` value at this line therefore means
+                  // "omitted, fill from default".
                   const ast::Expr* argExpr = nullptr;
                   llvm::Value* defaultV = nullptr;
-                  if (pi < ne.args.size() && ne.args[pi].value) {
-                      argExpr = ne.args[pi].value.get();
+                  if (argIdx >= 0 &&
+                      static_cast<std::size_t>(argIdx) < ne.args.size() &&
+                      ne.args[argIdx].value) {
+                      argExpr = ne.args[argIdx].value.get();
                   } else if (fs->posParam &&
                              (fs->posParam->defaultValue ||
                               !fs->posParam->defaultText.empty())) {
@@ -2773,7 +2827,8 @@ void Emitter::storePrimaryCtorPositionalArgs(
                       // but the explicit skip keeps the row silent rather
                       // than SIGSEGVing on an unsound GEP — same posture
                       // as the pre-fix `if (!ne.args[pi].value) continue;`
-                      // line this replaces.
+                      // line this replaces (the bound arm now reads
+                      // `ne.args[argIdx].value` per the §22.5 binding).
                       continue;
                   }
                   // issue #597: a positional primary-ctor argument is an
@@ -2861,8 +2916,11 @@ void Emitter::storePrimaryCtorPositionalArgs(
                   // expression that LOWERs to a non-+1 string, e.g. a
                   // field read) retains the same rule by the same
                   // expression-pointer identity, which is what
-                  // `isPlusOneStringProducer(*ne.args[pi].value)` answered
-                  // for the supplied arm just below.
+                  // `isPlusOneStringProducer(*ne.args[argIdx].value)`
+                  // answered for the supplied arm just below (#3196:
+                  // `argIdx` is the §22.5 binding's bound argument index
+                  // for the slot, not the slot's positional index — the
+                  // caller may have bound a NAMED argument).
                   if (v->getType()->isPointerTy() &&
                       isStringStorageMember(fs) &&
                       !isPlusOneStringProducer(argExpr))
@@ -2873,7 +2931,6 @@ void Emitter::storePrimaryCtorPositionalArgs(
               }
           }
       }
-    }
 }
 
 void Emitter::prePopulateBasePositionalFields(

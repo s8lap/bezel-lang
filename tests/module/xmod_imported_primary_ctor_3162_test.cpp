@@ -644,32 +644,33 @@ BEZEL_TEST(xmod_imported_primary_ctor_3162,
 }
 
 // ===========================================================================
-// T10 — §22.5 / #3162: a NAMED argument to an imported primary constructor is
-// DECLINED, loudly, with the reason.
+// T10 — §22.5 / #3196: a NAMED argument to an imported primary constructor
+// LOWERS correctly. Before #3196 this row asserted the loud `anyNamed`
+// decline (#3162's diagnostic at sema line ~10898), because the codegen
+// `storePrimaryCtorPositionalArgs` was a position-i pairing that would have
+// produced a calloc-zero object the moment #3196's now-removed `anyNamed`
+// gate fell. #3196 closes that gap on BOTH sides — the loud IMPORTED decline
+// is gone, the silent-zero LOCAL twin is gone — by having sema publish the
+// §22.5 binding on `SemaContext` and the codegen read the same binding
+// (field j → arg index, or -1). This row now asserts the construction
+// success it was previously guarding against.
 //
-// §22.5 admits `new PBox(W := 4, V := 3)` and the sema check above binds it
-// correctly — but `storePrimaryCtorPositionalArgs` lowers only the
-// all-positional form, so admitting the named one would compile clean and leave
-// the object calloc-zero. That is precisely the silent-wrong-object outcome
-// #3141 declined rather than ship, so it stays declined until the lowering
-// binds by name. (The LOCAL twin is silently wrong today for the same reason —
-// #3163's deferral — which is why this row has no twin assertion.)
+// Comprehensive coverage (named-basic, named-reversed, named-default
+// intermix, wrong-typed named-rejected-on-both-sides) is pinned by the
+// sibling test file `xmod_named_arg_imported_primary_ctor_3196_test.cpp`;
+// this row stays as the cross-module-specific named-argument regression
+// marker for the suite.
 // ===========================================================================
 BEZEL_TEST(xmod_imported_primary_ctor_3162,
-           t10_named_argument_declined_with_reason_22_5) {
+           t10_named_argument_lowers_correctly_22_5) {
     const std::string body =
         "  public static method Main(): int "
         "    var b := new PBox(W := 4, V := 3); "
         "    return b.Sum(); "
         "  end Main;";
-    std::string diag;
-    int r = compileImportAndRun3162(lib3162("TA"), app3162("TA", body), &diag);
+    int r = compileImportAndRun3162(lib3162("TA"), app3162("TA", body));
     if (r == kDepUnavailable3162) return;
-    BEZEL_EXPECT_EQ(r, kRejected3162);
-    BEZEL_EXPECT_TRUE(mentions3162(diag, "binds a NAMED argument to an "
-                                         "IMPORTED class's primary "
-                                         "constructor"));
-    BEZEL_EXPECT_TRUE(mentions3162(diag, "#3162"));
+    BEZEL_EXPECT_EQ(r, 7);
 }
 
 // ===========================================================================

@@ -10821,25 +10821,21 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             }
             return;
         }
-        // A CLASS with a primary constructor. Locally this used to stay
-        // deferred, exactly as before — but the deferral was UNCONDITIONAL
-        // (see the long ⚠ above; #3163), so even an unchained
-        // `class PBox(V: int, W: string)` got no arity and no per-argument
-        // type check, and `new PBox(3, 4)` SEGFAULTed on the first read of
-        // `W` while `new PBox(3)` silently answered a zero object (measured
-        // locally at this commit).
+        // A CLASS with a primary constructor (§22.10 / §2.8.3 rule 4).
         //
-        // fix #3163 (§22.10 / §22.5 / §5.1, v0.254): when the class has no
-        // explicit constructor whose arity matches the call's, the primary
-        // ctor IS the constructor (§22.10) and the §22.5/§5.1 check the
-        // record arm runs above is the check that should run here too. The
-        // codegen already routes `new C(5)` on `class C(x: int)` +
-        // `constructor() this(99)` to the primary ctor path (it does so
-        // today via silent deferral); the candidate-set question is
-        // preserved by only running the check when no explicit ctor has
-        // matching arity — `new C()` on the same class still routes to the
-        // 0-arg explicit ctor as before, and so does every `new C(...)`
-        // whose arity matches an explicit ctor's.
+        // #3196 narrows the LOCAL deferral (which used to be the
+        // unconditional `if (!ctx_.isImported(t)) return;` — #3163's domain)
+        // to the COMBINED "primary ctor + explicit ctor" shape ONLY.
+        // The §22.5/§5.1 check below is the no-explicit-ctor binder, so the
+        // combined form (whose construction routes through the explicit
+        // ctor's args) is kept on its pre-#3196 path; pinning this is what
+        // makes `tests/codegen/class_primary_ctor_serialization_2325_test.cpp`
+        // `primary_ctor_match_with_extra_explicit_ctor_uses_primary_spec_9_8_2362`
+        // stay green (a `new Widget(5)` against
+        // `class Widget(id: int)` PLUS a 2-arg
+        // `constructor(id: int, note: string) this(id);`). The combined
+        // shape's binding (explicit-ctor params + primary-ctor params
+        // share the call site) is #3163's wider work — out of scope here.
         //
         // ⚠ MERGE NOTE (#3196 ⨯ #3163): #3163's loud NAMED-argument decline
         // (the `if (anyNamed)` decline inside the unconditional local-
@@ -10921,15 +10917,21 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // arguments into their slots and then calls it (see the comment
             // there). Nothing new crosses the wire.
             //
-            // ONE shape stays declined, and loudly: a NAMED argument. §22.5
-            // admits `new PBox(W := 4, V := 3)` and this check binds it
-            // correctly, but `storePrimaryCtorPositionalArgs` lowers only the
-            // all-positional form — a named call would compile clean and leave
-            // the object calloc-zero, which is precisely the silent-wrong-object
-            // outcome #3141 declined rather than ship. (Its LOCAL twin is
-            // silently wrong today for the same reason; that is #3163's
-            // deferral, not this fix's to widen.) Filed as its own issue.
-            // A GENERIC imported class stays declined too, and this guard is
+            // fix #3196 (§22.5 / §22.10 / §2.8.3 rule 4, v0.254) — NAMED
+            // arguments to a primary constructor are now fully admitted, on
+            // BOTH sides of a module boundary and on both LOCAL and IMPORTED
+            // classes. The lowering changes are confined to codegen
+            // `storePrimaryCtorPositionalArgs`, which reads the §22.5 binding
+            // this check publishes on the `SemaContext` side table via
+            // `setNewExprPositionalBinding`. Before #3196 the imported arm
+            // here had a LOUD `anyNamed` decline (the symmetric sibling of
+            // #3163's silent local zero) — that decline is removed, and its
+            // local silence is removed too (the local class branch at line
+            // 10824 no longer defers). GENERIC imports stay declined (the
+            // local GENERIC sibling constructs correctly through the
+            // Foundation A path; pinning that asymmetry is the gate below).
+            //
+            // A GENERIC imported class stays declined, and this guard is
             // load-bearing: `lowerNew` routes an imported GENERIC to the #662
             // Foundation A/C arm (`emitInstanceInit`, monomorphized in the
             // importer), NOT to the `bz$<Type>$init` arm this fix taught to
@@ -10941,8 +10943,10 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // That is precisely the silent-wrong-object outcome #3141 declined
             // rather than ship, so the decline is kept for this shape and the
             // capability filed separately. (Found by testing the whole surface
-            // the accept path opened, not just the shape #3162 names.)
-            if (!t->genericParams.empty()) {
+            // the accept path opened, not just the shape #3162 names.) The
+            // LOCAL generic sibling is NOT declined: `twin3162.T13b` confirms
+            // the same declaration in one module constructs and answers 7.
+            if (ctx_.isImported(t) && !t->genericParams.empty()) {
                 ctx_.diagnostics().report(
                     Severity::Error, ne.span.begin,
                     std::string("`new ") + std::string(t->name) +
@@ -10958,21 +10962,6 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                         std::string(t->name) + "`");
                 return;
             }
-            bool anyNamed = false;
-            for (const auto& a : ne.args)
-                if (!a.name.empty()) { anyNamed = true; break; }
-            if (anyNamed) {
-                ctx_.diagnostics().report(
-                    Severity::Error, ne.span.begin,
-                    std::string("`new ") + std::string(t->name) +
-                        "` binds a NAMED argument to an IMPORTED class's "
-                        "primary constructor, which is not yet supported "
-                        "(§22.5 / §22.10 / §2.8.3 rule 4, #3162): only the "
-                        "all-positional spelling is lowered across a module "
-                        "boundary, and a named one would leave the object "
-                        "zero-initialized. Pass the arguments positionally");
-                return;
-            }
             // ⚠ One known imprecision, measured and filed as #3202: a §22.10
             // primary parameter may carry a DEFAULT (`class DefBox(A: int,
             // B: int := 9)` — the parser routes a class's primary list through
@@ -10981,10 +10970,12 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // reported here as "required parameter `B` is not supplied", which
             // is false of `B`. It is still an improvement on both neighbours:
             // pre-#3162 the same call was rejected outright, and the LOCAL twin
-            // silently answers a ZERO OBJECT today (#3163 + #3202). The
+            // silently answered a ZERO OBJECT today (#3163 + #3202). The
             // remedy is carriage, not a reworded string — this check is shared
             // with imported RECORDS, where §9.1 gives no per-field default and
-            // the message is exactly right.
+            // the message is exactly right. (#3196 closes both halves of the
+            // local silence for the named-shape and correctly-typed case;
+            // #3202 remains for default carriage only.)
             checkPositionalNewArgsFromSymbols(ne, t);
             return;
         }
@@ -11317,6 +11308,32 @@ void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
                  "` is not supplied (§22.5)");
             return;
         }
+    // fix #3196 (§22.5 / §22.10, v0.254): publish the per-slot binding just
+    // computed (field index j → call-site argument index, or -1 for a defaulted
+    // / unfilled slot) on the `SemaContext` side table so the lowering pass's
+    // `storePrimaryCtorPositionalArgs` reads the SAME mapping sema accepted.
+    // Without this, codegen could only do the trivial "argument i pairs with
+    // field i" walk, which silently zeroes every slot of a NAMED call like
+    // `new PBox(W := 4, V := 3)` — the spelling §22.5 admits, the §22.5
+    // binding rule above just resolved, but the lowering's separate `arg i`
+    // indexing would still store `4` into field 0 and `3` into field 1. The
+    // publication happens AFTER every arity/duplicate-name/unknown-name
+    // validation has passed (those failures returned above), so a published
+    // binding is always a fully-resolved §22.5 mapping — codegen never sees
+    // a half-resolved vector. The publication happens BEFORE the §5.1
+    // typecheck below so the binding is annotated even if a later per-arg
+    // typecheck rejects one slot — codegen still knows the per-slot sources
+    // and falls back to the same partial codegen path it used to. #3162's
+    // loud `anyNamed` decline was the symmetric defect: it rejected what
+    // sema had already bound, because the lowering couldn't follow — that
+    // arm is now removed (see the call site comment for #3196).
+    //
+    // Each entry points at a SLOT on the class's `recordPositionalFieldSymbols`
+    // list, which is the same index `storePrimaryCtorPositionalArgs` walks
+    // over to choose the GEP into `obj`. Local and IMPORTED classes both
+    // publish identically; the codegen reader is side-table-driven and the
+    // binding depends only on the §22.5 rule, so neither side can drift.
+    ctx_.setNewExprPositionalBinding(&ne, fieldToArg);
     // per §5.1: each bound argument must be assignable to its field's declared
     // type. `storageComponentType` is the accessor that consults both sources —
     // the positional `Param`'s type node, then the importer's member-type side

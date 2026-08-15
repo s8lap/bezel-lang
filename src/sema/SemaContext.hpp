@@ -150,6 +150,49 @@ public:
         auto it = patternSymbols_.find(&p);
         return it == patternSymbols_.end() ? nullptr : it->second;
     }
+
+    // fix #3196 (§22.5 "Optional parameters and named arguments" / §22.10
+    // "primary constructors", v0.254): a per-NewExpr side table that records
+    // the §22.5 named-vs-positional BINDING of the call's arguments to the
+    // target class's positional primary-ctor field slots. Each entry is a
+    // vector parallel to `recordPositionalFieldSymbols(t)` — index j holds the
+    // (0-based) argument index from `ne.args` that supplies field slot j, or
+    // `-1` when the call OMITS that slot (left to default-fill or calloc-zero).
+    //
+    // The binding has exactly one body — `checkPositionalNewArgsFromSymbols`
+    // in sema, which already computed it as a local `fieldToArg` vector
+    // (§22.5 positional/named resolution over the symbol-side
+    // `recordPositionalFieldSymbols` list) — and is published here so codegen
+    // reads the SAME mapping sema accepted. Without this, codegen's
+    // `storePrimaryCtorPositionalArgs` could only do the trivial "argument i
+    // stores into field i" pairing, which silently zeroes every slot when the
+    // call uses a named argument (`new PBox(W := 4, V := 3)` — §22.5 admits
+    // the spelling, sema binds `W→1, V→0`, but codegen pairs `ne.args[0]`
+    // with field 0 and `ne.args[1]` with field 1 and stores `4` into V, `3`
+    // into W).
+    //
+    // Published by `checkPositionalNewArgsFromSymbols` for any `new T(...)`
+    // whose target T has positional primary-ctor fields (LOCAL class primary
+    // ctor, IMPORTED class primary ctor, IMPORTED record — all use the same
+    // binding rule §22.5). Read by codegen's `storePrimaryCtorPositionalArgs`
+    // for classes; records do not currently call that helper.
+    //
+    // Keys are the NewExpr nodes of the importer's / single-module AST (kept
+    // alive by the SourceFile); values point into the map's own storage.
+    // Unlike the four remap-required side tables (#2839/#2818/#2857/#2857),
+    // this one lives ONLY on the call site — a `new` for an imported type
+    // occurs in the IMPORTER, never in the dependency's re-parsed body — so
+    // `ModuleLoader`'s body-reconstruction remap does not need to copy it.
+    void setNewExprPositionalBinding(const ast::NewExpr* ne,
+                                     std::vector<int> binding) {
+        newExprPositionalBindings_[ne] = std::move(binding);
+    }
+    const std::vector<int>* newExprPositionalBinding(
+        const ast::NewExpr& ne) const {
+        auto it = newExprPositionalBindings_.find(&ne);
+        return it == newExprPositionalBindings_.end() ? nullptr
+                                                      : &it->second;
+    }
     // §14.1/#783: iterate all AST-type→TypeRef and expr→TypeRef entries. Used by
     // ModuleLoader to COPY a re-parsed generic method body's resolved/expr types
     // from the fresh context into the main context, so codegen's per-instantiation
@@ -689,6 +732,15 @@ private:
     // §19.3 (#1853): see setPatternSymbol — a bare-name local-const NamedPattern.
     std::unordered_map<const ast::Pattern*, Symbol*> patternSymbols_;
     std::unordered_map<const ast::LambdaExpr*, std::vector<Symbol*>> lambdaParams_;
+    // fix #3196 (§22.5 / §22.10 / v0.254): per-NewExpr §22.5 binding of call
+    // arguments to positional primary-ctor field slots. Populated by
+    // `checkPositionalNewArgsFromSymbols`, read by codegen's
+    // `storePrimaryCtorPositionalArgs`. See the setter/getter comments above
+    // for the rationale and lifetime story. Local-only — never copied by
+    // ModuleLoader's body-reconstruction remap (the `new` site lives in the
+    // importer, not in a dependency's re-parsed body).
+    std::unordered_map<const ast::NewExpr*, std::vector<int>>
+        newExprPositionalBindings_;
     // Cache for the common primitive TypeRefs. Key is `(p << 1) | nullable`.
     std::unordered_map<std::uint32_t, TypeRef*> primitiveCache_;
     // §2.5 imports (issue #328 inc 3): owned imported symbols + their TypeRefs,
