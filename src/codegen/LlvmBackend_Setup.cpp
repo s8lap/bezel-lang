@@ -22829,14 +22829,44 @@ struct BoxEscapeWalker {
             expr(b->right.get(), /*safeRead=*/false);
             return;
         }
-        // A METHOD / PROPERTY receiver is an ESCAPE for a boxed Object (the call
-        // dispatches through the box and the callee could retain the receiver).
+        // A bare member access on a boxed Object. The CallExpr arm below
+        // recognizes `face.Method()` (a direct call) as a call-bounded borrow
+        // (§22.7 / §28.3: a method body cannot retain, transfer, or dispose
+        // its borrowed `this`), so the bare `face.Member` form must be split:
+        //   * a PROPERTY read (`face.Prop`) is the same situation — the getter
+        //     is dispatched via the itable and the receiver is borrowed `this`
+        //     in the getter body, so the box is not captured. The bare-MA
+        //     arm previously treated this as escape (the comment above #3229
+        //     conflated "method" and "property" and concluded the callee
+        //     could retain), which kept ANY Object/interface local that read
+        //     a property through an interface out of boxReleaseEligible_ —
+        //     the 24-byte box the record-to-interface bridge minted
+        //     (boxForTarget → boxValue → calloc) then leaked at scope end for
+        //     every such use (#3229's repro: `var face: IFace := value;
+        //     return face.Name;`).
+        //   * a FIELD / AUTO-PROPERTY STORAGE read runs no user code and
+        //     cannot capture `this` — safe by the same reason.
+        //   * a METHOD-GROUP REFERENCE (`face.Method` — the bare form that
+        //     yields a function value) DOES capture `this` (§27.6: a bound
+        //     method reference's `()` form captures the receiver, so the
+        //     resulting function value can outlive the producing scope and
+        //     the box escapes with it). Still an escape.
         if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
-            expr(m->target.get(), /*safeRead=*/false);
+            sema::Symbol* sym = ctx.exprSymbol(*m);
+            bool isMethodGroupRef = dynamic_cast<sema::MethodSymbol*>(sym) != nullptr;
+            expr(m->target.get(), /*safeRead=*/!isMethodGroupRef);
             return;
         }
+        // fix #3229 / §28.9 / §7.5 (v0.254): the null-conditional twin of the
+        // MemberAccessExpr arm just above — `face?.Prop` is a property read and
+        // safe; `face?.Method` is a method-group reference (escape). The
+        // original `safeRead=false` left the bare-`?.` form an escape even
+        // when the LHS was the tracked local, mirroring the same defect on
+        // the `.` form.
         if (auto* m = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
-            expr(m->target.get(), /*safeRead=*/false);
+            sema::Symbol* sym = ctx.exprSymbol(*m);
+            bool isMethodGroupRef = dynamic_cast<sema::MethodSymbol*>(sym) != nullptr;
+            expr(m->target.get(), /*safeRead=*/!isMethodGroupRef);
             return;
         }
         if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
