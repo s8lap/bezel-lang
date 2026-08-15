@@ -18351,6 +18351,7 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     if (!nm.target) return;
     TypeSymbol* targetType = memberTargetType(nm.target.get());
     Symbol* member = targetType ? lookupMember(targetType, nm.member) : nullptr;
+    const TypeRef* recvTyForDiag = nm.target ? ctx_.exprType(*nm.target) : nullptr;
     // §7.5 / §26.5 / #458: for a NULLABLE VALUE type receiver (e.g. `int?`,
     // `bool?`, `enum?`, `record?`) memberTargetType returns null (because the
     // type is Primitive or Named-record, not a class TypeSymbol). Also fall
@@ -18418,6 +18419,187 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             SourceLocation loc = nm.span.begin;
             if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
             checkEqualityMemberUseSite(gateType, nm.member, loc);
+        }
+        // fix #3155 (§7.5, v0.255): the `?.` form must MIRROR the `.` form's
+        // member-not-found diagnostic, not silently fall through. Before this
+        // fix, every `x?.M` whose `M` was not a real member of `x`'s type (or
+        // any §26.5 extension, or a built-in value member) returned without
+        // setting a type AND without emitting any error: the NodeExpr was left
+        // untyped, the enclosing local initializer was typed to nothing, and
+        // `lowerLocalDecl` (LlvmBackend_Setup.cpp) degraded to a zero-initialized
+        // slot — emitting only the
+        // "internal: lowerLocalDecl's initializer expression failed to lower to
+        // a value for this local's slot" note (#2434). Worse than the accept:
+        // the resulting *value* was wrong, because `x?.M ?? d` produced neither
+        // the member nor the coalesce default.
+        //
+        // The plain `.` form (resolveMemberAccess) rejects this in three
+        // complementary sites: a string-typed receiver draws "string member
+        // `.M` is not yet supported in codegen"; a non-string primitive
+        // receiver draws "no member `M` on primitive type `T`" with the
+        // documented-members-and-extension-no-match tail; a known-complete
+        // user type (class/record/enum/choice with a non-null decl or a
+        // non-generic imported decl) draws "no member `M` on type `T`
+        // (§11.3, §12.1)". The three are distinct because string has its own
+        // closed surface (handled by the dedicated string-block at ~line
+        // 14928) and primitive value types have no user TypeSymbol and so
+        // miss the known-complete gate — so this site reproduces all three,
+        // in the same order, gating the user-type form on `knownCompleteUserType`
+        // exactly as resolveMemberAccess does (issue #414).
+        //
+        // §8.1 universal members (ToString/Equals/GetHashCode/GetType/
+        // ReferenceEquals/Dispose) are exempted from the user-type form
+        // because they exist on every type without a user MemberSymbol; the
+        // primitive form's "documented members" tail already excludes them.
+        // The Equals/GetHashCode use-site gate above runs first and may have
+        // produced its own diagnostic, in which case this branch is still
+        // entered (per #2434's pattern — both diagnostics can fire on a
+        // non-bearing record `?.Equals`, which is the desired outcome since
+        // both gates are correct rejections). The arity-aware extension
+        // mismatch (#2328) does not apply here: the arity-specific wording
+        // belongs to a CALL, and `?.` on a non-call member is just a member
+        // access — the catch-all form is correct.
+        {
+            auto nmLoc = nm.span.begin;
+            if (nmLoc.line == 0 && nm.target) nmLoc = nm.target->span.begin;
+            const auto& mbr = nm.member;
+            // String-typed receiver gate (mirrors the resolveMemberAccess
+            // string block at ~line 14928, including the §26.5 extension
+            // fallback that ran before that block and the LINQ-on-string
+            // exemption that lives just below — both already happened above
+            // via lookupExtensionMember, so only the catch-all wording is
+            // needed here). The wording keeps the `.` form's "not yet
+            // supported in codegen" tail so the two spellings name the same
+            // surface — only the operator character changes (`.` → `?.`).
+            if (recvTyForDiag &&
+                recvTyForDiag->kind == TypeRef::Kind::Primitive &&
+                recvTyForDiag->primitive == PrimitiveType::String) {
+                // §9.6 string-LINQ operators are typed by typeCall (the
+                // §26.5 extension lookup above has already run for both
+                // forms). No string-LINQ operator name has a Symbol, so
+                // skip the wording for them and let typeCall finish; a
+                // missing-LINQ-member on a non-typed call would land in
+                // codegen's fallthrough and produce the same junk the .form
+                // did before #1220 — out of scope here.
+                bool isStringLinqOp =
+                    mbr == "Where"     || mbr == "Select"    ||
+                    mbr == "SelectMany" || mbr == "Skip"      ||
+                    mbr == "Take"       || mbr == "TakeWhile" ||
+                    mbr == "SkipWhile"  || mbr == "Distinct"  ||
+                    mbr == "OrderBy"    || mbr == "OrderByDescending" ||
+                    mbr == "ThenBy"     || mbr == "ThenByDescending"  ||
+                    mbr == "Concat"     || mbr == "Zip"       ||
+                    mbr == "Union"      || mbr == "Intersect" ||
+                    mbr == "Except"     || mbr == "Reverse"   ||
+                    mbr == "Any"        || mbr == "All"       ||
+                    mbr == "Count"      || mbr == "Sum"       ||
+                    mbr == "Min"        || mbr == "Max"       ||
+                    mbr == "Average"    || mbr == "First"     ||
+                    mbr == "Last"       || mbr == "Single"    ||
+                    mbr == "ElementAt"  || mbr == "FirstOrNull"  ||
+                    mbr == "LastOrNull"  || mbr == "SingleOrNull" ||
+                    mbr == "ToArray"    || mbr == "ToSet"     ||
+                    mbr == "ToDictionary" || mbr == "GroupBy" ||
+                    mbr == "Aggregate"  || mbr == "ForEach";
+                if (!isStringLinqOp) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, nmLoc,
+                        std::string("string member `?.") +
+                        std::string(mbr) +
+                        "` is not yet supported in codegen");
+                    return;
+                }
+            }
+            // Primitive-typed receiver gate (mirrors the resolveMemberAccess
+            // block at ~line 16850; comments there explain the string/Object/
+            // universal-member exemptions).
+            if (recvTyForDiag &&
+                recvTyForDiag->kind == TypeRef::Kind::Primitive &&
+                recvTyForDiag->primitive != PrimitiveType::String &&
+                recvTyForDiag->primitive != PrimitiveType::Object &&
+                recvTyForDiag->primitive != PrimitiveType::None) {
+                bool universalObjMember =
+                    mbr == "ToString"    || mbr == "Equals" ||
+                    mbr == "GetHashCode" || mbr == "GetType";
+                if (!universalObjMember) {
+                    auto primName =
+                        [](PrimitiveType p) -> const char* {
+                        using P = PrimitiveType;
+                        switch (p) {
+                            case P::Bool:    return "bool";
+                            case P::Char:    return "char";
+                            case P::Int:     return "int";
+                            case P::Object:  return "Object";
+                            case P::Byte:    return "byte";
+                            case P::SByte:   return "sbyte";
+                            case P::Short:   return "short";
+                            case P::UShort:  return "ushort";
+                            case P::UInt:    return "uint";
+                            case P::Long:    return "long";
+                            case P::ULong:   return "ulong";
+                            case P::Float:   return "float";
+                            case P::Double:  return "double";
+                            case P::Decimal: return "decimal";
+                            default:         return "primitive";
+                        }
+                    };
+                    ctx_.diagnostics().report(
+                        Severity::Error, nmLoc,
+                        std::string("no member `") + std::string(mbr) +
+                        "` on primitive type `" +
+                        primName(recvTyForDiag->primitive) +
+                        "`: primitive value types expose only their "
+                        "documented members (stdlib \xC2\xA7""9) and the "
+                        "universal `ToString`/`Equals`/`GetHashCode`/"
+                        "`GetType` (\xC2\xA7""8.1); no user member or "
+                        "\xC2\xA7""26.5 extension provides `" +
+                        std::string(mbr) + "`");
+                    return;
+                }
+            }
+            // Known-complete user type gate (mirrors the resolveMemberAccess
+            // block at ~line 17800: `knownCompleteUserType` is the §8.1/§11.3/
+            // §12.1 confidence condition, and the §8.1 universal members are
+            // exempted by name). An IMPORTED non-generic user type is also
+            // known-complete (its metadata carries the full member set, #795);
+            // imported generics and built-in classes stay permissive.
+            //
+            // The §31.4 built-in exception surface members (Message /
+            // StackTrace / CauseChain / ParamName) are exempted too: they
+            // exist on every class deriving from the matching built-in
+            // exception (§12.1's inheritance + §31.4's declaration), and the
+            // `.` form applies the same exemption (fix #2950 / #2971 / #2983,
+            // block at ~line 17694 in resolveMemberAccess). Without it, an
+            // `e?.Message` on a nullable `MyEx: Exception` would be rejected
+            // by this gate even though the `.` form accepts the same access —
+            // the EXACT mismatch the issue calls out, replayed on a built-in
+            // surface member.
+            if (targetType &&
+                (targetType->decl != nullptr ||
+                 (ctx_.isImported(targetType) &&
+                  targetType->genericParams.empty())) &&
+                (targetType->kind == ast::TypeDeclKind::Class ||
+                 targetType->kind == ast::TypeDeclKind::Record ||
+                 targetType->kind == ast::TypeDeclKind::Enum ||
+                 targetType->kind == ast::TypeDeclKind::Choice)) {
+                bool isUniversalObjectMember =
+                    mbr == "ToString" || mbr == "Equals" ||
+                    mbr == "GetHashCode" || mbr == "GetType" ||
+                    mbr == "ReferenceEquals" || mbr == "Dispose";
+                // §31.4 surface — any BuiltinExcMember::Message/etc. answer
+                // exempts the access (the lookup returns None when the
+                // receiver derives from no built-in exception).
+                bool isBuiltinExcSurface =
+                    builtinExceptionSurfaceMember(targetType, mbr) !=
+                        BuiltinExcMember::None;
+                if (!isUniversalObjectMember && !isBuiltinExcSurface) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, nmLoc,
+                        std::string("no member `") + std::string(mbr) +
+                        "` on type `" + std::string(targetType->name) +
+                        "` (§11.3, §12.1)");
+                }
+            }
         }
         return;
     }
