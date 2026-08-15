@@ -8812,6 +8812,67 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
             currentScope_ = saveScope;
             inFieldInitializer_ = saveIFI;
         }
+        // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional
+        // parameters and named arguments" / §22.8 step 0; v0.254): visit
+        // every §22.10 primary-ctor parameter's `:= Expr` default so the
+        // default expression's identifiers get their exprSymbol attached.
+        // §22.5 "Permitted default-value expressions" permits a default to
+        // read EARLIER primary-ctor parameters (`class W(A: int, B: int :=
+        // A + 1)` is the §22.5 explicit example), so the scope must expose
+        // every parameter symbol in declaration order — the same shape
+        // `runMethodBody` builds for an ordinary method's parameter list.
+        // The positional fields are reachable as FieldSymbols on
+        // currentType_->members (the §22.10 capture enumeration turns each
+        // `posParam` into one); a default value's identifier routes through
+        // `lookupName`, which walks `currentScope_`'s name map (and its
+        // parents — module scope, class scope — for outer references).
+        //
+        // Without this pass `lowerExpr(defaultValue)` returns null on every
+        // reference the default carries (a parameter name OR a constant OR
+        // a method call — `lookupName` is the choke point), and the codegen
+        // default arm #3202 added takes the `if (!defaultV) continue;`
+        // branch — leaving the slot calloc-zero, the same silent-zero
+        // outcome the local-twin of #3202 already fixed when ARGS are
+        // supplied.
+        //
+        // ⚠ The forward-parameter gate §22.5 already runs inside
+        // `visitMethodParams` (line 9297); mirroring it here for positional
+        // defaults would be a separate enforcement. The posParam-default
+        // scope built below exposes EVERY parameter symbol (including
+        // later ones) — a default that references a LATER parameter would
+        // silently find it instead of being rejected. Today the parser
+        // accepts that shape on a primary-ctor parameter list (no
+        // `forwardParamRef_` walk for positional fields), so this gate is
+        // filed as a follow-up if anyone reports it as a problem. The
+        // common, correct shape (the default reads earlier parameters
+        // only) is what this pass enables.
+        if (td->kind == ast::TypeDeclKind::Class &&
+            td->hasPositionalFields) {
+            Scope posScope;
+            posScope.parent = moduleScope_.get();
+            if (currentType_) {
+                for (Symbol* mem : currentType_->members) {
+                    if (auto* fs = dynamic_cast<FieldSymbol*>(mem)) {
+                        if (fs->posParam && !fs->name.empty()) {
+                            posScope.names[fs->name] = fs;
+                        }
+                    }
+                }
+            }
+            if (!posScope.names.empty()) {
+                Scope* saveScope = currentScope_;
+                currentScope_ = &posScope;
+                for (const auto& pf : td->positionalFields) {
+                    if (pf.defaultValue) {
+                        bool saveIFI = inFieldInitializer_;
+                        inFieldInitializer_ = true;
+                        visitExpr(*pf.defaultValue);
+                        inFieldInitializer_ = saveIFI;
+                    }
+                }
+                currentScope_ = saveScope;
+            }
+        }
         currentType_ = save;
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
         // §26.1: inside an extension block, `this` is the receiver. For an

@@ -661,6 +661,32 @@ struct Loader {
                     // `posParamBodyRef` is structurally false on both sides.
                     if (mm.posParamBodyRef)
                         f->posParamBodyRef = true;
+                    // fix #3202 (§22.10 "primary constructors" / §22.5
+                    // "Optional parameters and named arguments" / §2.8.3
+                    // rule 4, v0.254): the §22.10 primary-constructor
+                    // parameter's `:= Expr` default, textualised. Without
+                    // this, the importer cannot tell a primary parameter is
+                    // OPTIONAL at all — `checkPositionalNewArgsFromSymbols`
+                    // rejects `new DefBox(1)` against
+                    // `class DefBox(A: int, B: int := 9)` with "required
+                    // parameter `B` is not supplied", which is false of `B`.
+                    // The text rides on the SYNTHETIC `posParam` (#2516) so
+                    // codegen's runtime default arm can fold it through the
+                    // same `importedDefaultArgValue` machinery method
+                    // parameters already use. Empty → no default, which is
+                    // exactly the pre-fix behaviour a stale dependency
+                    // already exhibits — its primary parameters stay
+                    // required, and the same reject that surfaces today
+                    // stays. A record's positional field cannot reach this
+                    // either: `parsePositionalFieldList` admits no default
+                    // syntax (A.3 `PositionalField ::= Identifier ":" Type
+                    // SerializedClause? EqualityClause?`), so
+                    // `posParamDefaultText` is structurally empty for every
+                    // record (the §9.1 no-defaults rule is enforced at the
+                    // grammar on the local side; the encoder's `if
+                    // (fs->posParam->defaultValue)` is also structurally
+                    // false for record positional fields).
+                    p->defaultText = mm.posParamDefaultText;
                 }
                 applyBehavior(f);
                 return f;

@@ -11216,6 +11216,40 @@ void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
     }
     for (std::size_t j = 0; j < fields.size(); ++j)
         if (fieldToArg[j] == -1) {
+            // fix #3202 (§22.10 / §22.5, v0.254): a §22.10 primary-
+            // constructor parameter may carry a default (`class
+            // DefBox(A: int, B: int := 9)`), and an under-supplied call must
+            // fill the trailing defaulted slots rather than be reported as
+            // missing-required. The check has two sources for the default:
+            //   - LOCAL: `fs->posParam->defaultValue` (Expr*) — what the
+            //     parser produced at the primary-ctor parameter list.
+            //   - IMPORTED: `fs->posParam->defaultText` (string) — what the
+            //     encoder shipped via REC_POSPARAM_DEFAULT (the textual
+            //     form `renderConstExpr` produced on the exporting side,
+            //     carried by the dependency's metadata).
+            // §22.5 "Every parameter after the first defaulted parameter
+            // must itself have a default" — meaning a gap (a required
+            // parameter after a defaulted one) is itself a compile error
+            // on the declaring class. The check here is therefore a simple
+            // per-slot "is this slot bound OR defaulted?" predicate: a
+            // missing required parameter with NO default continues to
+            // surface the §22.5 reject; a missing parameter WITH a default
+            // is silent, because the runtime default arm
+            // (`LlvmBackend_Exprs2.cpp` storePrimaryCtorPositionalArgs,
+            // #3202's primary-ctor-side fix) materializes it on demand.
+            //
+            // RECORDS cannot reach this: `parsePositionalFieldList` admits
+            // no default syntax (A.3 `PositionalField ::= Identifier ":"
+            // Type SerializedClause? EqualityClause?`), so §9.1's
+            // "records carry no per-field defaults" rule is enforced at
+            // the grammar and a record's `defaultValue` / `defaultText`
+            // are structurally empty. A record's unbound positional field
+            // therefore keeps the §22.5 reject — unchanged.
+            auto* fs = dynamic_cast<const sema::FieldSymbol*>(fields[j]);
+            bool hasDefault = fs && fs->posParam &&
+                              (fs->posParam->defaultValue ||
+                               !fs->posParam->defaultText.empty());
+            if (hasDefault) continue;
             fail(desc + ": required parameter `" + std::string(fields[j]->name) +
                  "` is not supplied (§22.5)");
             return;
@@ -11237,6 +11271,19 @@ void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
     // did not resolve. Deferral is per-field and never a false reject.
     const TypeRef* target = ne.type ? ctx_.resolvedType(*ne.type) : nullptr;
     for (std::size_t j = 0; j < fields.size(); ++j) {
+        // fix #3202 (§22.10 / §22.5, v0.254): an UNBOUND slot — `fieldToArg[j]
+        // == -1` — means the call site omitted this parameter and the runtime
+        // default arm (codegen `storePrimaryCtorPositionalArgs`, #3202) fills
+        // it from `fs->posParam->defaultValue` / `::defaultText`. The §5.1
+        // assignability check below is meaningless for that slot: there is no
+        // argument to check the type of, and indexing `ne.args[…]` with the
+        // negative sentinel would OOB. Skipping here also matches the pre-fix
+        // behaviour where the per-argument walk only ran over the supplied
+        // slots — the arity gate above was the one that rejected an
+        // under-supplied call, and that gate now uses the SAME hasDefault
+        // predicate the runtime uses, so a slot that reaches THIS line
+        // without an argument is unreachable in a well-formed program.
+        if (fieldToArg[j] == -1) continue;
         const ast::CallArgument& a = ne.args[static_cast<std::size_t>(fieldToArg[j])];
         if (!a.value || a.isDiscard) continue;
         TypeRef* ft = const_cast<TypeRef*>(storageComponentType(fields[j], ctx_));

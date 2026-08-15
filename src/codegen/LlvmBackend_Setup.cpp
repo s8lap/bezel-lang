@@ -675,6 +675,52 @@ llvm::Value* Emitter::importedDefaultArgValue(const sema::MethodSymbol& ms,
     return foldImportedConstText(text, pt);
 }
 
+// fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters and
+// named arguments" / §2.8.3 rule 4, v0.254): the imported POSITIONAL-FIELD
+// half of `importedDefaultArgValue`. Where `importedDefaultArgValue` reads the
+// default off a method-parameter's `defaultText`, this one reads it off a
+// §22.10 primary-ctor parameter's `posParam->defaultText` — the textual
+// default the encoder shipped via #3202's REC_POSPARAM_DEFAULT.
+//
+// The fold logic is deliberately the SAME as `importedDefaultArgValue`'s:
+// null, `default(T)`, and constant fold go through one path each, with the
+// field's resolved type (read off the posParam's TYPE_BLOCK carriage, not
+// the imported MemberSymbol's `fieldTypes_` table — the positional field
+// uses `storageComponentType` for the same reason the local posParam's type
+// lookup is gated on `posParam->type`). The diagnostic shape matches
+// `importedDefaultArgValue`'s, naming the parameter, the source class, and
+// §22.5/#3202 as the references.
+llvm::Value* Emitter::lowerImportedPositionalDefault(
+        const sema::FieldSymbol& fs) {
+    if (!fs.posParam) return nullptr;
+    const std::string& text = fs.posParam->defaultText;
+    const sema::TypeRef* pt = storageComponentType(&fs, ctx_);
+    // Backstop (same shape as importedDefaultArgValue's): sema refuses the
+    // omission for exactly the texts this cannot fold, so reaching here with
+    // an unusable text means a call path that skipped that check.
+    if (!sema::importedDefaultTextIsMaterializable(text)) {
+        ctx_.diagnostics().report(
+            Severity::Error, SourceLocation{},
+            std::string("call to imported `new ") +
+                std::string(fs.parent ? fs.parent->name : std::string_view()) +
+                "` omits primary-constructor parameter `" +
+                std::string(fs.name) +
+                "`, whose default the dependency's metadata did not carry as "
+                "a compile-time value — pass the argument explicitly (§22.5, "
+                "#3202)");
+        return nullptr;
+    }
+    if (text == "null") {
+        if (pt && isNullableValueTy(pt)) return nullableValueNull(pt);
+        return llvm::ConstantPointerNull::get(ptrTy());
+    }
+    if (text.size() >= 8 && text.compare(0, 8, "default(") == 0) {
+        if (pt) return llvm::Constant::getNullValue(lowerTypeRef(pt));
+        return llvm::Constant::getNullValue(i32());
+    }
+    return foldImportedConstText(text, pt);
+}
+
 
 void Emitter::declareStatics() {
     for (const auto& sym : ctx_.symbols()) {

@@ -763,6 +763,53 @@ struct MetaMember {
     // Ignored for every kind but Field.
     bool posParamBodyRef = false;
 
+    // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters
+    // and named arguments" / §2.8.3 rule 4; spec v0.254) — the §22.10
+    // primary-constructor parameter's DEFAULT-VALUE EXPRESSION TEXT, for a
+    // positional Field member whose `isPositional` is set. Empty when the
+    // parameter carries no `:= Expr`, and for every non-positional Field
+    // member (a record's positional field carries no defaults — §9.1 — and a
+    // plain body field is not a parameter at all).
+    //
+    // Without this carriage an importer cannot tell that a primary parameter
+    // is even OPTIONAL, so the §22.5 arity check in
+    // `checkPositionalNewArgsFromSymbols` (the imported arm) rejects a
+    // correct `new DefBox(1)` against `class DefBox(A: int, B: int := 9)`
+    // with "required parameter `B` is not supplied" — `B` is NOT required,
+    // it has a default. The local twin
+    // (`storePrimaryCtorPositionalArgs`) has its own silent defect at the
+    // same shape: it skips the entire store loop when
+    // `ne.args.size() != posFields.size()`, so a `new DefBox(1)` leaves the
+    // whole object calloc-zero and `Total()` reads 0 instead of 10. This
+    // text is what lets the importer's runtime path
+    // (`LlvmBackend_Exprs2.cpp` storePrimaryCtorPositionalArgs default arm)
+    // materialize the default on demand.
+    //
+    // Carried as its OWN record (REC_POSPARAM_DEFAULT in ModuleMetadata.cpp)
+    // rather than as a 19th trailing scalar or a third trailing REC_STRING,
+    // for the same reason REC_SER_CLAUSE / REC_DISPOSE_VERDICT above are:
+    // adding yet another trailing REC_STRING slot makes the reader's
+    // `capIdx` ordering load-bearing in a way that any future addition
+    // silently misparses. A coded record is self-describing, is
+    // `skipRecord()`'d by every reader this format has had, and is emitted
+    // ONLY when the parameter actually carries a default — so a module with
+    // no defaulted primary parameter is byte-identical to before.
+    //
+    // RENDERED FORM mirrors MetaParam::defaultText / `fillParamDefaults`:
+    // `renderConstExpr` is the same machinery, and its non-empty-vs-empty
+    // distinction is the one the loader reads back. `default(T)` resolves
+    // as `default(T)` text (the importer's runtime path materializes it as
+    // the parameter's declared type's zero, #3213's precedent); an integer
+    // literal renders as that literal; a const reference renders as its
+    // qualified path (#3213). Empty → no default, and a pre-#3202 blob is
+    // structurally indistinguishable from "no default", which is exactly
+    // the pre-fix behaviour a stale dependency already exhibits — its
+    // primary parameters stay required, and the same reject that surfaces
+    // today stays. The cross-module fix is therefore SAFE in the
+    // dependency-direction: a stale module's primary parameters keep their
+    // already-broken reject, not a worse wrong value.
+    std::string posParamDefaultText;
+
     // §22.16 / §2.8.2: clauses in declaration order. For a `when` form from
     // §22.4 the builder emits the equivalent static-ensures record here.
     std::vector<MetaContractRecord> contracts;

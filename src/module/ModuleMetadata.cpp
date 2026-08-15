@@ -89,7 +89,23 @@ enum RecordCode : unsigned {
     // positional scalar would be read as #3139's `nBuiltinIfaces`, a silent
     // misparse. Absent (an OLD artifact) reads as false — pre-fix behaviour.
     REC_DISPOSE_VERDICT = 11,
-    // 12.. additive; unknown codes are skipRecord()'d by the reader
+    // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters
+    // and named arguments" / §2.8.3 rule 4, v0.254): MEMBER_BLOCK — the
+    // positional parameter's `:= Expr` default text, as a string payload
+    // under its OWN code. Emitted only when the parameter carries a default
+    // that `renderConstExpr` could render, so a module whose primary
+    // constructor parameters have no defaults is byte-identical to before.
+    // A distinct code (rather than a third trailing REC_STRING after
+    // `caps[1]`'s `fieldInitText`) for the same reason REC_SER_CLAUSE /
+    // REC_DISPOSE_VERDICT above are coded: adding a third positional REC_STRING
+    // makes the reader's `capIdx` ordering load-bearing for any future
+    // addition — a coded record is self-describing, and `skipRecord()`'d by
+    // every reader this format has had. Absent (an OLD artifact) reads as
+    // "no default" — the pre-fix behaviour a stale dependency already
+    // exhibits — so a recompile is required to gain the fix, with no
+    // silent wrong-value in the dependency-direction.
+    REC_POSPARAM_DEFAULT = 12,
+    // 13.. additive; unknown codes are skipRecord()'d by the reader
     REC_UNKNOWN_FUTURE = 90, // test-only: a record code this reader skips
 };
 
@@ -260,6 +276,17 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
         hashBool(h, m.serializedOptional);
         hashStr(h, m.serializedWireName);
     }
+    // fix #3202 (§22.10 / §22.5 / §2.8.3 rule 3, v0.254): a positional
+    // primary-ctor parameter's default-value text is part of the cross-module
+    // contract — a library adding or removing (or changing) a `:= Expr`
+    // default changes the value an under-supplied `new` constructs, so the
+    // importer must see the change. GUARDED to match the EMISSION condition
+    // at emitMember above: an unconditional fold would hash a length byte for
+    // the empty string too, perturbing the semantic hash of every type whose
+    // primary constructor carries no default. c97a49f had to correct exactly
+    // this defect on the sibling REC_SER_CLAUSE half of this family.
+    if (!m.posParamDefaultText.empty())
+        hashStr(h, m.posParamDefaultText);
     hashStr(h, m.valueText);  // §22.12 const value (issue #328 FINDING [3] BUG A)
     // §14 / #662c (schema v5): ctor body source text for generic classes.
     hashStr(h, m.ctorBodyText);
@@ -858,6 +885,22 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         for (char c : m.serializedWireName)
             sv.push_back(static_cast<std::uint8_t>(c));
         w.EmitRecord(REC_SER_CLAUSE, sv);
+    }
+    // fix #3202 (§22.10 / §22.5 / §2.8.3 rule 4, v0.254): a positional
+    // primary-ctor parameter's default-value expression text, under its
+    // OWN record code (REC_POSPARAM_DEFAULT, see enum RecordCode above).
+    // Emitted only when non-empty, mirroring the fieldInitText /
+    // methodBodyText / enumWireName / REC_SER_CLAUSE pattern above — a
+    // module whose primary parameters carry no default is byte-identical
+    // to before. `hashMember` is guarded by the SAME predicate, the
+    // property the F4 follow-up (c97a49f) had to correct for REC_SER_CLAUSE
+    // and that every subsequent additive record since then has held.
+    if (!m.posParamDefaultText.empty()) {
+        llvm::SmallVector<std::uint64_t, 64> dv;
+        dv.reserve(m.posParamDefaultText.size());
+        for (char c : m.posParamDefaultText)
+            dv.push_back(static_cast<std::uint8_t>(c));
+        w.EmitRecord(REC_POSPARAM_DEFAULT, dv);
     }
     // §11.3 (schema v4, issue #502): when kind == NestedType, emit the nested
     // type's full declaration as an embedded TYPE_BLOCK. The trailing
@@ -1638,6 +1681,25 @@ bool readMemberBody(Reader& r, MetaMember& m) {
                     for (std::size_t vi = 2; vi < vals.size(); ++vi)
                         m.serializedWireName.push_back(
                             static_cast<char>(vals[vi] & 0xFF));
+                    continue;
+                }
+                // fix #3202 (§22.10 / §22.5 / §2.8.3 rule 4, v0.254): the
+                // positional primary-ctor parameter's default-value text,
+                // captured BY CODE for the same reason REC_SER_CLAUSE /
+                // REC_DISPOSE_VERDICT above are coded: a coded record is
+                // self-describing and skipRecord()'d by every reader this
+                // format has had, so a pre-#3202 reader never sees this and a
+                // pre-#3202 BLOB simply leaves `posParamDefaultText` empty
+                // — which is the "no default" reading the loader and codegen
+                // default arm both treat as "required". Exactly the
+                // dependency-direction safety the format's other additive
+                // coded records hold.
+                if (got.get() == REC_POSPARAM_DEFAULT) {
+                    m.posParamDefaultText.clear();
+                    m.posParamDefaultText.reserve(vals.size());
+                    for (std::uint64_t v : vals)
+                        m.posParamDefaultText.push_back(
+                            static_cast<char>(v & 0xFF));
                 }
                 continue;
             }

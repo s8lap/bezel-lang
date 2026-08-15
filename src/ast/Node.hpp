@@ -565,6 +565,24 @@ struct Param {
     // modifier). Only ever populated for LambdaExpr params — method/ctor/
     // operator/indexer param lists never populate this field.
     std::unique_ptr<DestructuringPattern> destructure;
+    // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters
+    // and named arguments" / §2.8.3 rule 4, v0.254): the textual form of a
+    // §22.10 primary-constructor parameter's default value as carried across
+    // a module boundary. The LOCAL side keeps the source-level `defaultValue`
+    // Expr* above, evaluated by codegen under the enclosing scope's
+    // substitution; an IMPORTED class's synthetic `posParam`
+    // (ModuleLoader::makeImportedParam, #2516) has no Expr* to point at, so
+    // the encoder's `renderConstExpr` text rides here instead.
+    //
+    // Both representations are present (or absent) on the same Param: a
+    // local primary-ctor parameter has only `defaultValue` (an Expr*) and an
+    // empty `defaultText`; a synthesized imported Param has only
+    // `defaultText` (a string, the textual default the importer will
+    // materialize at construction time) and a null `defaultValue`. Codegen
+    // checks `defaultValue` first and falls through to `defaultText` for the
+    // imported case — the same two-channel shape MetaParam::defaultText
+    // carries on the method-parameter side.
+    std::string defaultText;
 };
 
 // A.3 GenericConstraints. One `where T: c1, c2` clause; multiple clauses

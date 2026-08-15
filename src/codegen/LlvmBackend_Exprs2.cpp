@@ -2659,19 +2659,123 @@ void Emitter::storePrimaryCtorPositionalArgs(
     const std::vector<const sema::Symbol*> posFields =
         sema::recordPositionalFieldSymbols(t);
     if (!posFields.empty()) {
-      // Only the all-positional case: store each arg value directly into
-      // the corresponding primary-ctor-param field slot.
+      // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters
+      // and named arguments" / §22.8 step 0, v0.254): a §22.10 primary
+      // parameter may carry a DEFAULT (`class DefBox(A: int, B: int := 9)`)
+      // and an under-supplied call must fill the trailing defaulted slots
+      // from the parameter's `:= Expr` rather than leaving the object
+      // calloc-zero. The OLD `ne.args.size() == posFields.size()` gate
+      // skipped the entire store loop whenever the call was short, so a
+      // `new DefBox(1)` left the WHOLE OBJECT zero — not just the unbound
+      // slot — and `Total()` read 0 instead of 10. The LOCAL side
+      // (`fs->posParam->defaultValue` Expr*) and the IMPORTED side
+      // (`fs->posParam->defaultText` string, the textualised default the
+      // encoder shipped via #3202's REC_POSPARAM_DEFAULT) are the two
+      // channels through which a default reaches this site.
+      //
+      // The named-argument shape is still declined here: `new PBox(W := 4,
+      // V := 3)` was the second of #3162's two declines (the first being
+      // GENERIC imported), and the same defect — only the all-positional
+      // form is lowered across a module boundary — applies. The NAMED arm
+      // already bypasses the store loop today (it fails `allPositional`),
+      // so keeping the same gate here just preserves the pre-fix decline
+      // while unbreaking the under-supplied POSITIONAL case.
       bool allPositional = true;
       for (const auto& a : ne.args)
           if (!a.name.empty()) { allPositional = false; break; }
-      if (allPositional && ne.args.size() == posFields.size()) {
+      if (allPositional && ne.args.size() <= posFields.size()) {
           for (std::size_t pi = 0; pi < posFields.size(); ++pi) {
               {  // scope for the per-field bindings below
                   auto* fs = const_cast<sema::FieldSymbol*>(
                       static_cast<const sema::FieldSymbol*>(posFields[pi]));
                   auto idxIt = fieldIndex_.find(fs);
                   if (idxIt == fieldIndex_.end()) continue;
-                  if (!ne.args[pi].value) continue;
+                  // The argument expression to lower: supplied positionally
+                  // when present, the parameter's `:= Expr` default
+                  // otherwise. `ne.args[pi].value` is null both when the
+                  // slot is omitted AND when it is `out _`-shaped — but the
+                  // latter never reaches this site (a positional primary-
+                  // ctor parameter admits plain and `owned` only, §22.10,
+                  // so no `out` slot can bind here). A `null` value at
+                  // this line therefore means "omitted, fill from default".
+                  const ast::Expr* argExpr = nullptr;
+                  llvm::Value* defaultV = nullptr;
+                  if (pi < ne.args.size() && ne.args[pi].value) {
+                      argExpr = ne.args[pi].value.get();
+                  } else if (fs->posParam &&
+                             (fs->posParam->defaultValue ||
+                              !fs->posParam->defaultText.empty())) {
+                      // §22.5 "Defaults and modifiers" + §22.10: a defaulted
+                      // primary-ctor parameter. LOCAL: lower the AST
+                      // `defaultValue` under the OUTER substitution
+                      // (mirroring the supplied-arg arm's #597 bracket
+                      // just below), but with `currentThis_ = obj` rather
+                      // than `thisForArgs` — the default may read EARLIER
+                      // primary-ctor parameters on the SAME list (§22.5
+                      // "Permitted default-value expressions"), and those
+                      // parameters live in `obj`'s captured field slots,
+                      // not in the enclosing scope. The supplied-arg arm
+                      // uses `thisForArgs` because the supplied arg is an
+                      // enclosing-scope expression that does NOT read
+                      // `t`'s own primary-ctor params (#597); the default
+                      // IS a function of `t`'s own params, so `obj` is
+                      // the right `this`. (For a non-captured earlier
+                      // parameter the IdentifierExpr for the param's
+                      // name still routes through `implicitFieldAddr` —
+                      // the capture-iff-used rule §22.10 sets
+                      // `posParamBodyRef`, but #2325's capture
+                      // enumeration also captures a parameter used in any
+                      // default of a later parameter, since that default
+                      // evaluates against the object.)
+                      //
+                      // The order-of-evaluation property this bracket
+                      // relies on is the loop's left-to-right: `pi = 0`
+                      // stores its slot BEFORE `pi = 1` evaluates its
+                      // default, so reading `A` (a primary-ctor param
+                      // stored at `pi = 0`) inside the default for `B`
+                      // (at `pi = 1`) sees the just-stored value, not
+                      // the calloc zero. Mirrors §22.5 "Defaults and
+                      // modifiers" / §22.8 step 0 sequencing.
+                      //
+                      // IMPORTED: the textual default folds through the
+                      // same `foldImportedConstText` machinery
+                      // `importedDefaultArgValue` uses for method
+                      // parameters — the imported positional-parameter
+                      // half of #3213's path.
+                      // `lowerImportedPositionalDefault` materializes the
+                      // constant on demand.
+                      if (fs->posParam->defaultValue) {
+                          // local — evaluate under the outer substitution,
+                          // with `currentThis_ = obj` so earlier
+                          // primary-ctor params resolve through their
+                          // captured slots.
+                          llvm::Value* savedThisForArg = currentThis_;
+                          currentThis_ = obj;
+                          auto posSubst = genericSubst_;
+                          auto posSemaTy = genericSubstSemaTy_;
+                          genericSubst_ = outerSubst;
+                          genericSubstSemaTy_ = outerSemaTy;
+                          defaultV = lowerExpr(*fs->posParam->defaultValue);
+                          genericSubst_ = std::move(posSubst);
+                          genericSubstSemaTy_ = std::move(posSemaTy);
+                          currentThis_ = savedThisForArg;
+                      } else {
+                          // imported — fold the textual default
+                          defaultV = lowerImportedPositionalDefault(*fs);
+                      }
+                      if (!defaultV) continue;
+                  } else {
+                      // No arg, no default — leave the slot calloc-zero
+                      // (the original behavior). This is unreachable for a
+                      // well-formed program whose args list has been
+                      // verified by `checkNewExprArgs` /
+                      // `checkPositionalNewArgsFromSymbols` (§22.5 arity),
+                      // but the explicit skip keeps the row silent rather
+                      // than SIGSEGVing on an unsound GEP — same posture
+                      // as the pre-fix `if (!ne.args[pi].value) continue;`
+                      // line this replaces.
+                      continue;
+                  }
                   // issue #597: a positional primary-ctor argument is an
                   // enclosing-scope expression — lower it under the outer
                   // substitution, then restore the new type's subst for
@@ -2695,23 +2799,32 @@ void Emitter::storePrimaryCtorPositionalArgs(
                   // is smaller). Restore the enclosing `this`
                   // (`thisForArgs`) for the evaluation only, mirroring
                   // the explicit-ctor arg path below (case (b) in its
-                  // comment) which already does this correctly.
-                  llvm::Value* savedThisForArg = currentThis_;
-                  currentThis_ = thisForArgs;
-                  auto posSubst = genericSubst_;
-                  auto posSemaTy = genericSubstSemaTy_;
-                  genericSubst_ = outerSubst;
-                  genericSubstSemaTy_ = outerSemaTy;
-                  llvm::Value* v = lowerExpr(*ne.args[pi].value);
-                  genericSubst_ = std::move(posSubst);
-                  genericSubstSemaTy_ = std::move(posSemaTy);
-                  currentThis_ = savedThisForArg;
-                  if (!v) continue;
+                  // comment) which already does this correctly. The
+                  // imported default arm (the `defaultV` branch above)
+                  // never needs this bracket — its value is already a
+                  // constant produced under the enclosing scope's
+                  // substitution by `lowerImportedPositionalDefault`.
+                  llvm::Value* v = nullptr;
+                  if (argExpr) {
+                      llvm::Value* savedThisForArg = currentThis_;
+                      currentThis_ = thisForArgs;
+                      auto posSubst = genericSubst_;
+                      auto posSemaTy = genericSubstSemaTy_;
+                      genericSubst_ = outerSubst;
+                      genericSubstSemaTy_ = outerSemaTy;
+                      v = lowerExpr(*argExpr);
+                      genericSubst_ = std::move(posSubst);
+                      genericSubstSemaTy_ = std::move(posSemaTy);
+                      currentThis_ = savedThisForArg;
+                      if (!v) continue;
+                  } else {
+                      v = defaultV;
+                  }
                   llvm::Type* fieldTy =
                       st->getElementType(idxIt->second);
                   v = coerceNumericToType(
                       v, fieldTy,
-                      isUnsignedTargetExpr(*ne.args[pi].value));
+                      argExpr ? isUnsignedTargetExpr(*argExpr) : false);
                   // #1605 / §4.6 / §28.9: `fs` is a genuine class
                   // FieldSymbol (disposed by the generated DisposeCore /
                   // emitOwnedFieldDisposals like any other string field,
@@ -2729,9 +2842,30 @@ void Emitter::storePrimaryCtorPositionalArgs(
                   // (`new Box(a + b)`) is TRANSFERRED (no retain); anything
                   // else (identifier / field / call) is RETAINED so the
                   // field's count is independent of the source's.
+                  //
+                  // A default value is a fresh producer each call (§22.5
+                  // "Evaluation timing" / §22.5 "Permitted default-value
+                  // expressions"): the expression is re-evaluated at every
+                  // omission, so the slot holds an INDEPENDENT reference
+                  // (a literal `:= "x"` materializes a fresh string each
+                  // time). For a STRING default the +1 is therefore
+                  // correct via the same rule as a fresh `+1` producer
+                  // argument (`isPlusOneStringProducer` returns true for a
+                  // string literal — `lowerExpr` of a `string` literal
+                  // already returns a +1 reference). Passing
+                  // `argExpr=nullptr` here is exactly the "fresh default
+                  // producer" path, so `isPlusOneStringProducer(nullptr)`
+                  // is the right test — implemented inline as `!argExpr`
+                  // for the imported default arm and the local literal
+                  // path; the non-literal local-default arm (a default
+                  // expression that LOWERs to a non-+1 string, e.g. a
+                  // field read) retains the same rule by the same
+                  // expression-pointer identity, which is what
+                  // `isPlusOneStringProducer(*ne.args[pi].value)` answered
+                  // for the supplied arm just below.
                   if (v->getType()->isPointerTy() &&
                       isStringStorageMember(fs) &&
-                      !isPlusOneStringProducer(ne.args[pi].value.get()))
+                      !isPlusOneStringProducer(argExpr))
                       emitStringRetain(v);
                   builder_.CreateStore(
                       v, builder_.CreateStructGEP(

@@ -5420,6 +5420,19 @@ private:
     llvm::Value* importedDefaultArgValue(const sema::MethodSymbol& ms,
                                          std::size_t pos);
 
+    // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters
+    // and named arguments" / §2.8.3 rule 4, v0.254): the positional-FIELD
+    // twin of `importedDefaultArgValue`. Reads the default off
+    // `fs.posParam->defaultText` (the textual default the encoder shipped
+    // via REC_POSPARAM_DEFAULT in #3202) and materializes it through the
+    // SAME fold path method parameters already use. Null when the text is
+    // not a shape that folds, which declines the call loudly rather than
+    // passing an unsound zero. Only meaningful for a §22.10 primary-
+    // constructor parameter's FieldSymbol (where `fs.posParam != nullptr`);
+    // returns null for a plain body field, matching the
+    // `storageComponentType`-style gate every other posParam consumer uses.
+    llvm::Value* lowerImportedPositionalDefault(const sema::FieldSymbol& fs);
+
     // §2.5 / §22.7 (issue #328 FINDING [7]): the external `bz$<Type>$ctor`
     // function for an IMPORTED type's reconstructed constructor, declared on
     // demand and cached in ctorFns_. The signature is `void(ptr this,

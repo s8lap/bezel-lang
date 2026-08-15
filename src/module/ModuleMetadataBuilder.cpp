@@ -1123,6 +1123,29 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // the answer is structurally the same. Measured: `record
             // R(v: int)` local compilation emits `posParamBodyRef = false`.
             out.posParamBodyRef = fs->posParamBodyRef;
+            // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional
+            // parameters and named arguments" / §2.8.3 rule 4, v0.254):
+            // carry the positional-parameter's default-value expression
+            // textually. `parsePositionalFieldList` admits no default syntax
+            // (A.3 `PositionalField ::= Identifier ":" Type SerializedClause?
+            // EqualityClause?`), so a RECORD cannot reach this line — §28.5's
+            // "records may not have owned fields" and §9.1's no-defaults
+            // rule are enforced together at the grammar. Only a §22.10
+            // CLASS's primary parameter carries a default. `renderConstExpr`
+            // returns "" for a non-foldable default (an arbitrary call,
+            // `new T()` against a non-trivial-dispose class, anything that
+            // isn't a literal/`default(T)`/const reference per #3213); that
+            // empty text is the exact "no default" reading the loader and
+            // the codegen default arm both treat as "required", which is
+            // the safe direction: a default the exporter could not render
+            // is a default the importer cannot materialize, so an under-
+            // supplied `new` continues to surface the §22.5 reject rather
+            // than passing a wrong-value zero. Same machinery
+            // `fillParamDefaults` uses for method parameters; the
+            // positional arm simply did not reach it.
+            if (fs->posParam && fs->posParam->defaultValue)
+                out.posParamDefaultText = renderConstExpr(
+                    fs->posParam->defaultValue.get(), &ctx);
             return true;
         }
     }
