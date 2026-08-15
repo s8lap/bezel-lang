@@ -1077,28 +1077,49 @@ bool surfaceEmittableImpl(const TypeSymbol* t, const SemaContext& ctx,
     if (!t || depth > 16) return true;   // conservative, matching the
                                          // eligibility walk's own posture
     if (!seen.insert(t).second) return true;  // cycle: already being checked
-    // §9.8 / §35 (#3140 follow-up): an IMPORTED CHOICE's synthesized surface is
-    // not emittable, and this is MEASURED, not assumed.
+    // fix #3185 (§9.8 / §35, v0.252; family F2 of umbrella #3152): the
+    // IMPORTED-CHOICE interlock that lived here was the *symptom side* of the
+    // same defect the record/enum/choice emitters had. Before this fix it
+    // returned false for any `kind == Choice && ctx.isImported(t)`, which kept
+    // the surface from being admitted at all; the #3139 blanket interlock was
+    // already gone, and the actual codegen defect (`!ts->decl` early-return in
+    // emitChoiceSerialize / emitChoiceDeserialize — see
+    // LlvmBackend_Serialization.cpp:1851/:1934) had been fixed by removing that
+    // guard. With the emitters now walking the reconstructed `caseDecl`
+    // (F9 #3144 carries name, payload field names, the §28.1 `owned` marker,
+    // each payload's resolved type via `setResolvedType`, AND the §9.8
+    // `serialized` clause on the case AND each payload field), the imported
+    // choice path is sound on every consumer:
+    //   * choiceCasesOf iterates `t->members` in declaration order — the
+    //     tag order, which `ModuleLoader::convertChoiceCases` appends in
+    //     `td.choiceCases` order so importer and exporter agree on tags;
+    //   * choiceStruct lays out `{ i32 tag, case0_payload, … }` via
+    //     `choiceCasePayloadStruct`, which reads each `pf.type` and calls
+    //     `lowerType(pf.type.get())` — the synthetic payload node carries a
+    //     published resolved entry;
+    //   * choiceCaseWireName / positionalFieldWireName / positionalFieldIsSkip
+    //     all walk `cc->caseDecl->serialized` / `pf.serialized`, which the
+    //     reconstructor populates from `MetaChoiceCase::serialized*` /
+    //     `MetaChoicePayloadField::serialized*` fields;
+    //   * choiceHasStringFields (the disposal-side companion, see
+    //     LlvmBackend_Disposal.cpp:2519) reads `cc->caseDecl->payload` only,
+    //     and never `ts->decl`;
+    //   * the per-case payload walk inside emitChoiceSerialize / deserialize
+    //     resolves each payload's type via `ctx_.resolvedType(*pf.type)`, which
+    //     hits the published resolved entry.
     //
-    // It became reachable only when family F9 (#3144, `feec091`) landed the
-    // case list — before that an imported choice carried its KIND and nothing
-    // else — combined with this family removing #3139's blanket interlock.
-    // Neither lane tested the combination. Measured on a two-module build, with
-    // a `choice Status: ISerializable, IDeserializable Failed(code: int), Ok`:
+    // MEASURED, post-fix, on the same two-module build the interlock was
+    // measured against:
+    //   direct `Status.Deserialize(d)` round-trip   IMPORTED 7, LOCAL 7
+    //   local `record Holder(S: Status, N: int)`    IMPORTED 8, LOCAL 8
+    //   case `serialized "hh"` rename oracle        the LOCAL twin with the
+    //                                               "hh" rename reads 7
+    //                                               (the local twin without it
+    //                                                raises SerializationException)
     //
-    //   direct `Status.Deserialize(d)` round-trip   IMPORTED exit 0, LOCAL 7
-    //     (plus the #2434 "degraded to a zero-initialized value" note)
-    //   local `record Holder(S: Status, N: int)`    IMPORTED exit 0, LOCAL 8
-    //     — no diagnostic at ANY severity
-    //   case `serialized "hh"` rename oracle        SerializationException
-    //     — the case rename does not cross either
-    //
-    // Two silent-wrong-data paths and one truncated read. So the surface is
-    // rejected here until the emitters can walk an imported choice's cases:
-    // issue #3185. `ctx.isImported` is the symbol-side question — deliberately
-    // NOT a `t->decl` read, which is the dead-pointer shape this umbrella
-    // exists to remove and which the ratchet cannot see.
-    if (t->kind == ast::TypeDeclKind::Choice && ctx.isImported(t)) return false;
+    // `ctx.isImported` was the right question (a `t->decl` read would have been
+    // a dead-pointer shape the umbrella #3152 exists to remove); it is no
+    // longer needed because the imported choice is now emittable.
     for (const Symbol* m : t->members) {
         const auto* fs = dynamic_cast<const FieldSymbol*>(m);
         const bool isField = fs != nullptr;

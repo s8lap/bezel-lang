@@ -1851,7 +1851,32 @@ llvm::Value* Emitter::emitEnumDeserialize(const TypeSymbol* ts,
 void Emitter::emitChoiceSerialize(const TypeSymbol* ts,
                                   llvm::Value* choiceVal,
                                   llvm::Value* serPtr) {
-    if (!ts || !ts->decl) return;
+    // fix #3185 (§9.8 / §35, v0.252; family F2 of umbrella #3152): this opened
+    // with `if (!ts || !ts->decl) return;`. `ModuleLoader` never assigns
+    // `Symbol::decl` for an imported type, so for an IMPORTED choice this
+    // function returned immediately and wrote NOTHING — no bytes, no
+    // diagnostic. MEASURED on a two-module build with the classification gate
+    // forced open and nothing else changed:
+    //
+    //   direct `Status.Deserialize(d)` round-trip   IMPORTED exit 0, LOCAL 7
+    //     (plus the #2434 "degraded to a zero-initialized value" note)
+    //   local `record Holder(S: Status, N: int)`    IMPORTED exit 0, LOCAL 8
+    //     — NO DIAGNOSTIC AT ANY SEVERITY
+    //   case `serialized "hh"` rename oracle        SerializationException
+    //     — the case rename does not cross either
+    //
+    // The body reads `cc->caseDecl` (never `ts->decl`), and F9 (#3144,
+    // `feec091`) reconstructed `caseDecl` — name, payload field names, the
+    // §28.1 `owned` marker, each payload's resolved type (published via
+    // `setResolvedType`), AND the §9.8 `serialized` clause on the case AND
+    // each payload field — for imported choices. So the `ts->decl` guard was
+    // the whole defect: the predicate fed by an empty source. Dropped it, and
+    // `choiceCasesOf(ts)` / `choiceStruct(ts)` / `cc->caseDecl->payload` all
+    // walk the imported representation correctly. `ctx.isImported` (not a
+    // `t->decl` read) is the symbol-side question the eligibility gate uses.
+    if (!ts) return;
+    // fix #3140 follow-up: name this type in the backstop diagnostic.
+    SerializationDiagScope diagScope(this, ts);
     llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
     auto cases = choiceCasesOf(ts);
     if (cases.empty()) return;
@@ -1933,7 +1958,12 @@ void Emitter::emitChoiceSerialize(const TypeSymbol* ts,
 // ---------------------------------------------------------------------------
 llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                                             llvm::Value* derPtr) {
-    if (!ts || !ts->decl) return nullptr;
+    // fix #3185: same removal as emitChoiceSerialize — see the comment there
+    // for the measured defect shape and the F9 reconstruction that makes the
+    // imported path walkable.
+    if (!ts) return nullptr;
+    // fix #3140 follow-up: name this type in the backstop diagnostic.
+    SerializationDiagScope diagScope(this, ts);
     llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
     llvm::StructType* st = choiceStruct(ts);
     auto cases = choiceCasesOf(ts);

@@ -844,25 +844,17 @@ BEZEL_TEST(xmod_record_serialization_3140,
 // ===========================================================================
 // ── THE IMPORTED-CHOICE ARM, reachable only since F9 (#3144) ──────────────
 //
-// Removing #3139's blanket interlock exposed the Choice arm of
-// `isSerializationEligibleType`, which F9 made reachable across a module
-// boundary for the first time by landing the case list. Neither lane tested the
-// combination. MEASURED, `choice StatusF2 … Failed(code: int), Ok`:
-//
-//   direct `StatusF2.Deserialize(d)`            IMPORTED exit 0, LOCAL 7
-//     (plus the #2434 "degraded to a zero-initialized value" note)
-//   local `record Holder(S: StatusF2, N: int)`  IMPORTED exit 0, LOCAL 8
-//     — NO DIAGNOSTIC AT ANY SEVERITY
-//   a case `serialized "hh"` rename oracle      SerializationException
-//
-// Two silent-wrong-data paths. Rejected until the emitters can walk an imported
-// choice's cases — issue #3185, the choice twin of #3179.
+// fix #3185 (§9.8 / §35, v0.252; family F2 of umbrella #3152): the surface is
+// now ADMITTED, with the silent-wrong-data paths closed. Both arms flipped
+// from `kImporterRejected` to a round-trip value on the same two-module build
+// that measured them as exit-0 before. The local twin T18 stays at 8 — it is
+// the control that says the choice path itself is unchanged.
 // ===========================================================================
 
-// T16 — a direct round-trip through an IMPORTED choice: REJECTED.
+// T16 — a direct round-trip through an IMPORTED choice.
 // // per §9.8 (choice `$case` form, v0.200) / §35
 BEZEL_TEST(xmod_record_serialization_3140,
-           imported_choice_serialization_surface_stays_closed) {
+           imported_choice_direct_round_trips) {
     int r = compileImportAndRunF2(
         kDepF2,
         "module AppF2n_3140; import DepF2_3140; import System.Serialization; "
@@ -870,26 +862,36 @@ BEZEL_TEST(xmod_record_serialization_3140,
         "  var st := StatusF2.Failed(7); "
         "  using var s := new BinarySerializer(); "
         "  st.Serialize(s); "
-        "  return 0; "
+        "  using var b := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
+        "  var st2 := StatusF2.Deserialize(d); "
+        "  return (case st2 of Failed(var c) => c, Ok => 99); "
         "end Main; end ProgF2;");
     if (r == -2) return;
-    BEZEL_EXPECT_EQ(r, kImporterRejected);
+    BEZEL_EXPECT_EQ(r, 7);
 }
 
-// T17 — a LOCAL record whose component is an IMPORTED choice: REJECTED. This is
-// the arm that was exit 0 with no diagnostic at all. // per §9.8 / §35
+// T17 — a LOCAL record whose component is an IMPORTED choice. This is the arm
+// that was exit 0 with no diagnostic at all before fix #3185. // per §9.8 / §35
 BEZEL_TEST(xmod_record_serialization_3140,
-           local_record_with_imported_choice_component_is_rejected) {
+           local_record_with_imported_choice_component_round_trips) {
     int r = compileImportAndRunF2(
         kDepF2,
         "module AppF2o_3140; import DepF2_3140; import System.Serialization; "
         "public record HolderF2(S: StatusF2, N: int)"
         ": ISerializable, IDeserializable end HolderF2; "
         "public class ProgF2 public static method Main(): int "
-        "  return 0; "
+        "  var h := new HolderF2(StatusF2.Failed(8), 5); "
+        "  using var s := new BinarySerializer(); "
+        "  h.Serialize(s); "
+        "  using var b := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(b.AsReadOnlySpan()); "
+        "  var h2 := HolderF2.Deserialize(d); "
+        "  if h2.N <> 5 then return 1; end if; "
+        "  return (case h2.S of Failed(var c) => c, Ok => 99); "
         "end Main; end ProgF2;");
     if (r == -2) return;
-    BEZEL_EXPECT_EQ(r, kImporterRejected);
+    BEZEL_EXPECT_EQ(r, 8);
 }
 
 // T18 — ★ THE LOCAL CHOICE TWIN. Both shapes above, in ONE module, still
