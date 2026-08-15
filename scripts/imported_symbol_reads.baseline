@@ -33,7 +33,7 @@
 #         PropertySymbol::decl is never set at all, so these answer the same
 #         silent "no" across a module boundary.
 19   src/codegen/LlvmBackend_Assign.cpp
-26   src/codegen/LlvmBackend_Calls2.cpp
+27   src/codegen/LlvmBackend_Calls2.cpp
 2    src/codegen/LlvmBackend_Disposal.cpp
 8    src/codegen/LlvmBackend_Exprs.cpp
 7    src/codegen/LlvmBackend_Exprs2.cpp
@@ -44,7 +44,7 @@
 2    src/codegen/LlvmBackend_String.cpp
 20   src/codegen/LlvmBackend_impl.hpp
 1    src/common/OwnershipFacts.cpp
-3    src/module/ModuleLoader.cpp
+2    src/module/ModuleLoader.cpp
 9    src/module/ModuleMetadataBuilder.cpp
 5    src/ownership/Ownership.cpp
 4    src/ownership/Ownership_Checks.cpp
