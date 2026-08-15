@@ -1455,11 +1455,32 @@ public:
         v.cs_ = &cs;
         return v;
     }
+    // fix #3173 (§22.5, v0.254): the POSITIONAL-FIELD view — a class / record's
+    // §9.1 / §22.10 primary-ctor parameter list, materialized as the per-slot
+    // symbol list `recordPositionalFieldSymbols` already returns. The view
+    // reads each slot's NAME from `Symbol::name` and its `hasDefault` predicate
+    // off `FieldSymbol::posParam` (the synthetic or real `ast::Param*`), so
+    // `bindArgsToParams` over this view applies the SAME rule and emits the
+    // SAME five diagnostic strings it already emits for a method / ctor /
+    // `ast::Param`-list callee. Before this view existed, the positional-field
+    // binder was a SECOND COPY of the rule, with five byte-identical
+    // diagnostics held identical only by authors typing the same sentence
+    // (#3141). The view is non-owning: callers pass the vector they already
+    // hold (`recordPositionalFieldSymbols(t)` returns by value, so the caller
+    // either stores it in a local or hands the rvalue to a temporary whose
+    // lifetime this view's binding reads from — the lifetime is the binder's
+    // call, which is the lifetime of `FormalsView`).
+    static FormalsView of(const std::vector<const Symbol*>& fields) {
+        FormalsView v;
+        v.fields_ = &fields;
+        return v;
+    }
 
     std::size_t size() const {
         if (params_) return params_->size();
         if (ms_) return formalParamCount(*ms_);
         if (cs_) return formalParamCount(*cs_);
+        if (fields_) return fields_->size();
         return 0;
     }
     std::string_view name(std::size_t i) const {
@@ -1467,6 +1488,9 @@ public:
                                                 : std::string_view{};
         if (ms_) return formalParamName(*ms_, i);
         if (cs_) return formalParamName(*cs_, i);
+        if (fields_)
+            return i < fields_->size() ? (*fields_)[i]->name
+                                       : std::string_view{};
         return {};
     }
     bool hasDefault(std::size_t i) const {
@@ -1474,6 +1498,18 @@ public:
             return i < params_->size() && (*params_)[i].defaultValue != nullptr;
         if (ms_) return formalParamHasDefault(*ms_, i);
         if (cs_) return formalParamHasDefault(*cs_, i);
+        // §22.10 / #3202: a primary-ctor parameter MAY carry a default (a
+        // record cannot — A.3 `PositionalField` admits no default syntax — so
+        // a record's posParam has neither defaultValue nor defaultText and
+        // this answers false, matching the prior behaviour).
+        if (fields_) {
+            if (i >= fields_->size()) return false;
+            if (auto* fs = dynamic_cast<const FieldSymbol*>((*fields_)[i]))
+                return fs->posParam &&
+                       (fs->posParam->defaultValue != nullptr ||
+                        !fs->posParam->defaultText.empty());
+            return false;
+        }
         return false;
     }
 
@@ -1481,6 +1517,10 @@ private:
     const std::vector<ast::Param>* params_ = nullptr;
     const MethodSymbol* ms_ = nullptr;
     const ConstructorSymbol* cs_ = nullptr;
+    // fix #3173 (§22.5, v0.254): see `of(const std::vector<const Symbol*>&)`
+    // above. A view, not a copy, so `bindArgsToParams` does not materialize a
+    // third spelling of the formal list.
+    const std::vector<const Symbol*>* fields_ = nullptr;
 };
 
 } // namespace bezel::sema

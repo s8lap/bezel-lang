@@ -11196,18 +11196,20 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
 // fix #3141 (family F3 of umbrella #3152) — §9.1 / §22.5 / §5.1 / §2.8.3 rule 4.
 // See the contract on the declaration in ExprTypecheck_impl.hpp.
 //
-// The binding rules below are bindArgsToParams' rules, applied to the positional
-// FIELD list instead of an `ast::Param` list, with the same diagnostic wording so
-// a cross-module rejection is indistinguishable from the local one. ⚠ That
-// identity is currently held only by the two texts matching — a SECOND COPY of
-// exactly the shape umbrella #3152 exists to remove. Generalizing
-// bindArgsToParams over a formal-list view (the `CtorFormals` idea already in
-// ownership/Ownership_Checks.cpp) is filed as #3173; it is a refactor of a
-// function on every call-site check's hot path, so it is not folded into a fix
-// that already spans 14 sites. §9.1 gives a
-// positional record "a primary constructor whose parameters are the positional
-// fields, in declaration order" and no per-field default syntax, so "unbound" is
-// always an error and there is no defaulted-slot arm to mirror.
+// fix #3173 (§22.5, v0.254): the binding rules below are now `bindArgsToParams`'s
+// rules, applied via a `sema::FormalsView::of(fields)` view over the positional
+// FIELD list — the same rule, the same five diagnostic strings, the same
+// `ne.span.begin` location the local / imported callee paths report. Before this
+// view existed (umbrella #3152) the positional-field binder was a SECOND COPY of
+// exactly the same code, with five byte-identical diagnostics held identical
+// only by authors typing the same sentence. The cross-module / local rejection
+// pair now shares ONE body. §9.1 gives a positional record "a primary
+// constructor whose parameters are the positional fields, in declaration
+// order" and no per-field default syntax, so "unbound" is always an error and
+// the §22.5 binder's hasDefault predicate answers false for a record
+// (preserving the previous behaviour). For a class, the view's hasDefault
+// reads `posParam->defaultValue` / `posParam->defaultText` (#3202), so a
+// defaulted primary-ctor parameter is still fillable.
 void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
                                                TypeSymbol* t) {
     const std::vector<const Symbol*> fields = recordPositionalFieldSymbols(t);
@@ -11226,88 +11228,27 @@ void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
     // `record Named(Tag: string, N: int)` compiled and SIGSEGV'd, while the
     // local twin rejected it under §14.5 — i.e. the SAME defect this fix
     // removes for `new Named(7, 2)`, surviving one added token.
-    std::vector<int> fieldToArg(fields.size(), -1);
-    bool sawNamed = false;
-    std::size_t pos = 0;
-    auto fail = [&](const std::string& msg) {
-        ctx_.diagnostics().report(Severity::Error, ne.span.begin, msg);
-    };
-    for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
-        const ast::CallArgument& a = ne.args[ai];
-        if (a.name.empty()) {
-            if (sawNamed) {
-                fail(desc +
-                     ": a positional argument may not follow a named "
-                     "argument (§22.5 — named arguments come after all "
-                     "positional arguments)");
-                return;
-            }
-            if (pos >= fields.size()) {
-                fail(desc + " supplies " + std::to_string(ne.args.size()) +
-                     " argument(s) but the parameter list has " +
-                     std::to_string(fields.size()) + " (§22.5)");
-                return;
-            }
-            fieldToArg[pos] = static_cast<int>(ai);
-            ++pos;
-        } else {
-            sawNamed = true;
-            std::size_t idx = fields.size();
-            for (std::size_t j = 0; j < fields.size(); ++j)
-                if (fields[j]->name == a.name) { idx = j; break; }
-            if (idx >= fields.size()) {
-                fail(desc + " has no parameter named `" + std::string(a.name) +
-                     "` (§22.5)");
-                return;
-            }
-            if (fieldToArg[idx] != -1) {
-                fail(desc + ": parameter `" + std::string(a.name) +
-                     "` is bound more than once (§22.5)");
-                return;
-            }
-            fieldToArg[idx] = static_cast<int>(ai);
-        }
-    }
-    for (std::size_t j = 0; j < fields.size(); ++j)
-        if (fieldToArg[j] == -1) {
-            // fix #3202 (§22.10 / §22.5, v0.254): a §22.10 primary-
-            // constructor parameter may carry a default (`class
-            // DefBox(A: int, B: int := 9)`), and an under-supplied call must
-            // fill the trailing defaulted slots rather than be reported as
-            // missing-required. The check has two sources for the default:
-            //   - LOCAL: `fs->posParam->defaultValue` (Expr*) — what the
-            //     parser produced at the primary-ctor parameter list.
-            //   - IMPORTED: `fs->posParam->defaultText` (string) — what the
-            //     encoder shipped via REC_POSPARAM_DEFAULT (the textual
-            //     form `renderConstExpr` produced on the exporting side,
-            //     carried by the dependency's metadata).
-            // §22.5 "Every parameter after the first defaulted parameter
-            // must itself have a default" — meaning a gap (a required
-            // parameter after a defaulted one) is itself a compile error
-            // on the declaring class. The check here is therefore a simple
-            // per-slot "is this slot bound OR defaulted?" predicate: a
-            // missing required parameter with NO default continues to
-            // surface the §22.5 reject; a missing parameter WITH a default
-            // is silent, because the runtime default arm
-            // (`LlvmBackend_Exprs2.cpp` storePrimaryCtorPositionalArgs,
-            // #3202's primary-ctor-side fix) materializes it on demand.
-            //
-            // RECORDS cannot reach this: `parsePositionalFieldList` admits
-            // no default syntax (A.3 `PositionalField ::= Identifier ":"
-            // Type SerializedClause? EqualityClause?`), so §9.1's
-            // "records carry no per-field defaults" rule is enforced at
-            // the grammar and a record's `defaultValue` / `defaultText`
-            // are structurally empty. A record's unbound positional field
-            // therefore keeps the §22.5 reject — unchanged.
-            auto* fs = dynamic_cast<const sema::FieldSymbol*>(fields[j]);
-            bool hasDefault = fs && fs->posParam &&
-                              (fs->posParam->defaultValue ||
-                               !fs->posParam->defaultText.empty());
-            if (hasDefault) continue;
-            fail(desc + ": required parameter `" + std::string(fields[j]->name) +
-                 "` is not supplied (§22.5)");
-            return;
-        }
+    //
+    // fix #3173 (§22.5, v0.254): §22.5 argument binding is the SAME rule for a
+    // positional-field list as for an `ast::Param` list / a MethodSymbol / a
+    // ConstructorSymbol — positional-in-order, named-after-positional, no
+    // duplicate binding, every required slot filled. Before this fix the rule
+    // was open-coded here as a SECOND COPY (#3141), with five byte-identical
+    // diagnostic strings held identical only by authors typing the same
+    // sentence, and #3178's view already exists for the other three
+    // producers. `sema::FormalsView::of(fields)` is the field-list view that
+    // turns THIS copy into a one-liner over `bindArgsToParams`. The view's
+    // `hasDefault` answers false for a record (A.3 admits no per-field default
+    // syntax) and reads `posParam->defaultValue` / `defaultText` for a class
+    // (#3202's primary-ctor parameter defaults), matching the predicate the
+    // deleted copy used. The view's `name(i)` reads `Symbol::name`, matching
+    // `fields[j]->name == a.name` below. The result: the same five §22.5
+    // diagnostic strings, the same `ce.span.begin` location, the same
+    // side-table semantics.
+    BindResult b = bindArgsToParams(sema::FormalsView::of(fields), ne.args,
+                                    ne.span.begin, desc, /*emit=*/true);
+    if (!b.ok) return;  // the binder reported; no cascade
+
     // fix #3196 (§22.5 / §22.10, v0.254): publish the per-slot binding just
     // computed (field index j → call-site argument index, or -1 for a defaulted
     // / unfilled slot) on the `SemaContext` side table so the lowering pass's
@@ -11317,8 +11258,8 @@ void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
     // `new PBox(W := 4, V := 3)` — the spelling §22.5 admits, the §22.5
     // binding rule above just resolved, but the lowering's separate `arg i`
     // indexing would still store `4` into field 0 and `3` into field 1. The
-    // publication happens AFTER every arity/duplicate-name/unknown-name
-    // validation has passed (those failures returned above), so a published
+    // publication happens AFTER the §22.5 binder accepted the call (the binder
+    // is `emit=true`, so a rejected call short-circuits above), so a published
     // binding is always a fully-resolved §22.5 mapping — codegen never sees
     // a half-resolved vector. The publication happens BEFORE the §5.1
     // typecheck below so the binding is annotated even if a later per-arg
@@ -11333,7 +11274,7 @@ void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
     // over to choose the GEP into `obj`. Local and IMPORTED classes both
     // publish identically; the codegen reader is side-table-driven and the
     // binding depends only on the §22.5 rule, so neither side can drift.
-    ctx_.setNewExprPositionalBinding(&ne, fieldToArg);
+    ctx_.setNewExprPositionalBinding(&ne, b.paramToArg);
     // per §5.1: each bound argument must be assignable to its field's declared
     // type. `storageComponentType` is the accessor that consults both sources —
     // the positional `Param`'s type node, then the importer's member-type side
@@ -11351,20 +11292,21 @@ void ExprTC::checkPositionalNewArgsFromSymbols(const ast::NewExpr& ne,
     // did not resolve. Deferral is per-field and never a false reject.
     const TypeRef* target = ne.type ? ctx_.resolvedType(*ne.type) : nullptr;
     for (std::size_t j = 0; j < fields.size(); ++j) {
-        // fix #3202 (§22.10 / §22.5, v0.254): an UNBOUND slot — `fieldToArg[j]
-        // == -1` — means the call site omitted this parameter and the runtime
-        // default arm (codegen `storePrimaryCtorPositionalArgs`, #3202) fills
-        // it from `fs->posParam->defaultValue` / `::defaultText`. The §5.1
+        // fix #3202 (§22.10 / §22.5, v0.254): an UNBOUND slot —
+        // `b.paramToArg[j] == -1` — means the call site omitted this parameter
+        // and the runtime default arm (codegen
+        // `storePrimaryCtorPositionalArgs`, #3202) fills it from
+        // `fs->posParam->defaultValue` / `::defaultText`. The §5.1
         // assignability check below is meaningless for that slot: there is no
         // argument to check the type of, and indexing `ne.args[…]` with the
         // negative sentinel would OOB. Skipping here also matches the pre-fix
         // behaviour where the per-argument walk only ran over the supplied
-        // slots — the arity gate above was the one that rejected an
-        // under-supplied call, and that gate now uses the SAME hasDefault
-        // predicate the runtime uses, so a slot that reaches THIS line
-        // without an argument is unreachable in a well-formed program.
-        if (fieldToArg[j] == -1) continue;
-        const ast::CallArgument& a = ne.args[static_cast<std::size_t>(fieldToArg[j])];
+        // slots — the §22.5 binder is the one that rejected an under-supplied
+        // call, and it now uses the SAME hasDefault predicate the runtime uses,
+        // so a slot that reaches THIS line without an argument is unreachable
+        // in a well-formed program.
+        if (b.paramToArg[j] == -1) continue;
+        const ast::CallArgument& a = ne.args[static_cast<std::size_t>(b.paramToArg[j])];
         if (!a.value || a.isDiscard) continue;
         TypeRef* ft = const_cast<TypeRef*>(storageComponentType(fields[j], ctx_));
         if (!ft) continue;
