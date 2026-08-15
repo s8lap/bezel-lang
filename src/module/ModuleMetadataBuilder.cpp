@@ -1195,6 +1195,33 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             out.returnOwned = od->returnOwned;
             out.params = convertParams(meth->params, ctx);
             fillParamDefaults(out.params, od->params, &ctx);
+            // fix #3226 (§25 / §14.1, v0.254): for a GENERIC record/class with
+            // an operator whose RETURN TYPE IS A RECORD (the umbrella #3152 F6
+            // residue), the importer must monomorphize the body per instantiation
+            // — the exporter compiled it once against the i32-PLACEHOLDER layout,
+            // so calling it with `T = string` (a different record layout, `%{ptr,
+            // ptr}` vs `%{i32, i32}`) reaches codegen with mismatched arg/return
+            // widths and the IR verifier aborts ("Call parameter type does not
+            // match function signature"). Mirror the MethodDecl branch's
+            // methodBodyText export verbatim: stamp `od->span` is in place since
+            // #2418 (OperatorDecl's span is set by parseOperatorDeclBody). The
+            // importer parses this text inside its synthetic single-type context
+            // (parseAndAttachOperatorBody in ModuleLoader.cpp) and attaches the
+            // re-parsed ast::OperatorDecl to the imported MethodSymbol, which
+            // lets the codegen HARD route's #1059 emitInlineGenericMethod
+            // pathway (it already accepts OperatorDecl via callableInfo) emit a
+            // per-instantiation specialization. The primitive-return case (the
+            // #3159 regression pin, where `T = int` happens to equal the i32
+            // placeholder and the call is therefore always type-correct) needs
+            // nothing here — the failure mode is exclusively the record-return
+            // shape with a non-placeholder concrete type argument.
+            if (isGenericType && !source.empty() &&
+                od->span.begin.offset < od->span.end.offset &&
+                od->span.end.offset <= source.size()) {
+                out.methodBodyText = std::string(
+                    source.substr(od->span.begin.offset,
+                                  od->span.end.offset - od->span.begin.offset));
+            }
         }
         return true;
     }

@@ -10448,7 +10448,18 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     // has no ast::MethodDecl, falls through, and stays gated.
     if (!genericSubst_.empty() && ctx_.isImported(ms) && ms->parent &&
         !ms->parent->genericParams.empty() &&
-        dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        (dynamic_cast<const ast::MethodDecl*>(ms->decl) ||
+         // fix #3226 (§25 / §14.1, v0.254): operators on a generic
+         // record/class are also members whose body is imported through
+         // methodBodyText (ModuleMetadataBuilder.cpp OperatorDecl arm) and
+         // attached as an ast::OperatorDecl — the previous MethodDecl-only
+         // guard excluded operators, so the call fell through to the i32-
+         // PLACEHOLDER template and IR-verified fail when the return type
+         // was a record (the F6 residue of umbrella #3152). emitInlineGeneric
+         // Method's #1059 already accepts OperatorDecl via callableInfo (see
+         // LlvmBackend_impl.hpp:2602-2614), so widening this guard to also
+         // include OperatorDecl is the whole codegen-side change for the fix.
+         dynamic_cast<const ast::OperatorDecl*>(ms->decl))) {
         llvm::Value* r = emitInlineGenericMethod(ms, args);
         emitPendingCheck();
         // HARD route: never fall through to methodFns_ for an imported generic

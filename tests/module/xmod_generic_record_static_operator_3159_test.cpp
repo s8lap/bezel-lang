@@ -230,5 +230,94 @@ BEZEL_TEST(xmod_generic_record_static_operator_3159,
     BEZEL_EXPECT_EQ(out, std::string("11\n22\n"));
 }
 
+// ─── §25 / §14.1 / §9.2 (#3226, v0.254) — RECORD-RETURN imported generic operator
+//
+// The follow-up to the #3159 family F6 residue: an imported generic RECORD
+// operator whose RETURN TYPE IS A RECORD. #3159 fixed the sema-side result-type
+// substitution; the codegen-side monomorphization — the importer must
+// specialize the operator body per instantiation — was still missing because
+// the exporter skipped operator bodies in methodBodyText (only MethodDecl
+// arms were carried) and the importer skipped the operator matching arm in
+// parseAndAttachMethodBody. With `T = int` (the #3159 pin) the i32-placeholder
+// layout happens to equal the per-instantiation layout, so the call passes by
+// accident. With `T = string` the per-instantiation layout is `%{ptr, ptr}`
+// while the placeholder is `%{i32, i32}`, and the importer-side call reaches
+// codegen with mismatched arg/return widths → LLVM IR verifier aborts
+// ("Call parameter type does not match function signature"). This case uses
+// `T = string` to pin the codegen-side fix.
+//
+// The fix has three pieces:
+//   * ModuleMetadataBuilder.cpp OperatorDecl arm: write the operator's full
+//     declaration text into `methodBodyText` on the wire (mirrors the
+//     MethodDecl arm exactly).
+//   * ModuleLoader.cpp body-attachment loop: remove the `ms->isOperator`
+//     skip so the matching walks operators; broaden parseAndAttachMethodBody
+//     to attach an OperatorDecl (the type the operator parses to) and to
+//     render constructor stubs in the synthetic source (the operator body
+//     uses `new Vec3226<T>(a := …, b := …)` which needs a matching ctor
+//     declaration to typecheck — records have an implicit positional ctor
+//     the metadata does not carry).
+//   * LlvmBackend_Calls2.cpp emitMethodCall HARD route: accept OperatorDecl
+//     (in addition to MethodDecl) so the imported operator goes through
+//     #1059's emitInlineGenericMethod per-instantiation specialization
+//     rather than the i32-PLACEHOLDER template.
+//
+// Expected behavior post-fix:
+//   * The consumer compiles cleanly: no IR-verifier abort.
+//   * `r.a` reads `"p-a"` (from `x.a`); `r.b` reads `"q-b"` (from `y.b`).
+//   * Exits 42 on the OK branch.
+BEZEL_TEST(xmod_generic_record_static_operator_3159,
+           imported_generic_record_operator_record_return_spec_25_14_1) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_3226_rr_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module OpLib3226; "
+        "public record Vec3226<T> "
+        "  public a: T; "
+        "  public b: T; "
+        "  public static method operator +(x: Vec3226<T>, y: Vec3226<T>): Vec3226<T> "
+        "    return new Vec3226<T>(a := x.a, b := y.b); "
+        "  end; "
+        "end Vec3226; ");
+    writeSource(bSrc.path,
+        "module OpApp3226; "
+        "import OpLib3226; "
+        "public class C3226 "
+        "  public static method Main(): int "
+        "    var p := new Vec3226<string>(a := \"p-a\", b := \"p-b\"); "
+        "    var q := new Vec3226<string>(a := \"q-a\", b := \"q-b\"); "
+        "    var r := p + q; "
+        "    Console.WriteLine(r.a); "
+        "    Console.WriteLine(r.b); "
+        "    if (r.a = \"p-a\") and (r.b = \"q-b\") then "
+        "      Console.WriteLine(\"OK\"); "
+        "      return 42; "
+        "    else "
+        "      Console.WriteLine(\"FAIL\"); "
+        "      return 1; "
+        "    end; "
+        "  end Main; "
+        "end C3226; ");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d; d.metadataPath = aObj.path; d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+    auto [code, out] = runCapture(bExe.path);
+    BEZEL_EXPECT_EQ(code, 42);
+    BEZEL_EXPECT_EQ(out, std::string("p-a\nq-b\nOK\n"));
+}
+
 }  // namespace
 }  // namespace bezel::module

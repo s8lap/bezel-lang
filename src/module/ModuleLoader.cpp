@@ -2054,10 +2054,76 @@ static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
         for (const std::string& mod : mm.modifiers) src += " " + mod;
         src += " " + mm.name + " : " + metaTypeToSourceText(mm.type) + ";\n";
     }
+    // fix #3226 (§25 / §14.1, v0.254): the operator body for our record-return
+    // case constructs a new Vec3226<T> with named-arg syntax
+    // (`new Vec3226<T>(a := x.a, b := y.b)`). The synthetic class carries fields
+    // and the operator itself, but no constructor — the named-arg call then
+    // trips the §22.7 soundness gate with "`new Vec3226` has 2 argument(s) but
+    // the implicit default constructor takes 0" and parseAndAttachMethodBody
+    // fails the typecheck gate. Declare every exported constructor as a
+    // parameter-only stub so `new T(...)` resolves against a matching
+    // ConstructorSymbol (the body is irrelevant — we are not calling the ctor,
+    // only type-checking the operator body that references it). Skipped for
+    // static ctors (they are not callable, #328 FINDING [7]).
+    //
+    // Records (§9.2) carry an IMPLICIT positional constructor whose parameters
+    // are the record's instance fields — but that ctor is NEVER explicitly
+    // declared in source, so it has NO entry in `td.members` and the loop above
+    // would still leave the record without a ctor in the synthetic class.
+    // Synthesize one for record types: `public constructor(<each field>: <its
+    // type>) end constructor;` matches the named-arg construction
+    // (`new T(a := ..., b := ...)`) the operator body uses. The instance fields
+    // are exactly the members of kind Field in this kind==Record type.
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Constructor) continue;
+        bool isStatic = false;
+        for (const std::string& mod : mm.modifiers)
+            if (mod == "static") { isStatic = true; break; }
+        if (isStatic) continue;
+        src += "  " + metaVisibilityToKeyword(mm.visibility);
+        src += " constructor(";
+        for (std::size_t pi = 0; pi < mm.params.size(); ++pi) {
+            if (pi) src += ", ";
+            src += mm.params[pi].name + ": " +
+                   metaTypeToSourceText(mm.params[pi].type);
+        }
+        src += ") end constructor;\n";
+    }
+    if (td.kind == MetaTypeDeclKind::Record) {
+        src += "  public constructor(";
+        bool first = true;
+        for (const MetaMember& mm : td.members) {
+            if (mm.kind != MetaMemberKind::Field) continue;
+            // Skip static fields — the implicit positional ctor only takes
+            // instance fields (§9.2).
+            bool isStatic = false;
+            for (const std::string& mod : mm.modifiers)
+                if (mod == "static") { isStatic = true; break; }
+            if (isStatic) continue;
+            if (!first) src += ", ";
+            src += mm.name + ": " + metaTypeToSourceText(mm.type);
+            first = false;
+        }
+        src += ") end constructor;\n";
+    }
     // Methods: the target carries its real body; every other method is a stub.
+    // fix #3226 (§25 / §14.1, v0.254): operators are now ALSO exported with
+    // methodBodyText (ModuleMetadataBuilder.cpp OperatorDecl arm), so the
+    // synthetic source must render the TARGET operator's full body verbatim
+    // (its operator body is the body's own context for self-field / self-ctor
+    // references). Non-target operators are skipped — `buildMethodStub` emits
+    // `public method NAME(...)` which is NOT the operator-declaration syntax
+    // (`public method operator NAME(...)`), and an operator body rarely calls
+    // a sibling operator by name (the body just reads its own operands'
+    // fields). Only the target needs to appear in the synthetic class for the
+    // matching loop below to find the fresh MethodSymbol.
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Method) continue;
-        if (mm.isOperator) continue;
+        if (mm.isOperator) {
+            if (&mm != &target) continue;  // skip non-target operators
+            src += "  " + target.methodBodyText + "\n";
+            continue;
+        }
         if (&mm == &target) {
             src += "  " + target.methodBodyText + "\n";
         } else {
@@ -2140,13 +2206,31 @@ static bool parseAndAttachMethodBody(
     sema::MethodSymbol* freshMs = nullptr;
     for (sema::Symbol* m : freshType->members) {
         auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
-        if (ms && !ms->isOperator &&
-            freshMethodSigKey(ms) == targetKey) { freshMs = ms; break; }
+        // fix #3226 (§25 / §14.1, v0.254): allow OPERATOR members here too.
+        // The previous `!ms->isOperator` guard excluded operators, leaving
+        // every imported generic-record operator's body unattached; codegen's
+        // HARD route at emitMethodCall line 10449 then refused the inline
+        // specialization (it required a MethodDecl on the imported symbol)
+        // and the call fell through to the i32-PLACEHOLDER template, which
+        // mismatched the per-instantiation record layout when the return type
+        // was a record (the F6 residue of umbrella #3152). The operator's
+        // name is its token (`+`, `==`, `mod`, …) — set by SymbolCollection
+        // — so freshMethodSigKey produces the same `(token, params...)` key
+        // as metaMemberSigKey does for the target.
+        if (ms && freshMethodSigKey(ms) == targetKey) { freshMs = ms; break; }
     }
     if (!freshMs) return false;
 
-    auto* parsedMd = dynamic_cast<const ast::MethodDecl*>(freshMs->decl);
-    if (!parsedMd) return false;
+    // fix #3226: the imported symbol's `decl` slot accepts either kind.
+    // MethodDecl for plain methods, OperatorDecl for §25 operator overloads
+    // (the new case). callableInfo in the codegen dispatches on either
+    // (LlvmBackend_impl.hpp:2602-2614), and emitInlineGenericMethod's #1059
+    // path already inlines OperatorDecl bodies.
+    const ast::Node* parsedMdBase = freshMs->decl;
+    if (!parsedMdBase) return false;
+    if (!dynamic_cast<const ast::MethodDecl*>(parsedMdBase) &&
+        !dynamic_cast<const ast::OperatorDecl*>(parsedMdBase))
+        return false;
 
     // Field remap map.
     std::unordered_map<std::string_view, sema::Symbol*> importedFields;
@@ -2322,7 +2406,7 @@ static bool parseAndAttachMethodBody(
     // Attach the parsed MethodDecl to the imported MethodSymbol and keep the
     // backing source + AST alive (string_view fields point into them), plus the
     // fresh context + diagnostics that own the copied TypeRefs.
-    importedMs->decl = parsedMd;
+    importedMs->decl = parsedMdBase;
     mainCtx.ownImportedSource(std::move(source));
     mainCtx.ownImportedAst(std::move(sf));
     // Keep the fresh context + diagnostics alive. importedAuxiliary_ destroys in
@@ -2907,6 +2991,19 @@ static void loadMetadataPass2(
         // methodBodyText and attach the re-parsed ast::MethodDecl to the matching
         // imported MethodSymbol, so codegen can monomorphize it per instantiation
         // (the cross-module complement of the local generic-method path).
+        //
+        // fix #3226 (§25 / §14.1, v0.254): operators are now ALSO exported with
+        // methodBodyText (ModuleMetadataBuilder.cpp OperatorDecl arm), so the
+        // matching loop must include them. The previous `ms->isOperator` skip
+        // excluded operators; without this change every imported generic-record
+        // operator's body stays unattached and codegen's HARD route at
+        // emitMethodCall line 10449 then refuses to inline-specialize the call
+        // (it required a MethodDecl on the imported symbol), falling through to
+        // the i32-PLACEHOLDER template and IR-verify failing on the cross-module
+        // call. For an operator `mm.name` IS the operator token (`+`, `==`,
+        // `mod`, …) — SymbolCollection at line 200 sets `sym->name = od->opToken`,
+        // and the exporter carries it on the wire verbatim — so the
+        // name-equals-mm.name check matches operators and methods the same way.
         for (const MetaMember& mm : td.members) {
             if (mm.kind != MetaMemberKind::Method || mm.methodBodyText.empty())
                 continue;
@@ -2917,7 +3014,7 @@ static void loadMetadataPass2(
                 const std::string mmSig = metaMemberSigKey("", mm.params);
                 for (sema::Symbol* m : t->members) {
                     auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
-                    if (!ms || ms->isOperator) continue;
+                    if (!ms) continue;
                     if (std::string(ms->name) != mm.name) continue;
                     if (ms->params.size() != mm.params.size()) continue;
                     std::string msSig = "(";
