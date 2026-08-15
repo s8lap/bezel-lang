@@ -2151,13 +2151,47 @@ bool ExprTC::caseArmsExhaustive(
         // only through their concrete descendants. `descendants` keeps the
         // full set (including those intermediates) so a pattern naming an
         // intermediate by name still resolves (subtype matching, §19.3).
+        //
+        // fix #3167 (§19.6/§11.7, v0.252): the descendant census walked
+        // `ctx_.symbols()` only, which by construction excludes every
+        // imported symbol (SemaContext.hpp:225), so an imported `closed`
+        // hierarchy had an EMPTY leaf set and the whole census never ran
+        // — the warn-missing path could not fire, and a case over an
+        // imported closed class silently accepted non-coverage. Walk the
+        // imported-symbol list too (SemaContext::importedSymbols), so a
+        // sub-ancestor's downstream leaves are seen at the match site.
+        // Local twin / shadow symbols: a name can appear in BOTH
+        // `ctx_.symbols()` and `ctx_.importedSymbols()` if a local
+        // declaration happens to share a name with an imported type.
+        // The dedupe by `visited` below is what makes that harmless — the
+        // same TypeSymbol pointer would be visited twice with the same
+        // outcome (and a local class can never descend from an imported
+        // base, so the worklist's ancestor check is what makes the local
+        // twin no-op for an imported root).
+        //
+        // §19.6 verbatim, on which the census is keyed: "A **leaf type**
+        // is every **concrete** (neither `abstract` nor `closed`) class in
+        // the closed set" — so a `closed` base is itself not a leaf and
+        // admits no concrete subclass outside the declaring module
+        // (§11.7), which is exactly the cross-module guarantee this
+        // census relies on. Without walking the imported list, the
+        // importer's view of "the closed set" is empty by construction
+        // and the proof has nothing to read.
+        //
+        // Determinism: the two source lists iterate in their declared
+        // insertion order; `visited` is keyed by `TypeSymbol*` so the
+        // dedupe is pointer-stable; the inner baseTypes worklist uses a
+        // `seen` set to break cycles and walks ancestors in declared
+        // order. No hash-driven iteration touches any decision path
+        // (#2116 — the known non-determinism source).
         std::vector<TypeSymbol*> leaves;
         std::vector<TypeSymbol*> descendants;
+        std::unordered_set<const TypeSymbol*> visited;
         bool sawOpenLeaf = false;  // a non-sealed subclass leaves the set open
-        for (const auto& s : ctx_.symbols()) {
-            auto* ts = dynamic_cast<TypeSymbol*>(s.get());
+        auto considerClass = [&](TypeSymbol* ts) {
             if (!ts || ts == sub || ts->kind != ast::TypeDeclKind::Class)
-                continue;
+                return;
+            if (!visited.insert(ts).second) return;
             // Is `sub` an ancestor of `ts`?
             bool isDescendant = false;
             std::vector<TypeSymbol*> work = ts->baseTypes;
@@ -2169,7 +2203,7 @@ bool ExprTC::caseArmsExhaustive(
                 if (b == sub) { isDescendant = true; break; }
                 for (TypeSymbol* bb : b->baseTypes) work.push_back(bb);
             }
-            if (!isDescendant) continue;
+            if (!isDescendant) return;
             descendants.push_back(ts);
             // §19.6's leaf definition, both halves: a `closed` intermediate is
             // NOT a leaf (it has no instances, §11.7/§12.5, so it needs no
@@ -2182,6 +2216,12 @@ bool ExprTC::caseArmsExhaustive(
                 leaves.push_back(ts);  // concrete leaf to be covered
             if (!hasModifier(ts, "sealed") && !tsInstanceless)
                 sawOpenLeaf = true;    // a non-sealed concrete subclass
+        };
+        for (const auto& s : ctx_.symbols()) {
+            considerClass(dynamic_cast<TypeSymbol*>(s.get()));
+        }
+        for (Symbol* s : ctx_.importedSymbols()) {
+            considerClass(dynamic_cast<TypeSymbol*>(s));
         }
 
         // The hierarchy is provably closed when the base is `closed`
