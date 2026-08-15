@@ -52,7 +52,22 @@ EXPECT_HEAD="$(git rev-parse HEAD 2>/dev/null || echo '')"
 # Truly-terminal log lines (emitted only at the end, by gate.sh's gate_finish and
 # by the gate_and_push wrapper). NOT '## GATE FAILURE:' — that shard-phase warning
 # can precede arbitration and is not itself a verdict.
-TERMINAL_RE='== GATE PASS|== GATE FAIL|GATE FAILED -> NOT pushing|PUSHED origin/main now'
+# The actual gate_and_push wrapper emits the line in the form
+#   == gate_and_push: GATE PASSED (rc=0) -> PUSHED origin/main now ==
+#   == gate_and_push: GATE FAILED (rc=1) -> NOT pushing (main left with the batch committed; diagnose) ==
+# — note the `gate_and_push:` lowercase prefix and the `(rc=N)` between the verb
+# and the arrow. The regex must match BOTH the carried-PASS and the carried-FAIL
+# verb regardless of the prefix / (rc=N) detail (otherwise the waiter spins past
+# the FAIL line and never fires, the ratchet that bit run 2026-08-16 wave 1).
+# Match the verb "GATE PASSED" / "GATE FAILED" anywhere in a line carrying the
+# gate_and_push prefix, and the post-batch ack "PUSHED origin/main now" line.
+# The previous regex (`== GATE PASS|== GATE FAIL|GATE FAILED -> NOT pushing|...`)
+# missed the actual output because it required `== GATE` and a literal `GATE FAILED ->`
+# without the `(rc=1)` middle token (counted under the run-2026-08-16 corridor as
+# a 59-minute spin over a finished failing gate; the conversation explicitly
+# flagged the regex as the cause). The current regex elides the (rc=N) gap with
+# `.*` between the verb and the arrow.
+TERMINAL_RE='GATE PASSED|GATE FAILED .*->|PUSHED origin/main now'
 
 n=0
 until [ -f "$LOG" ] && grep -qE "$TERMINAL_RE" "$LOG" 2>/dev/null; do
@@ -66,7 +81,7 @@ until [ -f "$LOG" ] && grep -qE "$TERMINAL_RE" "$LOG" 2>/dev/null; do
 done
 
 echo "=== GATE TERMINAL ($LOG) ==="
-grep -E 'coverage:|== GATE PASS|== GATE FAIL|GATE FAILED -> NOT pushing|PUSHED origin/main|failing tests' "$LOG" | tail -6
+grep -E 'coverage:|GATE PASSED|GATE FAILED|PUSHED origin/main|NOT pushing|failing tests' "$LOG" | tail -6
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
   echo "origin/main: $(git ls-remote origin main 2>/dev/null | cut -c1-8)"
 
@@ -99,9 +114,9 @@ case "$_v_rc" in
 esac
 # Log-marker decision: bail on FAIL, accept on PASS/PUSHED, else absent ("").
 _ldec=""
-if grep -qE '== GATE FAIL|GATE FAILED -> NOT pushing' "$LOG" 2>/dev/null; then
+if grep -qE 'GATE FAILED .*->|NOT pushing' "$LOG" 2>/dev/null; then
   _ldec=bail
-elif grep -qE '== GATE PASS|PUSHED origin/main now' "$LOG" 2>/dev/null; then
+elif grep -qE 'GATE PASSED|PUSHED origin/main now' "$LOG" 2>/dev/null; then
   _ldec=accept
 fi
 
@@ -112,8 +127,8 @@ _py_exit=0; [ "$_gw_dec" = accept ] || _py_exit=1
 
 # Legacy 3-branch ladder (faithful original, :79-102) as the dual-consume
 # CROSS-CHECK. Computes the same pass/fail from the raw read exit + log greps.
-_has_fail=0; grep -qE '== GATE FAIL|GATE FAILED -> NOT pushing' "$LOG" 2>/dev/null && _has_fail=1
-_has_pass=0; grep -qE '== GATE PASS|PUSHED origin/main now' "$LOG" 2>/dev/null && _has_pass=1
+_has_fail=0; grep -qE 'GATE FAILED .*->|NOT pushing' "$LOG" 2>/dev/null && _has_fail=1
+_has_pass=0; grep -qE 'GATE PASSED|PUSHED origin/main now' "$LOG" 2>/dev/null && _has_pass=1
 _legacy_exit=1
 if [ "$_v_rc" -eq 0 ]; then
   [ "$_has_fail" -eq 1 ] && _legacy_exit=1 || _legacy_exit=0

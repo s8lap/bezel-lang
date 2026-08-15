@@ -180,12 +180,23 @@ BEZEL_TEST(builtin_registry_snapshot, iterable_interface_head_set) {
 // (imported-only) are deliberately NOT in the shared set — they are the small
 // site-local deltas the two call sites still test explicitly.
 BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
-    static constexpr std::array<std::string_view, 65> kSnapshot = {
+    static constexpr std::array<std::string_view, 66> kSnapshot = {
         "Array", "OwningArray", "Dictionary", "OwningDictionary",
         // INTENTIONAL addition (stdlib §4.18, #1426): SortedSet — bz_dict_t*
         // rep on both the astNode and imported paths.
         "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
         "Set", "OwningSet", "LinkedList", "OwningLinkedList", "LinkedListNode",
+        // INTENTIONAL addition (fix #1740, v0.254): OwningBuffer<T> is a
+        // heap-owning collection (ptr rep on the astNode path; identical role
+        // to OwningArray<T>). Historically the BuiltinRegistry separated it
+        // into kNonHeapReservedBuiltins with a comment claiming it was still a
+        // heap ptr — the EFFECT was that producerState(new OwningBuffer)
+        // classified the producer as Borrowed (a value type), so `var buf :=
+        // new OwningBuffer<double>(4);` initialized `buf` in Borrowed state
+        // and the §28.3 consume-site freeze misclassifed the subsequent
+        // `owned buf` as a borrow and silently dropped the move. OwningArray
+        // is in the heap table, so OwningBuffer belongs alongside it.
+        "OwningBuffer",
         "StringBuilder", "Random",
         // INTENTIONAL addition (stdlib §8.1, #2025): Stopwatch — bz_stopwatch_t*
         // heap rep; without it, the generic `new T()` path returns ptr while the
@@ -214,8 +225,10 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         "JsonDeserializer",
     };
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isHeapPointerReferenceBuiltin(n));
-    // The two site-local deltas must NOT be in the shared set.
-    for (std::string_view n : {"OwningBuffer", "IntPtr", "UIntPtr", "CString",
+    // The site-local deltas must NOT be in the shared set. (OwningBuffer was
+    // historically here; fix #1740 promoted it to the heap table since it IS a
+    // heap-owning collection — see the OwningArray twin directly above.)
+    for (std::string_view n : {"IntPtr", "UIntPtr", "CString",
                                "WString", "RawBytes"})
         BEZEL_EXPECT_FALSE(isHeapPointerReferenceBuiltin(n));
     // Value-type / span / temporal builtins are NOT heap-pointer references.
@@ -243,7 +256,10 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
 BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
     // (a) the non-heap half: the names lowerTypeRef's Named case compares that
     // are NOT heap-pointer references. Exactly `kNonHeapReservedBuiltins`.
-    static constexpr std::array<std::string_view, 19> kNonHeapSnapshot = {
+    // (OwningBuffer was here before fix #1740; it IS a heap-owning collection
+    // and is now in the heap table, so it is reserved via the heap half, not
+    // this half.)
+    static constexpr std::array<std::string_view, 18> kNonHeapSnapshot = {
         // §32.5 / §32.7 — FFI boundary
         "IntPtr", "UIntPtr", "CString", "WString", "RawBytes",
         // §2.5 — temporal / identity value builtins
@@ -255,8 +271,6 @@ BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
         "ReadOnlyStringSpan",
         // §2.15 (#687)
         "JsonOptions",
-        // §4.14 — heap ptr, but only on the astNode rep path
-        "OwningBuffer",
         // §31.4 — the Exception.CauseChain element record
         "ExceptionInfo",
     };

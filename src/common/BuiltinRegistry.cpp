@@ -120,11 +120,21 @@ constexpr std::array<std::string_view, 3> kFfiBufferBuiltins = {
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
 // (imported-only) are NOT here — they stay as explicit deltas at the sites.
-constexpr std::array<std::string_view, 65> kHeapPointerReferenceBuiltins = {
+constexpr std::array<std::string_view, 66> kHeapPointerReferenceBuiltins = {
     // §4 collections (SortedSet: stdlib §4.18/#1426 — bz_dict_t* rep, both paths)
     "Array", "OwningArray", "Dictionary", "OwningDictionary",
     "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
     "Set", "OwningSet", "LinkedList", "OwningLinkedList", "LinkedListNode",
+    // §4.14 (fix #1740, v0.254): OwningBuffer<T> is a heap-owning collection
+    // (ptr rep on the astNode path; identical role to OwningArray<T>). It was
+    // historically in kNonHeapReservedBuiltins with a comment claiming it was
+    // still a heap ptr — but the EFFECT was that producerState(new OwningBuffer)
+    // classified the producer as Borrowed (a value type), so `var buf := new
+    // OwningBuffer<double>(4);` initialized `buf` in Borrowed state and the
+    // §28.3 consume-site freeze misclassifed the subsequent `owned buf` as a
+    // borrow and silently dropped the move. OwningArray is in the heap table,
+    // so OwningBuffer belongs alongside it.
+    "OwningBuffer",
     // §3 nullary heap classes with pointer rep
     "StringBuilder", "Random",
     // stdlib §8.1 (#2025): Stopwatch is a heap-allocated bz_stopwatch_t* — the
@@ -178,7 +188,7 @@ constexpr std::array<std::string_view, 65> kHeapPointerReferenceBuiltins = {
 // type name" — measured, not inferred), so no declaration-less single-part
 // Named ref can ever carry them. Adding them would only change the
 // generic-argument inference binding, with nothing to gain.
-constexpr std::array<std::string_view, 19> kNonHeapReservedBuiltins = {
+constexpr std::array<std::string_view, 18> kNonHeapReservedBuiltins = {
     // §32.5 / §32.7 / stdlib §10: FFI-boundary types (i64 / opaque ptr).
     "IntPtr", "UIntPtr", "CString", "WString", "RawBytes",
     // §2.5: the temporal/identity value builtins (i64 / i32 / {i64,i64}).
@@ -190,9 +200,6 @@ constexpr std::array<std::string_view, 19> kNonHeapReservedBuiltins = {
     "ReadOnlyStringSpan",
     // §2.15 (#687): JsonOptions — a compiler-known value record.
     "JsonOptions",
-    // §4.14: OwningBuffer<T> — a heap ptr, but only on the astNode rep path,
-    // so it is not a member of the shared heap table above.
-    "OwningBuffer",
     // §31.4: ExceptionInfo — the {ptr,ptr,ptr} Exception.CauseChain element.
     "ExceptionInfo",
 };
