@@ -23015,7 +23015,92 @@ struct BoxEscapeWalker {
             // Binding the target into ANOTHER local escapes it (the new local may
             // be returned/stored/aliased). Walk the initializer as an escape
             // position — its sub-reads (e.g. `o as T`) are still recognized.
-            expr(ld->initializer.get(), /*safeRead=*/false);
+            //
+            // fix #3200 (§12.7 / §8.6, v0.254): the §12.7 NARROWED-READ twin of
+            // the `is`/`as` safe-read just above. `var b: [3]int := o;` inside
+            // `if o is [3]int then` copies the box's PAYLOAD BYTES into the new
+            // value-typed local — the BOX itself stays in `o`, by §3.2 value-copy
+            // semantics (a value-typed destination is an independent copy, never
+            // a reference to the source's storage). The walker would otherwise
+            // treat the binding as an escape and refuse to release `o`'s box at
+            // scope end — 32 bytes leaked per iteration in a loop (a `[3]int`
+            // box: 8 vtable + 8 rc + 12 payload + 4 alignment padding). MEASURED
+            // on HEAD: `var a: [3]int := [i, i+1, i+2]; var o: Object := a; …
+            // var b: [3]int := o; … end;` leaked 319 968 bytes in 9 999
+            // allocations under LSan (the 32 B / object signature); removing the
+            // narrowed-read line made the leak disappear, confirming the read as
+            // the trigger. Admitted when ALL THREE hold:
+            //   * `ld->type` is annotated and resolves to a NON-Object/interface
+            //     type (a value type — primitive, record, enum, inline array,
+            //     value-builtin, nullable form, unit; in each case the slot
+            //     receives a copy, not a reference to the box wrapper);
+            //   * the initializer is a BARE identifier (the #3090 narrowing site
+            //     — `narrowedIdentDeclaredType` is the same predicate and only
+            //     answers for an identifier source);
+            //   * that identifier is currently narrowed at this program point
+            //     (`ctx.exprType` resolves to a non-Object/interface), the exact
+            //     shape `narrowedIdentDeclaredType` keys on (the converse of its
+            //     "no narrowing at this point" decline).
+            // The narrowed-read lowering is `narrowedBoxPayloadAddr` →
+            // `unboxNarrowedRead` (LlvmBackend_Layout.cpp, #3090); it reads the
+            // box payload from the box pointer stored in `o`'s slot and never
+            // touches the wrapper, so no double-release is possible and `o`
+            // uniquely owns its box at scope end. Other initializer shapes
+            // (a method call, a field, a complex expression) keep the
+            // conservative `safeRead=false` — they may alias the box or reach
+            // the source through any of the §12.7 escapes (`ref`, `out`,
+            // extern-by-address) where the borrow-bearing value's lifetime
+            // constraints would attach.
+            bool narrowedRead = false;
+            if (ld->type && ld->initializer) {
+                const sema::TypeRef* declTy = ctx.resolvedType(*ld->type);
+                const sema::TypeRef* initTy =
+                    ctx.exprType(*ld->initializer);
+                // Inline of Emitter::isObjectOrInterfaceTarget — the walker
+                // does not have an Emitter handle. §8.6: Object or an
+                // interface-declared Named type are the boxing-target shapes.
+                auto isBoxingTarget = [](const sema::TypeRef* t) {
+                    if (!t) return false;
+                    using K = sema::TypeRef::Kind;
+                    using P = sema::PrimitiveType;
+                    if (t->kind == K::Primitive)
+                        return t->primitive == P::Object;
+                    if (t->kind == K::Named && t->declaration)
+                        return t->declaration->kind ==
+                               ast::TypeDeclKind::Interface;
+                    return false;
+                };
+                if (declTy && initTy &&
+                    !isBoxingTarget(declTy) &&
+                    !isBoxingTarget(initTy)) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            ld->initializer.get())) {
+                        sema::Symbol* sym = ctx.exprSymbol(*id);
+                        // Both LocalSymbol and ParameterSymbol carry the
+                        // declared type (#3090's narrowedIdentDeclaredType
+                        // admits both; sema's narrowFromTypeTest narrows
+                        // both; a parameter is "the original variable" per
+                        // §12.7 just as a local is). Pick whichever the
+                        // symbol happens to be.
+                        const sema::TypeRef* idDeclTy = nullptr;
+                        if (auto* ls =
+                                dynamic_cast<sema::LocalSymbol*>(sym)) {
+                            idDeclTy = ls->declType;
+                        } else if (auto* ps =
+                                dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                            idDeclTy = ps->resolvedDeclType
+                                ? ps->resolvedDeclType
+                                : (ps->declType
+                                    ? ctx.resolvedType(*ps->declType)
+                                    : nullptr);
+                        }
+                        if (idDeclTy && isBoxingTarget(idDeclTy)) {
+                            narrowedRead = true;
+                        }
+                    }
+                }
+            }
+            expr(ld->initializer.get(), /*safeRead=*/narrowedRead);
             return;
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {

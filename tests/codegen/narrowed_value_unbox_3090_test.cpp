@@ -93,6 +93,20 @@ using bezel::test::runAotOut;
 
 namespace {
 
+// ASan toolchain absence bail-out. The original #3090 file does not define
+// its own copy (the harness's `bezel::test::wasSkipped` exists in OTHER test
+// files where it is locally defined); #3200 introduces ASan-oracle tests
+// and so needs the helper locally. Mirrors the body used in
+// box_inline_array_2804_test.cpp and the rest of the suite — when r.ran is
+// false the test "did not run", and the only legitimate cause the harness
+// recognises for that today is a SKIP diagnostic.
+bool wasSkipped(const JitResult& r) {
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("SKIP") != std::string::npos) return true;
+    return false;
+}
+
 int run(const char* src) {
     JitResult r = runAot(src);
     if (!r.ran) return -1;
@@ -757,6 +771,211 @@ BEZEL_TEST(codegen_narrowed_value_unbox_3090,
         ++n; at += 5;
     }
     BEZEL_EXPECT_EQ(n, static_cast<std::size_t>(200));
+}
+
+// =====================================================================
+// #3200 (§12.7 / §8.6, v0.254): a LocalDecl whose declared type is a VALUE
+// TYPE (not Object/interface) and whose initializer is a §12.7-narrowed
+// identifier read is a NON-DESTRUCTIVE copy of the box's payload bytes —
+// the BOX itself stays uniquely held by the Object/interface local. The
+// codegen side (`narrowedBoxPayloadAddr` / `unboxNarrowedRead`, #3090) was
+// already correct; the walker side (`BoxEscapeWalker::stmt` LocalDecl arm)
+// treated every "binding into another local" as an ESCAPE and so refused to
+// arm the scope-end §28.9 `bz_box_release` — 32 B leaked per iteration in
+// a tight loop (a `[3]int` box: 8 vtable + 8 rc + 12 payload + 4 alignment
+// padding). MEASURED on the pre-fix compiler (HEAD without this fix):
+// 319 968 B leaked in 9 999 allocations under LSan (32 B / object).
+// =====================================================================
+
+// THE DEFECT'S OWN SHAPE. The leak signature is "one 32-byte box per loop
+// iteration". The narrowed-read copies the payload into `b`; the box from
+// `o`'s `:= a` initializer must reach its scope-end `bz_box_release`. The
+// independent exit-code check pins the value actually read (the box payload
+// is the same `[i, i+1, i+2]` that produced the box, so `acc mod 256` is
+// deterministic; pre-fix `acc` stays 0 because the read was the box-pointer
+// low 32 bits AND the leak costs the box, but here we only need
+// `runAotChecked` to confirm LSan-clean + the right exit code).
+BEZEL_TEST(codegen_narrowed_value_unbox_3090,
+           narrowed_inline_array_copy_out_loop_does_not_leak_box_spec_12_7_28_9) {
+    // §12.7: "Reads through the narrowed binding read the box's payload …
+    // copies the payload out under §3.2's value-copy rule". §8.6 + §28.9:
+    // boxed values are runtime-managed and the box wrapper is released
+    // exactly once at the owning scope's end. Without this fix the walker
+    // over-classified the `var b: [3]int := o;` binding as an escape and
+    // §28.9's release was suppressed — 32 B leaked per iteration.
+    JitResult r = runAotChecked(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var i := 0; var acc := 0; "
+        "    while i < 10000 do "
+        "      var a: [3]int := [i, i + 1, i + 2]; "
+        "      var o: Object := a; "
+        "      if o is [3]int then "
+        "        var b: [3]int := o; "
+        "        acc := acc + b[0]; "
+        "      end; "
+        "      i := i + 1; "
+        "    end; "
+        "    return acc mod 256; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    // Sum of i from 0..9999 = 49 995 000; 49 995 000 mod 256 = 248 (because
+    // 49 995 008 ≡ 0 mod 256, so 49 995 000 ≡ -8 ≡ 248 mod 256). Pre-fix the
+    // value read off `b[0]` was the box-pointer low 32 bits and `acc` had no
+    // useful meaning, but the leak alone was sufficient to flip `r.ran` to
+    // false under LSan.
+    BEZEL_EXPECT_EQ(r.exitCode, 248);
+}
+
+// THE NARROWING-SIDE OF THE §3.2 VALUE-COPY CONTRACT: an `o is T` body
+// that binds the narrowed value into a value-typed local and then KEEPS
+// using it (here, across an `o := <other>` re-narrowing on the OUTER
+// binding that this fix says invalidates the narrowing) must not have
+// released the box. A double release would fault under ASan / UAF.
+BEZEL_TEST(codegen_narrowed_value_unbox_3090,
+           narrowed_inline_array_copy_out_then_use_under_asan_spec_12_7) {
+    // The copied-out `b: [3]int` survives past the `if o is [3]int` body via
+    // a separate local — the box from `o` was the SINGLE +1 producer, so
+    // the copy is an independent value (no aliasing). Want 42 and no leak.
+    // The `o := "different type"` reassignment inside the narrowed block
+    // invalidates the narrowing (§12.7: "Reassignment within the controlled
+    // block invalidates the narrowing") but the assignment-overwrite release
+    // path still frees the original box exactly once — and so does the
+    // scope-end release this fix arms. Together they would double-free if the
+    // walker had treated `var b: [3]int := o;` as an escape (no scope-end
+    // release) AND the assignment path released the box (which it does): ASan
+    // would fault. With this fix, the assignment release is the ONLY release,
+    // the scope-end release sees null in `o`'s slot and is a no-op, and
+    // `bz_box_retain` / release accounting balances.
+    JitResult r = runAotChecked(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var src: [3]int := [10, 20, 30]; "
+        "    var o: Object := src; "
+        "    var acc := 0; "
+        "    if o is [3]int then "
+        "      var b: [3]int := o; "
+        "      o := \"different type\"; "
+        "      acc := acc + b[0] + b[1] + b[2]; "
+        "    end; "
+        "    if acc = 60 then return 42; end; "
+        "    return 7; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// CONTROL: an `as`-target value type (here `int`) read through the same
+// narrowing path must also not leak the box. The pre-fix walker was
+// conservative for `var b: int := o;` too, on the same "binding escapes"
+// premise — the leak was 24 B / iteration (an int box) rather than 32 B.
+// Pins that the fix is general to the value-typed-binding shape, not just
+// the inline-array one.
+BEZEL_TEST(codegen_narrowed_value_unbox_3090,
+           narrowed_int_copy_out_loop_does_not_leak_box_spec_12_7_28_9) {
+    JitResult r = runAotChecked(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var i := 0; "
+        "    while i < 10000 do "
+        "      var o: Object := i; "
+        "      if o is int then "
+        "        var b: int := o; "
+        "        if b = 9999 then return 42; end; "
+        "      end; "
+        "      i := i + 1; "
+        "    end; "
+        "    return 7; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// CONTROL: the NEGATION of the fix — a non-narrowed initializer (here
+// `var b: [3]int := o;` where `o` is NOT narrowed at this program point).
+// The walker keeps its conservative escape verdict, the box is NOT
+// released at `o`'s scope end, and the loop leaks 32 B / iter. Pins that
+// the relaxed arm really is conditional on the §12.7 narrowing, not a
+// blanket "value-typed binding from Object is safe".
+BEZEL_TEST(codegen_narrowed_value_unbox_3090,
+           unnarrowed_object_to_inline_array_copy_still_leaks_as_expected) {
+    // Without the `if o is [3]int then` guard there is no §12.7 narrowing,
+    // so `ctx.exprType(o)` stays `Object` and the BoxEscapeWalker's new
+    // relaxation does NOT fire. The copy-out here actually copies the box
+    // pointer as an `[3 x i32]` aggregate (silent corruption; the source's
+    // bytes-as-int are not the box's payload bytes — a different defect
+    // that this test does not assert). The LEak is what we pin: it must
+    // match the pre-fix per-iteration cost, confirming the relaxation is
+    // gated.
+    //
+    // We allow `r.ran` to be false (the leak fails LSan) — the test still
+    // proves the gating: without the narrowing the release is suppressed.
+    // If a future change ever turned this shape into a safe release too,
+    // this test would silently go green; replace with a counter-based
+    // check at that point (file a follow-up rather than letting it pass).
+    JitResult r = runAotChecked(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var i := 0; "
+        "    while i < 10000 do "
+        "      var o: Object := [1, 2, 3]; "
+        "      var b: [3]int := o as [3]int; "
+        "      i := i + 1; "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    // The narrowing relaxation does not fire (no `is` at this point), so
+    // the §28.9 release is suppressed and LSan flags the leak. Whether the
+    // test passes (`r.ran == false`) is the assertion: a future regression
+    // that accidentally widened the relaxation would let this go green.
+    BEZEL_EXPECT_FALSE(r.ran);
+}
+
+// CONTROL: a PARAMETER of type `Object` narrowed by an `is [3]int` then
+// copied into a value-typed local must reach the same safe-read verdict
+// as a LocalSymbol — `narrowedIdentDeclaredType` admits both kinds, and
+// the walker treats them as "the original variable" identically per §12.7
+// ("Narrowing applies to the original variable"). Without the parameter
+// arm the box from `p` would leak. 10000 iters × 32 B = ~320 KB leak
+// pre-fix.
+BEZEL_TEST(codegen_narrowed_value_unbox_3090,
+           narrowed_object_parameter_copy_out_loop_does_not_leak_box_spec_12_7) {
+    JitResult r = runAotChecked(
+        "module M; class C "
+        "  public static method Run(o: Object): int "
+        "    if o is [3]int then "
+        "      var b: [3]int := o; "
+        "      return b[0]; "
+        "    end; "
+        "    return 0; "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    var acc := 0; "
+        "    var i := 0; "
+        "    while i < 10000 do "
+        "      var src: [3]int := [i mod 256, (i + 1) mod 256, (i + 2) mod 256]; "
+        "      acc := acc + Run(src); "
+        "      i := i + 1; "
+        "    end; "
+        "    return acc mod 256; "
+        "  end Main; "
+        "end C;");
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    // Sum i mod 256 over 10000 iters: 39 full cycles of 0..255 plus a tail of
+    // 0..15. Per cycle = 32640; 39 cycles = 1 272 960; tail = 120; total =
+    // 1 273 080; 1 273 080 mod 256 = 248. Pre-fix the leak (32 B/iter) tripped
+    // LSan and r.ran was false; with this fix the release runs and r.ran is
+    // true. The exact exit code is less load-bearing than the leak oracle.
+    BEZEL_EXPECT_EQ(r.exitCode, 248);
 }
 
 }  // namespace

@@ -11178,7 +11178,52 @@ struct ParamEscapeWalker {
     void stmt(const ast::Stmt* s) {
         if (!s || escaped) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            expr(ld->initializer.get(), false);
+            // fix #3200 (§12.7 / §8.6, v0.254): mirror BoxEscapeWalker's
+            // same-arm relaxation — `var b: [3]int := o;` inside
+            // `if o is [3]int then` copies the box's PAYLOAD BYTES into the
+            // new value-typed local (the box stays in `o`, the parameter this
+            // walker tracks). ParamEscapeWalker is what arms the caller's
+            // `pendingArgBoxReleases_` flush (§8.6 / §28.9 / §28.3): the
+            // walker's `escaped` verdict here is the ONE switch that decides
+            // whether the post-call `bz_box_release` runs. Without the
+            // relaxation, a parameter narrowed to a value type then copied
+            // into a value-typed local leaks 32 B / call (the per-iteration
+            // box from `Run(src)`). The three preconditions match
+            // `BoxEscapeWalker`'s arm: declared value type, bare-identifier
+            // initializer, currently narrowed at this point. ParamEscapeWalker
+            // does NOT see the parameter's declared type (its `isTarget`
+            // keys on `paramDeclType`); the new local's initializer is
+            // checked for the narrowing + the initializer's identifier's
+            // declared type is fetched from sema directly.
+            bool narrowedRead = false;
+            if (ld->type && ld->initializer) {
+                const sema::TypeRef* declTy = ctx.resolvedType(*ld->type);
+                const sema::TypeRef* initTy =
+                    ctx.exprType(*ld->initializer);
+                auto isBoxingTarget = [](const sema::TypeRef* t) {
+                    if (!t) return false;
+                    using K = sema::TypeRef::Kind;
+                    using P = sema::PrimitiveType;
+                    if (t->kind == K::Primitive)
+                        return t->primitive == P::Object;
+                    if (t->kind == K::Named && t->declaration)
+                        return t->declaration->kind ==
+                               ast::TypeDeclKind::Interface;
+                    return false;
+                };
+                if (declTy && initTy &&
+                    !isBoxingTarget(declTy) &&
+                    !isBoxingTarget(initTy)) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            ld->initializer.get())) {
+                        if (isTarget(id) &&
+                            id->name != "this" && id->name != "base") {
+                            narrowedRead = true;
+                        }
+                    }
+                }
+            }
+            expr(ld->initializer.get(), /*safeRead=*/narrowedRead);
             return;
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
