@@ -5188,9 +5188,30 @@ bool MethodOwnership::classChainHasOwningInlineArrayField(
             } else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
                 ty = fd->type.get();
             }
-            if (!ty) continue;
-            const sema::TypeRef* tr = ctx_.resolvedType(*ty);
-            if (tr && tr->kind == sema::TypeRef::Kind::InlineArray &&
+            // fix #3212 (§15.1.1 / §28.9 / §28.3, v0.254): an IMPORTED
+            // class's instance field carries no `FieldDecl` (ModuleLoader
+            // never reconstructs one for non-generic imports, per the
+            // #503/#2414 AST-attach convention) and a non-positional field
+            // also has no `posParam`; without a `Type` AST node to feed
+            // `resolvedType`, the walk falls through and the predicate
+            // returns false, suppressing the §28.3 auto-drop WARNING the
+            // single-module twin fires for the same `[N owned]T?` field.
+            // The wire side carries the field's type in
+            // `ModuleLoader::fieldTypes_` (MetaMember::type → TypeKind::
+            // InlineArray with `arrayOwned` preserved at
+            // ModuleLoader.cpp:225-231), published through
+            // `ctx.importedMemberType(fs)`, so we can resolve the predicate
+            // for the import the same way we do for local. Predicates that
+            // gate diagnostics and not correctness are safe to widen in
+            // this direction.
+            const sema::TypeRef* tr = nullptr;
+            if (ty) {
+                tr = ctx_.resolvedType(*ty);
+            } else if (!fs->decl && ctx_.isImported(fs)) {
+                tr = ctx_.importedMemberType(fs);
+            }
+            if (!tr) continue;
+            if (tr->kind == sema::TypeRef::Kind::InlineArray &&
                 tr->arrayOwned)
                 return true;
         }
