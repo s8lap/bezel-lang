@@ -30,17 +30,39 @@
 // "payload"; Main returns its `.Length` (7) so the observable rides the exit
 // code — before the fix (buggy order) this was 0.
 
+#include <atomic>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <string>
 #include <sys/wait.h>
+#include <unistd.h>
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
 
 namespace {
 namespace fs = std::filesystem;
+
+// Per-process unique temp-file stem. The old std::rand()-based naming was the
+// root cause of the #3002-class xmod COVERAGE SHORT: std::rand() is a single
+// global PRNG shared across every test in the same shard (it is not
+// thread-safe and the seed is per-process), and the birthday-paradox collision
+// probability on ~186 tests per shard is ~0.8% — a collision overwrites the
+// loser's source file mid-shard, garbles the in-flight compileObject child's
+// read, and the shard crashes. The fix: a process-wide atomic counter
+// combined with getpid() for cross-process uniqueness. O(1), no syscall per
+// call beyond the once-cached getpid(), and the stem is unique across the
+// whole /tmp scratch dir.
+std::atomic<uint64_t> &g_temp_stem_counter() {
+    static std::atomic<uint64_t> counter{0};
+    return counter;
+}
+std::string unique_stem(const char* prefix) {
+    return std::string(prefix) + "_" + std::to_string(::getpid()) + "_" +
+           std::to_string(
+               g_temp_stem_counter().fetch_add(1, std::memory_order_relaxed));
+}
 
 struct TempFile1487 {
     std::string path;
@@ -139,7 +161,7 @@ int buildAndRun1487(const std::string& stem, bool libMFirst) {
 // §2.5 / §2.8.3 rule 2 (use of a transitively-reached type) + rule 3 (one type
 // identity across artifacts).
 BEZEL_TEST(xmod_transitive_type_ref_1487, libm_before_libb_resolves_2_8_3) {
-    int r = buildAndRun1487("bz1487_mfirst_" + std::to_string(std::rand()),
+    int r = buildAndRun1487(unique_stem("bz1487_mfirst"),
                             /*libMFirst=*/true);
     if (r == -2) return;  // dependency toolchain unavailable — skip
     BEZEL_EXPECT_EQ(r, 7);
@@ -148,7 +170,7 @@ BEZEL_TEST(xmod_transitive_type_ref_1487, libm_before_libb_resolves_2_8_3) {
 // Order-independence canary: the reverse order (LibB before LibM) already worked
 // before the fix; it must keep working after. Same value, 7.
 BEZEL_TEST(xmod_transitive_type_ref_1487, libb_before_libm_still_resolves_2_8_3) {
-    int r = buildAndRun1487("bz1487_bfirst_" + std::to_string(std::rand()),
+    int r = buildAndRun1487(unique_stem("bz1487_bfirst"),
                             /*libMFirst=*/false);
     if (r == -2) return;
     BEZEL_EXPECT_EQ(r, 7);

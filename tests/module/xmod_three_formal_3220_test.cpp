@@ -52,6 +52,7 @@
 // imported callee was silently accepting non-inline shapes. The new behaviour
 // matches §22.4 and the local callee's already-rejecting behaviour.
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -73,6 +74,26 @@ namespace bezel::module {
 namespace {
 
 namespace fs = std::filesystem;
+
+// Per-process unique temp-file stem. The old std::rand()-based naming was the
+// root cause of the #3002-class xmod COVERAGE SHORT: std::rand() is a single
+// global PRNG shared across every test in the same shard (it is not
+// thread-safe and the seed is per-process), and the birthday-paradox collision
+// probability on ~186 tests per shard is ~0.8% — a collision overwrites the
+// loser's source file mid-shard, garbles the in-flight compileObject child's
+// read, and the shard crashes. The fix: a process-wide atomic counter
+// combined with getpid() for cross-process uniqueness. O(1), no syscall per
+// call beyond the once-cached getpid(), and the stem is unique across the
+// whole /tmp scratch dir.
+std::atomic<uint64_t> &g_temp_stem_counter() {
+    static std::atomic<uint64_t> counter{0};
+    return counter;
+}
+std::string unique_stem(const char* prefix) {
+    return std::string(prefix) + "_" + std::to_string(::getpid()) + "_" +
+           std::to_string(
+               g_temp_stem_counter().fetch_add(1, std::memory_order_relaxed));
+}
 
 struct TempFile3220 {
     std::string path;
@@ -137,7 +158,7 @@ std::string libSource3220_O() {
 int compileImportAndRun3220(const std::string& libSrc,
                             const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3220r_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3220r");
     TempFile3220 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3220 aObj((dir / (stem + "_a.o")).string());
     writeSource3220(aSrc.path, libSrc);
@@ -173,7 +194,7 @@ struct ImportCapture3220 {
 std::string captureStderrOf3220(const std::function<void()>& body) {
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz3220_err_" + std::to_string(std::rand()) + ".txt")).string();
+         (unique_stem("bz3220_err") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);
@@ -194,7 +215,7 @@ std::string captureStderrOf3220(const std::function<void()>& body) {
 ImportCapture3220 compileImport3220(const std::string& libSrc,
                                     const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3220_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3220");
     TempFile3220 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3220 aObj((dir / (stem + "_a.o")).string());
     writeSource3220(aSrc.path, libSrc);
@@ -226,7 +247,7 @@ ImportCapture3220 compileImport3220(const std::string& libSrc,
 // ── single-module compile + RUN for ACCEPT twin. ────────────────────────────
 int compileLocalAndRun3220(const std::string& src) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3220lr_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3220lr");
     TempFile3220 srcFile((dir / (stem + ".bzl")).string());
     TempFile3220 exeFile((dir / stem).string());
     writeSource3220(srcFile.path, src);
@@ -248,7 +269,7 @@ struct LocalCapture3220 {
 
 LocalCapture3220 compileLocal3220(const std::string& src) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3220l_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3220l");
     TempFile3220 srcFile((dir / (stem + ".bzl")).string());
     TempFile3220 exeFile((dir / stem).string());
     writeSource3220(srcFile.path, src);

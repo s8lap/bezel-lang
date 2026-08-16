@@ -35,6 +35,7 @@
 // Both arms now read `sema::storageComponentType`, the one both-sources
 // accessor.
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -55,6 +56,26 @@ namespace bezel::module {
 namespace {
 
 namespace fs = std::filesystem;
+
+// Per-process unique temp-file stem. The old std::rand()-based naming was the
+// root cause of the #3002-class xmod COVERAGE SHORT: std::rand() is a single
+// global PRNG shared across every test in the same shard (it is not
+// thread-safe and the seed is per-process), and the birthday-paradox collision
+// probability on ~186 tests per shard is ~0.8% — a collision overwrites the
+// loser's source file mid-shard, garbles the in-flight compileObject child's
+// read, and the shard crashes. The fix: a process-wide atomic counter
+// combined with getpid() for cross-process uniqueness. O(1), no syscall per
+// call beyond the once-cached getpid(), and the stem is unique across the
+// whole /tmp scratch dir.
+std::atomic<uint64_t> &g_temp_stem_counter() {
+    static std::atomic<uint64_t> counter{0};
+    return counter;
+}
+std::string unique_stem(const char* prefix) {
+    return std::string(prefix) + "_" + std::to_string(::getpid()) + "_" +
+           std::to_string(
+               g_temp_stem_counter().fetch_add(1, std::memory_order_relaxed));
+}
 
 struct TempFile3177W {
     std::string path;
@@ -83,7 +104,7 @@ struct Run3177W {
 Run3177W importCompileAndRun3177W(const std::string& libSrc,
                                   const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3177w_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3177w");
     TempFile3177W aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3177W aObj((dir / (stem + "_a.o")).string());
     writeSource3177W(aSrc.path, libSrc);
@@ -96,7 +117,7 @@ Run3177W importCompileAndRun3177W(const std::string& libSrc,
     TempFile3177W bExe((dir / stem).string());
     writeSource3177W(bSrc.path, appSrc);
     std::string errPath =
-        (dir / ("bz3177w_err_" + std::to_string(std::rand()) + ".txt")).string();
+        (dir / (unique_stem("bz3177w_err") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);
@@ -139,14 +160,14 @@ Run3177W importCompileAndRun3177W(const std::string& libSrc,
 
 Run3177W localCompile3177W(const std::string& src) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3177w_loc_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3177w_loc");
     TempFile3177W sFile((dir / (stem + ".bzl")).string());
     TempFile3177W eFile((dir / stem).string());
     writeSource3177W(sFile.path, src);
     Run3177W r;
     r.dependencyCompiled = true;
     std::string errPath =
-        (dir / ("bz3177w_lerr_" + std::to_string(std::rand()) + ".txt")).string();
+        (dir / (unique_stem("bz3177w_lerr") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);
