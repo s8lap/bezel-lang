@@ -1736,6 +1736,26 @@ void Resolver::checkOperatorGroups() {
                     "` may not be overloaded (§25.1)");
                 continue;
             }
+            // §25.1 (#3107): the assignment and compound-assignment tokens
+            // `:=`, `+=`, `-=`, `*=`, `/=`, `mod=`, `&=`, `|=`, `^=`, `<<=`,
+            // `>>=`, `??=` are not user-overloadable — the compound forms
+            // desugar mechanically to read-modify-write using the underlying
+            // binary operator's overload (§25.1, §6.6). They were silently
+            // accepted as overload declarations and the declared members were
+            // inert, so the author got a confusing "you declared no
+            // `operator +`" message while staring at the `operator +=` they
+            // just wrote.
+            if (tok == ":=" || tok == "+=" || tok == "-=" || tok == "*=" ||
+                tok == "/=" || tok == "mod=" || tok == "&=" || tok == "|=" ||
+                tok == "^=" || tok == "<<=" || tok == ">>=" || tok == "??=") {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    "operator `" + std::string(tok) +
+                    "` may not be overloaded (§25.1) — declare the underlying "
+                    "binary operator; the compound form composes from it "
+                    "automatically");
+                continue;
+            }
             // §11.8 (v0.176, #807): a STATIC INTERFACE operator member is a
             // contract, not an overload declaration — its parameters are the
             // constrained type parameter (`(a: T, b: T)`), it is implicitly
