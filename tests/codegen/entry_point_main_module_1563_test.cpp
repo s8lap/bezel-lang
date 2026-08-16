@@ -42,15 +42,27 @@
 #include <sys/wait.h>
 
 #include "driver/Driver.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir1563() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-1563");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // Write `source` to a fresh temp .bzl path and return that path.
 std::string writeSource(const std::string& source, const std::string& stem) {
-    std::string path = (fs::temp_directory_path() / (stem + ".bzl")).string();
+    std::string path = (wtDir1563() / (stem + ".bzl")).string();
     std::ofstream out(path);
     out << source;
     return path;
@@ -73,12 +85,11 @@ int runAndGetExitCode(const std::string& exe) {
 // before being handed to an importer (§2.5, issue #328 inc 3).
 BEZEL_TEST(codegen_entry_point_main_module_1563,
            dependency_with_qualifying_main_compiles_as_library_33_6) {
-    static int counter = 0;
     std::string src = writeSource(
         "module Dep1563A; "
         "class DepProgram public static method Main(): int => 99; "
         "end DepProgram;",
-        "bezel_1563_dep_lib_" + std::to_string(counter++));
+        "bezel_1563_dep_lib_" + unique_stem(""));
     std::string obj = src + ".o";
 
     bezel::Driver driver;
@@ -99,8 +110,7 @@ BEZEL_TEST(codegen_entry_point_main_module_1563,
 // the main module's Main (and only it) is the process entry point.
 BEZEL_TEST(codegen_entry_point_main_module_1563,
            main_module_main_wins_over_dependency_main_33_1_2_4) {
-    static int counter = 0;
-    std::string stem = "bezel_1563_scope_" + std::to_string(counter++);
+    std::string stem = "bezel_1563_scope_" + unique_stem("");
 
     // The dependency module: its own qualifying `Main` (§33.2) — must become
     // an ordinary method once compiled as a library artifact (§33.6/§2.5).
