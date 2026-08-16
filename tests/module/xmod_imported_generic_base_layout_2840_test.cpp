@@ -71,6 +71,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -164,7 +166,7 @@ BEZEL_TEST(xmod_imported_generic_base_layout_2840,
            t1_inherited_long_field_roundtrips_2_8_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2840_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2840_t1_");
     TempFile2840 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2840 aObj((dir / (stem + "_a.o")).string());
     writeSource2840(aSrc.path, kLib2840);
@@ -187,7 +189,7 @@ BEZEL_TEST(xmod_imported_generic_base_layout_2840,
            t2_inherited_string_field_roundtrips_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2840_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2840_t2_");
     TempFile2840 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2840 aObj((dir / (stem + "_a.o")).string());
     writeSource2840(aSrc.path, kLib2840);
@@ -228,7 +230,7 @@ BEZEL_TEST(xmod_imported_generic_base_layout_2840,
            t3_int_instantiation_unchanged_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2840_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2840_t3_");
     TempFile2840 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2840 aObj((dir / (stem + "_a.o")).string());
     writeSource2840(aSrc.path, kLib2840);
@@ -269,7 +271,7 @@ BEZEL_TEST(xmod_imported_generic_base_layout_2840,
            t4_non_generic_imported_base_unchanged_12) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2840_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2840_t4_");
     TempFile2840 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2840 aObj((dir / (stem + "_a.o")).string());
     writeSource2840(aSrc.path, kLib2840);
@@ -312,7 +314,7 @@ BEZEL_TEST(xmod_imported_generic_base_layout_2840,
            t5_single_module_parity_2_8_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2840_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2840_t5_");
     std::string src =
         "module App2840Single; "
         "public class GBase2840<T> "
@@ -351,7 +353,7 @@ BEZEL_TEST(xmod_imported_generic_base_layout_2840,
            t6_two_level_chain_through_non_generic_link_12) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2840_t6_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2840_t6_");
     TempFile2840 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2840 aObj((dir / (stem + "_a.o")).string());
     writeSource2840(aSrc.path, kLib2840);

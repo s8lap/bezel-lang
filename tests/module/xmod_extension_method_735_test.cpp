@@ -36,6 +36,8 @@
 #include "driver/Driver.hpp"
 #include "module/ModuleMetadata.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace {
 
@@ -93,7 +95,7 @@ bool importCompiles735x(const std::string& bSrc, const std::string& bExe,
 BEZEL_TEST(xmod_extension_735, imported_extension_method_class_receiver_26_5) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz735x_cls_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz735x_cls_");
     TempFile735x aSrc((dir / (stem + "_a.bzl")).string());
     TempFile735x aObj((dir / (stem + "_a.o")).string());
 
@@ -138,7 +140,7 @@ BEZEL_TEST(xmod_extension_735, imported_extension_method_class_receiver_26_5) {
 BEZEL_TEST(xmod_extension_735, imported_extension_receiver_abi_all_kinds_26_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz735x_abi_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz735x_abi_");
     TempFile735x aSrc((dir / (stem + "_a.bzl")).string());
     TempFile735x aObj((dir / (stem + "_a.o")).string());
 
@@ -197,7 +199,7 @@ BEZEL_TEST(xmod_extension_735, imported_extension_receiver_abi_all_kinds_26_2) {
 BEZEL_TEST(xmod_extension_735, imported_extension_on_interface_receiver_26_5) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz735x_ifc_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz735x_ifc_");
     TempFile735x aSrc((dir / (stem + "_a.bzl")).string());
     TempFile735x aObj((dir / (stem + "_a.o")).string());
 
@@ -241,7 +243,7 @@ BEZEL_TEST(xmod_extension_735, imported_extension_on_interface_receiver_26_5) {
 BEZEL_TEST(xmod_extension_735, imported_extension_owned_return_26_7) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz735x_own_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz735x_own_");
     TempFile735x aSrc((dir / (stem + "_a.bzl")).string());
     TempFile735x aObj((dir / (stem + "_a.o")).string());
 
@@ -282,7 +284,7 @@ BEZEL_TEST(xmod_extension_735, imported_extension_owned_return_26_7) {
 BEZEL_TEST(xmod_extension_735, internal_extension_is_not_exported_13_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz735x_int_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz735x_int_");
     TempFile735x aSrc((dir / (stem + "_a.bzl")).string());
     TempFile735x aObj((dir / (stem + "_a.o")).string());
 

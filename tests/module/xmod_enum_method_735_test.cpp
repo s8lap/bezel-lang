@@ -16,6 +16,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace {
 
@@ -55,7 +57,7 @@ int importRun735(const std::string& bSrc, const std::string& bExe,
 BEZEL_TEST(xmod_enum_method_735, imported_enum_instance_method_dispatch) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz735_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz735_");
     TempFile735 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile735 aObj((dir / (stem + "_a.o")).string());
 

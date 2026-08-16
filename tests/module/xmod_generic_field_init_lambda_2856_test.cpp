@@ -65,6 +65,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -107,7 +109,7 @@ int runXmod2856(const std::string& stem, const std::string& aSrcText,
                 const std::string& bSrcText) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string tag = stem + "_" + std::to_string(std::rand());
+    std::string tag = stem + "_" + unique_stem("");
     TempFile2856 aSrc((dir / (tag + "_a.bzl")).string());
     TempFile2856 aObj((dir / (tag + "_a.o")).string());
     writeSource2856(aSrc.path, aSrcText);
@@ -128,7 +130,7 @@ bool compileImportCaptureErr2856(const std::string& bSrc,
                                  const std::string& aObj, std::string& err) {
     namespace fs = std::filesystem;
     std::string errPath = (fs::temp_directory_path() /
-                           ("bz2856_err_" + std::to_string(std::rand()) +
+                           ("bz2856_err_" + unique_stem("") +
                             ".txt"))
                               .string();
 
@@ -403,7 +405,7 @@ BEZEL_TEST(xmod_generic_field_init_lambda_2856, t9_control_non_generic_class_22_
 BEZEL_TEST(xmod_generic_field_init_lambda_2856, t10_unreconstructible_is_a_hard_reject_2_8_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string tag = "bz2856_t10_" + std::to_string(std::rand());
+    std::string tag = "bz2856_t10_" + unique_stem("");
     TempFile2856 aSrc((dir / (tag + "_a.bzl")).string());
     TempFile2856 aObj((dir / (tag + "_a.o")).string());
     writeSource2856(aSrc.path,

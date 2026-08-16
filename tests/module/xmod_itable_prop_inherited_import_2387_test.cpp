@@ -80,6 +80,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -110,7 +112,7 @@ int compileImportAndRun2387(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2387_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2387_");
     TempFile2387 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2387 aObj((dir / (stem + "_a.o")).string());
     writeSource2387(aSrc.path, libSrc);
@@ -136,7 +138,7 @@ bool compileImportSucceeds2387(const std::string& libSrc,
                                const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2387_ok_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2387_ok_");
     TempFile2387 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2387 aObj((dir / (stem + "_a.o")).string());
     writeSource2387(aSrc.path, libSrc);
@@ -279,7 +281,7 @@ BEZEL_TEST(xmod_itable_prop_inherited_import_2387,
     bezel::Driver driver;
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2387_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2387_t4_");
     TempFile2387 src((dir / (stem + ".bzl")).string());
     TempFile2387 exe((dir / stem).string());
     writeSource2387(src.path,

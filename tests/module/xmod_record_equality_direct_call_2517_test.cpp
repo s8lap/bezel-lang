@@ -38,6 +38,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -66,7 +68,7 @@ bool compileImportCaptureErr2517(const std::string& libSrc,
                                  std::string& err) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2517_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2517_");
     TempFile2517 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2517 aObj((dir / (stem + "_a.o")).string());
     writeSource2517(aSrc.path, libSrc);
@@ -78,7 +80,7 @@ bool compileImportCaptureErr2517(const std::string& libSrc,
     writeSource2517(bSrc.path, appSrc);
 
     std::string errPath =
-        (dir / ("bz2517_err_" + std::to_string(std::rand()) + ".txt")).string();
+        (dir / ("bz2517_err_" + unique_stem("") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);
@@ -115,13 +117,13 @@ bool compileImportCaptureErr2517(const std::string& libSrc,
 bool compileSingleCaptureErr2517(const std::string& src, std::string& err) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2517s_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2517s_");
     TempFile2517 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2517 aExe((dir / (stem + "_a")).string());
     writeSource2517(aSrc.path, src);
 
     std::string errPath =
-        (dir / ("bz2517_err_" + std::to_string(std::rand()) + ".txt")).string();
+        (dir / ("bz2517_err_" + unique_stem("") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);

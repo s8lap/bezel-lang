@@ -106,6 +106,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -134,7 +136,7 @@ int compileImportAndRun3204(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3204_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3204_");
     TempFile3204 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3204 aObj((dir / (stem + "_a.o")).string());
     writeSource3204(aSrc.path, libSrc);
@@ -165,7 +167,7 @@ bool compileImportCaptureErr3204(const std::string& libSrc,
                                  std::string& err) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3204c_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3204c_");
     TempFile3204 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3204 aObj((dir / (stem + "_a.o")).string());
     writeSource3204(aSrc.path, libSrc);
@@ -177,7 +179,7 @@ bool compileImportCaptureErr3204(const std::string& libSrc,
     writeSource3204(bSrc.path, appSrc);
 
     std::string errPath =
-        (dir / ("bz3204_err_" + std::to_string(std::rand()) + ".txt"))
+        (dir / ("bz3204_err_" + unique_stem("") + ".txt"))
             .string();
     std::fflush(stderr);
     std::cerr.flush();
@@ -214,7 +216,7 @@ bool compileImportCaptureErr3204(const std::string& libSrc,
 int compileLocalAndRun3204(const std::string& src) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3204l_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3204l_");
     TempFile3204 aSrc((dir / (stem + ".bzl")).string());
     TempFile3204 aExe((dir / stem).string());
     writeSource3204(aSrc.path, src);

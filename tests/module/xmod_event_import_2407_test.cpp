@@ -78,6 +78,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -114,7 +116,7 @@ CompileImportResult2407 compileImportAndRun2407(const std::string& libSrc,
                                                  const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2407_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2407_");
     TempFile2407 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2407 aObj((dir / (stem + "_a.o")).string());
     writeSource2407(aSrc.path, libSrc);
@@ -243,7 +245,7 @@ BEZEL_TEST(xmod_event_import_2407, local_interface_event_control_unaffected) {
     bezel::Driver driver;
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2407_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2407_t3_");
     TempFile2407 src((dir / (stem + ".bzl")).string());
     TempFile2407 exe((dir / stem).string());
     writeSource2407(src.path,

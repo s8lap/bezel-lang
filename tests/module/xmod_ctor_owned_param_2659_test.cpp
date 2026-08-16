@@ -100,6 +100,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -168,7 +170,7 @@ std::string appSource2659(const std::string& body, const std::string& tag) {
 int runImported2659(const std::string& body, const std::string& tag,
                     std::string* capturedStderr = nullptr) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2659_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz2659_" + tag + "_" + unique_stem("");
 
     TempFile2659 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2659 aObj((dir / (stem + "_a.o")).string());
@@ -379,7 +381,7 @@ BEZEL_TEST(xmod_ctor_owned_param_2659, t5_marker_on_borrow_formal_still_spurious
 // ===========================================================================
 BEZEL_TEST(xmod_ctor_owned_param_2659, t6_same_module_control_22_3) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2659_t6_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2659_t6_");
     TempFile2659 src((dir / (stem + ".bzl")).string());
     TempFile2659 exe((dir / stem).string());
     writeSource2659(

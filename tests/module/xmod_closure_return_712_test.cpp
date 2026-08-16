@@ -57,6 +57,8 @@
 #include "llvm/IR/Module.h"
 
 #include "native_test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -273,7 +275,7 @@ static int singleModLsan712(const std::string& src, int expectedCode) {
 BEZEL_TEST(xmod_closure_return_712, c1_imported_instance_method_closure_lsan_28_9) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz712_c1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz712_c1_");
     TempFile712 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile712 aObj((dir / (stem + "_a.o")).string());
 
@@ -374,7 +376,7 @@ BEZEL_TEST(xmod_closure_return_712, c2_single_module_baseline_lsan_28_9) {
     // Compile and run natively to verify correctness.
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz712_c2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz712_c2_");
     TempFile712 srcFile((dir / (stem + ".bzl")).string());
     TempFile712 exeFile((dir / (stem + "_exe")).string());
     writeSource712(srcFile.path, singleSrc);
@@ -410,7 +412,7 @@ BEZEL_TEST(xmod_closure_return_712, c2_single_module_baseline_lsan_28_9) {
 BEZEL_TEST(xmod_closure_return_712, canary_non_closure_return_no_double_free_28_9) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz712_can_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz712_can_");
     TempFile712 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile712 aObj((dir / (stem + "_a.o")).string());
 

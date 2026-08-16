@@ -89,6 +89,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -138,7 +140,7 @@ bool compileImportCaptureErr2841(const std::string& bSrc,
     namespace fs = std::filesystem;
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz2841_err_" + std::to_string(std::rand()) + ".txt"))
+         ("bz2841_err_" + unique_stem("") + ".txt"))
             .string();
 
     std::fflush(stderr);
@@ -304,7 +306,7 @@ void expectRuns2841(const std::string& stem, const std::string& bSrc,
 BEZEL_TEST(xmod_imported_generic_static_state_2841,
            t1_two_instantiations_sharing_one_cell_rejected_22_12) {
     expectRejected2841(
-        "bz2841_t1_" + std::to_string(std::rand()),
+        "bz2841_t1_" + unique_stem(""),
         "module App2841T1; import Lib2841; "
         "public class C "
         "  public static method Main(): int "
@@ -326,7 +328,7 @@ BEZEL_TEST(xmod_imported_generic_static_state_2841,
 BEZEL_TEST(xmod_imported_generic_static_state_2841,
            t2_single_instantiation_split_cell_rejected_2_8_3) {
     expectRejected2841(
-        "bz2841_t2_" + std::to_string(std::rand()),
+        "bz2841_t2_" + unique_stem(""),
         "module App2841T2; import Lib2841; "
         "public class C "
         "  public static method Main(): int "
@@ -347,7 +349,7 @@ BEZEL_TEST(xmod_imported_generic_static_state_2841,
 BEZEL_TEST(xmod_imported_generic_static_state_2841,
            t3_reconstructible_body_still_runs_per_instantiation_14_1) {
     expectRuns2841(
-        "bz2841_t3_" + std::to_string(std::rand()),
+        "bz2841_t3_" + unique_stem(""),
         "module App2841T3; import Lib2841; "
         "public class C "
         "  public static method Main(): int "
@@ -367,7 +369,7 @@ BEZEL_TEST(xmod_imported_generic_static_state_2841,
 BEZEL_TEST(xmod_imported_generic_static_state_2841,
            t4_generic_without_static_state_not_rejected_22_12) {
     expectRuns2841(
-        "bz2841_t4_" + std::to_string(std::rand()),
+        "bz2841_t4_" + unique_stem(""),
         "module App2841T4; import Lib2841; "
         "public class C "
         "  public static method Main(): int "
@@ -386,7 +388,7 @@ BEZEL_TEST(xmod_imported_generic_static_state_2841,
 BEZEL_TEST(xmod_imported_generic_static_state_2841,
            t5_non_generic_imported_static_unchanged_22_12) {
     expectRuns2841(
-        "bz2841_t5_" + std::to_string(std::rand()),
+        "bz2841_t5_" + unique_stem(""),
         "module App2841T5; import Lib2841; "
         "public class C "
         "  public static method Main(): int "
@@ -410,7 +412,7 @@ BEZEL_TEST(xmod_imported_generic_static_state_2841,
 BEZEL_TEST(xmod_imported_generic_static_state_2841,
            t6_readonly_value_static_not_rejected_22_12_rule_3) {
     expectRuns2841(
-        "bz2841_t6_" + std::to_string(std::rand()),
+        "bz2841_t6_" + unique_stem(""),
         "module App2841T6; import Lib2841; "
         "public class C "
         "  public static method Main(): int "
@@ -430,7 +432,7 @@ BEZEL_TEST(xmod_imported_generic_static_state_2841,
 BEZEL_TEST(xmod_imported_generic_static_state_2841,
            t7_static_owned_by_non_generic_base_not_rejected_22_12) {
     expectRuns2841(
-        "bz2841_t7_" + std::to_string(std::rand()),
+        "bz2841_t7_" + unique_stem(""),
         "module App2841T7; import Lib2841; "
         "public class C "
         "  public static method Main(): int "
@@ -449,7 +451,7 @@ BEZEL_TEST(xmod_imported_generic_static_state_2841,
 BEZEL_TEST(xmod_imported_generic_static_state_2841,
            t8_direct_static_field_access_unaffected_22_12) {
     expectRuns2841(
-        "bz2841_t8_" + std::to_string(std::rand()),
+        "bz2841_t8_" + unique_stem(""),
         "module App2841T8; import Lib2841; "
         "public class C "
         "  public static method Main(): int "
@@ -472,7 +474,7 @@ BEZEL_TEST(xmod_imported_generic_static_state_2841,
 BEZEL_TEST(xmod_imported_generic_static_state_2841,
            t9_readonly_reference_static_rejected_2_8_3) {
     expectRejected2841(
-        "bz2841_t9_" + std::to_string(std::rand()),
+        "bz2841_t9_" + unique_stem(""),
         "module App2841T9; import Lib2841; "
         "public class C "
         "  public static method Main(): int "
@@ -495,7 +497,7 @@ BEZEL_TEST(xmod_imported_generic_static_state_2841,
            t10_single_module_per_instantiation_oracle_22_12) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2841_t10_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2841_t10_");
     std::string src =
         "module App2841Single; "
         "public class Helper2841 "

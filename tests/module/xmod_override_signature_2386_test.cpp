@@ -80,6 +80,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -110,7 +112,7 @@ bool compileImportCaptureErr2386(const std::string& bSrc,
                                  std::string& err) {
     namespace fs = std::filesystem;
     std::string errPath = (fs::temp_directory_path() /
-                           ("bz2386_err_" + std::to_string(std::rand()) +
+                           ("bz2386_err_" + unique_stem("") +
                             ".txt"))
                               .string();
 
@@ -152,7 +154,7 @@ int compileImportAndRun2386(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2386_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2386_");
     TempFile2386 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2386 aObj((dir / (stem + "_a.o")).string());
     writeSource2386(aSrc.path, libSrc);
@@ -185,7 +187,7 @@ BEZEL_TEST(xmod_override_signature_2386,
            method_return_type_mismatch_against_imported_base_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2386_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2386_t1_");
     TempFile2386 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2386 aObj((dir / (stem + "_a.o")).string());
     writeSource2386(aSrc.path,
@@ -225,7 +227,7 @@ BEZEL_TEST(xmod_override_signature_2386,
            property_type_mismatch_against_imported_base_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2386_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2386_t2_");
     TempFile2386 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2386 aObj((dir / (stem + "_a.o")).string());
     writeSource2386(aSrc.path,
@@ -269,7 +271,7 @@ BEZEL_TEST(xmod_override_signature_2386,
            method_parameter_type_mismatch_against_imported_base_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2386_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2386_t3_");
     TempFile2386 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2386 aObj((dir / (stem + "_a.o")).string());
     writeSource2386(aSrc.path,
@@ -309,7 +311,7 @@ BEZEL_TEST(xmod_override_signature_2386,
            method_return_type_mismatch_against_local_base_still_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2386_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2386_t4_");
     std::string bSrc =
         "module LocalMethod2386T4; "
         "public abstract class AbsBaseLocal2386T4 "
@@ -338,7 +340,7 @@ BEZEL_TEST(xmod_override_signature_2386,
            property_type_mismatch_against_local_base_still_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2386_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2386_t5_");
     std::string bSrc =
         "module LocalProp2386T5; "
         "public abstract class AbsPropBaseLocal2386T5 "
@@ -427,7 +429,7 @@ BEZEL_TEST(xmod_override_signature_2386,
            method_mismatch_against_two_level_imported_ancestry_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2386_t8_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2386_t8_");
     TempFile2386 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2386 aObj((dir / (stem + "_a.o")).string());
     writeSource2386(aSrc.path,

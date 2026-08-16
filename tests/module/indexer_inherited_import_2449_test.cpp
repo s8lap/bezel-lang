@@ -87,6 +87,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -116,7 +118,7 @@ int compileImportAndRun2449(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2449_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2449_");
     TempFile2449 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2449 aObj((dir / (stem + "_a.o")).string());
     writeSource2449(aSrc.path, libSrc);
@@ -154,7 +156,7 @@ bool compileImportCaptureErr2449(const std::string& libSrc,
                                  const std::string& appSrc, std::string& err) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2449_c_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2449_c_");
     TempFile2449 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2449 aObj((dir / (stem + "_a.o")).string());
     writeSource2449(aSrc.path, libSrc);
@@ -166,7 +168,7 @@ bool compileImportCaptureErr2449(const std::string& libSrc,
     writeSource2449(bSrc.path, appSrc);
 
     std::string errPath =
-        (dir / ("bz2449_err_" + std::to_string(std::rand()) + ".txt"))
+        (dir / ("bz2449_err_" + unique_stem("") + ".txt"))
             .string();
     std::fflush(stderr);
     std::cerr.flush();
@@ -358,7 +360,7 @@ BEZEL_TEST(indexer_inherited_import_2449,
     bezel::Driver driver;
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2449_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2449_t5_");
     TempFile2449 src((dir / (stem + ".bzl")).string());
     TempFile2449 exe((dir / stem).string());
     writeSource2449(src.path,

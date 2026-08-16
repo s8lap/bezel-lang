@@ -54,6 +54,8 @@
 #include "llvm/IR/Module.h"
 
 #include "native_test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -207,7 +209,7 @@ static int xmodLsan694(
 BEZEL_TEST(xmod_string_refcount_694, s1_imported_static_method_nonescaping_lsan_4_6) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz694_s1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz694_s1_");
     TempFile694 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile694 aObj((dir / (stem + "_a.o")).string());
 
@@ -263,7 +265,7 @@ BEZEL_TEST(xmod_string_refcount_694, s1_imported_static_method_nonescaping_lsan_
 BEZEL_TEST(xmod_string_refcount_694, s2_imported_class_string_field_lsan_4_6) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz694_s2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz694_s2_");
     TempFile694 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile694 aObj((dir / (stem + "_a.o")).string());
 
@@ -327,7 +329,7 @@ BEZEL_TEST(xmod_string_refcount_694, s2_imported_class_string_field_lsan_4_6) {
 BEZEL_TEST(xmod_string_refcount_694, s3_two_level_imported_string_return_lsan_4_6) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz694_s3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz694_s3_");
     TempFile694 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile694 aObj((dir / (stem + "_a.o")).string());
 
@@ -386,7 +388,7 @@ BEZEL_TEST(xmod_string_refcount_694, s3_two_level_imported_string_return_lsan_4_
 BEZEL_TEST(xmod_string_refcount_694, s4_b_passes_string_to_imported_fn_lsan_4_6) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz694_s4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz694_s4_");
     TempFile694 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile694 aObj((dir / (stem + "_a.o")).string());
 
@@ -440,7 +442,7 @@ BEZEL_TEST(xmod_string_refcount_694, s4_b_passes_string_to_imported_fn_lsan_4_6)
 BEZEL_TEST(xmod_string_refcount_694, s5_imported_string_stored_in_b_field_lsan_4_6) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz694_s5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz694_s5_");
     TempFile694 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile694 aObj((dir / (stem + "_a.o")).string());
 
@@ -504,7 +506,7 @@ BEZEL_TEST(xmod_string_refcount_694, s5_imported_string_stored_in_b_field_lsan_4
 BEZEL_TEST(xmod_string_refcount_694, s6_imported_string_escaping_no_asan_abort_4_6) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz694_s6_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz694_s6_");
     TempFile694 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile694 aObj((dir / (stem + "_a.o")).string());
 
@@ -608,7 +610,7 @@ BEZEL_TEST(xmod_string_refcount_694, s6_imported_string_escaping_no_asan_abort_4
 BEZEL_TEST(xmod_string_refcount_694, s7_literal_return_sentinel_no_abort_canary_4_6) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz694_s7_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz694_s7_");
     TempFile694 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile694 aObj((dir / (stem + "_a.o")).string());
 
@@ -660,7 +662,7 @@ BEZEL_TEST(xmod_string_refcount_694, s7_literal_return_sentinel_no_abort_canary_
 BEZEL_TEST(xmod_string_refcount_694, s8_imported_instance_method_nonescaping_lsan_4_6) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz694_s8_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz694_s8_");
     TempFile694 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile694 aObj((dir / (stem + "_a.o")).string());
 
@@ -711,7 +713,7 @@ BEZEL_TEST(xmod_string_refcount_694, s8_imported_instance_method_nonescaping_lsa
 BEZEL_TEST(xmod_string_refcount_694, dc1_two_calls_no_double_free_canary_4_6) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz694_dc1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz694_dc1_");
     TempFile694 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile694 aObj((dir / (stem + "_a.o")).string());
 
@@ -763,7 +765,7 @@ BEZEL_TEST(xmod_string_refcount_694, dc1_two_calls_no_double_free_canary_4_6) {
 BEZEL_TEST(xmod_string_refcount_694, dc2_imported_literal_return_no_release_canary_4_6) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz694_dc2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz694_dc2_");
     TempFile694 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile694 aObj((dir / (stem + "_a.o")).string());
 

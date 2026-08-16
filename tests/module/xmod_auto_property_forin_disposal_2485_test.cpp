@@ -108,6 +108,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -140,7 +142,7 @@ bool compileToObj2485(const std::string& src, const std::string& obj) {
 int compileImportRunAsan2485(const std::string& libSrc,
                              const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2485_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2485_");
     TempFile2485 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2485 aObj((dir / (stem + "_a.o")).string());
     writeSource2485(aSrc.path, libSrc);
@@ -178,7 +180,7 @@ int compileImportRunAsan2485(const std::string& libSrc,
 // program — the local-only control, unaffected by decl-dependence.
 int compileRunAsan2485Local(const std::string& src) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2485_local_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2485_local_");
     TempFile2485 srcFile((dir / (stem + ".bzl")).string());
     TempFile2485 exe((dir / stem).string());
     writeSource2485(srcFile.path, src);

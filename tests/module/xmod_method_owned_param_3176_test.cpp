@@ -110,6 +110,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -197,7 +199,7 @@ std::string appSource3176(const std::string& body, const std::string& tag) {
 int runImported3176(const std::string& body, const std::string& tag,
                     std::string* capturedStderr = nullptr) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3176_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3176_" + tag + "_" + unique_stem("");
 
     TempFile3176 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3176 aObj((dir / (stem + "_a.o")).string());
@@ -257,7 +259,7 @@ int runImported3176(const std::string& body, const std::string& tag,
 int runSingleModule3176(const std::string& src, const std::string& tag,
                         std::string* capturedStderr = nullptr) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3176ctl_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3176ctl_" + tag + "_" + unique_stem("");
     TempFile3176 sSrc((dir / (stem + ".bzl")).string());
     TempFile3176 sExe((dir / stem).string());
     TempFile3176 sErr((dir / (stem + ".err")).string());

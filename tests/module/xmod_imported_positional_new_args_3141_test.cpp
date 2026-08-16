@@ -74,6 +74,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -102,7 +104,7 @@ std::string captureStderrOf(const std::function<void()>& body) {
     namespace fs = std::filesystem;
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz3141_err_" + std::to_string(std::rand()) + ".txt")).string();
+         ("bz3141_err_" + unique_stem("") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);
@@ -125,7 +127,7 @@ ImportCapture3141 compileImport3141(const std::string& libSrc,
                                     const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3141_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3141_");
     TempFile3141 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3141 aObj((dir / (stem + "_a.o")).string());
     writeSource3141(aSrc.path, libSrc);
@@ -162,7 +164,7 @@ int compileImportAndRun3141(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3141r_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3141r_");
     TempFile3141 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3141 aObj((dir / (stem + "_a.o")).string());
     writeSource3141(aSrc.path, libSrc);
@@ -193,7 +195,7 @@ int compileImportAndRun3141(const std::string& libSrc,
 std::string compileLocal3141(const std::string& src, bool& ok) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3141l_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3141l_");
     TempFile3141 srcFile((dir / (stem + ".bzl")).string());
     TempFile3141 exeFile((dir / stem).string());
     writeSource3141(srcFile.path, src);
@@ -213,7 +215,7 @@ std::string compileLocal3141(const std::string& src, bool& ok) {
 int compileLocalAndRun3141(const std::string& src) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3141lr_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3141lr_");
     TempFile3141 srcFile((dir / (stem + ".bzl")).string());
     TempFile3141 exeFile((dir / stem).string());
     writeSource3141(srcFile.path, src);

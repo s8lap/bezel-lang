@@ -41,6 +41,8 @@
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -198,7 +200,7 @@ BEZEL_TEST(xmod_property_503, imported_property_access_typechecks_clean_spec_2_5
 // local path, this will catch it.
 BEZEL_TEST(xmod_property_503, same_module_property_getter_still_works_spec_22_9) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_503_samemod_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_503_samemod_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aExe((dir / (stem + "_a")).string());
 
@@ -233,7 +235,7 @@ BEZEL_TEST(xmod_property_503, same_module_property_getter_still_works_spec_22_9)
 // might touch the method-declaration path.
 BEZEL_TEST(xmod_property_503, imported_method_still_works_control_spec_2_5) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_503_meth_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_503_meth_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -276,7 +278,7 @@ BEZEL_TEST(xmod_property_503, imported_method_still_works_control_spec_2_5) {
 // field path has its own codegen slot and must not be disturbed by the fix).
 BEZEL_TEST(xmod_property_503, imported_field_read_still_works_control_spec_2_5) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_503_fld_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_503_fld_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -324,7 +326,7 @@ BEZEL_TEST(xmod_property_503, imported_field_read_still_works_control_spec_2_5) 
 // linkage; the importer calls it; the linked result is 42.
 BEZEL_TEST(xmod_property_503, imported_regular_property_getter_returns_value_spec_22_9) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_503_prop_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_503_prop_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -367,7 +369,7 @@ BEZEL_TEST(xmod_property_503, imported_regular_property_getter_returns_value_spe
 // The exporter emits the getter with external linkage; the importer calls it.
 BEZEL_TEST(xmod_property_503, imported_block_getter_property_returns_value_spec_22_9) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_503_blkget_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_503_blkget_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -419,7 +421,7 @@ BEZEL_TEST(xmod_property_503, imported_block_getter_property_returns_value_spec_
 // After: vtable slot dispatch → 2.
 BEZEL_TEST(xmod_property_503, imported_virtual_property_dispatch_spec_12_22_9) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_503_vprop_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_503_vprop_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -467,7 +469,7 @@ BEZEL_TEST(xmod_property_503, imported_virtual_property_dispatch_spec_12_22_9) {
 // typed variable holds a `Circle` and reads `.Area` → 7.
 BEZEL_TEST(xmod_property_503, abstract_property_dispatch_through_base_spec_12_23) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_503_absprop_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_503_absprop_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());

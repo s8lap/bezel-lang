@@ -45,6 +45,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // the sanitizer-honouring compileFile
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -114,7 +116,7 @@ std::string libSource3133() {
 int compileImportAndRun3133(const std::string& libSrc,
                             const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3133r_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3133r_");
     TempFile3133 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3133 aObj((dir / (stem + "_a.o")).string());
     writeSource3133(aSrc.path, libSrc);
@@ -150,7 +152,7 @@ struct ImportCapture3133 {
 std::string captureStderrOf3133(const std::function<void()>& body) {
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz3133_err_" + std::to_string(std::rand()) + ".txt")).string();
+         ("bz3133_err_" + unique_stem("") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);
@@ -171,7 +173,7 @@ std::string captureStderrOf3133(const std::function<void()>& body) {
 ImportCapture3133 compileImport3133(const std::string& libSrc,
                                     const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3133_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3133_");
     TempFile3133 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3133 aObj((dir / (stem + "_a.o")).string());
     writeSource3133(aSrc.path, libSrc);
@@ -203,7 +205,7 @@ ImportCapture3133 compileImport3133(const std::string& libSrc,
 // ── single-module compile + RUN for ACCEPT twin. ────────────────────────────
 int compileLocalAndRun3133(const std::string& src) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3133lr_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3133lr_");
     TempFile3133 srcFile((dir / (stem + ".bzl")).string());
     TempFile3133 exeFile((dir / stem).string());
     writeSource3133(srcFile.path, src);

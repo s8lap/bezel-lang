@@ -28,6 +28,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -61,7 +63,7 @@ std::pair<int, std::string> runCapture(const std::string& exe) {
 // consumed via `r.V` prints 15 and returns 15.
 BEZEL_TEST(xmod_operator_record_1485, same_module_operator_record_control_spec_25) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_1485_sm_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_1485_sm_");
     TempFile aSrc((dir / (stem + ".bzl")).string());
     TempFile aExe((dir / (stem + "_a")).string());
 
@@ -96,7 +98,7 @@ BEZEL_TEST(xmod_operator_record_1485, same_module_operator_record_control_spec_2
 // line was silently dropped and `r.V` read 0.
 BEZEL_TEST(xmod_operator_record_1485, imported_binary_operator_record_spec_25_9) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_1485_bin_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_1485_bin_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -145,7 +147,7 @@ BEZEL_TEST(xmod_operator_record_1485, imported_binary_operator_record_spec_25_9)
 // just 0). Both fields of the imported operator result must materialize.
 BEZEL_TEST(xmod_operator_record_1485, imported_operator_multifield_record_spec_25_9) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_1485_mf_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_1485_mf_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -190,7 +192,7 @@ BEZEL_TEST(xmod_operator_record_1485, imported_operator_multifield_record_spec_2
 // record must materialize its result.
 BEZEL_TEST(xmod_operator_record_1485, imported_unary_operator_record_spec_25_9) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_1485_un_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_1485_un_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -235,7 +237,7 @@ BEZEL_TEST(xmod_operator_record_1485, imported_unary_operator_record_spec_25_9) 
 // to the value-return path but touches all imported operators).
 BEZEL_TEST(xmod_operator_record_1485, imported_operator_primitive_control_spec_25) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_1485_prim_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_1485_prim_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());

@@ -101,6 +101,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -125,7 +127,7 @@ bool compileImportCaptureErr3199(const std::string& libSrc,
                                  std::string& err) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3199c_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3199c_");
     TempFile3199 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3199 aObj((dir / (stem + "_a.o")).string());
     writeSource3199(aSrc.path, libSrc);
@@ -140,7 +142,7 @@ bool compileImportCaptureErr3199(const std::string& libSrc,
     writeSource3199(bSrc.path, appSrc);
 
     std::string errPath =
-        (dir / ("bz3199_err_" + std::to_string(std::rand()) + ".txt")).string();
+        (dir / ("bz3199_err_" + unique_stem("") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);
@@ -179,7 +181,7 @@ int compileImportAndRun3199(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3199_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3199_");
     TempFile3199 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3199 aObj((dir / (stem + "_a.o")).string());
     writeSource3199(aSrc.path, libSrc);
@@ -212,7 +214,7 @@ int compileImportAndRun3199(const std::string& libSrc,
 int compileLocalAndRun3199(const std::string& src) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3199l_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3199l_");
     TempFile3199 aSrc((dir / (stem + ".bzl")).string());
     TempFile3199 aExe((dir / stem).string());
     writeSource3199(aSrc.path, src);

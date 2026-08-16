@@ -68,6 +68,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -96,7 +98,7 @@ bool compileImportCaptureErr2390(const std::string& bSrc,
                                  std::string& err) {
     namespace fs = std::filesystem;
     std::string errPath = (fs::temp_directory_path() /
-                           ("bz2390_err_" + std::to_string(std::rand()) +
+                           ("bz2390_err_" + unique_stem("") +
                             ".txt"))
                               .string();
 
@@ -138,7 +140,7 @@ int compileImportAndRun2390(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2390_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2390_");
     TempFile2390 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2390 aObj((dir / (stem + "_a.o")).string());
     writeSource2390(aSrc.path, libSrc);
@@ -174,7 +176,7 @@ BEZEL_TEST(xmod_override_accessor_presence_2390,
            imported_getonly_base_setter_added_override_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2390_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2390_t1_");
     TempFile2390 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2390 aObj((dir / (stem + "_a.o")).string());
     writeSource2390(aSrc.path,
@@ -217,7 +219,7 @@ BEZEL_TEST(xmod_override_accessor_presence_2390,
            local_getonly_base_setter_added_override_still_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2390_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2390_t2_");
     std::string bSrc =
         "module LocalGetOnly2390T2; "
         "public abstract class AbsGetOnlyBaseLocal2390T2 "
@@ -255,7 +257,7 @@ BEZEL_TEST(xmod_override_accessor_presence_2390,
            imported_settable_base_setter_dropped_override_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2390_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2390_t3_");
     TempFile2390 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2390 aObj((dir / (stem + "_a.o")).string());
     writeSource2390(aSrc.path,
@@ -332,7 +334,7 @@ BEZEL_TEST(xmod_override_accessor_presence_2390,
            settable_base_correct_settable_override_compiles) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2390_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2390_t5_");
     TempFile2390 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2390 aObj((dir / (stem + "_a.o")).string());
     writeSource2390(aSrc.path,

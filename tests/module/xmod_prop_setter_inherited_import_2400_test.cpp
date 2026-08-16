@@ -96,6 +96,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -125,7 +127,7 @@ int compileImportAndRun2400(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2400_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2400_");
     TempFile2400 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2400 aObj((dir / (stem + "_a.o")).string());
     writeSource2400(aSrc.path, libSrc);
@@ -271,7 +273,7 @@ BEZEL_TEST(xmod_prop_setter_inherited_import_2400,
     bezel::Driver driver;
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2400_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2400_t4_");
     TempFile2400 src((dir / (stem + ".bzl")).string());
     TempFile2400 exe((dir / stem).string());
     writeSource2400(src.path,

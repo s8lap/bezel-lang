@@ -66,6 +66,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -96,7 +98,7 @@ bool compileToObj2500(const std::string& src, const std::string& obj) {
 int compileImportRunAsan2500(const std::string& libSrc,
                              const std::string& appSrc, bool leaks) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2500_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2500_");
     TempFile2500 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2500 aObj((dir / (stem + "_a.o")).string());
     writeSource2500(aSrc.path, libSrc);
@@ -134,7 +136,7 @@ int compileImportRunAsan2500(const std::string& libSrc,
 // record control cells.
 int compileRunAsan2500Local(const std::string& src, bool leaks) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2500_local_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2500_local_");
     TempFile2500 srcFile((dir / (stem + ".bzl")).string());
     TempFile2500 exe((dir / stem).string());
     writeSource2500(srcFile.path, src);

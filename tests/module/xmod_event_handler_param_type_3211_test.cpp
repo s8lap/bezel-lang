@@ -117,6 +117,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -184,7 +186,7 @@ std::string sameModuleProgram3211(const std::string& body,
 int runImported3211(const std::string& body, const std::string& tag,
                     std::string* capturedStderr = nullptr) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3211_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3211_" + tag + "_" + unique_stem("");
 
     TempFile3211 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3211 aObj((dir / (stem + "_a.o")).string());
@@ -244,7 +246,7 @@ int runImported3211(const std::string& body, const std::string& tag,
 int runSingleModule3211(const std::string& src, const std::string& tag,
                         std::string* capturedStderr = nullptr) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3211ctl_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3211ctl_" + tag + "_" + unique_stem("");
     TempFile3211 sSrc((dir / (stem + ".bzl")).string());
     TempFile3211 sExe((dir / stem).string());
     TempFile3211 sErr((dir / (stem + ".err")).string());
@@ -298,7 +300,7 @@ bool mentions3211(const std::string& hay, const char* needle) {
 // ===========================================================================
 BEZEL_TEST(xmod_event_handler_param_type_3211, t0_dependency_library_builds) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3211dep_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3211dep_");
     TempFile3211 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3211 aObj((dir / (stem + "_a.o")).string());
     writeSource3211(aSrc.path, libSource3211());

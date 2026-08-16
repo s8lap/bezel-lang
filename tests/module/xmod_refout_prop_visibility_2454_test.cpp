@@ -93,6 +93,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -121,7 +123,7 @@ bool compileImportCaptureErr2454(const std::string& bSrc,
                                  const std::string& aObj, std::string& err) {
     namespace fs = std::filesystem;
     std::string errPath = (fs::temp_directory_path() /
-                           ("bz2454_err_" + std::to_string(std::rand()) +
+                           ("bz2454_err_" + unique_stem("") +
                             ".txt"))
                               .string();
 
@@ -162,7 +164,7 @@ int compileImportAndRun2454(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2454_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2454_");
     TempFile2454 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2454 aObj((dir / (stem + "_a.o")).string());
     writeSource2454(aSrc.path, libSrc);
@@ -193,7 +195,7 @@ BEZEL_TEST(xmod_refout_prop_visibility_2454,
            private_set_imported_property_rejected_as_ref_arg) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2454_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2454_t1_");
     TempFile2454 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2454 aObj((dir / (stem + "_a.o")).string());
     writeSource2454(aSrc.path,
@@ -243,7 +245,7 @@ BEZEL_TEST(xmod_refout_prop_visibility_2454,
            private_set_imported_property_rejected_as_out_arg) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2454_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2454_t2_");
     TempFile2454 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2454 aObj((dir / (stem + "_a.o")).string());
     writeSource2454(aSrc.path,
@@ -292,7 +294,7 @@ BEZEL_TEST(xmod_refout_prop_visibility_2454,
            getter_only_imported_property_rejected_as_ref_arg) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2454_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2454_t3_");
     TempFile2454 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2454 aObj((dir / (stem + "_a.o")).string());
     writeSource2454(aSrc.path,
@@ -338,7 +340,7 @@ BEZEL_TEST(xmod_refout_prop_visibility_2454,
            getter_only_imported_property_rejected_as_out_arg) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2454_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2454_t4_");
     TempFile2454 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2454 aObj((dir / (stem + "_a.o")).string());
     writeSource2454(aSrc.path,
@@ -452,7 +454,7 @@ BEZEL_TEST(xmod_refout_prop_visibility_2454,
            protected_set_imported_property_rejected_as_ref_from_unrelated) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2454_t7_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2454_t7_");
     TempFile2454 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2454 aObj((dir / (stem + "_a.o")).string());
     writeSource2454(aSrc.path,
@@ -546,7 +548,7 @@ BEZEL_TEST(xmod_refout_prop_visibility_2454,
            internal_set_imported_property_rejected_as_ref_arg) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2454_t9_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2454_t9_");
     TempFile2454 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2454 aObj((dir / (stem + "_a.o")).string());
     writeSource2454(aSrc.path,
@@ -597,7 +599,7 @@ BEZEL_TEST(xmod_refout_prop_visibility_2454,
            local_private_set_property_still_rejected_as_ref_control) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2454_t10_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2454_t10_");
     TempFile2454 src((dir / (stem + ".bzl")).string());
     TempFile2454 exe((dir / stem).string());
     writeSource2454(src.path,

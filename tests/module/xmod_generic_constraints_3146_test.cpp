@@ -70,6 +70,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -96,7 +98,7 @@ std::string captureStderr3146(Fn&& fn) {
     namespace fs = std::filesystem;
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz3146_err_" + std::to_string(std::rand()) + ".txt"))
+         ("bz3146_err_" + unique_stem("") + ".txt"))
             .string();
     std::fflush(stderr);
     std::cerr.flush();
@@ -122,7 +124,7 @@ Compiled3146 compileImport3146(const std::string& libSrc,
                                const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3146_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3146_");
     TempFile3146 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3146 aObj((dir / (stem + "_a.o")).string());
     writeSource3146(aSrc.path, libSrc);
@@ -155,7 +157,7 @@ Compiled3146 compileImport3146(const std::string& libSrc,
 Compiled3146 compileLocal3146(const std::string& src) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3146l_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3146l_");
     TempFile3146 aSrc((dir / (stem + ".bzl")).string());
     TempFile3146 aExe((dir / stem).string());
     writeSource3146(aSrc.path, src);

@@ -70,6 +70,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -99,7 +101,7 @@ bool compileImportCaptureErr2523(const std::string& bSrc,
                                  std::string& err) {
     namespace fs = std::filesystem;
     std::string errPath = (fs::temp_directory_path() /
-                           ("bz2523_err_" + std::to_string(std::rand()) +
+                           ("bz2523_err_" + unique_stem("") +
                             ".txt"))
                               .string();
 
@@ -156,7 +158,7 @@ BEZEL_TEST(xmod_indexer_blockform_override_2523,
            imported_blockform_with_set_correct_blockform_override_accepts) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2523_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2523_t1_");
     TempFile2523 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2523 aObj((dir / (stem + "_a.o")).string());
     writeSource2523(aSrc.path,
@@ -201,7 +203,7 @@ BEZEL_TEST(xmod_indexer_blockform_override_2523,
            local_blockform_with_set_correct_blockform_override_accepts) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2523_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2523_t2_");
     std::string bSrc =
         "module LocalBlockFormIdx2523T2; "
         "public abstract class AbsBlockFormIdxBaseLocal2523T2 "
@@ -242,7 +244,7 @@ BEZEL_TEST(xmod_indexer_blockform_override_2523,
            imported_blockform_with_set_getonly_override_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2523_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2523_t3_");
     TempFile2523 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2523 aObj((dir / (stem + "_a.o")).string());
     writeSource2523(aSrc.path,
@@ -293,7 +295,7 @@ BEZEL_TEST(xmod_indexer_blockform_override_2523,
            imported_shorthand_indexer_blockform_override_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2523_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2523_t4_");
     TempFile2523 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2523 aObj((dir / (stem + "_a.o")).string());
     writeSource2523(aSrc.path,
@@ -343,7 +345,7 @@ BEZEL_TEST(xmod_indexer_blockform_override_2523,
            imported_shorthand_indexer_getonly_override_accepts) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2523_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2523_t5_");
     TempFile2523 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2523 aObj((dir / (stem + "_a.o")).string());
     writeSource2523(aSrc.path,

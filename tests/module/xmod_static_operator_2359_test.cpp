@@ -118,6 +118,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace {
 namespace fs = std::filesystem;
@@ -140,7 +142,7 @@ int runImported2359(const std::string& libSrc, const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
     static int counter = 0;
     std::string stem = "bz2359_" + std::to_string(counter++) + "_" +
-                       std::to_string(std::rand());
+                       unique_stem("");
     TempFile2359 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2359 aObj((dir / (stem + "_a.o")).string());
     write2359(aSrc.path, libSrc);

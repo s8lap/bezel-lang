@@ -60,6 +60,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the sanitizer-honouring compileFile
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -127,7 +129,7 @@ int compileImportAndRun3182(const std::string& libSrc,
                             const std::string& appSrc,
                             std::string* diag = nullptr) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3182_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3182_");
     TempFile3182 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3182 aObj((dir / (stem + "_a.o")).string());
     writeSource3182(aSrc.path, libSrc);
@@ -165,7 +167,7 @@ int compileImportAndRun3182(const std::string& libSrc,
 // The single-module twin: the SAME declarations in one compilation.
 int compileAndRun3182(const std::string& src, std::string* diag = nullptr) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3182L_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3182L_");
     TempFile3182 s((dir / (stem + ".bzl")).string());
     TempFile3182 exe((dir / stem).string());
     writeSource3182(s.path, src);

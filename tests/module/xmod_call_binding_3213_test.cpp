@@ -48,6 +48,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -116,7 +118,7 @@ std::string sameModuleProgram3213(const std::string& body,
 int runImported3213(const std::string& body, const std::string& tag,
                     std::string* capturedStderr = nullptr) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3213_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3213_" + tag + "_" + unique_stem("");
 
     TempFile3213 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3213 aObj((dir / (stem + "_a.o")).string());
@@ -174,7 +176,7 @@ int runImported3213(const std::string& body, const std::string& tag,
 int runSingleModule3213(const std::string& src, const std::string& tag,
                         std::string* capturedStderr = nullptr) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3213ctl_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3213ctl_" + tag + "_" + unique_stem("");
     TempFile3213 sSrc((dir / (stem + ".bzl")).string());
     TempFile3213 sExe((dir / stem).string());
     TempFile3213 sErr((dir / (stem + ".err")).string());

@@ -101,6 +101,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -137,7 +139,7 @@ BuildResult2943 compileImportCaptureErr2943(
     const std::string& tag) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2943_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz2943_" + tag + "_" + unique_stem("");
     TempFile2943 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2943 aObj((dir / (stem + "_a.o")).string());
     writeSource2943(aSrc.path, libSrc);
@@ -298,7 +300,7 @@ BEZEL_TEST(xmod_imported_generic_iface_property_layout_movable_2943,
            layout_identical_no_t_fields_unchanged_spec_13) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2943ct3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2943ct3_");
     TempFile2943 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2943 aObj((dir / (stem + "_a.o")).string());
     writeSource2943(aSrc.path,
@@ -360,7 +362,7 @@ BEZEL_TEST(xmod_imported_generic_iface_property_layout_movable_2943,
            method_call_on_same_layout_moving_class_unchanged_spec_13) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2943ct4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2943ct4_");
     TempFile2943 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2943 aObj((dir / (stem + "_a.o")).string());
     writeSource2943(aSrc.path,

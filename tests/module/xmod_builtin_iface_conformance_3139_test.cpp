@@ -71,6 +71,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -116,7 +118,7 @@ int compileImportAndRun3139(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3139_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3139_");
     TempFile3139 lSrc((dir / (stem + "_lib.bzl")).string());
     TempFile3139 lObj((dir / (stem + "_lib.o")).string());
     writeSource3139(lSrc.path, libSrc);
@@ -147,7 +149,7 @@ int compileImportAndRun3139(const std::string& libSrc,
 int compileAndRun3139(const std::string& src) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3139l_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3139l_");
     TempFile3139 aSrc((dir / (stem + ".bzl")).string());
     TempFile3139 aExe((dir / stem).string());
     writeSource3139(aSrc.path, src);

@@ -96,6 +96,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -166,7 +168,7 @@ int compileImportAndRun3152P(const std::string& libSrc,
                              std::string* diag = nullptr) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3152p_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3152p_");
     TempFile3152P aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3152P aObj((dir / (stem + "_a.o")).string());
     writeSource3152P(aSrc.path, libSrc);
@@ -206,7 +208,7 @@ int compileImportAndRun3152P(const std::string& libSrc,
 int compileAndRun3152P(const std::string& src, std::string* diag = nullptr) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3152pL_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3152pL_");
     TempFile3152P s((dir / (stem + ".bzl")).string());
     TempFile3152P exe((dir / stem).string());
     writeSource3152P(s.path, src);

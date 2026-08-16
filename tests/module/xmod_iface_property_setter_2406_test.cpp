@@ -68,6 +68,8 @@
 #include "driver/Driver.hpp"
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -95,7 +97,7 @@ int compileImportAndRun2406(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2406_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2406_");
     TempFile2406 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2406 aObj((dir / (stem + "_a.o")).string());
     writeSource2406(aSrc.path, libSrc);
@@ -286,7 +288,7 @@ BEZEL_TEST(xmod_iface_property_setter_2406,
     bezel::Driver driver;
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2406_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2406_t5_");
     TempFile2406 src((dir / (stem + ".bzl")).string());
     TempFile2406 exe((dir / stem).string());
     writeSource2406(src.path,

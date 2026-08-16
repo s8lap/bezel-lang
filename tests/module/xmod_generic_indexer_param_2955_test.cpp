@@ -73,6 +73,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -100,7 +102,7 @@ BuildResult2955 compileImportCaptureErr2955(const std::string& libSrc,
                                             const std::string& appSrc,
                                             const std::string& tag) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2955_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz2955_" + tag + "_" + unique_stem("");
     TempFile2955 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2955 aObj((dir / (stem + "_a.o")).string());
     writeSource2955(aSrc.path, libSrc);
@@ -148,7 +150,7 @@ BuildResult2955 compileImportCaptureErr2955(const std::string& libSrc,
 std::pair<int, std::string> compileAndRun2955(const std::string& src,
                                               const std::string& tag) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2955s_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz2955s_" + tag + "_" + unique_stem("");
     TempFile2955 aSrc((dir / (stem + ".bzl")).string());
     TempFile2955 aExe((dir / stem).string());
     writeSource2955(aSrc.path, src);

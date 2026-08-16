@@ -73,6 +73,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -104,7 +106,7 @@ std::pair<int, std::string> compileImportRunCapture2885(const std::string& libSr
                                                         const std::string& appSrc,
                                                         const std::string& tag) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2885_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz2885_" + tag + "_" + unique_stem("");
     TempFile2885 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2885 aObj((dir / (stem + "_a.o")).string());
     writeSource2885(aSrc.path, libSrc);

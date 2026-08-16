@@ -77,6 +77,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -109,7 +111,7 @@ bool compileImportCaptureErr2373(const std::string& bSrc,
                                  const std::string& aObj, std::string& err) {
     namespace fs = std::filesystem;
     std::string errPath = (fs::temp_directory_path() /
-                           ("bz2373_err_" + std::to_string(std::rand()) +
+                           ("bz2373_err_" + unique_stem("") +
                             ".txt"))
                               .string();
 
@@ -149,7 +151,7 @@ int compileImportAndRun2373(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2373_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2373_");
     TempFile2373 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2373 aObj((dir / (stem + "_a.o")).string());
     writeSource2373(aSrc.path, libSrc);
@@ -175,7 +177,7 @@ bool compileImportSucceeds2373(const std::string& libSrc,
                                const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2373_ok_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2373_ok_");
     TempFile2373 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2373 aObj((dir / (stem + "_a.o")).string());
     writeSource2373(aSrc.path, libSrc);
@@ -206,7 +208,7 @@ BEZEL_TEST(xmod_abstract_impl_subst_2373,
            generic_return_type_mismatch_rejected_11_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2373_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2373_t1_");
     TempFile2373 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2373 aObj((dir / (stem + "_a.o")).string());
     writeSource2373(aSrc.path,
@@ -245,7 +247,7 @@ BEZEL_TEST(xmod_abstract_impl_subst_2373,
            generic_param_type_mismatch_rejected_11_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2373_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2373_t2_");
     TempFile2373 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2373 aObj((dir / (stem + "_a.o")).string());
     writeSource2373(
@@ -286,7 +288,7 @@ BEZEL_TEST(xmod_abstract_impl_subst_2373,
            nongeneric_return_type_mismatch_rejected_11_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2373_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2373_t3_");
     TempFile2373 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2373 aObj((dir / (stem + "_a.o")).string());
     writeSource2373(aSrc.path,
@@ -326,7 +328,7 @@ BEZEL_TEST(xmod_abstract_impl_subst_2373,
            generic_missing_implementation_still_rejected_12_5) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2373_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2373_t4_");
     TempFile2373 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2373 aObj((dir / (stem + "_a.o")).string());
     writeSource2373(aSrc.path,

@@ -27,6 +27,8 @@
 #include <string>
 #include <sys/wait.h>
 #include <vector>
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -54,7 +56,7 @@ void writeSource(const std::string& path, const std::string& src) {
 int buildAndRun(const std::string& libSrc, const std::string& mainSrc,
                 const std::string& tag) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_exc492_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bezel_exc492_" + tag + "_" + unique_stem("");
     TempFile lSrc((dir / (stem + "_lib.bzl")).string());
     TempFile lObj((dir / (stem + "_lib.o")).string());
     TempFile mSrc((dir / (stem + "_main.bzl")).string());
@@ -84,7 +86,7 @@ int buildAndRun(const std::string& libSrc, const std::string& mainSrc,
 // Single-module build for the control tests.
 int buildAndRunSingle(const std::string& src, const std::string& tag) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_exc492_single_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bezel_exc492_single_" + tag + "_" + unique_stem("");
     TempFile mSrc((dir / (stem + ".bzl")).string());
     TempFile mExe((dir / stem).string());
 

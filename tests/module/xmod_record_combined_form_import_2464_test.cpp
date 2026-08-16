@@ -52,6 +52,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -80,7 +82,7 @@ int compileImportAndRun2464(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2464_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2464_");
     TempFile2464 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2464 aObj((dir / (stem + "_a.o")).string());
     writeSource2464(aSrc.path, libSrc);
@@ -195,7 +197,7 @@ BEZEL_TEST(xmod_record_combined_form_import_2464,
     bezel::Driver driver;
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2464_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2464_t3_");
     TempFile2464 src((dir / (stem + ".bzl")).string());
     TempFile2464 exe((dir / stem).string());
     writeSource2464(src.path,

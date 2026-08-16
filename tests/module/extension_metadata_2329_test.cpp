@@ -18,6 +18,8 @@
 #include "sema/TypeResolution.hpp"
 #include "support/sema_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace {
 
@@ -39,7 +41,7 @@ bool compileImportCapture2329(const std::string& appSource,
     namespace fs = std::filesystem;
     const std::string errorPath =
         (fs::temp_directory_path() /
-         ("bz2329_err_" + std::to_string(std::rand()) + ".txt"))
+         ("bz2329_err_" + unique_stem("") + ".txt"))
             .string();
     std::fflush(stderr);
     std::cerr.flush();
@@ -157,7 +159,7 @@ BEZEL_TEST(extension_metadata_2329,
            two_cross_module_candidates_report_both_source_sites_26_5) {
     namespace fs = std::filesystem;
     const auto dir = fs::temp_directory_path();
-    const std::string stem = "bz2329_sites_" + std::to_string(std::rand());
+    const std::string stem = unique_stem("bz2329_sites_");
     TempFile2329 aSource((dir / (stem + "_a.bzl")).string());
     TempFile2329 aObject((dir / (stem + "_a.o")).string());
     TempFile2329 bSource((dir / (stem + "_b.bzl")).string());

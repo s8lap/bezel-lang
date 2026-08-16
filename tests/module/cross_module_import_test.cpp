@@ -45,6 +45,8 @@
 #include "support/Diagnostic.hpp"
 #include "support/aot_support.hpp"  // #2290: aot_detail::spawnCaptured/hasSanitizerReport
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -585,7 +587,7 @@ CrossModuleAsanResult runCrossModuleChecked(const std::string& aSource,
     namespace aot_detail = bezel::test::aot_detail;
     CrossModuleAsanResult result;
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_2290_asan_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_2290_asan_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -635,7 +637,7 @@ CrossModuleAsanResult runCrossModuleChecked(const std::string& aSource,
 // executable; run → 42.
 BEZEL_TEST(cross_module_import, a_imports_b_native_build_spec_2_6) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_inc3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_inc3_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -686,7 +688,7 @@ BEZEL_TEST(cross_module_import, a_imports_b_native_build_spec_2_6) {
 // non-deterministic garbage (an uninitialized read); after, it returns 7.
 BEZEL_TEST(cross_module_import, imported_const_read_spec_22_12) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_inc3_const_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_inc3_const_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -731,7 +733,7 @@ BEZEL_TEST(cross_module_import, imported_const_read_spec_22_12) {
 // fresh zero-initialized local copy); after, it returns the field's initial 99.
 BEZEL_TEST(cross_module_import, imported_static_field_read_spec_22_12) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_inc3_field_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_inc3_field_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -780,7 +782,7 @@ BEZEL_TEST(cross_module_import, imported_static_field_read_spec_22_12) {
 // canonical FINDING [7] A case; assert 42 (the ctor body ran).
 BEZEL_TEST(cross_module_import, imported_ctor_body_runs_native_spec_22_8) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_inc4_ctorA_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_inc4_ctorA_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -831,7 +833,7 @@ BEZEL_TEST(cross_module_import, imported_ctor_body_runs_native_spec_22_8) {
 // with the argument, so the field holds 10.
 BEZEL_TEST(cross_module_import, imported_nondefault_ctor_runs_native_spec_22_8) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_inc4_ctorB_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_inc4_ctorB_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -881,7 +883,7 @@ BEZEL_TEST(cross_module_import, imported_nondefault_ctor_runs_native_spec_22_8) 
 // cross-module construction, so the result is 7 (not the calloc-zero 0).
 BEZEL_TEST(cross_module_import, imported_field_initializer_runs_native_spec_22_8) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_inc4_fieldinit_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_inc4_fieldinit_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -937,7 +939,7 @@ BEZEL_TEST(cross_module_import, imported_field_initializer_runs_native_spec_22_8
 // class overriding an imported base's virtual AND a base-reference dispatch.
 BEZEL_TEST(cross_module_import, imported_virtual_dispatch_override_spec_12) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_vdisp_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_vdisp_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -995,7 +997,7 @@ BEZEL_TEST(cross_module_import, imported_virtual_dispatch_override_spec_12) {
 // at scope end → counter == 1.
 BEZEL_TEST(cross_module_import, imported_using_var_disposed_once_spec_28_4) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_dispose_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_dispose_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1055,7 +1057,7 @@ BEZEL_TEST(cross_module_import, imported_using_var_disposed_once_spec_28_4) {
 // initializer executes regardless of foldability → 5.
 BEZEL_TEST(cross_module_import, imported_nonfoldable_field_initializer_spec_22_8) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_nfinit_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_nfinit_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1108,7 +1110,7 @@ BEZEL_TEST(cross_module_import, imported_nonfoldable_field_initializer_spec_22_8
 // now propagate it. §10: "Each value is backed by an integer at runtime."
 BEZEL_TEST(cross_module_import, imported_enum_int_cast_explicit_values_spec_10_2) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_enum_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_enum_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1154,7 +1156,7 @@ BEZEL_TEST(cross_module_import, imported_enum_int_cast_explicit_values_spec_10_2
 // constants must compare unequal. Returns 42 when both hold.
 BEZEL_TEST(cross_module_import, imported_enum_equality_spec_10) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_enumeq_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_enumeq_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1200,7 +1202,7 @@ BEZEL_TEST(cross_module_import, imported_enum_equality_spec_10) {
 // imported enums covers this path too. Scrutinee Green → arm value 22.
 BEZEL_TEST(cross_module_import, imported_enum_case_arm_selects_spec_19) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_enumcase_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_enumcase_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1247,7 +1249,7 @@ BEZEL_TEST(cross_module_import, imported_enum_case_arm_selects_spec_19) {
 // 1*100 + 0*10 + 2 = 102.
 BEZEL_TEST(cross_module_import, imported_enum_implicit_values_spec_10_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_enumimp_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_enumimp_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1356,7 +1358,7 @@ BEZEL_TEST(cross_module_import, imported_nongeneric_new_still_ok_spec_2_5) {
 // (the ctor stored the argument into `value`).
 BEZEL_TEST(cross_module_import, imported_generic_ctor_body_native_spec_14_662c) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_genbox662c_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_genbox662c_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1406,7 +1408,7 @@ BEZEL_TEST(cross_module_import, imported_generic_ctor_body_native_spec_14_662c) 
 // `Util.Echo(42)` (T inferred = int) compiles, links, and returns 42.
 BEZEL_TEST(cross_module_import, imported_generic_static_method_still_ok_spec_14) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_genecho_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_genecho_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1461,7 +1463,7 @@ BEZEL_TEST(cross_module_import, imported_generic_static_method_still_ok_spec_14)
 // Sum = 2 + 2 + 100 + 7 + 50 = 161.
 BEZEL_TEST(cross_module_import, local_derives_imported_base_spec_12) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_derive_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_derive_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1522,7 +1524,7 @@ BEZEL_TEST(cross_module_import, local_derives_imported_base_spec_12) {
 // 10000 + 2000 + 300; total 12360 (exit code = 12360 mod 256 = 72).
 BEZEL_TEST(cross_module_import, local_derives_imported_base_field_layout_spec_12) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_derivefields_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_derivefields_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1585,7 +1587,7 @@ BEZEL_TEST(cross_module_import, local_derives_imported_base_field_layout_spec_12
 // DerivedDisposed = 1*10 + 1 = 11.
 BEZEL_TEST(cross_module_import, local_derives_imported_base_dispose_chain_spec_28_4) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_derivedisp_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_derivedisp_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1662,7 +1664,7 @@ BEZEL_TEST(cross_module_import, local_derives_imported_base_dispose_chain_spec_2
 // at Square.Area → 16.
 BEZEL_TEST(cross_module_import, interface_call_on_imported_object_spec_13) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_iface1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_iface1_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1718,7 +1720,7 @@ BEZEL_TEST(cross_module_import, interface_call_on_imported_object_spec_13) {
 // (referencing the external td$IShape from A) and bz_itable_lookup must find it.
 BEZEL_TEST(cross_module_import, local_class_implements_imported_interface_spec_13) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_iface2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_iface2_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1773,7 +1775,7 @@ BEZEL_TEST(cross_module_import, local_class_implements_imported_interface_spec_1
 // return Base() * 10 + Derived() must equal 1*10+2=12.
 BEZEL_TEST(cross_module_import, interface_inheritance_across_boundary_spec_13) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_xm_iface3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_xm_iface3_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1864,7 +1866,7 @@ BEZEL_TEST(cross_module_import, imported_generic_record_string_field_spec_14_1) 
 // construct + field read.  rc must be 5 (Length of "hello").
 BEZEL_TEST(cross_module_import, imported_generic_record_string_native_spec_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_428_grbs_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_428_grbs_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1906,7 +1908,7 @@ BEZEL_TEST(cross_module_import, imported_generic_record_string_native_spec_14_1)
 // stored int value.  rc must be 42.
 BEZEL_TEST(cross_module_import, imported_generic_record_int_field_native_spec_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_428_grbi_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_428_grbi_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1948,7 +1950,7 @@ BEZEL_TEST(cross_module_import, imported_generic_record_int_field_native_spec_14
 // (string + int).  Access both fields; return second.value (int).  rc must be 7.
 BEZEL_TEST(cross_module_import, imported_generic_record_pair_mixed_args_native_spec_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_428_grpair_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_428_grpair_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -1990,7 +1992,7 @@ BEZEL_TEST(cross_module_import, imported_generic_record_pair_mixed_args_native_s
 // Box<int> with a replaced value field.  rc must be 99.
 BEZEL_TEST(cross_module_import, imported_generic_record_with_update_native_spec_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_428_grwith_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_428_grwith_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2033,7 +2035,7 @@ BEZEL_TEST(cross_module_import, imported_generic_record_with_update_native_spec_
 // record.  LocalWrapper holds Box<int> from the imported module.  rc must be 17.
 BEZEL_TEST(cross_module_import, imported_generic_record_as_local_field_native_spec_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_428_grfield_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_428_grfield_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2078,7 +2080,7 @@ BEZEL_TEST(cross_module_import, imported_generic_record_as_local_field_native_sp
 // rc must be 0 (int(3.14) truncates to 3, return b.value > 3.0 ? 1 : 0 → 0).
 BEZEL_TEST(cross_module_import, imported_generic_record_double_field_native_spec_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_428_grdbl_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_428_grdbl_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2271,7 +2273,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_record_field_arithmetic_native_spec_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_428_grmath_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_428_grmath_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2316,7 +2318,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_record_field_string_length_native_spec_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_428_grstrlen_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_428_grstrlen_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2360,7 +2362,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_record_pair_comparison_native_spec_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_428_grpair2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_428_grpair2_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2433,7 +2435,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_class_owned_class_field_disposed_spec_28_4_662b) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_662b_owncls_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_662b_owncls_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2497,7 +2499,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_class_owned_string_field_disposed_spec_28_4_662b) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_662b_ownstr_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_662b_ownstr_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2647,7 +2649,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_class_zero_ctor_owned_field_disposed_spec_28_5_662a) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_662a_genbox_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_662a_genbox_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2708,7 +2710,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_class_two_instantiations_both_disposed_spec_28_5_662a) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_662a_twoinst_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_662a_twoinst_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2820,7 +2822,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_class_ctor_int_field_native_spec_14_662c) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_662c_int_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_662c_int_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2869,7 +2871,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_class_ctor_two_instantiations_native_spec_14_662c) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_662c_two_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_662c_two_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2918,7 +2920,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_class_ctor_arithmetic_native_spec_14_662c) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_662c_arith_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_662c_arith_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -2971,7 +2973,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_class_dtor_body_native_spec_14_662c) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_662c_dtor_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_662c_dtor_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3102,7 +3104,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_static_field_ctor_dtor_no_crash_spec_22_12_684) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_684_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_684_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3177,7 +3179,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_static_disposer_counter_correct_spec_22_12_684) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_684b_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_684b_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3258,7 +3260,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_private_static_field_per_instantiation_spec_22_12_1224) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_1224_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_1224_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3340,7 +3342,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_ctor_body_local_var_read_native_spec_14_2290) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_2290_localvar_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_2290_localvar_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3477,7 +3479,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_ctor_body_local_name_collision_spec_14_2290) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_2290_collide_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_2290_collide_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3546,7 +3548,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_ctor_body_selfcall_returns_value_native_spec_14_695) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_695_selfcall_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_695_selfcall_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3602,7 +3604,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_ctor_body_selfcall_uses_T_native_spec_14_695) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_695_Tparam_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_695_Tparam_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3658,7 +3660,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_ctor_body_selfcall_two_instantiations_native_spec_14_695) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_695_two_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_695_two_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3717,7 +3719,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_dtor_body_selfcall_no_crash_native_spec_14_695) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_695_dtor_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_695_dtor_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3780,7 +3782,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_post_construction_selfcall_regression_spec_14_695) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_695_post_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_695_post_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3861,7 +3863,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_ctor_method_overload_dispatch_native_spec_14_705) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_705_overload_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_705_overload_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -3940,7 +3942,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_equal_arity_ctor_body_attach_native_spec_14_705) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_705_ctorb_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_705_ctorb_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -4154,7 +4156,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_ctor_not_redefined_importer_side_spec_2_5_711) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bz711dup_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz711dup_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -4220,7 +4222,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            local_generic_derives_imported_generic_base_field_spec_12_14_711) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bz711anc_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz711anc_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -4277,7 +4279,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_ref_param_passes_address_not_value_spec_22_3_1221_A) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bz1221_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1221_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -4323,7 +4325,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_out_param_writes_back_spec_22_3_1221_B) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bz1221b_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1221b_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -4479,7 +4481,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            cross_module_base_chain_field_layout_aot_spec_11_3_12_1_1223) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_1223_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_1223_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -4592,7 +4594,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_static_state_shared_across_two_importers_spec_1513) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_1513_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_1513_");
     TempFile baseSrc((dir / (stem + "_base.bzl")).string());
     TempFile baseObj((dir / (stem + "_base.o")).string());
     TempFile w1Src((dir / (stem + "_w1.bzl")).string());
@@ -4695,7 +4697,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            generic_static_state_shared_same_module_control_spec_1513) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_1513_ctrl_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_1513_ctrl_");
     TempFile src((dir / (stem + ".bzl")).string());
     TempFile exe((dir / stem).string());
 
@@ -4747,7 +4749,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_static_two_instantiations_two_importers_spec_1513) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_1513_multi_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_1513_multi_");
     TempFile baseSrc((dir / (stem + "_base.bzl")).string());
     TempFile baseObj((dir / (stem + "_base.o")).string());
     TempFile w1Src((dir / (stem + "_w1.bzl")).string());
@@ -4861,7 +4863,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_static_field_initializer_runs_once_across_two_importers_spec_1513_2351) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_2351_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_2351_");
     TempFile baseSrc((dir / (stem + "_base.bzl")).string());
     TempFile baseObj((dir / (stem + "_base.o")).string());
     TempFile w1Src((dir / (stem + "_w1.bzl")).string());
@@ -5032,7 +5034,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_static_field_init_sibling_type_reconstructs_spec_2375_2_8_2) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_2375_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_2375_");
     TempFile baseSrc((dir / (stem + "_base.bzl")).string());
     TempFile baseObj((dir / (stem + "_base.o")).string());
     TempFile appSrc((dir / (stem + "_app.bzl")).string());
@@ -5109,7 +5111,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_static_field_init_sibling_member_ref_resolves_spec_2375_2_8_2) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_2375m_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_2375m_");
     TempFile baseSrc((dir / (stem + "_base.bzl")).string());
     TempFile baseObj((dir / (stem + "_base.o")).string());
     TempFile appSrc((dir / (stem + "_app.bzl")).string());
@@ -5175,7 +5177,7 @@ BEZEL_TEST(cross_module_import,
 BEZEL_TEST(cross_module_import,
            imported_generic_static_field_init_record_ctor_spec_2525_2_8_2) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_2525_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_2525_");
     TempFile baseSrc((dir / (stem + "_base.bzl")).string());
     TempFile baseObj((dir / (stem + "_base.o")).string());
     TempFile appSrc((dir / (stem + "_app.bzl")).string());
@@ -5231,7 +5233,7 @@ BEZEL_TEST(cross_module_import,
            imported_generic_static_owned_field_disposed_once_across_two_importers_spec_2351_22_13) {
     namespace aot_detail = bezel::test::aot_detail;
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_2351_owned_asan_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_2351_owned_asan_");
     TempFile baseSrc((dir / (stem + "_base.bzl")).string());
     TempFile baseObj((dir / (stem + "_base.o")).string());
     TempFile w1Src((dir / (stem + "_w1.bzl")).string());

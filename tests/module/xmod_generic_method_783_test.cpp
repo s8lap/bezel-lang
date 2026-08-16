@@ -40,6 +40,8 @@
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -166,7 +168,7 @@ static int xmodAsan783(const std::string& aObj, const std::string& bSrc,
 BEZEL_TEST(xmod_generic_method_783, t1_box_string_get_returns_value_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz783_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz783_t1_");
     TempFile783 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile783 aObj((dir / (stem + "_a.o")).string());
 
@@ -205,7 +207,7 @@ BEZEL_TEST(xmod_generic_method_783, t1_box_string_get_returns_value_14_1) {
 BEZEL_TEST(xmod_generic_method_783, t2_box_class_get_second_reftype_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz783_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz783_t2_");
     TempFile783 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile783 aObj((dir / (stem + "_a.o")).string());
 
@@ -253,7 +255,7 @@ BEZEL_TEST(xmod_generic_method_783, t2_box_class_get_second_reftype_14_1) {
 BEZEL_TEST(xmod_generic_method_783, t3_box_int_get_no_regression_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz783_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz783_t3_");
     TempFile783 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile783 aObj((dir / (stem + "_a.o")).string());
 
@@ -291,7 +293,7 @@ BEZEL_TEST(xmod_generic_method_783, t3_box_int_get_no_regression_14_1) {
 BEZEL_TEST(xmod_generic_method_783, t4_owned_generic_field_disposed_once_28_3) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz783_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz783_t4_");
     TempFile783 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile783 aObj((dir / (stem + "_a.o")).string());
 
@@ -342,7 +344,7 @@ BEZEL_TEST(xmod_generic_method_783, t4_owned_generic_field_disposed_once_28_3) {
 BEZEL_TEST(xmod_generic_method_783, t5_unreconstructable_body_stays_gated_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz783_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz783_t5_");
     TempFile783 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile783 aObj((dir / (stem + "_a.o")).string());
 

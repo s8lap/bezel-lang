@@ -43,6 +43,8 @@
 #include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -71,7 +73,7 @@ void writeSource2825(const std::string& path, const std::string& src) {
 // The VALUE assertion is what pins #2825's half.
 int compileImportRun2825(const std::string& libSrc, const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2825_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2825_");
 
     TempFile2825 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2825 aObj((dir / (stem + "_a.o")).string());

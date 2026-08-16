@@ -128,6 +128,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -159,7 +161,7 @@ bool compileToObj2490(const std::string& src, const std::string& obj) {
 int compileImportRunAsan2490(const std::string& libSrc,
                              const std::string& appSrc, bool leaks) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2490_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2490_");
     TempFile2490 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2490 aObj((dir / (stem + "_a.o")).string());
     writeSource2490(aSrc.path, libSrc);
@@ -200,7 +202,7 @@ int compileImportRunAsan2490(const std::string& libSrc,
 // property is virtual/interface-dispatched.
 int compileRunAsan2490Local(const std::string& src, bool leaks) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2490_local_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2490_local_");
     TempFile2490 srcFile((dir / (stem + ".bzl")).string());
     TempFile2490 exe((dir / stem).string());
     writeSource2490(srcFile.path, src);

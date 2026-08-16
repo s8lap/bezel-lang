@@ -54,6 +54,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -79,7 +81,7 @@ bool compileImportCaptureErr2874(const std::string& bSrc,
     namespace fs = std::filesystem;
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz2874_err_" + std::to_string(std::rand()) + ".txt"))
+         ("bz2874_err_" + unique_stem("") + ".txt"))
             .string();
 
     std::fflush(stderr);
@@ -151,7 +153,7 @@ std::string app2874(const std::string& moduleName, const std::string& lib,
 // reconstruction failures fall through to the diagnostic).
 BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
            explicit_ctor_construction_site_is_located_spec_2_8_2) {
-    std::string stem = "bz2874_loc_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2874_loc_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
         "module Lib2874A; "
@@ -193,7 +195,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
 // fixture so the diagnostic still fires.
 BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
            no_ctor_construction_site_stays_located_spec_2_8_2) {
-    std::string stem = "bz2874_noctor_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2874_noctor_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
         "module Lib2874B; "
@@ -232,7 +234,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
 // only the second construction's diagnostic is asserted.
 BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
            each_construction_gets_its_own_location_spec_2_8_2) {
-    std::string stem = "bz2874_two_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2874_two_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
         "module Lib2874C; "
@@ -293,7 +295,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
 // limitation is no longer one of them.
 BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
            unfoldable_constant_expression_now_runs_spec_17_14) {
-    std::string stem = "bz2874_fold_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2874_fold_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
         "module Lib2874D; public class GD2874<T> "
@@ -331,7 +333,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
 // declared value. Passes both ways; the expected value is deliberately not 0.
 BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
            carriable_initializer_still_builds_and_runs_spec_2_8_2) {
-    std::string stem = "bz2874_ok_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2874_ok_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
         "module Lib2874E; public class GE2874<T> "

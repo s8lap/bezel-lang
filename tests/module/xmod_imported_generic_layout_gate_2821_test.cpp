@@ -82,6 +82,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -126,7 +128,7 @@ bool compileImportCaptureErr2821(const std::string& bSrc,
     namespace fs = std::filesystem;
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz2821_err_" + std::to_string(std::rand()) + ".txt"))
+         ("bz2821_err_" + unique_stem("") + ".txt"))
             .string();
 
     std::fflush(stderr);
@@ -197,7 +199,7 @@ BEZEL_TEST(xmod_imported_generic_layout_gate_2821,
            t1_shifted_offset_reference_arg_rejected_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2821_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2821_t1_");
     TempFile2821 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2821 aObj((dir / (stem + "_a.o")).string());
     writeSource2821(aSrc.path, kLibShift2821);
@@ -238,7 +240,7 @@ BEZEL_TEST(xmod_imported_generic_layout_gate_2821,
            t2_int_instantiation_still_compiles_and_runs_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2821_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2821_t2_");
     TempFile2821 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2821 aObj((dir / (stem + "_a.o")).string());
     writeSource2821(aSrc.path, kLibShift2821);
@@ -272,7 +274,7 @@ BEZEL_TEST(xmod_imported_generic_layout_gate_2821,
            t3_no_type_param_storage_not_rejected_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2821_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2821_t3_");
     TempFile2821 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2821 aObj((dir / (stem + "_a.o")).string());
     writeSource2821(aSrc.path,
@@ -317,7 +319,7 @@ BEZEL_TEST(xmod_imported_generic_layout_gate_2821,
            t4_wider_value_type_argument_rejected_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2821_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2821_t4_");
     TempFile2821 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2821 aObj((dir / (stem + "_a.o")).string());
     writeSource2821(aSrc.path, kLibShift2821);
@@ -355,7 +357,7 @@ BEZEL_TEST(xmod_imported_generic_layout_gate_2821,
            t5_static_method_not_rejected_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2821_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2821_t5_");
     TempFile2821 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2821 aObj((dir / (stem + "_a.o")).string());
     writeSource2821(aSrc.path, kLibShift2821);
@@ -386,7 +388,7 @@ BEZEL_TEST(xmod_imported_generic_layout_gate_2821,
            t6_reconstructible_body_still_monomorphizes_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2821_t6_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2821_t6_");
     TempFile2821 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2821 aObj((dir / (stem + "_a.o")).string());
     writeSource2821(aSrc.path,
@@ -427,7 +429,7 @@ BEZEL_TEST(xmod_imported_generic_layout_gate_2821,
            t7_non_generic_imported_class_untouched_2_5) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2821_t7_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2821_t7_");
     TempFile2821 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2821 aObj((dir / (stem + "_a.o")).string());
     writeSource2821(aSrc.path,

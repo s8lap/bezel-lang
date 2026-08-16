@@ -58,6 +58,8 @@
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -346,7 +348,7 @@ std::vector<std::uint8_t> dumpSection(const std::string& objectPath,
                                       const std::string& section) {
     auto dir = std::filesystem::temp_directory_path();
     std::string out =
-        (dir / ("bezel_meta_dump_" + std::to_string(std::rand()) + ".bin"))
+        (dir / ("bezel_meta_dump_" + unique_stem("") + ".bin"))
             .string();
     std::string cmd = "objcopy --dump-section " + section + "=" + out + " " +
                       objectPath + " /dev/null 2>/dev/null";
@@ -388,7 +390,7 @@ BEZEL_TEST(module_metadata_emit, object_section_roundtrip_spec_2_6) {
         "end App;";
 
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_meta_obj_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_meta_obj_");
     std::string srcPath = (dir / (stem + ".bzl")).string();
     std::string exePath = (dir / stem).string();
     std::string objPath = exePath + ".o";  // Driver writes outputPath + ".o"

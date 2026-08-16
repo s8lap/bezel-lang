@@ -44,6 +44,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -79,7 +81,7 @@ CompileResult3167 compileAndCheckStderr3167(const std::string& libSrc,
                                             const std::string& tag) {
     CompileResult3167 out;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3167_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3167_" + tag + "_" + unique_stem("");
     TempFile3167 lSrc((dir / (stem + "_lib.bzl")).string());
     TempFile3167 lObj((dir / (stem + "_lib.o")).string());
     TempFile3167 aSrc((dir / (stem + "_app.bzl")).string());
@@ -203,7 +205,7 @@ CompileResult3167 compileLocalAndCheckStderr3167(const std::string& appSrc,
     CompileResult3167 out;
     out.depOk = true;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3167L_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3167L_" + tag + "_" + unique_stem("");
     TempFile3167 aSrc((dir / (stem + ".bzl")).string());
     TempFile3167 aExe((dir / stem).string());
     TempFile3167 aErr((dir / (stem + ".err")).string());

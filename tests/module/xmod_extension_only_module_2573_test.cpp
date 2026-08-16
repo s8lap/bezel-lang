@@ -40,6 +40,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace {
 
@@ -87,7 +89,7 @@ int importRun2573(const std::string& bSrc, const std::string& bExe,
 BEZEL_TEST(xmod_extension_only_2573, extension_only_module_primitive_receiver_26_5) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2573_prim_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2573_prim_");
     TempFile2573 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2573 aObj((dir / (stem + "_a.o")).string());
 
@@ -123,7 +125,7 @@ BEZEL_TEST(xmod_extension_only_2573, extension_only_module_primitive_receiver_26
 BEZEL_TEST(xmod_extension_only_2573, extension_only_module_method_with_arg_26_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2573_arg_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2573_arg_");
     TempFile2573 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2573 aObj((dir / (stem + "_a.o")).string());
 

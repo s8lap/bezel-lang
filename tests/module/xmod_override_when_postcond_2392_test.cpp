@@ -69,6 +69,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -98,7 +100,7 @@ bool compileImportCaptureErr2392(const std::string& bSrc,
                                  std::string& err) {
     namespace fs = std::filesystem;
     std::string errPath = (fs::temp_directory_path() /
-                           ("bz2392_err_" + std::to_string(std::rand()) +
+                           ("bz2392_err_" + unique_stem("") +
                             ".txt"))
                               .string();
 
@@ -140,7 +142,7 @@ int compileImportAndRun2392(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2392_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2392_");
     TempFile2392 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2392 aObj((dir / (stem + "_a.o")).string());
     writeSource2392(aSrc.path, libSrc);
@@ -175,7 +177,7 @@ BEZEL_TEST(xmod_override_when_postcond_2392,
            method_matching_when_true_override_of_imported_base_accepted_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2392_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2392_t1_");
     TempFile2392 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2392 aObj((dir / (stem + "_a.o")).string());
     writeSource2392(aSrc.path,
@@ -218,7 +220,7 @@ BEZEL_TEST(xmod_override_when_postcond_2392,
            method_missing_when_true_override_of_imported_base_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2392_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2392_t2_");
     TempFile2392 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2392 aObj((dir / (stem + "_a.o")).string());
     writeSource2392(aSrc.path,
@@ -263,7 +265,7 @@ BEZEL_TEST(xmod_override_when_postcond_2392,
            method_matching_when_true_override_of_local_base_accepted_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2392_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2392_t3_");
     std::string bSrc =
         "module LocalOutNull2392T3; "
         "public abstract class AbsOutNullBaseLocal2392T3 "
@@ -296,7 +298,7 @@ BEZEL_TEST(xmod_override_when_postcond_2392,
            method_missing_when_true_override_of_local_base_rejected_12_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2392_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2392_t4_");
     std::string bSrc =
         "module LocalOutNullBad2392T4; "
         "public abstract class AbsOutNullBaseLocalBad2392T4 "

@@ -99,6 +99,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -140,7 +142,7 @@ int runImported2668(const std::string& body, const std::string& tag,
                     std::string* errOut = nullptr) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2668_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz2668_" + tag + "_" + unique_stem("");
 
     TempFile2668 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2668 aObj((dir / (stem + "_a.o")).string());
@@ -252,7 +254,7 @@ BEZEL_TEST(xmod_ctor_out_var_typing_2668,
            local_ctor_out_var_unaffected) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2668_V4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2668_V4_");
     TempFile2668 src((dir / (stem + ".bzl")).string());
     TempFile2668 exe((dir / stem).string());
     writeSource2668(src.path,

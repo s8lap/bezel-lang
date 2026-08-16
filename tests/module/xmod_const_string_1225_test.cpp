@@ -24,6 +24,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace {
 
@@ -63,7 +65,7 @@ int runConstStringTest(const std::string& tag,
                        const std::string& mainSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1225_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz1225_" + tag + "_" + unique_stem("");
 
     TempFile1225 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1225 aObj((dir / (stem + "_a.o")).string());

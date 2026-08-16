@@ -35,6 +35,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -51,7 +53,7 @@ bool compilesAsLibrary2864(const std::string& libSrc, const char* stemTag) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
     std::string stem = std::string("bz2864_") + stemTag + "_" +
-                       std::to_string(std::rand());
+                       unique_stem("");
     TempFile2864 src((dir / (stem + ".bzl")).string());
     TempFile2864 obj((dir / (stem + ".o")).string());
     { std::ofstream out(src.path); out << libSrc; }

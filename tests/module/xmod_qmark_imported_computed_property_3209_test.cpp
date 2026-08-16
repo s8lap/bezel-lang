@@ -67,6 +67,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -112,7 +114,7 @@ std::string runCapture3209(const std::string& exe, int& code) {
 std::pair<int, std::string> compileImportRun3209(const std::string& libSrc,
                                                  const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3209_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3209_");
     TempFile3209 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3209 aObj((dir / (stem + "_a.o")).string());
     writeSource3209(aSrc.path, libSrc);
@@ -138,7 +140,7 @@ std::pair<int, std::string> compileImportRun3209(const std::string& libSrc,
 
 std::pair<int, std::string> compileLocalRun3209(const std::string& src) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3209_loc_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3209_loc_");
     TempFile3209 sFile((dir / (stem + ".bzl")).string());
     TempFile3209 eFile((dir / stem).string());
     writeSource3209(sFile.path, src);

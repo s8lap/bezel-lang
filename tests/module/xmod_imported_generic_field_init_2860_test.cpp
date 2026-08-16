@@ -77,6 +77,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -134,7 +136,7 @@ bool compileImportCaptureErr2860(const std::string& bSrc,
     namespace fs = std::filesystem;
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz2860_err_" + std::to_string(std::rand()) + ".txt"))
+         ("bz2860_err_" + unique_stem("") + ".txt"))
             .string();
 
     std::fflush(stderr);
@@ -231,7 +233,7 @@ bool buildLib2860(const std::string& stem, const char* libSrc,
 BEZEL_TEST(xmod_imported_generic_field_init_2860,
            t1_direct_new_runs_field_initializers_2_8_2) {
     namespace fs = std::filesystem;
-    std::string stem = "bz2860_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2860_t1_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2860(stem, kLib2860, aObj));
     TempFile2860 aObjFile(aObj);
@@ -267,7 +269,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_2860,
 BEZEL_TEST(xmod_imported_generic_field_init_2860,
            t2_non_generic_derived_of_generic_base_14_1) {
     namespace fs = std::filesystem;
-    std::string stem = "bz2860_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2860_t2_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2860(stem, kLib2860, aObj));
     TempFile2860 aObjFile(aObj);
@@ -308,7 +310,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_2860,
 BEZEL_TEST(xmod_imported_generic_field_init_2860,
            t3_generic_derived_control_unchanged_2524) {
     namespace fs = std::filesystem;
-    std::string stem = "bz2860_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2860_t3_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2860(stem, kLib2860, aObj));
     TempFile2860 aObjFile(aObj);
@@ -346,7 +348,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_2860,
 BEZEL_TEST(xmod_imported_generic_field_init_2860,
            t4_nullable_value_field_roundtrips_23_1) {
     namespace fs = std::filesystem;
-    std::string stem = "bz2860_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2860_t4_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2860(stem, kLib2860, aObj));
     TempFile2860 aObjFile(aObj);
@@ -384,7 +386,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_2860,
 BEZEL_TEST(xmod_imported_generic_field_init_2860,
            t5_non_generic_import_unchanged_2_5) {
     namespace fs = std::filesystem;
-    std::string stem = "bz2860_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2860_t5_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2860(stem, kLib2860, aObj));
     TempFile2860 aObjFile(aObj);
@@ -431,7 +433,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_2860,
            t6_single_module_parity_2_8_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2860_t6_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2860_t6_");
     std::string src =
         "module App2860Single; "
         "public class GInit2860<T> "
@@ -475,7 +477,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_2860,
 BEZEL_TEST(xmod_imported_generic_field_init_2860,
            t7_uncarriable_initializer_is_a_named_diagnostic_2_8_2) {
     namespace fs = std::filesystem;
-    std::string stem = "bz2860_t7_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2860_t7_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2860(stem,
         "module LibOwn2860; "
@@ -524,7 +526,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_2860,
 BEZEL_TEST(xmod_imported_generic_field_init_2860,
            t8_uncarriable_initializer_never_constructed_still_builds_2_5) {
     namespace fs = std::filesystem;
-    std::string stem = "bz2860_t8_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2860_t8_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2860(stem, kLibOwned2860, aObj));
     TempFile2860 aObjFile(aObj);
@@ -556,7 +558,7 @@ BEZEL_TEST(xmod_imported_generic_field_init_2860,
 BEZEL_TEST(xmod_imported_generic_field_init_2860,
            t9_several_instantiations_each_initialized_14_1) {
     namespace fs = std::filesystem;
-    std::string stem = "bz2860_t9_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2860_t9_");
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2860(stem, kLib2860, aObj));
     TempFile2860 aObjFile(aObj);

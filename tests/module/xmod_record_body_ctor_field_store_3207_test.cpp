@@ -124,6 +124,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -155,7 +157,7 @@ RunResult3207 runImported3207(const std::string& libSrc,
                               const std::string& appSrc,
                               const std::string& tag) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3207_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3207_" + tag + "_" + unique_stem("");
 
     TempFile3207 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3207 aObj((dir / (stem + "_a.o")).string());
@@ -210,7 +212,7 @@ RunResult3207 runImported3207(const std::string& libSrc,
 RunResult3207 runSingleModule3207(const std::string& src,
                                   const std::string& tag) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3207ctl_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3207ctl_" + tag + "_" + unique_stem("");
     TempFile3207 sSrc((dir / (stem + ".bzl")).string());
     TempFile3207 sExe((dir / stem).string());
     writeSource3207(sSrc.path, src);

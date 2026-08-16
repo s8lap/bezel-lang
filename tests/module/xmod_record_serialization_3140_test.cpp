@@ -85,6 +85,8 @@
 #include "module/ModuleMetadataBuilder.hpp"  // kMetadataSectionName
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -105,7 +107,7 @@ void writeSourceF2(const std::string& path, const std::string& src) {
 int compileImportAndRunF2(const std::string& libSrc, const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3140f2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3140f2_");
     TempFileF2 aSrc((dir / (stem + "_a.bzl")).string());
     TempFileF2 aObj((dir / (stem + "_a.o")).string());
     writeSourceF2(aSrc.path, libSrc);
@@ -135,7 +137,7 @@ int compileImportAndRunF2(const std::string& libSrc, const std::string& appSrc) 
 int compileAndRunF2(const std::string& src) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3140f2l_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3140f2l_");
     TempFileF2 aSrc((dir / (stem + ".bzl")).string());
     TempFileF2 aExe((dir / stem).string());
     writeSourceF2(aSrc.path, src);
@@ -177,7 +179,7 @@ ForgeOutcome3184 forgeStaleDepAndTryBuild3184(const std::string& libSrc,
                                                const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3184_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3184_");
     TempFileF2 depSrc((dir / (stem + "_dep.bzl")).string());
     TempFileF2 depObj((dir / (stem + "_dep.o")).string());
     TempFileF2 forgedObj((dir / (stem + "_dep_forged.o")).string());
@@ -201,7 +203,7 @@ ForgeOutcome3184 forgeStaleDepAndTryBuild3184(const std::string& libSrc,
                           const std::string& section) {
         auto tmpDir = std::filesystem::temp_directory_path();
         std::string out =
-            (tmpDir / ("bezel_meta_dump_" + std::to_string(std::rand()) + ".bin"))
+            (tmpDir / ("bezel_meta_dump_" + unique_stem("") + ".bin"))
                 .string();
         std::string cmd = "objcopy --dump-section " + section + "=" + out +
                           " " + objPath + " /dev/null 2>/dev/null";

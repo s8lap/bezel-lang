@@ -54,6 +54,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -84,7 +86,7 @@ bool compileToObj2504(const std::string& src, const std::string& obj) {
 std::pair<int, std::string> compileImportRunAsanCapture2504(
         const std::string& libSrc, const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2504_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2504_");
     TempFile2504 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2504 aObj((dir / (stem + "_a.o")).string());
     writeSource2504(aSrc.path, libSrc);
@@ -235,7 +237,7 @@ BEZEL_TEST(xmod_bare_ident_imported_setter_2504,
         "  end Main; "
         "end ProgramL2504;";
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2504_local_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2504_local_");
     TempFile2504 srcFile((dir / (stem + ".bzl")).string());
     TempFile2504 exe((dir / stem).string());
     writeSource2504(srcFile.path, src);

@@ -78,6 +78,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -106,7 +108,7 @@ bool compileImportCaptureErr2462(const std::string& bSrc,
                                  const std::string& aObj, std::string& err) {
     namespace fs = std::filesystem;
     std::string errPath = (fs::temp_directory_path() /
-                           ("bz2462_err_" + std::to_string(std::rand()) +
+                           ("bz2462_err_" + unique_stem("") +
                             ".txt"))
                               .string();
 
@@ -147,7 +149,7 @@ int compileImportAndRun2462(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2462_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2462_");
     TempFile2462 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2462 aObj((dir / (stem + "_a.o")).string());
     writeSource2462(aSrc.path, libSrc);
@@ -282,7 +284,7 @@ BEZEL_TEST(xmod_refout_imported_callee_prop_2462,
            private_set_property_to_imported_method_still_rejected_control) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2462_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2462_t4_");
     TempFile2462 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2462 aObj((dir / (stem + "_a.o")).string());
     writeSource2462(aSrc.path,

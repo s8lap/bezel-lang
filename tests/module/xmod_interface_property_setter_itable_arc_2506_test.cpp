@@ -60,6 +60,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -91,7 +93,7 @@ bool compileToObj2506(const std::string& src, const std::string& obj) {
 int compileImportRunAsan2506(const std::string& libSrc,
                              const std::string& appSrc, bool leaks) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2506_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2506_");
     TempFile2506 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2506 aObj((dir / (stem + "_a.o")).string());
     writeSource2506(aSrc.path, libSrc);
@@ -129,7 +131,7 @@ int compileImportRunAsan2506(const std::string& libSrc,
 // record control cells.
 int compileRunAsan2506Local(const std::string& src, bool leaks) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2506_local_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2506_local_");
     TempFile2506 srcFile((dir / (stem + ".bzl")).string());
     TempFile2506 exe((dir / stem).string());
     writeSource2506(srcFile.path, src);

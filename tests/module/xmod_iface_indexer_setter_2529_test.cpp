@@ -69,6 +69,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -99,7 +101,7 @@ bool compileImportCaptureErr2529(const std::string& bSrc,
                                  std::string& err) {
     namespace fs = std::filesystem;
     std::string errPath = (fs::temp_directory_path() /
-                           ("bz2529_err_" + std::to_string(std::rand()) +
+                           ("bz2529_err_" + unique_stem("") +
                             ".txt"))
                               .string();
 
@@ -141,7 +143,7 @@ int compileImportAndRun2529(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2529_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2529_");
     TempFile2529 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2529 aObj((dir / (stem + "_a.o")).string());
     writeSource2529(aSrc.path, libSrc);
@@ -179,7 +181,7 @@ BEZEL_TEST(xmod_iface_indexer_setter_2529,
            imported_readwrite_iface_getter_only_impl_rejected_11_2_23_4) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2529_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2529_t1_");
     TempFile2529 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2529 aObj((dir / (stem + "_a.o")).string());
     writeSource2529(aSrc.path,
@@ -230,7 +232,7 @@ BEZEL_TEST(xmod_iface_indexer_setter_2529,
            local_readwrite_iface_getter_only_impl_still_rejected_11_2_23_4) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2529_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2529_t2_");
     std::string src =
         "module LocalRWIdx2529T2; "
         "public interface IRWIdxLocal2529T2 "
@@ -273,7 +275,7 @@ BEZEL_TEST(xmod_iface_indexer_setter_2529,
            imported_readwrite_iface_block_form_getter_only_rejected_11_2_23_4) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2529_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2529_t3_");
     TempFile2529 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2529 aObj((dir / (stem + "_a.o")).string());
     writeSource2529(aSrc.path,

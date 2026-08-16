@@ -71,6 +71,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -118,7 +120,7 @@ bool compileImportCaptureErr(const std::string& bSrc, const std::string& bExe,
     namespace fs = std::filesystem;
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz1943_err_" + std::to_string(std::rand()) + ".txt"))
+         ("bz1943_err_" + unique_stem("") + ".txt"))
             .string();
 
     std::fflush(stderr);
@@ -175,7 +177,7 @@ BEZEL_TEST(xmod_generic_method_arg_marshalling_1943,
            t1_double_arg_clean_diagnostic_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1943_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1943_t1_");
     TempFile1943 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1943 aObj((dir / (stem + "_a.o")).string());
     writeSource1943(aSrc.path, kLib1943);
@@ -211,7 +213,7 @@ BEZEL_TEST(xmod_generic_method_arg_marshalling_1943,
            t2_long_var_arg_clean_diagnostic_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1943_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1943_t2_");
     TempFile1943 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1943 aObj((dir / (stem + "_a.o")).string());
     writeSource1943(aSrc.path, kLib1943);
@@ -245,7 +247,7 @@ BEZEL_TEST(xmod_generic_method_arg_marshalling_1943,
            t3_int_arg_still_works_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1943_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1943_t3_");
     TempFile1943 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1943 aObj((dir / (stem + "_a.o")).string());
     writeSource1943(aSrc.path, kLib1943);
@@ -274,7 +276,7 @@ BEZEL_TEST(xmod_generic_method_arg_marshalling_1943,
            t4_nongeneric_long_arg_still_works_2_5) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1943_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1943_t4_");
     TempFile1943 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1943 aObj((dir / (stem + "_a.o")).string());
     writeSource1943(aSrc.path, kLib1943);
@@ -307,7 +309,7 @@ BEZEL_TEST(xmod_generic_method_arg_marshalling_1943,
            t5_long_literal_arg_still_works_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1943_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1943_t5_");
     TempFile1943 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1943 aObj((dir / (stem + "_a.o")).string());
     writeSource1943(aSrc.path, kLib1943);

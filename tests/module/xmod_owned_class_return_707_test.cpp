@@ -49,6 +49,8 @@
 #include "llvm/IR/Module.h"
 
 #include "native_test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -202,7 +204,7 @@ static int xmodLsan707(
 BEZEL_TEST(xmod_owned_class_return_707, t1_static_factory_owned_return_disposed_28_10) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz707_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz707_t1_");
     TempFile707 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile707 aObj((dir / (stem + "_a.o")).string());
 
@@ -267,7 +269,7 @@ BEZEL_TEST(xmod_owned_class_return_707, t1_static_factory_owned_return_disposed_
 BEZEL_TEST(xmod_owned_class_return_707, t2_instance_factory_owned_return_disposed_28_10) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz707_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz707_t2_");
     TempFile707 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile707 aObj((dir / (stem + "_a.o")).string());
 
@@ -331,7 +333,7 @@ BEZEL_TEST(xmod_owned_class_return_707, t2_instance_factory_owned_return_dispose
 BEZEL_TEST(xmod_owned_class_return_707, t3_borrow_return_not_disposed_canary_28_10) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz707_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz707_t3_");
     TempFile707 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile707 aObj((dir / (stem + "_a.o")).string());
 

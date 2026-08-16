@@ -53,6 +53,8 @@
 #include "llvm/IR/Module.h"
 
 #include "native_test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -232,7 +234,7 @@ const char* kModA =
 // ===========================================================================
 BEZEL_TEST(xmod_owned_return_autodrop_1415, t1_imported_owned_never_discharged_28_3) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1415_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1415_t1_");
     TempFile1415 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1415 aObj((dir / (stem + "_a.o")).string());
     writeSource1415(aSrc.path, kModA);
@@ -273,7 +275,7 @@ BEZEL_TEST(xmod_owned_return_autodrop_1415, t1_imported_owned_never_discharged_2
 // ===========================================================================
 BEZEL_TEST(xmod_owned_return_autodrop_1415, t2_imported_owned_using_var_no_warn_28_3) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1415_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1415_t2_");
     TempFile1415 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1415 aObj((dir / (stem + "_a.o")).string());
     writeSource1415(aSrc.path, kModA);
@@ -308,7 +310,7 @@ BEZEL_TEST(xmod_owned_return_autodrop_1415, t2_imported_owned_using_var_no_warn_
 // ===========================================================================
 BEZEL_TEST(xmod_owned_return_autodrop_1415, t3_imported_borrow_return_not_owned_28_3) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1415_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1415_t3_");
     TempFile1415 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1415 aObj((dir / (stem + "_a.o")).string());
     writeSource1415(aSrc.path, kModA);

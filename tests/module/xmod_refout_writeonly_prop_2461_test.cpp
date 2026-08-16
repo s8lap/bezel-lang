@@ -69,6 +69,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -97,7 +99,7 @@ bool compileImportCaptureErr2461(const std::string& bSrc,
                                  const std::string& aObj, std::string& err) {
     namespace fs = std::filesystem;
     std::string errPath = (fs::temp_directory_path() /
-                           ("bz2461_err_" + std::to_string(std::rand()) +
+                           ("bz2461_err_" + unique_stem("") +
                             ".txt"))
                               .string();
 
@@ -138,7 +140,7 @@ int compileImportAndRun2461(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2461_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2461_");
     TempFile2461 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2461 aObj((dir / (stem + "_a.o")).string());
     writeSource2461(aSrc.path, libSrc);
@@ -174,7 +176,7 @@ BEZEL_TEST(xmod_refout_writeonly_prop_2461,
            write_only_imported_property_rejected_as_ref_arg) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2461_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2461_t1_");
     TempFile2461 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2461 aObj((dir / (stem + "_a.o")).string());
     writeSource2461(aSrc.path,
@@ -306,7 +308,7 @@ BEZEL_TEST(xmod_refout_writeonly_prop_2461,
            local_write_only_property_still_rejected_as_ref_control) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2461_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2461_t4_");
     TempFile2461 src((dir / (stem + ".bzl")).string());
     TempFile2461 exe((dir / stem).string());
     writeSource2461(src.path,

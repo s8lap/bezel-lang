@@ -63,6 +63,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -104,7 +106,7 @@ std::string runCapture3218(const std::string& exe, int& code) {
 std::pair<int, std::string> compileImportRunCapture3218(
         const std::string& libSrc, const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3218_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3218_");
     TempFile3218 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3218 aObj((dir / (stem + "_a.o")).string());
     writeSource3218(aSrc.path, libSrc);
@@ -133,7 +135,7 @@ std::pair<int, std::string> compileImportRunCapture3218(
 // The single-module control: the same program with no module boundary.
 std::pair<int, std::string> compileLocalRunCapture3218(const std::string& src) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3218_local_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3218_local_");
     TempFile3218 sFile((dir / (stem + ".bzl")).string());
     TempFile3218 eFile((dir / stem).string());
     writeSource3218(sFile.path, src);

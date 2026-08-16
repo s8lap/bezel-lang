@@ -84,6 +84,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -106,7 +108,7 @@ int compileImportAndRun3190(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3190_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3190_");
     TempFile3190 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3190 aObj((dir / (stem + "_a.o")).string());
     writeSource3190(aSrc.path, libSrc);
@@ -137,7 +139,7 @@ int compileImportAndRun3190(const std::string& libSrc,
 int compileLocalAndRun3190(const std::string& src) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3190l_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3190l_");
     TempFile3190 aSrc((dir / (stem + ".bzl")).string());
     TempFile3190 aExe((dir / stem).string());
     writeSource3190(aSrc.path, src);
@@ -154,7 +156,7 @@ bool compileImportCaptureErr3190(const std::string& libSrc,
                                  const std::string& appSrc, std::string& err) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3190c_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3190c_");
     TempFile3190 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3190 aObj((dir / (stem + "_a.o")).string());
     writeSource3190(aSrc.path, libSrc);
@@ -169,7 +171,7 @@ bool compileImportCaptureErr3190(const std::string& libSrc,
     writeSource3190(bSrc.path, appSrc);
 
     std::string errPath =
-        (dir / ("bz3190_err_" + std::to_string(std::rand()) + ".txt")).string();
+        (dir / ("bz3190_err_" + unique_stem("") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);

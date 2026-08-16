@@ -57,6 +57,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -85,7 +87,7 @@ bool compileImportCaptureErr2391(const std::string& bSrc,
                                  std::string& err) {
     namespace fs = std::filesystem;
     std::string errPath = (fs::temp_directory_path() /
-                           ("bz2391_err_" + std::to_string(std::rand()) +
+                           ("bz2391_err_" + unique_stem("") +
                             ".txt"))
                               .string();
 
@@ -127,7 +129,7 @@ int compileImportAndRun2391(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2391_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2391_");
     TempFile2391 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2391 aObj((dir / (stem + "_a.o")).string());
     writeSource2391(aSrc.path, libSrc);
@@ -170,7 +172,7 @@ BEZEL_TEST(xmod_override_generic_constraints_2391,
            imported_class_base_value_override_rejected_14_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2391_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2391_t1_");
     TempFile2391 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2391 aObj((dir / (stem + "_a.o")).string());
     writeSource2391(aSrc.path,
@@ -214,7 +216,7 @@ BEZEL_TEST(xmod_override_generic_constraints_2391,
            local_class_base_value_override_still_rejected_14_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2391_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2391_t2_");
     std::string bSrc =
         "module LocalClassLib2391T2; "
         "public class BaseL2391T2 "
@@ -253,7 +255,7 @@ BEZEL_TEST(xmod_override_generic_constraints_2391,
            imported_unconstrained_base_class_added_override_rejected_14_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2391_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2391_t3_");
     TempFile2391 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2391 aObj((dir / (stem + "_a.o")).string());
     writeSource2391(aSrc.path,
@@ -303,7 +305,7 @@ BEZEL_TEST(xmod_override_generic_constraints_2391,
            omitted_clause_inherits_imported_class_constraint_compiles) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2391_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2391_t4_");
     TempFile2391 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2391 aObj((dir / (stem + "_a.o")).string());
     writeSource2391(aSrc.path,
@@ -348,7 +350,7 @@ BEZEL_TEST(xmod_override_generic_constraints_2391,
            imported_class_base_restate_identical_class_compiles) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2391_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2391_t5_");
     TempFile2391 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2391 aObj((dir / (stem + "_a.o")).string());
     writeSource2391(aSrc.path,
@@ -395,7 +397,7 @@ BEZEL_TEST(xmod_override_generic_constraints_2391,
            imported_compose_base_restate_reordered_compiles) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2391_t6_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2391_t6_");
     TempFile2391 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2391 aObj((dir / (stem + "_a.o")).string());
     writeSource2391(aSrc.path,
@@ -446,7 +448,7 @@ BEZEL_TEST(xmod_override_generic_constraints_2391,
            imported_compose_base_drops_class_rejected_14_2) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2391_t7_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2391_t7_");
     TempFile2391 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2391 aObj((dir / (stem + "_a.o")).string());
     writeSource2391(aSrc.path,

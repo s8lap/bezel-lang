@@ -49,6 +49,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -94,7 +96,7 @@ std::pair<int, std::string> runCapture(const std::string& exe) {
 BEZEL_TEST(xmod_generic_record_static_operator_3159,
            imported_generic_record_operator_primitive_return_spec_25_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_3159_gpr_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_3159_gpr_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -144,7 +146,7 @@ BEZEL_TEST(xmod_generic_record_static_operator_3159,
 BEZEL_TEST(xmod_generic_record_static_operator_3159,
            same_module_generic_record_operator_control_spec_25_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_3159_gpr_sm_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_3159_gpr_sm_");
     TempFile aSrc((dir / (stem + ".bzl")).string());
     TempFile aExe((dir / (stem + "_a")).string());
 
@@ -186,7 +188,7 @@ BEZEL_TEST(xmod_generic_record_static_operator_3159,
 BEZEL_TEST(xmod_generic_record_static_operator_3159,
            imported_non_generic_record_operator_control_spec_25_9) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_3159_ngc_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_3159_ngc_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -269,7 +271,7 @@ BEZEL_TEST(xmod_generic_record_static_operator_3159,
 BEZEL_TEST(xmod_generic_record_static_operator_3159,
            imported_generic_record_operator_record_return_spec_25_14_1) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_3226_rr_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_3226_rr_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());

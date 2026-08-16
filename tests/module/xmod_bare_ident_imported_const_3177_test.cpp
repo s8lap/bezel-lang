@@ -45,6 +45,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -90,7 +92,7 @@ std::string runCapture3177K(const std::string& exe, int& code) {
 std::pair<int, std::string> compileImportRun3177K(const std::string& libSrc,
                                                   const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3177k_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3177k_");
     TempFile3177K aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3177K aObj((dir / (stem + "_a.o")).string());
     writeSource3177K(aSrc.path, libSrc);
@@ -116,7 +118,7 @@ std::pair<int, std::string> compileImportRun3177K(const std::string& libSrc,
 
 std::pair<int, std::string> compileLocalRun3177K(const std::string& src) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3177k_loc_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3177k_loc_");
     TempFile3177K sFile((dir / (stem + ".bzl")).string());
     TempFile3177K eFile((dir / stem).string());
     writeSource3177K(sFile.path, src);

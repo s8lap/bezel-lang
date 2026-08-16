@@ -74,6 +74,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the sanitizer-honouring compileFile
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -141,7 +143,7 @@ int compileImportAndRun3221(const std::string& libSrc,
                             const std::string& appSrc,
                             std::string* diag = nullptr) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3221_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3221_");
     TempFile3221 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3221 aObj((dir / (stem + "_a.o")).string());
     writeSource3221(aSrc.path, libSrc);
@@ -179,7 +181,7 @@ int compileImportAndRun3221(const std::string& libSrc,
 // The single-module twin: the SAME declarations in one compilation.
 int compileAndRun3221(const std::string& src, std::string* diag = nullptr) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3221L_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3221L_");
     TempFile3221 s((dir / (stem + ".bzl")).string());
     TempFile3221 exe((dir / stem).string());
     writeSource3221(s.path, src);

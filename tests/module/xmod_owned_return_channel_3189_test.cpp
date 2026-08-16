@@ -73,6 +73,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -212,7 +214,7 @@ int run3189(const std::string& appSrc, bool imported, const std::string& tag,
     fs::path dir = "/var/tmp/bezel-scratch/wt-3189";
     std::error_code ec;
     fs::create_directories(dir, ec);
-    std::string stem = "bz3189_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3189_" + tag + "_" + unique_stem("");
     TempFile3189 src((dir / (stem + ".bzl")).string());
     TempFile3189 exe((dir / stem).string());
     TempFile3189 err((dir / (stem + ".err")).string());

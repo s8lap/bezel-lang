@@ -89,6 +89,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -118,7 +120,7 @@ int compileImportAndRun2468(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2468_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2468_");
     TempFile2468 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2468 aObj((dir / (stem + "_a.o")).string());
     writeSource2468(aSrc.path, libSrc);
@@ -146,7 +148,7 @@ bool compileImportCaptureErr2468(const std::string& libSrc,
                                  const std::string& appSrc, std::string& err) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2468_c_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2468_c_");
     TempFile2468 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2468 aObj((dir / (stem + "_a.o")).string());
     writeSource2468(aSrc.path, libSrc);
@@ -158,7 +160,7 @@ bool compileImportCaptureErr2468(const std::string& libSrc,
     writeSource2468(bSrc.path, appSrc);
 
     std::string errPath =
-        (dir / ("bz2468_err_" + std::to_string(std::rand()) + ".txt"))
+        (dir / ("bz2468_err_" + unique_stem("") + ".txt"))
             .string();
     std::fflush(stderr);
     std::cerr.flush();
@@ -329,7 +331,7 @@ BEZEL_TEST(xmod_record_private_field_layout_import_2468,
     bezel::Driver driver;
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2468_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2468_t5_");
     TempFile2468 src((dir / (stem + ".bzl")).string());
     TempFile2468 exe((dir / stem).string());
     writeSource2468(src.path,

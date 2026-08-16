@@ -69,6 +69,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -98,7 +100,7 @@ bool compileImportCaptureErr2549(const std::string& bSrc,
     namespace fs = std::filesystem;
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz2549_err_" + std::to_string(std::rand()) + ".txt"))
+         ("bz2549_err_" + unique_stem("") + ".txt"))
             .string();
     std::fflush(stderr);
     std::cerr.flush();
@@ -144,7 +146,7 @@ ImportCapture2549 compileImportSources2549(const std::string& libSrc,
                                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2549_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2549_");
     TempFile2549 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2549 aObj((dir / (stem + "_a.o")).string());
     writeSource2549(aSrc.path, libSrc);
@@ -166,7 +168,7 @@ int compileImportAndRun2549(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2549_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2549_");
     TempFile2549 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2549 aObj((dir / (stem + "_a.o")).string());
     writeSource2549(aSrc.path, libSrc);
@@ -191,10 +193,10 @@ int compileImportAndRun2549(const std::string& libSrc,
 bool compileLocalReject2549(const std::string& src, std::string& err) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2549_local_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2549_local_");
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz2549_local_err_" + std::to_string(std::rand()) + ".txt"))
+         ("bz2549_local_err_" + unique_stem("") + ".txt"))
             .string();
     TempFile2549 srcFile((dir / (stem + ".bzl")).string());
     TempFile2549 exeFile((dir / stem).string());
@@ -226,7 +228,7 @@ bool compileLocalReject2549(const std::string& src, std::string& err) {
 int compileLocalAndRun2549(const std::string& src) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2549_local_run_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2549_local_run_");
     TempFile2549 srcFile((dir / (stem + ".bzl")).string());
     TempFile2549 exeFile((dir / stem).string());
     writeSource2549(srcFile.path, src);

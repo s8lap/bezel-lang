@@ -146,6 +146,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -227,7 +229,7 @@ int runImported2658(const std::string& mainBody, const std::string& moduleTag,
                     std::string* capturedStderr = nullptr) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2658_" + moduleTag + "_" + std::to_string(std::rand());
+    std::string stem = "bz2658_" + moduleTag + "_" + unique_stem("");
 
     TempFile2658 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2658 aObj((dir / (stem + "_a.o")).string());

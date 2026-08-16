@@ -69,6 +69,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -114,7 +116,7 @@ std::string runCapture3177(const std::string& exe, int& code) {
 std::pair<int, std::string> compileImportRunCapture3177(
         const std::string& libSrc, const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3177_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3177_");
     TempFile3177 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3177 aObj((dir / (stem + "_a.o")).string());
     writeSource3177(aSrc.path, libSrc);
@@ -143,7 +145,7 @@ std::pair<int, std::string> compileImportRunCapture3177(
 // The single-module control: the same program with no module boundary.
 std::pair<int, std::string> compileLocalRunCapture3177(const std::string& src) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3177_local_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3177_local_");
     TempFile3177 sFile((dir / (stem + ".bzl")).string());
     TempFile3177 eFile((dir / stem).string());
     writeSource3177(sFile.path, src);
@@ -166,7 +168,7 @@ struct ImportReject3177 {
 ImportReject3177 compileImportCaptureErr3177(const std::string& libSrc,
                                              const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3177r_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3177r_");
     TempFile3177 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3177 aObj((dir / (stem + "_a.o")).string());
     writeSource3177(aSrc.path, libSrc);
@@ -179,7 +181,7 @@ ImportReject3177 compileImportCaptureErr3177(const std::string& libSrc,
     TempFile3177 bExe((dir / stem).string());
     writeSource3177(bSrc.path, appSrc);
     std::string errPath =
-        (dir / ("bz3177_err_" + std::to_string(std::rand()) + ".txt")).string();
+        (dir / ("bz3177_err_" + unique_stem("") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);

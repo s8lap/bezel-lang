@@ -46,6 +46,8 @@
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -106,7 +108,7 @@ void writeSource(const std::string& path, const std::string& src) {
 // This is the baseline that must not regress after the cross-module fix.
 BEZEL_TEST(xmod_record_nested_501_502, same_module_positional_eq_spec_9_1_9_2) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_501_sm_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_501_sm_");
     TempFile aSrc((dir / (stem + ".bzl")).string());
     TempFile aExe((dir / (stem + "_a")).string());
 
@@ -160,7 +162,7 @@ BEZEL_TEST(xmod_record_nested_501_502, imported_positional_eq_typechecks_clean_s
 // return the correct value when both records have equal fields (exit 7).
 BEZEL_TEST(xmod_record_nested_501_502, imported_positional_eq_equal_case_spec_9_2) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_501_eq_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_501_eq_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -199,7 +201,7 @@ BEZEL_TEST(xmod_record_nested_501_502, imported_positional_eq_equal_case_spec_9_
 // return 0 when the records have unequal fields.
 BEZEL_TEST(xmod_record_nested_501_502, imported_positional_eq_unequal_case_spec_9_2) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_501_ne_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_501_ne_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -265,7 +267,7 @@ BEZEL_TEST(xmod_record_nested_501_502, imported_body_record_eq_still_errors_spec
 // This is the baseline that must not regress after #502a.
 BEZEL_TEST(xmod_record_nested_501_502, same_module_nested_type_spec_11_3) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_502_sm_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_502_sm_");
     TempFile aSrc((dir / (stem + ".bzl")).string());
     TempFile aExe((dir / (stem + "_a")).string());
 
@@ -381,7 +383,7 @@ BEZEL_TEST(xmod_record_nested_501_502, imported_nested_static_typechecks_clean_s
 // using `bz$Inner$Value`, which matches the exporter's symbol name.
 BEZEL_TEST(xmod_record_nested_501_502, imported_nested_static_returns_real_value_spec_11_3) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_502b_stat_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_502b_stat_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -424,7 +426,7 @@ BEZEL_TEST(xmod_record_nested_501_502, imported_nested_static_returns_real_value
 // Inner object from the importer, call a method on it, and return the result.
 BEZEL_TEST(xmod_record_nested_501_502, imported_nested_type_construction_e2e_spec_11_3) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_502a_new_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_502a_new_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());
@@ -474,7 +476,7 @@ BEZEL_TEST(xmod_record_nested_501_502, imported_nested_type_construction_e2e_spe
 // builder and loader).
 BEZEL_TEST(xmod_record_nested_501_502, imported_toplevel_method_still_works_spec_2_5) {
     auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_502_ctrl_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bezel_502_ctrl_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
     TempFile bSrc((dir / (stem + "_b.bzl")).string());

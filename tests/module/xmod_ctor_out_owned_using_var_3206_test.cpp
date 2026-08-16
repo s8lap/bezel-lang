@@ -68,6 +68,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the sanitizer-honouring compileFile
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -130,7 +132,7 @@ std::string sameModuleProgram3206(const std::string& body,
 int runImported3206(const std::string& body, const std::string& tag,
                     std::string* capturedStderr = nullptr, bool asan = false) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3206_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3206_" + tag + "_" + unique_stem("");
 
     TempFile3206 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3206 aObj((dir / (stem + "_a.o")).string());
@@ -194,7 +196,7 @@ int runSingleModule3206(const std::string& src, const std::string& tag,
                         std::string* capturedStderr = nullptr,
                         bool asan = false) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3206ctl_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3206ctl_" + tag + "_" + unique_stem("");
     TempFile3206 sSrc((dir / (stem + ".bzl")).string());
     TempFile3206 sExe((dir / stem).string());
     TempFile3206 sErr((dir / (stem + ".err")).string());
@@ -427,7 +429,7 @@ BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
 BEZEL_TEST(xmod_ctor_out_owned_using_var_3206,
            t6b_imported_ctor_second_out_owned_position_indexed_22_4) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3206idx_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3206idx_");
     TempFile3206 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3206 aObj((dir / (stem + "_a.o")).string());
     writeSource3206(aSrc.path,

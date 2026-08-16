@@ -32,6 +32,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -58,7 +60,7 @@ int compileImportAndRun2931(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2931_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz2931_");
     TempFile2931 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2931 aObj((dir / (stem + "_a.o")).string());
     writeSource2931(aSrc.path, libSrc);

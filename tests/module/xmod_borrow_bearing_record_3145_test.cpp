@@ -58,6 +58,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -85,7 +87,7 @@ bool compileImportCaptureErr3145(const std::string& bSrc,
     namespace fs = std::filesystem;
     std::string errPath =
         (fs::temp_directory_path() /
-         ("bz3145_err_" + std::to_string(std::rand()) + ".txt")).string();
+         ("bz3145_err_" + unique_stem("") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);
@@ -125,7 +127,7 @@ ImportCapture3145 compileImportSources3145(const std::string& libSrc,
                                            const std::string& appSrc) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3145_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3145_");
     TempFile3145 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3145 aObj((dir / (stem + "_a.o")).string());
     writeSource3145(aSrc.path, libSrc);
@@ -145,9 +147,9 @@ ImportCapture3145 compileImportSources3145(const std::string& libSrc,
 bool compileLocalCaptureErr3145(const std::string& src, std::string& err) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3145_local_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3145_local_");
     std::string errPath =
-        (dir / ("bz3145_local_err_" + std::to_string(std::rand()) + ".txt"))
+        (dir / ("bz3145_local_err_" + unique_stem("") + ".txt"))
             .string();
     TempFile3145 srcFile((dir / (stem + ".bzl")).string());
     TempFile3145 exeFile((dir / stem).string());

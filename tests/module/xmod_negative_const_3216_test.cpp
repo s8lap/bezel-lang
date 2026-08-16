@@ -63,6 +63,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -116,7 +118,7 @@ std::string sameModuleProgram3216(const std::string& body,
 // the dependency itself could not be produced (no toolchain).
 int runImported3216(const std::string& body, const std::string& tag) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3216_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3216_" + tag + "_" + unique_stem("");
 
     TempFile3216 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3216 aObj((dir / (stem + "_a.o")).string());
@@ -153,7 +155,7 @@ int runImported3216(const std::string& body, const std::string& tag) {
 
 int runSingleModule3216(const std::string& src, const std::string& tag) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3216ctl_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3216ctl_" + tag + "_" + unique_stem("");
     TempFile3216 sSrc((dir / (stem + ".bzl")).string());
     TempFile3216 sExe((dir / stem).string());
     writeSource3216(sSrc.path, src);

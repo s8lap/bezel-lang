@@ -58,6 +58,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -131,7 +133,7 @@ BEZEL_TEST(xmod_generic_method_record_return_1937,
            t1_register_pair_long_rejected_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1937_t1_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1937_t1_");
     TempFile1937 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1937 aObj((dir / (stem + "_a.o")).string());
     writeSource1937(aSrc.path, kLibPair1937);
@@ -168,7 +170,7 @@ BEZEL_TEST(xmod_generic_method_record_return_1937,
            t2_sret_triple_long_rejected_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1937_t2_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1937_t2_");
     TempFile1937 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1937 aObj((dir / (stem + "_a.o")).string());
     writeSource1937(aSrc.path,
@@ -212,7 +214,7 @@ BEZEL_TEST(xmod_generic_method_record_return_1937,
            t3_register_pair_int_also_rejected_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1937_t3_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1937_t3_");
     TempFile1937 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1937 aObj((dir / (stem + "_a.o")).string());
     writeSource1937(aSrc.path, kLibPair1937);
@@ -246,7 +248,7 @@ BEZEL_TEST(xmod_generic_method_record_return_1937,
            t4_direct_record_construction_still_works_9_4) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1937_t4_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1937_t4_");
     TempFile1937 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1937 aObj((dir / (stem + "_a.o")).string());
     writeSource1937(aSrc.path, kLibPair1937);
@@ -276,7 +278,7 @@ BEZEL_TEST(xmod_generic_method_record_return_1937,
            t5_nonparam_return_generic_method_still_works_14_1) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz1937_t5_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz1937_t5_");
     TempFile1937 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile1937 aObj((dir / (stem + "_a.o")).string());
     writeSource1937(aSrc.path,

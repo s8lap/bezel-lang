@@ -74,6 +74,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the sanitizer-honouring compileFile
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -142,7 +144,7 @@ std::string sameModuleProgram3188(const std::string& body,
 int runImported3188(const std::string& body, const std::string& tag,
                     std::string* capturedStderr = nullptr, bool asan = false) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3188_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3188_" + tag + "_" + unique_stem("");
 
     TempFile3188 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3188 aObj((dir / (stem + "_a.o")).string());
@@ -206,7 +208,7 @@ int runSingleModule3188(const std::string& src, const std::string& tag,
                         std::string* capturedStderr = nullptr,
                         bool asan = false) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3188ctl_" + tag + "_" + std::to_string(std::rand());
+    std::string stem = "bz3188ctl_" + tag + "_" + unique_stem("");
     TempFile3188 sSrc((dir / (stem + ".bzl")).string());
     TempFile3188 sExe((dir / stem).string());
     TempFile3188 sErr((dir / (stem + ".err")).string());

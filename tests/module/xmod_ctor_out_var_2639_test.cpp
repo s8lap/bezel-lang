@@ -120,6 +120,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -178,7 +180,7 @@ const char* kLib2639 =
 int runImported2639(const std::string& mainBody, const std::string& moduleTag) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz2639_" + moduleTag + "_" + std::to_string(std::rand());
+    std::string stem = "bz2639_" + moduleTag + "_" + unique_stem("");
 
     TempFile2639 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2639 aObj((dir / (stem + "_a.o")).string());

@@ -48,6 +48,8 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -85,7 +87,7 @@ struct ImportRun3177N {
 ImportRun3177N importCompileAndRun3177N(const std::string& libSrc,
                                         const std::string& appSrc) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3177n_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3177n_");
     TempFile3177N aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3177N aObj((dir / (stem + "_a.o")).string());
     writeSource3177N(aSrc.path, libSrc);
@@ -98,7 +100,7 @@ ImportRun3177N importCompileAndRun3177N(const std::string& libSrc,
     TempFile3177N bExe((dir / stem).string());
     writeSource3177N(bSrc.path, appSrc);
     std::string errPath =
-        (dir / ("bz3177n_err_" + std::to_string(std::rand()) + ".txt")).string();
+        (dir / ("bz3177n_err_" + unique_stem("") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);
@@ -142,14 +144,14 @@ ImportRun3177N importCompileAndRun3177N(const std::string& libSrc,
 // The single-module twin: compile with stderr captured, run if it compiled.
 ImportRun3177N localCompileAndRun3177N(const std::string& src) {
     auto dir = fs::temp_directory_path();
-    std::string stem = "bz3177n_loc_" + std::to_string(std::rand());
+    std::string stem = unique_stem("bz3177n_loc_");
     TempFile3177N sFile((dir / (stem + ".bzl")).string());
     TempFile3177N eFile((dir / stem).string());
     writeSource3177N(sFile.path, src);
     ImportRun3177N r;
     r.dependencyCompiled = true;  // no dependency in the local twin
     std::string errPath =
-        (dir / ("bz3177n_lerr_" + std::to_string(std::rand()) + ".txt")).string();
+        (dir / ("bz3177n_lerr_" + unique_stem("") + ".txt")).string();
     std::fflush(stderr);
     std::cerr.flush();
     int saved = ::dup(STDERR_FILENO);

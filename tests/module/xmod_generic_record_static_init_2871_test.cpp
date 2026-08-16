@@ -66,6 +66,8 @@
 
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
+#include "support/unique_stem.hpp"
+
 
 namespace bezel::module {
 namespace {
@@ -91,7 +93,7 @@ int runXmod2871(const std::string& stem, const std::string& aSrcText,
                 const std::string& bSrcText) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string tag = stem + "_" + std::to_string(std::rand());
+    std::string tag = stem + "_" + unique_stem("");
     TempFile2871 aSrc((dir / (tag + "_a.bzl")).string());
     TempFile2871 aObj((dir / (tag + "_a.o")).string());
     write2871(aSrc.path, aSrcText);
@@ -118,7 +120,7 @@ int runXmod2871(const std::string& stem, const std::string& aSrcText,
 int runSingle2871(const std::string& stem, const std::string& srcText) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
-    std::string tag = stem + "_" + std::to_string(std::rand());
+    std::string tag = stem + "_" + unique_stem("");
     TempFile2871 src((dir / (tag + ".bzl")).string());
     TempFile2871 exe((dir / (tag + "_x")).string());
     write2871(src.path, srcText);
