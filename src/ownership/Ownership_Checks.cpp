@@ -3856,6 +3856,36 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
     return nullptr;
 }
 
+// Defined further down alongside `awaitTaskKind` — the §30.5 producer-side
+// class gate that separates Pattern A/B from the no-obligation value forms.
+static bool taskResultArgIsClass(const sema::TypeRef* arg);
+
+// True when `rt` is a §30.5 **Pattern A** task type: `Task<T>` for class T (the
+// shared-borrow container). `Task` (unit), `Task<int>` and `OwningTask<T>`
+// (Pattern B) are all false. Mirrors `awaitTaskKind`'s Named/head/class-arg
+// test, but on a declared TYPE rather than an await operand — the indirect-
+// escape diagnostic below needs it for the escaping borrow's SOURCE local and
+// for the enclosing method's declared return type, neither of which is an
+// await expression. // per §30.5
+static bool isPatternATaskType(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->nullable)
+        return false;
+    if (rt->headName() != "Task") return false;
+    if (rt->genericArgs.empty()) return false;
+    return taskResultArgIsClass(rt->genericArgs.front());
+}
+
+// The declared type of a local or parameter symbol, or null for any other
+// symbol kind / an un-ascribed binding whose type was never inferred. Only the
+// two binding kinds that can source a borrow in a method body are handled.
+static const sema::TypeRef* symbolTypeRef(const sema::Symbol* sym) {
+    if (auto* ls = dynamic_cast<const sema::LocalSymbol*>(sym))
+        return ls->declType;
+    if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(sym))
+        return ps->resolvedDeclType;
+    return nullptr;
+}
+
 void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
     // §28.9 / §9.7 indirect form: `return holder;` where `holder` is a bare
     // local whose tracked borrow-source aliases a still-owned scope-bound
@@ -4013,6 +4043,36 @@ void MethodOwnership::checkIndirectEscapeOnReturn(const ast::Expr& e) {
             "arm body (the runtime disposes it after the arm completes), so "
             "it may not escape the arm (§31.1; copy the data you need out of "
             "it — e.g. its message — into an owned value instead)");
+        return;
+    }
+    // §30.5 (#3102): the ASYNC shape of this escape has its own remedy, and it
+    // is not the generic one below. When the escaping borrow's source is a
+    // Pattern A `Task<T>` local and the enclosing method itself returns a
+    // Pattern A `Task<U>`, the author wrote the NON-CHAINED spelling —
+    //
+    //     using var task := C.P(); var cfg := await task; return cfg;
+    //
+    // — of a flow §30.5 admits only in its **chained slot** form, `return await
+    // task;` (kind 2): there ownership of the source task transfers into the
+    // outer task's chained slot, the outer task's teardown disposes it, and the
+    // borrowed result therefore outlives this frame. "Bind the source in the
+    // caller's scope" is the §28.9/§9.7 advice for an ordinary aliasing value;
+    // here it is both unnecessary (no caller-side change is needed) and
+    // misleading (the caller cannot make a frame-local task outlive the frame).
+    // Fork only the remedy clause — the "carries a borrow of X whose source is
+    // disposed at scope end" diagnosis is identical and stays verbatim.
+    // // per §30.5 kind 2, v0.249
+    if (isAsync_ && isPatternATaskType(symbolTypeRef(st->source->sym)) &&
+        returnType_ && isPatternATaskType(ctx_.resolvedType(*returnType_))) {
+        report(
+            Severity::Error, id->span.begin,
+            std::string("returned `") + std::string(id->name) +
+            "` carries a borrow of `" + std::string(srcName) +
+            "` whose source is disposed at scope end — write `return await " +
+            std::string(srcName) +
+            ";` instead: the Pattern A chained slot (§30.5 kind 2) moves the "
+            "source task into the returned task, whose teardown disposes it, "
+            "so the borrowed result outlives this frame");
         return;
     }
     report(
