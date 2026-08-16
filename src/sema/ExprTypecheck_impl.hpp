@@ -438,6 +438,19 @@ private:
     // for the §22.8 rule that initializers may not observe instance
     // state (`this`, `base`, instance members).
     bool inFieldInitializer_ = false;
+    // fix #3227 (§22.10 / §22.5 / §22.8 step 0, v0.254): true while walking a
+    // primary-ctor parameter's `:= Expr` default. The default may read earlier
+    // primary-ctor parameters (§22.5 "Permitted default-value expressions"),
+    // and those references resolve against the SAME object instance — the
+    // captured parameter is consumed BY the default's evaluation, not consumed
+    // and routed onward as an init field's value (the §22.8 case `inFieldInitializer_`
+    // covers). The §22.10 capture-iff-used rule below routes the reference
+    // to `posParamBodyRef` (capture the parameter as a field) rather than
+    // `posParamInitRef` (consume into an init field), so an earlier parameter
+    // referenced ONLY inside a later default still becomes a real captured
+    // field slot. Distinct from `inFieldInitializer_` so the §22.8 instance-
+    // member gate (this/base/instance field) still fires inside defaults.
+    bool inPrimaryCtorDefault_ = false;
     // §10.6 (#772): true while typechecking the arm guards/bodies of a `case`
     // whose scrutinee is an enum (the scope into which that enum's constants are
     // injected). Gates the bare-enum-constant exprType attachment so it applies

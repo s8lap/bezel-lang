@@ -141,16 +141,100 @@ BEZEL_TEST(primary_ctor_param_default_local_3202,
         "end Main; end C;"), 0);
 }
 
-// T5 — gap, deferred to #3227. The spec-prescribed case — a primary-ctor
-// parameter's default expression referencing an EARLIER parameter on the
-// SAME list (`B := A + 1`) — requires a separate capture-iff-in-default
-// sema pass: the `posParamBodyRef` capture-iff-used rule
-// (`src/sema/ExprTypecheck_Exprs.cpp:1097`) only fires when the parameter is
-// referenced in a field initializer or a method body, not when referenced
-// only inside a later parameter's default. The codegen half of #3202
-// evaluates the default with `currentThis_ = obj`, expecting the
-// referenced earlier param to resolve through `implicitFieldAddr` to a
-// captured field slot — but the capture never happens, so the identifier
-// resolves to nothing and the read errors. Tracked at
-// https://github.com/s8lap/bezel-lang/issues/3227. Re-add the case here
-// when #3227 closes.
+// T5 — fix #3227 (§22.10 / §22.5 "Permitted default-value expressions" /
+// §22.8 step 0; spec v0.254): a §22.10 primary-ctor parameter's DEFAULT
+// expression may reference an EARLIER parameter on the SAME list — the
+// spec example is `class W(A: int, B: int := A + 1)`. The earlier
+// parameter is read by the default's evaluation (which runs against the
+// partially-constructed object), so it must be captured as a real field
+// slot the default can dereference — `posParamBodyRef=true`. Pre-fix,
+// the defaultValue walk set `inFieldInitializer_=true` for the entire
+// visit, so the §22.10 capture-iff-used rule set `posParamInitRef=true`
+// (init-position consumption) instead of `posParamBodyRef=true` (capture)
+// for the EARLIER parameter when it appeared ONLY inside the LATER
+// parameter's default. The earlier parameter's slot was then either
+// absent (storage predicate `isInstanceFieldStorageSymbol` returned false
+// for it) or, on the `owned` arm, captured-but-not-disposed
+// (`isCapturedOwnedPrimaryParam` rejected the slot because of
+// `posParamInitRef`, leaking the owned value — #3205 family). The fix:
+// a separate `inPrimaryCtorDefault_` flag gates the §22.10 rule so the
+// default visit takes the body-position arm (`posParamBodyRef=true`)
+// while keeping `inFieldInitializer_=true` for the §22.8 instance-
+// member gate. The codegen path is unchanged — `storePrimaryCtorPositionalArgs`
+// already evaluated defaults with `currentThis_=obj` (line ~2807,
+// #3202's local-twin) and `implicitFieldAddr` reads the captured slot.
+BEZEL_TEST(primary_ctor_param_default_local_3202,
+           default_reads_earlier_param_on_same_list_spec_22_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M;"
+        "public class W(A: int, B: int := A + 1)"
+        "  public method Total(): int return A + B; end Total;"
+        "end W;"
+        "class C public static method Main(): int"
+        "  using var w := new W(10);"
+        "  if w.Total() <> 21 then return 1; end;"
+        "  return 0;"
+        "end Main; end C;"), 0);
+}
+
+// T5b — the §22.5 "Permitted default-value expressions" shape, with the
+// EARLIER parameter also referenced in a method body (so the spec's
+// ordinary capture path also fires). The default reads `A`, the body
+// reads `A` AND `B`. After #3227 the default visit sets
+// `posParamBodyRef=true` for A (it would already have been true via the
+// body's `return A + B`), but the test exists to pin the dual path:
+// A must read correctly via the captured slot, and B must read the
+// default-derived value (10 + 1 = 11) via the captured slot. A fix that
+// captured ONLY through the body path (silently dropping the default
+// visit's contribution) would still pass T5 if the body happened to read
+// A, but T5b pins the defaultValue-only path with the same body shape.
+BEZEL_TEST(primary_ctor_param_default_local_3202,
+           default_reads_earlier_param_with_body_reference_spec_22_5) {
+    BEZEL_EXPECT_EQ(run(
+        "module M;"
+        "public class W(A: int, B: int := A + 1)"
+        "  public method GetA(): int return A; end GetA;"
+        "  public method GetB(): int return B; end GetB;"
+        "end W;"
+        "class C public static method Main(): int"
+        "  using var w := new W(10);"
+        "  if w.GetA() <> 10 then return 2; end;"
+        "  if w.GetB() <> 11 then return 3; end;"
+        "  return 0;"
+        "end Main; end C;"), 0);
+}
+
+// T5c — #3227's §22.10 OWNED case. `owned A: Res` referenced ONLY in a
+// later parameter's default (`B := A.v`) — A is NEVER read in any method
+// body — was pre-fix treated as init-consumed (`posParamInitRef=true`)
+// because the defaultValue walk set `inFieldInitializer_=true` for the
+// entire visit, so `isCapturedOwnedPrimaryParam` (`!posParamInitRef`
+// arm) returned false and `emitOwnedFieldDisposals` skipped A's slot —
+// the owned `Res` leaked (LSan-measurable #3205 family). After #3227,
+// A's defaultValue-only visit takes the body arm and the disposal walker
+// picks up the slot. The test exercises the path: an UNDER-SUPPLIED
+// call (`new W(new Res(10))`) forces B's default evaluation, the default
+// reads `A.v` through the captured slot, and `w`'s destructor must run
+// the owned-field cascade to dispose `A`. A successful run under
+// `runAotChecked` (= runAot + LeakSanitizer) means no leak on either
+// Res. A pre-fix #3227 run reports an LSan leak on the Res object
+// (r.ran goes false). // per §22.10, v0.254
+BEZEL_TEST(primary_ctor_param_default_local_3202,
+           owned_earlier_param_referenced_only_in_default_no_leak_spec_22_10) {
+    auto r = bezel::test::runAotChecked(
+        "module M;"
+        "class Res "
+        "  public v: int := 0; "
+        "  public constructor(x: int) v := x; end constructor; "
+        "end Res; "
+        "public class W(owned A: Res, B: int := A.v) "
+        "  public method GetB(): int return B; end GetB; "
+        "end W; "
+        "class C public static method Main(): int "
+        "  using var w := new W(new Res(10)); "
+        "  if w.GetB() <> 10 then return 1; end; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(0, r.exitCode);
+}

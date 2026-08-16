@@ -8905,9 +8905,12 @@ void ExprTC::visitTopDecl(const ast::TopDecl& d) {
                 for (const auto& pf : td->positionalFields) {
                     if (pf.defaultValue) {
                         bool saveIFI = inFieldInitializer_;
+                        bool savePCD = inPrimaryCtorDefault_;
                         inFieldInitializer_ = true;
+                        inPrimaryCtorDefault_ = true;
                         visitExpr(*pf.defaultValue);
                         inFieldInitializer_ = saveIFI;
+                        inPrimaryCtorDefault_ = savePCD;
                     }
                 }
                 currentScope_ = saveScope;

@@ -1109,11 +1109,35 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // body). An `owned` such parameter used only in bodies is captured
             // as an owned field disposed by the generated Dispose (§28.4); this
             // classification drives that decision in codegen.
+            //
+            // fix #3227 (§22.10 / §22.5, v0.254): the "later default" case —
+            // a §22.5 default-value expression of one parameter that reads an
+            // EARLIER parameter on the same list (`B := A + 1`). The default
+            // is visited with `inFieldInitializer_=true` so the §22.8 instance-
+            // member gate still fires, BUT the earlier parameter is NOT consumed
+            // by an init field or base-call argument — it is read by the
+            // default's evaluation, which runs against the same object instance
+            // (`currentThis_ = obj` in codegen) and sees the parameter through
+            // its captured field slot. Capture it: set `posParamBodyRef` (NOT
+            // `posParamInitRef`), matching the body-position shape. Without
+            // this, an earlier parameter used ONLY in a later default gets
+            // `posParamInitRef=true` / `posParamBodyRef=false`, so:
+            //   * `isCapturedOwnedPrimaryParam` (`!posParamInitRef` arm) reports
+            //     false → the `owned` half is treated as init-consumed and the
+            //     generated Dispose skips the slot → a LEAK for `owned` earlier
+            //     params;
+            //   * `isInstanceFieldStorageSymbol` reports false → the §9.8
+            //     serializer's captured-component census silently drops the
+            //     parameter;
+            //   * the §22.10 "Referenced only in field initializers" enumeration
+            //     case fires where the spec's body-position rule should.
             if (auto* pfs = dynamic_cast<FieldSymbol*>(sym)) {
                 if (pfs->posParam && pfs->parent &&
                     pfs->parent->kind == ast::TypeDeclKind::Class) {
-                    if (inFieldInitializer_) pfs->posParamInitRef = true;
-                    else                     pfs->posParamBodyRef = true;
+                    if (inFieldInitializer_ && !inPrimaryCtorDefault_)
+                        pfs->posParamInitRef = true;
+                    else
+                        pfs->posParamBodyRef = true;
                 }
             }
             // per §14.1 / §22.12 (issue #520): when the identifier is a
