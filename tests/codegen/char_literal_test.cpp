@@ -10,11 +10,23 @@
 #include "driver/Driver.hpp"
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
 
 namespace {
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDirCg32() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-cg32");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 int run(const std::string& body) {
     auto r = runAot(
@@ -24,9 +36,8 @@ int run(const std::string& body) {
 }
 
 std::string compileAndCapture(const std::string& source) {
-    static int counter = 0;
-    auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_cg32_" + std::to_string(counter++);
+    auto dir = wtDirCg32();
+    std::string stem = unique_stem("bezel_cg32");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     { std::ofstream out(src); out << source; }
