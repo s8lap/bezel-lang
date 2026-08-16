@@ -5424,7 +5424,16 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
     if (!ma || !ma->target) return nullptr;
 
     const std::string_view m = ma->member;
-    if (m != "ToArray" && m != "Contains" && m != "ToString") return nullptr;
+    // #3091 (§15.1.2 v0.249): an inline-array `a.Equals(b)` and
+    // `a.GetHashCode()` must lower through §15.1.2's structural equality and
+    // hash-combining rules, exactly as the `=` operator already does at
+    // LlvmBackend_Exprs.cpp ~L8520. Before this fix the methods fell through to
+    // a generic dispatch that returned a constant 0 / false (no inline-array
+    // member existed), so two equal inline arrays compared unequal and the
+    // hash was unconditionally 0 — the structural-equality / hashable
+    // contract of §3.6 (auto-hashable), §8.3 and §15.1.2 was silently broken.
+    if (m != "ToArray" && m != "Contains" && m != "ToString" &&
+        m != "Equals" && m != "GetHashCode") return nullptr;
 
     const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
     if (!recvTy || recvTy->kind != sema::TypeRef::Kind::InlineArray) return nullptr;
@@ -5600,6 +5609,74 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
         phi->addIncoming(builder_.getTrue(),  foundBB);
         phi->addIncoming(builder_.getFalse(), condBB);
         return phi;
+    }
+
+    // -----------------------------------------------------------------------
+    // Equals(other): structural equality on the whole array (§15.1.2 v0.249,
+    // #3091). The argument must be the same inline-array type; sema enforces
+    // the constraint, here we assume it. Two arrays are equal iff every
+    // element-pair compares equal under the element type's equality (§8.3,
+    // §9.2). Reuses emitInlineArrayEquality — the same helper the `=` operator
+    // dispatches to (LlvmBackend_Exprs.cpp ~L8520) — so the two paths cannot
+    // diverge on a corner case (e.g. a nested inline array, a string slot).
+    // Both sides need to be the loaded ArrayType VALUE (CreateExtractValue,
+    // which emitInlineArrayEquality uses to read slots, requires the SSA value,
+    // not a pointer).
+    // -----------------------------------------------------------------------
+    if (m == "Equals" && call.args.size() == 1 && call.args[0].value) {
+        // Receiver: already lowered above as arrAddr (lvalue) or spilled to
+        // an alloca (rvalue) — same path as ToArray/Contains above. Load the
+        // value from the address.
+        llvm::Value* lhsVal = builder_.CreateLoad(arrTy, arrAddr, "iae.l");
+
+        // Argument: same lowering shape — lvalue first, spill to alloca if
+        // the call site is a computed expression (e.g. method return).
+        llvm::Value* otherRaw = lowerExpr(*call.args[0].value);
+        if (!otherRaw) return nullptr;
+        llvm::Value* rhsVal = nullptr;
+        if (otherRaw->getType()->isArrayTy() &&
+            otherRaw->getType() == arrTy) {
+            rhsVal = otherRaw;  // already an ArrayType value
+        } else if (otherRaw->getType()->isPointerTy()) {
+            // Pointer-shaped (lvalue / spilled temporary): load.
+            rhsVal = builder_.CreateLoad(arrTy, otherRaw, "iae.r");
+        } else {
+            return nullptr;
+        }
+        // §15.1.2: equality by element, in slot order, no special cases.
+        // Returns i1 (true = equal). The pre-fix path returned a constant
+        // false (no member recognised at all), which is what made two
+        // equal inline arrays compare unequal.
+        return emitInlineArrayEquality(lhsVal, rhsVal, arrTy, elemRef);
+    }
+
+    // -----------------------------------------------------------------------
+    // GetHashCode(): combine slot hashes with the §9.1 record-style
+    // combiner (h = h*31 + slotHash), seeded with 17 — the same recipe
+    // emitValueHashCode uses for a field-typed inline array
+    // (LlvmBackend_String.cpp ~L3925), so a record containing an inline
+    // array field hashes identically with the field extracted and hashed
+    // in isolation. The pre-fix path returned a constant 0.
+    // -----------------------------------------------------------------------
+    if (m == "GetHashCode" && call.args.empty()) {
+        // Empty inline arrays are not a valid type (§15.1 — `[0]T` is a
+        // compile error), so N >= 1 always. Seed = 17 (non-zero per §8.3
+        // hashable contract), then h = h*31 + elemHash for each slot, the
+        // same recipe emitValueHashCode uses for a field-typed inline
+        // array (LlvmBackend_String.cpp ~L3925) and the record-hash combiner
+        // (§9.1/§9.2) — so a record containing an inline-array field
+        // hashes identically with the field extracted and hashed in
+        // isolation, and the `a.Equals(b)` ↔ `a.GetHashCode() = b.GetHashCode()`
+        // invariant holds (equal arrays hash equal).
+        llvm::Value* lhsVal = builder_.CreateLoad(arrTy, arrAddr, "iah.l");
+        llvm::Value* h = builder_.getInt32(17);
+        for (unsigned i = 0; i < arrTy->getNumElements(); ++i) {
+            llvm::Value* ei = builder_.CreateExtractValue(lhsVal, {i}, "iah.e");
+            llvm::Value* eh = emitValueHashCode(ei, elemRef);
+            h = builder_.CreateAdd(
+                builder_.CreateMul(h, builder_.getInt32(31)), eh, "iah.fold");
+        }
+        return h;
     }
 
     return nullptr;
