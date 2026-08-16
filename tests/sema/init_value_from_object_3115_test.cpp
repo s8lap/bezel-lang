@@ -28,16 +28,22 @@
 // pins).
 //
 // What this test pins:
-//   * REJECT: every value-typed target (`int`, `bool`, `char`, `byte`,
-//     long, `decimal`, `string` (a reference type that the brief
-//     explicitly includes), `DateTime`, a user record, a user enum, a
-//     user choice, an interface), at LOCAL-INIT, ASSIGNMENT, CALL-ARG,
-//     and RETURN positions. Pre-fix each compiled clean and degraded to
-//     a garbage value (silent-accept class — the worst defect shape).
+//   * REJECT (LocalDecl position, value-typed target):
+//       - `int`, `string` (reference-typed), `DateTime`, user record
+//         (`Point`), user enum (`Color`), user choice (`Shape`),
+//         interface-typed target (`IFoo` via class carrier).
+//       - All seven primitive target kinds: `int`, `bool`, `char`,
+//         `byte`, `long`, `decimal`, `string`. Each proves the gate
+//         fires for Primitive-kind `to` regardless of width.
+//   * REJECT (Assignment position): `i := o;` for an `int` target.
+//   * REJECT (Return position): `return o;` for an `int` method.
+//   * REJECT (Call-arg position): passing `o` to a `Foo(int)` parameter.
+//     Proves the gate is NOT LocalDecl-only — a regression to a
+//     LocalDecl-only fix would otherwise slip through.
 //   * ACCEPT-CONTROLS: the legitimately-allowed conversions stay
-//     admitted — `null → T?`, `T → Object` (boxing), constant narrowing,
-//     direct primitive initialization, narrowed `T?` reaching `T`,
-//     generic substitutions where `T` is a value-type parameter.
+//     admitted — `null → T?` (any nullable target), `null → T` (the
+//     existing §7 diagnostic, NOT the new §5.1 message), `T → Object`
+//     (boxing), direct primitive initialization, primitive widening.
 //
 // Each test asserts on diagnostic TEXT — `coarse rejects()` cannot
 // distinguish a genuine compile error from a codegen ICE, and the §5.1
@@ -324,6 +330,190 @@ BEZEL_TEST(sema_init_value_from_object_3115,
         "  public static method Main(): int "
         "    var o: Object := 42; "
         "    return o; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
+}
+
+// =====================================================================
+// §3 / issue #3115 — REJECT: an Object initializer into a Named-kind
+// target (user record / user enum / user choice / interface). The fix's
+// predicate fires on `from Primitive(Object)` regardless of `to`'s kind
+// (Primitive OR Named), so these cases must all reject — pre-fix they
+// were silent-accept. Without these, a regression that narrows the gate
+// to fire only on Primitive-kind `to` (the cheapest implementation
+// choice) would pass the existing primitive-target suite.
+// =====================================================================
+
+BEZEL_TEST(sema_init_value_from_object_3115,
+           object_into_user_record_local_rejected_spec_3_5_1) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Point(X: int, Y: int); "
+        "class C "
+        "  public static method Main(): int "
+        "    var o: Object := 42; "
+        "    var p: Point := o; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
+}
+
+BEZEL_TEST(sema_init_value_from_object_3115,
+           object_into_user_enum_local_rejected_spec_3_5_1) {
+    auto r = parseSemaAll(
+        "module M; "
+        "enum Color: Red, Green, Blue; "
+        "class C "
+        "  public static method Main(): int "
+        "    var o: Object := 42; "
+        "    var c: Color := o; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
+}
+
+BEZEL_TEST(sema_init_value_from_object_3115,
+           object_into_user_choice_local_rejected_spec_3_5_1) {
+    auto r = parseSemaAll(
+        "module M; "
+        "choice Shape: Circle(int), Square(int); "
+        "class C "
+        "  public static method Main(): int "
+        "    var o: Object := 42; "
+        "    var s: Shape := o; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
+}
+
+BEZEL_TEST(sema_init_value_from_object_3115,
+           object_into_interface_target_local_rejected_spec_3_5_1) {
+    // The `o` source carries a class type (`A`) that implements the
+    // target interface `IFoo`. Pre-fix the unchecked downcast admitted
+    // this and the first method call on the target saw instance
+    // confusion; the fix rejects the assignment outright.
+    auto r = parseSemaAll(
+        "module M; "
+        "interface IFoo: M(): void; end interface; "
+        "class A: implements IFoo; "
+        "  public method M(): void => end method; "
+        "end A; "
+        "class C "
+        "  public static method Main(): int "
+        "    var a := new A; "
+        "    var o: Object := a; "
+        "    var f: IFoo := o; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
+}
+
+// =====================================================================
+// §3 / issue #3115 — REJECT: every Primitive-kind target width must
+// reject. The brief listed `int`, `bool`, `char`, `byte`, `long`,
+// `decimal`, `string`. The existing suite covers `int` (init / assign
+// / return), `string`, `DateTime`. The remainder are pinned here so a
+// regression that narrows the gate to "only `int` Primitive target"
+// (a tempting optimization) is caught.
+// =====================================================================
+
+BEZEL_TEST(sema_init_value_from_object_3115,
+           object_into_bool_local_rejected_spec_3_5_1) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var o: Object := 42; "
+        "    var b: bool := o; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
+}
+
+BEZEL_TEST(sema_init_value_from_object_3115,
+           object_into_char_local_rejected_spec_3_5_1) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var o: Object := 42; "
+        "    var ch: char := o; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
+}
+
+BEZEL_TEST(sema_init_value_from_object_3115,
+           object_into_byte_local_rejected_spec_3_5_1) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var o: Object := 42; "
+        "    var by: byte := o; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
+}
+
+BEZEL_TEST(sema_init_value_from_object_3115,
+           object_into_long_local_rejected_spec_3_5_1) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var o: Object := 42; "
+        "    var l: long := o; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
+}
+
+BEZEL_TEST(sema_init_value_from_object_3115,
+           object_into_decimal_local_rejected_spec_3_5_1) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var o: Object := 42; "
+        "    var d: decimal := o; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
+}
+
+// =====================================================================
+// §3 / issue #3115 — REJECT: CALL-ARG position. The fix lives in
+// `checkAssignable`, which is the assignment-context gate every
+// initializer, assignment, return, AND call argument pass through.
+// Pinning this case proves the gate fires at call sites — a regression
+// to "fix only the LocalDecl path" (e.g. patching `lowerLocalDecl`
+// instead of the upstream checkAssignable) would slip past the
+// existing suite.
+// =====================================================================
+
+BEZEL_TEST(sema_init_value_from_object_3115,
+           object_as_call_arg_to_int_param_rejected_spec_3_5_1) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Helper "
+        "  public static method TakeInt(x: int): int => x; "
+        "end Helper; "
+        "class C "
+        "  public static method Main(): int "
+        "    var o: Object := 42; "
+        "    var v := Helper.TakeInt(o); "
+        "    return v; "
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(hasError(r, kIssue3115Diag));
