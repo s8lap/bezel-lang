@@ -1006,15 +1006,8 @@ bool serializationComponentTypeIsEmittable(const TypeRef* ty);
 // unbacked across a module boundary, and this walk is what backs it.
 bool serializationSurfaceIsEmittable(const TypeSymbol* t, const SemaContext& ctx);
 
-// §9.2 / §22.9: a member is an *auto-property* (`Name: T;`, optionally with an
-// initializer, no accessor bodies / arrow getter) — backed by compiler-
-// generated storage, exactly like a field. Indexers and static properties are
-// excluded. Shared by sema and codegen so both agree on what counts as
-// auto-property storage.
-bool isAutoPropertySymbol(const Symbol* m);
-
 // §9.2 / §22.9 / §2.8.2 clause 1 (umbrella #3152): the BOTH-SOURCES twin of
-// `isAutoPropertySymbol`. That predicate reads `ast::PropertyDecl::bodyKind`
+// `hasAstAutoPropertyDecl`. That predicate reads `ast::PropertyDecl::bodyKind`
 // off `ps->decl`, which is null for EVERY imported property (ModuleLoader has
 // no AST for a dependency's types), so it answers "not auto-property storage"
 // for an imported auto-property — a silent wrong answer, not a null-deref.
