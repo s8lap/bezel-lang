@@ -8234,10 +8234,35 @@ bool ExprTC::narrowFromTypeTest(const ast::Expr* cond, bool forTrueBranch) {
         return d->kind == TypeRef::Kind::Named && d->declaration &&
                d->declaration->kind == ast::TypeDeclKind::Interface;
     };
+    // fix #3122 (§12.7, v0.252): the declaration-less Named TypeRef shape a
+    // value-builtin ANNOTATION resolves to is also the shape of a bare type
+    // PARAMETER (`T` in `Box<T>`, #3092). The two cases are distinguished by
+    // NAME, not by shape — `valueBuiltinBoxNameStr` in codegen recognises the
+    // five boxable value-builtin names across the three TypeRef spellings
+    // (#1945/#2809). Sema needs the same name set to admit narrowing for
+    // `DateTime` / `TimeSpan` / `DateOnly` / `TimeOnly` / `Guid` while still
+    // excluding a bare `T`; without this the copy-out emits malformed IR
+    // (loudly, not silently) because the narrowed read falls through to the
+    // declared `Object`'s permissive acceptance (#605/#3115). Codegen's
+    // #3090 unbox path already handles value-builtins — `isBoxableValueType`
+    // returns true via `valueBuiltinBoxName`, `boxValue` stores the payload at
+    // the standard two-word offset, and `narrowedBoxPayloadAddr` reads from
+    // it — so sema widening the gate here is the only change needed.
+    auto isBoxableValueBuiltin = [](std::string_view n) {
+        return n == "DateTime" || n == "TimeSpan" ||
+               n == "DateOnly" || n == "TimeOnly" ||
+               n == "Guid";
+    };
     bool narrowable = false;
     switch (tt->kind) {
         case TypeRef::Kind::Named:
-            narrowable = tt->declaration != nullptr;
+            // Either a declaration-bearing Named (record / enum / value-builtin
+            // through its builtinClassSym shape) or a declaration-less annotation
+            // / imported spelling whose head names one of the five boxable
+            // value-builtins. A bare type parameter (`T` whose `headName()` is
+            // anything else) stays excluded — #3092's distinct defect.
+            narrowable = tt->declaration != nullptr ||
+                         isBoxableValueBuiltin(tt->headName());
             break;
         case TypeRef::Kind::Primitive:
             // `x is Object` narrows nothing (every value is an Object), and
