@@ -47,7 +47,7 @@
 2    src/module/ModuleLoader.cpp
 9    src/module/ModuleMetadataBuilder.cpp
 5    src/ownership/Ownership.cpp
-4    src/ownership/Ownership_Checks.cpp
+3    src/ownership/Ownership_Checks.cpp
 1    src/sema/DefiniteAssignment.cpp
 1    src/sema/EntryPoint.cpp
 10   src/sema/ExprTypecheck.cpp

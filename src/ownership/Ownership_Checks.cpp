@@ -9476,11 +9476,15 @@ bool MethodOwnership::isUnboundOwnedTempArg(const ast::Expr& arg) {
     if (!ce || !ce->callee) return false;
     auto* ms =
         dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*ce->callee));
-    const auto* md = ms ? dynamic_cast<const ast::MethodDecl*>(ms->decl)
-                         : nullptr;
-    if (!md) return false;
+    if (!ms) return false;
+    // fix #3149 family: read `static` off `MethodSymbol::modifiers` (populated
+    // by `SymbolCollection` for a local member and by `ModuleLoader` from
+    // `MetaMember::modifiers` for an import) — `ms->decl` is null for every
+    // imported method and the AST-cast arm silently said "not static" for an
+    // imported static factory, leaving its `using var` ownership registration
+    // missing the §28.3 admission.
     bool isStatic = false;
-    for (std::string_view mod : md->modifiers)
+    for (std::string_view mod : ms->modifiers)
         if (mod == "static") { isStatic = true; break; }
     if (!isStatic) return false;
     // A builtin iterator/async-iterator interface or Task-family type
