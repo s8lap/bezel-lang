@@ -34,18 +34,29 @@
 #include <sys/wait.h>
 
 #include "driver/Driver.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir941() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-941");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // Compile `source` to a temp native executable via the real Driver and run it;
 // returns the exit code, or -1 on compile/link/run failure.
 int compileAndRun(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_941_" + std::to_string(counter++);
+    auto dir = wtDir941();
+    std::string stem = unique_stem("bezel_941");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {
@@ -72,9 +83,8 @@ void expectValue941(const std::string& source, int expected) {
 
 // §30.3 (v0.162 / #1362): compile returns true when it fails (error emitted).
 bool compileFails941(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_941_neg_" + std::to_string(counter++);
+    auto dir = wtDir941();
+    std::string stem = unique_stem("bezel_941_neg");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {

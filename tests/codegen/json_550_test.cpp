@@ -46,6 +46,7 @@
 #include "support/Diagnostic.hpp"
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
@@ -70,9 +71,21 @@ bool compileFails(const std::string& src) {
 // §2.15: requires explicit import.
 const char* kImport = "import System.Serialization; ";
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDirJson() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-json");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // ---------------------------------------------------------------------------
 // AOT round-trip + ASan helper (lane-local rt object per mandatory memory
-// discipline: /tmp/wt-json/rt_asan.o — not /tmp/bezel_rt_asan_memoized.o).
+// discipline: lane-local path under /var/tmp/bezel-scratch/wt-json/ — not
+// shared /tmp/bezel_rt_asan_memoized.o).
 // ---------------------------------------------------------------------------
 static std::string laneLocalAsanObject() {
     // Build lane-local ASan runtime once per process.
@@ -81,7 +94,7 @@ static std::string laneLocalAsanObject() {
     if (attempted) return cached;
     attempted = true;
 
-    std::string rtObj = "/tmp/wt-json/rt_asan.o";
+    std::string rtObj = (wtDirJson() / "rt_asan.o").string();
     // #1414: build the combined (ld -r) ASan runtime object at the lane-local path.
     if (!::bezel::native_test::buildRuntimeSanitizerObject("address", rtObj))
         return cached;  // leave empty → SKIP
@@ -96,9 +109,8 @@ int runUnderLeakSanitizerJson(const std::string& source, bool detectLeaks = true
     const std::string& rtObj = laneLocalAsanObject();
     if (rtObj.empty()) return -1;
 
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_json_lsan_" + std::to_string(counter++);
+    auto dir = wtDirJson();
+    std::string stem = unique_stem("bezel_json_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 

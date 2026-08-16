@@ -42,6 +42,7 @@
 #include "support/Diagnostic.hpp"
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
@@ -65,6 +66,17 @@ bool compileFails(const std::string& src) {
 // §2.15: requires explicit import.
 const char* kImport = "import System.Serialization; ";
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDirOpts() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-opts");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // ---------------------------------------------------------------------------
 // AOT / ASan helper for leak detection.
 // ---------------------------------------------------------------------------
@@ -73,7 +85,7 @@ static std::string laneLocalAsanObjectOpts() {
     static bool attempted = false;
     if (attempted) return cached;
     attempted = true;
-    std::string rtObj = "/tmp/wt-opts/rt_asan.o";
+    std::string rtObj = (wtDirOpts() / "rt_asan.o").string();
     // #1414: build the combined (ld -r) ASan runtime object at the lane-local path.
     if (!::bezel::native_test::buildRuntimeSanitizerObject("address", rtObj))
         return cached;  // leave empty → SKIP
@@ -85,9 +97,8 @@ int runUnderAsanOpts(const std::string& source, bool detectLeaks = true) {
     namespace fs = std::filesystem;
     const std::string& rtObj = laneLocalAsanObjectOpts();
     if (rtObj.empty()) return -1;
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_opts_lsan_" + std::to_string(counter++);
+    auto dir = wtDirOpts();
+    std::string stem = unique_stem("bezel_opts_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
     {

@@ -55,6 +55,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
@@ -65,10 +66,20 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir422linq() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-422linq");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 int compileAndRun(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_422linq_" + std::to_string(counter++);
+    auto dir = wtDir422linq();
+    std::string stem = unique_stem("bezel_422linq");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {
@@ -115,9 +126,8 @@ int lowerToObject(const std::string& source, const std::string& objPath) {
 int runUnderLeakSanitizer(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_422linq_lsan_" + std::to_string(counter++);
+    auto dir = wtDir422linq();
+    std::string stem = unique_stem("bezel_422linq_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
     if (lowerToObject(source, objPath) != 0) return -1;
@@ -155,9 +165,8 @@ void expectValueAndLeakFree(const std::string& source, int expectedExitCode) {
 bool runNoCorruption(const std::string& source, int expectedExitCode) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return true;  // toolchain unavailable: SKIP
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_422linq_safe_" + std::to_string(counter++);
+    auto dir = wtDir422linq();
+    std::string stem = unique_stem("bezel_422linq_safe");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
     if (lowerToObject(source, objPath) != 0) return true;  // SKIP

@@ -35,21 +35,31 @@
 #include <string>
 
 #include "driver/Driver.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir1622() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-1622");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // Write `source` to a temp .bzl file and compile it to `outExe` via the
 // executable path (Driver::compileFile). Returns the CompileResult. Removes the
 // source file; the caller removes `outExe` if it was created.
 bezel::CompileResult compileToExe(const std::string& source,
                                   const std::string& outExe) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string src =
-        (dir / ("bezel_1622_" + std::to_string(counter++) + ".bzl")).string();
+    auto dir = wtDir1622();
+    std::string src = (dir / ("bezel_1622_" + unique_stem("") + ".bzl")).string();
     {
         std::ofstream out(src);
         out << source;
@@ -65,10 +75,8 @@ bezel::CompileResult compileToExe(const std::string& source,
 // front-end-on-recovery-AST bug.
 bezel::CompileResult compileToObj(const std::string& source,
                                   const std::string& outObj) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string src =
-        (dir / ("bezel_1622_" + std::to_string(counter++) + ".bzl")).string();
+    auto dir = wtDir1622();
+    std::string src = (dir / ("bezel_1622_" + unique_stem("") + ".bzl")).string();
     {
         std::ofstream out(src);
         out << source;

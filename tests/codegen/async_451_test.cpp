@@ -30,6 +30,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
@@ -40,13 +41,23 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir451() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-451");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // Compile and run, returning {exit_code, run_wall_ms}.
 // run_wall_ms is the time spent executing the compiled binary only (excludes
 // compile time).  Returns {-1, -1} on compile/link failure.
 std::pair<int,long> compileAndRunTimed(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_async451_timed_" + std::to_string(counter++);
+    auto dir = wtDir451();
+    std::string stem = unique_stem("bezel_async451_timed");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     { std::ofstream out(src); out << source; }
@@ -70,9 +81,8 @@ std::pair<int,long> compileAndRunTimed(const std::string& source) {
 // Compile `source` to a temp native executable via the real Driver and run it.
 // Returns the process exit code, or -1 on compile/link/run failure.
 int compileAndRun(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_async451_" + std::to_string(counter++);
+    auto dir = wtDir451();
+    std::string stem = unique_stem("bezel_async451");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {
@@ -94,9 +104,8 @@ int compileAndRun(const std::string& source) {
 // True when source FAILS to compile (deferred-feature diagnostic fired).
 // Mirrors the compileFails() helper in async_test.cpp.
 bool compileFails(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_async451_neg_" + std::to_string(counter++);
+    auto dir = wtDir451();
+    std::string stem = unique_stem("bezel_async451_neg");
     std::string src  = (dir / (stem + ".bzl")).string();
     std::string exe  = (dir / stem).string();
     {

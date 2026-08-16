@@ -63,6 +63,7 @@
 #include "support/Diagnostic.hpp"
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
@@ -75,6 +76,17 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDirExcdisp() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-excdisp");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 int run(const std::string& program) {
     auto r = runAot(program);
     return r.ran ? r.exitCode : -999;
@@ -84,9 +96,8 @@ int run(const std::string& program) {
 // run it; returns the exit code, or -1 if compilation/link/run failed. Mirrors
 // free_on_dispose_test.cpp.
 int compileAndRun(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_excdisp_" + std::to_string(counter++);
+    auto dir = wtDirExcdisp();
+    std::string stem = unique_stem("bezel_excdisp");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {
@@ -115,9 +126,8 @@ int runUnderLeakSanitizer(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed
 
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_excdisp_lsan_" + std::to_string(counter++);
+    auto dir = wtDirExcdisp();
+    std::string stem = unique_stem("bezel_excdisp_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 

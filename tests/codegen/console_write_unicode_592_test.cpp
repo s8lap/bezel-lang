@@ -29,6 +29,7 @@
 
 #include "driver/Driver.hpp"
 #include "support/codegen_support.hpp"
+#include "support/unique_stem.hpp"
 #include "native_test_harness.hpp"
 #include "test_harness.hpp"
 
@@ -49,13 +50,23 @@
 
 namespace {
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir592() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-592");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // Compile `source` to a temp native executable via the Driver and capture its
 // stdout. Returns the raw captured bytes, or an empty string on failure.
 // Uses a stable per-test counter so concurrent runs produce distinct paths.
 std::string compileAndCapture(const std::string& source) {
-    static int counter = 0;
-    auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_592_" + std::to_string(counter++);
+    auto dir = wtDir592();
+    std::string stem = unique_stem("bezel_592");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     { std::ofstream out(src); out << source; }
@@ -83,9 +94,8 @@ int runUnderLeakSanitizer(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;
 
-    static int counter = 0;
-    auto dir = std::filesystem::temp_directory_path();
-    std::string stem = "bezel_592_lsan_" + std::to_string(counter++);
+    auto dir = wtDir592();
+    std::string stem = unique_stem("bezel_592_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe = (dir / stem).string();
 

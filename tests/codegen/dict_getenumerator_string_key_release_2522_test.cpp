@@ -48,6 +48,7 @@
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
@@ -59,6 +60,17 @@ using bezel::test::runAot;
 namespace {
 
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir2522() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-2522");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 // AOT MIGRATION (JIT->AOT): the AOT driver runs the full ownership +
 // definite-assignment pipeline. Most exit codes are bounded to 8 bits
@@ -77,9 +89,8 @@ int runUnderLeakSanitizer(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;
 
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_2522_lsan_" + std::to_string(counter++);
+    auto dir = wtDir2522();
+    std::string stem = unique_stem("bezel_2522_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 

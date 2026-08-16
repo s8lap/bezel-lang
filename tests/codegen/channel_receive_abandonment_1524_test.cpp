@@ -56,6 +56,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 #include "llvm/ExecutionEngine/Orc/ExecutionUtils.h"
@@ -118,16 +119,25 @@ int run(const std::string& src) {
 
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir1524() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-1524");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // AOT ASan probe (mirrors bounded_channel_809_test.cpp::runUnderAsan): emit an
 // object from `source`, compile the runtime under ASan, link, run with leak
 // detection. Returns 0 (clean), 1 (ASan/LSan hit — leak/double-free/UAF), or
 // -1 when clang++/the sub-compile is unavailable (infra skip, not a failure).
 int runUnderAsan(const std::string& source) {
     if (std::system("clang++ --version > /dev/null 2>&1") != 0) return -1;
-    static int counter = 0;
-    fs::path dir = "/var/tmp/bezel-scratch";
-    std::error_code ec; fs::create_directories(dir, ec);
-    std::string stem = "bezel_1524_asan_" + std::to_string(counter++);
+    auto dir = wtDir1524();
+    std::string stem = unique_stem("bezel_1524_asan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string rtObj   = (dir / (stem + "_rt.o")).string();
     std::string exe     = (dir / stem).string();

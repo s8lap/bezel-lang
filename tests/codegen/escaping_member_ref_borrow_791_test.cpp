@@ -19,15 +19,26 @@
 #include <sys/wait.h>
 
 #include "driver/Driver.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir791() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-791");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 int compileAndRun(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_791_" + std::to_string(counter++);
+    auto dir = wtDir791();
+    std::string stem = unique_stem("bezel_791");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     { std::ofstream out(src); out << source; }
@@ -44,9 +55,8 @@ int compileAndRun(const std::string& source) {
 }
 
 bool compileFails(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_791_neg_" + std::to_string(counter++);
+    auto dir = wtDir791();
+    std::string stem = unique_stem("bezel_791_neg");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     { std::ofstream out(src); out << source; }

@@ -30,16 +30,28 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir633() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-633");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // Compile `source` to a native executable and return the exe path, or ""
 // on failure.  Caller is responsible for removing the exe.
 std::string compileToExe(const std::string& source, const std::string& stem) {
-    auto dir = fs::temp_directory_path();
+    auto dir = wtDir633();
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     { std::ofstream out(src); out << source; }
@@ -83,9 +95,8 @@ RunResult runWithArgs(const std::string& exe,
 RunResult compileAndRun(const std::string& source,
                         const std::vector<std::string>& args = {},
                         const std::string& stem = "") {
-    static int counter = 0;
     std::string s = stem.empty()
-        ? ("bezel_633_" + std::to_string(counter++))
+        ? ("bezel_633_" + unique_stem(""))
         : stem;
     std::string exe = compileToExe(source, s);
     if (exe.empty()) return {-1, ""};
