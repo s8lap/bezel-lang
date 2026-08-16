@@ -45,18 +45,29 @@
 #include <sys/wait.h>
 
 #include "driver/Driver.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir554() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-554");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // Compile `source` to a temp native executable via the real Driver and run it.
 // Returns the process exit code, or -1 on compile/link/run failure.
 int compileAndRun(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_554_" + std::to_string(counter++);
+    auto dir = wtDir554();
+    std::string stem = unique_stem("bezel_554");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {
@@ -77,9 +88,8 @@ int compileAndRun(const std::string& source) {
 
 // True when the source FAILS to compile (a diagnostic was raised).
 bool compileFails(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_554_neg_" + std::to_string(counter++);
+    auto dir = wtDir554();
+    std::string stem = unique_stem("bezel_554_neg");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {
