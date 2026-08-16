@@ -146,7 +146,8 @@ struct StorageMember {
 //     point — a new-channel job on the #2478/#2950 template, not a walk
 //     change.
 bool forEachStorageMember(const TypeSymbol* ts, const SemaContext& ctx,
-                          const std::function<bool(const StorageMember&)>& fn) {
+                          const std::function<bool(const StorageMember&)>& fn,
+                          const common::RecordSubstEnv* env = nullptr) {
     if (!ts) return true;
     // A `posParam` FieldSymbol is either a RECORD's §9.1 positional field
     // (storage) or a CLASS's §22.10 primary-constructor parameter.
@@ -227,6 +228,14 @@ bool forEachStorageMember(const TypeSymbol* ts, const SemaContext& ctx,
                 continue;  // methods/ctors/consts/events/nested: not storage
             }
             sm.type = storageComponentType(ms, ctx);
+            // #3171: the §30.14 class branch must weigh a generic base's fields as
+            // the SUBSTITUTED type, not the bare declaration-template parameter.
+            // `env` is seeded by the class branch from `rt->genericArgs` (own
+            // frame) and from `baseTypeRefs[i]->genericArgs` (each base frame);
+            // for a non-generic class / base, `env` is null and this is a no-op.
+            if (env) {
+                sm.type = common::resolveRecordFieldSubst(sm.type, env).ty;
+            }
             // The `owned` marker lives in two DIFFERENT places and a caller
             // that reads only one silently gets "not owned" for the other
             // (bc0edd5's warning on `anyRecordStorageField`, earned by this
@@ -284,14 +293,36 @@ bool forEachStorageMember(const TypeSymbol* ts, const SemaContext& ctx,
 // against a cyclic base chain (rejected elsewhere — a wrong verdict beats a
 // non-terminating compiler). Interfaces in `baseTypes` are skipped: an
 // interface declares no storage.
+//
+// fix #3171: the env is the substitution frame for `ts`'s OWN bare parameters
+// (the class under test). For each base, the env is RE-SEEDED from that base's
+// `baseTypeRefs[i]->genericArgs`, with `env` as the incoming frame — so a
+// `class Leaf<T>: Base<T>` walking through `Base<T>` resolves its `T` to the
+// `Leaf<T>` instantiation's concrete argument. A non-generic class passes
+// `nullptr` for `env`; a non-generic base re-seeds an empty frame.
 bool forEachInheritedStorageMember(
     const TypeSymbol* ts, const SemaContext& ctx,
-    const std::function<bool(const StorageMember&)>& fn, int depth = 0) {
+    const std::function<bool(const StorageMember&)>& fn,
+    const common::RecordSubstEnv* env = nullptr, int depth = 0) {
     if (!ts || depth > 64) return true;
-    for (const TypeSymbol* base : ts->baseTypes) {
+    for (size_t i = 0; i < ts->baseTypes.size(); ++i) {
+        const TypeSymbol* base = ts->baseTypes[i];
         if (!base || base->kind != ast::TypeDeclKind::Class) continue;
-        if (!forEachStorageMember(base, ctx, fn)) return false;
-        if (!forEachInheritedStorageMember(base, ctx, fn, depth + 1)) return false;
+        // Seed the env for this base from the use-site generic args.
+        // `baseTypeRefs[i]` is parallel to `baseTypes[i]` (#3145 / Symbol.hpp)
+        // and carries the instantiated arguments (e.g. `Container<int>` ->
+        // genericArgs[0]=int). An imported base's `baseTypeRefs[i]` is
+        // populated by ModuleLoader.
+        common::RecordSubstEnv baseEnv;
+        const common::RecordSubstEnv* baseEnvPtr = nullptr;
+        if (i < ts->baseTypeRefs.size() && ts->baseTypeRefs[i]) {
+            common::seedRecordSubstEnv(*base, *ts->baseTypeRefs[i], env,
+                                       baseEnv);
+            if (!baseEnv.map.empty()) baseEnvPtr = &baseEnv;
+        }
+        if (!forEachStorageMember(base, ctx, fn, baseEnvPtr)) return false;
+        if (!forEachInheritedStorageMember(base, ctx, fn, baseEnvPtr,
+                                           depth + 1)) return false;
     }
     return true;
 }
@@ -705,6 +736,18 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
                     return checkField(sm.type, sm.isOwned);
                 };
 
+                // fix #3171: seed the §9.7-style substitution environment for
+                // `decl` from `rt->genericArgs` so a generic class's own field
+                // `T` is weighed as the SUBSTITUTED type, not the bare
+                // declaration-template parameter. The walk threads this env
+                // into both the own-member pass and the inherited-base pass
+                // (each base re-seeds its own env from `baseTypeRefs[i]`).
+                common::RecordSubstEnv selfEnv;
+                common::seedRecordSubstEnv(*decl, *rt, /*incoming=*/nullptr,
+                                           selfEnv);
+                const common::RecordSubstEnv* selfEnvPtr =
+                    selfEnv.map.empty() ? nullptr : &selfEnv;
+
                 // §2.8.2 clause 1 / §30.14 (#1732, #3152): own fields and
                 // auto-properties (in a class an auto-property is a
                 // PropertyDecl with bodyKind=Auto; §9.2 makes it storage, so
@@ -714,12 +757,14 @@ bool isSendableType(const TypeRef* rt, SemaContext& ctx,
                 // silently lets a non-sendable imported class (one with a
                 // non-owned class-typed / interface-typed field) cross a domain
                 // boundary: a data race.
-                if (!forEachStorageMember(decl, ctx, memberSendable)) {
+                if (!forEachStorageMember(decl, ctx, memberSendable,
+                                          selfEnvPtr)) {
                     inProgress.erase(decl); return false;
                 }
                 // §30.14 rule 2's "including inherited fields": the same walk
                 // over the whole ancestor chain, imported or local.
-                if (!forEachInheritedStorageMember(decl, ctx, memberSendable)) {
+                if (!forEachInheritedStorageMember(decl, ctx, memberSendable,
+                                                  selfEnvPtr)) {
                     inProgress.erase(decl); return false;
                 }
             }
@@ -918,6 +963,15 @@ std::string sealedClassFailurePath(const TypeRef* rt, SemaContext& ctx,
     // an imported class alike, so this never names a component the verdict did
     // not weigh — before this commit the imported copy could name a COMPUTED
     // property as a "field".
+    //
+    // fix #3171: also seed the §9.7 substitution env so the diagnostic names
+    // the SUBSTITUTED type, not the bare declaration-template parameter, when
+    // walking a generic class's own field or an inherited base's field.
+    common::RecordSubstEnv selfEnv;
+    common::seedRecordSubstEnv(*decl, *rt, /*incoming=*/nullptr, selfEnv);
+    const common::RecordSubstEnv* selfEnvPtr =
+        selfEnv.map.empty() ? nullptr : &selfEnv;
+
     std::string path;
     auto probe = [&](const StorageMember& sm) -> bool {
         if (sm.name.empty() || !sm.type) return true;  // unnameable: skip
@@ -928,8 +982,8 @@ std::string sealedClassFailurePath(const TypeRef* rt, SemaContext& ctx,
     };
 
     // Own members, then §30.14 rule 2's inherited ones.
-    if (!forEachStorageMember(decl, ctx, probe)) return path;
-    if (!forEachInheritedStorageMember(decl, ctx, probe)) return path;
+    if (!forEachStorageMember(decl, ctx, probe, selfEnvPtr)) return path;
+    if (!forEachInheritedStorageMember(decl, ctx, probe, selfEnvPtr)) return path;
     return {};
 }
 
