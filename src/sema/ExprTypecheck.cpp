@@ -3445,6 +3445,55 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         to->primitive == PrimitiveType::Object) {
         return;
     }
+    // §3 / §5.1 / §8.6 / issue #3115: an `Object`-typed SOURCE (a class
+    // reference or a §8.6 box pointer) has NO implicit conversion to any
+    // non-`Object` target — value-typed or reference-typed. The static
+    // "unbox" path this function used to admit on `(!from->nullable ||
+    // to->nullable)` had no runtime counterpart: codegen's `lowerLocalDecl`
+    // stores the `ptr`-typed slot at the value's storage (LlvmBackend_Setup.cpp
+    // `llvm::Type* slotTy = v ? v->getType() : …`) and a later load
+    // reinterprets the box pointer as the value, so `var i: int := o;`
+    // prints the low 32 bits of the box's heap address under ASLR instead
+    // of `42`, and the assignment form `i := o;` produces the same garbage.
+    // The reference-typed-target case (`var s: string := o;`, DateTime,
+    // records, enums, choices, interfaces, generic interfaces) is an
+    // unchecked downcast with no instance-of check, instance confusion at
+    // runtime if `o` is not actually the target type. The only sanctioned
+    // spellings carry an explicit runtime check: §12.7 (`if o is T then
+    // var v: T := o; end;`, the proven-narrowing path #3090 leaves intact)
+    // or §17.4 (`var v := o as T;`, which produces `T?` so a failed unbox
+    // has somewhere to put `null`).
+    //
+    // The two exceptions preserved below mirror the prior comment text
+    // exactly so the existing tests stay green: `null` (typed `Object?`)
+    // assigning to any nullable target (`var x: int? := null;`) — the
+    // null-literal path §5.1's "Nullable conversions" admits — and `null`
+    // into a non-nullable target keeps the existing §7 nullable-source
+    // diagnostic so the user sees the right rule, not a §5.1 "not
+    // convertible" message. Every other `Object → non-Object` shape —
+    // the bug — is rejected with the §5.1 diagnostic naming both remedies.
+    if (from->kind == TypeRef::Kind::Primitive &&
+        from->primitive == PrimitiveType::Object) {
+        if (from->nullable && to->nullable) {
+            return;  // `null → T?` — the legitimate §5.1 path.
+        }
+        if (from->nullable) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what +
+                " is nullable but the target type is non-nullable (§7)");
+            return;
+        }
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("the ") + what +
+            " has type `Object` which has no implicit conversion to "
+            "the target type (§3, §5.1) — extract the value with an "
+            "explicit runtime check: `if o is T then var v: T := o; "
+            "end;` (§12.7, after #3090) or `var v := o as T;` (yielding "
+            "`T?`, §17.4)");
+        return;
+    }
     auto reportNullable = [&] {
         ctx_.diagnostics().report(
             Severity::Error, loc,
