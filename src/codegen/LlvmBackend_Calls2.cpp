@@ -4143,6 +4143,28 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // Same formal-resolution pattern as buildOrderedArgs's rescue
             // (L10532–10547): the formal may be a bare `T` that resolves to
             // `()` or `()?` through the callee's monomorphization.
+            //
+            // fix #3105 (§4.7 / §8.5 / §21.9, v0.255): broaden the guard to
+            // ALSO fire when v is a void-typed Value (a non-null CallInst
+            // for a unit-RETURNING call). The original `!v` premise was
+            // true for a literal `()` (lowerExpr returns null) but false
+            // for `ReturnsUnit()` (lowerExpr returns the call's void-
+            // typed instruction). The closure-call `fnTy` is built from
+            // the actual LLVM arg types (line ~4201), so a void-typed
+            // parameter here makes the function type invalid and the IR
+            // verifier aborts. Substitute the same byte the null-v rescue
+            // substitutes — the side effects of the original call are
+            // preserved (lowerExpr already emitted them).
+            if (v && v->getType()->isVoidTy() && pi < rt->funcParams.size()) {
+                const sema::TypeRef* formal0 =
+                    resolveTypeParamRef(rt->funcParams[pi].type);
+                if (formal0 && formal0->kind == sema::TypeRef::Kind::Unit &&
+                    !formal0->nullable) {
+                    v = llvm::ConstantInt::get(unitPlaceholderTy(), 0);
+                } else if (formal0 && isNullableUnitTy(formal0)) {
+                    v = nullableUnitPresent(formal0);
+                }
+            }
             if (!v && pi < rt->funcParams.size()) {
                 const sema::TypeRef* formal0 =
                     resolveTypeParamRef(rt->funcParams[pi].type);
@@ -4571,11 +4593,46 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // Lower call arguments.
         std::vector<llvm::Value*> args;
         args.push_back(envPtr);  // env_ptr is always the first arg
+        std::size_t iifeArgPos = 0;
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
+            // fix #3105 (§4.7 / §8.5 / §21.9, v0.255): mirror the
+            // `buildOrderedArgs` rescue for the IIFE shape — a unit-
+            // returning call lowers to a void-typed `CallInst` (non-null
+            // `Value*`, but type void), the `if (!v)` guard below does
+            // not fire, and the void value is pushed into `args` directly.
+            // The IIFE function type is built from the actual LLVM arg
+            // types (line ~4603), so a void-typed parameter makes the
+            // function type invalid and the IR verifier aborts. Detect
+            // the void-typed v BEFORE the guard and substitute the §4.7
+            // unit placeholder byte (i8 0) — the same byte the
+            // `buildOrderedArgs` non-nullable-unit rescue substitutes.
+            // The side effects of the original call (the emitted
+            // `CreateCall`) are preserved: `lowerExpr` already emitted
+            // them, the substitution only replaces the `Value*` the
+            // downstream code pushes into `args`. The IIFE callee is
+            // local, so the formal-parameter type is recovered from the
+            // lambda's own parameter list (iifeLam->params, parallel to
+            // `md->params` in `buildOrderedArgs`).
+            if (v && v->getType()->isVoidTy() && iifeLam &&
+                iifeArgPos < iifeLam->params.size()) {
+                const ast::Param* fp = &iifeLam->params[iifeArgPos];
+                if (fp->type) {
+                    if (auto* formal0 = ctx_.resolvedType(*fp->type)) {
+                        if (formal0->kind == sema::TypeRef::Kind::Unit &&
+                            !formal0->nullable) {
+                            v = llvm::ConstantInt::get(
+                                unitPlaceholderTy(), 0);
+                        } else if (isNullableUnitTy(formal0)) {
+                            v = nullableUnitPresent(formal0);
+                        }
+                    }
+                }
+            }
             if (!v) return nullptr;
             args.push_back(v);
+            ++iifeArgPos;
         }
         // Build the function type from the actual argument LLVM types.
         // Return type: consult the sema exprType of the expression body
@@ -12153,6 +12210,28 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                         /*isOut=*/formalMod == "out", accessorRefArgs);
             } else {
                 v = lowerExpr(*a.value);
+            }
+            // fix #3105 (§4.7 / §8.5 / §21.9, v0.255): the `?.` twin of
+            // the `buildOrderedArgs` rescue above. The imported-callee
+            // path rewrites the ordered args by hand (no
+            // `buildOrderedArgs` call) and runs the same `if (!v) return
+            // nullptr` guard, so a void-typed `lowerExpr` for a unit-
+            // returning argument slips through just like the local case
+            // does. Detect the void-typed v BEFORE the guard and
+            // substitute the §4.7 unit placeholder byte when the formal
+            // parameter (formalTy, resolved from the imported
+            // ParameterSymbol's `resolvedDeclType`) is unit-typed or
+            // nullable-unit. The void-shaped side effects are preserved
+            // — `lowerExpr` already emitted them; the substitution only
+            // replaces the `Value*` the downstream code stores in
+            // `ordered[pi]`.
+            if (v && v->getType()->isVoidTy() && formalTy) {
+                if (formalTy->kind == sema::TypeRef::Kind::Unit &&
+                    !formalTy->nullable) {
+                    v = llvm::ConstantInt::get(unitPlaceholderTy(), 0);
+                } else if (isNullableUnitTy(formalTy)) {
+                    v = nullableUnitPresent(formalTy);
+                }
             }
             if (!v) {
                 emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);

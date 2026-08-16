@@ -10606,6 +10606,54 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             v = lowerExpr(*a.value);
             expectedFunctionType_ = savedExpected;
         }
+        // fix #3105 (§4.7 / §8.5 / §21.9, v0.255): broaden #3079's Console
+        // guard to the broader call family. `lowerExpr` for a unit-returning
+        // CallExpr (`ReturnsUnit()` where `ReturnsUnit(): ()`) returns a
+        // NON-NULL but VOID-typed `llvm::Value*` — the `CallInst` IS a
+        // `Value`, the instruction is just type-void. The pre-fix #2915
+        // guard below was structured around the "lowerExpr returns null for
+        // unit-typed args" premise (the comment two lines up still states
+        // it), and that premise is false for a unit-RETURNING call: it
+        // returns a void-typed value, not null. The result: the `if (!v)`
+        // guard does NOT fire, the void value is pushed into `args`
+        // directly, and the call is emitted with a void-typed argument
+        // where the callee signature expects `i8` (the §4.7 unit placeholder
+        // byte `lowerParamType` substitutes for `void`). The IR verifier
+        // rejects the misaligned call with "Call parameter type does not
+        // match function signature" — MEASURED on 50eb493 with the issue's
+        // `TakeUnit(ReturnsUnit())` repro. The §3079 Console-only guard
+        // caught the same shape for `Console.WriteLine(<unit>)`; the
+        // broader call family did not.
+        //
+        // Detect the void-typed v BEFORE the existing rescue runs and
+        // substitute the §4.7 unit placeholder byte when the formal
+        // parameter is unit-typed — the same byte the existing null-v
+        // rescue substitutes. The side effects of the original call (the
+        // emitted `CreateCall`) are preserved: `lowerExpr` already emitted
+        // them above; the substitution only replaces the `Value*` the
+        // downstream code pushes into `args`. The nullable-unit branch
+        // below mirrors the existing `unitValueForTarget` path for the
+        // same formal shape.
+        if (v && v->getType()->isVoidTy() && params[idx].type) {
+            sema::TypeRef* formal0 = ctx_.resolvedType(*params[idx].type);
+            if (formal0) {
+                if (formal0->kind == sema::TypeRef::Kind::Named &&
+                    !formal0->declaration && formal0->nullable) {
+                    sema::TypeRef concrHolder;
+                    if (nullableTypeParamConcrete(formal0, concrHolder))
+                        formal0 = &concrHolder;
+                } else {
+                    formal0 = const_cast<sema::TypeRef*>(
+                        resolveTypeParamRef(formal0));
+                }
+            }
+            if (formal0 && formal0->kind == sema::TypeRef::Kind::Unit &&
+                !formal0->nullable) {
+                v = llvm::ConstantInt::get(unitPlaceholderTy(), 0);
+            } else if (formal0 && isNullableUnitTy(formal0)) {
+                v = nullableUnitPresent(formal0);
+            }
+        }
         // fix #2915 (§4.7 / §8.6 "Boxing of the unit value", v0.240): a
         // unit-typed argument has NO lowered value — `()` lowers to LLVM
         // `void`, so lowerExpr returns null for it — and at an `Object`/
