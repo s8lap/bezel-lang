@@ -322,6 +322,25 @@ bool ExprTC::defaultIllFormed(const TypeRef* t) {
         case TypeRef::Kind::Named: {
             if (!t->declaration) return false;  // generic param / unresolved
             auto k = t->declaration->kind;
+            // fix #3108 (§16.3/§16.4, v0.242): `default(Range<T>)` is a compile
+            // error for the COMPILER-INTRINSIC `Range<T>` — §16.4 promises "no
+            // `Range<T>` value with a zero step can exist" and the `default`
+            // form all-zeroes `Range<T>` would yield step=0, falsifying the
+            // invariant. The spec's own enumeration of `Range<T>` producers
+            // (range expressions; the deserialization path for `Range<char>`)
+            // excludes `default`, so the well-formedness check joins §17.11's
+            // rejection set alongside non-nullable references, enums with no
+            // zero-valued constant, and choices. The identity is the builtin
+            // `Range` (range expressions (§16.4) and the §16.3 closure of
+            // constructors), NOT a user-declared class `class Range<T>` — §11.3
+            // reserves no names, so `class Range<T>` is legal, and the builtin
+            // vs user-class distinction is the same `declaration ==
+            // builtinClassSym("Range")` pointer-equality the §5 LINQ receiver
+            // gate uses (ExprTypecheck_Calls.cpp:3872's #3022n precedent). The
+            // check runs BEFORE the Class arm so the builtin isn't admitted
+            // through `!isValueBuiltin` = false (the builtin is a `Class`-
+            // typed `TypeSymbol` with `isValueBuiltin=true`).
+            if (t->declaration == ctx_.builtinClassSym("Range")) return true;
             if (k == ast::TypeDeclKind::Class ||
                 k == ast::TypeDeclKind::Interface)
                 return !t->declaration->isValueBuiltin;
@@ -3739,6 +3758,19 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "` — it declares no constant of underlying value 0, so "
                         "it has no well-defined zero value; declare a "
                         "zero-valued constant (§17.11)");
+                } else if (defaultIllFormed(rt) && rt->kind == TypeRef::Kind::Named &&
+                           rt->declaration == ctx_.builtinClassSym("Range")) {
+                    // fix #3108 (§16.3/§16.4, v0.242): `default(Range<T>)` is a
+                    // compile error — the all-zeroes `Range<T>` would have step=0,
+                    // falsifying §16.4's "no `Range<T>` value with a zero step can
+                    // exist" invariant. The empty range is spelled `0..<0`; the
+                    // closed-constructor-surface rule (§17.7) bars `new Range<T>`.
+                    ctx_.diagnostics().report(
+                        Severity::Error, de->span.begin,
+                        std::string("`default(Range<T>)` is a compile error — "
+                            "the all-zeroes value would have step=0, falsifying "
+                            "§16.4's no-zero-step invariant; the empty range is "
+                            "spelled `0..<0` (§17.11)"));
                 } else if (defaultIllFormed(rt)) {
                     std::string detail;
                     if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
