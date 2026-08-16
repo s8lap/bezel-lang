@@ -47,10 +47,25 @@
 
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// fs::temp_directory_path() (== /tmp tmpfs) + non-atomic counter pattern was
+// race-prone: parallel shards overwrote each other's source/object files
+// mid-compile, garbling the in-flight child read. The atomic unique_stem
+// + /var/tmp/bezel-scratch parent fixes that class of flake (#3002-class).
+const std::filesystem::path& wtDir2776() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-2776");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 struct TempFile {
     std::string path;
@@ -68,9 +83,8 @@ void writeSource(const std::string& path, const std::string& src) {
 // itself meaningful here: the linkage half of this fix shows up as a -1.
 int compileAndRunCrossModule(const std::string& libSrc,
                              const std::string& mainSrc) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_xmod2776_" + std::to_string(counter++);
+    auto dir = wtDir2776();
+    std::string stem = unique_stem("bezel_xmod2776");
     TempFile lSrc((dir / (stem + "_lib.bzl")).string());
     TempFile lObj((dir / (stem + "_lib.o")).string());
     TempFile mSrc((dir / (stem + "_main.bzl")).string());
