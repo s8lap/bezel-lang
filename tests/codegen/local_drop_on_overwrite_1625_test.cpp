@@ -59,6 +59,17 @@ using bezel::test::runAot;
 namespace {
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir1625() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-1625");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // JIT run via the in-process pipeline (NOTE: no ownership pass on the codegen
 // AST — see file header). Used only for the sanity cases below that do not
 // depend on the becomesOwnedViaReassign flag.
@@ -74,9 +85,8 @@ int runUnderASan(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;
 
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_1625_asan_" + std::to_string(counter++);
+    auto dir = wtDir1625();
+    std::string stem = unique_stem("bezel_1625_asan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 
