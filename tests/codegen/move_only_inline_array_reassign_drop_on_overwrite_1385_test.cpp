@@ -48,6 +48,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/unique_stem.hpp"
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "native_test_harness.hpp"

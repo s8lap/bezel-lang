@@ -55,6 +55,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
