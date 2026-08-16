@@ -44,14 +44,30 @@
 
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
-#include "test_harness.hpp"
 #include "support/unique_stem.hpp"
+#include "test_harness.hpp"
 
 
 namespace bezel::module {
 namespace {
 
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// fs::temp_directory_path() (== /tmp tmpfs) was race-prone even with
+// unique_stem: parallel shards racing on the SAME /tmp parent dir overwrote
+// each other's _a.bzl / _a.o / _b.bzl mid-compileObject. The
+// /var/tmp/bezel-scratch parent fixes that class of flake (#3002-class
+// COVERAGE SHORT). popen() at L74 is kept — per-stem uniqueness already
+// mitigates the file-overwrite race; full fork isolation is a separate concern.
+const std::filesystem::path& wtDir3177k() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-3177k");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 struct TempFile3177K {
     std::string path;
@@ -91,7 +107,7 @@ std::string runCapture3177K(const std::string& exe, int& code) {
 // pass.
 std::pair<int, std::string> compileImportRun3177K(const std::string& libSrc,
                                                   const std::string& appSrc) {
-    auto dir = fs::temp_directory_path();
+    auto dir = wtDir3177k();
     std::string stem = unique_stem("bz3177k_");
     TempFile3177K aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3177K aObj((dir / (stem + "_a.o")).string());
@@ -117,7 +133,7 @@ std::pair<int, std::string> compileImportRun3177K(const std::string& libSrc,
 }
 
 std::pair<int, std::string> compileLocalRun3177K(const std::string& src) {
-    auto dir = fs::temp_directory_path();
+    auto dir = wtDir3177k();
     std::string stem = unique_stem("bz3177k_loc_");
     TempFile3177K sFile((dir / (stem + ".bzl")).string());
     TempFile3177K eFile((dir / stem).string());
