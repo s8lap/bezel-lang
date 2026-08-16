@@ -36,9 +36,27 @@
 #include <vector>
 
 #include "runtime/bezel_runtime.h"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// hardcoded /tmp/bzt_*.txt literal paths (== /tmp tmpfs) were race-prone:
+// parallel shards running sibling tests with the same hardcoded name
+// overwrote each other's files mid-test. The atomic unique_stem +
+// /var/tmp/bezel-scratch parent fixes that class of flake (#3002-class
+// COVERAGE SHORT).
+const std::filesystem::path& wtDir2237() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-2237");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
+namespace fs = std::filesystem;
 
 // Walk a bz_array_t* (the bz_file_read_all_lines return type) and copy each
 // element into a std::string. The element type is bz_string_struct* (§4.6,
@@ -84,15 +102,16 @@ bool writeFile(const char* path, const char* content, std::size_t n) {
 // list.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(runtime_fileio_read_all_lines_oom_2237, happy_path_multi_line_round_trip) {
-    const char* path = "/tmp/bzt_fileio_read_all_lines_oom_2237_multi.txt";
+    std::string path = (wtDir2237() / "multi.txt").string();
+    const char* cpath = path.c_str();
     // Raw bytes: "alpha\nbeta\r\ngamma\n" — verifies the '\r' strip and the
     // terminal-newline-no-trailing-empty behavior in one file.
     const char content[] = "alpha\nbeta\r\ngamma\n";
     const std::size_t contentLen = sizeof(content) - 1;
-    BEZEL_EXPECT_TRUE(writeFile(path, content, contentLen));
+    BEZEL_EXPECT_TRUE(writeFile(cpath, content, contentLen));
 
-    void* arr = bz_file_read_all_lines(path);
-    std::remove(path);
+    void* arr = bz_file_read_all_lines(cpath);
+    std::remove(cpath);
 
     const std::vector<std::string> expected = {"alpha", "beta", "gamma"};
     BEZEL_EXPECT_TRUE(arr != nullptr);
@@ -115,13 +134,14 @@ BEZEL_TEST(runtime_fileio_read_all_lines_oom_2237, happy_path_multi_line_round_t
 // newline terminator.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(runtime_fileio_read_all_lines_oom_2237, single_line_no_newline_yields_one_element) {
-    const char* path = "/tmp/bzt_fileio_read_all_lines_oom_2237_single.txt";
+    std::string path = (wtDir2237() / "single.txt").string();
+    const char* cpath = path.c_str();
     const char content[] = "lonely-line-no-newline";
     const std::size_t contentLen = sizeof(content) - 1;
-    BEZEL_EXPECT_TRUE(writeFile(path, content, contentLen));
+    BEZEL_EXPECT_TRUE(writeFile(cpath, content, contentLen));
 
-    void* arr = bz_file_read_all_lines(path);
-    std::remove(path);
+    void* arr = bz_file_read_all_lines(cpath);
+    std::remove(cpath);
 
     BEZEL_EXPECT_TRUE(arr != nullptr);
     BEZEL_EXPECT_EQ(bz_array_len(arr), (int64_t)1);
@@ -142,11 +162,12 @@ BEZEL_TEST(runtime_fileio_read_all_lines_oom_2237, single_line_no_newline_yields
 // loop).
 // ---------------------------------------------------------------------------
 BEZEL_TEST(runtime_fileio_read_all_lines_oom_2237, empty_file_yields_empty_array) {
-    const char* path = "/tmp/bzt_fileio_read_all_lines_oom_2237_empty.txt";
-    BEZEL_EXPECT_TRUE(writeFile(path, "", 0));
+    std::string path = (wtDir2237() / "empty.txt").string();
+    const char* cpath = path.c_str();
+    BEZEL_EXPECT_TRUE(writeFile(cpath, "", 0));
 
-    void* arr = bz_file_read_all_lines(path);
-    std::remove(path);
+    void* arr = bz_file_read_all_lines(cpath);
+    std::remove(cpath);
 
     BEZEL_EXPECT_TRUE(arr != nullptr);
     BEZEL_EXPECT_EQ(bz_array_len(arr), (int64_t)0);

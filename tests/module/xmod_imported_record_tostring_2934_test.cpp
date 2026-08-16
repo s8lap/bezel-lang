@@ -57,11 +57,27 @@
 #include "codegen/LlvmBackend.hpp"   // codegen::CodegenOptions
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace bezel::module {
 namespace {
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// fs::temp_directory_path() (== /tmp tmpfs) + non-atomic counter pattern was
+// race-prone: parallel shards overwrote each other's _lib.bzl / _lib.o /
+// _main.bzl mid-compileObject and garbled the in-flight child read. The atomic
+// unique_stem + /var/tmp/bezel-scratch parent fixes that class of flake
+// (#3002-class COVERAGE SHORT).
+const std::filesystem::path& wtDir2934() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-2934");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 struct TempFile2934 {
     std::string path;
@@ -103,9 +119,8 @@ void writeSource2934(const std::string& path, const std::string& src) {
 // form; the other tests carry the same net at one iteration each.
 std::string runXmodOut2934(const std::string& libSrc,
                            const std::string& mainSrc) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_xmod2934_" + std::to_string(counter++);
+    auto dir = wtDir2934();
+    std::string stem = unique_stem("bezel_xmod2934");
     TempFile2934 lSrc((dir / (stem + "_lib.bzl")).string());
     TempFile2934 lObj((dir / (stem + "_lib.o")).string());
     TempFile2934 mSrc((dir / (stem + "_main.bzl")).string());

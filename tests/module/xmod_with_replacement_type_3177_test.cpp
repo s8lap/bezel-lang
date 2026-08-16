@@ -50,6 +50,7 @@
 
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -57,24 +58,23 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Per-process unique temp-file stem. The old std::rand()-based naming was the
-// root cause of the #3002-class xmod COVERAGE SHORT: std::rand() is a single
-// global PRNG shared across every test in the same shard (it is not
-// thread-safe and the seed is per-process), and the birthday-paradox collision
-// probability on ~186 tests per shard is ~0.8% — a collision overwrites the
-// loser's source file mid-shard, garbles the in-flight compileObject child's
-// read, and the shard crashes. The fix: a process-wide atomic counter
-// combined with getpid() for cross-process uniqueness. O(1), no syscall per
-// call beyond the once-cached getpid(), and the stem is unique across the
-// whole /tmp scratch dir.
-std::atomic<uint64_t> &g_temp_stem_counter() {
-    static std::atomic<uint64_t> counter{0};
-    return counter;
-}
-std::string unique_stem(const char* prefix) {
-    return std::string(prefix) + "_" + std::to_string(::getpid()) + "_" +
-           std::to_string(
-               g_temp_stem_counter().fetch_add(1, std::memory_order_relaxed));
+// Per-process unique working dir under /var/tmp/bezel-scratch/. An earlier
+// partial pass added a LOCAL copy of unique_stem + g_temp_stem_counter (now
+// superseded by the canonical tests/support/unique_stem.hpp header included
+// above) and dropped the counter, but kept fs::temp_directory_path() — which
+// resolves to /tmp tmpfs. Parallel shards racing on the same /tmp path still
+// overwrote each other's _a.bzl / _a.o / _b.bzl mid-compileObject. This commit
+// replaces the temp_directory_path() call sites with wtDir3177w() (per-process
+// /var/tmp/bezel-scratch subdir) and removes the local helper in favour of the
+// canonical header. popen() is kept — per-stem uniqueness already mitigates
+// the file-overwrite race; full fork isolation is a separate concern.
+const std::filesystem::path& wtDir3177w() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-3177w");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
 }
 
 struct TempFile3177W {
@@ -103,7 +103,7 @@ struct Run3177W {
 
 Run3177W importCompileAndRun3177W(const std::string& libSrc,
                                   const std::string& appSrc) {
-    auto dir = fs::temp_directory_path();
+    auto dir = wtDir3177w();
     std::string stem = unique_stem("bz3177w");
     TempFile3177W aSrc((dir / (stem + "_a.bzl")).string());
     TempFile3177W aObj((dir / (stem + "_a.o")).string());
@@ -159,7 +159,7 @@ Run3177W importCompileAndRun3177W(const std::string& libSrc,
 }
 
 Run3177W localCompile3177W(const std::string& src) {
-    auto dir = fs::temp_directory_path();
+    auto dir = wtDir3177w();
     std::string stem = unique_stem("bz3177w_loc");
     TempFile3177W sFile((dir / (stem + ".bzl")).string());
     TempFile3177W eFile((dir / stem).string());

@@ -117,12 +117,31 @@
 #include <sys/wait.h>
 
 #include "driver/Driver.hpp"
-#include "test_harness.hpp"
 #include "support/unique_stem.hpp"
+#include "test_harness.hpp"
 
 
 namespace {
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// fs::temp_directory_path() (== /tmp tmpfs) + non-atomic counter++ stem was
+// race-prone: parallel shards overwrote each other's _a.bzl / _a.o / _b.bzl
+// mid-compileObject and garbled the in-flight child read. The atomic
+// unique_stem + /var/tmp/bezel-scratch parent fixes that class of flake
+// (#3002-class COVERAGE SHORT). Note: an earlier partial pass had already
+// added `#include "support/unique_stem.hpp"` and concatenated a no-op
+// unique_stem("") onto the end of the counter-derived stem — but the leading
+// counter++-derived prefix was the actual collision hazard. This commit
+// drops the counter entirely and uses unique_stem as the sole source.
+const std::filesystem::path& wtDir2359() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-2359");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 struct TempFile2359 {
     std::string path;
@@ -139,10 +158,8 @@ void write2359(const std::string& path, const std::string& src) {
 // Returns the program's exit code, -1 on importer compile/link/run failure,
 // or -2 when the dependency itself could not be produced (toolchain absent).
 int runImported2359(const std::string& libSrc, const std::string& appSrc) {
-    auto dir = fs::temp_directory_path();
-    static int counter = 0;
-    std::string stem = "bz2359_" + std::to_string(counter++) + "_" +
-                       unique_stem("");
+    auto dir = wtDir2359();
+    std::string stem = unique_stem("bz2359");
     TempFile2359 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2359 aObj((dir / (stem + "_a.o")).string());
     write2359(aSrc.path, libSrc);

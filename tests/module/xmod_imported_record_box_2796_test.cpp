@@ -53,10 +53,26 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// fs::temp_directory_path() (== /tmp tmpfs) + non-atomic counter pattern was
+// race-prone: parallel shards overwrote each other's _lib.bzl / _lib.o /
+// _main.bzl mid-compileObject and garbled the in-flight child read. The atomic
+// unique_stem + /var/tmp/bezel-scratch parent fixes that class of flake
+// (#3002-class COVERAGE SHORT).
+const std::filesystem::path& wtDir2796() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-2796");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 struct TempFile2796 {
     std::string path;
@@ -75,9 +91,8 @@ void writeSource2796(const std::string& path, const std::string& src) {
 // is a SIGSEGV (WIFEXITED false), and the fix adds external references to the
 // dependency's record methods, so a link failure must be visible too.
 int runXmod2796(const std::string& libSrc, const std::string& mainSrc) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_xmod2796_" + std::to_string(counter++);
+    auto dir = wtDir2796();
+    std::string stem = unique_stem("bezel_xmod2796");
     TempFile2796 lSrc((dir / (stem + "_lib.bzl")).string());
     TempFile2796 lObj((dir / (stem + "_lib.o")).string());
     TempFile2796 mSrc((dir / (stem + "_main.bzl")).string());
@@ -103,9 +118,8 @@ int runXmod2796(const std::string& libSrc, const std::string& mainSrc) {
 
 // Single-module control: the SAME declarations and the SAME body in one file.
 int runLocal2796(const std::string& src) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_loc2796_" + std::to_string(counter++);
+    auto dir = wtDir2796();
+    std::string stem = unique_stem("bezel_loc2796");
     TempFile2796 mSrc((dir / (stem + ".bzl")).string());
     TempFile2796 mExe((dir / stem).string());
     writeSource2796(mSrc.path, src);
