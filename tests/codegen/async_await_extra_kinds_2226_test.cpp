@@ -23,6 +23,7 @@
 // sanitizer-clean.
 
 #include "support/aot_support.hpp"   // runAotChecked — ASan/LSan AOT harness
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 #include <cstdio>
@@ -37,6 +38,17 @@ using bezel::test::runAotChecked;
 namespace {
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir2226() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-2226");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // Same shape as async_test.cpp::compileAndRun, but lifted here so the
 // regression test does not need the async_test.cpp TUs. The expected behavior
 // of every program below is: run to completion, exit with the expected exit
@@ -47,9 +59,8 @@ namespace fs = std::filesystem;
 // so a future maintainer can drop in per-test value assertions without
 // re-plumbing the call sites.
 int runWithTimeout(const std::string& source, int /*expectedExitCode*/) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_async_2226_" + std::to_string(counter++);
+    auto dir = wtDir2226();
+    std::string stem = unique_stem("bezel_async_2226");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {
