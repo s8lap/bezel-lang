@@ -30,13 +30,30 @@
 #include <string>
 
 #include "runtime/bezel_runtime.h"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// hardcoded /tmp/bzt_*.bin literal paths (== /tmp tmpfs) were race-prone:
+// parallel shards running sibling tests with the same hardcoded name
+// overwrote each other's files mid-test. The atomic unique_stem +
+// /var/tmp/bezel-scratch parent fixes that class of flake (#3002-class
+// COVERAGE SHORT).
+const std::filesystem::path& wtDir() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-fileio-errpaths");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // A path that is guaranteed not to exist (nested under a nonexistent dir, so
 // fopen() fails with ENOENT regardless of the working directory's contents).
-const char* kMissingPath = "/tmp/bzt_fileio_hardening_missing_dir_xyz/does_not_exist.bin";
+const std::string kMissingPath =
+    (wtDir() / "missing_dir_xyz" / "does_not_exist.bin").string();
 
 } // namespace
 
@@ -50,7 +67,7 @@ BEZEL_TEST(runtime_fileio_ws7_r1, read_all_bytes_missing_file_writes_defined_out
     uint8_t* out = reinterpret_cast<uint8_t*>(0xDEADBEEF);  // poison, to catch "never written"
     int64_t len = -12345;
 
-    int32_t r = bz_file_read_all_bytes(kMissingPath, &out, &len);
+    int32_t r = bz_file_read_all_bytes(kMissingPath.c_str(), &out, &len);
 
     BEZEL_EXPECT_TRUE(r != 0);              // fopen failed -> nonzero (-errno)
     BEZEL_EXPECT_TRUE(out == nullptr);      // §fix: defined, not the poison value
@@ -67,7 +84,7 @@ BEZEL_TEST(runtime_fileio_ws7_r1, read_all_text_missing_file_writes_defined_outp
     char* out = reinterpret_cast<char*>(0xDEADBEEF);
     int64_t byteLen = -12345;
 
-    int32_t r = bz_file_read_all_text(kMissingPath, &out, &byteLen);
+    int32_t r = bz_file_read_all_text(kMissingPath.c_str(), &out, &byteLen);
 
     BEZEL_EXPECT_TRUE(r != 0);
     BEZEL_EXPECT_TRUE(out == nullptr);
@@ -81,15 +98,15 @@ BEZEL_TEST(runtime_fileio_ws7_r1, read_all_text_missing_file_writes_defined_outp
 // handles it cleanly (no OOB write, correct 0 length, non-null buffer).
 // ---------------------------------------------------------------------------
 BEZEL_TEST(runtime_fileio_ws7_r1, read_all_bytes_empty_file_is_zero_length_non_null) {
-    const char* path = "/tmp/bzt_fileio_hardening_empty.bin";
-    FILE* f = std::fopen(path, "wb");
+    std::string path = (wtDir() / "empty.bin").string();
+    FILE* f = std::fopen(path.c_str(), "wb");
     BEZEL_EXPECT_TRUE(f != nullptr);
     if (f) std::fclose(f);
 
     uint8_t* out = nullptr;
     int64_t len = -1;
-    int32_t r = bz_file_read_all_bytes(path, &out, &len);
-    std::remove(path);
+    int32_t r = bz_file_read_all_bytes(path.c_str(), &out, &len);
+    std::remove(path.c_str());
 
     BEZEL_EXPECT_EQ(r, (int32_t)0);
     BEZEL_EXPECT_TRUE(out != nullptr);      // still a valid (empty) allocation
@@ -105,9 +122,9 @@ BEZEL_TEST(runtime_fileio_ws7_r1, read_all_bytes_empty_file_is_zero_length_non_n
 // the hardening did not disturb the happy path (stdlib §7.3).
 // ---------------------------------------------------------------------------
 BEZEL_TEST(runtime_fileio_ws7_r1, read_all_bytes_success_round_trip) {
-    const char* path = "/tmp/bzt_fileio_hardening_roundtrip.bin";
+    std::string path = (wtDir() / "roundtrip.bin").string();
     const char* content = "hello, bezel";
-    FILE* f = std::fopen(path, "wb");
+    FILE* f = std::fopen(path.c_str(), "wb");
     BEZEL_EXPECT_TRUE(f != nullptr);
     if (f) {
         std::fwrite(content, 1, std::strlen(content), f);
@@ -116,8 +133,8 @@ BEZEL_TEST(runtime_fileio_ws7_r1, read_all_bytes_success_round_trip) {
 
     uint8_t* out = nullptr;
     int64_t len = -1;
-    int32_t r = bz_file_read_all_bytes(path, &out, &len);
-    std::remove(path);
+    int32_t r = bz_file_read_all_bytes(path.c_str(), &out, &len);
+    std::remove(path.c_str());
 
     BEZEL_EXPECT_EQ(r, (int32_t)0);
     BEZEL_EXPECT_TRUE(out != nullptr);
