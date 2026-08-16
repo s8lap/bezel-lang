@@ -6173,7 +6173,7 @@ static bool refMentionsAnyOf(const TypeRef* t,
     }
 }
 
-// §12.2 (#1942): is the interface `itd` CLASH-PROTECTED — does every generic
+// §12.2 (#1942): is the interface `ts` CLASH-PROTECTED — does every generic
 // parameter appear in the RESULT position (method return / property or indexer
 // type) of some direct member whose (index) parameters mention NO generic
 // parameter of the interface? If so, a class cannot implement the interface at
@@ -6184,29 +6184,49 @@ static bool refMentionsAnyOf(const TypeRef* t,
 // IMarker<int>` a compile error), so the second implementation is rejected at
 // its own declaration and the open-world subclass hole is closed.
 //
+// fix #3161 (§19.3 / §2.8.3 rule 4, v0.254 — residue of #3143): walks the
+// interface's `MemberSymbol`s (via `ts->genericParams` / `ts->members`) rather
+// than its `ast::TypeDecl` AST — necessary because an IMPORTED interface
+// carries no AST at all (`itd` is null), and §2.8.3 rule 4 requires the
+// verdict to match the local-module twin's. The type side (return type /
+// property type / indexer-param types) is read from
+// `ctx.importedReturnType(ms)` / `ctx.importedMemberType(ps)` /
+// `ParameterSymbol::resolvedDeclType`, the modulators `static` /
+// own-genericParams come from the symbol's own fields — every channel that
+// was previously on `ast::MemberDecl` is reproduced on the reconstructed
+// symbol by `ModuleLoader::convertMember` / `convertParams` exactly so
+// cross-module consumers can read it back without an AST. The LOCAL
+// (AST-present) path mirrors the prior per-AST logic and is bytewise
+// equivalent to the pre-#3161 function for an unchanging local declaration;
+// the IMPORTED (AST-absent) path is the new code path, returning the same
+// verdict the local twin would.
+//
 // Conservative in the SOUND direction (a false "unprotected" only over-rejects):
 // only DIRECT instance methods/properties/indexers are credited (no inherited-
 // interface members — their substitution mapping is not chased here; no statics
 // or events), and a member declaring its OWN generic parameters is skipped
 // (name shadowing would make the mention test ambiguous).
-static bool ifaceClashProtectedAllParams(const ast::TypeDecl* itd,
+static bool ifaceClashProtectedAllParams(const TypeSymbol* ts,
                                          SemaContext& ctx) {
-    if (!itd) return false;
+    if (!ts) return false;
     std::unordered_set<std::string_view> allParams;
-    for (const auto& gp : itd->genericParams) allParams.insert(gp.name);
+    for (const Symbol* gp : ts->genericParams)
+        if (gp) allParams.insert(gp->name);
     if (allParams.empty()) return false;
     auto isStaticMember = [](const std::vector<std::string_view>& mods) {
         for (std::string_view m : mods)
             if (m == "static") return true;
         return false;
     };
-    for (const auto& gp : itd->genericParams) {
-        std::unordered_set<std::string_view> one{gp.name};
+    for (const Symbol* gp : ts->genericParams) {
+        if (!gp) continue;
+        std::unordered_set<std::string_view> one{gp->name};
         bool pinned = false;
-        for (const auto& mem : itd->members) {
+        for (Symbol* mem : ts->members) {
             if (!mem) continue;
             if (const auto* md =
-                    dynamic_cast<const ast::MethodDecl*>(mem.get())) {
+                    dynamic_cast<const ast::MethodDecl*>(mem->decl)) {
+                // LOCAL: AST present — read the prior per-AST shape.
                 if (!md->genericParams.empty() || isStaticMember(md->modifiers))
                     continue;
                 if (!md->returnType) continue;
@@ -6222,8 +6242,32 @@ static bool ifaceClashProtectedAllParams(const ast::TypeDecl* itd,
                     }
                 }
                 if (paramsClean) { pinned = true; break; }
+            } else if (auto* ms = dynamic_cast<MethodSymbol*>(mem)) {
+                // IMPORTED: no AST on the `MethodDecl*` above falls through
+                // here. `ModuleLoader::convertMember` populates `modifiers`
+                // (incl. `static`), `genericParams` (member's OWN, empty for
+                // a non-generic method), `params` (a `ParameterSymbol` list
+                // whose resolved types ride `ParameterSymbol::resolvedDeclType`),
+                // and the return type in `ctx.importedReturnType(ms)` — the
+                // same shape the AST path above reads via `ctx.resolvedType`.
+                if (!ms->genericParams.empty() ||
+                    isStaticMember(ms->modifiers)) continue;
+                const TypeRef* rt = ctx.importedReturnType(ms);
+                if (!rt || !refMentionsAnyOf(rt, one)) continue;
+                bool paramsClean = true;
+                for (Symbol* pSym : ms->params) {
+                    if (!pSym) continue;
+                    auto* ps = dynamic_cast<ParameterSymbol*>(pSym);
+                    const TypeRef* pt =
+                        ps ? ps->resolvedDeclType : nullptr;
+                    if (!pt || refMentionsAnyOf(pt, allParams)) {
+                        paramsClean = false;
+                        break;
+                    }
+                }
+                if (paramsClean) { pinned = true; break; }
             } else if (const auto* pdcl =
-                           dynamic_cast<const ast::PropertyDecl*>(mem.get())) {
+                           dynamic_cast<const ast::PropertyDecl*>(mem->decl)) {
                 if (isStaticMember(pdcl->modifiers)) continue;
                 if (!pdcl->type) continue;
                 const TypeRef* rt = ctx.resolvedType(*pdcl->type);
@@ -6233,6 +6277,31 @@ static bool ifaceClashProtectedAllParams(const ast::TypeDecl* itd,
                     for (const auto& p : pdcl->indexerParams) {
                         const TypeRef* pt =
                             p.type ? ctx.resolvedType(*p.type) : nullptr;
+                        if (!pt || refMentionsAnyOf(pt, allParams)) {
+                            paramsClean = false;
+                            break;
+                        }
+                    }
+                }
+                if (paramsClean) { pinned = true; break; }
+            } else if (auto* ps = dynamic_cast<PropertySymbol*>(mem)) {
+                // IMPORTED (Property/Indexer). `importedMemberType(ps)`
+                // carries the property type (the loader stores it in
+                // `fieldTypes_[p] = convert(mm.type)` and publishes via
+                // `setImportedMemberType`); `indexerParams` is the parameter
+                // list for an imported indexer (`isIndexer`-gated path in
+                // ModuleLoader's MetaMemberKind::Indexer arm).
+                if (isStaticMember(ps->modifiers)) continue;
+                const TypeRef* rt = ctx.importedMemberType(ps);
+                if (!rt || !refMentionsAnyOf(rt, one)) continue;
+                bool paramsClean = true;
+                if (ps->isIndexer) {
+                    for (Symbol* pSym : ps->indexerParams) {
+                        if (!pSym) continue;
+                        auto* paramSym =
+                            dynamic_cast<ParameterSymbol*>(pSym);
+                        const TypeRef* pt =
+                            paramSym ? paramSym->resolvedDeclType : nullptr;
                         if (!pt || refMentionsAnyOf(pt, allParams)) {
                             paramsClean = false;
                             break;
@@ -6491,21 +6560,26 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
         for (std::string_view m : pd->modifiers)
             if (m == "sealed") { sealedPd = true; break; }
         constexpr bool kClashProtectionAdmitEnabled = true;  // #2186 unblocked
-        // fix #3143 (§19.3 / §2.5, v0.254): `ifaceClashProtectedAllParams` is
-        // genuinely NEEDS-AST — it walks the interface's member DECLARATIONS
-        // (`itd->members`, each member's `returnType`/`params` AST nodes), which
-        // an IMPORTED interface does not have at all. This function's old
-        // blanket `!itd -> accept` early-out is gone (the VARIANCE it was
-        // standing in for is on the symbol), so the residue is confined here:
-        // with no declaration to probe, keep the conservative accept rather than
-        // let a missing AST read as "not clash-protected" and turn into a
-        // reject. Lifting it needs a symbol-side member-shape channel — filed
-        // as #3161, against the surface umbrella #3149 scopes.
-        const auto* itd = dynamic_cast<const ast::TypeDecl*>(sd->decl);
-        if (!itd) return IfaceBindReject::None;
+        // fix #3161 (§19.3 / §2.8.3 rule 4, v0.254): `ifaceClashProtectedAllParams`
+        // now reads the interface's MemberSymbol shape (`ts->genericParams`/
+        // `ts->members`, with `ctx.importedReturnType(ms)`,
+        // `ctx.importedMemberType(ps)`, and `ParameterSymbol::resolvedDeclType`
+        // covering every channel the AST path used to read from
+        // `ast::MethodDecl::returnType` / `ast::PropertyDecl::type` /
+        // `ast::Param::type`). The function therefore classifies an IMPORTED
+        // `IFoo<T>` whose `Get(): T` member is `clash-protected` correctly,
+        // where the pre-#3161 `!itd -> accept` blanket-accepted every erased-
+        // argument arm through it — the §19.3 admit this gates, AND a missing
+        // `IFoo` shape (no `T`-pinned member), continues to return `false`
+        // and fall through to the `ErasedAmbiguous` reject below. Both
+        // directions remain conservative in the sound sense: a false
+        // "protected" admit is impossible because the walker has no other
+        // member-kind assumption to make on the imported side than the AST
+        // path already makes on the local side; the admit OR the reject it
+        // produced is preserved.
         if (!sealedPd &&
             !(kClashProtectionAdmitEnabled && uniqueConformer &&
-              ifaceClashProtectedAllParams(itd, ctx_)))
+              ifaceClashProtectedAllParams(sd, ctx_)))
             return IfaceBindReject::ErasedAmbiguous;
     }
     return IfaceBindReject::None;  // erased but the UNIQUE conformer — sound.
