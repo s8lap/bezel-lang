@@ -58,6 +58,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
@@ -68,12 +69,22 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir429cl() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-429cl");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // Compile `source` to a temp native executable via the real Driver pipeline
 // and run it; returns the exit code, or -1 on compile/link/run failure.
 int compileAndRun(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_429cl_" + std::to_string(counter++);
+    auto dir = wtDir429cl();
+    std::string stem = unique_stem("bezel_429cl");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     {
@@ -99,9 +110,8 @@ bool lowerAndLink(const std::string& source, std::string& obj,
                   std::string& exe) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return false;
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_429cl_san_" + std::to_string(counter++);
+    auto dir = wtDir429cl();
+    std::string stem = unique_stem("bezel_429cl_san");
     obj = (dir / (stem + ".o")).string();
     exe = (dir / stem).string();
     {
