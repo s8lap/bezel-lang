@@ -7,10 +7,13 @@
 
 namespace bezel::sema {
 
-// per §6.5 (#1210; domain rule since v0.242, #3045): the shift count's domain
-// is bounded by the LEFT operand's bit width. This helper infers that width
-// purely from the AST shape, without a type-checker context:
-//   • an untyped integer literal is `int` (32-bit) per §2;
+// per §6.5 (#1210; domain rule since v0.242, #3045; result truncation since
+// v0.247, #3078): the shift count's domain is bounded by the LEFT operand's
+// bit width. This helper infers that width purely from the AST shape, without
+// a type-checker context:
+//   • an integer literal is `int` (32-bit) by default per §2, and `long`
+//     (64-bit) when suffixed with `L` or `l` (with or without a preceding `u`/
+//     `U`);
 //   • unary +/-/~ on a known-width sub-expression inherits that width;
 //   • a binary arithmetic/bitwise expression whose BOTH sides have the same
 //     known width inherits that width (Bezel has no implicit integer widening);
@@ -18,10 +21,20 @@ namespace bezel::sema {
 //     "unknown" — the caller cannot decide the domain for those here, and the
 //     typed check in ExprTypecheck (which does know the operand's type) covers
 //     them.
-// Only 32 is returned for normal literal-arithmetic; 8/16/64 require type
+// Only 32/64 are returned for literal-arithmetic; 8/16 require type
 // information that is not available at this level.
 static int inferIntWidthBitsForShift(const ast::Expr& e) {
-    if (dynamic_cast<const ast::IntLiteralExpr*>(&e)) return 32;
+    if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
+        // fix #3078 (§6.5 / §17.14, v0.247): an `L`/`l` literal suffix widens
+        // the literal to `long` (64-bit), so `1L << 63` has domain `0..63`
+        // (the long literal's source width), not `0..31`. Without this the
+        // count was checked against 32 and the in-domain `1L << 63` folded
+        // to nullopt, indistinguishable from the genuine fault `1L << 64`.
+        std::string_view text = il->text;
+        if (!text.empty() && (text.back() == 'L' || text.back() == 'l'))
+            return 64;
+        return 32;
+    }
     if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e))
         return u->operand ? inferIntWidthBitsForShift(*u->operand) : 0;
     if (auto* b = dynamic_cast<const ast::BinaryExpr*>(&e)) {
@@ -32,6 +45,51 @@ static int inferIntWidthBitsForShift(const ast::Expr& e) {
     }
     // IdentifierExpr or any other form: width needs a type-checker pass.
     return 0;
+}
+
+// Sibling of inferIntWidthBitsForShift for the LEFT operand's SIGNEDNESS —
+// drives the post-fold result truncation in fix #3078. Returns true for a
+// signed integer literal (the default per §2: `int`/`long`), false for an
+// unsigned literal (any `u`/`U` suffix). Same AST-shape-only discipline as
+// the width helper: any non-literal form returns true (the common case;
+// the typed check uses the actual type).
+static bool inferIntSignednessForShift(const ast::Expr& e) {
+    if (auto* il = dynamic_cast<const ast::IntLiteralExpr*>(&e)) {
+        std::string_view text = il->text;
+        // Strip the optional L/l suffix first, so `1uL` reads as `1u`.
+        if (!text.empty() && (text.back() == 'L' || text.back() == 'l'))
+            text.remove_suffix(1);
+        // A trailing `u`/`U` marks the literal as unsigned.
+        if (!text.empty() && (text.back() == 'u' || text.back() == 'U'))
+            return false;
+        return true;
+    }
+    if (auto* u = dynamic_cast<const ast::UnaryExpr*>(&e))
+        return u->operand ? inferIntSignednessForShift(*u->operand) : true;
+    return true;  // unknown — default signed (matches the `int` literal rule)
+}
+
+// fix #3078 (§6.5 / §17.14, v0.247): a shift's RESULT is truncated to the
+// LEFT operand's bit width, with sign extension for signed types — the
+// per-§6.5 "bits shifted beyond the left operand's width are discarded
+// silently" rule, applied to the `long long` fold so the destination-type
+// range check sees a value that IS representable in the destination (e.g.
+// `1 << 31` → -2147483648 on `int`, not the unrepresentable `2147483648`
+// from the unchecked 64-bit shift). `bits` is the LEFT operand's width
+// (8/16/32/64); `signedLeft` is the LEFT operand's signedness. Returns
+// `raw` unchanged when `bits >= 64` (the natural `long long` width) or
+// `bits <= 0` (unknown).
+static long long truncateShiftFoldToLeftWidth(
+    long long raw, int bits, bool signedLeft) {
+    if (bits <= 0 || bits >= 64) return raw;
+    long long mask = (1LL << bits) - 1;
+    long long truncated = raw & mask;
+    if (signedLeft && (truncated & (1LL << (bits - 1)))) {
+        // Re-extend the high bit as a sign, so the value fits `long long`
+        // the same way it would fit the destination signed type.
+        truncated -= (1LL << bits);
+    }
+    return truncated;
 }
 
 std::optional<long long> foldIntConst(
@@ -131,8 +189,16 @@ std::optional<long long> foldIntConst(
             int leftBits = inferIntWidthBitsForShift(*b->left);
             if (leftBits > 0 && (*r < 0 || *r >= leftBits)) return std::nullopt;
             if (*r < 0 || *r >= 64) return std::nullopt;
-            if (b->op == "<<") return *l << *r;
-            return *l >> *r;
+            // fix #3078 (§6.5 / §17.14, v0.247): the fold computes in `long
+            // long`, but §6.5 says a shift's RESULT is truncated to the LEFT
+            // operand's width. Without this re-truncation `1 << 31` folds to
+            // 2147483648 (which exceeds `Int`'s max), so the destination
+            // range check at the const declaration reports the representable
+            // value -2147483648 as a non-fit. Truncate here so the fold's
+            // result is what the destination type will actually hold.
+            long long raw = (b->op == "<<") ? (*l << *r) : (*l >> *r);
+            return truncateShiftFoldToLeftWidth(
+                raw, leftBits, inferIntSignednessForShift(*b->left));
         }
         if (b->op == "&") return *l & *r;
         if (b->op == "|") return *l | *r;
