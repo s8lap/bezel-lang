@@ -1149,6 +1149,74 @@ struct MetaTypeDecl {
     // trivial" and never "known trivial".
     bool nonTrivialDispose = false;
 
+    // §9.8 / §2.8.3 rule 4 (fix #3179, family F10 of umbrella #3152; additive
+    // within v7): the class's §9.8 serialized CLASS SHAPE, as decided by
+    // `Resolver::checkSerializationEligibility`'s pre-pass on the EXPORTER side
+    // and read back across the wire by the IMPORTER. Either empty (every non-
+    // class kind, and a class that does not declare ISerializable/
+    // IDeserializable), or one of exactly the three values the A.3 grammar
+    // admits: "tree" / "graph" / "cyclic". The shape decides which
+    // wire-format pass the importer's §9.8 `Deserialize` synthesis takes, the
+    // same way it does locally; emitting it carries the §9.8 surface across
+    // the boundary the same way `baseTypes` carries the §12 one.
+    //
+    // Until this field existed, `MetaTypeDeclKind::Class` crossed and the §9.8
+    // surface did not (the pre-fix record/enum/choice surface now crosses, but
+    // the class half was the remaining gap #3179 records). An imported `class
+    // C: ISerializable, IDeserializable` therefore had `serializedShape == ""`
+    // on the importer side, and every reader that asked `serializedClassShape`
+    // — at least 21 sites in `LlvmBackend_Serialization.cpp` listed at
+    // `src/sema/Symbol.hpp` — answered "" and so declined the surface, with
+    // the local twin compiling fine. The shape is exactly the information the
+    // §9.8 `Deserialize`/polymorphic dispatch synthesis needs to decide which
+    // wire path to emit, and without it the importer's `Deserialize` cannot be
+    // re-synthesised.
+    //
+    // Carried as its own REC_SER_TYPE_SHAPE record under TYPE_BLOCK (codes
+    // REC_SER_TYPE_SHAPE = 13, typed as the bytes of the shape string).
+    // Emitted only when non-empty — for every non-class kind and for a class
+    // that declares no ISerializable/IDeserializable conformance the shape is
+    // empty, so a module with no class serialization produces BYTE-IDENTICAL
+    // metadata to before (the same conditional-emission rule #2950 /
+    // #3139 / #3144 / #3191 already use). The matching hashTypeDecl fold is
+    // also conditional on the field being non-empty, with the same rationale —
+    // a fold the writer did not write moves the VBR-encoded header hash.
+    std::string serializedShape;
+
+    // §9.8 tier 4 / §2.8.3 rule 4 (fix #3179, same family): the class's
+    // `polymorphic(...)` registry entries in declaration order. Empty for
+    // every type whose class did not declare a registry; the polymorphic
+    // dispatch path's existence is a tier-4 opt-in (§9.8 tier 4 — "a base
+    // class whose serialized components may, at run time, hold instances of
+    // registered derived classes declares a `polymorphic` registry as a
+    // member of its body"), so empty is the meaningful default.
+    //
+    // Each entry is the wire discriminator string and the resolved
+    // registered concrete type. Until this field existed the registry did
+    // not cross (`MetaTypeDecl::polyCases` is read on the local side from
+    // `ast::TypeDecl::serializedClass->polyCases`); an imported polymorphic
+    // base therefore arrived as a non-polymorphic class, and a component
+    // whose static type was that base silently lost the `$type` field on
+    // round-trip while the local twin emitted it. The discriminator and the
+    // resolved type are the exact two facts the §9.8 wire form needs (the
+    // discriminator string becomes the `$type` value, the resolved type
+    // names which concrete class to dispatch to on read).
+    //
+    // Carried as trailing POLY_CASE_BLOCK subblocks under TYPE_BLOCK, one per
+    // entry, with NO count scalar — the same self-describing subblock-id
+    // pattern #3144 uses for `choiceCases` and the same reason: a 9th
+    // positional scalar would be read as #3139's `nBuiltinIfaces` by every
+    // type that declares no built-in interface (a silent misparse — see the
+    // ⚠ block on emitTypeDecl's 8th scalar). Both the emission and the
+    // hashTypeDecl fold are conditional on the list being non-empty, so a
+    // module with no polymorphic base is BYTE-IDENTICAL to before.
+    struct MetaPolyCase {
+        std::string discriminator;
+        MetaType type;
+        bool operator==(const MetaPolyCase&) const;
+    };
+    std::vector<MetaPolyCase> serializedPolyCases;
+
     bool operator==(const MetaTypeDecl&) const;
 };
 

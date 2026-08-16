@@ -43,6 +43,9 @@ enum BlockID : unsigned {
     METATYPE_BLOCK = 15, // one MetaType (a signature type, possibly nested)
     CONTRACT_BLOCK = 16, // one MetaContractRecord (§22.16 / #2054)
     EXTENSION_BLOCK = 17, // one MetaExtension (§26 / #735)
+    // §9.8 class shape + polymorphic registry (#3179, family F10 of umbrella
+    // #3152; block ids in the additive 20.. range reserved by #3144).
+    POLY_CASE_BLOCK = 20,  // one MetaPolyCase
     // §35.1 (#3144): one MetaChoiceCase / one MetaChoicePayloadField. These
     // ride as TRAILING subblocks of TYPE_BLOCK with no count scalar — see the
     // ⚠ block in emitTypeDecl for why a 9th positional scalar was not an
@@ -105,7 +108,20 @@ enum RecordCode : unsigned {
     // exhibits — so a recompile is required to gain the fix, with no
     // silent wrong-value in the dependency-direction.
     REC_POSPARAM_DEFAULT = 12,
-    // 13.. additive; unknown codes are skipRecord()'d by the reader
+    // §9.8 class shape + polymorphic registry (#3179, family F10 of umbrella
+    // #3152; additive within v7): TYPE_BLOCK — the §9.8 class wire SHAPE,
+    // carried as the bytes of one of the A.3 grammar's three identifiers
+    // ("tree" / "graph" / "cyclic") under its OWN code. Emitted only when
+    // non-empty — the same #2950/#3139/#3144/#3191 conditional-emission rule.
+    // A reader predating this field `skipRecord()`s the unknown code, leaving
+    // the shape empty (the pre-fix reading, which is exactly what the §9.8
+    // surface admits for a non-serializable class). The serializedPolyCases
+    // ride as trailing POLY_CASE_BLOCK subblocks under their own self-
+    // describing block id (same as #3144's CHOICE_CASE_BLOCK); they are read
+    // separately, in `readTypeDeclBody`, and do not need their own record
+    // code here.
+    REC_SER_TYPE_SHAPE = 13,
+    // 14.. additive; unknown codes are skipRecord()'d by the reader
     REC_UNKNOWN_FUTURE = 90, // test-only: a record code this reader skips
 };
 
@@ -382,6 +398,29 @@ void hashTypeDecl(std::uint64_t& h, const MetaTypeDecl& ty) {
     // folding a `false` the writer never wrote would move the VBR-encoded header
     // hash of every artifact for a change that wrote nothing.
     if (ty.nonTrivialDispose) hashBool(h, true);
+    // §9.8 / §2.8.3 rule 3 (#3179): the class's serialized SHAPE is part of
+    // the public contract — adding or removing `: ISerializable` (which flips
+    // the shape from "" to "tree" / "graph" / "cyclic") is a breaking change
+    // for any client whose `is` test, `catch` clause, or §19 pattern over a
+    // value of the type's serialization surface depended on it being open or
+    // closed. GUARDED ON EXACTLY THE EMISSION'S CONDITION (the same rule
+    // #2950 / #3139 / #3144 / #3191 state): a fold the writer did not write
+    // moves the VBR-encoded header hash of every artifact for a change that
+    // wrote nothing. The "absent" and "tree / graph / cyclic" reads cannot
+    // hash identically under this guard, since the guard itself forces the
+    // "absent" record.
+    if (!ty.serializedShape.empty()) hashStr(h, ty.serializedShape);
+    // §9.8 tier 4 (#3179): the polymorphic registry entries are part of the
+    // public contract — same staleness reasoning as the shape. "absent" and
+    // "empty" collapse to the same read for the same reason (the slot is
+    // empty), but a non-empty registry is its own self-describing content.
+    if (!ty.serializedPolyCases.empty()) {
+        hashU64(h, ty.serializedPolyCases.size());
+        for (const MetaTypeDecl::MetaPolyCase& pc : ty.serializedPolyCases) {
+            hashStr(h, pc.discriminator);
+            hashType(h, pc.type);
+        }
+    }
 }
 
 } // namespace
@@ -477,6 +516,13 @@ bool MetaChoiceCase::operator==(const MetaChoiceCase& o) const {
     return name == o.name && payload == o.payload &&
            hasSerialized == o.hasSerialized &&
            serializedName == o.serializedName;
+}
+
+// §9.8 tier 4 (#3179): a polymorphic registry entry's structural equality.
+// Backs the round-trip tests the same way MetaChoiceCase does (above).
+bool MetaTypeDecl::MetaPolyCase::operator==(
+    const MetaTypeDecl::MetaPolyCase& o) const {
+    return discriminator == o.discriminator && type == o.type;
 }
 
 bool MetaParam::operator==(const MetaParam& o) const {
@@ -608,7 +654,14 @@ bool MetaTypeDecl::operator==(const MetaTypeDecl& o) const {
            // §3.6 rule 3 (#3191): the trivial-dispose verdict is part of the
            // public contract, so two metadata values differing only in it are
            // NOT equal — this operator backs the round-trip tests.
-           nonTrivialDispose == o.nonTrivialDispose;
+           nonTrivialDispose == o.nonTrivialDispose &&
+           // §9.8 class shape + polymorphic registry (#3179) are part of the
+           // public contract — adding or removing `: ISerializable` (which
+           // flips the shape from "" to "tree") is a breaking change for any
+           // client that depended on the surface being closed, exactly as a
+           // signature change is (§2.8.3 rule 3).
+           serializedShape == o.serializedShape &&
+           serializedPolyCases == o.serializedPolyCases;
 }
 
 bool MetaFunction::operator==(const MetaFunction& o) const {
@@ -736,6 +789,21 @@ void emitChoiceCase(llvm::BitstreamWriter& w, const MetaChoiceCase& cc) {
     emitString(w, cc.serializedName);
     for (const MetaChoicePayloadField& pf : cc.payload)
         emitChoicePayloadField(w, pf);
+    w.ExitBlock();
+}
+
+// §9.8 tier 4 (#3179, family F10 of umbrella #3152): one entry of the
+// `polymorphic("d": T, ...)` registry. The block is unconditional inside
+// POLY_CASE_BLOCK — the block itself only exists for a polymorphic base, so
+// no non-polymorphic module pays a byte for it (the conditionality that
+// matters lives at the TYPE_BLOCK level, see emitTypeDecl). Shape mirrors
+// emitChoiceCase (scalars, then discriminator, then the registered type).
+void emitPolyCase(llvm::BitstreamWriter& w,
+                  const MetaTypeDecl::MetaPolyCase& pc) {
+    w.EnterSubblock(POLY_CASE_BLOCK, 4);
+    w.EmitRecord(REC_SCALARS, llvm::ArrayRef<std::uint64_t>{});
+    emitString(w, pc.discriminator);
+    emitType(w, pc.type);
     w.ExitBlock();
 }
 
@@ -1003,6 +1071,38 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty) {
     // trailing capture records above keep the exact positions they had.
     if (ty.nonTrivialDispose)
         w.EmitRecord(REC_DISPOSE_VERDICT, llvm::ArrayRef<std::uint64_t>{1});
+    // §9.8 / §2.8.3 rule 4 (#3179, family F10 of umbrella #3152): the class's
+    // serialized CLASS SHAPE, as the bytes of one of A.3's three identifiers
+    // ("tree" / "graph" / "cyclic"), under its OWN record code so the
+    // presence / absence is self-describing and a reader predating the field
+    // `skipRecord()`s it, leaving the field empty (the pre-fix reading, which
+    // is exactly what the §9.8 surface admits for a non-serializable class).
+    // Conditional on non-empty — empty for every non-class kind and for a
+    // class that declares no ISerializable / IDeserializable conformance. The
+    // matching `hashTypeDecl` fold is conditional on the same predicate, with
+    // the same rationale as the prior #2950 / #3139 / #3144 / #3191 records.
+    // Position after the existing trailing records is immaterial because the
+    // code is self-describing — emit LAST so the previous captures keep the
+    // exact positions they had.
+    if (!ty.serializedShape.empty()) {
+        llvm::SmallVector<std::uint64_t, 8> ss;
+        ss.reserve(ty.serializedShape.size());
+        for (char c : ty.serializedShape)
+            ss.push_back(static_cast<std::uint8_t>(c));
+        w.EmitRecord(REC_SER_TYPE_SHAPE, ss);
+    }
+    for (const MetaTypeDecl::MetaPolyCase& pc : ty.serializedPolyCases)
+        emitPolyCase(w, pc);
+    // §9.8 tier 4 / §2.8.3 rule 4 (#3179): the `polymorphic(...)` registry
+    // entries. Same trailing-block pattern as #3144's `choiceCases` — one
+    // POLY_CASE_BLOCK per entry, no count scalar (see the ⚠ block above the
+    // 8th scalar for why a 9th positional scalar was not an option, in
+    // particular on a class that declares no built-in interface: the reader
+    // would silently read it as `nBuiltinIfaces` and try to read that many
+    // METATYPE_BLOCKs, a silent misparse). `skipRecord()`s for any reader
+    // predating the block id leave an empty registry on the class — the
+    // pre-fix reading, and the correct one for a non-tier-4 class. Conditional
+    // on non-empty for byte-identical metadata on the unaffected majority.
     w.ExitBlock();
 }
 
@@ -1307,12 +1407,27 @@ bool enterSubblock(Reader& r, unsigned wantId) {
 // SkipBlock()'d exactly as an unknown subblock id always was, which is also
 // precisely what a reader predating this field does.
 bool readChoiceCaseBody(Reader& r, MetaChoiceCase& cc);  // fwd (#3144)
+bool readPolyCaseBody(Reader& r,
+                      MetaTypeDecl::MetaPolyCase& pc);  // fwd (#3179)
 
 bool finishBlockImpl(Reader& r, std::string* captureString,
                      unsigned capturedCode = 0,
                      std::string* codedCapture = nullptr,
                      std::vector<MetaChoiceCase>* choiceCases = nullptr,
-                     bool* disposeVerdict = nullptr) {
+                     bool* disposeVerdict = nullptr,
+                     // §9.8 class shape + polymorphic registry (#3179,
+                     // family F10 of umbrella #3152): a SECOND coded string
+                     // capture for REC_SER_TYPE_SHAPE (independent of the
+                     // existing `codedCapture`, which is already REC_EXC_BASE
+                     // in the readTypeDeclBody call site). `polyCases` rides
+                     // a subblock id and follows the same `choiceCases`
+                     // optional-pointer shape. Both are nullptrable so this
+                     // stays a strict extension of the previous 5-argument
+                     // API.
+                     unsigned secondCapturedCode = 0,
+                     std::string* secondCodedCapture = nullptr,
+                     std::vector<MetaTypeDecl::MetaPolyCase>* polyCases =
+                         nullptr) {
     while (true) {
         unsigned id = 0;
         Next n = nextEntry(r, id);
@@ -1347,6 +1462,18 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
                 } else if (codedCapture != nullptr && code == capturedCode) {
                     dst = codedCapture;
                     codedCapture = nullptr;
+                } else if (secondCodedCapture != nullptr &&
+                           code == secondCapturedCode) {
+                    // §9.8 (#3179): the second coded-capture slot. Read it
+                    // the same way the existing one is read (decode bytes
+                    // back into a std::string), set the pointer to nullptr
+                    // so a second REC_SER_TYPE_SHAPE — which #3191's same
+                    // "last wins" precedent does NOT predict, since at most
+                    // one such record exists per type — does not silently
+                    // overwrite the first; absent leaves the field empty,
+                    // the pre-fix reading.
+                    dst = secondCodedCapture;
+                    secondCodedCapture = nullptr;
                 }
                 if (dst != nullptr) {
                     dst->clear();
@@ -1366,6 +1493,17 @@ bool finishBlockImpl(Reader& r, std::string* captureString,
                 if (r.cursor.EnterSubBlock(CHOICE_CASE_BLOCK)) return false;
                 choiceCases->emplace_back();
                 if (!readChoiceCaseBody(r, choiceCases->back())) return false;
+                continue;
+            }
+            // §9.8 tier 4 (#3179): a trailing polymorphic registry entry,
+            // when the caller wants them. Same self-describing subblock-id
+            // pattern as CHOICE_CASE_BLOCK (no count scalar — see the ⚠
+            // block on emitTypeDecl's 8th scalar for why a 9th positional
+            // scalar would silently misparse as #3139's `nBuiltinIfaces`).
+            if (polyCases != nullptr && id == POLY_CASE_BLOCK) {
+                if (r.cursor.EnterSubBlock(POLY_CASE_BLOCK)) return false;
+                polyCases->emplace_back();
+                if (!readPolyCaseBody(r, polyCases->back())) return false;
                 continue;
             }
             if (r.cursor.SkipBlock()) return false;
@@ -1477,6 +1615,19 @@ bool readChoiceCaseBody(Reader& r, MetaChoiceCase& cc) {
         if (!enterSubblock(r, CHOICE_PAYLOAD_BLOCK)) return false;
         if (!readChoicePayloadFieldBody(r, cc.payload[i])) return false;
     }
+    return finishBlock(r);
+}
+
+// §9.8 tier 4 (#3179, family F10 of umbrella #3152): one entry of the
+// `polymorphic("d": T, ...)` registry. Mirrors readChoiceCaseBody (zero
+// scalars at the head — the `discriminator`/`type` pair fully identifies the
+// entry, matching emitPolyCase) followed by the discriminator string and the
+// registered MetaType.
+bool readPolyCaseBody(Reader& r, MetaTypeDecl::MetaPolyCase& pc) {
+    llvm::SmallVector<std::uint64_t, 1> sc;
+    if (!expectScalars(r, sc)) return false;  // exactly 0 scalars allowed
+    if (!expectString(r, pc.discriminator)) return false;
+    if (!readType(r, pc.type)) return false;
     return finishBlock(r);
 }
 
@@ -1783,10 +1934,20 @@ bool readTypeDeclBody(Reader& r, MetaTypeDecl& ty) {
     // is immaterial. Absent means false — an old artifact, or a trivial-dispose
     // type — which is the pre-fix reading and the safe one (see the field
     // comment: `false` must never mean "known trivial").
+    //
+    // §9.8 (#3179, family F10 of umbrella #3152): the SEC_TYPE_SHAPE carry
+    // through the new `secondCodedCapture` slot, and serializedPolyCases
+    // through POLY_CASE_BLOCK subblocks — both nullable for any other call
+    // site, present only here. The byte ordering is immaterial because the
+    // record is captured by code and the subblock is captured by id, exactly
+    // matching the emission's self-describing layout. Absent on either is the
+    // pre-fix reading: an empty `serializedShape` and an empty registry, both
+    // of which a non-§9.8-class wants anyway.
     return finishBlockImpl(
         r, !ty.genericParams.empty() ? &ty.dtorBodyText : nullptr,
         REC_EXC_BASE, &ty.builtinExceptionBase, &ty.choiceCases,
-        &ty.nonTrivialDispose);
+        &ty.nonTrivialDispose,
+        REC_SER_TYPE_SHAPE, &ty.serializedShape, &ty.serializedPolyCases);
 }
 
 bool readTypeDecl(Reader& r, MetaTypeDecl& ty) {

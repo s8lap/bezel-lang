@@ -1874,6 +1874,70 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         }
     }
 
+    // §9.8 / §2.8.3 rule 4 (#3179, family F10 of umbrella #3152): the
+    // §9.8 class wire SHAPE and `polymorphic(...)` REGISTRY, on the symbol
+    // side (mirrors the place #3140's F2 work wrote them — see
+    // `sema::TypeSymbol::serializedShape` / `::serializedPolyCases` in
+    // Symbol.hpp). Until this line existed, the §9.8 class serialization
+    // surface was correctly ELIGIBLE on the importer side (#3140's interlock
+    // is gone, #3185 confirmed the choice-case surface is sound, and the
+    // resolver's pre-pass writes the symbol shape on the local side) but the
+    // shape and registry were NEVER WRITTEN to the wire — `t.decl` is non-
+    // null here so the resolver ran, `t.serializedShape` is the resolver's
+    // chosen "tree" / "graph" / "cyclic" string, and the importer has no
+    // other path to learn it.
+    //
+    // Read from the SYMBOL, not from `t.decl->serializedClass->shape`, for
+    // the same reason the other class-level deriving properties (the §31.4
+    // exception base, #2950; the §28.9 dispose verdict, #3191; the built-in
+    // interface bases, #3139) all read from the symbol here: the symbol is
+    // what the resolver populates, and reading both sides would re-introduce
+    // the AST / symbol drift this same family (F2 #3140) recorded. The
+    // symbol-side writer IS authoritative on the local side, by the same
+    // resolvability argument.
+    //
+    // Conditional on `kind == Class`: every non-class kind has an empty
+    // shape and registry on the symbol, so a record / enum / choice with no
+    // outgoing §9.8 carriage is byte-identical to a pre-#3179 build.
+    if (t.kind == ast::TypeDeclKind::Class) {
+        out.serializedShape = std::string(t.serializedShape);
+        for (const auto& pc : t.serializedPolyCases) {
+            MetaTypeDecl::MetaPolyCase outPc;
+            outPc.discriminator = std::string(pc.discriminator);
+            // The resolver populates SerializedPolyCase::type with a
+            // sema::TypeSymbol (the resolved concrete type for the
+            // registry entry). The wire carries a MetaType describing the
+            // type by name and structure; since the registry's entries are
+            // named type references (each `: ISerializable, IDeserializable`
+            // is a class or interface, not a primitive or a generic
+            // construction), the named-name-with-module form suffices — same
+            // convention #3144 uses for `MetaChoicePayloadField::type` and
+            // #3139 uses for `builtinInterfaceBases`. The Loader resolves
+            // this on import via `convertAstType`, the same code path the
+            // rest of the export uses.
+            if (pc.type) {
+                outPc.type.kind = TypeKind::Named;
+                outPc.type.namedName = std::string(pc.type->name);
+                // moduleName slot is left empty: §9.8 tier 4 lists entries
+                // by their short name in the registry; same-compilation
+                // entries are the common case, and #3144's choice carries
+                // the module name through the `baseTypeRefs` source rather
+                // than inline. A cross-module concrete type named in a
+                // polymorphic registry will lose resolution on import (and
+                // get rejected at sema, loudly, as a missing type) — same
+                // conservative shape every other tier-4-class surface has.
+                if (!outPc.type.namedName.empty())
+                    out.serializedPolyCases.push_back(std::move(outPc));
+            } else {
+                // No resolved concrete type: still emit the discriminator
+                // (it can be useful as a hint in the importer's diagnostic);
+                // the type field's error sentinel will surface as a
+                // SerializationException at read.
+                out.serializedPolyCases.push_back(std::move(outPc));
+            }
+        }
+    }
+
     return out;
 }
 

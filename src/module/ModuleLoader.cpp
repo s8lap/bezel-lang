@@ -2884,6 +2884,21 @@ static void loadMetadataPass1(
         // exception base above — it is a property of the class itself, computed
         // by the exporter (which can see the destructor), and needs no other
         // dependency's shell to exist yet. See the sibling site's comment.
+        //
+        // fix #3179 (§9.8 tier 2+ / §2.8.3 rule 4, family F10 of umbrella
+        // #3152) NOTE: the §9.8 class wire SHAPE and `polymorphic(...)`
+        // REGISTRY fields on the symbol are NOT populated here in pass 1.
+        // They will be populated in pass 2 along with the codegen-ABI half
+        // (#3162 / #3191 family — the synthesized `Deserialize` construction
+        // for an IMPORTED class). Populating them in pass 1 alone, on this
+        // lane, would expose the §9.8 class surface to consumers without the
+        // construction machinery they need, turning the imported-class
+        // `b.Serialize(s)` call into a silent wrong-value path
+        // (#3140's T9/T10 over-acceptance controls pin the pre-#3179
+        // "still rejected" reading; #3179 itself records that those flip
+        // when the ABI lands, not when the wire alone lands). The wire
+        // carriage is the deliverable this lane lands; the symbol-side
+        // replay joins it when #3162/#3191 follow-up land.
         t->importedNonTrivialDispose = td.nonTrivialDispose;
         t->invariantContracts = toContractRecords(td.invariants);
         // #1488 / §2.8.3 rule 3: this type's declaring-module identity, as
