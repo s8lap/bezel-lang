@@ -16,7 +16,7 @@
 4    src/module/ModuleMetadataBuilder.cpp
 1    src/ownership/Ownership_Checks.cpp
 1    src/sema/EnumValues.hpp
-7    src/sema/ExprTypecheck.cpp
+6    src/sema/ExprTypecheck.cpp
 5    src/sema/ExprTypecheck_Calls.cpp
 7    src/sema/ExprTypecheck_Exprs.cpp
 4    src/sema/PureChecker.cpp
@@ -50,7 +50,7 @@
 3    src/ownership/Ownership_Checks.cpp
 1    src/sema/DefiniteAssignment.cpp
 1    src/sema/EntryPoint.cpp
-10   src/sema/ExprTypecheck.cpp
+12   src/sema/ExprTypecheck.cpp
 15   src/sema/ExprTypecheck_Calls.cpp
 18   src/sema/ExprTypecheck_Exprs.cpp
 10   src/sema/PureChecker.cpp
