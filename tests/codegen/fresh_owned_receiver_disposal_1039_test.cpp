@@ -38,6 +38,7 @@
 #include "support/aot_support.hpp"      // runAot — AOT oracle (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
 
@@ -49,6 +50,17 @@ using bezel::test::runAot;
 namespace {
 
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir1039() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-1039");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 // AOT oracle: fresh-receiver auto-drop (§28.3/§28.7) is disposal codegen, but
 // the surrounding programs must first pass the ownership pass the JIT skipped.
@@ -64,9 +76,8 @@ int runUnderLeakSanitizer(const std::string& source, bool detectLeaks = true) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;
 
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_1039_lsan_" + std::to_string(counter++);
+    auto dir = wtDir1039();
+    std::string stem = unique_stem("bezel_1039_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 
