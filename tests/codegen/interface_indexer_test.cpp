@@ -61,6 +61,17 @@ namespace {
 
 namespace fs = std::filesystem;
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDir401lsan() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-401lsan");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
 // JIT a program and return its `main` exit code (or -999 if it didn't run).
 int run(const std::string& src) {
     auto r = runAot(src);
@@ -76,9 +87,8 @@ int runUnderLeakSanitizer(const std::string& source) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;  // toolchain unavailable or compile failed
 
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_401_lsan_" + std::to_string(counter++);
+    auto dir = wtDir401lsan();
+    std::string stem = unique_stem("bezel_401_lsan");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe     = (dir / stem).string();
 
