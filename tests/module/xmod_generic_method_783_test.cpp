@@ -46,6 +46,19 @@
 namespace bezel::module {
 namespace {
 
+// Per-process unique working dir. The hardcoded /tmp/wt-783/ path was
+// flaky across shards (concurrent overwrites race the in-flight compileObject
+// child's read). Process-unique stem (atomic counter + ::getpid) gives every
+// shard its own directory under the same parent.
+const std::filesystem::path& wtDir783() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/tmp") / unique_stem("wt-783");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
+
 struct TempFile783 {
     std::string path;
     explicit TempFile783(const std::string& p) : path(p) {}
@@ -62,8 +75,8 @@ static const std::string& laneLocalAsanRt783() {
     static bool attempted = false;
     if (attempted) return cached;
     attempted = true;
-    std::string dst = "/tmp/wt-783/rt_asan.o";
-    std::filesystem::create_directories("/tmp/wt-783");
+    std::string dst = (wtDir783() / "rt_asan.o");
+    std::filesystem::create_directories(wtDir783());
     std::ifstream check(dst);
     if (check.good()) { cached = dst; return cached; }
     if (!::bezel::native_test::buildRuntimeSanitizerObject("address", dst))

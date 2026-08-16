@@ -63,6 +63,19 @@
 namespace bezel::module {
 namespace {
 
+// Per-process unique working dir. The hardcoded /tmp/wt-712/ path was
+// flaky across shards (concurrent overwrites race the in-flight compileObject
+// child's read). Process-unique stem (atomic counter + ::getpid) gives every
+// shard its own directory under the same parent.
+const std::filesystem::path& wtDir712() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/tmp") / unique_stem("wt-712");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -85,7 +98,7 @@ static const std::string& laneLocalAsanRt712() {
     static bool attempted = false;
     if (attempted) return cached;
     attempted = true;
-    std::string dst = "/tmp/wt-712/rt_asan.o";
+    std::string dst = (wtDir712() / "rt_asan.o");
     // If already built (by the pre-build step in the task instructions), reuse.
     std::ifstream check(dst);
     if (check.good()) { cached = dst; return cached; }

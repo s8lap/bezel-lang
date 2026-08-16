@@ -59,6 +59,23 @@
 namespace bezel::module {
 namespace {
 
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The hardcoded
+// shared /var/tmp/bezel-scratch/wt-1415/ path was the cause of the #3002-class
+// xmod COVERAGE SHORT: every shard that ran this test wrote its dep.bzl /
+// rt_asan.o to the same directory, so concurrent attempts overwrote each other's
+// source file mid-compileObject child-read, garbled the in-flight read, and the
+// shard crashed with SIGBUS. Process-unique stem (atomic counter + ::getpid)
+// gives every shard its own directory under the same parent.
+const std::filesystem::path& wtDir1415() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-1415");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+
+
 namespace fs = std::filesystem;
 
 struct TempFile1415 {
@@ -79,9 +96,9 @@ static const std::string& laneLocalAsanRt1415() {
     static bool attempted = false;
     if (attempted) return cached;
     attempted = true;
-    std::string dst = "/var/tmp/bezel-scratch/wt-1415/rt_asan.o";
+    std::string dst = (wtDir1415() / "rt_asan.o").string();
     std::error_code ec;
-    fs::create_directories("/var/tmp/bezel-scratch/wt-1415", ec);
+    fs::create_directories(wtDir1415(), ec);
     std::ifstream check(dst);
     if (check.good()) { cached = dst; return cached; }
     if (!::bezel::native_test::buildRuntimeSanitizerObject("address", dst))
@@ -154,7 +171,7 @@ static int xmodLsan1415(const std::string& aObj, const std::string& bSrc,
     const std::string& rt = laneLocalAsanRt1415();
     if (rt.empty()) return -1;
 
-    auto tmpDir = fs::path("/var/tmp/bezel-scratch/wt-1415");
+    auto tmpDir = fs::path(wtDir1415());
     static int ctr = 0;
     std::string stem = "bz1415_lsan_" + std::to_string(ctr++);
     std::string bObjPath = (tmpDir / (stem + "_b.o")).string();
