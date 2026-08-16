@@ -187,6 +187,40 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     // Evaluate the argument. If it's a string, use directly; if it's a
     // primitive, convert via emitPrimitiveToString first.
     llvm::Value* arg = lowerExpr(*call.args[0].value);
+    // fix #3104 (§4.7 / §8.5 / stdlib §2.1, v0.255): `lowerExpr` for a unit-
+    // typed argument returns a `Value*` with LLVM `void` type, NOT a null
+    // pointer — `builder_.CreateCall(callee, args)` at Calls2.cpp:10688
+    // produces a CallInst Value for the side effect, and `void`-typed
+    // instruction Values are non-null but unusable as a `bz_string*` arg
+    // to `bz_string_to_utf8z`. The pre-fix #3079 `if (!arg)` guard was
+    // structured around the (incorrect) premise that lowerExpr returns
+    // nullptr for any unlowered shape — true for built-in receiver calls
+    // and unconstructed `new`, FALSE for unit-typed calls (this shape).
+    // That off-by-one is exactly the asymmetry the issue names: a unit-
+    // typed `arg` IS non-null with type void, the guard's `if (!arg)` is
+    // false, and the post-guard code reaches `emitConsoleWrite` with a
+    // void-typed `strPtr`, which the IR verifier rejects with "Call
+    // parameter type does not match function signature" — measured on
+    // first cut (see also the sibling branch (b) at #3079, where the
+    // built-in receiver call hits the same null-not-void gap).
+    //
+    // §4.7 admits the boxing, §8.5 gives the rendering `()`, and stdlib
+    // §2.1 declares `Console.WriteLine(value: Object)` — so the spec
+    // gives the argument a well-defined answer. Replace whatever
+    // `arg` holds with the §8.5 sentinel BEFORE the guard runs: a
+    // bitcast'd `lowerStringLiteral` whose value is a static-rc global,
+    // exactly the same shape the nullable-value branch above uses for
+    // its `"null"` literal at line 360 (phied into a `ptrTy()` slot
+    // before `emitConsoleWrite`). The §2875 "+1 discharge" rule
+    // explicitly exempts borrowed statics, so no `releaseRender` flag.
+    if (call.args[0].value) {
+        const sema::TypeRef* preTy = ctx_.exprType(*call.args[0].value);
+        if (preTy && preTy->kind == sema::TypeRef::Kind::Unit) {
+            arg = builder_.CreateBitCast(
+                lowerStringLiteral("\"()\"", false), ptrTy(),
+                "console.arg.unit");
+        }
+    }
     if (!arg) {
         // fix #3079 (§8.5 / §21, v0.249): THE THIRD VALUE-DEMANDING DEGRADE —
         // the one #2966 named as a residual ("the three OTHER value-demanding
@@ -251,6 +285,17 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         const ast::Expr* argE = call.args[0].value.get();
         const sema::TypeRef* aTy = ctx_.exprType(*argE);
         const bool unitArg = aTy && aTy->kind == sema::TypeRef::Kind::Unit;
+        // fix #3104: a unit-typed argument is now handled by the pre-guard
+        // detection above (it overwrites `arg` with a bitcast'd §8.5
+        // sentinel, so `if (!arg)` is false and we never reach this guard
+        // for the unit case). The short-circuits below (`unitArg ? "" : …`)
+        // and the local `unitArg` capture are KEPT for symmetry with the
+        // original three-way severity split, even though with #3104 the
+        // unit-shaped arm never reports — the predicate helpers
+        // (`builtinReceiverOfMemberCall`, `unconstructedBuiltinNewName`)
+        // are non-trivial to evaluate on a unit-typed receiver, and the
+        // "diagnosed at most once" rule the original guard documented holds
+        // vacuously when the arm is unreachable.
         std::string argMember, argAppliedMember;
         const std::string argBuiltinRecv =
             unitArg ? std::string()
@@ -264,9 +309,7 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
                                                "argument"
                                              : "supply this `Console.Write` "
                                                "argument";
-        if (unitArg) {
-            // (a) — nothing to report.
-        } else if (!argBuiltinRecv.empty() && !ctx_.diagnostics().hasErrors()) {
+        if (!unitArg && !argBuiltinRecv.empty() && !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Error, argE->span.begin,
                 "`" + argMember + "` on built-in type `" + argBuiltinRecv +
@@ -291,6 +334,14 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
                 "nothing \xE2\x80\x94 not even the line terminator (stdlib "
                 "\xC2\xA7""2.1 / \xC2\xA7""21.9) \xE2\x80\x94 #3079");
         }
+        // fix #3104 (§4.7 / §8.5 / stdlib §2.1, v0.255): with the pre-guard
+        // unit detection above, the unit case no longer enters this guard
+        // (`arg` was overwritten with the §8.5 sentinel, so `if (!arg)`
+        // is false). The unitArg check the previous cut hoisted into this
+        // return is therefore gone — every entry here is a non-unit
+        // failure that the diagnostic just reported, and `return false`
+        // is uniformly correct. The "skip unit" predicate was load-bearing
+        // only when the unit case routed through here, which it does not.
         return false;
     }
     auto* argTy = ctx_.exprType(*call.args[0].value);
