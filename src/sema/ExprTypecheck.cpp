@@ -3445,6 +3445,91 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         to->primitive == PrimitiveType::Object) {
         return;
     }
+    // §3 / §5.1 / §8.6 / issue #3115 (scope = VALUE-TYPED targets only):
+    // an `Object`-typed SOURCE (a class reference or a §8.6 box pointer)
+    // admits NO implicit conversion to a VALUE-TYPED target — Primitive
+    // non-Object non-String (`int`, `bool`, `char`, `float`, …) and the
+    // Named value-builtins (`DateTime`, `TimeSpan`, `Guid`,
+    // `CancellationToken`, `DateOnly`, `TimeOnly`). The static "unbox"
+    // path this function used to admit on `(!from->nullable ||
+    // to->nullable)` had no runtime counterpart: codegen's
+    // `lowerLocalDecl` stores the `ptr`-typed slot at the value's
+    // storage (LlvmBackend_Setup.cpp `llvm::Type* slotTy = v ? v->
+    // getType() : …`) and a later load reinterprets the box pointer as
+    // the value, so `var i: int := o;` prints the low 32 bits of the
+    // box's heap address under ASLR instead of `42`, and the assignment
+    // form `i := o;` produces the same garbage. The sanctioned
+    // spellings carry an explicit runtime check: §12.7
+    // (`if o is T then var v: T := o; end;`, the proven-narrowing path
+    // #3090 leaves intact) or §17.4 (`var v := o as T;`, yielding `T?`).
+    //
+    // OUT OF SCOPE for this fix (deliberately kept on the permissive
+    // path): `Object → reference-typed Primitive` (`string`), `Object →
+    // Named` (class / interface / record / enum / choice), and
+    // `Object → function-typed` (the §27.6 property-getter-as-function-
+    // value re-type). These are surfaces pinned by the existing test
+    // suite (#2761 function-value thunk, #2752 `IEquatable<Object>`
+    // dispatch, #2766 method-group thunks, #1857 bare-T erasure
+    // substitution) and are a separate spec question (does §3 forbid
+    // implicit unchecked downcast to a reference-typed target, or is
+    // the iface dispatch vtable a sufficient runtime check?). The
+    // function-typed carve-out is critical: the §27.6 block below
+    // re-types the source expression as the function type, which
+    // codegen's property-thunk emitter needs; an early-return here
+    // would skip the re-typing and produce a runtime SIGSEGV.
+    //
+    // Exceptions preserved so existing tests stay green: `null` (typed
+    // `Object?`) assigning to a nullable target (`var x: int? := null;`)
+    // — the null-literal path §5.1's "Nullable conversions" admits —
+    // and `null` into a non-nullable target keeps the existing §7
+    // nullable-source diagnostic so the user sees the right rule, not
+    // a §5.1 "not convertible" message. Every other
+    // `Object → value-typed` shape — the bug — is rejected with the §5.1
+    // diagnostic naming both remedies.
+    if (from->kind == TypeRef::Kind::Primitive &&
+        from->primitive == PrimitiveType::Object) {
+        bool toIsValuePrimitive =
+            to->kind == TypeRef::Kind::Primitive &&
+            to->primitive != PrimitiveType::Object &&
+            to->primitive != PrimitiveType::String;
+        bool toIsValueBuiltinNamed =
+            to->kind == TypeRef::Kind::Named &&
+            isValueBuiltinByName(to->headName());
+        if (toIsValuePrimitive || toIsValueBuiltinNamed) {
+            if (from->nullable && to->nullable) {
+                return;  // `null → T?` — the legitimate §5.1 path.
+            }
+            if (from->nullable) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("the ") + what +
+                    " is nullable but the target type is non-nullable (§7)");
+                return;
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what +
+                " has type `Object` which has no implicit conversion to "
+                "the value type (§3, §5.1) — extract the value with an "
+                "explicit runtime check: `if o is T then var v: T := o; "
+                "end;` (§12.7, after #3090) or `var v := o as T;` (yielding "
+                "`T?`, §17.4)");
+            return;
+        }
+        // Object → reference-typed target: keep the permissive
+        // early-return that the pre-fix function admitted
+        // (Object→iface vtable dispatch, Object→string unchecked
+        // downcast). The function-typed carve-out is critical — the
+        // §27.6 property-getter-as-function-value block (further down)
+        // needs to RUN for `var f: () -> Object := h.O;` to re-type the
+        // source expression as a function thunk and emit the
+        // property-thunk codegen path. An early-return here would skip
+        // that re-typing and produce a runtime SIGSEGV (#2761).
+        if (to->kind != TypeRef::Kind::Function &&
+            (!from->nullable || to->nullable)) return;
+        // Function-typed target, OR Object? → non-nullable reference:
+        // fall through to the downstream blocks.
+    }
     auto reportNullable = [&] {
         ctx_.diagnostics().report(
             Severity::Error, loc,
