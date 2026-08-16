@@ -48,12 +48,28 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
-#include "test_harness.hpp"
 #include "support/unique_stem.hpp"
+#include "test_harness.hpp"
 
 
 namespace bezel::module {
 namespace {
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// std::filesystem::temp_directory_path() (== /tmp tmpfs) was race-prone even
+// with unique_stem: parallel shards racing on the SAME /tmp parent dir
+// overwrote each other's _a.bzl / _a.o / _b.bzl mid-compileObject. The
+// /var/tmp/bezel-scratch parent fixes that class of flake (#3002-class
+// COVERAGE SHORT). popen() at L72 is kept — per-stem uniqueness already
+// mitigates the file-overwrite race; full fork isolation is a separate concern.
+const std::filesystem::path& wtDir3159() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-3159");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 struct TempFile {
     std::string path;
@@ -95,7 +111,7 @@ std::pair<int, std::string> runCapture(const std::string& exe) {
 //   to `int`), the executable compiles, runs, prints 7, exits 7.
 BEZEL_TEST(xmod_generic_record_static_operator_3159,
            imported_generic_record_operator_primitive_return_spec_25_14_1) {
-    auto dir = std::filesystem::temp_directory_path();
+    auto dir = wtDir3159();
     std::string stem = unique_stem("bezel_3159_gpr_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
@@ -145,7 +161,7 @@ BEZEL_TEST(xmod_generic_record_static_operator_3159,
 // Already passes today; the fix MUST NOT regress it. Prints 7 / exits 7.
 BEZEL_TEST(xmod_generic_record_static_operator_3159,
            same_module_generic_record_operator_control_spec_25_14_1) {
-    auto dir = std::filesystem::temp_directory_path();
+    auto dir = wtDir3159();
     std::string stem = unique_stem("bezel_3159_gpr_sm_");
     TempFile aSrc((dir / (stem + ".bzl")).string());
     TempFile aExe((dir / (stem + "_a")).string());
@@ -187,7 +203,7 @@ BEZEL_TEST(xmod_generic_record_static_operator_3159,
 // symmetric, not doubling it. Prints 11 / 22 / exits 11.
 BEZEL_TEST(xmod_generic_record_static_operator_3159,
            imported_non_generic_record_operator_control_spec_25_9) {
-    auto dir = std::filesystem::temp_directory_path();
+    auto dir = wtDir3159();
     std::string stem = unique_stem("bezel_3159_ngc_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
@@ -270,7 +286,7 @@ BEZEL_TEST(xmod_generic_record_static_operator_3159,
 //   * Exits 42 on the OK branch.
 BEZEL_TEST(xmod_generic_record_static_operator_3159,
            imported_generic_record_operator_record_return_spec_25_14_1) {
-    auto dir = std::filesystem::temp_directory_path();
+    auto dir = wtDir3159();
     std::string stem = unique_stem("bezel_3226_rr_");
     TempFile aSrc((dir / (stem + "_a.bzl")).string());
     TempFile aObj((dir / (stem + "_a.o")).string());
