@@ -72,14 +72,30 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
-#include "test_harness.hpp"
 #include "support/unique_stem.hpp"
+#include "test_harness.hpp"
 
 
 namespace bezel::module {
 namespace {
 
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// fs::temp_directory_path() (== /tmp tmpfs) was race-prone even with
+// unique_stem: parallel shards racing on the SAME /tmp parent dir overwrote
+// each other's _a.bzl / _a.o / _b.bzl mid-compileObject. The
+// /var/tmp/bezel-scratch parent fixes that class of flake (#3002-class
+// COVERAGE SHORT). popen() at L163 is kept — per-stem uniqueness already
+// mitigates the file-overwrite race; full fork isolation is a separate concern.
+const std::filesystem::path& wtDir2955() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-2955");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 struct TempFile2955 {
     std::string path;
@@ -101,7 +117,7 @@ struct BuildResult2955 { bool depOk; bool success; std::string err; };
 BuildResult2955 compileImportCaptureErr2955(const std::string& libSrc,
                                             const std::string& appSrc,
                                             const std::string& tag) {
-    auto dir = fs::temp_directory_path();
+    auto dir = wtDir2955();
     std::string stem = "bz2955_" + tag + "_" + unique_stem("");
     TempFile2955 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2955 aObj((dir / (stem + "_a.o")).string());
@@ -149,7 +165,7 @@ BuildResult2955 compileImportCaptureErr2955(const std::string& libSrc,
 // that don't need a cross-module artifact to pin the gate.
 std::pair<int, std::string> compileAndRun2955(const std::string& src,
                                               const std::string& tag) {
-    auto dir = fs::temp_directory_path();
+    auto dir = wtDir2955();
     std::string stem = "bz2955s_" + tag + "_" + unique_stem("");
     TempFile2955 aSrc((dir / (stem + ".bzl")).string());
     TempFile2955 aExe((dir / stem).string());
