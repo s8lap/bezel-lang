@@ -75,10 +75,26 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// fs::temp_directory_path() (== /tmp tmpfs) + non-atomic counter pattern was
+// race-prone: parallel shards overwrote each other's _lib.bzl / _lib.o /
+// _main.bzl mid-compileObject and garbled the in-flight child read. The atomic
+// unique_stem + /var/tmp/bezel-scratch parent fixes that class of flake
+// (#3002-class COVERAGE SHORT).
+const std::filesystem::path& wtDir3197() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-3197");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 struct TempFile {
   std::string path;
@@ -96,9 +112,8 @@ void writeSource(const std::string& path, const std::string& src) {
 // SHAPE-A SIGSEGV the issue pins — the row asserts it is gone.
 int compileAndRunCrossModule(const std::string& libSrc,
                              const std::string& mainSrc) {
-  static int counter = 0;
-  auto dir = fs::temp_directory_path();
-  std::string stem = "bezel_xmod3197_" + std::to_string(counter++);
+  auto dir = wtDir3197();
+  std::string stem = unique_stem("bezel_xmod3197");
   TempFile lSrc((dir / (stem + "_lib.bzl")).string());
   TempFile lObj((dir / (stem + "_lib.o")).string());
   TempFile mSrc((dir / (stem + "_main.bzl")).string());
@@ -126,9 +141,8 @@ int compileAndRunCrossModule(const std::string& libSrc,
 
 // Single-module helper for the local-twin row.
 int compileAndRunSingleModule(const std::string& src) {
-  static int counter = 0;
-  auto dir = fs::temp_directory_path();
-  std::string stem = "bezel_xmod3197_sm_" + std::to_string(counter++);
+  auto dir = wtDir3197();
+  std::string stem = unique_stem("bezel_xmod3197_sm");
   TempFile srcF((dir / (stem + ".bzl")).string());
   TempFile exeF((dir / stem).string());
 
@@ -148,9 +162,8 @@ int compileAndRunSingleModule(const std::string& src) {
 // failure (the reject happened — the test passes). Mirrors the project's
 // "test the boundary" discipline (over-rejection control).
 int compileOnly(const std::string& src) {
-  static int counter = 0;
-  auto dir = fs::temp_directory_path();
-  std::string stem = "bezel_xmod3197_co_" + std::to_string(counter++);
+  auto dir = wtDir3197();
+  std::string stem = unique_stem("bezel_xmod3197_co");
   TempFile srcF((dir / (stem + ".bzl")).string());
   TempFile exeF((dir / stem).string());
 
