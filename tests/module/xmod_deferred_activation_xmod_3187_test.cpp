@@ -69,10 +69,28 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// fs::temp_directory_path() (== /tmp tmpfs) + non-atomic counter pattern was
+// race-prone: parallel shards overwrote each other's _lib.bzl / _lib.o /
+// _main.bzl mid-compileObject and garbled the in-flight child read. The atomic
+// unique_stem + /var/tmp/bezel-scratch parent fixes that class of flake
+// (#3002-class COVERAGE SHORT). popen() usage is kept (per-stem uniqueness
+// already mitigates the overwrite race; full fork isolation is a separate
+// concern).
+const std::filesystem::path& wtDir3187() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-3187");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 struct TempFile {
   std::string path;
@@ -92,9 +110,8 @@ void writeSource(const std::string& path, const std::string& src) {
 //   * -2 if the toolchain is unavailable.
 int compileAndRunCrossModule(const std::string& libSrc,
                              const std::string& mainSrc) {
-  static int counter = 0;
-  auto dir = fs::temp_directory_path();
-  std::string stem = "bezel_xmod3187_" + std::to_string(counter++);
+  auto dir = wtDir3187();
+  std::string stem = unique_stem("bezel_xmod3187");
   TempFile lSrc((dir / (stem + "_lib.bzl")).string());
   TempFile lObj((dir / (stem + "_lib.o")).string());
   TempFile mSrc((dir / (stem + "_main.bzl")).string());
@@ -128,9 +145,8 @@ int compileAndRunCrossModule(const std::string& libSrc,
 //   * -1 on a toolchain failure.
 int compileOnlyCrossModule(const std::string& libSrc,
                            const std::string& mainSrc) {
-  static int counter = 0;
-  auto dir = fs::temp_directory_path();
-  std::string stem = "bezel_xmod3187_co_" + std::to_string(counter++);
+  auto dir = wtDir3187();
+  std::string stem = unique_stem("bezel_xmod3187_co");
   TempFile lSrc((dir / (stem + "_lib.bzl")).string());
   TempFile lObj((dir / (stem + "_lib.o")).string());
   TempFile mSrc((dir / (stem + "_main.bzl")).string());
@@ -157,9 +173,8 @@ int compileOnlyCrossModule(const std::string& libSrc,
 //   * 0 if the compile failed (the rule under test rejected),
 //   * -1 on a toolchain failure.
 int compileOnlySingleModule(const std::string& src) {
-  static int counter = 0;
-  auto dir = fs::temp_directory_path();
-  std::string stem = "bezel_xmod3187_sm_" + std::to_string(counter++);
+  auto dir = wtDir3187();
+  std::string stem = unique_stem("bezel_xmod3187_sm");
   TempFile sSrc((dir / (stem + ".bzl")).string());
   TempFile sExe((dir / stem).string());
   writeSource(sSrc.path, src);
@@ -172,9 +187,8 @@ int compileOnlySingleModule(const std::string& src) {
 
 // Single-module compile-and-run. Returns the exit code or -1 on failure.
 int compileAndRunSingleModule(const std::string& src) {
-  static int counter = 0;
-  auto dir = fs::temp_directory_path();
-  std::string stem = "bezel_xmod3187_sm_" + std::to_string(counter++);
+  auto dir = wtDir3187();
+  std::string stem = unique_stem("bezel_xmod3187_sm");
   TempFile sSrc((dir / (stem + ".bzl")).string());
   TempFile sExe((dir / stem).string());
   writeSource(sSrc.path, src);
