@@ -45,6 +45,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 #include "llvm/IR/LLVMContext.h"
@@ -55,6 +56,17 @@
 namespace {
 
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDirScopedcall() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-scopedcall");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 // Lower `source` to an object via the real native pipeline; -1 on failure.
 int lowerToObject(const std::string& source, const std::string& objPath) {
@@ -86,9 +98,8 @@ int runUnderAsanWithOptions(const std::string& source, int expectedExitCode,
                             const std::string& asanOptions) {
     const std::string& rtObj = ::bezel::native_test::asanRuntimeObject();
     if (rtObj.empty()) return -1;
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_scopedcall_" + std::to_string(counter++);
+    auto dir = wtDirScopedcall();
+    std::string stem = unique_stem("bezel_scopedcall");
     std::string objPath = (dir / (stem + ".o")).string();
     std::string exe = (dir / stem).string();
     if (lowerToObject(source, objPath) != 0) return -1;
