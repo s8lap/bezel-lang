@@ -21,11 +21,23 @@
 #include <sys/wait.h>
 
 #include "driver/Driver.hpp"
+#include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
+
+// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+static const std::filesystem::path& wtDirUncrep() {
+    static const std::filesystem::path dir =
+        std::filesystem::path("/var/tmp/bezel-scratch") /
+        unique_stem("wt-uncrep");
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
 
 struct RunOutcome {
     int exitCode = -1;
@@ -35,9 +47,8 @@ struct RunOutcome {
 // Compile `source` to a temp native executable via the real Driver pipeline,
 // run it with stderr redirected to a temp file, and return (exit code, stderr).
 RunOutcome compileAndRunCapturingStderr(const std::string& source) {
-    static int counter = 0;
-    auto dir = fs::temp_directory_path();
-    std::string stem = "bezel_uncrep_" + std::to_string(counter++);
+    auto dir = wtDirUncrep();
+    std::string stem = unique_stem("bezel_uncrep");
     std::string src = (dir / (stem + ".bzl")).string();
     std::string exe = (dir / stem).string();
     std::string errf = (dir / (stem + ".stderr")).string();
