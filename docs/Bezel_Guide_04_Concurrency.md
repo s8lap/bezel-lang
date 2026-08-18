@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.259.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.261.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A **task is a heap resource you own**, like every other class instance (§2). **No mutable state is ever reachable from two domains** — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a **structured scope**, not loose tasks (§4). If you skim everything else, read the three sections headed **How Bezel does it** and the table in §10.
 
@@ -42,7 +42,7 @@ The blocking forms remain fully legal *outside* any domain: the synchronous pref
 
 ## 2. How Bezel does it: a task is a resource you own
 
-Elsewhere a task is garbage-collected plumbing you may freely drop. In Bezel a task is a class instance with a disposal obligation, and one rule from Guide 1 §4 governs where the obligation lands: **calls mint, storage lends** (spec §28.3, v0.190). Every call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` produces a *fresh task owned by you* — no `owned` marker needed, the return type is the type announcement (spec §28.3). A read of task *storage* (a `TaskCompletionSource.Task` property, an admitted static cache) lends a borrow.
+Elsewhere a task is garbage-collected plumbing you may freely drop. In Bezel a task is a class instance with a disposal obligation, and one rule from Guide 1 §4 governs where the obligation lands: **calls mint, storage lends** (spec §28.3, v0.190). Every call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` produces a *fresh task owned by you* — no `owned` marker needed, the return type is the type announcement (spec §28.3; the full declared-kind × callee-kind matrix is §28.3's announcement table). A read of task *storage* (a `TaskCompletionSource.Task` property, an admitted static cache) lends a borrow.
 
 ```bezel
 using var task := File.ReadAllTextAsync(path);   // fresh task: yours, disposed at scope end

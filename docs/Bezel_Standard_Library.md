@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.260 — August 2026**
+**Companion to the Bezel Language Specification, v0.261 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -3266,7 +3266,7 @@ end;
 <a id="sec-system-collections-linq"></a>
 ## 5. `System.Collections.Linq`
 
-**Not auto-imported:** these extensions require `import System.Collections.Linq;` — the extended `IEnumerable<T>` itself is always available (spec §2.3), but extension members resolve only when their declaring module is imported (v0.195). LINQ-style extension methods on `IEnumerable<T>`. All are lazy unless documented otherwise. Each deferred operator call mints a **caller-owned query frame** — the unmarked extension declarations below are the ordinary minting iterable-family spelling (calls mint, language spec [§28.3](Bezel_Language_Spec.md#sec-producers), v0.258). A lazy query produced by these operators is **single-consumption** — it may be enumerated at most once (a re-enumeration is a compile error, or `InvalidOperationException` where only dynamically reachable); the single consumption point spends the frame's **enumeration right**, layered over — not identified with — the standard owned-value obligation, which the caller discharges under the ordinary rules (`using var`, transfer, dispose, or auto-drop). Call `ToArray()` to materialize an owned, re-enumerable `Array<T>`. See language spec [§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration).
+**Not auto-imported:** these extensions require `import System.Collections.Linq;` — the extended `IEnumerable<T>` itself is always available (spec §2.3), but extension members resolve only when their declaring module is imported (v0.195). LINQ-style extension methods on `IEnumerable<T>`. All are lazy unless documented otherwise. Each deferred operator call mints a **caller-owned query frame** — the unmarked extension declarations below are the ordinary minting iterable-family spelling (calls mint, language spec [§28.3](Bezel_Language_Spec.md#sec-producers), v0.258; the per-callee-kind matrix is the spec's announcement table, [§28.3](Bezel_Language_Spec.md#sec-announcement-table)). A lazy query produced by these operators is **single-consumption** — it may be enumerated at most once (a re-enumeration is a compile error, or `InvalidOperationException` where only dynamically reachable); the single consumption point spends the frame's **enumeration right**, layered over — not identified with — the standard owned-value obligation, which the caller discharges under the ordinary rules (`using var`, transfer, dispose, or auto-drop). Call `ToArray()` to materialize an owned, re-enumerable `Array<T>`. See language spec [§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration).
 
 A bound lazy query is single-consumption with the normative consumption-point list of spec §29.11 (enumeration/terminal, composing a further operator, passing as `IEnumerable<T>`); inside a callee a plain `IEnumerable<T>` parameter is statically untracked and guarded at runtime.
 
@@ -4078,7 +4078,7 @@ end;
 <a id="sec-domain"></a>
 ### 6.8 `Domain`
 
-Static class for spawning execution domains (language spec [§30.14](Bezel_Language_Spec.md#sec-multiple-domains)). The compiler enforces the call-site rules of §30.14: the entry must be a non-capturing lambda or a static method reference, and the argument and result types must be sendable (the derived type property of language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)/[§30.14](Bezel_Language_Spec.md#sec-sendable-types)).
+Static class for spawning execution domains (language spec [§30.14](Bezel_Language_Spec.md#sec-multiple-domains)). `Spawn`'s explicit `owned Task`/`owned OwningTask<R>` returns state the calls-mint contract with emphasis — the owned-marked mint-announcing row of the spec's announcement table ([§28.3](Bezel_Language_Spec.md#sec-announcement-table)). The compiler enforces the call-site rules of §30.14: the entry must be a non-capturing lambda or a static method reference, and the argument and result types must be sendable (the derived type property of language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)/[§30.14](Bezel_Language_Spec.md#sec-sendable-types)).
 
 ```bezel
 public static class Domain
