@@ -4943,11 +4943,34 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 }
             }
             if (op == "mod") {
+                // §6.1 / §4.2 / §4.5 (#3109): `mod` is defined on the
+                // integer types and on `decimal`. The binary-floating-point
+                // rejection is spec §6.1 verbatim; the `char` rejection
+                // mirrors the `mod=` compound guard (ExprTypecheck.cpp,
+                // #3052), which reads `char` out of §3.5's "integer types and
+                // decimal" table — `char` is §4.5, a separate value type
+                // whose integer reading requires §5.2's explicit cast. A
+                // `char` remainder is spelled `int(c) mod e`, which says what
+                // it means. `float`/`double` keep the §6.1 wording verbatim.
+                // Exhaustive mirror of the compound guard's `bool`/`string`
+                // rejections is out of scope for #3109 and left for a
+                // separate ruling.
                 for (TypeRef* o : {lt, rt0}) {
-                    if (isFloatPrim(primOf(o))) {
-                        ctx_.diagnostics().report(Severity::Error, be.span.begin,
-                            "`mod` is not defined on `float` or `double` — use "
-                            "`Math.Fmod` or `Math.IEEERemainder` (§6.1)");
+                    PrimitiveType p = primOf(o);
+                    const char* badKind =
+                        isFloatPrim(p)               ? "`float` or `double`"
+                        : (p == PrimitiveType::Char) ? "`char`"
+                                                     : nullptr;
+                    if (badKind) {
+                        const char* remedy = isFloatPrim(p)
+                            ? "`Math.Fmod` or `Math.IEEERemainder` (§6.1)"
+                            : "`int(c) mod e` after a §5.2 cast";
+                        ctx_.diagnostics().report(
+                            Severity::Error, be.span.begin,
+                            std::string("`mod` is not defined on ") +
+                            badKind + " — it is defined on the integer types "
+                            "and `decimal` (§6.1); convert via " + remedy +
+                            ", or use `mod=`'s already-rejecting guard");
                         return;
                     }
                 }
