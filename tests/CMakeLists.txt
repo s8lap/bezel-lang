@@ -203,7 +203,12 @@ function(bezel_add_test_binary group)
     # falling back to the conservative whole-binary identity.
     target_compile_definitions(${tgt} PRIVATE
         BEZEL_RUNTIME_LIB_PATH="$<TARGET_FILE:bezel_runtime>"
-        BEZEL_CORE_LIB_PATH="$<TARGET_FILE:bezel_core>")
+        BEZEL_CORE_LIB_PATH="$<TARGET_FILE:bezel_core>"
+        # fix #3084: the bezelc --version regression test (tests/support/
+        # bezelc_version_test.cpp) needs to exec the driver binary to check
+        # the output. Same generator expression as the lit track uses; not on
+        # a separate target so a test-only build misses nothing.
+        BEZELC_PATH="$<TARGET_FILE:bezelc>")
     # Force all bezel_runtime object files in, then export-dynamic so a
     # process-symbol-table lookup resolves bz_array_*, bz_dict_*, etc.
     target_link_options(${tgt} PRIVATE

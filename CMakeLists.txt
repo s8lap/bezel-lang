@@ -62,6 +62,38 @@ project(bezel
     # feature checks (FindFFI / FindLibEdit) during find_package(LLVM).
     LANGUAGES C CXX)
 
+# fix #3084: derive a build-time version string the driver prints on
+# --version. The scaffold-era "0.0.0 (scaffold; no compilation implemented yet)"
+# string survived long after the compiler became an AOT oracle; tooling and logs
+# that record the version (the corpus README, gate telemetry) now say something
+# false. `git describe --tags --long --dirty=-modified` is the canonical source:
+# if the repo has tags it names the closest tag + commits-past + dirty suffix,
+# and --long makes the "N commits past" part zero on a tagged commit. When the
+# repo has NO tags (the case here, at the time of writing) --tags produces
+# nothing and the call would fail; fall back to --tags --always so the output is
+# at least the commit hash, and finally to a hard-coded constant so a build with
+# no .git directory at all still produces a valid binary. Cache the result so
+# the second execute_process call is skipped when the first succeeded.
+execute_process(
+    COMMAND git describe --tags --long --dirty=-modified
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    OUTPUT_VARIABLE BEZEL_GIT_DESCRIBE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+    RESULT_VARIABLE BEZEL_GIT_DESCRIBE_RC)
+if(NOT BEZEL_GIT_DESCRIBE_RC EQUAL 0 OR NOT BEZEL_GIT_DESCRIBE)
+    execute_process(
+        COMMAND git describe --tags --always --long
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE BEZEL_GIT_DESCRIBE
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+endif()
+if(NOT BEZEL_GIT_DESCRIBE)
+    set(BEZEL_GIT_DESCRIBE "0.0.0-unknown")
+endif()
+message(STATUS "Bezel: version ${BEZEL_GIT_DESCRIBE} (from git describe, fix #3084)")
+
 # C++20 per CLAUDE.md's "Build toolchain" section.
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -256,6 +288,12 @@ target_link_libraries(bezel_core PUBLIC ${BEZEL_LLVM_LIBS})
 # --- Compiler driver executable --------------------------------------------
 add_executable(bezelc src/main.cpp)
 target_link_libraries(bezelc PRIVATE bezel_core bezel_runtime bezel_warnings)
+# fix #3084: inject the build-time version into the driver so --version prints
+# a real string (git describe output, falling back to "0.0.0-unknown") instead
+# of the scaffold-era constant. The string is a configure-time substitution, so
+# a rebuild after a commit produces a different version with no code change.
+target_compile_definitions(bezelc PRIVATE
+    BEZEL_VERSION="${BEZEL_GIT_DESCRIBE}")
 # Teach the driver the path to libbezel_runtime.a so it can pass it to clang
 # when compiling standalone Bezel programs (generator expression → literal path).
 # NOTE: Driver.cpp is compiled as part of bezel_core, so the definition must

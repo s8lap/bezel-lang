@@ -12,8 +12,15 @@
 
 namespace {
 
-constexpr const char* kVersion =
-    "bezelc 0.0.0 (scaffold; no compilation implemented yet)";
+// fix #3084: the --version string is built from a configure-time substitution
+// (BEZEL_VERSION, defined in the root CMakeLists.txt via `git describe --tags
+// --long --dirty=-modified`). The macro is required — without it the scaffolding
+// comment below was the only fix and it drifted from the truth for too long.
+#ifndef BEZEL_VERSION
+#define BEZEL_VERSION "0.0.0-unknown"
+#endif
+
+constexpr const char* kVersion = "bezelc " BEZEL_VERSION;
 
 void printUsage(std::ostream& out) {
     out << "usage: bezelc [--version] [--help] [-c] [-o <output>] "
