@@ -2509,6 +2509,36 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (!obj) return nullptr;
     sema::TypeRef* rt = ctx_.resolvedType(*te.testType);
     if (!rt) return nullptr;
+    // fix #3092 narrow (§12.9/§8.6, v0.254): a BARE type-parameter target must
+    // be substituted through the active monomorphization so the descriptor
+    // resolution paths below can find its runtime tag. The shape is narrow on
+    // purpose — ONLY a bare-parameter placeholder (Named, declaration==nullptr,
+    // genericArgs.empty — a null-decl-with-args shape is a CONSTRUCTED null-decl
+    // builtin like `Array<T>`, recursed into by perInstDescriptorForTarget / box-
+    // DescriptorFor themselves) is rewritten. For a constructed generic target
+    // that MENTIONS a type parameter (e.g. `Wrap<T>`) the outer substitution
+    // would mask the bare T from rejectCollapsedTypeTestTarget above (which
+    // detects a collapsed-target instantiation via per-argument T mention) —
+    // that was the broad-vs-narrow lesson Wave 2's revert taught (commits
+    // 7a35a0c / b99f20d / aaad17f): the broad substitute over EVERY target let
+    // `Wrap<(int)->int>` (substituted from `Wrap<T>`) through the collapse-guard
+    // because the substituted arg was no longer "different from the original",
+    // and the test fell back to the shared class tag → the #2192 / #2012 /
+    // #2202 false-positive matches that gated the broad reject. Restricting to
+    // the bare-parameter shape preserves the #3092 fix without disturbing the
+    // #2069 per-monomorphization collapse-reject. The predicate is a no-op on
+    // every other target (Named-with-declaration, Primitive, InlineArray, Unit,
+    // Function, Range, …), so the existing fast paths are unaffected.
+    if (rt->kind == sema::TypeRef::Kind::Named &&
+        !rt->declaration &&
+        rt->genericArgs.empty() &&
+        !genericSubstSemaTy_.empty()) {
+        if (const sema::TypeRef* sub =
+                substituteTypeRefLocal(rt, genericSubstSemaTy_);
+            sub != rt) {
+            rt = const_cast<sema::TypeRef*>(sub);
+        }
+    }
 
     // fix #2775 (§8.6/§12.7/§19.3, v0.240): SILENCE AMPLIFIER. Every
     // `return nullptr` below is not "an error we recover from" — lowerIf turns
