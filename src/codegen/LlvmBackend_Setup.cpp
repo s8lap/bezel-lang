@@ -15663,18 +15663,26 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
     // makes for a named `using var` collection local. Reusing it is what keeps
     // the auto-drop and `using var` spellings from drifting.
     //
-    // SCOPED to the auto-drop (never-discharged) case deliberately. A collection
-    // param that IS discharged on the normal path (moved / returned / disposed)
-    // would need an unwind-ONLY entry, but the collection/dict/linkedList
-    // branches of `emitDisposals` carry no `releaseOnUnwindOnly` gate and do not
-    // null the slot after freeing, so registering one would double-free on an
-    // unwind that follows the discharge. That residual (an owned collection
-    // param leaking on the exception edge before its discharge point) is
-    // pre-existing and left untouched here; filed separately.
-    if (ps->autoDropAtScopeEnd &&
-        (isLinkedListTypeName(rt) || isDictTypeName(rt) ||
-         isCollectionTypeName(rt))) {
-        disposeStack_.front().push_back(buildCollectionTempDisposal(slot, rt));
+    // narrow #3036 / §28.3 / §28.11 (v0.240+): the §28.3 "Exception-path
+    // discharge" applies whether or not the body ALSO carries a normal-exit
+    // discharge point (the "undischarged" qualifier on the affine auto-drop
+    // above is orthogonal — an `owned` parameter's normal exit is owned by its
+    // discharge site if any, but the exception edge is always §28.3's implicit
+    // `try`/`finally`). The auto-drop case still disposes on BOTH exits; the
+    // discharged case needs an unwind-ONLY entry (`releaseOnUnwindOnly =
+    // !autoDropAtScopeEnd`), mirroring the ChannelSender/Channel/Shared branch
+    // one family out (#1957). The collection/dict/linkedList arms of
+    // `emitDisposals` are extended to (a) skip on the normal exit when
+    // `releaseOnUnwindOnly` is set (the new gate), and (b) null the slot
+    // after freeing (the class path's dispose-exactly-once pattern) so a
+    // sibling / outer disposal registered against the same slot reads null
+    // on its later unwind path and skips — without the null, a duplicate
+    // entry would double-free. // per §28.3, §28.11
+    if (isLinkedListTypeName(rt) || isDictTypeName(rt) ||
+        isCollectionTypeName(rt)) {
+        Disposal d = buildCollectionTempDisposal(slot, rt);
+        d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
+        disposeStack_.front().push_back(d);
         return;
     }
     if (!isClassOrInterfaceRef(rt) && !isClassOrInterfaceRef(resolveTypeParamRef(rt)))

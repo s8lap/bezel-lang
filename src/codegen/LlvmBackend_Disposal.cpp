@@ -4496,10 +4496,27 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // via bz_array_free; for an owning collection of class elements the
         // element-disposer thunk cascades disposal into each (non-null) element
         // exactly once (the thunk null-checks; the array iterates live slots).
+        // narrow #3036 / §28.3 (v0.240+): the unwind-only `releaseOnUnwindOnly`
+        // gate (`releaseOnUnwindOnly && !dropUndischarged` ⇒ skip — a
+        // discharged `owned` collection parameter's exception-edge cover, set
+        // by `registerUnwindOwnedParam`'s collection branch), and the null-
+        // guarded dispose + null-store pattern (the class path's
+        // dispose-exactly-once): a sibling / outer disposal registered
+        // against the same slot reads null on its later unwind path and
+        // skips. Without the null-store, a duplicate entry would double-
+        // free; without the gate, a discharged parameter's normal-exit
+        // disposal would run twice. Both halves are load-bearing.
         if (it->collection) {
+            if (it->releaseOnUnwindOnly && !dropUndischarged) continue;   // fix #3036 / #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* arr = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                arr, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB  = llvm::BasicBlock::Create(llvm_, "coll.free", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "coll.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
             llvm::Value* disp = it->collectionElemDisposer
                 ? llvm::cast<llvm::Value>(it->collectionElemDisposer)
                 : llvm::ConstantPointerNull::get(ptrTy());
@@ -4507,6 +4524,10 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {arr, disp});
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
             continue;
         }
         // #394 / stdlib §4.9: a `using var` hash-backed dictionary. Free the
@@ -4523,10 +4544,19 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // bz_string_release on every live key's string pointer. This discharges
         // the set's co-owned +1 per element (retained at Add). bz_dict_free is
         // then called with a null value disposer (sentinels, nothing to dispose).
+        // narrow #3036 / §28.3: same unwind-only gate + null-store pattern as
+        // the collection arm above.
         if (it->dict) {
+            if (it->releaseOnUnwindOnly && !dropUndischarged) continue;   // fix #3036 / #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* tbl = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                tbl, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB  = llvm::BasicBlock::Create(llvm_, "dict.free", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "dict.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
             if (it->dictStringKeys) {
                 // Set<string>: release each string element's +1 before freeing.
                 auto* relFn = declareC("bz_set_string_keys_release",
@@ -4540,6 +4570,10 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {tbl, disp});
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
             continue;
         }
         // per §4.6/§4.7: a `using var` LinkedList<T> / OwningLinkedList<T>.
@@ -4550,10 +4584,19 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // #602 batch 3/4: owningCollectionElemDisposer deleted; d.collectionElemDisposer
         // was set from elementPolicyFor at registerLocal time (covers class, interface,
         // Shared<T>, Weak<T> elements per §28.11 v0.135).
+        // narrow #3036 / §28.3: same unwind-only gate + null-store pattern as
+        // the collection arm above.
         if (it->linkedList) {
+            if (it->releaseOnUnwindOnly && !dropUndischarged) continue;   // fix #3036 / #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* list = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                list, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB  = llvm::BasicBlock::Create(llvm_, "llist.free", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "llist.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
             llvm::Value* disp = it->collectionElemDisposer
                 ? llvm::cast<llvm::Value>(it->collectionElemDisposer)
                 : llvm::ConstantPointerNull::get(ptrTy());
@@ -4561,6 +4604,10 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                 llvm::Type::getVoidTy(llvm_),
                                 {ptrTy(), ptrTy()});
             builder_.CreateCall(fn, {list, disp});
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
             continue;
         }
         // §2.15 / issue #550: a `using var` BinarySerializer — free the
