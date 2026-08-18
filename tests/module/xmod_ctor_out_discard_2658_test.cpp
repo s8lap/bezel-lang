@@ -103,7 +103,10 @@
 //     U2 `out _` vs `out n: string` (8-byte formal)        0          8
 //     U3 `ref _`: declined, diagnostic emitted          SILENT      loud
 //        (re-pointed at v0.244/#3049: now a hard compile REJECT, see U3)
-//     U4 `out owned` discard: diagnostic emitted        SILENT      loud
+//     U4 `out owned` discard: ctor body runs (rc==5)       0          5
+//        (re-pointed at v0.244/#3081: §22.6 implementation;
+//        the loud residual is now resolved; live-object
+//        counter test lives in the sibling #3081 file)
 //     U5 control: no modifiers at all                     49         49
 //     U6 control: imported type with NO constructor       60         60
 //     U7 control: inline `out var` (the #2639 shape)      10         10
@@ -362,20 +365,28 @@ BEZEL_TEST(xmod_ctor_out_discard_2658,
 }
 
 // ===========================================================================
-// U4 — THE GATING CONDITION. An `out owned` formal's discard is deliberately
-// still not lowered (it needs ownership bookkeeping this path does not have and
-// that cannot be verified across a module boundary). What must NOT happen is
-// that it stays SILENT: pre-fix this program compiled clean, emitted no
-// diagnostic of any kind, and returned a wrong answer. The residual is now
-// reported.
+// U4 — `out _` against an `out owned` formal is NORMATIVELY REQUIRED by §22.6
+// (v0.244). Pre-fix this program compiled clean, emitted no diagnostic of any
+// kind, and returned 0 (the constructor body never ran, so `v` kept its zero
+// default — fix #2658 made the SILENT residual loud). fix #3081 implements
+// §22.6: the scratch slot is allocated from the formal's type, null-initialized
+// in the entry block, pushed onto `discardOwnedOutSlots_`, AND paired with the
+// #1833(a) `unwindOnly dynamicDispose` entry so a callee that writes-then-
+// throws does not leak — exactly mirroring the in-module method-call path's
+// buildOrderedArgs #1301 block (`LlvmBackend_Assign.cpp:10439`). The
+// `disposeNewDiscardOwnedOutSlots(newDiscardOwnedBase)` call already at every
+// return of the imported branch handles the normal-return edge; the
+// `disposeStack_` unwind path handles the throw edge.
 //
-// Asserting the diagnostic TEXT rather than a coarse pass/fail is required
-// here twice over: a Warning moves neither `CompileResult::success` nor
-// `errorCount`, and the value returned is wrong either way, so the message is
-// the only observable that distinguishes fixed from broken.
+// The expected value is 5 (the constructor's `v := 5` assignment), NOT 0 (a
+// silent skip) and NOT the loud "#2658" diagnostic (a residual that fix #3081
+// resolves). The #3081 fix's live-object counter — see the sibling
+// `tests/module/xmod_ctor_out_owned_discard_3081_test.cpp` — proves the
+// disposal bookkeeping is exactly-once per construction; this case pins the
+// constructor body's correctness at the call site. // per §22.6, v0.244
 // ===========================================================================
 BEZEL_TEST(xmod_ctor_out_discard_2658,
-           imported_ctor_out_owned_discard_residual_is_not_silent) {
+           imported_ctor_out_owned_discard_runs_constructor_body_spec_22_6) {
     std::string err;
     int rc = runImported2658(
         "    var w := new WOwned(\"x\", out _); "
@@ -383,9 +394,12 @@ BEZEL_TEST(xmod_ctor_out_discard_2658,
         "    _ := w; "
         "    return q; ", "U4", &err);
     if (rc == -2) return;
-    BEZEL_EXPECT_TRUE(err.find("#2658") != std::string::npos);
-    BEZEL_EXPECT_TRUE(
-        err.find("no constructor call could be lowered") != std::string::npos);
+    BEZEL_EXPECT_EQ(rc, 5);
+    // The loud guard is now narrower — `out owned` discard is admitted, so
+    // the only shape still reaching the residual is NAMED / by-value `owned`
+    // / `scoped` / unsupported by-ref. Assert no #2658 diagnostic here, since
+    // this program now lowers cleanly.
+    BEZEL_EXPECT_TRUE(err.find("#2658") == std::string::npos);
 }
 
 // ===========================================================================

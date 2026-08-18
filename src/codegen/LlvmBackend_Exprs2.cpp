@@ -5774,10 +5774,17 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // keep today's behaviour exactly; each is the same silent-no-ctor-call
         // defect and is FILED separately rather than widened into here.
         // fix #2658 (§17.13 "The discard `_`" / §22.6 / §22.3, v0.236): the
-        // `out _` DISCARD is admitted too, but ONLY against a plain borrowing
-        // `out` formal.
+        // `out _` DISCARD is admitted too, against a plain borrowing `out`
+        // formal. fix #3081 (§22.6, v0.244) widened the admission to `out owned`
+        // formals AS WELL: §22.6's "out _. The discard form applies to both
+        // parameter kinds" mandates it. The plain `out` and `out owned` paths
+        // share the same scratch allocation; the `out owned` half adds the
+        // scratch-slot ownership bookkeeping (`discardOwnedOutSlots_` +
+        // #1833(a) unwind entry) below — exactly mirroring the in-module
+        // method-call path's buildOrderedArgs #1301 block (LlvmBackend_Assign.cpp
+        // :10439), which already implemented both.
         //
-        // The admitted set is exactly what §17.13 sanctions and no more.
+        // The admitted set is exactly what §17.13 / §22.6 sanction and no more.
         // §17.13's out-argument position reads: "As a positional argument with
         // the `out` modifier, `_` discards the out-parameter result", and the
         // section opens "Discard is permitted in three positions; in every
@@ -5795,20 +5802,6 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // "`out _` does not introduce a variable; the receiving slot is
         // internal to the compiler and is not observable. The argument is
         // type-inferred from the parameter's declared type."
-        //
-        // An `out owned` formal's discard is likewise NOT admitted, and that is
-        // a decline of a NORMATIVE obligation, recorded as such: §22.6 states
-        // "`out _`. The discard form applies to both parameter kinds: against
-        // `out T` the received value is simply dropped (§17.13); against
-        // `out owned T` the discarded value is an unbound owned temporary
-        // disposed at the end of the full statement (§28.3)." Implementing that
-        // here needs the scratch-slot ownership bookkeeping buildOrderedArgs
-        // performs (`discardOwnedOutSlots_` + the #1833(a) unwind entry), which
-        // this hand-rolled loop does not have; shipping it unverified is not an
-        // option because no oracle available here can see a cross-module leak
-        // or double-free (ASan is blind past `-c`). So it stays unimplemented
-        // but becomes LOUD instead of silent. FILED with the §22.6 target
-        // semantics so the next lane knows what to build.
         sema::ConstructorSymbol* cs = ctorForArgs(t, ne.args);
         auto importedFormalMod = [&](std::size_t ai) -> std::string_view {
             if (cs && ai < cs->params.size())
@@ -5822,7 +5815,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             const auto& a = ne.args[ai];
             if (!a.name.empty()) { allPositional = false; break; }
             if (a.isDiscard) {
-                if (importedFormalMod(ai) != "out")
+                // fix #3081 (§22.6 "out _", v0.244): the discard form applies to
+                // BOTH `out T` AND `out owned T` (§22.6, v0.244: "against
+                // `out T` the received value is simply dropped (§17.13);
+                // against `out owned T` the discarded value is an unbound owned
+                // temporary disposed at the end of the full statement
+                // (§28.3)"). The plain `out` case was the #2658 admission; this
+                // widens to `out owned` so the scratch-slot + disposal bookkeeping
+                // below can run. Refining the type-eligibility predicate
+                // (class/interface-only — the same one buildOrderedArgs' #1301
+                // block uses, the same one fix #3142 imported-side widened) lives
+                // at the scratch allocation site, not here, so a non-pointer
+                // `out owned` (a future builtin handle, say) still admits and
+                // passes through unchanged.
+                std::string_view fm = importedFormalMod(ai);
+                if (fm != "out" && fm != "out owned")
                     { allPositional = false; break; }
                 continue;
             }
@@ -5920,9 +5927,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // leak, not a pre-existing one.)
                 if (ne.args[ai].isDiscard) {
                     llvm::Type* scratchTy = nullptr;
+                    const sema::ParameterSymbol* ps = nullptr;
                     if (ai < cs->params.size())
-                        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
-                                cs->params[ai]))
+                        if ((ps = dynamic_cast<sema::ParameterSymbol*>(
+                                cs->params[ai])))
                             if (ps->resolvedDeclType)
                                 scratchTy = lowerTypeRef(ps->resolvedDeclType);
                     if (!scratchTy) { ok = false; break; }
@@ -5931,6 +5939,56 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                            std::next(scratch->getIterator()));
                     init.CreateStore(
                         llvm::Constant::getNullValue(scratchTy), scratch);
+                    // fix #3081 (§22.6 "out _" / §17.13 / §28.3, v0.244):
+                    // `out _` against an `out owned T` formal: §22.6 mandates
+                    // the discard form is "an unbound owned temporary disposed
+                    // at the end of the full statement", so the produced value
+                    // must reach the disposal loop at the bottom of lowerNew
+                    // (`disposeNewDiscardOwnedOutSlots(newDiscardOwnedBase)`,
+                    // already called at every return of this branch — the
+                    // imported path's symmetry with the in-module method-call
+                    // path's `discardOwnedOutSlots_` loop). Mirror the build-
+                    // OrderedArgs #1301 block (`LlvmBackend_Assign.cpp:10439`)
+                    // — null-initialize, push onto `discardOwnedOutSlots_`,
+                    // register the #1833(a) `unwindOnly dynamicDispose` entry so
+                    // a callee that writes-then-throws does not leak.
+                    //
+                    // The kind eligibility is the SAME class/interface gate
+                    // buildOrderedArgs uses: dynamic disposal dispatches through
+                    // vtable slot 2, which exists only for class/interface. A
+                    // value-typed or builtin-collection/handle `out owned` is
+                    // left untouched here — the slot is sized by the formal,
+                    // passed, and ignored; if no value is produced on the
+                    // normal-return edge the slot just stays null. Gated on
+                    // pointer-typed (the vtable dispatch) AND on a Named kind
+                    // with a non-null `declaration` (the #3142 fix widened this
+                    // off `->decl` so imported classes pass the same check).
+                    if (ps && ps->modifier == "out owned" &&
+                        scratchTy == ptrTy() && ps->resolvedDeclType &&
+                        ps->resolvedDeclType->kind ==
+                            sema::TypeRef::Kind::Named &&
+                        ps->resolvedDeclType->declaration) {
+                        const ast::TypeDeclKind tk =
+                            ps->resolvedDeclType->declaration->kind;
+                        if (tk == ast::TypeDeclKind::Class ||
+                            tk == ast::TypeDeclKind::Interface) {
+                            discardOwnedOutSlots_.push_back(scratch);
+                            // #1833 (a) / §22.6 / §28.3 / §17.13: the
+                            // normal-return path is handled by
+                            // disposeNewDiscardOwnedOutSlots below; the
+                            // throw-after-assign edge needs the same
+                            // null-guarded dynamic-dispose-on-unwind the
+                            // in-module method-call path registers. The
+                            // `unwindOnly` flag keeps the normal-return
+                            // path unaffected.
+                            if (!disposeStack_.empty()) {
+                                Disposal d{scratch, nullptr};
+                                d.unwindOnly = true;
+                                d.dynamicDispose = true;
+                                disposeStack_.back().push_back(d);
+                            }
+                        }
+                    }
                     args.push_back(scratch);
                     continue;
                 }
@@ -6031,12 +6089,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // `bz$T$init` (vtable + field initializers) runs, then the branch falls
         // to `return obj` and emits nothing further. That was #2639's defect
         // and it is still reachable for every shape this path does not lower:
-        // an `out owned` discard, a NAMED argument, a by-value `owned` /
-        // `scoped` argument, and any by-ref argument whose `lvalueAddr`
-        // returned null without the #2319 bracket applying (`out owned` is
-        // excluded from that bracket). A silent no-op is the worst failure mode
-        // available here — the program compiles clean and returns a wrong
-        // answer across a module boundary — so report it.
+        // a NAMED argument, a by-value `owned` / `scoped` argument, and any
+        // by-ref argument whose `lvalueAddr` returned null without the #2319
+        // bracket applying (`out owned` is excluded from that bracket). A
+        // silent no-op is the worst failure mode available here — the program
+        // compiles clean and returns a wrong answer across a module boundary
+        // — so report it.
         //
         // The predicate cannot fire for a legitimately ctor-less imported type:
         // `ctorForArgs` returned a constructor, so one exists and was selected
@@ -6096,11 +6154,15 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             /*disposeAndFreeOnThrow=*/true);
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
-        // #1833 (b): the imported-ctor path iterates ne.args manually (no
-        // buildOrderedArgs call), so no discardOwnedOutSlots_ entry was
-        // recorded. disposeNewDiscardOwnedOutSlots is therefore a no-op
-        // here — included for symmetry with the other return points so
-        // the stack discipline is unambiguous.
+        // #1833 (b) / fix #3081 (§22.6, v0.244): the imported-ctor path
+        // iterates ne.args manually (no buildOrderedArgs call), and now records
+        // `discardOwnedOutSlots_` + `unwindOnly dynamicDispose` entries for any
+        // `out owned` ctor formal whose discard is admitted (the #3081 widening
+        // of #2658). disposeNewDiscardOwnedOutSlots runs at this point — under
+        // `!diverged_`, null-guarded, dynamic vtable Dispose + reclaim — exactly
+        // mirroring lowerCall's loop shape, so an `out _` against an imported
+        // `out owned` formal disposes the produced value at the end of the
+        // full statement.
         disposeNewDiscardOwnedOutSlots(newDiscardOwnedBase);
         return obj;
     }
