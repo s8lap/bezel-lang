@@ -4836,23 +4836,17 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             // per §30.14 / #693
             llvm::Value* argVal = llvm::ConstantPointerNull::get(ptrTy());
             if (nExtra == 1 && call.args[1].value) {
-                // Single extra arg — existing single-ptr path.
+                // Single extra arg — heap-copy path for struct / float / double
+                // (fix #3181 + sharpen #3181: `spawnValueToVoidPtr` is the
+                // unified value-type payload lowering; the pre-fix
+                // `bitcast → i64` fallback hit the verifier for any struct not
+                // exactly 8 bytes, and the sharpen added f32 / f64 + an
+                // explicit diagnostic for unsupported types). The fallback
+                // below (now `--begin unreachable--`) is the same diagnostic-
+                // gated path the lambda uses upstream.
                 llvm::Value* argExprV = lowerExpr(*call.args[1].value);
                 if (argExprV) {
-                    if (argExprV->getType()->isPointerTy()) {
-                        argVal = argExprV;
-                    } else if (argExprV->getType()->isIntegerTy(64)) {
-                        argVal = builder_.CreateIntToPtr(argExprV, ptrTy(),
-                                                         "spawn.arg.cast");
-                    } else if (argExprV->getType()->isIntegerTy()) {
-                        argVal = builder_.CreateIntToPtr(
-                            builder_.CreateZExt(argExprV, i64()), ptrTy(),
-                            "spawn.arg.cast");
-                    } else {
-                        argVal = builder_.CreateIntToPtr(
-                            builder_.CreateBitCast(argExprV, i64()), ptrTy(),
-                            "spawn.arg.cast");
-                    }
+                    argVal = spawnValueToVoidPtr(argExprV);
                 } else {
                     // #1386: ICE — lowerExpr returned null for a single
                     // Domain.Spawn argument; arg silently passed as null.
