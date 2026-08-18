@@ -498,3 +498,131 @@ BEZEL_TEST(sema_as_degenerate_target_2911,
         if (d.message.find("§17.4") != std::string::npos) rejected = true;
     BEZEL_EXPECT_FALSE(rejected);
 }
+
+// =====================================================================
+// #3093 — §17.4 / §3.6 rule 2: the CHAINED-BINDING arm.
+//
+// The check pass beside this one (#2713) closes a use-after-free at one extra
+// level of generic composition by carrying a worklist that re-keys the
+// obligation: a binding that is itself another generic's parameter (`Outer<U>`
+// holding `Inner<U>` whose body does the `as T`) is unreachable by a single
+// pass over the *recording* type's instantiations, because no `Inner<T>` node
+// for a concrete T ever exists — the only `Inner<U>` site has the bare `U` as
+// its argument. §3.6 rule 2 still requires the rejection at the
+// *Outer's* instantiation. The #2911/#2962 pass deliberately did not carry
+// that worklist (see the RESIDUAL note at the end of
+// checkAsTargetInstantiations); #3093 closes it by sharing the walk.
+//
+// Pre-fix this prints only a #2434 "degraded to a zero-initialized value"
+// internal warning (the same symptom the direct form's SEGFAULT hid behind
+// before #2911); the fix turns it into ONE rejection at the `Outer<[3]int>`
+// site, naming the §17.4 rule and the offending [3]int substitution.
+// =====================================================================
+
+// CHAINED, one level. The body of `Inner` writes `as T`; the only
+// instantiation of `Inner` is `Inner<U>` (arg = bare `U`); the only
+// instantiation of `Outer` is `Outer<[3]int>`. The obligation must reach the
+// outer instantiation through U.
+BEZEL_TEST(sema_as_degenerate_target_3093,
+           chained_generic_instantiated_at_inline_array_rejected_spec_3_6_rule_2) {
+    JitResult r = runAot(
+        "module M; "
+        "class Inner<T> "
+        "  public constructor() end constructor; "
+        "  public method Probe(o: Object): int "
+        "    var r := o as T; "
+        "    if r <> null then return 1; end; "
+        "    return 0; "
+        "  end Probe; "
+        "end Inner; "
+        "class Outer<U> "
+        "  private owned _i: Inner<U> := new Inner<U>(); "
+        "  public constructor() end constructor; "
+        "end Outer; "
+        "class C "
+        "  public static method Main(): int "
+        "    var a: [3]int := [4, 5, 6]; "
+        "    var o: Object := a; "
+        "    using var outer := new Outer<[3]int>(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(rejectedInlineArrayTarget(r));
+    BEZEL_EXPECT_TRUE(rejectedAtInstantiationSite(r));
+}
+
+// CHAINED, one level, unit substitution. `#2962`'s unit arm at the
+// composition.
+BEZEL_TEST(sema_as_degenerate_target_3093,
+           chained_generic_instantiated_at_unit_rejected_spec_3_6_rule_2) {
+    JitResult r = runAot(
+        "module M; "
+        "class Inner<T> "
+        "  public constructor() end constructor; "
+        "  public method Probe(o: Object): int "
+        "    var r := o as T; "
+        "    if r <> null then return 1; end; "
+        "    return 0; "
+        "  end Probe; "
+        "end Inner; "
+        "class Outer<U> "
+        "  private owned _i: Inner<U> := new Inner<U>(); "
+        "  public constructor() end constructor; "
+        "end Outer; "
+        "class C "
+        "  public static method Main(): int "
+        "    var o: Object := (); "
+        "    using var outer := new Outer<()>() ; "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(rejectedUnitTarget(r));
+    BEZEL_EXPECT_TRUE(rejectedAtInstantiationSite(r));
+}
+
+// ACCEPT-CONTROL — the chained arm must fire ONLY per instantiation, not at
+// the body. `Outer<string>` binds U to `string`, so the obligation through
+// U lands on `string` (no `Inner<string>` is degenerate). This is the
+// control that catches a fix which rejected the body instead of the
+// offending instantiations — the same architectural worry the direct-form
+// accept-control #2911 pinned above.
+BEZEL_TEST(sema_as_degenerate_target_3093,
+           chained_generic_at_ordinary_substitution_accepted_spec_3_6_rule_2) {
+    JitResult r = runAot(
+        "module M; "
+        "class D "
+        "  public constructor() end constructor; "
+        "  public method Probe(o: Object): int "
+        "    var r := o as D; "
+        "    if r <> null then return 1; end; "
+        "    return 0; "
+        "  end Probe; "
+        "end D; "
+        "class Inner<T> "
+        "  public constructor() end constructor; "
+        "  public method Probe(o: Object): int "
+        "    var r := o as T; "
+        "    if r <> null then return 1; end; "
+        "    return 0; "
+        "  end Probe; "
+        "end Inner; "
+        "class Outer<U> "
+        "  private owned _i: Inner<U> := new Inner<U>(); "
+        "  public constructor() end constructor; "
+        "end Outer; "
+        "class C "
+        "  public static method Main(): int "
+        "    using var d := new D(); "
+        "    var od: Object := d; "
+        "    using var outer := new Outer<D>(); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    bool rejected = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("§17.4") != std::string::npos) rejected = true;
+    BEZEL_EXPECT_FALSE(rejected);
+}
