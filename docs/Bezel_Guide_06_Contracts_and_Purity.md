@@ -1,6 +1,6 @@
 # Bezel Guide 6: Contracts and Purity
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.253.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.260.*
 
 Bezel lets a signature state obligations the compiler enforces: **`requires(...)`** for what the caller must guarantee, **`ensures(...)`** for what the member guarantees back, **`invariant(...);`** for what an object maintains at its public boundary (spec §22.16), and **`pure`** for members that promise no effects at all (spec §22.15). The syntax is small; the *postures* are what this guide teaches. Contracts are grammar, not a debug-mode assertion library: `requires` runs in every build, and a violation is a bug report, not an outcome (§1). Two postures will break habits you may bring along, and each is headed **How Bezel does it**. First: `requires` states only what a *correct caller already guarantees* — never validation of trust-boundary input, which is value-shape territory Guide 2 owns (§2). Second: `pure` is a promise you *declare* and the compiler verifies — never inferred from a body (§5). If you skim everything else, read those two and the table in §9.
 
@@ -21,6 +21,7 @@ public class Account
 
   public constructor(limit: decimal)
     requires(limit >= 0m)
+
     _limit := limit;
   end constructor;
 
@@ -28,6 +29,7 @@ public class Account
     requires(amount > 0m)
     requires(amount <= _balance + _limit)
     ensures(_balance = old(_balance) - amount)
+
     _balance := _balance - amount;
   end Withdraw;
 end Account;
@@ -60,6 +62,7 @@ public class SampleWindow
   public method At(index: int): double
     requires(index >= 0)
     requires(index < _samples.Count)
+
     return _samples[index];
   end At;
 end SampleWindow;
@@ -72,6 +75,7 @@ A bad `requires` — the same syntax, on user input. This *compiles*: `int.Parse
 // expected outcome, not a caller bug — no caller of Listen can guarantee it.
 public method Listen(rawPort: string)
   requires(int.ParseOrNull(rawPort) <> null)   // misclassified: band 2 dressed as band 1
+
   Bind(int.ParseOrNull(rawPort)!);
 end Listen;
 ```
@@ -129,6 +133,7 @@ public method Discard(count: int)
   requires(count >= 0)
   requires(count <= _items.Count)
   ensures(_items.Count = old(_items.Count) - count)
+
   for var i in 0..<count do
     _items.RemoveAt(_items.Count - 1);
   end;
@@ -142,6 +147,7 @@ Contracts compose. Here the class invariant from §1 is what makes the postcondi
 ```bezel
 public pure method Headroom(): decimal
   ensures(result >= 0m)
+
   return _balance + _limit;     // the §1 invariant guarantees non-negativity
 end Headroom;
 ```
@@ -187,6 +193,7 @@ public record QuotRem(Quot: int, Rem: int);
 
 public static pure method DivMod(a: int, b: int): QuotRem
   requires(b <> 0)
+
   return new QuotRem(a / b, a mod b);
 end DivMod;
 ```
@@ -242,6 +249,7 @@ end Accepts;
 
 public method Transition(state: int)
   requires(Accepts(state))
+
   _current := state;
 end Transition;
 ```

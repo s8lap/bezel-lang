@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.259 — August 2026**
+**Companion to the Bezel Language Specification, v0.260 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -3213,6 +3213,8 @@ var answer := await t1 + await t2;                               // zero bytes c
 source). Because class-typed `T` is not admitted, the `IEnumerable<T>` conformance is unconditional — the
 category-conditional-conformance problem that keeps value-typed `OwningBuffer<T>` out of `IEnumerable` ([§4.14](#sec-owned-buffers-and-spans))
 does not arise.
+
+**Recorded pressure (2026-08-18 review programme; v0.260, proposal 0102 §6; no change now).** `FrozenArray<T>` freezes a *buffer*; there is no form that freezes a **class tree** — a build-once object graph whose deep immutability would admit it to the same [§28.13](Bezel_Language_Spec.md#sec-shared-ownership) set on the same ground (the class-element restriction above names it: *"frozen ownership trees are a designed future extension"*). That is the likely **first user pressure** on this deferral: the values services actually want to share across domains read-only are configurations, parsed documents, routing tables, and compiled schemas — object graphs, not arrays — and today each must be either re-synthesised per domain, wrapped in a lock ([§6.11](#sec-locked-and-rwlocked)'s *Taking data out* names this exact gap), or flattened into arrays of value records. Nothing changes here; the note exists so the next person to meet the gap finds it recorded rather than rediscovering it, and so that a proposal starts from the two questions the shape actually raises: **what makes a tree provably deeply immutable** (a `frozen`/`immutable` type property that propagates to every field type, checkable by the [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) derived-property machinery, versus a construction-phase-then-seal protocol that is a runtime state), and **how the borrow rules read a frozen tree's interior** (a borrow of a frozen node has no source-liveness constraint against mutation, but still has one against disposal — which is exactly `FrozenArray<T>`'s own `static owned readonly` singleton answer, scaled up). The rationale's MOVE-and-FREEZE record ([§12.9](Bezel_Design_Rationale.md#sec-data-parallelism)) carries the cross-reference.
 
 **Disposal.** Non-trivial dispose: the destructor releases the backing storage (the [§4.14](#sec-owned-buffers-and-spans)
 `OwningBuffer` reasoning). A standalone owned `FrozenArray<T>` is discharged like any owned class instance; under
