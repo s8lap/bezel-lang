@@ -4927,8 +4927,12 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         //     boolean operations use `and`/`or`/`not`. Reject all three operand
         //     kinds (§7.11's lift list applies only where the base operator is
         //     valid for `T`, so it does not extend bitwise to `bool?`/`char?`).
-        //   • `mod` is defined on integer types and decimal, but NOT on float or
-        //     double (§6.1).
+        //   • `mod` is defined on integer types and decimal (§6.1), but NOT on
+        //     `float`/`double`, `bool`, or `string` (§3.5: mod is admitted on
+        //     the integer types and `decimal`; invalid on `bool`, `char`, and
+        //     `string`). `char mod char` is also rejected (narrow #3109), but
+        //     `char mod <int>` and `<int> mod char` are admitted via §5.1's
+        //     char→int widening — the cast pattern `s[0] mod 256` is canonical.
         // (String/reference bitwise keeps its existing concatenation hint.)
         {
             const bool isBitwise = (op == "&" || op == "|" || op == "^" ||
@@ -4979,12 +4983,32 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                         return;
                     }
                 }
+                // #3243 (v0.256 follow-up): the binary `mod` arm previously
+                // rejected ONLY `char mod char` (narrow #3109); `bool` and
+                // `string` on EITHER side fell through to codegen and aborted
+                // with an IR-verify failure. §3.5 / §6.1 admit `mod` only on
+                // the integer types and `decimal` — `bool` and `string` have no
+                // implicit conversion to an integer type, so widening cannot
+                // rescue them. Reject on either side; the wording parallels
+                // the compound `mod=` arm (ExprTypecheck.cpp ~11940).
+                PrimitiveType lp = primOf(lt);
+                PrimitiveType rp = primOf(rt0);
+                const char* badKind =
+                    (lp == PrimitiveType::Bool || rp == PrimitiveType::Bool)
+                        ? "`bool` (boolean operations use `and`/`or`/`not`)"
+                    : (lp == PrimitiveType::String || rp == PrimitiveType::String)
+                        ? "`string`" : nullptr;
+                if (badKind) {
+                    ctx_.diagnostics().report(Severity::Error, be.span.begin,
+                        std::string("`mod` is not valid on ") + badKind +
+                        " — `mod` is defined on the integer types and `decimal` "
+                        "(§6.1)");
+                    return;
+                }
                 // NAARROW #3109 (v0.256): reject ONLY `char mod char` (both
                 // sides char). The cast pattern `char mod <int>` (e.g. `s[0]
                 // mod 256` for exit codes) is admitted via §5.1 widening; the
                 // over-broad fix (de3cd71, reverted) broke those tests.
-                PrimitiveType lp = primOf(lt);
-                PrimitiveType rp = primOf(rt0);
                 if (lp == PrimitiveType::Char && rp == PrimitiveType::Char) {
                     ctx_.diagnostics().report(Severity::Error, be.span.begin,
                         "`mod` is not defined on `char` operands (§6.1); a "
