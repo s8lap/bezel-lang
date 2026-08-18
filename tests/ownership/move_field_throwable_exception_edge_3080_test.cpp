@@ -291,3 +291,53 @@ BEZEL_TEST(own_throwable_edge_3080, in_try_move_with_catch_restore_accepted_28_8
         "end InTryCatchRestores;"));
     BEZEL_EXPECT_FALSE(hasErrorMessage(r, kEdgeDiag));
 }
+
+// §28.8.1 "Exception paths are not exempt" — #3241 R2: the in-`try` residue
+// from the narrow #3080 fix. The narrow fix returns early for any statement
+// lexically inside a `try`; the in-`try` case is NOT covered, because the
+// CFG's single throwability edge runs from the try body's END block to the
+// catch dispatcher (src/flow/CFG.cpp:544), a program point AFTER the
+// restoring assignment. Deciding it needs one exception edge per throwable
+// SITE — the precise F2 the CFG builder explicitly defers. #3241 R2: when a
+// throwable in the try body sees a moved-from field AND the catch arm does
+// NOT restore the field, the exception edge is an unrestored exit.
+//
+// §28.8.1's "path to the method's exit" includes the catch arm's exit
+// because the catch arm RETURNS a fresh value here, leaving `_r` still
+// moved-from when the method's destructor runs on `this`. The at-method-exit
+// check fires (kExitDiag); the exception-edge check (#3080 narrow, R2 of
+// #3241) must ALSO fire because the rule is "every exception edge" and the
+// edge in question runs out of `Dangerous()`, not out of the method.
+BEZEL_TEST(own_throwable_edge_3080, in_try_move_with_catch_NOT_restore_rejected_28_8_1) {
+    auto r = parseAndCheckOwnership(prog(
+        "public method InTry(): owned Res "
+        "  try "
+        "    var old := move _r; "
+        "    var q := Dangerous(); "
+        "    _r := new Res(); "
+        "    return old; "
+        "  catch var ex: Exception => "
+        "    return new Res(); "
+        "  end; "
+        "end InTry;"));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, kEdgeDiag));
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "owned field `_r`"));
+    BEZEL_EXPECT_TRUE(hasLocatedError(r, kEdgeDiag));
+}
+
+// Theatrical test of the "build before take" fix that recovers from #3241 R2:
+// move happens AFTER the throwable, so the throwable is NOT an exception edge
+// out of an unrestored slot. Compiles clean.
+BEZEL_TEST(own_throwable_edge_3080, in_try_build_before_take_accepted_28_8_1) {
+    auto r = parseAndCheckOwnership(prog(
+        "public method InTryBuildBeforeTake(): owned Res "
+        "  try "
+        "    var q := Dangerous();   // no move yet — fine to throw"
+        "    var old := move _r; "
+        "    _r := new Res(); "
+        "    return old; "
+        "  catch var ex: Exception => _r := new Res(); "
+        "  end; "
+        "end InTryBuildBeforeTake;"));
+    BEZEL_EXPECT_FALSE(hasErrorMessage(r, kEdgeDiag));
+}

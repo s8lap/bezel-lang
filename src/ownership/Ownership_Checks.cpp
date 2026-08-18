@@ -11177,46 +11177,63 @@ bool MethodOwnership::exprContainsAwait(const ast::Expr* e) const {
 // ---------------------------------------------------------------------------
 
 void MethodOwnership::collectStmtsInsideTryStmt(const ast::Stmt& s,
-                                                bool insideTry) {
-    if (insideTry) stmtsInsideTry_.insert(&s);
+                                                bool insideTry,
+                                                const ast::TryStmt* enclosingTry) {
+    if (insideTry) {
+        stmtsInsideTry_.insert(&s);
+        // §28.8.1 (#3241 R2): record the IMMEDIATE enclosing try alongside
+        // the in-`try` set membership, so the deferred-check firing can
+        // route the check to the right try's catch arms. The IMMEDIATE
+        // enclosing try is the one we're descending through on this
+        // recursive call — a statement inside a nested try's body is
+        // associated with the INNER try (which is the one whose catch arms
+        // are the relevant resolution set), not the outer.
+        if (enclosingTry) stmtsInsideTryByStmt_[&s] = enclosingTry;
+    }
     // Recurse into the control-flow forms that can lexically contain a try
     // statement (mirrors collectCatchBorrowsStmt's structure). `insideTry` stays
     // sticky once set: a statement nested three ifs deep inside a try body is
     // still inside that try.
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
         for (const auto& bs : ifs->ifBranch.body)
-            if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+            if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
         for (const auto& el : ifs->elifBranches)
             for (const auto& bs : el.body)
-                if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+                if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
         for (const auto& bs : ifs->elseBody)
-            if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+            if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
         return;
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
         for (const auto& bs : ws->body)
-            if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+            if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
         for (const auto& bs : fs->body)
-            if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+            if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
         return;
     }
     if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
         for (const auto& bs : dob->body)
-            if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+            if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
         return;
     }
     if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
         // Everything the try lexically encloses — body, each catch arm, and the
-        // finally body — is `insideTry` from here down.
+        // finally body — is `insideTry` from here down, with THIS try as the
+        // IMMEDIATE encloser. The body gets the new `ts` as its enclosingTry;
+        // catch arms and finally body do too (they are lexically inside the
+        // try, even though their dataflow is processed at the catch arm's
+        // level — a catch arm throwable's resolution set is the OUTER try's
+        // catch arms, not this try's, but the in-`try` set membership and
+        // the original R1 skip don't depend on the distinction).
         for (const auto& bs : ts->body)
-            if (bs) collectStmtsInsideTryStmt(*bs, true);
+            if (bs) collectStmtsInsideTryStmt(*bs, true, ts);
         for (const auto& arm : ts->catches)
-            if (arm.body) collectStmtsInsideTryStmt(*arm.body, true);
+            if (arm.body) collectStmtsInsideTryStmt(*arm.body, true, ts);
         for (const auto& bs : ts->finallyBody)
-            if (bs) collectStmtsInsideTryStmt(*bs, true);
+            if (bs) collectStmtsInsideTryStmt(*bs, true, ts);
         return;
     }
 }
@@ -11224,8 +11241,9 @@ void MethodOwnership::collectStmtsInsideTryStmt(const ast::Stmt& s,
 void MethodOwnership::collectStmtsInsideTry(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     stmtsInsideTry_.clear();
+    stmtsInsideTryByStmt_.clear();
     for (const auto& s : body)
-        if (s) collectStmtsInsideTryStmt(*s, false);
+        if (s) collectStmtsInsideTryStmt(*s, false, nullptr);
 }
 
 // §28.8.1's throwable-expression inventory, verbatim (v0.254):
@@ -11421,9 +11439,50 @@ void MethodOwnership::checkThrowableWhileFieldMovedFrom(const ast::Stmt& s) {
     // state. If a future statement kind gains a body, it must be added to the CFG
     // builder or skipped here.
     if (dynamic_cast<const ast::CaseStmt*>(&s)) return;
-    // An exception raised inside a `try` need not leave the method — see
-    // `stmtsInsideTry_`.
-    if (stmtsInsideTry_.count(&s)) return;
+    // An exception raised inside a `try` may be caught by a catch arm, so the
+    // check needs the catch arm's exit state to decide — we don't have it at
+    // the throwable's program point. Defer: record the throwable + moved
+    // fields; the firing happens in `firePendingInTryChecks` after the
+    // dataflow has processed the catch arms, using a SYNTACTIC check on
+    // the catch arm body for the restoration. (#3241 R2 — the narrow #3080
+    // fix returned early here, leaving a known residue that #3241 R1
+    // documents.) The IMMEDIATE enclosing try is the inner one (looked up
+    // from the parallel `stmtsInsideTryByStmt_` map populated by
+    // `collectStmtsInsideTryStmt`): a try nested inside an arm of the
+    // OUTER try's body is resolved by the INNER try's catch arms, not the
+    // outer's.
+    if (stmtsInsideTry_.count(&s)) {
+        // Only defer during the FINAL emit pass (suppressDiag_ = false). The
+        // fixpoint re-runs the check on every iteration, and the fire is
+        // called once after the dataflow; deferring every iteration would
+        // produce N copies of the same (throwable, field) entry in the
+        // pending list, which the fire would then report N times. Gating
+        // on `!suppressDiag_` makes the fire fire exactly once per
+        // throwable site. The IMMEDIATE enclosing try is looked up from
+        // the parallel `stmtsInsideTryByStmt_` map (populated by
+        // `collectStmtsInsideTryStmt` on the same recursive pre-pass
+        // that fills the `stmtsInsideTry_` set) — a statement inside a
+        // nested try is associated with the INNERMOST enclosing try
+        // (which is the one whose catch arms are the relevant resolution
+        // set for the §28.8.1 exception edge). // per §28.8.1, #3241 R2
+        if (suppressDiag_) return;
+        const ast::TryStmt* enclosing = nullptr;
+        auto it = stmtsInsideTryByStmt_.find(&s);
+        if (it != stmtsInsideTryByStmt_.end()) enclosing = it->second;
+        // Without a known enclosing try, we cannot route the deferred check
+        // — the only way to be in `stmtsInsideTry_` but off the map is an
+        // AST/collect bug, so just bail (do not fall through to a
+        // non-deferred fire that would point at the wrong catch set).
+        if (!enclosing) return;
+        const ast::Expr* throwable = nullptr;
+        visitStmtExprSites(s, [&](const ast::Expr& e, bool) {
+            if (!throwable) throwable = findThrowable28_8_1(&e);
+        });
+        if (!throwable) return;
+        pendingThrowableInTryChecks_.push_back(
+            {enclosing, throwable, moved});
+        return;
+    }
     const ast::Expr* throwable = nullptr;
     visitStmtExprSites(s, [&](const ast::Expr& e, bool) {
         if (!throwable) throwable = findThrowable28_8_1(&e);
@@ -11442,6 +11501,124 @@ void MethodOwnership::checkThrowableWhileFieldMovedFrom(const ast::Stmt& s) {
                    "move the `move` after it");
     }
 }
+
+// Returns true if the given catch arm body contains a top-level
+// AssignmentStmt that assigns to the given field. A top-level assignment
+// to the field is the simplest restoring shape; more complex restores
+// (conditional restore, restore through a nested try, restore via a
+// helper call) are conservatively reported as "may not restore" — the
+// under-approximation matches the R1 in-`try` skip's safety posture. //
+// per §28.8.1, #3241 R2
+static bool catchArmRestoresField(const ast::Stmt& body,
+                                  std::string_view field) {
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&body)) {
+        // Compound assignment shapes (`+=`, `/=`, `mod=`, …) are
+        // deliberately not considered "restoring": they are R4c residue
+        // and would need type-aware reasoning. Restoring shape is the
+        // plain `:=` assignment to the field.
+        if (as->op != ":=") return false;
+        // `_field := value` (bare identifier, implicit `this`) — the
+        // standard unqualified form. Sema's name resolution has already
+        // bound the identifier to the implicit receiver's field; from
+        // the AST's perspective it is a bare IdentifierExpr whose name
+        // IS the field name (mirrors handleAssignment's "name not found
+        // in local states — this bare identifier may resolve to an owned
+        // FIELD" branch in src/ownership/Ownership.cpp:5736-5746).
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(as->target.get())) {
+            return id->name == field;
+        }
+        // `this._field := value` (qualified) — symmetric restoration
+        // form. Matches handleAssignment's "this.field := value clears
+        // the moved-from mark" branch (src/ownership/Ownership.cpp:5752-5759).
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(as->target.get())) {
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+                if (tid->name == "this" && ma->member == field) return true;
+            }
+        }
+        return false;
+    }
+    // A catch arm body wrapped in a do/end block (the common spelling for
+    // multi-statement catch arms) — descend into each body statement.
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&body)) {
+        for (const auto& bs : dob->body) {
+            if (bs && catchArmRestoresField(*bs, field)) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
+void MethodOwnership::fireAllPendingInTryChecks() {
+    // Group pending checks by enclosing try, then fire each group. The
+    // check uses a SYNTACTIC pass over the catch arm body (see the
+    // catchArmRestoresField helper above) — the dataflow's exit state for
+    // the catch arm's last block is not reliable for the in-`try` case
+    // (pre-existing #3241 R1 residue: the CFG has only one throwability
+    // edge per try, anchored after the restoring assignment, so the
+    // at-exit OR-merge does not see the catch arm's field state for
+    // in-`try` cases).
+    if (pendingThrowableInTryChecks_.empty()) return;
+    // Snapshot and clear — the fire iterates the snapshot and may erase
+    // entries (so a repeated fire doesn't re-report). report()'s
+    // suppressDiag_ gate ensures the diagnostic fires exactly once at
+    // the final emit pass.
+    auto snapshot = std::move(pendingThrowableInTryChecks_);
+    pendingThrowableInTryChecks_.clear();
+    for (const auto& entry : snapshot) {
+        if (!entry.enclosingTry) continue;
+        bool anyArmFailsToRestore = false;
+        for (const auto& arm : entry.enclosingTry->catches) {
+            bool armRestores = false;
+            if (arm.body) {
+                for (std::string_view name : entry.moved) {
+                    if (catchArmRestoresField(*arm.body, name)) {
+                        armRestores = true;
+                        break;
+                    }
+                }
+            }
+            if (!armRestores) {
+                anyArmFailsToRestore = true;
+                break;
+            }
+        }
+        if (!anyArmFailsToRestore) continue;
+        for (std::string_view name : entry.moved) {
+            report(Severity::Error, entry.throwable->span.begin,
+                   std::string("owned field `") + std::string(name) +
+                       "` is moved-from here and this expression can raise, "
+                       "but the enclosing `try`'s catch arm leaves the field "
+                       "unrestored, so the exception edge is an exit path on "
+                       "which the field is never restored (§28.8.1 "
+                       "\"Exception paths are not exempt\") — build the "
+                       "replacement and restore `" + std::string(name) +
+                       "` BEFORE the throwable expression, or move the `move` "
+                       "after it");
+        }
+    }
+}
+
+void MethodOwnership::firePendingInTryChecks(
+    const ast::TryStmt* /*ts*/,
+    const std::vector<FieldMovedFrom>& /*catchArmExitStates*/) {
+    // Intentionally empty — the consolidated `fireAllPendingInTryChecks`
+    // does the work using the AST-level syntactic check. This entry point
+    // is preserved for the declaration in Ownership_impl.hpp because the
+    // original design hooked the fire from `visitStmt` for TryStmt, which
+    // is unreachable in this build (the ownership pass uses OPAQUE try
+    // handling, so a TryStmt is never in `block.stmts` and processBlock
+    // never calls visitStmt for one). The new fire is `fireAllPendingInTryChecks`,
+    // called from `run()` after the dataflow has converged.
+}
+
+// (Legacy no-op wrapper kept for the declaration in Ownership_impl.hpp
+// — the actual fire is `fireAllPendingInTryChecks`, which is called from
+// run() after the dataflow has converged. The per-`ts` form was the
+// original design before the unreachable `visitStmt` for TryStmt was
+// reduced to a no-op; the per-`ts` signature is preserved for any
+// hypothetical future in-block caller that wanted to fire for a single
+// try after processing its catch arms, but no such caller exists
+// today.)
 
 void MethodOwnership::collectReadIdentifiers(
     const ast::Expr* e, std::vector<const ast::IdentifierExpr*>& out) const {

@@ -203,6 +203,9 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // the arm (store-to-owned-field, return-as-owned, escaping closure
     // capture). Done first so the per-statement escape checks see it.
     collectCatchBorrows(body);
+    // §28.8.1 (#3241 R2): clear the per-method side state for the deferred
+    // in-`try` throwable checks. Fresh method = empty queue.
+    pendingThrowableInTryChecks_.clear();
     // §28.8.1 "Exception paths are not exempt" (#3080): record which statements a
     // `try` lexically encloses, so the exception-edge restoration check can skip
     // them — an exception caught in-method is not a method exit, and the catch arm
@@ -427,6 +430,17 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     }
     FlowState endFlow = runDataflow(*cfg, entry);
     const BlockState& endState = endFlow.locals;
+    // §28.8.1 (#3241 R2): fire the deferred in-`try` throwable checks
+    // AFTER the dataflow has converged. The check uses an AST-level
+    // syntactic pass over the catch arm body (does it contain a
+    // `_field := …` top-level assignment?); the dataflow's exit state
+    // for the catch arm's last block is not reliable for the in-`try`
+    // case (pre-existing R1 residue — the CFG has only ONE
+    // throwability edge per try, anchored after the restoring
+    // assignment). Done after the dataflow so the diagnostic emits
+    // exactly once via the report() gate on the final emit pass.
+    // per §28.8.1, #3241 R2
+    fireAllPendingInTryChecks();
     // §28.3 "Owned-local discharge requirement": an owned local must reach
     // an owned slot (or be disposed) before it goes out of scope on a
     // *normal-exit* path. The exception-path discharge is handled inside the
@@ -3074,6 +3088,20 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        // §28.8.1 (#3241 R2): the check for in-try body throwables is
+        // deferred — the catch arm's exit state isn't known at the
+        // throwable's program point, so `checkThrowableWhileFieldMovedFrom`
+        // (called from processBlock for the body statements, NOT here — the
+        // ownership pass uses OPAQUE try handling so a TryStmt is never in
+        // `block.stmts`) records the deferred check and the post-pass in
+        // run() fires it after the dataflow has converged. This arm
+        // therefore just visits the body, catch arms, and finally in order
+        // (mirroring the CFG builder's F2 expansion) so the dataflow's
+        // `fieldMovedFrom_` is correctly updated as the post-pass reads
+        // `pendingThrowableInTryChecks_`. (The OPAQUE-try handling is why
+        // this arm is unreachable from processBlock in practice — kept
+        // here only as a safety net for any future caller that does pass
+        // a TryStmt through; the post-pass fires regardless.)
         for (const auto& bs : ts->body) if (bs) visitStmt(*bs);
         for (const auto& arm : ts->catches) {
             if (arm.body) visitStmt(*arm.body);

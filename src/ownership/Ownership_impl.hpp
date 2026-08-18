@@ -726,6 +726,43 @@ private:
     // // per §28.8.1, #3080
     std::unordered_set<const ast::Stmt*> stmtsInsideTry_;
 
+    // §28.8.1 (#3241 R2): a parallel map from in-`try` statement to the
+    // IMMEDIATE enclosing TryStmt. The set above answers "is this in any
+    // try?" (used by the original R1 skip); this map answers "which try?"
+    // (used by the R2 deferred-check firing to know whose catch arms to ask).
+    // Populated by collectStmtsInsideTryStmt on the same recursive pass that
+    // fills the set, with the IMMEDIATE enclosing try tracked as the call
+    // descends. A statement lexically inside a nested try is associated
+    // with the INNERMOST enclosing try (the one whose catch arms are the
+    // relevant resolution set for the §28.8.1 exception edge). // per
+    // §28.8.1, #3241 R2
+    std::unordered_map<const ast::Stmt*, const ast::TryStmt*> stmtsInsideTryByStmt_;
+
+    // §28.8.1 (#3241 R2): deferred in-`try` throwable checks. When a
+    // throwable in a try body sees a moved-from field, we cannot decide if
+    // it's a violation until we know whether the catch arms restore the
+    // field — the dataflow's exitState for the catch arm's last block is
+    // empty in the current build (pre-existing #3241 R1 residue: the CFG
+    // throwability edge is one over-approximated end-of-body edge, not per
+    // throwable site, so the at-exit OR-merge does not see the catch arm's
+    // restored state for the in-`try` case). So the fire uses a SYNTACTIC
+    // check on the catch arm body — does it contain a top-level
+    // restoring assignment to the field? — which is conservative in the
+    // safe direction (a catch arm that conditionally restores would be
+    // reported as "may not restore"; an under-approximation that misses
+    // rather than invents a violation, matching the R1 in-`try` skip's
+    // safety posture). Each entry is the throwable's site + the moved
+    // fields at that site + the IMMEDIATE enclosing try. Populated during
+    // the dataflow and the final emit pass; report()'s suppressDiag_ gate
+    // emits the diagnostic exactly once at the final pass. // per §28.8.1,
+    // #3241 R2
+    struct PendingThrowableInTryCheck {
+        const ast::TryStmt* enclosingTry;
+        const ast::Expr* throwable;
+        std::vector<std::string_view> moved;
+    };
+    std::vector<PendingThrowableInTryCheck> pendingThrowableInTryChecks_;
+
     // §28.3 / #892: for loop-header Branch blocks, the ownership state
     // BEFORE the condition expression is evaluated. A while condition
     // `s.TryPop(out owned item)` marks `item` Owned in the post-condition
@@ -2713,7 +2750,8 @@ private:
     // to know which statements a `try` lexically encloses. // per §28.8.1
     void collectStmtsInsideTry(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
-    void collectStmtsInsideTryStmt(const ast::Stmt& s, bool insideTry);
+    void collectStmtsInsideTryStmt(const ast::Stmt& s, bool insideTry,
+                                   const ast::TryStmt* enclosingTry);
 
     // §28.8.1 (#3080): the section's throwable-expression inventory, as a SEARCH
     // rather than a predicate — returns the first sub-expression of `e` whose
@@ -2727,6 +2765,30 @@ private:
     // exit path on which the reassignment has not run". Called from processBlock
     // at each statement's ENTRY state. // per §28.8.1
     void checkThrowableWhileFieldMovedFrom(const ast::Stmt& s);
+
+    // §28.8.1 (#3241 R2): fire the deferred in-`try` throwable checks for
+    // `ts`. A throwable in the try body whose fieldMovedFrom_ at its site
+    // had the field moved-from is a violation iff at least one of the catch
+    // arms in `catchArmExitStates` has the same field still moved-from at
+    // ITS exit. The catch arm's exit state is the fieldMovedFrom_ snapshot
+    // taken right after the arm body's last statement (see visitStmt for
+    // TryStmt). The function erases the entries it processed so a later
+    // enclosing try does not re-fire them. // per §28.8.1, #3241 R2
+    void firePendingInTryChecks(
+        const ast::TryStmt* ts,
+        const std::vector<FieldMovedFrom>& catchArmExitStates);
+
+    // §28.8.1 (#3241 R2): fire ALL pending in-`try` throwable checks, in
+    // one pass. Used as a post-pass in run() after the dataflow has
+    // converged; the per-`ts` firePendingInTryChecks above is a legacy
+    // wrapper (no-op) for the original design that hooked the fire from
+    // the unreachable `visitStmt` for TryStmt. This version uses a
+    // SYNTACTIC check on the catch arm body (a top-level
+    // `_field := …` assignment is "restoring") because the dataflow's
+    // exit state for the catch arm's last block is not reliable for the
+    // in-`try` case — pre-existing #3241 R1 residue. // per §28.8.1,
+    // #3241 R2
+    void fireAllPendingInTryChecks();
 
     void checkAwaitSites(const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void checkAwaitSitesStmt(
