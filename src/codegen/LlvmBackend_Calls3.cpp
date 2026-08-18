@@ -4300,6 +4300,73 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             const ast::Expr* entryExpr = call.args[0].value.get();
             if (!entryExpr) return nullptr;
 
+            // #3181 / §30.14 / bz_domain_spawn arg_ptr comment: a struct-
+            // typed spawn value crosses the boundary as a heap copy of the
+            // value (the address is passed as the spawn's void* arg); the
+            // receiver loads it and frees the copy. Pointer-typed (class)
+            // values pass through (ownership transfer); integer-typed values
+            // pack their zero-extended bits into the slot; **floating-point
+            // values** (`f32` / `f64`) — also sendable per §30.14 — use the
+            // SAME heap-copy path the struct branch uses (one unified "any
+            // value-type payload" lowering; bits-in-slot has no representation
+            // for `float` and is meaningless for structs > 8 bytes). The pre-
+            // fix `bitcast → i64` fallback hit the verifier for both structs
+            // not exactly 8 bytes AND for f32/f64 (followed by a `zext`
+            // extension on a non-integer, both illegal) — the float/double
+            // case is a current-day verifier abort, not a future-type hazard.
+            // sharpen #3181: unsupported LLVM types (anything that is not
+            // pointer / integer / float / struct) now produce an explicit
+            // codegen diagnostic instead of an opaque verifier abort.
+            auto spawnValueToVoidPtr = [&](llvm::Value* val) -> llvm::Value* {
+                if (val->getType()->isPointerTy()) return val;
+                if (val->getType()->isIntegerTy(64))
+                    return builder_.CreateIntToPtr(val, ptrTy(),
+                                                   "spawn.arg.cast");
+                if (val->getType()->isIntegerTy())
+                    return builder_.CreateIntToPtr(
+                        builder_.CreateZExt(val, i64()), ptrTy(),
+                        "spawn.arg.cast");
+                if (val->getType()->isFloatTy() ||
+                    val->getType()->isDoubleTy() ||
+                    val->getType()->isStructTy()) {
+                    // #3181 (struct) / sharpen #3181 (f32 / f64): heap-copy
+                    // the value and pass the address. §30.14 says every
+                    // sendable value type crosses as a copy; the runtime
+                    // contract (bz_domain_spawn's arg_ptr comment) names the
+                    // copy's ADDRESS as the spawn arg.
+                    auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+                    int64_t sz = static_cast<int64_t>(
+                        module_->getDataLayout().getTypeAllocSize(
+                            val->getType()));
+                    llvm::Value* slot = builder_.CreateCall(
+                        mallocFn, {builder_.getInt64(sz)},
+                        "spawn.arg.slot");
+                    builder_.CreateStore(val,
+                        builder_.CreateBitCast(slot,
+                            val->getType()->getPointerTo()));
+                    return slot;
+                }
+                // sharpen #3181: the pre-fix `bitcast → i64` fallback
+                // produced an opaque IR-verifier abort whenever a non-
+                // pointer / non-integer type slipped past sema. Replace
+                // with a loud codegen diagnostic that names the type — a
+                // reviewer-facing failure rather than a silent wrong-IR
+                // pass-through (and §30.14's sendability check at the call
+                // site ought to have rejected anything that reaches here).
+                if (call.args[1].value) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, call.args[1].value->span.begin,
+                        "internal: unsupported spawn-arg LLVM type in "
+                        "Domain.Spawn marshalling — f32 / f64 / struct are "
+                        "handled via heap copy, integer / pointer via bits "
+                        "and passthrough, anything else is a codegen gap "
+                        "(\xC2\xA7""30.14 / #3181)");
+                }
+                return builder_.CreateIntToPtr(
+                    builder_.getInt64(0), ptrTy(),
+                    "spawn.arg.cast.unreachable");
+            };
+
             // Resolve the entry method symbol.
             sema::MethodSymbol* entryMs =
                 dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*entryExpr));
@@ -4654,6 +4721,16 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 llvm::Value* argParam = adapter->getArg(0);  // void* arg
 
                 // Helper: cast a void* to the expected param type.
+                // For struct-typed params (#3181: a value-like sendable
+                // choice or sendable record) and for f32 / f64 sendable
+                // primitives (sharpen #3181), the void* is the ADDRESS of a
+                // heap copy the caller malloc'd; load the value out of it.
+                // The caller records the same slot in heapCopiesToFree so
+                // we free it after the entry call returns. The pre-fix
+                // ptrtoint fallback is invalid for any non-trivial struct
+                // and silently wrong for any 8-byte struct; for f32 / f64
+                // the pre-fix code hit the verifier with `ptrtoint` of a
+                // pointer-as-i64 fed into a float call.
                 auto castToParamTy = [&](llvm::Value* voidPtr,
                                          llvm::Type*  paramTy) -> llvm::Value* {
                     if (paramTy->isPointerTy()) return voidPtr;
@@ -4663,19 +4740,44 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                         llvm::Value* w = builder_.CreatePtrToInt(voidPtr, i64());
                         return builder_.CreateTrunc(w, i32());
                     }
+                    if (paramTy->isFloatTy() ||
+                        paramTy->isDoubleTy() ||
+                        paramTy->isStructTy()) {
+                        // #3181 (struct) / sharpen #3181 (f32 / f64):
+                        // heap-copy of the value — load it.
+                        return builder_.CreateLoad(paramTy,
+                            builder_.CreateBitCast(voidPtr,
+                                paramTy->getPointerTo()));
+                    }
                     return builder_.CreatePtrToInt(voidPtr, i64());
                 };
+
+                // Track void* slots that the sender malloc'd as heap copies
+                // — we free each one after the entry call returns.
+                // Pointer / int args do not allocate (the slot itself
+                // carries the value or pointer bits); struct args DO, and
+                // f32 / f64 sendable primitives DO (sharpen #3181 — they
+                // ride on the same heap-copy path as structs). The
+                // multi-arg packed array's slots are freed together with
+                // the array below; we only need to track each heap copy
+                // individually here.
+                std::vector<llvm::Value*> heapCopiesToFree;
+                auto* freeFn = declareC("free",
+                                        llvm::Type::getVoidTy(llvm_),
+                                        {ptrTy()});
 
                 std::vector<llvm::Value*> callArgs;
                 if (nOrigParams == 1) {
                     // Single-argument entry: arg IS the param value (single void*).
-                    callArgs.push_back(castToParamTy(
-                        argParam, origFn->getArg(0)->getType()));
+                    llvm::Type* pTy = origFn->getArg(0)->getType();
+                    callArgs.push_back(castToParamTy(argParam, pTy));
+                    if (pTy->isStructTy() || pTy->isFloatTy() ||
+                        pTy->isDoubleTy())
+                        heapCopiesToFree.push_back(argParam);
                 } else if (nOrigParams >= 2) {
                     // Multi-argument entry: arg is a void*[N] malloc'd array.
-                    // Unpack each slot from the array, then free it.
-                    auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_),
-                                            {ptrTy()});
+                    // Unpack each slot from the array, then free the array
+                    // AND any per-slot heap-copies the sender made.
                     for (std::size_t i = 0; i < nOrigParams; ++i) {
                         // GEP into the void*[] at index i.
                         llvm::Value* slotPtr = builder_.CreateInBoundsGEP(
@@ -4684,8 +4786,11 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                             "spawn.slot" + std::to_string(i));
                         llvm::Value* slotVal = builder_.CreateLoad(
                             ptrTy(), slotPtr, "spawn.val" + std::to_string(i));
-                        callArgs.push_back(castToParamTy(
-                            slotVal, origFn->getArg(i)->getType()));
+                        llvm::Type* pTy = origFn->getArg(i)->getType();
+                        callArgs.push_back(castToParamTy(slotVal, pTy));
+                        if (pTy->isStructTy() || pTy->isFloatTy() ||
+                            pTy->isDoubleTy())
+                            heapCopiesToFree.push_back(slotVal);
                     }
                     // Free the packed-arg array after unpacking.
                     builder_.CreateCall(freeFn, {argParam});
@@ -4693,12 +4798,24 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 // else: nOrigParams == 0 — no-arg entry, no call args.
 
                 llvm::Value* ret = builder_.CreateCall(origFn, callArgs);
+                // #3181 / sharpen #3181: free every heap-copy the sender
+                // made for a struct / f32 / f64 arg AFTER the entry has
+                // consumed it (the entry runs synchronously here, so the
+                // copy is no longer needed).
+                for (llvm::Value* p : heapCopiesToFree)
+                    builder_.CreateCall(freeFn, {p});
                 if (origFn->getReturnType()->isVoidTy()) {
                     builder_.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
                 } else if (origFn->getReturnType()->isPointerTy()) {
                     builder_.CreateRet(ret);
                 } else {
-                    // Value result: inttoptr.
+                    // Value result: inttoptr. sharpen #3181 note: a
+                    // FLOAT / DOUBLE entry result still hits the verifier
+                    // here (the zext-only-on-integer rule), but that's a
+                    // separate return-side latent bug; the receiver-side
+                    // fix the amendment is about is sender / receiver
+                    // ARGS, not result marshalling. Round-trip test for
+                    // f32 / f64 RESULTs is filed separately.
                     llvm::Value* wide = ret;
                     if (!wide->getType()->isIntegerTy(64))
                         wide = builder_.CreateZExt(wide, i64());
