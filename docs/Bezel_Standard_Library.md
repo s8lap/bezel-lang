@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.254 — August 2026**
+**Companion to the Bezel Language Specification, v0.256 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -5005,6 +5005,8 @@ public record Range<T>: IEnumerable<T>
   public method GetEnumerator(): owned IEnumerator<T>;
 end Range;
 ```
+
+All six declared properties are the type's auto-property surface for the language's generated members (spec [§8.5](Bezel_Language_Spec.md#sec-tostring)/[§9.2](Bezel_Language_Spec.md#sec-body-records), v0.255): the generated `ToString` renders all six — `IsOpenEnded` and `IsEmpty` recomputed exactly as their member reads compute (spec [§16.3](Bezel_Language_Spec.md#sec-range-operations)) — whatever the intrinsic's storage layout.
 
 `Contains(v)` is `true` iff the range is nonempty under iteration and `v` lies within the endpoint extent (exclusive upper bound excluded) — an empty range contains nothing, and `Contains` agrees with range patterns on the stepless forms (language spec [§16.3](Bezel_Language_Spec.md#sec-range-operations), v0.162). `Step` affects membership only through direction/emptiness. This is the operation invoked by the `in` operator (spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)).
 
