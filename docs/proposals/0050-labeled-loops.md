@@ -1,6 +1,6 @@
 # 0050 - Labeled `break` and `continue`
 
-**Status:** superseded — graduated v0.201
+**Status:** graduated-v0.201 — superseded — graduated v0.201
 **Tracking issue:** [#2037](https://github.com/s8lap/bezel-lang/issues/2037)
 **Target:** Spec [§1.6](../Bezel_Language_Spec.md#sec-statements-and-termination) (two bullet clauses), [§21.3](../Bezel_Language_Spec.md#sec-the-while-statement)/[§21.4](../Bezel_Language_Spec.md#sec-the-for-statement) (one sentence each), [§21.5](../Bezel_Language_Spec.md#sec-break-and-continue) (rewritten; full proposed text in §2.2), [§29.2](../Bezel_Language_Spec.md#sec-desugaring-of-for) (label carry + edge-list generalization), Appendix [A.6](../Bezel_Language_Spec.md#sec-appendix-a-statements) (four production edits), Appendix [C](../Bezel_Language_Spec.md#sec-appendix-c) (invariant bullet). Rationale [§17.3](../Bezel_Design_Rationale.md#sec-goto) (amended into the decision record; the `goto` decline stands). **No stdlib change. No new keyword. No Appendix D change** (Core, see §4.12).
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)

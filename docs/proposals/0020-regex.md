@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System.Text.RegularExpressions` (new; explicit `import`) |
 | **Written against** | spec **v0.177** / stdlib **v0.165** |
 | **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | superseded — graduated v0.214 (critique-gated; the landed sweep is exhaustive over Appendix A's eighteen comma-list productions, per the critique's enumeration — the draft's list was short by seven) |
+| **Status** | graduated-v0.214 — superseded — graduated v0.214 (critique-gated; the landed sweep is exhaustive over Appendix A's eighteen comma-list productions, per the critique's enumeration — the draft's list was short by seven) |
 | **Tracking issue** | assigned at landing |
 | **Target** | Spec §1.6 (one normative sentence), Appendix A (`","?` added to every comma-separated list production that lacks it: all eighteen comma-list productions: ArgList, ParamList, LambdaParams, LambdaDestructure, GenericParams, GenericArgs, GenericConstraints, PositionalFields, PositionalPatternList, EnumConstants, ChoiceCases, CasePayload, PolymorphicMember, ExternParamList, FunctionType, Inheritance, EnumInheritance (both alternatives)). Impl: parser. |
 | **Written against** | spec v0.212 |

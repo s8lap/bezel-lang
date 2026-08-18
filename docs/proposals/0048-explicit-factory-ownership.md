@@ -1,6 +1,6 @@
 # 0048 - Explicit factory ownership: retire the static-return heuristic
 
-**Status:** superseded — graduated v0.201
+**Status:** graduated-v0.201 — superseded — graduated v0.201
 **Tracking issue:** [#2035](https://github.com/s8lap/bezel-lang/issues/2035)
 **Target:** Spec [§28.3](../Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) (the *Producers* table row for non-`owned` method calls; the *Factory methods and sourceless returns* subsection; the iterator-convention paragraph), [§28.6](../Bezel_Language_Spec.md#sec-leak-prevention) (two cross-reference tendrils), Appendix [C.3](../Bezel_Language_Spec.md#sec-appendix-c) (one bullet rewritten); rationale [§5.7](../Bezel_Design_Rationale.md#sec-factory-method-ownership) (amended with the retirement record; §5.5 cited as the doctrine it completes); Guide 01 §5 (one sentence). **No stdlib change** (§6.2: the sweep found zero reliant signatures). **No grammar change** (§4).
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Tracking issue** | [#1456](https://github.com/s8lap/bezel-lang/issues/1456) |
 | **Target module(s)** | `System.Diagnostics` (requires `import System.Diagnostics`); additions to `Debug` (existing §8.2) |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |

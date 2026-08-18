@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Target module** | `System` (auto-imported — `Instant`, `TimeSpan` additions); `System.Diagnostics` (§8.1 `Stopwatch` extensions) |
 | **Written against** | spec/stdlib **v0.177** |
 | **Tracking issue** | [#1444](https://github.com/s8lap/bezel-lang/issues/1444) |

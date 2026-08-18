@@ -2,13 +2,14 @@
 
 | | |
 |---|---|
-| **Status** | accepted — ruled under the owner's 2026-08-18 delegation; awaiting graduation train. Charter ruling C11 directs a **study**, in the 0089 mold: the outcome is **not pre-committed**. This document inventories the question, itemises the new evidence, confronts the recorded blockers, works three candidate rules, and ends in §7 with a recommendation and a stated confidence level — not with a fait accompli. |
+| **Status** | study — accepted — ruled under the owner's 2026-08-18 delegation; awaiting graduation train. Charter ruling C11 directs a **study**, in the 0089 mold: the outcome is **not pre-committed**. This document inventories the question, itemises the new evidence, confronts the recorded blockers, works three candidate rules, and ends in §7 with a recommendation and a stated confidence level — not with a fait accompli. |
 | **Tracking issue** | coordinator files |
 | **Target module(s)** | If adopted: **spec** — §28.7 (*Assignment to an owned field or owned local disposes the displaced value* — the carve-out clause), §15.3 (the *Whole-value reassignment* bullet — the warning-backed manual discipline), §15.1.1 (the owning-inline-array lifetime paragraph), §22.13/§28.3's form-(iv) static-field admission (which restates the carve), §28.3's exactly-once claim and its parenthetical, §28.11 (per-slot tracking at a reassignment point), the **axiom register (A13 → tombstone)**, Appendix C.3, Appendix D.2 (the Extended-level feature note). **rationale** — §5.26's A13 row. If declined: doc-only — §15.3 and the register gain the re-examined-and-kept record with this study as its evidence. |
-| **Written against** | spec/stdlib **v0.255** (`git show HEAD:docs/*.md`, HEAD = `5fa5a95b`) |
+| **Written against** | spec/stdlib **v0.255** (`git show 5fa5a95b:docs/*.md`) |
+| **Currency** | **v0.256** (HEAD `8f41e99d` — the defect train `4130d2de` plus its gate fixes `e8f5387a`): verified to touch **none** of this study's quoted sections — the v0.256 spec delta is §10.4/§13.3/§19.3/§22.9/§27.1.1/§27.6/§28.3-producers/§28.4/A.4/C.2/C.3/C.7 and the stdlib delta is the version header only, while this study quotes §15.3, §15.1.1, §22.13 form (iv), §28.7, §28.11, §28.3's exactly-once claim and table footnote, §35.4, the axiom register's A13 row, Appendix C.3's A13 row, Appendix D.2, and rationale §5.26 — all outside the delta (C.3 gained two *new* rows at v0.256; the A13 carve row is unchanged). Every quotation and count below stands as written. |
 | **Origin** | Charter C11. The direct antecedent is the 2026-07-21 ownership-kernel review, which ranked this as **C9, RECOMMEND** — *"the only shortlist item that improves the language rather than its text"* ([#1385](https://github.com/s8lap/bezel-lang/issues/1385) comment, 2026-07-21) — and the v0.252-era owning-choice ruling, which took the automatic behaviour A13 declines and said in its own text why. |
 
-*Reference convention: unprefixed §-references are language-spec references; K/A tags are §28.3's kernel ids. Every quotation is from the v0.255 snapshot.*
+*Reference convention: unprefixed §-references are language-spec references; K/A tags are §28.3's kernel ids. Every quotation is from the v0.255 snapshot, re-verified unchanged at v0.256. Bold inside a quotation is the source's own unless marked* (emphasis added).
 
 ---
 
@@ -22,7 +23,7 @@
 
 **The rule it licenses (§15.3, *Whole-value reassignment*):**
 
-> `arr := newValue;` on a move-only local or field: the assignment is plain — **the compiler does not insert automatic cleanup of the previous slots. If the LHS holds any slot that is not in moved-from state at the assignment site, those slots leak.** The programmer satisfies the discipline by first emptying every owned slot of the LHS … The compiler emits a warning when reassigning …
+> `arr := newValue;` on a move-only local or field: the assignment is plain — **the compiler does not insert automatic cleanup of the previous slots. If the LHS holds any slot that is not in moved-from state at the assignment site, those slots leak.** *(emphasis added)* The programmer satisfies the discipline by first emptying every owned slot of the LHS … The compiler emits a warning when reassigning …
 
 **Its cost, counted in the spec's own hedges.** The exactly-once claim is the chapter's headline and A13 is the asterisk on it, restated at four sites:
 
@@ -37,7 +38,7 @@ Plus §15.3's own asymmetry sentence and the register row. **Retiring A13 makes 
 
 v0.200 introduced choices; the owning classification's rules now state (§35.4):
 
-> - **Drop-on-overwrite is defined and automatic** (derives: K3.11). Whole-value reassignment of an owning-choice local or field *disposes the displaced value* per §28.7, like an owned class binding — **not** like §15.3's owning-inline-array reassignment rule (the warning-backed manual discipline): **that rule exists because an inline array's slots can be individually moved-from, leaving a partial state the compiler cannot cheaply dispose, and a choice has no partial states, so the sound automatic behavior is available and taken.**
+> - **Drop-on-overwrite is defined and automatic** (derives: K3.11). Whole-value reassignment of an owning-choice local or field *disposes the displaced value* per §28.7, like an owned class binding — **not** like §15.3's owning-inline-array reassignment rule (the warning-backed manual discipline): **that rule exists because an inline array's slots can be individually moved-from, leaving a partial state the compiler cannot cheaply dispose, and a choice has no partial states, so the sound automatic behavior is available and taken.** *(emphasis added)*
 
 And §28.7 states the same asymmetry from the other side:
 

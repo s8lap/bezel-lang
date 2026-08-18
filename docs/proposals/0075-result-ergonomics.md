@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **superseded — stages 1–2 graduated v0.233** (owner-ruled 2026-07-29, Q1–Q7 resolved as recommended; recorded in the v0.233 changelog entry; §4 remains the stage-3 deferral register and 0061 §3 the propagation evidence log) |
+| **Status** | graduated-v0.233 — **superseded — stages 1–2 graduated v0.233** (owner-ruled 2026-07-29, Q1–Q7 resolved as recommended; recorded in the v0.233 changelog entry; §4 remains the stage-3 deferral register and 0061 §3 the propagation evidence log) |
 | **Tracking issue** | [#2354](https://github.com/s8lap/bezel-lang/issues/2354) (stage 1), [#2355](https://github.com/s8lap/bezel-lang/issues/2355) (stage 2) |
 | **Target module(s)** | Stage 1: **spec** — [§35.3](../Bezel_Language_Spec.md#sec-choice-construction) (construction), with cross-reference notes at [§21.7](../Bezel_Language_Spec.md#sec-the-return-statement) (`return`), [§22.2](../Bezel_Language_Spec.md#sec-expression-bodied-methods)/[§23.2](../Bezel_Language_Spec.md#sec-expression-bodied-read-only-properties) (expression bodies), and [§27.3](../Bezel_Language_Spec.md#sec-lambda-expressions) (ascribed lambda returns); **no grammar change** (Appendix A untouched — the forms already parse; the edit is name resolution and typing). Stage 2: **stdlib** — [§2.20](../Bezel_Standard_Library.md#sec-result) `Result<T, E>`; plus the one spec edit the chosen enforcement mechanism requires (§3.2 below — this is stage 2's real question). Stage 3: nothing — two recorded deferrals. |
 | **Written against** | spec/stdlib v0.228 |

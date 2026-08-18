@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1459](https://github.com/s8lap/bezel-lang/issues/1459) |
 | **Target module** | `System` (§2.7 `Random`, auto-imported) |
 | **Written against** | spec v0.177 / stdlib v0.165 |

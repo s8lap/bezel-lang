@@ -1,6 +1,6 @@
 # 0052 - Machine-grade diagnostics and a compiler query API
 
-**Status:** draft
+**Status:** under-review — draft
 **Tracking issue:** [#2039](https://github.com/s8lap/bezel-lang/issues/2039)
 **Target:** Tooling only — reference-compiler surface (`bezelc` output formats, a diagnostic-code catalogue, `--explain`, a batch query mode, staged server modes). **Zero normative spec change**, defended in §2.1: Appendix [D](../Bezel_Language_Spec.md#appendix-d-conformance-levels)'s diagnostic-identity latitude (v0.163) is exercised, not narrowed — the code registry is reference-compiler surface, deliberately *not* a spec registry. No grammar change, no stdlib change.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision), compiler @ `bf96dd6`

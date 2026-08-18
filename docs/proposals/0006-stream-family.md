@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System.IO` (stdlib §7) |
 | **Written against** | spec/stdlib **v0.177** |
 | **Tracking issue** | [#1433](https://github.com/s8lap/bezel-lang/issues/1433) |

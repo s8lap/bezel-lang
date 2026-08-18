@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1453](https://github.com/s8lap/bezel-lang/issues/1453) |
 | **Target module(s)** | A new `System.Testing` module — **explicitly imported, deliberately *not* auto-imported** (§5.6). Builds on `System` (`Exception`/`ExceptionInfo` §31.4, `Type` stdlib §2.13, `Task` §30) |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |

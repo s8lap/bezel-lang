@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target modules** | `System.Net` (this proposal). `System.Net.Http` (0001) and the `Http` server (0002) sit on top. |
 | **Written against** | spec/stdlib **v0.177** |
 | **Tracking issue** | [#1436](https://github.com/s8lap/bezel-lang/issues/1436) |

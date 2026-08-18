@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | superseded — graduated v0.244 (owner-ruled 2026-08-11, all questions as recommended) |
+| **Status** | graduated-v0.244 — superseded — graduated v0.244 (owner-ruled 2026-08-11, all questions as recommended) |
 | **Tracking issue** | [#3050](https://github.com/s8lap/bezel-lang/issues/3050) |
 | **Target module(s)** | **spec** — §9.2 (the membership computation gains the clause; the disqualifier list gains the rescue), §9.3 (combined form: positional fields), §9.8 (one sentence stating the two packages' clauses are independent and both scope the shared membership computation), §35.7 (choice payload fields, per Q2), §3.6 (the auto-equality-bearing row's note; rule 3's breaking-change reach), Appendix A.3/A.4 (the `EqualityClause` production beside `SerializedClause`), Appendix B.2 (`equality` as a contextual keyword), Appendix C.1 (invariant row). **rationale** — §18's deferred entry resolves (pointer to the decision record); a new decision-record subsection. **guides** — Guide 3 gains two lines (the cache-field idiom). |
 | **Written against** | spec/stdlib v0.241 |

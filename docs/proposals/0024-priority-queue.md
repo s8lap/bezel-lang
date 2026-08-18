@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Tracking issue** | [#1451](https://github.com/s8lap/bezel-lang/issues/1451) |
 | **Target module(s)** | `System.Collections.Generic` (stdlib §4) — new §4.19 |
 | **Written against** | spec **v0.177**; stdlib companion v0.165 |
