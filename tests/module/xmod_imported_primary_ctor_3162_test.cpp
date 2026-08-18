@@ -750,46 +750,36 @@ BEZEL_TEST(xmod_imported_primary_ctor_3162,
 }
 
 // ===========================================================================
-// T13 — §14.1 / §22.10: an imported GENERIC class's primary constructor stays
-// DECLINED, and the decline is load-bearing.
+// T13 — §14.1 / §22.10 / §22.8 step 0: an imported GENERIC class's primary
+// constructor now LOWERS correctly. fix #3201 closed the generic half #3162
+// could not reach — the Foundation A/C arm (`emitInstanceInit`, monomorphized
+// in the importer) now performs §22.8 step 0 via `storePrimaryCtorPositionalArgs`
+// BEFORE installing the per-instantiation vtable, so the importer's callsite
+// is the storage for the primary-constructor parameters and a field-init
+// reading a primary parameter (§22.8 step 2) sees the just-stored value.
 //
-// ⚠ THIS ROW EXISTS BECAUSE THE FIX ITSELF OPENED IT. #3141's blanket decline
-// covered generic and non-generic imports alike; replacing it with the ordinary
-// §22.5 check admitted BOTH, and only the non-generic half acquired a lowering.
-// `lowerNew` routes an imported generic to #662's Foundation A/C arm
-// (`emitInstanceInit`, monomorphized in the importer) — a generic exports no
-// per-type `bz$<Type>$init` symbol at all — so the arm that now performs §22.8
-// step 0 is never reached. MEASURED with the guard absent:
-//
-//     new GBox<int>(3, 4)   two-module -> compiles CLEAN, `sum=0 v=0 w=0`
-//                           twin       -> `sum=7 v=3 w=4`
-//
-// a silent zero object, which is exactly what #3141 declined rather than ship.
-// Found by exercising the whole surface the accept path opened rather than the
-// one shape #3162 names.
+// `Sum()` = 3 + 4 = 7. A calloc-zero object (the pre-#3201 outcome #3141
+// declined rather than ship) reads 0. The single-module T13b twin confirms
+// the local construction is bit-identical, so the divergence is specifically
+// the imported-side storage — i.e. the silent-zero defect #3201 closed.
 // ===========================================================================
 BEZEL_TEST(xmod_imported_primary_ctor_3162,
-           t13_imported_generic_primary_ctor_declined_with_reason_14_1) {
+           t13_imported_generic_primary_ctor_stores_args_22_8) {
     const std::string body =
         "  public static method Main(): int "
         "    using var b := new GBox<int>(3, 4); "
         "    return b.Sum(); "
         "  end Main;";
-    std::string diag;
-    int r = compileImportAndRun3162(lib3162("TD"), app3162("TD", body), &diag);
+    int r = compileImportAndRun3162(lib3162("T13"), app3162("T13", body));
     if (r == kDepUnavailable3162) return;
-    BEZEL_EXPECT_EQ(r, kRejected3162);
-    BEZEL_EXPECT_TRUE(mentions3162(
-        diag, "constructs an IMPORTED GENERIC class through its primary "
-              "constructor"));
-    BEZEL_EXPECT_TRUE(mentions3162(diag, "#3162"));
+    BEZEL_EXPECT_EQ(r, 7);
 }
 
 // ===========================================================================
-// T13b — the twin, which proves the decline is a CROSS-MODULE limitation and
-// not a rejection of the language shape: the identical declaration in one
-// module constructs and answers 7. Without this row the guard above could be
-// satisfied by rejecting a generic primary constructor outright.
+// T13b — the twin, which proves the construction is the same shape the
+// single-module side lowers: the identical declaration in one module
+// constructs and answers 7. Without this row the imported row could be
+// satisfied by an artefact of the runtime or a stale dependency mirror.
 // ===========================================================================
 BEZEL_TEST(xmod_imported_primary_ctor_3162,
            t13b_twin_generic_primary_ctor_in_one_module_14_1) {
@@ -798,9 +788,55 @@ BEZEL_TEST(xmod_imported_primary_ctor_3162,
         "    using var b := new GBox<int>(3, 4); "
         "    return b.Sum(); "
         "  end Main;";
-    int r = compileAndRun3162(twin3162("TDL", body));
+    int r = compileAndRun3162(twin3162("T13L", body));
     if (r == kDepUnavailable3162) return;
     BEZEL_EXPECT_EQ(r, 7);
+}
+
+// ===========================================================================
+// T13c — §5.1 / §22.5 over-rejection control: a WRONG-TYPED argument to an
+// imported GENERIC primary constructor must still be REJECTED (not silently
+// zero-stored). The same `checkPositionalNewArgsFromSymbols` binder the
+// non-generic #3162 imported arm uses now runs for the generic too, so the
+// §5.1 reject is the same shape. Pre-#3201 this row was the rejected sibling
+// of the original T13 — confirming the widen did not also widen the wrong-
+// type door. (Pinned by the same kRejected3162 + diagnostic shape T13 once
+// was: any future "let it pass" regression flips the expected value back to 7
+// and the test fails loudly.)
+// ===========================================================================
+BEZEL_TEST(xmod_imported_primary_ctor_3162,
+           t13c_wrong_typed_arg_to_imported_generic_primary_ctor_5_1) {
+    const std::string body =
+        "  public static method Main(): int "
+        "    using var b := new GBox<int>(\"hello\", 4); "
+        "    return b.Sum(); "
+        "  end Main;";
+    std::string diag;
+    int r = compileImportAndRun3162(lib3162("T13C"), app3162("T13C", body),
+                                    &diag);
+    if (r == kDepUnavailable3162) return;
+    BEZEL_EXPECT_EQ(r, kRejected3162);
+}
+
+// ===========================================================================
+// T13d — §22.5 over-rejection control: a WRONG-ARITY call to an imported
+// GENERIC primary constructor must still be REJECTED. Same binder, same
+// outcome. The non-generic #3162 imported arm has the same guard (the
+// `checkPositionalNewArgsFromSymbols` arity check), so the symmetry is the
+// lock for the broader over-rejection contract #3201 touches.
+// ===========================================================================
+BEZEL_TEST(xmod_imported_primary_ctor_3162,
+           t13d_wrong_arity_to_imported_generic_primary_ctor_22_5) {
+    const std::string body =
+        "  public static method Main(): int "
+        "    using var b := new GBox<int>(3); "
+        "    return b.Sum(); "
+        "  end Main;";
+    std::string diag;
+    int r = compileImportAndRun3162(lib3162("T13D"), app3162("T13D", body),
+                                    &diag);
+    if (r == kDepUnavailable3162) return;
+    BEZEL_EXPECT_EQ(r, kRejected3162);
 }
 
 }  // namespace bezel::module

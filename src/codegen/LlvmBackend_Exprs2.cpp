@@ -5188,7 +5188,8 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     //   - the per-instantiation vtable is built by buildImportedGenericVtable
     //     (called from emitInstanceInit below) with genericSubst_ active.
     //   - there is no ctor body to inline and no external ctor ABI to match.
-    //   - the importer emits: calloc → install vtable → (no ctor call) → done.
+    //   - the importer emits: calloc → store primary-ctor positional args into
+    //     their field slots (fix #3201: §22.8 step 0) → install vtable → done.
     //   - sema narrowed the §14 gate: !hasAnyConstructor → accepted.
     //
     // Classes WITH an explicit constructor remain gated: the ctor body is
@@ -5290,6 +5291,47 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // Foundation A: no explicit ctor — install vtable, no ctor body.
         // Foundation C: explicit ctor with loaded body — install vtable first,
         // then fall through to the inline-ctor path (hasAnyConstructor guard).
+        //
+        // fix #3201 (§22.10 / §22.8 step 0 / §14.1 / §2.8.3 rule 4, v0.254):
+        // the GENERIC half of #3162 — `lowerNew` for an imported generic has
+        // no `bz$<Type>$init` to call (a generic is monomorphized in the
+        // importer, per §14.1), so it INSTALLS the per-instantiation vtable
+        // via `emitInstanceInit` and STOPPED there. With no step 0, the
+        // primary-constructor parameters were DROPPED and the object left
+        // calloc-zero — measured for `class GBox<T>(V: int, W: int)`,
+        // `new GBox<int>(3, 4)` answered `sum=0 v=0 w=0` (the silent-zero
+        // defect #3141 declined rather than ship). The fix is the same shape
+        // the non-generic imported arm uses: store the primary-constructor
+        // arguments into the FIELD SLOTS here, BEFORE `emitInstanceInit`
+        // installs the vtable — the importer's callsite is the storage for
+        // the primary parameters, the same layout the dependency's vtable's
+        // disposer and the importer's later field reads GEP through
+        // (§2.8.3 rule 4: one runtime type identity).
+        //
+        // `storePrimaryCtorPositionalArgs` was extracted by #3162 for exactly
+        // this kind of reuse, and it already handles the generic's
+        // `genericSubst_` (the LOCAL arm at line 5317 and the importer-side
+        // non-generic arm at line 5285 use the same helper, with the same
+        // SIGNATURE — the substitution is passed through unchanged).
+        // `currentThis_` is NOT set to `obj` here: nothing in this arm
+        // resolves `t`'s own implicit-field reads (the importer has no field
+        // initializers to walk for an imported generic — `emitInstanceInit`
+        // for an imported generic only installs the vtable and returns, see
+        // LlvmBackend_Setup.cpp:9680), so the enclosing `this` is what an
+        // argument expression needs and it is already current (#2367).
+        //
+        // The same `!hasAnyConstructor(t)` guard the non-generic arm uses
+        // applies here: an imported generic WITH an explicit body (the
+        // Foundation C arm, `importedGenericWithBody`) compiles a body that
+        // BUILDS the field values from its own parameters, so a step 0
+        // store would be a duplicate write. `#662` keeps the loaded body
+        // exhaustive only for the no-ctor case in the metadata format, so
+        // `compatibility-check.sh` does not measure this duplication today;
+        // the guard is the same shape, the same asymmetry, and the same
+        // reason as the non-generic imported arm one section up.
+        if (!hasAnyConstructor(t))
+            storePrimaryCtorPositionalArgs(t, obj, st, ne, savedSubst,
+                                           savedSemaTy, currentThis_);
         emitInstanceInit(t, obj, st);
     } else if (!ctx_.isImported(t)) {
         // §22.10 / §22.8 (#478): a class with primary-constructor parameters

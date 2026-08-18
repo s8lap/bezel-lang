@@ -10975,41 +10975,21 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
             // here had a LOUD `anyNamed` decline (the symmetric sibling of
             // #3163's silent local zero) — that decline is removed, and its
             // local silence is removed too (the local class branch at line
-            // 10824 no longer defers). GENERIC imports stay declined (the
-            // local GENERIC sibling constructs correctly through the
-            // Foundation A path; pinning that asymmetry is the gate below).
-            //
-            // A GENERIC imported class stays declined, and this guard is
-            // load-bearing: `lowerNew` routes an imported GENERIC to the #662
-            // Foundation A/C arm (`emitInstanceInit`, monomorphized in the
-            // importer), NOT to the `bz$<Type>$init` arm this fix taught to
-            // perform §22.8 step 0 — a generic has no exported per-type `init`
-            // symbol at all. Admitting it here therefore compiled clean and
-            // produced a ZERO OBJECT: measured for
-            // `class GBox<T>(V: int, W: int)`, `new GBox<int>(3, 4)` printed
-            // `sum=0 v=0 w=0` against the single-module twin's `sum=7 v=3 w=4`.
-            // That is precisely the silent-wrong-object outcome #3141 declined
-            // rather than ship, so the decline is kept for this shape and the
-            // capability filed separately. (Found by testing the whole surface
-            // the accept path opened, not just the shape #3162 names.) The
-            // LOCAL generic sibling is NOT declined: `twin3162.T13b` confirms
-            // the same declaration in one module constructs and answers 7.
-            if (ctx_.isImported(t) && !t->genericParams.empty()) {
-                ctx_.diagnostics().report(
-                    Severity::Error, ne.span.begin,
-                    std::string("`new ") + std::string(t->name) +
-                        "` constructs an IMPORTED GENERIC class through its "
-                        "primary constructor, which is not yet supported "
-                        "(§22.10 / §14.1 / §2.8.3 rule 4, #3162): a generic "
-                        "type exports no per-type initializer — its "
-                        "construction is monomorphized in the importer — so "
-                        "the positional parameters would be dropped and the "
-                        "object left zero-initialized. Declare an explicit "
-                        "constructor on the exported class, or expose a "
-                        "factory method that returns `owned " +
-                        std::string(t->name) + "`");
-                return;
-            }
+            // 10824 no longer defers). The check now runs on BOTH generic and
+            // non-generic imports: fix #3201 closed the generic half #3162
+            // could not reach — the Foundation A/C arm (`emitInstanceInit`,
+            // monomorphized in the importer) now performs §22.8 step 0 via
+            // `storePrimaryCtorPositionalArgs` BEFORE installing the per-
+            // instantiation vtable, so the importer's callsite is the storage
+            // for the primary-constructor parameters. Measured for
+            // `class GBox<T>(V: int, W: int)`, `new GBox<int>(3, 4)` now
+            // imports to `Sum()=7` (matching the single-module twin's
+            // `sum=7 v=3 w=4`) — the silent-zero defect #3141 declined rather
+            // than ship, and #3201 is the lowering that closes it. The
+            // `checkPositionalNewArgsFromSymbols` call below now also runs
+            // for the generic case, so the §22.5 / §5.1 reject is the same
+            // shape (over-rejection controls are pinned as T13c / T13d in
+            // xmod_imported_primary_ctor_3162_test.cpp).
             // ⚠ One known imprecision, measured and filed as #3202: a §22.10
             // primary parameter may carry a DEFAULT (`class DefBox(A: int,
             // B: int := 9)` — the parser routes a class's primary list through
