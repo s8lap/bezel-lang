@@ -2509,6 +2509,23 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (!obj) return nullptr;
     sema::TypeRef* rt = ctx_.resolvedType(*te.testType);
     if (!rt) return nullptr;
+    // fix #3092 (§12.9/§8.6, v0.254): a bare type-parameter target must be
+    // SUBSTITUTED through the active monomorphization before the descriptor
+    // resolution paths try to find its runtime tag. `boxDescriptorFor`,
+    // `perInstDescriptorForTarget` and the `descArray_` lookup all require
+    // the resolved target — `T` is a Named with declaration==nullptr, so
+    // every path missed it, the `is` read `nullptr`, and `lowerIf` turned
+    // the null condition into an unconditional branch PAST the body (so
+    // `Box<[3]int>.Probe(o is T)` answered 0 for a true [3]int — the silent
+    // false the issue names). `substituteTypeRefLocal` recurses into
+    // constructed types and inline-array elements, so a generic body whose
+    // argument is itself a constructed generic (`Box<U>` where `U = [3]int`)
+    // substitutes both layers. The function is a no-op on a literal target
+    // (`T` is already concrete): on a non-parameter target with active
+    // substitution it returns the same pointer, so the existing fast
+    // paths are unaffected.
+    rt = const_cast<sema::TypeRef*>(
+        substituteTypeRefLocal(rt, genericSubstSemaTy_));
 
     // fix #2775 (§8.6/§12.7/§19.3, v0.240): SILENCE AMPLIFIER. Every
     // `return nullptr` below is not "an error we recover from" — lowerIf turns
