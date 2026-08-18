@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Target module** | `System.Threading` (§6) |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1443](https://github.com/s8lap/bezel-lang/issues/1443) |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | §1 **superseded — graduated v0.216** (owner-activated 2026-07-22; spec §17.15, grammar A.7 `BindExpr`, kernel K8.5); §2 remains a recorded, evidence-gated study |
+| **Status** | graduated-v0.216 — §1 **superseded — graduated v0.216** (owner-activated 2026-07-22; spec §17.15, grammar A.7 `BindExpr`, kernel K8.5); §2 remains a recorded, evidence-gated study |
 | **Tracking issue** | — (assign if §2 activates) |
 | **Written against** | spec v0.214 (§1's pin re-verified against v0.215 at graduation; §17.15's landed text is the current rule) |
 

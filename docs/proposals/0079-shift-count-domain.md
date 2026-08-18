@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | superseded — graduated v0.242 (owner-ruled 2026-08-11, all Qs as recommended) |
+| **Status** | graduated-v0.242 — superseded — graduated v0.242 (owner-ruled 2026-08-11, all Qs as recommended) |
 | **Tracking issue** | [#3045](https://github.com/s8lap/bezel-lang/issues/3045) |
 | **Target module(s)** | **spec** — §6.5 (the rule change), §6.6 (`<<=`/`>>=` inherit; one sentence), §17.14 (the constant-evaluation list: "shift-count masking" becomes the shift-count fault), §31.4 (no new type under the Q2 recommendation), Appendix C.1 (invariant row). **stdlib** — none (no member's contract mentions shift counts; proposal 0008's `BitOperations` contract already says "defined faults" and aligns). **rationale** — a new decision-record subsection; §14.6 untouched. **guides** — none (no guide teaches shifting). |
 | **Written against** | spec/stdlib v0.241 |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | superseded — graduated v0.242 (owner-ruled 2026-08-11, all Qs as recommended) |
+| **Status** | graduated-v0.242 — superseded — graduated v0.242 (owner-ruled 2026-08-11, all Qs as recommended) |
 | **Tracking issue** | [#3052](https://github.com/s8lap/bezel-lang/issues/3052) |
 | **Target module(s)** | **spec** — §16.3/§16.4/§16.6 (item 1), §6.6/§17.1/§17.2 + A.6 `AssignOp` (item 2), §11.7/§12.4 + B.1 (item 3, if taken), §3.6/§14.2/§8.3 (item 4), §2.7 (item 6, presentation only). **rationale** — new entries for items 5, 7, 8; §9.5 (item 3). **stdlib** — §1 wording riders for item 4. **guides** — none. |
 | **Written against** | spec/stdlib v0.241 |

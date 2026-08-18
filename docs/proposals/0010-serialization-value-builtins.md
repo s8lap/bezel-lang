@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Tracking issue** | [#1435](https://github.com/s8lap/bezel-lang/issues/1435) |
 | **Target module(s)** | stdlib §2.5 (`DateTime`/`TimeSpan`/`DateOnly`/`TimeOnly`), §2.6 (`Guid`), §2.14 (`ISerializer`/`IDeserializer` vocabulary) |
 | **Written against** | spec v0.177, stdlib v0.177 |

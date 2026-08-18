@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System` (auto-imported): additions to `Environment` (§2.4) + new `OperatingSystem` static class |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1441](https://github.com/s8lap/bezel-lang/issues/1441) |

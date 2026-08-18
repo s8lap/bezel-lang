@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | superseded — graduated v0.214 (critique-gated; the path-shape, construction-residual, and §22.8-citation findings resolved in the landed text) |
+| **Status** | graduated-v0.214 — superseded — graduated v0.214 (critique-gated; the path-shape, construction-residual, and §22.8-citation findings resolved in the landed text) |
 | **Tracking issue** | assigned at landing |
 | **Target** | Spec §7.4 (the locals-only rule gains the readonly-field extension), §6.1-adjacent rationale (the "never fields" record gains its carve-out). Impl: sema narrowing pass. |
 | **Written against** | spec v0.212 |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Target module** | `System` (auto-imported): `SignalKind` enum + `Signals` static class; callers `import System.Threading` to use the returned `Channel<SignalKind>` |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1442](https://github.com/s8lap/bezel-lang/issues/1442) |

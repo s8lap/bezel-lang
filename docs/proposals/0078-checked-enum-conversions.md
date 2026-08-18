@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | superseded — graduated v0.242 (owner-ruled 2026-08-11, all Qs as recommended) |
+| **Status** | graduated-v0.242 — superseded — graduated v0.242 (owner-ruled 2026-08-11, all Qs as recommended) |
 | **Tracking issue** | [#3044](https://github.com/s8lap/bezel-lang/issues/3044) |
 | **Target module(s)** | **spec** — §5.4 (the rule change; both subsections), §5.3 (one composing sentence), §10.4 (the defensive-`_` paragraph deletes), §17.11 (the Q3 rider), §17.14 (no change — enum casts are already non-constant; the §5.4 constant-operand error extends), §19.6 (one sentence stating the restored guarantee), §21.7 (the statement-`case` totality rule's enum disqualifier — its recorded ground is exactly the premise this proposal deletes; Q5), Appendix C.1/C.7 (invariant rows). **stdlib** — §9-adjacent: the compiler-provided per-enum static member (declared in spec §10.4's static-surface terms, documented beside §1's tier conventions). **rationale** — a new decision-record subsection (the v0.72 entry documented the C#-inherited behavior; nothing ever weighed it). **guides** — Guide 3 wording only (the raw-value caveat retires). |
 | **Written against** | spec/stdlib v0.241 |

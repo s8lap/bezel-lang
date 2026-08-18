@@ -1,6 +1,6 @@
 # 0047 - Mechanized core semantics for ownership and domains
 
-**Status:** draft
+**Status:** under-review — draft
 **Tracking issue:** [#2034](https://github.com/s8lap/bezel-lang/issues/2034)
 **Target:** Verification artifact only — a new top-level `formal/` tree (paper calculus, Lean 4 model, differential-validation bridge), **never a compiler build dependency** (§5.4). No spec, stdlib, grammar, or compiler changes. Two process touch points, both staged: (a) one checklist line added to [`spec-change-process.md`](spec-change-process.md) §9 at stage S3 (a §28/§30 change updates the model or records its exclusion); (b) an **advisory, optional** CI lane alongside the existing `.github/workflows/ci.yml`, never in `scripts/gate.sh`'s blocking path.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)

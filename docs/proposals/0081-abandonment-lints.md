@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | superseded — graduated v0.243 (owner-ruled 2026-08-11, all Qs as recommended) |
+| **Status** | graduated-v0.243 — superseded — graduated v0.243 (owner-ruled 2026-08-11, all Qs as recommended) |
 | **Tracking issue** | [#3047](https://github.com/s8lap/bezel-lang/issues/3047) |
 | **Target module(s)** | **spec** — §15.4 (the store-lint paragraph: type set extended from trivial-dispose to all fresh unbound owned temporaries; the recorded #1813 follow-on taken), §28.11 (*Borrowing collections* store paragraph: one cross-reference sentence), §29.11/§28.3 (one sentence anchoring lint B's provenance predicate), stdlib §5 (one sentence at the accessor contract naming the lint), §30.10 area (cross-reference from the abandonment idioms). **rationale** — §5.28's Q1 record gains the taken-follow-on note; a short new decision paragraph for lint B. **guides** — Guide 04 §2 and Guide 05 §6 rewording at graduation (the traps become "the diagnostic you will see"). **No grammar change; no program that compiles today stops compiling.** |
 | **Written against** | spec/stdlib v0.241 |

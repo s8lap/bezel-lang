@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **superseded — graduated v0.231** (owner-accepted 2026-07-29; Q1–Q4 resolutions recorded in the v0.231 changelog entry) |
+| **Status** | graduated-v0.231 — **superseded — graduated v0.231** (owner-accepted 2026-07-29; Q1–Q4 resolutions recorded in the v0.231 changelog entry) |
 | **Tracking issue** | [#2347](https://github.com/s8lap/bezel-lang/issues/2347) (implementation) |
 | **Target module(s)** | stdlib only — `System` ([§2.5](../Bezel_Standard_Library.md#sec-datetime-timespan-dateonly-timeonly) `DateTime`/`DateOnly`/`TimeOnly`, [§2.6](../Bezel_Standard_Library.md#sec-guid) `Guid`), `System.Collections.Generic` ([§4.8](../Bezel_Standard_Library.md#sec-dictionaryk-v) `Dictionary<K, V>`, [§4.17](../Bezel_Standard_Library.md#sec-sorted-dictionary) `SortedDictionary<K, V>`, [§4.9](../Bezel_Standard_Library.md#sec-owneddictionaryk-v) `OwningDictionary<K, V>`), and the [§9](../Bezel_Standard_Library.md#sec-primitive-type-members) primitives. One sentence added to the [§1](../Bezel_Standard_Library.md#sec-conventions) Try-convention bullet (§3 below). **No spec change, no new types, no new grammar.** |
 | **Written against** | stdlib/spec v0.228 |

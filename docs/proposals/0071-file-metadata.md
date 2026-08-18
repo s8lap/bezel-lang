@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Tracking issue** | — (none yet) |
 | **Target module(s)** | `System.IO` (extends stdlib §7.3 `File`; new `FileStatus`/`FileKind` types in a new §7.3b — numbering at docs-editor discretion, the 0009 precedent; 0017 already claims §7.3a) |
 | **Written against** | spec/stdlib **v0.227** |

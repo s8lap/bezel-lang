@@ -5,10 +5,11 @@
 | **Status** | accepted — ruled under the owner's 2026-08-18 delegation; awaiting graduation train. Charter ruling C7: four adoptions + one decline + three repairs. Each item below is independently landable; the program is one proposal because every item touches stdlib §1 or §5 and they should be reviewed against one another. |
 | **Tracking issue** | coordinator files |
 | **Target module(s)** | **stdlib** — §1 (the exception-safety post-state convention band, new; the block-by-name shadowing note, new; the `*OrNull` tier bullet and the Try-convention bullet, one name each), §5 (`ElementAtOrNull` declared; the `Sum`/`Average` selector overloads; the §26.4→§26.5 citation repair), §5.1 (the no-selector `Sum`/`Average` extension blocks), §9.7 (the LINQ-applicability claim narrowed), §4.10 (`OwningSet<T>.Take`/`TryTake` → `Pop`/`TryPop`), §4.9 (the `PopValue` note gains its reason). **spec** — §29.11 (the terminal-accessor warning set gains `ElementAtOrNull`), §11.8 (the `Sum<T>` normative example, if the migration changes its shape). **guides** — 02 and 05 (the transfer-name teaching lists `Take` on the owning family). |
-| **Written against** | spec/stdlib **v0.255** (`git show HEAD:docs/*.md`, HEAD = `5fa5a95b`) |
+| **Written against** | spec/stdlib **v0.255** (`git show 5fa5a95b:docs/*.md`) |
+| **Currency** | **v0.256** (HEAD `8f41e99d` — the defect train `4130d2de` plus its gate fixes `e8f5387a`): verified to touch **none** of this proposal's quoted sections — the stdlib delta is the version header only, and the spec delta (§10.4/§13.3/§19.3/§22.9/§27.x/§28.3-producers/§28.4/A.4/C.x) leaves §29.11's warning set, §26.5, §29.2's span iteration, and §11.8 unchanged. Every quotation and count below stands as written. |
 | **Origin** | Charter C7, from the stdlib-surface review. |
 
-*Reference convention: unprefixed §-references are language-spec references; stdlib references are marked `stdlib §x`. Every quotation and every count is from the v0.255 snapshot or from `tests/` at HEAD.*
+*Reference convention: unprefixed §-references are language-spec references; stdlib references are marked `stdlib §x`. Every quotation and every count is from the v0.255 snapshot (re-verified unchanged at v0.256) or from `tests/` at HEAD. Bold inside a quotation is the source's own unless marked* (emphasis added).
 
 ---
 
@@ -21,7 +22,7 @@
 3. **stdlib §5**, the element-accessor failure prose: *"`First`/`Last`/`Single`/`ElementAt` throw `InvalidOperationException` (or `IndexOutOfRangeException` for `ElementAt`) on missing-element; **the `*OrNull` variants return `null` instead**."*
 4. **Guide 05 §**(eager operators): *"the element accessors (`First`/`Last`/`Single`/`ElementAt` and their `*OrNull` and predicate forms)"*.
 
-So the member set of a **normative compiler warning** names a member the stdlib does not declare. That is the repair's urgency: it is not an ergonomics gap, it is a spec text that cannot be implemented as written.
+So the member set of a **normative compiler warning** names a member the stdlib does not declare. That is the repair's urgency — stated precisely: the warning set is implementable as written (an entry for a member that cannot occur is simply **vacuous**), but a normative enumeration carrying a phantom member is a standing trap — four texts teach an API that does not resolve, and the first user to write `xs.ElementAtOrNull(i)` from the spec's own warning set gets a resolution error the documents say cannot happen. Not unimplementable; false in the way that misleads.
 
 **The declaration** (stdlib §5, immediately after `ElementAt`):
 
@@ -49,17 +50,26 @@ No predicate form: `ElementAt` has none (an index has no predicate analogue), so
 
 with the prose *"`Take(query: T)` finds the equal element in the set, removes it, and returns ownership. … `TryTake` is the no-throw variant."*
 
-**The ground for the rename is measured shadowing, not taste.** Spec §26.5 rule 1: *"If `x`'s declared type (or any base type) **declares** any instance member named `Foo` — of any arity, applicability, or accessibility — instance resolution is committed and extension blocks are **never consulted** for that name on that receiver."* LINQ's `Take(count: int): IEnumerable<T>` is an extension on `IEnumerable<T>`. So on an `OwningSet<T>` receiver, `Take` is the owning-egress member and **LINQ's `Take` is unreachable, by name, forever**. The rename to `Pop`/`TryPop` un-shadows it and puts the member in the family the guides already teach: Guide 2's *"`Get`/`Peek` borrow; `Pop`/`Drain`/`Take` transfer"*, and `OwningStack<T>`/`OwningQueue<T>`'s existing `Pop()`/`TryPop(out owned item: T?)`.
+**The ground for the rename is measured shadowing, not taste.** Spec §26.5 rule 1: *"If `x`'s declared type (or any base type) **declares** any instance member named `Foo` — of any arity, applicability, or accessibility — instance resolution is committed and extension blocks are **never consulted** for that name on that receiver"* *(the bold on "declares" is added; "never consulted" is the source's own)*. LINQ's `Take(count: int): IEnumerable<T>` is an extension on `IEnumerable<T>`. So on an `OwningSet<T>` receiver, `Take` is the owning-egress member and **LINQ's `Take` is unreachable, by name, forever**. The rename to `Pop`/`TryPop` un-shadows it and puts the member in the family the guides already teach: Guide 2's *"`Get`/`Peek` borrow; `Pop`/`Drain`/`Take` transfer"*, and `OwningStack<T>`/`OwningQueue<T>`'s existing `Pop()`/`TryPop(out owned item: T?)`.
 
 **Re-verified call-site count — the charter's "0 call sites" is wrong.** Measured at HEAD across `tests/`:
 
 | Site | Count | Files |
 |---|---|---|
-| `s.Take(…)` / `s.TryTake(…)` on an `OwningSet` receiver, in Bezel source | **10** | `tests/codegen/owned_set_take_1476_test.cpp` (9), `tests/sema/builtin_collection_nullable_arg_2582_test.cpp` (1) |
+| `s.Take(…)` / `s.TryTake(…)` on an `OwningSet` receiver, in Bezel source | **10** | `tests/codegen/owned_set_take_1476_test.cpp` (9: six `Take`, three `TryTake`), `tests/sema/builtin_collection_nullable_arg_2582_test.cpp` (1) |
 | `src/` occurrences of the string literals `"Take"` / `"TryTake"` (name-keyed recognition) | **27** | 8 files: `sema/ExprTypecheck_Calls.cpp`, `sema/ExprTypecheck.cpp`, `sema/ExprTypecheck_Exprs.cpp`, `common/OwnershipFacts.cpp`, `ownership/Ownership_Checks.cpp`, `codegen/LlvmBackend_Calls.cpp`, `LlvmBackend_Calls2.cpp`, `LlvmBackend_Calls3.cpp` |
-| LINQ `Take` call sites in the same test files that must **not** change | 4 | `arr.Take(2)`, `arr?.Take(2)`, `a.Take(3).ToArray()`, `a.Take(2)` as a `for` source |
+| LINQ `Take` call sites in the **same** test files that must **not** change | 3 | `arr.Take(2)` (2582), `a.Take(3).ToArray()` and `a.Take(2)` as a `for` source (1476) |
+| The null-conditional LINQ control, in a **third** file | 1 | `arr?.Take(2)` — `tests/sema/builtin_collection_nullcond_arg_2594_test.cpp`, the #2594 null-conditional-argument pin; outside the two rename files but keyed on the same name split, so the rename lane verifies it unchanged too |
 
-So the rename is **not free**, and the `src/` half is **not mechanical**: the compiler distinguishes the two `Take`s by receiver family today (`src/sema/ExprTypecheck_Calls.cpp`: `(m == "Take" || m == "TryTake") && colName == "OwningSet"` — the #2582 family gate), and after the rename it must distinguish `OwningSet`'s `Pop(query: T)` from `OwningStack`/`OwningQueue`'s `Pop()` by **arity** where today the name plus family sufficed. The graduation train's implementation issue must say so; a regex rename would silently mis-key the gate. *(This is the same shape as proposal 0091's `WhenAll` re-keying: name-keyed recognition becomes name-plus-signature recognition.)*
+So the rename is **not free**, and the `src/` half is **not mechanical**: the compiler distinguishes the two `Take`s by receiver family today — the #2582 family gate is a *negative* exclusion inside the lazy-LINQ typing path, quoted from `src/sema/ExprTypecheck_Calls.cpp`:
+
+```cpp
+if (m == "Where" || m == "Skip" ||
+    (m == "Take" && colName != "OwningSet") ||
+    m == "Distinct") {
+```
+
+— LINQ's `Take` is *every* `Take` **except** the `OwningSet` one, so after the rename the exclusion clause becomes dead (no instance `Take` remains to exclude) and the `Pop` recognition must distinguish `OwningSet`'s `Pop(query: T)` from `OwningStack`/`OwningQueue`'s `Pop()` by **arity** where today the name plus family sufficed. The graduation train's implementation issue must say so; a regex rename would silently mis-key the gate. *(This is the same shape as proposal 0091's `WhenAll` re-keying: name-keyed recognition becomes name-plus-signature recognition.)*
 
 **`OwningDictionary<K, V>.PopValue`/`TryPopValue` stay, with their reason stated.** stdlib §4.9's own inline comment already records it (*"forms remain PopValue/TryPopValue"*): the `Value` suffix **carries information** — the dictionary's egress transfers the *value* and consumes the *key* as a query, so `PopValue(key)` says which of the two the caller gets, where a bare `Pop(key)` would not. That is a naming-carries-information ground, not an exception to the rename; `OwningSet<T>` has no such ambiguity (its element and its query are the same type and the same thing), which is exactly why its member can lose its qualifier.
 
@@ -98,9 +108,9 @@ end;
 **`Average` does not migrate cleanly, and the graduation train must not pretend otherwise.** Two obstructions, both verified against the snapshot:
 
 1. **The result type is not the element type.** The declared overloads are `Average(selector: (T) -> int): double`, `(long) -> double`, `(uint) -> double`, `(ulong) -> double`, `(float) -> float`, `(double) -> double`, `(decimal) -> decimal`. Five of the seven **widen**: the integer families average to `double`. A single `Average<U>(): U where U: INumber<U>` would return `int` for an integer source — a silently truncating average, the worst possible outcome. A single `Average<U>(): double` would lose `decimal`'s exactness and `float`'s type, both of which the current surface deliberately preserves (v0.195 added the `float`→`float` and `ulong`→`double` forms precisely to complete this mapping).
-2. **`INumber<T>` cannot divide by a count.** Averaging requires `total / n` where `n: int`. `INumber<T>` declares `/` over `(T, T)` only, and offers no `int`→`T` conversion — `One()` repeated `n` times is the only in-constraint route, which is O(n) and absurd. The constraint as declared does not span the operation.
+2. **Dividing by the count is expressible — at the price of a second constraint.** Averaging requires `total / n` where `n: int`. `INumber<T>` declares `/` over `(T, T)` only and offers no `int`→`T` conversion, so within `INumber<U>` alone the operation is unwritable. But the conversion **does** exist one interface over: `ISteppable<T>` (stdlib §2.19) declares `static method Step(value: T, by: long): owned T` — *advance in T's space* — so `U.Step(U.Zero(), count)` produces the count as a `U` in O(1), and the whole primitive numeric tower conforms to both interfaces. A generic average is therefore expressible at `where U: INumber<U>, ISteppable<U>`. The objection moves from **impossibility to signature shape**: `Average` would carry a second constraint that `Sum` does not, its meaning stretched (`Step` is an ordinal-advance operation drafted for ranges, here pressed into service as a from-integer conversion), and every user conformer wanting `Average` must implement `ISteppable<U>` — an iteration vocabulary — to unlock an arithmetic aggregation.
 
-**Disposition:** adopt the migration **for `Sum` (14 overloads → 2)**; **record `Average` as blocked on an `INumber<T>` widening**, with the two obstructions named, and leave its 14 overloads in place. That is the truthful version of C7(iii): the ruling's "pre-1.0 cheap moment" is real for `Sum` and is not available for `Average` at the current constraint vocabulary. The stdlib §5 sentence that today says the migration is "recorded follow-up work" is rewritten to say what actually happened: `Sum` migrated; `Average` awaits a conversion or result-type facility on `INumber<T>` (a from-integer factory, or an associated result type — the same associated-types gap rationale §18 already records for traits). *(§9 Q1 puts the alternative to the graduation train.)*
+**Obstruction 1 alone still blocks.** Whatever the constraint vocabulary, a single `Average<U>(): U` truncates integer averages and a single `(): double` loses `decimal` and `float` — the result-type mapping is the surface's deliberate content, and no constraint expresses it. **Disposition unchanged:** adopt the migration **for `Sum` (14 overloads → 2)**; **record `Average` as blocked** — primarily on the result-type mapping (obstruction 1), secondarily on the constraint-shape cost of the now-expressible division (obstruction 2) — and leave its 14 overloads in place. That is the truthful version of C7(iii): the ruling's "pre-1.0 cheap moment" is real for `Sum` and is not available for `Average` at an acceptable signature. The stdlib §5 sentence that today says the migration is "recorded follow-up work" is rewritten to say what actually happened: `Sum` migrated; `Average` awaits a result-type facility on `INumber<T>` (an associated result type — the same associated-types gap rationale §18 already records for traits), the division half being expressible via `ISteppable<U>` but not worth the second constraint on its own. *(§9 Q1 puts the alternative to the graduation train.)*
 
 ## 4. The exception-safety post-state convention band (adoption iv)
 
@@ -131,16 +141,15 @@ Every band in stdlib §1 exists for exactly that shape (*the Try convention*, *N
 | §4.8 `Dictionary<K, V>` / §4.9 `OwningDictionary<K, V>` | `Contains`, `Count` |
 | §4.10 `Set<T>` / `OwningSet<T>` | `Take` (item 2 removes this one) |
 | §4.11 `Stack`/`OwningStack`/`Queue`/`OwningQueue` | `Contains` |
-| §4.14 `OwningBuffer<T>`, `Span<T>`, `ReadOnlySpan<T>` | `Contains`, `Reverse`, `ToArray` |
-| §4.15 `ArraySpan<T>`, `ReadOnlyArraySpan<T>` | `Contains`, `Reverse` |
-| §4.16 `IReadOnlySpan<TElement>` | `Contains`, `Sum` |
+| §4.14 `OwningBuffer<T>` at class `T` — the section's only `IEnumerable` implementer (`IEnumerable<T?>`) | **none** — `Length`, the indexer, and the `AsSpan`/`AsReadOnlySpan` families collide with no §5 name; the row's former `Contains`/`Reverse`/`ToArray` belonged to the span types, resolved moot below |
 | §4.17 `SortedDictionary<K, V>` | `Contains`, `Count` |
 | §4.18 `SortedSet<T>` | `Contains`, `Count`, `First`, `Last` |
 | §4.19 `FrozenArray<T>` | `ToArray` |
 | §4.20 `Counter<K>` | `Count` |
-| §3.3 `ReadOnlyStringSpan` | `Contains` |
 
-*(Measured by name collision between §5's operator set and each section's declared `method`/`property` names, including `pure readonly property` forms. The operative subset is those receivers on which the LINQ extension would otherwise apply — the span family may not implement `IEnumerable<T>` at all, in which case the collision is moot there; the graduation train should verify that narrowing before publishing the table. The `Set<T>`/`OwningSet<T>` row is section-level: `Take` is declared on `OwningSet<T>` only.)*
+*(Measured by name collision between §5's operator set and each section's declared `method`/`property` names, including `pure readonly property` forms. The `Set<T>`/`OwningSet<T>` row is section-level: `Take` is declared on `OwningSet<T>` only.)*
+
+**The span family is resolved moot, not deferred.** `Span<T>`/`ReadOnlySpan<T>` (§4.14), `ArraySpan<T>`/`ReadOnlyArraySpan<T>` (§4.15), `IReadOnlySpan<TElement>` (§4.16), and `ReadOnlyStringSpan` (§3.3) implement no `IEnumerable<T>`: spec §29.2 iterates every one of them by a **direct indexed loop** over the span's range (the inline-array rule's parallel), and the value-`T` `OwningBuffer<T>` form is declared with *"no IEnumerable conformance"* outright. §26.5's block-by-name rule arbitrates between an instance member and an *applicable* extension — on a receiver where the LINQ extensions never apply, there is nothing to block, so those four rows (and their `Contains`/`Reverse`/`ToArray`/`Sum` name lists) drop from the table rather than await verification.
 
 The note itself is short: an instance member blocks a same-named extension **by name**, so where a collection declares its own `Count`, `Contains`, `First`, `Last`, `Reverse`, or `ToArray`, that member — not the LINQ operator — is what a call resolves to; the semantics are usually equivalent (`Array<T>.Contains` and LINQ's `Contains` agree) and the differences, where they exist, are the member's own documented behavior. The value of stating it is that a reader who expects `arr.Count(pred)` to work now finds out why it does not.
 
@@ -173,7 +182,7 @@ The proposal on the table was a distinctly-named predicate-count operator, `Coun
 ## 8. Implementation sketch
 
 - **sema/codegen:** `ElementAtOrNull` joins the compiler-known terminal-accessor set (the same list that carries `ElementAt` for the §28.3 bare-type-parameter classification and the §29.11 warning). The `OwningSet` rename re-keys the recognition sites named in §2 from *name + collection family* to *name + arity + family*, because `Pop` now exists on three owning types with two different arities. The `Sum` migration replaces seven per-type recognitions with one constraint-checked generic; §11.8's static-interface dispatch already supports it.
-- **stdlib/tests:** the 10 `OwningSet` call sites respell; the 4 LINQ `Take` sites in the same files must be verified unchanged (they are the #2582 family-gate controls and would silently pass a bad rename).
+- **stdlib/tests:** the 10 `OwningSet` call sites respell; the 3 LINQ `Take` sites in the same files, plus the `arr?.Take(2)` control in `builtin_collection_nullcond_arg_2594_test.cpp`, must be verified unchanged (they are the family-gate controls and would silently pass a bad rename).
 - **Spec-cited regression tests** (`runAot`): `ElementAtOrNull` in range / out of range / at a nullable element type (the §7.10 conflation caveat) / drawing the §29.11 warning over a same-unit fresh-yield iterator; `OwningSet.Pop`/`TryPop` accept and the old names reject, plus `set.Take(2)` now resolving to LINQ on an `OwningSet` receiver (the un-shadowing, which is the rename's whole point and needs its own pin); `Sum()` and `Sum(selector)` at each primitive conformer and at a user `INumber<T>` conformer, plus the rejection at `string`/`bool`/`char` (stdlib §2.19's non-conformers); an exception-safety test per band clause — a throwing comparator in `Sort` and a throwing `GetHashCode` in an owning container's `Add`, each asserting the receiver is still usable and each element disposed exactly once under `--full`.
 
 ## 9. Drafting seams for the graduation train

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target module** | `System.Diagnostics` (stdlib §8; the type is `System.Diagnostics.Process`, the "open shape" deferred in stdlib [§11](../Bezel_Standard_Library.md#sec-modules-deferred-to-future-revisions)) |
 | **Written against** | spec/stdlib **v0.177** |
 | **Tracking issue** | [#1440](https://github.com/s8lap/bezel-lang/issues/1440) |

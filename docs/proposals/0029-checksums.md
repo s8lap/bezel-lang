@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Tracking issue** | [#1454](https://github.com/s8lap/bezel-lang/issues/1454) |
 | **Target module(s)** | `System.IO.Hashing` (new module; requires `import System.IO.Hashing`) |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |
