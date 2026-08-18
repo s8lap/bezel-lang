@@ -11139,6 +11139,310 @@ bool MethodOwnership::exprContainsAwait(const ast::Expr* e) const {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// §28.8.1 "Exception paths are not exempt" (#3080) — the exception-edge half of
+// the field-restoration rule.
+//
+// THE RULE (§28.8.1, spec v0.254). K9.2's path set "includes exception edges: a
+// throwable expression between the move and the reassignment introduces an exit
+// path on which the reassignment has not run, and if the destructor on `this` is
+// reached via that path, it would observe the field in moved-from state — the
+// hole a destructor must never observe."
+//
+// WHAT WAS MISSING. The at-method-exit check (Ownership.cpp, `endFlow.fields`)
+// covers the NORMAL exits, and thanks to the #867 OR-over-paths merge it also
+// covers a field restored on only SOME normal paths. It cannot see an exception
+// edge out of a throwable expression, because no such edge exists: the CFG models
+// throwability as ONE over-approximated edge from a `try` body's END block to
+// that try's catch dispatcher (src/flow/CFG.cpp:544). That fact cannot answer
+// this rule — (a) it does not exist at all when no `try` encloses the code, which
+// is the shape of the section's own `WrongOrder` example; (b) it is anchored AFTER
+// the restoring assignment, the wrong program point; (c) it carries no
+// per-expression classification, so §28.8.1's inventory has nothing to attach to.
+// Measured on 88c8f93: `WrongOrder` (a move, an intervening call, then the
+// restore) compiled clean, and the generated program SEGV'd in the holder's
+// destructor reading the nulled field — precisely the hole quoted above.
+//
+// WHY NO NEW CFG EDGES ARE NEEDED. An exception edge out of a throwable
+// expression leaves the method immediately and runs no further statement. So the
+// rule collapses to a LOCAL question asked where the throwable expression sits:
+//
+//     a throwable expression evaluated while an owned field is moved-from IS
+//     itself an unrestored exit.
+//
+// The fact that answers it already exists — `fieldMovedFrom_`, the #867
+// path-sensitive moved-from map, which at any statement holds the OR-over-paths
+// answer to "is this field moved-from here?". This check reads it; it derives
+// nothing new. // per §28.8.1, K9.2, #3080
+// ---------------------------------------------------------------------------
+
+void MethodOwnership::collectStmtsInsideTryStmt(const ast::Stmt& s,
+                                                bool insideTry) {
+    if (insideTry) stmtsInsideTry_.insert(&s);
+    // Recurse into the control-flow forms that can lexically contain a try
+    // statement (mirrors collectCatchBorrowsStmt's structure). `insideTry` stays
+    // sticky once set: a statement nested three ifs deep inside a try body is
+    // still inside that try.
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+        for (const auto& el : ifs->elifBranches)
+            for (const auto& bs : el.body)
+                if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+        for (const auto& bs : ifs->elseBody)
+            if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        for (const auto& bs : ws->body)
+            if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        for (const auto& bs : fs->body)
+            if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+        return;
+    }
+    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : dob->body)
+            if (bs) collectStmtsInsideTryStmt(*bs, insideTry);
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
+        // Everything the try lexically encloses — body, each catch arm, and the
+        // finally body — is `insideTry` from here down.
+        for (const auto& bs : ts->body)
+            if (bs) collectStmtsInsideTryStmt(*bs, true);
+        for (const auto& arm : ts->catches)
+            if (arm.body) collectStmtsInsideTryStmt(*arm.body, true);
+        for (const auto& bs : ts->finallyBody)
+            if (bs) collectStmtsInsideTryStmt(*bs, true);
+        return;
+    }
+}
+
+void MethodOwnership::collectStmtsInsideTry(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    stmtsInsideTry_.clear();
+    for (const auto& s : body)
+        if (s) collectStmtsInsideTryStmt(*s, false);
+}
+
+// §28.8.1's throwable-expression inventory, verbatim (v0.254):
+//
+//   "Method calls; indexer accesses (on inline arrays `[N]T`, on resizable
+//    collection classes such as `Array<T>` whose indexer can throw
+//    `IndexOutOfRangeException` or `KeyNotFoundException`, and on any
+//    user-declared indexer); division and modulo (which can throw
+//    `DivideByZeroException`); arithmetic on overflow-checked types; explicit
+//    casts in function-call form (e.g., `short(x)` and `int(d)` …); explicit enum
+//    casts from integer values …; shifts whose count is not a compile-time
+//    constant …; a range expression with a computed step (§16.4); and `await` are
+//    throwable. The `!` null-forgiving operator is throwable when the target is
+//    null."
+//
+// and the non-throwable list it complements: "assignments … where neither the LHS
+// nor the RHS is a throwable expression and the assignment performs no
+// drop-on-overwrite of a possibly-live value", "field reads", "local-variable
+// reads", "literals", "`move x.f` itself (the move is a state transition, not a
+// runtime check)", "`null`-coalescing where neither operand is throwable", plus
+// the explicit carve-out "The `as` operator is **not** throwable".
+//
+// WHAT THIS CLASSIFIES, and why it is a deliberate UNDER-approximation. The four
+// entries below are the ones decidable from the AST alone with no conditional
+// qualifier in the spec's own wording:
+//   * method calls — including the `?.`-invocation spelling, and the
+//     function-call-form cast spellings `short(x)` / `int(d)`, which parse as
+//     CallExpr and so are covered by the same arm;
+//   * indexer accesses;
+//   * division and modulo;
+//   * `await`.
+// The remainder are NOT classified: overflow-checked arithmetic, explicit enum
+// casts, and the constant-ness of a shift count need type-level facts this walk
+// does not have; a computed-step range needs §16.4's step classification; and the
+// `!` operator is stated conditionally by the spec itself ("throwable *when the
+// target is null*"), so treating it as unconditionally throwable would reject
+// programs whose target is provably non-null. Under-approximating the inventory
+// can only MISS a violation, never invent one — the right direction for a rule
+// whose false positive rejects a legal program. The residue — these entries, plus
+// the drop-on-overwrite condition on the non-throwable assignment clause and the
+// compound-assignment spellings `/=` / `mod=` — is tracked in #3241.
+//
+// A `new` expression is deliberately NOT classified throwable. It is not named in
+// the inventory, and the section's own `Wrong` example restores with `_resource :=
+// new Stream();` AFTER the move while the stated error names only the
+// false-branch path — so the spec's own annotation reads the shape as fine. A
+// constructor body can throw, so the soundness argument points the other way;
+// that tension is a genuine spec question, filed as #3240 rather than silently
+// decided. Flipping it is one arm here (return the node for NewExpr instead of
+// descending into its arguments).
+//
+// The traversal arms mirror `exprContainsAwait` above (same recursion, same
+// order) so the two can be diffed; LambdaExpr is likewise not descended — a
+// lambda body does not execute at this program point.
+const ast::Expr* MethodOwnership::findThrowable28_8_1(
+    const ast::Expr* e) const {
+    if (!e) return nullptr;
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
+        if (ue->op == "await") return e;               // inventory: `await`
+        return findThrowable28_8_1(ue->operand.get());
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        // inventory: "division and modulo (which can throw
+        // `DivideByZeroException`)". Bezel spells modulo `mod`, not `%` (§17.1
+        // precedence table level 3: `*` `/` `mod`; grammar A: Multiplicative ::=
+        // UnaryExpr (("*" | "/" | "mod") UnaryExpr)*). Operand order first so the
+        // reported node is the earliest-evaluated throwable, then this node itself.
+        if (auto* f = findThrowable28_8_1(be->left.get())) return f;
+        if (auto* f = findThrowable28_8_1(be->right.get())) return f;
+        if (be->op == "/" || be->op == "mod") return e;
+        return nullptr;
+    }
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e))
+        return findThrowable28_8_1(ma->target.get());
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e))
+        return findThrowable28_8_1(nm->target.get());
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+        if (auto* f = findThrowable28_8_1(ce->callee.get())) return f;
+        for (const auto& a : ce->args)
+            if (auto* f = findThrowable28_8_1(a.value.get())) return f;
+        return e;                                      // inventory: method calls
+    }
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        if (auto* f = findThrowable28_8_1(nc->callee.get())) return f;
+        for (const auto& a : nc->args)
+            if (auto* f = findThrowable28_8_1(a.value.get())) return f;
+        return e;                                      // inventory: method calls
+    }
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+        if (auto* f = findThrowable28_8_1(ix->target.get())) return f;
+        for (const auto& a : ix->indices)
+            if (auto* f = findThrowable28_8_1(a.value.get())) return f;
+        return e;                                  // inventory: indexer accesses
+    }
+    // PostfixBangExpr: the spec states `!` throwable only "when the target is
+    // null" — not classified here (see the header comment); descend regardless.
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        return findThrowable28_8_1(bg->operand.get());
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        // The `new` itself is not classified (see the header comment); its
+        // ARGUMENTS are ordinary expression positions and are.
+        for (const auto& a : ne->args)
+            if (auto* f = findThrowable28_8_1(a.value.get())) return f;
+        return nullptr;
+    }
+    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+        if (auto* f = findThrowable28_8_1(cd->condition.get())) return f;
+        if (auto* f = findThrowable28_8_1(cd->thenValue.get())) return f;
+        return findThrowable28_8_1(cd->elseValue.get());
+    }
+    // TypeTestExpr covers `is` / `is not` / `as`; §28.8.1: "The `as` operator is
+    // **not** throwable", and the `is` forms are pure tests. Descend only.
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
+        return findThrowable28_8_1(te->operand.get());
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e))
+        return findThrowable28_8_1(th->operand.get());
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        if (auto* f = findThrowable28_8_1(we->source.get())) return f;
+        for (const auto& ia : we->assigns)
+            if (auto* f = findThrowable28_8_1(ia.value.get())) return f;
+        return nullptr;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e)) {
+        // A computed STEP is in the inventory but needs §16.4's step
+        // classification; not classified here. Descend into the bounds.
+        if (auto* f = findThrowable28_8_1(re->lo.get())) return f;
+        if (auto* f = findThrowable28_8_1(re->hi.get())) return f;
+        return findThrowable28_8_1(re->step.get());
+    }
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& k : cl->keys)
+            if (auto* f = findThrowable28_8_1(k.get())) return f;
+        for (const auto& v : cl->elements)
+            if (auto* f = findThrowable28_8_1(v.get())) return f;
+        return nullptr;
+    }
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (const auto& p : is->parts)
+            if (auto* f = findThrowable28_8_1(p.expr.get())) return f;
+        return nullptr;
+    }
+    // LambdaExpr: the body does not execute at this program point — not descended.
+    return nullptr;
+}
+
+void MethodOwnership::checkThrowableWhileFieldMovedFrom(const ast::Stmt& s) {
+    // K9.3: "the field-restoration rule does *not* require reassignment inside a
+    // destructor" — teardown, no future read. Same exemption the at-exit check
+    // takes, for the same reason.
+    if (isDestructor_) return;
+    // The fields moved-from on some path reaching this statement. Collected into a
+    // SORTED vector rather than read straight off `fieldMovedFrom_`: that map is an
+    // unordered_map, so reporting from it directly would order the diagnostics of a
+    // two-moved-field method non-deterministically between runs. Also the cheap
+    // early-out — the expression walk below only runs when there is an obligation
+    // to protect.
+    std::vector<std::string_view> moved;
+    for (const auto& [name, isMoved] : fieldMovedFrom_)
+        if (isMoved) moved.push_back(name);
+    if (moved.empty()) return;
+    std::sort(moved.begin(), moved.end());
+    // A `case` STATEMENT is skipped whole. The CFG appends a CaseStmt as a single
+    // OPAQUE node (flow/CFG.cpp visitStmt has no case handler — see the matching
+    // note in Ownership.cpp's visitStmt CaseStmt arm), so `s` here is the entire
+    // `case`, and `visitStmtExprSites` descends into every arm's guard, expression
+    // body, and statements. Judging all of those against the PRE-case entry state
+    // is wrong in the REJECTING direction: an arm that restores the field and only
+    // then evaluates a throwable is legal under §28.8.1 (nothing is unrestored on
+    // that arm's exception edge), yet it would be reported. Measured — this exact
+    // shape compiled clean at 88c8f93 and was falsely rejected before this skip:
+    //
+    //     var old := move _r;
+    //     case tag of
+    //       1 => do _r := new Res(); var q := Dangerous(); end,   // legal
+    //       _ => do _r := new Res(); end,
+    //     end;
+    //
+    // Deciding a `case` properly needs ARM-LOCAL entry states, which the opaque
+    // node cannot supply; that is #3241's follow-up. Skipping converts a false
+    // reject into a MISS, the same safe direction as this rule's other
+    // under-approximations. The skip also subsumes the `stmtsInsideTry_` blind spot
+    // for a `try` nested in an arm (collectStmtsInsideTryStmt has no CaseStmt arm
+    // either, so an in-arm try's children are unmarked — moot once the whole `case`
+    // is skipped, because those children are never checked individually).
+    //
+    // `CaseStmt` is the ONLY statement kind needing this, and that is derived, not
+    // assumed: the body-bearing kinds `visitStmtExprSites` descends into are
+    // IfStmt, WhileStmt, ForStmt, DoEndBlock, TryStmt and CaseStmt, while
+    // flow/CFG.cpp's builder dispatches IfStmt, WhileStmt, ForStmt, DoEndBlock and
+    // TryStmt (plus the Break/Continue/Return/Throw leaves). The set difference is
+    // exactly {CaseStmt} — so every other body-bearing statement reaches this check
+    // already flattened into per-branch CFG blocks, with a correct per-block entry
+    // state. If a future statement kind gains a body, it must be added to the CFG
+    // builder or skipped here.
+    if (dynamic_cast<const ast::CaseStmt*>(&s)) return;
+    // An exception raised inside a `try` need not leave the method — see
+    // `stmtsInsideTry_`.
+    if (stmtsInsideTry_.count(&s)) return;
+    const ast::Expr* throwable = nullptr;
+    visitStmtExprSites(s, [&](const ast::Expr& e, bool) {
+        if (!throwable) throwable = findThrowable28_8_1(&e);
+    });
+    if (!throwable) return;
+    // Report at the throwable expression the walk actually found — the node whose
+    // exception edge is the unrestored exit — never at a synthesized location.
+    for (std::string_view name : moved) {
+        report(Severity::Error, throwable->span.begin,
+               std::string("owned field `") + std::string(name) +
+                   "` is moved-from here and this expression can raise, so the "
+                   "exception edge is an exit path on which the field is never "
+                   "restored (§28.8.1 \"Exception paths are not exempt\") — "
+                   "build the replacement and restore `" + std::string(name) +
+                   "` BEFORE the throwable expression (`build before take`), or "
+                   "move the `move` after it");
+    }
+}
+
 void MethodOwnership::collectReadIdentifiers(
     const ast::Expr* e, std::vector<const ast::IdentifierExpr*>& out) const {
     if (!e) return;

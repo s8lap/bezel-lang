@@ -709,6 +709,23 @@ private:
     FieldMovedFrom fieldMovedFrom_;
     std::unordered_map<std::string_view, SourceLocation> fieldMoveLoc_;
 
+    // §28.8.1 "Exception paths are not exempt" (#3080): the statements lying
+    // lexically inside a `try` of THIS method — its body, a catch arm body, or the
+    // finally body. `checkThrowableWhileFieldMovedFrom` deliberately does NOT fire
+    // on them: an exception raised inside a `try` need not leave the method, and
+    // the catch arm may itself restore the field, so a throwable expression there
+    // is not necessarily an unrestored *exit* and firing would reject legal
+    // programs. That leaves the in-`try` case a residual hole (#3241 R1): deciding
+    // it needs
+    // one exception edge per throwable SITE — the precise F2 the CFG builder
+    // explicitly defers ("A more precise F2 would emit one edge per throwable call
+    // site; for now we over-approximate", src/flow/CFG.cpp:544) — because the one
+    // edge it does emit leaves the try body's END block, a program point AFTER the
+    // restoring assignment has already run. Filled by collectStmtsInsideTry before
+    // the dataflow, so the answer is stable across the fixpoint passes.
+    // // per §28.8.1, #3080
+    std::unordered_set<const ast::Stmt*> stmtsInsideTry_;
+
     // §28.3 / #892: for loop-header Branch blocks, the ownership state
     // BEFORE the condition expression is evaluated. A while condition
     // `s.TryPop(out owned item)` marks `item` Owned in the post-condition
@@ -2689,6 +2706,27 @@ private:
         std::function<void(const ast::Expr& e, bool bindingValue)>;
     void visitStmtExprSites(const ast::Stmt& s,
                             const StmtExprSiteVisitor& visit);
+
+    // §28.8.1 "Exception paths are not exempt" (#3080): fill `stmtsInsideTry_`. A
+    // purely syntactic pre-pass whose traversal mirrors collectCatchBorrowsStmt's
+    // — the ownership CFG flattens the control-flow forms, but here we only need
+    // to know which statements a `try` lexically encloses. // per §28.8.1
+    void collectStmtsInsideTry(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void collectStmtsInsideTryStmt(const ast::Stmt& s, bool insideTry);
+
+    // §28.8.1 (#3080): the section's throwable-expression inventory, as a SEARCH
+    // rather than a predicate — returns the first sub-expression of `e` whose
+    // evaluation can raise, or null when none can. It returns the NODE, not a
+    // bool, because the diagnostic names a source location and the code that
+    // names it must be the code that found it. // per §28.8.1
+    const ast::Expr* findThrowable28_8_1(const ast::Expr* e) const;
+
+    // §28.8.1 (#3080): the exception-edge half of the field-restoration rule —
+    // "a throwable expression between the move and the reassignment introduces an
+    // exit path on which the reassignment has not run". Called from processBlock
+    // at each statement's ENTRY state. // per §28.8.1
+    void checkThrowableWhileFieldMovedFrom(const ast::Stmt& s);
 
     void checkAwaitSites(const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void checkAwaitSitesStmt(

@@ -203,6 +203,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // the arm (store-to-owned-field, return-as-owned, escaping closure
     // capture). Done first so the per-statement escape checks see it.
     collectCatchBorrows(body);
+    // §28.8.1 "Exception paths are not exempt" (#3080): record which statements a
+    // `try` lexically encloses, so the exception-edge restoration check can skip
+    // them — an exception caught in-method is not a method exit, and the catch arm
+    // may restore the field. Runs before the dataflow so the answer is stable
+    // across the fixpoint passes. // per §28.8.1
+    collectStmtsInsideTry(body);
     // §28.3 / §28.9 (#861): record each local's block-nesting depth so the
     // borrow-store escape check can tell whether a closure assigned to a plain
     // local outlives the owned local it captures.
@@ -2253,7 +2259,16 @@ void MethodOwnership::processBlock(const flow::CFGBlock& block) {
     // retained but unreachable from a block's statement list (the CFG
     // already extracted that control flow).
     for (const ast::Stmt* s : block.stmts) {
-        if (s) visitStmt(*s);
+        if (!s) continue;
+        // §28.8.1 "Exception paths are not exempt" (#3080): asked at this
+        // statement's ENTRY state — BEFORE its own transfer functions run — so
+        // `fieldMovedFrom_` still describes the program point at which this
+        // statement's throwable expressions are evaluated. A restoring assignment
+        // in this very statement clears the mark only after the RHS has been
+        // evaluated, which is exactly why the entry state is the right one: an
+        // exception out of the RHS precedes the store. // per §28.8.1
+        checkThrowableWhileFieldMovedFrom(*s);
+        visitStmt(*s);
     }
     // #2109 (§30.7 / §28.3): for every for/await-for loop whose iterable and
     // (optional) `with` cancellation-token expression are evaluated in this
