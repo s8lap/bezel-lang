@@ -16258,6 +16258,56 @@ struct UnwindIneligibleWalker {
                 expr(ld->initializer.get(), /*consuming=*/false);
                 return;
             }
+            // fix #3039 / §28.3 K3.13 (v0.240 line 6273): an UNMARKED, NON-`using`
+            // `var alias := <owned source>;` where the source is a bare-id named
+            // owned local (plain `var`, non-`using`) or `owned` parameter is a
+            // BORROW — K3.13 verbatim: "An **unmarked read of a class-typed
+            // binding never consumes**: `var b := a;` is always a borrow for
+            // class-typed `a`." The alias binding does NOT consume `r` (codegen
+            // just copies the pointer); `r` keeps the obligation, and the
+            // auto-drop branch in `registerUnwindOwnedParam` (#3035, v0.240) now
+            // covers the NORMAL exit (`ps->autoDropAtScopeEnd` ⇒
+            // `dynamicDispose`). On the EXCEPTION edge (K3.15, v0.240 line 6275:
+            // "The exception edge performs the same implicit disposal as the
+            // normal edge"), the residual bail at line 15254 dropped the
+            // `unwindOnly` registration for a parameter the walker had over-
+            // conservatively tainted — the catch-all below walked the source as
+            // `consuming=true`, mirroring `using var` (the W7L2 #3035 fix only
+            // addressed the auto-drop bail, not this walker over-approximation).
+            // Without the positive recognition the parameter leaks on a `throw`
+            // between the alias and method end: `R._n == 0` + a 16-byte leak,
+            // the same shape as the W7L2 #3035 normal-exit leak but on the
+            // exception edge. Add the K3.13 borrow branch: an unmarked plain
+            // `var` over a bare-id named owned local / `owned` parameter walks
+            // as a borrow, leaving the slot ELIGIBLE — the auto-drop branch
+            // fires on normal exit AND the `unwindOnly` branch (now reachable
+            // through the relocated bail's partner) fires on the unwind edge.
+            // Restricted to the EXACT set `markedOwnedSourceEligible` already
+            // accepts (a plain `var` owned local or an `owned` parameter —
+            // mirrors the walker's own narrow source-shape predicate), so the
+            // wider eligibility never reaches a source that has no §28.3
+            // obligation to begin with (a borrow local has nothing to dispose).
+            // The consuming-arg / `move` / explicit-dispose paths continue to
+            // taint via the regular `expr(consuming=true)` fall-through below.
+            // per §28.3 K3.13, K3.15
+            if (!ld->isUsing && !ld->initializerHasOwnedMarker &&
+                dynamic_cast<const ast::IdentifierExpr*>(ld->initializer.get())) {
+                auto* id = static_cast<const ast::IdentifierExpr*>(
+                    ld->initializer.get());
+                sema::Symbol* asym = ctx.exprSymbol(*id);
+                if (auto* loc = dynamic_cast<sema::LocalSymbol*>(asym)) {
+                    if (loc->decl && !loc->isUsing) {
+                        expr(ld->initializer.get(), /*consuming=*/false);
+                        return;
+                    }
+                } else if (auto* ps =
+                               dynamic_cast<sema::ParameterSymbol*>(asym)) {
+                    if (ps->modifier == "owned") {
+                        expr(ld->initializer.get(), /*consuming=*/false);
+                        return;
+                    }
+                }
+            }
             // `var s := x;` moves x (owned local read in an owning init); a
             // `move`/call/new RHS is handled by expr(consuming). Treat the whole
             // initializer as a consuming position.
