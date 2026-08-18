@@ -3798,6 +3798,25 @@ llvm::Value* Emitter::emitRangeToString(llvm::Value* rangeVal,
     auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
     using P = sema::PrimitiveType;
 
+    // fix #3242 (§8.5, v0.261): resolve the element TypeRef through the
+    // active generic substitution. A Range arriving through unresolved
+    // generic substitution (`Range<T>` in a generic body, e.g.
+    // `Wrap<T>(r: Range<T>).ToString()`) carries `T` (a bare generic
+    // parameter ref) as its element ref; the primitive-kind test below
+    // answers false for a Named-without-declaration ref, falling to the
+    // `P::Long` default and rendering the char endpoint as its code-point
+    // ordinal (`Start: 97`). §8.5's component rule requires the endpoint
+    // to render as its own ToString — a substituted `char` endpoint is a
+    // `char`, not an `i64`. The contract of `emitRangeToString` is "render
+    // this range value, knowing its concrete element type", so the
+    // substitution lives HERE rather than at every caller (the §8.5
+    // string-rendering arm just below, the `Range<T>.ToString()` member-
+    // call arm in LlvmBackend_Exprs.cpp, and the box-vtable ToString thunk
+    // in LlvmBackend_Setup.cpp all benefit) — matching #2503's
+    // interpolation-side fix and every other codegen site that consults a
+    // bare-T ref for rendering kind.
+    const sema::TypeRef* resolvedElem = resolveTypeParamRef(elemTy);
+
     // §8.5's component rule applied to the `T?` endpoints (stdlib §9.8), whose
     // storage is a plain i64 in `bz.range` whatever T is. §9.8 restricts T to
     // the integer types and `char`, so exactly two of them need more than the
@@ -3813,8 +3832,8 @@ llvm::Value* Emitter::emitRangeToString(llvm::Value* rangeVal,
     // identically through the signed-64 path, so they share it rather than
     // growing a per-width arm that could drift.
     const P elemPrim =
-        (elemTy && elemTy->kind == sema::TypeRef::Kind::Primitive)
-            ? elemTy->primitive
+        (resolvedElem && resolvedElem->kind == sema::TypeRef::Kind::Primitive)
+            ? resolvedElem->primitive
             : P::Long;
     const P endpointPrim = (elemPrim == P::Char)  ? P::Char
                          : (elemPrim == P::ULong) ? P::ULong
