@@ -4979,6 +4979,19 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                         return;
                     }
                 }
+                // NAARROW #3109 (v0.256): reject ONLY `char mod char` (both
+                // sides char). The cast pattern `char mod <int>` (e.g. `s[0]
+                // mod 256` for exit codes) is admitted via §5.1 widening; the
+                // over-broad fix (de3cd71, reverted) broke those tests.
+                PrimitiveType lp = primOf(lt);
+                PrimitiveType rp = primOf(rt0);
+                if (lp == PrimitiveType::Char && rp == PrimitiveType::Char) {
+                    ctx_.diagnostics().report(Severity::Error, be.span.begin,
+                        "`mod` is not defined on `char` operands (§6.1); a "
+                        "`char` remainder has neither a defined result type "
+                        "nor use — convert via `int(c) mod int(d)` (§5.2)");
+                    return;
+                }
             }
             // §6.5 / §17.14 (v0.242, #3045): both operands are now known to be
             // integer-kinded, so the shift count's DOMAIN can be checked. It is
