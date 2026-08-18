@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# check_docs.sh — the one-command docs gate for the six normative documents.
+# check_docs.sh — the one-command docs gate for the nine normative documents.
 #
 # Symmetric with scripts/gate.sh (the compiler gate): a single blessed signal
-# that a docs revision is internally consistent before it lands. Runs six
+# that a docs revision is internally consistent before it lands. Runs seven
 # mechanical checks and exits non-zero if any fails.
 #
 #   1. Anchor resolution   — every intra/cross-doc [...](file#anchor) link whose
@@ -31,12 +31,24 @@
 #                            to an anchor whose section names the property
 #                            (v0.257; proposal 0095 Q4, as respecified by the
 #                            v0.257 gate round).
+#   3d. Clause-region body separation — the docs follow the style §22.16
+#                            recommends (v0.260, proposal 0100): in every
+#                            fenced code block of the non-changelog documents,
+#                            a member whose contract-clause region
+#                            (`requires`/`ensures`, with or without `static`)
+#                            is followed by a body statement rather than by
+#                            `end` carries a blank line between the last
+#                            clause and that statement. Docs-only style
+#                            conformance — neither a compiler diagnostic nor
+#                            a lint over user code or tests/; it exists so the
+#                            documents follow the style they recommend.
+#                            Skipped by --quick, like check 4.
 #   4. Example extraction  — scripts/extract_doc_examples.py runs clean over the
 #                            CURRENT docs into a scratch tree (never the committed
 #                            corpus, per #1380); any parse failure is a finding.
 #
 # Usage:  scripts/check_docs.sh            # full gate
-#         scripts/check_docs.sh --quick    # skip extraction (checks 1-3 only)
+#         scripts/check_docs.sh --quick    # skip extraction (checks 1-3c only)
 #
 # This is a lint, not a proof: it catches the mechanical drift class that has
 # actually bitten docs revisions (dangling anchors, stale version headers,
@@ -210,7 +222,7 @@ none_named = set()
 for m in re.finditer(r'((?:`[^`]+`[/,\s]*)+)declares? no facts', text['stdlib']):
     none_named |= set(re.findall(r'`([^`]+)`', m.group(1)))
 
-EXPECT_TYPED = 10   # the 9 fact-granted types + Channel<T>'s explicit '— none' line
+EXPECT_TYPED = 11   # the 9 fact-granted types + the explicit '— none' lines: Channel<T> and ScopeGuard (v0.259, stdlib §2.21)
 EXPECT_NONE_NAMED = {'Lock', 'SemaphoreToken', 'EventSource<T>', 'AsyncEventSource<T>'}
 if len(facts) != EXPECT_TYPED:
     bad.append(f"  Facts-line roster: expected {EXPECT_TYPED} typed entries, found {len(facts)}: {sorted(facts)}")
@@ -389,9 +401,79 @@ PY
 STRUCT=$?
 
 if [ "$QUICK" = "1" ]; then
-    [ "$STRUCT" -eq 0 ] && echo "check_docs: OK (--quick; extraction skipped)" || echo "check_docs: FAIL"
+    [ "$STRUCT" -eq 0 ] && echo "check_docs: OK (--quick; extraction and style skipped)" || echo "check_docs: FAIL"
     exit "$STRUCT"
 fi
+
+# ---- 3d. Clause-region body separation (style, docs-only; v0.260) ----------
+# §22.16's recommended style (non-normative for user code; proposal 0100): where
+# a member's clause region is followed by a body, a blank line separates the
+# last clause from the first body statement — the promises above the gap, the
+# doing below it. This check makes the documents follow their own
+# recommendation; it is neither a compiler diagnostic nor a lint over user code
+# or tests/, and it must not be wired into gate.sh or agent_check.sh, which
+# gate the compiler, not the prose. Scope: every fenced code block (any tag) of
+# the nine non-changelog documents — the proposal's "six live normative
+# documents" implemented as the full non-changelog set, a superset that is a
+# no-op wherever no clause-bearing fence exists (recorded deviation, the
+# 0095-Q4 shape: a hardcoded six would drift as guides gain or lose contract
+# examples). A clause line is `requires(...)`/`ensures(...)` (optionally
+# `static`-prefixed, optionally comment-trailed) ending in `)` — a line ending
+# `);` is a body-less member or an `invariant` member, which has no seam. The
+# run's next line is a violation exactly when it is non-blank and is not:
+# another clause, an `end` closer, an expression body (`=>`), a lone `;`
+# (body-less), or the closing fence. Every other block is a no-op.
+# Two shapes sit silently outside the check's reach, recorded as its bound:
+# a member written on ONE line (clause and first body statement together —
+# the clause regex requires the line to end at the clause, so the line never
+# matches), and a clause whose EXPRESSION WRAPS past its own line (the scan
+# is line-wise, so a wrapped clause never matches and its seam is never
+# judged). Zero corpus instances of either shape today; a future instance is
+# invisible to this check, not blessed by it.
+python3 - <<'PY'
+import re, sys
+DOCS = ['docs/Bezel_Language_Spec.md', 'docs/Bezel_Standard_Library.md',
+        'docs/Bezel_Design_Rationale.md',
+        'docs/Bezel_Guide_01_Memory_and_Ownership.md',
+        'docs/Bezel_Guide_02_Errors_and_Nullability.md',
+        'docs/Bezel_Guide_03_Modeling_Data.md',
+        'docs/Bezel_Guide_04_Concurrency.md',
+        'docs/Bezel_Guide_05_Collections_and_Iteration.md',
+        'docs/Bezel_Guide_06_Contracts_and_Purity.md']
+clause = re.compile(r'^\s*(?:static\s+)?(?:requires|ensures)\(.*\)\s*(?://.*)?$')
+member = re.compile(r'\b(?:method|constructor)\s*(\w*)')
+bad = []
+checked = 0
+for p in DOCS:
+    lines = open(p, encoding='utf-8').read().split('\n')
+    infence = False
+    for i, l in enumerate(lines):
+        if l.lstrip().startswith('```'):
+            infence = not infence
+            continue
+        if not infence or not clause.match(l):
+            continue
+        if i + 1 >= len(lines) or clause.match(lines[i + 1]):
+            continue                      # run continues; judge at its last line
+        checked += 1
+        s = lines[i + 1].strip()
+        if (s == '' or s.startswith('```') or re.match(r'end\b', s)
+                or s.startswith('=>') or s == ';'):
+            continue                      # styled, or no body statement follows
+        name = '?'
+        for back in range(i, max(-1, i - 12), -1):
+            mm = member.search(lines[back])
+            if mm:
+                name = mm.group(1) or 'constructor'
+                break
+        bad.append(f"  {p}:{i + 2}  member '{name}': no blank line between the last clause and the first body statement")
+if bad:
+    print(f"STYLE: {len(bad)} clause-region/body adjacency violation(s) (§22.16 recommended style, v0.260):")
+    print('\n'.join(bad))
+    sys.exit(1)
+print(f"STYLE: clean ({checked} clause-region seam(s) checked across the nine non-changelog docs)")
+PY
+[ $? -ne 0 ] && STRUCT=1
 
 # ---- 4. Example extraction (scratch tree; never the committed corpus) ------
 SCRATCH=/var/tmp/bezel-scratch/check_docs.$$
