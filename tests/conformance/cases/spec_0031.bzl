@@ -8,7 +8,8 @@ enum Priority
     Medium => "Medium",
     High => "High");
 
-  public static readonly All: Array<Priority> := [Low, Medium, High];
+  public static owned readonly All: FrozenArray<Priority> :=
+      FrozenArray<Priority>.From([Low, Medium, High]);
 
   public static method Parse(text: string): Priority?
     return (case text of
