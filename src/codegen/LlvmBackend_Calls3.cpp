@@ -4317,7 +4317,19 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             // sharpen #3181: unsupported LLVM types (anything that is not
             // pointer / integer / float / struct) now produce an explicit
             // codegen diagnostic instead of an opaque verifier abort.
-            auto spawnValueToVoidPtr = [&](llvm::Value* val) -> llvm::Value* {
+            // fix #3239: `expectedTy` is the entry's actual parameter type.
+            // For a float / double literal the static type (default f64) does
+            // not match a f32 entry param — the pre-fix sender used
+            // `val->getType()` for both the malloc size AND the heap-store
+            // type, so an f64 literal → 8-byte slot stored as f64, while the
+            // receiver read 4 bytes as f32 and got the lower 4 bytes of the
+            // i64 (the low half of 3.25's double representation is all-zero).
+            // Coerce first so the heap copy is the entry param's size and
+            // representation; receiver-side castToParamTy already loads the
+            // expected type, so the round-trip aligns.
+            auto spawnValueToVoidPtr = [&](llvm::Value* val,
+                                           llvm::Type*  expectedTy)
+                                       -> llvm::Value* {
                 if (val->getType()->isPointerTy()) return val;
                 if (val->getType()->isIntegerTy(64))
                     return builder_.CreateIntToPtr(val, ptrTy(),
@@ -4329,6 +4341,20 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 if (val->getType()->isFloatTy() ||
                     val->getType()->isDoubleTy() ||
                     val->getType()->isStructTy()) {
+                    // Coerce f64 → f32 (or f32 → f64) when the literal's
+                    // static type doesn't match the entry param.
+                    if (expectedTy &&
+                        (expectedTy->isFloatTy() ||
+                         expectedTy->isDoubleTy())) {
+                        if (val->getType()->isDoubleTy() &&
+                            expectedTy->isFloatTy())
+                            val = builder_.CreateFPTrunc(val, expectedTy,
+                                "spawn.arg.coerce.f64tof32");
+                        else if (val->getType()->isFloatTy() &&
+                                 expectedTy->isDoubleTy())
+                            val = builder_.CreateFPExt(val, expectedTy,
+                                "spawn.arg.coerce.f32tof64");
+                    }
                     // #3181 (struct) / sharpen #3181 (f32 / f64): heap-copy
                     // the value and pass the address. §30.14 says every
                     // sendable value type crosses as a copy; the runtime
@@ -4494,6 +4520,18 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                         // adapter's castToParamTy below (that lambda is
                         // scoped to the entryMs-found branch, so it is not
                         // reachable here).
+                        // fix #3237: mirror the static-method adapter's `castToParamTy` shape
+                        // so a struct (or float / double) extra arg that the
+                        // sender heap-copied is loaded back as the user
+                        // param's actual type — not bitcast to i64. The
+                        // pre-fix fall-through was `CreatePtrToInt(voidPtr,
+                        // i64())`, which returned an i64 where the lambda's
+                        // actual param type is `%choice.CInt { i32, {i8},
+                        // {i32} }` (or f32 / f64); the indirect call to
+                        // the lambda then mismatched the function-type's
+                        // param against the i64 operand and the verifier
+                        // aborted with `i32Call parameter type does not
+                        // match function signature!`.
                         auto castSlotToParamTy =
                             [&](llvm::Value* voidPtr,
                                 llvm::Type* paramTy) -> llvm::Value* {
@@ -4504,6 +4542,13 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                                 llvm::Value* w =
                                     builder_.CreatePtrToInt(voidPtr, i64());
                                 return builder_.CreateTrunc(w, i32());
+                            }
+                            if (paramTy->isFloatTy() ||
+                                paramTy->isDoubleTy() ||
+                                paramTy->isStructTy()) {
+                                return builder_.CreateLoad(paramTy,
+                                    builder_.CreateBitCast(voidPtr,
+                                        paramTy->getPointerTo()));
                             }
                             return builder_.CreatePtrToInt(voidPtr, i64());
                         };
@@ -4563,6 +4608,30 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                         }
                         llvm::Value* lamRet =
                             builder_.CreateCall(lamFnTy, fnPtr, callArgs);
+
+                        // fix #3237: free each per-slot heap-copy the sender
+                        // made for a struct / float / double extra arg AFTER
+                        // the entry has consumed it. The static-method
+                        // adapter already tracks these individually; the
+                        // lambda adapter has to do the same now that the
+                        // sender's `spawnValueToVoidPtr` heap-copies structs
+                        // and floats instead of bitcasting them into i64 —
+                        // without this every struct/float extra arg leaks
+                        // (measured under LSan: one heap copy per spawn per
+                        // arg).
+                        auto* freeArgsFn = declareC(
+                            "free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                        for (std::size_t i = 0; i < extraSlotVals.size();
+                             ++i) {
+                            llvm::Type* pty = i < lamParamTys.size()
+                                ? lamParamTys[i] : nullptr;
+                            if (pty && (pty->isStructTy() ||
+                                        pty->isFloatTy() ||
+                                        pty->isDoubleTy())) {
+                                builder_.CreateCall(freeArgsFn,
+                                    {extraSlotVals[i]});
+                            }
+                        }
 
                         // Release closure cell in the spawned domain.
                         // Non-capturing lambda: rc=1→0, env=null, envdtor=null
@@ -4645,19 +4714,28 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                                     "Domain.Spawn argument — #1386");
                                 continue;
                             }
-                            llvm::Value* asPtr;
-                            if (val->getType()->isPointerTy()) {
-                                asPtr = val;
-                            } else if (val->getType()->isIntegerTy(64)) {
-                                asPtr = builder_.CreateIntToPtr(val, ptrTy());
-                            } else if (val->getType()->isIntegerTy()) {
-                                asPtr = builder_.CreateIntToPtr(
-                                    builder_.CreateZExt(val, i64()), ptrTy());
-                            } else {
-                                asPtr = builder_.CreateIntToPtr(
-                                    builder_.CreateBitCast(val, i64()),
-                                    ptrTy());
-                            }
+                            // fix #3237: use the same `spawnValueToVoidPtr`
+                            // unified marshalling the static-method adapter
+                            // uses, so a struct (or float / double) extra arg
+                            // rides on the heap-copy path instead of the
+                            // pre-fix `bitcast → i64` fallback. The fallback
+                            // is invalid IR for any struct not exactly 8
+                            // bytes — a choice like `%choice.CInt { i32, {i8},
+                            // {i32} }` is 12 bytes, so `bitcast … to i64` is
+                            // `Invalid bitcast`; the inttoptr cascade then
+                            // produces `Referring to an argument in another
+                            // function!` and `Function return type does not
+                            // match operand type of return inst!` errors when
+                            // the receiver (whose castSlotToParamTy also
+                            // needs the struct case — fixed below) tries to
+                            // round-trip the value. The expected type is the
+                            // lambda's user-param type so an f64 literal is
+                            // coerced to an f32 entry param just like in the
+                            // static-method fix #3239.
+                            llvm::Type* expectedTy = i < lamParamTys.size()
+                                ? lamParamTys[i] : nullptr;
+                            llvm::Value* asPtr =
+                                spawnValueToVoidPtr(val, expectedTy);
                             llvm::Value* slotPtr = builder_.CreateInBoundsGEP(
                                 ptrTy(), arr,
                                 builder_.getInt64(
@@ -4809,16 +4887,36 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 } else if (origFn->getReturnType()->isPointerTy()) {
                     builder_.CreateRet(ret);
                 } else {
-                    // Value result: inttoptr. sharpen #3181 note: a
-                    // FLOAT / DOUBLE entry result still hits the verifier
-                    // here (the zext-only-on-integer rule), but that's a
-                    // separate return-side latent bug; the receiver-side
-                    // fix the amendment is about is sender / receiver
-                    // ARGS, not result marshalling. Round-trip test for
-                    // f32 / f64 RESULTs is filed separately.
+                    // Value result: inttoptr. fix #3239: the pre-fix code
+                    // did `ZExt(ret, i64)` unconditionally for any non-
+                    // integer type, which is a verifier abort for a float /
+                    // double entry (`ZExt only operates on integer`); the
+                    // IR builder accepts the call silently under -DNDEBUG
+                    // and the verifier catches it downstream. For a float
+                    // entry the bitcast → int → zext → i64 path puts the
+                    // float bits in the low 4 bytes of an i64 (the same
+                    // shape the lambda adapter's else branch uses); the
+                    // await site's `CreateLoad(resTy, resPtr)` reads
+                    // `resultTy` bytes from offset 0, so a Task<float> sees
+                    // the original f32 bits. For double: bitcast f64 → i64
+                    // directly (both are 8 bytes; no zext needed). For an
+                    // integer result the existing ZExt → i64 path keeps
+                    // working.
                     llvm::Value* wide = ret;
-                    if (!wide->getType()->isIntegerTy(64))
-                        wide = builder_.CreateZExt(wide, i64());
+                    if (wide->getType()->isFloatTy()) {
+                        // f32 → i32 (bitcast) → i64 (zext).
+                        wide = builder_.CreateBitCast(wide, i32(),
+                            "spawn.ret.f32toi32");
+                        wide = builder_.CreateZExt(wide, i64(),
+                            "spawn.ret.zext");
+                    } else if (wide->getType()->isDoubleTy()) {
+                        // f64 → i64 (bitcast; same size).
+                        wide = builder_.CreateBitCast(wide, i64(),
+                            "spawn.ret.f64toi64");
+                    } else if (!wide->getType()->isIntegerTy(64)) {
+                        wide = builder_.CreateZExt(wide, i64(),
+                            "spawn.ret.zext");
+                    }
                     builder_.CreateRet(
                         builder_.CreateIntToPtr(wide, ptrTy()));
                 }
@@ -4846,7 +4944,15 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 // gated path the lambda uses upstream.
                 llvm::Value* argExprV = lowerExpr(*call.args[1].value);
                 if (argExprV) {
-                    argVal = spawnValueToVoidPtr(argExprV);
+                    // fix #3239: pass the entry's first param type so a
+                    // double-typed literal is truncated to a float param (the
+                    // pre-fix spawn used the literal's static type for both
+                    // the heap-copy size and the heap-store type, so the
+                    // receiver's 4-byte f32 read got the lower half of an
+                    // 8-byte f64 heap copy and observed 0.0).
+                    llvm::Type* expectedTy = nOrigParams >= 1
+                        ? origFn->getArg(0)->getType() : nullptr;
+                    argVal = spawnValueToVoidPtr(argExprV, expectedTy);
                 } else {
                     // #1386: ICE — lowerExpr returned null for a single
                     // Domain.Spawn argument; arg silently passed as null.

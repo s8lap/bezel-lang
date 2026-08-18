@@ -1984,7 +1984,67 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         asyncResultSemaType_ = savedAsyncResultSemaType;
         asyncPatternAResultDisposer_ = savedAsyncPatternAResultDisposer;
         asyncOwnedParamFrame_ = savedAsyncOwnedParamFrame;  // §30.1 (#1521)
-    } else
+    } else {
+    // fix #3237: a SYNC lambda body nested inside an async method also needs
+    // the enclosing machine's sm*_/async*_ fields cleared — the sync lambda
+    // body emit's `return value` lowers through emitReturn, and emitReturn
+    // routes through emitAsyncComplete whenever `smSelf_` is non-null (which
+    // it is here, set to the enclosing async resume fn's frame param). The
+    // pre-fix path produced e.g. `bz_task_complete(... %choice.CInt ...)`
+    // inside a `() -> int` lambda whose `%1` is actually the user's
+    // CInt param — verifier `Referring to an argument in another function!`
+    // for `getelementptr %async.Main, ptr %1, …` because `%1` is the
+    // lambda's CInt arg, not the enclosing machine's frame. The async
+    // branch above already does the same save/restore around emitAsyncLambda;
+    // mirror it (with the FULL sm*_/async*_ set so a sync body containing a
+    // nested iterator doesn't leak the iterator's frame back to the
+    // enclosing machine either — review verdict item 4) for the sync body so
+    // the enclosing machine's state is fully out of scope during
+    // lowerScopedBlock(lam.stmts) / lowerExpr(exprBody).
+    SuspendKind savedSmKindSync = smKind_;
+    llvm::StructType* savedSmStateStructSync = smStateStruct_;
+    llvm::Value* savedSmSelfSync = smSelf_;
+    llvm::Value* savedSmStateGEPSync = smStateGEP_;
+    auto savedSmStateBBsSync = smStateBBs_;
+    llvm::BasicBlock* savedSmDoneBBSync = smDoneBB_;
+    unsigned savedSmNextSuspendStateSync = smNextSuspendState_;
+    auto savedSmLocalFieldsSync = smLocalFields_;
+    auto savedSmAllocaToFieldSync = smAllocaToField_;
+    unsigned savedIterCurrentValFieldSync = iterCurrentValField_;
+    llvm::Type* savedIterElemTySync = iterElemTy_;
+    unsigned savedAsyncOuterTaskFieldSync = asyncOuterTaskField_;
+    unsigned savedAsyncPendingTaskFieldSync = asyncPendingTaskField_;
+    unsigned savedAsyncSpillPtrFieldSync = asyncSpillPtrField_;
+    auto savedAsyncHandlerSpillSlotsSync = asyncHandlerSpillSlots_;
+    llvm::Function* savedAsyncResumeFnSync = asyncResumeFn_;
+    llvm::Type* savedAsyncResultTySync = asyncResultTy_;
+    const sema::TypeRef* savedAsyncResultSemaTypeSync = asyncResultSemaType_;
+    llvm::Function* savedAsyncPatternAResultDisposerSync =
+        asyncPatternAResultDisposer_;
+    const StateMachineFrame* savedAsyncOwnedParamFrameSync = asyncOwnedParamFrame_;
+    smKind_ = SuspendKind::Yield;  // placeholder (no neutral value, mirrors
+                                    // NestedBodyScope / getter reset pattern;
+                                    // smSelf_=null makes emitAsyncComplete
+                                    // no-op regardless of smKind_ value)
+    smStateStruct_ = nullptr;
+    smSelf_ = nullptr;
+    smStateGEP_ = nullptr;
+    smStateBBs_.clear();
+    smDoneBB_ = nullptr;
+    smNextSuspendState_ = 0;
+    smLocalFields_.clear();
+    smAllocaToField_.clear();
+    iterCurrentValField_ = 0;
+    iterElemTy_ = nullptr;
+    asyncOuterTaskField_ = 0;
+    asyncPendingTaskField_ = 0;
+    asyncSpillPtrField_ = 0;
+    asyncHandlerSpillSlots_.clear();
+    asyncResumeFn_ = nullptr;
+    asyncResultTy_ = nullptr;
+    asyncResultSemaType_ = nullptr;
+    asyncPatternAResultDisposer_ = nullptr;
+    asyncOwnedParamFrame_ = nullptr;
     // Emit body.
     if (lam.exprBody) {
         llvm::Value* v = nullptr;
@@ -2136,6 +2196,29 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             if (retTy->isVoidTy()) builder_.CreateRetVoid();
             else builder_.CreateRet(llvm::Constant::getNullValue(retTy));
         }
+    }
+    // fix #3237: restore the enclosing machine's sm*_/async*_ after the sync
+    // body emit (paired with the save/clear above the `if (lam.exprBody)`).
+    smKind_ = savedSmKindSync;
+    smStateStruct_ = savedSmStateStructSync;
+    smSelf_ = savedSmSelfSync;
+    smStateGEP_ = savedSmStateGEPSync;
+    smStateBBs_ = std::move(savedSmStateBBsSync);
+    smDoneBB_ = savedSmDoneBBSync;
+    smNextSuspendState_ = savedSmNextSuspendStateSync;
+    smLocalFields_ = std::move(savedSmLocalFieldsSync);
+    smAllocaToField_ = std::move(savedSmAllocaToFieldSync);
+    iterCurrentValField_ = savedIterCurrentValFieldSync;
+    iterElemTy_ = savedIterElemTySync;
+    asyncOuterTaskField_ = savedAsyncOuterTaskFieldSync;
+    asyncPendingTaskField_ = savedAsyncPendingTaskFieldSync;
+    asyncSpillPtrField_ = savedAsyncSpillPtrFieldSync;
+    asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpillSlotsSync);
+    asyncResumeFn_ = savedAsyncResumeFnSync;
+    asyncResultTy_ = savedAsyncResultTySync;
+    asyncResultSemaType_ = savedAsyncResultSemaTypeSync;
+    asyncPatternAResultDisposer_ = savedAsyncPatternAResultDisposerSync;
+    asyncOwnedParamFrame_ = savedAsyncOwnedParamFrameSync;
     }
 
     // --- Restore emitter state ---
