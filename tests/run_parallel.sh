@@ -337,26 +337,12 @@ _rp_py_failure="$(PYTHONPATH="$repo_root/scripts" python3 -m gate.summary format
     --logdir "$logdir")"
 [[ -n "$_rp_py_failure" ]] && printf '%s\n' "$_rp_py_failure"
 
-# Per-shard wall times + ceiling ratio (observation only — narrow #3222 lets
-# real cycles answer whether the cf84884 x2 ceiling is right). The SHARD_ELAPSED
-# marker is the shard's own wall time; comparing to BEZEL_SHARD_TIMEOUT lets a
-# reader spot shards approaching the ceiling even when they cleared it (so the
-# ceiling-margin trend is visible BEFORE a kill happens). Harvested from each
-# shard's SHARD_ELAPSED marker before cleanup.
+# Per-shard wall times (observation only — lets the gate's timing log spot shard
+# imbalance). Harvested from each shard's SHARD_ELAPSED marker before cleanup.
 for (( b = 0; b < nbin; b++ )); do
     for (( i = 0; i < conc; i++ )); do
         et="$(grep -a -oE 'SHARD_ELAPSED [0-9.]+' "$logdir/shard.${names[$b]}.$i.log" 2>/dev/null | awk '{print $2}' | tail -1)"
-        if [[ -n "$et" ]]; then
-            sto="${BEZEL_SHARD_TIMEOUT:-}"
-            if [[ -n "$sto" && "$sto" -gt 0 ]]; then
-                # awk does the ratio so we don't need bc; the format mirrors
-                # the SHARD_ELAPSED marker's %.2f so the columns align.
-                pct="$(awk "BEGIN{ if ($sto > 0) printf \"%.1f%%\", ($et/$sto)*100; else print \"\" }")"
-                echo "shard ${names[$b]}.$i: ${et}s (ceiling ${sto}s, ${pct})"
-            else
-                echo "shard ${names[$b]}.$i: ${et}s"
-            fi
-        fi
+        [[ -n "$et" ]] && echo "shard ${names[$b]}.$i: ${et}s"
     done
 done
 

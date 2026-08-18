@@ -1257,41 +1257,67 @@ class PerShardCeilingRatioLogTest(unittest.TestCase):
     multiplier is sized right (the body file: "let real cycles answer it,
     rather than tuning the constant on the strength of one ratio").
 
-    The loop lives in tests/run_parallel.sh:328-345. The pin is bash-level
-    (the awk ratio calculation has its own edge cases), so we drive the loop
-    via subprocess with a minimal mocked logdir.
+    The loop lives in tests/run_parallel.sh. The pin is bash-level (the awk
+    ratio calculation has its own edge cases), so we drive the loop via
+    subprocess sourcing the actual run_parallel.sh with a mocked
+    run_parallel's main harness, against a minimal mocked logdir.
     """
 
-    # The bash snippet that mirrors tests/run_parallel.sh:328-345. Kept in
-    # sync manually with the source (the loop is small enough that a drift
-    # shows up in review); if either side changes, this test fires.
-    _LOOP_SNIPPET = r"""
-set -u
-logdir="$1"; conc="$2"
-nbin=$(ls "$logdir"/shard.*.log 2>/dev/null | sed -E 's@.*shard\.([^.]+)\.[0-9]+\.log@\1@' | sort -u | wc -l)
-names=( $(ls "$logdir"/shard.*.log 2>/dev/null | sed -E 's@.*shard\.([^.]+)\.[0-9]+\.log@\1@' | sort -u) )
-for (( b = 0; b < nbin; b++ )); do
-    name="${names[$b]}"
-    for (( i = 0; i < conc; i++ )); do
-        et="$(grep -a -oE 'SHARD_ELAPSED [0-9.]+' "$logdir/shard.${name}.$i.log" 2>/dev/null | awk '{print $2}' | tail -1)"
-        if [[ -n "$et" ]]; then
-            sto="${BEZEL_SHARD_TIMEOUT:-}"
-            if [[ -n "$sto" && "$sto" -gt 0 ]]; then
-                pct="$(awk "BEGIN{ if ($sto > 0) printf \"%.1f%%\", ($et/$sto)*100; else print \"\" }")"
-                echo "shard ${name}.$i: ${et}s (ceiling ${sto}s, ${pct})"
-            else
-                echo "shard ${name}.$i: ${et}s"
-            fi
-        fi
-    done
-done
-"""
+    _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__),
+                                              "..", "..", ".."))
+    _RUN_PARALLEL_SH = os.path.join(_REPO_ROOT, "tests", "run_parallel.sh")
 
     def _run_loop(self, logdir, conc, sto):
+        """Source tests/run_parallel.sh's per-shard timing loop with a
+        mocked `names` / `nbin` so the loop body runs against our logdir
+        WITHOUT launching the real shard machinery. This pins the loop AS
+        IT IS WRITTEN in the source, not a parallel copy — a drift between
+        source and test would fail loudly.
+
+        We extract JUST the for-for block (the comment + the two nested
+        for loops that follow), not everything from the comment onwards,
+        so the snippet doesn't pull in later references like `subset_mode`
+        / `bin_pass` that the parent harness sets up."""
         import subprocess
+        # Stub the parent-harness vars the loop body touches (nbin / conc /
+        # names / logdir). BEZEL_SHARD_TIMEOUT is in the env (set below),
+        # and the loop reads it via ${BEZEL_SHARD_TIMEOUT:-} so it never
+        # touches an unbound name there.
+        prelude = (
+            "nbin=1\n"
+            "conc={conc}\n"
+            "names=(codegen)\n"
+            "logdir=\"$1\"\n"
+            # sto is set inline by the loop body so the unset/zero tests can
+            # exercise the [[ -n \"$sto\" ]] / [[ \"$sto\" -gt 0 ]] guards
+            # without us overriding BEZEL_SHARD_TIMEOUT in env. Override
+            # BEZEL_SHARD_TIMEOUT in env (per-call) instead — the loop's
+            # fallback handles the unset case naturally.
+        ).format(conc=conc)
+        with open(self._RUN_PARALLEL_SH) as f:
+            content = f.read()
+        # Find the per-shard wall-times block: the comment, the two nested
+        # for loops, and the matching `done`s. We anchor on the comment and
+        # the next blank line / next non-indented line.
+        idx = content.find("# Per-shard wall times")
+        if idx < 0:
+            self.fail("per-shard wall-times block not found in run_parallel.sh")
+        # Walk forward from the comment, collecting lines until we see the
+        # first line that doesn't belong to the block. The block is two
+        # nested for/if/done constructs followed by a blank line; we stop
+        # at the first blank line AFTER at least one done was seen.
+        body_lines = []
+        seen_done = 0
+        for line in content[idx:].splitlines():
+            body_lines.append(line)
+            if line.strip() == "done":
+                seen_done += 1
+                if seen_done == 2:
+                    break
+        body = "\n".join(body_lines)
         env = dict(os.environ, BEZEL_SHARD_TIMEOUT=str(sto))
         return subprocess.run(
-            ["bash", "-c", self._LOOP_SNIPPET, "_", logdir, str(conc)],
+            ["bash", "-c", prelude + body, "_", logdir],
             capture_output=True, text=True, env=env)
 
     def test_ceiling_ratio_logged_when_both_set(self):
