@@ -3,6 +3,10 @@
 // v0.240): a `using var` bound to an atomic emitted NO scope-exit release at
 // all, so the instance leaked.
 //
+// #2965 (the closed-as-not-planned duplicate of #2973) is also pinned by this
+// file — verified clean on HEAD (575f8cc) 2026-08-18, 8/8 tests pass under
+// generated-code ASan.
+//
 //   using var a := new Atomic<int>(0);      // 4800 bytes / 200 allocations
 //
 // This is #2921's shape one receiver over: a built-in with a resolution on the
