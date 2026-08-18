@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1437](https://github.com/s8lap/bezel-lang/issues/1437) |
 | **Target module(s)** | `System` (auto-imported): the primitive-wrapper records (`Int32`/`UInt32`/`Int64`/`UInt64`, stdlib §9.1), a new `BitOperations` static class (sibling to `Math` §2.2 and `BitConverter` §2.12), a new `HashCode` value record |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |

@@ -5,16 +5,17 @@
 | **Status** | accepted — ruled under the owner's 2026-08-18 delegation; awaiting graduation train |
 | **Tracking issue** | coordinator files |
 | **Target module(s)** | **spec** — §28.3 (the kernel: K3.13, K4, K4.2, K5, K5.1–K5.7, K6.2, K2.4; the axiom register's A2/A4/A7 rows; *Move semantics for owned locals*; *The consume-site freeze*; *Owned-local discharge requirement*; the *Choosing a disposal form* recap table), §17.13, §22.3, §23.3, §28.7, §28.8.1, §28.9, §28.11, §28.14, §29.2, §30.5, §30.12, §31.1, §35.4, §35.5, Appendix A (the two indented commentary lines at A-grammar `MoveExpr`/field-path notes), Appendix C.3/C.6; **rationale** — §3.10, §5.1, §5.10, §5.23, §5.26, §5.28, §12.10 (the announcement-doctrine paragraphs); **stdlib** — §1, §6.8, §6.12, §4.19 (six announcement sentences); **guides** — 01 (4 sites), 04 (4 sites), 05 (1 site). Doc-only: **no semantics move.** |
-| **Written against** | spec/stdlib/rationale/guides **v0.255** (git `HEAD`, snapshot taken 2026-08-18). Every count in this document is measured against that snapshot; line numbers cited are snapshot line numbers and are given only as drafting aids, never as citations. |
+| **Written against** | spec/stdlib/rationale/guides **v0.255** (git `5fa5a95b`, snapshot taken 2026-08-18). Every count in this document is measured against that snapshot unless marked otherwise; line numbers cited are snapshot line numbers and are given only as drafting aids, never as citations. |
+| **Currency** | Re-verified against **v0.256** (git `4130d2de`, the review program's defect basket, plus its gate-fix commit `e8f5387a`; merged HEAD `8f41e99d`). Counts marked **⧗** were re-measured at that merged revision and supersede the snapshot figures where they differ; the graduation train re-measures at its own HEAD regardless. |
 | **Origin** | Review-program charter items **B1** and **B2** (consolidation basket), ruled under the owner's 2026-08-18 delegation. The trigger: §28.3's kernel carries one word — *announced* — for three unrelated propositions, a two-valued kill taxonomy (`disposing` / `transferring`) that cannot express two of its own five kill kinds, a freeze criterion stated three times with two strengthenings appended rather than derived, and a §35.4 census defined by subtraction from the label it is orthogonal to. |
 
-*Reference convention: unprefixed §-references are language-spec references; `K`/`A` tags are §28.3's kernel and axiom-register ids; rationale, stdlib, and guide references are marked. All prior art was read in full at the snapshot: §28.3 (kernel K1–K9, axiom register, Producers, Factory methods, Bare-type-parameter returns, Move semantics, Borrow lifetime rules, the consume-site freeze, the discharge requirement), §9.7, §17.13, §28.7, §28.14, §29.2, §30.5, §30.12, §31.1, §35.4.*
+*Reference convention: unprefixed §-references are language-spec references; `K`/`A` tags are §28.3's kernel and axiom-register ids; rationale, stdlib, and guide references are marked. Quotations are verbatim from the cited revision; any bold or italic emphasis this document adds to a quotation is marked "(emphasis added)" — unmarked emphasis inside a quotation is the source's own. All prior art was read in full at the snapshot: §28.3 (kernel K1–K9, axiom register, Producers, Factory methods, Bare-type-parameter returns, Move semantics, Borrow lifetime rules, the consume-site freeze, the discharge requirement), §9.7, §17.13, §28.7, §28.14, §29.2, §30.5, §30.12, §31.1, §35.4.*
 
 ---
 
 ## 0. What this proposal is, and is not
 
-It is a **restatement program**. Every rule it touches keeps its current verdict on every program. There is no new admission, no new rejection, no changed diagnostic *semantics*, no kernel extension, and no axiom movement. Three things happen:
+It is a **restatement program**. Every rule it touches keeps its current verdict on every program. There is no new admission, no new rejection, no changed diagnostic *semantics*, no kernel extension **in content** — K5's placement list gains one pointer (the §30.12 guards instance, §3.2), a new home for a strengthening the spec already states — and no axiom movement. Three things happen:
 
 1. one overloaded word is split into three named senses, and every downstream citation is re-pointed (**B1a**);
 2. K4's two-valued kill taxonomy is replaced by a three-bit table that reproduces every landed verdict and isolates the one recorded override (**B1b**);
@@ -34,11 +35,11 @@ Three kernel clauses use the word for three different things.
 
 These are independent. K3.13's set and K4.2's set overlap but neither contains the other: `throw x` and Pattern B `await x` are in both; the discard and `Dispose()` are in both; an `owned`-slot store and an owning `yield return` are K3.13-announced but **not** K4.2 kills (they are frozen); a `move` marker is in neither. K2.4/K6.2's sense is disjoint from both — it classifies results, not consumes.
 
-The conflation is not hypothetical. §30.5's Pattern B paragraph runs all three in one sentence:
+The conflation is not hypothetical. §30.5's Pattern B paragraph runs the senses together across two sentences:
 
-> "this consume is a [K4.2] **announced kill** with a runtime backstop: the `await` keyword plus the single-consumer operand type announce the kill at the source … are themselves the announcement ([K3.13]'s announced set), and the transfer marker is not admitted where the target already announces the consume"
+> "this consume is a [K4.2] **announced kill** with a runtime backstop: the `await` keyword plus the single-consumer operand type announce the kill at the source, and the await's implicit task disposal sets the disposed flag … Pattern B await therefore deliberately joins no consume-site freeze list and takes no operand marker — the `await` keyword plus the single-consumer operand type are themselves the announcement ([K3.13]'s announced set), and the transfer marker is not admitted where the target already announces the consume …; it is [K3.5] in the kernel's owned-consuming enumeration."
 
-Three senses, one word, one sentence, three different kernel clauses cited. §31.1's `throw` paragraph and Appendix C.3's yield row do the same.
+Two sentences, one word, three kernel clauses cited (K4.2, K3.13, K3.5). The first sentence's "announce the kill" is the K4.2 sense; the second's "are themselves the announcement" is the K3.13 sense; and the third sense rides *implicitly* in "the single-consumer operand type" — the declared `OwningTask<T>` is what does the announcing, K2.4/K6.2's sense, present in the words but cited nowhere. §31.1's `throw` paragraph and Appendix C.3's yield row run the same senses together.
 
 ### 1.2 The three names
 
@@ -65,32 +66,34 @@ Under K3.13 the marker is what a writer supplies **because nothing announces**; 
 
 ### 1.4 What the split costs, measured
 
-Occurrences of `announc*` across the nine normative documents at v0.255 (`Bezel_Changelog.md` excluded — pinned history, never edited):
+Occurrences of `announc*` across the nine normative documents at v0.256 ⧗ (`grep -oi 'announc[a-z]*'` per document; `Bezel_Changelog.md` excluded — pinned history, never edited):
 
 | Document | occurrences | paragraph sites | of which out-of-family (§1.4 note) | **in scope** |
 |---|---|---|---|---|
-| `Bezel_Language_Spec.md` | 123 | 77 | 4 | 73 |
-| `Bezel_Design_Rationale.md` | 48 | 29 | 4 | 25 |
+| `Bezel_Language_Spec.md` | 137 ⧗ | 81 ⧗ | 4 | 77 ⧗ |
+| `Bezel_Design_Rationale.md` | 49 ⧗ | 30 ⧗ | 4 | 26 ⧗ |
 | `Bezel_Standard_Library.md` | 7 | 6 | 0 | 6 |
 | `Bezel_Guide_01_Memory_and_Ownership.md` | 5 | 4 | 1 | 3 |
 | `Bezel_Guide_04_Concurrency.md` | 4 | 4 | 1 | 3 |
 | `Bezel_Guide_05_Collections_and_Iteration.md` | 1 | 1 | 0 | 1 |
 | `Bezel_Guide_06_Contracts_and_Purity.md` | 1 | 1 | 1 | 0 |
-| **Total** | **189** | **122** | **11** | **111** |
+| **Total** | **204** ⧗ | **127** ⧗ | **11** | **116** ⧗ |
 
-Classified by sense. Method: every occurrence read in context at the snapshot; a paragraph is assigned **every** sense it carries. The sense column is therefore *assignments*, not sites — 134 assignments over 122 sites, so **12 paragraphs carry more than one sense**, and those twelve are the conflation this item exists to end.
+(The v0.255 snapshot totalled 189/122. The v0.256 delta is wholly type-announced: six new sites — §27.1.1's iterable announcement-bearing bullet, §28.3's mirrored iterable-exclusion paragraph and its *Conservatism reach* companion, the *Producers* function-value row's fence parenthetical, Appendix C.3's function-slot exclusion row, and rationale §12.10's residual-closure record — minus one retired site, the narrowed-residual paragraph the fence replaced, plus one added occurrence in §27.6's amended fence sentence.)
+
+Classified by sense. Method: every occurrence read in context; a paragraph is assigned **every** sense it carries. The sense column is therefore *assignments*, not sites — 139 assignments over 127 sites, so **12 paragraphs carry more than one sense**, and those twelve are the conflation this item exists to end.
 
 | Sense | assignments | of which spec |
 |---|---|---|
 | **target-announced** (K3.13) | 31 | 24 |
 | **site-announced** (K4.2) | 30 | 20 |
-| **type-announced** (K2.4/K6.2) | 51 | 34 |
+| **type-announced** (K2.4/K6.2) | 56 ⧗ | 38 ⧗ |
 | *marker-announced* (§1.3 — respelled away) | 11 | 1 |
 | out-of-family | 11 | 4 |
 
-The out-of-family eleven are ordinary English and are **not touched**: §9.4's store "announced by the assignment itself" and its two rationale §9.13 twins; §28.9's "the ceremony announces observable disposal effects" and its rationale §5.28 and Guide 01 echoes; §11.2's "the callee retains less than announced"; §30.5's "the pin reading announces a scope"; rationale §12.2's "fan-out is announced in a design"; Guide 04's "the trap announces itself"; Guide 06's "a `Try` name announces". So the re-pointing work is **111 sites carrying 171 occurrences**, of which 11 sites (11 occurrences) are respellings rather than re-pointings.
+The out-of-family eleven are ordinary English and are **not touched**: §9.4's store "announced by the assignment itself" and its two rationale §9.13 twins; §28.9's "the ceremony announces observable disposal effects" and its rationale §5.28 and Guide 01 echoes; §11.2's "the callee retains less than announced"; §30.5's "the pin reading announces a scope"; rationale §12.2's "fan-out is announced in a design"; Guide 04's "the trap announces itself"; Guide 06's "a `Try` name announces". So the re-pointing work is **116 sites carrying 186 occurrences** ⧗, of which 11 sites (11 occurrences) are respellings rather than re-pointings.
 
-Kernel-tag citation counts at the snapshot, for the train's cross-check that every re-pointed site lands on a tag that exists: `K3.13` 9, `K4.2` 15, `K2.4` 18, `K6.2` 8.
+Kernel-tag citation counts at v0.256 ⧗, for the train's cross-check that every re-pointed site lands on a tag that exists: `K3.13` 9, `K4.2` 15, `K2.4` 20 ⧗, `K6.2` 10 ⧗ (the two increases are the v0.256 fence paragraphs' own citations).
 
 ### 1.5 Exact-rule sketch
 
@@ -125,19 +128,19 @@ So the kernel already reasons with three independent bits and names only two of 
 
 Two derived verdicts follow, and nothing else does:
 
-- **post-state of the binding** = *explicitly-disposed* when `¬moves ∧ flag`; *moved-from* when `moves`. (A conditional kill of any kind joins to *maybe-consumed*, K7.4 — one clause, stated once, applying to every row.)
+- **post-state of the binding**, for the rows whose kill subject is the binding's **current value** (rows 1–3 and 5) = *explicitly-disposed* when `¬moves ∧ flag`; *moved-from* when `moves`. Row 4 is outside the formula by its subject: the kill there is of the **displaced** value — the binding itself takes the new value and stays readable, and the displaced value is disposed, so no post-state question about the binding arises. (A conditional kill of any kind joins to *maybe-consumed*, K7.4 — one clause, stated once, applying to every row.)
 - **freeze** = unfrozen iff `keyword-visible ∧ flag-set-is-an-admissible-backstop` (§3), with K5.4's single recorded structural override.
 
 ### 2.3 The table, as drafted
 
-Subject: a kill of an owned **binding** — a local or an `owned` parameter. Kills of a **field or collection slot** are outside the freeze entirely (K5.6) and governed by K4.3's domain clause; that exemption is one sentence beneath the table, not a row in it.
+Subject: a kill of an owned **binding** — a local or an `owned` parameter. Kills of a **field or collection slot** are outside the freeze entirely (K5.6): the slot kill *by move* is governed by K4.3's domain clause, while overwrite and mutation kills of a slot sit under §28.7/§28.11's runtime-checked posture — a slot kill disposes, so the K4.1 backstop is real there. That exemption is one sentence beneath the table, not a row in it.
 
 | # | Kill | moves | flag | kw | Post-state of the binding | Freeze | Disposal moment | Kernel |
 |---|---|:---:|:---:|:---:|---|---|---|---|
 | 1 | explicit `Dispose()` (incl. `x?.Dispose()` / `x!.Dispose()`); the discard `_ := x;` | no | **yes** | **yes** | **explicitly-disposed** — straight-line use afterward is §28.2's mandatory use-after-dispose warning | **unfrozen** | at the call / at the end of the discard statement | K3.9, K3.10, K4.2, K5.3 |
 | 2 | `throw x`; Pattern B `await x` on an owned `OwningTask<T>` binding | **yes** | **yes** | **yes** | **moved-from** — a later read is an error until reassigned | **unfrozen** | after the matching catch arm completes, or at termination if uncaught / at the await, on all outgoing edges including fault and cancel | K3.5, K3.8, K4.2, K5.3 |
 | 3 | every transfer: `move x` at an argument, binding, assignment, scrutinee, or arm; a store into an `owned` field, an owning-collection slot, or a `set(owned)` accessor; `return` under an `owned` return, or under an unmarked `Task`-family return in a non-`async` body; an owning iterator's `yield return`; a move-only value's store into an owning location | **yes** | no | *varies* | **moved-from** | **frozen** | none here — the new holder's | K3.1–K3.4, K3.7, K3.12, K5.1 |
-| 4 | drop-on-overwrite — the consume of the **displaced** value at `x := …` | no | **yes** | **no** | the binding takes the new value; the **displaced** value is disposed | **frozen** | after the RHS is evaluated (RHS-first, K9.5) | K3.11, K5.2, §28.7 |
+| 4 | drop-on-overwrite — the consume of the **displaced** value at `x := …` | no | **yes** | **no** | the binding takes the new value; the **displaced** value is disposed | **frozen** | after the RHS is evaluated (RHS-first, K3.11; K9.5 is the slot analog) | K3.11, K5.2, §28.7 |
 | 5 | Pattern A chaining `return await x` over an owned source (an `owned` parameter or plain owned local) | **yes** | no | **yes** (the form) | **moved-from** | **unfrozen — by K5.4's override, not by the criterion** | the outer task's teardown, transitively | K3.6, K5.4, §30.5 kind 2 |
 
 **Reading notes, normative with the table:**
@@ -150,23 +153,28 @@ Subject: a kill of an owned **binding** — a local or an `owned` parameter. Kil
 
 ### 2.4 Every verdict reproduced
 
-Each row was built from §28.3 at the snapshot and checked against the landed rule that states it:
+Each table cell was built from §28.3 at the snapshot and checked against the landed rule that states it — **fifteen landed statements and one recorded derivation**, every cell covered (post-state, freeze, *and* disposal moment per row):
 
 | Row | Landed statement checked against | Agrees |
 |---|---|---|
 | 1 post-state | K4.2: *"after a *disposing* announced kill (`Dispose()`, the discard) the binding is **explicitly-disposed**"* | ✔ |
 | 1 freeze | K5.3; §28.3 *The explicit-`Dispose()` boundary*; §17.13 (*"the freeze does not apply"*) | ✔ |
+| 1 disposal moment | K4.2's closed set: *"explicit `Dispose()` … — disposes at the call"*; *"the discard `_ := x;` — disposes at the end of the discard statement"* (§17.13) | ✔ |
 | 2 post-state | K4.2: *"after `throw x` or a Pattern B `await`, the operand binding is **moved-from**"* | ✔ |
 | 2 freeze | K5.3; §30.5 (*"no call-site marker, no consume-site freeze, disposed-flag backstop"*); §31.1 | ✔ |
-| 3 freeze | K5.1: *"moves, marked transfers, owned-slot stores, owned returns … and owning-iterator `yield return` are frozen — transferring kills, alive under a new holder, no flag"* | ✔ |
+| 2 disposal moment | K4.2's closed set: *"`throw x` — the exception machinery disposes after the matching catch arm completes (or at program termination if uncaught)"* (§31.1); *"Pattern B `await x` … — the await's implicit task disposal, on all outgoing edges including fault/cancel"* (§30.5) | ✔ |
+| 3 freeze — the K5.1 members | K5.1: *"moves, marked transfers, owned-slot stores, owned returns … and owning-iterator `yield return` are frozen — transferring kills, alive under a new holder, no flag"* | ✔ |
+| 3 freeze — the K3.12 store | **derivation, not a landed sentence**: K5's lead freezes every K3-position consume unless it is a K4.2 announced kill or the K5.4 override, and a move-only value's store into an owning location (K3.12) is in neither set. No landed sentence names this member; the checklist records the verdict as **derived** (K5 lead + K4.2's closed set), and the train's reviewer confirms the derivation rather than hunting for a quote | ✔ (derived) |
 | 3 post-state | K1.3; §28.3 *Move semantics for owned locals* | ✔ |
+| 3 disposal moment (*"none here — the new holder's"*) | K4's opening: *"a *transferring* kill leaves the value alive under a new holder, setting nothing"*; K1.7 (one holder at a time) | ✔ |
 | 4 freeze | K5.2: *"drop-on-overwrite of a binding is frozen although it disposes — the reassignment is not keyword-visible as a kill of the *old* value"* | ✔ |
-| 4 disposal moment | K3.11 (*"disposed after the RHS is evaluated"*); K9.5 | ✔ |
+| 4 disposal moment | K3.11 (*"disposed after the RHS is evaluated"*); K9.5 as the slot analog | ✔ |
 | 5 freeze | K5.4's vacuity override; §30.5's chained-slot paragraph | ✔ |
 | 5 post-state | §30.5 kind 2 (*"an ordinary §28.3 move-out of the parameter"*) | ✔ |
+| 5 disposal moment (*"the outer task's teardown, transitively"*) | K5.4: *"its new holder (the outer task) cannot dispose the chained task before the body, `finally` blocks included, completes"*; §30.5 kind 2 | ✔ |
 | slot/field exemption | K5.6; §28.3 *Scope of the freeze* | ✔ (stated beneath the table, not as a row) |
 
-No row required a verdict the landed text does not already state, and no landed verdict is left without a row.
+No cell required a verdict the landed text does not already state — the single K3.12 entry is a derivation the landed text *implies* and the checklist records as such — and no landed verdict is left without a row.
 
 ## 3. One freeze criterion, with the strengthenings derived (B1c)
 
@@ -219,7 +227,7 @@ The parenthetical exists **only because the definition order forces it**. Define
 >
 > Two derived type properties ([§3.6](#sec-derived-type-properties)) are computed from the payload fields of *all* a choice's cases. The first is the input to the second.
 >
-> **A choice holds borrows** — a derived type property in its own right — iff any case has a *borrow-carrying* payload field under [§9.7](#sec-records-and-disposal)'s definition, reading **this property** at a nested choice payload. [The naming is proposal 0095's; at this proposal's revision the property is spelled as it is today.]
+> **A choice holds borrows** — a derived type property in its own right — iff any case has a *borrow-carrying* payload field under [§9.7](#sec-records-and-disposal)'s definition, reading **this property** at a nested choice payload. For a generic choice the property is evaluated per instantiation under [§3.6](#sec-derived-type-properties)'s rule 2, a declaration change that flips it is breaking under rule 3, and diagnostics name it under rule 4. [The rule-2/3/4 sentence is the landed v0.252 registration text, retained in substance — the restatement moves it, never drops it. The property naming is proposal 0095's; at this proposal's revision the property is spelled as it is today.]
 >
 > The **choice classification** is then:
 >
@@ -241,9 +249,9 @@ So the §35.4 parenthetical is, in that half, a duplicate of a live §9.7 senten
 
 ## 5. Corpus evidence
 
-**Documents.** The counts of §1.4 are the whole surface: 122 announcement sites (111 in scope), 5 kill-table rows re-deriving 12 landed statements, 1 freeze criterion currently stated 3 times with 2 appended strengthenings, 1 parenthetical retiring.
+**Documents.** The counts of §1.4 are the whole surface: 127 announcement sites (116 in scope) ⧗, 5 kill-table rows re-deriving 15 landed statements plus one recorded derivation (§2.4), 1 freeze criterion currently stated 3 times with 2 appended strengthenings, 1 parenthetical retiring.
 
-**Compiler and tests (read-only; no code changes are proposed).** Measured at the snapshot: `announc*` appears **44 times in `src/`** and **46 in `tests/`**. Most are comments and test names, but **eight `src/` sites put the word inside a string literal, of which five are user-visible diagnostic text** — and, tellingly, they carry three different senses:
+**Compiler and tests (read-only; no code changes are proposed).** Measured at v0.256 ⧗, by `grep -roi 'announc[a-z]*' src/ | wc -l` and the same over `tests/`: `announc*` appears **93 times in `src/`** and **84 in `tests/`**. Most are comments and test names, but **eight `src/` sites put the word inside a string literal, of which five are user-visible diagnostic text** (re-verified at v0.256, same file:line for all five) — and, tellingly, they carry three different senses:
 
 | Site | Text | Sense |
 |---|---|---|
@@ -266,15 +274,15 @@ The kill table introduces no new predicate the compiler does not already compute
 - **Newly defined:** three names (*target-announced*, *site-announced*, *type-announced*) for three propositions the kernel already states; the kill table's three bits, each of which is a restatement of a property the kernel already reasons with.
 - **Runtime behaviour:** unchanged everywhere.
 - **Doc-only:** all of it. **Zero semantic migration.**
-- **Citation sites re-pointed:** **111** (171 occurrences), of which **11** are respellings away from the marker-announced usage (§1.3) rather than re-pointings. Distribution: spec 73 sites, rationale 25, stdlib 6, Guide 01 3, Guide 04 3 (2 of them respellings), Guide 05 1, Guide 06 0.
+- **Citation sites re-pointed:** **116** (186 occurrences) ⧗, of which **11** are respellings away from the marker-announced usage (§1.3) rather than re-pointings. Distribution: spec 77 sites, rationale 26, stdlib 6, Guide 01 3, Guide 04 3 (2 of them respellings), Guide 05 1, Guide 06 0.
 
 ## 7. Mechanical validation, as a landing condition
 
 1. `scripts/check_docs.sh` (full, not `--quick`) green: anchor resolution, version consistency, §-citation sanity, statics-facts derivation, and example extraction over the current docs.
-2. **The kill-table acceptance test.** For each of the 12 landed statements in §2.4's checklist, the reviewer confirms the table's cell reproduces it verbatim in verdict. A row that needs a verdict the landed text does not state is a **stop**: this is a restatement program, and such a finding is an issue, not an edit.
+2. **The kill-table acceptance test.** For each of the 15 landed statements in §2.4's checklist, the reviewer confirms the table's cell reproduces it verbatim in verdict; for the checklist's one recorded derivation (row 3's K3.12 member), the reviewer re-derives the verdict from K5's lead plus K4.2's closed set and confirms no landed sentence contradicts it. Any *other* cell that needs a verdict the landed text does not state is a **stop**: this is a restatement program, and such a finding is an issue, not an edit.
 3. **The freeze-criterion acceptance test.** Placements K5.1–K5.7 plus §30.12's guards are each re-derived from the two conjuncts, and each derivation is checked against the placement's current sentence. K5.4 must remain the *only* override.
 4. **A vocabulary sweep.** After the train, `grep -oi 'announc[a-z]*'` over the nine normative documents must return only: the three named senses, the eleven out-of-family uses of §1.4, and zero marker-announced uses. The count is the check.
-5. **Before/after fragment extraction.** `scripts/extract_doc_examples.py` runs clean over the edited docs; every §28/§30/§35 fenced example is unchanged byte-for-byte (this program edits prose only — a changed fence is a defect).
+5. **Before/after fragment extraction.** `scripts/extract_doc_examples.py` is run twice — over the pre-edit snapshot, materialized as a git worktree of the train's base revision, and over the post-edit tree — into two scratch trees under `/var/tmp/bezel-scratch`; the two fragment sets must be **byte-identical**. This program edits prose only, so any fragment diff is a defect.
 
 ## 8. Alternatives, costed
 
@@ -289,7 +297,7 @@ The kill table introduces no new predicate the compiler does not already compute
 - **Q2 — the freeze criterion's shape (§3.3).** Two conjuncts with (ii) reading "admissible backstop" broadly enough to cover both §28.14's and §30.12's grounds (recommended — one criterion, two instances), or three conjuncts with (iii) stating the admission-relies-on-the-backstop condition literally?
 - **Q3 — where the kill table lives.** Inside K4, replacing its opening binary sentence (recommended — the table *is* K4's content), or in §28.3's prose beneath the kernel with K4 pointing at it? The first makes the kernel longer by a table and shorter by four clauses; the second keeps the kernel's clause-only shape.
 - **Q4 — Appendix C.3's kill-adjacent rows.** Three C.3 rows restate post-state and freeze facts (the discard row, the owning-yield row, the `Dispose()`-receiver row). Do they cite the kill table and shrink (recommended, and it is proposal 0094's cap doing the same work), or keep their current text?
-- **Q5 — §35.4's property spelling at this revision.** This proposal restates §35.4 census-first using the *current* name; proposal 0095 renames it. If both land in one revision the restatement writes 0095's name directly and §4.2's bracketed note drops. Confirm the two graduate together (recommended — one §35.4 edit, not two)?
+- **Q5 — §35.4's property spelling at this revision.** *Resolved by the post-gate ordering ruling (the §35.4 single-edit guard, §10 item 3):* §35.4 is edited **once, ever**, across this proposal and 0095 — when the two trains share a revision, the restatement lands here written directly in 0095's name (§4.2's bracketed note drops); otherwise this train skips §35.4 entirely and the census-first restatement graduates with 0095's train.
 
 ## 10. Graduation-train scope
 
@@ -298,10 +306,10 @@ The train lane executes from this section directly.
 **Spec, in this order** (the kernel first, so downstream re-pointing has a target):
 
 1. **§28.3 kernel** — K3.13 gains *target-announced*; K4's opening binary sentence is replaced by the §2.3 table (per Q3); K4.2 gains *site-announced*; K2.4 and K6.2 gain *type-announced*; K5 is restated per §3.2 and K5.1–K5.7 are re-cast as consequences; K5.7's §28.14 sentence and a new §30.12 pointer are added to K5's placement list.
-2. **§28.3 prose** — *Move semantics for owned locals* (4 announcement occurrences, all target-announced), *The consume-site freeze* (its *explicit-`Dispose()` boundary* paragraph becomes a pointer to K5's single statement), the **axiom register**'s A2, A4, and A7 rows, the *Producers* table's two rows carrying type-announced language, *Deferred-activation callees* and *Returning a deferred-activation frame* (type-announced), the *Choosing a disposal form* recap table (1 site).
-3. **Downstream spec sections**, each re-pointed to a named sense: §17.13 (3), §22.3 (2), §23.3 (2), §28.7, §28.8.1 (1), §28.9 (2, out-of-family — untouched), §28.11, §28.14 (5, incl. K5.7's derivation), §29.2 (7), §30.5 (6, incl. the Pattern B sentence of §1.1), §30.12 (1, plus the new K5 tag), §31.1 (3), §35.4 (the §4.2 restatement), §35.5 (2).
+2. **§28.3 prose** — *Move semantics for owned locals* (5 announcement occurrences, all target-announced), *The consume-site freeze* (its *explicit-`Dispose()` boundary* paragraph becomes a pointer to K5's single statement), the **axiom register**'s A2, A4, and A7 rows, the *Producers* table's three rows carrying type-announced language ⧗ (the function-value-invocation row joined at v0.256 with its fence parenthetical), *Factory methods and sourceless returns* incl. the v0.256 iterable-exclusion and *Conservatism reach* paragraphs ⧗ (type-announced throughout), *Deferred-activation callees* and *Returning a deferred-activation frame* (type-announced), the *Choosing a disposal form* recap table (1 site).
+3. **Downstream spec sections**, each re-pointed to a named sense (per-section occurrence counts re-measured at v0.256 ⧗): §15.4 (3: 1 target-announced, 2 type-announced), §17.13 (3), §21.10 (1, the owning-match announcement — target-announced), §22.3 (2), §22.16 (1, site-announced — the `old(E)` capture paragraph's announced-kill clause), §23.3 (2), §25.2 (1, target-announced — "the keyword-announced operand consumes"), §27.1.1 (8: the two announcement-bearing family bullets — type-announced), §27.6 (2, type-announced), §28.6 (3: 2 type-announced + 1 site-announced, the *Who may call `Dispose()`* announced-kill clause), §28.8.1 (1), §28.9 (2, out-of-family — untouched), §28.14 (6 over 4 sites, incl. K5.7's derivation), §29.2 (5 over 3 sites, incl. *Iterator yield ownership*), §29.3 (2, type-announced), §30.1 (1, type-announced), §30.5 (9 over 4 sites, incl. the Pattern B sentences of §1.1), §30.10 (1 — the marker-announced site §1.3 quotes, respelled), §30.12 (1, plus the new K5 tag), §31.1 (3), §35.4 (the §4.2 restatement — **conditional, per the single-edit guard**: §35.4 is edited **once, ever**, across this proposal and 0095; if this train and 0095's share a revision, the restatement lands here written directly in 0095's name, the bracketed note of §4.2 dropping; otherwise this train **skips §35.4 entirely** and the census-first restatement graduates with 0095's train, which executes §4.2 in one edit with the rename), §35.5 (2). (§9.4 and §11.2 carry only out-of-family occurrences and are untouched; the earlier draft's §28.7 and §28.11 entries are struck — both sections carry zero `announc*` occurrences at v0.256 ⧗.)
 4. **Appendix A** — the two indented commentary lines carrying "announced" (grammar notes at the `MoveExpr`/field-path commentary).
-5. **Appendix C** — C.3's three kill-adjacent rows and C.6's Pattern B row, per Q4.
+5. **Appendix C** — C.3's three kill-adjacent rows and C.6's Pattern B row, per Q4; C.3's v0.256 function-slot exclusion row (2 type-announced occurrences ⧗) is re-pointed in place.
 
 **Rationale:** §3.10 (5 sites, 4 of them marker-announced respellings), §5.1, §5.10, §5.23, §5.26 (the kernel's recorded reasons — the axiom register's one-line reasons stay), §5.28 (out-of-family — untouched), §12.10 (the announcement-doctrine paragraphs, 6 sites).
 
@@ -315,8 +323,9 @@ The train lane executes from this section directly.
 
 ## 11. Interactions
 
-- **Proposal 0094** (same basket) edits §28.3's *Factory methods* / *Bare-type-parameter returns* / iterable paragraphs into a **type-announced** table and caps Appendix C. Both proposals touch §28.3 and Appendix C.3/C.6; they must land in **one editing pass**, 0093 first (0094's table header uses 0093's names).
-- **Proposal 0095** (same basket) renames §35.4's census and registers `defaultable`. Overlaps this proposal at §35.4 only — see Q5.
+- **Proposal 0094** (same basket) edits §28.3's *Factory methods* / *Bare-type-parameter returns* / iterable paragraphs into an announcement table and caps Appendix C. The real dependency is twofold: the two proposals share an edit surface — the *Producers* rows and the Appendix C.3/C.6 rows — so when they share a revision those rows are written in **one editing pass**; and 0094's table reads this proposal's vocabulary in its row-8 cell ("frame classification is **type-announced**"). **0093 first**, in every ordering. Under the post-gate ordering ruling, 0094 graduates *last* in the program (after 0096, re-derived) — the shared rows are therefore written here first and 0094's train re-reads them at its own HEAD.
+- **Proposal 0095** (same basket) renames §35.4's census and registers `defaultable`. Overlaps this proposal at §35.4 only — governed by the single-edit guard (§10 item 3, Q5): one §35.4 edit ever, in 0095's name when the trains share a revision, wholly in 0095's train otherwise.
+- **Proposal 0096** (iterable announcement unification — accepted, same delegation, graduating **after** this proposal and 0095, **before** 0094's re-derivation, per the post-gate ordering ruling) rewrites the paragraphs that carry most of the v0.256 type-announced additions this proposal re-points: *Task-family calls produce owned frames* generalizes, the v0.256 iterable-exclusion fence and the A2 register row retire. No conflict — this proposal lands first, so 0096's train inherits the named senses and writes its new *mint-announcing families* paragraph **type-announced from birth**; the kill table and the freeze criterion are untouched by 0096 (it moves no kill and no freeze verdict). The train re-measuring its census at its own HEAD (per the Currency row) is what keeps the counts honest across that hand-off.
 - **Proposal 0046** (the kernel consolidation) is this program's parent: the K1–K9 shape, the axiom register, and the "every rule is a principle, a derivation, or a recorded axiom" discipline are its. This proposal adds no rule and retires no axiom, so 0046's ledger is unchanged.
 - **Proposal 0090** (the `move` unification, graduated v0.246) supplied the marker vocabulary the kill table's row 3 reads. Its rationale §3.10 record is where four of the eleven marker-announced respellings live.
 - **A7's register row** carries "at an announced target" (target-announced) and is re-pointed; the axiom's content is untouched.

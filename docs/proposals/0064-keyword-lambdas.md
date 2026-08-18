@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **superseded — graduated v0.217** (owner-accepted 2026-07-22, same day as drafting; spec §27.3/§27.4, grammar A.7 `LambdaExpr`, Appendix B.1; rationale §3.13). Graduation decided §8's open questions — hard cutover (0057 precedent, zero external users), the widening extension in the same revision, `async lambda` order — recorded in the v0.217 changelog entry. Impl delta tracked by [#2101](https://github.com/s8lap/bezel-lang/issues/2101); the §7 hole-delimitation adjacency filed as [#2102](https://github.com/s8lap/bezel-lang/issues/2102). |
+| **Status** | graduated-v0.217 — **superseded — graduated v0.217** (owner-accepted 2026-07-22, same day as drafting; spec §27.3/§27.4, grammar A.7 `LambdaExpr`, Appendix B.1; rationale §3.13). Graduation decided §8's open questions — hard cutover (0057 precedent, zero external users), the widening extension in the same revision, `async lambda` order — recorded in the v0.217 changelog entry. Impl delta tracked by [#2101](https://github.com/s8lap/bezel-lang/issues/2101); the §7 hole-delimitation adjacency filed as [#2102](https://github.com/s8lap/bezel-lang/issues/2102). |
 | **Tracking issue** | — (assign at review) |
 | **Target** | spec §27 (Lambdas and Function Types), §17.1 note, Appendix A.7 `LambdaExpr`, Appendix B.1 (one keyword addition); no stdlib surface |
 | **Written against** | spec v0.216 |

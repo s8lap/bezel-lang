@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | superseded — graduated v0.208 (`68d8002`); composition-gate fixes folded pre-push. Impl delta tracked at the landing issue |
+| **Status** | graduated-v0.208 — superseded — graduated v0.208 (`68d8002`); composition-gate fixes folded pre-push. Impl delta tracked at the landing issue |
 | **Tracking issue** | [#2077](https://github.com/s8lap/bezel-lang/issues/2077) |
 | **Target** | Spec: §20 (rewritten), §17.1 (the conditional's entry leaves the level-15 row; `throw` keeps it) + §17.2's atom note, §19 preamble + §19.7 *Termination* (both currently state the `end`-terminator norm), §19.1/§19.2 expression-position examples, §9.5 (`with(…)`), §30.7 (the header resolution, restated for the new spelling), Appendix **A.6** (new `CaseStmt`/`WhenStmt` statement productions) and A.7 (ConditionalExpr retired; the atoms; ThrowExpr notes; the `with` suffix), every expression-position occurrence across the six docs; rationale §3.3 (superseded and rewritten); both guides (idiom change — revalidation pins bump). |
 | **Written against** | spec v0.206 (graduating against v0.207) |

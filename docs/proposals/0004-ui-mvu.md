@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Early draft — **proposal-only by owner decision (2026-07-03): no implementation until a future explicit go**; architecture + code shape only, deliberately *not* a full API surface |
+| **Status** | under-review — Early draft — **proposal-only by owner decision (2026-07-03): no implementation until a future explicit go**; architecture + code shape only, deliberately *not* a full API surface |
 | **Origin** | exploration-ui.md's "fits like a glove" finding; owner asked for construction/control examples (2026-07-03) |
 | **Written against** | spec v0.216 (owner-directed currency refresh 2026-07-22 — the draft predated `choice` and the v0.208 expression forms; §3's "honest sum-type gap" is now closed by the language and the examples use current syntax. Architecture unchanged.) |
 | **Design influences** | Elm (the architecture), iced/Rust (MVU without a VM), **not** SwiftUI's property wrappers, **not** React hooks (exploration-ui.md records why) |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Target modules** | `System.Text` (§3, auto-imported) · `System` / `Convert` (§2.3, auto-imported) |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1434](https://github.com/s8lap/bezel-lang/issues/1434) |

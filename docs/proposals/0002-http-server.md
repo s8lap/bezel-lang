@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-24, delegated ruling #1402 — the four §7 open questions ruled; drafted proposal-text amendments in #1402's record apply at graduation) |
+| **Status** | accepted — accepted (2026-07-24, delegated ruling #1402 — the four §7 open questions ruled; drafted proposal-text amendments in #1402's record apply at graduation) |
 | **Depends on** | Proposal 0001 (client), proposal 0007 (`System.Net` substrate), stdlib §7 Stream family (#1394/#645), timers (#1378), proposal 0003 (guarded shared state) |
 | **Design influences** | ASP.NET **Minimal APIs** and **Express** for the routing surface (the two independently converged on the same shape); WHATWG fetch for the `Request → Response` handler symmetry; **not** full ASP.NET (no controllers, no DI container, no middleware pipeline in v1), **not** raw Node `http` (streams-and-callbacks is the wrong level, and callbacks fit serial-per-domain async poorly) |
 | **Bezel-native leverage** | Handlers run on worker **domains**; the §30.14 sendability rules make data-race freedom a *compile-time* property of the server — the marquee thing neither Express nor ASP.NET can promise |

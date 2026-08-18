@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Tracking issue** | — (none yet) |
 | **Target module(s)** | `System.Security.Cryptography` (new module; requires `import System.Security.Cryptography`) — the [stdlib §11](../Bezel_Standard_Library.md#11-modules-deferred-to-future-revisions) deferred line made concrete |
 | **Written against** | spec/stdlib **v0.227** |

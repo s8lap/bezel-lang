@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | superseded — graduated v0.244 (owner-ruled 2026-08-11, all questions as recommended) |
+| **Status** | graduated-v0.244 — superseded — graduated v0.244 (owner-ruled 2026-08-11, all questions as recommended) |
 | **Tracking issue** | [#3051](https://github.com/s8lap/bezel-lang/issues/3051) |
 | **Target module(s)** | **spec** — §22.15 body rule 5 (the amendment), §29.2 (one cross-reference sentence noting the pure-body normativity of the already-admitted elision). **stdlib** — none. **rationale** — §9.7 area (`pure` is declared, not derived) gains a one-paragraph record. **guides** — Guide 06 §6's "the rule that surprises people" passage rewritten at graduation. |
 | **Written against** | spec/stdlib v0.241 |

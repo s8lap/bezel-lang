@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1445](https://github.com/s8lap/bezel-lang/issues/1445) |
 | **Target module(s)** | `System` (§2.5 cluster, auto-imported) — new `DateTimeOffset` and `TimeZoneInfo` |
 | **Written against** | spec v0.177, stdlib v0.177 |

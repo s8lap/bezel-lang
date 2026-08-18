@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1455](https://github.com/s8lap/bezel-lang/issues/1455) |
 | **Target module(s)** | `System.Text` (auto-imported, §3 of stdlib); adds two methods to `String` (§9.6) and a new `NormalizationForm` enum |
 | **Written against** | Language spec **v0.177**; stdlib companion v0.165 |

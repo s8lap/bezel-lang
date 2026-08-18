@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft (consolidation stub — collects the recorded design fragments the normative docs previously cited as "the give-back-protocol RFC" without a file existing) |
+| **Status** | under-review — draft (consolidation stub — collects the recorded design fragments the normative docs previously cited as "the give-back-protocol RFC" without a file existing) |
 | **Tracking issue** | — (assign at first design pass) |
 | **Target** | stdlib §6.9 (`Channel<T>`); spec §30.15; possibly §30.8 (cancellation composition). |
 | **Written against** | spec v0.210 |

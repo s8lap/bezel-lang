@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Tracking issue** | [#1457](https://github.com/s8lap/bezel-lang/issues/1457) |
 | **Target module** | `System.Collections.Linq` (§5; requires `import System.Collections.Linq` — not auto-imported, spec §2.3 auto-imports only System / System.Text, and the spec's own LINQ examples write the import) |
 | **Written against** | spec v0.177 / stdlib v0.165 |

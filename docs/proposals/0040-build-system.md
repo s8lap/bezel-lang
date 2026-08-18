@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft (design sketch — owner-requested 2026-07-16; not yet under-review) |
+| **Status** | under-review — draft (design sketch — owner-requested 2026-07-16; not yet under-review) |
 | **Tracking issue** | [#1908](https://github.com/s8lap/bezel-lang/issues/1908) (ecosystem pillar 1 of [#1904](https://github.com/s8lap/bezel-lang/issues/1904)) |
 | **Target module(s)** | Tooling only — a build driver over the existing compiler surface. **No spec changes**: this proposal *implements* spec [§2.8](../Bezel_Language_Spec.md#sec-module-identity) (module identity / artifact interface / program assembly, landed v0.188 from proposal [0034](0034-module-identity.md)) and [§2.5/§2.6](../Bezel_Language_Spec.md#sec-dependency-resolution)'s SCC compilation units (settled v0.164). Stage 0 is exactly compiler tracker [#1398](https://github.com/s8lap/bezel-lang/issues/1398). |
 | **Written against** | spec/stdlib **v0.196**, compiler @ `974be95` |

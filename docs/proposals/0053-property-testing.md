@@ -1,6 +1,6 @@
 # 0053 - Property-based specification: generated-input properties over the 0022 test framework
 
-**Status:** draft
+**Status:** under-review — draft
 **Tracking issue:** [#2040](https://github.com/s8lap/bezel-lang/issues/2040)
 **Target:** Stdlib — the `System.Testing` module proposal [0022](0022-test-framework.md) defines (new `Generator`, `Property`, `PropertyOptions` surface; `TestRunner.AddProperty` overloads; the `FromGenerator` recognition convention; report formats). Spec — **none under 0022's fork (b)**; under fork (a), one clause amending the `test`-modifier shape rule when that rule lands on 0022's own spec track (§3.3 below; no grammar production changes — parameter lists already parse). Tooling — runner execution/reporting/knobs, and the stage-S2 contract-bridge generator riding proposal [0040](0040-build-system.md)'s driver. Rationale — none.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)

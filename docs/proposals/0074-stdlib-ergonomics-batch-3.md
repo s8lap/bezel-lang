@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | **superseded — graduated v0.231** (owner-accepted 2026-07-29; Q1–Q3/Q5 resolutions recorded in the v0.231 changelog entry; item 4/Q4 landed ahead at v0.230 with the #2243 ruling) |
+| **Status** | graduated-v0.231 — **superseded — graduated v0.231** (owner-accepted 2026-07-29; Q1–Q3/Q5 resolutions recorded in the v0.231 changelog entry; item 4/Q4 landed ahead at v0.230 with the #2243 ruling) |
 | **Tracking issue** | [#2348](https://github.com/s8lap/bezel-lang/issues/2348) (implementation) |
 | **Target module(s)** | stdlib only — `System` ([§2.4](../Bezel_Standard_Library.md#sec-environment) `Environment`, [§2.6](../Bezel_Standard_Library.md#sec-guid) `Guid`, [§2.18](../Bezel_Standard_Library.md#sec-iformattable) format specifiers), the [§9.6](../Bezel_Standard_Library.md#sec-string) `String` primitive, plus one [§1](../Bezel_Standard_Library.md#sec-conventions) convention sentence and one [§4.8](../Bezel_Standard_Library.md#sec-dictionaryk-v) disambiguating clause. **No spec change, no new types, no new grammar.** |
 | **Written against** | stdlib/spec v0.228 |

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Target module** | `System.IO` (stdlib §7 — new §7.3a `TempFile`; §7.4 `Path` and `Directory` extensions) |
 | **Written against** | spec/stdlib **v0.177** |
 | **Tracking issue** | [#1446](https://github.com/s8lap/bezel-lang/issues/1446) |

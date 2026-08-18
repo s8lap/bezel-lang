@@ -1,6 +1,6 @@
 # Self-Hosting Bezel Standard Library Collections — Design Proposal
 
-**Status:** Draft proposal for owner review. No source changes; this document only.  
+**Status:** under-review — Draft proposal for owner review. No source changes; this document only.  
 **Scope:** Moving the C++ runtime implementations of the stdlib collections into
 `.bzl` source that the Bezel compiler compiles, so the compiler's hardcoded
 "name == Array" gates progressively atrophy.  

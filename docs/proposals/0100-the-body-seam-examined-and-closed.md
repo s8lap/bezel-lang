@@ -4,11 +4,12 @@
 |---|---|
 | **Status** | accepted — ruled under the owner's 2026-08-18 delegation; awaiting graduation train. Charter ruling C12, an **owner-directed landing** (mid-turn 2026-08-18: *"what if we do nothing? And also accept an empty line as a separator between contracts and statements?"*, clarified *"i meant it as a convention"*). **Bare-open is kept**; the blank-line separator lands as a **recommended, non-normative style convention** inside §22.16's existing style note; the **floor** lands (reserve `requires`/`ensures`/`invariant`); and the **decline record is written in full**. This document is the permanent record of the whole exploration — it is written to stand alone, so that no future reader has to re-run the study to learn what was considered and why each option lost. |
 | **Tracking issue** | coordinator files |
-| **Target module(s)** | **spec** — §22.16 (one sentence appended to the existing *Recommended style, non-normative* note), Appendix B.1 (`requires`, `ensures`, `invariant` move from the contextual list to the unconditionally-reserved list), Appendix B.2 (their three rows delete; `old` and `result` stay contextual), Appendix A.4 commentary if it names the contextual reading. **rationale** — §3.1 (*Always semicolons*) gains the third-category note. **tests** — `tests/parser/contract_clauses_2053_test.cpp` :: `requires_as_parameter_name_not_a_marker_spec_22_16` flips from an accept to a reject (one site). **scripts** — `scripts/check_docs.sh` gains check 5 (docs-only style conformance). **guides** — Guide 06's clause-bearing examples restyle. |
-| **Written against** | spec/stdlib **v0.255** (`git show HEAD:docs/*.md`, HEAD = `5fa5a95b`) |
+| **Target module(s)** | **spec** — §22.16 (one sentence appended to the existing *Recommended style, non-normative* note), Appendix B.1 (`requires`, `ensures`, `invariant` become unconditionally reserved — **three edits in that one subsection**, §4.1), Appendix B.2 (**two** rows delete — `requires`/`ensures` share one; `old` and `result` stay contextual), Appendix A.4 commentary (the clause-region comment's "keyword reading always wins there (the B.2 env rule)" conforms — after reservation the winning reading is unconditional, not contextual). **rationale** — §3.1 (*Always semicolons*) gains the third-category note. **tests** — `tests/parser/contract_clauses_2053_test.cpp` :: `requires_as_parameter_name_not_a_marker_spec_22_16` flips from an accept to a reject (one site). **scripts** — `scripts/check_docs.sh` gains check 5 (docs-only style conformance). **guides** — Guide 06's clause-bearing examples restyle. |
+| **Written against** | spec/stdlib **v0.255** (`git show 5fa5a95b:docs/*.md`) |
+| **Currency** | **v0.256** (HEAD `8f41e99d` — the defect train `4130d2de` plus its gate fixes `e8f5387a`): every quoted §22.16, Appendix B, rationale §3.1, and test text is unchanged. Adjacent, no conflict: v0.256 added §13.3's fourth visibility exception (*an `invariant` member carries no visibility keyword*) and its Appendix C.2 row — prose about the `invariant` **member kind**, orthogonal to reserving the **word**; the floor's B.1/B.2 edits (§4.1) compose with it untouched. |
 | **Origin** | The body-seam study (elegance-review programme, 2026-08). The question: a Bezel member declaration's body opens with **no token at all**, so where a member carries `requires`/`ensures` clauses, the reader must recognise the end of the clause region by noticing that the next line is not a clause. Every language with a contract region and a bare-ish body has faced this; the study inventoried the answers. |
 
-*Reference convention: unprefixed §-references are language-spec references; rationale references are marked. Every quotation and every count is from the v0.255 snapshot or from `tests/` at HEAD.*
+*Reference convention: unprefixed §-references are language-spec references; rationale references are marked. Every quotation and every count is from the v0.255 snapshot (re-verified unchanged at v0.256) or from `tests/` at HEAD. Bold inside a quotation is the source's own unless marked* (emphasis added).
 
 ---
 
@@ -25,7 +26,13 @@ public method Withdraw(amount: decimal)
 end Withdraw;
 ```
 
-Three consecutive lines look alike and one of them is the body. The grammar has no ambiguity — §22.16 says *"The region is the maximal run of `ContractClause`s and ends at the first token that is not a clause opener"* — but the **reader** has to run that rule. That is the seam. It has two halves, and the study separated them:
+Three consecutive lines look alike and one of them is the body. The grammar has no ambiguity — the clause region is `ContractClause*` in the declaration productions (A.4: `GenericConstraints* ContractClause* MethodBody`, with `ContractClause ::= "static"? ("requires" | "ensures") "(" Expression ")"`), and A.4's own commentary states both halves of why that is unambiguous, quoted verbatim:
+
+> */* the parentheses are clause syntax, not expression tokens (§22.16): a clause is self-delimiting and carries no terminator. \*/*
+>
+> */* the clause region (§22.16): after the signature's GenericConstraints\*, the tokens requires/ensures (or static followed by either) open it; keyword reading always wins there (the B.2 env rule). \*/*
+
+So the region ends at the first token that opens no clause — but the **reader** has to run that rule. That is the seam. It has two halves, and the study separated them:
 
 - **(a) The reading half.** Nothing marks where the promise stops and the doing starts.
 - **(b) The stealing half.** Because `requires`/`ensures` are *contextual* keywords (Appendix B.2), a body's first statement could in principle be a call to something *named* `requires` — and the clause region would swallow it. Proposal 0055 §3 analysed this precisely and named the failure modes.
@@ -44,7 +51,7 @@ The contract-free case — a member with no clauses, whose signature is immediat
 
 §22.16 already contains one style recommendation, in its *Clause granularity is semantic* note:
 
-> **Clause granularity is semantic.** `requires(a) requires(b)` is not a style variant of `requires(a and b)`: the clause is the unit of tier, blame, evaluation order (stop at first failure), and interface identity. **Recommended style, non-normative:** one condition per clause, each clause on its own line.
+> **Clause granularity is semantic.** `requires(a) requires(b)` is not a style variant of `requires(a and b)`: the clause is the unit of tier, blame, evaluation order (stop at first failure), and interface identity. Recommended style, non-normative: one condition per clause, each clause on its own line.
 
 The blank-line convention lands **in that note, in that register**. It is a recommendation about how to write Bezel, not a rule about what Bezel is. There is **no normative obligation on user code**: a conforming implementation neither requires the blank line nor diagnoses its absence, and a program without it is in every respect as correct as one with it.
 
@@ -108,7 +115,7 @@ Today all three are **contextual keywords** (Appendix B.1's contextual roster; A
 | `requires`, `ensures` | *"Opening a contract clause in the clause region of a method or constructor declaration (§22.16); the keyword reading always wins there"* | *"Anywhere else: as identifiers"* |
 | `invariant` | *"Member-leading position in a class body, optionally after `static` (§22.16)"* | *"Anywhere else: as an identifier"* |
 
-They move to Appendix B.1's **unconditionally reserved** list; their three B.2 rows delete. `old` and `result` **stay contextual** — they are clause-interior names, they collide with ordinary user vocabulary far more plausibly (`result` especially), and their contextuality is already handled by B.2's marker-wins wording without a seam.
+They become unconditionally reserved. The edit, stated precisely so the train makes all of it: **B.1 takes three edits in one subsection** — (1) the three words join the **Unconditionally reserved** list, (2) they leave the **Contextual (see §B.2)** list, and (3) they leave B.1's *opening-paragraph roster* as well (the parenthesized contextual-keyword enumeration in B.1's first paragraph repeats the list, and a word removed from the list but left in the roster would make B.1 disagree with itself). **B.2 deletes two rows, not three** — `requires` and `ensures` share a single row (as the table above shows), and `invariant` has its own. `old` and `result` **stay contextual** — they are clause-interior names, they collide with ordinary user vocabulary far more plausibly (`result` especially), and their contextuality is already handled by B.2's marker-wins wording without a seam.
 
 **What it buys.** Proposal 0055 §3's *first-statement collision* — a body whose first statement calls something named `requires` — becomes **impossible**, because nothing can be named `requires` any more. The clause region can no longer steal a statement under any spelling, at any member kind. This is the reason the parser never has to look at the blank line.
 
@@ -164,7 +171,7 @@ Each candidate is recorded with the exact ground on which it lost. This is the s
 
 Two variants: `do` admitted everywhere but never required; or `do` **required exactly when the member carries clauses** and forbidden otherwise.
 
-- **Optional-everywhere** creates two legal spellings for every member body in the language, forever. The documents must then either pick one (a de-facto migration, i.e. §5.1's cost paid slowly) or stay neutral (the reader's burden **grows** — both spellings must be learned, and a reader who sees `do` on one member and not the next must decide whether the difference means something). This is the shape proposal 0090 §4 costed as *"the worst long-run state; viable only as a never-finish migration"*, and the v0.246 **one-spelling-per-site** ruling (Q2, owner-ruled) rejected the analogous both-ways surface for the transfer marker at a cost of three corpus lines. Declining here is consistency with an owner-ruled precedent of this same programme.
+- **Optional-everywhere** creates two legal spellings for every member body in the language, forever. The documents must then either pick one (a de-facto migration, i.e. §5.1's cost paid slowly) or stay neutral (the reader's burden **grows** — both spellings must be learned, and a reader who sees `do` on one member and not the next must decide whether the difference means something). This is the shape proposal 0090 §4 costed as *"the worst long-run state; viable only as a never-finish migration"*, and the v0.246 **one-spelling-per-site** ruling (Q2, owner-ruled) rejected the analogous both-ways surface for the transfer marker at a cost of three corpus lines. Declining here is consistency with an owner-ruled precedent of this same programme — the precedent proposal 0102 §2 records for the redundant-marker question, and the two records cite each other (§10).
 - **Conditional-on-clauses** is worse in a specific way: it makes a member's *body syntax* depend on whether it carries contracts, so **adding a `requires` clause to an existing method becomes a breaking edit to its body** — you must also insert `do`. Contracts are meant to be addable to working code; a rule that makes adding one a two-place edit taxes exactly the practice §22.16 exists to encourage. It also gives the parser a mode (`in a clause-bearing member`) that the grammar does not otherwise have.
 - **Verdict: both declined.**
 

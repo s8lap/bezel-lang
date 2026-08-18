@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted (2026-07-07, delegated ruling — owner review pending) |
+| **Status** | accepted — accepted (2026-07-07, delegated ruling — owner review pending) |
 | **Tracking issue** | [#1458](https://github.com/s8lap/bezel-lang/issues/1458) |
 | **Target modules** | `System.Text` (§3, auto-imported): new `StringSplitCursor` class; `string` (§9.6): three new `SplitSpans` overloads |
 | **Written against** | spec v0.177 / stdlib v0.165 |

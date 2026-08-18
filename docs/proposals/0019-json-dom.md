@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Tracking issue** | [#1461](https://github.com/s8lap/bezel-lang/issues/1461) |
 | **Target module(s)** | new `System.Text.Json` (the module named-but-deferred in stdlib §11); relates to §2.14/§2.15 (the serialization vocabulary + JSON format agent) without extending them |
 | **Written against** | spec **v0.177** / stdlib **v0.165** |

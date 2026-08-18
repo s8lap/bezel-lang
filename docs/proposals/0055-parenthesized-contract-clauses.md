@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | superseded — graduated v0.207 (`d333aff`); impl delta tracked at the landing issue |
+| **Status** | graduated-v0.207 — superseded — graduated v0.207 (`d333aff`); impl delta tracked at the landing issue |
 | **Tracking issue** | [#2074](https://github.com/s8lap/bezel-lang/issues/2074) |
 | **Target** | Spec: §22.16 (all clause spellings and the body-less-closure rule), Appendix A.4 (`ContractClause`, `InvariantDecl`, `IfaceMethod`/`IfaceStaticMethod` body slots, the `MethodDecl` comment), Appendix B.2 (clause-region row wording), §22.4/§2.8.2 (the desugared `static ensures` spelling in examples), Appendix C.15; stdlib §2.17 (the one cross-reference row); guides: none (contracts are not yet taught there). Impl: the #2053 slice-1 parser + its tests (mechanical); slices 2+ (typing, lowering, carriage) are surface-independent and untouched. |
 | **Written against** | spec v0.205 |

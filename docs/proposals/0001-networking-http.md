@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Target modules** | `System.Net.Http` (this proposal); `System.Net` substrate specified in **proposal 0007** |
 | **Written against** | spec/stdlib **v0.179** (refreshed 2026-07-07 from the v0.156 draft) |
 | **Tracking issue** | [#1376](https://github.com/s8lap/bezel-lang/issues/1376) |

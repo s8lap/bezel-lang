@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | superseded — graduated v0.244 (owner-ruled 2026-08-11, all questions as recommended) |
+| **Status** | graduated-v0.244 — superseded — graduated v0.244 (owner-ruled 2026-08-11, all questions as recommended) |
 | **Tracking issue** | [#3049](https://github.com/s8lap/bezel-lang/issues/3049); fresh context: the v0.241 `ref _` ruling ([#2679](https://github.com/s8lap/bezel-lang/issues/2679) part B) |
 | **Target module(s)** | **spec** — §1.3 (the identifier rule), §17.13 (rewritten shorter; the recap subsection shrinks; the write-once corollary and the `var _ := 5; Console.WriteLine(_)` worked example delete), §21.1/§28.10 (`using var _` as the anonymous binding), §22.4 (`out var _` folds into `out _`), §27.3/§27.4 (lambda-parameter ignore), Appendix A (A.1 identifier note; `LocalDecl`, `ForStmt`, `LambdaParam` alternatives; A.4 `ArgExpression` comment), Appendix B.1 (`_` becomes a reserved token). **rationale** — §3.2 rewritten (its closing claim becomes true). **guides** — none (no guide teaches `var _`). |
 | **Written against** | spec/stdlib v0.241 |

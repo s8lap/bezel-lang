@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft |
+| **Status** | under-review — draft |
 | **Tracking issue** | — (none yet) |
 | **Target module(s)** | `System.IO.Compression` (new module; requires `import System.IO.Compression`) |
 | **Written against** | spec/stdlib **v0.227** |

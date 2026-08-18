@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft for owner review |
+| **Status** | under-review — Draft for owner review |
 | **Target module** | `System.Diagnostics` (a new §8.3, beside `Stopwatch`/`Debug`; requires `import System.Diagnostics`) |
 | **Written against** | spec v0.177 / stdlib v0.165 |
 | **Tracking issue** | [#1460](https://github.com/s8lap/bezel-lang/issues/1460) |
