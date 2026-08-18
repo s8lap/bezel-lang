@@ -255,7 +255,7 @@ def _read_rc_files(logdir):
     return out
 
 
-def account(logdir, conc, names, subset=False):
+def account(logdir, conc, names, subset=False, shard_timeout=None):
     """Compute run_parallel's full accounting from the structured JSON shard
     summaries + the rc files.
 
@@ -266,6 +266,12 @@ def account(logdir, conc, names, subset=False):
     line carry 'selected'" test, read from the run config that determined it
     (the JSON always carries a `selected` field, so it cannot itself distinguish
     list mode from a filter; the env config can, and does, cleanly).
+    `shard_timeout` (optional, narrow #3222) is the configured per-shard
+    ceiling in seconds (BEZEL_SHARD_TIMEOUT). When set, crashed shards with
+    rc in {124, 137} AND elapsed >= CEILING_KILL_THRESHOLD * shard_timeout
+    are reclassified into `timed_out_shards` instead of `crashed_shards`,
+    so the banner distinguishes a ceiling-kill (infra defect, fix the
+    ceiling) from a real crash (suite defect, fix the code).
 
     Faithful to run_parallel.sh:185-270: per-binary ran==expected (#1861),
     every-shard-printed-a-summary (#1861), empty-subset-never-a-pass (#2100).
@@ -280,6 +286,7 @@ def account(logdir, conc, names, subset=False):
     count_ok = 1
     summary_ok = 1
     crashed_shards = []
+    timed_out_shards = []
     missing_summary_shards = []
     undercount_bins = []
     global_selected = 0
@@ -293,16 +300,34 @@ def account(logdir, conc, names, subset=False):
         b_summaries = 0
         for i in range(conc):
             key = (name, i)
+            shard_id = "%s/%d" % (name, i)
             rc = rc_map.get(key, 1)
             if rc != 0:
                 shard_rc_ok = 0
-                crashed_shards.append("%s/%d" % (name, i))
+                # narrow #3222: classify ceiling-killed shards separately. A
+                # shard with rc in {124, 137} AND elapsed near the configured
+                # ceiling was killed by the timeout budget (an INFRA defect),
+                # NOT a generic crash (a SUITE defect). See
+                # extract_shard_elapsed / CEILING_KILL_THRESHOLD docstrings for
+                # why each side of that AND is load-bearing: 124 alone catches
+                # deadlocks that happened to outlive the ceiling; near-ceiling
+                # alone catches a real crash whose `timeout` rc got mangled by
+                # an unrelated layer. Both required.
+                elapsed = extract_shard_elapsed(logdir, shard_id) \
+                    if shard_timeout else None
+                if (shard_timeout and rc in _TIMEOUT_RCS
+                        and elapsed is not None
+                        and elapsed
+                            >= CEILING_KILL_THRESHOLD * shard_timeout):
+                    timed_out_shards.append(shard_id)
+                else:
+                    crashed_shards.append(shard_id)
             js = summaries.get(key)
             if js is None:
                 # No structured summary: the shard validated NONE of its slice
                 # (crashed before the write, or a path that exit()d the harness
                 # mid-loop). summary_ok below catches it unconditionally.
-                missing_summary_shards.append("%s/%d" % (name, i))
+                missing_summary_shards.append(shard_id)
                 continue
             b_summaries += 1
             b_pass += int(js.get("passed", 0))
@@ -365,6 +390,7 @@ def account(logdir, conc, names, subset=False):
         "summary_ok": bool(summary_ok),
         "integrity_ok": bool(integrity_ok),
         "crashed_shards": crashed_shards,
+        "timed_out_shards": timed_out_shards,
         "missing_summary_shards": missing_summary_shards,
         "undercount_bins": undercount_bins,
         "binaries": bin_rows,
@@ -397,7 +423,8 @@ def emit_shell(acc):
     lines.append("rp_count_ok=%s" % flag(acc["count_ok"]))
     lines.append("rp_summary_ok=%s" % flag(acc["summary_ok"]))
     lines.append("rp_integrity_ok=%s" % flag(acc["integrity_ok"]))
-    for key in ("crashed_shards", "missing_summary_shards", "undercount_bins"):
+    for key in ("crashed_shards", "timed_out_shards",
+                "missing_summary_shards", "undercount_bins"):
         vals = " ".join(_shell_quote(x) for x in acc[key])
         lines.append("rp_%s=(%s)" % (key, vals))
     rows = acc["binaries"]
@@ -457,6 +484,77 @@ _RUN_PREFIX_RE = re.compile(r'^\[ RUN')
 # `sed -E 's/^\[ RUN  \] //'` — strip the gtest "[ RUN  ] " marker (two spaces
 # before the bracket, matching test_main.cpp's exact emission).
 _RUN_CULPRIT_RE = re.compile(r'^\[ RUN  \] ')
+
+# narrow #3222: ceiling-killed shards were misattributed as coverage defects.
+#
+# A shard killed at the per-shard timeout ceiling (BEZEL_SHARD_TIMEOUT,
+# tests/run_parallel.sh:159 `timeout -k 10 "${BEZEL_SHARD_TIMEOUT:-300}" ...`)
+# writes neither JSON nor a legacy summary line — `timeout` kills the harness
+# before the atexit hook (test_main.cpp:281-318) prints them — so the gate
+# headline read "shard X printed NO completion summary (slice not validated)"
+# and pointed an operator at the coverage/accounting reader, which is the one
+# place the problem is not. cf84884 raised the ASan ceiling from 1800s to
+# 3600s (x2) so the workload clears it; this module classifies any
+# remaining timeout-kill as an INFRA defect (ceiling too low) distinct from
+# a SUITE defect (a shard crashed mid-test).
+#
+# Classification signal: `timeout` returns 124 (SIGTERM at the deadline) or
+# 137 (SIGKILL after the -k grace period — tests/run_parallel.sh:159 sets
+# `-k 10`) — both are ceiling-kills, neither is a real crash. The shard's
+# SHARD_ELAPSED marker (tests/run_parallel.sh:163-164) records the process
+# wall time; near the configured ceiling confirms the kill was a budget hit
+# rather than a deadlock (which would either hang indefinitely or be caught
+# by an earlier timeout exit and a much smaller elapsed). Threshold: 95%
+# of BEZEL_SHARD_TIMEOUT — gives 5% slack for the SHARD_ELAPSED marker's
+# 1s /proc/uptime resolution and the post-kill cleanup between `timeout`
+# SIGTERM and the subshell recording rc.
+#
+# `extract_shard_elapsed` mirrors the SHARD_ELAPSED grep at
+# tests/run_parallel.sh:163-164: the LAST matching line in the log wins
+# (matching the awk `tail -1` semantics in the original). Returns None on
+# a missing log or absent marker — the caller treats None as "could not
+# classify, leave in crashed_shards" (conservative: a missing elapsed
+# marker on an rc=124 shard might be an even rarer harness bug we do not
+# want to silently re-classify).
+_SHARD_ELAPSED_RE = re.compile(r"^SHARD_ELAPSED\s+([0-9]+(?:\.[0-9]+)?)\s*$")
+# Fraction of BEZEL_SHARD_TIMEOUT at (or above) which an rc=124/137 shard is
+# classified as a ceiling-kill rather than a generic crash. See comment
+# above for the rationale.
+CEILING_KILL_THRESHOLD = 0.95
+# exit codes `timeout` returns when it killed the process. 124 = SIGTERM at
+# the deadline; 137 = SIGKILL after the -k grace period
+# (tests/run_parallel.sh:159). Distinct from test-failure exit codes
+# (typically 1) and segfault/abort (139/134).
+_TIMEOUT_RCS = frozenset((124, 137))
+
+
+def extract_shard_elapsed(logdir, shard_id):
+    """The shard's recorded SHARD_ELAPSED wall time in seconds, or None.
+
+    Mirrors tests/run_parallel.sh:163-164: `grep -a -oE 'SHARD_ELAPSED [0-9.]+'
+    <log> | awk '{print $2}' | tail -1`. Returns None on a missing log,
+    an unreadable log, or no marker — a missing marker on a ceiling-killed
+    shard is rare and the caller conservatively leaves the shard in
+    crashed_shards rather than re-classify on incomplete evidence."""
+    name, sep, idx_s = shard_id.partition('/')
+    if not sep:
+        return None
+    path = os.path.join(logdir, 'shard.{}.{}.log'.format(name, idx_s))
+    last = None
+    try:
+        with open(path, errors='replace') as f:
+            for line in f:
+                m = _SHARD_ELAPSED_RE.match(line)
+                if m:
+                    last = m.group(1)
+    except OSError:
+        return None  # mirrors `2>/dev/null` — a missing log reads as no marker
+    if last is None:
+        return None
+    try:
+        return float(last)
+    except ValueError:
+        return None
 
 
 def extract_crash_culprit(logdir, shard_id):
@@ -551,7 +649,7 @@ def format_phantom_warning(listed, selected):
 
 def format_failure_banner(ran, expected, nbin, undercount_bins, subset_empty,
                           missing_summary_shards, njobs, crashed_culprits,
-                          crashed_log_failures=None):
+                          crashed_log_failures=None, timed_out_shards=None):
     """The GATE FAILURE banner, byte-identical to run_parallel.sh:298-317, or
     '' when integrity is ok.
 
@@ -571,13 +669,28 @@ def format_failure_banner(ran, expected, nbin, undercount_bins, subset_empty,
     emitted — the new line is conditional, so the existing banner is
     byte-identical for the common no-FAIL case.
 
+    `timed_out_shards` (optional, narrow #3222) is the list of shard_ids that
+    account() reclassified as ceiling-killed (rc in {124,137} AND elapsed
+    near BEZEL_SHARD_TIMEOUT). They are surfaced as a SEPARATE block BEFORE
+    the generic "exited nonzero" block, with wording that names the defect
+    class — "shard TIMED OUT at the configured ceiling" — so an operator
+    reading the banner knows to fix the ceiling (BEZEL_SHARD_TIMEOUT / the
+    ASan multiplier in scripts/gate.sh:650) rather than chase the reader.
+    The "died on:" attribution is intentionally suppressed for these
+    shards: a timed-out shard's "last [ RUN ]" is the test in flight when
+    the clock ran out — a misattribution (#1608) that reads as a real
+    culprit and would point the operator at the wrong place. When
+    timed_out_shards is None or empty (the pre-#3222 shape), the banner is
+    byte-identical for the no-real-defect case.
+
     Returns '' when no integrity defect is present — the bash `if` guard maps
     exactly (any crashed shard, any undercount bin, any missing-summary shard,
     or subset-empty; count_ok==0 and summary_ok==0 are equivalent to those
     lists being non-empty, see account()).
     """
     has_defect = bool(crashed_culprits or undercount_bins
-                      or missing_summary_shards or subset_empty)
+                      or missing_summary_shards or subset_empty
+                      or timed_out_shards)
     if not has_defect:
         return ""
     lines = [
@@ -586,6 +699,18 @@ def format_failure_banner(ran, expected, nbin, undercount_bins, subset_empty,
         ("##   ran %d of %d expected tests (%d unaccounted) across %d binaries"
          % (ran, expected, expected - ran, nbin)),
     ]
+    # narrow #3222: surface ceiling-killed shards FIRST with their own
+    # distinct wording. The reader needs to see "TIMED OUT at ceiling" before
+    # the generic "exited nonzero" block, because the action is different:
+    # raise the ceiling (or shorten the suite), not chase the reader.
+    if timed_out_shards:
+        lines.append("##   %d shard(s) hit the configured per-shard ceiling "
+                     "(BEZEL_SHARD_TIMEOUT) — ceiling-killed, NOT a test crash."
+                     % len(timed_out_shards))
+        lines.append("##   shard(s) TIMED OUT at ceiling: %s"
+                     "  (raise BEZEL_SHARD_TIMEOUT or the ASan multiplier in"
+                     " scripts/gate.sh:650; the test runner itself was healthy)"
+                     % " ".join(timed_out_shards))
     for u in undercount_bins:
         lines.append("##   UNDERCOUNT %s" % u)
     if subset_empty:
@@ -654,11 +779,17 @@ def _main_account(argv):
                    help="per-binary shard count (run_parallel's resource cap)")
     p.add_argument("--subset", action="store_true",
                    help="BEZEL_TEST_LIST mode: expected = selected, not registry")
+    p.add_argument("--shard-timeout", type=int, default=None,
+                   help="per-shard ceiling in seconds (BEZEL_SHARD_TIMEOUT). "
+                        "When set, rc=124/137 shards with elapsed >= "
+                        "95%% of this are reclassified as timed_out_shards "
+                        "(ceiling-killed, #3222) rather than crashed_shards.")
     p.add_argument("--run-summary", default=None,
                    help="also write the merged run-summary JSON to PATH")
     p.add_argument("names", nargs="*", help="binary labels run_parallel launched")
     args = p.parse_args(argv)
-    acc = account(args.logdir, args.conc, args.names, subset=args.subset)
+    acc = account(args.logdir, args.conc, args.names, subset=args.subset,
+                  shard_timeout=args.shard_timeout)
     if args.run_summary:
         write_run_summary(args.run_summary, acc)
     sys.stdout.write(emit_shell(acc) + "\n")
@@ -710,6 +841,13 @@ def _main_format_failure(argv):
                    help="shard IDs (name/idx) that printed no summary")
     p.add_argument("--crashed", nargs="*", default=[],
                    help="shard IDs (name/idx) that exited nonzero")
+    # narrow #3222: ceiling-killed shards are passed separately so the banner
+    # surfaces them with their own wording ("TIMED OUT at ceiling") BEFORE the
+    # generic "exited nonzero" block. Empty list is the pre-#3222 shape —
+    # banner stays byte-identical.
+    p.add_argument("--timed-out", nargs="*", default=[],
+                   help="shard IDs (name/idx) reclassified as ceiling-killed "
+                        "(rc in {124,137} AND elapsed near BEZEL_SHARD_TIMEOUT)")
     p.add_argument("--logdir", required=True,
                    help="run_parallel shard logdir (shard.<name>.<i>.log)")
     args = p.parse_args(argv)
@@ -723,7 +861,8 @@ def _main_format_failure(argv):
     text = format_failure_banner(
         args.ran, args.expected, args.nbin, args.undercount,
         bool(args.subset_empty), args.missing_summary, args.njobs,
-        crashed_culprits, crashed_log_failures)
+        crashed_culprits, crashed_log_failures,
+        timed_out_shards=args.timed_out)
     if text:
         sys.stdout.write(text + "\n")
     return 0

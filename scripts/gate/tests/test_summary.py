@@ -229,10 +229,18 @@ class _Fixture(unittest.TestCase):
 
     def _shard(self, logdir, name, idx, passed, failed, total,
                selected=None, rc=0, schema=summary.SCHEMA, write_json=True,
-               write_log=True, legacy_extra=""):
+               write_log=True, legacy_extra="", shard_elapsed=None):
         """Write one shard's rc, JSON, and legacy log line. `selected=None`
         means non-subset (no 'selected' in the legacy line); an int means
-        subset mode (the line carries ', N selected')."""
+        subset mode (the line carries ', N selected').
+
+        `shard_elapsed` (optional, narrow #3222) appends a `SHARD_ELAPSED <s>`
+        marker to the legacy log — mirrors tests/run_parallel.sh:163-164.
+        Used by the timeout-classification tests to build the "killed at
+        ceiling" shape that distinguishes infra-defect from suite-defect.
+        When `shard_elapsed` is set the log is written even if `write_log`
+        is False — the marker is the only signal extract_shard_elapsed has,
+        and the timeout tests need it even on dead shards."""
         self._rc(logdir, name, idx, rc)
         if write_json:
             obj = {"schema": schema, "binary": "bin/" + name,
@@ -240,7 +248,8 @@ class _Fixture(unittest.TestCase):
                    "passed": passed, "failed": failed, "total": total,
                    "selected": selected if selected is not None else total,
                    "asan_mode": False, "rc": (0 if failed == 0 else 1),
-                   "elapsed_s": 1.0}
+                   "elapsed_s": (shard_elapsed if shard_elapsed is not None
+                                  else 1.0)}
             _write_json(logdir, name, idx, obj)
         if write_log:
             line = "{} passed, {} failed (shard {}/4), {} total".format(
@@ -248,7 +257,16 @@ class _Fixture(unittest.TestCase):
             if selected is not None:
                 line = "{} passed, {} failed, {} selected, {} total".format(
                     passed, failed, selected, total)
-            _write_log(logdir, name, idx, legacy_extra + line + "\n")
+            extra = legacy_extra
+            if shard_elapsed is not None:
+                extra = extra + "SHARD_ELAPSED {:.2f}\n".format(shard_elapsed)
+            _write_log(logdir, name, idx, extra + line + "\n")
+        elif shard_elapsed is not None:
+            # No legacy line (dead shard) but the SHARD_ELAPSED marker must
+            # still land — extract_shard_elapsed reads only the log. Write a
+            # log carrying JUST the marker, no legacy summary line.
+            _write_log(logdir, name, idx,
+                       "SHARD_ELAPSED {:.2f}\n".format(shard_elapsed))
 
     def _legacy_account(self, logdir, conc, names, subset):
         """Reference impl of run_parallel.sh:185-270 (the grep path), via the
@@ -901,12 +919,335 @@ class FormatCLITest(unittest.TestCase):
             self.assertIn("died on: Second.test", out.stdout)
 
     def test_format_failure_cli_no_defect_emits_nothing(self):
+        # Per #3012 / Phase 2c: the bash `[[ -n "$_rp_py_failure" ]]` guard
+        # only prints when there is a defect. The CLI must return "" for a
+        # no-defect invocation so the guard never fires spuriously.
         with tempfile.TemporaryDirectory() as d:
             out = self._run_cli(
                 ["format-failure", "--ran", "10", "--expected", "10",
                  "--nbin", "2", "--njobs", "4", "--logdir", d])
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertEqual(out.stdout, "")
+
+
+class ExtractShardElapsedTest(unittest.TestCase):
+    """extract_shard_elapsed mirrors the SHARD_ELAPSED grep at
+    tests/run_parallel.sh:163-164 (narrow #3222). Returns the LAST matching
+    line's float value — matching the `awk tail -1` semantics in the original
+    so a shard's recorded wall time is recoverable even if the harness printed
+    the marker twice (once in a setup hook, once at exit).
+    """
+
+    def test_returns_last_marker_when_present_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "12 passed\nSHARD_ELAPSED 3.14\n")
+            self.assertEqual(
+                summary.extract_shard_elapsed(d, "codegen/0"), 3.14)
+
+    def test_returns_last_marker_when_present_multiple_times(self):
+        # awk 'tail -1' — a stray earlier marker must not win.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0,
+                       "SHARD_ELAPSED 1.00\n12 passed\nSHARD_ELAPSED 2.50\n")
+            self.assertEqual(
+                summary.extract_shard_elapsed(d, "codegen/0"), 2.50)
+
+    def test_missing_log_returns_none(self):
+        # Mirrors `2>/dev/null` — a missing log reads as no marker.
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(
+                summary.extract_shard_elapsed(d, "codegen/9"))
+
+    def test_no_marker_returns_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "12 passed, 0 failed\n")
+            self.assertIsNone(
+                summary.extract_shard_elapsed(d, "codegen/0"))
+
+    def test_malformed_shard_id_returns_none(self):
+        # partition('/') finds no '/' — defensive guard (caller always passes
+        # name/idx, but the function must not crash on bad input).
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(summary.extract_shard_elapsed(d, "nodash"))
+
+    def test_malformed_marker_returns_none(self):
+        # `SHARD_ELAPSED abc` — non-numeric marker is unusable, returns None
+        # rather than raising (the caller's "conservatively leave in
+        # crashed_shards" rule then applies).
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "SHARD_ELAPSED abc\n")
+            self.assertIsNone(
+                summary.extract_shard_elapsed(d, "codegen/0"))
+
+
+class TimeoutClassificationTest(_Fixture):
+    """Narrow #3222: a shard with rc in {124,137} AND SHARD_ELAPSED near the
+    configured ceiling is reclassified as `timed_out_shards` (a CEILING KILL —
+    an INFRA defect, fix the ceiling) rather than `crashed_shards` (a SUITE
+    defect, fix the test). The two sides of that AND are each load-bearing:
+
+      - rc in {124,137} alone catches every `timeout`-killed shard, including
+        deadlocks that happened to outlive the ceiling (those are real crashes
+        that the timeout happens to catch). Without the elapsed check, a
+        deadlock at second 30 of a 3600s ASan ceiling would be misclassified
+        as a ceiling kill.
+      - elapsed >= 0.95*ceiling alone would silently reclassify any rc=124
+        shard regardless of WHY it took that long — including a real crash
+        whose `timeout` rc got mangled by an unrelated layer.
+
+    Together they isolate the genuine "budget exceeded" case.
+    """
+
+    def test_rc124_with_elapsed_near_ceiling_is_timed_out(self):
+        # The headline shape: ASan shard hit 1795s of a 1800s ceiling.
+        with tempfile.TemporaryDirectory() as d:
+            self._shard(d, "codegen", 0, 5, 0, 20)
+            self._shard(d, "codegen", 1, 0, 0, 0,
+                        write_json=False, write_log=False,
+                        rc=124, shard_elapsed=1795.0)
+            self._shard(d, "codegen", 2, 5, 0, 20)
+            self._shard(d, "codegen", 3, 5, 0, 20)
+            acc = summary.account(d, 4, ["codegen"], shard_timeout=1800)
+            self.assertEqual(acc["timed_out_shards"], ["codegen/1"])
+            self.assertEqual(acc["crashed_shards"], [])
+            self.assertIn("codegen/1", acc["missing_summary_shards"])
+
+    def test_rc124_with_elapsed_far_below_ceiling_is_still_a_crash(self):
+        # The deadlock shape: rc=124 came from `timeout`, but the shard only
+        # ran 30 seconds. This is a real crash (a deadlock that happens to
+        # outlive a tight ceiling, or any other early-death that `timeout`
+        # catches) — must NOT be reclassified as a ceiling kill.
+        with tempfile.TemporaryDirectory() as d:
+            self._shard(d, "codegen", 0, 5, 0, 20)
+            self._shard(d, "codegen", 1, 0, 0, 0,
+                        write_json=False, write_log=False,
+                        rc=124, shard_elapsed=30.0)
+            acc = summary.account(d, 2, ["codegen"], shard_timeout=1800)
+            self.assertEqual(acc["timed_out_shards"], [])
+            self.assertEqual(acc["crashed_shards"], ["codegen/1"])
+
+    def test_rc137_with_elapsed_near_ceiling_is_timed_out(self):
+        # `timeout -k 10` (tests/run_parallel.sh:159) SIGKILLs after the grace
+        # period, returning 137. Same classification rule applies — this is a
+        # ceiling kill, the shard was alive but slow.
+        with tempfile.TemporaryDirectory() as d:
+            self._shard(d, "codegen", 0, 0, 0, 0,
+                        write_json=False, write_log=False,
+                        rc=137, shard_elapsed=1805.0)
+            acc = summary.account(d, 1, ["codegen"], shard_timeout=1800)
+            self.assertEqual(acc["timed_out_shards"], ["codegen/0"])
+            self.assertEqual(acc["crashed_shards"], [])
+
+    def test_rc139_with_elapsed_near_ceiling_is_a_crash(self):
+        # Segfault (rc=139) — even if the elapsed is suspiciously close to the
+        # ceiling, rc=139 is NOT a timeout exit code. The ceiling
+        # classification must NOT swallow a real segfault.
+        with tempfile.TemporaryDirectory() as d:
+            self._shard(d, "codegen", 0, 0, 0, 0,
+                        write_json=False, write_log=False,
+                        rc=139, shard_elapsed=1799.5)
+            acc = summary.account(d, 1, ["codegen"], shard_timeout=1800)
+            self.assertEqual(acc["timed_out_shards"], [])
+            self.assertEqual(acc["crashed_shards"], ["codegen/0"])
+
+    def test_rc1_with_elapsed_near_ceiling_is_a_crash(self):
+        # Test failure (rc=1) — even if the run took near-ceiling time, a
+        # test-failure exit is NOT a timeout. A genuine test failure takes
+        # the whole slice to manifest.
+        with tempfile.TemporaryDirectory() as d:
+            self._shard(d, "codegen", 0, 0, 0, 0,
+                        write_json=False, write_log=False,
+                        rc=1, shard_elapsed=1800.0)
+            acc = summary.account(d, 1, ["codegen"], shard_timeout=1800)
+            self.assertEqual(acc["timed_out_shards"], [])
+            self.assertEqual(acc["crashed_shards"], ["codegen/0"])
+
+    def test_rc124_below_95_percent_of_ceiling_stays_a_crash(self):
+        # The 0.95 threshold (CEILING_KILL_THRESHOLD) — 95% gives 5% slack
+        # for the SHARD_ELAPSED marker's 1s /proc/uptime resolution and the
+        # post-kill cleanup between `timeout` SIGTERM and the subshell
+        # recording rc. A shard that died at 94% of the ceiling is most
+        # likely a real crash that happened to take ~ceiling time, not a
+        # ceiling hit.
+        with tempfile.TemporaryDirectory() as d:
+            self._shard(d, "codegen", 0, 0, 0, 0,
+                        write_json=False, write_log=False,
+                        rc=124, shard_elapsed=1700.0)  # 94.4% of 1800
+            acc = summary.account(d, 1, ["codegen"], shard_timeout=1800)
+            self.assertEqual(acc["timed_out_shards"], [])
+            self.assertEqual(acc["crashed_shards"], ["codegen/0"])
+
+    def test_no_shard_timeout_keeps_pre_3222_behaviour(self):
+        # shard_timeout=None (the pre-#3222 default) — every rc!=0 shard goes
+        # to crashed_shards, including rc=124. Back-compat pin: the new
+        # classification is opt-in by virtue of the caller passing the
+        # ceiling, so a call site that doesn't is unaffected.
+        with tempfile.TemporaryDirectory() as d:
+            self._shard(d, "codegen", 0, 0, 0, 0,
+                        write_json=False, write_log=False,
+                        rc=124, shard_elapsed=1800.0)
+            acc = summary.account(d, 1, ["codegen"], shard_timeout=None)
+            self.assertEqual(acc["timed_out_shards"], [])
+            self.assertEqual(acc["crashed_shards"], ["codegen/0"])
+
+    def test_rc124_without_elapsed_marker_stays_a_crash(self):
+        # A missing SHARD_ELAPSED marker on an rc=124 shard is rare; the
+        # conservative rule is to leave it in crashed_shards (rather than
+        # reclassify on incomplete evidence). Pin the rule.
+        with tempfile.TemporaryDirectory() as d:
+            self._shard(d, "codegen", 0, 0, 0, 0,
+                        write_json=False, write_log=False,
+                        rc=124, shard_elapsed=None)
+            # write_log=False above also drops the legacy line; with no log
+            # at all extract_shard_elapsed returns None. Reconstruct a log
+            # that has the legacy summary but no SHARD_ELAPSED marker.
+            _write_log(d, "codegen", 0, "0 passed, 0 failed (shard 0/1), 1 total\n")
+            acc = summary.account(d, 1, ["codegen"], shard_timeout=1800)
+            self.assertEqual(acc["timed_out_shards"], [])
+            self.assertEqual(acc["crashed_shards"], ["codegen/0"])
+
+    def test_multiple_ceiling_kills_all_listed(self):
+        # All-codegen-shards-killed-at-ceiling shape — the one that motivated
+        # cf84884. Every shard in the list, every one reclassified.
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(4):
+                self._shard(d, "codegen", i, 0, 0, 0,
+                            write_json=False, write_log=False,
+                            rc=124, shard_elapsed=1800.0)
+            acc = summary.account(d, 4, ["codegen"], shard_timeout=1800)
+            self.assertEqual(
+                acc["timed_out_shards"],
+                ["codegen/0", "codegen/1", "codegen/2", "codegen/3"])
+            self.assertEqual(acc["crashed_shards"], [])
+
+
+class TimedOutBannerSectionTest(unittest.TestCase):
+    """Narrow #3222: the GATE FAILURE banner surfaces ceiling-killed shards in
+    a DISTINCT block ("TIMED OUT at ceiling") before the generic
+    "exited nonzero" block, with wording that names the defect class so an
+    operator reads "fix the ceiling" rather than "chase the test reader".
+
+    Pin: when timed_out_shards is empty (the pre-#3222 shape), the banner is
+    byte-identical for the no-real-defect case.
+    """
+
+    def test_timed_out_section_surfaces_count_and_list(self):
+        out = summary.format_failure_banner(
+            ran=10, expected=10, nbin=2, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=8,
+            crashed_culprits=[],
+            timed_out_shards=["codegen/0", "codegen/1", "codegen/2",
+                              "codegen/3", "codegen/4", "codegen/5",
+                              "codegen/6", "codegen/7"])
+        # The defect class is named up front — operator sees "TIMED OUT at
+        # ceiling" before "exited nonzero".
+        self.assertIn("##   8 shard(s) hit the configured per-shard ceiling",
+                      out)
+        self.assertIn("##   shard(s) TIMED OUT at ceiling: "
+                      "codegen/0 codegen/1 codegen/2 codegen/3 "
+                      "codegen/4 codegen/5 codegen/6 codegen/7", out)
+        # The "raise BEZEL_SHARD_TIMEOUT" hint names the action — narrow
+        # #3222 explicitly required the operator-actionable wording.
+        self.assertIn("raise BEZEL_SHARD_TIMEOUT", out)
+        # No spurious "exited nonzero" lines — timed_out_shards don't carry
+        # a died-on attribution (a misattribution per #1608).
+        self.assertNotIn("exited nonzero", out)
+        self.assertNotIn("died on:", out)
+
+    def test_no_timed_out_shards_omits_section(self):
+        # timed_out_shards=None (default) — banner stays byte-identical for
+        # the no-real-defect case. Pin: existing consumers see no change.
+        out_none = summary.format_failure_banner(
+            ran=10, expected=10, nbin=2, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=8,
+            crashed_culprits=[])
+        out_empty = summary.format_failure_banner(
+            ran=10, expected=10, nbin=2, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=8,
+            crashed_culprits=[], timed_out_shards=[])
+        self.assertEqual(out_none, "")
+        self.assertEqual(out_empty, "")
+        self.assertNotIn("TIMED OUT", out_none)
+        self.assertNotIn("TIMED OUT", out_empty)
+
+    def test_timed_out_and_real_crash_both_surfaced(self):
+        # Mixed defect shape — some shards ceiling-killed, one segfault.
+        # The banner names BOTH distinctly: ceiling-kills first (operator
+        # action: raise the ceiling), then the segfault (operator action:
+        # investigate the test).
+        out = summary.format_failure_banner(
+            ran=10, expected=20, nbin=2, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=8,
+            crashed_culprits=[("sema/0", "SuiteA.qux")],
+            timed_out_shards=["codegen/0", "codegen/1"])
+        # TIMED OUT block comes BEFORE the "exited nonzero" block — order
+        # is a contract, see the format_failure_banner docstring.
+        idx_timed = out.index("TIMED OUT at ceiling:")
+        idx_died = out.index("died on:")
+        self.assertLess(idx_timed, idx_died,
+                        "TIMED OUT section must surface before died-on section")
+        # Both lists named.
+        self.assertIn("codegen/0 codegen/1", out)
+        self.assertIn("died on: SuiteA.qux", out)
+
+
+class TimeoutCLITest(_Fixture):
+    """The new --shard-timeout arg on `account` and --timed-out arg on
+    `format-failure`. Pins the CLI plumbing that tests/run_parallel.sh uses
+    (the comment on the new arg in summary.py calls these out)."""
+
+    _SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+    def _run_cli(self, args):
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=os.path.abspath(self._SCRIPTS_DIR))
+        return subprocess.run([sys.executable, "-m", "gate.summary"] + args,
+                              capture_output=True, text=True, env=env)
+
+    def test_account_cli_emits_timed_out_shards_list(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._shard(d, "codegen", 0, 0, 0, 0,
+                        write_json=False, write_log=False,
+                        rc=124, shard_elapsed=1800.0)
+            out = self._run_cli(
+                ["account", d, "--conc", "1", "--shard-timeout", "1800",
+                 "--", "codegen"])
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("rp_timed_out_shards=('codegen/0')", out.stdout)
+            self.assertIn("rp_crashed_shards=()", out.stdout)
+
+    def test_account_cli_without_shard_timeout_keeps_pre_3222(self):
+        with tempfile.TemporaryDirectory() as d:
+            self._shard(d, "codegen", 0, 0, 0, 0,
+                        write_json=False, write_log=False,
+                        rc=124, shard_elapsed=1800.0)
+            out = self._run_cli(
+                ["account", d, "--conc", "1", "--", "codegen"])
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("rp_timed_out_shards=()", out.stdout)
+            self.assertIn("rp_crashed_shards=('codegen/0')", out.stdout)
+
+    def test_format_failure_cli_with_timed_out_emits_section(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "SHARD_ELAPSED 1800.00\n")
+            out = self._run_cli([
+                "format-failure", "--ran", "8", "--expected", "10",
+                "--nbin", "1", "--njobs", "2",
+                "--timed-out", "codegen/0", "--logdir", d])
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("TIMED OUT at ceiling", out.stdout)
+            self.assertIn("codegen/0", out.stdout)
+
+    def test_format_failure_cli_without_timed_out_omits_section(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "[ RUN  ] Last.Run\n")
+            out = self._run_cli([
+                "format-failure", "--ran", "8", "--expected", "10",
+                "--nbin", "1", "--njobs", "2",
+                "--crashed", "codegen/0", "--logdir", d])
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("died on: Last.Run", out.stdout)
+            self.assertNotIn("TIMED OUT", out.stdout)
 
 
 if __name__ == "__main__":

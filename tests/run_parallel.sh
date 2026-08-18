@@ -212,6 +212,12 @@ _account_subset=0
 # the per-shard JSONs live in $logdir and are reaped on a clean exit).
 _account_args=(gate.summary account "$logdir" --conc "$conc")
 [[ "$_account_subset" -eq 1 ]] && _account_args+=(--subset)
+# narrow #3222: pass the configured per-shard ceiling so account() can classify
+# timeout-killed shards (rc in {124,137} AND elapsed near the ceiling) into
+# `timed_out_shards` rather than `crashed_shards`. Empty/zero leaves the
+# pre-#3222 behaviour (a timed-out shard reads as a generic crash) — this
+# matches the unit tests that don't care about the ceiling classification.
+[[ -n "${BEZEL_SHARD_TIMEOUT:-}" ]] && _account_args+=(--shard-timeout "$BEZEL_SHARD_TIMEOUT")
 [[ -n "${BEZEL_RUN_SUMMARY:-}" ]] && _account_args+=(--run-summary "$BEZEL_RUN_SUMMARY")
 _account_args+=(-- "${names[@]}")
 if ! _rp_out=$(PYTHONPATH="$repo_root/scripts" python3 -m "${_account_args[@]}" 2>"$logdir/account.err"); then
@@ -252,6 +258,10 @@ ran=$rp_ran
 expected_all=$rp_expected_all
 registry_all=$rp_registry_all
 crashed_shards=("${rp_crashed_shards[@]}")
+# narrow #3222: ceiling-killed shards are sourced from the same rp_* eval
+# (account() emits rp_timed_out_shards=(...)). Empty when no shard tripped
+# the ceiling — the banner omits the section entirely in that case.
+timed_out_shards=("${rp_timed_out_shards[@]:-}")
 missing_summary_shards=("${rp_missing_summary_shards[@]}")
 undercount_bins=("${rp_undercount_bins[@]}")
 declare -a bin_pass bin_fail bin_expected bin_registry
@@ -269,6 +279,14 @@ subset_empty=$rp_subset_empty
 # but it surfaces a crash immediately, ahead of the banner below).
 for _cs in "${crashed_shards[@]:-}"; do
     [[ -n "$_cs" ]] && echo "shard $_cs exited nonzero (crash or test failure)" >&2
+done
+# narrow #3222: surface ceiling-killed shards distinctly (the ASan ceiling
+# is the most likely reason for a shard dying in a healthy suite — see the
+# gate.sh:650 multiplier). The wording differs from the generic crash line
+# above so an operator scanning stderr knows it is an INFRA defect (raise
+# the ceiling), not a SUITE defect (chase the test).
+for _ts in "${timed_out_shards[@]:-}"; do
+    [[ -n "$_ts" ]] && echo "shard $_ts TIMED OUT at the per-shard ceiling (BEZEL_SHARD_TIMEOUT=#3222)" >&2
 done
 
 end=$(date +%s)
@@ -315,6 +333,7 @@ _rp_py_failure="$(PYTHONPATH="$repo_root/scripts" python3 -m gate.summary format
     --undercount "${undercount_bins[@]}" \
     --missing-summary "${missing_summary_shards[@]}" \
     --crashed "${crashed_shards[@]}" \
+    --timed-out "${timed_out_shards[@]:-}" \
     --logdir "$logdir")"
 [[ -n "$_rp_py_failure" ]] && printf '%s\n' "$_rp_py_failure"
 
