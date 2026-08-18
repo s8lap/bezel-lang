@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.247.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.257.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning (§2's trivial-dispose classes excepted). A use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -42,7 +42,7 @@ There is really only one disposal mechanism. At the end of a scope, every owned 
 | `using var x := …` | at scope end, every exit path | says nothing — you declared the intent |
 | plain `var x := …`, never moved on | at scope end (auto-drop) | **warns** at the drop — "did you mean to let this go?" |
 | `x.Dispose();` | right there, early | says nothing — the scope-end pass skips it |
-| `_ := x;` | right there, and ends the binding | says nothing — the discard is the announcement |
+| `_ := x;` | right there, and ends the binding | says nothing — the discard is the target announcement (spec §28.3) |
 
 `using var` is the default: *lives and dies here.* Plain `var` is for a value whose ownership will **move on** — a factory result you return, an accumulator, the best-so-far in a loop. The must-use warning then marks any path where it silently *doesn't* move on, so a leak is never quiet. An explicit `.Dispose()` is for an **early or conditional** release inside a longer scope. `_ := x;` disposes an unwanted owned value immediately (§9).
 
@@ -374,7 +374,7 @@ using var l := move line;         // warning-free
 yield return l;
 ```
 
-In a *borrowing* iterator the bare `yield return line;` also compiles (it re-borrows the frame-resident value) but leaves the must-use warning on `line`. In an *owning* iterator that bare yield instead *consumes* `line` — the owning return type is the announcement, so no marker is needed.
+In a *borrowing* iterator the bare `yield return line;` also compiles (it re-borrows the frame-resident value) but leaves the must-use warning on `line`. In an *owning* iterator that bare yield instead *consumes* `line` — the owning return type is the target announcement, so no marker is needed.
 
 **Frame-disposed `owned` parameters — adopt on entry.** An `owned` parameter of an iterator or async method is disposed by the frame at teardown, but the must-use warning still fires at the parameter; `using var r := move reader;` on the first line declares the intent and silences it.
 
@@ -390,7 +390,7 @@ case Connect(host) of                 // fresh call: owning match
 end;
 ```
 
-**Three one-line rules.** First: `_ := x;` disposes `x` *now* and ends the binding — an announced consume, no marker. Afterward `x` is treated exactly as after an explicit `.Dispose()`, so a later read is flagged the same way: a straight-line read is a must-use warning plus a checked-mode fault, while a read after a *conditional* discard — one branch consumed, another still owning — is a compile error at the merge (see Guide 2 §6). Second: a **closure** may *read* a captured owned value but never dispose, reassign, or move it out; a callback that must consume takes an `owned` parameter. Third: `Dispose()` needs a receiver you *own* — disposing a borrowed parameter, `this`, or a borrowed element is a compile error, with no exception (the owner disposes it). If a collection's elements are yours to dispose, say so in the type: an owning-family collection cascades on `Dispose()`, and selective cleanup takes elements out first (`Drain()`, `Pop*`, `move coll[i]`) into bindings you own.
+**Three one-line rules.** First: `_ := x;` disposes `x` *now* and ends the binding — a target-announced consume, no marker. Afterward `x` is treated exactly as after an explicit `.Dispose()`, so a later read is flagged the same way: a straight-line read is a must-use warning plus a checked-mode fault, while a read after a *conditional* discard — one branch consumed, another still owning — is a compile error at the merge (see Guide 2 §6). Second: a **closure** may *read* a captured owned value but never dispose, reassign, or move it out; a callback that must consume takes an `owned` parameter. Third: `Dispose()` needs a receiver you *own* — disposing a borrowed parameter, `this`, or a borrowed element is a compile error, with no exception (the owner disposes it). If a collection's elements are yours to dispose, say so in the type: an owning-family collection cascades on `Dispose()`, and selective cleanup takes elements out first (`Drain()`, `Pop*`, `move coll[i]`) into bindings you own.
 
 ---
 

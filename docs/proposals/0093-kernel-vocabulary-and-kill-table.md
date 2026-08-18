@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted — ruled under the owner's 2026-08-18 delegation; awaiting graduation train |
+| **Status** | graduated-v0.257 — superseded — graduated v0.257 (ruled under the owner's 2026-08-18 delegation; one train with proposal 0095, the §35.4 single-edit guard composing the two — census-first written directly in the holds-borrows name; acceptance tests passed cell-for-cell at the train's HEAD) |
 | **Tracking issue** | coordinator files |
 | **Target module(s)** | **spec** — §28.3 (the kernel: K3.13, K4, K4.2, K5, K5.1–K5.7, K6.2, K2.4; the axiom register's A2/A4/A7 rows; *Move semantics for owned locals*; *The consume-site freeze*; *Owned-local discharge requirement*; the *Choosing a disposal form* recap table), §17.13, §22.3, §23.3, §28.7, §28.8.1, §28.9, §28.11, §28.14, §29.2, §30.5, §30.12, §31.1, §35.4, §35.5, Appendix A (the two indented commentary lines at A-grammar `MoveExpr`/field-path notes), Appendix C.3/C.6; **rationale** — §3.10, §5.1, §5.10, §5.23, §5.26, §5.28, §12.10 (the announcement-doctrine paragraphs); **stdlib** — §1, §6.8, §6.12, §4.19 (six announcement sentences); **guides** — 01 (4 sites), 04 (4 sites), 05 (1 site). Doc-only: **no semantics move.** |
 | **Written against** | spec/stdlib/rationale/guides **v0.255** (git `5fa5a95b`, snapshot taken 2026-08-18). Every count in this document is measured against that snapshot unless marked otherwise; line numbers cited are snapshot line numbers and are given only as drafting aids, never as citations. |

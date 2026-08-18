@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.252.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.257.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A **task is a heap resource you own**, like every other class instance (§2). **No mutable state is ever reachable from two domains** — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a **structured scope**, not loose tasks (§4). If you skim everything else, read the three sections headed **How Bezel does it** and the table in §10.
 
@@ -42,7 +42,7 @@ The blocking forms remain fully legal *outside* any domain: the synchronous pref
 
 ## 2. How Bezel does it: a task is a resource you own
 
-Elsewhere a task is garbage-collected plumbing you may freely drop. In Bezel a task is a class instance with a disposal obligation, and one rule from Guide 1 §4 governs where the obligation lands: **calls mint, storage lends** (spec §28.3, v0.190). Every call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` produces a *fresh task owned by you* — no `owned` marker needed, the return type is the announcement. A read of task *storage* (a `TaskCompletionSource.Task` property, an admitted static cache) lends a borrow.
+Elsewhere a task is garbage-collected plumbing you may freely drop. In Bezel a task is a class instance with a disposal obligation, and one rule from Guide 1 §4 governs where the obligation lands: **calls mint, storage lends** (spec §28.3, v0.190). Every call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` produces a *fresh task owned by you* — no `owned` marker needed, the return type is the type announcement (spec §28.3). A read of task *storage* (a `TaskCompletionSource.Task` property, an admitted static cache) lends a borrow.
 
 ```bezel
 using var task := File.ReadAllTextAsync(path);   // fresh task: yours, disposed at scope end
@@ -81,7 +81,7 @@ tasks.Add(File.ReadAllTextAsync(path));   // compiles — but WARNS (spec §15.4
                                           //   the statement ends
 ```
 
-The two sanctioned spellings — the ones the warning names: give each task a **named holder** and build the borrowed array over the names (below, §4), or use the owning family (`OwningArray<OwningTask<T>>` with the owning `Task.WhenAll`/`WhenEach` overloads — same names since the v0.250 merge, the parameter type distinguishing them and the `move` marker announcing the transfer: `Task.WhenAll(move tasks)`, spec §22.3/stdlib §6.7) for dynamically-sized fan-in. Dynamic fan-in over fresh tasks is an ownership-transfer scenario by construction.
+The two sanctioned spellings — the ones the warning names: give each task a **named holder** and build the borrowed array over the names (below, §4), or use the owning family (`OwningArray<OwningTask<T>>` with the owning `Task.WhenAll`/`WhenEach` overloads — same names since the v0.250 merge, the parameter type distinguishing them and the `move` marker spelling the transfer: `Task.WhenAll(move tasks)`, spec §22.3/stdlib §6.7) for dynamically-sized fan-in. Dynamic fan-in over fresh tasks is an ownership-transfer scenario by construction.
 
 ---
 
@@ -187,7 +187,7 @@ await Task.WhenAll(both);                                // settles ALL inputs; 
                                                          //   first non-successful input's fault
 ```
 
-`WhenAll` never abandons laggards (spec §30.10). `WhenAny` yields the *index* of the first task to settle and never re-raises — you inspect the winner (spec §30.10). For results-bearing named holders, await each after the `WhenAll` — a completed await resumes synchronously. For a dynamically-sized set, use the owning overloads — same names since the v0.250 merge, the parameter type distinguishing them, the `move` marker announcing the consuming form (spec §22.3): `Task.WhenAll(move tasks)` collects everything, `Task.WhenEach(move tasks)` streams each task as it completes (stdlib §6.7).
+`WhenAll` never abandons laggards (spec §30.10). `WhenAny` yields the *index* of the first task to settle and never re-raises — you inspect the winner (spec §30.10). For results-bearing named holders, await each after the `WhenAll` — a completed await resumes synchronously. For a dynamically-sized set, use the owning overloads — same names since the v0.250 merge, the parameter type distinguishing them, the `move` marker spelling the consuming form (spec §22.3): `Task.WhenAll(move tasks)` collects everything, `Task.WhenEach(move tasks)` streams each task as it completes (stdlib §6.7).
 
 ---
 
@@ -218,7 +218,7 @@ The compiler enforces two things at every `Spawn` call site (stdlib §6.8):
 - **The entry is capture-free** — a static method reference or a non-capturing lambda. Captures are borrows of the origin domain's scopes and cannot cross. Data enters *only* through the explicit argument (aggregate several values into one sendable class, an `OwningArray`, or send the rest over a channel).
 - **Argument and result types are sendable** — the derived property that answers "may this value cross?" (spec §30.14). The rules you actually hit:
   - **Value types** are sendable iff they are neither **borrow-bearing** — no class- or interface-typed field anywhere, spec §9.7 — nor **move-only** (spec §15.3): primitives, enums, and those records and value-like choices whose fields and payloads are themselves sendable (spec §30.14; §35.12 for choices). They cross as *copies*. `string` crosses as a shared immutable reference.
-  - **A class is sendable iff it is transfer-closed**: `sealed`, and every field is a sendable value, `string`, an `owned` sendable class, an owning inline array of sendable classes, or an owning-choice field that carries no borrows (spec §35.4's census — no plain class- or interface-typed payload, borrow-bearing record payload, or reference-element inline-array payload, at any depth) and whose every payload of every case is transfer-compatible — obligation-bearing payloads recursively: `owned` class payloads by their class's sendability, `owned` interface payloads never, owning-inline-array payloads by their element class (interface elements never), nested owning choices recursively; every other payload by its own type's sendability, so a function-typed payload disqualifies (spec §35.12) — no interface-, `Object`-, or function-typed fields, and no plain (non-`owned`) class fields, because a back-reference aliases something another domain owns. Such an instance crosses as an **owned transfer** of its whole ownership tree.
+  - **A class is sendable iff it is transfer-closed**: `sealed`, and every field is a sendable value, `string`, an `owned` sendable class, an owning inline array of sendable classes, or an owning-choice field that holds no borrows (spec §35.4's holds-borrows property — no plain class- or interface-typed payload, borrow-bearing record payload, or reference-element inline-array payload, at any depth) and whose every payload of every case is transfer-compatible — obligation-bearing payloads recursively: `owned` class payloads by their class's sendability, `owned` interface payloads never, owning-inline-array payloads by their element class (interface elements never), nested owning choices recursively; every other payload by its own type's sendability, so a function-typed payload disqualifies (spec §35.12) — no interface-, `Object`-, or function-typed fields, and no plain (non-`owned`) class fields, because a back-reference aliases something another domain owns. Such an instance crosses as an **owned transfer** of its whole ownership tree.
   - **Never sendable**: open classes, interfaces, function values, tasks, lock guards, `CancellationToken` (§9). An owning choice does not cross directly (it is move-only, §3) but rides inside a transfer-closed owner's field — provided it carries no borrows and every payload is transfer-compatible (spec §35.4/§35.12).
 
 ```bezel
