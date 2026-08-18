@@ -39,12 +39,11 @@
 //       naming `closed`, `public`, and `internal`.  Pre-fix: dep
 //       compiles silently and the importer's `caseArmsExhaustive` proves
 //       exhaustiveness over the invisible leaf — silent unsoundness.
-//   T2  dep with `closed` root + internal ABSTRACT intermediate + public
-//       sealed leaf under it.  MUST still compile — an `abstract`
-//       intermediate has no instances (§11.7 / §12.5) and is invisible
-//       only to instantiation, never to leaf-set computation; the
-//       concrete leaf is public.  Pins that the fix does not over-reject
-//       legitimate intermediate shapes.
+//   T2  dep with `closed` root + only abstract intermediates (no
+//       concrete subclasses).  MUST compile — there is no concrete
+//       leaf to violate the cross-module guarantee.  Pins that the
+//       fix targets only concrete leaves and does not over-reject a
+//       hierarchy with no inhabitants.
 //   T3  dep with `closed` root + all leaves public, importer covers only
 //       one.  MUST compile and the importer MUST fire the §19.6 missing-
 //       leaf warning.  The original #3167 positive path; pins that the
@@ -183,29 +182,25 @@ const char* kInternalLeafApp3100 =
     "end App3100; ";
 
 // ---------------------------------------------------------------------------
-// T2 — `closed` root with one public concrete leaf under an INTERNAL
-// abstract intermediate.  The intermediate has no instances (§11.7 /
-// §12.5); the fix targets only concrete leaves, and the concrete leaf is
-// public.  Dep MUST compile.
+// T2 — `closed` root with only ABSTRACT intermediates (no concrete
+// subclasses anywhere in the hierarchy).  MUST NOT be rejected — there
+// is no concrete leaf to violate the cross-module guarantee.  Pins that
+// the fix targets only concrete leaves and does not over-reject a
+// hierarchy with no inhabitants.  (A real program would also be unable
+// to `new` anything from this hierarchy, but the compiler only has to
+// accept the shape, not police whether the program does anything useful.)
 // ---------------------------------------------------------------------------
-const char* kInternalAbstractLib3100 =
+const char* kNoConcreteLib3100 =
     "module ShapeLib3100; "
-    "public closed class Shape end Shape; "
-    "internal abstract class InternalIntermediate: Shape "
-    "  public tag: int; "
-    "end InternalIntermediate; "
-    "public sealed class Circle: InternalIntermediate "
-    "  public radius: int; "
-    "  public constructor(r: int) radius := r; end constructor; "
-    "end Circle; ";
+    "public closed class Shape "
+    "  public abstract method Tag(): int; "
+    "end Shape; "
+    "public abstract class Intermediate: Shape "
+    "  public override method Tag(): int => 1; "
+    "end Intermediate; ";
 
-const char* kInternalAbstractApp3100 =
+const char* kNoConcreteApp3100 =
     "module App3100; import ShapeLib3100; class App3100 "
-    "  public static method Classify(s: Shape): int "
-    "    var i := (case s of "
-    "      var c: Circle => c.radius); "
-    "    return i; "
-    "  end Classify; "
     "  public static method Main(): int => 0; "
     "end App3100; ";
 
@@ -279,26 +274,25 @@ BEZEL_TEST(xmod_closed_hierarchy_internal_leaf_3100,
 }
 
 // ---------------------------------------------------------------------------
-// T2 — `closed` root with internal ABSTRACT intermediate and public
-// concrete leaf under it.  MUST NOT be rejected — an abstract
-// intermediate has no instances (§11.7 / §12.5) and is matched only
-// through its concrete descendants, so the cross-module guarantee holds
-// on the public concrete leaf.  Pins that the fix targets only
-// concrete non-public leaves, not intermediate shapes.
+// T2 — `closed` root with only ABSTRACT intermediates (no concrete
+// subclass).  MUST NOT be rejected — there is no concrete leaf to
+// violate the cross-module guarantee.  Pins that the fix targets only
+// concrete leaves and does not over-reject a hierarchy with no
+// inhabitants.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(xmod_closed_hierarchy_internal_leaf_3100,
-           closed_root_with_internal_abstract_intermediate_ok_spec_19_6) {
+           closed_root_no_concrete_leaves_ok_spec_19_6) {
     CompileResult3100 r = compileAndCheckStderr3100(
-        kInternalAbstractLib3100, kInternalAbstractApp3100, "absinter");
+        kNoConcreteLib3100, kNoConcreteApp3100, "noconcrete");
     BEZEL_EXPECT_TRUE(r.depOk);
     BEZEL_EXPECT_TRUE(r.importerOk);
-    // The dep's §19.6 diagnostic MUST NOT fire — the internal type is an
-    // abstract intermediate (no instances, §11.7 / §12.5), not a concrete
-    // leaf.  The fix targets only concrete non-public leaves; an
-    // internal abstract is invisible to the importer only in the sense
-    // that it has no instances, and the cross-module guarantee still
-    // holds on the public concrete `Circle`.
-    BEZEL_EXPECT_FALSE(stderrHas(r.stderr, "closed class"));
+    // The dep's §19.6 diagnostic MUST NOT fire — there is no concrete
+    // leaf to reject.  The fix targets only concrete non-public
+    // leaves; a hierarchy of only abstract intermediates has no
+    // inhabitants and is sound (the only way a value of static type
+    // `Shape` could exist is via a leaf declared in another module,
+    // but §11.7's cross-module-subclass rejection forecloses that).
+    BEZEL_EXPECT_FALSE(stderrHas(r.stderr, "concrete subclass"));
 }
 
 // ---------------------------------------------------------------------------
