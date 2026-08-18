@@ -30,7 +30,7 @@ spec_0027	spec	Polymorphic-dispatch	skip	n/a	skip:incomplete-fragment (carried s
 spec_0028	spec	101-Basic-syntax	fragment	compiles	
 spec_0029	spec	102-Explicit-values	fragment	compiles	
 spec_0030	spec	103-Underlying-type	fragment	compiles	
-spec_0031	spec	104-Methods-properties-static-members	fragment	compiles	
+spec_0031	spec	104-Methods-properties-static-members	skip	n/a	blocked-on-#1723 (stdlib-unresolved: FrozenArray)
 spec_0032	spec	104-Methods-properties-static-members	skip	n/a	skip:signature-listing
 spec_0033	spec	104-Methods-properties-static-members	skip	n/a	skip:incomplete-fragment
 spec_0034	spec	105-Restrictions	fragment	compiles	
