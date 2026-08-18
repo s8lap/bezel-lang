@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -14,6 +15,7 @@
 #include "flow/CFG.hpp"
 #include "ownership/OwnershipState.hpp"
 #include "sema/ConstFold.hpp"   // §15.3 (#1549): fold a constant `move arr[i]` index
+#include "sema/EnumValues.hpp"  // enumHasZeroConstant — §7.9 / §17.11 enum row (#3072)
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 
@@ -9101,11 +9103,18 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
 // string, function, non-nullable Object) has no default value and must
 // be assigned by a field initializer or in every constructor. Value
 // types (records, enums, primitives other than string/Object, inline
-// arrays, unit) have well-defined defaults and are exempt. A static
-// field is exempt here (static-init rules, §22.13). Generic-parameter
-// and unresolved types are conservatively treated as non-reference
-// (not flagged). `owned` fields are a subset (class-typed) and are
-// covered by this rule.
+// arrays, unit) are exempt — EXCEPT, per §7.9 v0.247, a zero-less enum:
+// `default(E)` is ill-formed for such an enum (§17.11), so its storage
+// requires an explicit initializer just like a non-nullable reference.
+// A static field is exempt here (static-init rules, §22.13).
+// Generic-parameter and unresolved types are conservatively treated as
+// non-reference (not flagged). `owned` fields are a subset (class-typed)
+// and are covered by this rule. The R-2 deferred rows (records with
+// non-nullable reference fields, inline arrays of non-nullable reference
+// elements, owning inline arrays) are intentionally NOT folded in here —
+// landing the enum row alone keeps the fix narrowly scoped (#3072).
+// fix #3072 / §7.9 / §17.11: enum CARVE-OUT — a zero-less enum field is
+// no longer treated as a value-typed default-bearing field.
 bool isNonNullableReferenceField(const ast::FieldDecl& f,
                                  sema::SemaContext& ctx) {
     for (auto m : f.modifiers) {
@@ -9122,6 +9131,16 @@ bool isNonNullableReferenceField(const ast::FieldDecl& f,
             return true;
         case sema::TypeRef::Kind::Named:
             if (!rt->declaration) return false;  // built-in/generic — skip
+            // fix #3072 / §7.9 / §17.11: zero-less enum CARVE-OUT.
+            // enumHasZeroConstant returns nullopt when the enum's declared
+            // values cannot be decided (a non-constant initializer, already
+            // diagnosed) or the enum is empty; the conservative posture is to
+            // accept — matching §17.11's `defaultIllFormed` arm.
+            if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
+                std::optional<bool> hasZero =
+                    enumHasZeroConstant(*rt->declaration);
+                return hasZero && !*hasZero;
+            }
             return rt->declaration->kind == ast::TypeDeclKind::Class ||
                    rt->declaration->kind == ast::TypeDeclKind::Interface;
         default:
