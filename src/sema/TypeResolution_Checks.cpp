@@ -2400,42 +2400,99 @@ void Resolver::checkAsTargetInstantiations() {
                 break;
             }
         if (paramIdx >= s.enclosingType->genericParams.size()) continue;
-        for (const GenericInstantiation& inst : instantiations_) {
-            if (inst.type != s.enclosingType) continue;
-            if (paramIdx >= inst.argRefs.size()) continue;
-            const TypeRef* arg = inst.argRefs[paramIdx];
-            // Kind::Error → resolution already failed; suppress the cascade.
-            if (!arg || arg->kind == TypeRef::Kind::Error) continue;
-            const std::string degenerate = degenerateAsTargetReason(arg);
-            if (degenerate.empty()) continue;
-            if (!reported.insert({inst.site, s.paramName}).second) continue;
-            // §3.6 rule 2 wants the diagnostic AT the instantiation site, and
-            // that is where it goes — except that some `Named<…>` nodes carry
-            // no span (measured: a `new Box<[3]int>()` type node reports 0:0),
-            // and a 0:0 diagnostic is not actionable. Fall back to the `as`
-            // expression, which is a real location naming the body at fault;
-            // the message identifies both ends either way.
-            const SourceLocation at =
-                (inst.site && inst.site->span.begin.line != 0)
-                    ? inst.site->span.begin
-                    : s.loc;
-            ctx_.diagnostics().report(
-                Severity::Error, at,
-                "type parameter `" + std::string(s.paramName) + "` of `" +
-                std::string(s.enclosingType->name) +
-                "` is used as an `as` target in the generic body (line " +
-                std::to_string(s.loc.line) +
-                "), so this instantiation is rejected at the instantiation "
-                "site (§3.6 rule 2): " + degenerate);
+        // Fix #3093: a binding that is itself another generic's parameter
+        // (`class Outer<U>` holding `Inner<U>` whose body does `as T`) is
+        // unreachable by a single pass over `s.enclosingType`'s instantiations
+        // — the only `Inner<…>` node is `Inner<U>`, whose argument is the bare
+        // `U`. The worklist re-keys the obligation to (enclosingType, that
+        // parameter) and iterates, the same shape checkOwningElementInstantiations
+        // (#2713) uses for the owning-element arm beside this one — sharing the
+        // walk is cheaper and prevents the two predicates from drifting on
+        // exactly the same shape (#1463 name-list-skew lesson).
+        struct Pending {
+            TypeSymbol* type;
+            std::string_view paramName;
+            std::size_t idx;
+        };
+        std::vector<Pending> work{{s.enclosingType, s.paramName, paramIdx}};
+        // (type, param) visited set: a recursive generic (`class A<T>` holding
+        // an `A<T>`) or a diamond of instantiation sites must not re-enqueue.
+        std::set<std::pair<TypeSymbol*, std::string_view>> seen;
+        while (!work.empty()) {
+            Pending p = work.back();
+            work.pop_back();
+            if (!seen.insert({p.type, p.paramName}).second) continue;
+            for (const GenericInstantiation& inst : instantiations_) {
+                if (inst.type != p.type) continue;
+                if (p.idx >= inst.argRefs.size()) continue;
+                const TypeRef* arg = inst.argRefs[p.idx];
+                const ast::Type* argAst =
+                    (p.idx < inst.argAsts.size()) ? inst.argAsts[p.idx]
+                                                  : nullptr;
+                // Kind::Error → resolution already failed; suppress the cascade.
+                if (!arg || arg->kind == TypeRef::Kind::Error) continue;
+                if (isBareGenericParamBinding(arg, argAst)) {
+                    // Chained: re-key to the body this site sits in.
+                    if (!inst.enclosingType) continue;
+                    std::string_view nextName = argAst->name->parts.front();
+                    // Same misattribution guard as the recorder and #2713: a
+                    // METHOD enclosing this site binds that name → its
+                    // bindings are not tracked, and the chain must not
+                    // attribute the argument to `enclosingType`.
+                    bool boundByMethod = false;
+                    if (inst.methodGenericParams) {
+                        for (const ast::GenericParam& gp :
+                             *inst.methodGenericParams) {
+                            if (gp.name == nextName) {
+                                boundByMethod = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (boundByMethod) continue;
+                    std::size_t nextIdx =
+                        inst.enclosingType->genericParams.size();
+                    for (std::size_t i = 0;
+                         i < inst.enclosingType->genericParams.size(); ++i) {
+                        if (inst.enclosingType->genericParams[i] &&
+                            inst.enclosingType->genericParams[i]->name ==
+                                nextName) {
+                            nextIdx = i;
+                            break;
+                        }
+                    }
+                    // Not a parameter of that type either — nothing to track.
+                    if (nextIdx >= inst.enclosingType->genericParams.size())
+                        continue;
+                    work.push_back(
+                        {inst.enclosingType, nextName, nextIdx});
+                    continue;
+                }
+                const std::string degenerate = degenerateAsTargetReason(arg);
+                if (degenerate.empty()) continue;
+                if (!reported.insert({inst.site, s.paramName}).second) continue;
+                // §3.6 rule 2 wants the diagnostic AT the instantiation site,
+                // and that is where it goes — except that some `Named<…>`
+                // nodes carry no span (measured: a `new Box<[3]int>()` type
+                // node reports 0:0), and a 0:0 diagnostic is not actionable.
+                // Fall back to the `as` expression, which is a real location
+                // naming the body at fault; the message identifies both ends
+                // either way.
+                const SourceLocation at =
+                    (inst.site && inst.site->span.begin.line != 0)
+                        ? inst.site->span.begin
+                        : s.loc;
+                ctx_.diagnostics().report(
+                    Severity::Error, at,
+                    "type parameter `" + std::string(s.paramName) + "` of `" +
+                    std::string(s.enclosingType->name) +
+                    "` is used as an `as` target in the generic body (line " +
+                    std::to_string(s.loc.line) +
+                    "), so this instantiation is rejected at the instantiation "
+                    "site (§3.6 rule 2): " + degenerate);
+            }
         }
     }
-    // RESIDUAL, recorded rather than guessed at (#3093): a binding that is
-    // itself another generic's parameter (`class Outer<U>` holding an
-    // `Inner<U>` whose body does the `as U`) is not walked — the #2713 pass
-    // beside this one carries a worklist for exactly that composition, and the
-    // right close is to SHARE that walk, not to grow a second copy of it.
-    // Nothing here FALSELY rejects such a program; the check simply does not
-    // reach it.
 }
 
 void Resolver::checkStaticClassMember(TypeSymbol* t, Symbol* m) {
