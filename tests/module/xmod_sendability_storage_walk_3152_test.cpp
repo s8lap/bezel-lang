@@ -598,13 +598,15 @@ BEZEL_TEST(xmod_sendability_storage_walk_3152,
     BEZEL_EXPECT_EQ(local, 44);
     BEZEL_EXPECT_TRUE(diag.find("not sendable") == std::string::npos);
 
-    // The imported half, for the same reason and the same verdict. It
-    // constructs through an explicit convenience constructor chaining to the
-    // primary: an imported class's IMPLICIT primary constructor is not callable
-    // across a module boundary at all (`new Box(null)` -> "the implicit default
-    // constructor takes 0 (§22.7)") — measured here, unrelated to sendability,
-    // filed separately. The primary-ctor PARAMETER, the thing under test, is
-    // present either way.
+    // The imported half, for the same reason and the same verdict. Constructs
+    // the imported class through its §22.10 PRIMARY constructor directly
+    // (`new Box3152TAX(null)`) — the verbatim repro from #3166, pinned as a
+    // regression test against the cross-module primary-ctor gap. That gap
+    // (`new ImportedClass(args)` rejected as "implicit default constructor
+    // takes 0") was closed by #3162 + #3164 (commit 8d8af5d); before that
+    // commit this row had to chain through an explicit 0-arg convenience
+    // constructor, which side-stepped the actual gap it now exercises. The
+    // primary-ctor PARAMETER, the thing under test, is present either way.
     int r = compileImportAndRun3152(
         "module Lib3152TA; "
         "public interface IShape3152TAX "
@@ -612,15 +614,12 @@ BEZEL_TEST(xmod_sendability_storage_walk_3152,
         "public sealed class Box3152TAX(s: IShape3152TAX?) "
         "  private _n: int := 41; "
         "  public method N(): int => _n; "
-        "  public constructor() "
-        "    this(null); "
-        "  end constructor; "
         "end Box3152TAX;",
         "module App3152TA; import Lib3152TA; import System.Threading; "
         "public class C3152TAX "
         "  public static method Main(): int "
         "    using var ch := new Channel<Box3152TAX>(1); "
-        "    using var b := new Box3152TAX(); "
+        "    using var b := new Box3152TAX(null); "
         "    return b.N() + 3; "
         "  end Main; "
         "end C3152TAX;");
@@ -668,8 +667,14 @@ BEZEL_TEST(xmod_sendability_storage_walk_3152,
     BEZEL_EXPECT_EQ(local, 44);
     BEZEL_EXPECT_TRUE(diag.find("that is not `owned`") == std::string::npos);
 
-    // Constructed through an explicit convenience constructor for the reason
-    // given in T10's imported half.
+    // Constructed through the §22.10 PRIMARY constructor directly
+    // (`new Node3152TBX(new Leaf3152TBX())`), for the same reason as T10's
+    // imported half. The `owned` call-site marker on `new Leaf3152TBX()` is
+    // required by §22.3 and is now carried across the module boundary — that
+    // is #3164's half of the joint commit (8d8af5d); without it the constructor
+    // would be uncallable because the `owned` parameter would not see its
+    // mandatory matching marker. #3162 is the construction half. Both halves
+    // are necessary and are pinned together here.
     int r = compileImportAndRun3152(
         "module Lib3152TB; "
         "public sealed class Leaf3152TBX "
@@ -677,15 +682,12 @@ BEZEL_TEST(xmod_sendability_storage_walk_3152,
         "end Leaf3152TBX; "
         "public sealed class Node3152TBX(owned l: Leaf3152TBX) "
         "  public method Get(): int => l.V; "
-        "  public constructor() "
-        "    this(new Leaf3152TBX()); "
-        "  end constructor; "
         "end Node3152TBX;",
         "module App3152TB; import Lib3152TB; import System.Threading; "
         "public class C3152TBX "
         "  public static method Main(): int "
         "    using var ch := new Channel<Node3152TBX>(1); "
-        "    using var n := new Node3152TBX(); "
+        "    using var n := new Node3152TBX(new Leaf3152TBX()); "
         "    return n.Get() + 3; "
         "  end Main; "
         "end C3152TBX;");
