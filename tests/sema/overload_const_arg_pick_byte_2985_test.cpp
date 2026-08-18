@@ -3,6 +3,13 @@
 // or named-const argument never reached an OVERLOADED callee by the worked
 // example the spec names.
 //
+// #2985 (sema, MED) was SHIPPED at 6088e02 (Wave 3 Lane 4 cherry-pick) and
+// is on HEAD (575f8cc). The sibling qualified-const fold arm of the same
+// defect family landed at 33bd22d (Wave 5 Lane 3, #2986) and is verified by
+// qualified_const_int_fold_2986_test.cpp — both files together pin §5.1
+// constant narrowing end-to-end (fold → overload dispatch → unique winner).
+// Verified 2026-08-18 by Wave 4 Lane E.
+//
 // §5.1 (v0.240, *Constant narrowing*), verbatim:
 //   "An expression of integer type that is a **compile-time constant**
 //    ([§17.14](#sec-constant-expressions)) implicitly converts to any integer
