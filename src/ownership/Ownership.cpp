@@ -2697,32 +2697,82 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                 if (id->name != "this" && id->name != "base") {
                     auto* dstate = lookupState(id->name);
                     if (dstate && dstate->state == OwnershipState::Owned) {
-                        markDisposedByName(id->name, id->span.begin);
-                        const_cast<ast::DiscardStmt*>(ds)->discardOutOwnedVar =
-                            true;
-                        // fix #1892 / §17.13 / §28.5: when the discarded named
-                        // binding is a plain (non-`using`) owning-COLLECTION local,
-                        // record that on its LocalDecl so codegen registers the
-                        // collection's scope-end/unwind disposal (registerUsingDisposal)
-                        // — the class-only registerUnwindOwnedLocal (which this
-                        // markDisposedByName otherwise routes it to) does not cover
-                        // collections, so the container leaked on the pre-discard-throw
-                        // exception edge. The discard codegen disposes the container at
-                        // the discard point and nulls the slot, so the both-edges
-                        // registration is null-safe (no double-free). Only the plain
-                        // `var` form carries this obligation (a `using var`
-                        // owning-collection already disposes via registerUsingDisposal;
-                        // an `owned` PARAMETER is not a LocalDecl). // per §17.13, §28.5
-                        if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
-                            if (rt->kind == sema::TypeRef::Kind::Named &&
-                                isOwningCollectionNameHead(rt->headName()))
-                                if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
-                                        ctx_.exprSymbol(*id)))
-                                    if (auto* ld = dynamic_cast<
-                                            const ast::LocalDecl*>(loc->decl))
-                                        if (!ld->isUsing)
-                                            const_cast<ast::LocalDecl*>(ld)
-                                                ->dischargedByDiscard = true;
+                        // fix #3253 / §17.13 / §28.10 (v0.256, #2071 residual): a
+                        // discard `_ := alias;` over a `using var alias := r;`
+                        // borrow-pin is NOT an announced-consume of `alias` —
+                        // §28.10 verbatim: "the `using var` does not assume a
+                        // disposal obligation ... the value is not owned by this
+                        // scope." The `using var` records `alias`'s state as
+                        // Owned + implicitDischarge (line 4810, the #2072 funnel)
+                        // so the AXIOM-A5 immovability + scope-bound machinery
+                        // keys off it, but the §28.10 borrow-pin SHAPE is
+                        // recorded separately on the `usingVarSourceIsBorrow`
+                        // flag. The discard's announced-consume path emits an
+                        // explicit Dispose (discardOutOwnedVar →
+                        // explicitDisposeOwnedReceiverSlot) on `alias`'s slot,
+                        // which — for a class-typed borrow-pin aliasing an
+                        // `owned` parameter — points at the parameter's storage;
+                        // on the unwind edge the parameter's K3.15 auto-drop
+                        // then disposes the same slot (the residual of #3039
+                        // and the K3.13 carve-out's exception edge, the
+                        // headline of #3253: heap-use-after-free / segfault on
+                        // `throw new E();` between the alias and method end).
+                        // Skip the announced-consume path when the binding is a
+                        // §28.10 borrow-pin (`using var alias := <owned source>;`)
+                        // — `alias` is not a named owned binding the discard can
+                        // claim, the source's owner keeps the obligation. Mirrors
+                        // the structural carve-out: a BORROW-state operand is
+                        // already excluded at line 2685-2689; this generalizes it
+                        // to the borrow-pin-as-Owned-state shape, the same source
+                        // is `lookupState`-Owned but carries no obligation. The
+                        // `using var` adoption (`using var y := move x;`) keeps
+                        // the announced-consume path: alias's state is Owned AND
+                        // its obligation genuinely lives here, so `_ := alias`
+                        // discharges it (consistent with #2071's marking of an
+                        // unmarked `using var` as never-discharge-required but
+                        // the ADOPTION case holding the obligation). Restricted
+                        // to a LocalSymbol (parameters have no LocalDecl to
+                        // carry the flag — but a discard of an `owned`
+                        // parameter is already NOT this path, since parameters
+                        // are out-of-band: a parameter discard is the
+                        // `discardOutOwnedVar` path's `#1387` companion and is
+                        // handled separately, leaving this fix to apply only to
+                        // the in-scope LocalDecl case).
+                        bool aliasIsBorrowPin = false;
+                        if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                                ctx_.exprSymbol(*id)))
+                            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(
+                                    loc->decl))
+                                if (ld->isUsing && ld->usingVarSourceIsBorrow)
+                                    aliasIsBorrowPin = true;
+                        if (!aliasIsBorrowPin) {
+                            markDisposedByName(id->name, id->span.begin);
+                            const_cast<ast::DiscardStmt*>(ds)->discardOutOwnedVar =
+                                true;
+                            // fix #1892 / §17.13 / §28.5: when the discarded named
+                            // binding is a plain (non-`using`) owning-COLLECTION local,
+                            // record that on its LocalDecl so codegen registers the
+                            // collection's scope-end/unwind disposal (registerUsingDisposal)
+                            // — the class-only registerUnwindOwnedLocal (which this
+                            // markDisposedByName otherwise routes it to) does not cover
+                            // collections, so the container leaked on the pre-discard-throw
+                            // exception edge. The discard codegen disposes the container at
+                            // the discard point and nulls the slot, so the both-edges
+                            // registration is null-safe (no double-free). Only the plain
+                            // `var` form carries this obligation (a `using var`
+                            // owning-collection already disposes via registerUsingDisposal;
+                            // an `owned` PARAMETER is not a LocalDecl). // per §17.13, §28.5
+                            if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
+                                if (rt->kind == sema::TypeRef::Kind::Named &&
+                                    isOwningCollectionNameHead(rt->headName()))
+                                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                                            ctx_.exprSymbol(*id)))
+                                        if (auto* ld = dynamic_cast<
+                                                const ast::LocalDecl*>(loc->decl))
+                                            if (!ld->isUsing)
+                                                const_cast<ast::LocalDecl*>(ld)
+                                                    ->dischargedByDiscard = true;
+                        }
                     }
                 }
             }
@@ -4737,7 +4787,29 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                 // own obligation (auto-drop at scope end); the pin disposes nothing. A
                 // borrowing loop var is not seeded into states_ (only owning-enumerable
                 // loops are), so detect it by its decl being a non-owning ForStmt.
-                // // per §28.10, §28.3, §29.2
+                //
+                // fix #3253 / §28.10 (v0.255, #2071 residual): a bare-id `using var
+                // alias := <owned parameter>;` is the same shape as the tracked-owned-
+                // local case — §28.10 borrow-pin, no obligation transfer, the
+                // parameter keeps its §28.3 K3.14 auto-drop and the using-var
+                // disposes nothing. Parameters are not seeded into states_ (they are
+                // OWNED at entry by declaration, not by dataflow), so the tracked-
+                // Owned lookup misses this shape and the flag stayed clear —
+                // codegen's `registerUsingDisposal` (LlvmBackend_Setup.cpp:13552) did
+                // not skip the using-var's Dispose, and the using-var's Dispose + the
+                // parameter's auto-drop both fired on the same slot, double-disposing
+                // (heap-use-after-free / segfault on a `throw` between the alias and
+                // method end — the K3.15 unwind edge fires the parameter's auto-drop
+                // and the using-var's scope-end Dispose in the same unwinding pass).
+                // Recognize the bare-id-parameter shape directly: `modifier == "owned"`
+                // is the structural condition for the parameter to carry a §28.3
+                // obligation, the same one `registerUnwindOwnedParam` already gates
+                // on (LlvmBackend_Setup.cpp:15590). Restricted to the UNMARKED using-
+                // var (the marked form is the §28.10 adoption on line 4654, never a
+                // borrow-pin) — the outer `if (ld.isUsing)` already excludes the
+                // `using var _ := ...` const/let unannotated variant, and the
+                // `ld.isUsing` entry predicate here guarantees the using-var form.
+                // // per §28.10, §28.3 K3.13, K3.14, K3.15
                 if (sema::Symbol* srcSym = ctx_.exprSymbol(*aid)) {
                     auto it = states_.find(srcSym);
                     if (it != states_.end() &&
@@ -4751,6 +4823,14 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
                                 if (!iterableIsOwningEnumerable(*fs))
                                     const_cast<ast::LocalDecl&>(ld)
                                         .usingVarSourceIsBorrow = true;
+                        // fix #3253: bare-id `using var alias := <owned param>;`.
+                        // Parameters are not in states_; recognize the owned-param
+                        // shape directly (modifier == "owned" ⇒ §28.3 obligation).
+                        if (auto* ps =
+                                dynamic_cast<sema::ParameterSymbol*>(srcSym))
+                            if (ps->modifier == "owned")
+                                const_cast<ast::LocalDecl&>(ld)
+                                    .usingVarSourceIsBorrow = true;
                     }
                 }
             } else if (dynamic_cast<const ast::BindExpr*>(init)) {
