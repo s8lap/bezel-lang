@@ -1,6 +1,6 @@
 # Bezel Guide 5: Collections, Queries, and Iteration
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.258.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.259.*
 
 The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5, `import System.Collections.Linq;`). What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `move` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
 
@@ -40,7 +40,7 @@ So an owning collection admits only class or interface elements (`where T: class
 
 **Picking one is stating intent.** A holder that must dispose its elements says so in the type — `private owned _sessions: OwningArray<Session>;` — and the cascade replaces any destructor (Guide 1 §5). A collection that merely *indexes* objects owned elsewhere is the borrowing form, and storing a borrow carries the usual obligation: the element's owner must outlive the collection's use of it (spec §28.11).
 
-**The names tell you whether you now owe a disposal** (stdlib §1; spec §22.6). `Get`, `Peek`, `GetOrNull`, and the indexer are borrows: no obligation. On the **owning** family, `Pop`, `Dequeue`, `Take`, `PopValue`, and `Drain` are transfers: you discharge the result. (The borrowing `Stack<T>`/`Queue<T>` at class elements hand back the same borrow they dropped — `Pop` and `Dequeue` there produce borrows sourced at the collection, stdlib §4.11.)
+**The names tell you whether you now owe a disposal** (stdlib §1; spec §22.6). `Get`, `Peek`, `GetOrNull`, and the indexer are borrows: no obligation. On the **owning** family, `Pop`, `Dequeue`, `PopValue`, and `Drain` are transfers: you discharge the result. (The borrowing `Stack<T>`/`Queue<T>` at class elements hand back the same borrow they dropped — `Pop` and `Dequeue` there produce borrows sourced at the collection, stdlib §4.11.)
 
 ```bezel
 // jobs: OwningStack<Job>
@@ -172,7 +172,7 @@ end;
 
 (The *borrowing* `Dictionary<K, V>` iterates entries directly — `for var entry in dict` yields `DictionaryEntry<K, V>` values in insertion order, `entry.Value` a borrow at class V. The owning dictionary deliberately has **no** default entry iteration: its common intent is transfer, so you either iterate `Keys` to look or `Drain()` to take — stdlib §4.8/§4.9.)
 
-For *one* element, use the take-forms: `PopAt(i)`/`PopFirst()`/`PopLast()` on `OwningArray<T>`, `Pop()`/`Dequeue()` on the owning stack and queue, `PopValue(key)` on the owning dictionary, `Take(query)` on the owning set. Each has a `Try*` variant except `PopAt` (Guide 2 §2 shows the `Try` + `out using var` call shape). They remove the slot and hand you the owned element in one call. The low-level form is `move coll[i]`. It takes the element but leaves the slot **moved-from**, and the field-restoration rule applies: restore the slot before the method can exit (spec §28.8.1/§28.11; the same discipline as `move` on a field, Guide 1 §7):
+For *one* element, use the take-forms: `PopAt(i)`/`PopFirst()`/`PopLast()` on `OwningArray<T>`, `Pop()`/`Dequeue()` on the owning stack and queue, `PopValue(key)` on the owning dictionary, `Pop(query)` on the owning set (named `Take` through v0.258 — the v0.259 rename un-shadows LINQ's `Take(count)` on set receivers, stdlib §4.10). Each has a `Try*` variant except `PopAt` (Guide 2 §2 shows the `Try` + `out using var` call shape). They remove the slot and hand you the owned element in one call. The low-level form is `move coll[i]`. It takes the element but leaves the slot **moved-from**, and the field-restoration rule applies: restore the slot before the method can exit (spec §28.8.1/§28.11; the same discipline as `move` on a field, Guide 1 §7):
 
 ```bezel
 var fresh := Connect("fresh");   // build the replacement first — it may throw
@@ -252,7 +252,7 @@ var mean := hot.Average(lambda(r) => r.Celsius);  // as many passes as you like
 
 - The callback-taking lazy operators — `Where`, `Select`, `SelectMany`, `TakeWhile`, `SkipWhile`, `OrderBy`/`OrderByDescending`/`ThenBy`/`ThenByDescending`, `GroupBy`, `Zip` — **retain their callback in the query value until it is consumed**, and with it every borrow the callback captured.
 - The callback-free lazy operators (`Take`, `Skip`, `Reverse`, `Distinct`, `OfType`, `Concat`, `Union`, `Intersect`, `Except`) retain nothing.
-- The **eager** operators run during the call and retain nothing: the element accessors (`First`/`Last`/`Single`/`ElementAt` and their `*OrNull` and predicate forms), `Count`, `Any`, `All`, `Contains`, the aggregations (`Sum`, `Min`, `Max`, `Average`, `Aggregate`), and the materializers (`ToArray`, `ToDictionary`, `ToSet`).
+- The **eager** operators run during the call and retain nothing: the element accessors (`First`/`Last`/`Single`/`ElementAt`, with the `*OrNull` forms, and the predicate forms where they exist — `ElementAt`/`ElementAtOrNull` carry none), `Count`, `Any`, `All`, `Contains`, the aggregations (`Sum`, `Min`, `Max`, `Average`, `Aggregate`), and the materializers (`ToArray`, `ToDictionary`, `ToSet`).
 
 (On an `Array<T>` receiver, `Reverse()` resolves to the in-place instance method before extensions are consulted — the lazy operator applies only where the receiver has no instance `Reverse`; stdlib §5.)
 
@@ -376,7 +376,7 @@ After the freeze no writer can exist — the consume takes the buffer, and the c
 | Hold resources this holder disposes | the owning family — `Dispose()` cascades, no destructor |
 | Read elements, either family | an `IEnumerable<T>` / `IReadOnlyList<T>` parameter |
 | Look at an element | indexer, `Peek`, `GetOrNull` — borrows, no obligation |
-| Take one element out | `Pop*` / `Dequeue` / `Take` / `PopValue` — owned result (`move coll[i]` + restore for replace-in-place) |
+| Take one element out | `Pop*` / `Dequeue` / `PopValue` — owned result (`move coll[i]` + restore for replace-in-place) |
 | Consume every element | `for var x in coll.Drain() do using var c := move x; … end;` |
 | Read query results twice | `.ToArray()` first — a bound query is single-consumption |
 | Aggregate one group many ways | `GroupBy` — outer sequence once, each group re-enumerable |
@@ -387,4 +387,4 @@ After the freeze no writer can exist — the consume takes the buffer, and the c
 
 And the five traps, each a section above: **enumerating a bound query twice** (§4 — materialize); **escaping an iteration variable** from an interface-typed or minting source (§2 — concrete backing, or the owning path); **disposing a borrowed element** (§2 — only owners dispose; go through the owning collection or take the element out); **`First()` over a minting pipeline** (§6 — warned since v0.243 where the producer is same-unit, spec §29.11; give the elements a backing first); **holding a span past its buffer** (§7 — the caller owns the storage).
 
-Three habits carry most of it. Pick the family that states who disposes, and let `Dispose()` cascades and `Drain()` do the element work — hand-written disposal loops over collections are almost always the wrong shape. Treat everything a loop or accessor hands you at class elements as a borrow unless the name says transfer (`Pop`/`Drain`/`Take`). When you need it longer, take ownership explicitly rather than fighting the borrow checker. And treat a lazy query as a value you spend: bind it, consume it once, and reach for `ToArray()` the moment you need the results twice. The compiler enforces all three; the errors are it finding a leak, a dangle, or a silent re-execution before they happen.
+Three habits carry most of it. Pick the family that states who disposes, and let `Dispose()` cascades and `Drain()` do the element work — hand-written disposal loops over collections are almost always the wrong shape. Treat everything a loop or accessor hands you at class elements as a borrow unless the name says transfer (`Pop`/`Drain`). When you need it longer, take ownership explicitly rather than fighting the borrow checker. And treat a lazy query as a value you spend: bind it, consume it once, and reach for `ToArray()` the moment you need the results twice. The compiler enforces all three; the errors are it finding a leak, a dangle, or a silent re-execution before they happen.
