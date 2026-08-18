@@ -1071,8 +1071,13 @@ BEZEL_TEST(codegen_span549, arrayspan_ctor_direct_1275) {
         "end Main; end C;", 30);
 }
 
-// §4.14 (#1275): length out of range against the buffer Count throws
-// IndexOutOfRangeException at construction (was a SIGSEGV on later indexing).
+// §4.14 (#1275, #3135): length out of range against the buffer Count throws
+// IndexOutOfRangeException at the FIRST OUT-OF-RANGE ACCESS, not at
+// construction — stdlib §4.14 v0.195's no-eager-check rule. Before #3135 the
+// throw happened at construction; after #3135 the construction succeeds and
+// the indexer (#1158's `absIdx < source.Count` check) fires the same exception
+// at `sp[50]`. The exception class is identical, so the program-level outcome
+// (catch returns 88) is unchanged.
 BEZEL_TEST(codegen_span549, span_ctor_length_oob_throws_1275) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
@@ -1082,7 +1087,11 @@ BEZEL_TEST(codegen_span549, span_ctor_length_oob_throws_1275) {
         "end Main; end C;"), 88);
 }
 
-// §4.14 (#1275): start out of range throws IndexOutOfRangeException.
+// §4.14 (#1275, #3135): start out of range throws IndexOutOfRangeException at
+// the first out-of-range access. Same composition as the test above: the ctor
+// succeeds (no eager check, per §4.14 v0.195), `sp[0]` checks `0 < Length (1)`
+// (passes) and then `absIdx = Start + 0 = 9 ≥ source.Count = 4` (unsigned
+// compare, §4.15's indexer guard) throws.
 BEZEL_TEST(codegen_span549, span_ctor_start_oob_throws_1275) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "

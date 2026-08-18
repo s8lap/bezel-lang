@@ -3539,7 +3539,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     else elemSize = 8;  // ptr, i64, double
                 }
             }
-            // §4.14 (#1275): direct span constructors —
+            // §4.14 (#1275 + #3135): direct span constructors —
             //   new Span<T>(buffer, start, length)
             //   new ReadOnlySpan<T>(buffer, start, length)
             //   new ArraySpan<T>(source, start, length)
@@ -3549,9 +3549,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // generic record path built a value-layout struct with i64
             // Start/Length, so the later i32 span reads picked up garbage and
             // indexed out of bounds (SIGSEGV). Lower the buffer/array arg to its
-            // bz_array_t* backing and build the span directly, bounds-checking
-            // start/length against the backing Count (IndexOutOfRangeException,
-            // per §4.14 L1940 / L2179 — the documented supported constructor).
+            // bz_array_t* backing and build the span directly.
+            //
+            // §4.14 "Construction patterns" (v0.195), verbatim: "The direct
+            // constructors of the five span records do **not** range-check
+            // `(Start, Length)` against the source: a mis-constructed span
+            // faults at each out-of-range *access* instead — the span-level
+            // check passes and the source's own bounds check throws
+            // `IndexOutOfRangeException`". The safety of that composition is
+            // owed by the indexer (lowerCollectionIndexerGet): it checks the
+            // span's `Length` AND the source array's live `Count` (#1158), so
+            // every out-of-source read still throws. The four array-backed
+            // ctors matched this rule before #3135 only by accident of a
+            // stale-line-number comment — #3098 added the matching
+            // `ReadOnlyStringSpan` arm and surfaced the divergence. The eager
+            // checks are removed here; the factories (`AsSpan`/
+            // `AsReadOnlySpan`) and `Slice(r: Range<int>)` keep theirs and
+            // validate eagerly, as §4.14 requires.
             if ((colName == "Span" || colName == "ReadOnlySpan" ||
                  colName == "ArraySpan" || colName == "ReadOnlyArraySpan") &&
                 ne.args.size() == 3 &&
@@ -3565,24 +3579,6 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     start = builder_.CreateTrunc(start, i32(), "span.ctor.st");
                 if (!len->getType()->isIntegerTy(32))
                     len = builder_.CreateTrunc(len, i32(), "span.ctor.len");
-                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-                llvm::Value* count64 =
-                    builder_.CreateCall(lenFn, {src}, "span.ctor.cnt");
-                llvm::Value* count =
-                    builder_.CreateTrunc(count64, i32(), "span.ctor.cnt32");
-                // Start ∈ [0, Count]; Length ∈ [0, Count-Start].
-                llvm::Value* startNeg =
-                    builder_.CreateICmpSLT(start, builder_.getInt32(0));
-                llvm::Value* startOOB = builder_.CreateICmpSGT(start, count);
-                emitGuardThrow(builder_.CreateOr(startNeg, startOOB),
-                               "IndexOutOfRangeException");
-                llvm::Value* avail =
-                    builder_.CreateSub(count, start, "span.ctor.avail");
-                llvm::Value* lenNeg =
-                    builder_.CreateICmpSLT(len, builder_.getInt32(0));
-                llvm::Value* lenOOB = builder_.CreateICmpSGT(len, avail);
-                emitGuardThrow(builder_.CreateOr(lenNeg, lenOOB),
-                               "IndexOutOfRangeException");
                 return buildArraySpan(src, start, len);
             }
             // fix #3098 (language spec §17.7 "Standard-library builtins have
