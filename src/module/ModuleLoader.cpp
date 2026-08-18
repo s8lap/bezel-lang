@@ -12,6 +12,7 @@
 #include "lexer/Lexer.hpp"
 #include "module/ModuleMetadata.hpp"
 #include "module/ModuleMetadataBuilder.hpp"  // kMetadataSectionName
+#include "common/IntLiteral.hpp"
 #include "parser/Parser.hpp"
 #include "sema/ExprTypecheck.hpp"
 #include "sema/SemaContext.hpp"
@@ -100,6 +101,45 @@ sema::PrimitiveType fromPrimitiveKind(PrimitiveKind p) {
         case PrimitiveKind::Object:  return sema::PrimitiveType::Object;
     }
     return sema::PrimitiveType::None;
+}
+
+// fix #3230 (§17.14 / §15.1 / §22.12; family M11 of umbrella #3152): parse
+// the textual representation of an IMPORTED integer const's compile-time
+// value into a 64-bit signed integer. The wire carries a SINGLE integer
+// literal — `MetaMember::valueText` for an integer-typed const is the FOLDED
+// value (a digit string, possibly signed — fix #2898's "FOLD, don't render"),
+// not the source lexeme — so we parse with the same sign-split logic as
+// codegen's foldImportedConstText (LlvmBackend_Setup.cpp) and the same
+// magnitude decoder as `parseIntLiteral` (common/IntLiteral.hpp, the one
+// decoder for an A.8 literal — `0x` / `0b` / decimal / `_` separators all
+// admitted). Returns nullopt when the text does not start with a digit/sign
+// (a non-integer const reference, a reference to another const/enum by
+// name, an unparseable shape) — sema's fold closures then fall back to
+// returning nullopt, exactly the pre-#3230 behavior. The schema's wire
+// shape stays unchanged: the existing `valueText` is the only carrier and
+// we parse it at load time rather than on every codegen/materialize site.
+std::optional<std::int64_t> parseImportedConstIntText(std::string_view text) {
+    if (text.empty()) return std::nullopt;
+    const char c0 = text.front();
+    // Only fold an integer LITERAL (sign + magnitude). §22.12 permits a const
+    // initializer to reference another const/enum, which renderConstExpr
+    // emitted BY NAME (not as a digit string); folding that as an integer
+    // would silently produce 0. Reject it here so the caller's nullopt arm
+    // is the same fall-back it always was. The sign character is admitted
+    // because the textual channel already admits it (the guard mirrors
+    // LlvmBackend_Setup.cpp:551-552 one-for-one).
+    if (!((c0 >= '0' && c0 <= '9') || c0 == '+' || c0 == '-')) return std::nullopt;
+    const bool negative = (c0 == '-');
+    std::string_view mag = text;
+    if (c0 == '-' || c0 == '+') mag.remove_prefix(1);
+    // parseIntLiteral returns the unsigned magnitude as an i64 bit pattern;
+    // long.MinValue's magnitude is 2^63, which has no positive i64 — so
+    // negate in the UNSIGNED domain (~mv + 1u, two's complement with no
+    // signed arithmetic; same shape as LlvmBackend_Setup.cpp:574-583).
+    const std::uint64_t mv =
+        static_cast<std::uint64_t>(common::parseIntLiteral(mag));
+    return negative ? static_cast<std::int64_t>(~mv + 1u)
+                    : static_cast<std::int64_t>(mv);
 }
 
 ast::TypeDeclKind fromMetaTypeDeclKind(MetaTypeDeclKind k) {
@@ -705,6 +745,31 @@ struct Loader {
                 // library emits no storage symbol for a const). Recorded only
                 // when the builder rendered a value (non-empty).
                 if (!mm.valueText.empty()) constValues_[c] = mm.valueText;
+                // fix #3230 (§17.14 "Constant expressions" / §15.1 "Inline
+                // arrays" / §22.12 "Static members"; family M11 of umbrella
+                // #3152): an IMPORTED integer-typed const has no AST TypeDecl
+                // (the symbol is reconstructed from dependency metadata),
+                // so the sema fold closures that walk `cms->decl->value`
+                // silently return nullopt for it and `arraySizeValue` /
+                // case-pattern ranges / §5.1 narrowing silently miss the
+                // fold. Parse the textual value (the SAME wire text the
+                // existing `constValues_` channel already carries — fix
+                // #2898's "FOLD, don't render") into a typed int64 and
+                // attach it to the symbol. Only set when the const's
+                // declared type is an integer-family primitive (§4 bytes
+                // through ulong); string/bool/char/float/decimal consts
+                // leave it nullopt and continue to fold through the
+                // existing codegen `foldImportedConstText` path unchanged.
+                if (!mm.valueText.empty() && mm.type.kind == TypeKind::Primitive) {
+                    const sema::PrimitiveType p =
+                        fromPrimitiveKind(mm.type.primitive);
+                    using P = sema::PrimitiveType;
+                    if (p == P::Byte || p == P::SByte || p == P::Short ||
+                        p == P::UShort || p == P::Int || p == P::UInt ||
+                        p == P::Long || p == P::ULong) {
+                        c->intValue = parseImportedConstIntText(mm.valueText);
+                    }
+                }
                 applyBehavior(c);
                 return c;
             }

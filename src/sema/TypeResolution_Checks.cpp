@@ -925,6 +925,14 @@ void Resolver::checkTypeConsts(TypeSymbol* t) {
                             dynamic_cast<const ast::ConstDecl*>(scs->decl))
                         if (scd->value)
                             return foldIntConst(*scd->value, resolve, depth + 1);
+                    // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
+                    // umbrella #3152): an imported sibling const has no AST
+                    // TypeDecl (the symbol is reconstructed from metadata),
+                    // so the `scd->value` arm above returns nullopt and the
+                    // §6.1 / Appendix C.11 range check below silently no-ops.
+                    // Fall back to the typed value the loader populated
+                    // (parseImportedConstIntText in ModuleLoader.cpp).
+                    if (scs->intValue) return *scs->intValue;
                     return std::nullopt;
                 }
                 return std::nullopt;

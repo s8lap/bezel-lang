@@ -1404,11 +1404,31 @@ std::optional<long long> Resolver::foldIntConstExpr(const ast::Expr& e,
         for (TypeSymbol* ts = currentOuterType_; ts;) {
             for (Symbol* m : ts->members)
                 if (auto* cms = dynamic_cast<ConstMemberSymbol*>(m))
-                    if (cms->name == name)
-                        if (auto* cd =
-                                dynamic_cast<const ast::ConstDecl*>(cms->decl))
+                    if (cms->name == name) {
+                        // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
+                        // umbrella #3152): an IMPORTED class-level const has
+                        // no AST ConstDecl (the symbol is reconstructed from
+                        // dependency metadata, fix #328's reconstruction), so
+                        // the AST path's `cd->value` is unevaluable and the
+                        // fold would silently return nullopt — leaving
+                        // `arraySizeValue` at -1, the §5.1 narrowing
+                        // unchecked, and the case-pattern range ungated. Fall
+                        // back to the typed value the loader populated
+                        // (parseImportedConstIntText in ModuleLoader.cpp).
+                        // The `if (cd) /` `if (cd->value)` pair is wrapped
+                        // here in braces (not as a chained `else if`) so the
+                        // `else` binds to the OUTER `if (auto* cd = ...)`,
+                        // not to `if (cd->value)` — otherwise the imported
+                        // case (`cd == nullptr`) would fall off the chain
+                        // with no diagnostic and no fold. // per §17.14
+                        if (auto* cd = dynamic_cast<const ast::ConstDecl*>(
+                                cms->decl)) {
                             if (cd->value)
                                 return foldIntConst(*cd->value, resolve, d + 1);
+                        } else if (cms->intValue) {
+                            return *cms->intValue;
+                        }
+                    }
             TypeSymbol* nb = nullptr;
             for (TypeSymbol* base : ts->baseTypes)
                 if (base && base->kind == ast::TypeDeclKind::Class) {
@@ -1437,11 +1457,31 @@ ConstShiftDomainFault Resolver::findConstShiftDomainFaultInScope(
         for (TypeSymbol* ts = currentOuterType_; ts;) {
             for (Symbol* m : ts->members)
                 if (auto* cms = dynamic_cast<ConstMemberSymbol*>(m))
-                    if (cms->name == name)
-                        if (auto* cd =
-                                dynamic_cast<const ast::ConstDecl*>(cms->decl))
+                    if (cms->name == name) {
+                        // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
+                        // umbrella #3152): an IMPORTED class-level const has
+                        // no AST ConstDecl (the symbol is reconstructed from
+                        // dependency metadata, fix #328's reconstruction), so
+                        // the AST path's `cd->value` is unevaluable and the
+                        // fold would silently return nullopt — leaving
+                        // `arraySizeValue` at -1, the §5.1 narrowing
+                        // unchecked, and the case-pattern range ungated. Fall
+                        // back to the typed value the loader populated
+                        // (parseImportedConstIntText in ModuleLoader.cpp).
+                        // The `if (cd) /` `if (cd->value)` pair is wrapped
+                        // here in braces (not as a chained `else if`) so the
+                        // `else` binds to the OUTER `if (auto* cd = ...)`,
+                        // not to `if (cd->value)` — otherwise the imported
+                        // case (`cd == nullptr`) would fall off the chain
+                        // with no diagnostic and no fold. // per §17.14
+                        if (auto* cd = dynamic_cast<const ast::ConstDecl*>(
+                                cms->decl)) {
                             if (cd->value)
                                 return foldIntConst(*cd->value, resolve, d + 1);
+                        } else if (cms->intValue) {
+                            return *cms->intValue;
+                        }
+                    }
             TypeSymbol* nb = nullptr;
             for (TypeSymbol* base : ts->baseTypes)
                 if (base && base->kind == ast::TypeDeclKind::Class) {

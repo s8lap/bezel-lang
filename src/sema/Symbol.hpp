@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>  // #3145: anyRecordStorageField's predicate
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -621,6 +622,25 @@ struct EventSymbol : MemberSymbol {};
 
 struct ConstMemberSymbol : MemberSymbol {
     bool isStatic = false;
+    // fix #3230 (§17.14 "Constant expressions" / §15.1 "Inline arrays" /
+    // §22.12 "Static members", family M11 of umbrella #3152): the constant's
+    // typed integer value, when the const's declared type is a primitive
+    // integer-family primitive (§4, bytes through ulong) and its initializer
+    // is a §17.14 constant expression that folds. Populated for LOCAL consts
+    // by sema's resolveTypes / checkConstTypes pass from the AST initializer,
+    // and for IMPORTED consts by ModuleLoader from the textual
+    // `MetaMember::intValue` carrier (parsed with the same `parseIntLiteral`
+    // sign-split as codegen's foldImportedConstText, fix #3216). For an
+    // IMPORTED const the symbol is reconstructed from dependency metadata
+    // and has no AST TypeDecl, so the fold closures in TypeResolution_Names
+    // / TypeResolution_Checks / ExprTypecheck cannot read `decl->value` —
+    // they fall back to this field instead. Empty (default) for a const
+    // whose declared type is not an integer-family primitive (string, bool,
+    // char, float, decimal) and for a non-foldable integer initializer;
+    // default is `std::nullopt` so an unset value is distinguishable from
+    // a legitimate zero (a `:= 0` initializer sets the value to 0, not to
+    // "unset").
+    std::optional<std::int64_t> intValue;
 };
 
 struct EnumConstantSymbol : MemberSymbol {

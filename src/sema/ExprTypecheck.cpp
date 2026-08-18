@@ -8169,8 +8169,20 @@ std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
             val = lc->value.get();
         else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
             val = cd->value.get();
-        if (!val) return std::nullopt;
-        return foldIntConst(*val, resolve, d + 1);
+        if (val) return foldIntConst(*val, resolve, d + 1);
+        // fix #3230 (§17.14 / §5.1 / §22.12; family M11 of umbrella #3152):
+        // an IMPORTED class member const has no AST ConstDecl — the symbol
+        // is reconstructed from dependency metadata, fix #328 — so the
+        // AST path above returns nullopt and `case`-pattern out-of-range
+        // gates (#1153), the §5.1 narrowing range check (#2986 admission),
+        // and any other imported-class-const-driven constant expression
+        // silently no-op. Fall back to the typed value the loader
+        // populated (parseImportedConstIntText in ModuleLoader.cpp);
+        // std::nullopt for non-integer-family or non-foldable consts, which
+        // keep the pre-fix behavior unchanged. // per §17.14
+        if (auto* cms = dynamic_cast<ConstMemberSymbol*>(s))
+            if (cms->intValue) return *cms->intValue;
+        return std::nullopt;
     };
     // fix #2986 (§17.14 / §5.1 / §22.12, v0.240): admit a qualified class
     // const `C.GK` as a compile-time integer constant so it can drive §5.1
@@ -8195,7 +8207,21 @@ std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
         auto* cms = dynamic_cast<ConstMemberSymbol*>(mem);
         if (!cms) return std::nullopt;
         auto* cd = dynamic_cast<const ast::ConstDecl*>(cms->decl);
-        if (!cd || !cd->value) return std::nullopt;
+        if (!cd || !cd->value) {
+            // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of umbrella
+            // #3152): an IMPORTED class member const has no AST ConstDecl
+            // (the symbol is reconstructed from dependency metadata, fix
+            // #328's reconstruction), so the fold walks `cd->value` and
+            // silently returns nullopt — `case` pattern out-of-range gates
+            // (#1153), the §5.1 narrowing range check (#2986 admission),
+            // and any other `Lib.C.K`-driven constant expression all
+            // silently no-op. Fall back to the typed value the loader
+            // populated (parseImportedConstIntText in ModuleLoader.cpp);
+            // std::nullopt for string/bool/char/float/decimal/non-foldable
+            // consts — those keep the pre-fix behavior unchanged.
+            if (cms->intValue) return *cms->intValue;
+            return std::nullopt;
+        }
         return foldIntConst(*cd->value, resolve, 1);
     }
     return foldIntConst(e, resolve, 0);
