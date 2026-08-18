@@ -8,6 +8,35 @@ routinely *understate* the defect, and they occasionally overstate it).
 **Base:** `main` @ `701cb2d`, spec v0.252.
 **Umbrella issue:** #3152. **Family issues:** #3139–#3147, plus #3149, #3150, #3151.
 
+> **Lane contract — re-verified 2026-08-18 by issue #3168.** Per-row line
+> numbers in §5 drift on every `src/codegen/LlvmBackend_*.cpp` change,
+> and **the line label itself is the untrustworthy part of every row.**
+> Six of F6's 22 rows at this revision (Calls.cpp:8622, Calls2.cpp:8062,
+> Calls2.cpp:8315, Layout.cpp:1721, Exprs2.cpp:4731 — the `lowerNew`
+> site — and Layout.cpp:5630 — the `fieldAddr` site) had been wrong about
+> "what an imported symbol gets today" because the audit described the
+> pre-issue 3143 shape but the unified accessor introduced by issue 3143
+> is already in place at the content-addressable site; all six are now
+> ALREADY-CORRECT. A further three rows (Exprs.cpp:5110, Layout.cpp:4632,
+> Setup.cpp:7753) had audit line labels that did not even point at the
+> construct the audit was describing: `:5110` is now inside Exception
+> `CauseChain` handling, `:4632` is a blank line inside
+> `Emitter::makePropertyThunk`, and `:7753` is inside
+> `Emitter::rejectCollapsedTypeTestTarget`. **A reader must re-locate a
+> site by content (grep for the construct, not the line number) before
+> relying on any row.** Two of those three re-locate to sites that are
+> REACHABLE for an imported generic property — the #2884 sema-time gate
+> does not stop codegen from walking the AST — and use the unified
+> accessor (ALREADY-CORRECT). One re-locates to the
+> `templateGenericParamNames_` block inside `Emitter::emitFunctionBody`,
+> which the `isImported(ms)` early-return makes unreachable for imports
+> (UNREACHABLE for the right reason). The cheap check that catches the
+> wrong-line-label class: read the line and confirm it is the construct
+> the audit row describes; if not, grep for the construct (e.g.
+> `grep -n 'genericParamNames' <file>` for the F6 family) and re-derive.
+> This note is to be re-read against HEAD on every lane briefing; the
+> row-level corrections it documents are inline at the rows themselves.
+
 ---
 
 ## 1. Headline
@@ -183,14 +212,14 @@ imported symbols afterwards — so `currentType_` is never an imported symbol.
 |---|---|---|---|---|---|
 | 709 | **UNIFY** | F6 | setupReceiverGenericSubst | returns the saved subst unchanged (`!parent->decl` early-out) | genericParamNamesOf |
 | 758 | **UNIFY** | F7 | recordTypeOfRef: does the record carry auto equality? | false -> routed off the record-key fast path (#3132) | recordIsAutoBearing(ts) |
-| 8622 | **UNIFY** | F6 | generic substitution | no subst | genericParamNamesOf |
+| 8622 | **ALREADY-CORRECT** | F6 | generic substitution | MODEL ACCESSOR `sema::genericParamNames(cmpMs->parent)` — already the one both-sources walk introduced by #3143 (the line-number drifted past 8700 by 2026-08-18); the "no subst" claim was the pre-#3143 shape, but the unified accessor was applied at the same logical site | - |
 
 #### `src/codegen/LlvmBackend_Calls2.cpp`
 
 | line | verdict | family | question it answers | what an imported symbol gets today | what it should read |
 |---|---|---|---|---|---|
-| 8062 | **UNIFY** | F6 | generic substitution | no subst | genericParamNamesOf |
-| 8315 | **UNIFY** | F6 | generic substitution | no subst | genericParamNamesOf |
+| 8062 | **ALREADY-CORRECT** | F6 | generic substitution | MODEL ACCESSOR `sema::genericParamNames(ms->parent)` — already the one both-sources walk introduced by #3143; the "no subst" claim was the pre-#3143 shape, but the unified accessor was applied at the same logical site (line-number drifted past 8400 by 2026-08-18) | - |
+| 8315 | **ALREADY-CORRECT** | F6 | generic substitution | MODEL ACCESSOR `sema::genericParamNames(ms->parent)` — already the one both-sources walk introduced by #3143; the "no subst" claim was the pre-#3143 shape, but the unified accessor was applied at the same logical site (line-number drifted past 8650 by 2026-08-18) | - |
 | 8669 | **UNIFY** | F6 | generic substitution | no subst | genericParamNamesOf |
 | 8927 | **ALREADY-CORRECT** | — | - | MODEL ACCESSOR `genericParamNamesOf` -- AST first, `ts->genericParams` fallback | - |
 | 9996 | **UNIFY** | F6 | emitMethodCall: is the parent class generic (=> monomorphise)? | false -> the body is NOT monomorphised; static-field globals resolve to the unspecialised symbol | genericParamNamesOf(ms->parent) |
@@ -209,7 +238,7 @@ imported symbols afterwards — so `currentType_` is never an imported symbol.
 | line | verdict | family | question it answers | what an imported symbol gets today | what it should read |
 |---|---|---|---|---|---|
 | 2216 | **UNIFY** | F6 | generic substitution | no subst | genericParamNamesOf |
-| 5110 | **UNIFY** | F6 | generic substitution | no subst | genericParamNamesOf |
+| 5110 | **ALREADY-CORRECT** | F6 | property-getter generic substitution (re-located by content 2026-08-18) | The audit's `:5110` line label is stale; what's actually at `Exprs.cpp:5110` on HEAD is `i8Ty, excObj, builder_.getInt64(kExcCauseOffset));` inside the Exception `CauseChain` accessor — not a property-getter site at all. The content the audit MEANT is the `savedSubst = genericSubst_` block in `Emitter::lowerExprInner` (now at `LlvmBackend_Exprs.cpp:5304-5423`), which carries `sema::genericParamNames(ps->parent)` at `:5320` — the unified accessor from issue 3143, so ALREADY-CORRECT. The site IS reachable for an imported generic property: `#2884`'s `declineUnsupportedImportedPropertyAccess` (the sema-time gate at `ExprTypecheck_Calls.cpp:12678`) does not gate codegen, which walks the AST and reaches `lowerExprInner` regardless; the audit's earlier "no subst" claim was the pre-issue 3143 shape, but the unified accessor is in place at the content-addressable site today | - |
 | 6585 | **UNIFY** | F6 | generic substitution | no subst | genericParamNamesOf |
 
 #### `src/codegen/LlvmBackend_Exprs2.cpp`
@@ -219,7 +248,7 @@ imported symbols afterwards — so `currentType_` is never an imported symbol.
 | 351 | **UNIFY** | F6 | lowerUnary generic substitution | no subst | genericParamNamesOf |
 | 2646 | **UNIFY** | F3 | prePopulateBasePositionalFields: base's positional fields | not pre-populated | positional FieldSymbols |
 | 2668 | **NEEDS-AST** | F8 | the base-call argument expressions (`primaryBaseCtorArgs`) | arbitrary expressions; no symbol channel | - |
-| 4731 | **UNIFY** | F6 | generic substitution | no subst | genericParamNamesOf |
+| 4731 | **ALREADY-CORRECT** | F6 | `lowerNew` generic substitution | MODEL ACCESSOR `sema::genericParamNames(t)` — already the one both-sources walk introduced by #3143 (the line-number drifted past 5060 by 2026-08-18); the "no subst" claim was the pre-#3143 shape, but the unified accessor was applied at the same logical site, including the `#732` `allUnbound` guard that used to live only on the local arm | - |
 | 4938 | **UNIFY** | F3 | `new C(x)` primary-ctor field stores | skipped -> calloc-zero object (the class twin of #3130) | positional FieldSymbols |
 
 #### `src/codegen/LlvmBackend_Layout.cpp`
@@ -228,10 +257,10 @@ imported symbols afterwards — so `currentType_` is never an imported symbol.
 |---|---|---|---|---|---|
 | 1128 | **UNIFY** | F6 | generic substitution / specialised struct selection | the i32 placeholder layout is used for an imported instantiation | genericParamNamesOf |
 | 1233 | **UNIFY** | F6 | generic substitution / specialised struct selection | the i32 placeholder layout is used for an imported instantiation | genericParamNamesOf |
-| 1721 | **UNIFY** | F6 | generic substitution / specialised struct selection | the i32 placeholder layout is used for an imported instantiation | genericParamNamesOf |
+| 1721 | **ALREADY-CORRECT** | F6 | generic substitution / specialised struct selection | MODEL ACCESSOR `sema::genericParamNames(base)` — already the one both-sources walk introduced by #3143 (the line-number drifted past 1778 by 2026-08-18); the "i32 placeholder" claim was the pre-#3143 shape, but the unified accessor was applied at the same logical site | - |
 | 2097 | **ALREADY-CORRECT** | — | - | MODEL ACCESSOR -- RecordSubstGuard has the explicit `else if (!rtd && rt->declaration->genericParams...)` imported branch (#428) | - |
-| 4632 | **UNIFY** | F6 | generic substitution / specialised struct selection | the i32 placeholder layout is used for an imported instantiation | genericParamNamesOf |
-| 5630 | **UNIFY** | F6 | generic substitution / specialised struct selection | the i32 placeholder layout is used for an imported instantiation | genericParamNamesOf |
+| 4632 | **ALREADY-CORRECT** | F6 | property-getter generic substitution / specialised struct selection (re-located by content 2026-08-18) | The audit's `:4632` line label is stale; what's actually at `Layout.cpp:4632` on HEAD is a blank line between `auto savedSubst = genericSubst_;` and `auto savedSemaTy = genericSubstSemaTy_;` inside `Emitter::makePropertyThunk` (defined at `Layout.cpp:4578`) — not itself a substitution site, but inside the function the audit row was describing. The substitution the row MEANT is at `Layout.cpp:4699` (`sema::genericParamNames(ps->parent)`), the unified accessor from issue 3143, so ALREADY-CORRECT. The site IS reachable for an imported generic property: `makePropertyThunk` is invoked from `LlvmBackend_Exprs.cpp:5225`, which is not gated on `hasErrors()` (only the final `emitModule` checks errors at `LlvmBackend_impl.hpp:532`), so codegen walks the AST and reaches it whether or not the sema-time decline fired | - |
+| 5630 | **ALREADY-CORRECT** | F6 | `fieldAddr` generic substitution / specialised struct selection | MODEL ACCESSOR `sema::genericParamNames(ms->parent)` — already the one both-sources walk introduced by #3143 (the line-number drifted past 5705 by 2026-08-18); the "i32 placeholder" claim was the pre-#3143 shape, but the unified accessor was applied at the same logical site, including the `#828`/`#2014` `hasUnresolved` recovery that used to live only on the AST arm | - |
 
 #### `src/codegen/LlvmBackend_Serialization.cpp`
 
@@ -268,7 +297,7 @@ imported symbols afterwards — so `currentType_` is never an imported symbol.
 | 1794 | **ALREADY-CORRECT** | — | - | `isSynthesizedPrelude` -- the prelude decl is injected locally into every unit and is never exported | - |
 | 2088 | **ALREADY-CORRECT** | — | - | same; ModuleMetadataBuilder:1727 skips the prelude, so an imported parent is never one | - |
 | 5187 | **NEEDS-AST** | F12 | emitInvariantCheck: §22.16 invariants across the base chain | an imported base's invariants are canonical TEXT (`TypeSymbol::invariantContracts`), not a lowerable expression -- a real separate §22.16 gap, not a unify | - |
-| 7753 | **UNIFY** | F6 | templateGenericParamNames_ for the dead generic template body | empty set | genericParamNamesOf(ms->parent) |
+| 7753 | **UNREACHABLE** | F6 | templateGenericParamNames_ for the dead generic template body (re-located by content 2026-08-18) | The audit's `:7753` line label is stale; what's actually at `Setup.cpp:7753` on HEAD is `if (!sema::typeArgRuntimeReified(subst))` inside `Emitter::rejectCollapsedTypeTestTarget` (defined at `:7731`) — not inside `emitFunctionBody` at all. The block the audit MEANT is the `templateGenericParamNames_.clear()` / `.insert(gp)` / `.insert(gp.name)` cluster at `Setup.cpp:7968-7988`, which IS inside `Emitter::emitFunctionBody` (defined at `:7946`) AFTER the `ctx_.isImported(ms)` early-return at `:7955`. So the UNREACHABLE verdict holds — for the RIGHT reason this time: `emitFunctionBody` returns on import before the cluster runs, and the cluster uses `sema::genericParamNames(ms->parent)` (the unified accessor from issue 3143, applied at `:7976` "converted with the family so the read cannot answer differently from its siblings if that early-out ever moves") but with no consumer for an imported method today | - |
 | 10261 | **UNIFY** | F3 | emitChainCall `this(...)`: primary-ctor positional stores | skipped -> the object stays calloc-zero | positional FieldSymbols |
 | 10398 | **UNIFY** | F6 | generic substitution | no subst | genericParamNamesOf |
 | 10837 | **NEEDS-AST** | F8 | emitImplicitBase: `primaryBaseCtorArgs` (the `: Base(v)` clause) | arbitrary argument EXPRESSIONS; no symbol channel is possible without carrying body text | - |
