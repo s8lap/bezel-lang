@@ -8465,9 +8465,28 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
         if (!armTerm) builder_.CreateBr(endBB);
         builder_.SetInsertPoint(nextBB);
     }
-    // No arm matched → fall through (§19.6).
-    builder_.CreateBr(endBB);
-    builder_.SetInsertPoint(endBB);
+    // No arm matched.
+    if (cs.totalityGranted) {
+        // fix #3073 / §21.7 last sentence: the grant's soundness must not
+        // rest on the exhaustiveness computation alone — lower the dead
+        // no-match edge as a defined trap (MatchFailureException, §19.6)
+        // rather than fall through to end-of-callable + implicit-return.
+        // Without the trap, a bug in caseArmsExhaustive would degrade
+        // silently to a wrong value instead of a loud fault, defeating
+        // §21.7's stated guarantee. emitThrowBuiltin calloc's the exception
+        // object, stores its vtable, emits unwind disposals, and branches
+        // to the function's unwindBB — so this block needs no explicit
+        // terminator and we must NOT fall through to endBB.
+        emitThrowBuiltin("MatchFailureException");
+        // Defensive: emitThrowBuiltin always terminates with a br to
+        // unwindBB, so the next setInsertPoint only matters for analysis.
+        builder_.SetInsertPoint(endBB);
+    } else {
+        // §19.6: an unmatched value in statement position falls through
+        // with no action (the historical shape, kept for non-granted cases).
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+    }
     return false;
 }
 

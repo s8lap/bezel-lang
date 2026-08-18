@@ -1360,6 +1360,17 @@ struct BindExpr : Expr {
 struct CaseStmt : Stmt {
     std::unique_ptr<Expr> scrutinee;
     std::vector<CaseArm> arms;
+    // fix #3073 / §21.7: the statement-`case` totality grant — set by
+    // ExprTC::stmtAlwaysExits when BOTH conditions of the §21.7 rule hold
+    // (closed-value-space proof of exhaustiveness AND every arm diverges). When
+    // true, the no-match edge is statically dead and codegen MUST lower it as a
+    // defined trap (raising MatchFailureException or aborting), not as a
+    // fall-through to end-of-callable. Without the field the grant is consumed
+    // locally and the lowering cannot tell a granted `case` from any other.
+    // Default false; only ever flipped true; never inspected after sema except
+    // by Emitter::lowerCaseStmt, so a single AST-mutable field is sufficient
+    // (no need for a SemaContext side table).
+    bool totalityGranted = false;
 };
 
 // A.3 `ExtensionDecl ::= Visibility? "extension" Type GenericConstraints*

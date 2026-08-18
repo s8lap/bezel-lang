@@ -567,7 +567,14 @@ bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
         //     also admit the var-spelled irrefutable arm, so the untyped catch-all
         //     closes totality uniformly regardless of how the programmer wrote it.
         for (const auto& arm : cs->arms)
-            if (isUnguardedCatchAll(arm)) return true;
+            if (isUnguardedCatchAll(arm)) {
+                // fix #3073 / §21.7: persist the grant on the AST so codegen's
+                // statement-`case` lowering knows to emit a defined trap
+                // (MatchFailureException) on the dead no-match edge rather than
+                // fall through to end-of-callable + implicit-return.
+                const_cast<ast::CaseStmt*>(cs)->totalityGranted = true;
+                return true;
+            }
         // (2) §21.7 closed-value-space bullets (#2129 choice, #2133 bool +
         //     sealed): a CHOICE (§35.1 — the case set is closed by declaration),
         //     a BOOL primitive (§4.1 — no conversion manufactures a third value),
@@ -616,9 +623,15 @@ bool ExprTC::stmtAlwaysExits(const ast::Stmt& s) {
              (scrutTy->declaration->kind == ast::TypeDeclKind::Choice ||
               scrutTy->declaration->kind == ast::TypeDeclKind::Enum ||
               scrutTy->declaration->kind == ast::TypeDeclKind::Class)));
-        if (admitsTotality)
-            return caseArmsExhaustive(cs->arms, cs->scrutinee.get(), scrutTy,
-                                      s.span.begin, /*quiet=*/true);
+        if (admitsTotality &&
+            caseArmsExhaustive(cs->arms, cs->scrutinee.get(), scrutTy,
+                               s.span.begin, /*quiet=*/true)) {
+            // fix #3073 / §21.7: see the catch-all branch above — the
+            // closed-value-space grant is the same fact, recorded for the same
+            // reason.
+            const_cast<ast::CaseStmt*>(cs)->totalityGranted = true;
+            return true;
+        }
         return false;
     }
     if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
