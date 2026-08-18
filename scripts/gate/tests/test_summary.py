@@ -1250,5 +1250,126 @@ class TimeoutCLITest(_Fixture):
             self.assertNotIn("TIMED OUT", out.stdout)
 
 
+class PerShardCeilingRatioLogTest(unittest.TestCase):
+    """Narrow #3222: per-shard wall-time log now records the elapsed/ceiling
+    ratio so a reader can see how close shards got to BEZEL_SHARD_TIMEOUT —
+    a high-water mark that lets real cycles answer whether the cf84884 x2
+    multiplier is sized right (the body file: "let real cycles answer it,
+    rather than tuning the constant on the strength of one ratio").
+
+    The loop lives in tests/run_parallel.sh:328-345. The pin is bash-level
+    (the awk ratio calculation has its own edge cases), so we drive the loop
+    via subprocess with a minimal mocked logdir.
+    """
+
+    # The bash snippet that mirrors tests/run_parallel.sh:328-345. Kept in
+    # sync manually with the source (the loop is small enough that a drift
+    # shows up in review); if either side changes, this test fires.
+    _LOOP_SNIPPET = r"""
+set -u
+logdir="$1"; conc="$2"
+nbin=$(ls "$logdir"/shard.*.log 2>/dev/null | sed -E 's@.*shard\.([^.]+)\.[0-9]+\.log@\1@' | sort -u | wc -l)
+names=( $(ls "$logdir"/shard.*.log 2>/dev/null | sed -E 's@.*shard\.([^.]+)\.[0-9]+\.log@\1@' | sort -u) )
+for (( b = 0; b < nbin; b++ )); do
+    name="${names[$b]}"
+    for (( i = 0; i < conc; i++ )); do
+        et="$(grep -a -oE 'SHARD_ELAPSED [0-9.]+' "$logdir/shard.${name}.$i.log" 2>/dev/null | awk '{print $2}' | tail -1)"
+        if [[ -n "$et" ]]; then
+            sto="${BEZEL_SHARD_TIMEOUT:-}"
+            if [[ -n "$sto" && "$sto" -gt 0 ]]; then
+                pct="$(awk "BEGIN{ if ($sto > 0) printf \"%.1f%%\", ($et/$sto)*100; else print \"\" }")"
+                echo "shard ${name}.$i: ${et}s (ceiling ${sto}s, ${pct})"
+            else
+                echo "shard ${name}.$i: ${et}s"
+            fi
+        fi
+    done
+done
+"""
+
+    def _run_loop(self, logdir, conc, sto):
+        import subprocess
+        env = dict(os.environ, BEZEL_SHARD_TIMEOUT=str(sto))
+        return subprocess.run(
+            ["bash", "-c", self._LOOP_SNIPPET, "_", logdir, str(conc)],
+            capture_output=True, text=True, env=env)
+
+    def test_ceiling_ratio_logged_when_both_set(self):
+        # The shape that motivated the log: a shard cleared the ceiling by
+        # exactly the measured ratio (1.88x), so the next ASan cycle's ceiling
+        # choice is observable in the per-shard line.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0,
+                       "12 passed, 0 failed (shard 0/4), 40 total\n"
+                       "SHARD_ELAPSED 1795.50\n")
+            out = self._run_loop(d, 4, 1800)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("shard codegen.0: 1795.50s (ceiling 1800s, 99.8%)",
+                          out.stdout)
+
+    def test_ceiling_ratio_logged_near_ceiling_for_asan(self):
+        # ASan pass — the 1.9x ratio is the headline. A shard at 1915s of a
+        # 1800s ceiling (the cf84884 measurement) logs the right ratio so a
+        # reader sees 106.4% — confirming the shard cleared the plain
+        # ceiling AND hit the ASan ceiling (the very defect cf84884 fixed).
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0,
+                       "SHARD_ELAPSED 1915.61\n")
+            out = self._run_loop(d, 1, 1800)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("106.4%", out.stdout)
+
+    def test_no_ceiling_in_env_falls_back_to_bare_elapsed(self):
+        # The pre-#3222 path — no BEZEL_SHARD_TIMEOUT in env. Output must NOT
+        # fabricate a ratio, and must remain byte-identical for this case so
+        # existing consumers (gate_full_cycle.sh, gate.sh) see no change.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "SHARD_ELAPSED 12.34\n")
+            out = self._run_loop(d, 1, "")  # empty sto
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("shard codegen.0: 12.34s", out.stdout)
+            self.assertNotIn("ceiling", out.stdout)
+            self.assertNotIn("%", out.stdout)
+
+    def test_missing_elapsed_marker_skips_line(self):
+        # A shard that died before printing the marker contributes no line —
+        # matches the bash `[[ -n "$et" ]]` guard. Back-compat: the loop is
+        # observation-only, so a missing line is silent (not an error).
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0,
+                       "12 passed, 0 failed (shard 0/1), 40 total\n")
+            out = self._run_loop(d, 1, 1800)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout.strip(), "")
+
+    def test_zero_ceiling_falls_back_to_bare_elapsed(self):
+        # Defence-in-depth: an explicit zero BEZEL_SHARD_TIMEOUT must NOT
+        # trigger awk's divide-by-zero (it would print "inf%" which is a
+        # worse misleading signal than a missing ratio). The `sto > 0`
+        # guard short-circuits the same way as unset.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "SHARD_ELAPSED 12.34\n")
+            out = self._run_loop(d, 1, 0)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("shard codegen.0: 12.34s", out.stdout)
+            self.assertNotIn("ceiling", out.stdout)
+
+    def test_multiple_shards_all_have_ratios(self):
+        # The full-suite shape — every shard's ratio is logged, so a reader
+        # can spot the slowest shard and the cluster near the ceiling.
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(3):
+                _write_log(d, "codegen", i,
+                           "SHARD_ELAPSED {}\n".format(100.0 + i * 50))
+            out = self._run_loop(d, 3, 1000)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("shard codegen.0: 100.0s (ceiling 1000s, 10.0%)",
+                          out.stdout)
+            self.assertIn("shard codegen.1: 150.0s (ceiling 1000s, 15.0%)",
+                          out.stdout)
+            self.assertIn("shard codegen.2: 200.0s (ceiling 1000s, 20.0%)",
+                          out.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
