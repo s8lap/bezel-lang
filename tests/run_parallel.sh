@@ -333,7 +333,14 @@ _rp_py_failure="$(PYTHONPATH="$repo_root/scripts" python3 -m gate.summary format
     --undercount "${undercount_bins[@]}" \
     --missing-summary "${missing_summary_shards[@]}" \
     --crashed "${crashed_shards[@]}" \
-    --timed-out "${timed_out_shards[@]:-}" \
+    # timed_out_shards is locally declared at :264; with nargs="*", an empty
+    # declared array expands to zero args here, NOT a single empty string (the
+    # latter would make argparse `nargs="*"` produce args.timed_out=[""] — a
+    # one-element truthy list that flipped has_defect on every clean run, per
+    # the 11 poisoned attempts on d8ab1b7). The :- fallback is only needed
+    # when a variable might be UNSET (the for-loop use at :288 has that
+    # guard); here the array is in scope.
+    --timed-out "${timed_out_shards[@]}" \
     --logdir "$logdir")"
 [[ -n "$_rp_py_failure" ]] && printf '%s\n' "$_rp_py_failure"
 
