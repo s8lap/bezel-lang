@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.257.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.258.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning (§2's trivial-dispose classes excepted). A use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -87,13 +87,14 @@ var b := source.OpenBuffer();         // returns owned Buffer   -> owned
 var c := source.Buffer;               // field / property read  -> borrowed (source: source)
 var d := registry.Find("key");        // returns Buffer (no owned) -> borrowed
 var t := source.PrefetchAsync();      // returns Task<Buffer>  -> owned (task calls mint, v0.190)
+var q := xs.Where(p);                 // returns a lazy query  -> owned (calls mint, v0.258)
 var e := move holder.slot;            // move out of owned field -> owned
 ```
 
-The rule of thumb: `new` and any method whose return type says `owned` give you an owned value (you must discharge it). A plain field read or a plain (non-`owned`) return from an *instance* method is a borrow (you must not). Three refinements cover the rest:
+The rule of thumb: `new` and any method whose return type says `owned` give you an owned value (you must discharge it). A plain field read or — outside the mint-announcing families — a plain (non-`owned`) return from an *instance* method is a borrow (you must not). Three refinements cover the rest:
 
-- A *static* method's class-typed return must say `owned` — the compiler rejects the unmarked form, so a static signature always tells you whether you own the result.
-- A call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` is **owned** no matter the callee. Task-returning calls mint a fresh frame at every call, no marker needed (v0.190).
+- Outside the mint-announcing families, a *static* method's class-typed return must say `owned` — the compiler rejects the unmarked form, so a static signature always tells you whether you own the result.
+- A call whose declared return type is **mint-announcing** — `Task`/`Task<T>`/`OwningTask<T>`, or an iterable/enumerator interface or a lazy query — is **owned** no matter the callee: calls mint a fresh frame, no marker needed (tasks v0.190, iterables v0.258). A stored task or collection view is re-exposed as a property, whose read is a borrow.
 - A generic call returning bare `T`, like `Math.Max(a, b)`, is a **borrow of its arguments** (v0.194).
 
 When in doubt, the spec's producers table (§28.3) is exhaustive.
@@ -160,7 +161,7 @@ end TakeTransactions;
 
 So a caller that needs to *look at* `_transactions` gets a borrow (the bare-field-read return above, or a dedicated borrowing view); a caller that must *take* it uses `move` with an `owned` return (next section).
 
-**Returning a lazy pipeline is fine — over your own inputs.** A method may build and return a lazy query (or an iterator, or a `Task`) over its *own parameters or receiver*, even though the returned frame borrows them: `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` (an instance form spells the same contract `owned IEnumerable<int>`, spec §28.3/§29.3, v0.223). The caller re-establishes that borrow against its *own* argument and must keep it alive while it enumerates — for a returned `Task`, until the task settles. The returned task is itself caller-owned (task calls mint, v0.190), so it is discharged like any other owned value. What you may *not* return this way is a pipeline over a local you created inside the method; that borrow would dangle. Materialize it into an `owned Array<T>` instead.
+**Returning a lazy pipeline is fine — over your own inputs.** A method may build and return a lazy query (or an iterator, or a `Task`) over its *own parameters or receiver*, even though the returned frame borrows them: `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` (an instance or extension form is the same contract in the same unmarked spelling — every iterable-family call mints, whatever the callee kind; spec §28.3, v0.258 — with `owned` admissible as emphasis). The caller re-establishes that borrow against its *own* argument and must keep it alive while it enumerates — for a returned `Task`, until the task settles. The returned task is itself caller-owned (task calls mint, v0.190), so it is discharged like any other owned value. What you may *not* return this way is a pipeline over a local you created inside the method; that borrow would dangle. Materialize it into an `owned Array<T>` instead.
 
 ---
 

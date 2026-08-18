@@ -1,6 +1,6 @@
 # Bezel Guide 5: Collections, Queries, and Iteration
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.257.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.258.*
 
 The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5, `import System.Collections.Linq;`). What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `move` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
 
@@ -197,7 +197,7 @@ end Tail;
 Five rules cover the shape:
 
 - An `IEnumerable<T>`-returning iterator is re-iterable — each `GetEnumerator()` runs the body afresh — while an `IEnumerator<T>` return is single-use (spec §29.3).
-- An *instance or extension* iterator marks its return `owned` (`owned IEnumerable<T>`) — the unmarked instance spelling already means "borrowed view of a stored collection" (spec §28.3). A static iterator's declared type is announcement enough (type-announced, spec §28.3).
+- An iterator's declared type is announcement enough at *every* callee kind — static, instance, or extension (type-announced; calls mint, spec §28.3, v0.258) — so the unmarked spelling above is the whole convention, and `owned IEnumerable<T>` is admissible emphasis. A *stored* collection you want to re-expose is not a method's job: expose it as a **property** (`public readonly property Items: IEnumerable<Item> => _items;`), whose reads are borrows — a method returning the field no longer compiles.
 - There is no plain `return` in an iterator — exit early with `yield break;` (spec §29.5).
 - Resource handling inside the body prefers `using var` over `try`/`finally` (`yield` is barred inside a `try` that has a `catch`, spec §29.6). Cleanup is reliable on abandonment: if the consumer `break`s or the enumerator is disposed early, the frame runs its pending `using var` disposals and `finally` clauses exactly as if the body had exited at the suspension point (spec §29.7). An `owned` parameter the body never moved out is disposed by the frame too (spec §29.8; adopt-on-entry is the warning-free spelling, Guide 1 §9).
 - What a yield *hands over* follows the return type: yields from an `IEnumerable<T>` iterator at class T are retained by the enumerator — the consumer borrows them (§2, §6) — while an `IOwningEnumerable<T>` iterator passes ownership through to the consumer, `Drain()`-style. Yielding a *named* owned local in a borrowing iterator is the adopt-then-yield idiom (Guide 1 §9).
@@ -206,11 +206,11 @@ Five rules cover the shape:
 
 ## 4. How Bezel does it: a bound query is consumed exactly once
 
-The stdlib §5 operators (`import System.Collections.Linq;`) are the headline unusual feature. As elsewhere, most of them are **lazy**: `xs.Where(p)` does no work — it builds a deferred pipeline that runs when enumerated. Unlike elsewhere, a **bound lazy query is affine**: it may be enumerated **at most once**, and the first consumption uses it up, exactly as a `move` consumes an owned value (spec §29.11).
+The stdlib §5 operators (`import System.Collections.Linq;`) are the headline unusual feature. As elsewhere, most of them are **lazy**: `xs.Where(p)` does no work — it builds a deferred pipeline that runs when enumerated. Unlike elsewhere, a **bound lazy query is affine**: it may be enumerated **at most once** — the first consumption spends its one *enumeration right*, the way a `move` spends ownership. The frame itself is still yours to dispose (`using var`, as in every example here); the right and the disposal obligation are layered, not the same thing (spec §29.11).
 
 ```bezel
-var hot := readings.Where(lambda(r) => r.Celsius > 90.0);   // bound lazy query
-var n := hot.Count();            // consumes it
+using var hot := readings.Where(lambda(r) => r.Celsius > 90.0);   // bound lazy query
+var n := hot.Count();            // spends its one enumeration right
 for var r in hot do              // ERROR: `hot` was already consumed — the
   Plot(r);                       //   diagnostic points at .ToArray()
 end;
@@ -224,13 +224,13 @@ var n    := hot.Count;                            // a collection property now
 var mean := hot.Average(lambda(r) => r.Celsius);  // as many passes as you like
 ```
 
-`ToArray()` returns an owned `Array<T>` — a collection, enumerable any number of times. Only the bound lazy value is affine. Exactly three uses consume a bound query (spec §29.11):
+`ToArray()` returns an owned `Array<T>` — a collection, enumerable any number of times. Only the bound lazy value is affine. Exactly three uses spend a bound query's enumeration right (spec §29.11):
 
 1. **Enumeration or a terminal operator** — a `for` loop, `Count()`, `First()`, `ToArray()`, ….
 2. **Composing a further operator** — the right transfers into the composed query:
 
    ```bezel
-   var warm  := readings.Where(IsWarm);   // bound
+   using var warm  := readings.Where(IsWarm);   // bound
    var names := warm.Select(Label);       // consumes `warm` — the right moves into `names`
    var n     := warm.Count();             // ERROR: `warm` was consumed by the Select
    ```
@@ -242,7 +242,8 @@ var mean := hot.Average(lambda(r) => r.Celsius);  // as many passes as you like
      return xs.Average();               // one enumeration — all a callee may assume
    end Mean;
 
-   var m := Mean(readings.Select(CelsiusOf)); // the caller's binding is consumed here
+   var m := Mean(readings.Select(CelsiusOf)); // unbound temporary: the right passes to the callee,
+                                              //   the frame is disposed at statement end
    ```
 
    Inside the callee a plain `IEnumerable<T>` parameter is statically untracked — the affine tracking follows provenance, not the type, so a violation there is caught by the runtime guard instead: `InvalidOperationException`, the same loud failure as mutation during iteration. Write callees to enumerate a sequence parameter once; a callee that needs two passes materializes.
