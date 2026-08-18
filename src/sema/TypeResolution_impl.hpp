@@ -138,6 +138,20 @@ public:
     // discharge. No special wiring for that case.
     void checkSendableConstraintsLate();
 
+    // §14.2 / fix #3160: §14.2 constraint check at an instantiation site
+    // that does NOT have an `ast::Type` node — the receiver of a
+    // `Type<...>.staticMember` access (`Ferry<Bad>.Count()`). Public so the
+    // free-function wrapper `bezel::sema::checkGenericConstraintsAtExpr`
+    // (TypeResolution.hpp) can call it from a fresh Resolver; same pattern
+    // as `checkClassSerializationEligibilityLate` and
+    // `checkSendableConstraintsLate`. See the function's own comment for
+    // why the deferred-nested / deferred-type-bound paths are intentionally
+    // skipped here.
+    void checkGenericConstraintsAtUseSite(
+        SourceLocation useSite,
+        const std::vector<const ast::Type*>& argAsts,
+        const std::vector<TypeRef*>& argRefs, TypeSymbol* tsym);
+
 private:
     // Lookup environment in scope. A stack of scopes (module-level + per-type
     // + per-method). Each scope contributes a small name → Symbol table.
@@ -731,24 +745,39 @@ private:
     // §14.2 / Appendix C.4: at a generic instantiation site
     // (`Named<...>` type, including `new C<...>()`), verify every supplied
     // type argument satisfies the constraints its corresponding type
-    // parameter declares in the type's `where` clause. `tsym` is the
-    // resolved generic type; `t` carries the AST argument nodes (used to
-    // skip arguments that are themselves generic params — those can't be
-    // classified statically); `argRefs` are the resolved argument TypeRefs
+    // parameter declares in the type's `where` clause. `t` carries the
+    // instantiation AST node (its span is the diagnostic location; its
+    // `genericArgs` are the argument AST nodes — used to skip arguments
+    // that are themselves generic params, those can't be classified
+    // statically); `argRefs` are the resolved argument TypeRefs
     // (positionally aligned with `tsym->genericParams`); `scope` is used to
     // detect whether an argument name is an in-scope generic parameter.
     void checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
                                  const std::vector<TypeRef*>& argRefs,
                                  Scope* scope);
 
+    // §14.2 / fix #3160: the same check, but for an instantiation site
+    // that does NOT have an `ast::Type` node — the receiver of a
+    // `Type<...>.staticMember` access, where the IdentifierExpr carries
+    // its `typeArgs` as `ast::Type*` children but no wrapping `ast::Type`
+    // is constructed. Pre-#3160 this path built the instantiated TypeRef
+    // inline in ExprTC and never called checkGenericConstraints, so a
+    // `where T: sendable` (or any §14.2 constraint) was silently skipped.
+    // The full rationale and the deferred-nested edge case the use-site
+    // path cannot reach (the Resolver's `deferredNested_` /
+    // `deferredTypeBoundFailures_` lists are local to the resolveTypes-
+    // time instance) live on the public declaration above.
+
     // §14.2: check a single constraint `item` (one of class / value /
     // notnull / new() / a type-bound) against type argument `arg` (resolved)
-    // for the type parameter named `paramName`. `t` supplies the diagnostic
-    // span; `argAst` is the argument's AST node (for its spelling);
-    // `boundScope` resolves a LOCAL type-bound constraint's bound on demand
-    // (an imported bound arrives already resolved — see
-    // `sema::GenericParamConstraint`, fix #3146).
-    void checkOneConstraint(const ast::Type& t, std::string_view paramName,
+    // for the type parameter named `paramName`. `useSite` supplies the
+    // diagnostic span (the wrapping-form caller passes the instantiation
+    // `ast::Type`'s `span.begin`; the use-site overload from fix #3160
+    // passes the IdentifierExpr's span). `argAst` is the argument's AST
+    // node (for its spelling); `boundScope` resolves a LOCAL type-bound
+    // constraint's bound on demand (an imported bound arrives already
+    // resolved — see `sema::GenericParamConstraint`, fix #3146).
+    void checkOneConstraint(SourceLocation useSite, std::string_view paramName,
                             const GenericParamConstraint& item,
                             const ast::Type* argAst, TypeRef* arg,
                             Scope* boundScope);

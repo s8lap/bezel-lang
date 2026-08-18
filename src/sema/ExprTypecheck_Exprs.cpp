@@ -1148,20 +1148,48 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // finds a Named TypeRef with a declaration and resolves the static
             // member against the concretely instantiated class.
             // When typeArgs is empty (the common case) this block is skipped.
+            //
+            // fix #3160 (§14.2, v0.256): the `Ferry<Bad>.Count()` receiver was
+            // accepted pre-#3160 — this IdentifierExpr-as-type-name path built
+            // the instantiated TypeRef inline and never reached
+            // `Resolver::checkGenericConstraints`, so a failed `where T:
+            // sendable` (and every other §14.2 constraint form) was silently
+            // skipped at every static-member-access instantiation site. Run
+            // the constraint check on the just-built TypeRef via the
+            // free-function entry point, so the same diagnostic
+            // Resolver::checkGenericConstraints would have produced fires
+            // uniformly. The IdentifierExpr's span is the well-located
+            // diagnostic site (the wrapping `ast::Type` node path prints 0:0
+            // — the new-route location issue noted in #3160's "Note").
             if (!id->typeArgs.empty()) {
                 if (auto* ts = dynamic_cast<TypeSymbol*>(sym)) {
                     auto* instTy = ctx_.makeTypeRef();
                     instTy->kind = TypeRef::Kind::Named;
                     instTy->declaration = ts;
+                    std::vector<const ast::Type*> argAsts;
+                    argAsts.reserve(id->typeArgs.size());
                     for (const auto& ta : id->typeArgs) {
                         if (ta) {
                             TypeRef* resolved = ctx_.resolvedType(*ta);
                             instTy->genericArgs.push_back(resolved);
+                            argAsts.push_back(ta.get());
                         } else {
                             instTy->genericArgs.push_back(nullptr);
+                            argAsts.push_back(nullptr);
                         }
                     }
                     ctx_.setExprType(&e, instTy);
+                    // §14.2 constraint check at this instantiation site —
+                    // same dispatch as every other syntactic position that
+                    // names a generic type. Free-function entry point wraps a
+                    // fresh Resolver over the same ctx, so no ExprTC-
+                    // Resolver plumbing is needed; the deferred-nested /
+                    // deferred-type-bound paths (which require Resolver state
+                    // local to resolveTypes) are intentionally skipped here —
+                    // see Resolver::checkGenericConstraintsAtUseSite's
+                    // function-level comment.
+                    checkGenericConstraintsAtExpr(ctx_, e.span.begin, argAsts,
+                                                   instTy->genericArgs, ts);
                     // Return early — no further local/param/field type
                     // attachment is needed; the exprType is now set.
                     return;

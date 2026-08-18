@@ -439,4 +439,23 @@ bool checkSendableConstraintsLate(const ast::SourceFile& src,
     return !ctx.diagnostics().hasErrors();
 }
 
+// §14.2 / fix #3160: §14.2 constraint check at an instantiation site
+// without an `ast::Type` node — the receiver of a static-member access
+// (`Ferry<Bad>.Count()`). Same pattern as `checkSendableConstraintsLate`:
+// a fresh Resolver wrapping `ctx` runs the check; deferred state is
+// local to this Resolver and goes unused (already flushed by the
+// resolveTypes-time Resolver before ExprTC calls this), but the
+// common-shape case (concrete typeArgs) is handled. See the comment on
+// `Resolver::checkGenericConstraintsAtUseSite` for the full rationale
+// and the deferred-nested edge case.
+bool checkGenericConstraintsAtExpr(SemaContext& ctx,
+                                   SourceLocation useSite,
+                                   const std::vector<const ast::Type*>& argAsts,
+                                   const std::vector<TypeRef*>& argRefs,
+                                   TypeSymbol* tsym) {
+    Resolver r(ctx);
+    r.checkGenericConstraintsAtUseSite(useSite, argAsts, argRefs, tsym);
+    return !ctx.diagnostics().hasErrors();
+}
+
 } // namespace bezel::sema

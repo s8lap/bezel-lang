@@ -75,6 +75,28 @@ bool checkClassSerializationEligibilityLate(const ast::SourceFile& src,
 bool checkSendableConstraintsLate(const ast::SourceFile& src,
                                   SemaContext& ctx);
 
+// §14.2 / fix #3160: §14.2 constraint check at an instantiation site that
+// does NOT have an `ast::Type` node — the receiver of a
+// `Type<...>.staticMember` access (`Ferry<Bad>.Count()`). The IdentifierExpr
+// in that position is the one syntactic path that mints an instantiated
+// TypeRef without going through `Resolver::resolveType` (which is where the
+// wrapping-form `Resolver::checkGenericConstraints` runs). Pre-#3160 the
+// `where T: sendable` (and every §14.2 constraint form) was silently skipped
+// at this site. Exposed as a free function so ExprTypecheck.cpp's
+// IdentifierExpr handler can invoke it without depending on Resolver
+// directly. `argAsts` and `argRefs` are positionally aligned with
+// `tsym->genericParams`. Same pattern as `checkClassSerializationEligibilityLate`
+// and `checkSendableConstraintsLate`: a fresh Resolver wrapping `ctx` runs
+// the check; the deferred-nested / deferred-type-bound paths are local to
+// each Resolver instance and already flushed by the time this is called,
+// so the common case (concrete typeArgs) is handled and the deferred-edge
+// case stays no-worse than pre-#3160.
+bool checkGenericConstraintsAtExpr(SemaContext& ctx,
+                                   SourceLocation useSite,
+                                   const std::vector<const ast::Type*>& argAsts,
+                                   const std::vector<TypeRef*>& argRefs,
+                                   TypeSymbol* tsym);
+
 // Structural equality of two resolved TypeRefs (§19/§22.6 "exact match").
 // Returns false (conservatively) when either is null or an Error kind.
 // Exposes the resolver's existing structural-equality utility for reuse by

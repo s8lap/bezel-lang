@@ -5972,7 +5972,7 @@ static std::string_view constraintBoundBareName(
     return n;
 }
 
-void Resolver::checkOneConstraint(const ast::Type& t,
+void Resolver::checkOneConstraint(SourceLocation useSite,
                                   std::string_view paramName,
                                   const GenericParamConstraint& item,
                                   const ast::Type* argAst, TypeRef* arg,
@@ -5991,7 +5991,7 @@ void Resolver::checkOneConstraint(const ast::Type& t,
             "` does not satisfy the constraint `where " + param + ": " +
             reason + "` (§14.2)";
         if (!detail.empty()) msg += detail;
-        ctx_.diagnostics().report(Severity::Error, t.span.begin, msg);
+        ctx_.diagnostics().report(Severity::Error, useSite, msg);
     };
 
     if (item.kind == "notnull") {
@@ -6068,7 +6068,7 @@ void Resolver::checkOneConstraint(const ast::Type& t,
         if (arg->kind == TypeRef::Kind::Error) return;
         ctx_.addPendingSendableConstraint(
             SemaContext::PendingSendableConstraint{
-                t.span.begin, param, argName, arg});
+                useSite, param, argName, arg});
         return;
     }
     if (item.kind == "hashable") {
@@ -6181,7 +6181,7 @@ void Resolver::checkOneConstraint(const ast::Type& t,
         // type's bases are populated and reports persistent failures.
         if (!argSatisfiesTypeBound(arg, bound)) {
             deferredTypeBoundFailures_.push_back(DeferredTypeBoundFailure{
-                t.span.begin, param, boundName, argName, arg, bound});
+                useSite, param, boundName, argName, arg, bound});
         }
         return;
     }
@@ -6207,6 +6207,27 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
     // ModuleLoader rebuilds from `MetaGenericParam` — one representation, both
     // sources. `td` survives for ONE residual use below (see the
     // recordDeferredNested call).
+    //
+    // fix #3160 (§14.2, v0.256): the receiver of a static-member access
+    // (`Ferry<Bad>.Count()`) used to BYPASS this whole function — it is the
+    // sole syntactic position that mints an instantiated TypeRef without ever
+    // going through `Resolver::resolveType`. This wrapping-form overload is
+    // now a thin adapter: it pulls `t.span.begin` (diagnostic location) and
+    // the per-argument AST nodes out of `t.genericArgs` and forwards
+    // everything else to `checkGenericConstraintsAtUseSite`, which the
+    // static-member-access receiver path also calls. Every §14.2 constraint
+    // form (`where T: sendable`, `where T: class`, a base-type bound, a
+    // type-parameter bound) now fires uniformly at every instantiation site.
+    // The deferred-nested path (where the arg is itself an in-scope generic
+    // parameter of the enclosing type) is the one edge case the use-site
+    // overload cannot reach — the Resolver's `deferredNested_` /
+    // `deferredTypeBoundFailures_` lists are local to the resolveTypes-time
+    // Resolver instance and already flushed by the time ExprTC calls the
+    // overload. The wrapping-form `new` route preserves the full
+    // deferred-nested behaviour; the use-site overload handles only the
+    // static-member-access site, where the typeArg is a concrete class
+    // (the issue's repro and every realistic instantiation site) and no
+    // deferral is needed.
     if (!tsym) return;
     auto* td = dynamic_cast<const ast::TypeDecl*>(tsym->decl);
     bool anyConstraint = false;
@@ -6312,7 +6333,97 @@ void Resolver::checkGenericConstraints(const ast::Type& t, TypeSymbol* tsym,
                     continue;
                 }
             }
-            checkOneConstraint(t, gp->name, item, argAst, arg, &boundScope);
+            checkOneConstraint(t.span.begin, gp->name, item, argAst, arg, &boundScope);
+        }
+    }
+}
+
+void Resolver::checkGenericConstraintsAtUseSite(
+    SourceLocation useSite,
+    const std::vector<const ast::Type*>& argAsts,
+    const std::vector<TypeRef*>& argRefs, TypeSymbol* tsym) {
+    // fix #3160 (§14.2, v0.256): §14.2 constraint check at an instantiation
+    // site that does NOT have an `ast::Type` node — the receiver of a
+    // `Type<...>.staticMember` access (`Ferry<Bad>.Count()`). The pre-#3160
+    // IdentifierExpr handler built the instantiated TypeRef inline and never
+    // invoked `Resolver::checkGenericConstraints`, so a failed `where T:
+    // sendable` (or any §14.2 constraint) was silently skipped. This overload
+    // takes the already-resolved argument TypeRefs, the AST nodes for the
+    // arguments (for spelling in the diagnostic), and the use-site span
+    // (IdentifierExpr's span — well-located, unlike the new-site path that
+    // prints 0:0 from the wrapping `ast::Type` node's span), then runs the
+    // SAME per-constraint logic as the wrapping form. The deferred-nested
+    // and deferred-type-bound paths are intentionally skipped: they require
+    // Resolver state (`deferredNested_`, `deferredTypeBoundFailures_`) local
+    // to the resolveTypes-time Resolver, and ExprTC runs AFTER that
+    // Resolver's late-flush passes. For the common case (concrete typeArgs —
+    // every realistic instantiation site, including the issue's repro) no
+    // deferral is needed; the deferred-nested edge case stays no-worse than
+    // pre-#3160, since the static-member-access path never called this
+    // check at all.
+    if (!tsym) return;
+    bool anyConstraint = false;
+    for (Symbol* gpSym : tsym->genericParams) {
+        auto* gp = dynamic_cast<GenericParamSymbol*>(gpSym);
+        if (gp && !gp->constraints.empty()) { anyConstraint = true; break; }
+    }
+    if (!anyConstraint) return;
+
+    Scope boundModule;
+    if (ctx_.module()) {
+        for (Symbol* child : ctx_.module()->children) {
+            if (!child->name.empty()) boundModule.names[child->name] = child;
+        }
+    }
+    Scope boundScope;
+    boundScope.parent = &boundModule;
+    for (Symbol* gp : tsym->genericParams) {
+        if (gp) boundScope.names[gp->name] = nullptr;  // generic-param marker
+    }
+
+    for (std::size_t pi = 0; pi < tsym->genericParams.size() &&
+         pi < argAsts.size() && pi < argRefs.size(); ++pi) {
+        auto* gp = dynamic_cast<GenericParamSymbol*>(tsym->genericParams[pi]);
+        if (!gp) continue;
+        const ast::Type* argAst = argAsts[pi];
+        TypeRef* arg = argRefs[pi];
+        if (!argAst || !arg) continue;
+        // Skip the §14.2 deferred-nested path — see the function-level
+        // comment. The wrapping form's `isGenericParamRef` check requires a
+        // properly-marked scope, which this overload's caller does not
+        // supply; in practice the typeArg is concrete (else the
+        // IdentifierExpr wouldn't have typeArgs at all — generic params
+        // are not valid typeArg spellings at a static-member-access site
+        // when the param is the enclosing class's own).
+        if (arg->kind == TypeRef::Kind::Error) continue;
+
+        for (const GenericParamConstraint& item : gp->constraints) {
+            std::string_view boundParam = constraintBoundBareName(item);
+            if (!boundParam.empty()) {
+                std::size_t ui = tsym->genericParams.size();
+                for (std::size_t k = 0; k < tsym->genericParams.size(); ++k)
+                    if (tsym->genericParams[k] &&
+                        tsym->genericParams[k]->name == boundParam) {
+                        ui = k;
+                        break;
+                    }
+                if (ui < argRefs.size() && argRefs[ui]) {
+                    TypeRef* uSubst = argRefs[ui];
+                    if (arg->nullable) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, useSite,
+                            std::string("type argument `") +
+                            argSpelling(argAst) +
+                            "` does not satisfy the constraint `where " +
+                            std::string(gp->name) + ": " +
+                            std::string(boundParam) + "` (§14.2)");
+                    }
+                    // Non-named substitutions → defer with no diagnostic
+                    // (matches the wrapping form's conservatism).
+                    continue;
+                }
+            }
+            checkOneConstraint(useSite, gp->name, item, argAst, arg, &boundScope);
         }
     }
 }
@@ -6458,7 +6569,7 @@ void Resolver::checkDeferredNestedConstraints() {
             GenericParamConstraint view;
             view.kind = p.item->kind;
             view.astBound = p.item->typeArg.get();
-            checkOneConstraint(*p.innerSite, p.innerParamName, view,
+            checkOneConstraint(p.innerSite->span.begin, p.innerParamName, view,
                                boundAst, bound, &boundScope);
         }
     }
