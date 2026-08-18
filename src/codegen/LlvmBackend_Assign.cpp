@@ -245,6 +245,26 @@ llvm::Value* Emitter::lowerArrayRangeSlice(llvm::Value* recv,
     llvm::Value* lo = nullptr, *hi = nullptr;
     bool inclusive = true;
     if (auto* re = dynamic_cast<const ast::RangeExpr*>(&idxExpr)) {
+        // fix #3103 (§15.6, v0.255, range-step on slice): `arr[a..b step z]`
+        // is a SILENT-DROP defect — the step expression was never read in this
+        // lowering (only lo/hi/inclusive were), so the side effect of `z` was
+        // skipped and the runtime zero-step fault of §16.4 never fired.  The
+        // spec's slice form (§15.6) is stepless by definition: the slicing
+        // operation is over a contiguous range. A `step` in a slice index
+        // therefore has no meaning, mirroring §16.4's parallel restriction
+        // "step is not legal in case patterns" (sema/ExprTypecheck.cpp —
+        // those patterns test membership, and a stride has no meaning). The
+        // constant-zero case is already rejected at sema by §16.4, so the
+        // diagnostic here covers the rest: computed steps, including
+        // side-effecting ones that the old lowering skipped entirely.
+        if (re->step) {
+            ctx_.diagnostics().report(
+                Severity::Error, re->step->span.begin,
+                "`step` is not legal in a slice index — `arr[a..b]` is a "
+                "contiguous slice (§15.6) and has no stride; remove the "
+                "`step z` clause (use a `for`-loop over the stepped range "
+                "to walk a strided sub-range)");
+        }
         if (re->lo) {
             lo = lowerExpr(*re->lo);
             if (lo && !lo->getType()->isIntegerTy(64))
