@@ -332,6 +332,14 @@ void Resolver::run(const ast::SourceFile& src) {
     checkAsTargetInstantiations();
     // Slice S17: class-level modifier mutual-exclusions.
     checkClassModifierCombinations();
+    // fix #3100 (§19.6 / §11.7, v0.254): a `closed` class whose hierarchy
+    // has a non-public concrete subclass makes the cross-module
+    // exhaustiveness guarantee unsound (the leaf is invisible to importers
+    // but can still be a runtime value of the closed type). Runs after
+    // checkClassModifierCombinations because the descriptor needs the
+    // whole module's class set collected (the descendants of a `closed`
+    // root are not necessarily textually adjacent).
+    checkClosedHierarchyLeafVisibility();
     // Slice S19: overloads must differ in signature.
     checkOverloadSignatures();
     // Slice S22: top-level types may only be public or internal.

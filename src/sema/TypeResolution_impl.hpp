@@ -362,6 +362,20 @@ private:
     // `static` and appears only on a class.
     void checkClassModifierCombinations();
     void checkTypeModifierCombinations(TypeSymbol* t);
+    // fix #3100 (§19.6 / §11.7, v0.254): a `closed` class's cross-module
+    // exhaustiveness guarantee (§19.6 last sentence) depends on the COMPLETE
+    // leaf set being visible at the importer, but `internal` classes are
+    // NOT exported (ModuleMetadataBuilder.cpp:2112, "§13.2 internal types
+    // not exported"). A `closed` root with a non-public concrete subclass
+    // therefore has an importer-invisible leaf, and the importer's
+    // `caseArmsExhaustive` walk proves exhaustiveness against an
+    // incomplete leaf set — silent wrong behavior at runtime (a `case` the
+    // static proof accepts but whose runtime can dispatch to a leaf no arm
+    // names, raising MatchFailureException). Reject at the declaration
+    // site so the dependent module does not produce an artifact whose
+    // cross-module guarantee is unsound, and so the importer sees a
+    // closed root only over a leaf set it can read.
+    void checkClosedHierarchyLeafVisibility();
 
     // Slice S16 (§11.7): a class declared `static` may contain only
     // static members — no instance fields, methods, properties,

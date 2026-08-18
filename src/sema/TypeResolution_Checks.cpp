@@ -1631,6 +1631,122 @@ void Resolver::checkTypeModifierCombinations(TypeSymbol* t) {
     }
 }
 
+// fix #3100 (§19.6 / §11.7, v0.254): a `closed` class's cross-module
+// exhaustiveness guarantee ("exhaustiveness holds across module
+// boundaries", §19.6 last sentence) requires the COMPLETE leaf set to be
+// visible to the importer — and `internal` classes are NOT exported
+// (ModuleMetadataBuilder.cpp:2112, "§13.2 internal types not exported").
+// A `closed` root with a non-public CONCRETE subclass therefore has an
+// importer-invisible leaf: the importer's caseArmsExhaustive walk proves
+// exhaustiveness against an incomplete leaf set and accepts non-coverage
+// that the runtime can still dispatch into (the leaf's `new` is reachable
+// via the declaring module's own static factory, e.g. `Factory.Make()`,
+// and §2.8.3 rule 4 holds the runtime type identity across artifacts).
+// At runtime the `case` raises MatchFailureException (§21.7) — a silent
+// wrong behavior the static proof should have caught.
+//
+// The only sound posture: the cross-module guarantee holds for a `closed`
+// root only when every concrete leaf of its hierarchy is public, because
+// only public leaves ride the metadata (`isExportedType`, ModuleMetadata-
+// Builder.cpp:41) into the importer's symbol table. Reject the shape at
+// the declaration site so the dependent module does not produce an
+// artifact whose cross-module guarantee is unsound — the importer never
+// sees a closed root over a leaf set it cannot read, and the
+// `caseArmsExhaustive` gate's `isClosedRoot` arm keeps its §19.6 promise.
+//
+// §13.2's "top-level types may be `public` or `internal`" framing means
+// an `internal` `closed` root is fine (no other module can name it, so
+// the cross-module guarantee is moot); the check is restricted to PUBLIC
+// closed roots whose concrete leaves are not all public. An abstract or
+// `closed` intermediate is skipped because it has no instances (§11.7,
+// §12.5) and cannot itself be a runtime value of the closed type.
+void Resolver::checkClosedHierarchyLeafVisibility() {
+    if (!ctx_.module()) return;
+    // Collect the public closed-class roots declared in this module —
+    // an internal `closed` root cannot be named cross-module (§13.2) so
+    // its leaf set is local-only and the cross-module guarantee does not
+    // apply. (`isExportedType` requires Public; an internal root is not
+    // exported, period.)
+    std::vector<TypeSymbol*> closedRoots;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        if (t->kind != ast::TypeDeclKind::Class) continue;
+        if (!typeIsClosed(t)) continue;
+        if (t->visibility != ast::Visibility::Public) continue;
+        closedRoots.push_back(t);
+    }
+    if (closedRoots.empty()) return;
+    // Enumerate every class declared in this module (a closed root's leaf
+    // set is local to its declaring module, §11.7; cross-module subclasses
+    // are rejected at the base's inheritance site, TypeResolution_Names.
+    // cpp:717). Nested classes are included — a nested class can extend a
+    // top-level `closed` root.
+    std::vector<TypeSymbol*> localClasses;
+    std::function<void(TypeSymbol*)> collectNested = [&](TypeSymbol* parent) {
+        for (Symbol* m : parent->members) {
+            auto* nt = dynamic_cast<NestedTypeSymbol*>(m);
+            if (!nt || !nt->type) continue;
+            if (nt->type->kind != ast::TypeDeclKind::Class) continue;
+            localClasses.push_back(nt->type);
+            collectNested(nt->type);
+        }
+    };
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t || t->kind != ast::TypeDeclKind::Class) continue;
+        localClasses.push_back(t);
+        collectNested(t);
+    }
+    // For each public closed root, walk every concrete (non-abstract,
+    // non-`closed`) descendant in this module and check visibility.
+    // Abstract and `closed` intermediates have no instances and need no
+    // leaf — they are matched only through their concrete descendants
+    // (§19.6 verbatim). The same shape `caseArmsExhaustive`'s
+    // `tsInstanceless` check uses (ExprTypecheck.cpp:2213-2214) — local
+    // re-derivation rather than a shared helper because the check runs
+    // in a different pass with different reachability.
+    for (TypeSymbol* root : closedRoots) {
+        for (TypeSymbol* ts : localClasses) {
+            if (ts == root) continue;
+            // Is `root` an ancestor of `ts`?
+            bool isDescendant = false;
+            std::vector<TypeSymbol*> work = ts->baseTypes;
+            std::unordered_set<TypeSymbol*> seen;
+            while (!work.empty()) {
+                TypeSymbol* b = work.back();
+                work.pop_back();
+                if (!b || !seen.insert(b).second) continue;
+                if (b == root) { isDescendant = true; break; }
+                for (TypeSymbol* bb : b->baseTypes) work.push_back(bb);
+            }
+            if (!isDescendant) continue;
+            // Skip abstract and `closed` intermediates (no instances).
+            const bool tsInstanceless =
+                typeIsClosed(ts) ||
+                std::find(ts->modifiers.begin(), ts->modifiers.end(),
+                           std::string_view("abstract")) != ts->modifiers.end();
+            if (tsInstanceless) continue;
+            // Concrete leaf — visibility MUST be Public (§13.2, the only
+            // visibility that survives `isExportedType`).
+            if (ts->visibility != ast::Visibility::Public) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ts->declLoc,
+                    std::string("class `") + std::string(ts->name) +
+                    "` is a concrete subclass of `closed` class `" +
+                    std::string(root->name) +
+                    "` but is not `public` — a `closed` hierarchy's "
+                    "cross-module exhaustiveness guarantee (§19.6) "
+                    "requires every concrete leaf to be exported (§13.2), "
+                    "and `internal` classes are not; promote `" +
+                    std::string(ts->name) + "` to `public` or remove "
+                    "`closed` from `" + std::string(root->name) + "` "
+                    "(§11.7)");
+            }
+        }
+    }
+}
+
 void Resolver::checkStaticClassMembers() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {
