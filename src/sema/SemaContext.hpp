@@ -107,6 +107,32 @@ public:
         return it == resolvedTypes_.end() ? nullptr : it->second;
     }
 
+    // fix #3235 (§30.14 / §14.2): the §14.2 `where T: sendable` sites
+    // `Resolver::checkOneConstraint` defers during `resolveTypes()` so
+    // the late pass at the tail of `typecheckExpressions()` can replay
+    // them when `FieldSymbol::posParamBodyRef` is populated (see
+    // `bezel::sema::checkSendableConstraintsLate` / `Resolver::
+    // checkSendableConstraintsLate`). The list lives on `SemaContext`
+    // rather than on `Resolver` because the late pass is invoked from
+    // `typecheckExpressions()` (ExprTypecheck.cpp) through a fresh
+    // `Resolver` wrapper — the `Resolver` instance that recorded the
+    // sites is no longer in scope, but the sites themselves (location,
+    // param name, argument spelling, resolved TypeRef) are still valid
+    // for the late replay. Each entry stores the same fields the
+    // in-place `report` lambda in `checkOneConstraint` would have read.
+    struct PendingSendableConstraint {
+        SourceLocation loc;
+        std::string param;     // constraint's type-parameter name
+        std::string argName;   // argument spelling (diagnostic)
+        TypeRef* arg = nullptr;
+    };
+    void addPendingSendableConstraint(PendingSendableConstraint p) {
+        pendingSendableConstraints_.push_back(std::move(p));
+    }
+    std::vector<PendingSendableConstraint>& pendingSendableConstraints() {
+        return pendingSendableConstraints_;
+    }
+
     // Record the typecheck-pass-inferred type of an expression. Used by
     // the expression-typecheck pass and queried by later passes
     // (ownership, definite-assignment).
@@ -726,6 +752,13 @@ private:
     DiagnosticEngine& diagnostics_;
     std::vector<std::unique_ptr<Symbol>> symbols_;
     std::vector<std::unique_ptr<TypeRef>> typeRefs_;
+    // fix #3235 (§30.14 / §14.2): pending sendable-constraint sites for
+    // the late pass at the tail of `typecheckExpressions()`. See the
+    // `addPendingSendableConstraint` / `pendingSendableConstraints`
+    // accessors above for the full rationale. The list survives across
+    // Resolver instances because the late pass is invoked through a
+    // fresh Resolver wrapper (see `bezel::sema::checkSendableConstraintsLate`).
+    std::vector<PendingSendableConstraint> pendingSendableConstraints_;
     std::unordered_map<const ast::Type*, TypeRef*> resolvedTypes_;
     std::unordered_map<const ast::Expr*, TypeRef*> exprTypes_;
     std::unordered_map<const ast::Expr*, Symbol*> exprSymbols_;

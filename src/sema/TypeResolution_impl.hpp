@@ -105,6 +105,39 @@ public:
     // exactly like run() itself.
     void checkClassSerializationEligibilityLate();
 
+    // fix #3235 (§30.14 / §14.2, v0.254): the §14.2 `where T: sendable`
+    // satisfaction check runs INSIDE `resolveTypes()` (from
+    // `checkOneConstraint`'s `item.kind == "sendable"` arm), but
+    // `FieldSymbol::posParamBodyRef` — the §22.10 captured-vs-uncaptured
+    // bit that decides whether a primary-ctor parameter counts as a
+    // §30.14 rule-2 storage member — is computed by ExprTypecheck's
+    // OWN expression walk (`ExprTypecheck_Exprs.cpp`), which runs AFTER
+    // `resolveTypes()` finishes. Reading `posParamBodyRef` at the
+    // constraint site therefore answers "uncaptured" for every class,
+    // and a captured primary-ctor parameter of a non-sendable type
+    // passes `where T: sendable` — the accept-hole #3165 noted as
+    // unresolved on the §14.2 route.
+    //
+    // The fix mirrors #2325's `checkClassSerializationEligibilityLate`
+    // pattern: record each `where T: sendable` site in
+    // `pendingSendableConstraints_` (a span, the constraint param name,
+    // and the resolved argument TypeRef — the same fields the in-place
+    // `report` lambda reads), DO NOT call `isSendableType` here, and
+    // replay the recorded list at the tail of `typecheckExpressions()`
+    // via `checkSendableConstraintsLate` (which the free function
+    // `bezel::sema::checkSendableConstraintsLate` invokes, parallel to
+    // `checkClassSerializationEligibilityLate`). At that point the
+    // expression walk has finished, so `posParamBodyRef` is set on
+    // every captured parameter, and the §30.14 storage walk in
+    // `isSendableType` reads the bit correctly.
+    //
+    // This is also the deferred-nested (`checkDeferredNestedConstraints`)
+    // path: nested sendable obligations recorded during resolve are
+    // replayed through `checkOneConstraint`'s sendable arm, which
+    // appends to `pendingSendableConstraints_` — same late-pass
+    // discharge. No special wiring for that case.
+    void checkSendableConstraintsLate();
+
 private:
     // Lookup environment in scope. A stack of scopes (module-level + per-type
     // + per-method). Each scope contributes a small name → Symbol table.

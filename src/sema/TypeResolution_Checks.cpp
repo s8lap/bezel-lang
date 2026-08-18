@@ -5926,9 +5926,33 @@ void Resolver::checkOneConstraint(const ast::Type& t,
         // when the structural walk confidently pins the failure to a
         // single component (conservative — falls back to the flat message
         // rather than over-promising detail on ambiguous verdicts).
+        //
+        // fix #3235 (§30.14 / §14.2, v0.254): DEFER the `isSendableType`
+        // call to `checkSendableConstraintsLate`, run at the tail of
+        // `typecheckExpressions()`. `isSendableType` walks a class's §30.14
+        // rule-2 storage members, and for a class that includes the
+        // primary-ctor parameters IF `FieldSymbol::posParamBodyRef` is
+        // set (§22.10 captured parameters, storage; uncaptured ones,
+        // skipped). The bit is set by ExprTypecheck's expression walk —
+        // `resolveTypes()` finishes BEFORE that walk starts, so reading
+        // the bit here answers "uncaptured" for every class and a
+        // captured primary-ctor parameter of non-sendable type passes
+        // `where T: sendable`. The late pass replays this check after
+        // the expression walk has run, when the bit is populated, and
+        // sees the captured storage correctly. We still record the
+        // diagnostic location, the constraint param name, the argument
+        // spelling, and the argument TypeRef so the late replay can
+        // reproduce the exact diagnostic message — same shape the
+        // in-place `report` would have produced. The Error TypeRef
+        // defer is unchanged: an upstream failure has already been
+        // reported, no late replay needed. The pending list lives on
+        // `SemaContext` (not the Resolver) because the late pass runs
+        // through a fresh Resolver wrapper — see
+        // `SemaContext::pendingSendableConstraints` for the rationale.
         if (arg->kind == TypeRef::Kind::Error) return;
-        if (!isSendableType(arg, ctx_))
-            report("sendable", sendableFailureComponentPath(arg, ctx_));
+        ctx_.addPendingSendableConstraint(
+            SemaContext::PendingSendableConstraint{
+                t.span.begin, param, argName, arg});
         return;
     }
     if (item.kind == "hashable") {
@@ -8809,6 +8833,63 @@ std::string degenerateAsTargetReason(const TypeRef* target) {
                "form that is rejected (§17.4/§4.7)";
     }
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// Resolver::checkSendableConstraintsLate  §30.14 / §14.2 / #3235
+//
+// Replay each §14.2 `where T: sendable` site that was deferred in
+// `checkOneConstraint` (the `item.kind == "sendable"` arm — see that
+// function's comment for why). At replay time ExprTypecheck's expression
+// walk has finished, so `FieldSymbol::posParamBodyRef` (the §22.10
+// captured-vs-uncaptured bit for primary-ctor parameters) is set, and
+// `isSendableType`'s §30.14 rule-2 storage walk sees a class's captured
+// parameters of non-sendable type and reports them. The diagnostic
+// shape matches the in-place `report` lambda's output: a §14.2 citation
+// plus, when the walk confidently pins a single component, a §3.6
+// rule-4 component-path fragment.
+//
+// The pending list lives on `SemaContext` (not on `Resolver`) so it
+// survives across Resolver instances — this method is invoked through
+// `bezel::sema::checkSendableConstraintsLate`, which builds a fresh
+// Resolver wrapping the same ctx. Reading from
+// `ctx_.pendingSendableConstraints()` here is therefore the same list
+// the recording `checkOneConstraint` arm appended to.
+//
+// Idempotent w.r.t. diagnostics: an Error TypeRef is never enqueued
+// (the in-place check skips it because an upstream failure is already
+// reported), and the same is true here — the loop only re-runs
+// `isSendableType` on resolved TypeRefs.
+// ---------------------------------------------------------------------------
+void Resolver::checkSendableConstraintsLate() {
+    auto& pending = ctx_.pendingSendableConstraints();
+    if (pending.empty()) return;
+    for (const SemaContext::PendingSendableConstraint& p : pending) {
+        if (!p.arg) continue;  // defensive — enqueue path always sets this
+        if (p.arg->kind == TypeRef::Kind::Error) continue;
+        if (!isSendableType(p.arg, ctx_)) {
+            // Mirror the in-place `report` lambda's shape (checkOneConstraint):
+            // §14.2 citation plus the §3.6 rule-4 component-path fragment
+            // when the walk confidently pins a single component. The
+            // fragment string is built lazily so its `isSendableType`
+            // recursive walk runs against a TypeRef whose `posParamBodyRef`
+            // bits are now populated — the same fix #3165 closed on the
+            // call-site route.
+            const std::string detail =
+                sendableFailureComponentPath(p.arg, ctx_);
+            std::string msg =
+                std::string("type argument `") + p.argName +
+                "` does not satisfy the constraint `where " + p.param +
+                ": sendable` (§14.2)";
+            if (!detail.empty()) msg += detail;
+            ctx_.diagnostics().report(Severity::Error, p.loc, msg);
+        }
+    }
+    // Drain: subsequent runs of this pass (theoretically; today there is
+    // exactly one — at the tail of `typecheckExpressions()`) must not
+    // re-report the same sites. `pending` lives on SemaContext, so the
+    // drain is on the context, not the Resolver.
+    pending.clear();
 }
 
 void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {

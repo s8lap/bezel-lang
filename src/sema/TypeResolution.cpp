@@ -416,4 +416,19 @@ bool checkClassSerializationEligibilityLate(const ast::SourceFile& src,
     return !ctx.diagnostics().hasErrors();
 }
 
+// §30.14 / §14.2 / #3235: see the declaration comment (TypeResolution.hpp)
+// and Resolver::checkSendableConstraintsLate's own comment
+// (TypeResolution_Checks.cpp) for why this runs as a separate late pass.
+// Same pattern as `checkClassSerializationEligibilityLate`: a fresh
+// Resolver wrapping the same `ctx` replays the deferred sites; the
+// pending-sendable list is local to each Resolver instance, so this is
+// safe to call from any `typecheckExpressions()` pipeline.
+bool checkSendableConstraintsLate(const ast::SourceFile& src,
+                                  SemaContext& ctx) {
+    (void)src;
+    Resolver r(ctx);
+    r.checkSendableConstraintsLate();
+    return !ctx.diagnostics().hasErrors();
+}
+
 } // namespace bezel::sema

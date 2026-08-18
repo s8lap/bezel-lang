@@ -14714,6 +14714,23 @@ bool typecheckExpressions(const ast::SourceFile& src, SemaContext& ctx) {
     // Folding it into typecheckExpressions() itself means every existing and
     // future caller gets it for free, with no separate wiring.
     checkClassSerializationEligibilityLate(src, ctx);
+    // fix #3235 (§30.14 / §14.2): the §14.2 `where T: sendable` satisfaction
+    // check that `Resolver::checkOneConstraint` deferred during
+    // `resolveTypes()` needs `FieldSymbol::posParamBodyRef` (the §22.10
+    // captured-vs-uncaptured bit for primary-ctor parameters), which the
+    // walk above just finished setting on every captured parameter — same
+    // prerequisite as `checkClassSerializationEligibilityLate`, same
+    // rationale for living inside `typecheckExpressions()` rather than as a
+    // separate driver-called pass. Without this replay, a captured
+    // primary-ctor parameter of non-sendable type passes `where T: sendable`
+    // (the constraint site is visited at resolveTypes time, before the
+    // walk sets the bit, so the storage walk in `isSendableType` answers
+    // "uncaptured" for every class). Replaying at this point — after
+    // `checkClassSerializationEligibilityLate` so the §9.8 late-pass
+    // dependency direction is one-way — sees the bit populated and
+    // correctly rejects the captured-non-sendable shape that #3165 noted
+    // was still open on this route.
+    checkSendableConstraintsLate(src, ctx);
     return !ctx.diagnostics().hasErrors();
 }
 

@@ -55,6 +55,26 @@ bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx);
 bool checkClassSerializationEligibilityLate(const ast::SourceFile& src,
                                             SemaContext& ctx);
 
+// §30.14 / §14.2 / #3235: replay the §14.2 `where T: sendable` sites
+// `Resolver::checkOneConstraint` deferred during `resolveTypes()` —
+// those whose verdict depends on `FieldSymbol::posParamBodyRef`, the
+// §22.10 captured-vs-uncaptured bit computed by ExprTypecheck's
+// expression walk. The bit is set by the time `typecheckExpressions()`
+// returns, so the §30.14 rule-2 storage walk in `isSendableType` sees a
+// class's captured primary-ctor parameters of non-sendable type and
+// reports them. Same rationale as `checkClassSerializationEligibilityLate`
+// (#2325): living inside `typecheckExpressions()` itself means every
+// existing and future caller gets it for free with no separate wiring —
+// a separately-invoked pass would need every test-harness pipeline
+// (dozens build their own SemaContext + resolveTypes +
+// typecheckExpressions independent of Driver::compileFile) to also
+// remember to call it. Exposed as a free function so ExprTypecheck.cpp
+// can invoke it without depending on Resolver directly. See
+// Resolver::checkSendableConstraintsLate's own comment for the
+// per-entry replay detail.
+bool checkSendableConstraintsLate(const ast::SourceFile& src,
+                                  SemaContext& ctx);
+
 // Structural equality of two resolved TypeRefs (§19/§22.6 "exact match").
 // Returns false (conservatively) when either is null or an Error kind.
 // Exposes the resolver's existing structural-equality utility for reuse by
