@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.250.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.259.*
 
 Most of the syntax here is mainstream: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. The *emphasis* is not. Bezel splits failure signals by one rule (the **failure-signal rule**, stdlib §1), and it is worth knowing the shape before the details (teaching order here, not the rule's band order):
 
@@ -93,20 +93,20 @@ var greeting := config.GetOrNull("greeting") ?? "hello";
 ```bezel
 private owned _cache: OwningDictionary<string, Connection>;
 
-method TryTakeCached(name: string, out owned conn: Connection? when true): bool
+method TryPopCached(name: string, out owned conn: Connection? when true): bool
   if not _cache.ContainsKey(name) then
     conn := null;                  // every out path must assign (throw paths exempt)
     return false;
   end;
   conn := _cache.PopValue(name);   // takes ownership out of the cache
   return true;
-end TryTakeCached;
+end TryPopCached;
 ```
 
-The method is named `TryTakeCached`, not `TryGetCached`, on purpose. Where the two operations genuinely differ — `Get`/`Peek` leave the entry in place and borrow; `Pop`/`Drain`/`Take` also remove it and transfer — the stdlib keeps distinct names, so the name alone tells you whether you now owe a disposal (spec §22.6's `out owned` rule; stdlib §1). A pair that differs *only* in ownership is instead a same-name overload pair since v0.250, the call-site `move` marker telling the forms apart (stdlib §1). This one transfers: it hands the caller ownership through `out owned`. The parameter is typed `Connection?` (nullable) because the false path must assign *something*, and `default(Connection)` is illegal for a non-nullable reference type. The `when true` clause states the contract in the signature — "a `true` return implies `conn` is non-null" — and the caller's flow analysis picks it up:
+The method is named `TryPopCached`, not `TryGetCached`, on purpose. Where the two operations genuinely differ — `Get`/`Peek` leave the entry in place and borrow; `Pop`/`Drain` also remove it and transfer — the stdlib keeps distinct names, so the name alone tells you whether you now owe a disposal (spec §22.6's `out owned` rule; stdlib §1). A pair that differs *only* in ownership is instead a same-name overload pair since v0.250, the call-site `move` marker telling the forms apart (stdlib §1). This one transfers: it hands the caller ownership through `out owned`. The parameter is typed `Connection?` (nullable) because the false path must assign *something*, and `default(Connection)` is illegal for a non-nullable reference type. The `when true` clause states the contract in the signature — "a `true` return implies `conn` is non-null" — and the caller's flow analysis picks it up:
 
 ```bezel
-if pool.TryTakeCached("primary", out using var c) then
+if pool.TryPopCached("primary", out using var c) then
   UseConnection(c);                // owned, and narrowed non-null by `when true`
 end;                               // c disposed at the end of the enclosing block
 ```
@@ -274,6 +274,8 @@ end;
 ```
 
 Even a half-constructed object is safe: if a constructor throws after some `owned` fields are set, those fields are disposed before the exception propagates. The same holds for a half-built *expression*: if one argument throws while an earlier argument has already produced an owned temporary, that temporary is disposed during the unwind (v0.184) — an exception never leaks a half-built argument list. You do not write code for any of this.
+
+One edge worth knowing: what if cleanup itself throws *while an exception is already propagating*? A throw escaping a `finally` (or a disposer that throws during unwinding) **supersedes** the in-flight exception — the new one propagates, the old one is disposed (spec §31.2/§28.4). Since v0.259 the buried failure is not lost: before the drop, the runtime snapshots its type, message, and stack trace into the escaping exception's `SupersededChain` (spec §31.4) — the same three-string snapshot machinery as `CauseChain`, chronological, earliest lost first — and the uncaught-exception report prints it. So the failure you see at the top is always the *last* one thrown, and `SupersededChain` is where the *first* one — usually the real one — went. Read it like `CauseChain`: copy the strings out in the arm if you need them past it.
 
 One diagnostic worth recognizing in this area: disposing a value and then using it. A *straight-line* dispose-then-use is a warning (and a deterministic fault in checked mode); a use after a *conditional* dispose — disposed on one branch, still live on another — is a compile error at the merge (the value is "maybe-disposed"). Both are the compiler catching a use-after-free before it can happen.
 

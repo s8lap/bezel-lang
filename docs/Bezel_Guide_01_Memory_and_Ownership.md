@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.258.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.259.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning (§2's trivial-dispose classes excepted). A use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -395,7 +395,63 @@ end;
 
 ---
 
-## 10. Quick reference
+## 10. Cleanup that must not run on the success path: `ScopeGuard`
+
+Scope-end cleanup is automatic and needs no ceremony — that is what owned locals and `using var` are (§2). What has *no* automatic form is undoing a **side effect** only if the rest of the method fails, because a side effect is not a value and has no owner: a registration made, shared state mutated, a handle handed to a foreign library, a transaction begun. On success you keep it; on failure you undo it. `finally` runs on both paths, so the undo needs a flag — and this is correct, composes, and is what everyone writes:
+
+```bezel
+var committed := false;
+try
+  Register(id);
+  DoWork();
+  committed := true;
+finally
+  if not committed then Unregister(id); end;
+end;
+```
+
+It is also four extra lines and one mutable boolean at every site, and the `:= true` has to sit at exactly the right statement — a class of bug that is invisible on the success path. **`ScopeGuard` (stdlib §2.21) is that flag, packaged** — the same method, with the commit point a call the reader can see:
+
+```bezel
+Register(id);
+using var g := new ScopeGuard(lambda() => Unregister(id));
+DoWork();
+g.Dismiss();             // success: keep the registration
+```
+
+The undo is the same `Unregister(id)` call the flag version buried in its `finally` — a unit-returning method, so the lambda is `() -> ()` by construction. On any throwing edge the guard's disposal runs the undo (`using var` covers every exit, §2); `Dismiss()` disarms it, and dismissing twice is a no-op. The `scoped` constructor parameter is what lets the guard *store* your lambda (spec §28.14), and the admission has a price you should meet before it bites: **the locals your lambda captures are frozen while the guard is live** — they may not be moved from, reassigned, or disposed. So the build-guard-commit-*hand-it-out* shape does not compile as written:
+
+```bezel
+public method Open(): owned Session
+  var conn := Connect();
+  using var g := new ScopeGuard(lambda() => conn.Rollback());
+  Configure(conn);
+  g.Dismiss();
+  return move conn;        // ERROR: conn is frozen while g is live (spec §28.14)
+end Open;
+```
+
+The remedy is `do … end` (§21.6 — bounding a local's lifetime tighter than the method is exactly what it is for): end the guard's scope first, then transfer:
+
+```bezel
+public method Open(): owned Session
+  var conn := Connect();
+  do
+    using var g := new ScopeGuard(lambda() => conn.Rollback());
+    Configure(conn);
+    g.Dismiss();
+  end;                     // g's scope ends; the freeze on conn lifts
+  return move conn;
+end Open;
+```
+
+One sentence on why the freeze is the price: a stored callback that could observe a moved-from or disposed source is exactly what the rule exists to prevent — the freeze is what makes the capture sound. (Two further remedies, both idiomatic: express the action as a method reference on `this` — `new ScopeGuard(this.RollbackPending)` — which captures the receiver and leaves locals unfrozen; or keep the resource in a field, where the freeze does not reach — trading the static bound for spec §28.3's field-held residual-trust regime, with checked disposal (spec §28.2) as the backstop.)
+
+When *not* to reach for it: if the thing to undo is a **value**, it has an owner and the owner's disposal is the answer — `ScopeGuard` is for **effects**: registrations, foreign handles, transactions, counters. And if you arrive from a language with `defer`/`errdefer` and wonder where the keyword went: the value half is redundant under this guide's whole model, and the failure half would need an "are we unwinding?" primitive Bezel deliberately lacks — the decline, with its grounds and reopening bar, is rationale §17.11.
+
+---
+
+## 11. Quick reference
 
 | You want to… | Write |
 |---|---|

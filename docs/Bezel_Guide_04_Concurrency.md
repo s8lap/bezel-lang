@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.257.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.259.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A **task is a heap resource you own**, like every other class instance (§2). **No mutable state is ever reachable from two domains** — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a **structured scope**, not loose tasks (§4). If you skim everything else, read the three sections headed **How Bezel does it** and the table in §10.
 
@@ -297,7 +297,7 @@ Construction consumes an owned interior. `g.Value` is a borrow *whose source is 
 - **Non-reentrant, all of them** (`Mutex` included): a holder re-acquiring waits on itself. Never nest acquisitions of one lock — including a second `Read()` on the same `RwLocked<T>`, which may queue behind a waiting writer. `Semaphore` is not in this set: a second `Acquire()` by the same holder simply consumes another permit — not reentrancy, and legal while permits remain (spec §30.12).
 - **`RwLocked<T>` read guards are write-restricted**: stores, `move`, and `ref`/`out` passes through a `ReadGuard`-sourced borrow are compile errors. Calling a *mutating method* through one is the recorded obligation the compiler cannot see — when in doubt, take `Write()`.
 - **Interior must be a sendable class** (the §5 property, reused): own your values — `Locked<OwningDictionary<string, Session>>`, not `Locked<Dictionary<string, Session>>`.
-- **Data leaves as values or by transfer**: copy value-shaped data out, compute under the guard, or `PopValue`/`Take` an entry's ownership out. A guard borrow never escapes.
+- **Data leaves as values or by transfer**: copy value-shaped data out, compute under the guard, or `PopValue`/`Pop` an entry's ownership out. A guard borrow never escapes.
 - **Holding a guard across `await` is legal but linted** — narrow the scope instead. Lock *ordering* is out of scope by design; when ordering gets complicated, that is the actor idiom's cue (§6).
 
 The rest of the toolbox, in one breath: **`Mutex`** for a critical section that isn't guarding one datum (`using var guard := await m.AcquireAsync();`); **`Semaphore`** for permits; **`Atomic<T>`/`AtomicInteger<T>`** for cells — sequentially consistent, and the right spelling for the shared counter you were about to make a mutable static (§8). Cross-domain sharing of any of these rides `Shared<T>`: clone a handle, move the clone, both domains `Get()` (spec §28.13). `Shared<Mutex>` and `Shared<Locked<T>>` are the idiom; a `static owned readonly` lock (above) is the same thing with process-wide reach.
