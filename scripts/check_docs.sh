@@ -2,7 +2,7 @@
 # check_docs.sh — the one-command docs gate for the six normative documents.
 #
 # Symmetric with scripts/gate.sh (the compiler gate): a single blessed signal
-# that a docs revision is internally consistent before it lands. Runs five
+# that a docs revision is internally consistent before it lands. Runs six
 # mechanical checks and exits non-zero if any fails.
 #
 #   1. Anchor resolution   — every intra/cross-doc [...](file#anchor) link whose
@@ -23,6 +23,14 @@
 #                            2(i)/4, §28.13), assert the fact-line roster
 #                            (typed lines + named none-declaring types), and
 #                            fail on divergence.
+#   3c. §3.6 property table — the spec's derived-type-property registry (the
+#                            | Property | Defined in | Classifies | table)
+#                            keeps its row names pairwise distinguishable —
+#                            no shared first component, no equal component
+#                            multiset — and each row's Defined-in cell links
+#                            to an anchor whose section names the property
+#                            (v0.257; proposal 0095 Q4, as respecified by the
+#                            v0.257 gate round).
 #   4. Example extraction  — scripts/extract_doc_examples.py runs clean over the
 #                            CURRENT docs into a scratch tree (never the committed
 #                            corpus, per #1380); any parse failure is a finding.
@@ -264,6 +272,117 @@ if bad:
     print("\n".join(bad))
 else:
     print(f"FACTS: clean ({len(facts)} typed fact entries + {len(none_named)} named none-types; formulas agree at every carrier; all 3 derived-set parentheticals match)")
+
+# ---- 3c. §3.6 derived-type-property table (v0.257; proposal 0095 Q4) -------
+# The spec's §3.6 '| Property | Defined in | Classifies |' table is the single
+# registry of the derived type properties, and its row names are load-bearing
+# (diagnostics name them "in the words of the table", §3.6 rule 4). Three arms,
+# all hard failures:
+#   1. no two row names share their FIRST name component;
+#   2. no two row names have equal normalized component multisets;
+#   3. each row's Defined-in cell carries at least one ](...#anchor) link that
+#      resolves to an <a id="..."> anchor whose section body names the row's
+#      property (lowercased, non-alpha stripped, substring).
+# The section body is sliced from the anchor's immediately following markdown
+# heading to the next heading of the SAME OR SHALLOWER level — never to the
+# next <a id= (internal sub-anchors would spuriously truncate auto-hashable,
+# serialization-eligible, and element category). An anchor with no heading on
+# the following line is skipped for that row (the stdlib's
+# sec-owned-buffers-and-spans is one); the row passes on its other link.
+# Name normalization: strip bold/italic markers and a trailing '(formerly ...)',
+# split on '-' and whitespace, lowercase, strip one trailing 's' per component.
+# (0095 §7 item 3's as-worded invariant — no two rows sharing ANY component —
+# fails on the landed table twice (borrow-bearing/holds-borrows,
+# auto-hashable/hashable); the arms above are the v0.257 gate round's
+# respecification, recorded in the v0.257 changelog entry.)
+bad = []
+spec_t = text['spec']
+rows36 = []          # (display name, defined-in cell)
+mtab = re.search(r'^\| Property \| Defined in \| Classifies \|\s*$', spec_t, re.M)
+if not mtab:
+    bad.append("  the '| Property | Defined in | Classifies |' header row was not found in the spec (§3.6)")
+else:
+    for line in spec_t[mtab.end():].lstrip('\n').split('\n'):
+        if not line.startswith('|'):
+            break               # rows run until the first non-| line
+        cells = [c.strip() for c in line.strip().strip('|').split('|')]
+        if not cells or set(cells[0]) <= set('-: '):
+            continue            # the separator row
+        if len(cells) < 2:
+            bad.append(f"  malformed §3.6 row (fewer than 2 cells): {line.strip()}")
+            continue
+        raw = re.sub(r'\(formerly[^)]*\)\s*$', '', cells[0]).strip()
+        name = raw.replace('**', '').replace('*', '').strip()
+        rows36.append((name, cells[1]))
+    if not rows36:
+        bad.append('  the §3.6 table header was found but no rows parsed beneath it')
+
+def components36(name):
+    parts = re.split(r'[-\s]+', name.lower())
+    return [p[:-1] if p.endswith('s') else p for p in parts if p]
+
+# Arm 1: first components pairwise distinct.
+firsts = {}
+for name, _ in rows36:
+    comps = components36(name)
+    if comps:
+        firsts.setdefault(comps[0], []).append(name)
+for comp, hits in sorted(firsts.items()):
+    if len(hits) > 1:
+        bad.append(f"  arm 1 — rows share first name component '{comp}': " + ', '.join(f"'{h}'" for h in hits))
+
+# Arm 2: normalized component multisets pairwise distinct.
+msets = {}
+for name, _ in rows36:
+    msets.setdefault(tuple(sorted(components36(name))), []).append(name)
+for key, hits in sorted(msets.items()):
+    if len(hits) > 1:
+        bad.append(f"  arm 2 — rows have equal component multiset {sorted(key)}: " + ', '.join(f"'{h}'" for h in hits))
+
+# Arm 3: Defined-in resolution, property named in the linked section.
+def section_body36(doc, anchor):
+    t = text[doc]
+    am = re.search(r'<a id="' + re.escape(anchor) + r'"\s*>\s*</a>[ \t]*\n', t)
+    if not am:
+        return None             # anchor missing: this link is unresolved
+    rest = t[am.end():]
+    hm = re.match(r'(#{1,6})[ \t]+\S', rest)
+    if not hm:
+        return ''               # no heading on the following line: skip link
+    level = len(hm.group(1))
+    nxt = re.search(r'\n#{1,' + str(level) + r'}[ \t]', rest)
+    return rest[:nxt.start()] if nxt else rest
+
+for name, cell in rows36:
+    pname = re.sub(r'[^a-z]', '', name.lower())
+    named = False
+    notes = []
+    links = list(re.finditer(r'\]\(([^)#\s]*)#([^)\s]+)\)', cell))
+    if not links:
+        bad.append(f"  arm 3 — row '{name}': Defined-in cell has no ](…#anchor) link: {cell}")
+        continue
+    for lm in links:
+        fpart, anchor = lm.group(1), lm.group(2)
+        target = 'spec' if not fpart else base.get(os.path.basename(fpart))
+        if target is None:
+            notes.append(f"{fpart}#{anchor}: not a normative doc"); continue
+        body = section_body36(target, anchor)
+        if body is None:
+            notes.append(f"unresolved anchor {target}#{anchor}"); continue
+        if body == '':
+            notes.append(f"{target}#{anchor}: no heading follows the anchor (skipped)"); continue
+        if pname in re.sub(r'[^a-z]', '', body.lower()):
+            named = True; break
+        notes.append(f"{target}#{anchor}: section does not name '{name}'")
+    if not named:
+        bad.append(f"  arm 3 — row '{name}' has no resolving Defined-in link that names it: " + '; '.join(notes))
+
+if bad:
+    fail = 1
+    print('TABLE: the spec §3.6 derived-type-property table violates its invariants:')
+    print('\n'.join(bad))
+else:
+    print(f"TABLE: clean ({len(rows36)} rows; first components and component multisets pairwise distinct; every row's Defined-in resolves to a section naming it)")
 
 sys.exit(1 if fail else 0)
 PY

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | accepted — ruled under the owner's 2026-08-18 delegation; awaiting graduation train |
+| **Status** | graduated-v0.257 — superseded — graduated v0.257 (ruled under the owner's 2026-08-18 delegation; one train with proposal 0093, whose §35.4 census-first restatement landed written in this proposal's name; acceptance tests passed cell-for-cell at the train's HEAD) |
 | **Tracking issue** | coordinator files |
 | **Target module(s)** | **B4 (rename)** — **spec** §3.6 (three property rows), §9.7, §15.3, §22.16 ⧗ (the fused slip-and-census site), §28.3 (*The consume-site freeze*, *Producers*, K5.5; the *Deferred-activation* frame descriptor and §35.11's payload clause are **checked, not renamed**), §30.1, §30.14, §35.3, §35.4, §35.12 ⧗, Appendix C.1/C.3/C.6; **rationale** §3.14 (the v0.252 choice record) plus the two record-slip sites (§5.15, §15); **stdlib** §3.4 (one slip sentence); **Guide 04** §5. (The earlier draft's §28.5 entry is struck — zero occurrences ⧗ — and its §15.1/§17.7 entries belong to B5.) **B5 (`defaultable`)** — **spec** §3.6 (a new row), §17.11 (the home), §7.9, §9.8, §14.2, §15.1, §17.7, §22.7, §35.10, Appendix C.1/C.4; **rationale** the `default`-surface record (§9.6). Doc-only: **no semantics move**; one enumeration omission is corrected as a by-product (§4.4), and one interface-classification consequence is newly *stated* (§6). |
 | **Written against** | spec/stdlib/rationale/guides **v0.255** (git `5fa5a95b`, snapshot 2026-08-18). Every count is measured against that snapshot unless marked otherwise; `src/` and `tests/` were read **read-only** for the diagnostic-surface counts in §3.4 and §5. |
