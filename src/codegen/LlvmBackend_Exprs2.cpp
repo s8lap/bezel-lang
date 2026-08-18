@@ -4766,11 +4766,15 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             //
             // §6.8's REAL surface — `Domain.Spawn` — is a static call on the
             // identifier and lives in LlvmBackend_Calls3.cpp; it is untouched.
-            // The `.Name` getter (LlvmBackend_Exprs.cpp) and the `Domain` arm of
-            // the explicit `Dispose()` chain (LlvmBackend_Calls2.cpp) survive
-            // this change unreachable-from-`new`, together with the runtime trio
-            // behind them; removing those is a wider change than this fix and is
-            // filed separately.
+            // fix #2993 (language spec §11.7 "Static classes"; stdlib §6.8
+            // `Domain`): the companion `.Name` getter (LlvmBackend_Exprs.cpp)
+            // and `Domain` arm of the explicit `Dispose()` chain
+            // (LlvmBackend_Calls2.cpp) — the "instance" surface the stdlib does
+            // not declare — are removed in the same fix, together with the
+            // runtime trio (`bz_domain_alloc`/`bz_domain_get_name`/
+            // `bz_domain_dispose` and `bz_domain_t::name`) that existed only to
+            // back them. §11.7's "static class cannot be instantiated, does not
+            // implement `IDisposable`" is now load-bearing for both spellings.
             // §2.5: new DateTime(year, month, day) or
             //        new DateTime(year, month, day, hour, minute, second) or
             //        new DateTime(year, month, day, hour, minute, second, ms).

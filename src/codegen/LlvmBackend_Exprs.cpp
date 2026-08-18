@@ -3233,13 +3233,6 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 auto* fn = declareC("bz_task_scope_token", ptrTy(), {ptrTy()});
                 return builder_.CreateCall(fn, {sc}, "tscope.token.prop");
             }
-            // per §6.8 / #652: Domain instance property reads.
-            if (cn == "Domain" && ma->member == "Name") {
-                llvm::Value* dom = lowerExpr(*ma->target);
-                if (!dom) return nullptr;
-                auto* fn = declareC("bz_domain_get_name", ptrTy(), {ptrTy()});
-                return builder_.CreateCall(fn, {dom}, "dom.name");
-            }
             // stdlib §5 (#651): IGrouping<TKey, T>.Key property read.
             // IGrouping objects are bz_grouping_t* pointers; the key is
             // stored as key_esz bytes at group->key_data. bz_grouping_key

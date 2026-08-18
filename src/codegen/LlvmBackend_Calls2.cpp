@@ -6389,29 +6389,6 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         return nullptr;
                     }
                 }
-                // per §6.8 / #652: Domain instance Dispose() — release the
-                // bz_domain_t ref acquired by bz_domain_alloc. Calls
-                // bz_domain_dispose(dom) which calls domain_release().
-                {
-                    auto* recvTy = ctx_.exprType(*ma->target);
-                    if (recvTy && builtinTypeName(recvTy) == "Domain") {
-                        llvm::Value* dom = lowerExpr(*ma->target);
-                        if (dom && dom->getType()->isPointerTy()) {
-                            auto* fn = declareC("bz_domain_dispose",
-                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                            builder_.CreateCall(fn, {dom});
-                            if (!checkedDisposal_) {
-                                llvm::Type* slotTy = nullptr;
-                                if (llvm::Value* slot =
-                                        lvalueAddr(*ma->target, slotTy))
-                                    builder_.CreateStore(
-                                        llvm::ConstantPointerNull::get(ptrTy()),
-                                        slot);
-                            }
-                        }
-                        return nullptr;
-                    }
-                }
                 // §30.15 (#600 phase c): Channel<T>.Dispose() — close the channel,
                 // fault pending receivers with ChannelClosedException, dispose
                 // undelivered items in reverse order, and free the struct.

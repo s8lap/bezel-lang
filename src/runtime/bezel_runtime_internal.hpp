@@ -226,11 +226,6 @@ struct bz_domain_t {
     // last release (refs==1→0) deletes.  Starts at 0; callers add their refs.
     std::atomic<int>  refs{0};
 
-    // per §6.8 / #652: domain name (stdlib Domain.Name property).
-    // Stored as a malloc'd C string; empty string "" if no name was given.
-    // Freed in the destructor when the last ref is released.
-    char* name = nullptr;
-
     // per §8.3 (v0.204, #2055): per-domain deterministic identity-hash sequence.
     // Monotonic counter incremented on each first-request of an object's hash
     // inside this domain; the assigned value is what bz_obj_identity_hash
@@ -241,10 +236,7 @@ struct bz_domain_t {
     // sequence, also in bezel_runtime_refcounting.cpp.
     std::atomic<uint64_t> identity_hash_seq{0};
 
-    ~bz_domain_t() {
-        free(name);
-        name = nullptr;
-    }
+    ~bz_domain_t() = default;
 
     // Enqueue a continuation.  If the domain is idle, mark it active and
     // return true so the caller submits a drain to the pool.  If already

@@ -321,68 +321,6 @@ bz_domain_t* bz_main_domain_get() {
 }
 
 // ---------------------------------------------------------------------------
-// per §6.8 / #652: Domain instance — bz_domain_alloc / bz_domain_get_name.
-//
-// stdlib §6.8 documents Domain as a static-class for Domain.Spawn.  The probe
-// suite exercises `new Domain("test")` and `d.Name` as an instance-creation
-// path that lets programs name a domain for diagnostics.  The instance is an
-// owned heap pointer (IDisposable) backed by a bz_domain_t with a stored name.
-//
-// bz_domain_alloc(name_str: bz_string*) → bz_domain_t*
-//   Allocates a fresh bz_domain_t, copies the name from the bz_string argument
-//   (width-1 assumed for a domain name; falls back to "" for null/non-ASCII),
-//   and returns the pointer with refs=1 (the Bezel `using var` holds this ref).
-//
-// bz_domain_dispose(dom: bz_domain_t*) — IDisposable.Dispose() for a named
-//   Domain instance.  Releases the caller's ref (acquired by bz_domain_alloc).
-//   When refs drops to 0 the domain is deleted (destructor frees the name).
-//
-// bz_domain_get_name(dom: bz_domain_t*) → bz_string*
-//   Returns a fresh heap bz_string (rc=1) containing the domain's name.
-//   Caller owns the returned string (bz_string_release when done).
-// ---------------------------------------------------------------------------
-
-extern "C" void* bz_domain_alloc(const void* name_str_p) {
-    bz_domain_t* dom = new bz_domain_t();
-    domain_ref(dom);  // the `using var` in Bezel holds this ref
-    // Copy name from bz_string (§4.6 layout: width-1 ASCII name).
-    const char* raw = "";
-    int64_t     rlen = 0;
-    if (name_str_p) {
-        const bz_string_hdr* h = (const bz_string_hdr*)name_str_p;
-        if (h->data && h->width == 1) { raw = h->data; rlen = h->len; }
-    }
-    dom->name = (char*)malloc((size_t)rlen + 1);
-    memcpy(dom->name, raw, (size_t)rlen);
-    dom->name[rlen] = '\0';
-    return dom;
-}
-
-extern "C" void bz_domain_dispose(void* dom_p) {
-    if (!dom_p) return;
-    domain_release((bz_domain_t*)dom_p);
-}
-
-// bz_domain_get_name: return a fresh bz_string (rc=1) with the domain's name.
-extern "C" void* bz_domain_get_name(const void* dom_p) {
-    const char* nm = "";
-    int64_t     nlen = 0;
-    if (dom_p) {
-        const bz_domain_t* dom = (const bz_domain_t*)dom_p;
-        if (dom->name) { nm = dom->name; nlen = (int64_t)strlen(nm); }
-    }
-    char* buf = (char*)malloc((size_t)nlen + 1);
-    memcpy(buf, nm, (size_t)nlen);
-    buf[nlen] = '\0';
-    bz_string_hdr* sh = (bz_string_hdr*)calloc(1, sizeof(bz_string_hdr));
-    sh->data  = buf;
-    sh->len   = nlen;
-    sh->width = 1;
-    sh->rc    = 1;  // caller owns this reference (§4.6)
-    return sh;
-}
-
-// ---------------------------------------------------------------------------
 // bz_task_t
 // ---------------------------------------------------------------------------
 
