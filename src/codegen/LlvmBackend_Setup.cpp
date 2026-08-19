@@ -2920,17 +2920,58 @@ void Emitter::emitExportedIndexerSetters() {
 // Only engages for non-virtual properties (virtual ones dispatch via the vtable
 // slot already populated by buildVtable). Must run after declareVtables
 // (which calls buildVtable for imported types), so propGetSlot_ is accurate.
+//
+// fix #3267 (§29.1 + §29.2 / §2.8.2 / §2.8.3 rule 4 / §23, v0.262): the prior
+// `if (propGetSlot_.count(ps)) continue;` skip left every imported VIRTUAL
+// property WITHOUT an entry in `importedPropGetterFns_`. Sites 1, 2 (property/
+// indexer access via `b.P` / `b[i]`) had a separate thunk fallback in
+// `ensurePropertyAccessorFn` (`importedVirtualAccessorSlotFn` #3190), but
+// sites 3, 4, 5 — the §29.1 + §29.2 for-in Current read on an imported enumerator
+// whose `Current` is virtual — consult `importedPropGetterFns_[currentPropSym]`
+// DIRECTLY (LlvmBackend_Stmts.cpp ~L8004, the `else` arm of the `pd` gate, and
+// `wrapUserClassAsIEnumerable` ~L9729). With the map empty for any virtual
+// property, the for-in read fell through with `curVal == nullptr`, the loop
+// variable was never updated, and the producer summed zeros: cross-module
+// `for x in e do s := s + x; return s;` returned 0 where the single-module
+// twin returned 6 (silent wrong-value, no SIGSEGV — the VEnumIter3231's
+// MoveNext/Current pattern from the #3267 repro).
+//
+// Populate the map for VIRTUAL imported properties using the same thunk
+// (`importedVirtualAccessorSlotFn`) sites 1, 2 already use. The thunk body
+// loads the function pointer from the OWNER's `vt$<Owner>[slot]` (the
+// exporter's vtable global, ExternalLinkage resolved by the linker to the
+// dependency object) and forwards `this` to it — for a property declared on
+// the OWNER, that is the OWNER's own accessor; for an inherited virtual
+// property from an IMPORTED base with a LOCAL derived class (which has no
+// override of that member), that is the base's accessor. The forward is
+// byte-identical to what `ensurePropertyAccessorFn`'s #3190 fallback does
+// for `b.P`, so the two routes cannot diverge for one shape. Reusing the
+// existing thunk rather than minting a new `bz$<Class>$<Prop>$propget$direct`
+// ABI (§2.8.3 / #3190 / the issue's documented direction) is deliberate: the
+// thunk is already linker-correct (ExternalLinkage `vt$<Owner>` resolves to
+// the exporter's table) and call-shape-correct (the accessor's own ABI), so
+// the only addition here is populating a map that was empty for this shape.
 void Emitter::declareImportedPropertyGetters() {
     for (sema::Symbol* sym : ctx_.importedSymbols()) {
         auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
         if (!ps || ps->isIndexer) continue;
-        // Skip virtual: they dispatch through the vtable slot.
-        if (propGetSlot_.count(ps)) continue;
+        // Skip if already declared.
+        if (importedPropGetterFns_.count(ps)) continue;
         // Also skip interface properties: those dispatch through the itable.
         if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface)
             continue;
-        // Skip if already declared.
-        if (importedPropGetterFns_.count(ps)) continue;
+        // fix #3267 (§29.1 + §29.2 / §23): populate for VIRTUAL imported properties
+        // with the thunk that loads `vt$<Owner>[slot]` and forwards `this`.
+        // Closes the silent wrong-value shape `for x in e` over an imported
+        // IEnumerable whose enumerator's `Current` is virtual; without this
+        // entry the for-in Current read at Stmts.cpp ~L8004 falls through
+        // with `curVal == nullptr`, leaving the loop variable at zero.
+        if (propGetSlot_.count(ps)) {
+            if (llvm::Function* fwd =
+                    importedVirtualAccessorSlotFn(ps, /*isSet=*/false))
+                importedPropGetterFns_[ps] = fwd;
+            continue;
+        }
         // Derive the return type from the side table.
         sema::TypeRef* retRef = ctx_.importedMemberType(ps);
         llvm::Type* retTy = retRef ? lowerTypeRef(retRef) : i32();
@@ -2999,17 +3040,32 @@ void Emitter::declareImportedPropertySetters() {
     for (sema::Symbol* sym : ctx_.importedSymbols()) {
         auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
         if (!ps || ps->isIndexer) continue;
-        // Skip virtual: they dispatch through the vtable slot.
-        if (propSetSlot_.count(ps)) continue;
+        // Skip if already declared.
+        if (importedPropSetterFns_.count(ps)) continue;
         // Also skip interface properties: those dispatch through the itable.
         if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface)
             continue;
+        // fix #3267 (§29.1 + §29.2 / §23): populate for VIRTUAL imported properties
+        // with the thunk that loads `vt$<Owner>[slot]` and forwards `this`,
+        // mirroring the getter twin above. Same shape as #3267's getter fix;
+        // a setter on an imported virtual property has no entry in this map
+        // today and a for-in Current/SUM/ASSIGN pattern that happens to read
+        // or write through it would silently no-op the same way. Refcounted-
+        // setter semantics on a virtual Current are uncommon (Current is
+        // almost always read-only), so this half is mostly symmetric
+        // completeness rather than a confirmed bug, but applying the same
+        // fix keeps the two twins in lockstep so a future setter-only shape
+        // cannot diverge.
+        if (propSetSlot_.count(ps)) {
+            if (llvm::Function* fwd =
+                    importedVirtualAccessorSlotFn(ps, /*isSet=*/true))
+                importedPropSetterFns_[ps] = fwd;
+            continue;
+        }
         // fix #2400: skip a genuinely getter-only imported property — see the
         // long comment above this function for why this gate is load-bearing
         // (not just an optimization).
         if (!ctx_.importedPropertyHasSetter(ps)) continue;
-        // Skip if already declared.
-        if (importedPropSetterFns_.count(ps)) continue;
         // Derive the value-parameter type from the side table (same source the
         // getter twin uses — §23: get/set share one declared type).
         sema::TypeRef* retRef = ctx_.importedMemberType(ps);

@@ -211,4 +211,112 @@ BEZEL_TEST(xmod_imported_virtual_enumerator_forin_3231,
         "end C;");
 }
 
+// ===========================================================================
+// T2 — Site 5 (§29.1 + §29.2 for-in over an imported IEnumerable<T> whose IEnumerator<T>
+// has a VIRTUAL `Current` property): the silent wrong-value shape #3267 names.
+// REPRO SHAPE (matches the issue's verbatim lib.bzl/app.bzl pair, modulo the
+// spec-conformant formatting the parser accepts):
+//
+//   // lib.bzl
+//   module VAccLib3231T2;
+//   public class VEnum3231T2: IEnumerable<int>
+//     public method GetEnumerator(): IEnumerator<int>
+//       return new VEnumIter3231T2();
+//     end GetEnumerator;
+//   end VEnum3231T2;
+//   public class VEnumIter3231T2: IEnumerator<int>
+//     private _cur: int := 0;
+//     public constructor() end constructor;
+//     public method MoveNext(): bool
+//       _cur := _cur + 1;
+//       return _cur <= 3;
+//     end MoveNext;
+//     public virtual property Current: int get => _cur; end Current;
+//   end VEnumIter3231T2;
+//
+//   // app.bzl
+//   module VApp3231T2; import VAccLib3231T2;
+//   public class C
+//     public static method Main(): int
+//       using var e := new VEnum3231T2();
+//       var s := 0;
+//       for var x in e do s := s + x; end;
+//       return s;
+//     end Main;
+//   end C;
+//
+// Single-module twin:  s = 1+2+3 = 6  (correct).
+// Pre-#3267 cross-module:  s = 0      (silent wrong-value, exit 0, no SIGSEGV).
+// Post-#3267 cross-module: s = 6     (the fix populates importedPropGetterFns_
+//                                  for VIRTUAL imported properties with the
+//                                  thunk that loads vt$<VEnumIter3231T2>[slot]
+//                                  and forwards `this` — the §23 accessor
+//                                  itself, which reads `_cur`).
+//
+// The fix lives in LlvmBackend_Setup.cpp's declareImportedPropertyGetters
+// (the setter twin applies the same fix symmetrically). The pre-fix code
+// skipped virtual properties entirely (`if (propGetSlot_.count(ps)) continue;`),
+// leaving importedPropGetterFns_ empty for any virtual Current — and the §29.1 + §29.2
+// for-in's Current read (LlvmBackend_Stmts.cpp ~L8004, the `else` arm of the
+// `pd` gate) consults that map DIRECTLY, so it fell through with curVal=null
+// and the loop variable stayed at its default zero. The single-module twin
+// never had this gap (the local Current walks its own PropertyDecl), so the
+// two builds disagreed by exactly the difference between "loop variable stays
+// at 0" and "loop variable holds `_cur`".
+//
+// Pinning: the test asserts cross-module == twin (mechanical, twin-driven)
+// rather than a hand-written 6, so any future spec/codegen change to the
+// shape that consistently affects both modules is captured rather than
+// pinned to today's literal.
+// ===========================================================================
+BEZEL_TEST(xmod_imported_virtual_enumerator_forin_3231,
+           forin_5_over_imported_virtual_Current_agrees_with_twin_29_11) {
+    // The dependency: an IEnumerable<int> whose enumerator has a virtual
+    // `Current` property (the issue's repro shape, verbatim).
+    const std::string libSrc =
+        "module VAccLib3231T2; "
+        "public class VEnum3231T2: IEnumerable<int> "
+        "  public method GetEnumerator(): IEnumerator<int> "
+        "    return new VEnumIter3231T2(); "
+        "  end GetEnumerator; "
+        "end VEnum3231T2; "
+        "public class VEnumIter3231T2: IEnumerator<int> "
+        "  private _cur: int := 0; "
+        "  public constructor() end constructor; "
+        "  public method MoveNext(): bool "
+        "    _cur := _cur + 1; "
+        "    return _cur <= 3; "
+        "  end MoveNext; "
+        "  public virtual property Current: int get => _cur; end Current; "
+        "end VEnumIter3231T2; ";
+    const std::string appSrc =
+        "module VApp3231T2; import VAccLib3231T2; "
+        "public class C "
+        "  public static method Main(): int "
+        "    using var e := new VEnum3231T2(); "
+        "    var s := 0; "
+        "    for var x in e do s := s + x; end; "
+        "    return s; "
+        "  end Main; "
+        "end C;";
+    // The single-module twin: same declarations with the module boundary
+    // removed. Identical declarations, identical observable behaviour — if
+    // the twin does not agree, something OTHER than #3267 is broken (the
+    // existing for-in test #2545/#2553/#2546/#2550 family pins this shape
+    // locally; a fresh twin divergence here would be a new defect).
+    const std::string twinSrc =
+        "module VSingle3231T2; " + libSrc + appSrc;
+    int twin = compileLocalAndRun3231(twinSrc);
+    // Twin must compile and run cleanly — both implementations of the
+    // shape, the local-for-in path is what the spec says.
+    BEZEL_EXPECT_TRUE(twin >= 0);
+    int imported = compileImportAndRun3231(libSrc, appSrc);
+    if (imported == -2) return;  // dependency toolchain unavailable — skip
+    BEZEL_EXPECT_TRUE(imported >= 0);
+    // The refute: pre-#3267 cross-module returned 0 (silent wrong-value).
+    BEZEL_EXPECT_FALSE(imported == 0);
+    // The spec-correct answer: agreement with the twin.
+    BEZEL_EXPECT_EQ(imported, twin);
+}
+
 }  // namespace bezel::module
