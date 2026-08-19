@@ -1376,6 +1376,26 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 out.hasSetter = true;
                 for (auto mod : pd->modifiers)
                     if (mod == "readonly") { out.hasSetter = false; break; }
+                // fix #2939 follow-on wave-1-regression (§12.5/§23.1/§9.2,
+                // v0.240): mirror `propertyDeclHasSetter`'s abstract
+                // exclusion. An abstract Auto-bodied property
+                // (`public abstract property X: T;`) is implicitly get-only
+                // by §12.5 — "abstract on a member declares it without a
+                // body" — so it has no setter. Without this exclusion the
+                // wire bit answers `true` and the imported-base half of
+                // `checkPropertyOverrideSignatureMatch` (the
+                // `TypeResolution_Checks.cpp` override-match check at the
+                // imported branch) spuriously demanded a setter on the
+                // derived side, falsely rejecting the canonical
+                // `abstract property X: T;` + `public override property
+                // X: T => 7;` idiom across the module boundary. The
+                // correction stanza that lived at the override check
+                // (the `baseAbstract && isAutoShorthand` correction) used
+                // `isAutoProperty` (now correctly false for abstract after
+                // #2939) as its proxy; the wire bit itself is the single
+                // source of truth, so the correction becomes a no-op.
+                for (auto mod : pd->modifiers)
+                    if (mod == "abstract") { out.hasSetter = false; break; }
             } else {
                 out.hasSetter = false;
                 for (const auto& a : pd->accessors)

@@ -2807,12 +2807,30 @@ private:
         if (!pd) return ctx_.importedPropertyHasSetter(ps);
         if (pd->bodyKind == ast::PropertyBodyKind::Expression) return false;
         if (pd->bodyKind == ast::PropertyBodyKind::Auto) {
-            // Auto-property: read-write unless readonly. (Auto-properties are
-            // not virtual unless on an interface, but interfaces don't carry
-            // an Auto body — they use the abstract/block form — so this branch
-            // is effectively for completeness.)
+            // Auto-property: read-write unless readonly OR abstract. (Auto-
+            // properties are not virtual unless on an interface, but interfaces
+            // don't carry an Auto body — they use the abstract/block form —
+            // so this branch is effectively for completeness.) An abstract
+            // auto-property (`public abstract property X: T;`) is implicitly
+            // get-only by §12.5 — "abstract on a member declares it without
+            // a body" — so it has no setter to dispatch through. The wire
+            // bit (`MetaMember::hasSetter` at ModuleMetadataBuilder.cpp)
+            // already carries this exclusion — added in this commit so the
+            // LOCAL path and the IMPORTED path answer identically, the same
+            // symmetric guarantee #2478's body already documents for
+            // `isAutoProperty`. Without the symmetric local exclusion the
+            // vtable layout for a class hierarchy with an abstract auto-
+            // property DIVERGES between the local-compile and the
+            // import-this-base path — the local path leaves a setter slot
+            // allocated (and the override in the derived class inserts a
+            // setter-named override-key mirroring the slot), the imported
+            // path doesn't, and the override's `propSetSlot_[ps] = ...`
+            // ends up indexing into the imported-class's vt at the wrong
+            // offset — the #3190 abstract-root case.
             for (auto mod : pd->modifiers)
                 if (mod == "readonly") return false;
+            for (auto mod : pd->modifiers)
+                if (mod == "abstract") return false;
             return true;
         }
         // Block form: a set accessor present.
