@@ -2798,18 +2798,35 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             // disposal. producerState == Owned is the sound gate: a BORROW (a
             // field/local read, a borrow-returning collection method, a plain
             // Task) is Borrowed and left unmarked, so codegen never disposes it
-            // (no double-free). Restricted to a USER class/interface (declaration
-            // is a Class/Interface with a real AST decl, not value-builtin) —
-            // builtin handles (Task, Subscription, Shared, Stopwatch, …) resolve
-            // to a declaration-less / decl-null TypeSymbol and need their own free
-            // paths (deferred); owning collections are Owned* but decl-null too.
+            // (no double-free). Restricted to a USER class/interface (kind is
+            // Class/Interface and not value-builtin) — builtin handles (Task,
+            // Subscription, Shared, Stopwatch, …) resolve to a synthetic TypeSymbol
+            // with kind=Class but `moduleName.empty()` and need their own free
+            // paths (deferred); owning collections are Owned* but bypass via the
+            // OWNING-collection branch below (`disposeOwnedCollectionValue`),
+            // not this arm.
+            //
+            // sharpen #3081 (§22.6 / §17.13 / §28.3, v0.244): the pre-#3142 gate
+            // `rt->declaration->decl != nullptr` excluded EVERY imported user
+            // class because `ModuleLoader` never assigns `Symbol::decl` for a
+            // dependency's type (no AST exists across a module boundary). That
+            // is the SAME family-F5 defect #3142 widened on `isFreshOwnedClass-
+            // Producer` and the `out owned` discard site: the kind check is
+            // sufficient on both sides (locally `collectTypeDecl`, on import
+            // `fromMetaTypeDeclKind`). The `moduleName.empty()` discriminator
+            // (per #3022, the same shape that splits imported user types from
+            // synthetic builtin ClassSyms) keeps the gate correct: imported
+            // user types have a populated moduleName and are admitted; builtins
+            // have an empty moduleName and stay excluded. // per §17.13,
+            // #1009, #3142 family, #3081 sharpen
             if (producerState(*ds->value) == OwnershipState::Owned) {
                 if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
                     if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
                         (rt->declaration->kind == ast::TypeDeclKind::Class ||
                          rt->declaration->kind == ast::TypeDeclKind::Interface) &&
                         !rt->declaration->isValueBuiltin &&
-                        rt->declaration->decl != nullptr)
+                        (rt->declaration->decl != nullptr ||
+                         !rt->declaration->moduleName.empty()))
                         const_cast<ast::DiscardStmt*>(ds)->disposeOwnedValue = true;
             }
             // fix #1909 / §17.13 / §28.3 / §28.11: a discard `_ := <owned
