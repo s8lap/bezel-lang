@@ -334,7 +334,6 @@ BEZEL_TEST(pure_residuals_2061,
         "module M; "
         "record R(x: int) "
         "  public pure constructor(x: int) "
-        "    begin end; "
         "  end constructor; "
         "end R; "
         "class C "

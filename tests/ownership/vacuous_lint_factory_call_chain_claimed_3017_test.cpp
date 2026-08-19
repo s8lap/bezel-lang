@@ -329,7 +329,7 @@ BEZEL_TEST(vacuous_lint_factory_call_chain_claimed_3017,
         "module M; "
         "class C "
         "  private _arr: Array<int>; "
-        "  public constructor() begin _arr := new Array<int>(3); end constructor; "
+        "  public constructor() _arr := new Array<int>(3); end constructor; "
         "  public method Get(): Array<int> return _arr; end Get; "
         "  public static method M(): int "
         "    var c := new C(); "
