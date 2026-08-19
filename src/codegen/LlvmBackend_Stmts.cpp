@@ -7956,29 +7956,8 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             // neither of `declareImportedPropertyGetters`' two skips
             // (virtual, interface-parented) applies. Mirrors the parallel
             // change in `wrapUserClassAsIEnumerable` (LlvmBackend_Assign.cpp).
-            //
-            // fix #3267 (§29.11 / §29.2 case 1, v0.260): when `enumTs` is
-            // imported, `currentPropSym->decl` may be non-null (a re-parse
-            // side artifact); the `if (pd)` arm then inlines the getter
-            // body via `lowerExpr` / `ensurePropertyBlockGetter` against
-            // the IMPORTER-side class layout — but the actual instance
-            // was allocated by the EXPORTER, so the inlined read goes to
-            // the wrong offset and the for-in body sees a stale/wrong
-            // value.
-            //
-            // Lane C of Wave 5 investigated the alleged wrong-value bug
-            // across three rounds and could not exhibit it on HEAD — the
-            // thunk mechanism installed by fix #3190 (`726539b`) handles
-            // the import-virtual accessor path robustly enough that no
-            // repro shape surfaces the wrong-offset read. The guard is
-            // preserved as DEFENSIVE: it costs nothing in any repro we
-            // constructed, and it forecloses a future regression where
-            // the loader-side reparse programme (see follow-up #3275)
-            // might leave `currentPropSym->decl` non-null for an imported
-            // shape. Mirrors the guard at `wrapUserClassAsIEnumerable`
-            // (~LlvmBackend_Assign.cpp:9709).
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(currentPropSym->decl);
-            if (pd && !ctx_.isImported(enumTs)) {
+            if (pd) {
                 // Save/restore currentThis_.
                 llvm::Value* savedThis = currentThis_;
                 currentThis_ = enumObj2;
