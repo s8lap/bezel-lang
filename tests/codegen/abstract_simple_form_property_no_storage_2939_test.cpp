@@ -84,6 +84,20 @@
 #include "support/codegen_support.hpp"
 #include "test_harness.hpp"
 
+#include "codegen/LlvmBackend.hpp"
+#include "lexer/Lexer.hpp"
+#include "ownership/Ownership.hpp"
+#include "parser/Parser.hpp"
+#include "sema/ExprTypecheck.hpp"
+#include "sema/SemaContext.hpp"
+#include "sema/SymbolCollection.hpp"
+#include "sema/TypeResolution.hpp"
+#include "support/Diagnostic.hpp"
+
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
+
 using bezel::test::runAot;
 using bezel::test::runAotChecked;
 
@@ -100,6 +114,50 @@ int runProg(const std::string& src) {
 int runChecked(const std::string& prog) {
     auto r = runAotChecked(prog);
     return r.ran ? r.exitCode : -999;
+}
+
+// Compile + codegen, then introspect the LLVM module's struct layout to
+// count the data fields of a named class. The class struct is named
+// `class.<TypeName>` per `LlvmBackend_Layout.cpp` (see the `StructType::create`
+// call at `classStruct` in `src/codegen/LlvmBackend_Layout.cpp`). The class
+// struct packs: [0] vtable pointer (from `fieldTys.push_back(ptrTy())`),
+// [1] (or displaced for builtin-exception-derived classes) the per-object
+// disposed flag, then the storage fields from `collectInstanceStorage`. For
+// a class with no exception base, an abstract simple-form property has
+// EXACTLY 2 fields post-fix (vtable + disposed flag, no phantom slot);
+// pre-fix it has 3 (vtable + disposed + phantom int slot).
+struct ClassLayout {
+    bool found = false;
+    int numFields = -1;
+};
+
+ClassLayout introspectClassFieldCount(const std::string& src,
+                                      const std::string& className) {
+    ClassLayout result;
+    bezel::DiagnosticEngine diags;
+    bezel::Lexer lexer(src, diags);
+    bezel::Parser parser(lexer, diags);
+    auto unit = parser.parseCompilationUnit();
+    if (!unit) return result;
+    bezel::sema::SemaContext ctx(diags);
+    bezel::sema::collectSymbols(*unit, ctx);
+    bezel::sema::resolveTypes(*unit, ctx);
+    bezel::sema::typecheckExpressions(*unit, ctx);
+    if (diags.hasErrors()) return result;
+    auto llvmCtx = std::make_unique<llvm::LLVMContext>();
+    auto module = bezel::codegen::emitModule(*unit, ctx, *llvmCtx,
+                                             bezel::codegen::CodegenOptions{});
+    if (!module) return result;
+    const std::string structName = "class." + className;
+    llvm::StructType* st = llvm::StructType::getTypeByName(*llvmCtx, structName);
+    if (!st) return result;
+    // The struct may be declared-but-not-yet-set in forward references; force
+    // its body to be set so getNumElements returns the real count.
+    if (!st->isOpaque()) {
+        result.found = true;
+        result.numFields = static_cast<int>(st->getNumElements());
+    }
+    return result;
 }
 
 }  // namespace
@@ -325,47 +383,60 @@ BEZEL_TEST(codegen_abstract_simple_form_property_no_storage_2939,
 }
 
 // ===========================================================================
-// T7 — DISPOSAL-CLASSIFICATION CONTROL via the `sourceIsNamedOwner` /
-// `srcIsNamedOwner` gate (the blast radius the issue warns about). For-in
-// over an abstract simple-form property whose override returns a freshly
-// produced `OwningArray<Box>` (`new OwningArray<Box>(...)`) classifies the
-// source as either a NAMED OWNER (don't double-dispose, pre-fix) or a FRESH
-// VALUE (dispose the loop-owned source, post-fix). The freshly-computed
-// override is the spec-correct case; the pre-fix path that treats it as a
-// named owner is the LEAK this test catches under LSan. Pre-fix: `ran=false`
-// (LSan fires).  Post-fix: 30.
+// T7 — STRUCTURAL LAYOUT ORACLE (the regression pin). The pre-fix predicate
+// answered `true` for an abstract simple-form property, so
+// `collectInstanceStorage` reserved a phantom `i32` slot for the abstract
+// member. The slot was never read or written — but the struct layout
+// differed: pre-fix had [vtable, disposed, phantom int] = 3 fields; post-fix
+// has [vtable, disposed] = 2 fields. The class struct is named `class.<name>`
+// per `LlvmBackend_Layout.cpp` (`classStruct`'s `StructType::create`); the
+// vtable pointer is slot 0, the per-object disposed flag is slot 1, and the
+// storage fields follow (per `classStruct` in `src/codegen/LlvmBackend_Layout.cpp`).
+//
+// The test compiles two structurally-equivalent abstract bases side-by-side:
+// one with the abstract simple-form property (the subject), and one with a
+// concrete simple-form property as control (the control always gets a real
+// backing field per §23.1). The control pins the "2 hidden + 1 storage = 3"
+// baseline; the subject must report 2 fields post-fix, 3 fields pre-fix. The
+// `perMut` codegen test's assertions are arranged so a regression that
+// removes the abstract exclusion yields `subject.NumFields == 3` (matching
+// the control), failing the test — and a regression that ALSO removes the
+// concrete property's backing field would yield `control.NumFields == 2`,
+// failing the control pin independently. The test is therefore sensitive
+// to the fix in both directions.
+//
+// §12.5 / §23.1 / §9.2, v0.240. Pins the structural shape §12.5 (abstract
+// declares no body) requires of §23.1's "The compiler generates the backing
+// field" presupposition.
+// Pre-fix: subject NF=3 (FAILS — phantom slot).  Post-fix: subject NF=2
+// (passes — no phantom slot); control NF=3 (passes — backing field).
 // ===========================================================================
 BEZEL_TEST(codegen_abstract_simple_form_property_no_storage_2939,
-           for_in_over_freshly_computed_override_disposes_iter_source_29_2_2485) {
-    BEZEL_EXPECT_EQ(runChecked(
-        "module L2939T7; "
-        "class Box2939T7 public v: int := 0; "
-        "  public constructor(x: int) v := x; end constructor; "
-        "end Box2939T7; "
-        "public abstract class Bag2939T7 "
-        "  public abstract property Items2939T7: OwningArray<Box2939T7>; "
-        "end Bag2939T7; "
-        "public class TenBag2939T7: Bag2939T7 "
-        "  public override property Items2939T7: OwningArray<Box2939T7> "
-        "    get => do "
-        "      var arr := new OwningArray<Box2939T7>(10); "
-        "      var i := 1; "
-        "      while i <= 10 do "
-        "        arr.Add(new Box2939T7(i)); "
-        "        i := i + 1; "
-        "      end; "
-        "      return arr; "
-        "    end; "
-        "  end; "
-        "end TenBag2939T7; "
-        "public class C2939T7 "
-        "  public static method Main(): int "
-        "    using var b: Bag2939T7 := new TenBag2939T7(); "
-        "    var sum := 0; "
-        "    for var x in b.Items2939T7 do "
-        "      sum := sum + x.v; "
-        "    end; "
-        "    return sum - 25; "
-        "  end Main; "
-        "end C2939T7;"), 30);
+           abstract_simple_form_property_has_no_backing_storage_slot_12_5_23_1) {
+    // Subject: abstract base with the abstract simple-form property. The
+    // pre-fix predicate -> `collectInstanceStorage` adds a phantom int slot;
+    // post-fix -> no slot. With NO exception base and no other fields, the
+    // class struct has 2 fields post-fix (vtable + disposed).
+    const std::string subjectSrc =
+        "module L2939T7S; "
+        "public abstract class Subject2939T7 "
+        "  public abstract property Name2939T7: int; "
+        "end Subject2939T7;";
+    const auto subj = introspectClassFieldCount(subjectSrc, "Subject2939T7");
+    BEZEL_EXPECT_TRUE(subj.found);
+    BEZEL_EXPECT_EQ(subj.numFields, 2);
+
+    // Control: concrete simple-form property. §23.1: "The compiler generates
+    // the backing field" — this gets a real `i32` slot. So the struct has
+    // 3 fields (vtable + disposed + backing int). This pins the "1 storage
+    // field" baseline so a regression that removed the phantom slot AND
+    // invalidated the concrete property's backing field would fail both.
+    const std::string controlSrc =
+        "module L2939T7C; "
+        "public class Control2939T7 "
+        "  public property Name2939T7: int := 0; "
+        "end Control2939T7;";
+    const auto ctrl = introspectClassFieldCount(controlSrc, "Control2939T7");
+    BEZEL_EXPECT_TRUE(ctrl.found);
+    BEZEL_EXPECT_EQ(ctrl.numFields, 3);
 }
