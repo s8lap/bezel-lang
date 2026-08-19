@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | study — draft (2026-08-19), awaiting owner review |
-| **Tracking issue** | — |
+| **Tracking issue** | [#3270](https://github.com/s8lap/bezel-lang/issues/3270) (the §4 polymorphic-recursion gap, filed 2026-08-19 per Q1's recommendation) |
 | **Target module(s)** | none — a study; resolutions are recorded here and land only via 0103's §7 item 4 reopening triggers. One flagged exception: this study's §4 finds a **current-spec gap** (polymorphic recursion) that is strategy-independent and live in bezelc today; its landing vehicle would be an issue plus a §14 amendment through the docs workflow, gated on this study's Q1. |
 | **Written against** | spec/stdlib/rationale **v0.261** (`git show 39250d8:docs/*.md`; normative docs byte-identical to `4d783b6`, 0103's snapshot — verified: `git diff 4d783b6 39250d8 -- 'docs/Bezel_*.md'` is empty; the pathspec is deliberately narrow — quoted `docs/*.md` is a git pathspec whose `*` crosses `/` and picks up the changed `docs/proposals/` files) — every quotation re-verified against that snapshot |
 | **Currency** | v0.261 (HEAD `39250d8`) — written and verified at this revision; the delta note lands at the first re-verification against a later docs HEAD. Re-verification before any ruling must cover §2.8.2–§2.8.3, §11.8, §12.1, §12.4, §12.10, §14.1–§14.2, §14.5, §15.2, §17.10, §22.3, §27.1–§27.8, §28.1, §28.9, §28.13, §32.5, §32.8, §35.1, and stdlib §2.16 |
