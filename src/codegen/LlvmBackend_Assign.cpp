@@ -7212,9 +7212,34 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // A user class implementing IEnumerable<T> (declaration-carrying). A source
     // whose type is ALREADY a declaration-less IEnumerable (an alias / another
     // wrapped value) has no declaration and passes through unchanged.
+    //
+    // fix #3277 (§28.2 / §28.6 / §28.10, v0.262): when the source is a producer
+    // expression (e.g. `BoxEnum3267.FromSeed(seed)` — a CallExpr yielding a
+    // fresh `owned BoxEnum3267`), the wrapping is the SOURCE's only owner:
+    // the call is bound to no other name, so the wrapper's slot-1 Dispose
+    // must free the source. Mirror the local-decl / GetEnumerator sibling
+    // fixes (`!srcIsNamedOwner` at Setup.cpp:12607 and Calls2.cpp:5076) —
+    // both compute the same `srcIsNamedOwner` predicate (a named local /
+    // parameter / field / auto-property keeps the source alive for itself,
+    // the wrapper never owns it). Default `ownsSrc=false` at this site left
+    // every temporary producer at #3277's leak (single-module twin ASan
+    // could detect, cross-module imported could not — #2633's asymmetry).
     if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
-        actualTy->declaration)
-        return wrapUserClassAsIEnumerable(v, actualTy->declaration, targetTy);
+        actualTy->declaration) {
+        bool srcIsNamedOwner = false;
+        if (sema::Symbol* sym = ctx_.exprSymbol(*srcExpr)) {
+            if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+                dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
+                dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
+                srcIsNamedOwner = true;
+            } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+                srcIsNamedOwner =
+                    sema::isAutoPropertyStorageSymbol(ps, ctx_);
+            }
+        }
+        return wrapUserClassAsIEnumerable(v, actualTy->declaration, targetTy,
+                                          /*ownsSrc=*/!srcIsNamedOwner);
+    }
     return v;
 }
 
