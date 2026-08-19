@@ -7316,9 +7316,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // rejected via the `rcn == "X"` arms at lines 8006-8100,
                 // and §11.3 user classes of the same name would
                 // otherwise be wrongly false-rejected — see #2996 which
-                // fixed exactly that), `Linq` (a module name with no
-                // static-class surface — `Linq.X` is a name-lookup
-                // failure, not a member-call failure).
+                // fixed exactly that).
+                //
+                // `Linq` (#3274) is included as a row with an empty
+                // member list: `Linq` resolves as a builtin type
+                // identifier (arity 0 in `Resolver::builtinTypeArity`,
+                // TypeResolution_Names.cpp:314) with a synthetic
+                // TypeSymbol (decl == nullptr) set by
+                // ExprTypecheck_Exprs.cpp:1471. So
+                // `Linq.TotallyBogusMember(1, 2)` parses as
+                // `MemberAccess(Linq, TotallyBogusMember)(1, 2)` and
+                // reaches the static-call dispatch — the pre-#3274
+                // comment "Linq.X is a name-lookup failure, not a
+                // member-call failure" was wrong. Linq per spec / stdlib
+                // §5 has NO documented static methods — Linq is a
+                // module of extension methods on `IEnumerable<T>`, NOT
+                // a static class — so the empty member list correctly
+                // rejects every `Linq.X(...)` call (any name matches no
+                // member of the empty list). User classes named `Linq`
+                // (§11.3 collision — `class Linq { ... }`) compile
+                // cleanly via the `tgtSym->decl == nullptr` gate below.
                 {
                     struct StaticSurface {
                         std::string_view colName;
@@ -7457,6 +7474,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                          "Array<CancellationToken>) -> "
                          "owned CancellationTokenSource (§30.8)",
                          "6.1"},
+                        // §5 (v0.260 / #3274) — `Linq` is a MODULE of
+                        // extension methods on `IEnumerable<T>`, not a
+                        // static class — stdlib §5 documents zero static
+                        // methods on `Linq`. The empty member list
+                        // correctly rejects EVERY `Linq.X(...)` call
+                        // (any name matches no member). Pre-fix this
+                        // row was absent and the bogus member call
+                        // silent-zero-degraded via #2434 with only an
+                        // INTERNAL warning.
+                        {"Linq",
+                         {},
+                         "no static methods — `Linq` is a module of "
+                         "extension methods on `IEnumerable<T>` (§5)",
+                         "5"},
                     };
                     // Builtin-only gate: the receiver of a static call on
                     // a built-in static class is an IdentifierExpr whose
