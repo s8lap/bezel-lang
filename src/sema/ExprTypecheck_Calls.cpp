@@ -18110,7 +18110,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
         bool pAbstract = false;
-        if (pd)
+        // Mirror the named-method form L2373-2379 (#874): read the SYMBOL's
+        // modifiers FIRST (populated on import at ModuleLoader.cpp:851), then
+        // fall back to the AST decl's modifiers for the local case. The pure
+        // decl-only scan missed every IMPORTED abstract property — the
+        // imported PropertySymbol has no `decl` — so `base.P` on an imported
+        // abstract base degraded to the codegen-time #3199 cross-module
+        // reject instead of this clean §12.5 message. fix #3238.
+        for (auto mod : ps->modifiers)
+            if (mod == "abstract") { pAbstract = true; break; }
+        if (!pAbstract && pd)
             for (auto mod : pd->modifiers)
                 if (mod == "abstract") { pAbstract = true; break; }
         if (pAbstract && ma.target) {

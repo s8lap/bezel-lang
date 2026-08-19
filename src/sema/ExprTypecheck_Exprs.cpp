@@ -2989,7 +2989,24 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                               bps->decl)
                                         : nullptr;
                         bool bAbstract = false;
-                        if (bpd)
+                        // Mirror the named-method form L2373-2379 (#874) and
+                        // the named-property sibling above: read the SYMBOL's
+                        // modifiers FIRST (populated on import at
+                        // ModuleLoader.cpp:851), then fall back to the AST
+                        // decl's modifiers for the local case. The pure
+                        // decl-only scan missed every IMPORTED abstract
+                        // indexer — the imported PropertySymbol has no `decl`
+                        // — so `base[i]` on an imported abstract base
+                        // degraded to the codegen-time #2837 cross-module
+                        // reject instead of this clean §12.5 message. fix
+                        // #3238.
+                        if (bps)
+                            for (auto mod : bps->modifiers)
+                                if (mod == "abstract") {
+                                    bAbstract = true;
+                                    break;
+                                }
+                        if (!bAbstract && bpd)
                             for (auto mod : bpd->modifiers)
                                 if (mod == "abstract") {
                                     bAbstract = true;
