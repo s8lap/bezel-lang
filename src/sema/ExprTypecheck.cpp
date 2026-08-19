@@ -7546,11 +7546,41 @@ bool ExprTC::isExceptionDerivedClass(const TypeRef* ty) {
     return common::isBuiltinExceptionName(namedRefSimpleName(ty));
 }
 
+// §26.4 / #3083: walk `target`'s argument positions and report whether `name`
+// is a §26.4 type-parameter binding — a bare single-segment non-nullable
+// identifier, never a concrete generic-instantiation head (which is named but
+// carries its own generic args — the head is the type being instantiated, not
+// a free parameter). The rule mirrors Resolver::bindExtensionTargetTypeParams
+// (TypeResolution_Names.cpp) exactly so the §31.1/§31.2.1 check recognizes
+// the same set of names the resolver binds into the extension's scope.
+static bool isExtensionTargetTypeParam(const ast::Type& target,
+                                       std::string_view name) {
+    for (const auto& ga : target.genericArgs) {
+        if (!ga) continue;
+        if (ga->kind != ast::TypeKind::Named || !ga->name ||
+            ga->name->parts.size() != 1)
+            continue;
+        std::string_view n = ga->name->parts[0];
+        // A concrete generic-instantiation head (`Array` in `Array<T>`,
+        // `IEnumerable<T>` in a nested position, etc.) is never a free
+        // type parameter, even though it is a bare single-segment name —
+        // recurse to find the params in its OWN args. A false result is not
+        // terminal — sibling argument positions may still bind `name`.
+        if (!ga->genericArgs.empty()) {
+            if (isExtensionTargetTypeParam(*ga, name)) return true;
+            continue;
+        }
+        if (ga->nullable) continue;  // `T?` rejects binding (§26.4)
+        if (n == name) return true;
+    }
+    return false;
+}
+
 // §31.2.1 (v0.243, #3046): is `name` a generic type parameter declared by the
 // enclosing method, type, or extension? Only such a name can be the subject of
 // the arm-type generic-bound rule — every other declaration-less Named ref is a
 // built-in (user classes, local and imported, all carry a `TypeSymbol`).
-// per §14.2, §31.2.1
+// per §14.2, §26.4, §31.2.1, #3083
 bool ExprTC::isEnclosingTypeParamName(std::string_view name) const {
     auto has = [&](const auto& params) {
         for (const auto& gp : params)
@@ -7562,11 +7592,22 @@ bool ExprTC::isEnclosingTypeParamName(std::string_view name) const {
     if (currentType_ && currentType_->decl)
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
             if (has(td->genericParams)) return true;
-    if (currentExtension_ && currentExtension_->decl)
+    if (currentExtension_ && currentExtension_->decl) {
         if (auto* ed =
-                dynamic_cast<const ast::ExtensionDecl*>(currentExtension_->decl))
+                dynamic_cast<const ast::ExtensionDecl*>(currentExtension_->decl)) {
+            // (#3083) Extension's `<T>` clause lives in `targetType` (§26.4),
+            // NOT in `genericParams` — ExtensionDecl carries no `genericParams`
+            // field; parameters bind via the head's argument positions. Walk
+            // those for the spec-stated set, otherwise an UNCONSTRAINED T in
+            // `extension E<T>` is silently exempt from §31.1 (throw operand)
+            // and §31.2.1 (catch-arm type) — both predicates gate on this
+            // helper.
+            if (ed->targetType && isExtensionTargetTypeParam(*ed->targetType, name))
+                return true;
             for (const auto& gc : ed->genericConstraints)
                 if (gc.typeParam == name) return true;
+        }
+    }
     return false;
 }
 
