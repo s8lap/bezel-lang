@@ -4641,15 +4641,51 @@ sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
     // this an `owned` primary-ctor position would be misclassified as non-owned.
     const CalleeFormals ctorParams = resolveCtorParams(ne, ctx_);
     // §31.2.4 / #811 (v0.162): when the CONSTRUCTED type is itself an
-    // exception, an exception-typed argument is the CAUSE position of the
+    // exception AND the argument is flowing into the CAUSE parameter of its
     // snapshot-chaining constructor — "ex borrowed for the ctor call; snapshot
     // taken, instance not retained" (the spec's §31.2.4 wrap-and-rethrow
     // example is exactly `throw new DataAccessException("...", ex)` from a
-    // catch arm). The builtin base ctor copies the chain and retains nothing;
-    // a user subclass can only read or forward the borrow (§28.3 makes storing
-    // a borrow in a field inexpressible), so the escape is not a dangle.
+    // catch arm). The base `Exception` ctor is
+    // `constructor(message: string, cause: Exception)` (§31.4) — the `cause`
+    // parameter is the spec-defined marker of the cause slot — and user
+    // exception subclasses chain through it (`public constructor(msg: string,
+    // cause: Exception) base(msg, cause) end constructor;`, §31.4). The
+    // builtin base ctor copies the chain and retains nothing; a user subclass
+    // can only read or forward the borrow (§28.3 makes storing a borrow in a
+    // field inexpressible), so the escape is not a dangle.
+    //
+    // fix #3075: the carve-out was previously applied to ANY exception-typed
+    // argument when the constructed type was exception-derived — which §31.1
+    // v0.243 makes true at every throw site — so the check was structurally
+    // dead at every `throw new W(ex)` shape. NARROWED (§31.2.4, v0.243): skip
+    // ONLY when the parameter at `pos` is named `cause` (the spec marker);
+    // any other exception-typed argument falls through to the catch-borrow
+    // check below and is rejected if a borrow is stored into a non-owned
+    // parameter of a thrown/returned object. A second branch covers the
+    // BUILTIN base `Exception` itself (no user-declared ctor, so
+    // `ctorParams.valid()` is false): the spec fixes the snapshot-chaining
+    // signature to `(message: string, cause: Exception)`, so pos 1 of a
+    // 2-arg ctor is the cause slot.
     const bool constructedIsException =
         ne.type && ownershipIsExceptionClassRef(ctx_.resolvedType(*ne.type));
+    // fix #3075: the builtin base `Exception` has no local TypeDecl, so
+    // `ctorParams.valid()` is false at every `new Exception(...)` site; the
+    // carve-out must still fire for the cause slot. The spec fixes the
+    // snapshot-chaining signature to `(message: string, cause: Exception)`
+    // (§31.4) — a 2-arg ctor with the second parameter exception-typed — so
+    // recognise that shape and treat pos 1 as the cause slot. Named
+    // exception subclasses (e.g. `ArgumentException`, `IOException`) are
+    // reachable by the local-ctor branch above, not here, because they are
+    // builtins without a user-declared `cause` parameter name in this TU.
+    sema::TypeRef* rt = ne.type ? ctx_.resolvedType(*ne.type) : nullptr;
+    const bool constructedIsBaseExceptionBuiltin =
+        constructedIsException && !rt->declaration &&
+        common::isBuiltinExceptionName(
+            rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty()
+                ? std::string_view(rt->astNode->name->parts.back())
+                : std::string_view(rt->importedName)) &&
+        // Only the §31.4 base ctor has a `cause` slot — the 2-arg form.
+        ne.args.size() == 2;
     std::size_t pos = 0;
     for (const auto& a : ne.args) {
         if (!a.value) { ++pos; continue; }
@@ -4661,9 +4697,21 @@ sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
             ctorParams.valid() && pos < ctorParams.size() &&
             (ctorParams.modifier(pos) == "owned" ||
              ctorParams.modifier(pos) == "out owned");
-        // §31.2.4 cause position: skip (see constructedIsException above).
-        if (constructedIsException &&
-            ownershipIsExceptionClassRef(ctx_.exprType(*a.value))) {
+        // §31.2.4 cause position: skip ONLY when the argument lands in the
+        // spec-defined `cause` parameter of an exception-class ctor (§31.4).
+        // Any other exception-typed argument at a non-`cause` position falls
+        // through to the #430 check below. // per §31.2.4, §31.4, fix #3075
+        const bool isCauseByName =
+            constructedIsException &&
+            ownershipIsExceptionClassRef(ctx_.exprType(*a.value)) &&
+            ctorParams.valid() && pos < ctorParams.size() &&
+            ctorParams.name(pos) == "cause";
+        // Builtin base `Exception` has no user `cause` parameter; use the
+        // §31.4 spec signature — pos 1 of a 2-arg ctor — as the cause marker.
+        const bool isCauseByBuiltinBaseSig =
+            constructedIsBaseExceptionBuiltin && pos == 1 &&
+            ownershipIsExceptionClassRef(ctx_.exprType(*a.value));
+        if (isCauseByName || isCauseByBuiltinBaseSig) {
             ++pos;
             continue;
         }

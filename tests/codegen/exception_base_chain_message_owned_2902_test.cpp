@@ -359,7 +359,7 @@ BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
     auto r = runAotChecked(
         "module App; "
         "class SubEx7: Exception "
-        "  public constructor(m: string, c: Exception) base(m, c); "
+        "  public constructor(m: string, cause: Exception) base(m, cause); "
         "  end constructor; "
         "end SubEx7; "
         "class C public static method Main(): int "
@@ -473,7 +473,7 @@ BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
     auto r = runAotChecked(
         "module App; "
         "class ChainSub: Exception "
-        "  public constructor(m: string, c: Exception) base(m, c); "
+        "  public constructor(m: string, cause: Exception) base(m, cause); "
         "  end constructor; "
         "end ChainSub; "
         "class C public static method Main(): int "
