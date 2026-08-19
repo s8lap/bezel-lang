@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.261 — August 2026**
+**Companion to the Bezel Language Specification, v0.262 — August 2026**
 
 The spec describes the language. This document explains the choices behind it — places where two reasonable designs were possible and one was picked, places where a familiar-looking rule has a less-stated rule behind it, and places where something widely done elsewhere was deliberately left out. The spec says what the language *is*; this document says *why*, and what the alternatives would have cost.
 
@@ -1183,7 +1183,7 @@ Adopted v0.242 (proposal 0078; owner-ruled 2026-08-11, from the elegance review)
 
 Two extreme implementations exist. Erasure (Java) is fast to compile but produces poor codegen and disallows reflection on type parameters. Monomorphization (C++ templates, Rust) produces excellent codegen but slow compile times and binary bloat.
 
-Bezel's intended implementation specializes for value-type substitutions (where boxing would hurt) and shares for reference-type substitutions (where uniform layout is achievable). This gives most of the codegen benefit of monomorphization where it matters, and most of the binary-size benefit of erasure where it doesn't.
+Bezel's intended implementation specializes for value-type substitutions (where boxing would hurt) and shares for reference-type substitutions (where uniform layout is achievable). This gives most of the codegen benefit of monomorphization where it matters, and most of the binary-size benefit of erasure where it doesn't. That sentence records strategy *intent*, not a decline: a third point of the space — unboxed sharing at value substitutions through a per-instantiation witness descriptor — was examined and priced (proposals 0103/0104, 2026-08-19) and stands available under the spec's own latitude ([§11.8](Bezel_Language_Spec.md#sec-static-interface-members)). The reason the intent stands is codegen quality at value substitutions — indirect dispatch, not boxing — the one cost sharing cannot shed. (v0.262)
 
 `typeof(T)` and `value.GetType()` work because the runtime carries enough type information to resolve them, regardless of whether a particular generic was specialized or shared.
 

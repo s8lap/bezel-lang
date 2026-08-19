@@ -161,6 +161,7 @@ For a **ruling** or a **design-change graduation** (the full path):
 
 - [ ] Classify the change (§2). Design change → it must already be an accepted proposal (§6).
 - [ ] If the change touches §28/§30.5: state its kernel classification — derivation (name the K's), axiom extension (name the axiom), or new axiom (add the register row with its recorded reason) (v0.198).
+- [ ] If the change adds or alters a compile-time rule: state its body-locality classification (proposal 0105 §1) — **local** (no cross-body information), **fact-discharged** (names the per-body facts it consumes), **carve-out** (generic instantiation, confined to its two clauses), or **invariant amendment** (explicit, with the recorded reason) (v0.262).
 - [ ] Author the ruling with exact `old→new` edits; cite every `§` against the current heading.
 - [ ] Adversarial critique; resolve every blocking finding (no silent drops) (§4).
 - [ ] If multiple trains in one revision: run the composition gate over the union (§4).

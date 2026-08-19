@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | study — draft (2026-08-19), awaiting owner review |
+| **Status** | accepted — accepted (owner, 2026-08-19): the §4 polymorphic-recursion rule graduated at v0.262 as spec §14.6 (#3270 ruled here; closed at the v0.262 landing; enforcement #3271); the §1–§3 ABI resolutions stand as the recorded design behind 0103 §7 item 4's reopening triggers |
 | **Tracking issue** | [#3270](https://github.com/s8lap/bezel-lang/issues/3270) (the §4 polymorphic-recursion gap, filed 2026-08-19 per Q1's recommendation) |
 | **Target module(s)** | none — a study; resolutions are recorded here and land only via 0103's §7 item 4 reopening triggers. One flagged exception: this study's §4 finds a **current-spec gap** (polymorphic recursion) that is strategy-independent and live in bezelc today; its landing vehicle would be an issue plus a §14 amendment through the docs workflow, gated on this study's Q1. |
 | **Written against** | spec/stdlib/rationale **v0.261** (`git show 39250d8:docs/*.md`; normative docs byte-identical to `4d783b6`, 0103's snapshot — verified: `git diff 4d783b6 39250d8 -- 'docs/Bezel_*.md'` is empty; the pathspec is deliberately narrow — quoted `docs/*.md` is a git pathspec whose `*` crosses `/` and picks up the changed `docs/proposals/` files) — every quotation re-verified against that snapshot |

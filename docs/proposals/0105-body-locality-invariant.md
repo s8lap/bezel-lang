@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — draft (2026-08-19), awaiting owner review |
+| **Status** | accepted — accepted (owner, 2026-08-19, answering the strengthened Q7 — mint now) and landed in the same push as the process-§9 checklist line (v0.262 train); no normative-document surface — this proposal's §1 stays the invariant's carrier |
 | **Tracking issue** | — |
 | **Target module(s)** | conditional on acceptance: **process** — `spec-change-process.md` §9, one checklist line (the recommended landing, this proposal's §4); candidate, *not* recommended now: **spec** — a new Appendix C meta-entry (worked and declined, this proposal's §4). No normative document is edited by this proposal; the invariant text stays ▲. |
 | **Written against** | spec/stdlib/rationale **v0.261** (`git show 39250d8:docs/*.md`; normative docs verified byte-identical to 0103's `4d783b6` snapshot) |
