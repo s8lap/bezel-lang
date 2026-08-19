@@ -5701,6 +5701,27 @@ private:
         const sema::MethodSymbol& ms,
         const std::vector<ast::CallArgument>& args);
 
+    // fix #3268 (§22.5 / §2.8.2, v0.244): the IMPORTED-CONSTRUCTOR twin of
+    // `importedFormalToArg`. The rule is sema's
+    // `ExprTC::bindArgsToParams` restated over the imported ctor's
+    // `ConstructorSymbol::params` (which carries `ParameterSymbol`s for an
+    // imported ctor — same shape the method version walks), so positional
+    // arguments fill formals in order, a named argument fills the formal of
+    // that name, no formal is filled twice, and every unfilled formal with a
+    // default takes that default. Returns `sema::formalParamCount(cs)` entries:
+    // `[j] =` the call-site arg index for formal `j`, or −1 when it takes its
+    // declared default. Falls back to the identity map for any shape it
+    // cannot bind (a discard, an unknown parameter name, a double binding,
+    // or an unfilled required formal) — sema rejects all of those, so the
+    // fallback is the same defensive guard as `importedFormalToArg` rather
+    // than a second policy. This is the lowering-side companion to
+    // `SemaContext::setNewExprPositionalBinding` (#3196's publication
+    // mechanism, which `checkImportedNewExprArgs` now writes for the
+    // imported-ctor path).
+    std::vector<int> importedFormalToArg(
+        const sema::ConstructorSymbol& cs,
+        const std::vector<ast::CallArgument>& args);
+
     // The value for an imported formal left to its declared default (§22.5).
     // The exporter's rendered default literal rides
     // `ParameterSymbol::defaultText` (fix #3178 carried it off the wire, where

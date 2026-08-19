@@ -628,6 +628,54 @@ std::vector<int> Emitter::importedFormalToArg(
     return map;
 }
 
+// fix #3268 (§22.5 / §2.8.2, v0.244): the IMPORTED-CONSTRUCTOR twin of the
+// method `importedFormalToArg` above. The rule is byte-identical — every
+// `sema::formalParam*` accessor the method version consults is itself
+// overloaded for `ConstructorSymbol` (Symbol.hpp:1298-1399), so the only
+// difference is the symbol kind. Sema's `checkImportedNewExprArgs` now
+// publishes the same `bindArgsToParams` binding on the
+// `SemaContext::setNewExprPositionalBinding` side table (#3196's machinery),
+// and the matching lowering here mirrors the existing method-arm semantics.
+// Returns `sema::formalParamCount(cs)` entries: `[j] =` the index into `args`
+// that fills formal `j`, or −1 when formal `j` takes its declared default.
+// Identity fallback for any shape this cannot bind, matching the method
+// version's defensive posture (a discard, unknown parameter name, double
+// binding, unfilled required formal). Sema's `checkImportedNewExprArgs`
+// rejects every such shape (§22.5, #3213, #3082); the fallback keeps an
+// error-recovery lowering identical to what it was — never silently zeroing
+// the construction.
+std::vector<int> Emitter::importedFormalToArg(
+    const sema::ConstructorSymbol& cs,
+    const std::vector<ast::CallArgument>& args) {
+    auto identity = [&]() {
+        std::vector<int> ident(args.size());
+        for (std::size_t i = 0; i < args.size(); ++i)
+            ident[i] = static_cast<int>(i);
+        return ident;
+    };
+    const std::size_t n = sema::formalParamCount(cs);
+    for (const auto& a : args)
+        if (a.isDiscard) return identity();
+    std::vector<int> map(n, -1);
+    std::size_t pos = 0;
+    for (std::size_t ai = 0; ai < args.size(); ++ai) {
+        const ast::CallArgument& a = args[ai];
+        std::size_t idx = n;
+        if (a.name.empty()) {
+            idx = pos++;
+        } else {
+            for (std::size_t j = 0; j < n; ++j)
+                if (sema::formalParamName(cs, j) == a.name) { idx = j; break; }
+        }
+        if (idx >= n || map[idx] != -1) return identity();
+        map[idx] = static_cast<int>(ai);
+    }
+    for (std::size_t j = 0; j < n; ++j)
+        if (map[j] == -1 && !sema::formalParamHasDefault(cs, j))
+            return identity();
+    return map;
+}
+
 llvm::Value* Emitter::importedDefaultArgValue(const sema::MethodSymbol& ms,
                                               std::size_t pos) {
     const sema::TypeRef* pt = sema::formalParamResolvedType(ms, pos);

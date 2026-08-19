@@ -11585,14 +11585,38 @@ void ExprTC::checkImportedNewExprArgs(
                     "takes 0 (§22.7)");
         return;
     }
-    // A named/modifier argument is outside this conservative check.
-    for (const auto& a : ne.args)
-        if (!a.name.empty() || !a.modifier.empty() || a.isDiscard) return;
     if (ctors.size() != 1) return;  // imported ctor overloads deferred
     ConstructorSymbol* cs = ctors[0];
     const std::size_t nparams = cs->params.size();
     const std::string desc =
         std::string("`new ") + std::string(t->name) + "`";
+    // fix #3268 (§22.5 / §2.8.2, v0.244): a NAMED-argument call against an
+    // imported ctor with default-valued parameters must also be admitted and
+    // lowered. The previous guard ("A named/modifier argument is outside this
+    // conservative check.") returned silently, so codegen dropped into the
+    // #2658 loudness guard with an emitted `internal:` warning and a
+    // calloc-zero object — exactly the loud-but-wrong shape the issue
+    // names. `bindArgsToParams` itself ALREADY handles named arguments
+    // (the imported-method call path `checkImportedCallArity` runs it over
+    // named args too): the only thing missing was dispatching here for
+    // the named-only call shape, and publishing the §22.5 binding on the
+    // side table `lowerNew`'s imported-ctor branch reads. The modifier and
+    // discard shapes stay out of this conservative check — `out`/`out owned`
+    // and `ref`/`owned` markers are separate §22.3 obligations an arm like
+    // this would have to widen to admit, and the import side of those is
+    // #3081/`scoped` (#3081 widens the `out owned` discard) which is
+    // deliberately a different lane.
+    bool hasNamedArg = false;
+    for (const auto& a : ne.args) {
+        if (!a.name.empty()) { hasNamedArg = true; break; }
+    }
+    if (!hasNamedArg) {
+        bool hasModOrDiscard = false;
+        for (const auto& a : ne.args) {
+            if (!a.modifier.empty() || a.isDiscard) { hasModOrDiscard = true; break; }
+        }
+        if (hasModOrDiscard) return;
+    }
     // fix #3082 (§22.5 / §2.8.2, v0.244): an imported constructor's optional
     // parameters are part of the artifact interface (§2.8.2), so a caller in
     // another module must be able to omit them. The previous `nparams`-exact
@@ -11606,6 +11630,23 @@ void ExprTC::checkImportedNewExprArgs(
     BindResult b = bindArgsToParams(sema::FormalsView::of(*cs), ne.args,
                                     ne.span.begin, desc, /*emit=*/true);
     if (!b.ok) return;  // the binder reported; no cascade
+    // fix #3268 (§22.5 / §2.8.2, v0.244): publish the §22.5 binding on the
+    // `SemaContext` side table (the SAME side table the imported-record
+    // path `checkPositionalNewArgsFromSymbols` writes for
+    // `storePrimaryCtorPositionalArgs`), so `lowerNew`'s imported-ctor
+    // branch can walk the formals in declaration order and look up each
+    // one's call-site argument — the explicit call-out at the `if (cs &&
+    // allPositional && …)` gate (LlvmBackend_Exprs2.cpp) keys its `paramToArg`
+    // off this exact vector. Without it, the named-arg case still leaves
+    // the published positional-index reader at `paramToArg[j] == j` (the
+    // identity map never published) and codegen would index the wrong
+    // slot. The publication is a benign side-effect on the
+    // all-positional case (#3082's headline), where `b.paramToArg[j]` is
+    // already j (every positional argument at index j fills formal j), so
+    // even the existing positional path benefits: the codegen reader uses
+    // the explicit `paramToArg` instead of the previous implicit
+    // positional-index pairing.
+    ctx_.setNewExprPositionalBinding(&ne, b.paramToArg);
     for (std::size_t j = 0; j < nparams; ++j) {
         // per §22.5: an unbound parameter with a default takes that default.
         // As for imported methods (#3213), only a compile-time-constant

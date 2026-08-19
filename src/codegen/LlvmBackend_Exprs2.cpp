@@ -6121,6 +6121,142 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             emitAccessorRefArgWriteBacks(accessorRefArgs,
                                          /*emit=*/ok && !diverged_);
         }
+        // fix #3268 (§22.5 / §2.8.2, v0.244): the imported-ctor NAMED-argument
+        // path. The all-positional path above is the historical shape #3082
+        // lifted to admit omitted-trailing defaults, and remains untouched
+        // (its tail of #3081 `out owned` discard handling and the #2319 §22.3
+        // accessor bracket are not in scope here). The named-arg path uses
+        // the §22.5 binding sema publishes on the
+        // `SemaContext::setNewExprPositionalBinding` side table
+        // (`checkImportedNewExprArgs` writes it in `b.paramToArg`, the same
+        // side table the imported-record path `storePrimaryCtorPositionalArgs`
+        // reads via #3196).
+        //
+        // The §22.5 binding the side table carries is the lowering-side twin
+        // `importedFormalToArg(*cs, ne.args)` (LlvmBackend_Setup.cpp, the
+        // ctor twin of the method version `lowerCall` already uses at
+        // LlvmBackend_Calls2.cpp:8210). The helper's identity fallback is
+        // never reached here: sema's `bindArgsToParams` rejects every shape
+        // that would force the fallback (a `out _` discard, an unknown
+        // parameter name, a double binding, an unfilled required formal),
+        // so the binding is well-defined and the helper's broader-contract
+        // posture buys nothing in this arm. `importedFormalToArg` differs
+        // from the side table in exactly ONE way: the side table is
+        // published before `importedFormalToArg` runs, so the helper has
+        // the canonical binding; the side table itself is consulted by
+        // codegen purely as a "sema accepted this call" signal.
+        //
+        // The named-arg branch is purposefully narrow: only the basic
+        // shape `importedFormalToArg` admits (named and/or positional
+        // arguments with no modifier and no discard). The wider modifier
+        // + discard shapes the imported method arm handles are out of
+        // scope here — modifier-handling on a named-position argument
+        // would require the same §22.3 bracket the all-positional arm
+        // already builds (and which is presently tied to the
+        // `importedFormalMod(ai)`-by-ai lookup). Filing that widening is
+        // local to the ctor; the headline is the §22.5 named case the
+        // issue names.
+        if (!allPositional && cs && !cs->params.empty()) {
+            const std::vector<int>* bindingPtr =
+                ctx_.newExprPositionalBinding(ne);
+            if (bindingPtr && bindingPtr->size() == cs->params.size()) {
+                llvm::Function* ctorFn = declareImportedCtor(cs);
+                auto* fnTy = ctorFn->getFunctionType();
+                // The fill-or-default map j -> call-site arg index for
+                // formal j, or -1 when formal j takes its declared default.
+                const std::vector<int> formalToArg =
+                    importedFormalToArg(*cs, ne.args);
+                std::vector<llvm::Value*> ordered(cs->params.size(), nullptr);
+                // call-site arg -> formal index, so the
+                // `nullTransferredOwnedLocalSlot` post-pass (which keys off
+                // the FORMAL's modifier) can look up which formal a given
+                // arg actually fills. -1 for an arg the helper declined to
+                // bind (an unreachable shape; the helper's identity fallback
+                // is defensive — sema rejects these before the side table
+                // is published).
+                std::vector<int> argToFormal(ne.args.size(), -1);
+                for (std::size_t j = 0; j < formalToArg.size(); ++j)
+                    if (formalToArg[j] >= 0 &&
+                        static_cast<std::size_t>(formalToArg[j]) <
+                            argToFormal.size())
+                        argToFormal[static_cast<std::size_t>(
+                            formalToArg[j])] = static_cast<int>(j);
+                // §28.3: arguments are evaluated eagerly, left to right
+                // (same §28.3 rule `lowerCall`'s imported-method arm
+                // honours). Placement in `ordered` is by formal index.
+                // A FAILURE here (a `lowerExpr` returning null) is
+                // indistinguishable from the all-positional arm's
+                // `!v` bail: mark `ok = false`, skip the call, let the
+                // #2658 loudness residual below report.
+                bool ok = true;
+                // #1968 / §28.3: reclaim the uninitialized `obj` if an
+                // argument throws during evaluation (the imported ctor
+                // has not yet been entered; every field is zero until
+                // the imported ctor's body runs). The ctor's own throw
+                // edge is handled by emitNewPendingCheck below, so the
+                // arg-time unwind target is restored before the call.
+                llvm::BasicBlock* savedArgUT = unwindTarget_;
+                if (!ne.args.empty()) unwindTarget_ = newArgUnwindCleanup(obj);
+                for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
+                    const ast::CallArgument& a = ne.args[ai];
+                    const int fj = argToFormal[ai];
+                    if (fj < 0 || !a.value) { ok = false; break; }
+                    const std::size_t fi = static_cast<std::size_t>(fj);
+                    std::string_view formalMod;
+                    const sema::TypeRef* formalTy = nullptr;
+                    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                            cs->params[fi])) {
+                        formalMod = ps->modifier;
+                        formalTy = ps->resolvedDeclType;
+                    }
+                    llvm::Value* v = lowerExpr(*a.value);
+                    if (!v) { ok = false; break; }
+                    // fix #3133 / §7.2 / §2.5 (v0.252): an imported
+                    // ctor's formal is a `sema::TypeRef*`, so the
+                    // CG-nullable block buildOrderedArgs runs against
+                    // `params[idx].type` does NOT fire here. Mirror the
+                    // same three lines from buildOrderedArgs exactly: a
+                    // `null` literal becomes the all-zero nullable
+                    // struct, a bare T becomes a wrapped nullable, a
+                    // value already shaped is left alone. The named-arg
+                    // path does not currently exercise §22.3 ref/out
+                    // modifiers, so there is no by-ref carve-out to
+                    // import — `lowerExpr` is always the by-value path.
+                    if (formalTy && isNullableValueTy(formalTy)) {
+                        auto* expectedSt = nullableValueStructTy(formalTy);
+                        if (v->getType() != expectedSt) {
+                            if (v->getType()->isPointerTy() &&
+                                llvm::isa<llvm::ConstantPointerNull>(v)) {
+                                v = nullableValueNull(formalTy);
+                            } else if (v->getType() ==
+                                       expectedSt->getElementType(1)) {
+                                v = wrapNullableValue(formalTy, v);
+                            }
+                        }
+                    }
+                    ordered[fi] = v;
+                }
+                // Materialize every unfilled formal's §22.5 default.
+                for (std::size_t j = 0; j < ordered.size(); ++j) {
+                    if (ordered[j]) continue;
+                    llvm::Value* dv = importedCtorDefaultArgValue(*cs, j);
+                    if (!dv) { ok = false; break; }
+                    if (j + 1 < fnTy->getNumParams())
+                        dv = coerceNumericToType(dv, fnTy->getParamType(j + 1),
+                                                 /*isUnsigned=*/false);
+                    ordered[j] = dv;
+                }
+                unwindTarget_ = savedArgUT;
+                if (ok && ordered.size() == cs->params.size()) {
+                    std::vector<llvm::Value*> args;
+                    args.push_back(obj);
+                    for (std::size_t j = 0; j < ordered.size(); ++j)
+                        args.push_back(ordered[j]);
+                    builder_.CreateCall(ctorFn, args);
+                    emittedImportedCtorCall = true;  // fix #2658
+                }
+            }
+        }
         // fix #2658 (§22.3/§22.4, v0.236): MAKE THE RESIDUAL LOUD. Every exit
         // from the block above that did not emit `bz$T$ctor` leaves an object
         // whose CONSTRUCTOR BODY NEVER RAN — the instance is calloc'd and
