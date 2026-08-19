@@ -830,7 +830,7 @@ bool Emitter::isCollectionInterfaceName(const sema::TypeRef* rt) {
 // is a "record key" when the generic arg resolves to a record TypeSymbol that
 // actually carries synthesized GetHashCode/Equals (positional records, or
 // auto-hashable body records — §9.1 / §9.2). For such keys the generic
-// per §14.1 (generics are monomorphized): see the header comment. Build and
+// per §11.8's strategy latitude (this implementation monomorphizes; proposal 0103 records the choice): see the header comment. Build and
 // install `genericSubst_` from the receiver `target`'s concrete instantiation
 // of `parent`, returning the previous map for the caller to restore.
 std::unordered_map<std::string_view, llvm::Type*>

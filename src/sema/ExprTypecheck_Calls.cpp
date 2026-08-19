@@ -2446,7 +2446,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         }
         if (md && md->returnType) {
             if (auto* rt = ctx_.resolvedType(*md->returnType)) {
-                // per §14.1 (generics are monomorphized): a method whose
+                // per §11.8's strategy latitude (this implementation monomorphizes; proposal 0103 records the choice): a method whose
                 // declared return type is a bare type parameter of its parent
                 // class — `method GetIt(): T` on `Box<T>` — has the substituted
                 // type at a concrete instantiation: `b.GetIt()` on

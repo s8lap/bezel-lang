@@ -1825,7 +1825,7 @@ private:
         specializedStructs_;
     // specializedMethods_[(ms, llvm_subst_key, sema_id_key, param_tys)] =
     // specialized
-    // LLVM function. per §14.2 (generics are monomorphized): the cache key must
+    // LLVM function. per §11.8's strategy latitude (this implementation monomorphizes; proposal 0103 records the choice): the cache key must
     // distinguish instantiations that produce DIFFERENT specialized bodies. The
     // LLVM type vector alone is insufficient because every class/interface type
     // erases to `ptr` in IR, so `Maker<A>.Run` and `Maker<B>.Run` would share a
@@ -8380,7 +8380,7 @@ private:
         return nullptr;
     }
 
-    // per §14.1 (generics are monomorphized): install `genericSubst_` for a
+    // per §11.8's strategy latitude (this implementation monomorphizes; proposal 0103 records the choice): install `genericSubst_` for a
     // member access / call / indexer get whose RECEIVER expression `target` has
     // a concrete instantiation of the generic class `parent` (e.g. the getter
     // body of `Box<Pair>[i]` must read its `T`-typed field as the substituted
