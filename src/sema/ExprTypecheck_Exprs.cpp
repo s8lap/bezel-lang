@@ -745,6 +745,53 @@ void ExprTC::checkIndexArgNullability(const ast::IndexExpr& ix,
 // is a different node kind entirely and is untouched.
 void ExprTC::checkIndexArgsPositional(const ast::IndexExpr& ix) {
     for (const auto& a : ix.indices) {
+        if (!a.modifier.empty()) {
+            // fix #3097 (§23.5, v0.249) — INDEX ARGUMENTS ARE NEVER MODIFIERED.
+            //
+            // §23.5, verbatim (v0.249): "`ref` and `out` parameters are not
+            // allowed in indexer parameter lists." §28.1's closed-positions
+            // list for `owned` (and `scoped`, §28.14) forbids either on an
+            // argument whose position's parameter is determined by the
+            // indexer's declaration. The accepted modifier spellings on a
+            // `CallArgument` (Node.hpp `CallArgument::modifier`, §22.3 /
+            // §28.14, #1439) are "ref", "out", "out var", "out using var",
+            // "out owned", "out owned var", "owned", "scoped" — every one of
+            // them is forbidden at an index position. Ownership of an index
+            // argument is determined by the indexer's declared parameter
+            // ownership, so a `ref`/`out`/`owned`/`scoped` modifier here
+            // names nothing on either side: §23.5 declares the parameter
+            // side closed, and #2758 declared the call-site side closed too
+            // (the named-argument arm), leaving this modifier arm as the
+            // remaining gap. #3049 closed `_` at the parser; `out _` falls
+            // under this check too (modifier "out", `isDiscard == true`).
+            //
+            // Measured on the parent commit (c6a5355) the four modifiers
+            // and `out _` all parsed and reached sema; `o[out _]` then
+            // degraded at codegen behind an `internal: return-value
+            // expression failed to lower … (degraded to a zero/null return
+            // value) — #2491`, and the `o[out var i]` shape rejected for
+            // the wrong reason ("unresolved identifier i") — a silent
+            // accept surface and a wrong-reason surface, neither of which
+            // the spec admits.
+            //
+            // The modifier carries no span of its own (CallArgument carries
+            // only the value's), so report at the value — inside the
+            // brackets, which is what a reader needs — falling back to the
+            // whole index expression for the value-less `d[owned _]` shape.
+            ctx_.diagnostics().report(
+                Severity::Error,
+                a.value ? a.value->span.begin : ix.span.begin,
+                "an index argument may not carry a `" +
+                std::string(a.modifier) +
+                "` modifier — ownership of an index argument is determined "
+                "by the indexer's declared parameter ownership, and \xC2\xA7""23.5 "
+                "forbids `ref`/`out` parameters on indexer parameter lists "
+                "so neither `ref`/`out` nor `owned`/`scoped` names anything "
+                "here. Drop the `" + std::string(a.modifier) +
+                "` prefix and pass the index argument as a plain "
+                "expression (\xC2\xA7""23.5)");
+            continue;
+        }
         if (a.name.empty()) continue;
         // The name has no span of its own (CallArgument carries only the
         // value's), so report at the value — inside the brackets, which is
