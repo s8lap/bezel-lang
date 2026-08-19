@@ -2770,6 +2770,20 @@ private:
     // names it must be the code that found it. // per §28.8.1
     const ast::Expr* findThrowable28_8_1(const ast::Expr* e) const;
 
+    // §28.8.1 (R4b, #3241): the drop-on-overwrite clause of the non-throwable
+    // assignments list — "a store into an `owned` field, a plain-`var` owned
+    // local, or an owning-collection slot that may hold a live (non-null, not
+    // moved-from) value is throwable". Returns the RHS node to report at when
+    // the assignment is throwable by drop-on-overwrite, or nullptr when the
+    // store is into a provably moved-from/null/borrow/value-typed location.
+    // Distinguished from `findThrowable28_8_1` (which walks RHS sub-expressions
+    // for the throwable inventory) by the LHS-side, ownership-lattice check.
+    // Non-const because the local-state lookup reads the mutable `states_`
+    // map (the lookup itself is non-mutating, but `lookupState` is not
+    // const-qualified). // per §28.8.1, #3241 R4b
+    const ast::Expr* assignmentIs28_8_1ThrowableByOverwrite(
+        const ast::AssignmentStmt& as);
+
     // §28.8.1 (#3080): the exception-edge half of the field-restoration rule —
     // "a throwable expression between the move and the reassignment introduces an
     // exit path on which the reassignment has not run". Called from processBlock
