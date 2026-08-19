@@ -1638,6 +1638,72 @@ const TypeSymbol* ExprTC::enumTypeNamedBy(const ast::Expr& e) {
 // resolved MethodSymbol.
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
+    // §22.16 (v0.250, #3038): `old(E)` — the callee is the contextual
+    // keyword `old` and we are inside an `ensures` clause. The
+    // IdentifierExpr path in ExprTypecheck_Exprs.cpp suppresses its
+    // diagnostic for this one position; here we own the entire
+    // `old(E)` shape: visit the operand, enforce the §22.16 ownership
+    // restriction (a class- or interface-typed operand would hold a
+    // borrow across the whole body, which §22.16 forbids — the
+    // capture taxonomy lists the copyable-projection remedy), and set
+    // the CallExpr's exprType so downstream typecheck sees a typed
+    // expression. The class-typed rejection names the remedy per spec.
+    if (auto* oldId =
+            dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get())) {
+        if (oldId->name == "old" &&
+            currentClauseKind_ == ContractClauseKind::Ensures) {
+            if (ce.args.size() != 1 || !ce.args[0].value) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    "`old` takes exactly one argument — the expression "
+                    "whose entry value is to be captured "
+                    "(\xc2\xa7""22.16)");
+                return;
+            }
+            // Visit the operand so its type is populated and any
+            // nested IdentifierExpr / member access / etc. resolves.
+            visitExpr(*ce.args[0].value);
+            TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
+            // §22.16 ownership restriction: a class- or interface-typed
+            // capture would hold a borrow across the entire method body.
+            // Reject it with a diagnostic that names the copyable-
+            // projection remedy (§22.16 "old(E) — class- and
+            // interface-typed operands are captured as a frame-resident
+            // borrow" + the move-only operand paragraph). The
+            // value/primitive types are admitted: copyable by value
+            // (primitives, enums, records by value, strings, function
+            // types) or read-only borrows of fields that are themselves
+            // copyable. A class-typed operand fails the gate.
+            if (argTy) {
+                const bool isClassOrInterface =
+                    (argTy->kind == TypeRef::Kind::Named &&
+                     argTy->declaration &&
+                     (argTy->declaration->kind ==
+                          ast::TypeDeclKind::Class ||
+                      argTy->declaration->kind ==
+                          ast::TypeDeclKind::Interface));
+                if (isClassOrInterface) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "`old` over a class- or interface-typed value "
+                        "would hold a borrow across the entire method "
+                        "body and is rejected (\xc2\xa7""22.16); capture "
+                        "a copyable projection of the pre-state instead "
+                        "\xe2\x80\x94 an element- or payload-derived "
+                        "value, a `pure` member's result over a borrowed "
+                        "receiver, or a borrowing-match projection");
+                } else {
+                    // Set the CallExpr's type to the operand's type —
+                    // §22.16 "old(E) denotes the value E had at entry"
+                    // returns the same shape as E (the capture is by
+                    // copy for value kinds, by borrow for the
+                    // reference kinds we just gated).
+                    ctx_.setExprType(&ce, argTy);
+                }
+            }
+            return;
+        }
+    }
     // fix #3044 (§10.4 / stdlib §9.9, v0.242): `E.FromUnderlyingOrNull(value)`
     // — the COMPILER-PROVIDED per-enum static member. "Every enum `E` with
     // underlying type `U` carries one compiler-provided static member … no

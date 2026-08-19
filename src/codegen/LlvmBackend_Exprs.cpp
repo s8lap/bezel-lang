@@ -5972,6 +5972,22 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (llvm::Value* a = refParamAddr(e, refElem)) {
             return builder_.CreateLoad(refElem, a);
         }
+        // §22.16 (v0.250, #3038): the contextual keyword `result` inside an
+        // `ensures` clause. Sema binds a synthetic LocalSymbol with the
+        // declared return type; codegen recognises it here and loads from
+        // `ensuresResultSlot_` (already populated by emitReturn at every
+        // normal-completion path). The slot lives in the entry block, so the
+        // load in the epilogue sees the final return value bound. Sema
+        // already rejected `result` outside ensures, so any LocalSymbol
+        // named "result" reaching codegen is the §22.16 borrow.
+        if (auto* ls =
+                dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(e))) {
+            if (ls->name == "result" && ensuresResultSlot_) {
+                return builder_.CreateLoad(
+                    ensuresResultSlot_->getAllocatedType(),
+                    ensuresResultSlot_, "result");
+            }
+        }
         // CG3: a reference to a local variable loads from its slot.
         // §27.5: a captured ("boxed") local reads through its shared cell.
         if (llvm::AllocaInst* slot = localSlot(e)) {

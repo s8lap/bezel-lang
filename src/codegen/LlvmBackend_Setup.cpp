@@ -5335,6 +5335,149 @@ bool Emitter::armEnsuresEpilogue(
 // only; the normal-completion path runs ensures, then ret, leaving the
 // caller to drive any remaining out-param copy-out). Clears the armed
 // state so a nested callable's body (emitted afterwards) sees no epilogue.
+
+// §22.16 (v0.250, #3038): allocate one frame slot per `old(E)` CallExpr
+// found across the current method's ensures clauses. The slot lives in
+// the entry block; the entry-time evaluation of E (and the store) happens
+// in `captureOldOperands` right after the requires prologue, at the
+// §22.16 "after `requires` clauses" evaluation point. The ensures
+// clause body's `lowerCall` for an `old(E)` CallExpr loads from this
+// slot to read the entry value. Per textual order across all ensures
+// clauses; textually identical operands MAY share one binding, but the
+// simpler per-AST-node keying is observationally equivalent (the
+// operand is pure; two captures of the same expression at the same
+// point yield the same value).
+void Emitter::allocateOldCaptureSlots(
+    llvm::Function* fn,
+    const std::vector<ast::ContractClause>& clauses) {
+    for (const auto& c : clauses) {
+        if (c.kind != ast::ContractClause::Kind::Ensures) continue;
+        if (!c.expr) continue;
+        // Walk the expression tree to find every `old(E)` CallExpr.
+        // A simple recursive walk is enough — the only CallExpr we care
+        // about is one whose callee is an IdentifierExpr with name
+        // "old" (exactly what sema accepts in this position).
+        std::function<void(const ast::Expr&)> walk =
+            [&](const ast::Expr& e) {
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+                if (ce->callee) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            ce->callee.get())) {
+                        if (id->name == "old" && ce->args.size() == 1 &&
+                            ce->args[0].value) {
+                            // Allocate the slot only if we have not
+                            // already (per-AST-node keying). Use the
+                            // operand's resolved type from the sema
+                            // side — the same TypeRef set on the
+                            // CallExpr by ExprTypecheck_Calls.cpp.
+                            if (oldCaptureSlots_.find(ce) ==
+                                oldCaptureSlots_.end()) {
+                                sema::TypeRef* t =
+                                    ctx_.exprType(*ce->args[0].value);
+                                if (!t) t = ctx_.makeTypeRef();
+                                llvm::Type* elt = lowerTypeRef(t);
+                                if (elt) {
+                                    auto* slot = entryAlloca(elt);
+                                    oldCaptureSlots_[ce] = slot;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (ce->callee) walk(*ce->callee);
+                for (const auto& a : ce->args)
+                    if (a.value) walk(*a.value);
+            } else if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+                if (be->left) walk(*be->left);
+                if (be->right) walk(*be->right);
+            } else if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+                if (ue->operand) walk(*ue->operand);
+            } else if (auto* ma =
+                           dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+                if (ma->target) walk(*ma->target);
+            } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+                if (ix->target) walk(*ix->target);
+                for (const auto& i : ix->indices)
+                    if (i.value) walk(*i.value);
+            } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+                if (nc->callee) walk(*nc->callee);
+                for (const auto& a : nc->args)
+                    if (a.value) walk(*a.value);
+            }
+        };
+        walk(*c.expr);
+    }
+}
+
+// §22.16 (v0.250, #3038): after the requires prologue passes, evaluate
+// every `old(E)` operand and store it into its capture slot. The
+// builder is positioned in the entry block at this point (the requires
+// checks are emitted in the entry block too, but they branch around the
+// capture code — the captures are unconditional, just like `requires`
+// always evaluates before the body). On a rejected call (a failed
+// `requires`) the captures are dead but harmless: the throw goes out
+// before any return edge could read them.
+void Emitter::captureOldOperands(
+    llvm::Function* fn,
+    const std::vector<ast::ContractClause>& clauses) {
+    if (oldCaptureSlots_.empty()) return;
+    // Snapshot the entry state — the builder was positioned in the
+    // entry block by the caller (armEnsuresEpilogue / emitFunctionBody
+    // driver). We emit stores here in the entry block, after the
+    // requires checks have all branched past.
+    llvm::BasicBlock* entryBB = &fn->getEntryBlock();
+    llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+    builder_.SetInsertPoint(entryBB);
+    // Walk the clauses in textual order so captures happen in spec
+    // order (textual position across the member's ensures clauses).
+    for (const auto& c : clauses) {
+        if (c.kind != ast::ContractClause::Kind::Ensures) continue;
+        if (!c.expr) continue;
+        std::function<void(const ast::Expr&)> walk =
+            [&](const ast::Expr& e) {
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+                if (ce->callee) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            ce->callee.get())) {
+                        if (id->name == "old" && ce->args.size() == 1 &&
+                            ce->args[0].value) {
+                            auto it = oldCaptureSlots_.find(ce);
+                            if (it != oldCaptureSlots_.end()) {
+                                llvm::Value* v = lowerExpr(*ce->args[0].value);
+                                if (v) {
+                                    builder_.CreateStore(v, it->second);
+                                }
+                            }
+                            return;  // don't descend into the operand
+                        }
+                    }
+                }
+                if (ce->callee) walk(*ce->callee);
+                for (const auto& a : ce->args)
+                    if (a.value) walk(*a.value);
+            } else if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+                if (be->left) walk(*be->left);
+                if (be->right) walk(*be->right);
+            } else if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+                if (ue->operand) walk(*ue->operand);
+            } else if (auto* ma =
+                           dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+                if (ma->target) walk(*ma->target);
+            } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+                if (ix->target) walk(*ix->target);
+                for (const auto& i : ix->indices)
+                    if (i.value) walk(*i.value);
+            } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+                if (nc->callee) walk(*nc->callee);
+                for (const auto& a : nc->args)
+                    if (a.value) walk(*a.value);
+            }
+        };
+        walk(*c.expr);
+    }
+    builder_.SetInsertPoint(savedBB);
+}
+
 void Emitter::finalizeEnsuresEpilogue() {
     if (!ensuresFn_) return;
     llvm::Function* fn = ensuresFn_;
@@ -5346,11 +5489,16 @@ void Emitter::finalizeEnsuresEpilogue() {
     llvm::BasicBlock* exitBB = ensuresExitBB_;
     // Clear armed state BEFORE evaluating the clauses' expressions, so a
     // nested emitReturn (e.g. inside a pure-callee that itself has clauses)
-    // does not redirect back into this epilogue. Also clear before the
-    // final ret below so emitReturn's redirect logic is inert here.
+    // does not redirect back into this epilogue. §22.16 (v0.250, #3038):
+    // `ensuresResultSlot_` MUST stay set through the clause-evaluation loop
+    // — the IdentifierExpr path lowerExpr→resultSlot load consults the
+    // field, and clearing it here would make every `result` read in an
+    // `ensures` clause silently return null (SIGSEGV on the load). The
+    // slot is cleared AFTER the clauses run, just before the final emitReturn
+    // (whose own re-store guard `if (ensuresResultSlot_ && v)` would
+    // otherwise re-store the result we are about to read back out).
     ensuresFn_ = nullptr;
     ensuresExitBB_ = nullptr;
-    ensuresResultSlot_ = nullptr;
     ensuresClauses_ = nullptr;
     ensuresReturnTypeNode_ = nullptr;
     ensuresTypeName_.clear();
@@ -5391,6 +5539,13 @@ void Emitter::finalizeEnsuresEpilogue() {
     if (invClass) {
         emitInvariantCheck(currentThis_, invClass);
     }
+    // §22.16 (v0.250, #3038): the clauses have all run; clear
+    // ensuresResultSlot_ now so the `emitReturn` immediately below
+    // does not re-store the result we are about to read back out. Its
+    // own `if (ensuresResultSlot_ && v)` guard would otherwise re-store
+    // the local `resultSlot` value (which IS the same alloca — the
+    // re-store is a no-op but the redirect-into-epilogue would loop).
+    ensuresResultSlot_ = nullptr;
     // Reload the result temp (if any) and emit the original return. We
     // temporarily swap `currentReturnTypeNode_` so emitReturn's box/coerce
     // matches what the original return sites would have done.
@@ -8290,6 +8445,11 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     if (ms->decl) {
         if (auto* md =
                 dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            // §22.16 (v0.250, #3038): allocate one frame slot per
+            // `old(E)` CallExpr in the entry block. Must run BEFORE the
+            // requires prologue so the allocas are placed at the top of
+            // the entry block (LLVM's alloca-required-in-entry rule).
+            allocateOldCaptureSlots(fn, md->contractClauses);
             if (!md->contractClauses.empty()) {
                 emitRequiresPrologue(
                     md->contractClauses,
@@ -8320,6 +8480,26 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             if (isPublicInstanceMethod) {
                 emitInvariantCheck(currentThis_, ms->parent);
             }
+            // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
+            // epilogue before lowering the body. If armed, emitReturn
+            // redirects every normal-completion path through the epilogue
+            // block, which evaluates the ensures clauses and only then
+            // performs the original ret. The §22.16 (v0.240, #2941) exit-
+            // edge invariant check (after ensures, before ret) is wired
+            // through the `invariantClass` parameter. Finalized after the
+            // body is complete (below).
+            //
+            // §22.16 (v0.250, #3038): capture every `old(E)` operand
+            // into its slot, in the entry block, after the requires
+            // prologue. The requires checks branch past each other
+            // and the `req.cont` block falls through; placing the
+            // captures in the entry block means they happen on every
+            // path that survives the requires checks. A failed
+            // `requires` skips the captures — correct, because the
+            // ensures clauses are never evaluated on a throws path
+            // (§22.16 "no clause evaluation of any kind; the ordinary
+            // exception-path discharge unwinds the frame").
+            captureOldOperands(fn, md->contractClauses);
             // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
             // epilogue before lowering the body. If armed, emitReturn
             // redirects every normal-completion path through the epilogue
@@ -9502,10 +9682,21 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     // body effect has occurred, the object and all arguments are exactly as
     // the caller left them).
     if (!cd->contractClauses.empty()) {
+        // §22.16 (v0.250, #3038): per the spec, `old` and `result` are
+        // forbidden in constructor clauses (fields sit at the §22.7
+        // null watermark, no pre-state exists for `old`, and constructors
+        // return no value for `result` to denote). The sema path rejects
+        // any such use, so `allocateOldCaptureSlots` will simply find no
+        // `old(E)` operands in the constructor's ensures — a no-op
+        // call. We still need to invoke it before the requires prologue
+        // for code uniformity, and the empty `oldCaptureSlots_` map is
+        // harmless when the constructor's ensures clause is evaluated.
+        allocateOldCaptureSlots(fn, cd->contractClauses);
         emitRequiresPrologue(cd->contractClauses,
                              cs->parent ? cs->parent->name
                                         : std::string_view{},
                              "constructor");
+        captureOldOperands(fn, cd->contractClauses);
         // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
         // epilogue for the ctor (return type is null — ctor's return is
         // void, so no result temp). Finalized at body-end (below). The

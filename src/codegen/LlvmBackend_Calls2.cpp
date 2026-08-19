@@ -3485,6 +3485,28 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
 
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
+    // §22.16 (v0.250, #3038): `old(E)` inside an `ensures` clause. The
+    // capture slot was allocated by `allocateOldCaptureSlots` and the
+    // entry-time value was stored there by `captureOldOperands` (both
+    // called from the `emitFunctionBody` driver in Setup.cpp). The
+    // ensures clause body's read is just a load from that slot — the
+    // call itself does not re-evaluate E, which is exactly the
+    // §22.16 "value E had at the member's entry" semantics.
+    if (auto* oldId =
+            dynamic_cast<const ast::IdentifierExpr*>(call.callee.get())) {
+        if (oldId->name == "old" && call.args.size() == 1) {
+            auto it = oldCaptureSlots_.find(&call);
+            if (it != oldCaptureSlots_.end()) {
+                return builder_.CreateLoad(
+                    it->second->getAllocatedType(), it->second, "old");
+            }
+            // No capture slot — sema did not bind this `old` (it
+            // lives outside an `ensures` clause, or the clause is
+            // itself malformed). Fall through to ordinary dispatch,
+            // which will produce the standard "no method named old"
+            // diagnostic.
+        }
+    }
     // Pre-create out var slots so lvalueAddr can find them in all paths.
     ensureOutVarSlots(call);
     // fix #2966 (v0.240): the same observation `lowerCall`'s wrapper makes,

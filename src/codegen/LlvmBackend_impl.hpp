@@ -651,6 +651,32 @@ private:
     const std::vector<ast::ContractClause>* ensuresClauses_ = nullptr;
     std::string ensuresTypeName_;
     std::string ensuresMemberName_;
+    // §22.16 (v0.250, #3038): pointer identity of the synthetic LocalSymbol
+    // sema binds to the contextual keyword `result` inside an `ensures`
+    // clause. Set by sema through `ctx_.setExprSymbol` (the same heap
+    // address is reused across every `result` reference, see
+    // ExprTypecheck_impl.hpp's `syntheticResultLocal`). When the
+    // IdentifierExpr path in lowerExpr sees this symbol it loads from
+    // `ensuresResultSlot_` instead of going through localSlot — the
+    // synthetic symbol has no entry in `locals_` (it is not a declared
+    // local with a stack slot) but it is the §22.16 "borrow of the
+    // returned value" that the existing `ensuresResultSlot_` already
+    // materialises. Null when the currently-emitting function is not a
+    // value-returning method (so a stray `result` outside ensures would
+    // never reach codegen — the sema path rejects it).
+    const sema::LocalSymbol* ensuresResultSymbol_ = nullptr;
+    // §22.16 (v0.250, #3038): one frame slot per `old(E)` operand in the
+    // currently-armed ensures epilogue. The slot is allocated in the
+    // function's entry block by `captureOldOperands` (called from the
+    // `emitFunctionBody` driver right after the requires prologue, before
+    // the body is emitted), and the entry-time evaluation of E is stored
+    // there. The ensures clause's `lowerCall` for an `old(E)` CallExpr
+    // then loads from the slot to read the entry value. Keyed by the
+    // `old(E)` CallExpr's AST address so the textual-position canonical
+    // form (a single E at multiple sites) is honoured. Cleared on
+    // epilogue finalise.
+    std::unordered_map<const ast::CallExpr*, llvm::AllocaInst*>
+        oldCaptureSlots_;
     // §22.16 (v0.240, #2941): the class whose invariant must be checked at
     // the EXIT edge of this instrumented public method. Null when the
     // currently-armed epilogue belongs to a non-public, static, or non-class
@@ -6688,6 +6714,26 @@ private:
     // throws on failure, then performs the original return (ret value / ret
     // void). Clears the armed state.
     void finalizeEnsuresEpilogue();
+
+    // §22.16 (v0.250, #3038): pre-walk the ensures clauses to find every
+    // `old(E)` CallExpr and allocate a frame slot (in the entry block) for
+    // the entry-time capture. Called from `emitFunctionBody` right before
+    // `armEnsuresEpilogue` so the slot exists when the body is emitted.
+    // The capture itself happens in `captureOldOperands` immediately
+    // after the requires prologue so the entry-time evaluation of E runs
+    // at the §22.16 "after `requires` clauses" evaluation point.
+    void allocateOldCaptureSlots(
+        llvm::Function* fn,
+        const std::vector<ast::ContractClause>& clauses);
+
+    // §22.16 (v0.250, #3038): emit the entry-time evaluation and store
+    // of every `old(E)` operand. Called from `emitFunctionBody` right
+    // after the requires prologue. The builder must be positioned in the
+    // entry block on entry; on exit the caller's insertion point is
+    // restored. No-op if no `old` clauses are present in the method.
+    void captureOldOperands(
+        llvm::Function* fn,
+        const std::vector<ast::ContractClause>& clauses);
 
     // §22.16 (v0.240, #2941): emit runtime checks for the class invariant
     // of `classType` (a class with declared `invariant(E);` members). Walks

@@ -1552,39 +1552,69 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // keeps today's "unresolved identifier" error.
             ctx_.setExprSymbol(&e, typeParamMarker(id->name));
         } else if (currentScope_) {
-            // §22.16 (v0.240, #2942): `result` and `old` are contextual
+            // §22.16 (v0.250, #3038): `result` and `old` are contextual
             // keywords (§22.16 / Appendix B.2), valid only inside an
             // `ensures` clause — `result` denotes the method's return
-            // value (typed as the declared return type, read as a borrow),
-            // `old(E)` denotes the value of `E` at method entry. Neither
-            // is implemented in this revision (issue #2942); both fall
-            // through to ordinary name lookup and report "unresolved
-            // identifier". Replace that generic error with a context-aware
-            // one — outside `ensures`, point the user at §22.16's keyword
-            // rule; inside an `ensures` clause, point them at this issue
-            // (the "loud, hence safe" Option-A path the issue asks for).
-            // Inside a `requires` clause or an `invariant` member, §22.16
-            // also forbids these names, so the outside-`ensures` diagnostic
-            // applies uniformly — only `ensures` is the permitted position.
-            if (id->name == "result" || id->name == "old") {
-                if (currentClauseKind_ == ContractClauseKind::Ensures) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, id->span.begin,
-                        std::string("the contextual keyword `") +
-                        std::string(id->name) +
-                        "` is not yet implemented in `ensures` clauses "
-                        "(\xc2\xa7""22.16, v0.240; issue #2942) \xe2\x80\x94 "
-                        "postconditions cannot name the return value or "
-                        "the entry snapshot until that fix lands");
+            // value (typed as the declared return type, read as a borrow);
+            // `old(E)` denotes the value `E` had at the method's entry.
+            // Option B (the binding + capture form) is now implemented:
+            //   * `result` is bound in the `ensures` scope only — a
+            //     synthetic LocalSymbol typed as the method's declared
+            //     return type. The IdentifierExpr's exprSymbol and exprType
+            //     are set so the rest of the typecheck (member access on
+            //     the borrow, comparisons) sees an ordinary identifier.
+            //     Codegen's IdentifierExpr path recognises the synthetic
+            //     symbol and loads from the `ensuresResultSlot_` frame slot.
+            //   * `old(E)` is the callee of a CallExpr. The IdentifierExpr
+            //     path is silent for that one position — the CallExpr
+            //     handler (typeCall in ExprTypecheck_Calls.cpp) takes over,
+            //     visiting the operand and setting the CallExpr's type
+            //     (with the §22.16 ownership restriction — class-typed
+            //     operands are rejected with a diagnostic).
+            // Anywhere else (method body, `requires`, `invariant`, void
+            // method, constructor) `result`/`old` are still rejected as
+            // contextual keywords reserved for `ensures`.
+            if (id->name == "result") {
+                if (currentClauseKind_ == ContractClauseKind::Ensures &&
+                    currentReturnType_ &&
+                    returnCtx_ == ReturnCtx::ValueMethod) {
+                    // Per §22.16: `result` denotes the returned value,
+                    // typed as the declared return type, in a read-only
+                    // borrow position. Bind a synthetic LocalSymbol so
+                    // downstream typecheck sees a normal identifier.
+                    LocalSymbol* rsym = ctx_.syntheticResultLocal();
+                    rsym->declType = currentReturnType_;
+                    ctx_.setExprSymbol(&e, rsym);
+                    ctx_.setExprType(&e, currentReturnType_);
                 } else {
                     ctx_.diagnostics().report(
                         Severity::Error, id->span.begin,
-                        std::string("`") + std::string(id->name) +
-                        "` is a contextual keyword reserved for `ensures` "
-                        "clauses (\xc2\xa7""22.16, v0.240; issue #2942); "
-                        "it is not an identifier and cannot be referenced "
-                        "from a method body, a `requires` clause, or an "
-                        "`invariant` member");
+                        std::string("`result` is a contextual keyword "
+                                    "reserved for `ensures` clauses on a "
+                                    "value-returning method (\xc2\xa7"
+                                    "22.16); it is not an identifier and "
+                                    "cannot be referenced from a method "
+                                    "body, a `requires` clause, an "
+                                    "`invariant` member, a void method, "
+                                    "or a constructor"));
+                }
+            } else if (id->name == "old") {
+                if (currentClauseKind_ == ContractClauseKind::Ensures &&
+                    &e == calleeOfCallCtx_) {
+                    // `old(E)` — the CallExpr handler (typeCall) takes
+                    // over from here: it visits the operand, enforces
+                    // the §22.16 ownership restriction, and sets the
+                    // CallExpr's exprType. Suppress the contextual-
+                    // keyword diagnostic so the handler runs cleanly.
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, id->span.begin,
+                        std::string("`old` is a contextual keyword "
+                                    "reserved for `ensures` clauses "
+                                    "(\xc2\xa7""22.16); it is not an "
+                                    "identifier and cannot be referenced "
+                                    "from a method body, a `requires` "
+                                    "clause, or an `invariant` member"));
                 }
             } else {
                 ctx_.diagnostics().report(
