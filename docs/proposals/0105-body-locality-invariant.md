@@ -1,0 +1,97 @@
+# Proposal 0105 — The body-locality invariant
+
+| | |
+|---|---|
+| **Status** | under-review — draft (2026-08-19), awaiting owner review |
+| **Tracking issue** | — |
+| **Target module(s)** | conditional on acceptance: **process** — `spec-change-process.md` §9, one checklist line (the recommended landing, this proposal's §4); candidate, *not* recommended now: **spec** — a new Appendix C meta-entry (worked and declined, this proposal's §4). No normative document is edited by this proposal; the invariant text stays ▲. |
+| **Written against** | spec/stdlib/rationale **v0.261** (`git show 39250d8:docs/*.md`; normative docs verified byte-identical to 0103's `4d783b6` snapshot) |
+| **Currency** | v0.261 (HEAD `39250d8`) — written and verified at this revision; delta note at first re-verification against a later docs HEAD. Re-verify before any ruling: §2.6, §2.8.2–§2.8.3, §3.6, §7.9, §14.5, §22.13, §22.15–§22.16, §31.2.1, §33.5, §35.11, Appendix C's preamble, rationale §5.26, process doc §9 |
+| **Origin** | 0103's Q7 (*"Is the body-locality invariant worth a separate proposal …, or does it stay a recorded observation?"*), left open by the owner's 2026-08-19 acceptance of 0103, which also invited follow-up proposals. This is Q7's "yes"-branch artifact — a real proposal, not a study — minting 0103 §8's out-of-scope seam as a recorded, reviewable obligation on future spec rules. |
+
+*Reference convention (0103 §1's fix, kept): unprefixed §-references are language-spec references; rationale and process-document references are marked; references to this proposal's own sections are always written "this proposal's §N". Every quotation is verbatim from the v0.261 snapshot, re-verified for this proposal; bold and italics inside quotations are the source's own; elisions are "…"-marked and link targets are elided. ▲ marks proposed surface, landed nowhere — here, the candidate invariant sentence (this proposal's §1) and checklist line (its §4). This proposal decides nothing about codegen strategy.*
+
+---
+
+## 1. The invariant, stated precisely ▲
+
+0103 §8's candidate sentence: *"no rule of the specification may require information from inside a later declaration's body to check an earlier one, and no rule may require re-elaborating a body per use — except generic instantiation …"* (the carve-out's two confinements restated below). This proposal's §2 found exactly one rule (§22.13) the sentence, read literally, misclassifies as a violation; the refined text adds the **per-body-fact** clause that makes it true, and the definitions that make it checkable:
+
+> ▲ **The body-locality invariant.** A *declaration* is one module-level declaration — a type declaration together with all its member bodies, or a module-level member; a *body* is any member body a declaration contains (method, constructor, static-constructor, destructor, and accessor bodies; field and default-value initializers; contract-clause expressions); to *check* a declaration is to decide every compile-time rule whose diagnostic attaches to it; to *re-elaborate* a body is to run any front-end pass (parse, resolve, type-check, ownership or flow analysis) over its content after its own check completed. The invariant: **every body is checked exactly once, at its declaration; no rule of this specification may require information from inside another declaration's body to check a declaration, except through per-body facts — facts each body yields at its own single check — and no rule may require re-elaborating a body per use.** One carve-out: **generic instantiation**, whose per-use work is confined to (i) evaluating declaration-computable facts against the substitution and (ii) selecting runtime behavior, and is never a re-check of the body.
+
+Four boundary statements, so the invariant is not over-read:
+
+1. **It constrains bodies, not declarations.** Module-level declaration order-freedom is untouched: §2.6's phase 2 — *"Resolve all type declarations across the module and its dependencies."* — runs before phase 3's body checking, so a body freely references later declarations' *signatures*. A declaration prescan is not body information.
+2. **It binds rules, not implementations.** An implementation may be less local — bezelc's importer re-elaborates carried generic bodies per instantiation (0103 §4.1 item 2), admissible under §2.8.2's format latitude (*"source text, serialized AST, IR, or any mix"*).
+3. **Intra-declaration checking is unconstrained.** §7.9's definite assignment reading a type's constructor bodies to check its fields is one declaration checking its own bodies.
+4. **The carve-out's confinements are load-bearing.** Confinement (i) is 0103 §2's finding restated — every per-instantiation *check* (its Classes A–C) consumes the substitution plus facts computable at the declaration, never a re-elaborated body; confinement (ii) is its Class D. A per-instantiation rule not statable in that shape is what this ratchet exists to catch.
+
+## 2. The audit, by citation
+
+**The instantiation-facing half is already done — cite, don't re-derive.** 0103 §2 inventoried every per-instantiation rule of v0.261 into four classes and concluded *"no rule requires retaining a generic body past its declaration for later *checking*"*, its absence claim discharged against named near-misses; that inventory is the carve-out's evidence base, incorporated by citation. Its two cleanest existing statements, re-verified:
+
+- **§31.2.1** (generic catch-arm bounds): a malformed arm is *"a compile error at the arm, **checked at the generic declaration** — whether the parameter carries such a bound is decidable from the enclosing declaration's constraint set alone … so the arm's well-formedness never depends on an instantiation; only the *matching* is per instantiation, against the substituted type."*
+- **§35.11** (generic choices): *"Method bodies of a generic choice type-check once, against `this`-as-borrow ([§35.2]), so their checking is classification-independent; classification-dependent *admissibility* rules … are enforced at the instantiation or use site with [§3.6] rule 2's diagnostics."*
+
+**The half 0103 did not audit — does any rule check an *earlier* declaration using a *later* body, outside instantiation?** Swept area by area:
+
+| Area | Finding |
+|---|---|
+| **§22.13 static initialization** — *the one near-exception, the refinement's cause* | The forward-reference rule and the cross-type cycle graph traverse bodies: an edge exists when a static initializer or static constructor references a static member *"directly, or transitively through the bodies of **statically-resolvable calls** (static methods and static property getters reached by direct name within the compilation unit …)"* — bodies possibly belonging to *later* declarations. Against 0103 §8's sentence, a violation (the earlier declaration's diagnostic needs later bodies); against this proposal's §1, satisfied: the dependence factors completely through **per-body facts** — each body's outgoing statically-resolvable static-member reference set, computable at that body's own single check — the verdict a graph closure over those facts at end of unit, retaining and re-elaborating no body. The rule's own bounds keep the facts local: *"Calls through function values, virtual dispatch, and code outside the compilation unit contribute **no** edges"*. |
+| **§22.15 purity** | Clean — the corpus's strongest body-locality statement: *"Each pure body is checked in isolation against the rules above; every call site is admitted by the *declaration* of the statically named member, never by inspecting its body — no inference, no interprocedural fixpoint"*; generically, *"A generic pure member is checked once, at its declaration, under its constraints … Nothing purity-relevant depends on the substitution."* |
+| **§22.16 static-clause discharge** | Clean. `ensures`/`invariant` clauses are *"discharged at the **declaring body**"*; a `requires` clause's discharge site is *"**every call site**: the caller's compiler substitutes the actual arguments into the clause and discharges the instance"* — consuming the clause's canonical text (signature-carried as §2.8.2 contract records), never the callee's body; *"A **`static requires` clause may mention only state its call sites can see**"* exists for this reason. §2.8.2 already argues in this invariant's terms: a per-call-site discharge is never recorded because *"recording it would make the interface depend on particular bodies and call sites."* |
+| **§7.9 definite assignment** | Clean under the granularity definition: a non-nullable field must be *"assigned a value in every constructor before the constructor returns"* or carry an initializer — intra-declaration (this proposal's §1 boundary 3); locals are checked within their own body. |
+| **§33 entry-point selection** | Clean: qualification is by *"the eight signature shapes from [§33.2]"*, and *"The search space is the root compilation only ([§2.8.4]): a qualifying `Main` in a dependency artifact is inert and never conflicts"* (§33.5) — a whole-unit selection over signatures, prescan territory (boundary 1), no body facts. |
+| **§2.8.2 carried bodies, consumer-side** | Clean as a constraint on *rules* (boundary 2): clause 2 states a capability (*"**Instantiate** every public generic type and generic method at arbitrary module-external type arguments …"*), and the definition-site carriage sentence is strategy-consequent (0103 §1.1 — *"The interface must therefore carry…"*, derived, not a mandate). No rule requires the consumer to re-elaborate a carried body; that bezelc does is an implementation choice. |
+
+**The absence claim, near-misses named:** no rule of v0.261 requires retaining or re-elaborating any body to check another declaration. The closest passages: §22.13's through-bodies closure (above — discharged by per-body facts; the one refinement's cause); §2.8.2's definition-site carriage sentence (strategy-consequent — 0103 §1.1 near-miss (i)); §21.10's *"a public generic's carried body ([§2.8.2]) carries it as ordinary body content"* (descriptive of the current model); and §14.5's inference, provably expression-local (*"Inference runs after arity filtering and named-argument binding"*; no phase consults the generic body or other call sites — 0103 §2). The audit found **no rule the invariant text must carve** beyond the stated generic-instantiation carve-out.
+
+## 3. What minting it buys
+
+The move has an exact in-spec precedent — §3.6's closing sentence, turning an emergent pattern into an obligation on future rules: *"New rules added to this specification that need a structural classification of types must define it as a derived type property under the rules of this section, rather than introducing a parallel mechanism."* The same move, for body locality:
+
+1. **A review obligation instead of silent accumulation.** Today body locality is emergent — true of every rule, guaranteed by none. A rule quietly demanding a whole-program body analysis (an interprocedural purity inference, a per-use re-check) would land with no one obliged to notice the cost class it introduces. Under the mint, each ruling states its body-locality classification at review time, as §28/§30.5 rulings state their kernel classification.
+2. **The streaming tier starts from a named invariant.** 0103 §7 item 4's trigger (iii) defers C/D/E behind *"the streaming-compiler tier becoming a real workstream"*, whereupon *"this study's §2's inventory and §3's schema are its starting documents"*. Minting adds the third: the invariant itself, held true meanwhile — the difference between "the property still holds when the tier opens" and "someone re-audits every revision since 0103".
+3. **Spec reviews gain a checklist line** — this proposal's §4's landing — at the moment a new rule is cheapest to fix.
+
+## 4. Where it lands
+
+Three candidate homes, worked honestly:
+
+**(a) A new Appendix C entry.** C's charter, per its preamble: *"This appendix consolidates the invariants the compiler enforces. It is a checklist for implementers and a reference for programmers wanting to know which classes of error are caught at compile time."* Its entries bind *programs*, as short §-cited bullets — e.g. C.1's *"Every non-nullable local is assigned before its first read."* The body-locality invariant binds *future spec revisions*: a meta-invariant no program can violate — a category mismatch under C's own charter; doing it honestly needs a new meta-subsection with its own charter sentence, a charter change nothing yet forces. Declined for now; recorded as the natural normative anchor if the streaming tier opens and wants one (§3.6's closing sentence proves the spec can carry meta-obligations).
+
+**(b) A spec-change-process checklist line — recommended.** Process-only — no spec text, no revision bump — landing at the enforcement point. The precedent already on the §9 checklist: *"If the change touches §28/§30.5: state its kernel classification — derivation (name the K's), axiom extension (name the axiom), or new axiom (add the register row with its recorded reason) (v0.198)."* The candidate line ▲, in the same shape:
+
+> - [ ] State the change's body-locality classification (proposal 0105 §1): **local** (no cross-body information), **fact-discharged** (names the per-body facts it consumes), **carve-out** (generic instantiation, confined to its two clauses), or **invariant amendment** (explicit, with the recorded reason).
+
+The invariant's full statement stays carried by this proposal's §1, which the line cites. Price: the statement lives in a non-normative folder — accepted, since the checklist is on the path every ruling takes, read at the only moment it matters.
+
+**(c) Both — C carrying the statement, the checklist the enforcement.** The kernel's own shape (register in §28.3, obligation on the checklist) — the correct division of labor, but it inherits (a)'s charter mismatch today; the right end state exactly when (a)'s condition fires.
+
+**Recommendation: (b) now**; escalate to (c) when 0103 §7 item 4's trigger (iii) opens the streaming tier and the invariant earns a normative anchor.
+
+## 5. What this proposal does NOT do
+
+- **No compiler change, no conformance change, no test change.** The invariant is true of v0.261 as audited; nothing observable moves — no lit/FileCheck or gtest surface, no changelog migration category.
+- **No bearing on 0103's alternatives C/D/E** (deferred behind their recorded triggers) or B (implementation freedom with or without this mint). The invariant does not presuppose or advance any codegen strategy — it constrains what future *rules* may demand.
+- **A ratchet, not a wall.** A future rule genuinely needing cross-body information remains land-able — by explicitly amending the invariant's record in the same ruling, reason recorded: the fourth arm of this proposal's §4's checklist line. That is rationale §5.26's register discipline transposed — *"A future ruling that touches §28/§30.5 states its classification — a derivation …, an axiom extension …, or a new axiom (adding a register row with its recorded reason). This is a changelog-entry obligation on the spec-change checklist."* — with its append-only form as the shape amendments take. Under landing (b) the amendment record is this proposal plus the amending rulings' changelog entries.
+
+## 6. Alternatives declined-or-deferred
+
+1. **Leave it as 0103 §8's recorded observation.** Price: rediscovery — the next reviewer of a body-reaching rule must independently notice the property, find 0103 §8, and re-derive its audit; nothing obliges them to look (this proposal's §3 item 1's silent-accumulation mode). Declined.
+2. **Land it only when the streaming tier opens.** Price: every rule landed meanwhile is unchecked against it — the tier would open with an audit debt — and the ratchet's whole value is prospective. The invariant is worth holding *even if the tier never opens*: it is what keeps checking costs declaration-local and the artifact-interface story summary-shaped (§2.8.2 clause 1, the contract records). Declined.
+3. **Mint now, at the enforcement point (this proposal).** Cost: one checklist line and this file. Recommended.
+
+## 7. Interactions
+
+- **0103 (accepted 2026-08-19)** — the parent. Its §2 inventory is the evidence base; its §8 is the sentence this proposal's §1 refines; its §7 item 4 trigger (iii) is where the §4 escalation to (c) keys. Deliberately independent of 0103's C/D/E dispositions and its open Q5.
+- **0047 §2.3 (mechanized core semantics, under-review)** — no interaction beyond shared motivation: 0047 models *program* semantics; this invariant quantifies over *specification rules* and is not a theorem any layer of that model could state. Stated so no reader expects a T-numbered obligation here.
+- **`spec-change-process.md`** — landing (b)'s carrier; the §9 edit is process-class (no revision bump, no `check_docs.sh` surface). Its §2 reopening rule is untouched: amending the invariant later is an ordinary recorded decision, not a reopening.
+- **The proposals ledger** — the Live-queue row and a `scripts/check_proposals.sh` run are the coordinator's landing step; the file alone does not complete registration.
+
+## 8. Questions for the owner
+
+This proposal **is** Q7's artifact: the acceptance decision on it answers Q7 — accept, and Q7 closes "yes, minted"; decline, and it closes "recorded observation only" (0103 §8 then stands as the record; price, this proposal's §6 item 1). Beyond that, two genuine questions:
+
+- **Q1 — The refinement.** Confirm the per-body-fact clause (this proposal's §1, forced by §22.13) as the invariant's canonical reading, rather than keeping 0103 §8's shorter sentence and carving §22.13 as a named exception? (Recommended: it is the true statement, and gives future rules a named discharge shape instead of a precedent for exceptions.)
+- **Q2 — The landing.** Confirm landing (b) — the §9 checklist line, process-only — with escalation to (c) keyed to 0103 §7 item 4's trigger (iii)? (Recommended.)
