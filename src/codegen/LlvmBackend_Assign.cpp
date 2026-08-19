@@ -9691,8 +9691,27 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
         // this shape: the `Current` here is non-virtual and class-parented,
         // so neither of `declareImportedPropertyGetters`' two skips
         // (virtual, interface-parented) applies.
+        //
+        // fix #3267 (§29.11 / §29.2 case 1, v0.260): when the enumerator
+        // class `enumTs` is imported, `currentPropSym->decl` may be non-null
+        // (a re-parse side artifact), in which case the `if (pd)` arm
+        // below would compile a LOCAL `bz$exprget$<Name>` thunk from the
+        // importer-side class layout and dispatch through it — but the
+        // actual enumerator instance was allocated in the exporter, with
+        // the EXPORTER-side layout, so the thunk reads the WRONG offsets
+        // and the for-in sum is wrong.
+        //
+        // Lane C of Wave 5 investigated the alleged wrong-value bug across
+        // three rounds and could not exhibit it on HEAD — the thunk
+        // mechanism installed by fix #3190 (`726539b`) handles the
+        // import-virtual accessor path robustly enough that no repro
+        // shape surfaces the wrong-offset read. The guard is preserved
+        // as DEFENSIVE: it costs nothing in any repro we constructed,
+        // and it forecloses a future regression where the loader-side
+        // reparse programme (see follow-up #3275) might leave
+        // `currentPropSym->decl` non-null for an imported shape.
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(currentPropSym->decl);
-        if (pd) {
+        if (pd && !ctx_.isImported(enumTs)) {
             if (const ast::PropertyAccessor* acc = blockGetterOf(currentPropSym)) {
                 currentFn = ensurePropertyBlockGetter(pd, acc);
             } else if (const ast::Expr* ge = computedGetterOf(currentPropSym)) {
