@@ -863,11 +863,42 @@ std::string builtinExceptionSurfaceList(std::string_view builtinBase) {
     return out;
 }
 
-// §9.2 / §22.9: see Symbol.hpp. The AST-ONLY half — a non-static, non-indexer
-// property whose `ast::PropertyDecl` declares the auto form (`Name: T;` — no
-// expression body, no accessor block). Answers `false` for every IMPORTED
-// property, because `ps->decl` is null there; that is why the storage question
-// is asked through `isAutoPropertyStorageSymbol` below and not through this.
+// §9.2 / §22.9 / §12.5: see Symbol.hpp. The AST-ONLY half — a non-static,
+// non-indexer property whose `ast::PropertyDecl` declares the auto form
+// (`Name: T;` — no expression body, no accessor block). Answers `false` for
+// every IMPORTED property, because `ps->decl` is null there; that is why the
+// storage question is asked through `isAutoPropertyStorageSymbol` below and
+// not through this.
+//
+// fix #2939 (§12.5/§23.1/§9.2): an `abstract` simple-form property
+// (`public abstract property X: int;`) is spelled identically to the auto
+// form and so records `bodyKind == Auto`, but §12.5, verbatim: "`abstract` on
+// a member declares it without a body; every concrete subclass must override
+// it." §23.1's "The compiler generates the backing field" presupposes a body,
+// which an abstract member has by construction not — so an abstract
+// simple-form property has no backing field to generate and the storage
+// classification MUST answer `false`. The pre-fix predicate answered `true`,
+// so `collectInstanceStorage` reserved a phantom storage slot every derived
+// class inherits by prefix layout (the issue's measured 4-byte waste per
+// abstract simple-form property, never written or read). This is the AST-
+// predicate half; the wire-bit half (`MetaMember::isAutoProperty`, set at
+// `module/ModuleMetadataBuilder.cpp`'s export of the same shape) carries the
+// same exclusion so an IMPORTED abstract simple-form property reaches the
+// same answer through `isAutoPropertyStorageSymbol`'s decl-null fallback.
+// Note: `isAutoPropertyStorageSymbol` is also the disposal-classification
+// gate (the `sourceIsNamedOwner`/`srcIsNamedOwner` consumers in
+// `lowerIEnumerableBuiltinFor` and the using/await paths, #2485). Flipping
+// the abstract case from "named borrow" to "freshly produced" is the same
+// direction the interface-property exclusion would go if `storageMemberOf`
+// did not guard it (#2931); the #2939 path has no live wrong-value bug
+// because the simple-form abstract property is implicitly get-only (§12.5,
+// §23.1's "compiler generates the backing field" — no setter on an Auto
+// bodyKind either way) and every read dispatches through `lowerVirtualPropertyGet`
+// before reaching `fieldAddr`/`lvalueAddr`. The disposal consequence is
+// "dispose a fresh value" — correct for any override that returns a freshly
+// produced result, conservative-but-not-wrong for an auto-property override
+// (whose value is still owned by its own backing field, never by the
+// iteration source).
 bool hasAstAutoPropertyDecl(const Symbol* m) {
     auto* ps = dynamic_cast<const PropertySymbol*>(m);
     if (!ps || ps->isIndexer) return false;
@@ -876,6 +907,8 @@ bool hasAstAutoPropertyDecl(const Symbol* m) {
         return false;
     for (auto mod : ps->modifiers)
         if (mod == "static") return false;
+    for (auto mod : ps->modifiers)
+        if (mod == "abstract") return false;
     return true;
 }
 

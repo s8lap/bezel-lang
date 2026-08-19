@@ -1343,6 +1343,25 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             out.isAutoProperty = pd->bodyKind == ast::PropertyBodyKind::Auto;
             for (auto mod : m.modifiers)
                 if (mod == "static") { out.isAutoProperty = false; break; }
+            // fix #2939 (§12.5/§23.1/§9.2, v0.240): also exclude `abstract`.
+            // An `abstract` simple-form property (`public abstract property
+            // X: T;`) records `bodyKind == Auto` but has no body by §12.5,
+            // verbatim — "`abstract` on a member declares it without a
+            // body; every concrete subclass must override it" — so it has
+            // no backing field to back. Without this exclusion the wire bit
+            // answers `true` for an abstract simple-form property, the
+            // importer's `importedPropertyIsAutoStorage` follows, and
+            // `isAutoPropertyStorageSymbol`'s decl-null fallback hands that
+            // `true` back to `collectInstanceStorage`/`storageMemberOf` —
+            // same wasted-slot shape as the local predicate, just cross
+            // module. Mirrors the matching exclusion added to
+            // `sema::hasAstAutoPropertyDecl` so the wire classification
+            // and the local-decl classification agree on the abstract case
+            // by construction (the same agreement #2478's body already
+            // guarantees for non-abstract members, and #2523's comment
+            // already names as the predicate's invariant).
+            for (auto mod : m.modifiers)
+                if (mod == "abstract") { out.isAutoProperty = false; break; }
             // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): mirror
             // LlvmBackend_impl.hpp's propertyHasSetter exactly. That codegen
             // helper only ever operates on a LOCAL decl (the same `pd`
