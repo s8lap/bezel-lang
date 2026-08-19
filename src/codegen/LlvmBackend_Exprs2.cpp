@@ -5861,7 +5861,19 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // whose constructor body never ran — a silent wrong answer — so the
         // residual is reported rather than dropped (see the guard after it).
         bool emittedImportedCtorCall = false;
-        if (cs && allPositional && ne.args.size() == cs->params.size()) {
+        // fix #3082 (§22.5 / §2.8.2, v0.244): an imported constructor with
+        // optional parameters is callable with fewer arguments, and the
+        // omitted formals take their declared defaults. The previous
+        // `ne.args.size() == cs->params.size()` predicate was a §22.5 / #2.8.2
+        // violation — a caller in another module could not omit any default
+        // form, while the in-module twin could. Sema now admits the call
+        // (checkImportedNewExprArgs over `FormalsView::of(*cs)`), so the
+        // codegen path must follow: arity-≤-count with every unfilled
+        // trailing formal carrying a §22.5 default. Defaults are materialized
+        // by `importedCtorDefaultArgValue` (the ctor twin of
+        // `importedDefaultArgValue`) at the same point the
+        // imported-method-call path does it.
+        if (cs && allPositional && ne.args.size() <= cs->params.size()) {
             llvm::Function* ctorFn = declareImportedCtor(cs);
             std::vector<llvm::Value*> args;
             args.push_back(obj);
@@ -6050,6 +6062,32 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         v, fnTy->getParamType(ai + 1),
                         isUnsignedTargetExpr(*ne.args[ai].value));
                 args.push_back(v);
+            }
+            // fix #3082 (§22.5 / §2.8.2, v0.244): an imported constructor
+            // was called with fewer arguments than its parameter list has —
+            // every unfilled TRAILING formal takes its §22.5 default. The
+            // call site is positional (`allPositional` is true above), so the
+            // unfilled slot is exactly `ne.args.size()` + k for k in
+            // [0, cs->params.size() - ne.args.size()). The default is
+            // materialized by `importedCtorDefaultArgValue`, which reads
+            // `ParameterSymbol::defaultText` (the same wire data the method-
+            // call twin uses) and folds it through the same
+            // null / `default(T)` / constant-fold arms. Sema already
+            // pre-rejected unfilled formals whose default is not
+            // materializable, so this returns a value for every slot or
+            // reports the same §22.5/#3082 diagnostic on the way out.
+            for (std::size_t ai = ne.args.size();
+                 ok && ai < cs->params.size(); ++ai) {
+                llvm::Value* dv = importedCtorDefaultArgValue(*cs, ai);
+                if (!dv) { ok = false; break; }
+                // §5.1: same coerceNumericToType the call-site-arg branch
+                // applies, so an int default landing in a wider numeric
+                // formal gets the right ABI (no-op for an already-typed
+                // constant; mirrors the local-twin buildOrderedArgs arm).
+                if (ai + 1 < fnTy->getNumParams())
+                    dv = coerceNumericToType(dv, fnTy->getParamType(ai + 1),
+                                             /*isUnsigned=*/false);
+                args.push_back(dv);
             }
             unwindTarget_ = savedArgUT;
             if (ok && args.size() == ctorFn->arg_size()) {

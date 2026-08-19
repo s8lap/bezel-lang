@@ -5686,6 +5686,17 @@ private:
     llvm::Value* importedDefaultArgValue(const sema::MethodSymbol& ms,
                                          std::size_t pos);
 
+    // fix #3082 (§22.5 / §2.8.2, v0.244): the CONSTRUCTOR twin of
+    // `importedDefaultArgValue`. The shape of the source data is identical
+    // (a `ParameterSymbol::defaultText` carried off the wire in #3178), so
+    // this delegates to the SAME fold path the method-call version uses —
+    // null / `default(T)` / constant fold, all sharing one evaluator. Sema
+    // (checkImportedNewExprArgs) already filtered out texts this helper
+    // cannot materialize, so the backstop below is the same defensive
+    // guard `importedDefaultArgValue` carries.
+    llvm::Value* importedCtorDefaultArgValue(const sema::ConstructorSymbol& cs,
+                                            std::size_t pos);
+
     // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters
     // and named arguments" / §2.8.3 rule 4, v0.254): the positional-FIELD
     // twin of `importedDefaultArgValue`. Reads the default off
@@ -10305,8 +10316,25 @@ private:
         for (sema::Symbol* m : cls->members) {
             auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
             if (!cs || cs->isStatic) continue;
-            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-            if (cd && argsCanFill(cd->params, args)) return cs;
+            // fix #3082 (§22.5 / §2.8.2, v0.244): the previous `dynamic_cast
+            // <ast::ConstructorDecl*>` gate made this fallback unreachable for
+            // every IMPORTED constructor (the #2374 shape — the dep never
+            // ships the AST), so an imported constructor with a default
+            // parameter, called with fewer arguments, returned null here and
+            // the ctor-arg call was never emitted. Lift the gate: a local
+            // ctor still uses the AST-level `argsCanFill` (its `cd->params`
+            // carries the real `ast::Expr` defaults, which a `Param`-list
+            // binder can reference); an imported ctor uses the
+            // `ParameterSymbol`-level predicate `formalParamHasDefault` over
+            // `argsCanFillSymbolic`, the per-slot counterpart that reads
+            // `ParameterSymbol::hasDefault` (fix #3178 carried the predicate
+            // off the wire). Both rules admit an omitted trailing default
+            // and reject every other shape the same way the call site does.
+            if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
+                if (argsCanFill(cd->params, args)) return cs;
+                continue;
+            }
+            if (argsCanFillSymbolic(*cs, args)) return cs;
         }
         return nullptr;
     }
@@ -12594,6 +12622,20 @@ private:
     // pick a constructor/method overload before lowering its arguments.
     static bool argsCanFill(const std::vector<ast::Param>& params,
                             const std::vector<ast::CallArgument>& args);
+
+    // fix #3082 (§22.5 / §2.8.2, v0.244): the imported-CONSTRUCTOR twin of
+    // `argsCanFill`. Reads the formal parameter list off the
+    // `ConstructorSymbol` (the only form an imported ctor has — the dep
+    // never ships an `ast::ConstructorDecl`, the #2374 shape), names via
+    // `sema::formalParamName` and defaults via `sema::formalParamHasDefault`
+    // (the same predicates `bindArgsToParams`'s `FormalsView` uses, so this
+    // answers identically to the in-module path on every shape the sema
+    // binder accepts). Used by `ctorForArgs`'s fallback to lift the
+    // `dynamic_cast<ast::ConstructorDecl*>` gate that made imported ctor
+    // overload resolution UNREACHABLE for any defaulted call.
+    static bool argsCanFillSymbolic(
+        const sema::ConstructorSymbol& cs,
+        const std::vector<ast::CallArgument>& args);
 
     // #1302 / §22.3 (v0.228) "**`ref` local and field targets alias; accessor
     // targets bracket.**": a `ref`/`out` argument naming an **indexer slot or

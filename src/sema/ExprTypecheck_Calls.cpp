@@ -11496,18 +11496,44 @@ void ExprTC::checkImportedNewExprArgs(
     const std::size_t nparams = cs->params.size();
     const std::string desc =
         std::string("`new ") + std::string(t->name) + "`";
-    if (ne.args.size() != nparams) {
-        ctx_.diagnostics().report(
-            Severity::Error, ne.span.begin,
-            desc + " has " + std::to_string(ne.args.size()) +
-                " argument(s) but the parameter list has " +
-                std::to_string(nparams) + " (§22.5)");
-        return;
-    }
+    // fix #3082 (§22.5 / §2.8.2, v0.244): an imported constructor's optional
+    // parameters are part of the artifact interface (§2.8.2), so a caller in
+    // another module must be able to omit them. The previous `nparams`-exact
+    // check rejected every such call loudly with the §22.5 message, while the
+    // in-module twin accepted it — exactly the asymmetry the issue names.
+    // `bindArgsToParams` over `FormalsView::of(*cs)` runs the SAME rule the
+    // imported-method call path already uses (`checkImportedCallArity`): it
+    // admits an omitted trailing formal whose `ParameterSymbol::hasDefault`
+    // is true, and reports the same §22.5 diagnostics (required parameter
+    // not supplied, unknown parameter name, duplicate binding) for the rest.
+    BindResult b = bindArgsToParams(sema::FormalsView::of(*cs), ne.args,
+                                    ne.span.begin, desc, /*emit=*/true);
+    if (!b.ok) return;  // the binder reported; no cascade
     for (std::size_t j = 0; j < nparams; ++j) {
+        // per §22.5: an unbound parameter with a default takes that default.
+        // As for imported methods (#3213), only a compile-time-constant
+        // default survives the wire — `renderConstExpr` would otherwise
+        // emit a bare identifier with no importer-side meaning. The
+        // materializability check is the same predicate the imported-method
+        // call site uses, so a call that sema accepts is one the codegen
+        // fallback can actually lower.
+        if (b.paramToArg[j] < 0) {
+            if (!sema::importedDefaultTextIsMaterializable(
+                    sema::formalParamDefaultText(*cs, j)))
+                ctx_.diagnostics().report(
+                    Severity::Error, ne.span.begin,
+                    desc + ": parameter `" +
+                        std::string(sema::formalParamName(*cs, j)) +
+                        "` of an imported constructor declares a default the "
+                        "dependency's metadata did not carry as a compile-time "
+                        "value, so it cannot be materialized here — pass the "
+                        "argument explicitly (§22.5, #3082)");
+            continue;
+        }
         auto* p = dynamic_cast<ParameterSymbol*>(cs->params[j]);
         if (!p || !p->resolvedDeclType) continue;
-        const ast::CallArgument& a = ne.args[j];
+        const ast::CallArgument& a =
+            ne.args[static_cast<std::size_t>(b.paramToArg[j])];
         if (!a.value) continue;
         checkAssignable(ctx_.exprType(*a.value), p->resolvedDeclType,
                         a.value->span.begin,

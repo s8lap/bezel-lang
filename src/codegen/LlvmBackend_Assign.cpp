@@ -6997,6 +6997,39 @@ bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
     return true;
 }
 
+// fix #3082 (§22.5 / §2.8.2, v0.244): the imported-CONSTRUCTOR twin of
+// `argsCanFill`. Same rule, same return value on every input the sema
+// binder (`bindArgsToParams` over `FormalsView::of(cs)`) accepts; differs
+// only in the source of the parameter list (an `ast::Param` vector vs. a
+// `ConstructorSymbol` whose params are `ParameterSymbol`s with `hasDefault`
+// carried on the wire by #3178). Pure check — no IR emitted — consumed by
+// `ctorForArgs`'s fallback to select the right ctor before lowering its
+// arguments.
+bool Emitter::argsCanFillSymbolic(
+        const sema::ConstructorSymbol& cs,
+        const std::vector<ast::CallArgument>& args) {
+    const std::size_t n = sema::formalParamCount(cs);
+    std::vector<bool> filled(n, false);
+    std::size_t pos = 0;
+    for (const auto& a : args) {
+        std::size_t idx;
+        if (a.name.empty()) {
+            if (pos >= n) return false;
+            idx = pos++;
+        } else {
+            idx = n;
+            for (std::size_t j = 0; j < n; ++j)
+                if (sema::formalParamName(cs, j) == a.name) { idx = j; break; }
+            if (idx >= n) return false;
+        }
+        if (filled[idx]) return false;
+        filled[idx] = true;
+    }
+    for (std::size_t j = 0; j < n; ++j)
+        if (!filled[j] && !sema::formalParamHasDefault(cs, j)) return false;
+    return true;
+}
+
 
 // §29.2 / §4.3 (#1310): shared array/user-class → IEnumerable<T> wrapping. When
 // a value is coerced to the pure declaration-less `IEnumerable<T>` (a call

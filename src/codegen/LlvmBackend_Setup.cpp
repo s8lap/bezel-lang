@@ -675,6 +675,40 @@ llvm::Value* Emitter::importedDefaultArgValue(const sema::MethodSymbol& ms,
     return foldImportedConstText(text, pt);
 }
 
+// fix #3082 (§22.5 / §2.8.2, v0.244): the imported-CONSTRUCTOR twin of
+// `importedDefaultArgValue`. The data source is the SAME
+// `ParameterSymbol::defaultText` the method-call version reads; only the
+// enclosing symbol kind differs, so the fold path is byte-identical. Sema's
+// `checkImportedNewExprArgs` already filtered out texts that cannot fold
+// (using `sema::importedDefaultTextIsMaterializable`); reaching this backstop
+// means a call path skipped that check, so say so loudly — a bare null
+// return would abandon the whole construction with no diagnostic.
+llvm::Value* Emitter::importedCtorDefaultArgValue(
+        const sema::ConstructorSymbol& cs, std::size_t pos) {
+    const sema::TypeRef* pt = sema::formalParamResolvedType(cs, pos);
+    const std::string text(sema::formalParamDefaultText(cs, pos));
+    if (!sema::importedDefaultTextIsMaterializable(text)) {
+        ctx_.diagnostics().report(
+            Severity::Error, SourceLocation{},
+            std::string("call to imported `new ") + std::string(cs.parent ? cs.parent->name : std::string_view()) +
+                "` omits parameter `" +
+                std::string(sema::formalParamName(cs, pos)) +
+                "`, whose default the dependency's metadata did not carry as "
+                "a compile-time value — pass the argument explicitly (§22.5, "
+                "#3082)");
+        return nullptr;
+    }
+    if (text == "null") {
+        if (pt && isNullableValueTy(pt)) return nullableValueNull(pt);
+        return llvm::ConstantPointerNull::get(ptrTy());
+    }
+    if (text.size() >= 8 && text.compare(0, 8, "default(") == 0) {
+        if (pt) return llvm::Constant::getNullValue(lowerTypeRef(pt));
+        return llvm::Constant::getNullValue(i32());
+    }
+    return foldImportedConstText(text, pt);
+}
+
 // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters and
 // named arguments" / §2.8.3 rule 4, v0.254): the imported POSITIONAL-FIELD
 // half of `importedDefaultArgValue`. Where `importedDefaultArgValue` reads the
