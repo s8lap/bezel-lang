@@ -11504,7 +11504,8 @@ private:
     // inline array (no-op — caller is on the ordinary path).
     bool lowerOwningInlineArrayReassign(const ast::Expr& target,
                                         llvm::Value* arrayAddr,
-                                        llvm::Type* elemTy);
+                                        llvm::Type* elemTy,
+                                        bool skipDisposal = false);
 
     // #429 (box FIELD-STORE / disposal) / §8.6 / §28.9: the per-module set of
     // class field symbols (FieldSymbol / auto-property PropertySymbol) for which

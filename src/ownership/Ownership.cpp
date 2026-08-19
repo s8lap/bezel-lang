@@ -5888,7 +5888,17 @@ bool MethodOwnership::isMoveOnlyInlineArrayType(const sema::TypeRef* rt,
 }
 
 void MethodOwnership::moveOnlyArrayNoteWholeTransfer(std::string_view name) {
+    // fix #3263 (§15.3 v0.260 / §28.7 v0.260): the name has been transferred
+    // out as a whole (a §15.3 bullet-1 move — `var b := a;`, a return of `a`,
+    // a discard of `a`, an argument passing of a move-only `a`). Track this
+    // so a later `moveOnlyArrayCheckReassignment` for the same name can set
+    // `AssignmentStmt::wholeValueLhsMovedFrom` and codegen suppresses the
+    // drop-on-overwrite pass (defect 2 — the stale alloca pointers belong
+    // to the receiver now). Without this the pass would re-dispose the
+    // moved-out slots, double-freeing the same instances the new owner
+    // (e.g. `b`) will free at its scope end.
     moveOnlyArrayLive_.erase(std::string(name));
+    moveOnlyArrayWholeValueMovedFrom_.insert(std::string(name));
 }
 
 // §15.3 (#1899) bullet 1: mark the move-only inline-array local read by a bare
@@ -5982,6 +5992,36 @@ void MethodOwnership::moveOnlyArrayCheckReassignment(
     long long size = 0;
     if (!isMoveOnlyInlineArrayType(ctx_.exprType(*as.target), size)) return;
     const std::string name(id->name);
+    // fix #3263 (§15.3 v0.260 / §28.7 v0.260, defect 2): the LHS was whole-
+    // value moved-from by a prior `var b := a;` (or return/discard/arg) —
+    // a §15.3 bullet-1 transfer of the WHOLE array, not a per-slot `move a[i]`.
+    // §28.7 *Moved-from and null*: the drop-on-overwrite pass disposes nothing
+    // on a moved-from LHS; the stale alloca pointers now belong to the
+    // receiver (e.g. `b`) and will be freed there. Mark the AssignmentStmt
+    // so codegen suppresses the pass. Distinguishes from "all slots happen
+    // to be moved-from via per-slot `move a[i]`" (the alloca IS nulled slot-
+    // wise, per #747 lowerMoveFromCollectionSlot) — the pass correctly runs
+    // in that case (it reads nulls and skips via the null-guard).
+    if (moveOnlyArrayWholeValueMovedFrom_.count(name)) {
+        // fix #3263 (§15.3 v0.260 / §28.7 v0.260, defect 2): the LHS was
+        // whole-value moved-from by a prior `var b := a;` (or return/
+        // discard/arg) — a §15.3 bullet-1 transfer of the WHOLE array, not
+        // a per-slot `move a[i]`. §28.7 *Moved-from and null*: the drop-on-
+        // overwrite pass disposes nothing on a moved-from LHS; the stale
+        // alloca pointers now belong to the receiver (e.g. `b`) and will be
+        // freed there. Mark the AssignmentStmt so codegen suppresses the
+        // pass. Distinguishes from "all slots happen to be moved-from via
+        // per-slot `move a[i]`" (the alloca IS nulled slot-wise, per #747
+        // lowerMoveFromCollectionSlot) — the pass correctly runs in that
+        // case (it reads nulls and skips via the null-guard). One-shot:
+        // remove from the set so a SECOND reassignment of the same name
+        // (e.g. `a := X; a := Y;` after `var b := a;`) gets the pass
+        // restored — `a` holds a fresh value (X) at the second site, and
+        // any stale pointers at THAT site belong to X, not to the prior
+        // `b`-transferred value.
+        const_cast<ast::AssignmentStmt&>(as).wholeValueLhsMovedFrom = true;
+        moveOnlyArrayWholeValueMovedFrom_.erase(name);
+    }
     auto it = moveOnlyArrayLive_.find(name);
     if (it != moveOnlyArrayLive_.end() &&
         static_cast<long long>(it->second.movedSlots.size()) < it->second.size) {
@@ -6237,6 +6277,7 @@ void MethodOwnership::moveOnlyArrayLeakScanStmt(const ast::Stmt* s) {
 void MethodOwnership::moveOnlyArrayLeakScan(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     moveOnlyArrayLive_.clear();
+    moveOnlyArrayWholeValueMovedFrom_.clear();
     for (auto& s : body) moveOnlyArrayLeakScanStmt(s.get());
 }
 

@@ -307,6 +307,19 @@ struct AssignmentStmt : Stmt {
     // ownership pass (handleAssignment → handleMarkedOwnedAssignment). Only
     // meaningful when `op == ":="`.
     bool valueHasOwnedMarker = false;
+    // fix #3263 (§28.7 v0.260 / §15.3 v0.260): the LHS was whole-value moved-
+    // from at this store site — typically a prior `var b := a;` transferred
+    // ownership of `a`'s slots to `b` (the §15.3 bullet-1 whole-array move),
+    // so the slot pointers in `a`'s alloca now belong to `b`. §28.7's
+    // *Moved-from and null* rule: the drop-on-overwrite pass disposes nothing
+    // — the LHS is moved-from, not live. Sema sets this; codegen reads it as
+    // the suppression key for `lowerOwningInlineArrayReassign`. The dispose-
+    // on-overwrite is suppressed (the stale alloca pointers must NOT be
+    // disposed — `b` owns them now and will free them at its scope end).
+    // Without this flag, the pass would double-free the moved-out slots
+    // (#3263 defect 2). Only meaningful when `op == ":="` and the LHS is a
+    // move-only inline-array local/field.
+    bool wholeValueLhsMovedFrom = false;
 };
 
 // A.6: `ThrowStmt ::= "throw" Expression? ";"`.

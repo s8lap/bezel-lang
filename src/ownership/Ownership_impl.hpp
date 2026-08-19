@@ -1072,6 +1072,16 @@ private:
         std::unordered_set<long long> movedSlots;  // provably moved-from
     };
     std::unordered_map<std::string, MoveOnlyArraySlots> moveOnlyArrayLive_;
+    // fix #3263 (§15.3 v0.260 / §28.7 v0.260): a name that has been the source
+    // of a whole-value move-out — `var b := a;`, a return of `a`, a discard
+    // sink of `a`, an argument passing of `a` (a move-only param/argument is
+    // a move, #1922) — distinct from per-slot `move a[i]` moves. The leak
+    // scan calls `moveOnlyArrayNoteWholeTransfer(name)` to populate the
+    // erased set's complement; `moveOnlyArrayCheckReassignment` reads this
+    // set to mark a later `a := X;` with `wholeValueLhsMovedFrom` so codegen
+    // suppresses the drop-on-overwrite pass (defect 2 — the stale alloca
+    // pointers now belong to the receiver, not to `a`).
+    std::unordered_set<std::string> moveOnlyArrayWholeValueMovedFrom_;
 
     void handleReturn(const ast::Expr& e);
 
