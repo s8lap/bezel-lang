@@ -1741,6 +1741,19 @@ llvm::Function* Emitter::genericInstEnsureInitFn(
     genericInstInitExcGV_[key] = excGV;
     genericInstInitOwnerGV_[key] = ownerTidGV;
 
+    auto* voidFnTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(
+        voidFnTy, llvm::GlobalValue::LinkOnceODRLinkage,
+        "bz$" + base + "$ensureinit", module_.get());
+    // fix #2948 / §22.13: publish the partially-built ensureinit BEFORE
+    // genericInstSfinitFn lowers field initializers. A sibling static read in
+    // an earlier initializer recursively asks for this same ensureinit; caching
+    // only after sfinit was built created a second guard (`ensureinit.4`) with
+    // independent state, which ran sfinit twice and overwrote First from 107 to
+    // 200 after Second had been assigned. One instantiation has one guard.
+    genericInstEnsureInitFns_[key] = fn;
+
     llvm::Function* sfinitFn = genericInstSfinitFn(ts, typeArgMangle);
 
     // #1391: the same process-wide runtime entry points emitEnsureInitFns
@@ -1753,13 +1766,6 @@ llvm::Function* Emitter::genericInstEnsureInitFn(
         declareC("bz_static_init_wait", i8Ty, {ptrTy()});
     llvm::Function* notifyFn =
         declareC("bz_static_init_notify", llvm::Type::getVoidTy(llvm_), {ptrTy()});
-
-    auto* voidFnTy = llvm::FunctionType::get(
-        llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
-    auto* fn = llvm::Function::Create(
-        voidFnTy, llvm::GlobalValue::LinkOnceODRLinkage,
-        "bz$" + base + "$ensureinit", module_.get());
-    genericInstEnsureInitFns_[key] = fn;
 
     llvm::Function* savedFn = currentFn_;
     auto* savedInsert = builder_.GetInsertBlock();
