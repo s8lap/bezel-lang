@@ -7681,13 +7681,56 @@ void ExprTC::checkThrowableType(const ast::Expr& value) {
     // The check is the positive `isExceptionDerivedClass` list; the branches
     // below only choose WHICH reason the diagnostic states.
     //
-    // SCOPE (recorded, #3046): the sentence's "nullability not admitted" clause
-    // is NOT enforced here. `ctx_.exprType` reports the DECLARED type, while
-    // §7.4 flow narrowing lives in this pass's own `nullNarrowed_` side-set, so
-    // a bare `nullable` reject would fire on the narrowed `if e <> null then
-    // throw e; end;` shape the spec admits. Tracked separately (#3076).
+    // fix #3076 (§31.1's "nullability not admitted" clause — the second half
+    // of the §31.1 sentence, deferred from #3046): an `Exception`-derived
+    // operand is admitted ONLY when its nullability is provably not admitted at
+    // this site. `ctx_.exprType` returns the DECLARED type — `vt->nullable`
+    // reports the static nullability, which for a `throw e` on a `var e:
+    // AppError? := …` declaration is `true` even after `if e <> null then`
+    // narrows it. The narrowing lives in this pass's own `nullNarrowed_` /
+    // `narrowings_` side-sets (consulted via `isKnownNonNull`), so the rule
+    // admits three provably-non-null shapes and rejects the rest:
+    //
+    //   * non-nullable declared type — `vt->nullable == false` (covers
+    //     `throw new Foo()`, `throw e!` whose PostfixBangExpr result type
+    //     flips `nullable` to false, and `throw` of a parameter/local/field
+    //     whose declared type is non-nullable);
+    //
+    //   * §7.4 null-narrowed at this site — `nullNarrowed_` (and the
+    //     type-narrowing map) records the fact established by an `if e <>
+    //     null then`, an `is`-type-test that produced a non-nullable
+    //     refinement, or a prior assignment of a non-nullable value;
+    //
+    //   * a `!` (PostfixBangExpr) operand — its exprType is the non-nullable
+    //     form of the operand's type per `visitExpr`'s PostfixBangExpr arm,
+    //     so the `vt->nullable == false` path above already admits it; no
+    //     special-case branch is needed.
+    //
+    // Any other nullable operand (a call result, a method-returned
+    // `AppError?`, a local whose declared type is nullable and that has not
+    // been narrowed) is rejected here with the §31.1 "nullability not
+    // admitted" diagnostic.
     // // per §31.1, §17.12, Appendix C.5
-    if (isExceptionDerivedClass(vt)) return;
+    if (isExceptionDerivedClass(vt)) {
+        if (!vt->nullable) return;
+        // An `Exception`-derived NULLABLE operand — admit iff a narrowing
+        // fact proves it non-null at this throw site. `exprSymbol` returns a
+        // symbol for place references (IdentifierExpr / MemberAccessExpr /
+        // IndexExpr) and nullptr for value expressions (call results, `new`,
+        // literals); the latter have no narrowing fact to consult, so the
+        // rejection is sound.
+        if (Symbol* sym = ctx_.exprSymbol(value)) {
+            if (isKnownNonNull(sym)) return;
+        }
+        ctx_.diagnostics().report(
+            Severity::Error, value.span.begin,
+            "the throw operand's type is nullable (§31.1 — nullability not "
+            "admitted): an `Exception`-derived class instance must be "
+            "non-null at the throw site — narrow with `if e <> null then`, "
+            "assert with the postfix `!` operator, or change the declared "
+            "type to non-nullable");
+        return;
+    }
 
     // A declaration-less Named ref that is neither a reserved built-in nor a
     // type parameter of the enclosing declaration is not a user class (local
