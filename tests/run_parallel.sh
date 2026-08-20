@@ -154,8 +154,17 @@ for (( b = 0; b < nbin; b++ )); do
             # stderr line; the agreement check below compares the two. The path
             # lives in $logdir so it shares the run's lifetime (reaped on a
             # clean exit, kept with the logs on a failure).
+            # per #3014 + gate audit F3: route this shard's AOT cache stats to
+            # its OWN file. The counters exist and the sink is unit-tested
+            # (aot_cache_stats_sink_test.cpp) but were wired NOWHERE, so the
+            # `aot` telemetry field has always been null and the gate could not
+            # see its own dominant cost. The FILE sink is the structural #3012
+            # fix: the [aot-cache] line never touches this shard's stderr, so it
+            # cannot land mid-line in the "N passed, M failed" summary the
+            # accounting below parses. Merged into ONE line after `wait`.
             TMPDIR="$shard_tmp" BEZEL_SHARD_COUNT="$conc" BEZEL_SHARD_INDEX="$i" \
                 BEZEL_SHARD_SUMMARY="$logdir/summary.${names[$b]}.$i.json" \
+                BEZEL_AOT_CACHE_STATS_FILE="$logdir/aotstats.${names[$b]}.$i.txt" \
                 timeout -k 10 "${BEZEL_SHARD_TIMEOUT:-300}" "${bins[$b]}" \
                 > "$logdir/shard.${names[$b]}.$i.log" 2>&1
             _rc=$?
@@ -322,6 +331,20 @@ if [[ "$subset_mode" -eq 1 && -z "${BEZEL_TEST_FILTER:-}" && -r "${BEZEL_TEST_LI
 fi
 [[ -n "$_rp_py_phantom" ]] && printf '%s\n' "$_rp_py_phantom"
 
+# fix #3300: THE COMMENT BELOW USED TO SIT INSIDE THE \-CONTINUATION.
+# Bash ends a command at a `#` comment even mid-continuation, so every argument
+# after it — `--timed-out` and, fatally, the REQUIRED `--logdir` — was never
+# passed. format-failure then exited 2 on a usage error for every run since,
+# `_rp_py_failure` was always empty, and this banner has NEVER printed. Keep
+# explanatory prose above the command, never between continued lines.
+#
+# timed_out_shards is locally declared at :264; with nargs="*", an empty
+# declared array expands to zero args, NOT a single empty string (the latter
+# would make argparse `nargs="*"` produce args.timed_out=[""] — a one-element
+# truthy list that flipped has_defect on every clean run, per the 11 poisoned
+# attempts on d8ab1b7). The :- fallback is only needed when a variable might be
+# UNSET (the for-loop use at :288 has that guard); here the array is in scope.
+#
 # GATE INTEGRITY (#1861): a crashed shard (segfault / uncaught exit(70)) silently
 # drops its remaining tests. Detect three ways — nonzero shard exit, a per-binary
 # count short of its total, a shard that printed no summary — and fail LOUDLY,
@@ -333,13 +356,6 @@ _rp_py_failure="$(PYTHONPATH="$repo_root/scripts" python3 -m gate.summary format
     --undercount "${undercount_bins[@]}" \
     --missing-summary "${missing_summary_shards[@]}" \
     --crashed "${crashed_shards[@]}" \
-    # timed_out_shards is locally declared at :264; with nargs="*", an empty
-    # declared array expands to zero args here, NOT a single empty string (the
-    # latter would make argparse `nargs="*"` produce args.timed_out=[""] — a
-    # one-element truthy list that flipped has_defect on every clean run, per
-    # the 11 poisoned attempts on d8ab1b7). The :- fallback is only needed
-    # when a variable might be UNSET (the for-loop use at :288 has that
-    # guard); here the array is in scope.
     --timed-out "${timed_out_shards[@]}" \
     --logdir "$logdir")"
 [[ -n "$_rp_py_failure" ]] && printf '%s\n' "$_rp_py_failure"
@@ -378,6 +394,37 @@ subset_note=""
 [[ "$subset_mode" -eq 1 ]] && subset_note="  [SUBSET: $global_selected selected of $registry_all registered]"
 echo "TOTAL: $total_pass passed, $total_fail failed  (across $njobs shards, $((end - start))s)$subset_note"
 echo "============================================================"
+
+# ── AOT cache stats: merge the per-shard sinks into ONE line ────────────────
+# per #3014 + gate audit F3 (docs/research/2026-08-19-gate-performance-audit.md).
+# Each shard wrote its [aot-cache] counters to its own file (never to stderr —
+# that was the #3012 corruption). Sum them here, in the single-threaded summary
+# printer AFTER `wait`, and print one aggregate line. gate.sh already has the
+# harvest for this line (it greps `[aot-cache] hits=`/`misses=` out of
+# gate_shard.log and feeds --aot-hits/--aot-misses); that harvest has been dead
+# code since #3012 disabled the only producer. This revives it — and with it
+# trend rule R4 — without gate.sh changing at all.
+#
+# PURE OBSERVATION: a missing/short/garbled file contributes nothing and never
+# affects accounting or the exit status. A shard killed at the ceiling simply
+# has no file (its atexit hook never ran), so the totals under-report rather
+# than mislead; the printed shard count is the denominator to read it against.
+if compgen -G "$logdir/aotstats.*.txt" > /dev/null 2>&1; then
+    awk '
+      match($0, / hits=[0-9]+/)       { h  += substr($0, RSTART+6,  RLENGTH-6) }
+      match($0, /misses=[0-9]+/)      { m  += substr($0, RSTART+7,  RLENGTH-7) }
+      match($0, /exe-key-hits=[0-9]+/){ eh += substr($0, RSTART+13, RLENGTH-13) }
+      match($0, /obj-hits=[0-9]+/)    { oh += substr($0, RSTART+9,  RLENGTH-9) }
+      match($0, /link-hits=[0-9]+/)   { lh += substr($0, RSTART+10, RLENGTH-10) }
+      match($0, /store_failures=[0-9]+/){ sf += substr($0, RSTART+15, RLENGTH-15) }
+      match($0, /store_fsyncs=[0-9]+/){ fy += substr($0, RSTART+13, RLENGTH-13) }
+      { n++ }
+      END {
+        if (n == 0) exit 0
+        printf "[aot-cache] hits=%d misses=%d (%d%% hit) exe-key-hits=%d obj-hits=%d link-hits=%d store_failures=%d store_fsyncs=%d shards_reporting=%d\n",
+               h, m, (h+m) ? (100*h/(h+m)) : 0, eh, oh, lh, sf, fy, n
+      }' "$logdir"/aotstats.*.txt 2>/dev/null || true
+fi
 
 # Per-shard JSON/legacy agreement was ASSERTED in the accounting block above
 # (a mismatch fails the run loud). The legacy stderr line is still dual-emitted
