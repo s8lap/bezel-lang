@@ -6690,6 +6690,32 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
 // dispatch handle it). Always lowers the receiver and arguments when
 // returning non-null — the dispatch returns the result value the caller
 // expects.
+// fix #3287 helper: invoke a PRE-EVALUATED function-typed expression whose
+// closure pointer is `closurePtr` (a `ptr`) with the single payload value
+// `val` (LLVM type `valLL`), expecting the function's return type to be
+// `retSemTy`. Mirrors lowerCall's closure-call arm's fn-ptr + env-ptr +
+// retTy derivation. Split out from `invokeClosureOnValue` so the argument
+// expression can be evaluated eagerly at the call site (spec §22.5
+// evaluation order) before the Ok/Error branch, while the actual invocation
+// (which depends on the chosen arm's payload value `v` or `e`) stays in the
+// appropriate arm.
+llvm::Value* Emitter::invokeEvaluatedClosurePtr(
+        llvm::Value* closurePtr,
+        llvm::Value* val,
+        llvm::Type* valLL,
+        const sema::TypeRef* retSemTy) {
+    if (!closurePtr || !closurePtr->getType()->isPointerTy()) return nullptr;
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closurePtr);
+    llvm::Value* envSlot = builder_.CreateGEP(
+        ptrTy(), closurePtr, {builder_.getInt32(1)});
+    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot);
+    llvm::Type* retLL = lowerTypeRef(retSemTy);
+    auto* fnTy = llvm::FunctionType::get(
+        retLL, {ptrTy(), valLL}, false);
+    return builder_.CreateCall(
+        fnTy, fnPtr, {envPtr, val}, "rescomb.fcall");
+}
+
 llvm::Value* Emitter::tryLowerResultCombinatorCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -6794,6 +6820,36 @@ llvm::Value* Emitter::tryLowerResultCombinatorCall(const ast::CallExpr& call) {
     auto* okBB  = llvm::BasicBlock::Create(llvm_, "rescomb.ok",  currentFn_);
     auto* errBB = llvm::BasicBlock::Create(llvm_, "rescomb.err", currentFn_);
     auto* endBB = llvm::BasicBlock::Create(llvm_, "rescomb.end", currentFn_);
+    // fix #3287: spec §22.5 (evaluation order) requires the call's supplied
+    // argument expressions to run BEFORE the call body enters, in textual
+    // order — and stdlib §2.20 ("UnwrapOr(fallback: T) declares by-value
+    // param — no lazy twin; UnwrapOrElse recorded-decline") makes this
+    // normative for all four combinators. The pre-fix shape evaluated the
+    // argument INSIDE the Ok or Error arm, so a side-effecting or throwing
+    // argument on the unused branch never ran. Evaluate it here at the call
+    // site, then stash the result in an alloca slot so each arm can load it.
+    // For Map/MapError/AndThen the argument is a closure (function-typed);
+    // we evaluate it eagerly to a closure pointer here. The actual
+    // `CreateCall` (which takes the arm's payload v or e) still belongs in
+    // the arm — that part is arm-dependent. For UnwrapOr the argument is a
+    // plain T value evaluated eagerly once; the Error arm uses it.
+    const sema::TypeRef* argSemTy = ctx_.exprType(*call.args[0].value);
+    llvm::Value* argVal = lowerExpr(*call.args[0].value);
+    if (!argVal) return nullptr;
+    llvm::Type* argSlotTy = nullptr;
+    if (m == "UnwrapOr") {
+        // UnwrapOr: the lowered value is the fallback itself. May be an SSA
+        // primitive (i32 from a literal/local) or a pointer (a class instance
+        // / spilled aggregate). The slot stores the value as-is.
+        argSlotTy = argVal->getType();
+    } else {
+        // Map/MapError/AndThen: argVal must be a pointer to the closure
+        // struct. Reserve a `ptr`-sized slot holding the closure pointer.
+        if (!argVal->getType()->isPointerTy()) return nullptr;
+        argSlotTy = ptrTy();
+    }
+    llvm::Value* argSlot = entryAlloca(argSlotTy);
+    builder_.CreateStore(argVal, argSlot);
     llvm::Value* isOk = builder_.CreateICmpEQ(
         tag, llvm::ConstantInt::get(i32(), 0), "rescomb.isok");
     builder_.CreateCondBr(isOk, okBB, errBB);
@@ -6801,9 +6857,12 @@ llvm::Value* Emitter::tryLowerResultCombinatorCall(const ast::CallExpr& call) {
     builder_.SetInsertPoint(okBB);
     llvm::Value* okResult = nullptr;
     if (m == "Map") {
-        // Ok(f(v))
-        llvm::Value* mapped = invokeClosureOnValue(
-            *call.args[0].value, v, tLL,
+        // Ok(f(v)) — arg was eagerly evaluated at the call site; load the
+        // closure pointer and invoke it with the Ok payload v.
+        llvm::Value* closurePtr = builder_.CreateLoad(
+            ptrTy(), argSlot, "rescomb.arg.closure");
+        llvm::Value* mapped = invokeEvaluatedClosurePtr(
+            closurePtr, v, tLL,
             resultSemTy->genericArgs[0]);  // U
         okResult = buildChoiceStructValue(
             resultSemTy->declaration, /*okTag=*/0,
@@ -6818,12 +6877,12 @@ llvm::Value* Emitter::tryLowerResultCombinatorCall(const ast::CallExpr& call) {
                 lowerTypeRef(resultSemTy->genericArgs[1])));
     } else if (m == "AndThen") {
         // f(v) is itself a Result<U, E> (the lambda's return type). Invoke
-        // the closure with v as the parameter; the closure returns the
-        // Result<U, E> struct directly (lambda is plain `(T) -> Result<U, E>`,
-        // so the closure's funcReturn is the choice struct — pass that as the
-        // retSemTy to invokeClosureOnValue so the right FunctionType is built).
-        okResult = invokeClosureOnValue(
-            *call.args[0].value, v, tLL, resultSemTy);
+        // the pre-evaluated closure with v; the closure returns the
+        // Result<U, E> struct directly.
+        llvm::Value* closurePtr = builder_.CreateLoad(
+            ptrTy(), argSlot, "rescomb.arg.closure");
+        okResult = invokeEvaluatedClosurePtr(
+            closurePtr, v, tLL, resultSemTy);
     } else {  // UnwrapOr
         okResult = v;
     }
@@ -6844,9 +6903,12 @@ llvm::Value* Emitter::tryLowerResultCombinatorCall(const ast::CallExpr& call) {
                 lowerTypeRef(resultSemTy->genericArgs[0])),
             /*errPayload=*/e);
     } else if (m == "MapError") {
-        // Error(f(e))
-        llvm::Value* mapped = invokeClosureOnValue(
-            *call.args[0].value, e, eLL,
+        // Error(f(e)) — arg was eagerly evaluated at the call site; load
+        // the closure pointer and invoke it with the Error payload e.
+        llvm::Value* closurePtr = builder_.CreateLoad(
+            ptrTy(), argSlot, "rescomb.arg.closure");
+        llvm::Value* mapped = invokeEvaluatedClosurePtr(
+            closurePtr, e, eLL,
             resultSemTy->genericArgs[1]);  // F
         errResult = buildChoiceStructValue(
             resultSemTy->declaration, /*errTag=*/1,
@@ -6860,11 +6922,10 @@ llvm::Value* Emitter::tryLowerResultCombinatorCall(const ast::CallExpr& call) {
                 lowerTypeRef(resultSemTy->genericArgs[0])),
             /*errPayload=*/e);
     } else {  // UnwrapOr
-        // Evaluate the eagerly-supplied fallback argument (spec §35.2: no
-        // lazy UnwrapOrElse) and return its value.
-        llvm::Value* fb = lowerExpr(*call.args[0].value);
-        if (!fb) return nullptr;
-        errResult = fb;
+        // The fallback value was eagerly evaluated at the call site (spec
+        // §22.5 evaluation order); load it here and use it as the Error
+        // arm's result. The Ok arm's result is the payload v.
+        errResult = builder_.CreateLoad(argSlotTy, argSlot, "rescomb.arg.fb");
     }
     builder_.CreateBr(endBB);
     auto* errEnd = builder_.GetInsertBlock();

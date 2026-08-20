@@ -13373,6 +13373,13 @@ private:
     llvm::Value* invokeClosureOnValue(const ast::Expr& arg, llvm::Value* val,
                                       llvm::Type* valLL,
                                       const sema::TypeRef* retSemTy);
+    // fix #3287 helper: invoke a PRE-EVALUATED closure (the lowerExpr that
+    // produced `closurePtr` was hoisted to the call site per spec §22.5's
+    // eager argument-evaluation rule). Used by the Result combinator
+    // lowering after `invokeClosureOnValue` is split into eval+invoke.
+    llvm::Value* invokeEvaluatedClosurePtr(
+        llvm::Value* closurePtr, llvm::Value* val,
+        llvm::Type* valLL, const sema::TypeRef* retSemTy);
     // fix #2513 helper: build a choice struct value { i32 tag, ok_payload,
     // err_payload } with the active case's payload filled from `okPayload`
     // or `errPayload`. Inactive slots stay undef (per §35.4 choice values
