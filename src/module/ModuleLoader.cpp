@@ -546,11 +546,54 @@ struct Loader {
         t->importedNonTrivialDispose = td.nonTrivialDispose;
         t->invariantContracts = toContractRecords(td.invariants);
         t->genericParams = convertGenericParams(td.genericParams, t->memberScope);
+        // fix #3151 (§2.8.3 rule 4, v0.252): the LOCAL side at
+        // TypeResolution_Names.cpp L604 pushes to `baseTypes` AND
+        // `baseTypeRefs` under ONE guard
+        //   `kind == TypeRef::Kind::Named && ref->declaration`,
+        // so the two vectors stay index-aligned for every local type. The
+        // IMPORTER side here used to push to `baseTypeRefs` unconditionally
+        // and to `baseTypes` only when the guard held — an asymmetry that
+        // made baseTypeRefs longer than baseTypes for every imported type
+        // whose metadata carried an UNRESOLVABLE named base (a transitive
+        // dependency the importer does not load, or any name the importer's
+        // `lookupNamed` returns null for). Every consumer that walks the
+        // two vectors in lockstep (the indexed reads at
+        // TypeResolution_Checks.cpp L2612 / L3123 / L4029 / L5335;
+        // LlvmBackend_Disposal.cpp L3674; LlvmBackend_Layout.cpp L1748;
+        // …) then pairs baseTypes[bi] with baseTypeRefs[bi] whose bi is
+        // shifted by one — the resolved base's layout bound to the
+        // unresolved base's TypeRef, the displacement measured on a plain
+        // `D<long> : B<T>` case (see issue body).
+        //
+        // DESIGN (CLAUDE.md §4 — recorded decision, NOT a silent narrowing).
+        // The issue offers two options:
+        //   (1) importer pushes to BOTH vectors under one guard — same as
+        //       local, and the choice taken here. Documented invariant
+        //       ("parallel vectors") preserved. The unresolvable named base
+        //       is dropped from BOTH lists, but the load-bearing
+        //       "unresolvable-named" facts already have their own dedicated
+        //       channels (`builtinExceptionBase` for #2950's exception base,
+        //       `builtinInterfaceBases` for #3139's built-in interface
+        //       bases) — both populated from their own MetaType fields, NOT
+        //       from the baseTypes array, so this narrowing does not lose
+        //       any of those facts.
+        //   (2) push to BOTH unconditionally and tolerate null holes in
+        //       baseTypes. Touches every `baseTypes` walk to add a null
+        //       check; chose against because the documentation invariant
+        //       ("parallel vectors, by index") already implies null-free
+        //       and the holes would be load-bearing null vs. "missing"
+        //       ambiguity.
+        //
+        // The TypeRef itself stays owned by `ctx` (it was allocated via
+        // `ctx.makeImportedTypeRef()`), so the skip is a pure no-push, not
+        // a leak — the reference lives for the context's lifetime, and the
+        // importer does not surface it.
         for (const MetaType& base : td.baseTypes) {
             sema::TypeRef* ref = convert(base);
-            t->baseTypeRefs.push_back(ref);
-            if (ref->kind == sema::TypeRef::Kind::Named && ref->declaration)
+            if (ref->kind == sema::TypeRef::Kind::Named && ref->declaration) {
+                t->baseTypeRefs.push_back(ref);
                 t->baseTypes.push_back(ref->declaration);
+            }
         }
         // fix #3139 (§9.8 / §18.5 / §21.4 / §2.8.3 rule 4, family F1 of
         // #3152): restore the BUILT-IN INTERFACE bases. Without them this
@@ -2995,11 +3038,17 @@ static void loadMetadataPass2(
         sema::TypeSymbol* t = created[i];
         t->genericParams =
             loader.convertGenericParams(td.genericParams, t->memberScope);
+        // fix #3151 (§2.8.3 rule 4, v0.252): mirror the local rule from
+        // reconstructTypeSymbol above — push to `baseTypeRefs` and
+        // `baseTypes` under ONE guard (`kind == Named && declaration`) so
+        // the two vectors stay index-aligned. See the sibling fix above
+        // for the design note (CLAUDE.md §4 — recorded decision).
         for (const MetaType& base : td.baseTypes) {
             sema::TypeRef* ref = loader.convert(base);
-            t->baseTypeRefs.push_back(ref);
-            if (ref->kind == sema::TypeRef::Kind::Named && ref->declaration)
+            if (ref->kind == sema::TypeRef::Kind::Named && ref->declaration) {
+                t->baseTypeRefs.push_back(ref);
                 t->baseTypes.push_back(ref->declaration);
+            }
         }
         // fix #3139 — see the sibling restore in `reconstructTypeSymbol`.
         for (const MetaType& iface : td.builtinInterfaceBases)
