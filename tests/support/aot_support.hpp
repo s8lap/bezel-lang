@@ -123,9 +123,45 @@ namespace aot_detail {
 
 namespace fs = std::filesystem;
 
-// Base scratch dir for per-run temp artifacts. Per CLAUDE.md: never /tmp (tmpfs
-// is RAM; a scratch object tree there thrashes the box) — /var/tmp is disk.
-inline std::string scratchBase() { return "/var/tmp/bezel-scratch/aot-harness"; }
+// Defined further down with the rest of the cache; scratchBase() derives from it.
+inline const std::string& cacheDir();
+
+// Base scratch dir for per-run temp artifacts — the per-test workdir holding the
+// emitted object, the linked executable, and the program's own run.
+//
+// COLOCATED WITH THE CACHE, BY CONSTRUCTION. storeToCache() and
+// installFromCache() both PREFER fs::create_hard_link and fall back to a full
+// byte copy, and a hardlink only works WITHIN ONE FILESYSTEM. That invariant
+// used to hold by accident — both paths were hardcoded siblings under
+// /var/tmp/bezel-scratch — and then the bincache was pointed at a faster
+// spindle (a symlink to /mnt/fast), which silently turned every store and every
+// hit into a cross-device copy. Nothing failed; the harness just got slower,
+// and the comment on installFromCache went on asserting "the cache and workdir
+// share /var/tmp" for months. Deriving the workdir from the cache makes the
+// invariant hold by construction instead of by two paths agreeing.
+//
+// Measured 2026-08-21, 1,266-test ASan slice, empty cache, conc=8, one variable:
+//     workdir on /var/tmp (a 7200 RPM ST2000DM008): 211s, 5.2 GB in 3345 files
+//     workdir beside the cache on NVMe            : 140s, 2.7 GB in 3345 files
+// 34% faster, and HALF the bytes for the same file count — the exe-key and
+// link-key entries are two hardlinks to one inode instead of two copies.
+//
+// When the cache dir is a plain directory this reproduces the historical path
+// exactly, so a box without the symlink sees no change. Per CLAUDE.md the base
+// must never be /tmp (tmpfs is RAM); the fallback keeps /var/tmp. An explicit
+// BEZEL_AOT_SCRATCH_DIR overrides.
+inline const std::string& scratchBase() {
+    static const std::string* v = [] {
+        if (const char* e = std::getenv("BEZEL_AOT_SCRATCH_DIR"); e && *e)
+            return new std::string(e);
+        std::error_code ec;
+        const fs::path c = fs::weakly_canonical(fs::path(cacheDir()), ec);
+        if (!ec && c.has_parent_path() && !c.parent_path().empty())
+            return new std::string((c.parent_path() / "aot-harness").string());
+        return new std::string("/var/tmp/bezel-scratch/aot-harness");
+    }();
+    return *v;
+}
 
 // Per-test wall-clock deadline for the compiled PROGRAM run (seconds) — a hung
 // program cannot wedge the run. qr1 S4: the default is 30s, deliberately LOWER
@@ -1629,9 +1665,13 @@ inline void ensureStatsAtExit() {
 }
 
 // Install a cached executable into the test's workdir at `exePath`: a hardlink
-// (no byte copy; the cache and workdir share /var/tmp) or, across a filesystem
-// boundary (a custom BEZEL_AOT_CACHE_DIR), a copy. Returns false on failure, in
-// which case the caller falls back to a real compile.
+// (no byte copy — scratchBase() is derived from cacheDir() precisely so the two
+// share a filesystem) or, if they somehow do not, a copy. Returns false on
+// failure, in which case the caller falls back to a real compile.
+//
+// The copy fallback is the SLOW path, not a neutral alternative: when it was
+// silently taken (the workdir on /var/tmp, the cache symlinked to another
+// spindle) it cost 34% of an ASan slice's wall — see scratchBase().
 inline bool installFromCache(const std::string& cachePath,
                              const std::string& exePath) {
     std::error_code ec;
