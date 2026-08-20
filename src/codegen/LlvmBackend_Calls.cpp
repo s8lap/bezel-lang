@@ -11012,16 +11012,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         return builder_.CreateCall(fn, {ticks, fmtStr},
                                                    "dt.tostr.default");
                     }
-                    // per §2.5 / #648: ToString(format: string): string —
-                    // expand format specifiers via bz_datetime_to_string_fmt.
+                    // per §2.5 / #648 / §2.18 v0.230 / #3292: ToString(format)
+                    // — expand format specifiers via bz_datetime_to_string_fmt.
+                    // The runtime returns nullptr on a malformed specifier run
+                    // (§2.18 strict-fault); check for nullptr and raise
+                    // FormatException via emitGuardThrow, matching the decimal
+                    // pattern at bz_decimal_to_string_fmt.
                     if (mname == "ToString" && call.args.size() == 1 &&
                         call.args[0].value) {
                         llvm::Value* fmtStr = lowerExpr(*call.args[0].value);
                         if (!fmtStr) return nullptr;
                         auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
                                             {i64(), ptrTy()});
-                        return builder_.CreateCall(fn, {ticks, fmtStr},
-                                                   "dt.tostr.fmt");
+                        llvm::Value* res = builder_.CreateCall(fn, {ticks, fmtStr},
+                                                               "dt.tostr.fmt");
+                        llvm::Value* isNull = builder_.CreateICmpEQ(
+                            res,
+                            llvm::Constant::getNullValue(ptrTy()),
+                            "dt.fmt.null");
+                        emitGuardThrow(isNull, "FormatException");
+                        return res;
                     }
                 }
             }

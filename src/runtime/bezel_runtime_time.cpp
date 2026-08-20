@@ -285,9 +285,10 @@ static void fmt_int(char* buf, int* pos, int32_t val, int width) {
     for (int i = 0; i < n; ++i) buf[(*pos)++] = tmp[i];
 }
 
-// per §2.5 / #648: ToString(format: string): string — format a DateTime tick
-// value using a .NET-style format string.
-// Supported specifiers (per §2.5 / .NET DateTime custom format conventions):
+// per §2.5 / §2.18 (v0.230) / #648: ToString(format: string): string — format
+// a DateTime tick value using a temporal pattern. Per stdlib §2.18's
+// "Temporal patterns: non-specifier characters are literals" paragraph, the
+// ONLY well-formed specifier runs in the Bezel vocabulary are:
 //   yyyy  → 4-digit year
 //   MM    → 2-digit month (01-12)
 //   dd    → 2-digit day (01-31)
@@ -295,8 +296,15 @@ static void fmt_int(char* buf, int* pos, int32_t val, int width) {
 //   mm    → 2-digit minute (00-59)
 //   ss    → 2-digit second (00-59)
 //   fff   → 3-digit millisecond (000-999)
-// All other characters in the format string are emitted verbatim (e.g. '-',
-// 'T', ' ', ':' separators). Returns a fresh heap-allocated bz_string (rc=1).
+// Every other character (including the specifier letters with a different run
+// length — `y`, `yy`, `yyy`, `yyyyy`, `M`, `MMM`, `MMMM`, `d`, `H`, `h`, `m`,
+// `s`, `f`, `ff`, `ffff`, …) is a LITERAL if it is not a specifier letter, and
+// a MALFORMED SPECIFIER RUN if it is one of `y M d H m s f` — the run length
+// must match exactly. A malformed run is a strict-fault (return nullptr →
+// FormatException via caller; §2.18 strict-fault, §18.5 hole parsing). This
+// is the v0.230 catch-up for #3292.
+// Returns a fresh heap-allocated bz_string (rc=1), or nullptr on a malformed
+// specifier run.
 extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
     int32_t yr, mo, dy, hr, mn, sc, ms;
     bz_datetime_ticks_to_parts(ticks, &yr, &mo, &dy, &hr, &mn, &sc, &ms);
@@ -312,31 +320,48 @@ extern "C" void* bz_datetime_to_string_fmt(int64_t ticks, const void* fmt_p) {
     int pos = 0;
 
     for (int64_t i = 0; i < flen; ) {
-        // Try to match multi-char specifiers first (longest first).
-        int rem = (int)(flen - i);
-        if (rem >= 4 && fmt[i]=='y' && fmt[i+1]=='y' && fmt[i+2]=='y' && fmt[i+3]=='y') {
-            fmt_int(out, &pos, yr, 4); i += 4; continue;
+        char ch = fmt[i];
+        // Expected run length per specifier letter; -1 means "not a specifier".
+        int expected = -1;
+        switch (ch) {
+            case 'y': expected = 4; break;       // yyyy
+            case 'M': expected = 2; break;       // MM
+            case 'd': expected = 2; break;       // dd
+            case 'H': expected = 2; break;       // HH
+            case 'm': expected = 2; break;       // mm
+            case 's': expected = 2; break;       // ss
+            case 'f': expected = 3; break;       // fff
+            default: break;                      // any other char: literal
         }
-        if (rem >= 3 && fmt[i]=='f' && fmt[i+1]=='f' && fmt[i+2]=='f') {
-            fmt_int(out, &pos, ms, 3); i += 3; continue;
+        if (expected < 0) {
+            // Verbatim character (any non-specifier char, including 'h' — so
+            // "hh" remains a literal while "HH" is the hour; per §2.18 v0.230).
+            out[pos++] = ch;
+            ++i;
+            continue;
         }
-        if (rem >= 2 && fmt[i]=='M' && fmt[i+1]=='M') {
-            fmt_int(out, &pos, mo, 2); i += 2; continue;
+        // Specifier letter: count the run of identical letters.
+        int64_t j = i;
+        while (j < flen && fmt[j] == ch) ++j;
+        int64_t runLen = j - i;
+        if (runLen != (int64_t)expected) {
+            // Malformed specifier run (per §2.18 v0.230, #3292): e.g. "yyy",
+            // "MMM", "s". Signal the fault by returning nullptr; the caller
+            // raises FormatException (§2.18 strict-fault, §18.5 hole parsing).
+            free(out);
+            return nullptr;
         }
-        if (rem >= 2 && fmt[i]=='d' && fmt[i+1]=='d') {
-            fmt_int(out, &pos, dy, 2); i += 2; continue;
+        switch (ch) {
+            case 'y': fmt_int(out, &pos, yr, 4); break;
+            case 'M': fmt_int(out, &pos, mo, 2); break;
+            case 'd': fmt_int(out, &pos, dy, 2); break;
+            case 'H': fmt_int(out, &pos, hr, 2); break;
+            case 'm': fmt_int(out, &pos, mn, 2); break;
+            case 's': fmt_int(out, &pos, sc, 2); break;
+            case 'f': fmt_int(out, &pos, ms, 3); break;
+            default: break;  // unreachable
         }
-        if (rem >= 2 && fmt[i]=='H' && fmt[i+1]=='H') {
-            fmt_int(out, &pos, hr, 2); i += 2; continue;
-        }
-        if (rem >= 2 && fmt[i]=='m' && fmt[i+1]=='m') {
-            fmt_int(out, &pos, mn, 2); i += 2; continue;
-        }
-        if (rem >= 2 && fmt[i]=='s' && fmt[i+1]=='s') {
-            fmt_int(out, &pos, sc, 2); i += 2; continue;
-        }
-        // Verbatim character.
-        out[pos++] = fmt[i++];
+        i = j;
     }
 
     // Build bz_string header (§4.6 layout: data/len/width/rc at offsets 0/8/16/24).
