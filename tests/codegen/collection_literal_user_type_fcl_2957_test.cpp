@@ -34,8 +34,13 @@
 // parameter) builds and returns the right sum, (5) the empty-literal case
 // is admitted (per §15.4.1 last paragraph) and reaches the factory's
 // empty-case branch, (6) the owning form builds and disposes exactly once
-// across a loop (ASan dispose-once), and (7) the borrowing form is
-// ASan-clean across a loop (no double-free of the backing bz_array_t).
+// across a loop (ASan dispose-once), (7) the borrowing form is
+// ASan-clean across a loop (no double-free of the backing bz_array_t),
+// and (8) the owning-form spec-example shape `Cell(10)+Cell(20)+Cell(30)=60`
+// is materialized through the `runAot` pipeline (issue #3029, post-#3027
+// parser-fix unblock — the disabled sub-test
+// `owning_form_class_elem_materializes_spec_15_4_1` from
+// `tests/codegen/from_collection_literal_local_decl_2957_test.cpp`).
 
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +60,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/aot_support.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
@@ -63,6 +69,9 @@
 #include "llvm/IR/Module.h"
 
 namespace {
+
+using bezel::test::JitResult;
+using bezel::test::runAot;
 
 namespace fs = std::filesystem;
 
@@ -276,6 +285,21 @@ const std::string kLocalDeclOwning =
     "  end Main; "
     "end C;";
 
+// §15.4.1 OWNING form re-enable shape (issue #3029 — the spec-example
+// values `new Cell(10), new Cell(20), new Cell(30)`, sum = 60). The original
+// disabled test lived in
+// `tests/codegen/from_collection_literal_local_decl_2957_test.cpp` (deleted
+// in the #2957 revert, 49bdfb1); this is the same shape, asserted via
+// `runAot` per the brief.
+const std::string kLocalDeclOwningReenabled =
+    std::string("module M; ") + kBagOwningClass +
+    "class C "
+    "  public static method Main(): int "
+    "    using var bg: Bag := [new Cell(10), new Cell(20), new Cell(30)]; "
+    "    return bg.Count; "
+    "  end Main; "
+    "end C;";
+
 // §15.4.1 / §28.3: BORROWING form looped — the per-call backing bz_array_t is
 // released immediately after each FCL call returns, so a 1000-iteration
 // loop is ASan-clean (no double-free of the backing, no leak of the per-
@@ -367,6 +391,26 @@ BEZEL_TEST(codegen_collection_literal_user_type_fcl_2957,
 BEZEL_TEST(codegen_collection_literal_user_type_fcl_2957,
            local_decl_owning_count_15_4_1) {
     BEZEL_EXPECT_EQ(compileAndRun(kLocalDeclOwning), 15);
+}
+
+// §15.4.1 OWNING form re-enable (issue #3029, post-#3027 parser-fix
+// unblock): LOCAL-DECL position with the spec-example class-typed elements
+// `[new Cell(10), new Cell(20), new Cell(30)]` — the `owned OwningArray<Cell>`
+// aggregate is materialized, ownership transfers into the `FromCollectionLiteral`
+// call (§28.3), the factory drains it (sum is 60), and the temp aggregate is
+// discharged by the callee. This is the re-enable of the disabled sub-test
+// `owning_form_class_elem_materializes_spec_15_4_1` originally in
+// `tests/codegen/from_collection_literal_local_decl_2957_test.cpp`
+// (disabled in 0edf69e pending the parser fix; that file was deleted in the
+// #2957 revert, 49bdfb1, and replaced with this one — same arm, different
+// shape). The assertion shape uses `runAot` so the test exercises the full
+// AOT pipeline (fork-isolated `Driver::compileFile` + clang link + native
+// exec) per CLAUDE.md's strict-oracle rule.
+BEZEL_TEST(codegen_collection_literal_user_type_fcl_2957,
+           owning_form_class_elem_materializes_spec_15_4_1) {
+    JitResult r = runAot(kLocalDeclOwningReenabled);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 60);
 }
 
 // ---- ASan dispose-exactly-once (no leak, no double-free) --------------------
