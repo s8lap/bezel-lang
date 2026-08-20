@@ -218,12 +218,28 @@ across 8–16 parallel workers.
 
 ## 6. Still open
 
-- **F15 (linker).** The system `ld` is GNU bfd 2.45.1; mold and lld are both
-  installed, and `Driver::linkCommandLine` runs a bare `clang`. A first probe
-  was contaminated by a concurrent suite run — its two runs disagreed on the
-  SIGN of the effect — and is discarded. Needs re-measuring on a quiet box.
-  Note it is Tier 2 regardless: it changes `linkRecipeSignature`, i.e. a
-  one-time full K2 cold, and wants a recorded decision.
+- **F15 (linker) — MEASURED AND DECLINED (#3303).** Quiet box, three linkers
+  interleaved rep-by-rep, 20 reps, on the real recipe:
+
+  | oracle | bfd (today) | lld | mold |
+  |---|---|---|---|
+  | plain | 97.8 ms | **76.8 ms (−21%)** | 105.3 ms (+8%) |
+  | ASan  | 190.5 ms | **185.1 ms (−3%)** | 235.2 ms (+23%) |
+
+  At ~11,897 AOT builds per cold pass that is ~25s (plain) + ~8s (ASan) per
+  cycle — against a one-time FULL K2 cold (~2,000s of shard time) to change
+  `linkRecipeSignature`. Payback ~60 cycles. Declined; revisit only if a
+  K2-invalidating change is landing anyway, when the migration is already sunk.
+
+  The audit's estimate ("~100-300ms per link, potentially the largest per-test
+  win after F1") was ~10x high. Caveat on method: lld is measured through a
+  PATH shim that forks a shell and mold through `mold -run`'s LD_PRELOAD, so
+  lld's gain comes DESPITE an extra process while part of mold's loss IS its
+  wrapper — a fair mold number needs the change itself.
+
+  ⚠ The first attempt at this ran beside an 18-core suite run and its two
+  repetitions disagreed on the SIGN of the effect. Do not measure linkers on a
+  busy box.
 - **Whole-cycle payoff.** Both oracles are measured on an AOT-dense slice
   (above); the whole-suite figure will be lower and is best read off
   gate-timings once a few cycles have run on the fix.
@@ -231,6 +247,25 @@ across 8–16 parallel workers.
   `store_fsyncs=3348` for 1,266 tests is still ~2.6 fsync+rename pairs per test.
 - **F9** (`tests/module` bypassing the harness) is untouched and, given the
   91% cold rate, is not a caching win — it is a fork-isolation gap.
+
+## Validation
+
+Both oracles gated trustworthy-green at `b5d71da` with every change above in
+place (plain shard 180.5s, ASan 122.5s, 18,288 gtest + 2,179 lit, conformance
+green). That cycle ran WARM — the changes touch a test header and scripts, not
+`libbezel_core.a`, so the build identity is unchanged — and therefore validates
+correctness rather than demonstrating the store-path saving, which appears on
+the next cold gate.
+
+The gate's own record now carries both new fields for the first time:
+
+    aot : {"hits": 7064, "misses": 4833, "store_failures": 0}
+    mem : {"anon_bytes": 1548982704, "current_bytes": 13964873728, "samples": 90}
+
+One unplanned consequence: that record says `cold=false` while the `aot` field
+shows a 59% hit rate. The gate's cold/warm PREDICTION is now falsifiable
+against what actually happened — it could not be before, because the field it
+needed was always null.
 
 ## Status
 
