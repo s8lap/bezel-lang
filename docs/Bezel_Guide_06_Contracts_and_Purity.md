@@ -10,7 +10,7 @@ Bezel lets a signature state obligations the compiler enforces: **`requires(...)
 
 ## 1. Contracts are grammar
 
-Contract clauses sit **between the signature and the body**. Each clause's parentheses are structural, so a clause is self-delimiting and takes no `;`. The `invariant` member, being a class member, keeps its `;` (spec §22.16):
+Contract clauses sit **between the signature and the body**. Each clause's parentheses are structural, so a clause is self-delimiting and takes no `;`. The `invariant` member, being a member, keeps its `;` (spec §22.16 — a class body or a record body may declare one):
 
 ```bezel
 public class Account
