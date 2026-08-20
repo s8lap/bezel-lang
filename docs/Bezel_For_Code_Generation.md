@@ -1704,9 +1704,9 @@ Task.FireAndForget(DoTelemetryAsync());
 ```
 
 ```bezel
-public method Wrong(replace: bool): owned Stream
+public method Wrong(replace: bool): owned FileStream
   var old := move _resource;
-  if replace then _resource := new Stream(); end;
+  if replace then _resource := new FileStream(_path, FileMode.Open); end;
   return old;                      // ERROR: the field is unrestored on the false path
 end Wrong;
 
@@ -1724,8 +1724,8 @@ end Header;
 > §28.8.1: every path from a field move to any exit must restore the field — and **build the replacement before taking**, so no throwable call sits on the unrestored edge. A caught exception is a borrow: copy the strings out. §9.7: spans may not be returned past their source, stored in class fields, or used as `async` parameters or results.
 
 ```bezel
-public method Right(): owned Stream
-  var fresh := new Stream();       // build first — it may throw
+public method Right(): owned FileStream
+  var fresh := new FileStream(_path, FileMode.Open);   // build first — it may throw
   var old := move _resource;       // then take — nothing throwable follows
   _resource := fresh;              // restore
   return old;
