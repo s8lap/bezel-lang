@@ -87,7 +87,7 @@ The mutating interfaces are deliberately separate hierarchies (`IList<T>` vs `IO
 | value elements (`Array<int>`, a range, a `string`'s chars) | a copy |
 | `string` or function-typed elements | a shared reference |
 | class elements of a collection — either family, default iteration | a **borrow** of the slot |
-| an iterator's fresh yields (`IEnumerable<T>` at class T) | a borrow of the **enumerator's** slot |
+| an iterator's enumerator-owned yields — minted, or adopted into a frame binding (`IEnumerable<T>` at class T) | a borrow of the **enumerator's** slot |
 | `coll.Drain()`, or any `IOwningEnumerable<T>` | **owned** — you discharge it (§3) |
 | `Dictionary<K, V>` | a `DictionaryEntry<K, V>`; `entry.Value` borrows at class V |
 | spans, inline arrays | direct indexed loop; copy or borrow per slot (§7) |
@@ -273,7 +273,7 @@ The compiler tracks the captures as sources carried by the query value (spec §2
 
 ## 5. `GroupBy`: consume the outer sequence once; read each group freely
 
-`GroupBy` is lazy until first enumerated, then buffers fully — no complete group can exist before the source is exhausted. That first enumeration is where it consumes its source (stdlib §5, v0.230). Single-consumption binds to the **outer** `IEnumerable<IGrouping<TKey, T>>` only. Each group is a materialized, **re-enumerable** collection that stays valid after the outer sequence advances past it — the *grouping* survives, though at class or interface elements its buffer holds borrows, so the *elements* survive only as long as their own owner does, and a grouping over a minting source carries dead borrows exactly as a materializer does (stdlib §5, v0.265; §6). Over a collection-backed source the many-aggregations idiom is direct:
+`GroupBy` is lazy until first enumerated, then buffers fully — no complete group can exist before the source is exhausted. That first enumeration is where it consumes its source (stdlib §5, v0.230). Single-consumption binds to the **outer** `IEnumerable<IGrouping<TKey, T>>` only. Each group is a materialized, **re-enumerable** collection that stays valid after the outer sequence advances past it — the *grouping* survives, though at class or interface elements its buffer holds borrows, so the *elements* survive only as long as their own owner does, and a grouping over a source whose enumerator owns the elements carries dead borrows exactly as a materializer does — and, since v0.268, draws §6's warning at an accessor over the group where that source is same-unit (stdlib §5; §6). Over a collection-backed source the many-aggregations idiom is direct:
 
 ```bezel
 for var g in requests.GroupBy(lambda(r) => r.Route) do     // outer: consumed by this loop
@@ -299,15 +299,33 @@ var idle := fleet.FirstOrNull(lambda(c) => not c.IsBusy());  // borrow of the el
 idle?.Ping();                     // fine while fleet lives — fleet is the backing
 ```
 
-**The trap is the minting pipeline.** Over a fresh-yield source — an iterator that `new`s its elements, or an operator chain over one — the element lives in the pipeline's *own* enumerator, which the terminal operator disposes before returning. The borrow you get back points at a disposed element, and the next use faults deterministically in checked mode (`DisposedAccessException`, spec §28.2). Since v0.243 the compiler **warns at the accessor call** whenever the minting iterator is compiled in the same unit (stdlib §5; the predicate is spec §29.11's) — the diagnostic says the element does not survive the call and names the remedies below; a cross-module producer escapes the warning and keeps only the checked-mode fault:
+**The trap is a pipeline whose elements the enumerator owns.** Over such a source — an iterator that `new`s its elements, an iterator that binds them to an owned local or a `using var` and yields that name, or an operator chain over either — the element lives in the pipeline's *own* enumerator frame, which the terminal operator disposes before returning. The borrow you get back points at a disposed element, and the next use faults deterministically in checked mode (`DisposedAccessException`, spec §28.2). Since v0.243 the compiler **warns at the accessor call** whenever that iterator is compiled in the same unit — since v0.268 for the adopt-then-yield producer as well as the minting one, and through a `ToArray()` or `GroupBy` in the chain (stdlib §5; the predicate is spec §29.11's) — the diagnostic says the element does not survive the call and names the remedies below; a cross-module producer escapes the warning and keeps only the checked-mode fault:
 
 ```bezel
 using var probes := Probes(8);    // Probes is an iterator minting fresh Probe objects
 var p := probes.First();          // borrow of the element — compiles, but WARNS
-                                  //   (stdlib §5, spec §29.11: same-unit minting root)
+                                  //   (stdlib §5, spec §29.11: same-unit
+                                  //    enumerator-owned-yield root)
 p.Run();                          // checked mode: DisposedAccessException — the element
                                   //   died with First()'s internal enumerator
 ```
+
+The `new`-in-the-yield spelling is not the only one. An iterator that binds the element first — the spelling §29.2 calls *warning-free*, because binding it is what silences the **producer's** must-use warning — hands the enumerator's frame the same ownership, and since v0.268 the consumer's accessor warns identically:
+
+```bezel
+public static method Load(paths: IEnumerable<string>): IEnumerable<Doc>
+  for var p in paths do
+    using var d := Parse(p);      // Parse(p: string): owned Doc — frame-owned
+    yield return d;               // adopt-then-yield: a borrow of a frame-owned binding
+  end;
+end Load;
+
+var first := Load(paths).First();  // WARNS (v0.268) — spec §29.11's adopting arm
+first.Title;                       // checked mode: DisposedAccessException — §29.7's
+                                   //   pass disposed d when First() disposed the enumerator
+```
+
+*Warning-free at the producer* and *warned at the consumer* are both true and are about different call sites. What still does **not** warn: yielding a re-borrow of an element the *caller* owns (`for var d in docs do yield return d; end;` — sound), and reaching a frame-owned value through an indexer or a field rather than by name (`yield return seen[i];` — silent by choice, spec §29.11, because a frame-resident *borrowing* collection would be warned on wrongly).
 
 The remedy is the one the stdlib states (§5), and `ToArray()` is **not** it: materializing hands you a fresh `Array<T>` whose slots are *borrows* of the same dead elements (stdlib §5, §4.4) — §4's materialize-first remedy answers re-enumeration, not liveness. Two things work. Use each element inside the loop body that borrows it, before the next advance. Or give the elements an owner: run the producer through the owning path (an `IOwningEnumerable<T>` iterator consumed with §3's owning iteration, where you genuinely own each element) and build them into an owning collection — the plainest form, and then `probes.FirstOrNull(...)` over an `OwningArray<Probe>` is collection-backed and sound. If the producer is a borrowing minting iterator you cannot change, there is no way to keep an element past the next advance; consume it in the body.
 
@@ -385,6 +403,6 @@ After the freeze no writer can exist — the consume takes the buffer, and the c
 | Zero-copy sub-range | spans via `AsSpan()` — bounded by the source's life (string spans exempt) |
 | Share bulk data across domains, forever | `FrozenArray<T>`, under `Shared<T>` |
 
-And the five traps, each a section above: **enumerating a bound query twice** (§4 — materialize); **escaping an iteration variable** from an interface-typed or minting source (§2 — concrete backing, or the owning path); **disposing a borrowed element** (§2 — only owners dispose; go through the owning collection or take the element out); **`First()` over a minting pipeline** (§6 — warned since v0.243 where the producer is same-unit, spec §29.11; materializing does not help — give the elements an *owner*, or use each one in the loop body that borrows it); **holding a span past its buffer** (§7 — the caller owns the storage).
+And the five traps, each a section above: **enumerating a bound query twice** (§4 — materialize); **escaping an iteration variable** from an interface-typed or minting source (§2 — concrete backing, or the owning path); **disposing a borrowed element** (§2 — only owners dispose; go through the owning collection or take the element out); **`First()` over a pipeline whose enumerator owns the elements** (§6 — warned since v0.243 where the producer is same-unit, widened at v0.268 to adopt-then-yield producers and to chains through `ToArray()`/`GroupBy`, spec §29.11; materializing does not help — give the elements an *owner*, or use each one in the loop body that borrows it); **holding a span past its buffer** (§7 — the caller owns the storage).
 
 Three habits carry most of it. Pick the family that states who disposes, and let `Dispose()` cascades and `Drain()` do the element work — hand-written disposal loops over collections are almost always the wrong shape. Treat everything a loop or accessor hands you at class elements as a borrow unless the name says transfer (`Pop`/`Drain`). When you need it longer, take ownership explicitly rather than fighting the borrow checker. And treat a lazy query as a value you spend: bind it, consume it once, and reach for `ToArray()` the moment you need the results twice. The compiler enforces all three; the errors are it finding a leak, a dangle, or a silent re-execution before they happen.
