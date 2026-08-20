@@ -1,6 +1,6 @@
 # Bezel Guide 5: Collections, Queries, and Iteration
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.261.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.265.*
 
 The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5, `import System.Collections.Linq;`). What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `move` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
 
@@ -32,7 +32,7 @@ The `Owning` prefix names the **element** axis, not the container axis: `owned O
 
 | Element type | Borrowing family | Owning family |
 |---|---|---|
-| value type (`int`, records) | copies in and out | *(rejected — nothing to own)* |
+| value type (`int`, records) | copies in and out (a *borrow-bearing* record — §7, spec §9.7 — additionally requires every source it carries to outlive the collection) | *(rejected — nothing to own)* |
 | `string`, function values | shared references | *(rejected)* |
 | class / interface | slots hold **borrows** | slots are **owned** |
 
@@ -206,7 +206,7 @@ Five rules cover the shape:
 
 ## 4. How Bezel does it: a bound query is consumed exactly once
 
-The stdlib §5 operators (`import System.Collections.Linq;`) are the headline unusual feature. As elsewhere, most of them are **lazy**: `xs.Where(p)` does no work — it builds a deferred pipeline that runs when enumerated. Unlike elsewhere, a **bound lazy query is affine**: it may be enumerated **at most once** — the first consumption spends its one *enumeration right*, the way a `move` spends ownership. The frame itself is still yours to dispose (`using var`, as in every example here); the right and the disposal obligation are layered, not the same thing (spec §29.11).
+The stdlib §5 operators (`import System.Collections.Linq;`) are the headline unusual feature. As elsewhere, most of them are **lazy**: `xs.Where(p)` does no work — it builds a deferred pipeline that runs when enumerated. Unlike elsewhere, a **bound lazy query is affine**: it may be enumerated **at most once** — the first consumption spends its one *enumeration right*, the way a `move` spends ownership. The frame itself is still yours to dispose — `using var` where you want scope disposal, otherwise K3.14's auto-drop, with the must-use warning suppressed wherever the consumption point is statically visible; the right and the disposal obligation are layered, not the same thing (spec §29.11).
 
 ```bezel
 using var hot := readings.Where(lambda(r) => r.Celsius > 90.0);   // bound lazy query
@@ -224,7 +224,7 @@ var n    := hot.Count;                            // a collection property now
 var mean := hot.Average(lambda(r) => r.Celsius);  // as many passes as you like
 ```
 
-`ToArray()` returns an owned `Array<T>` — a collection, enumerable any number of times. Only the bound lazy value is affine. Exactly three uses spend a bound query's enumeration right (spec §29.11):
+`ToArray()` returns an owned `Array<T>` — a collection, enumerable any number of times. Only the bound lazy value is affine. The `owned` is the **container** axis: at class or interface elements the fresh array is a *borrowing* collection whose slots hold borrows of the elements it enumerated (stdlib §5, §4.4; spec §28.11), so materializing answers *re-enumeration* over a live backing and answers nothing about the elements' own lifetimes — that is §6's problem, with §6's remedies. Exactly three uses spend a bound query's enumeration right (spec §29.11):
 
 1. **Enumeration or a terminal operator** — a `for` loop, `Count()`, `First()`, `ToArray()`, ….
 2. **Composing a further operator** — the right transfers into the composed query:
@@ -267,13 +267,13 @@ using var kept := q.ToArray();                             //   and its borrow o
                                                            //   until this consumption
 ```
 
-The compiler tracks the captures as sources carried by the query value (spec §28.14; stdlib §5), so the failure mode is a compile error, not a dangle. The same tracking draws the return boundary. A method may return a pipeline over its *own inputs* — `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` — because each caller re-establishes the borrow against its own argument. A pipeline over a local you created dies with the method and cannot be returned; materialize it into an owned `Array<T>` instead (Guide 1 §6).
+The compiler tracks the captures as sources carried by the query value (spec §28.14; stdlib §5), so the failure mode is a compile error, not a dangle. The same tracking draws the return boundary. A method may return a pipeline over its *own inputs* — `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` — because each caller re-establishes the borrow against its own argument. A pipeline over a local you created dies with the method and cannot be returned. At value, `string`, and runtime-managed elements, materializing it into an owned `Array<T>` is the fix — the slots are copies or runtime-managed references, and the array carries nothing of the local. At **class or interface** elements it is not: the materialized slots are borrows of elements the local still owns, so the returned array dangles the moment the local is disposed (stdlib §5, v0.265). Return an owning collection you built through §6's owning path, or let the caller own the source.
 
 ---
 
 ## 5. `GroupBy`: consume the outer sequence once; read each group freely
 
-`GroupBy` is lazy until first enumerated, then buffers fully — no complete group can exist before the source is exhausted. That first enumeration is where it consumes its source (stdlib §5, v0.230). Single-consumption binds to the **outer** `IEnumerable<IGrouping<TKey, T>>` only. Each group is a materialized, **re-enumerable** collection that stays valid after the outer sequence advances past it — so the many-aggregations idiom is direct:
+`GroupBy` is lazy until first enumerated, then buffers fully — no complete group can exist before the source is exhausted. That first enumeration is where it consumes its source (stdlib §5, v0.230). Single-consumption binds to the **outer** `IEnumerable<IGrouping<TKey, T>>` only. Each group is a materialized, **re-enumerable** collection that stays valid after the outer sequence advances past it — the *grouping* survives, though at class or interface elements its buffer holds borrows, so the *elements* survive only as long as their own owner does, and a grouping over a minting source carries dead borrows exactly as a materializer does (stdlib §5, v0.265; §6). Over a collection-backed source the many-aggregations idiom is direct:
 
 ```bezel
 for var g in requests.GroupBy(lambda(r) => r.Route) do     // outer: consumed by this loop
@@ -380,11 +380,11 @@ After the freeze no writer can exist — the consume takes the buffer, and the c
 | Consume every element | `for var x in coll.Drain() do using var c := move x; … end;` |
 | Read query results twice | `.ToArray()` first — a bound query is single-consumption |
 | Aggregate one group many ways | `GroupBy` — outer sequence once, each group re-enumerable |
-| Keep an element past the loop | a concrete collection-backed source (or materialize); the owning path when elements are minted |
+| Keep an element past the loop | a concrete collection-backed source (materializing gives one only where the elements' own owner outlives the use); the owning path when elements are minted |
 | Tally occurrences | `Counter<K>` (stdlib §4.20) — not a dictionary dance |
 | Zero-copy sub-range | spans via `AsSpan()` — bounded by the source's life (string spans exempt) |
 | Share bulk data across domains, forever | `FrozenArray<T>`, under `Shared<T>` |
 
-And the five traps, each a section above: **enumerating a bound query twice** (§4 — materialize); **escaping an iteration variable** from an interface-typed or minting source (§2 — concrete backing, or the owning path); **disposing a borrowed element** (§2 — only owners dispose; go through the owning collection or take the element out); **`First()` over a minting pipeline** (§6 — warned since v0.243 where the producer is same-unit, spec §29.11; give the elements a backing first); **holding a span past its buffer** (§7 — the caller owns the storage).
+And the five traps, each a section above: **enumerating a bound query twice** (§4 — materialize); **escaping an iteration variable** from an interface-typed or minting source (§2 — concrete backing, or the owning path); **disposing a borrowed element** (§2 — only owners dispose; go through the owning collection or take the element out); **`First()` over a minting pipeline** (§6 — warned since v0.243 where the producer is same-unit, spec §29.11; materializing does not help — give the elements an *owner*, or use each one in the loop body that borrows it); **holding a span past its buffer** (§7 — the caller owns the storage).
 
 Three habits carry most of it. Pick the family that states who disposes, and let `Dispose()` cascades and `Drain()` do the element work — hand-written disposal loops over collections are almost always the wrong shape. Treat everything a loop or accessor hands you at class elements as a borrow unless the name says transfer (`Pop`/`Drain`). When you need it longer, take ownership explicitly rather than fighting the borrow checker. And treat a lazy query as a value you spend: bind it, consume it once, and reach for `ToArray()` the moment you need the results twice. The compiler enforces all three; the errors are it finding a leak, a dangle, or a silent re-execution before they happen.
