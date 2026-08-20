@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.266 — August 2026**
+**Version 0.267 — August 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -619,7 +619,7 @@ Operations:
 - `s[i]` returns the `char` at code-point position `i`, zero-indexed. O(1). Out-of-range raises `IndexOutOfRangeException`.
 - `s[r]` for a `Range<int>` value `r` returns the substring spanning `r`. O(k) for a result of length `k`. Endpoints follow the standard rules for `Range<int>` over `s`'s indices: a closed `s[a..b]` includes both ends, a half-open `s[a..<b]` excludes the upper, and the open-ended forms (`s[..b]`, `s[a..]`, `s[..]`) extend to the start or end of the string. Out-of-range endpoints raise `IndexOutOfRangeException`; an empty range produces the empty string. The result is a fresh `string`; mutating one does not affect the other (strings are immutable, so this is observably true regardless of representation).
 - `s = t` and `s <> t` compare by code-point sequence. O(min(|s|, |t|)).
-- `s < t`, `s > t`, `s <= t`, `s >= t` perform ordinal lexicographic comparison of the code-point sequence. Locale-aware comparison is provided by standard library methods. Ordering requires **non-nullable** operands: an operand of static type `string?` is a compile error — narrow first ([§7.4](#sec-member-access-on-nullable-values)) — the same use-requires-narrowing discipline as every other operation on a nullable reference; equality stays null-safe per [§8.4](#sec-=-and), and [§7.11](#sec-lifted-operators)'s relational lifting is a nullable-*value*-type rule that does not extend here.
+- `s < t`, `s > t`, `s <= t`, `s >= t` perform ordinal lexicographic comparison of the code-point sequence. Locale-aware comparison is provided by standard library methods. Ordering requires **non-nullable** operands: an operand of static type `string?` is a compile error — narrow first ([§7.4](#sec-member-access-on-nullable-values)) — the same use-requires-narrowing discipline as every other operation on a nullable reference; equality stays null-safe per [§8.4](#sec-=-and). Ordering admits no absent operand at any type: [§7.11](#sec-lifted-operators) states the rule once, for nullable value operands and nullable reference operands alike, and this bullet is that rule read at `string`.
 - `s + t` concatenates two strings. The compiler does not implicitly convert other types to `string`; use interpolation or `.ToString()`.
 - `c in s` tests whether the character `c` appears in `s` (equivalent to `s.Contains(c)`, [§17.5](#sec-the-in-operator)).
 
@@ -905,32 +905,27 @@ never need it: a shift's result already has the left operand's type
 out-of-domain count is the same fault — compile error for a constant count,
 `OverflowException` at runtime otherwise.
 
-**Nullable value-typed targets.** When T is a nullable value type `U?` whose
-underlying type `U` is a primitive on which the operator is defined, this
-section's typing is read on the **underlying** types: `x op e` is the lifted
-operation of [§7.11](#sec-lifted-operators), so R is the nullable form of the
-underlying result, and the compound form is admitted exactly where the
-corresponding non-nullable form is — directly when R is T, by
-[§5.1](#sec-implicit-conversions) where its conversions admit (they lift:
-`int?` → `long?`), and otherwise by the checked narrow-integer write-back when
-`U` is an integer type or `char` and R's underlying type is an integer type.
-Every other underlying pairing is the same compile error it is without the
-`?`: `int? += double?` is rejected exactly as `int += double` is. The runtime
-semantics are [§7.11](#sec-lifted-operators)'s: the operation, its overflow and
-divide-by-zero checks, and the write-back's own checked narrowing (or a `char`
-target's [§5.2](#sec-explicit-conversions) code-point check) run **only when
-both operands are present**; when either is `null` the result is `null`, no
-check fires, and `null` is stored back through the target's single write —
-`b += 100` on `b: byte?` raises `OverflowException` when `b` is present and the
-sum leaves `byte`'s range, and assigns `null` when `b` is null. Two boundaries.
-A **nullable R against a non-nullable T** is a compile error in every case —
-§5.1's nullable conversions run `T` → `T?` and never back — so `i += n` with
-`i: int` and `n: int?` is rejected, naming the narrowing remedy
-([§7.4](#sec-member-access-on-nullable-values), `n!`, or `n ?? 0`). And a
-nullable **reference**-typed target is outside this paragraph — §7.11 lifts
-only value types — so a compound form on one is the compile error above;
-narrow first. The same reading governs the `++`/`--` forms
-([§17.6](#sec-the-increment-and-decrement-operators)).
+**Nullable targets and operands.** A read-modify-write compound assignment —
+`+=`, `-=`, `*=`, `/=`, `mod=`, `&=`, `|=`, `^=`, `<<=`, `>>=` — is a
+**compile error** when the static type of its left-hand side, or of its right
+operand, is a **nullable** type: the desugared `x op e` has no meaning, because
+no arithmetic, bitwise, shift, or relational operator is defined on a nullable
+operand ([§7.11](#sec-lifted-operators)). One sentence covers every position
+the operation can meet an absent value — the target, the right operand, or both
+— so `n += 1` and `n += m` with `n: int?` are rejected exactly as `i += n` with
+`i: int` and `n: int?` is, and a nullable **reference**-typed target is rejected
+by this rule rather than by a separate one. The diagnostic names
+[§7.11](#sec-lifted-operators)'s remedies — a
+[§7.4](#sec-member-access-on-nullable-values) narrowing check, `??`
+([§7.7](#sec-null-coalescing-and-=)), or `!` ([§7.8](#sec-null-forgiving)):
+`b := (b ?? 0) + 1;`, `b := b! + 1;`, or a check followed by the ordinary
+non-nullable form. The narrow-integer write-back above governs *storing* a wider
+result into a narrower target and is unreached here: no operation types. `??=`
+is unaffected — it is not a read-modify-write (below), and the absent case is
+its whole purpose; after `x ??= e;` the target is narrowed non-null
+([§7.4](#sec-member-access-on-nullable-values)), so the ordinary compound form
+applies to it from the next statement on. The same reading governs the `++`/`--`
+forms ([§17.6](#sec-the-increment-and-decrement-operators)).
 
 **`??=`** is not a read-modify-write: `x ??= e` assigns `e` only when `x`'s
 current value is null, with the typing and ownership rules of
@@ -966,6 +961,10 @@ var s: short := 1;
 s <<= 2;                   // R = short (§6.5) — 4, no write-back involved
 var c: char := 'a';
 c += 1;                    // c := char(c + 1) — 'b'; §5.2's code-point check applies
+// var m: int? := 0;
+// m += 1;                 // compile error: `+` is not defined on a nullable operand
+//                         //   (§7.11) — write m := (m ?? 0) + 1; or narrow first
+// m++;                    // compile error: the same rule through §17.6's desugaring
 counts[category] += 1;     // §17.6's indexer instance: collection, index, getter, setter — once each
 // var f: float := 1.0f;
 // f += 2.5;               // compile error: R = double does not return to float implicitly —
@@ -1134,19 +1133,19 @@ Inside the generic body, T is non-nullable under any type-bound constraint.
 **`?` is idempotent under substitution.** When an unconstrained `T` is instantiated with a nullable type `U?`, the substituted `T?` denotes `U?` itself — there is no two-level optional, consistent with the grammar (Appendix A: `Type ::= TypeNoNullable "?"?`, at most one `?`) and with [§8.6](#sec-boxing)'s single-wrapper boxing. Consequently an API whose result type is `T?` (e.g. the stdlib `FirstOrNull` family) cannot distinguish "no value" from "a present `null`" when instantiated at a nullable `T`; callers who need the distinction use the shape that carries it (`Count`/index checks, or the `Try` pattern). A field or local of **bare** type `T` under an unconstrained parameter follows [§7.9](#sec-definite-assignment-for-non-nullable-fields)'s non-nullable-reference rules (must-initialize, no vacuous `null` default), since T may be instantiated non-nullable; *reads* remain conservatively possibly-null per this section.
 
 <a id="sec-lifted-operators"></a>
-### 7.11 Lifted operators
+### 7.11 Operators over nullable operands
 
-For a nullable value type `T?` whose underlying type `T` is a primitive on which a built-in operator ([§3.5](#sec-operators-on-primitive-types)) is defined, that operator **lifts** to the nullable form. Lifting is the natural completion of the null-safe equality already defined for `=`/`<>` ([§8.4](#sec-=-and)): the operators are defined on `T?` operands in terms of the underlying operator on `T`, with `null` handled uniformly. The rules differ by operator category.
+No operator **lifts** to a nullable type. For a nullable value type `T?`, the operators [§3.5](#sec-operators-on-primitive-types) defines on the underlying type `T` are not defined on `T?`: an operand whose static type is a nullable value type is a **compile error** at every arithmetic, bitwise, shift, and relational operator — on either side, and in the mixed `T?`/`T` pairing alike — with the diagnostic naming the remedies the language uses at every other position where a nullable value meets a non-nullable one: a [§7.4](#sec-member-access-on-nullable-values) narrowing check, `??` ([§7.7](#sec-null-coalescing-and-=)), or `!` ([§7.8](#sec-null-forgiving)). The rule reads the operand's **static** type, so an operand that [§7.4](#sec-member-access-on-nullable-values) has narrowed non-null is a non-nullable operand and the ordinary operator applies to it unchanged; no separate rule is needed for that case. Nullable **reference** operands take the same answer at their own types ([§4.6](#sec-string) for `string`). What propagates absence in this language is marked: `?.` ([§7.5](#sec-null-conditional-access)), `?(args)` ([§7.6](#sec-null-conditional-call-args)), `??` and `??=` ([§7.7](#sec-null-coalescing-and-=)) each carry the `?` that announces it. Equality is total over an absent operand and is unaffected by this section ([§8.4](#sec-=-and): `null = null` is `true`, `null = nonNull` is `false`). (Rationale [§6.4](Bezel_Design_Rationale.md#sec-operators-do-not-lift).)
 
-**Arithmetic, bitwise, and shift operators.** The binary operators `+`, `-`, `*`, `/`, `mod`, `&`, `|`, `^`, `<<`, `>>` and the unary operators `+`, `-`, and `~` lift to yield `T?` (unary `+` per its [§3.5](#sec-operators-on-primitive-types) identity semantics). A lifted binary operator produces `null` if *either* operand is `null`; a lifted unary operator produces `null` if its operand is `null`. A mixed expression in which one operand is `T?` and the other is the non-nullable `T` lifts as well — the non-nullable operand is treated as present (never `null`), and the result is `T?`. The runtime checks each operator already performs — `OverflowException` on integer overflow ([§6.1](#sec-integer-arithmetic)), `DivideByZeroException` on integer or `decimal` division/`mod` by zero ([§6.1](#sec-integer-arithmetic)) — apply only when both operands are present (non-null); when the lifted result is `null` by reason of a null operand, no underlying operation runs and no check fires. As stated above, an operator lifts only where it is defined on the underlying type `T`: the bitwise and shift operators (`&`, `|`, `^`, `<<`, `>>`, `~`) therefore do **not** lift to `bool?` or `char?`, since they are not valid on `bool` or `char` ([§6.5](#sec-bitwise-operations)) — boolean combinations use `and`/`or`/`not`, which do not lift either (see *No three-valued logic* below).
+**The rejected operators.** The binary `+`, `-`, `*`, `/`, `mod`, `&`, `|`, `^`, `<<`, `>>`; the unary `+`, `-`, `~`; and the relational `<`, `<=`, `>`, `>=`. Their compound-assignment forms are rejected with them ([§6.6](#sec-compound-assignments)), as are `++` and `--`, whose desugaring is §6.6's ([§17.6](#sec-the-increment-and-decrement-operators)) — `??=` excepted, which is not a read-modify-write ([§6.6](#sec-compound-assignments)). The runtime checks these operators carry are unchanged and unmoved: `OverflowException` on integer overflow ([§6.1](#sec-integer-arithmetic)), `DivideByZeroException` on integer or `decimal` division or `mod` by zero ([§6.1](#sec-integer-arithmetic)), and the shift-count domain ([§6.5](#sec-bitwise-operations)) are checks of the operation on present operands, reached after the operands are narrowed. This section introduces no fault of its own and no new throwable expression ([§28.8.1](#sec-the-move-expression)): an absent operand is diagnosed at compile time, and the remedies that assert presence rather than test it (`!`, [§7.8](#sec-null-forgiving)) carry their own already-defined fault.
 
-**Relational operators.** The relational operators `<`, `<=`, `>`, `>=` lift to yield **`bool`** — *not* `bool?`. A lifted relational comparison yields `false` if *either* operand is `null`. This mirrors the rule that a `null` participant in an ordering comparison is not "less than" or "greater than" anything; the result is simply `false`. (Equality `=` and `<>` are unchanged — they are already null-safe per [§8.4](#sec-=-and), where `null = null` is `true` and `null = nonNull` is `false`.) Two boundary notes: lifted ordering deliberately breaks the usual `<=`-reflexivity-of-equality **on null** — `null = null` is `true` while `null <= null` is `false` — so code treating `a = b` as implying `a <= b` should narrow first (advisory — the comparison itself is legal and yields `false`). And the relational lifting is confined to nullable **value** types whose underlying type has an ordering: `bool?` operands do not lift ([§3.5](#sec-operators-on-primitive-types) defines no `bool` ordering), and nullable *reference* operands (`string?`) are outside this section entirely — ordering them is a compile error ([§4.6](#sec-string)).
+**Ordering, specifically.** An ordering comparison over an absent participant has no defensible result: `null` is not less than, equal to, or greater than a value, and answering `false` would assert two definite claims at once — `a < b` and `a >= b` both `false`, `not (a < b)` a definite `true`. So `<`, `<=`, `>`, `>=` reject a nullable operand rather than answer for it. This is [§4.6](#sec-string)'s rule for `string?` read at every other type, and it is what [§18.5](#sec-interpolated-strings) already says when it contrasts rendering a null (which has a defensible answer) with ordering one (which does not). An order over possibly-absent values is written where the reader can see the choice: `(a ?? 0) < b` names a sentinel, `a! < b` asserts presence, and a [§7.4](#sec-member-access-on-nullable-values) check ranks the absent case in a branch of its own. Pattern position takes the same rule: a relational or range pattern requires a non-nullable scrutinee ([§19.3](#sec-patterns), [§16.6](#sec-empty-ranges-and-equal-bound-ranges)).
 
-**No three-valued logic.** Lifting does *not* introduce three-valued (`bool?`) logical operators. The boolean operators `and`, `or`, `not` ([§17.2](#sec-notes-on-operators)) operate only on `bool`; there is no lifted `and`/`or`/`not` over `bool?`, and a `bool?` operand to a boolean operator is a compile error. Code that needs to combine `bool?` values handles the `null` case explicitly (e.g. with `??` ([§7.7](#sec-null-coalescing-and-=)) or a narrowing check).
+**No three-valued logic.** There are no `bool?` logical operators. `and`, `or`, `not` ([§17.2](#sec-notes-on-operators)) operate only on `bool`; a `bool?` operand is a compile error, and code combining `bool?` values handles the absent case explicitly (`??` ([§7.7](#sec-null-coalescing-and-=)), or a narrowing check). This is not a separate rule but this section's rule at the boolean operators: the language carries no third truth value, and it does not collapse one into `false` at an operator either.
 
-**User-defined operators.** Lifting applies to the built-in primitive operators only. Lifting of user-defined operators ([§25](#sec-operator-overloading)) declared on record or class types is **deferred**; a future revision may define how (or whether) a user-declared `operator +` on a value type lifts to its nullable form.
+**User-defined operators.** The rule does not turn on where an operator is declared. A user-declared `operator` on a record or class type ([§25](#sec-operator-overloading)) is likewise not defined on a nullable operand: such an operand at a user-defined-operator position is the same compile error, naming the same remedies.
 
-**Safety.** A lifted arithmetic/bitwise/shift result stays typed `T?`. It is therefore subject to the same narrowing discipline as any other nullable value: [§7.4](#sec-member-access-on-nullable-values) narrowing (or a null-coalescing/null-forgiving form) is still required before the result is used in a non-nullable position. Lifting never silently produces a non-nullable value from nullable operands; it only defines what the operators *mean* on nullable operands. Compound assignment to a nullable value-typed target reads [§6.6](#sec-compound-assignments)'s typing on the underlying types and applies this section's present-branch semantics to the operation and to §6.6's write-back alike; a lifted result never stores back into a non-nullable target.
+**What follows.** No operator produces a value from an absent operand, and none consumes one silently: an absent value is confronted at the operand, in the source, once — the same discipline [§7.4](#sec-member-access-on-nullable-values) applies to member access, indexing, and calls, now with no exception to it. A nullable value therefore reaches a non-nullable position only through a narrowing check, `??`, or `!`, and the operations that do answer over an absent operand — equality ([§8.4](#sec-=-and)), the null and type tests ([§12.7](#sec-type-tests-is-is-not-as), [§19.5](#sec-type-pattern-matching-never-matches-null)), and interpolation ([§18.5](#sec-interpolated-strings)) — answer questions that have answers.
 
 ---
 
@@ -1331,7 +1330,7 @@ A body-only record receives auto-generated `=`, `<>`, `GetHashCode`, and `ToStri
 
 - a primitive type, an enum, or `string`;
 - another record that is itself auto-hashable (recursively, this same rule);
-- `T?` where `T` is admissible — the comparison is the null-safe `=` of [§8.4](#sec-=-and)/[§7.11](#sec-lifted-operators);
+- `T?` where `T` is admissible — the comparison is the null-safe `=` of [§8.4](#sec-=-and);
 - a non-owning inline array `[N]T` or `[N]T?` whose element type is admissible — the comparison is element-by-element per [§8.3](#sec-equals-and-gethashcode)'s inline-array rows;
 - a **value-like choice** that is itself auto-hashable ([§35.7](#sec-choice-equality) — recursively, this same list applied to every case's payload fields).
 
@@ -3199,7 +3198,7 @@ Open-ended ranges are designed for slicing ([§15.6](#sec-slicing)) and pattern 
 <a id="sec-empty-ranges-and-equal-bound-ranges"></a>
 ### 16.6 Empty ranges and equal-bound ranges
 
-A range whose lower bound exceeds its upper bound (in the direction of iteration) is empty. Iterating an empty range is a no-op. Construction is not an error. **Range patterns:** a range pattern `lo..hi` / `lo..<hi` (necessarily stepless, [§16.4](#sec-step)) matches `v` iff `lo <= v <= hi` (resp. `< hi`) read directionally as written. With the `Contains` rule this **agrees exactly with `in`** on the stepless forms — a reversed pattern like `100..0` matches nothing, and `50 in 100..0` is likewise `false`; there is no pattern-vs-`Contains` asymmetry. Because a *constant* reversed range pattern can never match, the compiler emits a **warning** at the pattern ("this pattern never matches — bounds are reversed"), the same constant-fold discipline as [§16.4](#sec-step)'s step diagnostics.
+A range whose lower bound exceeds its upper bound (in the direction of iteration) is empty. Iterating an empty range is a no-op. Construction is not an error. **Range patterns:** a range pattern `lo..hi` / `lo..<hi` (necessarily stepless, [§16.4](#sec-step)) matches `v` iff `lo <= v <= hi` (resp. `< hi`) read directionally as written. With the `Contains` rule this **agrees exactly with `in`** on the stepless forms — a reversed pattern like `100..0` matches nothing, and `50 in 100..0` is likewise `false`; there is no pattern-vs-`Contains` asymmetry. The agreement extends to absent values: `in` requires a non-nullable left operand ([§17.5](#sec-the-in-operator)) and a range pattern likewise requires a non-nullable scrutinee ([§19.3](#sec-patterns)) — both reject an absent operand rather than answer for it. Because a *constant* reversed range pattern can never match, the compiler emits a **warning** at the pattern ("this pattern never matches — bounds are reversed"), the same constant-fold discipline as [§16.4](#sec-step)'s step diagnostics.
 
 A range whose bounds are equal is a special case where direction is undefined:
 
@@ -3341,7 +3340,7 @@ c--;            // c is 5
 
 `x := y++` is a compile error; `++c` is a parse error. There is no prefix form.
 
-The operand must be an assignable lvalue (a local variable, a writable field, an indexer slot, or a property with a setter — the same storage categories [§22.3](#sec-ref-and-out-argument-locations)'s `ref`/`out` arguments reuse). Read-only locations cannot be incremented. For a value-type operand whose type T overloads `operator ++`, the statement `x++` is equivalent to `x := T.operator++(x)`; the new value replaces the old through the lvalue's normal assignment path. For built-in numeric types, `x++` is equivalent to `x := x + 1` (and likewise `x--` to `x := x - 1`), with the same overflow semantics as `+` and `-` ([§6.1](#sec-integer-arithmetic)).
+The operand must be an assignable lvalue (a local variable, a writable field, an indexer slot, or a property with a setter — the same storage categories [§22.3](#sec-ref-and-out-argument-locations)'s `ref`/`out` arguments reuse). Read-only locations cannot be incremented. For a value-type operand whose type T overloads `operator ++`, the statement `x++` is equivalent to `x := T.operator++(x)`; the new value replaces the old through the lvalue's normal assignment path. For built-in numeric types, `x++` is equivalent to `x := x + 1` (and likewise `x--` to `x := x - 1`), with the same overflow semantics as `+` and `-` ([§6.1](#sec-integer-arithmetic)). An operand whose static type is a nullable type is a **compile error**: the desugared `x + 1` has no meaning on a nullable operand ([§7.11](#sec-lifted-operators)), and this form and [§6.6](#sec-compound-assignments)'s compound assignments are one rule read through one desugaring — write `x := (x ?? 0) + 1;`, `x := x! + 1;`, or narrow first.
 
 For reference-type operands, `++` and `--` apply only when the reference type overloads the operator; the overload returns a new instance, and the statement reassigns the local or field to the new instance. Overloading `++`/`--` on a class is permitted but uncommon; the `Counter` example in [§25.3](#sec-examples) demonstrates the typical record use.
 
@@ -3856,8 +3855,8 @@ text `null` exactly as to any other rendered text (it participates in field
 padding). The hole is not a [§7.4](#sec-member-access-on-nullable-values)
 member access: the dispatch is performed by the language with a defined null
 case, the same posture as the null-safe `=`/`<>` of [§8.4](#sec-=-and) — and
-unlike [§4.6](#sec-string)'s ordering rule, where a null participant has no
-defensible result, rendering one does: making it *visible*. Rendering `null`
+unlike the ordering rules ([§4.6](#sec-string), [§7.11](#sec-lifted-operators)),
+where a null participant has no defensible result, rendering one does: making it *visible*. Rendering `null`
 rather than the empty string keeps absent values diagnosable in output.
 
 ```bezel
@@ -4024,7 +4023,7 @@ Because the alternative separator `|` is distinct from the slot separator `,`, a
 
 **Inclusive and exclusive ranges:** `90..100`, `0..<60`. Open-ended forms allowed: `..<0` (less than 0), `31..` (at least 31).
 
-**Relational:** `> 70`, `< 50`, `<= 100`, `>= 0`. Compares the scrutinee against the right-hand operand.
+**Relational:** `> 70`, `< 50`, `<= 100`, `>= 0`. Compares the scrutinee against the right-hand operand, under the ordering of the scrutinee's type. A **nullable** scrutinee — value or reference — is a compile error at a relational pattern, and at a range pattern ([§16.6](#sec-empty-ranges-and-equal-bound-ranges)) alike: ordering admits no absent participant ([§7.11](#sec-lifted-operators)), and pattern position performs no narrowing. The absent case is separated first and the ordering interrogated on the bound value — `case n of null => …, var m: int when m > 70 => …, _ => … end` ([§19.5](#sec-type-pattern-matching-never-matches-null): a typed binding pattern matches only non-null values). Constant patterns over a nullable scrutinee are unaffected: a constant pattern is the equality test of [§8.4](#sec-=-and), which is total on `null` and simply does not equal a constant.
 
 **Type patterns without binding:** `string`, `int`, `Dog`. Subtypes match: a `Dog` value matches an `Animal` pattern. Subtype matching is a property of *reference-typed* scrutinees. Over an **unboxed value-typed scrutinee** (a primitive, record, enum, or inline array), a type pattern is a **static** test — the value's runtime and static type coincide ([§8.2](#sec-gettype)) — so over a non-nullable value scrutinee a type pattern naming its exact type always matches (over a *nullable* value scrutinee `T?`, the `T` pattern remains the null-rejecting refutable test of [§19.5](#sec-type-pattern-matching-never-matches-null)), and a pattern naming any *reference* type (a class, an interface — including one the value type implements — `string`, or `Object`) is a compile error: the pattern could never discriminate at runtime, and matching it would require an implicit boxing conversion, which pattern position never performs ([§8.6](#sec-boxing) boxing is a conversion at value-use sites; a pattern naming any *other* type is likewise rejected under this section's pattern/scrutinee compatibility rules). To test a value against an interface it implements, box explicitly via an `Object`-ascribed binding and match the boxed scrutinee: `var o: Object := p;` then `case o of var q: IShape => …`. The same applies to type patterns with binding (`var q: IShape`).
 
@@ -4050,7 +4049,7 @@ A named slot's `Identifier` resolves against the pattern's type, by kind:
 
 An unknown name, a duplicate name in one slot list, a write-only property ([§23.3](#sec-block-form-properties)), an indexer ([§23.4](#sec-indexers)), a static member, a record **method** or non-`public` explicit field, or — on a class — a field or method rather than a property, is a compile error at the pattern, each naming its rule. Enums and primitives have no named-destructure form (they have no slot surface). An interface-typed pattern head is not admitted in v1. Resolution honours ordinary member visibility ([§13](#sec-visibility)); v1 fixes the class set to *public* readable properties.
 
-Matching `T(N1 = p1, …, Nk = pk)` proceeds like the positional form: the **type test comes first** (subtype matching for a class hierarchy, the case-tag test for a choice case; a named pattern therefore never matches `null`, [§19.5](#sec-type-pattern-matching-never-matches-null), and no slot is read on a failed type test), then the named members are read in **textual order**, short-circuiting on the first refuted slot. Each read is the ordinary member read — a record field copy/borrow, a choice payload read, or a **class property getter invocation** — and a getter *runs* during matching: [§19.4](#sec-guards)'s first-match arm order makes the getter-evaluation order deterministic and observable, and a getter that throws propagates out of the `case` construct from the arm being tried (`pure` and contract-bearing getters keep their [§22.15](#sec-pure-members)/[§22.16](#sec-contract-clauses) semantics; matching adds no purity requirement). Each slot's right-hand side is a **full pattern** (grammar A.7 `AltPattern`): a binding (`var w`), `_`, a constant, `null`, a range, a relational, a per-slot `|` alternative among binding-free members (§19.3, unchanged), a type test, or a nested destructuring — named or positional — recursively. A **constant slot is the equality test** `scrutinee.N = c` under the slot's declared type's `=` ([§8.4](#sec-=-and), null-safe, lifted per [§7.11](#sec-lifted-operators) for a nullable slot); a constant slot whose declared type does not bear `=` (e.g. a non-auto-hashable record, [§9.2](#sec-body-records)) is a compile error at the pattern — the same use-site discipline as writing the comparison out.
+Matching `T(N1 = p1, …, Nk = pk)` proceeds like the positional form: the **type test comes first** (subtype matching for a class hierarchy, the case-tag test for a choice case; a named pattern therefore never matches `null`, [§19.5](#sec-type-pattern-matching-never-matches-null), and no slot is read on a failed type test), then the named members are read in **textual order**, short-circuiting on the first refuted slot. Each read is the ordinary member read — a record field copy/borrow, a choice payload read, or a **class property getter invocation** — and a getter *runs* during matching: [§19.4](#sec-guards)'s first-match arm order makes the getter-evaluation order deterministic and observable, and a getter that throws propagates out of the `case` construct from the arm being tried (`pure` and contract-bearing getters keep their [§22.15](#sec-pure-members)/[§22.16](#sec-contract-clauses) semantics; matching adds no purity requirement). Each slot's right-hand side is a **full pattern** (grammar A.7 `AltPattern`): a binding (`var w`), `_`, a constant, `null`, a range, a relational, a per-slot `|` alternative among binding-free members (§19.3, unchanged), a type test, or a nested destructuring — named or positional — recursively. A **constant slot is the equality test** `scrutinee.N = c` under the slot's declared type's `=` ([§8.4](#sec-=-and), null-safe over a nullable slot); a constant slot whose declared type does not bear `=` (e.g. a non-auto-hashable record, [§9.2](#sec-body-records)) is a compile error at the pattern — the same use-site discipline as writing the comparison out.
 
 A naked identifier on a named slot's right-hand side is **not** a binding. Directly after `=` — the interrogation operator — it resolves as at the top level of a pattern: a constant reference or a type test by name resolution, so `Rect(Width = w)` is an equality test when `w` names a `const`. The positional naked-binding shorthand (above) is scoped to positional slots, where there is no `=` to misread; a binding in a named slot is spelled `var w`.
 
@@ -11645,6 +11644,8 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - `default(C)` is a compile error for every choice type C; choices never satisfy `where T: new()` ([§35.10](#sec-choice-default-with), [§14.2](#sec-constraints)).
 - A non-nullable reference may not be assigned `null`.
 - A nullable value may not be dereferenced without a null check or `!`.
+- No operator lifts over a nullable operand: an operand of nullable type at an arithmetic, bitwise, shift, or relational operator — built-in or user-declared, in expression, compound-assignment ([§6.6](#sec-compound-assignments)), or `++`/`--` ([§17.6](#sec-the-increment-and-decrement-operators)) position — is a compile error naming the [§7.4](#sec-member-access-on-nullable-values)/`??`/`!` remedies ([§7.11](#sec-lifted-operators), [§4.6](#sec-string)); a relational or range **pattern** requires a non-nullable scrutinee ([§19.3](#sec-patterns), [§16.6](#sec-empty-ranges-and-equal-bound-ranges)). Equality (`=`, `<>`, [§8.4](#sec-=-and)) and the marked propagating forms (`?.`, `?(args)`, `??`, `??=`) are unaffected.
+
 - Every non-nullable field is assigned in every constructor or has a field initializer.
 - Every non-nullable local is assigned before its first read.
 - Definite-assignment analysis applies uniformly to instance and static non-nullable reference fields. A static constructor body's `try`/`catch` is subject to the same flow analysis as any constructor body: every path through the static initializer (including catch-and-recover paths) must definitely-assign every non-nullable reference static field.
