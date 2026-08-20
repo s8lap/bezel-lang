@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | study — draft (2026-08-19), awaiting owner review |
+| **Status** | accepted — accepted (owner, 2026-08-20): the §9 slate acted on — the two rulings and the recording train landed at v0.263; proposals 0107–0111 filed for slate items i/vi/v/(iv+viii+ix)/x |
 | **Tracking issue** | — |
 | **Target module(s)** | none — a survey; it adopts nothing and amends nothing. The genuinely-open items this study recommends **opening** each name their own vehicle (a proposal, a fact ruling, a rationale record, or a tooling item) in this study's §9, which also names the ones deliberately carried without one |
 | **Written against** | spec/stdlib/rationale **v0.262** (HEAD `088fb13` at authoring) — every quotation was re-verified against that tree, not taken from the research bundle |
