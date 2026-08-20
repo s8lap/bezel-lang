@@ -7260,7 +7260,7 @@ A class whose disposal **provably runs no user code and releases only memory** �
 
 `using var` on a trivial-dispose class is permitted; it names the owner explicitly and has no observable effect other than scope limitation (the free at scope end runs no user code).
 
-Standard library classes that are trivial-dispose include `Random` ([§2.7](Bezel_Standard_Library.md#sec-random) of the standard library) and the singleton `Encoding` subclass instances ([§3.2](Bezel_Standard_Library.md#sec-encoding) of the standard library). User-defined classes with no destructor, no owned fields of non-trivial-dispose type, and no owning-inline-array fields are automatically trivial-dispose.
+Standard library classes that are trivial-dispose include `Random` ([§2.7](Bezel_Standard_Library.md#sec-random) of the standard library), `StringBuilder` ([§3.1](Bezel_Standard_Library.md#sec-stringbuilder) of the standard library — it declares no destructor and no `owned` fields, and its intrinsic backing storage is released by the instance's own free, exactly as a borrowing collection's is), and the singleton `Encoding` subclass instances ([§3.2](Bezel_Standard_Library.md#sec-encoding) of the standard library). User-defined classes with no destructor, no owned fields of non-trivial-dispose type, and no owning-inline-array fields are automatically trivial-dispose.
 
 <a id="sec-trivial-dispose-for-generic-class-instantiations"></a>
 #### Trivial-dispose for generic class instantiations
