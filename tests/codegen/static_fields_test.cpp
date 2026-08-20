@@ -135,12 +135,19 @@ BEZEL_TEST(codegen_cg12, static_array_literal_field_743) {
         "end Main; end C;"), "340");
 }
 
-// On an ENUM (the original repro): a static array of the enum's values.
-BEZEL_TEST(codegen_cg12, enum_static_array_literal_field_743) {
+// On an ENUM (the original repro): a static FrozenArray of the enum's
+// values — the §10.4 v0.256 spelling (`FrozenArray<Color>.From([...])`).
+// Fix #3249: FrozenArray<T> carries the immutable fact (stdlib §4.19), so
+// this `static readonly` of it is the sanctioned spelling the spec's
+// §10.4 example names (the pre-#3249 `Array<Color>` shape would draw
+// §22.12 rule 4's sharing warning; FrozenArray<Color> does not, by being
+// in rule 4's warning-suppression set).
+BEZEL_TEST(codegen_cg12, enum_static_frozen_array_literal_field_3249) {
     BEZEL_EXPECT_EQ(runProg(
         "module M; "
         "enum Color Red, Green, Blue; "
-        "  public static readonly All: Array<Color> := [Red, Green, Blue]; "
+        "  public static readonly All: FrozenArray<Color> := "
+        "      FrozenArray<Color>.From([Red, Green, Blue]); "
         "end Color; "
         "class C public static method Main(): int return Color.All.Length; end Main; "  // 3
         "end C;"), 3);

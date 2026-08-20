@@ -751,13 +751,24 @@ bool Emitter::isFfiBufferTypeRef(const sema::TypeRef* rt) {
 
 
 bool Emitter::isCollectionTypeName(const sema::TypeRef* rt) {
-    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+    // Reject a USER-CLASS declaration — only builtin shapes are the array-backed
+    // collections named in the spec. `rt->declaration` can be null (the
+    // declaration-less Named shape TypeResolution produces for an annotation) OR
+    // a builtinClassSym (the declaration stamped for a static-factory result
+    // like `FrozenArray<T>.From(...)`); both are accepted, and the actual
+    // membership test is the name-only lookup on the registry below.
+    if (rt->declaration && (rt->declaration->decl ||
+                            !rt->declaration->moduleName.empty()))
         return false;
     std::string_view n = builtinTypeName(rt);  // handles both astNode and importedName
     if (n.empty()) return false;
     // per §4.6/§4.7: LinkedList/OwningLinkedList are NOT array-backed — they
     // use bz_llist_t; §4.14 OwningBuffer<T> IS bz_array_t-backed. The name set
     // lives in the #1414 stage-3 registry (one home, snapshot-pinned).
+    // fix #3249: §4.19 FrozenArray<T> joins the array-backed set (it shares
+    // bz_array_t* storage with Array<T>); its `From(...)` factory result carries
+    // builtinClassSym, which this predicate now also accepts.
     return common::isArrayBackedCollectionName(n);
 }
 

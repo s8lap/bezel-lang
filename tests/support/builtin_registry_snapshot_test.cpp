@@ -94,7 +94,7 @@ BEZEL_TEST(builtin_registry_snapshot, owning_prefix_predicate) {
 
 // --- isArrayBackedCollectionName (§4.4–§4.7/§4.14) : isCollectionTypeName ---
 BEZEL_TEST(builtin_registry_snapshot, array_backed_collection_set) {
-    static constexpr std::array<std::string_view, 10> kSnapshot = {
+    static constexpr std::array<std::string_view, 11> kSnapshot = {
         "Array",  "OwningArray", "OwningBuffer",
         "Stack",  "OwningStack", "Queue",
         "OwningQueue", "Set",    "OwningSet",
@@ -102,6 +102,12 @@ BEZEL_TEST(builtin_registry_snapshot, array_backed_collection_set) {
         // collection-dispatch gate — it was MISSING pre-#1426 (i32-typed,
         // lowerNew no-op), the 4th missed-name-list instance.
         "SortedSet",
+        // INTENTIONAL addition (fix #3249, stdlib §4.19, v0.186): FrozenArray<T>
+        // — the deeply-immutable shared-read primitive shares the bz_array_t*
+        // rep with Array<T> (the same `Length`/indexer/`ToArray`/destructor
+        // runtime functions; the only differences are the absence of mutating
+        // members and the §22.12-suppression-set membership).
+        "FrozenArray",
     };
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isArrayBackedCollectionName(n));
     // LinkedList (bz_llist_t) and Dictionary (bz_dict_t) are NOT array-backed.
@@ -180,12 +186,16 @@ BEZEL_TEST(builtin_registry_snapshot, iterable_interface_head_set) {
 // (imported-only) are deliberately NOT in the shared set — they are the small
 // site-local deltas the two call sites still test explicitly.
 BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
-    static constexpr std::array<std::string_view, 66> kSnapshot = {
+    static constexpr std::array<std::string_view, 67> kSnapshot = {
         "Array", "OwningArray", "Dictionary", "OwningDictionary",
         // INTENTIONAL addition (stdlib §4.18, #1426): SortedSet — bz_dict_t*
         // rep on both the astNode and imported paths.
         "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
         "Set", "OwningSet", "LinkedList", "OwningLinkedList", "LinkedListNode",
+        // INTENTIONAL addition (fix #3249, stdlib §4.19, v0.186): FrozenArray<T>
+        // — heap-allocated via the §4.19 `From` overloads; same bz_array_t*
+        // rep on both rep paths.
+        "FrozenArray",
         // INTENTIONAL addition (fix #1740, v0.254): OwningBuffer<T> is a
         // heap-owning collection (ptr rep on the astNode path; identical role
         // to OwningArray<T>). Historically the BuiltinRegistry separated it
@@ -342,6 +352,10 @@ BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
                                "OwningDictionary", "SortedDictionary",
                                "SortedSet", "Stack", "Queue", "Set",
                                "LinkedList", "LinkedListNode",
+                               // fix #3249 (§4.19, v0.186): FrozenArray<T> —
+                               // heap-allocated, no vtable; the same vtable-less
+                               // treatment as Array<T> on the bz_array_t* rep.
+                               "FrozenArray",
                                "StringBuilder", "Random", "Stopwatch",
                                "FileStream", "Task", "OwningTask",
                                "Subscription", "CancellationToken",
@@ -432,6 +446,10 @@ BEZEL_TEST(builtin_registry_snapshot, builtin_interface_head_set_8_1) {
                                "OwningDictionary", "SortedDictionary",
                                "SortedSet", "Stack", "Queue", "Set",
                                "LinkedList", "LinkedListNode",
+                               // fix #3249 (§4.19, v0.186): FrozenArray<T> —
+                               // reserved built-in CLASS (not interface head);
+                               // it sits in the vtable-less half of the split.
+                               "FrozenArray",
                                "StringBuilder", "Random", "Stopwatch",
                                "FileStream", "Task", "OwningTask",
                                "Subscription", "CancellationToken",
@@ -534,7 +552,7 @@ BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3
 // deliberately does not name them) stay OUT — they render lowercase or
 // not at all, respectively.
 BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
-    static constexpr std::array<std::string_view, 77> kSnapshot = {
+    static constexpr std::array<std::string_view, 78> kSnapshot = {
         // §2 System — §2.5/§2.6 value-builtins whose box thunk renders the
         // type-name literal (fix #3119 (a)).
         "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid",
@@ -563,6 +581,8 @@ BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
         "Set", "OwningSet", "SortedSet", "Dictionary", "OwningDictionary",
         "SortedDictionary", "LinkedList", "OwningLinkedList",
         "LinkedListNode", "OwningBuffer",
+        // fix #3249 (§4.19, v0.186): FrozenArray<T> — System.Collections.Generic.
+        "FrozenArray",
         // §6 System.Threading — sync, atomics, channels, nursery, etc.
         "Mutex", "Lock", "Semaphore", "SemaphoreToken", "Atomic",
         "AtomicInteger", "TaskCompletionSource", "OwningTaskCompletionSource",

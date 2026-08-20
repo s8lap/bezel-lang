@@ -1508,7 +1508,16 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                    // the type name (CString.From) is accepted in expression position.
                    id->name == "CString" ||
                    id->name == "WString" ||
-                   id->name == "RawBytes") {
+                   id->name == "RawBytes" ||
+                   // fix #3249 (§4.19, v0.186): FrozenArray<T> — the §4.19
+                   // shared-read primitive has a static factory
+                   // (`FrozenArray<T>.From(items: Array<T>)` — the spec's
+                   // example at §10.4). Recognized here so the bare
+                   // `FrozenArray<T>.From` member-access shape compiles and
+                   // the IdentifierExpr's typeArgs path (line ~1211 below)
+                   // builds the instantiated TypeRef against the
+                   // builtinClassSym declaration.
+                   id->name == "FrozenArray") {
             // §2.3: these System classes are auto-imported and always
             // available without an explicit import. Give them a synthetic
             // TypeSymbol (null decl) so member access can proceed; the

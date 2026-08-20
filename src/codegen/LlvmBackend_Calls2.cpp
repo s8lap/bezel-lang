@@ -200,6 +200,86 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
 }
 
 
+// fix #3249 (§4.19, v0.186): FrozenArray<T>.From(items: Array<T>): owned
+// FrozenArray<T> — the §4.19 copying construction form. The O(n) copy: allocate
+// a fresh bz_array_t of the source's count and copy the storage. The result
+// carries no disposer (FrozenArray's element type is restricted to sendable
+// value types + string; the string case is paid here as one retain — see
+// emitArrayRetainStringsIfStringArray, the same call site Array.Reversed uses
+// at #429 — so bz_array_free's disposer argument is null). Returns null when
+// the call is not this shape (no MemberAccessExpr target named FrozenArray, or
+// the member isn't `From`, or the call carries no argument).
+llvm::Value* Emitter::tryLowerFrozenArrayCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    // The receiver is the TYPE reference `FrozenArray<T>` — a MemberAccessExpr
+    // with target=IdentifierExpr("FrozenArray"). Detect both shapes: the bare
+    // identifier `FrozenArray` (no generic args, only used with explicit
+    // substitution) and the qualified `FrozenArray<T>` head.
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id || id->name != "FrozenArray") return nullptr;
+    if (ma->member != "From") return nullptr;
+    if (call.args.size() != 1 || !call.args[0].value) return nullptr;
+
+    // Confirm sema resolved the call to a builtin FrozenArray result
+    // (ExprTypecheck_Calls.cpp stamps it). Without this conjunct a user type
+    // named `FrozenArray` with a static `From` would also match — the same
+    // protection #977's CString.From arm uses.
+    const sema::TypeRef* resTy = ctx_.exprType(call);
+    if (builtinTypeName(resTy) != "FrozenArray") return nullptr;
+
+    // The source is typically a CollectionLiteralExpr `[a, b, c]` (the §10.4
+    // example) — `lowerExpr` returns null for it (the ordinary expression
+    // path doesn't materialize collections; the call-argument path at
+    // LlvmBackend_Assign.cpp:10592 does). We're dispatched BEFORE that
+    // argument-lowering path runs, so we materialize the literal ourselves.
+    // FrozenArray<T> shares bz_array_t* storage with Array<T> (#3249), so the
+    // materializer's `isCollectionTypeName` check now accepts both shapes
+    // (LlvmBackend_Calls.cpp:isCollectionTypeName widened to admit the
+    // builtinClassSym-declaration form). Passing resTy (FrozenArray<T>) yields
+    // the same bz_array_t* shape an Array<T> target would — and bz_array_copy
+    // doesn't care about the source TypeRef's nominal identity.
+    llvm::Value* src = nullptr;
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+            call.args[0].value.get())) {
+        if (!cl->isDict) {
+            src = materializeHeapCollectionLiteral(cl, resTy);
+        } else {
+            src = materializeHeapDictLiteral(cl, resTy);
+        }
+    }
+    if (!src) {
+        // Not a collection literal (e.g. a named Array<T> variable) — fall
+        // through to lowerExpr for the ordinary expression path.
+        src = lowerExpr(*call.args[0].value);
+    }
+    if (!src) return nullptr;
+
+    // bz_array_copy(src, elem_size) — the §4.19 copying construction. The
+    // byte-stride is the source's element type size, which collectionElemSize
+    // reads from genericArgs[0] (same as Array<T>.Reversed()).
+    int64_t esz = collectionElemSize(resTy);
+    auto* copyFn = declareC("bz_array_copy", ptrTy(), {ptrTy(), i64()});
+    llvm::Value* copy = builder_.CreateCall(
+        copyFn, {src, builder_.getInt64(esz)}, "farr.copy");
+
+    // #429 / §4.6 / §28.9: a copied Array<string> independently co-owns a +1
+    // per element. Retain each so the FrozenArray can release symmetrically
+    // at its own free. Retain is null/sentinel-safe; a non-string element
+    // type is a no-op.
+    emitArrayRetainStringsIfStringArray(resTy, copy);
+
+    // §28.3: free the source Array<T> temporary now that the FrozenArray owns
+    // its own copy. The source's element policy is the borrowing form (no
+    // disposer), matching the bz_array_free call's null 2nd arg.
+    auto* freeFn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+    builder_.CreateCall(freeFn, {src, llvm::ConstantPointerNull::get(ptrTy())});
+    return copy;
+}
+
+
 // spec §32.6 / stdlib §10.4 (v0.240, #2734): the shared lowering of every
 // "C buffer → Bezel string" conversion — `string.From(c: CString)`,
 // `string.From(w: WString)`, `string.FromCStringPointer(p)` and
@@ -3653,6 +3733,14 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
     if (auto* v = tryLowerEncodingCall(call)) return v;
+    // fix #3249 (§4.19, v0.186): FrozenArray<T>.From(items: Array<T>) — the
+    // §4.19 copying construction form. Dispatched BEFORE the method-symbol
+    // path because the call's callee is a TYPE reference (no resolved
+    // MethodSymbol on a builtinClassSym — it has no user TypeDecl), so the
+    // regular dispatch would diagnose "no matching overload" before reaching
+    // the runtime copy. tryLowerFrozenArrayCall returns null for any other
+    // shape, so the regular path runs unchanged.
+    if (auto* v = tryLowerFrozenArrayCall(call)) return v;
     // §30.14/§30.15 (#600 phase c): Channel<T>/ChannelSender<T> methods + Domain.Spawn.
     if (auto* v = tryLowerChannelAndDomainCall(call)) return v;
     // §6.2 / issue #647: Mutex.Acquire / TryAcquire / AcquireAsync / TryAcquireAsync.

@@ -221,6 +221,16 @@ int Resolver::builtinTypeArity(std::string_view n) {
         // §4.14 / issue #550: OwningBuffer<T> (e.g. OwningBuffer<byte> returned
         // by BinarySerializer.ToBytes() per stdlib §2.15).
         n == "OwningBuffer" ||
+        // fix #3249 (§4.19, v0.186): FrozenArray<T> — the deeply-immutable,
+        // fixed-size, bz_array_t*-backed shared-read primitive. Arity 1; the
+        // resolved TypeRef carries no user TypeDecl (the declaration-less Named
+        // shape every other §4 collection type uses here). Element-type
+        // restriction is the §3.6 structural check (T must be a sendable value
+        // type or string; classes/records excluded — the FrozenArray.From
+        // copying overload does not admit class trees, the recorded pressure
+        // on the §4.19 prose's "frozen ownership trees are a designed future
+        // extension").
+        n == "FrozenArray" ||
         // §4.14-§4.15 / issue #959: the concrete span VALUE types — borrowing
         // spans over Array<T> (ArraySpan/ReadOnlyArraySpan, §4.15) and owning
         // spans over OwningBuffer<T> (Span/ReadOnlySpan, §4.14). Each carries a
