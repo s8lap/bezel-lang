@@ -371,11 +371,11 @@ Forget the adoption and the loop variable auto-drops each iteration with a per-i
 **Yielding an owned local — adopt, then yield.** Same shape: pin a named owned value before yielding it.
 
 ```bezel
-using var l := move line;         // warning-free
+using var l := move line;         // warning-free *at the producer*
 yield return l;
 ```
 
-In a *borrowing* iterator the bare `yield return line;` also compiles (it re-borrows the frame-resident value) but leaves the must-use warning on `line`. In an *owning* iterator that bare yield instead *consumes* `line` — the owning return type is the target announcement, so no marker is needed.
+In a *borrowing* iterator the bare `yield return line;` also compiles (it re-borrows the frame-resident value) but leaves the must-use warning on `line`. Both spellings hand the *enumerator's frame* the element, so a consumer's class-element terminal accessor (`First()`, `Last()`, …) over such an iterator draws its own warning — Guide 5 §6 (spec §29.11, v0.268). In an *owning* iterator that bare yield instead *consumes* `line` — the owning return type is the target announcement, so no marker is needed.
 
 **Frame-disposed `owned` parameters — adopt on entry.** An `owned` parameter of an iterator or async method is disposed by the frame at teardown, but the must-use warning still fires at the parameter; `using var r := move reader;` on the first line declares the intent and silences it.
 
