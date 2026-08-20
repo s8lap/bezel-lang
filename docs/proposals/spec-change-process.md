@@ -150,7 +150,7 @@ Two supporting rules the runs learned:
 The paired records that support the queue:
 
 - `docs/proposals/README.md` — the index and status of every proposal + the supporting records.
-- `docs/proposals/DECLINED.md` — the declined register, with reasons.
+- `docs/proposals/DECLINED.md` — the declined register and the decline index: the register carries this folder's own declined-with-reasons entries, and the index above it is the single ground-truth for *where* every recorded decline, deferral, non-goal, and retirement lives across all five homes (it points; it never restates a reason).
 - `docs/proposals/implementation-roadmap-2026-07.md` — the sequenced work-list for turning accepted proposals and landed-but-unimplemented rulings into compiler work.
 
 ---
@@ -162,6 +162,7 @@ For a **ruling** or a **design-change graduation** (the full path):
 - [ ] Classify the change (§2). Design change → it must already be an accepted proposal (§6).
 - [ ] If the change touches §28/§30.5: state its kernel classification — derivation (name the K's), axiom extension (name the axiom), or new axiom (add the register row with its recorded reason) (v0.198).
 - [ ] If the change adds or alters a compile-time rule: state its body-locality classification (proposal 0105 §1) — **local** (no cross-body information), **fact-discharged** (names the per-body facts it consumes), **carve-out** (generic instantiation, confined to its two clauses), or **invariant amendment** (explicit, with the recorded reason) (v0.262).
+- [ ] If the change records a new decline, deferral, non-goal, or retirement — or graduates or declines a proposal: add or update its row in `DECLINED.md`'s decline index in the same commit, with its verdict class, its authoritative record (file + section), and its reopening bar or `—(none stated)`. This binds a decline recorded **outside** a graduation train too — a per-section decision record, a rationale amendment, a gate-round ruling — since that is how most declines actually arrive (v0.262-era, owner-commissioned 2026-08-20).
 - [ ] Author the ruling with exact `old→new` edits; cite every `§` against the current heading.
 - [ ] Adversarial critique; resolve every blocking finding (no silent drops) (§4).
 - [ ] If multiple trains in one revision: run the composition gate over the union (§4).
