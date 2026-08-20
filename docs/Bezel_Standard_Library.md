@@ -5082,15 +5082,15 @@ public record Range<T>: IEnumerable<T>
   public readonly property End: T?;                // null if open-ended on the upper side
   public readonly property Step: long;             // default 1; signed to support descending
   public readonly property IsEndInclusive: bool;   // true for `..`, false for `..<`
-  public readonly property IsOpenEnded: bool;      // true if Start or End is null
-  public readonly property IsEmpty: bool;          // true if the range contains no values
+  public pure readonly property IsOpenEnded: bool; // true if Start or End is null
+  public pure readonly property IsEmpty: bool;     // true if the range contains no values
 
   public pure method Contains(value: T): bool;
   public method GetEnumerator(): owned IEnumerator<T>;
 end Range;
 ```
 
-All six declared properties are the type's auto-property surface for the language's generated members (spec [§8.5](Bezel_Language_Spec.md#sec-tostring)/[§9.2](Bezel_Language_Spec.md#sec-body-records), v0.255): the generated `ToString` renders all six — `IsOpenEnded` and `IsEmpty` recomputed exactly as their member reads compute (spec [§16.3](Bezel_Language_Spec.md#sec-range-operations)) — whatever the intrinsic's storage layout.
+All six declared properties are the type's auto-property surface for the language's generated members (spec [§8.5](Bezel_Language_Spec.md#sec-tostring)/[§9.2](Bezel_Language_Spec.md#sec-body-records), v0.255): the generated `ToString` renders all six — `IsOpenEnded` and `IsEmpty` recomputed exactly as their member reads compute (spec [§16.3](Bezel_Language_Spec.md#sec-range-operations)) — whatever the intrinsic's storage layout. That surface decides the *generated members*, not purity: `Start`, `End`, `Step` and `IsEndInclusive` read stored slots, so their getters are pure by classification (spec [§22.15](Bezel_Language_Spec.md#sec-pure-classification)) and the marker on them would be redundant, while `IsOpenEnded` and `IsEmpty` are recomputed and therefore carry `pure` as the stated contract of a runtime-provided body — which `Contains` needs, its normative formula reading `IsEmpty` ([§16.3](Bezel_Language_Spec.md#sec-range-operations)).
 
 `Contains(v)` is `true` iff the range is nonempty under iteration and `v` lies within the endpoint extent (exclusive upper bound excluded) — an empty range contains nothing, and `Contains` agrees with range patterns on the stepless forms (language spec [§16.3](Bezel_Language_Spec.md#sec-range-operations), v0.162). `Step` affects membership only through direction/emptiness. This is the operation invoked by the `in` operator (spec [§17.5](Bezel_Language_Spec.md#sec-the-in-operator)). `Contains` is **`pure`** — the intrinsic-purity contract of spec [§22.15](Bezel_Language_Spec.md#sec-pure-members), normative for the implementation: the result is a function of the receiver's components and the argument, evaluated by the membership formula above, and the runtime-provided body writes no storage outside its own frame, allocates nothing, and raises nothing. The marker is what admits a range test inside a contract clause: `requires(port in 0..65535)` is a [§22.16](Bezel_Language_Spec.md#sec-contract-clauses) clause expression, whose `in` call §22.15's calls-to-pure-members rule permits. `GetEnumerator` is not `pure` and cannot be: it produces an owned class instance, and §22.15's pure body prohibits calls returning `owned` class instances — whatever the return's declared interface spelling.
 
