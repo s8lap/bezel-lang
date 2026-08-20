@@ -38,6 +38,7 @@ import sys
 
 DOCS = [
     ("spec",   "docs/Bezel_Language_Spec.md"),
+    ("codegen", "docs/Bezel_For_Code_Generation.md"),
     ("guide1", "docs/Bezel_Guide_01_Memory_and_Ownership.md"),
     ("guide2", "docs/Bezel_Guide_02_Errors_and_Nullability.md"),
     ("guide3", "docs/Bezel_Guide_03_Modeling_Data.md"),

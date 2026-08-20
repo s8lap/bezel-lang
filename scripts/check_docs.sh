@@ -67,6 +67,7 @@ DOCS = {
     'stdlib':    'docs/Bezel_Standard_Library.md',
     'rationale': 'docs/Bezel_Design_Rationale.md',
     'changelog': 'docs/Bezel_Changelog.md',
+    'codegen':   'docs/Bezel_For_Code_Generation.md',
     'guide01':   'docs/Bezel_Guide_01_Memory_and_Ownership.md',
     'guide02':   'docs/Bezel_Guide_02_Errors_and_Nullability.md',
     'guide03':   'docs/Bezel_Guide_03_Modeling_Data.md',
