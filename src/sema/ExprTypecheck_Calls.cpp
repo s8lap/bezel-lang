@@ -12840,6 +12840,54 @@ static bool propertyDeclIsSetOnly(const ast::PropertyDecl* pd) {
     return hasSet && !hasGet;
 }
 
+// fix #2945 (§14.1 / §2.8.3 rule 4 / §2.5, v0.252): helper for the
+// layout-identical predicate. Walks the TypeRef recursively — head names,
+// genericArgs, function parameters, function return, inline-array element —
+// and returns true if any part of it has a HEAD NAME that matches a name in
+// `names`. A null TypeRef returns false (not "uses nothing" — that's the
+// default for an unresolved or absent type, which the caller is responsible
+// for handling separately; this helper is only called when `ref` is
+// non-null). Conservative in the right direction: a type whose head is a
+// generic param of the receiver class moves under substitution (T -> i32 vs
+// T -> ptr), a generic instantiation of which a generic param is an
+// argument (List<T>) moves in the same way, a function with a T-typed
+// parameter or return moves similarly, and an array of T (`T[]`) moves.
+// Nothing admitted here that the codegen-side
+// `instanceLayoutDiffersFromErasedTemplate` would call layout-different;
+// some layout-different shapes (`Func<int>` for a class-typed function
+// argument, etc.) might be admitted here because we cannot inspect their
+// bodies without lowering — that is the documented narrowness (#2945 calls
+// it out: "a disagreement between the two would put the rejection and the
+// fill out of step", and a too-broad admit would silently wrong-value).
+static bool typeRefReferencesAnyNameIn(
+    const TypeRef* ref,
+    const std::unordered_map<std::string_view, std::size_t>& names) {
+    if (!ref) return false;
+    switch (ref->kind) {
+        case TypeRef::Kind::Error:
+        case TypeRef::Kind::Primitive:
+        case TypeRef::Kind::Unit:
+            return false;
+        case TypeRef::Kind::Named: {
+            if (names.count(ref->headName()) != 0) return true;
+            for (const TypeRef* arg : ref->genericArgs) {
+                if (typeRefReferencesAnyNameIn(arg, names)) return true;
+            }
+            return false;
+        }
+        case TypeRef::Kind::InlineArray: {
+            return typeRefReferencesAnyNameIn(ref->arrayElement, names);
+        }
+        case TypeRef::Kind::Function: {
+            for (const auto& p : ref->funcParams) {
+                if (typeRefReferencesAnyNameIn(p.type, names)) return true;
+            }
+            return typeRefReferencesAnyNameIn(ref->funcReturn, names);
+        }
+    }
+    return false;
+}
+
 // fix #3177 (§14.1 / §2.8.3 rule 4 / §13 / §23 / §2.5 / §7.5, v0.254):
 // the two IMPORTED-property access DECLINES, asked once for both member-access
 // spellings. `resolveMemberAccess` (`.`) has carried them since #2884/#2943;
@@ -12901,7 +12949,114 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
         ctx_.isImported(ips->parent) &&
         !ips->parent->genericParams.empty() &&
         (ips->parent->kind == ast::TypeDeclKind::Class ||
-         ips->parent->kind == ast::TypeDeclKind::Record)) {
+         ips->parent->kind == ast::TypeDeclKind::Record) &&
+        // fix #2945 (§14.1 / §2.8.3 rule 4 / §2.5 / §23, v0.252): narrow
+        // #2884's decline to admit the layout-identical, non-virtual,
+        // non-static case whose accessor #2894's export-side lift made
+        // correct. The cheap sema-side proxy "no field of the class or any
+        // ancestor declares a generic-parameter-typed type, and the
+        // property's own type also does not" mirrors the codegen-side
+        // `instanceLayoutDiffersFromErasedTemplate` (#2894's own gate) —
+        // conservative in the right direction (it admits nothing that
+        // #2894's gate would refuse, and refuses some admissible cases
+        // the codegen gate would admit, e.g. `List<int>` vs `List<T>`-on-
+        // erased-but-ptr-when-substituted shapes). The virtual and static
+        // arms stay declined because the exporter skips both
+        // (`isVirtualProperty(ps)` and `mod == "static"` gates in
+        // `emitExportedProperty{Getters,Setters}`), so the symbol genuinely
+        // does not exist for either shape. The property's-own-type-uses-T
+        // arm stays declined because the exported stub's ABI is the i32
+        // placeholder (the T-erased template type), which would silently
+        // mis-represent a non-int substitution. All four predicates are
+        // local reads of `ips`, `ips->parent` and the parent chain — no
+        // sema pass ordering beyond what #2884 already assumes.
+        ![&]() -> bool {
+            // (1) virtual / override / abstract: importer-side the symbol
+            // is statically known to be virtual, exporter-side the stub is
+            // skipped, so the symbol genuinely does not exist.
+            for (auto mod : ips->modifiers) {
+                if (mod == "virtual" || mod == "override" ||
+                    mod == "abstract")
+                    return false;
+            }
+            // (2) static: the exporter skips static properties
+            // (`mod == "static"` gate at LlvmBackend_Setup.cpp ~2459),
+            // so the `$propget`/`$propset` symbols are not emitted.
+            for (auto mod : ips->modifiers) {
+                if (mod == "static") return false;
+            }
+            // Build a name → index map of THIS CLASS's generic params —
+            // this is the only param-name set whose substitution moves a
+            // field's or property's type at this access site (the field
+            // / property is declared on this class, so any other class's
+            // params are not in scope here).
+            std::unordered_map<std::string_view, std::size_t> gpIndex;
+            for (std::size_t gi = 0; gi < ips->parent->genericParams.size();
+                 ++gi) {
+                if (auto* gp =
+                        dynamic_cast<const GenericParamSymbol*>(
+                            ips->parent->genericParams[gi]))
+                    gpIndex[gp->name] = gi;
+            }
+            if (gpIndex.empty()) return false;  // sanity: a non-empty
+                                               // genericParams should
+                                               // always carry names.
+            // Walk the base chain (own + ancestors) and refuse if any
+            // class in it declares a field whose TYPE references one of
+            // its own generic params (an ancestor's field's T is bound
+            // to the ANCESTOR's T, but the substitution still moves the
+            // field's storage width — `T -> i32` vs `T -> ptr` — so the
+            // gate stays refused).
+            std::vector<const TypeSymbol*> work;
+            work.push_back(ips->parent);
+            for (std::size_t wi = 0; wi < work.size(); ++wi) {
+                const TypeSymbol* cur = work[wi];
+                if (!cur) continue;
+                std::unordered_map<std::string_view, std::size_t>
+                    curGpIndex;
+                for (std::size_t gi = 0; gi < cur->genericParams.size();
+                     ++gi) {
+                    if (auto* gp =
+                            dynamic_cast<const GenericParamSymbol*>(
+                                cur->genericParams[gi]))
+                        curGpIndex[gp->name] = gi;
+                }
+                for (Symbol* m : cur->members) {
+                    auto* fs = dynamic_cast<FieldSymbol*>(m);
+                    if (!fs) continue;
+                    TypeRef* fty = nullptr;
+                    if (auto* fd =
+                            dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+                        if (fd->type)
+                            fty = ctx_.resolvedType(*fd->type);
+                    } else if (!fs->decl) {
+                        // IMPORTED field: ride the loader's
+                        // importedMemberType side table, exactly as
+                        // #2943's predicate below does.
+                        fty = ctx_.importedMemberType(fs);
+                    }
+                    if (!typeRefReferencesAnyNameIn(fty, curGpIndex))
+                        continue;
+                    return false;
+                }
+                for (const TypeSymbol* b : cur->baseTypes) work.push_back(b);
+            }
+            // (3) the property's own TYPE uses a generic param of the
+            // receiver class — the exported stub's ABI is the i32
+            // placeholder, so a non-int substitution would silently
+            // mis-represent the value (e.g. `property P: T` on
+            // `GBox<T>` instantiates to `P: ptr` at runtime but the
+            // stub's lowerType(T) lowered to `i32`).
+            TypeRef* pty = nullptr;
+            if (auto* pd =
+                    dynamic_cast<const ast::PropertyDecl*>(ips->decl)) {
+                if (pd->type) pty = ctx_.resolvedType(*pd->type);
+            } else if (!ips->decl) {
+                pty = ctx_.importedMemberType(ips);
+            }
+            if (typeRefReferencesAnyNameIn(pty, gpIndex)) return false;
+            return true;
+        }()) {
         ctx_.diagnostics().report(
             Severity::Error, loc,
             "property `" + std::string(ips->name) +
