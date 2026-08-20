@@ -3485,6 +3485,28 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
 
 llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
+    // §22.16 (v0.250, #3038): `old(E)` inside an `ensures` clause. The
+    // capture slot was allocated by `allocateOldCaptureSlots` and the
+    // entry-time value was stored there by `captureOldOperands` (both
+    // called from the `emitFunctionBody` driver in Setup.cpp). The
+    // ensures clause body's read is just a load from that slot — the
+    // call itself does not re-evaluate E, which is exactly the
+    // §22.16 "value E had at the member's entry" semantics.
+    if (auto* oldId =
+            dynamic_cast<const ast::IdentifierExpr*>(call.callee.get())) {
+        if (oldId->name == "old" && call.args.size() == 1) {
+            auto it = oldCaptureSlots_.find(&call);
+            if (it != oldCaptureSlots_.end()) {
+                return builder_.CreateLoad(
+                    it->second->getAllocatedType(), it->second, "old");
+            }
+            // No capture slot — sema did not bind this `old` (it
+            // lives outside an `ensures` clause, or the clause is
+            // itself malformed). Fall through to ordinary dispatch,
+            // which will produce the standard "no method named old"
+            // diagnostic.
+        }
+    }
     // Pre-create out var slots so lvalueAddr can find them in all paths.
     ensureOutVarSlots(call);
     // fix #2966 (v0.240): the same observation `lowerCall`'s wrapper makes,
@@ -10800,9 +10822,9 @@ llvm::Value* Emitter::emitGenericSpecialization(sema::MethodSymbol* ms,
 llvm::Function* Emitter::buildSpecializedMethodFn(
         sema::MethodSymbol* ms, const CallableInfo& ci,
         const std::vector<llvm::Type*>& paramTys) {
-    // Build the substitution key for caching. per §14.2 (monomorphization): the
-    // key must distinguish instantiations whose specialized bodies differ. The
-    // erased LLVM type vector alone is not enough — every class/interface type
+    // Build the substitution key for caching. per §2.8.3 rule 4 (monomorphization):
+    // the key must distinguish instantiations whose specialized bodies differ.
+    // The erased LLVM type vector alone is not enough — every class/interface type
     // erases to `ptr`, so `Maker<A>.Run` and `Maker<B>.Run` would collide on
     // `[ptr]` and the second would reuse the first's body (wrong when the body
     // disposes a concrete class via `using var a := new T()`). Pair each LLVM
@@ -10818,7 +10840,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // test inside baked the FIRST T's per-monomorphization descriptor, silently
     // mis-dispatching (over-match / wrong body, order-dependent). The recursive
     // key encodes every nested type argument, exactly as the runtime descriptor
-    // identity (§12.9 invariance) does, so distinct nested instantiations that
+    // identity (§12.7 invariance) does, so distinct nested instantiations that
     // share a top-level declaration get DISTINCT bodies.
     std::vector<llvm::Type*> substKey;
     std::vector<std::string> idKey;
@@ -11331,7 +11353,7 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // parent) or implementers (interface parent), each paired with the
     // implementation it runs.
     //
-    // fix #2896 (§12.9 "Type identity", v0.240): `desc`/`subst` carry what a
+    // fix #2896 (§12.7 "Type identity", v0.240): `desc`/`subst` carry what a
     // GENERIC candidate needs and the shared, declaration-level `descArray_[c]`
     // cannot supply. A `DGen<string>` object's vtable slot 0 holds
     // `td$DGen_string` — its PER-INSTANTIATION descriptor (#1843) — so a

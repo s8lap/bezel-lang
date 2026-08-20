@@ -91,12 +91,16 @@ bool isLinkedListName(std::string_view n);
 // NOT an object with a header, so any handler that reaches into one at a
 // `%bz.string` field offset reads out of bounds.
 //
-// This is the set the member-access handlers in `LlvmBackend_Exprs.cpp` must
-// recognise BEFORE the declaration-less `.Length` string fallback claims the
-// receiver: `isStringFallbackTarget` is a negative list ("not StringBuilder,
-// not Buffer, not FileStream, not a collection → assume `%bz.string`"), and
-// these three were its fifth missing category (#2809: a `c: CString` parameter
-// read `c.Length` as a `%bz.string` length field → heap-buffer-overflow).
+// The member-access handlers in `LlvmBackend_Exprs.cpp` recognise these three
+// via `isFfiBufferTypeRef` (which reads `builtinTypeName` for the
+// declaration-less ANNOTATION shape AND the built-in factory shape) so a
+// `c: CString` parameter's `.Length` is dispatched to `strlen`/`bz_wstrlen`/
+// `bz_rawbytes_length` rather than `loadStringLen` (#2809: the parameter
+// shape's `%bz.string` field-1 read was an ASan heap-buffer-overflow). After
+// #2933 the `isStringFallbackTarget` predicate in `LlvmBackend_Exprs.cpp` is
+// a POSITIVE list (return true ONLY when the receiver gives no information
+// to rule a `%bz.string` out), so these three names are no longer excluded
+// FROM the predicate — each dedicated `.Length` arm matches on its own.
 // The FFI value TYPES `IntPtr`/`UIntPtr` are deliberately NOT here: they are
 // pointer-sized integers, not buffers, and no member handler dereferences one.
 // per §32.5 / stdlib §10.1–§10.3

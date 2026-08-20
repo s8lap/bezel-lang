@@ -1369,6 +1369,217 @@ void Resolver::checkTopLevelVisibility() {
     }
 }
 
+// fix #3032 (§15.4.1, v0.262): a type declaring a static
+// `FromCollectionLiteral` whose carrier is a recognized form
+// (`ReadOnlySpan<T>` or `owned OwningArray<T>`) must be `public` and must
+// return `owned C<T>` at the enclosing type's own arity; declaring both
+// carriers on the same type is a compile error. #2957 deliberately scoped
+// the recognition predicate to the three mechanically-distinguishable
+// conjuncts (exact name, `static`, exactly one recognized carrier) and
+// declared these three conjuncts out of scope — folding them into the
+// recognition predicate would reclassify such a type as "not a
+// sequence-literal target at all", which is the wrong advice (the target
+// type is fine; the factory's modifier or return type is at fault). The
+// check therefore fires on the method's own declaration so the user sees a
+// declaration-site diagnostic that points at the offending method, not at
+// every literal site that targets it.
+//
+// Three conjuncts are checked (the three explicitly enumerated by §15.4.1
+// v0.262, lines 2942-2954):
+//   1. public — visibility must be `ast::Visibility::Public`.
+//   2. owned C<T> return — must return `owned`, and the return type's head
+//      must be the enclosing type with the same arity as the enclosing
+//      type's generic-parameter list.
+//   3. both-forms-allowed — at most one recognized carrier may be declared
+//      on a given type; declaring both is a compile error. The error
+//      surfaces on the SECOND declaration site so the user sees the value
+//      that's the conflict (the FIRST declaration is the one they'll keep
+//      when they delete the second).
+//
+// Out of scope (already enforced structurally elsewhere):
+//   * `static` — the recognition predicate `isCollectionLiteralAdmissibleTarget`
+//     (ExprTypecheck_Calls.cpp) only recognises a static method, so a non-
+//     static `FromCollectionLiteral` is silently treated as a non-opt-in.
+//   * declared directly on the collection type — `TypeSymbol::members` is
+//     scoped to the current type so extension methods and inherited
+//     members from a base class never appear here.
+void Resolver::checkCollectionLiteralFactoryConjuncts() {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t) continue;
+        // Walk the type's members for every static `FromCollectionLiteral`
+        // overload. The check fires on overloads whose carrier is one of
+        // the two recognized forms; a non-recognized carrier leaves the
+        // method NOT in the sequence-literal protocol and §15.4.1's
+        // public / return-type / both-forms conjuncts do not apply.
+        //
+        // The both-forms check is per-type-across-overloads, so we
+        // accumulate the form of each canonical-signature overload and
+        // fire the diagnostic on the SECOND one found (deterministic —
+        // `TypeSymbol::members` is in declaration order, the order the
+        // user wrote them).
+        const MethodSymbol* borrowForm = nullptr;
+        const MethodSymbol* owningForm = nullptr;
+        for (Symbol* m : t->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms || ms->name != "FromCollectionLiteral") continue;
+            if (ms->params.empty()) continue;
+            // Static? Mirrors the predicate at ExprTypecheck_Calls.cpp:411-413
+            // — `static` is on the modifiers vector, not a separate flag.
+            bool isStatic = false;
+            for (auto mod : ms->modifiers)
+                if (mod == "static") { isStatic = true; break; }
+            if (!isStatic) continue;
+            // Identify the carrier form by reading the sole parameter's
+            // resolved type. The carrier is checked directly off the
+            // ParameterSymbol so the test is symmetric on local and
+            // imported symbols (the AST-side arm is preferred when present;
+            // for an imported method the resolved type lives on
+            // `resolvedDeclType`).
+            auto* param = dynamic_cast<ParameterSymbol*>(ms->params.front());
+            if (!param) continue;
+            const TypeRef* paramTy = param->declType
+                                        ? ctx_.resolvedType(*param->declType)
+                                        : param->resolvedDeclType;
+            if (!paramTy || paramTy->kind != TypeRef::Kind::Named ||
+                !paramTy->astNode || paramTy->astNode->name->parts.empty())
+                continue;
+            std::string_view carrierName =
+                paramTy->astNode->name->parts.back();
+            // The borrowing form's `ReadOnlySpan<T>` is read by-value into
+            // the factory; the owning form's `OwningArray<T>` is read
+            // `owned` (the spec example writes `owned elements: OwningArray<T>`).
+            // The carrier NAME is the discriminator — the modifier is
+            // irrelevant to the §15.4.1 form split.
+            const bool isBorrowForm = (carrierName == "ReadOnlySpan");
+            const bool isOwningForm = (carrierName == "OwningArray");
+            if (!isBorrowForm && !isOwningForm) continue;
+            // Conjunct 1: visibility must be `public`. §15.4.1: "The method
+            // must be `public`". `ast::Visibility::None` is the parser's
+            // default for a missing modifier (the same default that lets
+            // §11.1's default class member visibility be `private`); for
+            // a method it is always-default `private`.
+            if (ms->visibility != ast::Visibility::Public) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ms->declLoc,
+                    std::string("`FromCollectionLiteral` on type `") +
+                    std::string(t->name) + "` must be `public` (§15.4.1)");
+            }
+            // Conjunct 2: return type must be `owned C<T>` at the
+            // enclosing type's own arity. §15.4.1: "must return `owned
+            // C<T>` where `C<T>` is the enclosing type at its own arity".
+            // The `owned` marker is checked first; the head-and-arity
+            // match is checked second (returnType must resolve to a Named
+            // type whose head is the enclosing type and whose arity matches
+            // the enclosing type's generic-parameter list — a non-generic
+            // enclosing type has arity 0, so the return type carries no
+            // generic args; a generic enclosing type has arity 1, so the
+            // return type carries exactly one generic arg).
+            // SEAM-ACCESSOR: AST-arm of the both-sources pattern; the
+            // importer-side arm is the producer's sema pass (the spec
+            // shape check on an imported factory ran in the importer's
+            // own compilation, so the AST-side guard here is local-only
+            // by spec). `returnOwned` below uses `methodReturnsOwned`.
+            auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+            if (!md) continue;
+            if (!md->returnType) {
+                // Spec: the method must return `owned C<T>`. A missing
+                // `: <type>` clause leaves the method returning `()`
+                // (§22.1), which is not `owned C<T>` for any C — diagnostic.
+                ctx_.diagnostics().report(
+                    Severity::Error, ms->declLoc,
+                    std::string("`FromCollectionLiteral` on type `") +
+                    std::string(t->name) +
+                    "` must return `owned " + std::string(t->name) +
+                    "` (§15.4.1)");
+            } else {
+                if (!methodReturnsOwned(*ms, ctx_)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ms->declLoc,
+                        std::string("`FromCollectionLiteral` on type `") +
+                        std::string(t->name) +
+                        "` must return `owned " + std::string(t->name) +
+                        "` (§15.4.1)");
+                }
+                const TypeRef* retTy = ctx_.resolvedType(*md->returnType);
+                // The return type's element type must match the carrier's
+                // element type — §15.4.1: "must return `owned C<T>` where
+                // `C<T>` is the enclosing type at its own arity" and "the
+                // element type is read directly from the parameter's
+                // element type". The shape check is split into three parts:
+                //   (a) head matches the enclosing type,
+                //   (b) arity matches the enclosing type's arity,
+                //   (c) the element type (the carrier's sole generic arg)
+                //       equals the return type's sole generic arg.
+                // The combined predicate mirrors the "owned C<T>" rule from
+                // the spec's parameter signature template (§15.4.1 lines
+                // 2945 and 2951).
+                const TypeRef* elemTy =
+                    (!paramTy->genericArgs.empty())
+                        ? paramTy->genericArgs[0]
+                        : nullptr;
+                const TypeRef* retElemTy =
+                    (retTy && !retTy->genericArgs.empty())
+                        ? retTy->genericArgs[0]
+                        : nullptr;
+                const bool shapeOk =
+                    retTy && retTy->kind == TypeRef::Kind::Named &&
+                    retTy->declaration == t &&
+                    retTy->genericArgs.size() == t->genericParams.size() &&
+                    // The element-type match (§15.4.1 "must return `owned
+                    // C<T>`" — T is the SOLE type argument of both the
+                    // carrier AND the return type when the enclosing is
+                    // generic) is only meaningful for generic enclosing
+                    // types. For a NON-generic enclosing type the return
+                    // is `owned C` — no element type exists to compare
+                    // against the carrier's element type, and
+                    // `retElemTy == nullptr` while `elemTy` is the
+                    // carrier's (e.g. `int` from `ReadOnlySpan<int>`).
+                    // Without this carve the conjunct rejected every
+                    // non-generic-owning form (with no T to bind, the
+                    // carrier's T is whatever the user wrote).
+                    (t->genericParams.size() == 0 ||
+                     typeRefEqual(elemTy, retElemTy));
+                if (!shapeOk) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ms->declLoc,
+                        std::string("`FromCollectionLiteral` on type `") +
+                        std::string(t->name) +
+                        "` must return `owned " + std::string(t->name) +
+                        "` (§15.4.1)");
+                }
+            }
+            // Conjunct 3: at most one form declared on a given type.
+            // Fire the diagnostic on the SECOND declaration; the first one
+            // stays put so the user's "delete the second" fix is obvious.
+            if (isBorrowForm) {
+                if (owningForm) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ms->declLoc,
+                        "type `" + std::string(t->name) +
+                        "` declares both recognized `FromCollectionLiteral` "
+                        "carriers (`ReadOnlySpan<T>` and `OwningArray<T>" +
+                        "`); exactly one may be declared on a given type "
+                        "(§15.4.1)");
+                }
+                borrowForm = ms;
+            } else /* isOwningForm */ {
+                if (borrowForm) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ms->declLoc,
+                        "type `" + std::string(t->name) +
+                        "` declares both recognized `FromCollectionLiteral` "
+                        "carriers (`ReadOnlySpan<T>` and `OwningArray<T>" +
+                        "`); exactly one may be declared on a given type "
+                        "(§15.4.1)");
+                }
+                owningForm = ms;
+            }
+        }
+    }
+}
+
 bool Resolver::typeRefEqual(const TypeRef* a, const TypeRef* b) {
     if (!a || !b) return false;
     if (a->kind != b->kind) return false;
@@ -1392,7 +1603,7 @@ bool Resolver::typeRefEqual(const TypeRef* a, const TypeRef* b) {
         }
         case TypeRef::Kind::InlineArray:
             // #2001: `[3]T` and `[4]T` are DISTINCT types — the size N is part
-            // of the type identity (§14.2 / §15.1). Comparing only element +
+            // of the type identity (§2.8.3 rule 4 / §15.1). Comparing only element +
             // ownedness collapsed them, mirroring (and feeding) the runtime
             // descriptor collision. Distinguish ONLY when both sizes are FOLDED
             // (arraySizeValue >= 0, the folded compile-time size): if either is

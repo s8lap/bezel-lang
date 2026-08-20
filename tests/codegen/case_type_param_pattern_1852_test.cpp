@@ -405,7 +405,7 @@ BEZEL_TEST(case_type_param_pattern_1852, type_param_boxed_generic_record_matches
         "end Main; end Program;"), 22);
 }
 
-// §19.3 / §12.9 (#2177, #1939 leg 2): the per-monomorphization descriptor must
+// §19.3 / §2.8.3 rule 4 (#2177, #1939 leg 2): the per-monomorphization descriptor must
 // keep sibling instantiations distinct — Chk<Pair<int,string>> does NOT match a
 // boxed Pair<int,int>. Guards against an over-matching regression of the fix
 // (the shared erased descriptor would match both → 2; the precise per-inst

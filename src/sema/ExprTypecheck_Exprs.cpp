@@ -745,6 +745,53 @@ void ExprTC::checkIndexArgNullability(const ast::IndexExpr& ix,
 // is a different node kind entirely and is untouched.
 void ExprTC::checkIndexArgsPositional(const ast::IndexExpr& ix) {
     for (const auto& a : ix.indices) {
+        if (!a.modifier.empty()) {
+            // fix #3097 (§23.5, v0.249) — INDEX ARGUMENTS ARE NEVER MODIFIERED.
+            //
+            // §23.5, verbatim (v0.249): "`ref` and `out` parameters are not
+            // allowed in indexer parameter lists." §28.1's closed-positions
+            // list for `owned` (and `scoped`, §28.14) forbids either on an
+            // argument whose position's parameter is determined by the
+            // indexer's declaration. The accepted modifier spellings on a
+            // `CallArgument` (Node.hpp `CallArgument::modifier`, §22.3 /
+            // §28.14, #1439) are "ref", "out", "out var", "out using var",
+            // "out owned", "out owned var", "owned", "scoped" — every one of
+            // them is forbidden at an index position. Ownership of an index
+            // argument is determined by the indexer's declared parameter
+            // ownership, so a `ref`/`out`/`owned`/`scoped` modifier here
+            // names nothing on either side: §23.5 declares the parameter
+            // side closed, and #2758 declared the call-site side closed too
+            // (the named-argument arm), leaving this modifier arm as the
+            // remaining gap. #3049 closed `_` at the parser; `out _` falls
+            // under this check too (modifier "out", `isDiscard == true`).
+            //
+            // Measured on the parent commit (c6a5355) the four modifiers
+            // and `out _` all parsed and reached sema; `o[out _]` then
+            // degraded at codegen behind an `internal: return-value
+            // expression failed to lower … (degraded to a zero/null return
+            // value) — #2491`, and the `o[out var i]` shape rejected for
+            // the wrong reason ("unresolved identifier i") — a silent
+            // accept surface and a wrong-reason surface, neither of which
+            // the spec admits.
+            //
+            // The modifier carries no span of its own (CallArgument carries
+            // only the value's), so report at the value — inside the
+            // brackets, which is what a reader needs — falling back to the
+            // whole index expression for the value-less `d[owned _]` shape.
+            ctx_.diagnostics().report(
+                Severity::Error,
+                a.value ? a.value->span.begin : ix.span.begin,
+                "an index argument may not carry a `" +
+                std::string(a.modifier) +
+                "` modifier — ownership of an index argument is determined "
+                "by the indexer's declared parameter ownership, and \xC2\xA7""23.5 "
+                "forbids `ref`/`out` parameters on indexer parameter lists "
+                "so neither `ref`/`out` nor `owned`/`scoped` names anything "
+                "here. Drop the `" + std::string(a.modifier) +
+                "` prefix and pass the index argument as a plain "
+                "expression (\xC2\xA7""23.5)");
+            continue;
+        }
         if (a.name.empty()) continue;
         // The name has no span of its own (CallArgument carries only the
         // value's), so report at the value — inside the brackets, which is
@@ -1552,39 +1599,69 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // keeps today's "unresolved identifier" error.
             ctx_.setExprSymbol(&e, typeParamMarker(id->name));
         } else if (currentScope_) {
-            // §22.16 (v0.240, #2942): `result` and `old` are contextual
+            // §22.16 (v0.250, #3038): `result` and `old` are contextual
             // keywords (§22.16 / Appendix B.2), valid only inside an
             // `ensures` clause — `result` denotes the method's return
-            // value (typed as the declared return type, read as a borrow),
-            // `old(E)` denotes the value of `E` at method entry. Neither
-            // is implemented in this revision (issue #2942); both fall
-            // through to ordinary name lookup and report "unresolved
-            // identifier". Replace that generic error with a context-aware
-            // one — outside `ensures`, point the user at §22.16's keyword
-            // rule; inside an `ensures` clause, point them at this issue
-            // (the "loud, hence safe" Option-A path the issue asks for).
-            // Inside a `requires` clause or an `invariant` member, §22.16
-            // also forbids these names, so the outside-`ensures` diagnostic
-            // applies uniformly — only `ensures` is the permitted position.
-            if (id->name == "result" || id->name == "old") {
-                if (currentClauseKind_ == ContractClauseKind::Ensures) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, id->span.begin,
-                        std::string("the contextual keyword `") +
-                        std::string(id->name) +
-                        "` is not yet implemented in `ensures` clauses "
-                        "(\xc2\xa7""22.16, v0.240; issue #2942) \xe2\x80\x94 "
-                        "postconditions cannot name the return value or "
-                        "the entry snapshot until that fix lands");
+            // value (typed as the declared return type, read as a borrow);
+            // `old(E)` denotes the value `E` had at the method's entry.
+            // Option B (the binding + capture form) is now implemented:
+            //   * `result` is bound in the `ensures` scope only — a
+            //     synthetic LocalSymbol typed as the method's declared
+            //     return type. The IdentifierExpr's exprSymbol and exprType
+            //     are set so the rest of the typecheck (member access on
+            //     the borrow, comparisons) sees an ordinary identifier.
+            //     Codegen's IdentifierExpr path recognises the synthetic
+            //     symbol and loads from the `ensuresResultSlot_` frame slot.
+            //   * `old(E)` is the callee of a CallExpr. The IdentifierExpr
+            //     path is silent for that one position — the CallExpr
+            //     handler (typeCall in ExprTypecheck_Calls.cpp) takes over,
+            //     visiting the operand and setting the CallExpr's type
+            //     (with the §22.16 ownership restriction — class-typed
+            //     operands are rejected with a diagnostic).
+            // Anywhere else (method body, `requires`, `invariant`, void
+            // method, constructor) `result`/`old` are still rejected as
+            // contextual keywords reserved for `ensures`.
+            if (id->name == "result") {
+                if (currentClauseKind_ == ContractClauseKind::Ensures &&
+                    currentReturnType_ &&
+                    returnCtx_ == ReturnCtx::ValueMethod) {
+                    // Per §22.16: `result` denotes the returned value,
+                    // typed as the declared return type, in a read-only
+                    // borrow position. Bind a synthetic LocalSymbol so
+                    // downstream typecheck sees a normal identifier.
+                    LocalSymbol* rsym = ctx_.syntheticResultLocal();
+                    rsym->declType = currentReturnType_;
+                    ctx_.setExprSymbol(&e, rsym);
+                    ctx_.setExprType(&e, currentReturnType_);
                 } else {
                     ctx_.diagnostics().report(
                         Severity::Error, id->span.begin,
-                        std::string("`") + std::string(id->name) +
-                        "` is a contextual keyword reserved for `ensures` "
-                        "clauses (\xc2\xa7""22.16, v0.240; issue #2942); "
-                        "it is not an identifier and cannot be referenced "
-                        "from a method body, a `requires` clause, or an "
-                        "`invariant` member");
+                        std::string("`result` is a contextual keyword "
+                                    "reserved for `ensures` clauses on a "
+                                    "value-returning method (\xc2\xa7"
+                                    "22.16); it is not an identifier and "
+                                    "cannot be referenced from a method "
+                                    "body, a `requires` clause, an "
+                                    "`invariant` member, a void method, "
+                                    "or a constructor"));
+                }
+            } else if (id->name == "old") {
+                if (currentClauseKind_ == ContractClauseKind::Ensures &&
+                    &e == calleeOfCallCtx_) {
+                    // `old(E)` — the CallExpr handler (typeCall) takes
+                    // over from here: it visits the operand, enforces
+                    // the §22.16 ownership restriction, and sets the
+                    // CallExpr's exprType. Suppress the contextual-
+                    // keyword diagnostic so the handler runs cleanly.
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, id->span.begin,
+                        std::string("`old` is a contextual keyword "
+                                    "reserved for `ensures` clauses "
+                                    "(\xc2\xa7""22.16); it is not an "
+                                    "identifier and cannot be referenced "
+                                    "from a method body, a `requires` "
+                                    "clause, or an `invariant` member"));
                 }
             } else {
                 ctx_.diagnostics().report(
@@ -1907,7 +1984,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // of the target type (a failed cast is null). Recording it lets
     // `(x as T)` — and member access on its result — resolve.
     if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
-        // §12.9/§14.2/§17.4 (v0.197, #2006): erasure guard for the plain
+        // §12.7/§2.8.3 rule 4/§17.4 (v0.197, #2006): erasure guard for the plain
         // `is`/`as` expression path — parity with the case-binding path
         // (#1927/#1946). A runtime type-test against a CONSTRUCTED generic
         // whose type argument is a runtime-ERASED kind reaches a COLLAPSED
@@ -1934,7 +2011,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "kind (e.g. a function type), which the runtime type "
                         "descriptor collapses, so the test would confuse "
                         "distinct instantiations and bind a value at a wrong "
-                        "static type (§12.9/§14.2/§17.4)");
+                        "static type (§12.7/§2.8.3 rule 4/§17.4)");
             }
         }
         if (te->op == "is" || te->op == "is not") {
@@ -2959,7 +3036,24 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                               bps->decl)
                                         : nullptr;
                         bool bAbstract = false;
-                        if (bpd)
+                        // Mirror the named-method form L2373-2379 (#874) and
+                        // the named-property sibling above: read the SYMBOL's
+                        // modifiers FIRST (populated on import at
+                        // ModuleLoader.cpp:851), then fall back to the AST
+                        // decl's modifiers for the local case. The pure
+                        // decl-only scan missed every IMPORTED abstract
+                        // indexer — the imported PropertySymbol has no `decl`
+                        // — so `base[i]` on an imported abstract base
+                        // degraded to the codegen-time #2837 cross-module
+                        // reject instead of this clean §12.5 message. fix
+                        // #3238.
+                        if (bps)
+                            for (auto mod : bps->modifiers)
+                                if (mod == "abstract") {
+                                    bAbstract = true;
+                                    break;
+                                }
+                        if (!bAbstract && bpd)
                             for (auto mod : bpd->modifiers)
                                 if (mod == "abstract") {
                                     bAbstract = true;
@@ -8334,7 +8428,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 "also implements the scrutinee interface type, so "
                                 "the erased runtime type-test could bind a value "
                                 "at a wrong static type (§19.3/§5.1/§12.9)");
-                        // §12.9/§14.2/§17.4 (v0.197, #2018): the VALUE/expression
+                        // §12.7/§2.8.3 rule 4/§17.4 (v0.197, #2018): the VALUE/expression
                         // `case` form's copy of #2012's PLAIN-scrutinee erasure
                         // guard — the sibling of ExprTypecheck.cpp's CaseStmt
                         // handler, and the case-binding analog of the #2006
@@ -8384,7 +8478,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 "runtime type descriptor collapses, so the type-"
                                 "test could match a different instantiation and "
                                 "bind the value at a wrong static type "
-                                "(§19.3/§12.9/§14.2/§17.4)");
+                                "(§19.3/§12.7/§2.8.3 rule 4/§17.4)");
                     }
                 }
                 Scope* saveScope = currentScope_;

@@ -6475,7 +6475,7 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
     for (const TypeRef* a : patTy->genericArgs)
         if (!typeArgRuntimeReified(a)) { allReified = false; break; }
 
-    // §19.3/§12.9/§14.2 (#1941): a VARIANT scrutinee interface.
+    // §19.3/§12.7/§2.8.3 rule 4 (#1941): a VARIANT scrutinee interface.
     //
     //   * All-REIFIED pattern arguments: the post-#1843 runtime test matches
     //     only genuine `C<A>` values (verified: a `Box<Animal>` behind a
@@ -6661,7 +6661,7 @@ bool typeArgRuntimeReified(const TypeRef* t) {
     switch (t->kind) {
         case TypeRef::Kind::Named:
             if (!t->declaration) {
-                // #2022 (§12.9, §14.2, §17.4, v0.197): a null-DECLARATION builtin
+                // #2022 (§12.7, §2.8.3 rule 4, §17.4, v0.197): a null-DECLARATION builtin
                 // generic (Array<T>, Dictionary<K,V>, … — declaration null per
                 // §2.5/§29.3) with NON-EMPTY recursively-reified genericArgs IS
                 // runtime-reified: appendDescKey (the descriptor-key factory)
@@ -7546,11 +7546,41 @@ bool ExprTC::isExceptionDerivedClass(const TypeRef* ty) {
     return common::isBuiltinExceptionName(namedRefSimpleName(ty));
 }
 
+// §26.4 / #3083: walk `target`'s argument positions and report whether `name`
+// is a §26.4 type-parameter binding — a bare single-segment non-nullable
+// identifier, never a concrete generic-instantiation head (which is named but
+// carries its own generic args — the head is the type being instantiated, not
+// a free parameter). The rule mirrors Resolver::bindExtensionTargetTypeParams
+// (TypeResolution_Names.cpp) exactly so the §31.1/§31.2.1 check recognizes
+// the same set of names the resolver binds into the extension's scope.
+static bool isExtensionTargetTypeParam(const ast::Type& target,
+                                       std::string_view name) {
+    for (const auto& ga : target.genericArgs) {
+        if (!ga) continue;
+        if (ga->kind != ast::TypeKind::Named || !ga->name ||
+            ga->name->parts.size() != 1)
+            continue;
+        std::string_view n = ga->name->parts[0];
+        // A concrete generic-instantiation head (`Array` in `Array<T>`,
+        // `IEnumerable<T>` in a nested position, etc.) is never a free
+        // type parameter, even though it is a bare single-segment name —
+        // recurse to find the params in its OWN args. A false result is not
+        // terminal — sibling argument positions may still bind `name`.
+        if (!ga->genericArgs.empty()) {
+            if (isExtensionTargetTypeParam(*ga, name)) return true;
+            continue;
+        }
+        if (ga->nullable) continue;  // `T?` rejects binding (§26.4)
+        if (n == name) return true;
+    }
+    return false;
+}
+
 // §31.2.1 (v0.243, #3046): is `name` a generic type parameter declared by the
 // enclosing method, type, or extension? Only such a name can be the subject of
 // the arm-type generic-bound rule — every other declaration-less Named ref is a
 // built-in (user classes, local and imported, all carry a `TypeSymbol`).
-// per §14.2, §31.2.1
+// per §14.2, §26.4, §31.2.1, #3083
 bool ExprTC::isEnclosingTypeParamName(std::string_view name) const {
     auto has = [&](const auto& params) {
         for (const auto& gp : params)
@@ -7562,11 +7592,22 @@ bool ExprTC::isEnclosingTypeParamName(std::string_view name) const {
     if (currentType_ && currentType_->decl)
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
             if (has(td->genericParams)) return true;
-    if (currentExtension_ && currentExtension_->decl)
+    if (currentExtension_ && currentExtension_->decl) {
         if (auto* ed =
-                dynamic_cast<const ast::ExtensionDecl*>(currentExtension_->decl))
+                dynamic_cast<const ast::ExtensionDecl*>(currentExtension_->decl)) {
+            // (#3083) Extension's `<T>` clause lives in `targetType` (§26.4),
+            // NOT in `genericParams` — ExtensionDecl carries no `genericParams`
+            // field; parameters bind via the head's argument positions. Walk
+            // those for the spec-stated set, otherwise an UNCONSTRAINED T in
+            // `extension E<T>` is silently exempt from §31.1 (throw operand)
+            // and §31.2.1 (catch-arm type) — both predicates gate on this
+            // helper.
+            if (ed->targetType && isExtensionTargetTypeParam(*ed->targetType, name))
+                return true;
             for (const auto& gc : ed->genericConstraints)
                 if (gc.typeParam == name) return true;
+        }
+    }
     return false;
 }
 
@@ -7640,13 +7681,56 @@ void ExprTC::checkThrowableType(const ast::Expr& value) {
     // The check is the positive `isExceptionDerivedClass` list; the branches
     // below only choose WHICH reason the diagnostic states.
     //
-    // SCOPE (recorded, #3046): the sentence's "nullability not admitted" clause
-    // is NOT enforced here. `ctx_.exprType` reports the DECLARED type, while
-    // §7.4 flow narrowing lives in this pass's own `nullNarrowed_` side-set, so
-    // a bare `nullable` reject would fire on the narrowed `if e <> null then
-    // throw e; end;` shape the spec admits. Tracked separately (#3076).
+    // fix #3076 (§31.1's "nullability not admitted" clause — the second half
+    // of the §31.1 sentence, deferred from #3046): an `Exception`-derived
+    // operand is admitted ONLY when its nullability is provably not admitted at
+    // this site. `ctx_.exprType` returns the DECLARED type — `vt->nullable`
+    // reports the static nullability, which for a `throw e` on a `var e:
+    // AppError? := …` declaration is `true` even after `if e <> null then`
+    // narrows it. The narrowing lives in this pass's own `nullNarrowed_` /
+    // `narrowings_` side-sets (consulted via `isKnownNonNull`), so the rule
+    // admits three provably-non-null shapes and rejects the rest:
+    //
+    //   * non-nullable declared type — `vt->nullable == false` (covers
+    //     `throw new Foo()`, `throw e!` whose PostfixBangExpr result type
+    //     flips `nullable` to false, and `throw` of a parameter/local/field
+    //     whose declared type is non-nullable);
+    //
+    //   * §7.4 null-narrowed at this site — `nullNarrowed_` (and the
+    //     type-narrowing map) records the fact established by an `if e <>
+    //     null then`, an `is`-type-test that produced a non-nullable
+    //     refinement, or a prior assignment of a non-nullable value;
+    //
+    //   * a `!` (PostfixBangExpr) operand — its exprType is the non-nullable
+    //     form of the operand's type per `visitExpr`'s PostfixBangExpr arm,
+    //     so the `vt->nullable == false` path above already admits it; no
+    //     special-case branch is needed.
+    //
+    // Any other nullable operand (a call result, a method-returned
+    // `AppError?`, a local whose declared type is nullable and that has not
+    // been narrowed) is rejected here with the §31.1 "nullability not
+    // admitted" diagnostic.
     // // per §31.1, §17.12, Appendix C.5
-    if (isExceptionDerivedClass(vt)) return;
+    if (isExceptionDerivedClass(vt)) {
+        if (!vt->nullable) return;
+        // An `Exception`-derived NULLABLE operand — admit iff a narrowing
+        // fact proves it non-null at this throw site. `exprSymbol` returns a
+        // symbol for place references (IdentifierExpr / MemberAccessExpr /
+        // IndexExpr) and nullptr for value expressions (call results, `new`,
+        // literals); the latter have no narrowing fact to consult, so the
+        // rejection is sound.
+        if (Symbol* sym = ctx_.exprSymbol(value)) {
+            if (isKnownNonNull(sym)) return;
+        }
+        ctx_.diagnostics().report(
+            Severity::Error, value.span.begin,
+            "the throw operand's type is nullable (§31.1 — nullability not "
+            "admitted): an `Exception`-derived class instance must be "
+            "non-null at the throw site — narrow with `if e <> null then`, "
+            "assert with the postfix `!` operator, or change the declared "
+            "type to non-nullable");
+        return;
+    }
 
     // A declaration-less Named ref that is neither a reserved built-in nor a
     // type parameter of the enclosing declaration is not a user class (local
@@ -13512,7 +13596,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // just without drop-edge carving).
         auto tryJoinNull = afterBodyNull;
         for (const auto& arm : trys->catches) {
-            // §31.2.1/§12.9/§14.2 (#1939): the CATCH-surface copy of the
+            // §31.2.1/§12.7/§2.8.3 rule 4 (#1939): the CATCH-surface copy of the
             // #2006/#2012/#2018 erasure guard. §31.2.1: an arm "matches any
             // thrown exception that is an instance of the type" — but a
             // constructed generic arm type whose argument is a still-ERASED
@@ -13547,7 +13631,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         "kind (e.g. a function type), which the runtime type "
                         "descriptor collapses, so the arm could match a "
                         "different instantiation and bind the exception at a "
-                        "wrong static type (§31.2.1/§12.9/§14.2)");
+                        "wrong static type (§31.2.1/§12.7/§2.8.3 rule 4)");
             }
             // #1939 catch-arm erasure guard (above) and #2116 narrowing-fact
             // setup (below) are independent: the guard is diagnostic-only over
@@ -14250,8 +14334,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "and another instantiation of the pattern class "
                                 "also implements the scrutinee interface type, so "
                                 "the erased runtime type-test could bind a value "
-                                "at a wrong static type (§19.3/§5.1/§12.9)");
-                        // §12.9/§14.2/§17.4 (v0.197, #2012): the PLAIN-scrutinee
+                                "at a wrong static type (§19.3/§5.1/§12.7)");
+                        // §12.7/§2.8.3 rule 4/§17.4 (v0.197, #2012): the PLAIN-scrutinee
                         // analog of #2006's `is`/`as` erasure guard.
                         // typeTestInterfaceBindAmbiguous only reasons about a
                         // generic-INTERFACE scrutinee (its `None` there means
@@ -14294,7 +14378,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "runtime type descriptor collapses, so the type-"
                                 "test could match a different instantiation and "
                                 "bind the value at a wrong static type "
-                                "(§19.3/§12.9/§14.2/§17.4)");
+                                "(§19.3/§12.7/§2.8.3 rule 4/§17.4)");
                     }
                 }
                 Scope* saveScope = currentScope_;

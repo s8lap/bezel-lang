@@ -370,3 +370,29 @@ BEZEL_TEST(generic_static_atomic_1513,
     // #709 test's own expression order favors."
     BEZEL_EXPECT_EQ(r.exitCode, 98);
 }
+
+// fix #2948 — §22.13 (v0.260): generic statics initialize once, in textual
+// declaration order. First reads the later mutable Second while Second still
+// holds its §7.9 default, so First must become 107. The initializer deliberately
+// uses `90 + "abc".Length` rather than a literal, distinguishing this from a
+// constant-folder bug. Before the fix, lowering that sibling read recursively
+// built a second per-instantiation ensureinit guard; the second guard reran
+// sfinit after Second became 93 and silently overwrote First with 200.
+BEZEL_TEST(generic_static_atomic_1513,
+           later_mutable_static_read_uses_textual_order_default_2948) {
+    const std::string prog =
+        "module M; "
+        "class Og<T> "
+        "  public v: T; "
+        "  public static readonly First: int := 107 + Second; "
+        "  public static Second: int := 90 + \"abc\".Length; "
+        "end Og; "
+        "class Program "
+        "  public static method Main(): int "
+        "    return Og<string>.First; "
+        "  end Main; "
+        "end Program;";
+    auto r = runAot(prog);
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 107);
+}

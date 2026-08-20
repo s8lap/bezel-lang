@@ -30,7 +30,7 @@
 #include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
 #include "common/IntLiteral.hpp"       // #2936: the one integer-literal parser
 #include "sema/SemaContext.hpp"
-#include "sema/TypeResolution.hpp"  // typeRefEqual — §14.2 exact type identity
+#include "sema/TypeResolution.hpp"  // typeRefEqual — §2.8.3 rule 4 exact type identity
 #include "sema/Symbol.hpp"
 
 #include "llvm/IR/BasicBlock.h"
@@ -651,6 +651,32 @@ private:
     const std::vector<ast::ContractClause>* ensuresClauses_ = nullptr;
     std::string ensuresTypeName_;
     std::string ensuresMemberName_;
+    // §22.16 (v0.250, #3038): pointer identity of the synthetic LocalSymbol
+    // sema binds to the contextual keyword `result` inside an `ensures`
+    // clause. Set by sema through `ctx_.setExprSymbol` (the same heap
+    // address is reused across every `result` reference, see
+    // ExprTypecheck_impl.hpp's `syntheticResultLocal`). When the
+    // IdentifierExpr path in lowerExpr sees this symbol it loads from
+    // `ensuresResultSlot_` instead of going through localSlot — the
+    // synthetic symbol has no entry in `locals_` (it is not a declared
+    // local with a stack slot) but it is the §22.16 "borrow of the
+    // returned value" that the existing `ensuresResultSlot_` already
+    // materialises. Null when the currently-emitting function is not a
+    // value-returning method (so a stray `result` outside ensures would
+    // never reach codegen — the sema path rejects it).
+    const sema::LocalSymbol* ensuresResultSymbol_ = nullptr;
+    // §22.16 (v0.250, #3038): one frame slot per `old(E)` operand in the
+    // currently-armed ensures epilogue. The slot is allocated in the
+    // function's entry block by `captureOldOperands` (called from the
+    // `emitFunctionBody` driver right after the requires prologue, before
+    // the body is emitted), and the entry-time evaluation of E is stored
+    // there. The ensures clause's `lowerCall` for an `old(E)` CallExpr
+    // then loads from the slot to read the entry value. Keyed by the
+    // `old(E)` CallExpr's AST address so the textual-position canonical
+    // form (a single E at multiple sites) is honoured. Cleared on
+    // epilogue finalise.
+    std::unordered_map<const ast::CallExpr*, llvm::AllocaInst*>
+        oldCaptureSlots_;
     // §22.16 (v0.240, #2941): the class whose invariant must be checked at
     // the EXIT edge of this instrumented public method. Null when the
     // currently-armed epilogue belongs to a non-public, static, or non-class
@@ -1843,7 +1869,7 @@ private:
     // body (first-seen-wins mis-dispatch: an `is Foo<T>` in the body baked the
     // FIRST T's descriptor). The recursive key encodes every nested type
     // argument, so nested instantiations that share a top-level declaration get
-    // DISTINCT specialized bodies (§14.2 monomorphization, §12.9 invariance).
+    // DISTINCT specialized bodies (§2.8.3 rule 4 monomorphization, §12.9 invariance).
     // fix #1894 #1895: the fourth element is the concrete LLVM PARAMETER type
     // vector. Two call sites can share the same type-argument substitution yet
     // pass arguments at DIFFERENT LLVM widths — e.g. `Make<long,long>(100,200)`
@@ -2781,12 +2807,30 @@ private:
         if (!pd) return ctx_.importedPropertyHasSetter(ps);
         if (pd->bodyKind == ast::PropertyBodyKind::Expression) return false;
         if (pd->bodyKind == ast::PropertyBodyKind::Auto) {
-            // Auto-property: read-write unless readonly. (Auto-properties are
-            // not virtual unless on an interface, but interfaces don't carry
-            // an Auto body — they use the abstract/block form — so this branch
-            // is effectively for completeness.)
+            // Auto-property: read-write unless readonly OR abstract. (Auto-
+            // properties are not virtual unless on an interface, but interfaces
+            // don't carry an Auto body — they use the abstract/block form —
+            // so this branch is effectively for completeness.) An abstract
+            // auto-property (`public abstract property X: T;`) is implicitly
+            // get-only by §12.5 — "abstract on a member declares it without
+            // a body" — so it has no setter to dispatch through. The wire
+            // bit (`MetaMember::hasSetter` at ModuleMetadataBuilder.cpp)
+            // already carries this exclusion — added in this commit so the
+            // LOCAL path and the IMPORTED path answer identically, the same
+            // symmetric guarantee #2478's body already documents for
+            // `isAutoProperty`. Without the symmetric local exclusion the
+            // vtable layout for a class hierarchy with an abstract auto-
+            // property DIVERGES between the local-compile and the
+            // import-this-base path — the local path leaves a setter slot
+            // allocated (and the override in the derived class inserts a
+            // setter-named override-key mirroring the slot), the imported
+            // path doesn't, and the override's `propSetSlot_[ps] = ...`
+            // ends up indexing into the imported-class's vt at the wrong
+            // offset — the #3190 abstract-root case.
             for (auto mod : pd->modifiers)
                 if (mod == "readonly") return false;
+            for (auto mod : pd->modifiers)
+                if (mod == "abstract") return false;
             return true;
         }
         // Block form: a set accessor present.
@@ -5675,6 +5719,27 @@ private:
         const sema::MethodSymbol& ms,
         const std::vector<ast::CallArgument>& args);
 
+    // fix #3268 (§22.5 / §2.8.2, v0.244): the IMPORTED-CONSTRUCTOR twin of
+    // `importedFormalToArg`. The rule is sema's
+    // `ExprTC::bindArgsToParams` restated over the imported ctor's
+    // `ConstructorSymbol::params` (which carries `ParameterSymbol`s for an
+    // imported ctor — same shape the method version walks), so positional
+    // arguments fill formals in order, a named argument fills the formal of
+    // that name, no formal is filled twice, and every unfilled formal with a
+    // default takes that default. Returns `sema::formalParamCount(cs)` entries:
+    // `[j] =` the call-site arg index for formal `j`, or −1 when it takes its
+    // declared default. Falls back to the identity map for any shape it
+    // cannot bind (a discard, an unknown parameter name, a double binding,
+    // or an unfilled required formal) — sema rejects all of those, so the
+    // fallback is the same defensive guard as `importedFormalToArg` rather
+    // than a second policy. This is the lowering-side companion to
+    // `SemaContext::setNewExprPositionalBinding` (#3196's publication
+    // mechanism, which `checkImportedNewExprArgs` now writes for the
+    // imported-ctor path).
+    std::vector<int> importedFormalToArg(
+        const sema::ConstructorSymbol& cs,
+        const std::vector<ast::CallArgument>& args);
+
     // The value for an imported formal left to its declared default (§22.5).
     // The exporter's rendered default literal rides
     // `ParameterSymbol::defaultText` (fix #3178 carried it off the wire, where
@@ -5685,6 +5750,17 @@ private:
     // unsound zero.
     llvm::Value* importedDefaultArgValue(const sema::MethodSymbol& ms,
                                          std::size_t pos);
+
+    // fix #3082 (§22.5 / §2.8.2, v0.244): the CONSTRUCTOR twin of
+    // `importedDefaultArgValue`. The shape of the source data is identical
+    // (a `ParameterSymbol::defaultText` carried off the wire in #3178), so
+    // this delegates to the SAME fold path the method-call version uses —
+    // null / `default(T)` / constant fold, all sharing one evaluator. Sema
+    // (checkImportedNewExprArgs) already filtered out texts this helper
+    // cannot materialize, so the backstop below is the same defensive
+    // guard `importedDefaultArgValue` carries.
+    llvm::Value* importedCtorDefaultArgValue(const sema::ConstructorSymbol& cs,
+                                            std::size_t pos);
 
     // fix #3202 (§22.10 "primary constructors" / §22.5 "Optional parameters
     // and named arguments" / §2.8.3 rule 4, v0.254): the positional-FIELD
@@ -6677,6 +6753,26 @@ private:
     // throws on failure, then performs the original return (ret value / ret
     // void). Clears the armed state.
     void finalizeEnsuresEpilogue();
+
+    // §22.16 (v0.250, #3038): pre-walk the ensures clauses to find every
+    // `old(E)` CallExpr and allocate a frame slot (in the entry block) for
+    // the entry-time capture. Called from `emitFunctionBody` right before
+    // `armEnsuresEpilogue` so the slot exists when the body is emitted.
+    // The capture itself happens in `captureOldOperands` immediately
+    // after the requires prologue so the entry-time evaluation of E runs
+    // at the §22.16 "after `requires` clauses" evaluation point.
+    void allocateOldCaptureSlots(
+        llvm::Function* fn,
+        const std::vector<ast::ContractClause>& clauses);
+
+    // §22.16 (v0.250, #3038): emit the entry-time evaluation and store
+    // of every `old(E)` operand. Called from `emitFunctionBody` right
+    // after the requires prologue. The builder must be positioned in the
+    // entry block on entry; on exit the caller's insertion point is
+    // restored. No-op if no `old` clauses are present in the method.
+    void captureOldOperands(
+        llvm::Function* fn,
+        const std::vector<ast::ContractClause>& clauses);
 
     // §22.16 (v0.240, #2941): emit runtime checks for the class invariant
     // of `classType` (a class with declared `invariant(E);` members). Walks
@@ -7794,7 +7890,7 @@ private:
     // interface with concrete arguments; nullptr otherwise (caller keeps its
     // existing shared-descriptor resolution).
     llvm::GlobalVariable* perInstDescriptorForTarget(const sema::TypeRef* rt);
-    // §12.9/§14.2/§19.3/§31.2.1 (#2012, per the #2069 ruling): at a given
+    // §12.7/§2.8.3 rule 4/§19.3/§31.2.1 (#2012, per the #2069 ruling): at a given
     // monomorphization, REJECT a runtime type-test target whose type-parameter-
     // mentioning generic argument substitutes to a GROUND but runtime-ERASED kind
     // (a function type, or a collapse at any depth) — the descriptor key would
@@ -10305,8 +10401,25 @@ private:
         for (sema::Symbol* m : cls->members) {
             auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
             if (!cs || cs->isStatic) continue;
-            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-            if (cd && argsCanFill(cd->params, args)) return cs;
+            // fix #3082 (§22.5 / §2.8.2, v0.244): the previous `dynamic_cast
+            // <ast::ConstructorDecl*>` gate made this fallback unreachable for
+            // every IMPORTED constructor (the #2374 shape — the dep never
+            // ships the AST), so an imported constructor with a default
+            // parameter, called with fewer arguments, returned null here and
+            // the ctor-arg call was never emitted. Lift the gate: a local
+            // ctor still uses the AST-level `argsCanFill` (its `cd->params`
+            // carries the real `ast::Expr` defaults, which a `Param`-list
+            // binder can reference); an imported ctor uses the
+            // `ParameterSymbol`-level predicate `formalParamHasDefault` over
+            // `argsCanFillSymbolic`, the per-slot counterpart that reads
+            // `ParameterSymbol::hasDefault` (fix #3178 carried the predicate
+            // off the wire). Both rules admit an omitted trailing default
+            // and reject every other shape the same way the call site does.
+            if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl)) {
+                if (argsCanFill(cd->params, args)) return cs;
+                continue;
+            }
+            if (argsCanFillSymbolic(*cs, args)) return cs;
         }
         return nullptr;
     }
@@ -11430,7 +11543,8 @@ private:
     // inline array (no-op — caller is on the ordinary path).
     bool lowerOwningInlineArrayReassign(const ast::Expr& target,
                                         llvm::Value* arrayAddr,
-                                        llvm::Type* elemTy);
+                                        llvm::Type* elemTy,
+                                        bool skipDisposal = false);
 
     // #429 (box FIELD-STORE / disposal) / §8.6 / §28.9: the per-module set of
     // class field symbols (FieldSymbol / auto-property PropertySymbol) for which
@@ -12594,6 +12708,20 @@ private:
     // pick a constructor/method overload before lowering its arguments.
     static bool argsCanFill(const std::vector<ast::Param>& params,
                             const std::vector<ast::CallArgument>& args);
+
+    // fix #3082 (§22.5 / §2.8.2, v0.244): the imported-CONSTRUCTOR twin of
+    // `argsCanFill`. Reads the formal parameter list off the
+    // `ConstructorSymbol` (the only form an imported ctor has — the dep
+    // never ships an `ast::ConstructorDecl`, the #2374 shape), names via
+    // `sema::formalParamName` and defaults via `sema::formalParamHasDefault`
+    // (the same predicates `bindArgsToParams`'s `FormalsView` uses, so this
+    // answers identically to the in-module path on every shape the sema
+    // binder accepts). Used by `ctorForArgs`'s fallback to lift the
+    // `dynamic_cast<ast::ConstructorDecl*>` gate that made imported ctor
+    // overload resolution UNREACHABLE for any defaulted call.
+    static bool argsCanFillSymbolic(
+        const sema::ConstructorSymbol& cs,
+        const std::vector<ast::CallArgument>& args);
 
     // #1302 / §22.3 (v0.228) "**`ref` local and field targets alias; accessor
     // targets bracket.**": a `ref`/`out` argument naming an **indexer slot or

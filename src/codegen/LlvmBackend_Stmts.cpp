@@ -534,18 +534,36 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 ? llvm::dyn_cast<llvm::ArrayType>(aelemTy)
                                 : nullptr) {
                             if (aaddr) {
-                                // §28.7 / §15.3 (#1385): dispose each non-null
-                                // slot of the displaced value in reverse order
-                                // BEFORE the per-slot stores below overwrite
-                                // them. The plain AssignmentStmt path
-                                // (lowerOwningInlineArrayReassign called from
-                                // the `:=` block at line 504) covers
-                                // non-collection-literal RHS forms; this call
-                                // covers the literal form, which the literal
-                                // handler short-circuits past the line-504 site.
-                                lowerOwningInlineArrayReassign(*as->target,
-                                                               aaddr, aelemTy);
+                                // §28.7 / §15.3 (#1385 / v0.260, K9.5): the RHS
+                                // of a whole-value reassignment is evaluated
+                                // FIRST, then the drop-on-overwrite pass runs,
+                                // then the new value is stored. The plain
+                                // AssignmentStmt path (lowerOwningInlineArray
+                                // Reassign called from the `:=` block at line
+                                // ~504) covers non-collection-literal RHS
+                                // forms (the RHS is already evaluated at that
+                                // point, per the comment there). The literal
+                                // form short-circuits past that site, so this
+                                // arm must itself evaluate the literal elements
+                                // FIRST into temporaries, then run the disposal
+                                // pass, then store. Pre-fix (defect 1,
+                                // #3263): the pass ran BEFORE the per-element
+                                // evaluation — a literal element of the shape
+                                // `move a[0]` read slot 0 of the LHS, which the
+                                // pass had already disposed (UAF on the freed
+                                // slot pointer). A literal of arity < N
+                                // additionally left trailing slots disposed-
+                                // then-unstored (stale freed pointers in the
+                                // alloca). Post-fix: every element lowers into
+                                // a per-element alloca, the pass runs against
+                                // the live LHS slots, then each temporary is
+                                // stored — a slot shorter than N is stored as
+                                // the slot's zero/null value (the trailing-
+                                // empty state) and the literal-element read
+                                // of `move a[i]` sees a live slot.
                                 llvm::Type* et = aty->getElementType();
+                                std::vector<llvm::Value*> elemTemps(
+                                    cl->elements.size(), nullptr);
                                 for (std::size_t i = 0;
                                      i < cl->elements.size() &&
                                      i < aty->getNumElements(); ++i) {
@@ -574,14 +592,59 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                                  ? builder_.CreateSExt(ev, et)
                                                  : builder_.CreateTrunc(ev, et);
                                     }
+                                    // #813 / §15.1: wrap into the nullable-value
+                                    // slot struct for an `[N]T?` literal assign
+                                    // — same wrapping the post-disposal store
+                                    // below would apply. Materialized into a
+                                    // per-element alloca so the disposal pass
+                                    // can run AFTER every element has been
+                                    // evaluated (K9.5).
+                                    llvm::Value* wrapped =
+                                        coerceToNullableSlot(et, ev);
+                                    llvm::AllocaInst* tmp =
+                                        entryAlloca(wrapped->getType());
+                                    tmp->setName("ioar.lit.elem");
+                                    builder_.CreateStore(wrapped, tmp);
+                                    elemTemps[i] = tmp;
+                                }
+                                // Disposal pass runs AFTER every element is
+                                // materialized, matching §28.7 v0.260's
+                                // "RHS-first" rule. fix #3263 defect 2: pass
+                                // `as->wholeValueLhsMovedFrom` so the
+                                // whole-value-moved-from LHS skips the pass.
+                                lowerOwningInlineArrayReassign(
+                                    *as->target, aaddr, aelemTy,
+                                    /*skipDisposal=*/
+                                    as->wholeValueLhsMovedFrom);
+                                // Now store the materialized temporaries into
+                                // the LHS slots. Slots whose element was
+                                // missing or whose `lowerExpr` returned null
+                                // (and the diagnostic was reported) are left
+                                // with whatever the disposal pass left —
+                                // null, after defect 3's slot-empty rule. A
+                                // literal of arity < N therefore leaves
+                                // trailing slots null (the only observable
+                                // post-condition on the non-abandoned-store
+                                // path; the abandoned-store path's spec
+                                // ruling is §15.1.1's "non-nullable slot
+                                // invariant" reconciliation in §28.7).
+                                for (std::size_t i = 0;
+                                     i < cl->elements.size() &&
+                                     i < aty->getNumElements(); ++i) {
+                                    if (!elemTemps[i]) continue;
                                     llvm::Value* gep = builder_.CreateGEP(
                                         aty, aaddr,
                                         {builder_.getInt32(0),
                                          builder_.getInt32((unsigned)i)});
-                                    // #813 / §15.1: wrap into the nullable-value
-                                    // slot struct for an `[N]T?` literal assign.
+                                    // The temporary's type is `et` (the slot
+                                    // element type, possibly a nullable-value
+                                    // struct). Recreate the load type from
+                                    // the element type — the same as what
+                                    // was stored.
                                     builder_.CreateStore(
-                                        coerceToNullableSlot(et, ev), gep);
+                                        builder_.CreateLoad(
+                                            et, elemTemps[i]),
+                                        gep);
                                 }
                                 return false;  // handled
                             }
@@ -886,7 +949,13 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // RHS is already evaluated (lines 377-388 above) so the disposal
                 // runs after the RHS's side effects, matching §28.7's
                 // "RHS-first, then dispose displaced, then store" ordering.
-                lowerOwningInlineArrayReassign(*as->target, addr, elemTy);
+                // fix #3263: pass `as->wholeValueLhsMovedFrom` as `skipDisposal`
+                // — sema set it when the LHS was whole-value moved-from by a
+                // prior `var b := a;` (defect 2: stale alloca pointers now
+                // belong to `b`; disposing them would double-free).
+                lowerOwningInlineArrayReassign(
+                    *as->target, addr, elemTy,
+                    /*skipDisposal=*/as->wholeValueLhsMovedFrom);
                 // #429 / §4.6 / §28.9: a store into a CLASS string field /
                 // auto-property takes an independent +1 (retain-new or transfer-
                 // producer / release-old), released on the owner's disposal.
@@ -3349,32 +3418,96 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
 
 bool Emitter::lowerOwningInlineArrayReassign(const ast::Expr& target,
                                               llvm::Value* arrayAddr,
-                                              llvm::Type* elemTy) {
-    // §28.7 / §15.3 (#1385): whole-value reassignment of a move-only OWNING
-    // inline-array local or field (`[N owned]T` / `[N owned]T?`) disposes each
-    // non-moved-from slot of the displaced value in REVERSE slot order, then
-    // the caller performs the new-value store. Sema's `moveOnlyArrayLive_` map
-    // (#1549) tracks per-slot moved-from state statically, but we rely on the
-    // runtime invariant that `move a[i]` nulls the slot in the alloca
-    // (lowerMoveFromCollectionSlot, #747) — so a slot that is semantically
-    // moved-from is also literally null at the reassignment site, and the
-    // null-guard below skips it. Whole-array moves `var b := a;` likewise
-    // dispose `a`'s slots when they go out of scope, leaving the alloca's
-    // slots live but semantically transferred (sema suppresses the scope-end
-    // disposal in that case); this helper covers the leak in any path where
-    // the new value is about to overwrite an unset slot. Returns true iff
+                                              llvm::Type* elemTy,
+                                              bool skipDisposal) {
+    // §28.7 / §15.3 (#1385 / v0.260): whole-value reassignment of a move-only
+    // OWNING inline-array local or field (`[N owned]T` / `[N owned]T?`) disposes
+    // each live (non-null, non-moved-from) slot of the displaced value in
+    // REVERSE slot order, then the caller performs the new-value store. Sema's
+    // `moveOnlyArrayLive_` map (#1549) tracks per-slot moved-from state
+    // statically, but we rely on the runtime invariant that `move a[i]` nulls
+    // the slot in the alloca (lowerMoveFromCollectionSlot, #747) — so a slot
+    // that is semantically moved-from is also literally null at the
+    // reassignment site, and the null-guard below skips it. Returns true iff
     // the helper ran; the caller continues with the new-value store.
+    //
+    // fix #3263: two correctness extensions layered on the #1385 shape:
+    //   (defect 2) `skipDisposal` — the LHS was whole-value moved-from by a
+    //     prior `var b := a;` (sema's `moveOnlyArrayWholeValueMovedFrom_` set
+    //     populated it via `moveOnlyArrayNoteWholeTransfer`; the per-Assignment
+    //     flag `wholeValueLhsMovedFrom` reads it back here). §28.7 *Moved-from
+    //     and null*: "Overwriting a moved-from field/local ... stores without
+    //     disposal" — the alloca's stale pointers now belong to the receiver
+    //     (e.g. `b`), and the receiver's scope-end disposal will free them.
+    //     Disposing them here would double-free. Suppress the entire pass.
+    //   (defect 3) null each slot immediately after `emitDisposeAndReclaim`,
+    //     AND wrap the per-slot disposal so a throwing slot disposer does not
+    //     stop the pass — §28.7 *Ordering and exceptions* (v0.260): the pass
+    //     is "a multi-value cleanup in §28.4's sense — a slot disposer that
+    //     throws does not stop the pass; the remaining live slots are still
+    //     disposed, a later throw superseding an earlier one under §31.2's
+    //     ordinary rule ... — and the displaced value's later unwinding
+    //     discharge observes only empty slots". The throwing slot is nulled
+    //     so the unwinding discharge (a later `a`'s own scope-end or field
+    //     reclamation) sees it as empty and skips it; the remaining live
+    //     slots continue to be disposed; the latest throw wins for in-flight
+    //     propagation.
     if (!arrayAddr || !elemTy) return false;
     const sema::TypeRef* rt = ctx_.exprType(target);
     if (!rt || rt->kind != sema::TypeRef::Kind::InlineArray || !rt->arrayOwned)
         return false;
     auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(elemTy);
     if (!arrTy) return false;
+    // fix #3263 defect 2: the LHS was whole-value moved-from — the stale
+    // alloca pointers belong to the receiver now. Suppress the entire pass.
+    if (skipDisposal) return true;
     // Per §15.1.1 / #747, the owning inline-array slot storage is `[N x ptr]`
     // (a null ptr means empty; a non-null ptr owns the slot's object). Iterate
     // in REVERSE order per the spec wording on #1385: "disposes each non-moved-
     // from slot of the displaced value (reverse slot order), then stores".
     unsigned N = arrTy->getNumElements();
+    // fix #3263 defect 3: a slot disposer that throws does not stop the
+    // pass (per-slot multi-value cleanup, §28.7 v0.260 + §28.4 composition).
+    // Capture the entry bz$exc value (parkedExc): a pre-existing propagating
+    // exception in flight at the pass's entry (e.g. the unwinding discharge
+    // is itself inside a try-finally whose catch arm ran the assignment).
+    // Clear bz$exc for the run of the pass (the same park-discipline the
+    // destructor-body block at LlvmBackend_Disposal.cpp:127 uses), so each
+    // slot's dispose sees a clean exception context — a throwing disposer
+    // sets bz$exc to its NEW exception and we record that as the pass's
+    // currently-propagating one, leaving the parked exception for the post-
+    // pass restore. The latest throw wins (later-wins, §28.7 *Ordering and
+    // exceptions*); on the pass's exit, if the pass raised a new exception
+    // (inFlightExc), the parked exception is disposed as superseded
+    // (SupersededChain / §31.4 v0.259 is the runtime record channel; at
+    // HEAD the runtime field is not yet shipped, so we dispose directly —
+    // the diagnostic loss the chain would recover is on the §31.4 ledger,
+    // and the *disposal* of the superseded exception is the part the
+    // composition actually requires). The bz$exc slot is restored to the
+    // chosen in-flight exception (or the parked one, if no throw happened)
+    // at the pass's exit — symmetric with the destructor body's restore.
+    //
+    // The "running winner" `inFlightExc` is a loop-carried value: each
+    // iteration's `advanceBB` reassigns it to the latest throw, and the
+    // NEXT iteration's `checkBB` reads it. A C++ variable holding an SSA
+    // value does NOT flow through the loop's CFG (each iteration's `newExc`
+    // is a separate load, so the SSA value of `inFlightExc` after one
+    // `advanceBB` is the previous-iter's `newExc`; the next iter's uses
+    // would reference that SSA value, but the previous iter's `advanceBB`
+    // is NOT dominated by it). Park the running winner in a stack slot
+    // (entryAlloca) — load on each use, store on each advance — so the
+    // value flows through the loop as a memory location.
+    llvm::Value* excSlot = emitExcSlot();
+    llvm::Value* parkedExc =
+        builder_.CreateLoad(ptrTy(), excSlot, "ioar.parked");
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), excSlot);
+    llvm::AllocaInst* inFlightSlot = entryAlloca(ptrTy());
+    inFlightSlot->setName("ioar.inflight");
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                         inFlightSlot);
+    auto loadInFlight = [&]() -> llvm::Value* {
+        return builder_.CreateLoad(ptrTy(), inFlightSlot, "ioar.inflight.v");
+    };
     for (unsigned i = N; i > 0; --i) {
         unsigned idx = i - 1;
         llvm::Value* slotAddr = builder_.CreateInBoundsGEP(
@@ -3386,18 +3519,137 @@ bool Emitter::lowerOwningInlineArrayReassign(const ast::Expr& target,
             obj, llvm::ConstantPointerNull::get(ptrTy()));
         auto* dispBB =
             llvm::BasicBlock::Create(llvm_, "ioar.dispose", currentFn_);
+        auto* nullSlotBB =
+            llvm::BasicBlock::Create(llvm_, "ioar.nullslot", currentFn_);
         auto* contBB =
             llvm::BasicBlock::Create(llvm_, "ioar.cont", currentFn_);
-        builder_.CreateCondBr(isNull, contBB, dispBB);
+        builder_.CreateCondBr(isNull, nullSlotBB, dispBB);
         builder_.SetInsertPoint(dispBB);
         // Same dispatch the scope-end disposal uses (Disposal.inlineOwnedArray,
         // LlvmBackend_Disposal.cpp ~1890): dynamic-dispatched Dispose + block
         // reclaim via the slot object's own vtable. Idempotent on a null input
-        // (the guard above already routed null to contBB).
+        // (the guard above already routed null to nullSlotBB).
         emitDisposeAndReclaim(obj);
+        // fix #3263 defect 3: leave the disposed slot EMPTY (§28.7 v0.260:
+        // "every slot the pass disposed is left empty ... and the displaced
+        // value's later unwinding discharge observes only empty slots"). The
+        // store is to the SAME slotAddr the dispose loaded from — the nulling
+        // happens AFTER the dispose so the dispose sees the live object, and
+        // a subsequent unwinding scope-end disposal (or the thrower's own
+        // re-disposal via the bz$exc propagation) finds the slot null and
+        // skips it via its null-guard. Without this the disposed slot's
+        // pointer is still in the alloca — a later path that reads or
+        // re-disposes it sees a freed instance.
+        builder_.CreateStore(
+            llvm::ConstantPointerNull::get(ptrTy()), slotAddr);
+        // fix #3263 defect 3: a throwing slot disposer does NOT stop the
+        // pass. Check bz$exc after the dispose — if a NEW exception was set
+        // (the slot's disposer threw, or a callee inside Dispose threw), the
+        // running winner is updated to it and the previous winner (if any) is
+        // disposed as superseded. bz$exc itself is cleared so the NEXT slot
+        // dispose sees a clean context (its own throw, if any, will be the
+        // one that propagates after the pass — not this throw).
+        llvm::Value* newExc =
+            builder_.CreateLoad(ptrTy(), excSlot, "ioar.newexc");
+        llvm::Value* hasNewExc = builder_.CreateICmpNE(
+            newExc, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* checkBB =
+            llvm::BasicBlock::Create(llvm_, "ioar.check", currentFn_);
+        auto* disposePrevBB =
+            llvm::BasicBlock::Create(llvm_, "ioar.disposeprev", currentFn_);
+        auto* advanceBB =
+            llvm::BasicBlock::Create(llvm_, "ioar.advance", currentFn_);
+        auto* setInFlightBB =
+            llvm::BasicBlock::Create(llvm_, "ioar.setinflight", currentFn_);
+        // If the slot's dispose threw (hasNewExc), branch to checkBB to
+        // dispose the previous in-flight as superseded and set the new
+        // in-flight. If not, branch to advanceBB to leave the previous
+        // in-flight intact (later-wins: a no-throw iter does not
+        // "supersede" anything; the running exception is whatever was
+        // the latest throw from a PRIOR iter).
+        builder_.CreateCondBr(hasNewExc, checkBB, advanceBB);
+        builder_.SetInsertPoint(checkBB);
+        // The previous in-flight exception (if any) is superseded by newExc.
+        // Dispose it exactly as emitPendingCheckIf / emitNewPendingCheck do
+        // for the sibling finally/catch-guard supersede (#1216/#1149),
+        // including the #1288/§30.9 deferred-fault clear so a superseded
+        // task-owned fault's single-dispose invariant still holds. The
+        // disposal itself is `emitDisposeAndReclaim` (idempotent Dispose +
+        // reclaim — bz_clear_exc_deferred resets the deferred flag first).
+        llvm::Value* prevExc = loadInFlight();
+        llvm::Value* prevIsNull = builder_.CreateICmpEQ(
+            prevExc, llvm::ConstantPointerNull::get(ptrTy()));
+        builder_.CreateCondBr(prevIsNull, setInFlightBB, disposePrevBB);
+        builder_.SetInsertPoint(disposePrevBB);
+        builder_.CreateCall(
+            declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy()}),
+            {prevExc});
+        emitDisposeAndReclaim(prevExc);
+        builder_.CreateBr(setInFlightBB);
+        // setInFlightBB: store newExc (the latest throw) into inFlightSlot,
+        // clear bz$exc so the next iter's dispose sees a clean context,
+        // branch to contBB. This is the ONE place newExc is written to
+        // inFlightSlot, ensuring a no-throw iteration (which bypasses
+        // checkBB entirely) leaves the previous in-flight throw intact.
+        builder_.SetInsertPoint(setInFlightBB);
+        builder_.CreateStore(newExc, inFlightSlot);
+        builder_.CreateStore(
+            llvm::ConstantPointerNull::get(ptrTy()), excSlot);
+        builder_.CreateBr(contBB);
+        // advanceBB: the no-throw path. Leave inFlightSlot intact (a no-throw
+        // iter does not supersede a previous throw — the running exception
+        // is whatever was set by a prior throw). Branch to contBB to
+        // continue the loop. CRITICAL: do NOT touch inFlightSlot here; a
+        // prior throw must survive a no-throw iter (later-wins, but a null
+        // is not a "winner" — it just doesn't change the running exception).
+        builder_.SetInsertPoint(advanceBB);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(nullSlotBB);
+        // Null-slot edge: nothing to dispose. Branch to contBB.
         builder_.CreateBr(contBB);
         builder_.SetInsertPoint(contBB);
     }
+    // fix #3263 defect 3: pass complete. Restore bz$exc to the running
+    // winner (later-wins — last throw wins for propagation), disposing the
+    // parked exception as superseded if the pass raised a new one. On the
+    // no-throw path we restore the parked exception unchanged (or null if
+    // there was no exception in flight at the pass's entry).
+    llvm::Value* finalInFlight = loadInFlight();
+    llvm::Value* passThrew = builder_.CreateICmpNE(
+        finalInFlight, llvm::ConstantPointerNull::get(ptrTy()));
+    auto* restoreBB =
+        llvm::BasicBlock::Create(llvm_, "ioar.restore", currentFn_);
+    auto* supersedeParkedBB =
+        llvm::BasicBlock::Create(llvm_, "ioar.supersedeparked", currentFn_);
+    auto* finalBB =
+        llvm::BasicBlock::Create(llvm_, "ioar.final", currentFn_);
+    builder_.CreateCondBr(passThrew, restoreBB, finalBB);
+    builder_.SetInsertPoint(restoreBB);
+    // Dispose the parked exception (the one in flight at the pass's entry)
+    // as superseded, leaving the running winner as the new in-flight.
+    llvm::Value* hadParked = builder_.CreateICmpNE(
+        parkedExc, llvm::ConstantPointerNull::get(ptrTy()));
+    builder_.CreateCondBr(hadParked, supersedeParkedBB, finalBB);
+    builder_.SetInsertPoint(supersedeParkedBB);
+    builder_.CreateCall(
+        declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
+                 {ptrTy()}),
+        {parkedExc});
+    emitDisposeAndReclaim(parkedExc);
+    builder_.CreateBr(finalBB);
+    builder_.SetInsertPoint(finalBB);
+    llvm::Value* restoredExc = builder_.CreateSelect(
+        passThrew, finalInFlight, parkedExc);
+    builder_.CreateStore(restoredExc, excSlot);
+    // fix #3263 defect 3: if the pass raised a new exception, propagate it
+    // here. emitPendingCheck branches to the assignment statement's unwind
+    // target (the surrounding try/catch or the caller's unwind) when bz$exc
+    // is non-null — the later-wins throw now lives there. Without this, the
+    // throw would be silently dropped (the AssignmentStmt path's post-pass
+    // code does not itself emit a pending-check, since the #1385
+    // implementation never had a throwing disposer in the pass).
+    emitPendingCheck();
     return true;
 }
 
@@ -3696,7 +3948,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 descNode = resolved->astNode;
             llvm::GlobalVariable* desc =
                 descriptorForTypeName(resolved, descNode);
-            // §31.2.1/§12.9 (#1939 leg 3): a CONSTRUCTED generic arm type
+            // §31.2.1/§12.7 (#1939 leg 3): a CONSTRUCTED generic arm type
             // (`catch var e: MyExc<string>`, or `MyExc<T>` under the active
             // substitution) must test against its per-monomorphization
             // descriptor — the same resolution `is`/`as` (lowerTypeTest) and
@@ -3709,7 +3961,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             // recursively and returns null for a non-generic / non-concrete
             // target, keeping the shared resolution for those.
             //
-            // §12.9/§14.2/§31.2.1 (#2012, #2069): if the arm's type parameter
+            // §12.7/§2.8.3 rule 4/§31.2.1 (#2012, #2069): if the arm's type parameter
             // substitutes to a runtime-erased kind at this monomorphization
             // (`catch var e: MyExc<T>`, T=(int)->int) the descriptor collapses
             // onto a sibling and the arm would catch a wrong-instantiation

@@ -1072,6 +1072,16 @@ private:
         std::unordered_set<long long> movedSlots;  // provably moved-from
     };
     std::unordered_map<std::string, MoveOnlyArraySlots> moveOnlyArrayLive_;
+    // fix #3263 (§15.3 v0.260 / §28.7 v0.260): a name that has been the source
+    // of a whole-value move-out — `var b := a;`, a return of `a`, a discard
+    // sink of `a`, an argument passing of `a` (a move-only param/argument is
+    // a move, #1922) — distinct from per-slot `move a[i]` moves. The leak
+    // scan calls `moveOnlyArrayNoteWholeTransfer(name)` to populate the
+    // erased set's complement; `moveOnlyArrayCheckReassignment` reads this
+    // set to mark a later `a := X;` with `wholeValueLhsMovedFrom` so codegen
+    // suppresses the drop-on-overwrite pass (defect 2 — the stale alloca
+    // pointers now belong to the receiver, not to `a`).
+    std::unordered_set<std::string> moveOnlyArrayWholeValueMovedFrom_;
 
     void handleReturn(const ast::Expr& e);
 
@@ -2759,6 +2769,20 @@ private:
     // bool, because the diagnostic names a source location and the code that
     // names it must be the code that found it. // per §28.8.1
     const ast::Expr* findThrowable28_8_1(const ast::Expr* e) const;
+
+    // §28.8.1 (R4b, #3241): the drop-on-overwrite clause of the non-throwable
+    // assignments list — "a store into an `owned` field, a plain-`var` owned
+    // local, or an owning-collection slot that may hold a live (non-null, not
+    // moved-from) value is throwable". Returns the RHS node to report at when
+    // the assignment is throwable by drop-on-overwrite, or nullptr when the
+    // store is into a provably moved-from/null/borrow/value-typed location.
+    // Distinguished from `findThrowable28_8_1` (which walks RHS sub-expressions
+    // for the throwable inventory) by the LHS-side, ownership-lattice check.
+    // Non-const because the local-state lookup reads the mutable `states_`
+    // map (the lookup itself is non-mutating, but `lookupState` is not
+    // const-qualified). // per §28.8.1, #3241 R4b
+    const ast::Expr* assignmentIs28_8_1ThrowableByOverwrite(
+        const ast::AssignmentStmt& as);
 
     // §28.8.1 (#3080): the exception-edge half of the field-restoration rule —
     // "a throwable expression between the move and the reassignment introduces an

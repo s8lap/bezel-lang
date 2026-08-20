@@ -487,6 +487,20 @@ private:
     // the ownership machinery and silently traps.
     void checkUserDeclaredDispose();
 
+    // fix #3032 (§15.4.1, v0.262): a type declaring a static
+    // `FromCollectionLiteral` whose carrier is a recognized form
+    // (`ReadOnlySpan<T>` or `owned OwningArray<T>`) must be `public` and must
+    // return `owned C<T>` at the enclosing type's own arity; declaring both
+    // carriers on the same type is a compile error. These are declaration-
+    // site diagnostics — they fire on the method's own declaration so the
+    // user is told the right thing (their factory's modifier or return type
+    // is wrong, not their target type). Out of scope: the "declared directly
+    // on the collection type" conjunct already holds structurally
+    // (`TypeSymbol::members` carries only directly-declared members), and
+    // the `static` conjunct is already enforced by the recognition predicate
+    // `isCollectionLiteralAdmissibleTarget` (ExprTypecheck_Calls.cpp).
+    void checkCollectionLiteralFactoryConjuncts();
+
     static bool isOverloadable(Symbol* m);
 
     void checkTypeDuplicates(TypeSymbol* t);

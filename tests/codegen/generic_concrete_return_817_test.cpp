@@ -1,6 +1,6 @@
 // Codegen — issue #817: a method of a GENERIC class that returns a CONCRETE
 // (non-type-parameter) type while reading a generic-typed field emitted
-// malformed IR (§14.2 monomorphization).
+// malformed IR (§2.8.3 rule 4 monomorphization).
 //
 // THE BUG: a generic class's method bodies are emitted twice — (1) a correct
 // per-instantiation specialization, used at every call (the receiver always

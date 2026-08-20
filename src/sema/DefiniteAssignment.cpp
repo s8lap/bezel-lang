@@ -1,11 +1,13 @@
 #include "sema/DefiniteAssignment.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "sema/EnumValues.hpp"  // enumHasZeroConstant — §7.9 / §17.11 enum row (#3072)
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -20,9 +22,15 @@ namespace {
 // declaring class must explicitly initialize is definitely assigned. That set
 // is exactly §7.9's non-nullable *reference*-typed fields without an
 // initializer (fields with an initializer count as assigned at body entry;
-// value-typed fields have a defined default). Mirrors ownership's
-// isNonNullableReferenceField (the O9 field-DA check) — same classification,
-// so the observation gate and the field-DA obligation stay in lock-step.
+// value-typed fields have a defined default) — plus, per §7.9 v0.247, a
+// zero-less enum field (the enum CARVE-OUT, see §17.11: an enum without a
+// declared zero-valued constant has no well-defined default, so its storage
+// is likewise §7.9-strict). Mirrors ownership's isNonNullableReferenceField
+// (the O9 field-DA check) — same classification, so the observation gate and
+// the field-DA obligation stay in lock-step. The R-2 deferred rows
+// (records with non-nullable reference fields, inline arrays of non-nullable
+// reference elements, owning inline arrays) are intentionally NOT folded in
+// here — landing the enum row alone keeps the fix narrowly scoped (#3072).
 bool isSevenNineStrictField(const ast::FieldDecl& f, SemaContext& ctx) {
     for (auto m : f.modifiers)
         if (m == "static") return false;
@@ -38,6 +46,20 @@ bool isSevenNineStrictField(const ast::FieldDecl& f, SemaContext& ctx) {
             return true;
         case TypeRef::Kind::Named:
             if (!rt->declaration) return false;  // built-in / generic — skip
+            // fix #3072 / §7.9 / §17.11: a zero-less enum field has no
+            // well-defined default — `default(E)` is ill-formed for it
+            // (and zero-fill leaves the slot holding an undeclared value, in
+            // violation of §5.4's invariant). Treat it as §7.9-strict so the
+            // constructor must assign it on every normal-exit path. An enum
+            // whose declared-value set is incomplete (a non-constant
+            // initializer, already diagnosed) is NOT rejected: enumHasZero
+            // Constant returns nullopt and the conservative posture is to
+            // accept — matching §17.11's `defaultIllFormed` arm.
+            if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
+                std::optional<bool> hasZero =
+                    enumHasZeroConstant(*rt->declaration);
+                return hasZero && !*hasZero;
+            }
             return rt->declaration->kind == ast::TypeDeclKind::Class ||
                    rt->declaration->kind == ast::TypeDeclKind::Interface;
         default:
@@ -51,7 +73,9 @@ bool isSevenNineStrictField(const ast::FieldDecl& f, SemaContext& ctx) {
 // it joins the observation gate's needing-set exactly like a field. Indexers,
 // static, and initialized auto-properties are excluded (the last is assigned at
 // entry). A computed (block/expression-bodied) property has no backing storage
-// and is not counted.
+// and is not counted. fix #3072: the enum CARVE-OUT (zero-less enum) is
+// treated as §7.9-strict for the same reason as a field — auto-prop storage
+// mints an undeclared value at construction when zero-filled.
 bool isSevenNineStrictAutoProp(const ast::PropertyDecl& p, SemaContext& ctx) {
     if (p.bodyKind != ast::PropertyBodyKind::Auto) return false;
     if (p.isIndexer || p.autoInitializer) return false;
@@ -68,6 +92,13 @@ bool isSevenNineStrictAutoProp(const ast::PropertyDecl& p, SemaContext& ctx) {
             return true;
         case TypeRef::Kind::Named:
             if (!rt->declaration) return false;
+            // fix #3072 / §7.9 / §17.11: zero-less enum auto-prop storage is
+            // §7.9-strict (same reasoning as isSevenNineStrictField).
+            if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
+                std::optional<bool> hasZero =
+                    enumHasZeroConstant(*rt->declaration);
+                return hasZero && !*hasZero;
+            }
             return rt->declaration->kind == ast::TypeDeclKind::Class ||
                    rt->declaration->kind == ast::TypeDeclKind::Interface;
         default:

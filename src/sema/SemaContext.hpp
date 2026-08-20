@@ -55,6 +55,22 @@ public:
     SemaContext(const SemaContext&) = delete;
     SemaContext& operator=(const SemaContext&) = delete;
 
+    // §22.16 (v0.250, #3038): a stable-address LocalSymbol standing in for
+    // the contextual keyword `result` inside an `ensures` clause. Owned by
+    // the SemaContext (lifetime = whole compilation) so the pointer stays
+    // valid for codegen to read after the ExprTC that created the binding
+    // is destroyed. The symbol's `declType` is rebound (not preserved) to
+    // the current method's return type at every IdentifierExpr visit; a
+    // single instance is reused across every `result` reference in every
+    // clause of every method.
+    LocalSymbol* syntheticResultLocal() {
+        if (!syntheticResultLocal_) {
+            syntheticResultLocal_ = makeSymbol<LocalSymbol>();
+            syntheticResultLocal_->name = "result";
+        }
+        return syntheticResultLocal_;
+    }
+
     DiagnosticEngine& diagnostics() { return diagnostics_; }
 
     // Allocate-and-own a symbol of the requested kind. Returns a raw pointer
@@ -762,6 +778,10 @@ private:
     std::unordered_map<const ast::Type*, TypeRef*> resolvedTypes_;
     std::unordered_map<const ast::Expr*, TypeRef*> exprTypes_;
     std::unordered_map<const ast::Expr*, Symbol*> exprSymbols_;
+    // §22.16 (v0.250, #3038): see `syntheticResultLocal()` accessor. Lazy so
+    // the symbol is only created when an `ensures` clause actually uses
+    // `result` (the common program has no clauses at all).
+    LocalSymbol* syntheticResultLocal_ = nullptr;
     // §19.3 (#1853): see setPatternSymbol — a bare-name local-const NamedPattern.
     std::unordered_map<const ast::Pattern*, Symbol*> patternSymbols_;
     std::unordered_map<const ast::LambdaExpr*, std::vector<Symbol*>> lambdaParams_;

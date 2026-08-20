@@ -5774,10 +5774,17 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // keep today's behaviour exactly; each is the same silent-no-ctor-call
         // defect and is FILED separately rather than widened into here.
         // fix #2658 (§17.13 "The discard `_`" / §22.6 / §22.3, v0.236): the
-        // `out _` DISCARD is admitted too, but ONLY against a plain borrowing
-        // `out` formal.
+        // `out _` DISCARD is admitted too, against a plain borrowing `out`
+        // formal. fix #3081 (§22.6, v0.244) widened the admission to `out owned`
+        // formals AS WELL: §22.6's "out _. The discard form applies to both
+        // parameter kinds" mandates it. The plain `out` and `out owned` paths
+        // share the same scratch allocation; the `out owned` half adds the
+        // scratch-slot ownership bookkeeping (`discardOwnedOutSlots_` +
+        // #1833(a) unwind entry) below — exactly mirroring the in-module
+        // method-call path's buildOrderedArgs #1301 block (LlvmBackend_Assign.cpp
+        // :10439), which already implemented both.
         //
-        // The admitted set is exactly what §17.13 sanctions and no more.
+        // The admitted set is exactly what §17.13 / §22.6 sanction and no more.
         // §17.13's out-argument position reads: "As a positional argument with
         // the `out` modifier, `_` discards the out-parameter result", and the
         // section opens "Discard is permitted in three positions; in every
@@ -5795,20 +5802,6 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // "`out _` does not introduce a variable; the receiving slot is
         // internal to the compiler and is not observable. The argument is
         // type-inferred from the parameter's declared type."
-        //
-        // An `out owned` formal's discard is likewise NOT admitted, and that is
-        // a decline of a NORMATIVE obligation, recorded as such: §22.6 states
-        // "`out _`. The discard form applies to both parameter kinds: against
-        // `out T` the received value is simply dropped (§17.13); against
-        // `out owned T` the discarded value is an unbound owned temporary
-        // disposed at the end of the full statement (§28.3)." Implementing that
-        // here needs the scratch-slot ownership bookkeeping buildOrderedArgs
-        // performs (`discardOwnedOutSlots_` + the #1833(a) unwind entry), which
-        // this hand-rolled loop does not have; shipping it unverified is not an
-        // option because no oracle available here can see a cross-module leak
-        // or double-free (ASan is blind past `-c`). So it stays unimplemented
-        // but becomes LOUD instead of silent. FILED with the §22.6 target
-        // semantics so the next lane knows what to build.
         sema::ConstructorSymbol* cs = ctorForArgs(t, ne.args);
         auto importedFormalMod = [&](std::size_t ai) -> std::string_view {
             if (cs && ai < cs->params.size())
@@ -5822,7 +5815,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             const auto& a = ne.args[ai];
             if (!a.name.empty()) { allPositional = false; break; }
             if (a.isDiscard) {
-                if (importedFormalMod(ai) != "out")
+                // fix #3081 (§22.6 "out _", v0.244): the discard form applies to
+                // BOTH `out T` AND `out owned T` (§22.6, v0.244: "against
+                // `out T` the received value is simply dropped (§17.13);
+                // against `out owned T` the discarded value is an unbound owned
+                // temporary disposed at the end of the full statement
+                // (§28.3)"). The plain `out` case was the #2658 admission; this
+                // widens to `out owned` so the scratch-slot + disposal bookkeeping
+                // below can run. Refining the type-eligibility predicate
+                // (class/interface-only — the same one buildOrderedArgs' #1301
+                // block uses, the same one fix #3142 imported-side widened) lives
+                // at the scratch allocation site, not here, so a non-pointer
+                // `out owned` (a future builtin handle, say) still admits and
+                // passes through unchanged.
+                std::string_view fm = importedFormalMod(ai);
+                if (fm != "out" && fm != "out owned")
                     { allPositional = false; break; }
                 continue;
             }
@@ -5854,7 +5861,19 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // whose constructor body never ran — a silent wrong answer — so the
         // residual is reported rather than dropped (see the guard after it).
         bool emittedImportedCtorCall = false;
-        if (cs && allPositional && ne.args.size() == cs->params.size()) {
+        // fix #3082 (§22.5 / §2.8.2, v0.244): an imported constructor with
+        // optional parameters is callable with fewer arguments, and the
+        // omitted formals take their declared defaults. The previous
+        // `ne.args.size() == cs->params.size()` predicate was a §22.5 / #2.8.2
+        // violation — a caller in another module could not omit any default
+        // form, while the in-module twin could. Sema now admits the call
+        // (checkImportedNewExprArgs over `FormalsView::of(*cs)`), so the
+        // codegen path must follow: arity-≤-count with every unfilled
+        // trailing formal carrying a §22.5 default. Defaults are materialized
+        // by `importedCtorDefaultArgValue` (the ctor twin of
+        // `importedDefaultArgValue`) at the same point the
+        // imported-method-call path does it.
+        if (cs && allPositional && ne.args.size() <= cs->params.size()) {
             llvm::Function* ctorFn = declareImportedCtor(cs);
             std::vector<llvm::Value*> args;
             args.push_back(obj);
@@ -5920,9 +5939,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // leak, not a pre-existing one.)
                 if (ne.args[ai].isDiscard) {
                     llvm::Type* scratchTy = nullptr;
+                    const sema::ParameterSymbol* ps = nullptr;
                     if (ai < cs->params.size())
-                        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
-                                cs->params[ai]))
+                        if ((ps = dynamic_cast<sema::ParameterSymbol*>(
+                                cs->params[ai])))
                             if (ps->resolvedDeclType)
                                 scratchTy = lowerTypeRef(ps->resolvedDeclType);
                     if (!scratchTy) { ok = false; break; }
@@ -5931,6 +5951,56 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                                            std::next(scratch->getIterator()));
                     init.CreateStore(
                         llvm::Constant::getNullValue(scratchTy), scratch);
+                    // fix #3081 (§22.6 "out _" / §17.13 / §28.3, v0.244):
+                    // `out _` against an `out owned T` formal: §22.6 mandates
+                    // the discard form is "an unbound owned temporary disposed
+                    // at the end of the full statement", so the produced value
+                    // must reach the disposal loop at the bottom of lowerNew
+                    // (`disposeNewDiscardOwnedOutSlots(newDiscardOwnedBase)`,
+                    // already called at every return of this branch — the
+                    // imported path's symmetry with the in-module method-call
+                    // path's `discardOwnedOutSlots_` loop). Mirror the build-
+                    // OrderedArgs #1301 block (`LlvmBackend_Assign.cpp:10439`)
+                    // — null-initialize, push onto `discardOwnedOutSlots_`,
+                    // register the #1833(a) `unwindOnly dynamicDispose` entry so
+                    // a callee that writes-then-throws does not leak.
+                    //
+                    // The kind eligibility is the SAME class/interface gate
+                    // buildOrderedArgs uses: dynamic disposal dispatches through
+                    // vtable slot 2, which exists only for class/interface. A
+                    // value-typed or builtin-collection/handle `out owned` is
+                    // left untouched here — the slot is sized by the formal,
+                    // passed, and ignored; if no value is produced on the
+                    // normal-return edge the slot just stays null. Gated on
+                    // pointer-typed (the vtable dispatch) AND on a Named kind
+                    // with a non-null `declaration` (the #3142 fix widened this
+                    // off `->decl` so imported classes pass the same check).
+                    if (ps && ps->modifier == "out owned" &&
+                        scratchTy == ptrTy() && ps->resolvedDeclType &&
+                        ps->resolvedDeclType->kind ==
+                            sema::TypeRef::Kind::Named &&
+                        ps->resolvedDeclType->declaration) {
+                        const ast::TypeDeclKind tk =
+                            ps->resolvedDeclType->declaration->kind;
+                        if (tk == ast::TypeDeclKind::Class ||
+                            tk == ast::TypeDeclKind::Interface) {
+                            discardOwnedOutSlots_.push_back(scratch);
+                            // #1833 (a) / §22.6 / §28.3 / §17.13: the
+                            // normal-return path is handled by
+                            // disposeNewDiscardOwnedOutSlots below; the
+                            // throw-after-assign edge needs the same
+                            // null-guarded dynamic-dispose-on-unwind the
+                            // in-module method-call path registers. The
+                            // `unwindOnly` flag keeps the normal-return
+                            // path unaffected.
+                            if (!disposeStack_.empty()) {
+                                Disposal d{scratch, nullptr};
+                                d.unwindOnly = true;
+                                d.dynamicDispose = true;
+                                disposeStack_.back().push_back(d);
+                            }
+                        }
+                    }
                     args.push_back(scratch);
                     continue;
                 }
@@ -5993,6 +6063,32 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         isUnsignedTargetExpr(*ne.args[ai].value));
                 args.push_back(v);
             }
+            // fix #3082 (§22.5 / §2.8.2, v0.244): an imported constructor
+            // was called with fewer arguments than its parameter list has —
+            // every unfilled TRAILING formal takes its §22.5 default. The
+            // call site is positional (`allPositional` is true above), so the
+            // unfilled slot is exactly `ne.args.size()` + k for k in
+            // [0, cs->params.size() - ne.args.size()). The default is
+            // materialized by `importedCtorDefaultArgValue`, which reads
+            // `ParameterSymbol::defaultText` (the same wire data the method-
+            // call twin uses) and folds it through the same
+            // null / `default(T)` / constant-fold arms. Sema already
+            // pre-rejected unfilled formals whose default is not
+            // materializable, so this returns a value for every slot or
+            // reports the same §22.5/#3082 diagnostic on the way out.
+            for (std::size_t ai = ne.args.size();
+                 ok && ai < cs->params.size(); ++ai) {
+                llvm::Value* dv = importedCtorDefaultArgValue(*cs, ai);
+                if (!dv) { ok = false; break; }
+                // §5.1: same coerceNumericToType the call-site-arg branch
+                // applies, so an int default landing in a wider numeric
+                // formal gets the right ABI (no-op for an already-typed
+                // constant; mirrors the local-twin buildOrderedArgs arm).
+                if (ai + 1 < fnTy->getNumParams())
+                    dv = coerceNumericToType(dv, fnTy->getParamType(ai + 1),
+                                             /*isUnsigned=*/false);
+                args.push_back(dv);
+            }
             unwindTarget_ = savedArgUT;
             if (ok && args.size() == ctorFn->arg_size()) {
                 // fix #2659 / #1918 (§28.3): the "call about to run" point —
@@ -6025,18 +6121,154 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             emitAccessorRefArgWriteBacks(accessorRefArgs,
                                          /*emit=*/ok && !diverged_);
         }
+        // fix #3268 (§22.5 / §2.8.2, v0.244): the imported-ctor NAMED-argument
+        // path. The all-positional path above is the historical shape #3082
+        // lifted to admit omitted-trailing defaults, and remains untouched
+        // (its tail of #3081 `out owned` discard handling and the #2319 §22.3
+        // accessor bracket are not in scope here). The named-arg path uses
+        // the §22.5 binding sema publishes on the
+        // `SemaContext::setNewExprPositionalBinding` side table
+        // (`checkImportedNewExprArgs` writes it in `b.paramToArg`, the same
+        // side table the imported-record path `storePrimaryCtorPositionalArgs`
+        // reads via #3196).
+        //
+        // The §22.5 binding the side table carries is the lowering-side twin
+        // `importedFormalToArg(*cs, ne.args)` (LlvmBackend_Setup.cpp, the
+        // ctor twin of the method version `lowerCall` already uses at
+        // LlvmBackend_Calls2.cpp:8210). The helper's identity fallback is
+        // never reached here: sema's `bindArgsToParams` rejects every shape
+        // that would force the fallback (a `out _` discard, an unknown
+        // parameter name, a double binding, an unfilled required formal),
+        // so the binding is well-defined and the helper's broader-contract
+        // posture buys nothing in this arm. `importedFormalToArg` differs
+        // from the side table in exactly ONE way: the side table is
+        // published before `importedFormalToArg` runs, so the helper has
+        // the canonical binding; the side table itself is consulted by
+        // codegen purely as a "sema accepted this call" signal.
+        //
+        // The named-arg branch is purposefully narrow: only the basic
+        // shape `importedFormalToArg` admits (named and/or positional
+        // arguments with no modifier and no discard). The wider modifier
+        // + discard shapes the imported method arm handles are out of
+        // scope here — modifier-handling on a named-position argument
+        // would require the same §22.3 bracket the all-positional arm
+        // already builds (and which is presently tied to the
+        // `importedFormalMod(ai)`-by-ai lookup). Filing that widening is
+        // local to the ctor; the headline is the §22.5 named case the
+        // issue names.
+        if (!allPositional && cs && !cs->params.empty()) {
+            const std::vector<int>* bindingPtr =
+                ctx_.newExprPositionalBinding(ne);
+            if (bindingPtr && bindingPtr->size() == cs->params.size()) {
+                llvm::Function* ctorFn = declareImportedCtor(cs);
+                auto* fnTy = ctorFn->getFunctionType();
+                // The fill-or-default map j -> call-site arg index for
+                // formal j, or -1 when formal j takes its declared default.
+                const std::vector<int> formalToArg =
+                    importedFormalToArg(*cs, ne.args);
+                std::vector<llvm::Value*> ordered(cs->params.size(), nullptr);
+                // call-site arg -> formal index, so the
+                // `nullTransferredOwnedLocalSlot` post-pass (which keys off
+                // the FORMAL's modifier) can look up which formal a given
+                // arg actually fills. -1 for an arg the helper declined to
+                // bind (an unreachable shape; the helper's identity fallback
+                // is defensive — sema rejects these before the side table
+                // is published).
+                std::vector<int> argToFormal(ne.args.size(), -1);
+                for (std::size_t j = 0; j < formalToArg.size(); ++j)
+                    if (formalToArg[j] >= 0 &&
+                        static_cast<std::size_t>(formalToArg[j]) <
+                            argToFormal.size())
+                        argToFormal[static_cast<std::size_t>(
+                            formalToArg[j])] = static_cast<int>(j);
+                // §28.3: arguments are evaluated eagerly, left to right
+                // (same §28.3 rule `lowerCall`'s imported-method arm
+                // honours). Placement in `ordered` is by formal index.
+                // A FAILURE here (a `lowerExpr` returning null) is
+                // indistinguishable from the all-positional arm's
+                // `!v` bail: mark `ok = false`, skip the call, let the
+                // #2658 loudness residual below report.
+                bool ok = true;
+                // #1968 / §28.3: reclaim the uninitialized `obj` if an
+                // argument throws during evaluation (the imported ctor
+                // has not yet been entered; every field is zero until
+                // the imported ctor's body runs). The ctor's own throw
+                // edge is handled by emitNewPendingCheck below, so the
+                // arg-time unwind target is restored before the call.
+                llvm::BasicBlock* savedArgUT = unwindTarget_;
+                if (!ne.args.empty()) unwindTarget_ = newArgUnwindCleanup(obj);
+                for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
+                    const ast::CallArgument& a = ne.args[ai];
+                    const int fj = argToFormal[ai];
+                    if (fj < 0 || !a.value) { ok = false; break; }
+                    const std::size_t fi = static_cast<std::size_t>(fj);
+                    std::string_view formalMod;
+                    const sema::TypeRef* formalTy = nullptr;
+                    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                            cs->params[fi])) {
+                        formalMod = ps->modifier;
+                        formalTy = ps->resolvedDeclType;
+                    }
+                    llvm::Value* v = lowerExpr(*a.value);
+                    if (!v) { ok = false; break; }
+                    // fix #3133 / §7.2 / §2.5 (v0.252): an imported
+                    // ctor's formal is a `sema::TypeRef*`, so the
+                    // CG-nullable block buildOrderedArgs runs against
+                    // `params[idx].type` does NOT fire here. Mirror the
+                    // same three lines from buildOrderedArgs exactly: a
+                    // `null` literal becomes the all-zero nullable
+                    // struct, a bare T becomes a wrapped nullable, a
+                    // value already shaped is left alone. The named-arg
+                    // path does not currently exercise §22.3 ref/out
+                    // modifiers, so there is no by-ref carve-out to
+                    // import — `lowerExpr` is always the by-value path.
+                    if (formalTy && isNullableValueTy(formalTy)) {
+                        auto* expectedSt = nullableValueStructTy(formalTy);
+                        if (v->getType() != expectedSt) {
+                            if (v->getType()->isPointerTy() &&
+                                llvm::isa<llvm::ConstantPointerNull>(v)) {
+                                v = nullableValueNull(formalTy);
+                            } else if (v->getType() ==
+                                       expectedSt->getElementType(1)) {
+                                v = wrapNullableValue(formalTy, v);
+                            }
+                        }
+                    }
+                    ordered[fi] = v;
+                }
+                // Materialize every unfilled formal's §22.5 default.
+                for (std::size_t j = 0; j < ordered.size(); ++j) {
+                    if (ordered[j]) continue;
+                    llvm::Value* dv = importedCtorDefaultArgValue(*cs, j);
+                    if (!dv) { ok = false; break; }
+                    if (j + 1 < fnTy->getNumParams())
+                        dv = coerceNumericToType(dv, fnTy->getParamType(j + 1),
+                                                 /*isUnsigned=*/false);
+                    ordered[j] = dv;
+                }
+                unwindTarget_ = savedArgUT;
+                if (ok && ordered.size() == cs->params.size()) {
+                    std::vector<llvm::Value*> args;
+                    args.push_back(obj);
+                    for (std::size_t j = 0; j < ordered.size(); ++j)
+                        args.push_back(ordered[j]);
+                    builder_.CreateCall(ctorFn, args);
+                    emittedImportedCtorCall = true;  // fix #2658
+                }
+            }
+        }
         // fix #2658 (§22.3/§22.4, v0.236): MAKE THE RESIDUAL LOUD. Every exit
         // from the block above that did not emit `bz$T$ctor` leaves an object
         // whose CONSTRUCTOR BODY NEVER RAN — the instance is calloc'd and
         // `bz$T$init` (vtable + field initializers) runs, then the branch falls
         // to `return obj` and emits nothing further. That was #2639's defect
         // and it is still reachable for every shape this path does not lower:
-        // an `out owned` discard, a NAMED argument, a by-value `owned` /
-        // `scoped` argument, and any by-ref argument whose `lvalueAddr`
-        // returned null without the #2319 bracket applying (`out owned` is
-        // excluded from that bracket). A silent no-op is the worst failure mode
-        // available here — the program compiles clean and returns a wrong
-        // answer across a module boundary — so report it.
+        // a NAMED argument, a by-value `owned` / `scoped` argument, and any
+        // by-ref argument whose `lvalueAddr` returned null without the #2319
+        // bracket applying (`out owned` is excluded from that bracket). A
+        // silent no-op is the worst failure mode available here — the program
+        // compiles clean and returns a wrong answer across a module boundary
+        // — so report it.
         //
         // The predicate cannot fire for a legitimately ctor-less imported type:
         // `ctorForArgs` returned a constructor, so one exists and was selected
@@ -6096,11 +6328,15 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             /*disposeAndFreeOnThrow=*/true);
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
-        // #1833 (b): the imported-ctor path iterates ne.args manually (no
-        // buildOrderedArgs call), so no discardOwnedOutSlots_ entry was
-        // recorded. disposeNewDiscardOwnedOutSlots is therefore a no-op
-        // here — included for symmetry with the other return points so
-        // the stack discipline is unambiguous.
+        // #1833 (b) / fix #3081 (§22.6, v0.244): the imported-ctor path
+        // iterates ne.args manually (no buildOrderedArgs call), and now records
+        // `discardOwnedOutSlots_` + `unwindOnly dynamicDispose` entries for any
+        // `out owned` ctor formal whose discard is admitted (the #3081 widening
+        // of #2658). disposeNewDiscardOwnedOutSlots runs at this point — under
+        // `!diverged_`, null-guarded, dynamic vtable Dispose + reclaim — exactly
+        // mirroring lowerCall's loop shape, so an `out _` against an imported
+        // `out owned` formal disposes the produced value at the end of the
+        // full statement.
         disposeNewDiscardOwnedOutSlots(newDiscardOwnedBase);
         return obj;
     }
@@ -9374,7 +9610,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     // Object scrutinee (see emitStringGuardedIsA) — a `var x: C`
                     // typed binding shares the concrete-name fault the bare
                     // `case o of C` NamedPattern above had.
-                    // §12.9/§14.2/§19.3 (#2012, #2069): a `var x: Wrap<T>` binding
+                    // §12.7/§2.8.3 rule 4/§19.3 (#2012, #2069): a `var x: Wrap<T>` binding
                     // whose T substitutes to a runtime-erased kind at this
                     // monomorphization collapses onto a sibling descriptor — REJECT
                     // (probes p_case_stmt/p_case_val: rc=0, answered TRUE on

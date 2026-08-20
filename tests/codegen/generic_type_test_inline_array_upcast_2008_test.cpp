@@ -1,4 +1,4 @@
-// #2008 (§12.9 type-test invariance, §14.2 monomorphization, §15.1 subtyping,
+// #2008 (§12.9 type-test invariance, §2.8.3 rule 4 monomorphization, §15.1 subtyping,
 // v0.197) — an upcast runtime `is`/`as` through a GENERIC base class or
 // interface whose type ARGUMENT is a folded-size inline array must match.
 //

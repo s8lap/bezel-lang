@@ -1,4 +1,4 @@
-// #2006 (§12.9/§14.2/§17.4, v0.197) — the runtime-correctness half of the plain
+// #2006 (§12.7/§2.8.3 rule 4/§17.4, v0.197) — the runtime-correctness half of the plain
 // `is`/`as` erasure guard. The sema half (is_as_type_test_erased_2006_test.cpp)
 // pins that a FUNCTION-typed generic argument is REJECTED at compile time on the
 // plain expression path (parity with the case-binding path). This half pins the

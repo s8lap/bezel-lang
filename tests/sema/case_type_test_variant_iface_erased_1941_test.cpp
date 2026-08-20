@@ -1,4 +1,4 @@
-// Spec-derived tests for §19.3/§12.9/§14.2 (#1941, spec v0.220): the erasure
+// Spec-derived tests for §19.3/§12.7/§2.8.3 rule 4 (#1941, spec v0.220): the erasure
 // guard on a VARIANT (`in`/`out`) generic-interface scrutinee.
 //
 // §12.7: "`is T` tests whether a value is an instance of `T`" — and §19.3's

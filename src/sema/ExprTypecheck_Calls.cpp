@@ -1638,6 +1638,72 @@ const TypeSymbol* ExprTC::enumTypeNamedBy(const ast::Expr& e) {
 // resolved MethodSymbol.
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
+    // §22.16 (v0.250, #3038): `old(E)` — the callee is the contextual
+    // keyword `old` and we are inside an `ensures` clause. The
+    // IdentifierExpr path in ExprTypecheck_Exprs.cpp suppresses its
+    // diagnostic for this one position; here we own the entire
+    // `old(E)` shape: visit the operand, enforce the §22.16 ownership
+    // restriction (a class- or interface-typed operand would hold a
+    // borrow across the whole body, which §22.16 forbids — the
+    // capture taxonomy lists the copyable-projection remedy), and set
+    // the CallExpr's exprType so downstream typecheck sees a typed
+    // expression. The class-typed rejection names the remedy per spec.
+    if (auto* oldId =
+            dynamic_cast<const ast::IdentifierExpr*>(ce.callee.get())) {
+        if (oldId->name == "old" &&
+            currentClauseKind_ == ContractClauseKind::Ensures) {
+            if (ce.args.size() != 1 || !ce.args[0].value) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    "`old` takes exactly one argument — the expression "
+                    "whose entry value is to be captured "
+                    "(\xc2\xa7""22.16)");
+                return;
+            }
+            // Visit the operand so its type is populated and any
+            // nested IdentifierExpr / member access / etc. resolves.
+            visitExpr(*ce.args[0].value);
+            TypeRef* argTy = ctx_.exprType(*ce.args[0].value);
+            // §22.16 ownership restriction: a class- or interface-typed
+            // capture would hold a borrow across the entire method body.
+            // Reject it with a diagnostic that names the copyable-
+            // projection remedy (§22.16 "old(E) — class- and
+            // interface-typed operands are captured as a frame-resident
+            // borrow" + the move-only operand paragraph). The
+            // value/primitive types are admitted: copyable by value
+            // (primitives, enums, records by value, strings, function
+            // types) or read-only borrows of fields that are themselves
+            // copyable. A class-typed operand fails the gate.
+            if (argTy) {
+                const bool isClassOrInterface =
+                    (argTy->kind == TypeRef::Kind::Named &&
+                     argTy->declaration &&
+                     (argTy->declaration->kind ==
+                          ast::TypeDeclKind::Class ||
+                      argTy->declaration->kind ==
+                          ast::TypeDeclKind::Interface));
+                if (isClassOrInterface) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "`old` over a class- or interface-typed value "
+                        "would hold a borrow across the entire method "
+                        "body and is rejected (\xc2\xa7""22.16); capture "
+                        "a copyable projection of the pre-state instead "
+                        "\xe2\x80\x94 an element- or payload-derived "
+                        "value, a `pure` member's result over a borrowed "
+                        "receiver, or a borrowing-match projection");
+                } else {
+                    // Set the CallExpr's type to the operand's type —
+                    // §22.16 "old(E) denotes the value E had at entry"
+                    // returns the same shape as E (the capture is by
+                    // copy for value kinds, by borrow for the
+                    // reference kinds we just gated).
+                    ctx_.setExprType(&ce, argTy);
+                }
+            }
+            return;
+        }
+    }
     // fix #3044 (§10.4 / stdlib §9.9, v0.242): `E.FromUnderlyingOrNull(value)`
     // — the COMPILER-PROVIDED per-enum static member. "Every enum `E` with
     // underlying type `U` carries one compiler-provided static member … no
@@ -7250,9 +7316,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // rejected via the `rcn == "X"` arms at lines 8006-8100,
                 // and §11.3 user classes of the same name would
                 // otherwise be wrongly false-rejected — see #2996 which
-                // fixed exactly that), `Linq` (a module name with no
-                // static-class surface — `Linq.X` is a name-lookup
-                // failure, not a member-call failure).
+                // fixed exactly that).
+                //
+                // `Linq` (#3274) is included as a row with an empty
+                // member list: `Linq` resolves as a builtin type
+                // identifier (arity 0 in `Resolver::builtinTypeArity`,
+                // TypeResolution_Names.cpp:314) with a synthetic
+                // TypeSymbol (decl == nullptr) set by
+                // ExprTypecheck_Exprs.cpp:1471. So
+                // `Linq.TotallyBogusMember(1, 2)` parses as
+                // `MemberAccess(Linq, TotallyBogusMember)(1, 2)` and
+                // reaches the static-call dispatch — the pre-#3274
+                // comment "Linq.X is a name-lookup failure, not a
+                // member-call failure" was wrong. Linq per spec / stdlib
+                // §5 has NO documented static methods — Linq is a
+                // module of extension methods on `IEnumerable<T>`, NOT
+                // a static class — so the empty member list correctly
+                // rejects every `Linq.X(...)` call (any name matches no
+                // member of the empty list). User classes named `Linq`
+                // (§11.3 collision — `class Linq { ... }`) compile
+                // cleanly via the `tgtSym->decl == nullptr` gate below.
                 {
                     struct StaticSurface {
                         std::string_view colName;
@@ -7391,6 +7474,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                          "Array<CancellationToken>) -> "
                          "owned CancellationTokenSource (§30.8)",
                          "6.1"},
+                        // §5 (v0.260 / #3274) — `Linq` is a MODULE of
+                        // extension methods on `IEnumerable<T>`, not a
+                        // static class — stdlib §5 documents zero static
+                        // methods on `Linq`. The empty member list
+                        // correctly rejects EVERY `Linq.X(...)` call
+                        // (any name matches no member). Pre-fix this
+                        // row was absent and the bogus member call
+                        // silent-zero-degraded via #2434 with only an
+                        // INTERNAL warning.
+                        {"Linq",
+                         {},
+                         "no static methods — `Linq` is a module of "
+                         "extension methods on `IEnumerable<T>` (§5)",
+                         "5"},
                     };
                     // Builtin-only gate: the receiver of a static call on
                     // a built-in static class is an IdentifierExpr whose
@@ -11488,26 +11585,93 @@ void ExprTC::checkImportedNewExprArgs(
                     "takes 0 (§22.7)");
         return;
     }
-    // A named/modifier argument is outside this conservative check.
-    for (const auto& a : ne.args)
-        if (!a.name.empty() || !a.modifier.empty() || a.isDiscard) return;
     if (ctors.size() != 1) return;  // imported ctor overloads deferred
     ConstructorSymbol* cs = ctors[0];
     const std::size_t nparams = cs->params.size();
     const std::string desc =
         std::string("`new ") + std::string(t->name) + "`";
-    if (ne.args.size() != nparams) {
-        ctx_.diagnostics().report(
-            Severity::Error, ne.span.begin,
-            desc + " has " + std::to_string(ne.args.size()) +
-                " argument(s) but the parameter list has " +
-                std::to_string(nparams) + " (§22.5)");
-        return;
+    // fix #3268 (§22.5 / §2.8.2, v0.244): a NAMED-argument call against an
+    // imported ctor with default-valued parameters must also be admitted and
+    // lowered. The previous guard ("A named/modifier argument is outside this
+    // conservative check.") returned silently, so codegen dropped into the
+    // #2658 loudness guard with an emitted `internal:` warning and a
+    // calloc-zero object — exactly the loud-but-wrong shape the issue
+    // names. `bindArgsToParams` itself ALREADY handles named arguments
+    // (the imported-method call path `checkImportedCallArity` runs it over
+    // named args too): the only thing missing was dispatching here for
+    // the named-only call shape, and publishing the §22.5 binding on the
+    // side table `lowerNew`'s imported-ctor branch reads. The modifier and
+    // discard shapes stay out of this conservative check — `out`/`out owned`
+    // and `ref`/`owned` markers are separate §22.3 obligations an arm like
+    // this would have to widen to admit, and the import side of those is
+    // #3081/`scoped` (#3081 widens the `out owned` discard) which is
+    // deliberately a different lane.
+    bool hasNamedArg = false;
+    for (const auto& a : ne.args) {
+        if (!a.name.empty()) { hasNamedArg = true; break; }
     }
+    if (!hasNamedArg) {
+        bool hasModOrDiscard = false;
+        for (const auto& a : ne.args) {
+            if (!a.modifier.empty() || a.isDiscard) { hasModOrDiscard = true; break; }
+        }
+        if (hasModOrDiscard) return;
+    }
+    // fix #3082 (§22.5 / §2.8.2, v0.244): an imported constructor's optional
+    // parameters are part of the artifact interface (§2.8.2), so a caller in
+    // another module must be able to omit them. The previous `nparams`-exact
+    // check rejected every such call loudly with the §22.5 message, while the
+    // in-module twin accepted it — exactly the asymmetry the issue names.
+    // `bindArgsToParams` over `FormalsView::of(*cs)` runs the SAME rule the
+    // imported-method call path already uses (`checkImportedCallArity`): it
+    // admits an omitted trailing formal whose `ParameterSymbol::hasDefault`
+    // is true, and reports the same §22.5 diagnostics (required parameter
+    // not supplied, unknown parameter name, duplicate binding) for the rest.
+    BindResult b = bindArgsToParams(sema::FormalsView::of(*cs), ne.args,
+                                    ne.span.begin, desc, /*emit=*/true);
+    if (!b.ok) return;  // the binder reported; no cascade
+    // fix #3268 (§22.5 / §2.8.2, v0.244): publish the §22.5 binding on the
+    // `SemaContext` side table (the SAME side table the imported-record
+    // path `checkPositionalNewArgsFromSymbols` writes for
+    // `storePrimaryCtorPositionalArgs`), so `lowerNew`'s imported-ctor
+    // branch can walk the formals in declaration order and look up each
+    // one's call-site argument — the explicit call-out at the `if (cs &&
+    // allPositional && …)` gate (LlvmBackend_Exprs2.cpp) keys its `paramToArg`
+    // off this exact vector. Without it, the named-arg case still leaves
+    // the published positional-index reader at `paramToArg[j] == j` (the
+    // identity map never published) and codegen would index the wrong
+    // slot. The publication is a benign side-effect on the
+    // all-positional case (#3082's headline), where `b.paramToArg[j]` is
+    // already j (every positional argument at index j fills formal j), so
+    // even the existing positional path benefits: the codegen reader uses
+    // the explicit `paramToArg` instead of the previous implicit
+    // positional-index pairing.
+    ctx_.setNewExprPositionalBinding(&ne, b.paramToArg);
     for (std::size_t j = 0; j < nparams; ++j) {
+        // per §22.5: an unbound parameter with a default takes that default.
+        // As for imported methods (#3213), only a compile-time-constant
+        // default survives the wire — `renderConstExpr` would otherwise
+        // emit a bare identifier with no importer-side meaning. The
+        // materializability check is the same predicate the imported-method
+        // call site uses, so a call that sema accepts is one the codegen
+        // fallback can actually lower.
+        if (b.paramToArg[j] < 0) {
+            if (!sema::importedDefaultTextIsMaterializable(
+                    sema::formalParamDefaultText(*cs, j)))
+                ctx_.diagnostics().report(
+                    Severity::Error, ne.span.begin,
+                    desc + ": parameter `" +
+                        std::string(sema::formalParamName(*cs, j)) +
+                        "` of an imported constructor declares a default the "
+                        "dependency's metadata did not carry as a compile-time "
+                        "value, so it cannot be materialized here — pass the "
+                        "argument explicitly (§22.5, #3082)");
+            continue;
+        }
         auto* p = dynamic_cast<ParameterSymbol*>(cs->params[j]);
         if (!p || !p->resolvedDeclType) continue;
-        const ast::CallArgument& a = ne.args[j];
+        const ast::CallArgument& a =
+            ne.args[static_cast<std::size_t>(b.paramToArg[j])];
         if (!a.value) continue;
         checkAssignable(ctx_.exprType(*a.value), p->resolvedDeclType,
                         a.value->span.begin,
@@ -18018,7 +18182,16 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
     if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
         bool pAbstract = false;
-        if (pd)
+        // Mirror the named-method form L2373-2379 (#874): read the SYMBOL's
+        // modifiers FIRST (populated on import at ModuleLoader.cpp:851), then
+        // fall back to the AST decl's modifiers for the local case. The pure
+        // decl-only scan missed every IMPORTED abstract property — the
+        // imported PropertySymbol has no `decl` — so `base.P` on an imported
+        // abstract base degraded to the codegen-time #3199 cross-module
+        // reject instead of this clean §12.5 message. fix #3238.
+        for (auto mod : ps->modifiers)
+            if (mod == "abstract") { pAbstract = true; break; }
+        if (!pAbstract && pd)
             for (auto mod : pd->modifiers)
                 if (mod == "abstract") { pAbstract = true; break; }
         if (pAbstract && ma.target) {

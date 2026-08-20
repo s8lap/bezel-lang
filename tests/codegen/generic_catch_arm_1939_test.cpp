@@ -1,4 +1,4 @@
-// Codegen tests for §31.2/§31.2.1/§12.9/§14.2 (#1939 leg 3, spec v0.220):
+// Codegen tests for §31.2/§31.2.1/§12.7/§2.8.3 rule 4 (#1939 leg 3, spec v0.220):
 // catch-arm dispatch for GENERIC exception types honors the type argument.
 //
 // §31.2.1: a bare-type arm "matches any thrown exception that is an instance

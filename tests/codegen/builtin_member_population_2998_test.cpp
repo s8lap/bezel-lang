@@ -271,10 +271,29 @@ const std::vector<BuiltinCase>& registryCases() {
         {"JsonDeserializer",                "import System.Serialization; import System.Threading; ", "", "JsonDeserializer"},
         {"JsonOptions",                     "import System.Serialization; import System.Threading; ", "var v := new JsonOptions();", "v"},
 
+        // ── §5 module-name-as-static-call (#3274) ────────────────────────
+        // `Linq` (System.Collections.Linq) is a MODULE of extension methods
+        // on `IEnumerable<T>`, NOT a static class — stdlib §5 documents
+        // zero static methods on `Linq`. It resolves as a builtin type
+        // identifier (arity 0 in `Resolver::builtinTypeArity`,
+        // TypeResolution_Names.cpp:314) with a synthetic TypeSymbol
+        // (decl == nullptr) set by ExprTypecheck_Exprs.cpp:1471. So
+        // `Linq.TotallyBogusMember(1, 2)` parses as
+        // `MemberAccess(Linq, TotallyBogusMember)(1, 2)`, reaches the
+        // static-call dispatch, fails the per-static-class arm's column
+        // lookup (no entry), and pre-#3274 silent-degraded via the #2434
+        // zero-init fallback. The row below is the value-demanding static-
+        // call form. Pre-fix: `r.ran == true` (silent-zero degrade).
+        // Post-fix: `r.ran == false` (the per-static-class arm emits the
+        // `no member … documented surface` Error). No import needed —
+        // `Linq` is in the builtin type registry, available without an
+        // explicit `import`.
+        {"Linq",                            "", "", "Linq"},
+
         // ── Names OUT OF SCOPE for this issue (#2998) ────────────────────
         //
         // STATIC CLASSES (no instance receiver): File, Directory, Path,
-        // Encoding, BitConverter, Debug, Linq, Domain.
+        // Encoding, BitConverter, Debug, Domain.
         //
         // #2998 is about the codegen gate for INSTANCE member calls on
         // built-in values (`lowerCall`'s `emittedSideEffectSince`

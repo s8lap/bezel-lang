@@ -195,7 +195,7 @@ bool mentions3147(const Compiled3147& c, const char* needle) {
 const char* kDepExc3147 =
     "module DepF11_3147; "
     "public class WrapExc3147: Exception "
-    "  public constructor(e: Exception) end constructor; "
+    "  public constructor(cause: Exception) end constructor; "
     "end WrapExc3147; "
     // The NEGATIVE's subject: derives from NOTHING, so the §31.1/#430 reject
     // must keep firing for it.
@@ -273,7 +273,7 @@ BEZEL_TEST(xmod_imported_symbol_residues_3147,
     auto r = compileLocal3147(
         "module LocalF11_3147; "
         "public class WrapExc3147L: Exception "
-        "  public constructor(e: Exception) end constructor; "
+        "  public constructor(cause: Exception) end constructor; "
         "end WrapExc3147L; " +
         handlerBody3147("WrapExc3147L"));
     BEZEL_EXPECT_FALSE(mentions3147(r, kCatchCtorReject3147));

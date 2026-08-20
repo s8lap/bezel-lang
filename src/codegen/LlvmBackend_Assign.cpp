@@ -6997,6 +6997,39 @@ bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
     return true;
 }
 
+// fix #3082 (§22.5 / §2.8.2, v0.244): the imported-CONSTRUCTOR twin of
+// `argsCanFill`. Same rule, same return value on every input the sema
+// binder (`bindArgsToParams` over `FormalsView::of(cs)`) accepts; differs
+// only in the source of the parameter list (an `ast::Param` vector vs. a
+// `ConstructorSymbol` whose params are `ParameterSymbol`s with `hasDefault`
+// carried on the wire by #3178). Pure check — no IR emitted — consumed by
+// `ctorForArgs`'s fallback to select the right ctor before lowering its
+// arguments.
+bool Emitter::argsCanFillSymbolic(
+        const sema::ConstructorSymbol& cs,
+        const std::vector<ast::CallArgument>& args) {
+    const std::size_t n = sema::formalParamCount(cs);
+    std::vector<bool> filled(n, false);
+    std::size_t pos = 0;
+    for (const auto& a : args) {
+        std::size_t idx;
+        if (a.name.empty()) {
+            if (pos >= n) return false;
+            idx = pos++;
+        } else {
+            idx = n;
+            for (std::size_t j = 0; j < n; ++j)
+                if (sema::formalParamName(cs, j) == a.name) { idx = j; break; }
+            if (idx >= n) return false;
+        }
+        if (filled[idx]) return false;
+        filled[idx] = true;
+    }
+    for (std::size_t j = 0; j < n; ++j)
+        if (!filled[j] && !sema::formalParamHasDefault(cs, j)) return false;
+    return true;
+}
+
 
 // §29.2 / §4.3 (#1310): shared array/user-class → IEnumerable<T> wrapping. When
 // a value is coerced to the pure declaration-less `IEnumerable<T>` (a call
@@ -7179,9 +7212,34 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // A user class implementing IEnumerable<T> (declaration-carrying). A source
     // whose type is ALREADY a declaration-less IEnumerable (an alias / another
     // wrapped value) has no declaration and passes through unchanged.
+    //
+    // fix #3277 (§28.2 / §28.6 / §28.10, v0.262): when the source is a producer
+    // expression (e.g. `BoxEnum3267.FromSeed(seed)` — a CallExpr yielding a
+    // fresh `owned BoxEnum3267`), the wrapping is the SOURCE's only owner:
+    // the call is bound to no other name, so the wrapper's slot-1 Dispose
+    // must free the source. Mirror the local-decl / GetEnumerator sibling
+    // fixes (`!srcIsNamedOwner` at Setup.cpp:12607 and Calls2.cpp:5076) —
+    // both compute the same `srcIsNamedOwner` predicate (a named local /
+    // parameter / field / auto-property keeps the source alive for itself,
+    // the wrapper never owns it). Default `ownsSrc=false` at this site left
+    // every temporary producer at #3277's leak (single-module twin ASan
+    // could detect, cross-module imported could not — #2633's asymmetry).
     if (actualTy && actualTy->kind == sema::TypeRef::Kind::Named &&
-        actualTy->declaration)
-        return wrapUserClassAsIEnumerable(v, actualTy->declaration, targetTy);
+        actualTy->declaration) {
+        bool srcIsNamedOwner = false;
+        if (sema::Symbol* sym = ctx_.exprSymbol(*srcExpr)) {
+            if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+                dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
+                dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
+                srcIsNamedOwner = true;
+            } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+                srcIsNamedOwner =
+                    sema::isAutoPropertyStorageSymbol(ps, ctx_);
+            }
+        }
+        return wrapUserClassAsIEnumerable(v, actualTy->declaration, targetTy,
+                                          /*ownsSrc=*/!srcIsNamedOwner);
+    }
     return v;
 }
 

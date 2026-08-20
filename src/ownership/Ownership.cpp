@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -14,6 +15,7 @@
 #include "flow/CFG.hpp"
 #include "ownership/OwnershipState.hpp"
 #include "sema/ConstFold.hpp"   // §15.3 (#1549): fold a constant `move arr[i]` index
+#include "sema/EnumValues.hpp"  // enumHasZeroConstant — §7.9 / §17.11 enum row (#3072)
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 
@@ -2796,18 +2798,35 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
             // disposal. producerState == Owned is the sound gate: a BORROW (a
             // field/local read, a borrow-returning collection method, a plain
             // Task) is Borrowed and left unmarked, so codegen never disposes it
-            // (no double-free). Restricted to a USER class/interface (declaration
-            // is a Class/Interface with a real AST decl, not value-builtin) —
-            // builtin handles (Task, Subscription, Shared, Stopwatch, …) resolve
-            // to a declaration-less / decl-null TypeSymbol and need their own free
-            // paths (deferred); owning collections are Owned* but decl-null too.
+            // (no double-free). Restricted to a USER class/interface (kind is
+            // Class/Interface and not value-builtin) — builtin handles (Task,
+            // Subscription, Shared, Stopwatch, …) resolve to a synthetic TypeSymbol
+            // with kind=Class but `moduleName.empty()` and need their own free
+            // paths (deferred); owning collections are Owned* but bypass via the
+            // OWNING-collection branch below (`disposeOwnedCollectionValue`),
+            // not this arm.
+            //
+            // sharpen #3081 (§22.6 / §17.13 / §28.3, v0.244): the pre-#3142 gate
+            // `rt->declaration->decl != nullptr` excluded EVERY imported user
+            // class because `ModuleLoader` never assigns `Symbol::decl` for a
+            // dependency's type (no AST exists across a module boundary). That
+            // is the SAME family-F5 defect #3142 widened on `isFreshOwnedClass-
+            // Producer` and the `out owned` discard site: the kind check is
+            // sufficient on both sides (locally `collectTypeDecl`, on import
+            // `fromMetaTypeDeclKind`). The `moduleName.empty()` discriminator
+            // (per #3022, the same shape that splits imported user types from
+            // synthetic builtin ClassSyms) keeps the gate correct: imported
+            // user types have a populated moduleName and are admitted; builtins
+            // have an empty moduleName and stay excluded. // per §17.13,
+            // #1009, #3142 family, #3081 sharpen
             if (producerState(*ds->value) == OwnershipState::Owned) {
                 if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
                     if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
                         (rt->declaration->kind == ast::TypeDeclKind::Class ||
                          rt->declaration->kind == ast::TypeDeclKind::Interface) &&
                         !rt->declaration->isValueBuiltin &&
-                        rt->declaration->decl != nullptr)
+                        (rt->declaration->decl != nullptr ||
+                         !rt->declaration->moduleName.empty()))
                         const_cast<ast::DiscardStmt*>(ds)->disposeOwnedValue = true;
             }
             // fix #1909 / §17.13 / §28.3 / §28.11: a discard `_ := <owned
@@ -5869,7 +5888,17 @@ bool MethodOwnership::isMoveOnlyInlineArrayType(const sema::TypeRef* rt,
 }
 
 void MethodOwnership::moveOnlyArrayNoteWholeTransfer(std::string_view name) {
+    // fix #3263 (§15.3 v0.260 / §28.7 v0.260): the name has been transferred
+    // out as a whole (a §15.3 bullet-1 move — `var b := a;`, a return of `a`,
+    // a discard of `a`, an argument passing of a move-only `a`). Track this
+    // so a later `moveOnlyArrayCheckReassignment` for the same name can set
+    // `AssignmentStmt::wholeValueLhsMovedFrom` and codegen suppresses the
+    // drop-on-overwrite pass (defect 2 — the stale alloca pointers belong
+    // to the receiver now). Without this the pass would re-dispose the
+    // moved-out slots, double-freeing the same instances the new owner
+    // (e.g. `b`) will free at its scope end.
     moveOnlyArrayLive_.erase(std::string(name));
+    moveOnlyArrayWholeValueMovedFrom_.insert(std::string(name));
 }
 
 // §15.3 (#1899) bullet 1: mark the move-only inline-array local read by a bare
@@ -5963,6 +5992,36 @@ void MethodOwnership::moveOnlyArrayCheckReassignment(
     long long size = 0;
     if (!isMoveOnlyInlineArrayType(ctx_.exprType(*as.target), size)) return;
     const std::string name(id->name);
+    // fix #3263 (§15.3 v0.260 / §28.7 v0.260, defect 2): the LHS was whole-
+    // value moved-from by a prior `var b := a;` (or return/discard/arg) —
+    // a §15.3 bullet-1 transfer of the WHOLE array, not a per-slot `move a[i]`.
+    // §28.7 *Moved-from and null*: the drop-on-overwrite pass disposes nothing
+    // on a moved-from LHS; the stale alloca pointers now belong to the
+    // receiver (e.g. `b`) and will be freed there. Mark the AssignmentStmt
+    // so codegen suppresses the pass. Distinguishes from "all slots happen
+    // to be moved-from via per-slot `move a[i]`" (the alloca IS nulled slot-
+    // wise, per #747 lowerMoveFromCollectionSlot) — the pass correctly runs
+    // in that case (it reads nulls and skips via the null-guard).
+    if (moveOnlyArrayWholeValueMovedFrom_.count(name)) {
+        // fix #3263 (§15.3 v0.260 / §28.7 v0.260, defect 2): the LHS was
+        // whole-value moved-from by a prior `var b := a;` (or return/
+        // discard/arg) — a §15.3 bullet-1 transfer of the WHOLE array, not
+        // a per-slot `move a[i]`. §28.7 *Moved-from and null*: the drop-on-
+        // overwrite pass disposes nothing on a moved-from LHS; the stale
+        // alloca pointers now belong to the receiver (e.g. `b`) and will be
+        // freed there. Mark the AssignmentStmt so codegen suppresses the
+        // pass. Distinguishes from "all slots happen to be moved-from via
+        // per-slot `move a[i]`" (the alloca IS nulled slot-wise, per #747
+        // lowerMoveFromCollectionSlot) — the pass correctly runs in that
+        // case (it reads nulls and skips via the null-guard). One-shot:
+        // remove from the set so a SECOND reassignment of the same name
+        // (e.g. `a := X; a := Y;` after `var b := a;`) gets the pass
+        // restored — `a` holds a fresh value (X) at the second site, and
+        // any stale pointers at THAT site belong to X, not to the prior
+        // `b`-transferred value.
+        const_cast<ast::AssignmentStmt&>(as).wholeValueLhsMovedFrom = true;
+        moveOnlyArrayWholeValueMovedFrom_.erase(name);
+    }
     auto it = moveOnlyArrayLive_.find(name);
     if (it != moveOnlyArrayLive_.end() &&
         static_cast<long long>(it->second.movedSlots.size()) < it->second.size) {
@@ -6218,6 +6277,7 @@ void MethodOwnership::moveOnlyArrayLeakScanStmt(const ast::Stmt* s) {
 void MethodOwnership::moveOnlyArrayLeakScan(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     moveOnlyArrayLive_.clear();
+    moveOnlyArrayWholeValueMovedFrom_.clear();
     for (auto& s : body) moveOnlyArrayLeakScanStmt(s.get());
 }
 
@@ -9101,11 +9161,18 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
 // string, function, non-nullable Object) has no default value and must
 // be assigned by a field initializer or in every constructor. Value
 // types (records, enums, primitives other than string/Object, inline
-// arrays, unit) have well-defined defaults and are exempt. A static
-// field is exempt here (static-init rules, §22.13). Generic-parameter
-// and unresolved types are conservatively treated as non-reference
-// (not flagged). `owned` fields are a subset (class-typed) and are
-// covered by this rule.
+// arrays, unit) are exempt — EXCEPT, per §7.9 v0.247, a zero-less enum:
+// `default(E)` is ill-formed for such an enum (§17.11), so its storage
+// requires an explicit initializer just like a non-nullable reference.
+// A static field is exempt here (static-init rules, §22.13).
+// Generic-parameter and unresolved types are conservatively treated as
+// non-reference (not flagged). `owned` fields are a subset (class-typed)
+// and are covered by this rule. The R-2 deferred rows (records with
+// non-nullable reference fields, inline arrays of non-nullable reference
+// elements, owning inline arrays) are intentionally NOT folded in here —
+// landing the enum row alone keeps the fix narrowly scoped (#3072).
+// fix #3072 / §7.9 / §17.11: enum CARVE-OUT — a zero-less enum field is
+// no longer treated as a value-typed default-bearing field.
 bool isNonNullableReferenceField(const ast::FieldDecl& f,
                                  sema::SemaContext& ctx) {
     for (auto m : f.modifiers) {
@@ -9122,6 +9189,16 @@ bool isNonNullableReferenceField(const ast::FieldDecl& f,
             return true;
         case sema::TypeRef::Kind::Named:
             if (!rt->declaration) return false;  // built-in/generic — skip
+            // fix #3072 / §7.9 / §17.11: zero-less enum CARVE-OUT.
+            // enumHasZeroConstant returns nullopt when the enum's declared
+            // values cannot be decided (a non-constant initializer, already
+            // diagnosed) or the enum is empty; the conservative posture is to
+            // accept — matching §17.11's `defaultIllFormed` arm.
+            if (rt->declaration->kind == ast::TypeDeclKind::Enum) {
+                std::optional<bool> hasZero =
+                    enumHasZeroConstant(*rt->declaration);
+                return hasZero && !*hasZero;
+            }
             return rt->declaration->kind == ast::TypeDeclKind::Class ||
                    rt->declaration->kind == ast::TypeDeclKind::Interface;
         default:

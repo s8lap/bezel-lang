@@ -1,4 +1,4 @@
-// Codegen tests for §12.7/§12.9/§14.2/§17.4 (#1939 leg 2, spec v0.220): runtime
+// Codegen tests for §12.7/§12.9/§2.8.3 rule 4/§17.4 (#1939 leg 2, spec v0.220): runtime
 // is/as/case type tests on BOXED GENERIC RECORDS honor the type arguments.
 //
 // §12.7: "`is T` tests whether a value is an instance of `T`"; §12.9 makes

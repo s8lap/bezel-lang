@@ -4641,15 +4641,51 @@ sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
     // this an `owned` primary-ctor position would be misclassified as non-owned.
     const CalleeFormals ctorParams = resolveCtorParams(ne, ctx_);
     // §31.2.4 / #811 (v0.162): when the CONSTRUCTED type is itself an
-    // exception, an exception-typed argument is the CAUSE position of the
+    // exception AND the argument is flowing into the CAUSE parameter of its
     // snapshot-chaining constructor — "ex borrowed for the ctor call; snapshot
     // taken, instance not retained" (the spec's §31.2.4 wrap-and-rethrow
     // example is exactly `throw new DataAccessException("...", ex)` from a
-    // catch arm). The builtin base ctor copies the chain and retains nothing;
-    // a user subclass can only read or forward the borrow (§28.3 makes storing
-    // a borrow in a field inexpressible), so the escape is not a dangle.
+    // catch arm). The base `Exception` ctor is
+    // `constructor(message: string, cause: Exception)` (§31.4) — the `cause`
+    // parameter is the spec-defined marker of the cause slot — and user
+    // exception subclasses chain through it (`public constructor(msg: string,
+    // cause: Exception) base(msg, cause) end constructor;`, §31.4). The
+    // builtin base ctor copies the chain and retains nothing; a user subclass
+    // can only read or forward the borrow (§28.3 makes storing a borrow in a
+    // field inexpressible), so the escape is not a dangle.
+    //
+    // fix #3075: the carve-out was previously applied to ANY exception-typed
+    // argument when the constructed type was exception-derived — which §31.1
+    // v0.243 makes true at every throw site — so the check was structurally
+    // dead at every `throw new W(ex)` shape. NARROWED (§31.2.4, v0.243): skip
+    // ONLY when the parameter at `pos` is named `cause` (the spec marker);
+    // any other exception-typed argument falls through to the catch-borrow
+    // check below and is rejected if a borrow is stored into a non-owned
+    // parameter of a thrown/returned object. A second branch covers the
+    // BUILTIN base `Exception` itself (no user-declared ctor, so
+    // `ctorParams.valid()` is false): the spec fixes the snapshot-chaining
+    // signature to `(message: string, cause: Exception)`, so pos 1 of a
+    // 2-arg ctor is the cause slot.
     const bool constructedIsException =
         ne.type && ownershipIsExceptionClassRef(ctx_.resolvedType(*ne.type));
+    // fix #3075: the builtin base `Exception` has no local TypeDecl, so
+    // `ctorParams.valid()` is false at every `new Exception(...)` site; the
+    // carve-out must still fire for the cause slot. The spec fixes the
+    // snapshot-chaining signature to `(message: string, cause: Exception)`
+    // (§31.4) — a 2-arg ctor with the second parameter exception-typed — so
+    // recognise that shape and treat pos 1 as the cause slot. Named
+    // exception subclasses (e.g. `ArgumentException`, `IOException`) are
+    // reachable by the local-ctor branch above, not here, because they are
+    // builtins without a user-declared `cause` parameter name in this TU.
+    sema::TypeRef* rt = ne.type ? ctx_.resolvedType(*ne.type) : nullptr;
+    const bool constructedIsBaseExceptionBuiltin =
+        constructedIsException && !rt->declaration &&
+        common::isBuiltinExceptionName(
+            rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty()
+                ? std::string_view(rt->astNode->name->parts.back())
+                : std::string_view(rt->importedName)) &&
+        // Only the §31.4 base ctor has a `cause` slot — the 2-arg form.
+        ne.args.size() == 2;
     std::size_t pos = 0;
     for (const auto& a : ne.args) {
         if (!a.value) { ++pos; continue; }
@@ -4661,9 +4697,21 @@ sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
             ctorParams.valid() && pos < ctorParams.size() &&
             (ctorParams.modifier(pos) == "owned" ||
              ctorParams.modifier(pos) == "out owned");
-        // §31.2.4 cause position: skip (see constructedIsException above).
-        if (constructedIsException &&
-            ownershipIsExceptionClassRef(ctx_.exprType(*a.value))) {
+        // §31.2.4 cause position: skip ONLY when the argument lands in the
+        // spec-defined `cause` parameter of an exception-class ctor (§31.4).
+        // Any other exception-typed argument at a non-`cause` position falls
+        // through to the #430 check below. // per §31.2.4, §31.4, fix #3075
+        const bool isCauseByName =
+            constructedIsException &&
+            ownershipIsExceptionClassRef(ctx_.exprType(*a.value)) &&
+            ctorParams.valid() && pos < ctorParams.size() &&
+            ctorParams.name(pos) == "cause";
+        // Builtin base `Exception` has no user `cause` parameter; use the
+        // §31.4 spec signature — pos 1 of a 2-arg ctor — as the cause marker.
+        const bool isCauseByBuiltinBaseSig =
+            constructedIsBaseExceptionBuiltin && pos == 1 &&
+            ownershipIsExceptionClassRef(ctx_.exprType(*a.value));
+        if (isCauseByName || isCauseByBuiltinBaseSig) {
             ++pos;
             continue;
         }
@@ -11246,6 +11294,116 @@ void MethodOwnership::collectStmtsInsideTry(
         if (s) collectStmtsInsideTryStmt(*s, false, nullptr);
 }
 
+// §28.8.1 (R4b, #3241): the drop-on-overwrite half of the non-throwable
+// assignments list. Returns the RHS node to report at when the assignment is
+// throwable by drop-on-overwrite, or nullptr when the store is into a
+// provably moved-from/null/borrow/value-typed location (the spec's stated
+// non-throwable subclasses).
+//
+// The spec (v0.254, highlighted):
+//
+//   "assignments where neither the LHS nor the RHS is a throwable expression
+//    **and** the assignment performs no drop-on-overwrite of a possibly-live
+//    value: a store into an `owned` field, a plain-`var` owned local, or an
+//    owning-collection slot that may hold a live (non-null, not moved-from)
+//    value is **throwable** — the implicit §28.7 disposal runs the displaced
+//    value's destructor, which may throw with defined behavior (§28.4),
+//    propagating from the drop-on-overwrite site. Stores into provably
+//    moved-from or null locations, and stores into borrow-state or value-typed
+//    locations, remain non-throwable — which is why this section's restoration
+//    idioms are unaffected (`_resource := fresh;` after a `move` targets a
+//    moved-from slot)."
+//
+// SCOPS. The check is the LHS-side, ownership-lattice half of the rule — the
+// RHS-side, throwable-inventory half is `findThrowable28_8_1` (the walk
+// invoked from `checkThrowableWhileFieldMovedFrom`). Pairing them in the
+// caller produces the precise inventory the spec states: an assignment is
+// throwable iff EITHER the inventory walk finds a throwable in the RHS/LHS
+// OR the LHS may hold a live owned value being displaced.
+//
+// PER-KIND LHS DECISION.
+//
+// Owned field (`targetIsOwnedField`). The "may hold a live value" test is
+// the #867 path-sensitive `fieldMovedFrom_` fact — an entry mapping to
+// `false` means the field is alive at this program point on some path; an
+// absent entry means the field has never been moved-from on any path
+// reaching this site (so it owns a live value, which drop-on-overwrite will
+// dispose). Only an entry mapping to `true` (the field is moved-from on
+// every path) discharges the obligation under §28.7's "Moved-from and null"
+// rule. Walks both the bare-identifier (implicit `this`) and the qualified
+// `obj.f` spellings — the same two-target coverage `handleAssignment` itself
+// uses to clear the moved-from mark (src/ownership/Ownership.cpp:5736-5759).
+//
+// Plain-`var` owned local. `lookupState(name)->state == Owned` is the
+// OWNED-state fact on the locals' lattice — the most-recent-assigned-owns
+// path-sensitive answer at this program point. MovedFrom / Disposed /
+// Uninitialized / Poisoned states are NOT "live" and the store is
+// non-throwable; PolyNull (a nullable local that has only held `null`) is
+// also non-throwable because the nullable didn't hold a live owned value.
+// A bare identifier is the only assignment-target spelling that names a
+// local (a `member` access names a field).
+//
+// Owning-inline-array slot (`targetIsOwningInlineArraySlot`). The slot's
+// per-index liveness is hard to establish statically (a non-constant index
+// can't be tied to a specific slot state, §28.11's per-slot conservative
+// tracking). Per the spec's "owned inline-array slot … may hold a live
+// value" framing, the conservative answer is "may hold a live value":
+// the slot MAY hold a live, non-null, not-moved-from owned value and we
+// cannot disprove it. The conservative direction is the spec's projection
+// of the established position (under-approximate MISS over over-reject):
+// a slot that DOESN'T hold a live value reports wrongly, but a slot that
+// DOES hold a live value is caught. The same trade-off `findThrowable28_8_1`
+// itself takes on the items it under-approximates (the header comment).
+//
+// EXCLUSIONS. Stores into a value-typed target (`_x: int := …`), a borrow
+// field (no `owned` modifier), a static owned field (the §22.13 static-
+// overwrite exemption that never disposes the displaced referent), and a
+// non-`owned` pass. Compound assignments (`+=`, `-=`, …) follow the spec's
+// "compound assignment carries no classification of its own" rule — they
+// classify like their desugared form, which would be a separate trip
+// through this helper (the caller detects them via `as.op != ":="` and
+// routes them away; the residue is the #3241 R4c follow-up).
+const ast::Expr* MethodOwnership::assignmentIs28_8_1ThrowableByOverwrite(
+    const ast::AssignmentStmt& as) {
+    if (as.op != ":=") return nullptr;  // compound is #3241 R4c residue
+    if (!as.target || !as.value) return nullptr;
+    // Owned field: alive iff not moved-from on every path.
+    if (targetIsOwnedField(*as.target)) {
+        std::string_view fname;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(as.target.get()))
+            fname = id->name;
+        else if (auto* ma =
+                     dynamic_cast<const ast::MemberAccessExpr*>(as.target.get()))
+            fname = ma->member;
+        if (!fname.empty()) {
+            auto it = fieldMovedFrom_.find(fname);
+            // absent entry = field has never been moved-from on any path
+            // reaching this site → it MAY hold a live owned value.
+            // entry maps to false → field is alive on some path.
+            // entry maps to true → field is moved-from on every path →
+            // §28.7 "Moved-from and null" exempts the store from the
+            // drop-on-overwrite; the `Right`/`Right2` restoration idioms
+            // target this exact case.
+            if (it == fieldMovedFrom_.end() || !it->second)
+                return as.value.get();
+        }
+        return nullptr;
+    }
+    // Plain-`var` owned local: alive iff state is Owned at this program point.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(as.target.get())) {
+        if (auto* st = lookupState(id->name)) {
+            if (st->state == OwnershipState::Owned) return as.value.get();
+        }
+    }
+    // Owning-inline-array slot: conservative — the slot MAY hold a live value.
+    // (Per-IndexExpr constant-index specialisation is tractable but belongs
+    // here only if the spec's exact wording ever makes it mandatory; the
+    // current over-approximation matches the rest of §28.8.1's deliberate
+    // under-approximations.)
+    if (targetIsOwningInlineArraySlot(*as.target)) return as.value.get();
+    return nullptr;
+}
+
 // §28.8.1's throwable-expression inventory, verbatim (v0.254):
 //
 //   "Method calls; indexer accesses (on inline arrays `[N]T`, on resizable
@@ -11475,18 +11633,49 @@ void MethodOwnership::checkThrowableWhileFieldMovedFrom(const ast::Stmt& s) {
         // non-deferred fire that would point at the wrong catch set).
         if (!enclosing) return;
         const ast::Expr* throwable = nullptr;
-        visitStmtExprSites(s, [&](const ast::Expr& e, bool) {
-            if (!throwable) throwable = findThrowable28_8_1(&e);
-        });
+        // §28.8.1 (R4b, #3241): pair with the non-deferred branch below — the
+        // drop-on-overwrite clause applies to in-`try` statements too. A
+        // statement that is itself a throwable drop-on-overwrite is routed
+        // through the same deferred path so the catch arm's restoration
+        // discipline (§28.8.1) is checked against the same throwable.
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+            if (auto* t = assignmentIs28_8_1ThrowableByOverwrite(*as)) {
+                throwable = t;
+            }
+        }
+        if (!throwable) {
+            visitStmtExprSites(s, [&](const ast::Expr& e, bool) {
+                if (!throwable) throwable = findThrowable28_8_1(&e);
+            });
+        }
         if (!throwable) return;
         pendingThrowableInTryChecks_.push_back(
             {enclosing, throwable, moved});
         return;
     }
     const ast::Expr* throwable = nullptr;
-    visitStmtExprSites(s, [&](const ast::Expr& e, bool) {
-        if (!throwable) throwable = findThrowable28_8_1(&e);
-    });
+    // §28.8.1 (R4b, #3241): an assignment is throwable on its OWN account
+    // when its LHS may hold a live owned value being displaced — the
+    // drop-on-overwrite clause of the non-throwable list. This is the
+    // LHS-side, ownership-lattice half of the rule; the RHS-side inventory
+    // walk is `findThrowable28_8_1` below. The check is statement-shaped
+    // because the assignment's throwability is a property of the WHOLE
+    // assignment (LHS+RHS+overwrite), not of any individual sub-expression
+    // — `visitStmtExprSites` splits the LHS and RHS into separate expression
+    // visits, neither of which alone observes the drop-on-overwrite fact.
+    // Lookup the assignment directly when `s` is one; the returned RHS node
+    // is the source location the diagnostic names, exactly as the inventory
+    // walk would have returned a sub-expression. // per §28.8.1, #3241 R4b
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (auto* t = assignmentIs28_8_1ThrowableByOverwrite(*as)) {
+            throwable = t;
+        }
+    }
+    if (!throwable) {
+        visitStmtExprSites(s, [&](const ast::Expr& e, bool) {
+            if (!throwable) throwable = findThrowable28_8_1(&e);
+        });
+    }
     if (!throwable) return;
     // Report at the throwable expression the walk actually found — the node whose
     // exception edge is the unrestored exit — never at a synthesized location.

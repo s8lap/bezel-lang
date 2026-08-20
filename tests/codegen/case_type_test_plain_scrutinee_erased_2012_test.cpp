@@ -1,4 +1,4 @@
-// #2012 (§12.9/§14.2/§17.4, v0.197) — the runtime half of the case-binding
+// #2012 (§12.7/§2.8.3 rule 4/§17.4, v0.197) — the runtime half of the case-binding
 // erasure guard for a PLAIN scrutinee (src/sema/ExprTypecheck.cpp, the CaseStmt
 // handler). The sema half (tests/sema/case_type_test_plain_scrutinee_erased_2012)
 // pins that a FUNCTION-typed generic target is REJECTED at compile time on this

@@ -628,6 +628,54 @@ std::vector<int> Emitter::importedFormalToArg(
     return map;
 }
 
+// fix #3268 (§22.5 / §2.8.2, v0.244): the IMPORTED-CONSTRUCTOR twin of the
+// method `importedFormalToArg` above. The rule is byte-identical — every
+// `sema::formalParam*` accessor the method version consults is itself
+// overloaded for `ConstructorSymbol` (Symbol.hpp:1298-1399), so the only
+// difference is the symbol kind. Sema's `checkImportedNewExprArgs` now
+// publishes the same `bindArgsToParams` binding on the
+// `SemaContext::setNewExprPositionalBinding` side table (#3196's machinery),
+// and the matching lowering here mirrors the existing method-arm semantics.
+// Returns `sema::formalParamCount(cs)` entries: `[j] =` the index into `args`
+// that fills formal `j`, or −1 when formal `j` takes its declared default.
+// Identity fallback for any shape this cannot bind, matching the method
+// version's defensive posture (a discard, unknown parameter name, double
+// binding, unfilled required formal). Sema's `checkImportedNewExprArgs`
+// rejects every such shape (§22.5, #3213, #3082); the fallback keeps an
+// error-recovery lowering identical to what it was — never silently zeroing
+// the construction.
+std::vector<int> Emitter::importedFormalToArg(
+    const sema::ConstructorSymbol& cs,
+    const std::vector<ast::CallArgument>& args) {
+    auto identity = [&]() {
+        std::vector<int> ident(args.size());
+        for (std::size_t i = 0; i < args.size(); ++i)
+            ident[i] = static_cast<int>(i);
+        return ident;
+    };
+    const std::size_t n = sema::formalParamCount(cs);
+    for (const auto& a : args)
+        if (a.isDiscard) return identity();
+    std::vector<int> map(n, -1);
+    std::size_t pos = 0;
+    for (std::size_t ai = 0; ai < args.size(); ++ai) {
+        const ast::CallArgument& a = args[ai];
+        std::size_t idx = n;
+        if (a.name.empty()) {
+            idx = pos++;
+        } else {
+            for (std::size_t j = 0; j < n; ++j)
+                if (sema::formalParamName(cs, j) == a.name) { idx = j; break; }
+        }
+        if (idx >= n || map[idx] != -1) return identity();
+        map[idx] = static_cast<int>(ai);
+    }
+    for (std::size_t j = 0; j < n; ++j)
+        if (map[j] == -1 && !sema::formalParamHasDefault(cs, j))
+            return identity();
+    return map;
+}
+
 llvm::Value* Emitter::importedDefaultArgValue(const sema::MethodSymbol& ms,
                                               std::size_t pos) {
     const sema::TypeRef* pt = sema::formalParamResolvedType(ms, pos);
@@ -668,6 +716,40 @@ llvm::Value* Emitter::importedDefaultArgValue(const sema::MethodSymbol& ms,
     // (LlvmBackend_Assign.cpp:10867), which is also `getNullValue(lowerType(…))`
     // for a `DefaultExpr`, so a same-module call and an imported call produce
     // the same lowered zero value (§2.8.3 rule 4).
+    if (text.size() >= 8 && text.compare(0, 8, "default(") == 0) {
+        if (pt) return llvm::Constant::getNullValue(lowerTypeRef(pt));
+        return llvm::Constant::getNullValue(i32());
+    }
+    return foldImportedConstText(text, pt);
+}
+
+// fix #3082 (§22.5 / §2.8.2, v0.244): the imported-CONSTRUCTOR twin of
+// `importedDefaultArgValue`. The data source is the SAME
+// `ParameterSymbol::defaultText` the method-call version reads; only the
+// enclosing symbol kind differs, so the fold path is byte-identical. Sema's
+// `checkImportedNewExprArgs` already filtered out texts that cannot fold
+// (using `sema::importedDefaultTextIsMaterializable`); reaching this backstop
+// means a call path skipped that check, so say so loudly — a bare null
+// return would abandon the whole construction with no diagnostic.
+llvm::Value* Emitter::importedCtorDefaultArgValue(
+        const sema::ConstructorSymbol& cs, std::size_t pos) {
+    const sema::TypeRef* pt = sema::formalParamResolvedType(cs, pos);
+    const std::string text(sema::formalParamDefaultText(cs, pos));
+    if (!sema::importedDefaultTextIsMaterializable(text)) {
+        ctx_.diagnostics().report(
+            Severity::Error, SourceLocation{},
+            std::string("call to imported `new ") + std::string(cs.parent ? cs.parent->name : std::string_view()) +
+                "` omits parameter `" +
+                std::string(sema::formalParamName(cs, pos)) +
+                "`, whose default the dependency's metadata did not carry as "
+                "a compile-time value — pass the argument explicitly (§22.5, "
+                "#3082)");
+        return nullptr;
+    }
+    if (text == "null") {
+        if (pt && isNullableValueTy(pt)) return nullableValueNull(pt);
+        return llvm::ConstantPointerNull::get(ptrTy());
+    }
     if (text.size() >= 8 && text.compare(0, 8, "default(") == 0) {
         if (pt) return llvm::Constant::getNullValue(lowerTypeRef(pt));
         return llvm::Constant::getNullValue(i32());
@@ -1707,6 +1789,19 @@ llvm::Function* Emitter::genericInstEnsureInitFn(
     genericInstInitExcGV_[key] = excGV;
     genericInstInitOwnerGV_[key] = ownerTidGV;
 
+    auto* voidFnTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(
+        voidFnTy, llvm::GlobalValue::LinkOnceODRLinkage,
+        "bz$" + base + "$ensureinit", module_.get());
+    // fix #2948 / §22.13: publish the partially-built ensureinit BEFORE
+    // genericInstSfinitFn lowers field initializers. A sibling static read in
+    // an earlier initializer recursively asks for this same ensureinit; caching
+    // only after sfinit was built created a second guard (`ensureinit.4`) with
+    // independent state, which ran sfinit twice and overwrote First from 107 to
+    // 200 after Second had been assigned. One instantiation has one guard.
+    genericInstEnsureInitFns_[key] = fn;
+
     llvm::Function* sfinitFn = genericInstSfinitFn(ts, typeArgMangle);
 
     // #1391: the same process-wide runtime entry points emitEnsureInitFns
@@ -1719,13 +1814,6 @@ llvm::Function* Emitter::genericInstEnsureInitFn(
         declareC("bz_static_init_wait", i8Ty, {ptrTy()});
     llvm::Function* notifyFn =
         declareC("bz_static_init_notify", llvm::Type::getVoidTy(llvm_), {ptrTy()});
-
-    auto* voidFnTy = llvm::FunctionType::get(
-        llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
-    auto* fn = llvm::Function::Create(
-        voidFnTy, llvm::GlobalValue::LinkOnceODRLinkage,
-        "bz$" + base + "$ensureinit", module_.get());
-    genericInstEnsureInitFns_[key] = fn;
 
     llvm::Function* savedFn = currentFn_;
     auto* savedInsert = builder_.GetInsertBlock();
@@ -2832,17 +2920,58 @@ void Emitter::emitExportedIndexerSetters() {
 // Only engages for non-virtual properties (virtual ones dispatch via the vtable
 // slot already populated by buildVtable). Must run after declareVtables
 // (which calls buildVtable for imported types), so propGetSlot_ is accurate.
+//
+// fix #3267 (§29.1 + §29.2 / §2.8.2 / §2.8.3 rule 4 / §23, v0.262): the prior
+// `if (propGetSlot_.count(ps)) continue;` skip left every imported VIRTUAL
+// property WITHOUT an entry in `importedPropGetterFns_`. Sites 1, 2 (property/
+// indexer access via `b.P` / `b[i]`) had a separate thunk fallback in
+// `ensurePropertyAccessorFn` (`importedVirtualAccessorSlotFn` #3190), but
+// sites 3, 4, 5 — the §29.1 + §29.2 for-in Current read on an imported enumerator
+// whose `Current` is virtual — consult `importedPropGetterFns_[currentPropSym]`
+// DIRECTLY (LlvmBackend_Stmts.cpp ~L8004, the `else` arm of the `pd` gate, and
+// `wrapUserClassAsIEnumerable` ~L9729). With the map empty for any virtual
+// property, the for-in read fell through with `curVal == nullptr`, the loop
+// variable was never updated, and the producer summed zeros: cross-module
+// `for x in e do s := s + x; return s;` returned 0 where the single-module
+// twin returned 6 (silent wrong-value, no SIGSEGV — the VEnumIter3231's
+// MoveNext/Current pattern from the #3267 repro).
+//
+// Populate the map for VIRTUAL imported properties using the same thunk
+// (`importedVirtualAccessorSlotFn`) sites 1, 2 already use. The thunk body
+// loads the function pointer from the OWNER's `vt$<Owner>[slot]` (the
+// exporter's vtable global, ExternalLinkage resolved by the linker to the
+// dependency object) and forwards `this` to it — for a property declared on
+// the OWNER, that is the OWNER's own accessor; for an inherited virtual
+// property from an IMPORTED base with a LOCAL derived class (which has no
+// override of that member), that is the base's accessor. The forward is
+// byte-identical to what `ensurePropertyAccessorFn`'s #3190 fallback does
+// for `b.P`, so the two routes cannot diverge for one shape. Reusing the
+// existing thunk rather than minting a new `bz$<Class>$<Prop>$propget$direct`
+// ABI (§2.8.3 / #3190 / the issue's documented direction) is deliberate: the
+// thunk is already linker-correct (ExternalLinkage `vt$<Owner>` resolves to
+// the exporter's table) and call-shape-correct (the accessor's own ABI), so
+// the only addition here is populating a map that was empty for this shape.
 void Emitter::declareImportedPropertyGetters() {
     for (sema::Symbol* sym : ctx_.importedSymbols()) {
         auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
         if (!ps || ps->isIndexer) continue;
-        // Skip virtual: they dispatch through the vtable slot.
-        if (propGetSlot_.count(ps)) continue;
+        // Skip if already declared.
+        if (importedPropGetterFns_.count(ps)) continue;
         // Also skip interface properties: those dispatch through the itable.
         if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface)
             continue;
-        // Skip if already declared.
-        if (importedPropGetterFns_.count(ps)) continue;
+        // fix #3267 (§29.1 + §29.2 / §23): populate for VIRTUAL imported properties
+        // with the thunk that loads `vt$<Owner>[slot]` and forwards `this`.
+        // Closes the silent wrong-value shape `for x in e` over an imported
+        // IEnumerable whose enumerator's `Current` is virtual; without this
+        // entry the for-in Current read at Stmts.cpp ~L8004 falls through
+        // with `curVal == nullptr`, leaving the loop variable at zero.
+        if (propGetSlot_.count(ps)) {
+            if (llvm::Function* fwd =
+                    importedVirtualAccessorSlotFn(ps, /*isSet=*/false))
+                importedPropGetterFns_[ps] = fwd;
+            continue;
+        }
         // Derive the return type from the side table.
         sema::TypeRef* retRef = ctx_.importedMemberType(ps);
         llvm::Type* retTy = retRef ? lowerTypeRef(retRef) : i32();
@@ -2911,17 +3040,32 @@ void Emitter::declareImportedPropertySetters() {
     for (sema::Symbol* sym : ctx_.importedSymbols()) {
         auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
         if (!ps || ps->isIndexer) continue;
-        // Skip virtual: they dispatch through the vtable slot.
-        if (propSetSlot_.count(ps)) continue;
+        // Skip if already declared.
+        if (importedPropSetterFns_.count(ps)) continue;
         // Also skip interface properties: those dispatch through the itable.
         if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface)
             continue;
+        // fix #3267 (§29.1 + §29.2 / §23): populate for VIRTUAL imported properties
+        // with the thunk that loads `vt$<Owner>[slot]` and forwards `this`,
+        // mirroring the getter twin above. Same shape as #3267's getter fix;
+        // a setter on an imported virtual property has no entry in this map
+        // today and a for-in Current/SUM/ASSIGN pattern that happens to read
+        // or write through it would silently no-op the same way. Refcounted-
+        // setter semantics on a virtual Current are uncommon (Current is
+        // almost always read-only), so this half is mostly symmetric
+        // completeness rather than a confirmed bug, but applying the same
+        // fix keeps the two twins in lockstep so a future setter-only shape
+        // cannot diverge.
+        if (propSetSlot_.count(ps)) {
+            if (llvm::Function* fwd =
+                    importedVirtualAccessorSlotFn(ps, /*isSet=*/true))
+                importedPropSetterFns_[ps] = fwd;
+            continue;
+        }
         // fix #2400: skip a genuinely getter-only imported property — see the
         // long comment above this function for why this gate is load-bearing
         // (not just an optimization).
         if (!ctx_.importedPropertyHasSetter(ps)) continue;
-        // Skip if already declared.
-        if (importedPropSetterFns_.count(ps)) continue;
         // Derive the value-parameter type from the side table (same source the
         // getter twin uses — §23: get/set share one declared type).
         sema::TypeRef* retRef = ctx_.importedMemberType(ps);
@@ -4955,7 +5099,7 @@ llvm::Value* Emitter::emitTypeParamPatternTest(const sema::TypeRef* ct,
                                                SourceLocation loc) {
     if (!ct) return nullptr;
 
-    // §12.9/§14.2/§19.3 (#2012, #2069): `ct` is the type argument a bare `case`/
+    // §12.7/§2.8.3 rule 4/§19.3 (#2012, #2069): `ct` is the type argument a bare `case`/
     // `is` type-parameter pattern (`case o of var x: T`) resolved to at this
     // monomorphization. If it is a CONSTRUCTED generic whose own argument is
     // runtime-erased (`T=Wrap<(int)->int>`), the descriptor collapses onto a
@@ -5301,6 +5445,149 @@ bool Emitter::armEnsuresEpilogue(
 // only; the normal-completion path runs ensures, then ret, leaving the
 // caller to drive any remaining out-param copy-out). Clears the armed
 // state so a nested callable's body (emitted afterwards) sees no epilogue.
+
+// §22.16 (v0.250, #3038): allocate one frame slot per `old(E)` CallExpr
+// found across the current method's ensures clauses. The slot lives in
+// the entry block; the entry-time evaluation of E (and the store) happens
+// in `captureOldOperands` right after the requires prologue, at the
+// §22.16 "after `requires` clauses" evaluation point. The ensures
+// clause body's `lowerCall` for an `old(E)` CallExpr loads from this
+// slot to read the entry value. Per textual order across all ensures
+// clauses; textually identical operands MAY share one binding, but the
+// simpler per-AST-node keying is observationally equivalent (the
+// operand is pure; two captures of the same expression at the same
+// point yield the same value).
+void Emitter::allocateOldCaptureSlots(
+    llvm::Function* fn,
+    const std::vector<ast::ContractClause>& clauses) {
+    for (const auto& c : clauses) {
+        if (c.kind != ast::ContractClause::Kind::Ensures) continue;
+        if (!c.expr) continue;
+        // Walk the expression tree to find every `old(E)` CallExpr.
+        // A simple recursive walk is enough — the only CallExpr we care
+        // about is one whose callee is an IdentifierExpr with name
+        // "old" (exactly what sema accepts in this position).
+        std::function<void(const ast::Expr&)> walk =
+            [&](const ast::Expr& e) {
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+                if (ce->callee) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            ce->callee.get())) {
+                        if (id->name == "old" && ce->args.size() == 1 &&
+                            ce->args[0].value) {
+                            // Allocate the slot only if we have not
+                            // already (per-AST-node keying). Use the
+                            // operand's resolved type from the sema
+                            // side — the same TypeRef set on the
+                            // CallExpr by ExprTypecheck_Calls.cpp.
+                            if (oldCaptureSlots_.find(ce) ==
+                                oldCaptureSlots_.end()) {
+                                sema::TypeRef* t =
+                                    ctx_.exprType(*ce->args[0].value);
+                                if (!t) t = ctx_.makeTypeRef();
+                                llvm::Type* elt = lowerTypeRef(t);
+                                if (elt) {
+                                    auto* slot = entryAlloca(elt);
+                                    oldCaptureSlots_[ce] = slot;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (ce->callee) walk(*ce->callee);
+                for (const auto& a : ce->args)
+                    if (a.value) walk(*a.value);
+            } else if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+                if (be->left) walk(*be->left);
+                if (be->right) walk(*be->right);
+            } else if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+                if (ue->operand) walk(*ue->operand);
+            } else if (auto* ma =
+                           dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+                if (ma->target) walk(*ma->target);
+            } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+                if (ix->target) walk(*ix->target);
+                for (const auto& i : ix->indices)
+                    if (i.value) walk(*i.value);
+            } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+                if (nc->callee) walk(*nc->callee);
+                for (const auto& a : nc->args)
+                    if (a.value) walk(*a.value);
+            }
+        };
+        walk(*c.expr);
+    }
+}
+
+// §22.16 (v0.250, #3038): after the requires prologue passes, evaluate
+// every `old(E)` operand and store it into its capture slot. The
+// builder is positioned in the entry block at this point (the requires
+// checks are emitted in the entry block too, but they branch around the
+// capture code — the captures are unconditional, just like `requires`
+// always evaluates before the body). On a rejected call (a failed
+// `requires`) the captures are dead but harmless: the throw goes out
+// before any return edge could read them.
+void Emitter::captureOldOperands(
+    llvm::Function* fn,
+    const std::vector<ast::ContractClause>& clauses) {
+    if (oldCaptureSlots_.empty()) return;
+    // Snapshot the entry state — the builder was positioned in the
+    // entry block by the caller (armEnsuresEpilogue / emitFunctionBody
+    // driver). We emit stores here in the entry block, after the
+    // requires checks have all branched past.
+    llvm::BasicBlock* entryBB = &fn->getEntryBlock();
+    llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+    builder_.SetInsertPoint(entryBB);
+    // Walk the clauses in textual order so captures happen in spec
+    // order (textual position across the member's ensures clauses).
+    for (const auto& c : clauses) {
+        if (c.kind != ast::ContractClause::Kind::Ensures) continue;
+        if (!c.expr) continue;
+        std::function<void(const ast::Expr&)> walk =
+            [&](const ast::Expr& e) {
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+                if (ce->callee) {
+                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                            ce->callee.get())) {
+                        if (id->name == "old" && ce->args.size() == 1 &&
+                            ce->args[0].value) {
+                            auto it = oldCaptureSlots_.find(ce);
+                            if (it != oldCaptureSlots_.end()) {
+                                llvm::Value* v = lowerExpr(*ce->args[0].value);
+                                if (v) {
+                                    builder_.CreateStore(v, it->second);
+                                }
+                            }
+                            return;  // don't descend into the operand
+                        }
+                    }
+                }
+                if (ce->callee) walk(*ce->callee);
+                for (const auto& a : ce->args)
+                    if (a.value) walk(*a.value);
+            } else if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+                if (be->left) walk(*be->left);
+                if (be->right) walk(*be->right);
+            } else if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+                if (ue->operand) walk(*ue->operand);
+            } else if (auto* ma =
+                           dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+                if (ma->target) walk(*ma->target);
+            } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
+                if (ix->target) walk(*ix->target);
+                for (const auto& i : ix->indices)
+                    if (i.value) walk(*i.value);
+            } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
+                if (nc->callee) walk(*nc->callee);
+                for (const auto& a : nc->args)
+                    if (a.value) walk(*a.value);
+            }
+        };
+        walk(*c.expr);
+    }
+    builder_.SetInsertPoint(savedBB);
+}
+
 void Emitter::finalizeEnsuresEpilogue() {
     if (!ensuresFn_) return;
     llvm::Function* fn = ensuresFn_;
@@ -5312,11 +5599,16 @@ void Emitter::finalizeEnsuresEpilogue() {
     llvm::BasicBlock* exitBB = ensuresExitBB_;
     // Clear armed state BEFORE evaluating the clauses' expressions, so a
     // nested emitReturn (e.g. inside a pure-callee that itself has clauses)
-    // does not redirect back into this epilogue. Also clear before the
-    // final ret below so emitReturn's redirect logic is inert here.
+    // does not redirect back into this epilogue. §22.16 (v0.250, #3038):
+    // `ensuresResultSlot_` MUST stay set through the clause-evaluation loop
+    // — the IdentifierExpr path lowerExpr→resultSlot load consults the
+    // field, and clearing it here would make every `result` read in an
+    // `ensures` clause silently return null (SIGSEGV on the load). The
+    // slot is cleared AFTER the clauses run, just before the final emitReturn
+    // (whose own re-store guard `if (ensuresResultSlot_ && v)` would
+    // otherwise re-store the result we are about to read back out).
     ensuresFn_ = nullptr;
     ensuresExitBB_ = nullptr;
-    ensuresResultSlot_ = nullptr;
     ensuresClauses_ = nullptr;
     ensuresReturnTypeNode_ = nullptr;
     ensuresTypeName_.clear();
@@ -5357,6 +5649,13 @@ void Emitter::finalizeEnsuresEpilogue() {
     if (invClass) {
         emitInvariantCheck(currentThis_, invClass);
     }
+    // §22.16 (v0.250, #3038): the clauses have all run; clear
+    // ensuresResultSlot_ now so the `emitReturn` immediately below
+    // does not re-store the result we are about to read back out. Its
+    // own `if (ensuresResultSlot_ && v)` guard would otherwise re-store
+    // the local `resultSlot` value (which IS the same alloca — the
+    // re-store is a no-op but the redirect-into-epilogue would loop).
+    ensuresResultSlot_ = nullptr;
     // Reload the result temp (if any) and emit the original return. We
     // temporarily swap `currentReturnTypeNode_` so emitReturn's box/coerce
     // matches what the original return sites would have done.
@@ -5721,7 +6020,7 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     // one vtable. That was harmless while slot 0 was a private `[self, null]`
     // that matched nothing; with a real identity in it, the shared vtable would
     // hand every `G<Cat>` the FIRST instantiation's descriptor, and `catIsDog`
-    // would answer TRUE — a §12.9 invariance break in the FALSE-POSITIVE
+    // would answer TRUE — a §12.7 invariance break in the FALSE-POSITIVE
     // direction, i.e. strictly worse than the false negatives #2977/#2956 are
     // about, because the `as` behind it binds a `Cat` at the `Dog` static type
     // (the #1843/#2001 type-confusion class). MEASURED, not reasoned about: an
@@ -7245,7 +7544,7 @@ static void appendDescKey(const sema::TypeRef* t, std::string& out) {
                 for (const sema::TypeRef* a : t->genericArgs) appendDescKey(a, out);
                 out += '>';
             } else {
-                // #2013 (§12.9 type-test invariance, §14.2 monomorphization,
+                // #2013 (§12.7 type-test invariance, §2.8.3 rule 4 monomorphization,
                 // §17.4): a null-DECLARATION builtin generic type (Array<T>,
                 // Dictionary<K,V>, Task<T>, … — declaration intentionally null, per
                 // TypeResolution_Names §2.5/§29.3) MUST recurse into its generic
@@ -7273,7 +7572,7 @@ static void appendDescKey(const sema::TypeRef* t, std::string& out) {
             out += std::to_string(static_cast<int>(t->primitive));
             break;
         case sema::TypeRef::Kind::InlineArray:
-            // #2001 (§14.2 value/inline-array type args, §12.9 type-test
+            // #2001 (§2.8.3 rule 4 value/inline-array type args, §12.7 type-test
             // invariance): the key MUST encode the inline-array size N (and
             // ownedness) — otherwise `C<Box<[3]int>>` and `C<Box<[4]int>>`
             // produce the SAME key, collapse onto ONE runtime descriptor, and a
@@ -7327,13 +7626,13 @@ std::string Emitter::typeRefIdentityKey(const sema::TypeRef* t) {
 // Is ONE type argument concrete enough to key a per-monomorphization descriptor?
 // Mirrors typeRefIdentityToken's non-null set (a resolved Named declaration or a
 // primitive tag; an unbound generic-parameter placeholder is Named with
-// declaration == nullptr → not concrete). #2001 (§14.2 / §12.9): a FOLDED-size
+// declaration == nullptr → not concrete). #2001 (§2.8.3 rule 4 / §12.7): a FOLDED-size
 // inline array (`[N]T`, N known) whose element is itself concrete is ALSO
 // distinguishable — appendDescKey now encodes its N (and ownedness), so
 // `Box<[3]int>` and `Box<[4]int>` mint DISTINCT descriptors. An UNFOLDED size
 // (< 0) stays conservatively non-concrete (its key still collapses). (Inlined
 // rather than calling typeRefIdentityToken, which is a private Emitter member.)
-// #2022 (§12.9 type-test invariance, §14.2 monomorphization, §17.4 is/as): a
+// #2022 (§12.7 type-test invariance, §2.8.3 rule 4 monomorphization, §17.4 is/as): a
 // null-DECLARATION builtin generic (Array<T>, Dictionary<K,V>, Task<T>, … —
 // declaration intentionally null per §2.5/§29.3) with NON-EMPTY genericArgs
 // that are recursively concrete is ALSO distinguishable: appendDescKey recurses
@@ -7349,7 +7648,7 @@ static bool descTypeArgConcrete(const sema::TypeRef* a) {
     if (a->kind == sema::TypeRef::Kind::InlineArray)
         return a->arraySizeValue >= 0 && descTypeArgConcrete(a->arrayElement);
     if (a->kind == sema::TypeRef::Kind::Named) {
-        // #2184 (§12.9/§14.2/§17.4/#2069 ruling): a DECLARED-Named head is
+        // #2184 (§12.7/§2.8.3 rule 4/§17.4/#2069 ruling): a DECLARED-Named head is
         // not, by itself, "concrete" for descriptor-key purposes — the inner
         // genericArgs might still collapse (a function-typed arg, an erased
         // builtin, an unfolded inline-array size). Recurse into the args,
@@ -7516,7 +7815,7 @@ llvm::GlobalVariable* Emitter::instanceDescriptorFor(
             auto it = subst.find(gp->name);
             const sema::TypeRef* a = it != subst.end() ? it->second : nullptr;
             symArgs.push_back(a);
-            // #2008 (§12.9 type-test invariance, §14.2 monomorphization, §15.1):
+            // #2008 (§12.7 type-test invariance, §2.8.3 rule 4 monomorphization, §15.1):
             // use the SAME concreteness predicate as the top-level gate
             // (descArgsConcrete) so a folded-size inline-array base arg counts as
             // concrete. Using typeRefIdentityToken here (nullptr for InlineArray)
@@ -7682,7 +7981,7 @@ static bool typeTestArgStillOpen(const sema::TypeRef* t) {
     }
 }
 
-// §12.9/§14.2/§19.3/§31.2.1 (#2012, per the #2069 ruling
+// §12.7/§2.8.3 rule 4/§19.3/§31.2.1 (#2012, per the #2069 ruling
 // /var/tmp/bezel-scratch/impl-run-2026-07-24/rulings/misc/issue-2069.md):
 // the per-monomorphization RE-RUN of the descriptor-erasure guard, as a
 // conservative compile-time REJECT.
@@ -8256,6 +8555,11 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     if (ms->decl) {
         if (auto* md =
                 dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            // §22.16 (v0.250, #3038): allocate one frame slot per
+            // `old(E)` CallExpr in the entry block. Must run BEFORE the
+            // requires prologue so the allocas are placed at the top of
+            // the entry block (LLVM's alloca-required-in-entry rule).
+            allocateOldCaptureSlots(fn, md->contractClauses);
             if (!md->contractClauses.empty()) {
                 emitRequiresPrologue(
                     md->contractClauses,
@@ -8286,6 +8590,26 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             if (isPublicInstanceMethod) {
                 emitInvariantCheck(currentThis_, ms->parent);
             }
+            // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
+            // epilogue before lowering the body. If armed, emitReturn
+            // redirects every normal-completion path through the epilogue
+            // block, which evaluates the ensures clauses and only then
+            // performs the original ret. The §22.16 (v0.240, #2941) exit-
+            // edge invariant check (after ensures, before ret) is wired
+            // through the `invariantClass` parameter. Finalized after the
+            // body is complete (below).
+            //
+            // §22.16 (v0.250, #3038): capture every `old(E)` operand
+            // into its slot, in the entry block, after the requires
+            // prologue. The requires checks branch past each other
+            // and the `req.cont` block falls through; placing the
+            // captures in the entry block means they happen on every
+            // path that survives the requires checks. A failed
+            // `requires` skips the captures — correct, because the
+            // ensures clauses are never evaluated on a throws path
+            // (§22.16 "no clause evaluation of any kind; the ordinary
+            // exception-path discharge unwinds the frame").
+            captureOldOperands(fn, md->contractClauses);
             // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
             // epilogue before lowering the body. If armed, emitReturn
             // redirects every normal-completion path through the epilogue
@@ -9468,10 +9792,21 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     // body effect has occurred, the object and all arguments are exactly as
     // the caller left them).
     if (!cd->contractClauses.empty()) {
+        // §22.16 (v0.250, #3038): per the spec, `old` and `result` are
+        // forbidden in constructor clauses (fields sit at the §22.7
+        // null watermark, no pre-state exists for `old`, and constructors
+        // return no value for `result` to denote). The sema path rejects
+        // any such use, so `allocateOldCaptureSlots` will simply find no
+        // `old(E)` operands in the constructor's ensures — a no-op
+        // call. We still need to invoke it before the requires prologue
+        // for code uniformity, and the empty `oldCaptureSlots_` map is
+        // harmless when the constructor's ensures clause is evaluated.
+        allocateOldCaptureSlots(fn, cd->contractClauses);
         emitRequiresPrologue(cd->contractClauses,
                              cs->parent ? cs->parent->name
                                         : std::string_view{},
                              "constructor");
+        captureOldOperands(fn, cd->contractClauses);
         // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
         // epilogue for the ctor (return type is null — ctor's return is
         // void, so no result temp). Finalized at body-end (below). The
