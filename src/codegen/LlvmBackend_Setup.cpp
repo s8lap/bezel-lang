@@ -18996,8 +18996,21 @@ struct StringEscapeWalker {
     // `stringReleaseMode`; when null every into-local binding stays a
     // conservative escape, matching the pre-#2900 behavior.
     const std::unordered_set<const void*>* objectStringBorrowAliases = nullptr;
+    // fix #2641 / §22.4: the `out var x` ARGUMENT occurrence that INTRODUCES the
+    // tracked recipient. For an inline out-var the "decl node" IS an
+    // `ast::IdentifierExpr` in an argument list (ExprTypecheck_Exprs.cpp sets
+    // `lsym->decl = id`), so the walk would otherwise reach the declaration
+    // itself through the call-argument arm — where a modifier-carrying argument
+    // takes no safe-read relaxation — and report an escape for EVERY inline
+    // out-var, making the analysis vacuous. Declaring a variable is not a use of
+    // it, so this one node is excluded. Null for every LocalDecl-keyed walk (a
+    // `LocalDecl` is a Stmt and can never equal an Expr node), leaving them
+    // bit-identical.
+    const void* outVarIntroSite = nullptr;
 
     bool isTargetIdent(const ast::Expr* e) {
+        if (outVarIntroSite && static_cast<const void*>(e) == outVarIntroSite)
+            return false;
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
         if (!id) return false;
         auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
@@ -21339,6 +21352,13 @@ void Emitter::collectStringReleaseEligible(
     stringBorrowAll_.clear();
     stringLocalCandidates_.clear();               // fix #2817
     valueLikeChoiceStrReleaseEligible_.clear();  // fix #2115
+    // fix #2641: pin the body this walk analyzed, so an inline `out var`
+    // recipient — an IdentifierExpr inside an argument list, which the
+    // LocalDecl-only statement scan below can never enumerate — can be
+    // escape-walked on demand from ensureOutVarSlots against these same
+    // statements. Set before the scan so an early return cannot leave a stale
+    // body pinned alongside freshly-cleared sets.
+    stringReleaseAnalyzedBody_ = &body;
     // Find every `var` (non-using) string LocalDecl, classified as a +1 PRODUCER
     // (`+`/interpolation/range-slice) or a BORROW (any other string initializer:
     // a field/param/call/identifier read). Run the escape walk for each; a decl
@@ -21505,6 +21525,40 @@ void Emitter::collectStringReleaseEligible(
             valueLikeChoiceStrReleaseEligible_.insert(
                 static_cast<const void*>(ld));
     }
+}
+
+
+// fix #2641 / §22.4 / §22.3 / §28.9 — see the declaration in
+// LlvmBackend_impl.hpp.
+//
+// WHY THIS IS A SEPARATE, ON-DEMAND WALK. collectStringReleaseEligible above
+// enumerates its candidates with a STATEMENT scan for `ast::LocalDecl` nodes.
+// An inline `out var x` recipient is not a LocalDecl at all: §22.4's inline
+// form declares the variable *at an argument position*, and sema models it by
+// minting a LocalSymbol whose `decl` is the argument's own IdentifierExpr
+// (ExprTypecheck_Exprs.cpp). Enumerating those would mean adding a full
+// EXPRESSION walk to the pre-pass; instead ensureOutVarSlots — which already
+// holds the introducing IdentifierExpr, and runs while the body is the pinned
+// one — asks for a verdict on exactly the one recipient it is about to slot.
+//
+// The walk itself is byte-for-byte the producer-candidate walk above: same
+// StringEscapeWalker, same four opt-ins. That is deliberate — the question is
+// identical ("does any use of this string-typed local outlive its scope?"), and
+// the ANSWER must stay identical as those relaxations evolve, so this must not
+// grow a private variant of them.
+bool Emitter::outVarStringReleaseEligible(const ast::IdentifierExpr* id) {
+    if (!id || !stringReleaseAnalyzedBody_) return false;
+    StringEscapeWalker w{ctx_, static_cast<const void*>(id)};
+    w.stringReleaseMode = true;      // #1997
+    w.scrutineeBorrowMode = true;    // fix #2481
+    w.borrowRetainedAliases = &stringBorrowAll_;          // fix #2764
+    w.objectStringBorrowAliases = &objectStringBorrowAll_;  // fix #2900
+    w.outVarIntroSite = static_cast<const void*>(id);
+    for (auto& s : *stringReleaseAnalyzedBody_) {
+        w.stmt(s.get());
+        if (w.escaped) break;
+    }
+    return !w.escaped;
 }
 
 

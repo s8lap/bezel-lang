@@ -1068,6 +1068,21 @@ private:
         // (no UAF) and it runs once per exit (no double-free). `slot` holds the
         // string pointer; the class/collection/dict fields are unused.
         bool stringRelease = false;
+        // fix #2641 / §22.4 / §22.3 / §28.9: null the slot immediately after the
+        // `stringRelease` above. Set ONLY for an inline `out var` recipient,
+        // whose slot — unlike a `var` local's — is READ BACK after the scope-end
+        // release: the recipient's alloca is entry-block hoisted, so on the next
+        // iteration of an enclosing loop the CALLEE's store through the hidden
+        // `out` reference (lowerStringRefParamStore, #2321) first LOADS the slot
+        // and releases what it displaces. Without this store that load sees the
+        // pointer this disposal just freed — a double release / UAF. Nulling
+        // makes the callee's release-of-prior a documented no-op
+        // (bezel_runtime_refcounting.cpp:126) and is equally what keeps the
+        // disposal itself idempotent if a scope is exited twice on distinct
+        // paths. A plain `var` string local never needs it (its next binding is a
+        // fresh LocalDecl initialization, which has no release-of-prior), so the
+        // flag is off by default and no existing registration changes shape.
+        bool nullSlotAfterRelease = false;
         // #422 / §27.5 / §28.9: a `var` closure (function-typed) local that
         // PROVABLY does not escape its scope (a non-escape walk found every use
         // is a non-consuming read) and was initialized once by a
@@ -11115,6 +11130,27 @@ private:
     // reference is co-owned through the shared cell and dropped by the env
     // destructor; the lambda body owns nothing.
     std::unordered_set<const void*> stringLocalCandidates_;
+    // fix #2641 / §22.4 / §28.9: the statement list collectStringReleaseEligible
+    // last analyzed — i.e. the body `stringReleaseEligibleFn_` was compiled from.
+    // The three eligibility sets above are keyed on `ast::LocalDecl` nodes found
+    // by that STATEMENT scan, so an INLINE `out var` recipient (an
+    // `ast::IdentifierExpr` living inside an argument list) is never among them.
+    // `outVarStringReleaseEligible` re-runs the same conservative escape walk on
+    // demand, at the call site, against this body. Null whenever no body is
+    // pinned (an unanalyzed destructor / expression-bodied lambda), which makes
+    // that helper answer false — the leak-over-UAF default.
+    const std::vector<std::unique_ptr<ast::Stmt>>* stringReleaseAnalyzedBody_ =
+        nullptr;
+    // fix #2641 / §22.4 / §22.3 / §28.9: is the inline `out var` recipient
+    // introduced at `id` provably NON-ESCAPING within the analyzed body, so its
+    // copied-out +1 may be released at scope end? Runs the SAME StringEscapeWalker
+    // (same opt-in relaxations) collectStringReleaseEligible runs for a `var`
+    // string local, keyed on `id` — which IS the recipient's `LocalSymbol::decl`
+    // (ExprTypecheck_Exprs.cpp sets `lsym->decl = id` for the inline form), so
+    // every later read of the recipient matches the walker's `isTargetIdent`.
+    // The INTRODUCING occurrence itself is excluded (see `outVarIntroSite`):
+    // being the `out var` argument is the declaration, not a use.
+    bool outVarStringReleaseEligible(const ast::IdentifierExpr* id);
     // #429: emit retain-or-transfer for a `var`-string local at bind time, and
     // arm its scope-end release. Returns true if it armed/handled the local's
     // string reference (the caller still performs the slot store). `init` is the
@@ -13623,6 +13659,21 @@ private:
     // ensures lvalueAddr() finds the slot regardless of which code path handles
     // the call. Must be called at the start of lowerCall.
     void ensureOutVarSlots(const ast::CallExpr& call);
+    // fix #2641 / §22.4 / §22.3 / §28.9: register the scope-end
+    // `bz_string_release` for a PLAIN inline `out var` recipient of non-nullable
+    // `string` type — the arm of `ensureOutVarSlots` that, unlike its
+    // `out owned var` / `out using var` siblings, registered no disposal at all
+    // and so leaked one heap string per call. `id` is the introducing
+    // IdentifierExpr, `loc` its LocalSymbol, `ms`/`pos` the resolved callee and
+    // this argument's index, `slot` the freshly created recipient alloca. Every
+    // gate it applies (and why each is load-bearing) is documented at the
+    // definition in LlvmBackend_Calls2.cpp; a no-op whenever any of them fails,
+    // which leaves the pre-existing leak exactly as it was — the deliberate
+    // leak-over-UAF direction.
+    void registerOutVarStringRelease(const ast::IdentifierExpr& id,
+                                     const sema::LocalSymbol* loc,
+                                     const sema::MethodSymbol* ms,
+                                     std::size_t pos, llvm::AllocaInst* slot);
 
     // §22.4 / §7.9 (v0.235, #2395; extended #2402): recursively pre-create
     // (and, via ensureOutVarSlots / ensureCtorOutVarSlots,

@@ -1164,6 +1164,15 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     auto savedValueLikeChoiceStrReleaseEligible =
         valueLikeChoiceStrReleaseEligible_;
     llvm::Function* savedStringReleaseEligibleFn = stringReleaseEligibleFn_;
+    // fix #2641: the analyzed-body pointer travels with the eligibility sets
+    // above — a nested lambda's own collectStringReleaseEligible repoints it, and
+    // without this restore the enclosing body's later inline `out var` recipients
+    // would be escape-walked against the LAMBDA's statements (the wrong body:
+    // an escaping use would go unseen ⇒ a scope-end release of a value the
+    // enclosing body still aliases). Same failure shape #2807 measured for the
+    // sets themselves, in the UAF direction rather than the leak direction.
+    const std::vector<std::unique_ptr<ast::Stmt>>* savedStringReleaseBody =
+        stringReleaseAnalyzedBody_;
 
     // §27.5: the set of outer locals/params the body references.
     std::unordered_set<const sema::Symbol*> capturedSyms;
@@ -2233,6 +2242,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     valueLikeChoiceStrReleaseEligible_ =
         std::move(savedValueLikeChoiceStrReleaseEligible);
     stringReleaseEligibleFn_ = savedStringReleaseEligibleFn;
+    stringReleaseAnalyzedBody_ = savedStringReleaseBody;   // fix #2641
     currentReturnTypeNode_ = savedCurrentReturnTypeNode;  // #2515
     currentLambdaReturnSemaTy_ = savedLambdaRetSemaTy;    // fix #2688
     lambdaParamTypeHint_ = std::move(savedLambdaParamHints);

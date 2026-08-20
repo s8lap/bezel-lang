@@ -4093,6 +4093,14 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         if (it->stringRelease) {
             llvm::Value* s = builder_.CreateLoad(ptrTy(), it->slot, "str.rel");
             emitStringRelease(s);
+            // fix #2641 / §22.4 / §22.3: an inline `out var` recipient's slot is
+            // read back after this release — the next loop iteration's callee
+            // store through the hidden `out` reference loads it to release what
+            // it displaces (#2321). Null it so that load cannot see the pointer
+            // just freed. Off for every other stringRelease registration.
+            if (it->nullSlotAfterRelease)
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), it->slot);
             continue;
         }
         // #422 / §27.5 / §28.9: a provably-non-escaping `var` closure
