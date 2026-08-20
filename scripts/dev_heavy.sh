@@ -68,7 +68,13 @@ case "$kind" in
       cw=100;   iw=80;  mem=12G
     fi ;;
   suite)
-    cw=10000; iw=800; mem=12G ;;
+    # per gate audit F1: the suite cage is the knob that bounds shard
+    # concurrency, NOT the slice budget the gate.sh comment cites. gate.sh caps
+    # the ASan pass at 8 shards and sizes that against "the ~24-28G slice" —
+    # but every suite op actually runs in THIS cage, which is 12G. Making it a
+    # variable lets the ASan concurrency be raised and measured against the
+    # thing that really constrains it. Default unchanged (12G).
+    cw=10000; iw=800; mem="${BEZEL_SUITE_MEM:-12G}" ;;
   *)
     # probe: tiny; outside the slice, its own small cage, no accounting overhead.
     exec systemd-run --user --scope -q -p MemoryMax=4G -p MemorySwapMax=0 -- "$@" ;;

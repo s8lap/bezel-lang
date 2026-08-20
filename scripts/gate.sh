@@ -279,16 +279,31 @@ if [ "$ASAN" -eq 1 ]; then
   SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)   # see #3012 note above
   SHARD_NOTE="asan-instrumented"
   SHARD_LABEL="crash/undercount + generated-code ASan"
-  # 2026-07-17: 16 concurrent ASan shards OOM-kill workers under the dev_heavy
-  # memory-capped slice (~24G soft / 28G hard) — each ASan compile+exec peaks
-  # ~2.5-3G RSS, so 16x exceeds the budget once the box is under pressure and a
-  # worker gets OOM-killed => a spurious "shard crash / undercount" FAIL (with a
-  # DIFFERENT random set of tests each run). ASan is memory-bound, not CPU-bound,
-  # and fewer shards measured FASTER here (8 shards ~270-320s vs 16 shards
-  # ~360-965s). So the ASan pass DEFAULTS to a memory-safe shard count (cap 8,
-  # tuned to the ~24-28G slice); an explicit GATE_SHARDS overrides it (raise on a
-  # larger-memory host, lower on a smaller one). The plain (non-ASan) pass is not
-  # memory-bound and keeps run_parallel's nproc default.
+  # The ASan pass caps at 8 shards. The ORIGINAL rationale (2026-07-17) was that
+  # 16 concurrent ASan shards OOM-kill workers — "each ASan compile+exec peaks
+  # ~2.5-3G RSS", sized against "the ~24-28G slice" — producing a spurious
+  # "shard crash / undercount" FAIL over a different random set of tests each
+  # run. The OBSERVATION was real (8 shards measured ~270-320s vs 16 shards
+  # ~360-965s). The EXPLANATION was wrong twice over, and both errors were only
+  # found when someone finally measured (2026-08-21):
+  #
+  #   1. WRONG CGROUP. A suite op does not run in the 24-28G slice; it runs in
+  #      the `dev_heavy.sh suite` cage, which is 12G (now BEZEL_SUITE_MEM).
+  #   2. NOT MEMORY-BOUND AT ALL. A full ASan pass peaks ~1 GiB of ANON memory
+  #      against that 12G cage. The ~2.5-3G figure was memory.current, which is
+  #      ~all reclaimable page cache (`anon 0 / file 14.3G` at idle) — the
+  #      kernel reclaims it rather than OOM-killing for it.
+  #
+  # What actually bounds this pass is the AOT link-token pool:
+  # aotLinkTokenCount() = min(physicalCores, MemAvailable/1.5GiB) = 10 here, so
+  # shards past ~10 just block on an flock. Measured full suite, ASan, cold:
+  # conc=8 634s vs conc=16 615s — 3%. The cap therefore stays at 8 because
+  # raising it BUYS NOTHING, not because 16 is unsafe; and a larger-memory host
+  # will not help. GATE_SHARDS still overrides. The plain pass keeps
+  # run_parallel's nproc default (16), which is already past the token pool.
+  #
+  # scripts/gate/mempeak.sh samples the anon peak into the `mem` telemetry
+  # field, so this stays checkable instead of becoming folklore again.
   if [ -z "${GATE_SHARDS:-}" ]; then
     _ncpu=$(nproc 2>/dev/null || echo 8)
     GATE_SHARDS=$(( _ncpu < 8 ? _ncpu : 8 ))
@@ -392,6 +407,9 @@ emit_json() { # rc result total_s -> append one JSON object; best-effort
   [ -n "${AOT_HITS:-}" ] && a+=(--aot-hits "$AOT_HITS")
   [ -n "${AOT_MISSES:-}" ] && a+=(--aot-misses "$AOT_MISSES")
   [ -n "${AOT_STORE_FAILS:-}" ] && a+=(--aot-store-fails "$AOT_STORE_FAILS")
+  [ -n "${MEM_ANON_MAX:-}" ] && a+=(--mem-anon-max "$MEM_ANON_MAX")
+  [ -n "${MEM_CURRENT_MAX:-}" ] && a+=(--mem-current-max "$MEM_CURRENT_MAX")
+  [ -n "${MEM_SAMPLES:-}" ] && a+=(--mem-samples "$MEM_SAMPLES")
   [ -n "${GATE_BIN_EXPECTED:-}" ] && a+=(--bin-expected "$GATE_BIN_EXPECTED")
   [ -n "${GATE_BIN_RAN:-}" ] && a+=(--bin-ran "$GATE_BIN_RAN")
   PYTHONPATH=scripts python3 -m gate.telemetry emit "${a[@]}" > /dev/null 2>&1 || true
@@ -815,7 +833,36 @@ PHASE_T0=$(now)
 # printed TOTAL / per-binary lines. $S is /var/tmp/bezel-scratch (line 76).
 GATE_RUN_SUMMARY="$S/gate_run_summary.json"
 SHARD_ENV+=(BEZEL_RUN_SUMMARY="$GATE_RUN_SUMMARY")
+# per gate audit F1: sample the dev_heavy slice's ANON high-water mark across
+# the shard phase. ANON (+shmem+slab), not memory.current — the latter is ~all
+# RECLAIMABLE page cache here (measured `anon 0 / file 14.3G` on an idle slice),
+# so sizing anything against it overstates load by more than 10x. Anon is what
+# OOM-kills a shard.
+#
+# MEASURED 2026-08-21, and the answer was "memory is not the constraint": a full
+# ASan pass peaks ~1 GiB anon against this cage's 12G, and doubling shards
+# (conc=8 -> 16) changed wall by 3%. The binding limit is the link-token pool
+# (min(physicalCores, RAM/1.5GiB) = 10 here), not the cage. Kept sampling so the
+# claim stays checkable as the suite and the box change — this is the number the
+# conc=8 cap was sized against without anyone ever having measured it.
+#
+# Sampled, not queried after the fact: the run's scope is a transient unit
+# systemd releases on exit, so a postmortem `systemctl show -p MemoryPeak` reads
+# nothing. PURE OBSERVATION — best-effort, holds nothing, fails nothing.
+MEMPEAK_OUT="$S/gate_mempeak.env"; MEMPEAK_PID=""
+rm -f "$MEMPEAK_OUT" 2>/dev/null || true   # never source a PRIOR gate's numbers
+if [ -x scripts/gate/mempeak.sh ]; then
+  MEMPEAK_PID=$(scripts/gate/mempeak.sh start "$MEMPEAK_OUT" 2 2>/dev/null || true)
+fi
 "$DH" suite "${SHARD_ENV[@]}" tests/run_parallel.sh ${GATE_SHARDS:-} >"$S/gate_shard.log" 2>&1; rc=$?
+if [ -n "${MEMPEAK_PID:-}" ]; then
+  scripts/gate/mempeak.sh stop "$MEMPEAK_PID" 2>/dev/null || true
+  # shellcheck disable=SC1090
+  [ -s "$MEMPEAK_OUT" ] && . "$MEMPEAK_OUT" 2>/dev/null || true
+  MEM_ANON_MAX="${mem_anon_max_bytes:-}"; MEM_CURRENT_MAX="${mem_current_max_bytes:-}"
+  MEM_SAMPLES="${mem_samples:-}"
+  scripts/gate/mempeak.sh report "$MEMPEAK_OUT" 2>/dev/null | sed 's/^/== gate: /' || true
+fi
 # When ASan is on (--full), the shard phase's recorded duration INCLUDES the
 # ASan compile+run (SHARD_NOTE marks it), so the ASan cost is captured in the
 # phases array here — there is no separate asan phase.
@@ -928,8 +975,11 @@ if [ -r "$S/gate_shard.log" ]; then
                | grep -oE '[0-9]+$' | awk '{t+=$1} END{if(NR)print t}')
   AOT_MISSES=$(grep -aoE 'misses=[0-9]+' "$S/gate_shard.log" 2>/dev/null \
                | grep -oE '[0-9]+$' | awk '{t+=$1} END{if(NR)print t}')
+  AOT_STORE_FAILS=$(grep -aoE 'store_failures=[0-9]+' "$S/gate_shard.log" 2>/dev/null \
+               | grep -oE '[0-9]+$' | awk '{t+=$1} END{if(NR)print t}')
   if [ -n "${AOT_HITS:-}${AOT_MISSES:-}" ]; then
-    echo "== gate: AOT cache: ${AOT_HITS:-?} hits / ${AOT_MISSES:-?} misses =="
+    echo "== gate: AOT cache: ${AOT_HITS:-?} hits / ${AOT_MISSES:-?} misses" \
+         "(store failures: ${AOT_STORE_FAILS:-?}) =="
   fi
 fi
 # Whole-suite-timeout acceptance is LOUD (#2100): when the sharded pass exited

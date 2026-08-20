@@ -39,11 +39,12 @@ TOP_LEVEL_FIELDS = [
     "expected_gtests", "coverage_floor_enforced", "cold", "cache_n",
     "shard_timeout_s", "aot", "binaries", "shard_count", "shard_reported_s",
     "arbitration_suspects", "serial_attempts", "serial_total",
-    "asan_shards_reported", "asan_errors", "shard_times", "phases",
+    "asan_shards_reported", "asan_errors", "shard_times", "mem", "phases",
 ]
 
 PHASE_FIELDS = ["name", "s", "rc", "status", "note"]
 AOT_FIELDS = ["hits", "misses", "store_failures"]
+MEM_FIELDS = ["anon_bytes", "current_bytes", "samples"]
 BINARY_FIELDS = ["ran", "expected"]
 
 
@@ -60,6 +61,8 @@ def _basic_record(**overrides):
         aot_hits="5000", aot_misses="200", aot_store_fails="3",
         bin_expected="codegen:3000", bin_ran="codegen:3000",
         shard_count="16", shard_reported_s="358",
+        mem_anon_max="6442450944", mem_current_max="12884901888",
+        mem_samples="700",
     )
     base.update(overrides)
     return T.build_record(**base)
@@ -72,11 +75,31 @@ class SchemaFieldOrderTest(unittest.TestCase):
         rec = _basic_record()
         self.assertEqual(list(rec.keys()), TOP_LEVEL_FIELDS)
 
-    def test_top_level_field_count_is_29(self):
-        # 29 keys — adding or dropping one is a schema break the dual-run
+    def test_top_level_field_count_is_30(self):
+        # 30 keys — adding or dropping one is a schema break the dual-run
         # would catch, but this count is a cheap first-line defense.
+        # 29 -> 30 on 2026-08-21: `mem` (gate audit F1 Tier-0, the shard
+        # phase's anon high-water mark) joined the record.
         rec = _basic_record()
-        self.assertEqual(len(rec), 29)
+        self.assertEqual(len(rec), 30)
+
+    def test_mem_sub_object_field_order(self):
+        rec = _basic_record()
+        self.assertEqual(list(rec["mem"].keys()), MEM_FIELDS)
+
+    def test_mem_is_null_when_unmeasured(self):
+        # per #3010's rule: AN UNMEASURED NUMBER EMITS null, NEVER 0. The
+        # sampler is best-effort, so "no measurement" must be distinguishable
+        # from "the slice really used 0 bytes".
+        rec = _basic_record(mem_anon_max=None, mem_current_max=None,
+                            mem_samples=None)
+        self.assertIsNone(rec["mem"])
+
+    def test_mem_anon_survives_when_only_anon_measured(self):
+        rec = _basic_record(mem_anon_max="123", mem_current_max=None,
+                            mem_samples=None)
+        self.assertEqual(rec["mem"]["anon_bytes"], 123)
+        self.assertIsNone(rec["mem"]["current_bytes"])
 
     def test_schema_is_always_2(self):
         self.assertEqual(_basic_record()["schema"], 2)

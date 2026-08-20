@@ -205,6 +205,26 @@ def _build_aot(hits, misses, store_fails):
     }
 
 
+def _build_mem(anon_max, current_max, samples):
+    """The mem sub-object, or None. per gate audit F1 (Tier 0).
+
+    anon_bytes is THE figure: anonymous+shmem+slab in the dev_heavy slice,
+    sampled while the shard phase ran. It is what OOM-kills a shard and so what
+    bounds shard concurrency. current_bytes (memory.current) is carried only as
+    a foil — it is dominated by RECLAIMABLE page cache (measured: anon 0 /
+    file 14.3G on an idle slice), so sizing concurrency against it overstates
+    the load by more than 10x. Null when the sampler recorded nothing (it is
+    best-effort and never fails a gate).
+    """
+    if (anon_max is None or anon_max == "") and (current_max is None or current_max == ""):
+        return None
+    return {
+        "anon_bytes": _optint(anon_max),
+        "current_bytes": _optint(current_max),
+        "samples": _optint(samples),
+    }
+
+
 def _build_binaries(bin_expected, bin_ran):
     """The per-binary ran/expected map, or None. per gate.sh:336-353 (the awk merge).
 
@@ -284,7 +304,8 @@ def build_record(*, ts, epoch, host, mode, head, head_short, dirty, result,
                  shard_count="0", shard_reported_s="0",
                  arbitration_suspects="0", serial_attempts="0",
                  serial_total="0", asan_shards_reported="0",
-                 asan_errors="0"):
+                 asan_errors="0", mem_anon_max=None, mem_current_max=None,
+                 mem_samples=None):
     """Build the schema:2 record dict (one gate-timings.jsonl entry).
 
     The null-vs-0 fields (#3010) take the RAW bash string values (or None for
@@ -326,6 +347,7 @@ def build_record(*, ts, epoch, host, mode, head, head_short, dirty, result,
         "asan_shards_reported": _to_int(asan_shards_reported, 0),
         "asan_errors": _to_int(asan_errors, 0),
         "shard_times": _shard_times_list(shard_times),
+        "mem": _build_mem(mem_anon_max, mem_current_max, mem_samples),
         "phases": [
             {"name": p.name, "s": p.s, "rc": p.rc, "status": p.status,
              "note": p.note}
@@ -478,6 +500,9 @@ def _main_emit(argv):
     p.add_argument("--aot-hits", default="")
     p.add_argument("--aot-misses", default="")
     p.add_argument("--aot-store-fails", default="")
+    p.add_argument("--mem-anon-max", default="")
+    p.add_argument("--mem-current-max", default="")
+    p.add_argument("--mem-samples", default="")
     p.add_argument("--bin-expected", default="")
     p.add_argument("--bin-ran", default="")
     # always-numeric fields (default "0", never null)
@@ -508,6 +533,9 @@ def _main_emit(argv):
         aot_hits=args.aot_hits or None,
         aot_misses=args.aot_misses or None,
         aot_store_fails=args.aot_store_fails or None,
+        mem_anon_max=args.mem_anon_max or None,
+        mem_current_max=args.mem_current_max or None,
+        mem_samples=args.mem_samples or None,
         bin_expected=args.bin_expected, bin_ran=args.bin_ran,
         shard_count=args.shard_count, shard_reported_s=args.shard_reported_s,
         arbitration_suspects=args.arbitration_suspects,
