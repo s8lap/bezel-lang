@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — draft (2026-08-20) — authored in the v0.266 ruling lane for [#3259](https://github.com/s8lap/bezel-lang/issues/3259), which the same revision records as an open boundary at §31.4 |
+| **Status** | graduated-v0.268 — superseded — graduated v0.268; was under-review — draft (2026-08-20) — authored in the v0.266 ruling lane for [#3259](https://github.com/s8lap/bezel-lang/issues/3259), which the same revision records as an open boundary at §31.4 |
 | **Tracking issue** | [#3259](https://github.com/s8lap/bezel-lang/issues/3259) |
 | **Target module(s)** | **spec** — §31.4 (*The base `Exception` surface*: one member added; the two rendering-promise sentences gain their declaring text), §8.5 (**no edit** — see this proposal's §5, the audit that expected one and found none needed), §33.3 and §32.8 (one clause each, stating that the reports' content is defined independently of `ToString`). **stdlib** — §2.17, at most a mirroring line; the surface is normative in the spec and §2.17 says so. **rationale** — one paragraph in §11's exception record. **guides** — 02 (Errors and Nullability), where logging an exception is taught. No language change: `Object.ToString` is already `public virtual` (§8.1) and every class already carries the slot. |
 | **Written against** | spec/stdlib/rationale **v0.265** (HEAD `03c3ffc`). Every existing name cited was re-verified against that tree; every new name is marked **▲**. |

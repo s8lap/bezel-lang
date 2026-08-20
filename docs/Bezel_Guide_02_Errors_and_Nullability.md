@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.259.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.268.*
 
 Most of the syntax here is mainstream: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. The *emphasis* is not. Bezel splits failure signals by one rule (the **failure-signal rule**, stdlib §1), and it is worth knowing the shape before the details (teaching order here, not the rule's band order):
 
@@ -103,7 +103,7 @@ method TryPopCached(name: string, out owned conn: Connection? when true): bool
 end TryPopCached;
 ```
 
-The method is named `TryPopCached`, not `TryGetCached`, on purpose. Where the two operations genuinely differ — `Get`/`Peek` leave the entry in place and borrow; `Pop`/`Drain` also remove it and transfer — the stdlib keeps distinct names, so the name alone tells you whether you now owe a disposal (spec §22.6's `out owned` rule; stdlib §1). A pair that differs *only* in ownership is instead a same-name overload pair since v0.250, the call-site `move` marker telling the forms apart (stdlib §1). This one transfers: it hands the caller ownership through `out owned`. The parameter is typed `Connection?` (nullable) because the false path must assign *something*, and `default(Connection)` is illegal for a non-nullable reference type. The `when true` clause states the contract in the signature — "a `true` return implies `conn` is non-null" — and the caller's flow analysis picks it up:
+The method is named `TryPopCached`, not `TryGetCached`, on purpose. Where the two operations genuinely differ — `Get`/`Peek` leave the entry in place and borrow; `Pop`/`Drain` also remove it and transfer — the stdlib keeps distinct names, so the name alone tells you whether you now owe a disposal (spec §22.6's `out owned` rule; stdlib §1). A pair that differs *only* in ownership on an **ordinary (argument-side)** parameter is instead a same-name overload pair since v0.250, the call-site `move` marker telling the forms apart (stdlib §1). This one transfers: it hands the caller ownership through `out owned`. The parameter is typed `Connection?` (nullable) because the false path must assign *something*, and `default(Connection)` is illegal for a non-nullable reference type. The `when true` clause states the contract in the signature — "a `true` return implies `conn` is non-null" — and the caller's flow analysis picks it up:
 
 ```bezel
 if pool.TryPopCached("primary", out using var c) then
@@ -164,6 +164,8 @@ public method WellKnownPort(text: string): Result<int, string>
   end);
 end WellKnownPort;
 ```
+
+One trap the `??` of §1 does not prepare you for: **a combinator's argument is an ordinary argument, evaluated at the call site before the call — on the success path exactly as on the failure path** (stdlib §2.20, v0.265). `??` is conditional, so `a ?? Expensive()` never runs `Expensive()` when `a` is non-null (spec §7.7); `.UnwrapOr($"bad port: {raw}")` builds that string on the `Ok` path as well. There is no lazy `UnwrapOrElse`. Where the fallback must be computed only on failure, compute it in the `Error` arm of a `case`.
 
 Note the `AndThen` lambda's return-type ascription: it makes the lambda's own returns declared-result positions, so the bare `Ok`/`Error` spelling works inside it too. The combinators exist only at **value-like** instantiations — payloads of values and strings, the common case. A `Result` carrying an owned resource (`Result<Connection, string>`) has none of them, deliberately. Extraction there is consumption, and consumption is the owning match's job — for owning results, the exhaustive `case` *is* the pipeline. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure is branched on with a value-shaped payload.
 
@@ -238,7 +240,8 @@ end Handle;
 
 private method RecordError(ex: Exception)
   _lastErrorText := ex.Message;            // string is fine to keep
-  Log($"{ex.Message}\n{ex.StackTrace}");
+  Log($"{ex}\n{ex.StackTrace}");           // the hole dispatches to Exception.ToString():
+                                           //   qualified type name, message, both chains
 end RecordError;
 ```
 
@@ -277,7 +280,7 @@ Even a half-constructed object is safe: if a constructor throws after some `owne
 
 One edge worth knowing: what if cleanup itself throws *while an exception is already propagating*? A throw escaping a `finally` (or a disposer that throws during unwinding) **supersedes** the in-flight exception — the new one propagates, the old one is disposed (spec §31.2/§28.4). Since v0.259 the buried failure is not lost: before the drop, the runtime snapshots its type, message, and stack trace into the escaping exception's `SupersededChain` (spec §31.4) — the same three-string snapshot machinery as `CauseChain`, chronological, earliest lost first — and the uncaught-exception report prints it. So the failure you see at the top is always the *last* one thrown, and `SupersededChain` is where the *first* one — usually the real one — went. Read it like `CauseChain`: copy the strings out in the arm if you need them past it.
 
-One diagnostic worth recognizing in this area: disposing a value and then using it. A *straight-line* dispose-then-use is a warning (and a deterministic fault in checked mode); a use after a *conditional* dispose — disposed on one branch, still live on another — is a compile error at the merge (the value is "maybe-disposed"). Both are the compiler catching a use-after-free before it can happen.
+One diagnostic worth recognizing in this area: disposing a value and then using it. A *straight-line* dispose-then-use is a warning (and a deterministic fault in checked mode); a use after a *conditional* dispose — disposed on one branch, still live on another — is a compile error at the merge (the value is "maybe-consumed", spec §28.3). Both are the compiler catching a use-after-free before it can happen.
 
 ---
 
