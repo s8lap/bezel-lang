@@ -188,6 +188,55 @@ else:
     print(f"SECTION: clean (live {counts[SEC_LIVE]} / graduated {counts[SEC_GRAD]} / "
           f"declined {counts[SEC_DECL]})")
 
+
+# ---- TABLE: Markdown table integrity in the ledger files ----------------------
+# Added v0.267 after a composition gate found six blank lines inserted *inside*
+# DECLINED.md's tables (a blank line terminates a GFM table, so ~80 rows rendered
+# as literal pipe text) and one row pasted outside the Graduated ledger entirely.
+# Neither mechanical gate could see either defect.
+def _pipes(ln):
+    # count unescaped pipes: a `\\|` inside a cell is literal text, not a separator.
+    # (DECLINED.md's *Structural / anonymous unions* row is the standing example, and it
+    # has defeated every naive counter written against this file.)
+    return len(re.findall(r'(?<!\\)\|', ln))
+
+tbad = []
+for path in (README, os.path.join(PROPDIR, 'DECLINED.md')):
+    lines = open(path, encoding="utf-8").read().split("\n")
+    hdr_cells = None          # cell count of the table we are inside; None = not in a table
+    prev_row = False
+    for i, ln in enumerate(lines, 1):
+        is_row = ln.startswith("|")
+        is_delim = is_row and set(ln.replace("|", "").replace(" ", "")) <= {"-", ":"} and "-" in ln
+        if is_delim:
+            hdr_cells = _pipes(ln)
+            prev_row = True
+            continue
+        if is_row:
+            nxt = lines[i] if i < len(lines) else ""
+            is_header = nxt.startswith("|") and set(nxt.replace("|", "").replace(" ", "")) <= {"-", ":"} and "-" in nxt
+            if is_header:
+                prev_row = True
+                continue          # a header row legitimately precedes its delimiter
+            if hdr_cells is None:
+                tbad.append(f"  {os.path.basename(path)}:{i}: table row outside any table (no delimiter above)")
+            elif _pipes(ln) != hdr_cells:
+                tbad.append(f"  {os.path.basename(path)}:{i}: row has {_pipes(ln)} pipes, table header has {hdr_cells}")
+            prev_row = True
+            continue
+        if not ln.strip():
+            # a blank line ends the table; flag it only when a row follows immediately
+            if prev_row and i < len(lines) and lines[i].startswith("|"):
+                tbad.append(f"  {os.path.basename(path)}:{i}: blank line between two table rows (terminates the table)")
+            hdr_cells = None
+        prev_row = False
+if tbad:
+    fail = 1
+    print(f"TABLE: {len(tbad)} violation(s):")
+    print("\n".join(tbad))
+else:
+    print("TABLE: clean (ledger tables well-formed; no interior blank lines, no orphan rows)")
+
 sys.exit(1 if fail else 0)
 PY
 RC=$?

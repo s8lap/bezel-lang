@@ -924,7 +924,11 @@ result into a narrower target and is unreached here: no operation types. `??=`
 is unaffected — it is not a read-modify-write (below), and the absent case is
 its whole purpose; after `x ??= e;` the target is narrowed non-null
 ([§7.4](#sec-member-access-on-nullable-values)), so the ordinary compound form
-applies to it from the next statement on. The same reading governs the `++`/`--`
+applies to it from the next statement on. This paragraph replaces the nullable-target
+admission of v0.265 (#2158), which typed `x op= e` on the underlying types and so made
+`b += 100` on a `byte?` well-typed; v0.267 removes its premise rather than its reasoning
+(rationale [§6.4](Bezel_Design_Rationale.md#sec-operators-do-not-lift)). The same reading
+governs the `++`/`--`
 forms ([§17.6](#sec-the-increment-and-decrement-operators)).
 
 **`??=`** is not a read-modify-write: `x ??= e` assigns `e` only when `x`'s
