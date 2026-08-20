@@ -84,6 +84,49 @@ for k, p in DOCS.items():
 fail = 0
 base = {os.path.basename(p): k for k, p in DOCS.items()}
 
+# ---- 0. PIN: derived documents declare the revision they were validated at ----
+# Added v0.268. The guides carry pins and nothing checked them, which is how
+# Guide 02 sat NINE revisions stale (v0.259 against a v0.268 spec) with both
+# gates green. A pin is an assertion that someone re-traced the document; an
+# unchecked assertion is the failure mode this project keeps rediscovering.
+#
+# Policy: report every pin and its staleness. FAIL only for documents whose
+# staleness produces WRONG CODE rather than stale prose -- currently
+# Bezel_For_Code_Generation.md, which exists to be copied from. Guides are
+# reported, not failed: a guide teaching a still-valid idiom at an older pin is
+# imprecise, not incorrect, and forcing a re-trace every revision would buy
+# ceremony rather than accuracy.
+PIN_RE = re.compile(r're-validated against v(\d+)\.(\d+)|[Vv]alidated against v(\d+)\.(\d+)')
+CODEGEN = 'docs/Bezel_For_Code_Generation.md'
+CODEGEN_MAX_STALE = 3      # revisions; beyond this the document is a liability
+
+m = re.search(r'^\*\*Version (\d+)\.(\d+)', text['spec'], re.M)
+if not m:
+    print("PIN: cannot parse the spec version header"); fail = 1
+else:
+    cur = int(m.group(2))
+    rows, pin_fail = [], []
+    for key, path in sorted(DOCS.items()):
+        if key in ('spec', 'stdlib', 'rationale', 'changelog'):
+            continue                      # versioned headers, covered by VERSION
+        head = '\n'.join(text[key].split('\n')[:6])
+        pm = PIN_RE.search(head)
+        if not pm:
+            rows.append(f"{os.path.basename(path)}: no pin"); continue
+        minor = int(pm.group(2) or pm.group(4))
+        stale = cur - minor
+        rows.append(f"{os.path.basename(path)}: v0.{minor} ({stale} behind)" if stale else
+                    f"{os.path.basename(path)}: v0.{minor} (current)")
+        if path == CODEGEN and stale > CODEGEN_MAX_STALE:
+            pin_fail.append(f"  {os.path.basename(path)} is {stale} revisions stale "
+                            f"(v0.{minor} vs v0.{cur}); max {CODEGEN_MAX_STALE} -- "
+                            f"re-validate it and move its pin, or the code it teaches is wrong")
+    if pin_fail:
+        fail = 1
+        print(f"PIN: {len(pin_fail)} violation(s):"); print("\n".join(pin_fail))
+    else:
+        print("PIN: clean (" + "; ".join(rows) + ")")
+
 # ---- 1. Anchor resolution -------------------------------------------------
 # The repo uses TWO anchor styles: explicit <a id="sec-..."> for cross-refs, and
 # GitHub-auto heading slugs for the table of contents ('## 1. Foo' -> #1-foo).
