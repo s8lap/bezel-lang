@@ -173,6 +173,7 @@ For a **ruling** or a **design-change graduation** (the full path):
 - [ ] `scripts/check_docs.sh` passes (§3).
 - [ ] File a tracking issue for every spec-ahead-of-impl delta; comment/close the issues the revision resolves (§5).
 - [ ] Revalidate the guides if idiom changed; bump their pins (§5).
+- [ ] **If the revision changes syntax, the stdlib surface, or an ownership rule: update [`Bezel_For_Code_Generation.md`](../Bezel_For_Code_Generation.md) and move its pin, in the same commit.** That document is written to be *copied from* by a model that will not read the spec, so a stale line there is wrong code rather than stale teaching — which is why `check_docs.sh`'s PIN check **fails** it past three revisions of staleness while merely reporting the guides'. Its fenced examples are extracted and checked with the rest, so a stale *example* fails the gate mechanically; its prose is the part a human has to re-read.
 - [ ] If the revision ships something the rationale §18 deferred list carries: annotate that entry with the shipped marker in the same revision (v0.201 rule; the ReceiveAll staleness is the cautionary case).
 - [ ] Commit (one revision = one commit or a tight pushed sequence), push, and — for a graduation — flip the proposal to `superseded` and update the README status (§8).
 
