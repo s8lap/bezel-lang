@@ -1397,6 +1397,28 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             }
             ++pos;
         }
+        // §28.3 / §22.4 (fix #2681): mirror the CallExpr branch's
+        // `markOutOwnedArgs(call->args, call->callee.get())` call above
+        // (the bare-statement-call analog at ~line 1191) — model the
+        // caller-side owned-OUT transfer for a bare-statement `new`
+        // `new T(out owned var x);` so the recipient `x` enters
+        // `states_` as Owned. Without this, the OWNERSHIP pass's end-of-
+        // scope §28.3 affine auto-drop never sees `x` (the symbol is
+        // registered in sema as `out owned var` but the dataflow has no
+        // record-MarkOwned-pair for it), so
+        //   (a) the must-use warning at Ownership.cpp:782-795 (the
+        //       IdentifierExpr-decl branch) never fires, and
+        //   (b) ensureCtorOutVarSlots' `locoo->autoDropAtScopeEnd` gate
+        //       (LlvmBackend_Calls2.cpp:2137) is never true, so the
+        //       scope-end disposal is never registered either, and the
+        //       owned `Res` bound to `x` silently leaks (16 B under
+        //       ASan/LSan — the issue's own measurement).
+        // The CALL-arg / `recordMovesIn` initializer forms already get
+        // this via `recordMovesIn`'s NewExpr branch (~line 459), so
+        // this is strictly additive — bare statement-context only.
+        // Mirrors the comment on the CallExpr branch just above.
+        // per §28.3, §22.4, #2681, #2429
+        markOutOwnedArgs(ne->args, ctorParams);
         return;
     }
     // Fallback: just check the expression as a read.
