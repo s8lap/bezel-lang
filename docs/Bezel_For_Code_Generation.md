@@ -383,7 +383,7 @@ arr[2..5]   arr[..5]   arr[10..]   arr[..]
 var cfg := LoadConfig() ?? throw new InvalidOperationException("no config");
 ```
 
-`step` applies to closed ranges only and never appears in a pattern (§16.4).
+`step` may not be applied to an **open-ended** range (one missing an endpoint: `10..`, `..5`) — an exclusive-upper range is fine, `0..<50 step 5` is §16.4's own example. A step of zero is rejected at construction; step sign must agree with the range's direction. `step` never appears in a pattern (§16.4).
 
 ### 3.6 Naming
 
