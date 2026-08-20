@@ -5271,11 +5271,18 @@ bool MethodOwnership::rhsIsVacuousBorrowPin(const ast::Expr& e) const {
 //   * `new` expressions only. The spec sentence names the `new` expression
 //     form; a factory call returning `owned T` is not covered by it, so it
 //     keeps today's warning.
-//   * user CLASS declarations only. A builtin with no `TypeDecl`
-//     (`Array<int>`, …) has no member list to walk, so it is not classified
-//     here and keeps today's behaviour. §28.9 does call the borrowing
-//     collections trivial-dispose, so that half of the exemption is a real
-//     residual — filed as #2667 rather than guessed at here.
+//   * builtin class heads with no `TypeDecl` (`Array<int>`, `Dictionary<K,V>`,
+//     `OwningArray<T>`, …) consult `common::isChainClaimedBuiltinHeadName`
+//     — the SHARED authority: the §28.10 vacuity-lint (rhsIsDisposableClassType,
+//     above) AND the §28.3 auto-drop chain's collection-family arms already
+//     consult this table (BuiltinRegistry.hpp:296, BuiltinRegistry.cpp:555-558
+//     — #3017). It covers the 8 borrowing collections §28.9 names trivial-
+//     dispose ("they do not own their elements") — Array/Stack/Queue/Set/
+//     SortedSet/Dictionary/SortedDictionary/LinkedList — plus the 5 vtable-
+//     less trivial-dispose builtins (Random/Atomic/AtomicInteger/Stopwatch/
+//     Buffer). The Owning* / OwningBuffer variants are DELIBERATELY ABSENT
+//     from the table and must keep the warning. Reuses one shared authority
+//     rather than hand-rolling a parallel name list. // fix #2667
 //   * an owning-inline-array field (`[N owned]T?` / `[N owned]T`, §15.1.1)
 //     DISQUALIFIES. The spec's trivial-dispose definition excludes such a
 //     field, but the shared `common::isNonTrivialDisposeClass` walk does not
@@ -5285,7 +5292,7 @@ bool MethodOwnership::rhsIsVacuousBorrowPin(const ast::Expr& e) const {
 // The `using var` / `owned`-location half of the spec's precondition is
 // structural: `ld.isUsing` is excluded below, and an `owned` LOCATION (field,
 // `owned` parameter) is not an `ast::LocalDecl` at all, so it cannot reach
-// this arm.  // per §28.9, §28.3, v0.237, #2654
+// this arm.  // per §28.9, §28.3, v0.268, #2654 + #2667
 bool MethodOwnership::localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld) {
     if (ld.isUsing) return false;                      // "…or `using var`"
     if (!ld.initializer) return false;
@@ -5303,8 +5310,25 @@ bool MethodOwnership::localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld) 
     const sema::TypeRef* t = ctx_.exprType(*ne);
     if (!t && ne->type) t = ctx_.resolvedType(*ne->type);
     if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+    // fix #2667 (§28.9, v0.268): §28.9's "Trivial-dispose for generic class
+    // instantiations" names the standard borrowing-collection types (Array<T>,
+    // Dictionary<K,V>, Set<T>, LinkedList<T>, Stack<T>, Queue<T> — plus
+    // SortedSet/SortedDictionary, both borrowing-family) trivial-dispose
+    // because they do not own their elements. The Owning* variants are
+    // DELIBERATELY excluded because they own their elements (their storage
+    // primitive declares a destructor, §28.9's "non-trivial at every
+    // instantiation" sentence). `t->declaration` is null for builtin class
+    // heads — there is no user TypeDecl to walk — so the user-class arm below
+    // bails. Reuse the SHARED `common::isChainClaimedBuiltinHeadName` table
+    // (BuiltinRegistry.cpp:555-558, #3017) that the §28.10 vacuity-lint AND
+    // the codegen auto-drop chain both already consult — same 13 names, no
+    // hand-list to drift. The Owning* heads are NOT on that table. // per
+    // §28.9, fix #2667
+    if (!t->declaration) {
+        return common::isChainClaimedBuiltinHeadName(t->headName());
+    }
     sema::TypeSymbol* d = t->declaration;
-    if (!d || d->kind != ast::TypeDeclKind::Class) return false;
+    if (d->kind != ast::TypeDeclKind::Class) return false;
     if (common::isNonTrivialDisposeClass(d)) return false;
     if (classChainHasOwningInlineArrayField(d)) return false;
     return true;
