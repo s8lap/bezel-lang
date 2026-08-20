@@ -2103,7 +2103,7 @@ An alias declaration carrying a predicate — `type Port = int requires(value in
 
 **(3) It could not appear in a public signature.** Aliases are module-internal, and exportable aliases (`public type`) are their own deferral (§18) inside the module-identity family. A constrained alias would be a validity guarantee that stops at the module boundary — the boundary where validation matters most.
 
-Its useful content survives elsewhere: a validity predicate belongs to the *type* that carries the value, which is the record-invariant design spec §22.16 defines under *Record invariants* (landed v0.264, from proposal 0107; proposal 0106 §6.2(d′) worked it out). **Reopening bar:** not new syntax for the alias, but new evidence against ground (1) — a demonstration that a transparent constrained type is what the language wants, which would first have to survive §27.8's see-through rule and §25.4's no-conversions posture.
+Its useful content survives elsewhere: a validity predicate belongs to the *type* that carries the value, which is the record-invariant design spec §22.16 records as out of scope for this revision and proposal 0106 §6.2(d′) works out. **Reopening bar:** not new syntax for the alias, but new evidence against ground (1) — a demonstration that a transparent constrained type is what the language wants, which would first have to survive §27.8's see-through rule and §25.4's no-conversions posture.
 
 <a id="sec-ambient-authority"></a>
 ### 17.13 Ambient authority: no object-capability discipline (v0.263)

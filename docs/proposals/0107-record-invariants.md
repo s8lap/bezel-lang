@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | graduated-v0.264 — **superseded — graduated v0.264** (owner-accepted 2026-08-20 and graduated under that direction; all four owner questions ruled at the landing — Q1 decode band: `SerializationException` with the violation in its `CauseChain`, raised compiler-internally, so the train stayed spec-only; Q2: §9.3's combined form is the spelling, no `ContractClause` slot on `RecordDecl`; Q3: checked-contracts mode, uniform with class invariants, with non-defaultability static and therefore mode-independent; Q4: the structural form of restriction (a′), the expression-level variant recorded liftable. Landed in spec §22.16 *Record invariants*, §3.6, §17.11, §9.2, §9.5, §9.8, §2.8.2, §2.8.6, Appendix A.4 and Appendix C; the declines are indexed in `DECLINED.md`) |
+| **Status** | under-review — draft (2026-08-20); **scoped into v0.264, then withdrawn from it before landing** (2026-08-20) and returned to this state. The four owner questions were ruled by the coordinator under the owner's autonomous-work direction and the design was drafted into the normative documents; three adversarial rounds then found, each time, a **new admitted forge or the reopening of a closed one**, and the proposal was withdrawn rather than landed with a soundness argument that had not held. No text of it survives in any normative document (changelog v0.264, *The 0107 withdrawal*). **Section 13 (*Revision record — the v0.264 withdrawal*) is the starting point for any redesign**; the four rulings in §11 stand as coordinator rulings on questions the redesign may reopen. |
 | **Tracking issue** | — |
 | **Target module(s)** | none — **spec-only, and deliberately so**. The normative surface is §22.16 (a `Record invariants` subsection plus two sentence amendments), §3.6's *defaultable* row, §17.11, §9.2's membership list, §9.5, §9.8 (two additions: the `serialized optional` guard and the decode-band rule), §2.8.2's contract-record carriage sentence, and one Appendix A.4 grammar *comment*. **No grammar productions change** (this proposal's §2.1) and **no stdlib document changes**: the §6 decode-band ruling is spelled as compiler-internal construction precisely so that it needs none (this proposal's §6, and §8(g) for the stdlib-amending alternative declined there). |
 | **Written against** | spec/stdlib/rationale **v0.262** (HEAD `8a03dd2` at authoring) — every quotation re-verified against that tree, not taken from proposal 0106's transcription |
@@ -448,3 +448,120 @@ Drafted 2026-08-20; revised the same day after adversarial verification. The rev
 - **A fifth fabrication route was missing.** `serialized optional` supplies `default(T)` with no defaultability guard (this proposal's §1.6, §4(3)).
 - **The decode-band mechanism named a constructor `SerializationException` does not declare** (this proposal's §6, reason 4) — re-spelled as compiler-internal, which is also what keeps this proposal spec-only.
 - Smaller corrections: the two-site `static invariant` discharge withdrawn as invented tier machinery (this proposal's §2.6); §3.3 rebuilt on the enum precedent alone; the enum/interface amendment corrected (syntax-unreachable, not semantically rejected — this proposal's §2.1); the FFI residual stated over §32.13's whole position list; `OwningBuffer<T>(length)` added; the Currency row's evidence restated as per-section byte-identity; 0106's status updated to accepted; five quotation truncations closed.
+
+## 13. Revision record — the v0.264 withdrawal
+
+This proposal was scoped into revision **v0.264**, its four §11 questions ruled by the coordinator under the owner's 2026-08-20 autonomous-work direction, and its design drafted into the normative documents. It was then **withdrawn before landing**, and every one of its edits reverted; v0.264 shipped proposal 0109 alone. Status returns to `under-review`.
+
+The ground for withdrawal is narrow and worth stating precisely, because it is not "the feature is unwanted": record invariants remain proposal 0106's first-rank finding, `DECLINED.md`'s *Record invariants* row stands as a plain deferral against §22.16's out-of-scope item, and nothing here bears on whether the language should have them. What failed is **this proposal's soundness argument** — specifically §2.3's *instrumentation-completeness* claim, that the instrumentation points plus a copy are the only ways a value of an invariant-bearing record comes to exist. That claim was attacked in three independent adversarial rounds and **each round found either a new admitted forge or the reopening of one already closed**. A redesign should start from this section rather than from §2.
+
+### 13.1 Round 1 — non-public writable storage
+
+The first landed rule was §2.2's: instrument every setter, and bar a **`public`** writable field. The critique produced a working forge using only members the rule declined to instrument — a `private` settable auto-property, written from a **static factory of the declaring record itself**, where §13's visibility rules make the private member fully accessible:
+
+```bezel
+public record Rate
+  public readonly property Value: int;
+  private property Scratch: int;              // private, settable — not barred
+  invariant(Value > 0);
+
+  public constructor(v: int)
+    requires(v > 0)
+    Value := v;
+    Scratch := 0;
+  end constructor;
+
+  // Same-type, so `private` is accessible. No instrumentation point is
+  // reached: this is not a constructor, not a `with`, not a synthesized
+  // Deserialize — and under the round-1 rule the setter of a *private*
+  // auto-property was not instrumented either.
+  public static method Forge(r: Rate): Rate
+    var copy := r;
+    copy.Scratch := -1;
+    return copy;
+  end Forge;
+end Rate;
+```
+
+Three variants of the same shape were produced: a `private` writable **field**, a `ref` parameter of the record's own type, and a `private` **inline-array** component whose slot store lands in the component's own storage (§9.4's inline-array chain). The common mechanism is that the rule keyed on **visibility**, while the reachability that matters is the *declaring type's own* code, for which visibility is no boundary at all.
+
+**The repair adopted:** §2.2 was replaced by the structural rule — a record declaring an `invariant` member **declares no writable storage at any visibility**, so no assignable location exists inside the value and there is no store to instrument anywhere. That repair is sound as far as it goes, and rounds 2 and 3 went further.
+
+### 13.2 Round 2, forge A — the constructor escape, and why §22.7's gate is vacuous here
+
+§2.3 asserted that construction composes with §22.7 exactly, borrowing the class rule's reasoning: at construction exit every §7.9-required field is definitely assigned, so evaluating the invariant is admitted by the observation gate. **The direction that matters is the other one** — not whether the invariant may be evaluated at exit, but whether a value may *leave* before exit. It may, and for an all-primitive record it may from the constructor's **first statement**:
+
+```bezel
+public record Pos
+  public readonly property X: int;
+  public readonly property Y: int;
+  invariant(X > 0);
+
+  public constructor(x: int, y: int, ref leaked: Pos)
+    requires(x > 0)
+    leaked := this;      // a COPY of `this`, with X = 0 — invariant false
+    X := x;
+    Y := y;
+  end constructor;
+end Pos;
+```
+
+The escape is legal, and the mechanism is exact. §22.7 rule 1 gates a synchronous observation of `this` — "`this` stored anywhere" included — on every field **"that §7.9 requires to be explicitly initialized"** being definitely assigned. §7.9's *Default initialization* subsection says a field whose type is **defaultable** "satisfies the must-initialize rule vacuously and is implicitly initialized to that default"; only a **non**-defaultable field "requires an explicit initializer". `X` and `Y` are `int`. **The gated set is therefore empty, and the gate admits the escape at every point in the body, including before any assignment.** The leaked copy holds `X = 0`, reaches no instrumentation point, and is indistinguishable at every later use from a value that passed one.
+
+The gate is not vacuous for the *class* rule this argument was borrowed from — a class typically has non-defaultable fields — and, decisively, **§22.16's class subsection anticipates the escape and neutralizes it**: a leaked `this` re-entering a public method from outside the instance hits an instrumented public entry, which is why the class rule can afford to record the escape as a bounded residual. This proposal's record subsection **deletes that mechanism** — a record has no public re-entry point, by design, since it declares no writable storage — and never re-audits the inherited escape argument against its own removal of the thing that answered it. That is the single most transferable finding here.
+
+### 13.3 Round 2, forge B — `readonly` storage is assignable in *any* constructor of the declaring record
+
+The no-writable-storage rule admits exactly three storage shapes: auto-generated positional-field properties (§9.1), `readonly` auto-properties (§23.1), and `readonly` fields (§22.8). For the latter two, the permission that makes them writable during construction is stated **positionally, not per-instance**. §22.8: a `readonly` field "may be assigned only in a field initializer or **in a constructor body**". §23.1: a `readonly` auto-property "may be assigned only in a field initializer or **in a constructor**". Neither says *of this instance*. §22.3's assignable-location list carries the same qualification from the other side — "no `readonly` field **outside its assignable context** (§22.8)" — so inside that context the location is assignable, whoever holds it:
+
+```bezel
+public record Counter
+  public readonly property Value: int;
+  invariant(Value > 0);
+
+  public constructor(v: int)
+    requires(v > 0)
+    Value := v;
+  end constructor;
+
+  // Any constructor of Counter is inside `readonly`'s assignable context.
+  // The context is POSITIONAL, so `victim`'s storage is assignable here too.
+  public constructor(v: int, ref victim: Counter)
+    requires(v > 0)
+    Value := v;
+    victim.Value := 0;   // another instance, already constructed and checked,
+                         //   made invalid — no instrumentation point reached
+  end constructor;
+end Counter;
+```
+
+This one is worse than forge A for the proposal's structure: it is not an escape of a *partly built* value but a **retroactive falsification of a fully constructed, already-checked one**, and it defeats the completeness argument at its root — the claim that no assignable location exists inside the value is false inside the declaring record's own constructors, which is precisely where the argument stopped looking.
+
+### 13.4 Round 3 — the §9.7 amendment reopened the store it was written to close
+
+§2.3's *Never instrumented* paragraph argues that the **mediating** store §9.4 legalises cannot be spelled on such a record, because a mediating store needs a class- or interface-typed field and §9.7 admits only **runtime-managed** reference components there, none of which declares a settable member. An interface-typed field is the hole: §9.7's list of what does *not* make a record borrow-bearing reads "`string`, function types, **boxed value types**", and a field declared as an interface type may at runtime hold a boxed value — so whether the predicate reads the **declared type** or the **held value** decides whether `record R(Handle: ISomething)` is borrow-bearing and therefore whether restriction (a′) excludes it.
+
+The amendment written to close this added a *declared field types* sentence to §9.7 — but left **"boxed value types" standing in the enumeration immediately before it** (spec §9.7, first paragraph after the bullet list) **and again in §9.7's closing summary** ("a record whose only reference-typed fields are of runtime-managed types (`string`, function types, boxed value types)"). Two unamended neighbours contradicting the amendment is not a closed ambiguity; an interface-typed field still escapes borrow-bearing classification under the surviving text, restriction (a′) still fails to exclude the record, and the mediating store that §2.3 declares unspellable is readmitted.
+
+**Recorded separately, for the next revision:** the underlying question — *does the borrow-bearing predicate read declared field types or held values?* — is a **real, pre-existing §9.7 defect**, independent of this proposal. It is being filed as a spec-defect issue rather than fixed here, because the half-fix above is what made it look closed.
+
+### 13.5 The frame question the patches never reached
+
+None of the three rounds' repairs touches this, and it may be the deeper problem. An invariant clause is admitted under §22.15's pure-body discipline, and §22.15 rule 1 admits **static field reads**, stating outright that "a pure member may read *mutable* state, so two calls with identical arguments may return different values". So:
+
+```bezel
+public record Window
+  public readonly property Hi: int;
+  invariant(Hi <= Limits.Max);   // Limits.Max is mutable static state
+  ...
+end Window;
+```
+
+`Limits.Max` changes; every existing `Window` value now violates its invariant, with **no store to the record, no copy, and no instrumentation point anywhere** — nothing for any instrumentation set, however complete, to catch. This is not a forge to be closed by another restriction; it is a question the design must answer first: **is a record invariant a standing property of every value of the type, or a construction-time claim about how a value was made?** §2.3's completeness argument is written as though the former; the instrumentation set can only ever deliver the latter. Every rule in §2 reads differently depending on the answer, which is why no patch in three rounds could be the right next step.
+
+### 13.6 What a redesign inherits
+
+- **Sound and re-usable:** the §3.6/§17.11 non-defaultability derivation (§3.3), whose enum-zero-valued-constant precedent is exact and which was verified under attack; the §4 companion list, in particular the §9.2 auto-equality membership trap, which a redesign must still carry; and the corpus survey of §7.
+- **Answered but not landed:** the four §11 rulings (decode band; the §9.3 combined form as the spelling; checked-contracts mode; the structural form of restriction (a′)). They stand as coordinator rulings a redesign may reopen, not as settled text.
+- **Must be re-derived from scratch:** §2.3's instrumentation-completeness argument, and with it the *Never instrumented* paragraph and §2.2's declaration restrictions, which exist only to support it. The two forges above and §13.5's frame question are the acceptance tests.
+- **The structural lesson:** the class subsection's soundness rests on a **re-entry point** (public-method entry/exit re-checking) that the record form deliberately has none of. Any record design that borrows the class rule's reasoning must first re-audit every argument that mechanism was silently carrying.
