@@ -6499,9 +6499,9 @@ The direction is deliberate: rejection at 3 rather than demotion is what makes t
 The build-before-take discipline and the throwable-expression classification are derivations under K9, stated in [§28.8.1](#sec-the-move-expression); the per-slot conservative tracking for non-constant indices is stated in [§28.11](#sec-move-on-a-collection-slot).
 
 <a id="sec-axiom-register"></a>
-#### The axiom register (A1–A14)
+#### The axiom register (A1–A15)
 
-Ten axioms (and four tombstones). Each is a rule the kernel cannot derive — a recorded design decision — and each is the extension point a future ruling in its area must name; a tombstone row records a retired axiom and points at the retiring revision's changelog entry. Ordering is by home section; one-line reasons here, full recorded reasons in rationale [§5.26](Bezel_Design_Rationale.md#sec-the-ownership-kernel). Axiom ids are stable: new axioms append; a deleted axiom leaves a tombstone row pointing at the deleting revision's changelog entry.
+Eleven axioms (and four tombstones). Each is a rule the kernel cannot derive — a recorded design decision — and each is the extension point a future ruling in its area must name; a tombstone row records a retired axiom and points at the retiring revision's changelog entry. Ordering is by home section; one-line reasons here, full recorded reasons in rationale [§5.26](Bezel_Design_Rationale.md#sec-the-ownership-kernel). Axiom ids are stable: new axioms append; a deleted axiom leaves a tombstone row pointing at the deleting revision's changelog entry.
 
 | # | Axiom | Home | Recorded reason (one line) |
 |---|---|---|---|
@@ -6519,6 +6519,7 @@ Ten axioms (and four tombstones). Each is a rule the kernel cannot derive — a 
 | A12 | Pattern A chaining's disposal-timing dispensation for a `using var` source (deferral to the outer task's teardown) | [§30.5](#sec-result-lifetime-and-task-disposal) kind 2 | A recorded timing carve against A5's pin — not a move (the slot lives in the frame); exactly-once is preserved transitively. |
 | A13 | *Retired.* The prior axiom and its decision record are in the [changelog](Bezel_Changelog.md). | — | — |
 | A14 | No `owned` generic type arguments; owning semantics live in named types | [§28.1](#sec-where-the-owned-modifier-can-appear), [§14.4](#sec-owned-and-generic-type-arguments); rationale §5.3/§5.11 | Named types capture owning semantics without generic substitution machinery; the declined design is rationale §5.3/§5.11's record. |
+| A15 | The self-returning enumerator: a **class** implementing both `IEnumerable<T>` and `IEnumerator<T>` may `return this;` from its own `GetEnumerator()` body, and the disposal of a self-returned frame runs `Dispose()` without reclaiming | [§28.3](#sec-announcement-table) (rows 2–3), [§29.1](#sec-iterator-protocol), [§29.2](#sec-desugaring-of-for) | The announcement table's callee-side set is closed and admits no borrow return; `this` is a borrow, so the [§29.1](#sec-iterator-protocol) form escapes it and cannot be a derivation — [K6.3](#sec-kernel-k6) demands a fresh or owned frame and this return is neither. Recorded as an axiom rather than widened into the set, because the admission is keyed on three conjuncts (the class implements both heads; the member is the protocol's `GetEnumerator()`; the returned expression is literally `this`) and every column's caller-side classification is unchanged. The non-reclaiming disposal is the half that makes it sound where the receiver is a borrow the caller does not own (v0.266, [#3289](https://github.com/s8lap/bezel-lang/issues/3289)).
 
 <a id="sec-ownership-state-of-locals"></a>
 #### Ownership state of locals
