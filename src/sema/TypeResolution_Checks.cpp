@@ -1527,7 +1527,20 @@ void Resolver::checkCollectionLiteralFactoryConjuncts() {
                     retTy && retTy->kind == TypeRef::Kind::Named &&
                     retTy->declaration == t &&
                     retTy->genericArgs.size() == t->genericParams.size() &&
-                    typeRefEqual(elemTy, retElemTy);
+                    // The element-type match (§15.4.1 "must return `owned
+                    // C<T>`" — T is the SOLE type argument of both the
+                    // carrier AND the return type when the enclosing is
+                    // generic) is only meaningful for generic enclosing
+                    // types. For a NON-generic enclosing type the return
+                    // is `owned C` — no element type exists to compare
+                    // against the carrier's element type, and
+                    // `retElemTy == nullptr` while `elemTy` is the
+                    // carrier's (e.g. `int` from `ReadOnlySpan<int>`).
+                    // Without this carve the conjunct rejected every
+                    // non-generic-owning form (with no T to bind, the
+                    // carrier's T is whatever the user wrote).
+                    (t->genericParams.size() == 0 ||
+                     typeRefEqual(elemTy, retElemTy));
                 if (!shapeOk) {
                     ctx_.diagnostics().report(
                         Severity::Error, ms->declLoc,
