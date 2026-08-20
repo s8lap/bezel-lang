@@ -103,6 +103,49 @@ class FormatFailureArgvTest(unittest.TestCase):
             "FormatFailureArgvTest.REQUIRED and the run_parallel.sh call")
 
 
+class EmptyArrayDefaultTest(unittest.TestCase):
+    """`"${arr[@]:-}"` on an EMPTY array yields ONE EMPTY STRING, not zero args.
+
+    summary.py's `has_defect = bool(... or timed_out_shards)` is truthy for
+    [""], so a phantom element makes every CLEAN run print a GATE FAILURE
+    banner claiming a shard hit the per-shard ceiling. That is the shape that
+    poisoned 11 retries on d8ab1b7.
+
+    a4c0bdc removed this `:-` at the argument site but left it at the
+    declaration; the comment it added there then amputated the whole call
+    (#3300), hiding the second instance until #3300 was fixed. Two independent
+    bugs, one masking the other.
+
+    An ARRAY ASSIGNMENT is what matters: the two `for _x in "${arr[@]:-}"`
+    loops are each guarded by `[[ -n "$_x" ]]`, so a phantom element is
+    discarded there.
+    """
+
+    def test_no_bare_default_in_an_array_assignment(self):
+        offenders = []
+        for n, line in enumerate(SCRIPT.read_text().split('\n'), 1):
+            stripped = line.strip()
+            if stripped.startswith('#'):
+                continue
+            if re.search(r'^\s*\w+=\(\"\$\{\w+\[@\]:-\}\"\)', line):
+                offenders.append((n, stripped[:70]))
+        self.assertEqual(
+            offenders, [],
+            'an array assignment must not use "${arr[@]:-}" — on an empty '
+            'array it manufactures a one-element [""] rather than an empty '
+            'array (#3300 follow-up):\n' +
+            '\n'.join(f"  {SCRIPT.name}:{n}: {t}" for n, t in offenders))
+
+    def test_bash_default_on_empty_array_yields_one_empty_element(self):
+        out = subprocess.run(
+            ['bash', '-c',
+             'declare -a e=(); x=("${e[@]:-}"); echo "${#x[@]}"; '
+             'y=("${e[@]}"); echo "${#y[@]}"'],
+            capture_output=True, text=True)
+        self.assertEqual(out.stdout.split(), ['1', '0'],
+                         'bash semantics changed; re-derive the rule above')
+
+
 class BashBehaviourTest(unittest.TestCase):
     """Pin the bash behaviour itself, so the rule above is not folklore."""
 

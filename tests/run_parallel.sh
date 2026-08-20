@@ -270,7 +270,20 @@ crashed_shards=("${rp_crashed_shards[@]}")
 # narrow #3222: ceiling-killed shards are sourced from the same rp_* eval
 # (account() emits rp_timed_out_shards=(...)). Empty when no shard tripped
 # the ceiling — the banner omits the section entirely in that case.
-timed_out_shards=("${rp_timed_out_shards[@]:-}")
+#
+# NO `:-` HERE. On an EMPTY array "${arr[@]:-}" expands to ONE EMPTY STRING,
+# not to zero args — so the `:-` manufactured a phantom one-element array on
+# every clean run, and summary.py's `has_defect = bool(... or timed_out_shards)`
+# is truthy for [""]. Every healthy run would print "1 shard(s) hit the
+# configured per-shard ceiling" under a GATE FAILURE banner.
+#
+# a4c0bdc removed exactly this `:-` at the ARGUMENT site and left it here; the
+# explanatory comment it added there then amputated the whole call (#3300), so
+# `--timed-out` never reached summary.py and this second instance was invisible
+# for as long as the amputation lasted. Fixing #3300 surfaced it immediately.
+# account() ALWAYS emits the key (verified: `rp_timed_out_shards=()` on a clean
+# run), so there is nothing to default — match the sibling arrays above.
+timed_out_shards=("${rp_timed_out_shards[@]}")
 missing_summary_shards=("${rp_missing_summary_shards[@]}")
 undercount_bins=("${rp_undercount_bins[@]}")
 declare -a bin_pass bin_fail bin_expected bin_registry
