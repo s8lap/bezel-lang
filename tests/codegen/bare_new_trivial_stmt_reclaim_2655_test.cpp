@@ -304,10 +304,16 @@ BEZEL_TEST(bare_new_trivial_stmt_reclaim_2655,
 // rather than relying on that measurement, and this test locks the observable
 // in so a future reordering cannot regress it silently.
 //
-// runAot: `x` is not disposed at its own scope end either (16 B, `Res.alive`
-// still 1 at the read) — a PRE-EXISTING `out owned var` gap, identical in that
-// same untouched discard spelling, filed separately. This test pins the
-// recipient's liveness, not that leak.
+// runAot: the BARE-statement form `new Widget(out owned var x);` IS now
+// disposed at its own scope end by #2681 (the OWNERSHIP pass marks `x` as
+// Owned and the NewExpr branch in handleDischarge calls markOutOwnedArgs,
+// which routes the scope-end disposal). The remaining gap is the DISCARD
+// form `_ := new Widget(out owned var x);` — a newly-surfaced latent SEGV
+// in `DiscardStmt::disposeOwnedValue`'s open-scope-first ordering
+// (LlvmBackend_Stmts.cpp:~2873): the one-entry dispose scope opens BEFORE
+// `lowerExpr`, re-homing the disposal from BLOCK scope to STATEMENT scope
+// and SEGVing a subsequent `x.Id` read. Filed as #3293. This test pins the
+// BARE-statement recipient's liveness, not the discard form's leak-and-SEGV.
 // per §22.3, §22.4, §28.3 (issue #2655, reviewer-directed self-pass)
 BEZEL_TEST(bare_new_trivial_stmt_reclaim_2655,
            out_owned_var_recipient_stays_live_after_the_statement_free) {
