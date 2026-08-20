@@ -355,6 +355,13 @@ void Resolver::run(const ast::SourceFile& src) {
     checkSerializationEligibility();
     // #594 (§28.2): user code may not declare Dispose() on a class/record.
     checkUserDeclaredDispose();
+    // fix #3032 (§15.4.1, v0.262): public / owned C<T> return / both-forms
+    // declaration-site diagnostics for a static `FromCollectionLiteral`
+    // factory. Runs after every parameter / return type has been resolved
+    // so the carrier identification and return-type shape checks can read
+    // `ctx_.resolvedType(...)` (the same prerequisite every other post-
+    // type-resolution check has).
+    checkCollectionLiteralFactoryConjuncts();
     // Slice S28: accessor visibility (§13.6).
     checkAccessorVisibility();
     // Slice S30: const member type must be primitive or string.
