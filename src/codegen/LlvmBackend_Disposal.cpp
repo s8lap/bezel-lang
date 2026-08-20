@@ -4525,13 +4525,34 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* contBB = llvm::BasicBlock::Create(llvm_, "coll.cont", currentFn_);
             builder_.CreateCondBr(isNull, contBB, frBB);
             builder_.SetInsertPoint(frBB);
-            llvm::Value* disp = it->collectionElemDisposer
-                ? llvm::cast<llvm::Value>(it->collectionElemDisposer)
-                : llvm::ConstantPointerNull::get(ptrTy());
-            auto* fn = declareC("bz_array_free",
-                                llvm::Type::getVoidTy(llvm_),
-                                {ptrTy(), ptrTy()});
-            builder_.CreateCall(fn, {arr, disp});
+            // fix #2630 / §28.5/§28.11 / stdlib §4.3: a `using var` typed by a
+            // BORROWING list interface (IReadOnlyList<T>/IList<T>) whose static
+            // head erases the dynamic backing — could be borrowing Array<T>
+            // (no disposer) or owning OwningArray<T> (disposer stamped at
+            // construction per #2608). When no static element disposer was
+            // derived AND the static head is a borrowing list interface, free
+            // via bz_array_free_dynamic, which consults the disposer header
+            // recorded at construction. An untagged (borrowing) backing yields
+            // NULL there and the dynamic call degenerates EXACTLY to
+            // bz_array_free(arr, null) — the call it replaces for the
+            // borrowing case, bit-for-bit. Mirrors the field free site
+            // (LlvmBackend_Disposal.cpp ~L873). Owned IOwningList<T> and
+            // concrete OwningArray<T> locals keep the static disposer path:
+            // collectionElemDisposer is set by registerUsingDisposal for
+            // them and they never set collArrayDynamicFree.
+            if (it->collArrayDynamicFree) {
+                auto* dynFn = declareC("bz_array_free_dynamic",
+                                       llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(dynFn, {arr});
+            } else {
+                llvm::Value* disp = it->collectionElemDisposer
+                    ? llvm::cast<llvm::Value>(it->collectionElemDisposer)
+                    : llvm::ConstantPointerNull::get(ptrTy());
+                auto* fn = declareC("bz_array_free",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {arr, disp});
+            }
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);

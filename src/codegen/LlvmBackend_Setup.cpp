@@ -14898,6 +14898,64 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         disposeStack_.back().push_back(d);
         return;
     }
+    // fix #2630 / §28.5/§28.11 / stdlib §4.3-§4.5: a `using var` typed by a
+    // list interface (IReadOnlyList<T> / IList<T> / IOwningList<T>). The
+    // sibling collectionTypeOfLocal branch above deliberately REJECTS these
+    // shapes — they are not builtin-concrete array-backed names, and the
+    // erased static head erases whether the dynamic backing is borrowing
+    // (`Array<T>` — elements must NOT be disposed) or owning (`OwningArray<T>`
+    // — elements MUST be, per #2608's disposer-stamped header). The FIELD
+    // free site handles this via bz_array_free_dynamic (#2608). Mirror it
+    // here for the local-disposal path, which previously registered NOTHING
+    // for these shapes and so leaked every Cell of an owning-backed
+    // `using var v: IReadOnlyList<Cell>` (measured: 2/2 leaked + the
+    // bz_array_t itself, 216 B total).
+    //
+    // Detection mirrors the field site: derive a static element disposer via
+    // elementPolicyFor; fall back to the string-element release thunk for a
+    // borrowing string; fall back to bz_array_free_dynamic for a borrowing
+    // interface with class/value elements (the disposer header was stamped
+    // at construction if the backing is owning, else NULL → degenerate).
+    // IOwningList<T> is statically owning and gets the static disposer path
+    // — elementPolicyFor(elem, owning=true) yields a vtable thunk that
+    // matches OwningArray<T>'s existing scope-end path.
+    //
+    // Why we do NOT route IOwningList<T> through the dynamic path: the
+    // disposer is statically known and bz_array_free(arr, disposer) is one
+    // fewer indirection than bz_array_free_dynamic. The dynamic path is the
+    // LAST-resort fallback only for the static head that genuinely cannot
+    // tell the two backings apart.
+    if (const sema::TypeRef* liTy = listInterfaceTypeOfLocal(ld)) {
+        bool ifaceIsOwning = isOwningListInterfaceName(liTy);
+        const sema::TypeRef* liEl =
+            (!liTy->genericArgs.empty()) ? liTy->genericArgs[0] : nullptr;
+        ElementPolicy cp = elementPolicyFor(liEl, ifaceIsOwning);
+        Disposal d{it->second, nullptr};
+        d.collection = true;
+        d.collectionElemDisposer = cp.disposerThunk;
+        // String-element release thunk: matches the LinkedList sibling and
+        // the field-path string gate (#401/#429). For an OwningList<string>
+        // this branch is dead — stdlib §4.4 rejects owning + string — and
+        // elementPolicyFor(liEl, true) already yields a non-throwing Value
+        // row, so the disposer stays null (correctly: no element release).
+        if (!d.collectionElemDisposer && !ifaceIsOwning && liEl &&
+                !liEl->nullable &&
+                liEl->kind == sema::TypeRef::Kind::Primitive &&
+                liEl->primitive == sema::PrimitiveType::String &&
+                cp.cat == ElementPolicy::Category::RuntimeManaged)
+            d.collectionElemDisposer = stringElementReleaseThunk();
+        // Dynamic-free fallback: a borrowing list interface typed local whose
+        // element policy yielded no static disposer — defer to the disposer
+        // the owning backing stamped into its bz_array_t header at
+        // construction (#2608). A borrowing backing's header is NULL and the
+        // dynamic path degenerates to bz_array_free(arr, null) — i.e. exactly
+        // the call it replaces for the borrowing backing, bit-for-bit
+        // unchanged. Set ONLY when no static disposer was derived; otherwise
+        // the statically-known path stays the call (cheaper, one fewer load).
+        d.collArrayDynamicFree = !d.collectionElemDisposer && !ifaceIsOwning;
+        disposeStack_.back().push_back(d);
+        return;
+    }
     if (const sema::TypeRef* collTy = collectionTypeOfLocal(ld)) {
         if (isCollectionTypeName(collTy)) {
             // #429 / §28.9 / §4.10: Set<string> is dict-backed (bz_dict_t*), NOT
@@ -25648,6 +25706,29 @@ const sema::TypeRef* Emitter::collectionTypeOfLocal(const ast::LocalDecl* ld) {
     if (ld->initializer) {
         if (auto* rt = ctx_.exprType(*ld->initializer))
             if (isCollectionTypeName(rt)) return rt;
+    }
+    return nullptr;
+}
+
+// fix #2630 / §28.5 / §28.11 / stdlib §4.3: recover the local's resolved
+// list-interface TypeRef (IReadOnlyList<T>/IList<T>/IOwningList<T>) — the
+// erased-interface twin of collectionTypeOfLocal. Mirrors its shape: prefer
+// declared type, then initializer's expression type. Accepts a declaration-
+// less Named TypeRef (the synthesized interface head — see ExprTypecheck.cpp
+// `makeBuiltin`), which is exactly what the spec's interface-upcast sites
+// (`OwningArray<T>` / `Array<T>` returned as `IReadOnlyList<T>`) produce.
+// A USER-DECLARED type implementing one of these interfaces (a `class MyC:
+// IReadOnlyList<T>`) is REJECTED here — isListInterfaceName checks
+// rt->declaration — so the dynamic-backing path only runs for genuine
+// list-interface heads, not user-class instances of them.
+const sema::TypeRef* Emitter::listInterfaceTypeOfLocal(const ast::LocalDecl* ld) {
+    if (ld->type) {
+        if (auto* rt = ctx_.resolvedType(*ld->type))
+            if (isListInterfaceName(rt)) return rt;
+    }
+    if (ld->initializer) {
+        if (auto* rt = ctx_.exprType(*ld->initializer))
+            if (isListInterfaceName(rt)) return rt;
     }
     return nullptr;
 }

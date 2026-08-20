@@ -969,6 +969,17 @@ private:
         // borrowing collection or value elements — only the backing is freed).
         bool collection = false;
         llvm::Value* collectionElemDisposer = nullptr;
+        // fix #2630 / §28.5/§28.11 / stdlib §4.3: a `using var` typed by an
+        // erased-interface list (IReadOnlyList<T>/IList<T>) has a DYNAMIC backing
+        // — could be borrowing Array<T> (no disposer) or owning OwningArray<T>
+        // (disposer stamped at construction per #2608). When no static element
+        // disposer is derived AND the static head is a borrowing list interface,
+        // call `bz_array_free_dynamic` instead of `bz_array_free(arr, null)` so
+        // the owning backing's stamped disposer is consulted at runtime; an
+        // untagged (borrowing) backing yields NULL there → exactly the
+        // `bz_array_free(arr, null)` it replaces. IOwningList<T> is statically
+        // owning — it gets the static disposer path and never needs this.
+        bool collArrayDynamicFree = false;
         // #394 / stdlib §4.9 + #401 / stdlib §4.8: a `using var` bound to a
         // hash-backed dictionary (Dictionary<K,V>/OwningDictionary<K,V>). At scope
         // end it is freed via bz_dict_free. `dictValueDisposer` is the per-VALUE
@@ -11654,6 +11665,13 @@ private:
     // type, then `new` initializer type, then inferred initializer type), or
     // null if the local is not a heap collection.
     const sema::TypeRef* collectionTypeOfLocal(const ast::LocalDecl* ld);
+
+    // fix #2630 / §28.5 / stdlib §4.3: the resolved list-interface TypeRef of
+    // a local (IReadOnlyList<T> / IList<T> / IOwningList<T>), or null if the
+    // local is not a list interface. Mirrors collectionTypeOfLocal's shape
+    // and is rejected for user-declared types implementing these interfaces
+    // (a `class MyC: IReadOnlyList<T>` does NOT go through this path).
+    const sema::TypeRef* listInterfaceTypeOfLocal(const ast::LocalDecl* ld);
 
     // #465 / §15.4 / stdlib §4.4–§4.5: materialize a sequence collection literal
     // `[e1, e2, …]` into a freshly-allocated heap collection (Array<T> /
