@@ -304,8 +304,23 @@ BEZEL_TEST(xmod_imported_virtual_enumerator_forin_3231,
     // the twin does not agree, something OTHER than #3267 is broken (the
     // existing for-in test #2545/#2553/#2546/#2550 family pins this shape
     // locally; a fresh twin divergence here would be a new defect).
+    //
+    // Concatenating `libSrc + appSrc` directly would emit THREE `module`
+    // declarations (one from each string + the leading `module
+    // VSingle3231T2;`), which the parser rejects with "expected top-level
+    // declaration". Strip the leading module + import preamble from each so
+    // the only module declaration in the twin is the wrapper; the body
+    // strings still match the cross-module lib/app sources exactly.
+    const std::size_t libBodyStart = libSrc.find("public class");
+    const std::size_t appBodyStart = appSrc.find("public class");
     const std::string twinSrc =
-        "module VSingle3231T2; " + libSrc + appSrc;
+        "module VSingle3231T2; " +
+        (libBodyStart != std::string::npos
+            ? libSrc.substr(libBodyStart)
+            : std::string{} /* unreachable: libSrc starts with module decl */) +
+        (appBodyStart != std::string::npos
+            ? appSrc.substr(appBodyStart)
+            : std::string{} /* unreachable: appSrc starts with module decl */);
     int twin = compileLocalAndRun3231(twinSrc);
     // Twin must compile and run cleanly — both implementations of the
     // shape, the local-for-in path is what the spec says.
