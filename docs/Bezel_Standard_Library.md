@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.263 — August 2026**
+**Companion to the Bezel Language Specification, v0.264 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -2898,6 +2898,120 @@ end;
 
 The unsigned variants follow by casting through the matching unsigned type at the boundary; the 16/64-bit variants follow by changing the byte count and shift widths; float variants compose Read/Write with the matching `BitConverter` call. The implementation pattern is mechanical and the standard library provides the methods so user code does not repeat them.
 
+<a id="sec-bit-granular-accessors"></a>
+#### Bit-granular accessors
+
+A tier below the byte accessors, for formats that pack fields at sub-byte positions — a protocol header whose flag, opcode, and code fields share a byte; a stream of variable-width codes. `BitReader` and `BitWriter` are records carrying a span plus a `(BitStart, BitLength)` window counted in **bits**; every read and write covers a run of 1 to 64 bits and needs no mask-and-shift ladder at the call site.
+
+```bezel
+public record BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)
+
+  public pure property IsEmpty: bool => BitLength = 0;
+  public pure property IsByteAligned: bool => BitStart mod 8 = 0;
+
+  // Reads — from bit 0 of the view; count in 1..64
+  public method ReadBitsBigEndianMsbFirst(count: int): ulong;
+  public method ReadBitsLittleEndianLsbFirst(count: int): ulong;
+  public method ReadBitMsbFirst(): bool;
+  public method ReadBitLsbFirst(): bool;
+
+  // Try variants — return false instead of throwing on a short view
+  public method TryReadBitsBigEndianMsbFirst(count: int, out value: ulong): bool;
+  public method TryReadBitsLittleEndianLsbFirst(count: int, out value: ulong): bool;
+  public method TryReadBitMsbFirst(out value: bool): bool;
+  public method TryReadBitLsbFirst(out value: bool): bool;
+
+  // Repositioning — the §4.14 Slice family, counted in bits
+  public method Slice(bitStart: int): BitReader;
+  public method Slice(bitStart: int, bitLength: int): BitReader;
+  public method Slice(r: Range<int>): BitReader;      // Range form: normalized against
+                                                       //   BitLength (spec §16.3), then
+                                                       //   equivalent to Slice(start, length)
+  public method AlignToByte(): BitReader;             // advance to the next byte boundary
+
+  // The byte-aligned remainder — an ordinary sub-span, no bit machinery
+  public method AlignedTail(): ReadOnlySpan<byte>;
+end BitReader;
+
+public record BitWriter(Source: Span<byte>, BitStart: int, BitLength: int)
+
+  public pure property IsEmpty: bool => BitLength = 0;
+  public pure property IsByteAligned: bool => BitStart mod 8 = 0;
+
+  public method WriteBitsBigEndianMsbFirst(value: ulong, count: int);
+  public method WriteBitsLittleEndianLsbFirst(value: ulong, count: int);
+  public method WriteBitMsbFirst(value: bool);
+  public method WriteBitLsbFirst(value: bool);
+
+  // Try variants — false on a short view; the destination is not modified
+  public method TryWriteBitsBigEndianMsbFirst(value: ulong, count: int): bool;
+  public method TryWriteBitsLittleEndianLsbFirst(value: ulong, count: int): bool;
+  public method TryWriteBitMsbFirst(value: bool): bool;
+  public method TryWriteBitLsbFirst(value: bool): bool;
+
+  public method Slice(bitStart: int): BitWriter;
+  public method Slice(bitStart: int, bitLength: int): BitWriter;
+  public method Slice(r: Range<int>): BitWriter;
+  public method AlignToByte(): BitWriter;
+
+  public method AlignedTail(): Span<byte>;
+  public method AsReadOnly(): BitReader;
+end BitWriter;
+
+// Entry points, parallel to AsSpan / AsReadOnlySpan
+public extension ReadOnlySpan<byte>
+  public method AsBitReader(): BitReader;
+end;
+
+public extension Span<byte>
+  public method AsBitReader(): BitReader;             // delegates via AsReadOnly()
+  public method AsBitWriter(): BitWriter;
+end;
+```
+
+**Bit order and byte order in the method name.** Each multi-bit method names both axes, exactly as the byte accessors name endianness: there is no bit-order parameter, no constructor argument, and no default. A constructor argument would be worse than the enum parameter the byte tier already rejects — it moves the decision further from the call site that depends on it.
+
+**Bit numbering.** Let *k* be the absolute bit index `BitStart + i` for view bit *i*. Under **MsbFirst**, bit *k* is bit `7 - (k mod 8)` of byte `k / 8`, and the first bit read or written is the **most** significant bit of the value; under **LsbFirst**, bit *k* is bit `k mod 8` of byte `k / 8`, and the first bit is the **least** significant.
+
+**Two families, and why these two.** The two axes are independent, so four combinations are nameable; two are declared, because those two obey an agreement law with the accessors above. At a byte-aligned position, for `count` in {16, 32, 64}, `ReadBitsBigEndianMsbFirst(count)` yields exactly what `ReadUInt16BigEndian` / `ReadUInt32BigEndian` / `ReadUInt64BigEndian` yields there, and `ReadBitsLittleEndianLsbFirst(count)` exactly what the matching `…LittleEndian` accessor yields; the write side agrees the same way. Each declared family is therefore the bit-granular generalization of a byte accessor, and its name says which. The mixed combinations (big-endian with LSB-first, little-endian with MSB-first) are **not declared**: they generalize no accessor of the byte tier, so a compound name would promise a correspondence there is nothing to check against. A field packed in a mixed order is read with the per-bit members — a code packed most-significant-bit-first into an LSB-first stream is `ReadBitLsbFirst` accumulated most-significant-bit-first by the caller, which is the loop a variable-width-code decoder walks anyway. The naming scheme is additive if a named mixed family is ever warranted.
+
+**No offset parameter; slice to advance.** Every read and write operates from bit 0 of the view, the byte tier's rule at bit granularity. To walk a sequence of fields, slice between operations:
+
+```bezel
+var r      := header.AsBitReader();
+var id     := ushort(r.ReadBitsBigEndianMsbFirst(16));  r := r.Slice(16);
+var qr     := r.ReadBitMsbFirst();                      r := r.Slice(1);
+var opcode := byte(r.ReadBitsBigEndianMsbFirst(4));     r := r.Slice(4);
+```
+
+`Slice` is record construction, not allocation, and a peek costs nothing (read without slicing). A reader does not advance itself: in an instance member of a value kind `this` is a borrow of the receiver, so a store into the receiver's own storage is a compile error (language spec [§9.4](Bezel_Language_Spec.md#sec-value-receivers-are-borrows)) — the position is part of the value, and each read is total on the value it is given. The cost of that shape is stated rather than hidden: each width appears twice, in the read and in the slice, and a mismatch between them is silent — it reads the neighbouring bits rather than faulting. Both numbers sit on one line, and an over-run of the view faults (below) rather than reading past it.
+
+**One result type.** Every multi-bit read returns `ulong` and every multi-bit write takes `ulong`, for every width in 1..64; the byte tier next door is the typed tier, serving every byte-aligned width under a name that carries it. Narrowing at the call site is safe by construction: Bezel's narrowing casts are checked (language spec [§5.2](Bezel_Language_Spec.md#sec-explicit-conversions)), and a `count`-bit value is representable in every primitive of at least `count` bits, so `ushort(r.ReadBitsBigEndianMsbFirst(16))` cannot overflow. There is no signed form — a two's-complement field is one sign-extension expression on the `ulong`.
+
+**Bounds-check semantics.** Read and write methods throw `IndexOutOfRangeException` if the view holds fewer than `count` bits. A `count` outside 1..64 throws `ArgumentOutOfRangeException`. `AlignedTail()` on a view whose `BitStart` is not byte-aligned throws `InvalidOperationException`.
+
+`TryRead*` variants return `false` instead of throwing and assign the `out` parameter to `default(T)` on the false path, as the byte tier's do. One consequence is worth stating at the surface: `TryReadBitMsbFirst(out value: bool)` assigns `false` on the false path, which is indistinguishable from a legitimately-read zero bit — callers branch on the return value, never on the out.
+
+`TryWrite*` variants return `false` on a view too short to hold the run. On the false path the destination is **not modified**, the byte tier's atomicity guarantee at bit granularity.
+
+**Partial bytes.** A write that begins or ends inside a byte preserves that byte's other bits (read-modify-write of the two edge bytes). `AlignToByte()` returns the view repositioned at the next byte boundary — the same view when it is already aligned. `AlignedTail()` returns the whole-byte remainder `Source.Slice(BitStart / 8, BitLength / 8)`; a trailing partial byte (`BitLength mod 8 <> 0`) is excluded rather than silently folded in, and the composition with the byte accessors is direct: `r.AlignedTail().ReadUInt32BigEndian()`.
+
+**Borrows and lifetimes.** Both records are **borrow-bearing** (language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)) by transitivity: the `Source` component is a span, itself borrow-bearing, so a bit view's lifetime is bounded by its source's exactly as the span's is by the buffer's. Every consequence is the span family's, unchanged — no instance field of a class, no static field, no escaping capture, no construction from a temporary; not an `async` method's parameter or result, while a view over a span whose source is co-resident in the same async frame (an owned local, `using var`, or `owned` parameter of that method) may live across `await` points in that method. Nothing here owns anything: records carry no `owned` fields and no destructors.
+
+Like the span records, both are purely user-level Bezel — no compiler intrinsic. The implementation is mask-and-shift over the borrowed bytes, written once:
+
+```bezel
+public record BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)
+  public method ReadBitMsbFirst(): bool
+    if BitLength < 1 then
+      throw new IndexOutOfRangeException();
+    end;
+    var k := BitStart;
+    return (int(Source[k / 8]) & (1 << (7 - (k mod 8)))) <> 0;
+  end ReadBitMsbFirst;
+end BitReader;
+```
+
 <a id="sec-arrayspant-readonlyarrayspant"></a>
 ### 4.15 `ArraySpan<T>`, `ReadOnlyArraySpan<T>`
 
@@ -2906,6 +3020,8 @@ Records carrying borrows of an `Array<T>` ([§4.4](#sec-arrayt)) plus a `(Start,
 `ArraySpan<T>` is the writable form; `ReadOnlyArraySpan<T>` is the read-only form. The split parallels `Span<T>` / `ReadOnlySpan<T>` ([§4.14](#sec-owned-buffers-and-spans)) but with `Array<T>` as the source instead of `OwningBuffer<T>`. The two span families coexist; they are not interchangeable (a method that takes `Span<T>` does not accept `ArraySpan<T>` and vice versa) because the underlying storage models differ — `OwningBuffer<T>` owns its slots for class T, while `Array<T>` borrows them. Both types declare the three `Slice` overloads of the §4.14 family, including the `Slice(r: Range<int>)` Range form under [§4.14](#sec-owned-buffers-and-spans)'s normalization contract (v0.241).
 
 **Byte-buffer accessors (v0.165, #1358):** the §4.14 endianness-aware extension family is mirrored onto this family — all `Read*{Little,Big}Endian`/`TryRead*` forms on `ReadOnlyArraySpan<byte>` and `ArraySpan<byte>`, and the `Write*`/`TryWrite*` forms on `ArraySpan<byte>`, with identical semantics (no offset parameters; slice first). This closes the file→binary-parse path: `File.ReadAllBytes(p).AsReadOnlySpan().ReadUInt32LittleEndian()` is direct and zero-copy.
+
+**Bit-granular accessors (v0.264):** the §4.14 bit tier is mirrored the same way, as `ArrayBitReader` and `ArrayBitWriter` — see [below](#sec-array-bit-granular-accessors).
 
 <a id="sec-arrayspant"></a>
 #### `ArraySpan<T>`
@@ -3024,6 +3140,47 @@ A read-only counterpart to `ArraySpan<T>`. Mechanically the same shape but expos
 `Slice` returns `ReadOnlyArraySpan<T>` (read-only slice of a read-only span). There is no widening operation from `ReadOnlyArraySpan<T>` to `ArraySpan<T>` — once read-only through that handle, write access requires reaching the underlying array through a different path.
 
 The borrow-of-`Array<T>` lifetime story is the same as `ArraySpan<T>`'s.
+
+<a id="sec-array-bit-granular-accessors"></a>
+#### Bit-granular accessors
+
+The [§4.14](#sec-bit-granular-accessors) bit tier is mirrored onto this family as `ArrayBitReader` and `ArrayBitWriter`, member-for-member identical to `BitReader` and `BitWriter` with `ReadOnlyArraySpan<byte>` and `ArraySpan<byte>` substituted for the source type — the same device, and for the same reason, as the byte accessors' mirror above: the two span families are not interchangeable, and the dominant byte sources sit on opposite sides. `Stream.Read(buffer: Span<byte>)` ([§7.1](#sec-stream)) fills the buffer-backed family, while `File.ReadAllBytes` and `Stream.ReadAll()` return `owned Array<byte>`, whose `AsReadOnlySpan()` is the array-backed one. Without the mirror the file path could not reach the bit tier at all.
+
+Every rule of §4.14's bit tier holds here verbatim: the two named families and their agreement law, bit numbering, the 1..64 `ulong` result, no offset parameter (slice to advance), the `IndexOutOfRangeException` / `ArgumentOutOfRangeException` / `InvalidOperationException` faults, the Try shapes and the `TryWrite*` atomicity, the partial-byte rules, and the borrow-bearing lifetime story.
+
+```bezel
+public record ArrayBitReader(Source: ReadOnlyArraySpan<byte>, BitStart: int, BitLength: int)
+  public pure property IsEmpty: bool => BitLength = 0;
+  public pure property IsByteAligned: bool => BitStart mod 8 = 0;
+
+  public method ReadBitsBigEndianMsbFirst(count: int): ulong;
+  // ... (the full 15-member surface of BitReader, with ArrayBitReader for
+  //      BitReader and ReadOnlyArraySpan<byte> for ReadOnlySpan<byte>
+  //      throughout; omitted here for brevity)
+  public method AlignedTail(): ReadOnlyArraySpan<byte>;
+end ArrayBitReader;
+
+public record ArrayBitWriter(Source: ArraySpan<byte>, BitStart: int, BitLength: int)
+  public pure property IsEmpty: bool => BitLength = 0;
+  public pure property IsByteAligned: bool => BitStart mod 8 = 0;
+
+  public method WriteBitsBigEndianMsbFirst(value: ulong, count: int);
+  // ... (the full 16-member surface of BitWriter, with ArrayBitWriter for
+  //      BitWriter and ArraySpan<byte> for Span<byte> throughout; omitted
+  //      here for brevity)
+  public method AlignedTail(): ArraySpan<byte>;
+  public method AsReadOnly(): ArrayBitReader;
+end ArrayBitWriter;
+
+public extension ReadOnlyArraySpan<byte>
+  public method AsBitReader(): ArrayBitReader;
+end;
+
+public extension ArraySpan<byte>
+  public method AsBitReader(): ArrayBitReader;        // delegates via AsReadOnly()
+  public method AsBitWriter(): ArrayBitWriter;
+end;
+```
 
 <a id="sec-ireadonlyspan"></a>
 <a id="sec-ireadonlyspantelement"></a>

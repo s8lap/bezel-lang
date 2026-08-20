@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — draft (2026-08-20) |
+| **Status** | graduated-v0.264 — **superseded — graduated v0.264** (owner-accepted 2026-08-20 and graduated under that direction; all four owner questions ruled at the landing — Q1: one `ulong` for every width 1–64; Q2: the two compound-named families that reduce to §4.14's accessors, the two mixed combinations declined with reasons; Q3: (a) slice-and-walk, ruled on the absence of destructuring variable binding, with (b)/(c)/(d) declined — (c) recorded as legal and declined on design grounds; Q4: the §4.15 mirror lands in the same batch. Landed as stdlib §4.14 *Bit-granular accessors* and §4.15's mirror — 68 members, no language change) |
 | **Tracking issue** | — |
 | **Target module(s)** | `System.Collections.Generic` (stdlib §4) — the [§4.14](../Bezel_Standard_Library.md#sec-owned-buffers-and-spans) byte-buffer-accessor family gains a bit-granular tier, mirrored onto [§4.15](../Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant) as the byte tier already is. No language change. |
 | **Written against** | spec/stdlib/rationale **v0.263** (v0.262 at HEAD `8a03dd2`, plus the v0.263 landings in the working tree). Every *existing* name cited was re-verified against that tree; every *new* name is marked **▲**. |
