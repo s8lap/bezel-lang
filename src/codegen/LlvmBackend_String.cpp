@@ -701,19 +701,34 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
     // the inner format, so this single branch covers both.
     if (spec[0] != ',' && rt && rt->kind == sema::TypeRef::Kind::Named) {
         std::string_view bn = builtinTypeName(rt);
-        // §18.5 / §2.5 / §2.18 (v0.172, #812/#1339): temporal + Guid dispatch.
-        // DateTime / DateOnly / TimeOnly format via bz_datetime_to_string_fmt
-        // (DateOnly's day-number and TimeOnly's ms-of-day are first widened to
-        // DateTime ticks). Any pattern is valid (non-pattern chars are literal
-        // separators), so no FormatException on those. TimeSpan takes only "c";
-        // Guid only "D"/"N"; an unrecognized specifier on those raises
-        // FormatException (§2.18 strict-fault).
+        // §18.5 / §2.5 / §2.18 (v0.172, #812/#1339; v0.230, #3292): temporal +
+        // Guid dispatch. DateTime / DateOnly / TimeOnly format via
+        // bz_datetime_to_string_fmt (DateOnly's day-number and TimeOnly's
+        // ms-of-day are first widened to DateTime ticks). Per §2.18 v0.230,
+        // non-specifier characters are LITERAL separators, but a malformed
+        // run of a specifier letter (y/M/d/H/m/s/f) FAULTS as FormatException
+        // (strict-fault) — the runtime returns nullptr and the call site
+        // raises FormatException. TimeSpan takes only "c"; Guid only "D"/"N";
+        // an unrecognized specifier on those raises FormatException
+        // (§2.18 strict-fault).
         if (!bn.empty()) {
             llvm::Value* fmtStr = lowerStringLiteral("\"" + spec + "\"", false);
+            // §2.18 (v0.230, #3292): bz_datetime_to_string_fmt returns nullptr
+            // on a malformed specifier run ("yyy", "MMM", lone "s", …). The
+            // interpolation format is a compile-time constant, so we COULD
+            // validate it here — but the runtime check is the single source
+            // of truth for the rule, and matches the decimal pattern at
+            // bz_decimal_to_string_fmt. Defending in depth at the call site
+            // means a future caller that bypasses emitWithFormatSpec doesn't
+            // re-introduce the silent-pass-through behavior (#3292).
             if (bn == "DateTime" && val->getType()->isIntegerTy(64)) {
                 auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
                                     {i64(), ptrTy()});
-                return builder_.CreateCall(fn, {val, fmtStr}, "dt.fmt");
+                llvm::Value* res = builder_.CreateCall(fn, {val, fmtStr}, "dt.fmt");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    res, llvm::Constant::getNullValue(ptrTy()), "dt.fmt.null");
+                emitGuardThrow(isNull, "FormatException");
+                return res;
             }
             if (bn == "DateOnly" && val->getType()->isIntegerTy()) {
                 llvm::Value* dn = val->getType()->isIntegerTy(32)
@@ -723,7 +738,11 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
                     builder_.getInt64(864000000000LL));  // TICKS_PER_DAY
                 auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
                                     {i64(), ptrTy()});
-                return builder_.CreateCall(fn, {ticks, fmtStr}, "do.fmt");
+                llvm::Value* res = builder_.CreateCall(fn, {ticks, fmtStr}, "do.fmt");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    res, llvm::Constant::getNullValue(ptrTy()), "do.fmt.null");
+                emitGuardThrow(isNull, "FormatException");
+                return res;
             }
             if (bn == "TimeOnly" && val->getType()->isIntegerTy()) {
                 llvm::Value* ms = val->getType()->isIntegerTy(32)
@@ -733,7 +752,11 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
                     builder_.getInt64(10000LL));          // TICKS_PER_MS
                 auto* fn = declareC("bz_datetime_to_string_fmt", ptrTy(),
                                     {i64(), ptrTy()});
-                return builder_.CreateCall(fn, {ticks, fmtStr}, "to.fmt");
+                llvm::Value* res = builder_.CreateCall(fn, {ticks, fmtStr}, "to.fmt");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    res, llvm::Constant::getNullValue(ptrTy()), "to.fmt.null");
+                emitGuardThrow(isNull, "FormatException");
+                return res;
             }
             if (bn == "TimeSpan" && val->getType()->isIntegerTy(64)) {
                 if (spec == "c") {

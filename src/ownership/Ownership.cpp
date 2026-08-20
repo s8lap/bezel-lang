@@ -6813,6 +6813,47 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
     // Task` returned above via `returnOwned_`. // per §28.3 (v0.190, SB-01)
     const bool plainTaskInSyncBody =
         common::isTaskFamilyHead(head) && !isAsync_;
+    // §28.6 (v0.258, #3295) STORED-VIEW EXCLUSION for the NON-OWNING iterable
+    // heads (`IEnumerable<T>`, `IEnumerator<T>`, `IAsyncEnumerable<T>`,
+    // `IAsyncEnumerator<T>`). §28.6 bullet 1's receiver-owned-field carve-out
+    // grants a borrow return through a non-`owned` concrete-collection return
+    // ("at the concrete collection type, whose non-`owned` return is this
+    // bullet's ordinary receiver-sourced borrow"), but EXCLUDES a stored view
+    // re-exposed through an unmarked mint-announcing method return ("a stored
+    // frame — a stored task, a stored collection view — is re-exposed through
+    // a property, field, or collection slot ... — never through an unmarked
+    // mint-announcing method return"). The four OWNING iterable heads
+    // (`IOwningEnumerable<T>` etc.) already reject the same shape below via the
+    // `deferredActivationOwningHead` gate; the four NON-OWNING iterable heads
+    // were the v0.221 retirement hole (#3295's defect — the compiler still
+    // implements the four-head formulation). Under v0.258 they close the
+    // stored-view case too — a bare read of an `owned` receiver field
+    // returned through an unmarked `IEnumerable<T>`/`IEnumerator<T>`/
+    // `IAsyncEnumerable<T>`/`IAsyncEnumerator<T>` would alias the same
+    // underlying state machine from two callers (the receiver's destructor
+    // frees the field; the wrapper's caller iterates through the same storage
+    // past the receiver's lifetime — a use-after-free / double-dispose).
+    // Other borrow shapes through the same heads (a borrowed PARAMETER
+    // passthrough, a local holding a fresh frame, an index read, a bare
+    // `this` from a `GetEnumerator()` body per axiom A15) are NOT "stored
+    // frames" and remain admitted — the wrapper holds a borrow of the
+    // call-bound value, the non-owning wrapper's `Dispose` is a no-op, and
+    // the caller's scope bounds the wrapper's lifetime to the source's
+    // lifetime. // per §28.6 (v0.258, #3295)
+    if (common::isIterableInterfaceHead(head) &&
+        !common::isOwningIterableInterfaceHead(head) &&
+        exprIsReceiverOwnedFieldBorrow(e)) {
+        report(
+            Severity::Error, e.span.begin,
+            std::string("a stored view is re-exposed through the mint-announcing "
+                        "return `") + head +
+            "<…>` — a receiver-owned-field bare read returned through an "
+            "unmarked mint-announcing method return would alias the same "
+            "underlying state machine from two callers (§28.6, v0.258, #3295); "
+            "return the storage at the concrete collection type, declare the "
+            "return type `owned`, or use a borrowing return type");
+        return;
+    }
     if (!isOwningTypeNameHead(head) && !plainTaskInSyncBody) return;
     if (!isOwningCollectionNameHead(head)) {
         // Owning WRAPPER (OwningTask, Shared, Weak, ChannelSender,

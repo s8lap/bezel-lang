@@ -2870,17 +2870,43 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // dynamicDispose entry dispatches Dispose+reclaim through the
                 // object's own vtable (correct for any runtime class/interface),
                 // null-guarded.
-                disposeStack_.emplace_back();
+                //
+                // fix #3293 / §17.13 / §22.3 / §28.3 (v0.266): the one-entry
+                // dispose scope must be emplaced AFTER `lowerExpr(*ds->value)`,
+                // not before — mirroring the `ExpressionStmt::disposeOwnedValue`
+                // shape (this file's line 2717/2721) which already lowers first
+                // and for the documented reason ("Opening it first (the shape
+                // #1009's discard arm uses) would RE-HOME every disposal that
+                // expression lowering itself pushes onto `disposeStack_.back()`").
+                // The re-home hazard materialised as a SEGFAULT after #2681
+                // (commit ab417d5) started marking `out owned var` ctor
+                // recipients as Owned: the ctor's `ensureCtorOutVarSlots`
+                // (LlvmBackend_Calls2.cpp) pushes the recipient's slot disposal
+                // onto `disposeStack_.back()` during `lowerExpr(*ds->value)` —
+                // which on this discard arm was the STATEMENT scope, not the
+                // enclosing BLOCK scope. The slot was disposed-and-nulled at end
+                // of statement, and a subsequent `x.Id` read on the still-in-
+                // scope `x` dereferenced null (SIGSEGV, exit 139). Lowering
+                // first leaves those BLOCK-scope registrations where they
+                // belong, and the discard's own one-entry scope (now opened
+                // after the lower) still covers both edges for the discard's
+                // own produced value, exactly as before. Scoped narrowly to
+                // this one arm; the `disposeOwnedBuilderValue` and
+                // `disposeOwnedCollectionValue` siblings have the same shape
+                // and the same re-home exposure but do not currently surface a
+                // ctor-recipient interaction, so they are left unchanged to
+                // keep this commit minimal (#3294 candidates).
                 llvm::Value* v = lowerExpr(*ds->value);
                 if (!diverged_ && v) {
+                    disposeStack_.emplace_back();
                     llvm::AllocaInst* slot = entryAlloca(ptrTy());
                     builder_.CreateStore(v, slot);
                     Disposal d{slot, nullptr};
                     d.dynamicDispose = true;
                     disposeStack_.back().push_back(d);
+                    emitDisposals(disposeStack_.back());
+                    disposeStack_.pop_back();
                 }
-                if (!diverged_) emitDisposals(disposeStack_.back());
-                disposeStack_.pop_back();
             } else if (ds->disposeOwnedBuilderValue) {
                 // fix #2655 / §17.13 / §28.3 / §28.9 (v0.237): the ownership
                 // pass classified this discard's value as a fresh owned

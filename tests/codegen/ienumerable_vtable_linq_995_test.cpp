@@ -47,6 +47,9 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 
+using bezel::test::hasErrorMessage;
+using bezel::test::parseAndCheckOwnership;
+
 namespace {
 // Full-pipeline runner (runs the ownership pass before codegen so scope-end /
 // loop disposals are emitted), then JIT-executes `main` and returns its value.
@@ -483,35 +486,46 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
 }
 
 // §29.2 / §4.3 / #1310: a method RETURNING an owned OwningArray<T> field coerced
-// to its `IEnumerable<T>` view — binding the result then letting it leave scope
-// SIGSEGV'd (no iteration required): the raw bz_array_t* was returned unwrapped,
-// and the caller's scope-end disposal dispatched through the array's first word
-// as if it were a vtable (null-fn-pointer call). The return-coercion sites
-// (ReturnStmt, `=> expr` body) now route through wrapAsIEnumerableForTarget like
-// the argument and local-decl paths.
+// to its `IEnumerable<T>` view was previously admitted under v0.221 (the
+// wrapper that constructs the IEnumerable<T> from the field read was emitted
+// at every return site; the receiver's destructor invalidated the storage on
+// Holder's scope-end). §28.6 (v0.258, #3295) closed the stored-view case for
+// the four non-owning iterable heads — the shape is REJECTED at the def site
+// and the vtable-coercion runtime shape is no longer reachable. Converted
+// from a runtime test (which pinned the v0.221 acceptance + the runtime
+// fix for the SIGSEGV from the un-wrapped raw bz_array_t*) to a compile-
+// failure test that pins the v0.258 rejection.
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_field_returned_as_ienumerable_bind_only_1310) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = parseAndCheckOwnership(
         "module M; class Dog end Dog; "
         "class Holder "
         "  private owned arr: OwningArray<Dog>; "
         "  public constructor() arr := new OwningArray<Dog>(); end constructor; "
         "  public method Items(): IEnumerable<Dog> => arr; "
-        "end Holder; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var h := new Holder(); "
-        "    var e := h.Items(); "
-        "    return 7; "
-        "  end Main; end C;"), 7);
+        "end Holder;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a stored view is re-exposed through the mint-announcing"));
 }
 
-// §29.2 / #1310: iterating the IEnumerable<T>-typed return (`=> expr` body)
-// walks the shared array through the wrapper's vtable protocol.
-// Migrated from OwningArray<int> → OwningArray<Cell> per stdlib §4.2/#1327.
+// §29.2 / §28.6 (v0.258, #3295): an owned field re-exposed through an
+// unmarked mint-announcing method return is REJECTED — the receiver's
+// destructor frees the field's storage, and the wrapper's caller iterates
+// through the same storage past the receiver's lifetime (a use-after-free).
+// The shape was admitted under v0.221; v0.258's stored-view exclusion closed
+// it. Converted from a runtime test (which pinned the v0.221 acceptance) to a
+// compile-failure test that pins the v0.258 rejection. The for-in vtable
+// protocol is still exercised by the parameter-passthrough siblings below;
+// the underlying `OwningArray<Cell> → IEnumerable<Cell>` wrapper remains
+// exercised by `owned_field_returned_as_iowningenumerable_disposed_once_1310`
+// in `owning_iterable_head_borrow_return_2369_test.cpp` (the owning-four
+// sibling) — but for the non-owning four this exact shape is no longer
+// legal under v0.258. // Migrated from OwningArray<int> → OwningArray<Cell>
+// per stdlib §4.2/#1327.
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_field_returned_as_ienumerable_iterated_1310) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = parseAndCheckOwnership(
         "module M; "
         "class Cell public V: int := 0; "
         "  public constructor(v: int) V := v; end constructor; end Cell; "
@@ -522,22 +536,17 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "    arr.Add(new Cell(3)); arr.Add(new Cell(4)); "
         "  end constructor; "
         "  public method Items(): IEnumerable<Cell> => arr; "
-        "end Holder; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var h := new Holder(); "
-        "    var s := 0; for var x in h.Items() do s := s + x.V; end; "
-        "    return s; "
-        "  end Main; end C;"), 7);
+        "end Holder;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a stored view is re-exposed through the mint-announcing"));
 }
 
-// §29.2 / #1310: the explicit-ReturnStmt path (LlvmBackend_Stmts.cpp) wraps the
-// same way as the `=> expr` path; two independent coerced returns (one iterated,
-// one bind-only) from the same owned field are both safe.
-// Migrated from OwningArray<int> → OwningArray<Cell> per stdlib §4.2/#1327.
+// §28.6 (v0.258, #3295): the explicit-ReturnStmt path (`return arr;` body)
+// hits the same stored-view exclusion as the `=> arr` body above.
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_field_returned_as_ienumerable_return_stmt_1310) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = parseAndCheckOwnership(
         "module M; "
         "class Cell public V: int := 0; "
         "  public constructor(v: int) V := v; end constructor; end Cell; "
@@ -549,23 +558,18 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "  public method Items(): IEnumerable<Cell> "
         "    return arr; "
         "  end Items; "
-        "end Holder; "
-        "class C "
-        "  public static method Main(): int "
-        "    using var h := new Holder(); "
-        "    var s := 0; for var x in h.Items() do s := s + x.V; end; "
-        "    var e := h.Items(); "
-        "    return s; "
-        "  end Main; end C;"), 5);
+        "end Holder;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a stored view is re-exposed through the mint-announcing"));
 }
 
-// §29.2 / §28.3 / #1310 disposal: the returned view SHARES the owned field's
-// array — binding it disposes NO elements, and the Holder's disposal at scope
-// end disposes each element exactly once (n=0 while the view is live inside the
-// block, 2 disposals after → rc 0*10+2).
+// §28.6 (v0.258, #3295): the disposal-tracking variant of the same shape —
+// the receiver's destructor frees the field; the wrapper's caller iterates
+// through the same storage past the receiver's lifetime. Pin the rejection.
 BEZEL_TEST(ienumerable_vtable_linq_995,
            owned_field_returned_as_ienumerable_disposed_once_1310) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = parseAndCheckOwnership(
         "module M; class Dog public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end Dog; "
         "class Holder "
@@ -574,14 +578,10 @@ BEZEL_TEST(ienumerable_vtable_linq_995,
         "    arr := new OwningArray<Dog>(); arr.Add(new Dog()); arr.Add(new Dog()); "
         "  end constructor; "
         "  public method Items(): IEnumerable<Dog> => arr; "
-        "end Holder; "
-        "class C "
-        "  public static method Main(): int "
-        "    var n := 0; "
-        "    do using var h := new Holder(); "
-        "       var e := h.Items(); n := Dog._n; end; "
-        "    return n * 10 + Dog._n; "
-        "  end Main; end C;"), 2);
+        "end Holder;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a stored view is re-exposed through the mint-announcing"));
 }
 
 // §12.9 / §29.2 / stdlib §4.4 / #1316: a METHOD-LEVEL-GENERIC method returning
