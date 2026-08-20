@@ -10684,6 +10684,31 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             v = lowerExpr(*a.value);
             expectedFunctionType_ = savedExpected;
         }
+        // fix #3296 / §17.12 (v0.266): a `throw` expression used as an
+        // argument diverges (CG40 — `lowerExpr` set `diverged_ = true` and
+        // branched the current BB to `unwindBB`). The loop body below
+        // emits FFI-buffer reclaims (`CreateStore` — see the #2809 block),
+        // nullable wrapping (`CreateInsertValue` / `nullableValueNull` /
+        // `wrapNullableValue`), §8.6 boxing (`CreateAlloc` / `CreateStore`),
+        // IEnumerable wrapping (`CreateStore` / `disposeStack_.push_back`),
+        // `disposeStack_.push_back` for `unwindOnly` / `dynamicDispose`
+        // registrations, `boxForTarget`, and `wrapAsIEnumerableForTarget` —
+        // all of which would land in the now-terminated basic block and the
+        // IR verifier would reject with "Basic Block ... does not have
+        // terminator". Return false (call failure) on the divergent edge.
+        // The post-loop `transferredOwnedArgSlots` CreateStore and the
+        // `argTempSlots` discharge below are guarded by the same
+        // `diverged_` check just before `return true` at the bottom of this
+        // function. The caller (lowerCallDispatch at line 8310) returns
+        // `nullptr` on this failure; the CallExpr caller in `lowerExpr`
+        // (LlvmBackend_Exprs.cpp:1690) propagates `nullptr` upward, and the
+        // throw has already branched to `unwindBB` so no further IR is
+        // emitted on the dead BB by THIS call. Sibling fix at the
+        // extern-call argument loop (LlvmBackend_Calls2.cpp:4046, also for
+        // #3296) and at `tryLowerResultCombinatorCall`
+        // (LlvmBackend_Calls.cpp:6818). Scoped narrowly to the divergent-
+        // argument case; the happy path is untouched.
+        if (diverged_) return false;
         // fix #3105 (§4.7 / §8.5 / §21.9, v0.255): broaden #3079's Console
         // guard to the broader call family. `lowerExpr` for a unit-returning
         // CallExpr (`ReturnsUnit()` where `ReturnsUnit(): ()`) returns a
@@ -11167,6 +11192,17 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         out.push_back(ordered[j]);
         if (outExprs) outExprs->push_back(orderedExprs[j]);
     }
+    // fix #3296 / §17.12 (v0.266): a `throw` argument above set `diverged_`
+    // and branched the current BB to `unwindBB`. The post-loop
+    // `transferredOwnedArgSlots` CreateStore (the caller's transferred-owned
+    // slot nulling) and the `argTempSlots` discharge `scope.erase` below
+    // both operate on the dead BB and would either fail the IR verifier
+    // (CreateStore into a terminated BB) or, for the scope.erase, run
+    // bookkeeping on a scope the throw has already unwound through.
+    // Returning false here propagates the same fail-with-error code path the
+    // caller (`if (!buildOrderedArgs(...))`) already handles — the divergent
+    // edge has no caller to discharge into anyway (the call never runs).
+    if (diverged_) return false;
     // §28.3 (#993): all arguments (and any default-value expressions) evaluated
     // successfully — the call is about to run and will take ownership of any
     // transferred owned temporaries on the normal path. Discharge the transient

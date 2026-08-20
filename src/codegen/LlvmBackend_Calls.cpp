@@ -6836,6 +6836,20 @@ llvm::Value* Emitter::tryLowerResultCombinatorCall(const ast::CallExpr& call) {
     const sema::TypeRef* argSemTy = ctx_.exprType(*call.args[0].value);
     llvm::Value* argVal = lowerExpr(*call.args[0].value);
     if (!argVal) return nullptr;
+    // fix #3296 / §17.12 (v0.266): a `throw` expression used as the
+    // combinator's argument diverges (CG40 — `lowerExpr` set `diverged_ = true`
+    // and branched the current BB to `unwindBB`). The dispatch below
+    // (`CreateStore(argVal, argSlot)` / `CreateICmpEQ` / `CreateCondBr` /
+    // arm-body emit) would all land in a now-terminated basic block and the
+    // IR verifier would reject the result with "Basic Block in function ...
+    // does not have terminator". The call's control flow on the throw edge is
+    // already complete (the throw branched to `unwindBB`); there is no join
+    // to build. Return a poison placeholder consistent with the CG40 shape —
+    // the call's value at this scope is bottom (a `throw` argument never
+    // produces one), so a poison value is correct at every join that would
+    // have consumed it. Scoped narrowly to the diverged-argument case; the
+    // happy path is untouched.
+    if (diverged_) return llvm::PoisonValue::get(ptrTy());
     llvm::Type* argSlotTy = nullptr;
     if (m == "UnwrapOr") {
         // UnwrapOr: the lowered value is the fallback itself. May be an SSA

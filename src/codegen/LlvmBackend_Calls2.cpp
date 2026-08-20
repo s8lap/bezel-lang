@@ -4047,6 +4047,22 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
             if (!v) return nullptr;
+            // fix #3296 / §17.12 (v0.266): a `throw` expression used as an
+            // argument diverges (CG40 — `lowerExpr` set `diverged_ = true` and
+            // branched the current BB to `unwindBB`). The loop body below
+            // emits FFI-buffer reclaims (`CreateStore`), the CString width
+            // marshalling (`CreateICmpEQ` / `CreateCondBr` / `CreateCall` /
+            // `CreatePHI` — see lines ~4070-4155), and `args.push_back` — all
+            // of which would land in the now-terminated basic block and the
+            // IR verifier would reject with "Basic Block ... does not have
+            // terminator". Break out of the loop so the rest of the body is
+            // skipped; the post-loop CreateCall is then guarded below by a
+            // second `diverged_` check that returns a poison placeholder
+            // consistent with the CG40 shape (the call's value is bottom on
+            // the throw edge — never produced). Scoped narrowly to the
+            // extern/FFI arg loop; the combinator path's identical defect
+            // (#3296 site 2) is fixed at tryLowerResultCombinatorCall.
+            if (diverged_) break;
             // Record BEFORE the RawBytes two-slot expansion below, which
             // `continue`s past the rest of the loop body.
             {
@@ -4166,6 +4182,16 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             ++idx;
         }
         if (args.size() != it->second->arg_size()) return nullptr;
+        // fix #3296 / §17.12 (v0.266): an argument `throw` expression broke
+        // the loop above (the BB is already terminated by the unwind branch
+        // from `emitThrowValue`). The CreateCall below would emit into that
+        // terminated BB and the IR verifier would reject it. Return a poison
+        // placeholder of the callee's return type — consistent with the CG40
+        // shape — so the caller never observes the bottom-typed value (the
+        // throw edge already branched to `unwindBB`, no join can reach a
+        // join that consumes this). Mirrors the combinator-path fix in
+        // `tryLowerResultCombinatorCall`.
+        if (diverged_) return llvm::PoisonValue::get(it->second->getReturnType());
         // per §32 / issue #496: coerce the return value if the canonical
         // function returns a different type than the user's extern declared.
         // E.g. malloc returns ptr but user declared IntPtr (i64): ptrtoint.
@@ -8390,6 +8416,36 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     v = lowerExpr(*a.value);
                 }
                 if (!v) {
+                    if (didPrePass) {
+                        genericSubst_ = std::move(preSavedSubst);
+                        genericSubstSemaTy_ = std::move(preSavedSema);
+                    }
+                    emitAccessorRefArgWriteBacks(accessorRefArgs,
+                                                 /*emit=*/false);
+                    return nullptr;
+                }
+                // fix #3296 / §17.12 (v0.266): a `throw` argument above
+                // diverged (`lowerExpr` set `diverged_ = true` and branched
+                // the current BB to `unwindBB`). The CG-nullable wrapping
+                // (`CreateInsertValue` via `nullableValueNull` /
+                // `wrapNullableValue`), #2809 FFI-buffer reclaim
+                // (`CreateStore` + `registerFfiExprTemp`), §8.6 box escape
+                // analysis (`boxForTarget`), and the eventual `CreateCall`
+                // below all land in the now-terminated BB — the IR verifier
+                // would reject with "Basic Block ... does not have
+                // terminator". The sibling #3296 fix is in `buildOrderedArgs`
+                // (LlvmBackend_Assign.cpp) which the LOCAL-callee path
+                // uses; this is the IMPORTED-callee sibling (the `else`
+                // branch above this loop body), where buildOrderedArgs cannot
+                // run (#1221: imported method has no AST param). Same fix
+                // shape — bail out of the call on the divergent edge,
+                // returning nullptr (the throw has already branched to
+                // `unwindBB`; no join can reach a join that consumes the
+                // call's value). The post-loop `args.push_back(ordered[j])`
+                // / `CreateCall` is gated by `ordered[j]` being null for
+                // every position after the break (the existing `if
+                // (!ordered[j])` early-out covers it).
+                if (diverged_) {
                     if (didPrePass) {
                         genericSubst_ = std::move(preSavedSubst);
                         genericSubstSemaTy_ = std::move(preSavedSema);
