@@ -18131,11 +18131,12 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // string-returning property, an indexer `obj[i]`, or a property whose body
     // is not a recognized producer all correctly return false here (the body
     // arms of isPlusOneStringProducer handle the borrow/imported paths, and
-    // block getters with a statement body return null from computedGetterOf
-    // so the arm never fires — sound, the safe-direction leak remains in those
-    // unfixed shapes, in lockstep with the other `isUserMethodStringReturnCall`
-    // exclusions above). Indexers and non-string properties are excluded by
-    // the type/symbol gate below.
+    // statement-bodied block getters whose body is NOT exactly one
+    // `return <producer>;` continue to return null from the inline predicate
+    // below — their bodies can still produce a borrow at any single point we
+    // don't statically know, so they are conservatively left for the borrow
+    // path; no leak there, no double-release either). Indexers and non-string
+    // properties are excluded by the type/symbol gate below.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init)) {
         sema::Symbol* sym = ctx_.exprSymbol(*ma);
         if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
@@ -18161,6 +18162,45 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                                     acc.bodyKind ==
                                         ast::PropertyAccessorBodyKind::Expression) {
                                     getter = acc.exprBody.get();
+                                    break;
+                                }
+                                // fix #2704 / §23.3 / §28.9: the
+                                // STATEMENT-BODIED block-getter twin — a body
+                                // that is exactly one `return <producer>;`
+                                // hands the caller the producer's single +1
+                                // reference unchanged (the getter's return
+                                // contract is +0, currentReturnTypeNode_ stays
+                                // null per #2694, so emitReturn does not mint
+                                // — the producer's +1 flows straight through
+                                // to the read site at LlvmBackend_Exprs.cpp
+                                // ~5455, the blockGetterOf path). Pre-fix this
+                                // arm never fired: `computedGetterOf` returns
+                                // null for a statement body, the read site
+                                // handed the call result back as a borrow, and
+                                // every read leaked (LSan: 771 B / 40 alloc
+                                // over 20 reads — the issue's repro). Inline
+                                // the predicate here because `blockGetterOf`
+                                // is non-const and this recognizer is `const`
+                                // — the single-statement gate is deliberately
+                                // narrow: a body with intermediate locals or
+                                // branches can still produce a borrow at any
+                                // single point we don't statically know, so it
+                                // is conservatively left for the borrow path
+                                // (no leak there, no double-release either —
+                                // the getter returns a borrow and the caller
+                                // handles it as one). Lockstep with #2694's
+                                // +0 read-face contract: a borrow-bodied
+                                // getter classifies as false here and the
+                                // call site retains at bind / releases at
+                                // scope end as today.
+                                if (!acc.isSet &&
+                                    acc.bodyKind ==
+                                        ast::PropertyAccessorBodyKind::Block &&
+                                    acc.stmts.size() == 1) {
+                                    auto* rs = dynamic_cast<const ast::ReturnStmt*>(
+                                        acc.stmts[0].get());
+                                    if (rs && rs->value)
+                                        getter = rs->value.get();
                                     break;
                                 }
                             }
