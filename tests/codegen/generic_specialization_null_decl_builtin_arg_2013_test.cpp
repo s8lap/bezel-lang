@@ -1,4 +1,4 @@
-// #2013 (§12.9 type-test invariance / §14.2 monomorphization / §17.4, v0.197) —
+// #2013 (§12.9 type-test invariance / §2.8.3 rule 4 monomorphization / §17.4, v0.197) —
 // the structural descriptor/monomorphization key (appendDescKey, via
 // typeRefIdentityKey / descIdentityKey in LlvmBackend_Setup.cpp) must recurse
 // into the generic arguments of a NULL-DECLARATION builtin generic type

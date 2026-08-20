@@ -3948,7 +3948,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 descNode = resolved->astNode;
             llvm::GlobalVariable* desc =
                 descriptorForTypeName(resolved, descNode);
-            // §31.2.1/§12.9 (#1939 leg 3): a CONSTRUCTED generic arm type
+            // §31.2.1/§12.7 (#1939 leg 3): a CONSTRUCTED generic arm type
             // (`catch var e: MyExc<string>`, or `MyExc<T>` under the active
             // substitution) must test against its per-monomorphization
             // descriptor — the same resolution `is`/`as` (lowerTypeTest) and
@@ -3961,7 +3961,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
             // recursively and returns null for a non-generic / non-concrete
             // target, keeping the shared resolution for those.
             //
-            // §12.9/§14.2/§31.2.1 (#2012, #2069): if the arm's type parameter
+            // §12.7/§2.8.3 rule 4/§31.2.1 (#2012, #2069): if the arm's type parameter
             // substitutes to a runtime-erased kind at this monomorphization
             // (`catch var e: MyExc<T>`, T=(int)->int) the descriptor collapses
             // onto a sibling and the arm would catch a wrong-instantiation

@@ -1392,7 +1392,7 @@ bool Resolver::typeRefEqual(const TypeRef* a, const TypeRef* b) {
         }
         case TypeRef::Kind::InlineArray:
             // #2001: `[3]T` and `[4]T` are DISTINCT types — the size N is part
-            // of the type identity (§14.2 / §15.1). Comparing only element +
+            // of the type identity (§2.8.3 rule 4 / §15.1). Comparing only element +
             // ownedness collapsed them, mirroring (and feeding) the runtime
             // descriptor collision. Distinguish ONLY when both sizes are FOLDED
             // (arraySizeValue >= 0, the folded compile-time size): if either is

@@ -1,5 +1,5 @@
 // Codegen — issue #847: a non-generic multi-field RECORD used as a generic type
-// ARGUMENT miscompiled in two related ways (§14.2 monomorphization / §9 records
+// ARGUMENT miscompiled in two related ways (§2.8.3 rule 4 monomorphization / §9 records
 // are value types):
 //
 //   Repro A — a `T?` field where T = a record returned garbage: the record's

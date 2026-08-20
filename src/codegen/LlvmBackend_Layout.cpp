@@ -2655,7 +2655,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                 nonNull, obj, llvm::ConstantPointerNull::get(ptrTy()));
         return nullptr;
     }
-    // §12.9/§14.2/§19.3 (#2012, per the #2069 ruling): at THIS monomorphization
+    // §12.7/§2.8.3 rule 4/§19.3 (#2012, per the #2069 ruling): at THIS monomorphization
     // the target's type-parameter argument may substitute to a runtime-erased
     // kind (a function type) whose descriptor key collapses onto a sibling
     // instantiation, so `o is Wrap<T>` (T=(int)->int) would match a

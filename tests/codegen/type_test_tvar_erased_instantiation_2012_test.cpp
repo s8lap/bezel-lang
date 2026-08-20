@@ -1,4 +1,4 @@
-// §12.9/§14.2/§19.3/§31.2.1 (#2012, spec v0.220, per the #2069 ruling
+// §12.7/§2.8.3 rule 4/§19.3/§31.2.1 (#2012, spec v0.220, per the #2069 ruling
 // /var/tmp/bezel-scratch/impl-run-2026-07-24/rulings/misc/issue-2069.md) — the
 // TYPE-VARIABLE residual of the is/as/case/catch descriptor-erasure family.
 //

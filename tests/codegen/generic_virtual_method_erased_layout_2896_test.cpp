@@ -1,5 +1,5 @@
 // fix #2896 / §14.1 "Generic declarations" + §12 "Inheritance and Dispatch" +
-// §12.1 "Members are non-virtual by default" + §12.9 "Type identity" +
+// §12.1 "Members are non-virtual by default" + §12.7 "Type identity" +
 // §22.8 "Field initializers", v0.240.
 //
 // A method marked `virtual` (or `override`) on a GENERIC class was dispatched to

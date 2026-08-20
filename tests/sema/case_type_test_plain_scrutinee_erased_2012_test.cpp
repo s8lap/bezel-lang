@@ -1,4 +1,4 @@
-// Spec-derived tests for §12.9/§14.2/§17.4 (#2012, v0.197): the erasure guard on
+// Spec-derived tests for §12.7/§2.8.3 rule 4/§17.4 (#2012, v0.197): the erasure guard on
 // the case-binding type-test path for a PLAIN (non-generic-interface) scrutinee
 // (src/sema/ExprTypecheck.cpp — the statement-position CaseStmt handler).
 //

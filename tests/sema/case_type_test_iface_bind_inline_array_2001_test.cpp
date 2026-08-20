@@ -1,4 +1,4 @@
-// Spec-derived tests for §19.3/§12.9/§14.2 (#2001, resolves #1971, v0.197): the
+// Spec-derived tests for §19.3/§12.7/§2.8.3 rule 4 (#2001, resolves #1971, v0.197): the
 // #1946 predicate `typeArgRuntimeReified` (src/sema/ExprTypecheck.cpp) gates the
 // DEAD-ARM admission of a typed binding `var x: C<A>` against a generic INTERFACE
 // scrutinee. It formerly treated EVERY inline-array type argument as erased (not

@@ -1,4 +1,4 @@
-// #2001 (§14.2 value/inline-array type args, §12.9 type-test invariance, §17.4
+// #2001 (§2.8.3 rule 4 value/inline-array type args, §12.9 type-test invariance, §17.4
 // is/as, v0.197) — a runtime `is`/`as`/case type test against a CONSTRUCTED
 // generic type whose type ARGUMENT is an inline array must honor the array SIZE
 // N, not just the element type.

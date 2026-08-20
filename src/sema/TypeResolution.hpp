@@ -153,7 +153,7 @@ bool overrideParamTypeMatches(const TypeRef* derivedTy, const TypeRef* baseTy,
 // delegates to Resolver::isBuiltinTypeName.
 bool isBuiltinTypeName(std::string_view n);
 
-// §14.2/§12.9/§19.3 (#1946, #2069): the STRICT runtime-reification oracle. A
+// §2.8.3 rule 4/§12.7/§19.3 (#1946, #2069): the STRICT runtime-reification oracle. A
 // type argument is runtime-reified — the per-monomorphization descriptor (#1843)
 // distinguishes it from a sibling — iff it is a concrete Named type (resolved
 // declaration, or a null-decl builtin generic with reified args), a primitive,

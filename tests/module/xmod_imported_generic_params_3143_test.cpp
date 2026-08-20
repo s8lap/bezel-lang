@@ -609,7 +609,7 @@ BEZEL_TEST(xmod_imported_generic_params_3143,
 // terminator!" / "IR verification failed". So the change replaces a
 // malformed-IR compile abort with the sourced §19.3 diagnostic — strictly
 // better, and the same verdict the single-module twin (T9b) has always given.
-// // per §19.3 / §12.9 / §14.2 / §2.8.3 rule 4, v0.254
+// // per §19.3 / §12.7 / §2.8.3 rule 4, v0.254
 // ===========================================================================
 BEZEL_TEST(xmod_imported_generic_params_3143,
            t9_imported_variant_iface_erased_arg_now_rejects_19_3) {

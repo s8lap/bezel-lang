@@ -1,4 +1,4 @@
-// #1947 (§14.2 monomorphization / §12.9 invariance / §19.3 v0.182 / §19.6
+// #1947 (§2.8.3 rule 4 monomorphization / §12.9 invariance / §19.3 v0.182 / §19.6
 // v0.196) — self-nested generic instantiations must NOT collide in the
 // monomorphization cache. When BOTH `Foo<int>` and `Foo<Foo<int>>` (a
 // self-nesting of the SAME generic) are used as the type argument of one generic

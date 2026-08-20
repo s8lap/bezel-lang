@@ -5,7 +5,7 @@
 // the bare argument into the tagged `{i8,T}` struct, #850 peeling `T?`→`T` for
 // inference); these tests pin the exact reported repros against regression.
 //
-// §7 nullable values / §14.2 monomorphization. Each `??` coalesces a `T?`
+// §7 nullable values / §2.8.3 rule 4 monomorphization. Each `??` coalesces a `T?`
 // parameter against a `T` fallback inside a generic body and must return the
 // substituted scalar (not the `{i8,T}` wrapper), matching the method's `T`
 // return ABI.

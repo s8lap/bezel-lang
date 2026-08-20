@@ -5099,7 +5099,7 @@ llvm::Value* Emitter::emitTypeParamPatternTest(const sema::TypeRef* ct,
                                                SourceLocation loc) {
     if (!ct) return nullptr;
 
-    // §12.9/§14.2/§19.3 (#2012, #2069): `ct` is the type argument a bare `case`/
+    // §12.7/§2.8.3 rule 4/§19.3 (#2012, #2069): `ct` is the type argument a bare `case`/
     // `is` type-parameter pattern (`case o of var x: T`) resolved to at this
     // monomorphization. If it is a CONSTRUCTED generic whose own argument is
     // runtime-erased (`T=Wrap<(int)->int>`), the descriptor collapses onto a
@@ -6020,7 +6020,7 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     // one vtable. That was harmless while slot 0 was a private `[self, null]`
     // that matched nothing; with a real identity in it, the shared vtable would
     // hand every `G<Cat>` the FIRST instantiation's descriptor, and `catIsDog`
-    // would answer TRUE — a §12.9 invariance break in the FALSE-POSITIVE
+    // would answer TRUE — a §12.7 invariance break in the FALSE-POSITIVE
     // direction, i.e. strictly worse than the false negatives #2977/#2956 are
     // about, because the `as` behind it binds a `Cat` at the `Dog` static type
     // (the #1843/#2001 type-confusion class). MEASURED, not reasoned about: an
@@ -7544,7 +7544,7 @@ static void appendDescKey(const sema::TypeRef* t, std::string& out) {
                 for (const sema::TypeRef* a : t->genericArgs) appendDescKey(a, out);
                 out += '>';
             } else {
-                // #2013 (§12.9 type-test invariance, §14.2 monomorphization,
+                // #2013 (§12.7 type-test invariance, §2.8.3 rule 4 monomorphization,
                 // §17.4): a null-DECLARATION builtin generic type (Array<T>,
                 // Dictionary<K,V>, Task<T>, … — declaration intentionally null, per
                 // TypeResolution_Names §2.5/§29.3) MUST recurse into its generic
@@ -7572,7 +7572,7 @@ static void appendDescKey(const sema::TypeRef* t, std::string& out) {
             out += std::to_string(static_cast<int>(t->primitive));
             break;
         case sema::TypeRef::Kind::InlineArray:
-            // #2001 (§14.2 value/inline-array type args, §12.9 type-test
+            // #2001 (§2.8.3 rule 4 value/inline-array type args, §12.7 type-test
             // invariance): the key MUST encode the inline-array size N (and
             // ownedness) — otherwise `C<Box<[3]int>>` and `C<Box<[4]int>>`
             // produce the SAME key, collapse onto ONE runtime descriptor, and a
@@ -7626,13 +7626,13 @@ std::string Emitter::typeRefIdentityKey(const sema::TypeRef* t) {
 // Is ONE type argument concrete enough to key a per-monomorphization descriptor?
 // Mirrors typeRefIdentityToken's non-null set (a resolved Named declaration or a
 // primitive tag; an unbound generic-parameter placeholder is Named with
-// declaration == nullptr → not concrete). #2001 (§14.2 / §12.9): a FOLDED-size
+// declaration == nullptr → not concrete). #2001 (§2.8.3 rule 4 / §12.7): a FOLDED-size
 // inline array (`[N]T`, N known) whose element is itself concrete is ALSO
 // distinguishable — appendDescKey now encodes its N (and ownedness), so
 // `Box<[3]int>` and `Box<[4]int>` mint DISTINCT descriptors. An UNFOLDED size
 // (< 0) stays conservatively non-concrete (its key still collapses). (Inlined
 // rather than calling typeRefIdentityToken, which is a private Emitter member.)
-// #2022 (§12.9 type-test invariance, §14.2 monomorphization, §17.4 is/as): a
+// #2022 (§12.7 type-test invariance, §2.8.3 rule 4 monomorphization, §17.4 is/as): a
 // null-DECLARATION builtin generic (Array<T>, Dictionary<K,V>, Task<T>, … —
 // declaration intentionally null per §2.5/§29.3) with NON-EMPTY genericArgs
 // that are recursively concrete is ALSO distinguishable: appendDescKey recurses
@@ -7648,7 +7648,7 @@ static bool descTypeArgConcrete(const sema::TypeRef* a) {
     if (a->kind == sema::TypeRef::Kind::InlineArray)
         return a->arraySizeValue >= 0 && descTypeArgConcrete(a->arrayElement);
     if (a->kind == sema::TypeRef::Kind::Named) {
-        // #2184 (§12.9/§14.2/§17.4/#2069 ruling): a DECLARED-Named head is
+        // #2184 (§12.7/§2.8.3 rule 4/§17.4/#2069 ruling): a DECLARED-Named head is
         // not, by itself, "concrete" for descriptor-key purposes — the inner
         // genericArgs might still collapse (a function-typed arg, an erased
         // builtin, an unfolded inline-array size). Recurse into the args,
@@ -7815,7 +7815,7 @@ llvm::GlobalVariable* Emitter::instanceDescriptorFor(
             auto it = subst.find(gp->name);
             const sema::TypeRef* a = it != subst.end() ? it->second : nullptr;
             symArgs.push_back(a);
-            // #2008 (§12.9 type-test invariance, §14.2 monomorphization, §15.1):
+            // #2008 (§12.7 type-test invariance, §2.8.3 rule 4 monomorphization, §15.1):
             // use the SAME concreteness predicate as the top-level gate
             // (descArgsConcrete) so a folded-size inline-array base arg counts as
             // concrete. Using typeRefIdentityToken here (nullptr for InlineArray)
@@ -7981,7 +7981,7 @@ static bool typeTestArgStillOpen(const sema::TypeRef* t) {
     }
 }
 
-// §12.9/§14.2/§19.3/§31.2.1 (#2012, per the #2069 ruling
+// §12.7/§2.8.3 rule 4/§19.3/§31.2.1 (#2012, per the #2069 ruling
 // /var/tmp/bezel-scratch/impl-run-2026-07-24/rulings/misc/issue-2069.md):
 // the per-monomorphization RE-RUN of the descriptor-erasure guard, as a
 // conservative compile-time REJECT.

@@ -1,4 +1,4 @@
-// #2022 (§12.9 type-test invariance / §14.2 monomorphization / §17.4 is/as,
+// #2022 (§12.9 type-test invariance / §2.8.3 rule 4 monomorphization / §17.4 is/as,
 // v0.197) — the runtime must mint a precise per-monomorphization descriptor
 // for a constructed generic whose type ARGUMENT is a NULL-DECLARATION builtin
 // generic (`Array<T>`, `Dictionary<K,V>`, `Task<T>`, … — declaration

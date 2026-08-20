@@ -6475,7 +6475,7 @@ ExprTC::IfaceBindReject ExprTC::typeTestInterfaceBindAmbiguous(
     for (const TypeRef* a : patTy->genericArgs)
         if (!typeArgRuntimeReified(a)) { allReified = false; break; }
 
-    // §19.3/§12.9/§14.2 (#1941): a VARIANT scrutinee interface.
+    // §19.3/§12.7/§2.8.3 rule 4 (#1941): a VARIANT scrutinee interface.
     //
     //   * All-REIFIED pattern arguments: the post-#1843 runtime test matches
     //     only genuine `C<A>` values (verified: a `Box<Animal>` behind a
@@ -6661,7 +6661,7 @@ bool typeArgRuntimeReified(const TypeRef* t) {
     switch (t->kind) {
         case TypeRef::Kind::Named:
             if (!t->declaration) {
-                // #2022 (§12.9, §14.2, §17.4, v0.197): a null-DECLARATION builtin
+                // #2022 (§12.7, §2.8.3 rule 4, §17.4, v0.197): a null-DECLARATION builtin
                 // generic (Array<T>, Dictionary<K,V>, … — declaration null per
                 // §2.5/§29.3) with NON-EMPTY recursively-reified genericArgs IS
                 // runtime-reified: appendDescKey (the descriptor-key factory)
@@ -13596,7 +13596,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // just without drop-edge carving).
         auto tryJoinNull = afterBodyNull;
         for (const auto& arm : trys->catches) {
-            // §31.2.1/§12.9/§14.2 (#1939): the CATCH-surface copy of the
+            // §31.2.1/§12.7/§2.8.3 rule 4 (#1939): the CATCH-surface copy of the
             // #2006/#2012/#2018 erasure guard. §31.2.1: an arm "matches any
             // thrown exception that is an instance of the type" — but a
             // constructed generic arm type whose argument is a still-ERASED
@@ -13631,7 +13631,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         "kind (e.g. a function type), which the runtime type "
                         "descriptor collapses, so the arm could match a "
                         "different instantiation and bind the exception at a "
-                        "wrong static type (§31.2.1/§12.9/§14.2)");
+                        "wrong static type (§31.2.1/§12.7/§2.8.3 rule 4)");
             }
             // #1939 catch-arm erasure guard (above) and #2116 narrowing-fact
             // setup (below) are independent: the guard is diagnostic-only over
@@ -14334,8 +14334,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "and another instantiation of the pattern class "
                                 "also implements the scrutinee interface type, so "
                                 "the erased runtime type-test could bind a value "
-                                "at a wrong static type (§19.3/§5.1/§12.9)");
-                        // §12.9/§14.2/§17.4 (v0.197, #2012): the PLAIN-scrutinee
+                                "at a wrong static type (§19.3/§5.1/§12.7)");
+                        // §12.7/§2.8.3 rule 4/§17.4 (v0.197, #2012): the PLAIN-scrutinee
                         // analog of #2006's `is`/`as` erasure guard.
                         // typeTestInterfaceBindAmbiguous only reasons about a
                         // generic-INTERFACE scrutinee (its `None` there means
@@ -14378,7 +14378,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "runtime type descriptor collapses, so the type-"
                                 "test could match a different instantiation and "
                                 "bind the value at a wrong static type "
-                                "(§19.3/§12.9/§14.2/§17.4)");
+                                "(§19.3/§12.7/§2.8.3 rule 4/§17.4)");
                     }
                 }
                 Scope* saveScope = currentScope_;

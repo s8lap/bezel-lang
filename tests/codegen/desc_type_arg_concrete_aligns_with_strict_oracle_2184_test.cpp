@@ -1,4 +1,4 @@
-// fix #2184 / §12.9 type-test invariance / §14.2 monomorphization / §17.4
+// fix #2184 / §12.9 type-test invariance / §2.8.3 rule 4 monomorphization / §17.4
 // is/as (spec v0.226): the codegen-side `descTypeArgConcrete` oracle in
 // `LlvmBackend_Setup.cpp` (decides whether a per-monomorphization descriptor
 // is minted vs the shared erased descriptor) was LAX — it admitted a
@@ -53,7 +53,7 @@
 // → per-instantiation). These all pass before AND after; the test
 // documents the alignment contract and pins the safe direction.
 //
-// per §12.9, §14.2, §17.4, #2184, #2069 ruling, #2012, #2018, #2022
+// per §12.9, §2.8.3 rule 4, §17.4, #2184, #2069 ruling, #2012, #2018, #2022
 
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"

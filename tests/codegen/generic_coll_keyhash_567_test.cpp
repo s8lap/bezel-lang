@@ -241,7 +241,7 @@ BEZEL_TEST(codegen_generic_coll_keyhash_567, wrap_set_record_contains_14_1) {
 // ── §14.1: two distinct instantiations from the same generic method ───────────
 
 // Both Set<int> and Set<string> from the SAME Wrap<T> must each dispatch through
-// their own concrete element's hash/eq (distinct monomorphizations, §14.2).
+// their own concrete element's hash/eq (distinct monomorphizations, §2.8.3 rule 4).
 BEZEL_TEST(codegen_generic_coll_keyhash_567, wrap_set_two_instantiations_14_2) {
     auto r = jit(
         "module M; "

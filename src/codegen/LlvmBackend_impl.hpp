@@ -30,7 +30,7 @@
 #include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
 #include "common/IntLiteral.hpp"       // #2936: the one integer-literal parser
 #include "sema/SemaContext.hpp"
-#include "sema/TypeResolution.hpp"  // typeRefEqual — §14.2 exact type identity
+#include "sema/TypeResolution.hpp"  // typeRefEqual — §2.8.3 rule 4 exact type identity
 #include "sema/Symbol.hpp"
 
 #include "llvm/IR/BasicBlock.h"
@@ -1869,7 +1869,7 @@ private:
     // body (first-seen-wins mis-dispatch: an `is Foo<T>` in the body baked the
     // FIRST T's descriptor). The recursive key encodes every nested type
     // argument, so nested instantiations that share a top-level declaration get
-    // DISTINCT specialized bodies (§14.2 monomorphization, §12.9 invariance).
+    // DISTINCT specialized bodies (§2.8.3 rule 4 monomorphization, §12.9 invariance).
     // fix #1894 #1895: the fourth element is the concrete LLVM PARAMETER type
     // vector. Two call sites can share the same type-argument substitution yet
     // pass arguments at DIFFERENT LLVM widths — e.g. `Make<long,long>(100,200)`
@@ -7890,7 +7890,7 @@ private:
     // interface with concrete arguments; nullptr otherwise (caller keeps its
     // existing shared-descriptor resolution).
     llvm::GlobalVariable* perInstDescriptorForTarget(const sema::TypeRef* rt);
-    // §12.9/§14.2/§19.3/§31.2.1 (#2012, per the #2069 ruling): at a given
+    // §12.7/§2.8.3 rule 4/§19.3/§31.2.1 (#2012, per the #2069 ruling): at a given
     // monomorphization, REJECT a runtime type-test target whose type-parameter-
     // mentioning generic argument substitutes to a GROUND but runtime-ERASED kind
     // (a function type, or a collapse at any depth) — the descriptor key would

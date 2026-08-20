@@ -1984,7 +1984,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // of the target type (a failed cast is null). Recording it lets
     // `(x as T)` — and member access on its result — resolve.
     if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
-        // §12.9/§14.2/§17.4 (v0.197, #2006): erasure guard for the plain
+        // §12.7/§2.8.3 rule 4/§17.4 (v0.197, #2006): erasure guard for the plain
         // `is`/`as` expression path — parity with the case-binding path
         // (#1927/#1946). A runtime type-test against a CONSTRUCTED generic
         // whose type argument is a runtime-ERASED kind reaches a COLLAPSED
@@ -2011,7 +2011,7 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         "kind (e.g. a function type), which the runtime type "
                         "descriptor collapses, so the test would confuse "
                         "distinct instantiations and bind a value at a wrong "
-                        "static type (§12.9/§14.2/§17.4)");
+                        "static type (§12.7/§2.8.3 rule 4/§17.4)");
             }
         }
         if (te->op == "is" || te->op == "is not") {
@@ -8428,7 +8428,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 "also implements the scrutinee interface type, so "
                                 "the erased runtime type-test could bind a value "
                                 "at a wrong static type (§19.3/§5.1/§12.9)");
-                        // §12.9/§14.2/§17.4 (v0.197, #2018): the VALUE/expression
+                        // §12.7/§2.8.3 rule 4/§17.4 (v0.197, #2018): the VALUE/expression
                         // `case` form's copy of #2012's PLAIN-scrutinee erasure
                         // guard — the sibling of ExprTypecheck.cpp's CaseStmt
                         // handler, and the case-binding analog of the #2006
@@ -8478,7 +8478,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 "runtime type descriptor collapses, so the type-"
                                 "test could match a different instantiation and "
                                 "bind the value at a wrong static type "
-                                "(§19.3/§12.9/§14.2/§17.4)");
+                                "(§19.3/§12.7/§2.8.3 rule 4/§17.4)");
                     }
                 }
                 Scope* saveScope = currentScope_;

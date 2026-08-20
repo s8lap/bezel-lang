@@ -9610,7 +9610,7 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
                     // Object scrutinee (see emitStringGuardedIsA) — a `var x: C`
                     // typed binding shares the concrete-name fault the bare
                     // `case o of C` NamedPattern above had.
-                    // §12.9/§14.2/§19.3 (#2012, #2069): a `var x: Wrap<T>` binding
+                    // §12.7/§2.8.3 rule 4/§19.3 (#2012, #2069): a `var x: Wrap<T>` binding
                     // whose T substitutes to a runtime-erased kind at this
                     // monomorphization collapses onto a sibling descriptor — REJECT
                     // (probes p_case_stmt/p_case_val: rc=0, answered TRUE on

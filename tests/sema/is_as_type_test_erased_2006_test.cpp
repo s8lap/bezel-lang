@@ -1,4 +1,4 @@
-// Spec-derived tests for §12.9/§14.2/§17.4 (#2006, v0.197): the erasure guard on
+// Spec-derived tests for §12.7/§2.8.3 rule 4/§17.4 (#2006, v0.197): the erasure guard on
 // the PLAIN `is`/`as` EXPRESSION path (src/sema/ExprTypecheck_Exprs.cpp).
 //
 // The case-binding path already consults `typeArgRuntimeReified` and rejects a

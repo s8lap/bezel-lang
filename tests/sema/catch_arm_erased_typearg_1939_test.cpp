@@ -1,4 +1,4 @@
-// Spec-derived tests for §31.2.1/§12.9/§14.2 (#1939 leg 3 guard, spec v0.220):
+// Spec-derived tests for §31.2.1/§12.7/§2.8.3 rule 4 (#1939 leg 3 guard, spec v0.220):
 // the erasure guard on CATCH-ARM types — parity with #2006 (is/as), #2012
 // (statement case) and #2018 (value-form case).
 //

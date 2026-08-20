@@ -1,4 +1,4 @@
-// #2018 (§12.9/§14.2/§17.4, v0.197) — the runtime half of the erasure guard on the
+// #2018 (§12.7/§2.8.3 rule 4/§17.4, v0.197) — the runtime half of the erasure guard on the
 // VALUE/expression `case` form for a PLAIN scrutinee (src/sema/
 // ExprTypecheck_Exprs.cpp, the CaseExpr handler). The value-form sibling of #2012
 // (statement form) and #2006 (plain `is`/`as`). The sema half
