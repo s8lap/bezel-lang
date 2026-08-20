@@ -242,7 +242,7 @@ private method RecordError(ex: Exception)
 end RecordError;
 ```
 
-`ex.Message` is a `string` (runtime-managed, no ownership obligation), so copying it out is fine. The exception *instance* cannot escape. The single exception to the rule is the bare re-throw `throw;`, which hands the in-flight exception back to the runtime rather than capturing it.
+`ex.Message` is a `string` (runtime-managed, no ownership obligation), so copying it out is fine. The exception *instance* cannot escape. The single exception to the rule is the bare re-throw `throw;`, which hands the in-flight exception back to the runtime rather than capturing it. For a one-call summary of what you *do* copy out there is `ex.ToString()`: it renders the exception's type name, its `Message`, and both diagnostic chains (`CauseChain` and `SupersededChain`) into a single `string` you may keep — deliberately *without* the stack trace, which stays the separate `ex.StackTrace` the example logs above (spec §31.4).
 
 The reasoning: an exception often carries no disposable resources, but the rule is uniform so the language never has to ask "does this exception own something?" at a `catch` boundary. Copy what you need; let the instance go.
 
@@ -294,7 +294,7 @@ One diagnostic worth recognizing in this area: disposing a value and then using 
 | Operation invalid in current state | `throw new InvalidOperationException(...)` (or an `invariant(...)`/`requires(...)` where the condition is a class or caller contract) |
 | Must run cleanup that is not a disposal | `try … finally` |
 | Must dispose an owned resource on failure | nothing — ownership handles it automatically |
-| Preserve failure details past a `catch` | copy `ex.Message` / `ex.StackTrace` into owned values; never the exception itself |
+| Preserve failure details past a `catch` | copy `ex.Message` / `ex.StackTrace` into owned values — or `ex.ToString()`, one string carrying the type name, the message, and both chains; never the exception itself |
 
 The table is the teaching mirror of a normative rule: the **failure-signal rule** (stdlib §1) classifies every fault condition a library surface declares — five bands, first match wins, one mechanism per condition. Two of its sentences are worth restating here. First, the line between the `choice` row and a typed exception is *where the failure is consumed* and *whether its payload can be a plain value* — never how much information it carries. A fault whose data is read once at a boundary is a typed exception, however rich the data; a fault the caller branches on near the call site, with a value-shaped payload, is a `choice` return. Second, `catch` is a boundary-and-supervision tool — convert, log, retry, report, re-raise. Branching program logic on caught exception types at an interior call site is the signal to check the rule for a value-shaped tier.
 
