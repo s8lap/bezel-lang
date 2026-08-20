@@ -128,6 +128,43 @@ else:
     else:
         print("PIN: clean (" + "; ".join(rows) + ")")
 
+# ---- 0b. FENCE: every opening code fence carries a language tag ---------------
+# Added v0.269. A bare ``` opening fence is ambiguous in a way that hides defects:
+# nothing distinguishes "untagged because it is not Bezel" from "untagged because
+# somebody forgot". The 2026-08-20 example sweep partitioned the spec by ```bezel
+# and so assigned 10 blocks to no lane at all; a further 4 were invisible to the
+# partition's keyword filter. All 14 turned out to be EBNF or schematics -- but
+# that was luck, not a guarantee, and the next one might be real Bezel that no
+# reviewer and no extractor ever looks at.
+#
+# Closing fences are bare by definition and are not checked; only openers are.
+fbad = []
+for key, path in DOCS.items():
+    # The changelog is exempt: it is pinned history, written at each revision and
+    # never retroactively edited (spec-change-process §5). Its fences are historical
+    # quotations, and re-tagging them would edit a record that is meant to be fixed.
+    if key == 'changelog':
+        continue
+    lines = text[key].split("\n")
+    inblock = False
+    for i, ln in enumerate(lines, 1):
+        m = re.match(r'^\s*```(\S*)\s*$', ln)
+        if not m:
+            continue
+        if inblock:                     # this is the closer
+            inblock = False
+            continue
+        inblock = True
+        if m.group(1) == "":
+            fbad.append(f"  {os.path.basename(path)}:{i}: opening code fence has no language tag "
+                        f"(use `bezel` for Bezel, or `text`/`ebnf`/`json` for anything else)")
+if fbad:
+    fail = 1
+    print(f"FENCE: {len(fbad)} violation(s):")
+    print("\n".join(fbad))
+else:
+    print("FENCE: clean (every opening code fence is tagged)")
+
 # ---- 1. Anchor resolution -------------------------------------------------
 # The repo uses TWO anchor styles: explicit <a id="sec-..."> for cross-refs, and
 # GitHub-auto heading slugs for the table of contents ('## 1. Foo' -> #1-foo).

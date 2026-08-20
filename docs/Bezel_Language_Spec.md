@@ -1548,7 +1548,7 @@ A serialized **cycle** closes through a `Weak<T>` back-edge on a `Shared<T>` spi
 
 A base class whose serialized components may, at run time, hold instances of registered derived classes declares a `polymorphic` registry as a member of its body:
 
-```
+```text
 public abstract class Shape: ISerializable, IDeserializable
   polymorphic ("circle": Circle, "square": Square);
   // ... other members ...
@@ -1961,7 +1961,7 @@ A class ends with `end ClassName;`. Members may end with `end MemberName;` or `e
 
 When a member declaration carries multiple modifiers, they appear in this order:
 
-```
+```text
 visibility static (async | pure) (abstract | virtual | override | sealed override) (owned | scoped) readonly member-kind Name ...
 ```
 
@@ -3777,7 +3777,7 @@ const Cap := (if Flags > 0 then 64 else 32);     // constant conditional
 
 The binding atom names a subexpression within expression position (grammar A.7 `BindExpr`, the PrimaryAtom family):
 
-```
+```text
 (var name := initializer; body)
 (var a := E1; var b := E2; body)
 ```
@@ -3864,7 +3864,7 @@ var msg := $"({point.X}, {point.Y}) - area = {point.Area()}";
 
 An interpolation may include alignment and a format specifier:
 
-```
+```text
 {expression}
 {expression,alignment}
 {expression:format}
@@ -4219,7 +4219,7 @@ When the scrutinee has an enum type, the enum prefix may be omitted in patterns.
 
 The `if` expression selects between values, condition-first, as a parenthesized, self-delimiting atom (grammar A.7 `IfExpr`, the PrimaryAtom family):
 
-```
+```text
 (if condition then trueValue else falseValue)
 (if c1 then v1 elif c2 then v2 else fallback)
 ```
@@ -9233,7 +9233,7 @@ end ArgumentException;
 
 The following exception types are language-built-in and available without import. The hierarchy is shown as a tree; types not indented under another type derive directly from `Exception`.
 
-```
+```text
 Exception
 ├─ ContractViolationException — a `requires`/`ensures`/`invariant` clause evaluated `false` ([§22.16](#sec-contract-clauses))
 ├─ ArgumentException                — invalid arguments.
@@ -10362,7 +10362,7 @@ Whitespace and comments are recognized by the lexer and may appear between any t
 <a id="sec-lexical"></a>
 ### A.1 Lexical
 
-```
+```ebnf
 Identifier      ::= Letter IdentCont* | "_" IdentCont+
                               /* The bare single-character `_` is NOT an
                                  Identifier: it is lexed as its own reserved
@@ -10403,7 +10403,7 @@ InterpPart      ::= "{" Expression ("," "-"? IntLiteral)? (":" FormatSpec)? "}"
 <a id="sec-source-file"></a>
 ### A.2 Source file
 
-```
+```ebnf
 SourceFile      ::= ModuleDecl Import* TopDecl*
 ModuleDecl      ::= "module" QualifiedName ";"
 Import          ::= "import" QualifiedName ("as" Identifier)? ";"
@@ -10424,7 +10424,7 @@ TypeAliasDecl   ::= "type" Identifier GenericParams? ":=" Type
 <a id="sec-type-declarations"></a>
 ### A.3 Type declarations
 
-```
+```ebnf
 ClassDecl       ::= Visibility? Modifier* "class" Identifier GenericParams?
                     PrimaryCtorParams?
                     Inheritance?
@@ -10610,7 +10610,7 @@ VariadicClause  ::= "variadic" "(" IntLiteral ")"
 <a id="sec-members"></a>
 ### A.4 Members
 
-```
+```ebnf
 Member          ::= FieldDecl | MethodDecl | PropertyDecl | IndexerDecl
                   | ConstructorDecl | DestructorDecl
                   | OperatorDecl | NestedTypeDecl | ConstDecl
@@ -10946,7 +10946,7 @@ Constraint      ::= "class" | "value" | "notnull" | "sendable" | "hashable" | "n
 <a id="sec-types"></a>
 ### A.5 Types
 
-```
+```ebnf
 Type            ::= TypeNoNullable "?"?
 TypeNoNullable  ::= QualifiedName GenericArgs?
                   | PrimitiveType
@@ -11008,7 +11008,7 @@ PrimitiveType   ::= IntegerType | "float" | "double" | "decimal"
 <a id="sec-appendix-a-statements"></a>
 ### A.6 Statements
 
-```
+```ebnf
 Statement       ::= LocalDecl | LocalConstDecl | AssignmentStmt | ExpressionStmt
                   | DiscardStmt
                   | IfStmt | WhileStmt | ForStmt | DoEndBlock
@@ -11181,7 +11181,7 @@ YieldStmt       ::= "yield" "return" Expression ";"
 
 The grammar shown here is informal: it lists the alternatives at each precedence level rather than expanding every binary level into recursive productions. Operator precedence is given in [§17.1](#sec-precedence).
 
-```
+```ebnf
 Expression      ::= LogicalOr
                   | ThrowExpr
                               /* IfExpr, CaseExpr, and WhenExpr are PrimaryAtom
@@ -11595,7 +11595,7 @@ DefaultExpr     ::= "default" "(" Type ")"
 <a id="sec-constants-and-literals"></a>
 ### A.8 Constants and literals
 
-```
+```ebnf
 Literal         ::= IntLiteral | FloatLiteral | CharLiteral
                   | StringLiteral | InterpString
                   | "true" | "false" | "null"
