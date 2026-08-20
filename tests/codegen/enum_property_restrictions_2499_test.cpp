@@ -117,7 +117,8 @@ BEZEL_TEST(enum_property_restrictions_2499,
 
 // ── §10.4 regression guard: the expression-bodied read-only form MUST
 //    still compile AND run correctly — the false-reject risk this fix
-//    must avoid. This is the exact worked example from §10.4. ───────────
+//    must avoid. This is the exact worked example from §10.4, respelled
+//    to the v0.256 FrozenArray<Priority> form. ──────────────────────────
 
 BEZEL_TEST(enum_property_restrictions_2499,
            expression_bodied_readonly_property_still_compiles_spec_10_4) {
@@ -130,7 +131,8 @@ BEZEL_TEST(enum_property_restrictions_2499,
         "    Low => \"Low\", "
         "    Medium => \"Medium\", "
         "    High => \"High\"); "
-        "  public static readonly All: Array<Priority> := [Low, Medium, High]; "
+        "  public static readonly All: FrozenArray<Priority> := "
+        "      FrozenArray<Priority>.From([Low, Medium, High]); "
         "  public static method Parse(text: string): Priority? "
         "    return (case text of "
         "      \"Low\" => Low, "

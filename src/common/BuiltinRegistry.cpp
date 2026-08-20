@@ -89,9 +89,13 @@ constexpr std::array<std::string_view, 2> kTaskFamilyHeads = {
     "Task", "OwningTask",
 };
 
-// §4.4–§4.7 / §4.14: the bz_array_t*-backed collections (isCollectionTypeName).
-// LinkedList/OwningLinkedList are bz_llist_t-backed and excluded here.
-constexpr std::array<std::string_view, 10> kArrayBackedCollections = {
+// §4.4–§4.7 / §4.14 / §4.19: the bz_array_t*-backed collections
+// (isCollectionTypeName). LinkedList/OwningLinkedList are bz_llist_t-backed and
+// excluded here. FrozenArray<T> shares the bz_array_t* representation with
+// Array<T> (§4.19, fix #3249): the only construction forms are the two
+// §4.19 `From` overloads, so the storage is owned and shared only via the
+// §30.14 string-precedent tolerance — no mutating member ever sees it.
+constexpr std::array<std::string_view, 11> kArrayBackedCollections = {
     "Array",  "OwningArray", "OwningBuffer",
     "Stack",  "OwningStack", "Queue",
     "OwningQueue", "Set",    "OwningSet",
@@ -99,6 +103,10 @@ constexpr std::array<std::string_view, 10> kArrayBackedCollections = {
     // (bz_dict_alloc_generic) but routes through the collection-dispatch gate
     // (isArr → isSetName), like Set/OwningSet.
     "SortedSet",
+    // fix #3249: §4.19 FrozenArray<T> — same bz_array_t* rep as Array<T>;
+    // its `Length` / indexer-get / `ToArray` / destructor all lower through
+    // bz_array_* the same way, so it joins the array-backed collection gate.
+    "FrozenArray",
 };
 
 // §4.8 / §4.17: the bz_dict_t*-backed collections (isDictTypeName).
@@ -122,11 +130,16 @@ constexpr std::array<std::string_view, 3> kFfiBufferBuiltins = {
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
 // (imported-only) are NOT here — they stay as explicit deltas at the sites.
-constexpr std::array<std::string_view, 66> kHeapPointerReferenceBuiltins = {
+constexpr std::array<std::string_view, 67> kHeapPointerReferenceBuiltins = {
     // §4 collections (SortedSet: stdlib §4.18/#1426 — bz_dict_t* rep, both paths)
     "Array", "OwningArray", "Dictionary", "OwningDictionary",
     "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
     "Set", "OwningSet", "LinkedList", "OwningLinkedList", "LinkedListNode",
+    // fix #3249 (§4.19, v0.186): FrozenArray<T> — same bz_array_t* rep on
+    // both rep paths; the type is heap-allocated (constructed via the §4.19
+    // `From` overloads), so its type-annotation lower lowers to ptr on both
+    // the astNode and the imported-name paths.
+    "FrozenArray",
     // §4.14 (fix #1740, v0.254): OwningBuffer<T> is a heap-owning collection
     // (ptr rep on the astNode path; identical role to OwningArray<T>). It was
     // historically in kNonHeapReservedBuiltins with a comment claiming it was
@@ -606,7 +619,7 @@ struct BuiltinClassModulePath {
     std::string_view name;
     std::string_view modulePath;
 };
-constexpr std::array<BuiltinClassModulePath, 77> kBuiltinClassModulePaths = {{
+constexpr std::array<BuiltinClassModulePath, 78> kBuiltinClassModulePaths = {{
     // stdlib §2 (System) — the §2.5/§2.6 temporal/identity value types are
     // value-shaped (§3.1) but their BOX thunk (`valueBuiltinBoxToStringThunk`)
     // is in the §8.5 default path, so they belong here too.
@@ -679,6 +692,10 @@ constexpr std::array<BuiltinClassModulePath, 77> kBuiltinClassModulePaths = {{
     {"OwningLinkedList", "System.Collections.Generic"},
     {"LinkedListNode", "System.Collections.Generic"},
     {"OwningBuffer", "System.Collections.Generic"},
+    // fix #3249 (§4.19, v0.186): FrozenArray<T> — heap-backed bz_array_t*,
+    // System.Collections.Generic per the stdlib section structure; the
+    // §8.5 name-only default and stdlib §2.13 rule 1 both consult this table.
+    {"FrozenArray", "System.Collections.Generic"},
     // stdlib §4.18 (#1414): DictionaryEntry, DrainedEntry — synthetic
     // TypeRefs (no astNode, importedName-keyed); not reachable from a written
     // type annotation and therefore not in §8.5's default path.

@@ -3747,7 +3747,15 @@ llvm::Function* Emitter::collectionNodeFreeThunk(const sema::TypeRef* nodeTy) {
             childIsDictValue
                 ? (head == "Dictionary" || head == "SortedDictionary")
                 : (head == "Array" || head == "Stack" || head == "Queue" ||
-                   head == "LinkedList");
+                   head == "LinkedList" ||
+                   // fix #3249 (§4.19, v0.186): FrozenArray<T> shares the
+                   // borrowing collection's string-element contract — its
+                   // From(items: Array<T>) copying construction calls
+                   // emitArrayRetainStringsIfStringArray at the call site
+                   // (tryLowerFrozenArrayCall, LlvmBackend_Calls2.cpp), so the
+                   // matching release here is a balanced thunk, not a
+                   // double-free.
+                   head == "FrozenArray");
         if (!childDisposer && isStrElem(childTy) && strChildRetainedAtConstruction)
             childDisposer = stringElementReleaseThunk();
         // The child is itself an aggregate node (`Dictionary<string,

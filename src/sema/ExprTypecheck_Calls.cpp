@@ -6750,6 +6750,44 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                     }
 
+                    // fix #3249 (§4.19, v0.186): FrozenArray<T>.From(items: Array<T>):
+                    // owned FrozenArray<T> — the copying construction form. The
+                    // O(1) `From(owned buffer: OwningBuffer<T>)` overload is
+                    // deliberately out of scope for the v0.256 catch-up (§4.19's
+                    // VALUE-TYPED-ONLY arm: no string-element form, since
+                    // OwningBuffer<T> doesn't admit string). Stamp the result
+                    // type as FrozenArray<T> with the same generic arg as the
+                    // target type; codegen's tryLowerFrozenArrayCall handles the
+                    // runtime bz_array_copy dispatch.
+                    if (colName == "FrozenArray" && m == "From" &&
+                        ce.args.size() == 1 && ce.args[0].value) {
+                        // The callee target is `FrozenArray<T>` (a type
+                        // reference, not a value). The IdentifierExpr
+                        // `FrozenArray` carries its explicit generic args on
+                        // the AST node itself (`id->typeArgs`); recover T
+                        // from there — `ctx_.exprType(target)` may be null at
+                        // this point because the IdentifierExpr's type is
+                        // stamped by ExprTC for expressions AFTER this call
+                        // resolution runs.
+                        const std::vector<std::unique_ptr<ast::Type>>* faArgs = nullptr;
+                        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(
+                                ce.callee.get())) {
+                            if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(
+                                    ma2->target.get()))
+                                faArgs = &id2->typeArgs;
+                        }
+                        if (faArgs && !faArgs->empty() && (*faArgs)[0]) {
+                            TypeRef* argTy = ctx_.resolvedType(*(*faArgs)[0]);
+                            if (argTy) {
+                                auto* fTy = ctx_.makeTypeRef();
+                                fTy->kind = TypeRef::Kind::Named;
+                                fTy->declaration = builtinClassSym("FrozenArray");
+                                fTy->genericArgs.push_back(argTy);
+                                ctx_.setExprType(&ce, fTy);
+                            }
+                        }
+                    }
+
                     // §6.1 / §30.8: CancellationToken instance method return types.
                     // ThrowIfCancellationRequested() → unit (void).
                     // Register(cb) → owned Subscription is typed in the builtinInstName

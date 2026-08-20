@@ -13573,6 +13573,15 @@ private:
     // lowered value (owned Array<byte> or string), or null if not this shape.
     llvm::Value* tryLowerEncodingCall(const ast::CallExpr& call);
 
+    // fix #3249 (§4.19, v0.186): FrozenArray<T>.From(items: Array<T>): owned
+    // FrozenArray<T>. The O(n) copying construction form — allocates a fresh
+    // bz_array_t holding a copy of `items`'s storage and returns the new heap
+    // pointer typed as FrozenArray<T>. The receiver is a TYPE reference (the
+    // callee is `FrozenArray<T>.From`, not a value-method call), so the
+    // dispatch inspects the callee MemberAccessExpr's TARGET for the
+    // `FrozenArray<...>` head. Returns null when the call is not this shape.
+    llvm::Value* tryLowerFrozenArrayCall(const ast::CallExpr& call);
+
     // §3.4: static methods on primitive type names — `int.Parse(s)`,
     // `double.Parse(s)`, etc. The target is a primitive keyword identifier.
     llvm::Value* tryLowerPrimitiveStaticCall(const ast::CallExpr& call);
