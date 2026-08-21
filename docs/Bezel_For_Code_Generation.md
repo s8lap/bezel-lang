@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.276. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.277. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -987,7 +987,7 @@ public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int)  // : IR
   method Fill(value: T);  CopyFrom(source: ReadOnlySpan<T>);  CopyTo(destination: Span<T>);  // value T only
 end
 public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int)
-  // read surface + Slice x3;  value T only: CopyTo(destination: Span<T>), ToArray(): owned Array<T>
+  // read surface + Slice x3;  value T only: CopyTo(destination: Span<T>).  No ToArray() (v0.277)
 end
 public record ArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnlySpan<T>
   property [i: int]: T { get; set; }            // the setter stores a BORROW; `move` NOT admitted
@@ -995,7 +995,7 @@ public record ArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnly
   Fill(value: T);  CopyFrom(source: ReadOnlyArraySpan<T>);  CopyTo(destination: ArraySpan<T>);  Reverse();
 end
 public record ReadOnlyArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnlySpan<T>
-  // read surface + CopyTo(destination: ArraySpan<T>).  No ToArray() here.
+  // read surface + CopyTo(destination: ArraySpan<T>).  No ToArray() (neither span family has one)
 end
 public interface IReadOnlySpan<TElement>        // implemented by all five span types
   readonly property Length: int;   readonly property IsEmpty: bool;
@@ -1054,7 +1054,7 @@ public extension IEnumerable<T>
   SelectMany<U>(selector: (T) -> IEnumerable<U>): IEnumerable<U>;
   // Quantifiers and element access (EAGER)
   Any(): bool;   Any(predicate): bool;   All(predicate): bool;
-  Count(): int;  Count(predicate): int;  Contains(value: T): bool;
+  Count(): int;  Count(predicate): int;
   First(): T;  First(predicate): T;   FirstOrNull(): T?;  FirstOrNull(predicate): T?;
   Last(): T;   Last(predicate): T;    LastOrNull(): T?;   LastOrNull(predicate): T?;
   Single(): T; Single(predicate): T;  SingleOrNull(): T?; SingleOrNull(predicate): T?;
@@ -1070,18 +1070,28 @@ public extension IEnumerable<T>
   OrderBy<TKey>(key: (T) -> TKey): IOrderedEnumerable<T>            where TKey: IComparable<TKey>;
   OrderByDescending<TKey>(key: (T) -> TKey): IOrderedEnumerable<T>  where TKey: IComparable<TKey>;
   Reverse(): IEnumerable<T>;
-  // Set-like (LAZY; require hashable T)
-  Distinct(): IEnumerable<T>;  Union(other); Intersect(other); Except(other): IEnumerable<T>;
+  // (the hashable-requiring operators are a separate constrained block, below)
   // Slicing (LAZY; counts CLAMP)
   Take(count: int); TakeWhile(predicate); Skip(count: int); SkipWhile(predicate): IEnumerable<T>;
   // Combination and grouping (LAZY)
   Concat(other: IEnumerable<T>): IEnumerable<T>;
   Zip<U, R>(other: IEnumerable<U>, combine: (T, U) -> R): IEnumerable<R>;   // ends when either ends
-  GroupBy<TKey>(key: (T) -> TKey): IEnumerable<IGrouping<TKey, T>>;
+  GroupBy<TKey>(key: (T) -> TKey): IEnumerable<IGrouping<TKey, T>>   where TKey: hashable;
   // Materialization (EAGER)
   ToArray(): owned Array<T>;
-  ToDictionary<TKey>(key: (T) -> TKey): owned Dictionary<TKey, T>;
-  ToDictionary<TKey, TValue>(key: (T) -> TKey, value: (T) -> TValue): owned Dictionary<TKey, TValue>;
+  ToDictionary<TKey>(key: (T) -> TKey): owned Dictionary<TKey, T>         where TKey: hashable;
+  ToDictionary<TKey, TValue>(key: (T) -> TKey, value: (T) -> TValue):
+      owned Dictionary<TKey, TValue>                                       where TKey: hashable;
+end
+// The six hashable-element operators are a SECOND extension block (v0.277). §26.6 merges
+// the two, so call sites are unchanged -- but write `where T: hashable` if you declare
+// your own, and expect a non-hashable T to be rejected here rather than inside Set<T>.
+public extension IEnumerable<T> where T: hashable
+  Contains(value: T): bool;
+  Distinct(): IEnumerable<T>;
+  Union(other: IEnumerable<T>): IEnumerable<T>;
+  Intersect(other: IEnumerable<T>): IEnumerable<T>;
+  Except(other: IEnumerable<T>): IEnumerable<T>;
   ToSet(): owned Set<T>;
 end
 public interface IGrouping<TKey, T>: IEnumerable<T>   readonly property Key: TKey;   end

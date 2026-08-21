@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | `draft`, **Draft 2** (2026-08-21), re-argued against **v0.276** after a three-lane costing of option (c). **Draft 2 reverses Draft 1's recommendation** — see this proposal's §11. Draft 1 was authored against v0.275. Origin is the closing comment on [#3324](https://github.com/s8lap/bezel-lang/issues/3324), which carried the question forward explicitly: *"The `OwningArray<T>` half and the conditional-member question are being carried forward as their own work rather than left implicit here."* |
+| **Status** | **`graduated-v0.277` — superseded** (owner go, 2026-08-21). Landed as spec §14.2 *Conditionally-admitted members* with its three-row register, §35.2's narrowing, §3.6's pointer sentence, Appendix C.1's row, the `ReadOnlySpan<T>.ToArray()` deletion, D9's respell, and rationale §5.15; five `DECLINED.md` rows landed with it. ⚠ **The register's keystone is not landed and was not this revision's to land:** [#3336](https://github.com/s8lap/bezel-lang/issues/3336) — §26.4's block `where` clause does not filter extension applicability, so D9's respell is correct and **inert** until it does. *(prior: `draft`, **Draft 2** (2026-08-21), re-argued against v0.276 after a three-lane costing of option (c) — **Draft 2 reversed Draft 1's recommendation**, see this proposal's §11; Draft 1 was authored against v0.275.)* Origin is the closing comment on [#3324](https://github.com/s8lap/bezel-lang/issues/3324), which carried the question forward explicitly: *"The `OwningArray<T>` half and the conditional-member question are being carried forward as their own work rather than left implicit here."* |
 | **Tracking issue** | [**#3328**](https://github.com/s8lap/bezel-lang/issues/3328) (opened at the v0.276 landing). The issues this proposal's §10 asks for are filed: [#3329](https://github.com/s8lap/bezel-lang/issues/3329) (the C1 diagnostic), [#3330](https://github.com/s8lap/bezel-lang/issues/3330) (is a member-level `where` inert?), [#3331](https://github.com/s8lap/bezel-lang/issues/3331) (the unenforced conditions), [#3332](https://github.com/s8lap/bezel-lang/issues/3332) (can `check_docs.sh` police the register?). |
 | **Target module(s)** | **spec** — [§14.2](../Bezel_Language_Spec.md#sec-constraints) gains one subsection (*Conditionally-admitted members*, with a register table: the whole normative payload); [§35.2](../Bezel_Language_Spec.md#sec-choice-members)'s v0.233 paragraph is **narrowed to its choice-specific half** and cites the general rule for the rest; [§3.6](../Bezel_Language_Spec.md#sec-derived-type-properties)'s reservation paragraph gains one sentence (D5). **stdlib** — four prose sites gain a citation apiece; §5's six hashable-requiring operators move to a constrained extension block (D9); [§4.5](../Bezel_Standard_Library.md#sec-ownedarrayt) gains two declaration lines under D3's branch A. **rationale** — [§5.15](../Bezel_Design_Rationale.md#sec-owned-buffers-and-spans) one decision record. **`Bezel_For_Code_Generation.md`** — one line, D3-dependent (§9 obligation). **guides** — Guide 02 teaches C3's combinators but states no rule this proposal moves, so no pin moves (verified, this proposal's §6, *Not edited*). **Appendix A** — untouched: **no grammar changes, no new tokens** (D7 is a semantic rejection of an already-grammatical form). **Appendix C** — one row (D7's rejection). **`DECLINED.md`** — four decline-index rows (this proposal's §9). |
 | **Written against** | Draft 2: spec/stdlib/rationale/changelog **v0.276**, HEAD `b26ad189`. ⚠ **Every `file:line` written in Draft 1 has drifted 1–6 lines** under v0.276's edits to §9.2, §25.2 and §35.7; citations in sections Draft 2 rewrote are re-verified, and those in sections it did not are marked *(Draft 1 numbering)*. Draft 1: **v0.275**, HEAD `17db9bee`. Every quotation was re-verified against that tree. Compiler citations are `file:line` at that commit and were obtained **by reading only** — this proposal's author could not build or run `bezelc`, and every claim that would require a build is marked as such and left unasserted. |
@@ -28,7 +28,7 @@ Four facts, each established in this proposal's §1 and §4:
 
 5. **Users are not as helpless as the framing assumes.** §26.4's own worked example is a constrained extension declaring `Sort()` — *"`extension IEnumerable<T> where T: IComparable<T>`"* (`Bezel_Language_Spec.md:5870`) — and §26.4 states its meaning normatively: *"A `where` clause on the block constrains which instantiations of the extended type the extension applies to."* A user **can** write a conditional member today, under any name the receiver type does not already declare, whenever the condition is a §14.2 constraint. The stdlib's five are precisely the cases where one of those two conditions fails.
 
-**Draft 2 recommends a fourth option the framing did not contain, and that Draft 1 argued against: retire four of the five, and register the one that is left.**
+**Draft 2 recommends a fourth option the framing did not contain, and that Draft 1 argued against: retire four of the five, and register what is left.**
 
 Draft 1 recommended option (b) — register all four surviving rows as a standing privilege. A costing of option (c) (this proposal's §5.3, rebuilt) found that Draft 1 had argued the weak version of it. Option (c) is not *"delete the members"*; it is **remove the conditionality**, and on that reading four of the five rows leave the census on their own evidence:
 
@@ -40,7 +40,12 @@ Draft 1 recommended option (b) — register all four surviving rows as a standin
 | **C3** `Result<T, E>`'s four combinators | Shipped, ~455 lines | **Route to its own ruling** — proposal 0075 §3.3 Option B makes it an ordinary constrained extension |
 | **C1** `Array<T>.Sort()`/`Sorted()` | Shipped, hardened, five issues | **Register it** — the one true residue |
 
-So the register lands with **one row, carrying a recorded expiry**, not four as a standing privilege. That is a materially smaller normative claim than Draft 1 made, and it is the difference between *"the standard library may do what users cannot"* and *"one member does, for a reason that is written down and will lapse."*
+⚠ **Corrected before graduation.** An earlier wording of this paragraph said the register lands with *"one row"*. That was true only of the version in which C2 was **deleted** and C3's ruling landed simultaneously. §5.3.1 reverses the first, and D1 item 3 routes the second, so **both remain conditional members until their own forums decide them — and a member that remains is a member that must be anchored, which is the entire purpose of the register.** The true shape is:
+
+- **Retired from the census: two.** C4 is deleted; C5 is respelled.
+- **Registered: three.** C1, C2, C3.
+
+**What makes this different from Draft 1 is not the count — it is that no row is a standing privilege.** Draft 1 would have registered four members with a growth discipline and nothing else. Every row here carries its own disposition off the register: C1 an **expiry** (re-examined when proposal 0005 self-hosts the collections), C2 a **route** (the v0.283 subtraction review, with its status as unimplemented on the row's face — D8's discipline), C3 a **route** (its own ruling, per proposal 0075 §3.3 Option B). The register is a holding pen with three occupants and three exit doors, not a grant of four permanent privileges. If all three routes complete, it empties.
 
 **What C1's residue actually is.** Its predicate `T: IComparable<T>` is already a writable §14.2 constraint; it is blocked only by §26.5 rule 1's name rule. Renaming does not rescue it, because `Array<T>` is a declaration-less builtin (`src/common/BuiltinRegistry.cpp:679`) and `src/runtime/` is C — the sort stays a compiler intrinsic under any spelling. **C1 is an artifact of the standard library not being self-hosted, not a language design commitment**, and its register row says so and points at proposal [0005](0005-selfhost-stdlib-collections.md).
 
@@ -200,7 +205,7 @@ Five members. Four families. Eighty-nine revisions between the first (v0.186) an
 
 The practice is small enough to enumerate on one screen and old enough that no revision has enumerated it. Draft 1 read that as the argument for a **register** over either a general feature or a removal.
 
-**Draft 2 reads it differently, because the costing changed two of the five facts above.** An enumerable practice with no enumeration does grow silently — but three of these five rows are not a *practice* at all: C4 is a member the compiler rejects, C2 is a member the compiler never had, and C5 needs no privilege by this proposal's own D9. What the census actually shows is **one shipped conditional member (C1), one shipped-and-anchored one (C3), and three documents-only entries**. Registering all four would have written three fictions into a normative table and given them a growth discipline. The register is still right for what is left; what is left is one row.
+**Draft 2 reads it differently, because the costing changed two of the five facts above.** An enumerable practice with no enumeration does grow silently — but three of these five rows are not a *practice* at all: C4 is a member the compiler rejects, C2 is a member the compiler never had, and C5 needs no privilege by this proposal's own D9. What the census actually shows is **one shipped conditional member (C1), one shipped-and-anchored one (C3), and three documents-only entries**. Registering all four would have written two fictions into a normative table and given them a growth discipline — C4, which the compiler rejects, and C5, which needs no privilege at all. The register is still right for what is left; what is left is **three rows, each with a route or an expiry off it** (this proposal's §0).
 
 ---
 
@@ -208,7 +213,7 @@ The practice is small enough to enumerate on one screen and old enough that no r
 
 ### D1 — A conditional member is a **standing, stated, compiler-known-standard-library privilege**, defined once in §14.2 and carried in a closed register ▲
 
-**Decision (Draft 2).** **Retire four, register one.** Draft 1's decision — option (b) over all four surviving rows — is superseded; what remains of it is the mechanism, applied to a single row.
+**Decision (Draft 2).** **Retire two, register three — and no row is a standing grant** (this proposal's §0, corrected before graduation). Draft 1's decision — option (b) over all four surviving rows — is superseded; what remains of it is the mechanism, applied to a single row.
 
 1. **C4 and C2 are deleted from the standard library**, as ordinary corrections: C4 because §4.14 documents a call the compiler rejects (the defect class v0.275 corrected in the opposite direction), C2 because ninety revisions of zero implementation and zero call sites is what process §10's subtraction review exists to act on. Neither deletion needs this proposal's mechanism, and neither is a design change — see §5.3.
 2. **C5 is respelled** as `extension IEnumerable<T> where T: hashable` (D9, unchanged from Draft 1), which needs no privilege.
@@ -417,7 +422,7 @@ Draft 2's remaining findings on this row stand. Draft 2 adds that the presentati
 
 **C3 — routed, not deleted, and this is where Draft 1's decline actually fails.** Draft 1 declined option (c) partly because *"the removal does not achieve its own goal — C3 stays regardless"*. That is true of deletion and false of the strong reading. §26.2's own exclusion sentence names the way out:
 
-> Choices. The extendable list above is closed against the choice kind — **no [§14.2] constraint names the value-like classification** a payload-generic extension surface would need, and the value-payload combinator surface of stdlib `Result<T, E>` is **compiler-provided** ([§35.2]), not an extension block.
+> Choices. The extendable list above is closed against the choice kind — **no [§14.2] constraint names the value-like **classification bound** a payload-generic extension surface would need, and the value-payload combinator surface of stdlib `Result<T, E>` is **compiler-provided** ([§35.2]), not an extension block.
 
 The privilege exists *because* the constraint vocabulary is too narrow — stated in the section that closes the escape route, added at **the same v0.233 landing that created C3**, citing C3 as its reason. Admit the constraint and the exclusion's own stated ground evaporates. Proposal 0075 §3.3 **Option B** specified exactly this and was declined at v0.233 as *"permanent user-facing constraint vocabulary bought on one program's evidence"*.
 
@@ -481,10 +486,10 @@ That does not meet R1's bar as worded — R1 asks for evidence that the *predica
 
 ⚠ **Draft 2 replaces this table.** Draft 1's version scored option C at *"2 of 5 rows resolved"* and *"contradicts a recorded decision — v0.275, hours old"*, both of which priced the deletion reading. The strong reading of C resolves four and contradicts nothing: v0.275's decision is about **C1**, which Draft 2 also declines to remove.
 
-| | A (user feature) | B (register all four) | **C′ (retire four, register one)** | D (nothing) |
+| | A (user feature) | B (register all four) | **C′ (retire two, register three with routes)** | D (nothing) |
 |---|---|---|---|---|
-| Census rows resolved | 1 of 5 | 5 of 5, by registering 3 fictions | **5 of 5, by deleting 2 and routing 1** | 0 |
-| Normative claim made | a new admissibility form | a standing four-row privilege | **one row, with a recorded expiry** | none |
+| Census rows resolved | 1 of 5 | 5 of 5, by registering 2 fictions | **5 of 5: one deleted, one respelled, three registered with routes** | 0 |
+| Normative claim made | a new admissibility form | a standing four-row privilege | **three rows, none standing: one expiry, two routes** | none |
 | Contradicts a recorded decision | v0.56, v0.97 (weakly) | no | **no** — v0.275 governs C1, which C′ keeps | no |
 | New grammar / tokens | new semantics for an existing form | none | **none here**; C3's routed ruling costs one contextual keyword | none |
 | Undefined interactions opened | four | none | **none** | four already open |
@@ -762,7 +767,7 @@ stdlib §4.14 records the gap in this proposal's own vocabulary (`Bezel_Standard
 
 ## 9. Reopening bars, collected
 
-⚠ **Draft 2 changes R3 and suspends R1.** R3 routed `DangerousPointer()`'s removal to the v0.283 subtraction review and declined removing it *as a side effect of defining a mechanism*; Draft 2 **recommends the removal outright** (§5.3.1), so R3 is no longer a decline — it is a proposed deletion, and the row below is kept only as the record of Draft 1's position. R1 is **suspended, not withdrawn**: its bar asks for evidence about the predicate vocabulary rather than the name, and [#3336](https://github.com/s8lap/bezel-lang/issues/3336) shows the mechanism the bar presumes does not currently function, so the bar can be neither met nor missed until #3336 lands. §5.5's prior art suggests it is aimed at the wrong thing and should be re-drawn at graduation. **R2 and R4 are unchanged.**
+⚠ **Draft 2 changes R3 and suspends R1.** R3 routed `DangerousPointer()`'s removal to the v0.283 subtraction review and declined removing it *as a side effect of defining a mechanism*; an intermediate wording of Draft 2 recommended removing it outright; that was reversed on the BLAS/argv evidence (§5.3.1, C2), so **R3 stands as written** and is the row `DECLINED.md` indexes. R1 is **suspended, not withdrawn**: its bar asks for evidence about the predicate vocabulary rather than the name, and [#3336](https://github.com/s8lap/bezel-lang/issues/3336) shows the mechanism the bar presumes does not currently function, so the bar can be neither met nor missed until #3336 lands. §5.5's prior art suggests it is aimed at the wrong thing and should be re-drawn at graduation. **R2 and R4 are unchanged.**
 
 **Draft 2 adds one bar of its own:**
 
@@ -785,7 +790,7 @@ stdlib §4.14 records the gap in this proposal's own vocabulary (`Bezel_Standard
 
 ### Questions
 
-⚠ **Draft 2 supersedes Q1, Q2 and Q4.** **Q1** — D1's option — is now answered by §5.3's costing rather than put to the owner as an open choice: retire four, register one. **Q2** (D3's branch) was landed at v0.276. **Q4** (should `DangerousPointer()` be a subtraction-review candidate) is superseded by §5.3.1's recommendation to delete it outright, which the owner may still prefer to route to v0.283 instead. **Q3 and Q5 stand.**
+⚠ **Draft 2 supersedes Q1, Q2 and Q4.** **Q1** — D1's option — is now answered by §5.3's costing rather than put to the owner as an open choice: retire two, register three, no row a standing grant. **Q2** (D3's branch) was landed at v0.276. **Q4** (should `DangerousPointer()` be a subtraction-review candidate) is **answered yes** by §5.3.1 — an intermediate wording of Draft 2 recommended deleting it outright and was reversed on the evidence; Draft 1's R3 stands. **Q3 and Q5 stand.**
 
 **Draft 2's questions:**
 
