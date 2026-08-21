@@ -4303,6 +4303,23 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         common::conditionalCaseArmMeetIsOwned(
             e, ctx_, [](const sema::TypeRef* t) { return t; }))
         return OwnershipState::Owned;
+    // §28.3 range-slice row (v0.240, #2753): `arr[r]` on `Array<T>` is a
+    // a fresh `Array<T>` slice — the compiler-recognized `Slice(r: Range<int>):
+    // owned Array<T>` form (stdlib §4.4) — and is NOT the indexer row above.
+    // ProducerState previously had no IndexExpr arm, so the slice fell through
+    // to the §28.3 indexer row (Borrowed, the receiver as transit point) and
+    // was never reclaimed in any binding spelling (`const`, `using var`, plain
+    // `var`) — container allocated by `bz_array_slice` and never freed. The
+    // shared predicate is the SAME one the §21.1 `const` rejection and the
+    // #2073 lint guard already use (common::isBuiltinArrayRangeSliceIndex), so
+    // a single condition carries the sema classification, the const-rejection
+    // messaging, and the codegen reclaim eligible set — they cannot skew. The
+    // sema fix is load-bearing: producerState == Owned is the gate the
+    // registerUsingDisposal and the materializer-reclaim paths both consult.
+    // // per §28.3, §15.6, §21.1, #2749, #2753
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+        if (common::isBuiltinArrayRangeSliceIndex(*ix, ctx_))
+            return OwnershipState::Owned;
     // Default: Borrowed.
     return OwnershipState::Borrowed;
 }
@@ -4550,14 +4567,31 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
             }
         }
     }
-    // An INDEXER access — a bare `coll[i]` / `arr[i]`. The element-slot table
+    // An INDEXER access — a bare `coll[i]` / `arr[i]` (single-element read, NOT
+    // the range-slice `arr[r]`; see the carve-out below). The element-slot table
     // (§28.11) classifies indexer-get / default iteration as a BORROW out
     // (source: the collection, a transit point), for both borrowing and owning
     // families. Ownership leaves a collection only through `move coll[i]`, the
     // `Pop*` family, or `Drain()` — a UnaryExpr / call, never a bare IndexExpr —
     // so those keep their adoption. // per §28.10, §28.11, #2128
-    if (dynamic_cast<const ast::IndexExpr*>(&init))
-        return true;
+    if (dynamic_cast<const ast::IndexExpr*>(&init)) {
+        // CARVE-OUT (#2753): the range-slice `arr[r]` on `Array<T>` is §28.3's
+        // OWNED producer row (a fresh `Array<T>`, the compiler-recognized
+        // `Slice(r: Range<int>): owned Array<T>` form, stdlib §4.4), NOT an
+        // indexer row. The producerState IndexExpr arm classifies it Owned;
+        // matching that, the using-var over it is an ADOPTION (the new Array<T>
+        // needs scope-end disposal), NOT a borrow-pin. Without this carve-out
+        // the prior #2128 rule would treat every `using var s := arr[…]`
+        // binding as a pin and skip the disposal — leaving the leaked slice
+        // the adopting owner should release. The same predicate `const`
+        // rejections and the #2073 lint guard already use (the `producerState`
+        // IndexExpr arm's gate, common::isBuiltinArrayRangeSliceIndex) is the
+        // single condition here — a single fact for the three channels. // per
+        // §28.3, §28.10, §28.11, #2749, #2753
+        if (!common::isBuiltinArrayRangeSliceIndex(
+                *static_cast<const ast::IndexExpr*>(&init), ctx_))
+            return true;
+    }
     // A concrete borrow-returning CALL — a directly-resolved user method whose
     // declared return is not `owned` and whose EVERY return is a bare receiver-
     // owned-field borrow (`return this._f`). methodReturnsOnlyWrapperReceiver-
