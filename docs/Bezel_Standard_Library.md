@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.269 — August 2026**
+**Companion to the Bezel Language Specification, v0.270 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -2464,7 +2464,7 @@ public class OwningBuffer<T>                              // no IEnumerable conf
   // move buf[i] NOT admitted (values have no ownership; use plain read)
 
   // Foreign-memory access (v0.186; language spec §32.12) — admitted only for
-  //   FFI-pointee scalar and C-compatible-record T; see prose. The result type
+  //   T in the language spec §32.12 FFI-pointee set; see prose. The result type
   //   lives in System.Interop: naming Ptr<T> requires that import, using the
   //   returned value does not (language spec §2.8.3 rule 2; v0.265).
   public method DangerousPointer(): Ptr<T>;
@@ -2492,7 +2492,7 @@ The "Owning" in the name refers to the buffer-class's ownership of *its allocate
 
 **Span views (v0.109).** `AsSpan()` and its overloads return a `Span<T>` (writable view) over a contiguous range of the buffer; `AsReadOnlySpan()` returns a `ReadOnlySpan<T>`. These views are non-allocating record constructions and admit the standard span surface (`Slice`, indexer, search, equality, bulk mutation per T's category). The methods are pure ergonomics — `buf.AsSpan(0, 100)` reads more naturally than `new Span<T>(buf, 0, 100)` and matches the established pattern from v0.104's `string.AsSpan()` and v0.107's `Array<T>.AsSpan()`. `AsSpan` returns the writable form by default (matching the buffer's mutability); callers wanting read-only access either call `AsReadOnlySpan` directly or call `.AsReadOnly()` on the writable form. The four overload signatures of each form accept range parameters: no-arg (full buffer, `0..<Length`), `(start)` (from offset to end), `(start, length)`, or `(r: Range<int>)`. Bounds-check semantics follow the standard Bezel convention: `IndexOutOfRangeException` if `start` or `length` is out of range against the buffer's `Length`.
 
-**`DangerousPointer()` (v0.186).** Returns the address of slot 0 as a `Ptr<T>` (language spec [§32.12](Bezel_Language_Spec.md#sec-foreign-memory)), valid until the buffer is disposed. Declared on the value-typed presentation only, and admitted only where `T` is an FFI-pointee scalar — integer types, `float`, `double`, `bool`, `IntPtr`, `UIntPtr` — or a C-compatible record (language spec [§32.13](Bezel_Language_Spec.md#sec-c-compatible-records)); every other `T` — classes (the class-typed presentation never satisfies the gate, so the member does not appear there), `string`, and `Ptr<U>` elements (whose slot address would reconstruct the declined `Ptr<Ptr<U>>`) — is rejected at the call's instantiation with a diagnostic naming the set. Pointer arrays are `OwningBuffer<IntPtr>` — exactly the argv shape. The `Dangerous` prefix marks the one accessor family whose result aliases mutable Bezel-owned slots; native retention past the synchronous call is the language spec [§32.10](Bezel_Language_Spec.md#sec-boundary-contract) obligation, and the recorded mitigation is the wrapper class that owns buffer and registration together.
+**`DangerousPointer()` (v0.186).** Returns the address of slot 0 as a `Ptr<T>` (language spec [§32.12](Bezel_Language_Spec.md#sec-foreign-memory)), valid until the buffer is disposed. Declared on the value-typed presentation only, and admitted only where `T` is in the **FFI-pointee set** — `Ptr<T>`'s own pointee gate (language spec [§32.12](Bezel_Language_Spec.md#sec-foreign-memory)): integer types, `float`, `double`, `bool`, `IntPtr`, `UIntPtr`, and C-compatible records (language spec [§32.13](Bezel_Language_Spec.md#sec-c-compatible-records)). The result is a `Ptr<T>`, so the gate is the same gate: every other `T` — classes (the class-typed presentation never satisfies the gate, so the member does not appear there), `string`, and `Ptr<U>` elements (whose slot address would be the declined `Ptr<Ptr<U>>`) — is rejected at the call's instantiation with a diagnostic naming the set. Pointer arrays are `OwningBuffer<IntPtr>` — exactly the argv shape. The `Dangerous` prefix marks the one accessor family whose result aliases mutable Bezel-owned slots; native retention past the synchronous call is the language spec [§32.10](Bezel_Language_Spec.md#sec-boundary-contract) obligation, and the recorded mitigation is the wrapper class that owns buffer and registration together.
 
 **Iteration.** For class-typed T, `OwningBuffer<T>` implements `IEnumerable<T?>`; iteration yields borrows of `T?` (slot contents, possibly null). The `for var x in buf do ... end` form works both via the enumerator protocol and via the direct-indexed-loop optimization that [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) permits for concretely-typed sources. For value-typed T, `OwningBuffer<T>` does *not* implement `IEnumerable<T>` (the type-parameter-category dispatch would require conditional interface implementation, which Bezel does not currently provide as a general mechanism). `for var x in buf do ... end` over a value-typed OwningBuffer desugars to a direct indexed loop per the [§29.2](Bezel_Language_Spec.md#sec-desugaring-of-for) extension; the iteration variable has type T and is a copy of the slot. Users who need IEnumerable<T> conformance on a value-typed buffer can wrap or convert.
 
@@ -5456,7 +5456,7 @@ public record Ptr<T>
 end Ptr;
 ```
 
-The pointee gate mirrors language spec [§32.12](Bezel_Language_Spec.md#sec-foreign-memory): `T` is drawn from the FFI-pointee set — integer types, `float`, `double`, `bool`, `IntPtr`, `UIntPtr`, and C-compatible records (language spec [§32.13](Bezel_Language_Spec.md#sec-c-compatible-records)); any other instantiation is rejected at the instantiation site with a diagnostic naming the set. `Ptr<Ptr<U>>` is not admitted; pointer-array walking is `Ptr<IntPtr>` plus explicit re-typing.
+The pointee gate mirrors language spec [§32.12](Bezel_Language_Spec.md#sec-foreign-memory): `T` is drawn from the FFI-pointee set — integer types, `float`, `double`, `bool`, `IntPtr`, `UIntPtr`, and C-compatible records (language spec [§32.13](Bezel_Language_Spec.md#sec-c-compatible-records)); any other instantiation is rejected at the instantiation site with a diagnostic naming the set. `Ptr<Ptr<U>>` is not admitted — `Ptr<U>` is an FFI-compatible scalar (language spec [§32.5](Bezel_Language_Spec.md#sec-ffi-compatible-types)) but is not in this set; pointer-array walking is `Ptr<IntPtr>` plus explicit re-typing.
 
 `CopyToArray(count)` copies `count` elements from foreign memory into a fresh Bezel-owned `Array<T>`; `CopyFromArray(source)` writes `source.Count` elements at `p`. Both are explicit whole-copies — foreign data becomes Bezel data at exactly one visible point.
 

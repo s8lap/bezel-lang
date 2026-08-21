@@ -83,7 +83,7 @@ Implementation milestones (e.g., "lexer for §1," "parser for §17 expression gr
 
 These require explicit human direction; do not undertake them on your own initiative:
 
-- **Changes to the documents in `docs/`** (spec, rationale, stdlib, guides). These are amended through their own dedicated workflow (per-revision changelog, full mechanical validation), not as part of implementation PRs.
+- **Changes to the documents in `docs/`** (spec, rationale, stdlib, guides). These are amended through their own dedicated workflow, written down in [`docs/proposals/spec-change-process.md`](docs/proposals/spec-change-process.md) — **read it before amending any normative document.** It defines the change classes (editorial / clarification / ruling / design-change / Ratchet) and the gate each one earns, the artifacts each revision must leave behind, and a one-screen checklist (§9) covering the version-header bump, the kernel and body-locality classifications, the `DECLINED.md` obligation, and the code-generation-reference obligation. Amendments are not part of implementation PRs.
 - **Changes to the project's license or governance.**
 - **Adoption of new dependencies.** Dependencies are debt; adding one is a project-level decision.
 - **Performance optimization that complicates code.** Until the compiler is functionally complete, simplicity beats speed. A correct slow compiler can be made fast; a fast incorrect one cannot be made correct.
