@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.274. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.275. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -708,7 +708,7 @@ public interface IFormattable      method ToString(format: string): string;   en
 public class Subscription  destructor; end     // no public ctor; returned as `owned Subscription`
 ```
 
-`IComparable<T>`/`IEquatable<T>` are **invariant**. `BitConverter`: `FloatToInt32Bits`, `Int32BitsToFloat`, `DoubleToInt64Bits`, `Int64BitsToDouble`, `Reinterpret<TTo>(value)`. `Type` (`public sealed class`): `Name`, `FullName`, `IsClass/IsInterface/IsRecord/IsEnum/IsPrimitive/IsInlineArray/IsFunctionType/IsValueType`, `BaseType: Type?`, `Implements(iface)`, `IsAssignableFrom(other)`, `EnumNames`, `EnumValues` — **no member reflection at all** (declined, not deferred).
+`IComparable<T>`/`IEquatable<T>` are **invariant**. `BitConverter`: `FloatToInt32Bits`, `Int32BitsToFloat`, `DoubleToInt64Bits`, `Int64BitsToDouble`, `Reinterpret<TTo>(value)`. `Type` (`public sealed class`): `Name`, `FullName`, `IsClass/IsInterface/IsRecord/IsEnum/IsChoice/IsPrimitive/IsInlineArray/IsFunctionType/IsValueType`, `BaseType: Type?`, `Implements(iface)`, `IsAssignableFrom(other)`, `EnumNames`, `EnumValues` — **no member reflection at all** (declined, not deferred).
 
 **Format specifiers** (invariant culture only; an unrecognized specifier raises `FormatException`): integers `D`/`Dn`, `X`/`x`/`Xn`, `B` (no grouping separators); `double`/`float` `F`/`Fn` (default 2), `E`/`En`, `G`/`Gn`, `P`/`Pn`, `R`; `decimal` `F`/`Fn`, `E`/`En`, `G`, `P`/`Pn` (midpoints half-to-even); `DateTime`/`DateOnly`/`TimeOnly` patterns of `yyyy MM dd HH mm ss fff` with every other character a literal; `TimeSpan` `c`; `Guid` `D`/`N`; `bool`, `char`, `string` take **none** — a format spec on those is a compile error. **`C` (currency) deliberately does not exist**: write `$"{amount:F2} EUR"`.
 
@@ -818,6 +818,8 @@ public class Array<T>: IList<T>                      // borrowing, resizable
   method AsSpan([start[, length]] | r: Range<int>): ArraySpan<T>;
   method AsReadOnlySpan([start[, length]] | r: Range<int>): ReadOnlyArraySpan<T>;
   method Slice(r: Range<int>): owned Array<T>;       // `arr[r]` is the compiler-recognized form
+  method Sort(); method Sorted(): owned Array<T>;    // natural order; only where T: IComparable<T>,
+                                                     //   checked at the call's instantiation (v0.275)
 end
 ```
 
@@ -837,7 +839,9 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
   method TryPopFirst(out owned item: T?): bool;   TryPopLast(out owned item: T?): bool;
   method Drain(): IOwningEnumerable<T>;
 end
-public extension OwningArray<T> where T: class, IComparable<T>   method Sort();  end
+// No `OwningArray<T>` extension supplies a default-comparer `Sort`: §26.5 rule 1
+// commits instance resolution by *name*, and the class declares `Sort` above, so an
+// extension member of that name is never consulted. Callers pass a comparer.
 ```
 
 There is **no `TryPopAt`**, and `OwningArray<T>` declares **no `Reversed`, no `Sorted`, no `ToArray`** — an *owning* copy is inexpressible. Reorder in place with `Reverse()`/`Sort()`; move elements to a new owning collection with `Drain()`. `move arr[i]` takes an element out, leaving the slot moved-from (reassign it before the next exit point). `Drain()` mints a fresh drain-view frame — disposing the frame does not dispose the collection, and partial iteration leaves the remainder.
@@ -1319,7 +1323,7 @@ All string comparison is **ordinal** (code-point), `ignoreCase` included; `Lengt
 
 ### 5.10 FFI
 
-The carriers are `IntPtr`/`UIntPtr` (records: `static const Zero`, `=`, `<>`; opaque, never dereferenced), `CString` (`static From(s: string): owned CString`, `static FromBytes(bytes: Array<byte>): owned CString`, `Length`, `Pointer: IntPtr`, `ToBytes(): owned Array<byte>`, `destructor`), `WString` (`static From`, `Length`, `Pointer`, `destructor`), `RawBytes` (`static From(buffer: Array<byte>)`, `static FromForeign(p: IntPtr, length: int, freeOnDispose: bool := false)`, `Length`, `Pointer`, `CopyTo(destination: Array<byte>, destOffset: int)`, `destructor`) — none has a public constructor — plus `System.Interop`'s `Ptr<T>` and `Interop` (`LastErrno()`, `CodeAddress<F>(callback)`). For the `extern` declaration syntax and the pointee gating, read spec §32 and stdlib §10.
+The carriers are `IntPtr`/`UIntPtr` (records: `static readonly property Zero`, `Equals`, `GetHashCode`, `=`, `<>`; opaque, never dereferenced), `CString` (`static From(s: string): owned CString`, `static FromBytes(bytes: Array<byte>): owned CString`, `Length`, `Pointer: IntPtr`, `ToBytes(): owned Array<byte>`, `destructor`), `WString` (`static From`, `Length`, `Pointer`, `destructor`), `RawBytes` (`static From(buffer: Array<byte>)`, `static FromForeign(p: IntPtr, length: int, freeOnDispose: bool := false)`, `Length`, `Pointer`, `CopyTo(destination: Array<byte>, destOffset: int)`, `destructor`) — none has a public constructor — plus `System.Interop`'s `Ptr<T>` and `Interop` (`LastErrno()`, `CodeAddress<F>(callback)`). For the `extern` declaration syntax and the pointee gating, read spec §32 and stdlib §10.
 
 ### 5.11 What the standard library does **not** have
 
@@ -1350,7 +1354,7 @@ What is **not** pure, where a writer expects it to be:
 - In the bit tier: every read, every write (including `TryWrite*`), every `TryRead*`, `AlignedTail`, `AsReadOnly`, and the two *delegating* entry points `Span<byte>.AsBitReader`/`ArraySpan<byte>.AsBitReader` — the four *constructing* entry points are pure.
 - `Exception(message, cause)` and `Exception.ToString()`. (`Exception()`, `Exception(message)`, `ArgumentException(message)` and `ArgumentException(message, paramName)` are `pure constructor`s.)
 
-The pure collection surface is small and worth knowing by heart: `IReadOnlyCollection<out T>.Count` (an interface slot — every conformer must be pure), `Count`/`Capacity` on `Array<T>`/`OwningArray<T>`, `Count` on the dictionaries, sets, `LinkedList`s and `Counter<K>` (plus `Counter.Total`, `SortedDictionary.FirstKey`/`LastKey`, `SortedSet.First`/`Last`, `LinkedList.First`/`Last`/`FirstNode`/`LastNode`), `StringBuilder.Capacity`, and `Peek()` on all four stack/queue types.
+The pure collection surface is small and worth knowing by heart: `IReadOnlyCollection<out T>.Count` (an interface slot — every conformer must be pure), `Count`/`Capacity` on `Array<T>`/`OwningArray<T>`, `Count` on the dictionaries, sets, `LinkedList`s and `Counter<K>` (plus `Counter.Total`, `SortedDictionary.FirstKey`/`LastKey`, `SortedSet.First`/`Last`, `LinkedList.First`/`Last`/`FirstNode`/`LastNode`), `StringBuilder.Capacity`, `OwningBuffer<T>.Length`, and `Peek()` on all four stack/queue types.
 
 **Nothing in the query operators, threading, I/O, diagnostics, or the `Result` combinators carries `pure`.** `pure` is admitted on a getter (`pure get`) and **never on a setter — `pure set` does not parse** (§22.15).
 
