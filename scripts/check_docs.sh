@@ -272,7 +272,14 @@ for k in ('spec',):
         # skip cross-doc citations: a doc name in the 24 chars before, OR a
         # markdown link to a different doc file in the 60 chars after (the
         # '[§5.11](Bezel_Design_Rationale.md#...)' form — doc name follows the §).
-        pre = text[k][max(0, m.start()-24):m.start()].lower()
+        # The lookback is measured in COLLAPSED text, not raw characters: an
+        # indented, wrapped citation puts "(rationale" at the end of one line and
+        # "§5.18, §5.22)" at the start of the next, behind 30+ spaces of comment
+        # indentation, so a raw 24-char window sees only whitespace. That single
+        # site in Appendix A.3 produced both standing advisories for many
+        # revisions -- a check crying wolf, which is the failure mode this file
+        # keeps rediscovering.
+        pre = ' '.join(text[k][max(0, m.start()-160):m.start()].split()).lower()[-24:]
         if any(w in pre for w in ('stdlib', 'standard library', 'rationale', 'guide')):
             continue
         post = text[k][m.end():m.end()+60]
