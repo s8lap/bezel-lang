@@ -835,14 +835,17 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
   method Insert(index: int, owned item: T);
   method RemoveAt(index: int);   Remove(item: T): bool;   Clear();      // all dispose
   method Contains(item: T): bool;   IndexOf(item: T): int;
-  method Sort(comparer: (T, T) -> int);   Reverse();     // the comparer takes borrows
+  method Sort(comparer: (T, T) -> int);   Sort();   Reverse();   // comparer takes borrows;
+                                                                //   bare Sort() is natural order,
+                                                                //   only where T: IComparable<T>
   method PopAt(index: int): owned T;   PopFirst(): owned T;   PopLast(): owned T;   // raise if empty
   method TryPopFirst(out owned item: T?): bool;   TryPopLast(out owned item: T?): bool;
   method Drain(): IOwningEnumerable<T>;
 end
 // No `OwningArray<T>` extension supplies a default-comparer `Sort`: §26.5 rule 1
 // commits instance resolution by *name*, and the class declares `Sort` above, so an
-// extension member of that name is never consulted. Callers pass a comparer.
+// extension member of that name is never consulted. Callers pass a comparer, or
+// call the parameterless `Sort()` above where `T: IComparable<T>` (v0.276).
 ```
 
 There is **no `TryPopAt`**, and `OwningArray<T>` declares **no `Reversed`, no `Sorted`, no `ToArray`** — an *owning* copy is inexpressible. Reorder in place with `Reverse()`/`Sort()`; move elements to a new owning collection with `Drain()`. `move arr[i]` takes an element out, leaving the slot moved-from (reassign it before the next exit point). `Drain()` mints a fresh drain-view frame — disposing the frame does not dispose the collection, and partial iteration leaves the remainder.
