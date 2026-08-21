@@ -238,15 +238,22 @@ BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
         "    var xs: Set<OwningSet<Conn>> := [[new Conn(1)]]; return 0; ");
 }
 
-// `OwningDictionary<Conn, int>` is non-trivial-dispose at its VALUE
-// position (the key borrows). `Dictionary<int, OwningDictionary<Conn, int>>`
+// `OwningDictionary<Conn, Conn>` is non-trivial-dispose at its VALUE
+// position (the key borrows). `Dictionary<Conn, OwningDictionary<Conn, Conn>>`
 // is the borrowing analogue; the inner literal at the owning dictionary's
-// value position is the third fresh-producer form. // per §15.4 (#3307)
+// value position is the third fresh-producer form. The OUTER KEY is a
+// borrowed `using var` binding (NOT a fresh producer), so the rejection
+// can only come from the new third-form arm — if the new arm were
+// reverted, this row would still pass via the outer-key rejection
+// (the #2673 first arm), which is the wrong reason. The same borrowed-
+// key pattern as `array_owning_array_borrowed_inner_rejected_spec_15_4`
+// at line 184 of this file. // per §15.4 (#3307)
 BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
            dictionary_owning_dictionary_value_rejected_spec_15_4) {
     expectRejected(
-        "    var d: Dictionary<int, OwningDictionary<Conn, int>> := "
-        "        [1: [new Conn(1): 5]]; "
+        "    using var c := new Conn(7); "
+        "    var d: Dictionary<Conn, OwningDictionary<Conn, Conn>> := "
+        "        [c: [new Conn(1): new Conn(5)]]; "
         "    return 0; ");
 }
 
@@ -280,19 +287,21 @@ BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
         2);
 }
 
-// The misleading-looking case: a nested literal at `Array<OwningArray<int>>`.
-// The inner literal TARGET is `OwningArray<int>`, an owning-family head with
-// a VALUE-type element — `int` is not a non-trivial-dispose class, so
-// `OwningArray<int>` is trivial-dispose, and the new arm's predicate
-// returns false. The literal-tree ownership rule's "nested literal node"
-// admission therefore carries the inner `[1, 2]` aggregate under the
-// OUTER `OwningArray<int>` slot — which then becomes the outer
-// `Array<OwningArray<int>>`'s borrow, exactly as a sequence-of-ints does.
-// Outer `Length` = 2. // per §15.4 (#3307)
+// The trivially-dispose-bound nested literal at `Array<OwningArray<Box>>`.
+// The inner literal TARGET is `OwningArray<Box>`, an owning-family head
+// with a TRIVIAL-dispose class element (`Box` has no destructor and no
+// `owned` field, so `OwningArray<Box>` is trivial-dispose), and the new
+// arm's predicate returns false. The literal-tree ownership rule's "nested
+// literal node" admission therefore carries the inner `[new Box(1)]`
+// aggregate under the OUTER `OwningArray<Box>` slot — exactly as a
+// trivial-dispose fresh element does (#2673's `trivial_dispose_class
+// _fresh_element_admitted_spec_15_4_28_9` row). Outer `Length` = 2.
+// per §15.4, §28.9 (#3307)
 BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
-           array_owning_array_int_literal_admitted_spec_15_4) {
+           array_owning_array_box_literal_admitted_spec_15_4) {
     expectAccepted(
-        "    var g: Array<OwningArray<int>> := [[1, 2], [3]]; return g.Length; ",
+        "    var g: Array<OwningArray<Box>> := [[new Box(1)], [new Box(2)]]; "
+        "    return g.Length; ",
         2);
 }
 
@@ -314,15 +323,17 @@ BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
 // not a fresh producer). The outer literal is admitted as a borrow of
 // `a` exactly as #2673's `named_source_remedy_compiles_and_reads_back
 // _spec_15_4` reads back through a single borrow. `b` is a second owned
-// Conn read back through the second element. Read-back: 22.
-// per §15.4, §28.11 (#3307)
+// `OwningArray<Conn>` read back through the second element. Read-back: 22
+// (11 + 11 from the inner Conn.Ids). // per §15.4, §28.11 (#3307)
 BEZEL_TEST(sema_borrowing_family_nested_literal_fresh_producer_3307,
            owned_locals_as_elements_admitted_spec_15_4) {
     expectAccepted(
-        "    using var a := new Conn(11); "
-        "    using var b := new Conn(11); "
+        "    using var a := new OwningArray<Conn>(); "
+        "    a.Add(new Conn(11)); "
+        "    using var b := new OwningArray<Conn>(); "
+        "    b.Add(new Conn(11)); "
         "    var xs: Array<OwningArray<Conn>> := [a, b]; "
-        "    return xs[0].Id + xs[1].Id; ",
+        "    return xs[0][0].Id + xs[1][0].Id; ",
         22);
 }
 
