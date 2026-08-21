@@ -1,5 +1,5 @@
 // Regression tests for #1152 (§19.3): a `case` over a `decimal` scrutinee with
-// a range / relational / constant pattern aborted the compiler. A decimal value
+// a relational / constant pattern aborted the compiler. A decimal value
 // lowers to decimalStructType() (a 128-bit struct, neither integer nor floating-
 // point); the comparing-pattern handlers in patternMatches (LlvmBackend_Exprs.cpp)
 // branched only on isFloatingPointTy (FCmp) vs else (ICmp), so a decimal scrutinee
@@ -8,8 +8,21 @@
 // bz_decimal_cmp — the same path a plain `x < 2m` / a `when v < 2m` guard uses —
 // and lowers each pattern operand directly as a decimal struct (a decimal literal
 // in pattern position frequently lacks a sema exprType and would otherwise lower
-// to a `double`, feeding a double bit-pattern to bz_decimal_cmp). §19.3 does not
-// restrict a case scrutinee to integer types.
+// to a `double`, feeding a double bit-pattern to bz_decimal_cmp).
+//
+// Range patterns over a decimal scrutinee are NO LONGER tested here: §16.3
+// (v0.272, #3319) restricts `Range<T>`'s T to the integer types and `char`,
+// so a `0m..<2m` / `0m..2m` / `..` pattern over a decimal is rejected at sema
+// (range pattern is not admitted over a `decimal` scrutinee) and never reaches
+// codegen. The bz_decimal_cmp path the #1152 fix installed is still exercised
+// by the relational and constant-pattern arms below — those are the patterns
+// §16.3 leaves in scope over a decimal scrutinee. The range-pattern tests that
+// used to live here (`range_half_open_matches`, `range_half_open_excludes_upper`,
+// `range_inclusive_includes_upper`, `range_below_lower`, `range_negative_bounds`,
+// `nullable_range_present_matches`, `nullable_null_falls_to_null_arm`) were
+// removed when the §16.3 gate landed; their coverage is now provided by the
+// new tests in case_pattern_range_over_float_scrutinee_rejected_3319_test.cpp
+// (rejection) and the existing case_range_* tests for int/char (positive).
 //
 // runJit returns the raw exit code (0..255).
 
@@ -31,31 +44,6 @@ std::string decCase(const std::string& init, const std::string& arm) {
            "  return (case x of " + arm + ", _ => 4); end Main; end App;";
 }
 }  // namespace
-
-// The #1152 repro verbatim: a half-open range pattern over a decimal matches.
-BEZEL_TEST(case_decimal_pattern_1152, range_half_open_matches) {
-    BEZEL_EXPECT_EQ(run(decCase("1.5m", "0m..<2m => 2")), 2);  // 0 <= 1.5 < 2
-}
-
-// Exclusive upper bound: the boundary value is NOT in `0m..<2m`.
-BEZEL_TEST(case_decimal_pattern_1152, range_half_open_excludes_upper) {
-    BEZEL_EXPECT_EQ(run(decCase("2m", "0m..<2m => 2")), 4);  // 2 not < 2 → `_`
-}
-
-// Inclusive range includes its upper bound.
-BEZEL_TEST(case_decimal_pattern_1152, range_inclusive_includes_upper) {
-    BEZEL_EXPECT_EQ(run(decCase("2m", "0m..2m => 2")), 2);   // 0 <= 2 <= 2
-}
-
-// A value below the lower bound falls through to `_`.
-BEZEL_TEST(case_decimal_pattern_1152, range_below_lower) {
-    BEZEL_EXPECT_EQ(run(decCase("-1m", "0m..2m => 2")), 4);
-}
-
-// Negative bounds round-trip through the decimal parser's sign.
-BEZEL_TEST(case_decimal_pattern_1152, range_negative_bounds) {
-    BEZEL_EXPECT_EQ(run(decCase("-1.5m", "-2m..<0m => 2")), 2);  // -2 <= -1.5 < 0
-}
 
 // Relational pattern `< 2m` over a decimal.
 BEZEL_TEST(case_decimal_pattern_1152, relational_lt_matches) {
@@ -87,24 +75,6 @@ BEZEL_TEST(case_decimal_pattern_1152, constant_non_match) {
 // normalises scale).
 BEZEL_TEST(case_decimal_pattern_1152, constant_scale_insensitive) {
     BEZEL_EXPECT_EQ(run(decCase("1.00m", "1.0m => 7")), 7);
-}
-
-// A nullable `decimal?` scrutinee: range pattern on a present value matches.
-BEZEL_TEST(case_decimal_pattern_1152, nullable_range_present_matches) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class App public static method Main(): int "
-        "  var x: decimal? := 1.5m; "
-        "  return (case x of 0m..<2m => 2, null => 6, _ => 4); end Main; end App;"),
-        2);
-}
-
-// A null `decimal?` scrutinee never matches a comparing pattern → the null arm.
-BEZEL_TEST(case_decimal_pattern_1152, nullable_null_falls_to_null_arm) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class App public static method Main(): int "
-        "  var x: decimal? := null; "
-        "  return (case x of 0m..<2m => 2, null => 6, _ => 4); end Main; end App;"),
-        6);
 }
 
 // A nullable `decimal?` with relational then constant arms.

@@ -1835,16 +1835,22 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
 
 // §19.6 / §35.6: the shared exhaustiveness VERDICT — returns true iff `arms`
 // provably cover every value of the scrutinee (the spec-listed shapes: an
-// unguarded `_`/untyped-`var x` catch-all, a total `..` range, a covering typed
-// binding, and enum / bool / choice / `closed`-hierarchy coverage,
-// each in its nullable variant). Reused by BOTH the expression-position warning
-// (checkCaseExhaustiveness, quiet=false — emits the §19.6 warning and runs the
-// §5.1 pattern-range side-check exactly as before) and the statement-position
-// totality analysis (stmtAlwaysExits, quiet=true — §21.7 / #2129: a case
-// STATEMENT whose arms are exhaustive AND all diverge returns on every path,
-// because an unmatched value in statement position falls through (§19.6) rather
-// than raising, so only exhaustiveness closes the fall-through edge). In quiet
-// mode no diagnostic is emitted and the range side-check is skipped (the
+// unguarded `_`/untyped-`var x` catch-all, a covering typed binding, and
+// enum / bool / choice / `closed`-hierarchy coverage, each in its nullable
+// variant). A bare `..` range pattern does NOT discharge exhaustiveness on
+// its own: §19.6's list of what proves exhaustiveness is closed, and §19.3
+// (v0.273) makes that explicit — "`_` is the idiomatic spelling of an arm
+// that matches everything (§19.6 counts `_` and an untyped `var x`, not
+// `..`, toward a static exhaustiveness proof)." #3319.
+//
+// Reused by BOTH the expression-position warning (checkCaseExhaustiveness,
+// quiet=false — emits the §19.6 warning and runs the §5.1 pattern-range
+// side-check exactly as before) and the statement-position totality analysis
+// (stmtAlwaysExits, quiet=true — §21.7 / #2129: a case STATEMENT whose arms
+// are exhaustive AND all diverge returns on every path, because an unmatched
+// value in statement position falls through (§19.6) rather than raising, so
+// only exhaustiveness closes the fall-through edge). In quiet mode no
+// diagnostic is emitted and the range side-check is skipped (the
 // statement-position caller already ran it — re-running would double-report).
 bool ExprTC::caseArmsExhaustive(
     const std::vector<ast::CaseArm>& arms, const ast::Expr* scrutinee,
@@ -1873,28 +1879,6 @@ bool ExprTC::caseArmsExhaustive(
     // case is non-exhaustive regardless of the non-null coverage below.
     bool nullableUncovered =
         scrutTy && scrutTy->nullable && !armsCoverNull(arms);
-
-    // §19.3 / §19.5 / §19.6 (#1472): a bare `..` RangePattern (no lo/hi/step,
-    // grammar A.7) is vacuously satisfied by every value in the value domain,
-    // so an unguarded `..` arm covers all NON-NULL values — but a range pattern
-    // never matches null (§19.5: null is matched only by `null`/untyped `var
-    // x`/`_`). For a non-nullable scrutinee this is a total catch-all
-    // (exhaustive); for a nullable scrutinee the non-null domain is covered but
-    // `null` still needs its own arm (§19.6 nullable rule). Mirrors the
-    // typed-binding-covers-the-full-type logic below. Without this a valid
-    // total `..` case drew a spurious non-exhaustiveness warning.
-    for (const auto& arm : arms) {
-        if (arm.guard) continue;
-        auto* rp = dynamic_cast<const ast::RangePattern*>(arm.pattern.get());
-        if (!rp) continue;
-        auto* re = dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get());
-        if (re && !re->lo && !re->hi && !re->step) {
-            if (!nullableUncovered) return true;  // total over the value domain
-            warn("the nullable scrutinee's non-null values are covered by a "
-                 "`..` range pattern, but `null` is not");
-            return false;
-        }
-    }
 
     // §19.5 / §19.6 (#784): an unguarded typed-binding arm `var n: T` matches
     // ALL non-null values (§19.5 — "a typed binding pattern `var n: T` matches
@@ -8473,6 +8457,51 @@ void ExprTC::checkCasePatternConstantRanges(
         return;
     }
     if (!scrutTy || scrutTy->kind != TypeRef::Kind::Primitive) return;
+    // §16.3 (v0.272, #3319): `Range<T>`'s T is restricted by the compiler to
+    // the integer types (`byte`, `sbyte`, `short`, `ushort`, `int`, `uint`,
+    // `long`, `ulong`) and `char` — "Other substitutions are rejected. This
+    // restriction is enforced as a compiler-intrinsic rule." A range pattern
+    // `lo..hi` / `lo..<hi` / `..` is a RangePattern with element type drawn
+    // from the scrutinee, so a range pattern over a `float`/`double`/`decimal`
+    // scrutinee is `Range<float>` / `Range<double>` / `Range<decimal>` — none
+    // of which exist per §16.3. The implementation previously routed them
+    // through codegen (decCmp / FCmp), silently implementing `Range<double>`;
+    // §16.3 forbids that. Reject the pattern at sema so a clean diagnostic
+    // replaces what would otherwise reach codegen. The same applies to a
+    // range pattern inside a `|` alternative list (§19.3 v0.183, #1584).
+    if (scrutTy->primitive == PrimitiveType::Float ||
+        scrutTy->primitive == PrimitiveType::Double ||
+        scrutTy->primitive == PrimitiveType::Decimal) {
+        const char* tyName = scrutTy->primitive == PrimitiveType::Float
+            ? "float" : scrutTy->primitive == PrimitiveType::Double
+            ? "double" : "decimal";
+        auto rejectRangeOverFloat = [&](const ast::Pattern* rp) {
+            ctx_.diagnostics().report(
+                Severity::Error, rp->span.begin,
+                std::string("a range pattern is not admitted over a `") +
+                tyName + "` scrutinee \xe2\x80\x94 `Range<T>` restricts T to "
+                "the integer types and `char` (\xc2\xa7""16.3)");
+        };
+        for (const auto& arm : arms) {
+            const ast::Pattern* p = arm.pattern.get();
+            if (!p) continue;
+            if (dynamic_cast<const ast::RangePattern*>(p)) {
+                rejectRangeOverFloat(p);
+            } else if (auto* ap =
+                           dynamic_cast<const ast::AltPattern*>(p)) {
+                for (const auto& m : ap->members)
+                    if (auto* rp =
+                            dynamic_cast<const ast::RangePattern*>(m.get()))
+                        rejectRangeOverFloat(rp);
+            }
+        }
+        // Let the integer-scrutinee range check below also run for any
+        // non-range patterns (constants / relational) — they are valid over
+        // float/double/decimal and the integer check happens to be a no-op
+        // for those primitives (caseIntScrutineeRange returns false), so the
+        // §5.1 narrowing gate is never reached for them. Falling through
+        // keeps a single code path.
+    }
     long long lo = 0, hi = 0;
     if (!caseIntScrutineeRange(scrutTy->primitive, lo, hi)) return;
     auto checkConst = [&](const ast::Expr* c) {
