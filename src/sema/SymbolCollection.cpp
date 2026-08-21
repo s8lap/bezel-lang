@@ -976,6 +976,38 @@ bool constructorIsPure(const ConstructorSymbol* cs) {
     return false;
 }
 
+// §9.2 (v0.276, fix #3326): the §9.2/§25.2 homogeneity test shared by both
+// record-eligibility walks. A `=`/`<>` operator overload is **homogeneous**
+// iff BOTH of its operands resolve to the declaring record/enum/choice type —
+// the third §9.2 disqualifier and the §25.2 co-declaration trigger both
+// key on this single fact. A **heterogeneous**-operand overload (`T = U`,
+// `T = int`, …) defines a comparison the synthesis never provided and takes
+// over nothing — §9.2 keeps the record auto-hashable, and §25.2 carries no
+// co-declaration obligation. Resolver::checkEqualityCoDeclaration
+// (TypeResolution_Checks.cpp:2274-2285) has the SAME predicate inlined for
+// its first-match scan; that site is left alone (its logic is slightly
+// different — it needs the *first* homogeneous overload's declLoc for
+// diagnostics, not just yes/no — and refactoring it is out of scope per the
+// fix's "reusing the existing helper" guidance: one helper for the two NEW
+// uses, the existing call site keeps its inline copy).
+static bool isHomogeneousEqualityOperatorOverload(const MethodSymbol* meth,
+                                                  const TypeSymbol* rec,
+                                                  const SemaContext& ctx) {
+    if (!meth || !rec) return false;
+    if (!meth->isOperator) return false;
+    if (meth->operatorToken != "=" && meth->operatorToken != "<>") return false;
+    if (meth->params.size() != 2) return false;
+    // Homogeneous iff BOTH operands resolve to the declaring type.
+    for (Symbol* psym : meth->params) {
+        auto* p = dynamic_cast<ParameterSymbol*>(psym);
+        const TypeRef* pt = (p && p->declType)
+            ? ctx.resolvedType(*p->declType) : nullptr;
+        if (!pt || pt->kind != TypeRef::Kind::Named ||
+            pt->declaration != rec) { return false; }
+    }
+    return true;
+}
+
 // §9.3 (v0.158, #1383): forward declaration for mutual recursion with
 // isAdmissibleComponentType — a positional field's type calls
 // isAdmissibleComponentType recursively, which in turn calls this function
@@ -1368,10 +1400,15 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
         }
         if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
             // A manually-declared equality member suppresses the auto package
-            // (§9.2): an `Equals`/`GetHashCode` method, or an `=`/`<>` operator
-            // overload.
+            // (§9.2): an `Equals`/`GetHashCode` method, or a *homogeneous*
+            // `=`/`<>` operator overload (§9.2 v0.276, fix #3326). A
+            // heterogeneous-operand `=`/`<>` overload (`T = U`) defines a
+            // comparison the synthesis never provided and takes over
+            // nothing — neither qualifies nor disqualifies, exactly as
+            // §25.2 frees it from the co-declaration obligation for the
+            // same reason.
             if (meth->isOperator) {
-                if (meth->operatorToken == "=" || meth->operatorToken == "<>")
+                if (isHomogeneousEqualityOperatorOverload(meth, rec, ctx))
                     return false;
                 continue;  // any other operator overload is fine (§9.2)
             }
@@ -1452,8 +1489,13 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
         if (dynamic_cast<const PropertySymbol*>(m)) continue;
         if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
             if (meth->isOperator) {
-                // User `=`/`<>` operator: opts the record out of auto-equality.
-                if (meth->operatorToken == "=" || meth->operatorToken == "<>")
+                // §9.2 v0.276 (fix #3326): only a HOMOGENEOUS `=`/`<>`
+                // operator overload opts the record out of auto-equality —
+                // a heterogeneous-operand overload (`T = U`) defines a
+                // comparison the synthesis never provided and takes over
+                // nothing. See isAutoEqualityBearingBodyRecord above for
+                // the same predicate.
+                if (isHomogeneousEqualityOperatorOverload(meth, rec, ctx))
                     return false;
                 continue;  // other operator overloads are benign
             }
@@ -1486,6 +1528,14 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
 // it remains a compile error (#1249).  The `.Equals`/`.GetHashCode` call path
 // is separately gated: lookupMember finds the user method and dispatches
 // directly, so that path does not reach this function.
+//
+// §9.2 v0.276 (fix #3326, see isHomogeneousEqualityOperatorOverload above):
+// for a heterogeneous-only overload (`T = U`) this function returns true but
+// the record is ALSO auto-hashable (§9.2 v0.276 keeps it); the callers
+// (isEqualityBearing, checkEqualityMemberUseSite) OR this predicate with the
+// auto-hashable one, so the verdict is unchanged. The narrower "user took
+// over equality" reading would require threading a SemaContext through this
+// function's signature — out of scope per the fix's minimal-touch posture.
 bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
     if (!rec) return false;
     for (const Symbol* m : rec->members) {
