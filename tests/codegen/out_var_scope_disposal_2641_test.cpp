@@ -344,33 +344,27 @@ BEZEL_TEST(out_var_scope_disposal_2641,
 }
 
 // -----------------------------------------------------------------------------
-// CONTROL — a PRE-DECLARED (non-inline) `out n` recipient never reaches
-// `ensureOutVarSlots`' inline arm at all: its slot already exists (created by its
-// own `LocalDecl`), so the arm's "skip if slot already created" guard fires, and
-// its call-site modifier is `out`, not `out var`. It is therefore structurally
-// outside this fix.
+// fix #3304 — a PRE-DECLARED (non-inline) `out n: string` recipient leaks at
+// scope end unless the escape walk knows `out`-modified arguments at a
+// non-nullable `string` formal are a WRITE into the slot, not an escape of the
+// local. Same 39 B leak as #2641, different cause: #2641's `ensureOutVarSlots`
+// arm structurally never runs for a pre-declared recipient (its slot already
+// exists; the arm's "skip if already created" guard fires, and the call-site
+// modifier is `out`, not `out var`), so the fix is in
+// `StringEscapeWalker::walkCallArgs` instead — see that arm's predicate comment
+// in `src/codegen/LlvmBackend_Setup.cpp`.
 //
-// ⚠ IT LEAKS THE SAME 39 B, and that is a SEPARATE PRE-EXISTING DEFECT, measured
-// here rather than assumed. #2641 listed "whether a pre-declared (non-inline)
-// `out n: string` recipient leaks the same way at scope exit" among what it did
-// NOT verify; `scripts/agent_check.sh --probe --asan` on this exact program
-// reports "39 byte(s) leaked in 2 allocation(s)" from `bz$M.Widget$Make` — the
-// same signature as the inline case. The cause is different: the pre-declared
-// recipient IS an ordinary `var` string local, and the existing escape walk
-// treats an `out`-modified argument as a conservative escape, so
-// `armStringLocalRefcount` never arms its scope-end release. Fixing it means
-// teaching that walk about the `out` position, not touching this file's arm —
-// filed separately.
-//
-// So this control asserts on the PLAIN oracle. Its job is to catch a fix that
-// over-reached into the pre-declared shape and registered a SECOND release on a
-// slot whose own machinery may already own one — a double-free. Upgrade it to
-// `runChecked` when the separate defect lands.
+// ORACLE — LeakSanitizer (the leak is invisible on the plain build, exactly as
+// #2641's leak was). Pre-fix: "39 byte(s) leaked in 2 allocation(s)" from
+// `bz$M.Widget$Make` (measured). Post-fix: zero leaks. Value (6) is pinned too
+// to catch a fix that over-reached and registered a SECOND release on a slot
+// whose own machinery may already own one (a double-free would crash under
+// ASan).
 // per §22.3, §28.9
 // -----------------------------------------------------------------------------
 BEZEL_TEST(out_var_scope_disposal_2641,
            predeclared_out_recipient_control_unaffected) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runChecked(
         "module M; class Widget "
         "  public static method Make(s: string, out n: string): bool "
         "    n := s + \"-tail\"; return true; "
