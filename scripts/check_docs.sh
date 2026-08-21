@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# check_docs.sh — the one-command docs gate for the nine normative documents.
+# check_docs.sh — the one-command docs gate for the ten normative documents
+# plus the derived code-generation reference (eleven files in all).
 #
 # Symmetric with scripts/gate.sh (the compiler gate): a single blessed signal
-# that a docs revision is internally consistent before it lands. Runs seven
+# that a docs revision is internally consistent before it lands. Runs nine
 # mechanical checks and exits non-zero if any fails.
 #
+#   0. Derived-document pins — every derived document declares the revision it
+#                            was validated against, and Bezel_For_Code_Generation.md
+#                            fails past three revisions stale (v0.269). The
+#                            guides are reported, not failed. A missing pin on
+#                            the code-generation reference is itself a failure.
 #   1. Anchor resolution   — every intra/cross-doc [...](file#anchor) link whose
 #                            target is an explicit <a id="..."> resolves.
 #   2. Version consistency — the spec/stdlib/rationale/changelog headers agree
@@ -43,12 +49,19 @@
 #                            a lint over user code or tests/; it exists so the
 #                            documents follow the style they recommend.
 #                            Skipped by --quick, like check 4.
+#   3e. Fenced-code tagging — every OPENING code fence in the non-changelog
+#                            documents carries a language tag (v0.269). An
+#                            untagged fence is invisible to any tag-keyed
+#                            sweep, which is how fourteen of them escaped the
+#                            v0.269 example audit's first pass. The changelog
+#                            is exempt: its fences are pinned historical
+#                            quotations.
 #   4. Example extraction  — scripts/extract_doc_examples.py runs clean over the
 #                            CURRENT docs into a scratch tree (never the committed
 #                            corpus, per #1380); any parse failure is a finding.
 #
 # Usage:  scripts/check_docs.sh            # full gate
-#         scripts/check_docs.sh --quick    # skip extraction (checks 1-3c only)
+#         scripts/check_docs.sh --quick    # skip extraction (skips checks 3d and 4)
 #
 # This is a lint, not a proof: it catches the mechanical drift class that has
 # actually bitten docs revisions (dangling anchors, stale version headers,
@@ -86,8 +99,8 @@ fail = 0
 base = {os.path.basename(p): k for k, p in DOCS.items()}
 
 # ---- 0. PIN: derived documents declare the revision they were validated at ----
-# Added v0.268. The guides carry pins and nothing checked them, which is how
-# Guide 02 sat NINE revisions stale (v0.259 against a v0.268 spec) with both
+# Added v0.269. The guides carry pins and nothing checked them, which is how
+# Guide 03 sat NINETEEN revisions stale (v0.250 against a v0.269 spec) with both
 # gates green. A pin is an assertion that someone re-traced the document; an
 # unchecked assertion is the failure mode this project keeps rediscovering.
 #
@@ -139,11 +152,14 @@ else:
 # ---- 0b. FENCE: every opening code fence carries a language tag ---------------
 # Added v0.269. A bare ``` opening fence is ambiguous in a way that hides defects:
 # nothing distinguishes "untagged because it is not Bezel" from "untagged because
-# somebody forgot". The 2026-08-20 example sweep partitioned the spec by ```bezel
-# and so assigned 10 blocks to no lane at all; a further 4 were invisible to the
-# partition's keyword filter. All 14 turned out to be EBNF or schematics -- but
-# that was luck, not a guarantee, and the next one might be real Bezel that no
-# reviewer and no extractor ever looks at.
+# somebody forgot". The 2026-08-20 example sweep hit two separate holes. Its
+# partition matched ```bezel at column zero, so 8 INDENTED Bezel blocks (inside
+# bullet lists) were assigned to no lane. Independently, 14 fences carried NO tag
+# at all and so were invisible to a tag-keyed sweep by construction; the first
+# pass surfaced 10 of them and this census found the remaining 4. All 14 turned
+# out to be EBNF or schematics -- but that was luck, not a guarantee, and the
+# next one might be real Bezel that no reviewer and no extractor ever looks at.
+# (8 and 14 count different sets; they are not two estimates of one number.)
 #
 # Closing fences are bare by definition and are not checked; only openers are.
 fbad = []

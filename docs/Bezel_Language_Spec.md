@@ -10465,7 +10465,7 @@ PolyCase ::= StringLiteral ":" QualifiedName
                                  reflective discovery of subtypes (rationale
                                  §5.18, §5.22). The discriminator must be a
                                  non-empty literal and unique within the
-                                 registry; each TypeName must name a type
+                                 registry; each QualifiedName must name a type
                                  assignable to the declaring class and itself
                                  type-driven serialization-eligible (declares
                                  ISerializable/IDeserializable). The declaring
