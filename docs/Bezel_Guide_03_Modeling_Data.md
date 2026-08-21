@@ -1,6 +1,6 @@
 # Bezel Guide 3: Modeling Data
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.250.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.270.*
 
 Bezel gives you five ways to declare a data shape and three ways to select over one. This guide is the picking rule for each. The definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing a **failure signal** (`T?` vs `Try` vs `Result` vs `requires`/exceptions), see Guide 2 §7 — that table is the home; this guide does not repeat it.
 
@@ -9,8 +9,8 @@ Bezel gives you five ways to declare a data shape and three ways to select over 
 | You have… | Use | Because |
 |---|---|---|
 | A closed set of named constants, no payloads | `enum` | Exhaustive `case` for free; serialization by name; nothing to own |
-| Value-shaped data — compared by content, copied freely | `record` | Structural `=`/`GetHashCode` synthesized when components qualify; `with(…)` update; no identity, no disposal |
-| One-of-several alternatives **with payloads**, closed set | `choice` | Exhaustive `case` over the cases; value-like choices compare structurally; owning choices carry resources through the arms |
+| Value-shaped data — compared by content, copied freely | `record` | Structural `=`/`GetHashCode` synthesized when components qualify; `with(…)` update unless the record is constructor-only (§9.9); no identity, no disposal |
+| One-of-several alternatives **with payloads**, closed set | `choice` | Exhaustive `case` over the cases; value-like choices compare structurally; borrow-bearing ones do not (§35.7) and carry §9.7's lifetime rules; owning choices carry resources through the arms |
 | A stateful thing with identity, behavior, or an owned resource | `class` | Reference semantics, `owned` fields, destructor cascade, virtual dispatch |
 | An open-within-the-module family dispatched by type | `closed` class hierarchy | §19.6 exhaustiveness over the leaves; per-leaf payload and behavior |
 
@@ -40,7 +40,8 @@ Boundary calls that come up in practice:
 
 - **Enum vs choice.** The moment one alternative needs a payload, it is a `choice`. Do not encode payloads beside an enum in parallel fields — the compiler cannot tie them together. A `choice` case carries its payload, and the `case` arms bind it.
 - **Record vs class.** If two instances with the same components should be *the same value* — dictionary keys, messages, coordinates — it is a `record`. If it has a lifecycle (opened, mutated, disposed) or identity matters, it is a `class`. A record cannot hold an owned resource; that is the design, not a limitation (spec §28.5 — copy-semantics holders cannot carry disposal obligations).
-- **A cache field on a record.** Mark it `equality skip` — `private equality skip _cachedLen: int;` — and the structural `=`/hash package survives with the cache excluded (spec §9.2); the clause mirrors `serialized skip`. An *unannotated* cache field still makes comparison a loud compile error, never silent reference equality.
+- **A cache field on a record.** Mark it `equality skip` — `private equality skip _cachedLen: int;` — and the structural `=`/hash package survives with the cache excluded (spec §9.2); the clause mirrors `serialized skip`. An *unannotated* cache field still makes comparison a loud compile error, never silent reference equality. Fill the cache in the **constructor**, not lazily: since v0.255 `this` is a borrow in every value-kind member body, so a store landing in the receiver's own storage is a compile error (§9.4) — a record has no place to memoize from.
+- **A record that validates its own construction.** A `requires` or `ensures` clause on *any* declared constructor makes the record **constructor-only** (§9.9, v0.268) — a §3.6 derived property, read off the declaration and never annotated. Two static consequences follow: the record is **not defaultable** (`default(R)`, an uninitialized `R` local or field, `[8]R` default slots, and `R` at a `where T: new()` substitution are all rejected, §17.11), and **`with` is a compile error** on it (§9.5), because `with` runs no constructor and the copy would be a value with no constructor behind it — spell the constrained update as a named method whose body constructs the result. A *positional* record may not declare such a constructor at all: put the storage in body auto-properties so every constructor is declared, or state the condition on a **static factory method** and keep the record ordinary. Equality, hashing, and serialization are untouched — the property claims *provenance*, not validity.
 - **Choice vs closed hierarchy.** A `choice` is data-first: a fixed case list, pattern-matched everywhere, no per-case methods. A `closed` hierarchy is behavior-first: each leaf is a class with its own members and can carry owned state, and `case` over the leaves is still exhaustive (§19.6) — for *non-generic* hierarchies; the carve is in §2 below. Reach for the hierarchy when cases have *behavior*; reach for the choice when cases are *shapes of data*.
 - **Choice vs `T?`.** A choice with one meaningful payload and one empty case is what `T?` already provides — use `T?` (the recorded rule; DECLINED.md's `Option<T>` entry).
 
@@ -85,4 +86,4 @@ end;
 
 ## 3. Where the failure signal fits
 
-One line, since Guide 2 §7 owns this: model the *result* with §1's kinds (`T?` for absence, `Result<T, E>` or a domain choice when the caller branches on the failure and its payload is a plain value shape), model the *contract* with `requires(…)`, and keep exceptions for what neither models. The full table with the habits is Guide 2 §7.
+One line, since Guide 2 §7 owns this: model the *result* with §1's kinds (`T?` for absence, `Result<T, E>` or a domain choice when the caller branches on the failure and its payload is a plain value shape), model the *contract* with `requires(…)` — remembering that on a **record** constructor that clause is also a modeling decision, making the record constructor-only (§1) — and keep exceptions for what neither models. The full table with the habits is Guide 2 §7.
