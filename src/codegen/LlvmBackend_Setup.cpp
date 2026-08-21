@@ -11609,6 +11609,81 @@ bool Emitter::emitSpecializedImplicitBaseCtor(const sema::TypeSymbol* cls,
     // requires an ast::ConstructorDecl and reads no arguments here (an implicit
     // base chain is always arity 0), so nothing needs binding in paramSlots_.
     if (!target->params.empty()) return false;
+    // fix #2890 (§2.5 / §22.8 step 1 / §14.1, v0.240): the IMPORTED sibling of
+    // #2882's own-generic case. An imported generic base's parameterless ctor
+    // has no live ast::ConstructorDecl — the #783 mechanism does not
+    // reconstruct ctors across the boundary today (only methods, in the cases
+    // the re-parse succeeds for), so the obligation-1 dynamic_cast below
+    // would silently decline and the caller's `declareImportedCtor + CreateCall`
+    // would invoke the exporter's placeholder-layout `bz$<Base>$ctor` against
+    // an object laid out for the instantiation. Every store in that body lands
+    // 8 bytes early (or wherever the placeholder's offset points) over a
+    // different storage slot, the first owned-field initialization corrupts an
+    // adjacent field's header, and a SEGV follows with no diagnostic at any
+    // severity. This is the issue's repro on `GCtor<T> { v: T; owned cell:
+    // Cell; a: int }` at T = string, reached through `class DCtor :
+    // GCtor<string>` with NO derived constructor: the base ctor's `cell := new
+    // Cell()` wrote over `v`, and `d.cell` read the still-zero slot. Detect
+    // the EXACT layout question the inline path below asks (so the accept-
+    // controls — `T = int` and any imported generic base with no parameter-
+    // typed storage — keep compiling with no behaviour change) and reject when
+    // it differs. A located compile error is the honest fallback the #783
+    // design note promises and is strictly better than the SEGV. Scoped to
+    // the IMPORTED case so the existing local-class path is untouched; it has
+    // its own live decl and the inline path below takes it from here.
+    if (ctx_.isImported(base)) {
+        // SEAM-ACCESSOR: target->decl is the AST gate — for imported bases this
+        // is null (ModuleLoader doesn't reconstruct ctor decls across the
+        // boundary yet, #783), so the dynamic_cast returns nullptr and the
+        // layout-mismatch diagnostic fires. This is the precise condition
+        // #2890 detects; the read is intentional and gated by isImported.
+        if (!dynamic_cast<const ast::ConstructorDecl*>(target->decl)) {
+            sema::TypeRef synth;
+            synth.kind = sema::TypeRef::Kind::Named;
+            synth.declaration = const_cast<sema::TypeSymbol*>(cls);
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (computeAncestorGenericSubst(&synth, base, ancSubst, ancSema)) {
+                auto savedSubst = genericSubst_;
+                auto savedSema = genericSubstSemaTy_;
+                genericSubst_.clear();
+                genericSubstSemaTy_.clear();
+                std::vector<llvm::Type*> tmplLayout = instanceStorageTypes(base);
+                genericSubst_ = ancSubst;
+                genericSubstSemaTy_ = ancSema;
+                std::vector<llvm::Type*> specLayout = instanceStorageTypes(base);
+                genericSubst_ = std::move(savedSubst);
+                genericSubstSemaTy_ = std::move(savedSema);
+                if (tmplLayout != specLayout) {
+                    SourceLocation loc;
+                    // SEAM-ACCESSOR: cls->decl is null for imports; the guard handles
+                    // that — we only read span.begin when non-null, so the read is
+                    // sound under the AST gate.
+                    if (cls->decl) loc = cls->decl->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "implicit base chain into imported generic class `" +
+                            std::string(base->name) +
+                            "` is not yet monomorphized for this instantiation "
+                            "(\xC2\xA7""14.1 / \xC2\xA7""2.5 / #783, #2890): this "
+                            "class's parameterless constructor body could not be "
+                            "reconstructed importer-side, so the only available "
+                            "callee is the defining module's placeholder-compiled "
+                            "`bz$" + std::string(base->name) +
+                            "$ctor` — and this instantiation does not lay `" +
+                            std::string(base->name) +
+                            "` out the way that placeholder (`int` for every type "
+                            "parameter) does, so the callee would write this "
+                            "object's storage at the placeholder's offsets and "
+                            "silently corrupt it. Use an instantiation whose "
+                            "layout matches the placeholder (an `int` argument, "
+                            "or any base with no parameter-typed storage), until "
+                            "importer-side ctor monomorphization lands");
+                    return true;  // skip the declareImportedCtor + CreateCall.
+                }
+            }
+        }
+    }
     if (!dynamic_cast<const ast::ConstructorDecl*>(target->decl)) return false;
 
     // Obligation 2: the base instantiation's substitution.
@@ -19287,6 +19362,75 @@ struct StringEscapeWalker {
                 a.name.empty() && isConsoleNonRetainingStringArg(callee, i) &&
                 isTargetIdent(a.value.get()))
                 safeArg = true;
+            // fix #3304 / §22.3 / §28.9: a pre-declared `out n: string`
+            // recipient — `out n` at a non-nullable `string` formal of a
+            // resolved user/imported method — is a WRITE into the recipient's
+            // slot, not an escape of the recipient. §22.3 makes `out`
+            // copy-out-on-normal-return and licenses "An implementation may pass
+            // a hidden reference", which is what this backend does: the callee's
+            // `n := <expr>` routes through `lowerStringRefParamStore` (#2321),
+            // whose §28.9 balance (load-old → retain-new (or TRANSFER a +1
+            // producer) → store-new → release-old) leaves the slot holding
+            // EXACTLY one reference no other party owns. So the recipient local
+            // is the SOLE owner of one reference at scope end — exactly the
+            // shape `armStringLocalRefcount` discharges by refcount, the same
+            // shape the #2641 inline-`out-var` fix relies on (whose sibling fix
+            // is this one). Without the relaxation the walk taints the local
+            // ESCAPED, `stringBorrowRetainEligible_` excludes it, no scope-end
+            // release is armed, and the callee's +1 leaks (39 B in 2 allocations,
+            // measured; same signature as #2641's inline shape).
+            //
+            // Mirroring #2641's gates, narrowly:
+            //   * Resolved MethodSymbol (ms != null) — same compiled-callee
+            //     premise as the #1430 plain-borrow relaxation above; an FFI
+            //     callee writes a raw pointer (§32.5) and is excluded on the
+            //     same conservative footing. Builtin / unresolved callees (no
+            //     MethodSymbol) fall through to ESCAPE.
+            //   * Formal modifier `out` (not `ref`, not `owned`) — `ref` is
+            //     deliberately NOT admitted: a `ref` callee reads the caller's
+            //     slot via a hidden reference and may alias the value through
+            //     field store / return / capture without minting its own +1
+            //     (no `lowerStringRefParamStore` write balance fires — the
+            //     caller still owns the reference), so releasing the local at
+            //     scope end would dangle any such alias (UAF).
+            //   * Formal type non-nullable `string` — mirrors
+            //     `lowerStringRefParamStore`'s exact surface (it bails on a
+            //     nullable target), keeping a generic `out T` instantiated at
+            //     `string` OUT of scope: the specialized callee's assignment is
+            //     typed by `T`, so whether #2321 fires there is a separate
+            //     question — leaving it to leak is the safe direction.
+            //   * Gated on stringReleaseMode (the #1997 narrowing) — the shared
+            //     dict-materializer (#1028), grouping (#1930), borrowing-Array
+            //     (#1003), record-call-result (#1747) and value-like-choice
+            //     (#2115) walks reuse this walker with mode=false, so a plain
+            //     `out T` collection recipient stays their conservative ESCAPE
+            //     (their FFI / callee retain discipline is not asserted by any
+            //     test, leak-over-UAF is the safe default).
+            //
+            // The recipient's bind-time retain (a no-op on a literal sentinel,
+            // a real retain otherwise) and the callee's #2321 store both touch
+            // the same slot; end-to-end the slot owns exactly one reference at
+            // scope end, which `armStringLocalRefcount`'s registered
+            // `bz_string_release` decrements. // per §22.3, §28.9
+            if (!safeArg && stringReleaseMode && ms &&
+                a.modifier == "out" && a.name.empty() &&
+                i < ms->params.size() && isTargetIdent(a.value.get())) {
+                auto* ps =
+                    dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
+                if (ps && ps->modifier == "out") {
+                    const sema::TypeRef* fty = ps->resolvedDeclType;
+                    if (!fty && ms->decl) {
+                        if (auto* md =
+                                dynamic_cast<const ast::MethodDecl*>(ms->decl))
+                            if (i < md->params.size() && md->params[i].type)
+                                fty = ctx.resolvedType(*md->params[i].type);
+                    }
+                    if (fty && !fty->nullable &&
+                        fty->kind == sema::TypeRef::Kind::Primitive &&
+                        fty->primitive == sema::PrimitiveType::String)
+                        safeArg = true;
+                }
+            }
             expr(a.value.get(), safeArg);
         }
     }
@@ -21642,6 +21786,31 @@ void Emitter::collectRecordCallResultReleaseEligible(
                              isProvablyFreshRecordFactoryMethod(ms, tr->declaration)) ||
                             isSynthesizedRecordDeserializeCall(call, tr->declaration))
                             candidates.push_back(ld);
+                    }
+                }
+                // fix #2866 / §9.7 / §28.3 / §28.9 (v0.240): a `new P(...)`
+                // initializer IS in scope as a fresh-construction candidate
+                // too — the +1 string producer argument's reference is bound
+                // to no local (§28.3's unbound owned temporary), and §9.7
+                // makes the record's reference fields BORROWS, so the
+                // construction-site store transfers the +1 to the slot and
+                // the slot's scope-end release (Disposal.cpp ~4234,
+                // `emitRecordStringFieldReleases`) is what balances it.
+                // Without this admission the per-iteration +1 leaks at
+                // program exit — #2866's loop-amplified repro shows 675
+                // bytes / 38 allocations. Eligibility proof reuses
+                // isFreshRecordConstructionOfExactType (#2448), so a NewExpr
+                // whose constructor is opaque (explicit ctor, nested value
+                // type, non-producer string arg, etc.) still falls to the
+                // safe-direction leak, identical to the CallExpr arm above.
+                if (auto* ne = dynamic_cast<const ast::NewExpr*>(
+                        ld->initializer.get())) {
+                    const sema::TypeRef* tr = nullptr;
+                    if (ld->type) tr = ctx_.resolvedType(*ld->type);
+                    if (!tr) tr = ctx_.exprType(*ld->initializer);
+                    if (tr && isRecordWithStringFieldsTypeRef(tr) && ne->type &&
+                        isFreshRecordConstructionOfExactType(ne, tr->declaration)) {
+                        candidates.push_back(ld);
                     }
                 }
             }

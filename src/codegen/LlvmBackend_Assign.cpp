@@ -2343,7 +2343,22 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         }
         if (fnTy->getNumParams() == 0) return false;
         llvm::Type* valTy = fnTy->getParamType(fnTy->getNumParams() - 1);
-        callArgs.push_back(coerceNumericToType(val, valTy, false));
+        // fix #2859 (§7.2/§5.1/§2.8.2/§23.4, v0.240): the IMPORTED-indexer
+        // setter twin of `lowerVirtualPropertySet`'s #2927 fix. The setter
+        // slot is §7.2's tagged `{i8 hasValue; T}` struct for a nullable VALUE
+        // element, but the RHS arrives here as the bare payload `T`. The bare
+        // `coerceNumericToType` has no case for that struct, and a nullable
+        // value assignment `r[i] := 4` would emit a malformed IR call and fail
+        // verification. Mirror the property setters' #2927/#2937 pair: first
+        // slot-width adjustment (#2903, §5.1 in both directions, with the
+        // nullable slot's PAYLOAD as the width to match), then §7.2's
+        // present-wrap (which also normalizes a `null` literal to the all-zero
+        // form). Both helpers are no-ops when `val` already IS the slot type,
+        // so the callers that arrive with a tagged value (the §22.3
+        // `ref`/`out` write-back, #2862's compound path) are unaffected.
+        val = coerceInitializerToSlot(val, valTy, /*srcUnsigned=*/false);
+        val = coerceToNullableSlot(valTy, val);
+        callArgs.push_back(val);
         builder_.CreateCall(fnTy, fn, callArgs);
         emitPendingCheck();
         releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
@@ -2458,7 +2473,15 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
             callArgs.push_back(coerceNumericToType(argVal, paramTys[k + 1],
                                                    false));
         }
-        callArgs.push_back(coerceNumericToType(val, valTy, false));
+        // fix #2859 (§7.2/§5.1/§2.8.2/§23.4, v0.240): the INTERFACE-indexer
+        // setter twin of #2927. valTy is the interface-indexer's element type,
+        // which is §7.2's tagged `{i8 hasValue; T}` struct for a nullable value
+        // element. The bare RHS arrives as the bare payload `T`; same pair
+        // (#2903 + #813) — see the imported-setter twin's rationale directly
+        // above for the full citation chain.
+        val = coerceInitializerToSlot(val, valTy, /*srcUnsigned=*/false);
+        val = coerceToNullableSlot(valTy, val);
+        callArgs.push_back(val);
         builder_.CreateCall(sFnTy, fnPtr, callArgs);
         emitPendingCheck();
         // fix #2540 (§23.4/§28.9/§11, v0.236): the INDEXER twin of
@@ -2620,7 +2643,17 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
                         coerceNumericToType(argVal, paramTys[k + 1], false));
                     idxArgVals.push_back(argVal);
                 }
-                callArgs.push_back(coerceNumericToType(val, valTy, false));
+                // fix #2859 (§7.2/§5.1/§2.8.2/§23.4, v0.240): the CLASS-
+                // VTABLE-indexer setter twin of #2927. valTy reads
+                // `pd->type.get()` straight, so a nullable VALUE element
+                // (property [k]: int?) reaches the call as the tagged struct
+                // and `r[i] := 4` lands with bare-i32 where struct is required
+                // — same IR verification abort as the property case. Same
+                // pair (#2903 + #813) — see the imported-setter twin's
+                // rationale directly above for the full citation chain.
+                val = coerceInitializerToSlot(val, valTy, /*srcUnsigned=*/false);
+                val = coerceToNullableSlot(valTy, val);
+                callArgs.push_back(val);
                 builder_.CreateCall(sFnTy, fnPtr, callArgs);
                 emitPendingCheck();
                 releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
@@ -3021,7 +3054,16 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
                 v, setFnTy->getParamType(k + 1), false));
         }
         llvm::Type* valTy = setFnTy->getParamType(setFnTy->getNumParams() - 1);
-        setArgs.push_back(coerceNumericToType(newVal, valTy, false));
+        // fix #2859 (§7.2/§5.1/§2.8.2/§23.4/§6.6, v0.240): the IMPORTED-
+        // INDEXER compound-assign twin of #2927. The setter's `value`
+        // parameter is the SAME tagged struct the plain `:=` setter expects,
+        // but `newVal` is the §7.11/emitCompoundOp result, which is the bare
+        // payload for a nullable value element (the lifting arm wraps the
+        // RHS, not the LHS-to-set slot). Same pair — see the plain setter
+        // twin's rationale directly above for the citation chain.
+        newVal = coerceInitializerToSlot(newVal, valTy, /*srcUnsigned=*/false);
+        newVal = coerceToNullableSlot(valTy, newVal);
+        setArgs.push_back(newVal);
         builder_.CreateCall(setFnTy, setFn, setArgs);
         emitPendingCheck();
         // fix #2717: the index was evaluated ONCE and shared by the getter and
@@ -3221,7 +3263,17 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
         std::vector<llvm::Value*> setArgs;
         setArgs.push_back(obj);
         loadIndices(setArgs);
-        setArgs.push_back(coerceNumericToType(newVal, elemTy, false));
+        // fix #2859 (§7.2/§5.1/§2.8.2/§23.4/§6.6, v0.240): the INTERFACE-
+        // INDEXER compound-assign twin of #2927. elemTy is the interface
+        // indexer's element type — a §7.2 tagged struct for a nullable value
+        // element, with the bare payload as `newVal`'s type. Same pair as the
+        // plain-setter twin — see that block's comment for the chain. The
+        // RECORDED SCOPE LIMIT's UAF release reasoning still applies
+        // unchanged: the wrap is slot-shape only and affects only the LAST
+        // call argument.
+        newVal = coerceInitializerToSlot(newVal, elemTy, /*srcUnsigned=*/false);
+        newVal = coerceToNullableSlot(elemTy, newVal);
+        setArgs.push_back(newVal);
         builder_.CreateCall(sFnTy, setPtr, setArgs);
         emitPendingCheck();
         // RECORDED SCOPE LIMIT, not an oversight: no producer release fires on
@@ -3323,7 +3375,17 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
                 std::vector<llvm::Value*> setArgs;
                 setArgs.push_back(obj);
                 loadIndices(setArgs);
-                setArgs.push_back(coerceNumericToType(newVal, elemTy, false));
+                // fix #2859 (§7.2/§5.1/§2.8.2/§23.4/§6.6, v0.240): the
+                // CLASS-VTABLE-indexer compound twin of #2927. elemTy reads
+                // `pd->type.get()` straight, so a nullable VALUE element (a
+                // tagged struct) hits the same IR-verification abort as the
+                // plain setter. Same helper pair — see that fix's block
+                // comment for the citation chain. The setter retains (the
+                // class-gated path), so the §7.11 lifting arm's wrapped
+                // result is what we hand to the call.
+                newVal = coerceInitializerToSlot(newVal, elemTy, /*srcUnsigned=*/false);
+                newVal = coerceToNullableSlot(elemTy, newVal);
+                setArgs.push_back(newVal);
                 builder_.CreateCall(sFnTy, setPtr, setArgs);
                 emitPendingCheck();
                 // A vtable slot is always a CLASS's own slot (§9 again), so the

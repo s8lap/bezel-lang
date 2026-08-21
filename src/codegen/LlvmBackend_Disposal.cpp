@@ -113,6 +113,50 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         // this._f;` inside the destructor — the auto field-dispose below would
         // dispose the same (moved-from) field, double-freeing it.
         //
+        // fix #2852 / #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §28.4 (v0.240):
+        // run the `var` STRING-local refcount analysis for the destructor body
+        // and pin the token to this fn. EVERY consumer of the three string sets
+        // gates on `currentFn_ == stringReleaseEligibleFn_` (#2807/#2817), and
+        // this function sets `currentFn_` but never touched that token, so no
+        // string local in any destructor body was ever retained OR released:
+        // both allocations (bz_string header + payload) leaked, per local, per
+        // disposal (measured 2033 B / 80 allocations for 20 disposals x 2 locals).
+        // The #2817 template transfers: collectStringReleaseEligible classifies
+        // the body's own `var` string locals, and the pin unlocks the bind-time
+        // retain + scope-end Disposal{stringRelease} that armStringLocalRefcount
+        // registers.
+        //
+        // ORDERING. The walk is a pure AST inspection of `dd->body`, so running
+        // it here (before the body is lowered) merely describes the function
+        // about to be emitted; it registers no IR. The scope-end releases
+        // themselves are emitted by lowerScopedBlock below at the body-end scope,
+        // sitting BEFORE the post-body field-disposal cascade below (§28.4 step
+        // 2) — which is the only ordering the §28.4 sequence constrains. A
+        // string local cannot be live before its own declaration, so no release
+        // can precede a field disposal that might read the same heap string.
+        // A `var s := this.SomeStringField` borrow local (§28.3) inside the
+        // body aliases a field the disposer is about to release; the borrow
+        // model retains at bind and releases at scope end, so the OVERALL
+        // release of the field's reference is unaffected — the local's release
+        // drops the borrow, then the field cascade drops the original. The
+        // `armValueLikeChoiceStrRelease` `if (emittingDisposerBody_) return;`
+        // guard (LlvmBackend_Setup.cpp) covers the §11 choice-value path, not
+        // the `var` string-local path; the analysis here is the correct one
+        // for the latter.
+        //
+        // CO-GATED PARAMETER RETAIN. A destructor takes no parameters (§18),
+        // so retainAssignedStringParams with an empty params vector is a
+        // structural no-op — but the invariant is that the two predicates move
+        // together, and the pin also enables the drop-on-overwrite release the
+        // pin above enables for anything `localSlot()` resolves (an enclosing
+        // local read of a string parameter is impossible here). Calling it
+        // makes the invariant checkable at review. The empty vector is the
+        // documented "no params" representation (see the destructor's
+        // `DestructorDecl::body` AST — no `params` field, by language design).
+        collectStringReleaseEligible(dd->body);
+        stringReleaseEligibleFn_ = fn;
+        retainAssignedStringParams(dd->body, /*params=*/{});
+        //
         // fix #1468 / §28.3 "Exception-path discharge" / §28.4: capture bz_exc as
         // it stands at disposer entry. When this destructor runs as an owned
         // local/field is disposed DURING stack unwinding, bz_exc already holds the
