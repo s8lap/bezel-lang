@@ -18767,17 +18767,30 @@ void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
                 " form.");
         }
     } else if (targetType->kind == ast::TypeDeclKind::Choice) {
-        // §35.7 (v0.200, #2045; v0.226, #2110): a choice rejects direct
-        // `.Equals(...)`/`.GetHashCode()` at the call site when it is NOT
-        // auto-hashable — any borrow-bearing or owning choice, AND any
-        // value-like choice whose case payload fails the §9.2 admissible-
-        // component rule. Mirrors the record gate above (and `=`/`<>`,
-        // isEqualityBearing §3.6, `where T: hashable` §14.2,
-        // checkHashContainerKeys — same predicate).
+        // §35.7 (v0.200, #2045; v0.226, #2110; v0.276, #3333): a choice
+        // rejects direct `.Equals(...)`/`.GetHashCode()` at the call site
+        // when it is NOT auto-hashable — any borrow-bearing or owning choice,
+        // AND any value-like choice whose case payload fails the §9.2
+        // admissible-component rule, AND — v0.276 — any value-like choice
+        // carrying a homogeneous `=`/`<>` overload. Mirrors the record
+        // gate above (and `=`/`<>`, isEqualityBearing §3.6, `where T:
+        // hashable` §14.2, checkHashContainerKeys — same predicate set).
+        // §35.7's rescue clause: the §25.2 co-declared `Equals(T)`/
+        // `GetHashCode` pair is the user-declared equality surface and
+        // makes the direct `.Equals(...)`/`.GetHashCode()` calls legal on
+        // a value-like choice with a homogeneous overload. v0.276 #3333
+        // wires the rescue through choiceHasUserDeclaredEquality.
         sema::TypeRef rt;
         rt.kind = sema::TypeRef::Kind::Named;
         rt.declaration = targetType;
-        if (!isAutoEqualityBearingChoice(targetType, ctx_, &rt)) {
+        // §35.7 / §3.6 (v0.276, #3333): the rescue clause — a value-like
+        // choice with the §25.2 co-declared pair is hashable, so direct
+        // `.Equals(...)`/`.GetHashCode()` are legal (they dispatch to the
+        // user's members). The OR mirrors the record gate above: `isEq ||
+        // userDeclared`. Pre-#3333 the choice arm OR'd nothing and a
+        // non-auto-hashable choice rejected even with the rescue in place.
+        if (!isAutoEqualityBearingChoice(targetType, ctx_, &rt) &&
+            !choiceHasUserDeclaredEquality(targetType, ctx_, &rt)) {
             auto verdict = common::classifyChoiceType(&rt, ctx_);
             std::string reason;
             if (verdict &&

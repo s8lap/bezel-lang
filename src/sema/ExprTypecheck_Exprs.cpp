@@ -4826,6 +4826,20 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 // lives inside isAutoEqualityBearingChoice; the classification
                 // is consulted only to phrase the diagnostic (owning /
                 // borrow-bearing vs value-like-with-inadmissible-payload).
+                //
+                // v0.276 / #3333 widened isAutoEqualityBearingChoice to ALSO
+                // return false on a value-like choice with a homogeneous
+                // `=`/`<>` overload, but the binary `=`/`<>` use-site path
+                // is unreachable on such a choice: findBinaryOperator above
+                // already dispatched to the user's overload when one was
+                // declared (a choice with `=`/`<>` overload and no
+                // co-declared pair gets the §25.2 co-declaration error
+                // separately, not this one). The rescue clause
+                // (choiceHasUserDeclaredEquality) therefore matters ONLY on
+                // the direct-call path — see ExprTypecheck_Calls.cpp's
+                // checkEqualityMemberUseSite, which is OR'd with the
+                // choice-side predicate. The binary expression site keeps
+                // its original single-predicate shape.
                 if (!isAutoEqualityBearingChoice(ts, ctx_, opTy)) {
                     auto verdict = common::classifyChoiceType(opTy, ctx_);
                     std::string reason;
@@ -4842,7 +4856,11 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                     } else {
                         // Value-like yet still not auto-hashable:
                         // a case payload failed the §9.2 admissible-component
-                        // rule (§35.7's recursive clause).
+                        // rule (§35.7's recursive clause). The choice
+                        // cannot have a homogeneous `=`/`<>` overload here
+                        // — findBinaryOperator dispatched to it above when
+                        // one was declared — so the cause is uniquely the
+                        // per-payload rule.
                         reason =
                             "it is not auto-hashable (§35.7): the "
                             "choice is value-like but a case payload is not "

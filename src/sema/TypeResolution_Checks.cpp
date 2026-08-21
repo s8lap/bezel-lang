@@ -2269,36 +2269,49 @@ void Resolver::checkEqualsHashCodePairing() {
     }
 }
 
-// §25.2 (v0.158, #1338; enum spelling corrected v0.183, #1381/#1582): "A record
-// or enum that overloads `=`/`<>` with both operands of the declaring type must
-// also declare `Equals(T)` and — on a record, `override GetHashCode`; on an
-// enum, a plain `GetHashCode(): int`, since enum members never carry `override`
-// (§10.5) — the same discipline, and the same diagnostic style, as §8.3's
-// Equals→GetHashCode pairing." The three surfaces (`=`, `Equals`, hashing) can
-// otherwise silently diverge exactly where it hurts: `a = b` true while a
-// `Set<T>` treats them as distinct. Heterogeneous-operand overloads (`T = U`)
-// carry no such obligation.
+// §25.2 (v0.158, #1338; enum spelling corrected v0.183, #1381/#1582; choices
+// added v0.276, #3333): "A record, enum, or choice that overloads `=`/`<>`
+// with both operands of the declaring type must also declare `Equals(T)` and
+// — on a record, `override GetHashCode`; on an enum, a plain `GetHashCode(): int`,
+// since enum members never carry `override` (§10.5); on a choice, the enum
+// spelling, §35.2 carrying §10.5's plain-member replacement rule over — the
+// same discipline, and the same diagnostic style, as §8.3's Equals→GetHashCode
+// pairing." The three surfaces (`=`, `Equals`, hashing) can otherwise silently
+// diverge exactly where it hurts: `a = b` true while a `Set<T>` treats them as
+// distinct. Heterogeneous-operand overloads (`T = U`) carry no such obligation.
 //
 // Per v0.275/v0.276: there is no exemption for compiler-intrinsic types.
 // `IntPtr`/`UIntPtr` (stdlib §10.0) declare the four members and satisfy the
 // rule on their own merits; the date-scoped exemption they formerly carried
 // was retired (the *predate* ground was refuted by #3322: rule at v0.158,
 // `Ptr<T>` at v0.186, twenty-eight revisions later). The check therefore runs
-// against every record/enum and is keyed on the *declaration*, not on the
-// type's name — a user type named `IntPtr` is subject to the same rule.
+// against every record/enum/choice and is keyed on the *declaration*, not on
+// the type's name — a user type named `IntPtr` is subject to the same rule.
 //
 // v0.183 fix: the diagnostic text below previously said `` `override
 // GetHashCode` `` unconditionally, including for enums — but §10.5 REJECTS
 // `override` on any enum method, so an enum author following that diagnostic
 // literally hit a second compile error. The message now spells the requirement
-// the way each `t->kind` actually accepts it.
+// the way each `t->kind` actually accepts it. v0.276 widens the kind set to
+// choices and uses the enum spelling on them (§35.2 carries §10.5's plain-
+// member replacement rule over to choices).
+//
+// #3333 dependency note: §35.2 carries the rule over "for the boxable
+// classifications"; an owning choice's ability to declare `Equals(T)`/
+// `GetHashCode` is the open question tracked as #3335. Under the likely
+// reading (§35.2's clause is about `Object`-virtual replacement, not about
+// declaring plain members) the obligation is dischargeable on every
+// classification and this check is correct as written — the diagnostic
+// text is uniform. The fix takes that reading; #3335 settling the other way
+// would add a classification guard here, not a different message.
 void Resolver::checkEqualityCoDeclaration() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t) continue;
         if (t->kind != ast::TypeDeclKind::Record &&
-            t->kind != ast::TypeDeclKind::Enum)
+            t->kind != ast::TypeDeclKind::Enum &&
+            t->kind != ast::TypeDeclKind::Choice)
             continue;
 
         MethodSymbol* homoOp = nullptr;   // first homogeneous `=`/`<>` overload
@@ -2331,12 +2344,16 @@ void Resolver::checkEqualityCoDeclaration() {
             }
         }
         if (homoOp && !(hasEquals && hasGetHashCode)) {
-            bool isEnum = t->kind == ast::TypeDeclKind::Enum;
-            std::string kind = isEnum ? "an enum" : "a record";
-            // §10.5: enum members never carry `override` — a plain
-            // `GetHashCode(): int` is the enum spelling (v0.183 fix, #1582).
+            // §10.5 + §35.2: enum and choice members never carry `override` —
+            // a plain `GetHashCode(): int` is the only spelling both kinds
+            // accept (v0.183 fix for enums, #1381/#1582; v0.276 widening for
+            // choices, #3333).
+            bool isRecord = t->kind == ast::TypeDeclKind::Record;
+            std::string kind =
+                isRecord ? "a record" :
+                (t->kind == ast::TypeDeclKind::Enum ? "an enum" : "a choice");
             std::string hashSpelling =
-                isEnum ? "`GetHashCode`" : "`override GetHashCode`";
+                isRecord ? "`override GetHashCode`" : "`GetHashCode`";
             ctx_.diagnostics().report(
                 Severity::Error, homoOp->declLoc,
                 kind + " that overloads `=` must also declare `Equals(T)` and "
