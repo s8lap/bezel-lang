@@ -262,11 +262,27 @@ BEZEL_TEST(codegen_generic_static_536, no_error_for_valid_code_22_12) {
 // miscompiled: the null-check read the pointer's low byte as the hasValue tag and
 // the unwrapped "value" was a 32-bit fragment of the address — Val() returned 0.
 
-// Minimal repro: `Holder<Cell>.shared := new Cell(4)` followed by
-// `Holder<Cell>.shared!.Val()` must return 4.
-// Per §22.12 (per-instantiation static state) / §28.5 (owned fields).
-BEZEL_TEST(codegen_generic_static_536, static_owned_typeParam_nullable_field_roundtrip_22_12_28_5) {
-    BEZEL_EXPECT_EQ(run(
+// #2331 / §22.12 rule 2 (v0.230): a mutable (non-`readonly`, non-`const`)
+// static field or auto-property whose declared type is a bare generic
+// parameter of the enclosing TYPE (T, T?) is admitted by no form above and
+// is a COMPILE ERROR at the declaration site, whatever the parameter's
+// constraints or eventual substitutions. The original spec cited the two
+// tests below as roundtrip cases; #1393's first implementation routed this
+// through rule 2's residual error branch and regressed them, then `adff878`
+// restored status quo pending the v0.230 ruling. v0.230 settles the case
+// as a declaration-site rejection; the roundtrip shape the v0.230 comment
+// preserved flips to a rejection case — the §22.12 ruling text states the
+// case is "admitted by no form above" — and the per-instantiation roundtrip
+// behaviour moves to the `static owned readonly` form (the v0.262 ruling
+// #3269 / issue #3272 classifies the readonly arm per instantiation).
+//
+// The fix: emit a declaration-site compile error here; pin the §22.12 /
+// #2331 rejection in the same tests. (Per-lane instruction: do NOT close
+// #2331 in this commit; the change here ships the ruling's enforcement and
+// the comment cites both issues. #2331 stays open as the issue tracker
+// entry until closed in a separate commit.)
+BEZEL_TEST(codegen_generic_static_536, mutable_typeParam_static_field_rejected_spec_22_12_v0_230_2331) {
+    auto r = jit(
         "module M; "
         "class Cell "
         "  private _v: int; "
@@ -274,22 +290,27 @@ BEZEL_TEST(codegen_generic_static_536, static_owned_typeParam_nullable_field_rou
         "  public method Val(): int => _v; "
         "end Cell; "
         "class Holder<T> where T: class "
-        "  public static owned shared: T?; "
+        "  public static shared: T?; "  // mutable — rejected at declaration
         "end Holder; "
         "class C "
-        "  public static method Main(): int "
-        "    Holder<Cell>.shared := new Cell(4); "
-        "    return Holder<Cell>.shared!.Val(); "
-        "  end Main; "
-        "end C;"), 4);
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool found22_12 = false, found2331 = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("§22.12") != std::string::npos) found22_12 = true;
+        if (d.message.find("#2331") != std::string::npos) found2331 = true;
+    }
+    BEZEL_EXPECT_TRUE(found22_12);
+    BEZEL_EXPECT_TRUE(found2331);
 }
 
-// Two distinct instantiations of the `static owned T?` field must have
-// independent storage and independent concrete types.  Holder<Cell>.shared and
-// Holder<Dog>.shared must not alias each other's per-instantiation global.
-// Per §22.12 (each instantiation has its own static state) / §28.5 / #1116.
-BEZEL_TEST(codegen_generic_static_536, static_owned_typeParam_nullable_two_instantiations_22_12_28_5) {
-    BEZEL_EXPECT_EQ(run(
+// Companion to the rejection case above: the two-instantiation shape that
+// the original roundtrip pinned is now rejected at the declaration for the
+// same reason (one diagnostic, not two — the rejection is keyed to the
+// declaration, not to each instantiation).
+BEZEL_TEST(codegen_generic_static_536, mutable_typeParam_static_two_insts_one_rejection_spec_22_12_v0_230_2331) {
+    auto r = jit(
         "module M; "
         "class Cell "
         "  private _v: int; "
@@ -302,17 +323,55 @@ BEZEL_TEST(codegen_generic_static_536, static_owned_typeParam_nullable_two_insta
         "  public method Val(): int => _v; "
         "end Dog; "
         "class Holder<T> where T: class "
-        "  public static owned shared: T?; "
+        "  public static shared: T?; "  // mutable — rejected at declaration
         "end Holder; "
         "class C "
         "  public static method Main(): int "
-        "    Holder<Cell>.shared := new Cell(10); "
-        "    Holder<Dog>.shared := new Dog(20); "
-        "    var a := Holder<Cell>.shared!.Val(); "
-        "    var b := Holder<Dog>.shared!.Val(); "
-        "    return a + b; "
+        "    var h1 := new Holder<Cell>(); "
+        "    var h2 := new Holder<Dog>(); "
+        "    return 0; "
         "  end Main; "
-        "end C;"), 30);
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    int rejectionCount = 0;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("§22.12 rule 2") != std::string::npos &&
+            d.message.find("#2331") != std::string::npos) {
+            ++rejectionCount;
+        }
+    }
+    BEZEL_EXPECT_EQ(rejectionCount, 1);
+}
+
+// Per-instantiation CONTROL via the READONLY arm — the v0.262 ruling
+// (#3269 / issue #3272) classifies `static owned readonly F: T?;` per
+// instantiation: a class-typed instantiation takes rule 4's warning unless
+// the substituted class is in the warning-suppression set. `Mutex` is in
+// the form-(i) synchronized set which silences rule 4 — so
+// `Holder<Mutex>` instantiates warning-free. Note that the `readonly`
+// modifier prevents an external assign (§22.8), so the roundtrip-control
+// shape (assign then read) that the v0.230 mutable arm used is
+// unavailable here; this test pins the resolution-only path (the warning
+// is suppressed; the declaration is admitted per-instantiation). The
+// §28.5 disposal hook is exercised by the v0.230 mutable case above
+// (which now rejects at the declaration per #2331) and by the
+// non-generic `Store.item` control — together they cover the static-
+// `owned` disposal path.
+BEZEL_TEST(codegen_generic_static_536, readonly_typeParam_mutex_no_warning_spec_22_12_v0_262_3272) {
+    auto r = jit(
+        "module M; "
+        "class Holder<T> where T: class "
+        "  public static owned readonly shared: T?; "
+        "end Holder; "
+        "class C "
+        "  public static method Main(): int "
+        "    var s: Mutex? := Holder<Mutex>.shared; "
+        "    if s = null then return 0; else return 1; end; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
 // Concrete non-generic static owned field on a non-generic class must still work

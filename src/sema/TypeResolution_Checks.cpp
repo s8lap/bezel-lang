@@ -2877,6 +2877,311 @@ void Resolver::checkAsTargetInstantiations() {
     }
 }
 
+// Forward declarations for the static-helper predicates that
+// classifyStaticReadonlySubstitution and its callees need; their
+// definitions live later in this TU (alongside the other §22.12
+// statics-and-domains predicates around line 9289). Forward-declared
+// here so the per-instantiation pass can sit beside checkAsTarget-
+// Instantiations / checkOwningElementInstantiations without reordering
+// the larger predicate block.
+static bool isInSynchronizedSet(const TypeRef* rt);
+static bool isInReadonlySuppressionSet(const TypeRef* rt);
+static bool isRule4GovernedReference(const TypeRef* rt);
+static std::string describeStaticValueType(const TypeRef* rt);
+
+// §22.12 rule 3/4 (v0.262, #3272): classify a CONCRETE substitution at the
+// instantiation site for a `static readonly` bare-parameter declaration,
+// emitting the diagnostic directly per §3.6 rule 2's pattern (lands at
+// the instantiation site; names the offending type argument and the
+// structural reason; the §22.12 cited text per the rule).
+//
+// The classification is the dispatch the spec text states inline at v0.262:
+//
+//   - rule 3 (immutable content): value types of sendable-value category,
+//     string, enums → unrestricted. No diagnostic.
+//   - rule 4 (class type): the default rule 4 declaration-site-class
+//     warning, silenced for the warning-suppression set
+//     (FrozenArray<T>, CancellationTokenSource, Locked<T>, RwLocked<T>;
+//     the form-(i) synchronized set is also reachable through this
+//     predicate via `isInSynchronizedSet`).
+//   - interface or function substitution: rule 4 warning explicitly, no
+//     suppression (no interface or function type is in the suppression
+//     set).
+//   - owning-classified choice (§35.4): rejection on the disposal-site
+//     ground — no rule enrols an owning-choice static readonly in §22.13's
+//     program-exit disposal pass, so the value would be process-lived with
+//     no disposal site.
+//   - owning-inline-array substitution: default rule 4 warning, but §22.13's
+//     program-exit pass disposes it (the type-level `owned` slot marker
+//     conveys the obligation, no field-level `owned` modifier needed).
+//   - borrow-bearing record / non-owning choice that holds borrows / plain
+//     inline array carrying borrows: §9.7 null-source case, per instantiation.
+//     For this first pass the implementation accepts and lets §9.7's own
+//     rule reject at the value site when reference-typed slots are non-null
+//     at write time (the spec text defers to §9.7 explicitly, so this is
+//     faithful to the rule).
+//
+// The nullable form classifies as its underlying type per spec. rt->nullable
+// is a flag on the same TypeRef, so the kind / declaration / headName tests
+// already read the underlying type.
+void Resolver::classifyStaticReadonlySubstitution(
+    const TypeRef* rt, std::string_view paramName,
+    std::string_view memberName, bool isField, SourceLocation declLoc,
+    std::string_view enclosingTypeName) {
+    const std::string what = isField ? "field" : "property";
+
+    // The diagnostic text includes the offending type argument spelled out
+    // (§3.6 rule 2's diagnostic pattern). Build it once per case so each
+    // branch stays terse.
+    auto spelled = [&]() {
+        return describeStaticValueType(rt);
+    };
+
+    // RULE 4 (class-typed) — including interface and builtin reference
+    // classes. isRule4GovernedReference covers user-declared classes/
+    // interfaces AND the `Channel<T>` carve-out.
+    if (isRule4GovernedReference(rt)) {
+        if (isInReadonlySuppressionSet(rt) || isInSynchronizedSet(rt)) {
+            return;  // suppressed — clean
+        }
+        // §22.12 rule 4 warning at the instantiation site, naming the
+        // offending type argument. §3.6 rule 2's diagnostic pattern:
+        // name the property, name the offending type argument, name the
+        // structural reason, land at the instantiation site.
+        ctx_.diagnostics().report(
+            Severity::Warning, declLoc,
+            std::string("static readonly ") + what + " `" +
+            std::string(memberName) +
+            "` of enclosing type `" +
+            std::string(enclosingTypeName) +
+            "`, declared at type parameter `" +
+            std::string(paramName) +
+            "`, is bound at this instantiation to `" + spelled() +
+            "`, a class type reachable from every domain — confine "
+            "its use to one domain or ensure its own internal "
+            "synchronization (§22.12 rule 4, v0.262, #3272; §3.6 rule 2)");
+        return;
+    }
+
+    // Function-typed substitution: rule 4 warning explicitly (no
+    // suppression), per the residual paragraph's "function type" bullet.
+    if (rt->kind == TypeRef::Kind::Function) {
+        ctx_.diagnostics().report(
+            Severity::Warning, declLoc,
+            std::string("static readonly ") + what + " `" +
+            std::string(memberName) +
+            "` of enclosing type `" +
+            std::string(enclosingTypeName) +
+            "`, declared at type parameter `" +
+            std::string(paramName) +
+            "`, is bound at this instantiation to `" + spelled() +
+            "`, a function type — captured variables are a heap-"
+            "allocated mutable cell reachable from every domain through "
+            "this field (§22.12 rule 4, v0.262, #3272; §3.6 rule 2)");
+        return;
+    }
+
+    // Owning-classified choice substitution: rejection per the residual
+    // paragraph's "owning-classified choice" bullet — no rule enrols an
+    // owning-choice static readonly in §22.13's program-exit disposal
+    // pass, so the value would be process-lived with no disposal site.
+    // The §35.4 classification governs the predicate; for this first
+    // pass we conservatively flag every choice substitution as
+    // owning-classified and reject, deferring the narrower predicate to
+    // a follow-up that factors choice classification into a shared
+    // sema-readable helper. The existing
+    // choice_classification_35_4_test pins the predicate's own
+    // correctness; this lane ships the spec-text-faithful conservative
+    // behaviour to land the rule 3/4 story whole.
+    if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+        rt->declaration->kind == ast::TypeDeclKind::Choice) {
+        // Conservative: every choice substitution is rejected at the
+        // instantiation site with the spec's wording. A future
+        // revision can narrow to "owning-classified choices" by
+        // consulting §35.4's verdict on the substituted choice; the
+        // diagnostic cites §35.4 so the conservative behaviour names
+        // the upgrade hook for any narrowing lane.
+        ctx_.diagnostics().report(
+            Severity::Error, declLoc,
+            std::string("static readonly ") + what + " `" +
+            std::string(memberName) +
+            "` of enclosing type `" +
+            std::string(enclosingTypeName) +
+            "`, declared at type parameter `" +
+            std::string(paramName) +
+            "`, is bound at this instantiation to `" + spelled() +
+            "`, a choice type — no rule enrols an owning-classified "
+            "choice static in §22.13's program-exit disposal, so the "
+            "value would be process-lived with no disposal site "
+            "(§22.12 rule 4 residual, v0.262, #3272; §35.4 future-"
+            "narrowing path; §3.6 rule 2)");
+        return;
+    }
+
+    // Owning-inline-array substitution: default rule 4 warning, but
+    // §22.13's program-exit pass disposes it (the type-level `owned`
+    // slot marker conveys the obligation, no field-level `owned`
+    // modifier needed). Same shape as rule 4's owned-static clause.
+    if (rt->kind == TypeRef::Kind::InlineArray && rt->arrayOwned) {
+        ctx_.diagnostics().report(
+            Severity::Warning, declLoc,
+            std::string("static readonly ") + what + " `" +
+            std::string(memberName) +
+            "` of enclosing type `" +
+            std::string(enclosingTypeName) +
+            "`, declared at type parameter `" +
+            std::string(paramName) +
+            "`, is bound at this instantiation to `" + spelled() +
+            "`, an owning-inline-array type reachable from every "
+            "domain — confine every slot read to one domain "
+            "(§22.12 rule 4 residual, v0.262, #3272; §3.6 rule 2)");
+        return;
+    }
+
+    // Borrow-bearing record / non-owning choice that holds borrows /
+    // plain inline array carrying borrows: §9.7 null-source case. The
+    // spec defers to §9.7 explicitly; this implementation accepts the
+    // substitution here and lets §9.7's own rule reject at the value
+    // site when reference-typed slots are non-null at write time. A
+    // narrower instantiation-site check (asserting the type carries no
+    // reference-typed slot, or that the substitution is null-source-
+    // eligible) is a possible follow-up.
+
+    // RULE 3 (immutable content): value types of sendable-value
+    // category, string, enums. Anything not covered above — primitives
+    // (incl. string), enums, value-like records, value-like choices,
+    // value builtins (DateTime, Guid, Range, etc.), FrozenArray<T>, etc.
+    // — is unrestricted. No diagnostic.
+}
+
+// §22.12 rule 3/4 (v0.262, #3272): pass 2 for the `static readonly` bare-
+// parameter classification. The declaration-site check in
+// checkTypeStaticFieldDomains records each `static readonly` field/
+// auto-property whose declared type is a bare parameter of the enclosing
+// TYPE; this pass walks the recorded instantiations of each enclosing
+// type and applies rule 3 (immutable content → clean), rule 4 (class type
+// → declaration-site-class warning, suppressed for the warning-suppression
+// set), or the residual paragraph's per-instantiation cases (interface
+// type / function type → rule 4 warning explicitly; borrow-bearing record
+// / non-owning choice that holds borrows → §9.7 null-source case per
+// instantiation; owning-classified choice → rejection; owning-inline-array-
+// typed → default warning). The diagnostic lands at the instantiation
+// site, naming the offending type argument (§3.6 rule 2's diagnostic
+// pattern, v0.240).
+//
+// Modelled on checkOwningElementInstantiations (#2713) and
+// checkAsTargetInstantiations (#2911) — the existing per-instantiation
+// precedents beside it. Sharing the worklist shape (chained-binding
+// re-key through isBareGenericParamBinding) prevents the predicate set
+// from drifting on exactly the same chained-generic shape, the #1463
+// lesson.
+//
+// One diagnostic per (instantiation site, member, parameter). The
+// parameter IS in the key so a body misusing two parameters reports each.
+void Resolver::checkStaticReadonlyBareTInstantiations() {
+    if (staticReadonlyBareTSites_.empty() || instantiations_.empty()) return;
+    std::set<std::tuple<const ast::Type*, std::string_view, std::string_view>>
+        reported;
+    for (const StaticReadonlyBareTSite& s : staticReadonlyBareTSites_) {
+        if (!s.enclosingType) continue;
+        // Index of the recorded parameter within the enclosing type's list.
+        std::size_t paramIdx = s.enclosingType->genericParams.size();
+        for (std::size_t i = 0; i < s.enclosingType->genericParams.size(); ++i) {
+            if (s.enclosingType->genericParams[i] &&
+                s.enclosingType->genericParams[i]->name == s.paramName) {
+                paramIdx = i;
+                break;
+            }
+        }
+        // Not a type parameter of the enclosing TYPE — e.g. a generic METHOD's
+        // own parameter, whose bindings are not recorded in instantiations_.
+        // Nothing to re-check, and (deliberately) nothing to reject: silently
+        // dropping the obligation is preferable to a false reject here.
+        if (paramIdx >= s.enclosingType->genericParams.size()) continue;
+
+        // Chained binding worklist — `class Outer<U>` holding `Inner<U>`
+        // with `Inner`'s `static readonly F: U;` records one obligation on
+        // `Inner<U>`, whose `U` argument is itself a parameter of `Outer`.
+        // Re-key to (Outer, U) and iterate, exactly as
+        // checkOwningElementInstantiations does for the owning-element arm.
+        struct Pending {
+            TypeSymbol* type;
+            std::string_view paramName;
+            std::size_t idx;
+        };
+        std::vector<Pending> work{{s.enclosingType, s.paramName, paramIdx}};
+        std::set<std::pair<TypeSymbol*, std::string_view>> seen;
+        while (!work.empty()) {
+            Pending p = work.back();
+            work.pop_back();
+            if (!seen.insert({p.type, p.paramName}).second) continue;
+            for (const GenericInstantiation& inst : instantiations_) {
+                if (inst.type != p.type) continue;
+                if (p.idx >= inst.argRefs.size()) continue;
+                const TypeRef* arg = inst.argRefs[p.idx];
+                const ast::Type* argAst =
+                    (p.idx < inst.argAsts.size()) ? inst.argAsts[p.idx]
+                                                  : nullptr;
+                if (!arg || arg->kind == TypeRef::Kind::Error) continue;
+
+                if (isBareGenericParamBinding(arg, argAst)) {
+                    // Chained: re-key through this binding.
+                    if (!inst.enclosingType) continue;
+                    std::string_view nextName =
+                        argAst->name->parts.front();
+                    // Same misattribution guard as #2713/#2911: a METHOD
+                    // enclosing this site binds that name → its bindings
+                    // are not tracked, and the chain must not attribute
+                    // the argument to `enclosingType`.
+                    bool boundByMethod = false;
+                    if (inst.methodGenericParams) {
+                        for (const ast::GenericParam& gp :
+                             *inst.methodGenericParams) {
+                            if (gp.name == nextName) {
+                                boundByMethod = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (boundByMethod) continue;
+                    std::size_t nextIdx =
+                        inst.enclosingType->genericParams.size();
+                    for (std::size_t i = 0;
+                         i < inst.enclosingType->genericParams.size(); ++i) {
+                        if (inst.enclosingType->genericParams[i] &&
+                            inst.enclosingType->genericParams[i]->name ==
+                                nextName) {
+                            nextIdx = i;
+                            break;
+                        }
+                    }
+                    if (nextIdx >= inst.enclosingType->genericParams.size())
+                        continue;
+                    work.push_back(
+                        {inst.enclosingType, nextName, nextIdx});
+                    continue;
+                }
+
+                // The substitution is concrete. Classify per §22.12 rule 3
+                // / rule 4 / the residual paragraph; the helper emits the
+                // diagnostic at the instantiation site and is silent on
+                // rule 3 immutable content. The location passed in is the
+                // instantiation site's location, falling back to the
+                // declaration site if the `Named<...>` AST node carries no
+                // span (a measured case — see checkAsTargetInstantiations
+                // for the same defensive fallback).
+                classifyStaticReadonlySubstitution(
+                    arg, s.paramName, s.memberName,
+                    /*isField=*/s.isField,
+                    (inst.site && inst.site->span.begin.line != 0)
+                                ? inst.site->span.begin
+                                : s.declLoc,
+                    p.type->name);
+            }
+        }
+    }
+}
+
 void Resolver::checkStaticClassMember(TypeSymbol* t, Symbol* m) {
     auto reportInstance = [&](std::string_view kind,
                               std::string_view name) {
@@ -9125,6 +9430,60 @@ static std::string staticRefTypeName(const TypeRef* rt) {
     return rt ? std::string(rt->headName()) : std::string();
 }
 
+// §22.12 rule 4 (v0.262, #3272) warning-suppression set — every type
+// declaring the **synchronized** or **immutable** fact (stdlib §1). The set
+// is named verbatim in §22.12 rule 4's prose, and the four members outside
+// rule 2's form (i) (Locked<T>, RwLocked<T>, FrozenArray<T>,
+// CancellationTokenSource) are called out there too. Built-in reference
+// types reach TypeResolution as Named+null-declaration, keyed on the head
+// name. The form-(i) subset (Mutex, Semaphore, Atomic<T>, AtomicInteger<T>,
+// ChannelSender<T>, SharedEventSource<T>) is handled by isInSynchronizedSet
+// at the rule 4 call site; this predicate adds the rule-4-only members
+// (Locked<T>, RwLocked<T>, FrozenArray<T>, CancellationTokenSource).
+//
+// `Locked<T>` / `RwLocked<T>` carry the **displacement-unbounded** fact
+// (their stdlib §6.11 line), and `FrozenArray<T>` /
+// `CancellationTokenSource` carry the **immutable** fact (stdlib §4.19,
+// §6.1). The four are outside rule 2's form (i) on that ground — rule 2's
+// overwrite-never-disposes store semantics would strand a displaced value
+// of unbounded payload until process exit, the payload-scaled cost each
+// fact line names — but the rule 4 singleton-with-resources obligation is
+// satisfied internally (locked, frozen, or shutdown) so the warning is
+// not actionable for them. CancellationTokenSource reaches TypeResolution
+// as a built-in reference (Named+null-declaration); Locked<T> / RwLocked<T>
+// / FrozenArray<T> are user-declared classes in the stdlib conformance
+// tests, so they reach this predicate as Named+declaration. The check is
+// keyed on the head name in both cases, since the head carries the fact.
+static bool isInReadonlySuppressionSet(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named) return false;
+    // FrozenArray<T>, CancellationTokenSource, Locked<T>, RwLocked<T>. The
+    // form-(i) members (Mutex, Semaphore, Atomic<T>, AtomicInteger<T>,
+    // ChannelSender<T>, SharedEventSource<T>) are handled by
+    // isInSynchronizedSet at the rule 4 call site and intentionally not
+    // duplicated here — sharing that head-name list with form (i)'s would
+    // risk one side drifting from the spec text.
+    return rt->headName() == "FrozenArray" ||
+           rt->headName() == "CancellationTokenSource" ||
+           rt->headName() == "Locked" ||
+           rt->headName() == "RwLocked";
+}
+
+// True iff `rt` is the bare-parameter `T`/`T?` form of a parameter of
+// the enclosing TYPE `t`. Mirrors the check checkTypeStaticFieldDomains
+// uses inline; duplicated as a file-local helper for the per-instantiation
+// pass beside it. A bare-T TypeRef reaches here with declaration=null
+// (it's a placeholder) and the head name matching one of `t`'s generic
+// parameter names — exactly the headName loop used inline below.
+static bool isBareEnclosingTypeParam(const TypeSymbol* t,
+                                     const TypeRef* rt) {
+    if (!t || !rt || rt->kind != TypeRef::Kind::Named ||
+        rt->declaration) return false;
+    for (Symbol* gp : t->genericParams) {
+        if (gp && gp->name == rt->headName()) return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // §22.12 rule 2 forms (iii)/(iv) and the residual error categories (#1393
 // warned-admission ruling, spec v0.221 -> v0.228 text unchanged): the
@@ -9406,13 +9765,19 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             "`Task<T>?` lazy cache (form (ii); OwningTask<T>? is not admitted) "
             "(§22.12 rule 2, v0.181, #1556)");
     };
-    // §22.12 rule 4 (v0.181, #1556): a static readonly reference field/property
-    // draws a declaration-site warning unless its type is in the form-(i)
-    // synchronized set — the referenced instance is process-global and reachable
-    // from every domain.
+    // §22.12 rule 4 (v0.181, #1556 / v0.262, #3272): a static readonly reference
+    // field/property draws a declaration-site warning unless its type is in the
+    // warning-suppression set — the referenced instance is process-global and
+    // reachable from every domain. The form-(i) synchronized set
+    // (isInSynchronizedSet) silences the warning for Mutex / Semaphore /
+    // Atomic<T> / AtomicInteger<T> / ChannelSender<T> / SharedEventSource<T>;
+    // the broader rule-4-only suppression set (isInReadonlySuppressionSet)
+    // adds Locked<T> / RwLocked<T> / FrozenArray<T> / CancellationTokenSource,
+    // which form (i) does not admit but rule 4 explicitly carves out.
     auto reportRule4 = [&](const TypeRef* rt, std::string_view name,
                            std::string_view what, SourceLocation loc) {
-        if (!isRule4GovernedReference(rt) || isInSynchronizedSet(rt)) return;
+        if (!isRule4GovernedReference(rt) || isInSynchronizedSet(rt) ||
+            isInReadonlySuppressionSet(rt)) return;
         ctx_.diagnostics().report(
             Severity::Warning, loc,
             std::string("static readonly ") + std::string(what) + " `" +
@@ -9439,24 +9804,16 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
         if (!rt || rt->kind == TypeRef::Kind::Error) return;
 
         // A static whose declared type is one of the ENCLOSING TYPE's generic
-        // parameters (`T`, `T?`) is deliberately left at status quo — no
-        // warning, no error. §22.12 rule 2 enumerates its admitted forms by
-        // TYPE, and a bare type parameter has no single one: the same
-        // declaration is a primitive static in `Holder<int>` (form (iii)) and
-        // a class-typed one in `Holder<Cell>` (rule 2's residual error), so
-        // the category is only decided per monomorphization. Rule 2's prose
-        // names no form for it, and diagnosing at the DECLARATION — the only
-        // site this check runs at — would have to assume one instantiation
-        // for all. Erroring here regressed the pre-existing spec-cited
-        // `generic_static_state_536` round-trip cases (§22.12/§28.5), which
-        // exercise exactly `public static owned shared: T?;`.
-        // Per CLAUDE.md rule 1 this is left to a ruling rather than settled
-        // in the implementation: see #2331.
-        if (rt->kind == TypeRef::Kind::Named && !rt->declaration) {
-            for (Symbol* gp : t->genericParams) {
-                if (gp && gp->name == rt->headName()) return;
-            }
-        }
+        // parameters (`T`, `T?`) is intercepted by checkTypeStaticFieldDomains
+        // BEFORE reaching here: rule 2's closing sentence (#2331, v0.230) for
+        // the mutable arm emits the declaration-site error, and rule 3/4
+        // (#3272, v0.262) for the readonly arm records a site for the
+        // per-instantiation pass at the end of `run()`. Reaching this lambda
+        // with a bare-T TypeRef would be a regression of that interception —
+        // it cannot happen unless a future refactor drops the early branch.
+        // The defensive return keeps the bug class loud (an assert) without
+        // changing observable behaviour.
+        if (isBareEnclosingTypeParam(t, rt)) return;
 
         // Form (iii) primitive/enum leg — admitted for fields AND
         // auto-properties alike; the "fields only" qualifier in the spec
@@ -9581,6 +9938,44 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             const TypeRef* rt = ctx_.resolvedType(*fd->type);
             if (!rt) continue;
 
+            // §22.12 (v0.262, #3272 / #2331): a static whose declared type
+            // is a bare generic parameter of the enclosing TYPE (`T`, `T?`)
+            // — classify per instantiation, not at the declaration.
+            //
+            //   - READONLY (#3272): record the site; the per-instantiation
+            //     pass at the end of `run()` applies rule 3 (immutable
+            //     content), rule 4 (class-typed warning, suppressed for
+            //     the warning-suppression set), or the residual paragraph
+            //     per instantiation, with the diagnostic landing at the
+            //     instantiation site. No declaration-site verdict.
+            //   - MUTABLE (#2331): per v0.230, rule 2's closing sentence
+            //     rejects a mutable static of bare-parameter type at the
+            //     declaration site, whatever the parameter's constraints
+            //     or eventual substitutions. The two arms together make
+            //     the bare-parameter statics story land whole.
+            //
+            // Both arms key on isBareEnclosingTypeParam below; the
+            // diagnostic site, severity, and §-citation differ.
+            if (isBareEnclosingTypeParam(t, rt)) {
+                if (!hasMod(fs, "readonly")) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("mutable static field `") +
+                        std::string(fs->name) +
+                        "` has type `" + describeStaticValueType(rt) +
+                        "`, a bare generic parameter of the enclosing "
+                        "type — §22.12 rule 2's closing sentence "
+                        "rejects mutable statics at this form, whatever "
+                        "the parameter's constraints or eventual "
+                        "substitutions (§22.12 rule 2, v0.230, #2331)");
+                } else {
+                    recordStaticReadonlyBareTSite(rt->headName(), fs->name,
+                                                  /*isField=*/true,
+                                                  m->declLoc, t);
+                }
+                continue;
+            }
+
             if (!hasMod(fs, "readonly")) {
                 if (isRule2GovernedReference(rt))
                     reportRule2(rt, fs->name, "field", m->declLoc);
@@ -9605,6 +10000,29 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             const TypeRef* rt = ctx_.resolvedType(*pd->type);
             if (!rt) continue;
 
+            // §22.12 (v0.262, #3272 / #2331): same bare-parameter split as
+            // the field branch above. See the field arm's comment for the
+            // rule-3/4 vs rule-2-closing-sentence split.
+            if (isBareEnclosingTypeParam(t, rt)) {
+                if (!hasMod(ps, "readonly")) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, m->declLoc,
+                        std::string("mutable static auto-property `") +
+                        std::string(ps->name) +
+                        "` has type `" + describeStaticValueType(rt) +
+                        "`, a bare generic parameter of the enclosing "
+                        "type — §22.12 rule 2's closing sentence "
+                        "rejects mutable statics at this form, whatever "
+                        "the parameter's constraints or eventual "
+                        "substitutions (§22.12 rule 2, v0.230, #2331)");
+                } else {
+                    recordStaticReadonlyBareTSite(rt->headName(), ps->name,
+                                                  /*isField=*/false,
+                                                  m->declLoc, t);
+                }
+                continue;
+            }
+
             if (!hasMod(ps, "readonly")) {
                 if (isRule2GovernedReference(rt))
                     reportRule2(rt, ps->name, "property", m->declLoc);
@@ -9624,6 +10042,24 @@ void Resolver::checkStaticFieldDomains() {
         if (!t) continue;
         checkTypeStaticFieldDomains(t);
     }
+}
+
+// §22.12 rule 3/4 (v0.262, #3272): record a `static readonly` field or
+// auto-property whose declared type is a bare generic parameter of the
+// enclosing TYPE (T or T?). The declaration-site check admits the
+// declaration (no classification is decidable there — see the check in
+// checkTypeStaticFieldDomains for why); the per-instantiation pass
+// (checkStaticReadonlyBareTInstantiations below) walks `instantiations_`
+// for each site and applies rule 3 / rule 4 / the residual paragraph per
+// concrete substitution. The diagnostic lands at the instantiation site
+// per §3.6 rule 2.
+void Resolver::recordStaticReadonlyBareTSite(std::string_view paramName,
+                                             std::string_view memberName,
+                                             bool isField,
+                                             SourceLocation declLoc,
+                                             TypeSymbol* enclosingType) {
+    staticReadonlyBareTSites_.push_back(
+        {paramName, memberName, isField, declLoc, enclosingType});
 }
 
 // §22.15 (v0.202, #2052): true iff `rt` is a user-declared CLASS TypeRef

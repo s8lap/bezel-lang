@@ -412,6 +412,19 @@ void Resolver::run(const ast::SourceFile& src) {
     // static readonly class/interface fields. Runs after type resolution
     // so field types are available.
     checkStaticFieldDomains();
+    // §22.12 rule 3/4 (v0.262, #3272): pass 2 for the `static readonly`
+    // bare-parameter classification. Walks the recorded instantiations of
+    // each enclosing type whose body declared a `static readonly` field/
+    // auto-property at a bare parameter (`T`, `T?`), and applies rule 3
+    // (immutable content → clean), rule 4 (class-typed warning, suppressed
+    // for the warning-suppression set), or the residual paragraph's per-
+    // instantiation cases (interface, function, borrow-bearing record,
+    // holds-borrows choice, owning choice → rejection, owning-inline-array
+    // → default warning). The diagnostic lands at the instantiation site
+    // per §3.6 rule 2. Runs here for the same reason as
+    // checkOwningElementInstantiations / checkAsTargetInstantiations above:
+    // every instantiation site has been recorded by now.
+    checkStaticReadonlyBareTInstantiations();
 }
 
 bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx) {
