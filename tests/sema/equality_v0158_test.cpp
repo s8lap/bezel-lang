@@ -322,6 +322,62 @@ BEZEL_TEST(equality_v0158, codecl_enum_satisfied_with_plain_gethashcode_spec_25_
     BEZEL_EXPECT_FALSE(hasCoDeclError(r));
 }
 
+// ─── §25.2 v0.275/v0.276: no exemption for compiler-intrinsic types (#3334) ──
+
+// §25.2 (v0.275, completed v0.276): "There is no exemption for compiler-
+// intrinsic types. The pointer records of stdlib §10.0 and §10.5 — `IntPtr`,
+// `UIntPtr`, `Ptr<T>` — declare `Equals(T)` and `override GetHashCode` beside
+// their operators like any other record." A user record **named** `IntPtr`
+// (distinct from stdlib §10.0's `IntPtr`, whose `t->name == "IntPtr"`
+// exemption the v0.275 retirement removed) overloading `=`/`<>` without the
+// co-declared pair is rejected by §25.2 — the check is keyed on the
+// *declaration*, not on the type's name. Pre-fix this compiled (the guard
+// short-circuited on `t->name == "IntPtr"`); post-fix it is rejected with the
+// standard §25.2 diagnostic naming the record and the missing members.
+BEZEL_TEST(equality_v0158,
+           codecl_user_record_named_intptr_rejected_spec_25_2_v0_275) {
+    auto r = parseSema(
+        "module M; "
+        "record IntPtr(n: int) "
+        "  public static method operator =(a: IntPtr, b: IntPtr): bool => a.n = b.n; "
+        "  public static method operator <>(a: IntPtr, b: IntPtr): bool => a.n <> b.n; "
+        "end IntPtr; class F public static method Main(): int return 0; end Main; end F;");
+    BEZEL_EXPECT_TRUE(hasCoDeclError(r));
+}
+
+// §25.2 (v0.275/v0.276): the symmetric case — a user record **named** `UIntPtr`
+// overloading `=`/`<>` without the co-declared pair — is also rejected. The
+// pre-fix `t->name == "UIntPtr"` short-circuit applied to both names; the
+// v0.275 retirement removes both.
+BEZEL_TEST(equality_v0158,
+           codecl_user_record_named_uintptr_rejected_spec_25_2_v0_275) {
+    auto r = parseSema(
+        "module M; "
+        "record UIntPtr(n: int) "
+        "  public static method operator =(a: UIntPtr, b: UIntPtr): bool => a.n = b.n; "
+        "  public static method operator <>(a: UIntPtr, b: UIntPtr): bool => a.n <> b.n; "
+        "end UIntPtr; class F public static method Main(): int return 0; end Main; end F;");
+    BEZEL_EXPECT_TRUE(hasCoDeclError(r));
+}
+
+// §25.2 (v0.275/v0.276): a user record named `IntPtr` WITH the co-declared
+// pair (the four members `Ptr<T>` has always declared) satisfies the rule on
+// its own merits. The check is now keyed on the *declaration*, not the name —
+// so the rule is satisfied by the same shape that stdlib §10.0's `IntPtr`
+// uses, whether or not the name collides with stdlib's record.
+BEZEL_TEST(equality_v0158,
+           codecl_user_record_named_intptr_with_pair_accepted_spec_25_2_v0_275) {
+    auto r = parseSema(
+        "module M; "
+        "record IntPtr(n: int) "
+        "  public static method operator =(a: IntPtr, b: IntPtr): bool => a.n = b.n; "
+        "  public static method operator <>(a: IntPtr, b: IntPtr): bool => a.n <> b.n; "
+        "  public method Equals(other: IntPtr): bool => n = other.n; "
+        "  public override method GetHashCode(): int => n; "
+        "end IntPtr; class F public static method Main(): int return 0; end Main; end F;");
+    BEZEL_EXPECT_FALSE(hasCoDeclError(r));
+}
+
 // ─── §3.6 / §8.3 v0.158: hashable hash-container keys (#1338) ────────
 
 // §3.6/§8.3: an `int` key is hashable — `Dictionary<int, int>` accepted.

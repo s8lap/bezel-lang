@@ -2244,8 +2244,15 @@ void Resolver::checkEqualsHashCodePairing() {
 // Equals→GetHashCode pairing." The three surfaces (`=`, `Equals`, hashing) can
 // otherwise silently diverge exactly where it hurts: `a = b` true while a
 // `Set<T>` treats them as distinct. Heterogeneous-operand overloads (`T = U`)
-// carry no such obligation. The compiler-intrinsic IntPtr/UIntPtr operator
-// declarations predate and are exempt.
+// carry no such obligation.
+//
+// Per v0.275/v0.276: there is no exemption for compiler-intrinsic types.
+// `IntPtr`/`UIntPtr` (stdlib §10.0) declare the four members and satisfy the
+// rule on their own merits; the date-scoped exemption they formerly carried
+// was retired (the *predate* ground was refuted by #3322: rule at v0.158,
+// `Ptr<T>` at v0.186, twenty-eight revisions later). The check therefore runs
+// against every record/enum and is keyed on the *declaration*, not on the
+// type's name — a user type named `IntPtr` is subject to the same rule.
 //
 // v0.183 fix: the diagnostic text below previously said `` `override
 // GetHashCode` `` unconditionally, including for enums — but §10.5 REJECTS
@@ -2260,8 +2267,6 @@ void Resolver::checkEqualityCoDeclaration() {
         if (t->kind != ast::TypeDeclKind::Record &&
             t->kind != ast::TypeDeclKind::Enum)
             continue;
-        // §25.2: the compiler-intrinsic pointer-sized integer records are exempt.
-        if (t->name == "IntPtr" || t->name == "UIntPtr") continue;
 
         MethodSymbol* homoOp = nullptr;   // first homogeneous `=`/`<>` overload
         bool hasEquals = false, hasGetHashCode = false;
