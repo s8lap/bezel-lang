@@ -85,6 +85,9 @@ std::string main_(const char* preamble, const std::string& body) {
 
 // #2790 / stdlib §4.4 — the repro.  Before the fix this compiled and silently
 // left the array unsorted.
+// D2 contract needles (per #3329 / #3325): the diagnostic spells the element
+// name (`Plain`) in both the constraint and the comparer substitution, not
+// the bare `T`.
 BEZEL_TEST(array_sort_constraint_gate_2790, sort_non_comparable_class_rejected) {
     // ⚠ UPDATED BY #3329 / proposal 0116 §3 D2 (spec §14.2, stdlib §4.4,
     // v0.276).  The pre-fix needle was `"Array<T>.Sort() requires T to
@@ -101,7 +104,7 @@ BEZEL_TEST(array_sort_constraint_gate_2790, sort_non_comparable_class_rejected) 
         "    var arr: Array<Plain> := [a, b, c]; "
         "    arr.Sort(); "
         "    return arr[0].V() * 16 + arr[1].V() * 4 + arr[2].V(); "),
-        "Array<Plain>.Sort() requires T: IComparable<T> "
+"Array<Plain>.Sort() requires T: IComparable<T> "
         "(spec §14.2, stdlib §4.4, v0.276); Plain does not implement "
         "IComparable<Plain>"));
 }

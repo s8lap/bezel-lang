@@ -5504,22 +5504,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                 m == "ToSet" ? "Set" : "Array",
                                 recvTy->genericArgs[0]));
-                        // stdlib §3 / #472: Array<T>.Reversed() and
-                        // Array<T>.Sorted() / Array<T>.Sorted(comparer) —
-                        // value-returning copy-forms (past-participle convention).
-                        // Return type: owned Array<T> (same element type as receiver).
-                        // Only on Array<T> (not OwningArray<T>); OwningArray has unique
-                        // ownership semantics that make copying its elements unsound.
-                        // Sorted() without a comparer requires T: IComparable<T> —
-                        // we check here that T is int or string (the concrete types
-                        // implementing IComparable<T> in this milestone); all other
-                        // element types require the explicit-comparer form.
+                        // stdlib §3 / #472: Array<T>.Reversed() (and Array<T>.Sorted()
+                        // / Array<T>.Sorted(comparer)) — value-returning copy-forms
+                        // (past-participle convention). Return type: owned Array<T>
+                        // (same element type as receiver). Only on Array<T> (not
+                        // OwningArray<T>); OwningArray has unique ownership semantics
+                        // that make copying its elements unsound. Sorted() without a
+                        // comparer requires T: IComparable<T> — we check here that T
+                        // is int or string (the concrete types implementing
+                        // IComparable<T> in this milestone); all other element types
+                        // require the explicit-comparer form. (The Sort() / Sorted()
+                        // gate below this comment is widened to OwningArray<T>.Sort()
+                        // by #3325 — the `Reversed` arm above is Array-only by
+                        // design, and the `Sorted` arm keeps the Array-only prefix
+                        // because `Reversed`/`Sorted` are rejected on OwningArray by
+                        // the ownership-cannot-copy rejection further below.)
                         else if (colName == "Array" && !recvTy->genericArgs.empty() &&
                                  m == "Reversed" && ce.args.empty()) {
                             ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                 "Array", recvTy->genericArgs[0]));
-                        } else if (colName == "Array" && !recvTy->genericArgs.empty() &&
-                                   (m == "Sorted" || m == "Sort") &&
+                        } else if ((colName == "Array" || colName == "OwningArray") &&
+                                   !recvTy->genericArgs.empty() &&
+                                   (m == "Sort" ||
+                                    (colName == "Array" && m == "Sorted")) &&
                                    ce.args.empty()) {
                             // fix #2790 (stdlib §4.4, spec §14.2, v0.240): the
                             // PARAMETERLESS `Sort()` reached this branch under
@@ -5535,6 +5542,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // constraint, so both take the same gate; only the
                             // RESULT TYPE differs (Sorted() yields a new Array,
                             // Sort() is in place), which is handled below.
+                            //
+                            // fix #3325 (stdlib §4.5, spec §14.2, v0.276): the
+                            // OWNING side of #2790's defect. `OwningArray<T>`
+                            // declares its own parameterless `Sort()` (stdlib
+                            // §4.5, v0.276) carrying the same `T: IComparable<T>`
+                            // constraint, but the gate at #2790 was made inside
+                            // the `colName == "Array"` arm and never carried
+                            // over. The three sema sites that admit `Sort` on an
+                            // owning receiver (the §22.5 owning-container allow-
+                            // list, the explicit `OwningArray` name in the
+                            // result-typing arm, and the codegen arm keyed only
+                            // on name+arity) all let it through, so an
+                            // `OwningArray<Plain>.Sort()` for a `Plain` with
+                            // no `CompareTo` reached codegen and silently
+                            // `strcmp`'d each element's vtable pointer as a
+                            // `char*` — the same unbounded read #2768 fixed on
+                            // the borrowing side. The widened conjunct above
+                            // admits `OwningArray<T>.Sort()` to this gate but
+                            // NOT `OwningArray<T>.Sorted()` — that copy-form's
+                            // `Reversed`/`Sorted` rejection at line 5694 below
+                            // stays the authority for the copy-form, since the
+                            // reason `Sorted()` is absent on the owning side is
+                            // ownership (§28.3), not element comparability.
                             // Constraint check: T must be IComparable<T>.  Accepts:
                             // (a) built-in primitive comparable types (int, string,
                             //     long, byte, double, float, char — §9.x);
@@ -5625,33 +5655,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // overload — suggesting `Sorted(comparer)` to
                                 // someone who called `Sort()` sends them to a
                                 // different operation (a copy, not in place).
-                                //
-                                // fix #3329 / proposal 0116 §3 D2 (spec §14.2,
-                                // stdlib §4.4, v0.276): the pre-fix text
-                                // printed unsubstituted `T` (defect 1), cited
-                                // the retired stdlib §3 (defect 2), and stated
-                                // an accept-list ("is not a built-in comparable
-                                // type") rather than the structural reason
-                                // (defect 3). D2's four-part contract: name
-                                // the receiver with the substituted type
-                                // argument, name the condition in §14.2's
-                                // words, name the structural reason (the
-                                // substituted type does not conform to
-                                // `IComparable<Self>`), and name the remedy
-                                // (the compare-overload for the form the user
-                                // actually wrote, with the substituted type
-                                // substituted).
+// fix #3325 (W1B on top of W1D #3329's D2
+                                // diagnostic contract): parameterize on BOTH the
+                                // receiver name (`Array` or `OwningArray`) AND
+                                // the stdlib section that declares the member
+                                // (§4.4 for `Array<T>`, §4.5 for
+                                // `OwningArray<T>`). Element name via the
+                                // file-local `typeNameForDiag` (line 43) so the
+                                // message names the failing type and its
+                                // `IComparable<>` substitution concretely.
                                 const std::string elemName =
                                     typeNameForDiag(elemTy472);
+                                const std::string stdlibSection =
+                                    (colName == "OwningArray")
+                                        ? "stdlib §4.5"
+                                        : "stdlib §4.4";
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
-                                    "Array<" + elemName + ">." +
-                                    std::string(m) +
+                                    std::string(colName) + "<" + elemName +
+                                    ">." + std::string(m) +
                                     "() requires T: IComparable<T> "
-                                    "(spec §14.2, stdlib §4.4, v0.276); " +
-                                    elemName + " does not implement "
-                                    "IComparable<" + elemName + ">. "
-                                    "Use " + std::string(m) +
+                                    "(spec §14.2, " + stdlibSection +
+                                    ", v0.276); " +
+                                    elemName + " does not implement " +
+                                    "IComparable<" + elemName + ">. Use " +
+                                    std::string(m) +
                                     "(comparer: (" + elemName + ", " +
                                     elemName + ") -> int) instead.");
                             } else if (m == "Sorted") {
