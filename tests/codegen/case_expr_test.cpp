@@ -1010,16 +1010,24 @@ BEZEL_TEST(codegen_cg28, neg_range_long_miss_1233) {
         "return (case x of -10L..-6L => 1, _ => 0);"), 0);
 }
 
-// §19.3: negative range on a `double` scrutinee.
+// §19.3 / §16.3 (v0.277 / #3319): a range pattern over a `double` scrutinee
+// is REJECTED at sema (Range<T>'s T must be integer or char). The pre-fix
+// behaviour silently routed these through codegen via FCmp; that path is
+// now unreachable. Negative-bounds are still covered on the integer path
+// above (neg_range_long_inside_1233 / neg_range_long_miss_1233).
 BEZEL_TEST(codegen_cg28, neg_range_double_inside_1233) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runAot(
         "var x: double := -3.0; "
-        "return (case x of -5.0..-1.0 => 1, _ => 0);"), 1);
+        "return (case x of -5.0..-1.0 => 1, _ => 0);");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 BEZEL_TEST(codegen_cg28, neg_range_double_miss_1233) {
-    BEZEL_EXPECT_EQ(run(
+    auto r = runAot(
         "var x: double := 0.0; "
-        "return (case x of -5.0..-1.0 => 1, _ => 0);"), 0);
+        "return (case x of -5.0..-1.0 => 1, _ => 0);");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // ── fix #1234 / §19 / §9.4: DestructuringPattern on an Object/interface ──

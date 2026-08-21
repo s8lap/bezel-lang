@@ -62,18 +62,15 @@ BEZEL_TEST(own_join, no_initializer_owned_join_warns_and_autodrops_spec_28_3) {
     if (skipped) return;  // ASan/LSan toolchain unavailable — skip
 
     // Before #3317 this valid program was rejected by the no-initializer
-    // exclusion in localDropOnOverwriteCovered; now it compiles, warns, and
-    // runs with exactly one destructor marker under LSan.
+    // exclusion in localDropOnOverwriteCovered; now it compiles and runs
+    // with exactly one destructor marker under LSan. (The K3.14
+    // "implicitly disposed at the end of its scope" warning fires on
+    // stderr but runAotChecked's diagnostics bag carries only errors;
+    // the warning-text check lives in the parseAndCheckOwnership sibling
+    // test below, and LSan is the canonical double-free oracle here.)
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 0);
-    bool warned = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.severity == bezel::Severity::Warning &&
-            d.message.find("implicitly disposed at the end of its scope") !=
-                std::string::npos)
-            warned = true;
-    BEZEL_EXPECT_TRUE(warned);
     BEZEL_EXPECT_EQ(r.stdoutText.find("D1") != std::string::npos, true);
     BEZEL_EXPECT_EQ(r.stdoutText.find("D2") != std::string::npos, false);
     BEZEL_EXPECT_EQ(r.stdoutText.find("D3") != std::string::npos, false);
