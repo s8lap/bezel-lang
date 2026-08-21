@@ -9,5 +9,4 @@
 
 module M; class C public static method Main(): int var i: int? := 5; var b: bool? := true; i += b; return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: compound assignment `+=` has no valid result: `int? + bool?` computes `bool?`, which is neither `int?` nor implicitly convertible to it
-// CHECK-SAME: (§6.6)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: compound assignment `+=` is not defined when both operands are nullable (target `int?`, right-hand operand `bool?`) — the arithmetic, bitwise, or shift operators do not lift over a nullable value type (§7.11, v0.267); narrow first (§7.4 check, `?? <fallback>` (§7.7), or `!` (§7.8)) and use the non-nullable compound form (e.g. `b := (b ?? 0) + 1;`) (§6.6)

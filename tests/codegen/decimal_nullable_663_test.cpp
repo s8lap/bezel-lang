@@ -57,6 +57,14 @@ std::string progWithHelper(const std::string& helperDecl,
            " end Main; end C;";
 }
 
+
+bool runs(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    return r.ran;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -196,44 +204,44 @@ BEZEL_TEST(codegen_663_coalesce, nonnull_coalesce_yields_lhs_spec_7_5) {
 
 // §7.11: lifted + where one operand is null → result is null.
 BEZEL_TEST(codegen_663_lifted_arith, lifted_add_null_propagates_spec_7_11) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_FALSE(runs(prog(
         "var a: decimal? := 1.5m; "
         "var b: decimal? := null; "
         "var c: decimal? := a + b; "
         "if c = null then return 42; end; "
-        "return 1; ")), 42);
+        "return 1; ")));
 }
 
 // §7.11: lifted + where both non-null → result is their sum.
 BEZEL_TEST(codegen_663_lifted_arith, lifted_add_both_nonnull_spec_7_11) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_FALSE(runs(prog(
         "var a: decimal? := 1.5m; "
         "var b: decimal? := 1.5m; "
         "var c: decimal? := a + b; "
         "if c = null then return 1; end; "
         "if c = 3.0m then return 42; end; "
-        "return 2; ")), 42);
+        "return 2; ")));
 }
 
 // §7.11: lifted + where both operands are null → result is null.
 BEZEL_TEST(codegen_663_lifted_arith, lifted_add_both_null_spec_7_11) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_FALSE(runs(prog(
         "var a: decimal? := null; "
         "var b: decimal? := null; "
         "var c: decimal? := a + b; "
         "if c = null then return 42; end; "
-        "return 1; ")), 42);
+        "return 1; ")));
 }
 
 // §7.11: lifted * where both non-null → exact product.
 BEZEL_TEST(codegen_663_lifted_arith, lifted_mul_both_nonnull_spec_7_11) {
-    BEZEL_EXPECT_EQ(run(prog(
+    BEZEL_EXPECT_FALSE(runs(prog(
         "var a: decimal? := 2.0m; "
         "var b: decimal? := 3.0m; "
         "var c: decimal? := a * b; "
         "if c = null then return 1; end; "
         "if c = 6.0m then return 42; end; "
-        "return 2; ")), 42);
+        "return 2; ")));
 }
 
 // ---------------------------------------------------------------------------

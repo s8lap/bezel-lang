@@ -90,6 +90,14 @@ int runBody(const std::string& body) {
         body + " end Main; end C;");
     return r.ran ? r.exitCode : -999;
 }
+
+bool runsBody(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    return r.ran;
+}
+
 }  // namespace
 BEZEL_TEST(codegen_1049_unsigned_compare, ulong_high_bit_gt_small_literal) {
     BEZEL_EXPECT_EQ(runBody(
@@ -127,6 +135,14 @@ BEZEL_TEST(codegen_1049_unsigned_compare, uint_small_gt_large_literal_false) {
 // site) — `uint? 3e9 > 1000` was signed-compared and returned false. (Observed
 // through a `bool?` local, which correctly wraps the lifted i1 result; the
 // inline `(cmp) ?? false` form is a separate consumption bug, #1045.)
+// §7.11 (v0.286, #3298): each `u`/`i` below is a LOCAL initialised with a
+// non-null literal, which §7.4 narrows at the initialiser — so §7.11 reads it
+// at the non-nullable type and "the ordinary operator applies to it
+// unchanged". #1050's original value assertions therefore stand, and they are
+// the stronger oracle: they pin the UNSIGNED comparison, which is what #1050
+// was about. (A draft of #3298 flipped all five to "expect rejection", which
+// would have deleted that coverage AND was wrong for four of them — the
+// `:= null` row is the only genuinely nullable operand here.)
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_high_bit_gt_literal) {
     BEZEL_EXPECT_EQ(runBody(
         "var u: uint? := 3000000000; var r: bool? := u > 1000; "
@@ -142,16 +158,19 @@ BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_lt_literal_false)
         "var u: uint? := 3000000000; var r: bool? := u < 1000; "
         "return (if (r ?? false) then 1 else 0);"), 0);
 }
-// No-regression: signed nullable and null propagation unchanged.
+// No-regression: signed nullable unchanged.
 BEZEL_TEST(codegen_1050_lifted_unsigned_compare, int_nullable_signed_compare_unchanged) {
     BEZEL_EXPECT_EQ(runBody(
         "var i: int? := 0 - 5; var r: bool? := i < 1000; "
         "return (if (r ?? false) then 1 else 0);"), 1);
 }
-BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_null_propagates) {
-    BEZEL_EXPECT_EQ(runBody(
+// …and the UN-narrowed operand — initialised with `null` — is the §7.11
+// rejection. This row is the control that keeps the four above honest: they
+// pass because §7.4 narrowed, not because the gate is absent.
+BEZEL_TEST(codegen_1050_lifted_unsigned_compare, uint_nullable_null_rejected_3298) {
+    BEZEL_EXPECT_FALSE(runsBody(
         "var u: uint? := null; var r: bool? := u > 1000; "
-        "return (if (r ?? false) then 1 else 0);"), 0);
+        "return (if (r ?? false) then 1 else 0);"));
 }
 
 // #1210 / §6.5 — the const-fold of a shift. ⚠ THE RULE CHANGED AT v0.242

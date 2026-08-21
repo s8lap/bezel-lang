@@ -18,4 +18,3 @@ class C
 end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: compound assignment `+=` has no valid result: no built-in operator `+` is defined between `int` and enum type `Priority` (§6.2's promotion covers primitive numeric operands only), and `Priority` declares no applicable `operator +` overload (§25.2)
-// CHECK-SAME: (§6.6)

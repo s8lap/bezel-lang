@@ -551,6 +551,12 @@ BEZEL_TEST(filestream_2617_7_4, narrowed_long_nullable_position_set_in_if_block)
 // UN-narrowed form of the same expression ("the assigned value is nullable but
 // the target type is non-nullable (§7)", confirmed mechanically), so the
 // unwrap here is on a value sema proved non-null.
+// §7.11 / §7.4 (v0.286, #3298): `p` is narrowed twice over — by its non-null
+// literal initialiser and by the `if p = null then return 0; end;` guard — so
+// `p + 1L` is the ordinary `long` addition and the setter receives a `long`.
+// #2617's subject (the narrowed-nullable value reaching a `long` property
+// setter) is unchanged, and this row keeps its original value assertion; a
+// draft of #3298 flipped it to "expect rejection" and deleted that coverage.
 BEZEL_TEST(filestream_2617_7_4, narrowed_nullable_in_lifted_operator_position_set) {
     BEZEL_EXPECT_EQ(runChecked(prog(
         "using var src := new Array<byte>(); "

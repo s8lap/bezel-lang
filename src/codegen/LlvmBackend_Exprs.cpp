@@ -7356,6 +7356,14 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         auto* range = dynamic_cast<const ast::RangeExpr*>(bin.right.get());
         if (range && range->lo && range->hi && !range->step) {
             llvm::Value* x  = lowerExpr(*bin.left);
+            // §17.5 / §7.11 (v0.286, #3298): the PAIR — sema rejects a
+            // NON-narrowed nullable left operand at a range receiver
+            // (ExprTypecheck_Exprs.cpp, `op == "in"`), so a nullable-typed
+            // operand reaching here is one §7.4 narrowed non-null and its
+            // `{i8, T}` box must be unwrapped to the scalar the comparisons
+            // below need. Without the unwrap this emitted `icmp {i8,i32}, i32`
+            // and died in IR verification.
+            x = unwrapNarrowedNullableOperand(x, bin.left.get());
             llvm::Value* st = lowerExpr(*range->lo);
             llvm::Value* en = lowerExpr(*range->hi);
             if (!x || !st || !en) return nullptr;
@@ -7390,6 +7398,12 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             auto* rTy = ctx_.exprType(*bin.right);
             if (isRangeType(rTy)) {
                 llvm::Value* x  = lowerExpr(*bin.left);
+                // §17.5 / §7.11 (v0.286, #3298): same pair as the literal
+                // fast path above — sema's range gate rejects the
+                // non-narrowed nullable operand, so unwrapping the narrowed
+                // one here is sound (see unwrapNarrowedNullableOperand's
+                // soundness precondition).
+                x = unwrapNarrowedNullableOperand(x, bin.left.get());
                 llvm::Value* rv = lowerExpr(*bin.right);
                 if (!x || !rv) return nullptr;
                 llvm::Value* st   = builder_.CreateExtractValue(rv, {0u}, "r.st");
@@ -7868,452 +7882,71 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
                 r = builder_.CreateLoad(st, r, "this.val");
         }
     }
-    // §7.11 Lifted operators — nullable value types (int?, long?, double?,
-    // bool?, …). When either operand is a nullable value type:
-    //   - Arithmetic / bitwise / shift: result is T? (null when EITHER operand
-    //     is null). The underlying op and its overflow/div-zero checks run ONLY
-    //     when both operands are present (conditional branch, NOT a select).
-    //   - Relational (<, <=, >, >=): result is bool (false when EITHER null).
-    //     fcmp/icmp never trap, so a select suffices.
-    // Equality (= / <>) is handled separately (§8.4, already null-safe above).
-    // User-defined operator overloads are handled by the early call path above.
+    bool lUnwrapped_ = false;
+    bool rUnwrapped_ = false;
+    // §7.11 / #914 / #1117 (proposal 0114, v0.267): the §7.11 lifted-operator
+    // path that this site used to gate was deleted — sema now rejects every
+    // nullable primitive operand at the operator itself. But a NARROWED
+    // operand (one §7.4 has established non-null) still lowers as the
+    // nullable-form `{i8, T}` struct regardless of its declared nullable
+    // type. The sema EXPR type at a binary operand site is the declared
+    // type (sema doesn't rewrite exprType for narrowed reads), so the
+    // unwrap condition has to key on the SHAPE of the lowered value being
+    // a tagged-optional struct (and being the only such shape the binary
+    // operand site ever sees), not on the declared nullable flag.
+    // unwrapNarrowedNullable itself verifies that the struct's payload
+    // element matches the requested target type — extra-paranoid against
+    // arbitrary record/class/choice boxes (#2614's "isNullablePrimTy" gate).
     {
         const sema::TypeRef* lTy = bin.left  ? ctx_.exprType(*bin.left)  : nullptr;
         const sema::TypeRef* rTy = bin.right ? ctx_.exprType(*bin.right) : nullptr;
-        // §7.11 / #914 / #1117: a NESTED narrowed nullable arithmetic result is
-        // lowered as a {i8, T} struct (the lifted path always builds the struct),
-        // but its sema type is the NON-nullable T (the nullable operand was proven
-        // non-null by null-flow narrowing). When such a value flows in as an
-        // operand here, unwrap it to its scalar payload so this operator sees a
-        // plain T — otherwise an outer `(a+b) + b` emits `add {i8,i64}, i64`
-        // (malformed IR). Only unwrap when the operand's sema type is a
-        // NON-nullable primitive: a genuine nullable operand must keep its struct
-        // for the lifted path below.
-        auto unwrapIfNarrowed = [&](llvm::Value* v,
-                                    const sema::TypeRef* t) -> llvm::Value* {
-            if (v && t && t->kind == sema::TypeRef::Kind::Primitive &&
-                !t->nullable && v->getType()->isStructTy())
-                return unwrapNarrowedNullable(v, lowerTypeRef(t));
-            return v;
+        // The `=`/`<>` (null-check) operator already handles nullable
+        // operands in its own way (extracts the hasValue tag for null
+        // comparison; lines ~7740 below). Unwrapping here would clobber the
+        // boxed operand the null-check is looking at. Skip for equality.
+        auto unwrapIfTagged = [&](llvm::Value* v,
+                                  const sema::TypeRef* t) -> llvm::Value* {
+            if (!v || !t) return v;
+            // §7.11 / §10.3 (#3298): a nullable ENUM operand is a nullable
+            // VALUE operand — sema rejects the un-narrowed form at the
+            // relational gate, so one reaching here is §7.4-narrowed and its
+            // `{i8, <underlying>}` box must be unwrapped exactly as a
+            // primitive's is. Restricted to primitives and enums: a record or
+            // choice operand routes through a user-declared operator, which
+            // takes its own argument binding.
+            const bool enumOperand =
+                t->kind == sema::TypeRef::Kind::Named && t->declaration &&
+                t->declaration->kind == ast::TypeDeclKind::Enum;
+            if (t->kind != sema::TypeRef::Kind::Primitive && !enumOperand)
+                return v;
+            // Build a NON-NULLABLE clone of `t` so `lowerTypeRef` produces the
+            // underlying scalar type (e.g. `i32` from `int?`), not the nullable
+            // `{i8, i32}` struct. unwrapNarrowedNullable then matches the
+            // struct's payload element against `i32` and extracts it.
+            sema::TypeRef nonnull = *t;
+            nonnull.nullable = false;
+            return unwrapNarrowedNullable(v, lowerTypeRef(&nonnull));
         };
-        l = unwrapIfNarrowed(l, lTy);
-        r = unwrapIfNarrowed(r, rTy);
-        // §7.11 lifting: detect nullable value type operands.
-        // For mixed T + T? where left is non-nullable: lNullable = false but
-        // rNullable = true. The left payload is the raw scalar (l itself),
-        // not a struct — check isStructTy() guards this case.
-        bool lNullable = lTy && isNullableValueTy(lTy) && l->getType()->isStructTy();
-        bool rNullable = rTy && isNullableValueTy(rTy) && r->getType()->isStructTy();
-        bool isArithOp = (op == "+" || op == "-" || op == "*" || op == "/" ||
-                          op == "mod" || op == "&" || op == "|" || op == "^" ||
-                          op == "<<" || op == ">>");
-        bool isRelOp   = (op == "<" || op == "<=" || op == ">" || op == ">=");
-        if ((lNullable || rNullable) && (isArithOp || isRelOp)) {
-            // Extract (tag, payload) for each operand.
-            // A non-nullable operand has implicit tag=true and its value as payload.
-            llvm::Value* lTag     = lNullable ? nullablePrimHasValue(l) : builder_.getTrue();
-            llvm::Value* lPayload = lNullable ? nullablePrimValue(l)    : l;
-            llvm::Value* rTag     = rNullable ? nullablePrimHasValue(r) : builder_.getTrue();
-            llvm::Value* rPayload = rNullable ? nullablePrimValue(r)    : r;
-            // bothPresent = lTag AND rTag (i1).
-            llvm::Value* bothPresent = builder_.CreateAnd(lTag, rTag, "lift.both");
-
-            // ---- RELATIONAL: result is bool, no trap possible. ----
-            if (isRelOp) {
-                // Compute the comparison on payloads (safe to do always — icmp/fcmp
-                // never trap, and we AND with bothPresent anyway).
-                bool lFP = lPayload->getType()->isFloatingPointTy();
-                bool rFP = rPayload->getType()->isFloatingPointTy();
-                llvm::Value* cmp = nullptr;
-                if (lFP || rFP) {
-                    // Promote narrower FP type if widths differ.
-                    auto* fty =
-                        (lFP && rFP)
-                            ? (lPayload->getType()->getPrimitiveSizeInBits() >=
-                                       rPayload->getType()->getPrimitiveSizeInBits()
-                                   ? lPayload->getType()
-                                   : rPayload->getType())
-                            : (lFP ? lPayload->getType() : rPayload->getType());
-                    auto toFP = [&](llvm::Value* v) -> llvm::Value* {
-                        if (!v->getType()->isFloatingPointTy())
-                            return builder_.CreateSIToFP(v, fty);
-                        if (v->getType() != fty)
-                            return builder_.CreateFPExt(v, fty);
-                        return v;
-                    };
-                    llvm::Value* lp = toFP(lPayload);
-                    llvm::Value* rp = toFP(rPayload);
-                    if      (op == "<")  cmp = builder_.CreateFCmpOLT(lp, rp, "lift.cmp");
-                    else if (op == "<=") cmp = builder_.CreateFCmpOLE(lp, rp, "lift.cmp");
-                    else if (op == ">")  cmp = builder_.CreateFCmpOGT(lp, rp, "lift.cmp");
-                    else                 cmp = builder_.CreateFCmpOGE(lp, rp, "lift.cmp");
-                } else {
-                    // Integer comparison; widen to common width if needed.
-                    llvm::Value* lp = lPayload, *rp = rPayload;
-                    if (lp->getType()->isIntegerTy() && rp->getType()->isIntegerTy() &&
-                        lp->getType() != rp->getType()) {
-                        unsigned lb = lp->getType()->getIntegerBitWidth();
-                        unsigned rb = rp->getType()->getIntegerBitWidth();
-                        // #814: widen each narrower payload by ITS OWN signedness.
-                        bool lU = bin.left && isUnsignedTargetExpr(*bin.left);
-                        bool rU = bin.right && isUnsignedTargetExpr(*bin.right);
-                        if (lb < rb)
-                            lp = lU ? builder_.CreateZExt(lp, rp->getType())
-                                    : builder_.CreateSExt(lp, rp->getType());
-                        else
-                            rp = rU ? builder_.CreateZExt(rp, lp->getType())
-                                    : builder_.CreateSExt(rp, lp->getType());
-                    }
-                    bool uns = isUnsignedBinOperand(bin);
-                    // #1049 (lifted): mirror the non-nullable comparison — an
-                    // unsigned operand vs a non-negative constant compares
-                    // UNSIGNED (§5.1), so a lifted `uint? > 1000` is not wrongly
-                    // signed-compared once the unsigned value's high bit is set.
-                    if (!uns) {
-                        bool lU = bin.left  && isUnsignedTargetExpr(*bin.left);
-                        bool rU = bin.right && isUnsignedTargetExpr(*bin.right);
-                        auto nonNegConst = [](llvm::Value* v) {
-                            auto* ci = llvm::dyn_cast<llvm::ConstantInt>(v);
-                            return ci && !ci->isNegative();
-                        };
-                        if ((lU && nonNegConst(rp)) || (rU && nonNegConst(lp)))
-                            uns = true;
-                    }
-                    if      (op == "<")  cmp = uns ? builder_.CreateICmpULT(lp, rp, "lift.cmp")
-                                                   : builder_.CreateICmpSLT(lp, rp, "lift.cmp");
-                    else if (op == "<=") cmp = uns ? builder_.CreateICmpULE(lp, rp, "lift.cmp")
-                                                   : builder_.CreateICmpSLE(lp, rp, "lift.cmp");
-                    else if (op == ">")  cmp = uns ? builder_.CreateICmpUGT(lp, rp, "lift.cmp")
-                                                   : builder_.CreateICmpSGT(lp, rp, "lift.cmp");
-                    else                 cmp = uns ? builder_.CreateICmpUGE(lp, rp, "lift.cmp")
-                                                   : builder_.CreateICmpSGE(lp, rp, "lift.cmp");
-                }
-                // §7.11: false when either operand is null; inner cmp when both present.
-                // Guard: cmp is nullptr when the payload type is neither FP nor integer
-                // (e.g. decimal? whose payload is a %bz.decimal struct). A null cmp
-                // would crash CreateAnd; when cmp is null fall through to let the
-                // non-lifted relational path handle it — decimal relational goes through
-                // operator overloads (bz_decimal_cmp) at the user-defined-overload
-                // call site above this block, so we never reach here for decimal?.
-                if (cmp)
-                    return builder_.CreateAnd(bothPresent, cmp, "lift.rel");
-            }
-
-            // ---- ARITHMETIC / BITWISE / SHIFT: result is T? ----
-            // The underlying op (including overflow/div-zero checks) must run
-            // ONLY in the bothPresent branch (§7.11). Use a conditional branch
-            // so the side-effecting checks don't fire on null-by-null-operand paths.
-            // Determine the result sema type (T?). #1044: this is the PROMOTED
-            // nullable type, NOT the bare nullable operand type — `byte? + int`
-            // yields `int?` (§5.1 promotion), so the result struct is {i8, i32},
-            // not the operand's {i8, i8}. Prefer the sema result type (which
-            // carries the promotion); fall back to the nullable operand type when
-            // it is unavailable. Using the operand type built a too-narrow struct
-            // and `insertvalue`d the widened payload → malformed IR.
-            const sema::TypeRef* nvTy = lNullable ? lTy : rTy;
-            if (const sema::TypeRef* brt = ctx_.exprType(bin)) {
-                if (isNullableValueTy(brt))
-                    nvTy = brt;
-                // #1117: the result struct's payload width must be the PROMOTED
-                // result width — `int? + long` is `long?` (i64 payload), not the
-                // narrow nullable OPERAND type `int?` (i32). When the nullable
-                // operand is proven non-null (§7.11/#914), sema types the result
-                // as the NON-nullable promoted primitive (e.g. `long`); the
-                // isNullableValueTy gate above misses it, leaving nvTy at the
-                // narrow operand type → the widened i64 payload truncated to i32
-                // (silent wrap). nullableValueStructTy reads only ->primitive, so
-                // a non-nullable promoted primitive gives the correct payload.
-                else if (brt->kind == sema::TypeRef::Kind::Primitive)
-                    nvTy = brt;
-            }
-            // Build the conditional branch.
-            auto* entryBB  = builder_.GetInsertBlock();
-            auto* opBB     = llvm::BasicBlock::Create(llvm_, "lift.op",  currentFn_);
-            auto* mergeBB  = llvm::BasicBlock::Create(llvm_, "lift.end", currentFn_);
-            builder_.CreateCondBr(bothPresent, opBB, mergeBB);
-
-            // --- opBB: both operands are present, run the actual op. ---
-            builder_.SetInsertPoint(opBB);
-            // Widen integer payloads to a common width (mirrors the non-nullable path).
-            llvm::Value* lp = lPayload, *rp = rPayload;
-            bool lFP = lp->getType()->isFloatingPointTy();
-            bool rFP = rp->getType()->isFloatingPointTy();
-            if (!lFP && !rFP && lp->getType()->isIntegerTy() &&
-                rp->getType()->isIntegerTy() &&
-                lp->getType() != rp->getType()) {
-                unsigned lb = lp->getType()->getIntegerBitWidth();
-                unsigned rb = rp->getType()->getIntegerBitWidth();
-                llvm::Type* wide = lb >= rb ? lp->getType() : rp->getType();
-                // #814: widen each narrower payload by ITS OWN signedness.
-                bool lU = bin.left && isUnsignedTargetExpr(*bin.left);
-                bool rU = bin.right && isUnsignedTargetExpr(*bin.right);
-                if (lb < rb) lp = lU ? builder_.CreateZExt(lp, wide)
-                                     : builder_.CreateSExt(lp, wide);
-                if (rb < lb) rp = rU ? builder_.CreateZExt(rp, wide)
-                                     : builder_.CreateSExt(rp, wide);
-            }
-            // Promote integer payload to FP when the other side is FP.
-            if (lFP || rFP) {
-                auto* fty =
-                    (lFP && rFP)
-                        ? (lp->getType()->getPrimitiveSizeInBits() >=
-                                   rp->getType()->getPrimitiveSizeInBits()
-                               ? lp->getType()
-                               : rp->getType())
-                        : (lFP ? lp->getType() : rp->getType());
-                auto toFP = [&](llvm::Value* v) -> llvm::Value* {
-                    if (!v->getType()->isFloatingPointTy())
-                        return builder_.CreateSIToFP(v, fty);
-                    if (v->getType() != fty)
-                        return builder_.CreateFPExt(v, fty);
-                    return v;
-                };
-                lp = toFP(lp); rp = toFP(rp);
-            }
-            // #1047: a lifted decimal arithmetic with a mixed INTEGER operand
-            // (`decimal? + int`, or `int + decimal?`) must promote the integer
-            // operand to a `%bz.decimal` (§5.1 int→decimal widening) before the
-            // decimal-arith branch below, which stores both operands into decimal
-            // slots and calls bz_decimal_*. Without this the i32 was stored raw
-            // into a decimal slot → a garbage decimal that faults/overflows at
-            // runtime (`decimal? + 1` threw instead of yielding 6). Mirrors the
-            // non-nullable `toDecSlot` helper; covers both operand orders so the
-            // `lp == decimalStructType()` gate below sees a decimal `lp`.
-            {
-                bool lpDec = lp->getType() == decimalStructType();
-                bool rpDec = rp->getType() == decimalStructType();
-                auto intToDec = [&](llvm::Value* v,
-                                    const ast::Expr* e) -> llvm::Value* {
-                    const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
-                    sema::PrimitiveType p =
-                        (t && t->kind == sema::TypeRef::Kind::Primitive)
-                            ? t->primitive : sema::PrimitiveType::Int;
-                    llvm::AllocaInst* slot = entryAlloca(decimalStructType());
-                    emitIntToDecimal(v, p, slot);
-                    return builder_.CreateLoad(decimalStructType(), slot,
-                                               "lift.dec.int");
-                };
-                if (lpDec && rp->getType()->isIntegerTy())
-                    rp = intToDec(rp, bin.right.get());
-                else if (rpDec && lp->getType()->isIntegerTy())
-                    lp = intToDec(lp, bin.left.get());
-            }
-            // §4.4 / §7.11 / fix #663: decimal? lifted arithmetic — the payload
-            // of a decimal? struct is a %bz.decimal (itself a struct), not a scalar.
-            // All decimal runtime functions take pointers; mirror the non-nullable
-            // path (§6.4) but emit alloca/store/call inside the bothPresent branch.
-            // Relational (isRelOp) on decimal? is handled by the early return above.
-            llvm::Value* payloadResult = nullptr;
-            if (lp->getType()->isStructTy() &&
-                lp->getType() == decimalStructType() && isArithOp) {
-                llvm::StructType* dst = decimalStructType();
-                if (op == "/" || op == "mod") {
-                    // §6.4: zero-divisor check inside the bothPresent branch.
-                    llvm::Value* lo  = builder_.CreateExtractValue(rp, {0u});
-                    llvm::Value* mid = builder_.CreateExtractValue(rp, {1u});
-                    llvm::Value* hi  = builder_.CreateExtractValue(rp, {2u});
-                    llvm::Value* orv = builder_.CreateOr(
-                        builder_.CreateOr(lo, mid), hi);
-                    emitGuardThrow(
-                        builder_.CreateICmpEQ(orv, llvm::ConstantInt::get(i32(), 0)),
-                        "DivideByZeroException");
-                }
-                if (op == "+" || op == "-" || op == "*" ||
-                    op == "/" || op == "mod") {
-                    llvm::AllocaInst* aSlot = entryAlloca(dst);
-                    llvm::AllocaInst* bSlot = entryAlloca(dst);
-                    llvm::AllocaInst* oSlot = entryAlloca(dst);
-                    builder_.CreateStore(lp, aSlot);
-                    builder_.CreateStore(rp, bSlot);
-                    const char* fn_name =
-                        op == "+"   ? "bz_decimal_add" :
-                        op == "-"   ? "bz_decimal_sub" :
-                        op == "*"   ? "bz_decimal_mul" :
-                        op == "/"   ? "bz_decimal_div" :
-                        /* mod */     "bz_decimal_mod";
-                    auto getOVEVtable = [&]() -> llvm::Value* {
-                        auto vit = builtinVtable_.find("OverflowException");
-                        if (vit == builtinVtable_.end())
-                            return llvm::ConstantPointerNull::get(ptrTy());
-                        return vit->second;
-                    };
-                    auto* fn = declareC(fn_name, llvm::Type::getVoidTy(llvm_),
-                                        {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-                    builder_.CreateCall(fn, {aSlot, bSlot, oSlot, getOVEVtable()});
-                    emitPendingCheck();  // per fix #521 / §6.4: runtime sets bz_exc on overflow
-                    payloadResult = builder_.CreateLoad(dst, oSlot, "lift.dec.res");
-                }
-            }
-            // Compute the payload result using the same logic as the non-nullable
-            // path (including overflow and div-zero checks, per §7.11).
-            if (!payloadResult && lp->getType()->isFloatingPointTy()) {
-                // FP arithmetic — no overflow/div-zero checks (§6.3).
-                if      (op == "+")   payloadResult = builder_.CreateFAdd(lp, rp);
-                else if (op == "-")   payloadResult = builder_.CreateFSub(lp, rp);
-                else if (op == "*")   payloadResult = builder_.CreateFMul(lp, rp);
-                else if (op == "/")   payloadResult = builder_.CreateFDiv(lp, rp);
-            } else if (!payloadResult) {
-                bool uns = isUnsignedBinOperand(bin);
-                // CG22 checked integer arithmetic (§6.1) — overflow/div-zero
-                // checks fire here, inside the bothPresent branch.
-                bool checkedInt = lp->getType()->isIntegerTy() &&
-                                  !lp->getType()->isIntegerTy(1);
-                if (checkedInt) {
-                    if (op == "+") {
-                        payloadResult = emitCheckedArith(
-                            uns ? llvm::Intrinsic::uadd_with_overflow
-                                : llvm::Intrinsic::sadd_with_overflow, lp, rp);
-                    } else if (op == "-") {
-                        payloadResult = emitCheckedArith(
-                            uns ? llvm::Intrinsic::usub_with_overflow
-                                : llvm::Intrinsic::ssub_with_overflow, lp, rp);
-                    } else if (op == "*") {
-                        payloadResult = emitCheckedArith(
-                            uns ? llvm::Intrinsic::umul_with_overflow
-                                : llvm::Intrinsic::smul_with_overflow, lp, rp);
-                    } else if (op == "/" || op == "mod") {
-                        emitGuardThrow(builder_.CreateICmpEQ(rp, zeroLike(rp)),
-                                       "DivideByZeroException");
-                        if (uns) {
-                            payloadResult = (op == "/") ? builder_.CreateUDiv(lp, rp)
-                                                        : builder_.CreateURem(lp, rp);
-                        } else {
-                            // Signed INT_MIN op -1 (§6.1): only division overflows
-                            // (result not representable); modulo is 0 and must not
-                            // raise. srem of INT_MIN,-1 is UB, so force divisor to 1
-                            // and select 0 on that path.
-                            llvm::Value* minV   = minIntLike(rp);
-                            llvm::Value* negOne = llvm::ConstantInt::getSigned(
-                                rp->getType(), -1);
-                            llvm::Value* isMinNegOne =
-                                builder_.CreateAnd(builder_.CreateICmpEQ(lp, minV),
-                                                   builder_.CreateICmpEQ(rp, negOne));
-                            if (op == "/") {
-                                emitGuardThrow(isMinNegOne, "OverflowException");
-                                payloadResult = builder_.CreateSDiv(lp, rp);
-                            } else {
-                                llvm::Value* safeR = builder_.CreateSelect(
-                                    isMinNegOne,
-                                    llvm::ConstantInt::getSigned(rp->getType(), 1),
-                                    rp);
-                                llvm::Value* rem = builder_.CreateSRem(lp, safeR);
-                                payloadResult = builder_.CreateSelect(
-                                    isMinNegOne,
-                                    llvm::ConstantInt::get(rp->getType(), 0), rem);
-                            }
-                        }
-                    }
-                }
-                if (!payloadResult) {
-                    // Unchecked ops (bool bitwise on i1, shifts, plain add/sub for
-                    // non-integer — fallback).
-                    if      (op == "+")   payloadResult = builder_.CreateAdd(lp, rp);
-                    else if (op == "-")   payloadResult = builder_.CreateSub(lp, rp);
-                    else if (op == "*")   payloadResult = builder_.CreateMul(lp, rp);
-                    else if (op == "/")   payloadResult = uns ? builder_.CreateUDiv(lp, rp)
-                                                              : builder_.CreateSDiv(lp, rp);
-                    else if (op == "mod") payloadResult = uns ? builder_.CreateURem(lp, rp)
-                                                              : builder_.CreateSRem(lp, rp);
-                    else if (op == "&")   payloadResult = builder_.CreateAnd(lp, rp);
-                    else if (op == "|")   payloadResult = builder_.CreateOr(lp, rp);
-                    else if (op == "^")   payloadResult = builder_.CreateXor(lp, rp);
-                    else if (op == "<<" || op == ">>") {
-                        // §6.5 (#1094; domain rule v0.242, #3045): a nullable
-                        // shift's result type is the LEFT operand's type — it is
-                        // NOT promoted by the count. The lifted operands were
-                        // widened to a common width, so the DOMAIN and the shift
-                        // are at the RESULT payload width (the left operand's true
-                        // width), not the widened `lp` width. Without this,
-                        // `byte? << int 9` widened lp to i32 and used the i32
-                        // domain, shifting 1<<9 = 512, then truncating to byte = 0
-                        // — instead of `byte`'s `0..7` domain, under which count 9
-                        // now raises OverflowException. Narrow lp to the result
-                        // width and check the count against THAT width.
-                        // emitShiftCountInDomain also coerces the count to the
-                        // shifted value's type, which avoids the LLVM "both shift
-                        // operands same type" assert (a crash) when lp/rp differ.
-                        // §7.11: this runs only on the both-present branch, so a
-                        // null operand still yields null and never faults.
-                        llvm::Type* resTy =
-                            nullableValueStructTy(nvTy)->getElementType(1);
-                        llvm::Value* lsh = lp;
-                        if (resTy->isIntegerTy() && resTy != lp->getType())
-                            lsh = builder_.CreateTrunc(lp, resTy);
-                        bool cntUns =
-                            bin.right && isUnsignedTargetExpr(*bin.right);
-                        llvm::Value* cnt =
-                            emitShiftCountInDomain(lsh, rp, cntUns);
-                        if (op == "<<") {
-                            payloadResult = builder_.CreateShl(lsh, cnt);
-                        } else {
-                            // #814 / §6.5: `>>` fill is logical (LShr) iff the
-                            // SHIFTED (LEFT) operand is unsigned, arithmetic (AShr)
-                            // for a signed left operand — independent of the
-                            // operation's common signedness `uns` (mirrors the
-                            // non-nullable path). Using `uns` here arithmetic-shifted
-                            // an unsigned `byte?` once lp was narrowed to i8 (-128 >>
-                            // 1 = -64 instead of 64).
-                            bool lShiftUns =
-                                bin.left && isUnsignedTargetExpr(*bin.left);
-                            payloadResult = lShiftUns
-                                ? builder_.CreateLShr(lsh, cnt)
-                                : builder_.CreateAShr(lsh, cnt);
-                        }
-                    }
-                }
-            }
-            // #1044: the op ran at the widened operand width, but the result
-            // struct's payload is the sema result type's width (the promoted
-            // width for arithmetic — `byte? + int` → `int?`/i32; or the left
-            // operand's width for a shift — `byte? << 1` → `byte?`/i8). Coerce
-            // the integer payload to that width HERE (still inside the op block,
-            // so the value dominates the PHI that consumes it from opEndBB) so
-            // the wrap's `insertvalue` is well-typed and the value is correctly
-            // narrowed where the result is narrower than the computed width.
-            if (payloadResult && payloadResult->getType()->isIntegerTy()) {
-                llvm::Type* wantTy = nullableValueStructTy(nvTy)->getElementType(1);
-                if (wantTy->isIntegerTy() && wantTy != payloadResult->getType())
-                    payloadResult = builder_.CreateIntCast(
-                        payloadResult, wantTy, /*isSigned=*/true);
-            }
-            auto* opEndBB = builder_.GetInsertBlock();
-            builder_.CreateBr(mergeBB);
-
-            // --- mergeBB: phi between present-value and zero-payload. ---
-            builder_.SetInsertPoint(mergeBB);
-            // PHI nodes must be first in the block. Create the payload PHI first,
-            // then the tag ZExt (which uses bothPresent from entryBB — a constant-
-            // or instruction-value already computed before the branch, so it is
-            // dominating and valid as a non-PHI operand after the PHIs).
-            // Build the result T? struct: {i8 tag, T payload}.
-            // - tag: 1 when both present (payloadResult is valid), 0 otherwise.
-            // - payload: payloadResult when present, else zero (the tag signals
-            //   null so the zero value is never read by correct code).
-            llvm::Value* payloadPhi = nullptr;
-            if (payloadResult) {
-                // PHI first (required to be at the top of the block).
-                auto* phi = builder_.CreatePHI(payloadResult->getType(), 2,
-                                               "lift.payload");
-                phi->addIncoming(payloadResult, opEndBB);
-                phi->addIncoming(
-                    llvm::Constant::getNullValue(payloadResult->getType()), entryBB);
-                payloadPhi = phi;
-            } else {
-                // Fallback: use zero of the struct's payload type.
-                auto* nvSt = nullableValueStructTy(nvTy);
-                payloadPhi = llvm::Constant::getNullValue(nvSt->getElementType(1));
-            }
-            // Non-PHI instructions follow the PHI group.
-            llvm::Value* resultTag = builder_.CreateZExt(
-                bothPresent, nullablePrimHasValTy(), "lift.tag");
-            // Construct the result nullable struct {tag, payload}.
-            auto* st = nullableValueStructTy(nvTy);
-            llvm::Value* res = builder_.CreateInsertValue(
-                llvm::UndefValue::get(st), resultTag, {0u}, "lift.res");
-            res = builder_.CreateInsertValue(res, payloadPhi, {1u});
-            return res;
+        if (op != "=" && op != "<>") {
+            llvm::Value* lBefore = l;
+            llvm::Value* rBefore = r;
+            l = unwrapIfTagged(l, lTy);
+            r = unwrapIfTagged(r, rTy);
+            // §7.11 (v0.286, #3298): record whether the unwrap actually fired.
+            // Sema does not rewrite a narrowed operand's exprType — it stays
+            // `T?` — so every downstream block keying on `!ty->nullable` reads
+            // the DECLARED type and mis-routes a narrowed operand. The unwrap
+            // is the only place that knows.
+            // ⚠ The test is "did the value CHANGE", not "is it no longer a
+            // struct": a `decimal` payload is itself a `%bz.decimal` STRUCT, so
+            // an isStructTy() test reports `decimal?` as still-boxed and
+            // reintroduces exactly the mis-route this flag exists to prevent.
+            lUnwrapped_ = (l != lBefore);
+            rUnwrapped_ = (r != rBefore);
         }
     }
+    const bool lUnwrapped = lUnwrapped_;
+    const bool rUnwrapped = rUnwrapped_;
     // §4.4 / §6.4 fix #521: decimal arithmetic — route via bz_decimal_* runtime.
     // Decimal values are { i32 lo32, i32 mid32, i32 hi32, i32 flags } structs.
     // All runtime functions take pointers, so we alloca the operands, store,
@@ -8327,15 +7960,26 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
             ? resolveTypeParamRef(ctx_.exprType(*bin.left)) : nullptr;
         const sema::TypeRef* rTy = bin.right
             ? resolveTypeParamRef(ctx_.exprType(*bin.right)) : nullptr;
-        // fix #663: exclude nullable decimal (decimal?) — those values lower to
-        // the {i8, %bz.decimal} tagged struct; the lifted-arithmetic block above
-        // handles decimal? operands by extracting the payload before routing here.
-        // A decimal? operand reaching this point carries the full wrapper struct,
-        // not the bare %bz.decimal that the runtime functions expect.
-        bool lDec = lTy && lTy->kind == sema::TypeRef::Kind::Primitive &&
-                    lTy->primitive == P::Decimal && !lTy->nullable;
-        bool rDec = rTy && rTy->kind == sema::TypeRef::Kind::Primitive &&
-                    rTy->primitive == P::Decimal && !rTy->nullable;
+        // #3298 (v0.286): the §7.11 lifted-arithmetic block this comment
+        // historically referenced was deleted by proposal 0114 — an
+        // un-narrowed nullable operand is rejected at sema and never reaches
+        // codegen. A NARROWED one does, and it keeps its declared `decimal?`
+        // exprType, so `!lTy->nullable` is the wrong test: it said "not a
+        // decimal operand" about a bare `%bz.decimal` and routed
+        // `var a: decimal? := 5; var d: decimal := a + 1;` into the INTEGER
+        // path, emitting `add %bz.decimal, i32` (an IR-verification abort at
+        // exit 141). An earlier revision of this comment asserted "a decimal?
+        // operand therefore never reaches this decimal block" — measured
+        // false. What decides is whether the unwrap above produced a bare
+        // value: `decimalOperand` is "declared decimal AND lowered as a bare
+        // decimal", which covers the non-nullable and the narrowed operand
+        // alike and still excludes a live `{i8, %bz.decimal}` box.
+        auto decimalOperand = [&](const sema::TypeRef* ty, bool unwrapped) {
+            return ty && ty->kind == sema::TypeRef::Kind::Primitive &&
+                   ty->primitive == P::Decimal && (!ty->nullable || unwrapped);
+        };
+        bool lDec = decimalOperand(lTy, lUnwrapped);
+        bool rDec = decimalOperand(rTy, rUnwrapped);
         // §5.1: integers implicitly widen to decimal — promote an integer operand.
         // We detect this by: result type is decimal, and one operand is integer.
         const sema::TypeRef* resTy = resolveTypeParamRef(ctx_.exprType(bin));
@@ -8349,11 +7993,16 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
         // is routed through emitValueEquality → bz_decimal_cmp. Entering here
         // with a nullable side would pass the full {i8, %bz.decimal} wrapper
         // struct to bz_decimal_cmp as if it were a bare %bz.decimal → wrong.
+        // #3298 (v0.286): "still a box" is the condition, not "declared
+        // nullable". `=`/`<>` skip the unwrap above by design, so a genuinely
+        // nullable decimal operand there is still a `{i8, %bz.decimal}` and
+        // #663's skip stands unchanged; a §7.4-narrowed arithmetic operand has
+        // been unwrapped and must NOT skip.
         bool eitherNullableDecimal =
             (lTy && lTy->kind == sema::TypeRef::Kind::Primitive &&
-             lTy->primitive == P::Decimal && lTy->nullable) ||
+             lTy->primitive == P::Decimal && lTy->nullable && !lUnwrapped) ||
             (rTy && rTy->kind == sema::TypeRef::Kind::Primitive &&
-             rTy->primitive == P::Decimal && rTy->nullable);
+             rTy->primitive == P::Decimal && rTy->nullable && !rUnwrapped);
         if (!eitherNullableDecimal && (lDec || rDec || resDec)) {
             llvm::StructType* dst = decimalStructType();
             // Helper: promote value to decimal struct (alloca + runtime call).

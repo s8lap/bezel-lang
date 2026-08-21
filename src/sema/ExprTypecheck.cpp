@@ -9828,10 +9828,125 @@ bool ExprTC::isKnownNonNull(Symbol* sym) {
     return dt && !dt->nullable;
 }
 
+// §7.4 / §7.11 (v0.286, #3298): the ONE §7.4-narrowed-operand test. See the
+// header for why this is one function and not six. `lookupName` rather than
+// `ctx_.exprSymbol` is deliberate: the §7.11 gates run inside `typeBinary` /
+// `typeUnary`, where the operand expression has been visited but a
+// binding-site symbol may not yet be recorded on it, and the lexical lookup is
+// what `isKnownNonNull`'s own callers (resolveMemberAccess, the #1575 guard)
+// already use.
+bool ExprTC::isNarrowedNonNullRead(const ast::Expr* e) {
+    if (!e) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+    if (id && id->name != "this" && id->name != "base") {
+        if (Symbol* s = lookupName(id->name))
+            if (dynamic_cast<LocalSymbol*>(s) ||
+                dynamic_cast<ParameterSymbol*>(s))
+                return isKnownNonNull(s);
+    }
+    // §7.4 (v0.214, #2085/#2116): a nullable `readonly` FIELD narrows too — it
+    // has no writer after construction, so there is no TOCTOU hazard, and
+    // `if _n <> null then … _n + 1 …` is exactly the guard §7.4 licenses.
+    // Consultation is read-only (assignIds=false): it mints no ids and touches
+    // no compiler state on the reject path — the same call the member-access
+    // gate makes (ExprTypecheck_Calls.cpp). A MUTABLE field or a property
+    // returns nullopt here and stays a nullable operand, which is the correct
+    // answer: §7.4 does not narrow them at all.
+    if (auto key = readonlyFieldPathOf(e, /*assignIds=*/false))
+        return fieldNarrowed_.count(*key) > 0;
+    return false;
+}
+
+// §7.4 (v0.286, #3298): see the header. A value whose static type is
+// non-nullable proves the target non-null (the original #418 rule); so does a
+// non-`null` LITERAL whose type §5.3 constant-narrowing has retyped to the
+// nullable target type. `null` itself, and every non-literal expression, fall
+// through to the type test unchanged.
+bool ExprTC::valueProvesNonNull(const ast::Expr* value,
+                                const TypeRef* valueType) {
+    if (valueType && !valueType->nullable) return true;
+    if (!value) return false;
+    if (dynamic_cast<const ast::NullLiteralExpr*>(value)) return false;
+    return dynamic_cast<const ast::IntLiteralExpr*>(value) ||
+           dynamic_cast<const ast::FloatLiteralExpr*>(value) ||
+           dynamic_cast<const ast::CharLiteralExpr*>(value) ||
+           dynamic_cast<const ast::StringLiteralExpr*>(value) ||
+           dynamic_cast<const ast::BoolLiteralExpr*>(value);
+}
+
+// §7.11 (v0.286, #3298): "The rule reads the operand's static type, so an
+// operand that §7.4 has narrowed non-null is a non-nullable operand and the
+// ordinary operator applies to it unchanged." Normalizing here is what makes
+// that sentence true for the RESULT type as well as for the rejection: without
+// it `if n <> null then m := n + 1;` types the sum `int?` and the store into a
+// non-nullable `m` is a false reject.
+TypeRef* ExprTC::operandStaticTypeAt(const ast::Expr* e, TypeRef* declared) {
+    if (!declared || !declared->nullable ||
+        declared->kind != TypeRef::Kind::Primitive)
+        return declared;
+    if (!isNarrowedNonNullRead(e)) return declared;
+    TypeRef* nonnull = ctx_.makeTypeRef();
+    *nonnull = *declared;
+    nonnull->nullable = false;
+    return nonnull;
+}
+
+// §19.3 / §16.6 / §7.11 (v0.286, #3298): a relational (`> x`) or range
+// (`lo..hi`, `..<hi`, `lo..`, bare `..`) pattern over a NULLABLE scrutinee is a
+// compile error — "A nullable scrutinee — value or reference — is a compile
+// error at a relational pattern, and at a range pattern (§16.6) alike:
+// ordering admits no absent participant (§7.11), and pattern position performs
+// no narrowing" (§19.3, v0.286). The rejection is keyed on the pattern's KIND,
+// not on which bounds are written, so it reaches the open-ended forms and the
+// fully open `..` with the closed ones.
+//
+// Before this gate these patterns lowered through the backend's nullable
+// relational/range match paths, which ANDed the comparison with the hasValue
+// tag and so silently never matched a `null` — the reading proposal 0114's D5
+// proposed and v0.267 deliberately overrode. Deleting that lowering without
+// this gate turns the silent mismatch into a malformed-IR ICE, which is why
+// the two ship together and why the gate is keyed on nullability rather than
+// on the primitive family the deleted lowering happened to cover.
+void ExprTC::checkOrderingPatternsOverNullableScrutinee(
+        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms) {
+    if (!scrutTy || !scrutTy->nullable) return;
+    for (const ast::CaseArm& arm : arms) {
+        // Iterative walk: the only nesting an ordering pattern can sit inside
+        // at this level is an alternative list's member set (§19.3 admits
+        // ranges and relationals as binding-free alternative members).
+        std::vector<const ast::Pattern*> queue{arm.pattern.get()};
+        while (!queue.empty()) {
+            const ast::Pattern* q = queue.back();
+            queue.pop_back();
+            if (!q) continue;
+            const bool isRel =
+                dynamic_cast<const ast::RelOpPattern*>(q) != nullptr;
+            if (isRel || dynamic_cast<const ast::RangePattern*>(q)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, q->span.begin,
+                    std::string("a ") + (isRel ? "relational" : "range") +
+                    " pattern requires a non-nullable scrutinee \xE2\x80\x94 "
+                    "ordering admits no absent participant and pattern "
+                    "position performs no narrowing (\xC2\xA7""19.3, "
+                    "\xC2\xA7""16.6, \xC2\xA7""7.11); separate the absent "
+                    "case first (`case x of null => \xE2\x80\xA6, "
+                    "var v: T when v > 70 => \xE2\x80\xA6, _ => "
+                    "\xE2\x80\xA6 end`), or narrow the scrutinee with `??` "
+                    "(\xC2\xA7""7.7) or `!` (\xC2\xA7""7.8) before the "
+                    "`case`");
+                continue;
+            }
+            if (auto* ap = dynamic_cast<const ast::AltPattern*>(q))
+                for (const auto& m : ap->members) queue.push_back(m.get());
+        }
+    }
+}
+
 // §7.4 (issue #418): refresh `nullNarrowed_` for `sym := value`. A non-null
 // value proves the variable non-null from here; a nullable value (including a
 // bare `null` literal, typed nullable) clears any prior knowledge.
-void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType) {
+void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType,
+                                const ast::Expr* value) {
     if (!sym) return;
     if (!dynamic_cast<LocalSymbol*>(sym) &&
         !dynamic_cast<ParameterSymbol*>(sym))
@@ -9849,7 +9964,7 @@ void ExprTC::narrowOnAssignment(Symbol* sym, const TypeRef* valueType) {
     // hold (they were about the old referent). Drop them regardless of the new
     // value's nullability.
     dropFieldFactsRooted(sym);
-    if (valueType && !valueType->nullable)
+    if (valueProvesNonNull(value, valueType))
         nullNarrowed_.insert(sym);
     else
         nullNarrowed_.erase(sym);
@@ -12727,8 +12842,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // non-null value is known non-null until reassigned (parallel to
             // the assignment-narrowing in AssignmentStmt above).
             if (ld->initializer && lsym->declType && lsym->declType->nullable) {
-                if (TypeRef* initTy = ctx_.exprType(*ld->initializer))
-                    if (!initTy->nullable) nullNarrowed_.insert(lsym);
+                // §7.4 / #3298: `valueProvesNonNull`, not `!initTy->nullable` —
+                // a §5.3 constant-narrowed literal carries the nullable TARGET
+                // type, which made `var a: byte? := 3;` fail to narrow while
+                // `var a: int? := 3;` narrowed.
+                if (valueProvesNonNull(ld->initializer.get(),
+                                       ctx_.exprType(*ld->initializer)))
+                    nullNarrowed_.insert(lsym);
             }
         }
     } else if (auto* lc =
@@ -12833,8 +12953,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // for the rest of its scope — its narrowing is never
             // invalidated (no invalidating form can apply to a const).
             if (lc->value && lsym->declType && lsym->declType->nullable) {
-                if (TypeRef* initTy = ctx_.exprType(*lc->value))
-                    if (!initTy->nullable) nullNarrowed_.insert(lsym);
+                // §7.4 / #3298: same predicate as the `var` site above.
+                if (valueProvesNonNull(lc->value.get(),
+                                       ctx_.exprType(*lc->value)))
+                    nullNarrowed_.insert(lsym);
             }
         }
     } else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
@@ -13886,20 +14008,40 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // §5.1's nullable conversions run T → T? only, never back.
                 // Applies to all nine operator forms; reported below once the
                 // operand KINDS have passed their own checks.
+                //
+                // #3298 (§6.6/§7.11, v0.267): §7.11's lifting is REJECTED for
+                // arithmetic/bitwise/shift/relational operators, so ANY nullable
+                // operand (target OR right-hand side) is a compile error —
+                // `int? += 1` and `int? += int?` are both rejected with the
+                // same §7.11 wording. `??=` is structurally excluded from this
+                // gate (it is not a read-modify-write and `as->op != "??="`
+                // guards the whole arithmetic / bitwise / shift family above).
                 auto reportNullableRhs = [&]() {
                     std::string binOp(as->op.substr(0, as->op.size() - 1));
+                    bool targetNull = tTy && tTy->nullable;
+                    bool rhsNull = rTy && rTy->nullable;
+                    std::string which;
+                    if (targetNull && rhsNull)
+                        which = "both operands are nullable (target `" +
+                                spellN(tTy) + "`, right-hand operand `" +
+                                spellN(rTy) + "`)";
+                    else if (targetNull)
+                        which = "the target is nullable (`" + spellN(tTy) + "`)";
+                    else
+                        which = "the right-hand operand is nullable (`" +
+                                spellN(rTy) + "`)";
                     ctx_.diagnostics().report(
                         Severity::Error, as->value->span.begin,
                         std::string("compound assignment `") +
                         std::string(as->op) +
-                        "` has a nullable right-hand operand (`" +
-                        spellN(rTy) + "`) with a non-nullable target (`" +
-                        spellN(tTy) + "`): the result of `" + spellN(tTy) +
-                        " " + binOp + " " + spellN(rTy) + "` is nullable "
-                        "where defined (§7.11) and cannot store back into "
-                        "the non-nullable target — narrow the right-hand "
-                        "operand first (`?? <fallback>`, `!`, or a §7.4 "
-                        "check) (§6.6)");
+                        "` is not defined when " + which +
+                        " \xE2\x80\x94 the arithmetic, bitwise, or shift "
+                        "operators do not lift over a nullable value type "
+                        "(\xC2\xA7""7.11, v0.267); narrow first "
+                        "(\xC2\xA7""7.4 check, `?? <fallback>` (\xC2\xA7""7.7), or "
+                        "`!` (\xC2\xA7""7.8)) and use the non-nullable compound "
+                        "form (e.g. `b := (b ?? 0) " + binOp + " 1;`) (\xC2\xA7"
+                        "6.6)");
                 };
                 // §6.2/§6.6 (#2155): the compound desugaring `x op= e` →
                 // `x := x op e` (§6.6) inherits the binary op's §6.2
@@ -13952,11 +14094,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "` is not valid on " + badKind + " — bitwise and "
                             "shift operators require integer operands "
                             "(§6.5)");
-                    // §6.6/§7.11 (#2153): an integer-kinded NULLABLE RHS with
-                    // a non-nullable target (`int &= long?`, `int <<= int?`)
-                    // has no storable result — same rule as the arithmetic
-                    // forms below.
-                    else if (rTy->nullable && !tTy->nullable)
+                    // #3298 (§6.6/§7.11, v0.267): reject when EITHER the
+                    // right-hand operand OR the target is a nullable value
+                    // type — `int &= int?` (RHS nullable) and `int? &= int`
+                    // (target nullable) are both compile errors (proposal
+                    // 0114 D6). The pre-#3298 wording was "nullable RHS with
+                    // non-nullable target" and missed the nullable-target
+                    // direction; the new diagnostic names which direction is
+                    // nullable through reportNullableRhs's `which` arm. `??=`
+                    // is excluded — the outer `as->op` enumeration skips it.
+                    else if (rTy->nullable || tTy->nullable)
                         reportNullableRhs();
                     // §6.2/§6.6 (#2155): the bitwise (non-shift) forms
                     // (`&= |= ^=`) carry the SAME pair-admissibility as the
@@ -14027,9 +14174,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         "a non-nullable `string` — §7.11's lifting covers "
                         "nullable value types only and does not extend to "
                         "`string`; narrow the target first (§7.4) (§6.6)");
-                } else if (rTy->nullable && !tTy->nullable) {
-                    // §6.6/§7.11 (#2153): nullable RHS, non-nullable target
-                    // (`int += int?`, `string += int?`) — see reportNullableRhs.
+                } else if (rTy->nullable || tTy->nullable) {
+                    // §6.6/§7.11 (#2153, widened by #3298 v0.267): reject when
+                    // EITHER the right-hand operand OR the target is a nullable
+                    // value type. The previous #2153 wording was "nullable
+                    // RHS with non-nullable target"; v0.267 makes both
+                    // directions a §7.11 compile error (proposal 0114).
+                    // reportNullableRhs names the §7.4/`??`/`!` remedies.
+                    // `??=` never reaches here — the outer `as->op != "??="`
+                    // gate skips the whole arithmetic/bitwise/shift family.
                     reportNullableRhs();
                 } else if (tTy->primitive == P::String) {
                     // §6.6/§4.6 (#2157): a non-nullable STRING target. The
@@ -14620,7 +14773,8 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     as->target.get())) {
                 if (tid->name != "this" && tid->name != "base") {
                     if (Symbol* tsym = lookupName(tid->name))
-                        narrowOnAssignment(tsym, ctx_.exprType(*as->value));
+                        narrowOnAssignment(tsym, ctx_.exprType(*as->value),
+                                           as->value.get());
                 }
             }
         } else if (as->target) {
@@ -15597,7 +15751,29 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     targetTy->declaration &&
                     targetTy->declaration->kind ==
                         ast::TypeDeclKind::Record;
-                if (isRefType || isValueTypeRecord) {
+                // §17.6 (v0.286) / §7.11 (v0.267, #3298): "An operand whose
+                // static type is a NULLABLE TYPE is a compile error." That is
+                // unconditional, so it is decided BEFORE §17.6's three-category
+                // dispatch below — a nullable record or class that DOES declare
+                // `operator ++` otherwise matched the overload branch, was
+                // admitted, and died in codegen ("Call parameter type does not
+                // match function signature": the `{i8, %record.C}` box passed
+                // where the operator takes a bare `%record.C`). Testing it in
+                // an `else if` after the dispatch, as the first draft did,
+                // cannot reach that case at all. The non-nullable reference and
+                // record rows (#2585/#2599) are untouched: they never enter
+                // this branch.
+                if (targetTy->nullable) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, is->target->span.begin,
+                        std::string("`") + std::string(is->op) +
+                        "` is not defined on a nullable type — narrow "
+                        "first (`x <> null and …` (§7.4), `??` (§7.7), or `!` "
+                        "(§7.8)); `++`/`--` desugar to `x := x + 1` / `x := x "
+                        "- 1` (§17.6), and the arithmetic operators do not lift "
+                        "over `T?` (§7.11, v0.267)");
+                }
+                else if (isRefType || isValueTypeRecord) {
                     // Look for a user-defined `operator ++`/`operator --` on
                     // the target's Named type (§25 overload resolution).
                     // Both reference types and value-type records resolve
@@ -15676,6 +15852,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             "` does not)");
                     }
                 }
+                // §7.11 / proposal 0114 / v0.267 (#3298): `++`/`--` do not
+                // lift over a nullable value type. The §17.6 desugaring is
+                // `c := c + 1`; with a nullable `c`, the underlying `+` is the
+                // §7.11 rejected form. Codegen had no clean path and either
+                // emitted a fabricated nonsense constant (#2888's ICE) or
+                // silently dropped the write (#2888's silent-drop case for a
+                // nullable property). Reject at the front end with the same
+                // §7.4 / `??` / `!` remedies, ruling this out before codegen
+                // sees the form.
             }
         }
         // §7.4 (v0.214, #2116 pre-gate review): `c++`/`c--` desugars to
@@ -15703,6 +15888,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         TypeRef* scrutTy =
             cs->scrutinee ? ctx_.exprType(*cs->scrutinee) : nullptr;
         scrutTy = recoverChoiceThisScrutTy(cs->scrutinee.get(), scrutTy);
+        // §19.3 / §16.6 / §7.11 (v0.286, #3298): the statement-position form
+        // takes the same rule as the CaseExpr site — one shared checker, so
+        // the two spellings of `case` cannot drift apart on this verdict.
+        checkOrderingPatternsOverNullableScrutinee(scrutTy, cs->arms);
         // §5.1 / §19 (#1153): reject an out-of-range integer pattern literal
         // (statement-position `case` is exempt from exhaustiveness but not from
         // the literal-range gate — codegen would otherwise truncate it).

@@ -1873,10 +1873,59 @@ private:
     // always to a non-nullable form) OR its declared type is non-nullable.
     bool isKnownNonNull(Symbol* sym);
 
+    // §7.4 / §7.11 (v0.286, #3298): the ONE "is this operand read as
+    // non-null here?" test. §7.11 reads an operand's STATIC type and states
+    // that "an operand that §7.4 has narrowed non-null is a non-nullable
+    // operand and the ordinary operator applies to it unchanged" — so every
+    // §7.11 gate (binary arithmetic/bitwise/shift, relational, unary, the
+    // #1575 `string?` ordering guard, the §17.5 `in`-over-a-range gate) has to
+    // ask exactly this question. It was spelled FIVE times, each an independent
+    // copy of the same lookup; a sixth copy is how the family drifts.
+    //
+    // §7.4 narrows TWO kinds of storage and this consults both:
+    //   * a simple local or parameter — `nullNarrowed_` / `narrowings_`, via
+    //     isKnownNonNull (`this`/`base` are never narrowable operands);
+    //   * a `readonly` FIELD path (`this._f`, `TypeName._s`, `local._f`) —
+    //     `fieldNarrowed_`, v0.214/#2085/#2116, admitted because a readonly
+    //     field has no writer after construction and so no TOCTOU hazard.
+    // A MUTABLE field or a property never narrows and is excluded by both.
+    bool isNarrowedNonNullRead(const ast::Expr* e);
+
+    // §7.11 (v0.286, #3298): the static type an operand is READ AT, which is
+    // the declared type with the nullable flag dropped when
+    // `isNarrowedNonNullRead` holds. Returns `declared` unchanged for every
+    // other operand, so a caller can normalize both operands once and then
+    // compute §6.2 promotion and the result type without a narrowing special
+    // case of its own.
+    TypeRef* operandStaticTypeAt(const ast::Expr* e, TypeRef* declared);
+
+    // §19.3 / §16.6 / §7.11 (v0.286, #3298): reject a relational or range
+    // pattern in `arms` when the scrutinee's static type is nullable. Shared by
+    // the CaseExpr and CaseStmt sites — the two forms take the same rule and
+    // the same diagnostic, and §19.3 keys the rejection on the pattern's KIND,
+    // not on which bounds are written.
+    void checkOrderingPatternsOverNullableScrutinee(
+        const TypeRef* scrutTy, const std::vector<ast::CaseArm>& arms);
+
     // §7.4 (issue #418): update `nullNarrowed_` for an assignment of a value of
     // `valueType` to the simple variable `sym` — a non-null value makes it
-    // known-non-null; a (possibly-)null value clears that knowledge.
-    void narrowOnAssignment(Symbol* sym, const TypeRef* valueType);
+    // known-non-null; a (possibly-)null value clears that knowledge. `value`
+    // is the assigned expression where the caller has it (see
+    // `valueProvesNonNull` for why the type alone is not sufficient).
+    void narrowOnAssignment(Symbol* sym, const TypeRef* valueType,
+                            const ast::Expr* value = nullptr);
+
+    // §7.4 (v0.286, #3298): does this assigned/initialising VALUE prove the
+    // target non-null? The rule was spelled `!valueType->nullable` at all three
+    // establishment sites, and that is wrong for a §5.3 constant-narrowed
+    // literal: `var a: byte? := 3;` retypes the literal to the TARGET type
+    // `byte?`, so the type test said "possibly null" about the constant 3 and
+    // no narrowing was established. `int?`/`long?`/`double?` were unaffected
+    // (their literals keep a non-nullable type), which made §7.4 — and every
+    // rule reading it, §7.11's operator gate included — answer differently for
+    // `byte?` than for `int?` at identical shapes. A literal is never `null`
+    // except `NullLiteralExpr`, so consulting the expression settles it.
+    bool valueProvesNonNull(const ast::Expr* value, const TypeRef* valueType);
 
     // §7.4 (#2258): reduce the three live narrowing sets to their INTERSECTION
     // with one snapshot — the single primitive every all-paths join and every

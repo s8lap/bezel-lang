@@ -107,34 +107,62 @@ BEZEL_TEST(codegen_alt_range_1584, open_ended_member_with_constant) {
 }
 
 // ---- `null | 1..5` over a nullable value scrutinee -------------------------
-// §19.3 v0.183 / §19.5: `null` matches the absent slot; the range member
-// matches a present in-range value; both are members of one binding-free arm.
+// §19.3 / §16.6 / §7.11 (v0.286, #3298) — REJECTION, reversing the three
+// acceptance rows that used to live here. §19.3 admits a range as an
+// alternative MEMBER, and it separately requires a non-nullable scrutinee at
+// any range or relational pattern; the rejection is keyed on the member's
+// pattern KIND, so it reaches an ordering member inside an alternative list
+// exactly as it reaches a top-level one. A rule that stopped at the top level
+// would make the verdict depend on the spelling of the arm — the "same shape,
+// opposite answers, decided by spelling" defect proposal 0114 exists to remove.
+//
+// The alternative-list machinery #1584 installed is unaffected: it is still
+// exercised over a NON-nullable scrutinee by every row above, and by the
+// pure-constant row below.
 
-BEZEL_TEST(codegen_alt_range_1584, null_or_range_matches_null) {
-    const std::string prog =
-        "module M; class C public static method Main(): int "
-        "  var x: int? := null; "
-        "  return (case x of null | 1..5 => 8, _ => 0); "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(runProg(prog), 8);
+namespace {
+bool altRangeOverNullableRejected(const std::string& prog) {
+    auto r = runAot(prog);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const auto& m = d.message;
+        if (m.find("pattern requires a non-nullable scrutinee") ==
+                std::string::npos)
+            continue;
+        if (m.find("19.3") == std::string::npos) continue;
+        return true;
+    }
+    return false;
 }
+}  // namespace
 
-BEZEL_TEST(codegen_alt_range_1584, null_or_range_matches_in_range_present) {
-    const std::string prog =
+BEZEL_TEST(codegen_alt_range_1584, null_or_range_member_over_nullable_rejected) {
+    BEZEL_EXPECT_TRUE(altRangeOverNullableRejected(
         "module M; class C public static method Main(): int "
         "  var x: int? := 3; "
         "  return (case x of null | 1..5 => 8, _ => 0); "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(runProg(prog), 8);
+        "end Main; end C;"));
 }
 
-BEZEL_TEST(codegen_alt_range_1584, null_or_range_falls_through_out_of_range) {
-    const std::string prog =
+// The absent-case member alone is still admitted: `null` is not an ordering
+// pattern (§19.3's rejection is kind-keyed), and a constant member is §8.4
+// equality, which is total on `null`.
+BEZEL_TEST(codegen_alt_range_1584, null_or_constant_member_over_nullable_accepted) {
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class C public static method Main(): int "
+        "  var x: int? := null; "
+        "  return (case x of null | 3 => 8, _ => 0); "
+        "end Main; end C;"), 8);
+    BEZEL_EXPECT_EQ(runProg(
+        "module M; class C public static method Main(): int "
+        "  var x: int? := 3; "
+        "  return (case x of null | 3 => 8, _ => 0); "
+        "end Main; end C;"), 8);
+    BEZEL_EXPECT_EQ(runProg(
         "module M; class C public static method Main(): int "
         "  var x: int? := 99; "
-        "  return (case x of null | 1..5 => 8, _ => 0); "
-        "end Main; end C;";
-    BEZEL_EXPECT_EQ(runProg(prog), 0);
+        "  return (case x of null | 3 => 8, _ => 0); "
+        "end Main; end C;"), 0);
 }
 
 // ---- a binding member in an alternative list is still rejected -------------

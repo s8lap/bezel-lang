@@ -886,20 +886,48 @@ BEZEL_TEST(codegen_cg28, typed_binding_over_nullable_value_null_738) {
         "return r;"), 99);  // §19.5: typed binding never matches null
 }
 
-// #738 / §19.3: a range pattern over an `int?` scrutinee (alongside a null arm).
-// Previously IR-failed (nullable-value path deferred RangePattern); now matches
-// hasValue AND in-range.
-BEZEL_TEST(codegen_cg28, range_pattern_over_nullable_value_738) {
+// §19.3 / §16.6 (v0.286, #3298) — REJECTION, reversing #738's two acceptance
+// rows. #738 taught the nullable-value RangePattern lowering ("matches hasValue
+// AND in-range"); v0.267 deliberately overrode that reading (proposal 0114's
+// declined D5) and §19.3 now reads: "A nullable scrutinee — value or reference
+// — is a compile error at a relational pattern, and at a range pattern (§16.6)
+// alike: ordering admits no absent participant (§7.11), and pattern position
+// performs no narrowing." An explicit `null` arm beside the range does not
+// rescue it — the rejection is on the range pattern itself. The absent case is
+// written `case x of null => …, var n: int when n >= 5 and n <= 10 => …`.
+//
+// #738's OTHER subject — a typed binding pattern over a nullable scrutinee —
+// is unaffected and still covered by the rows above.
+BEZEL_TEST(codegen_cg28, range_pattern_over_nullable_value_rejected_3298) {
+    auto r = runAot(
+        "module M; class C public static method Main(): int "
+        "  var x: int? := 5; "
+        "  var v := (case x of null => 0, 5..10 => 1, _ => 2); "
+        "  return v; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool sawRule = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("range pattern requires a non-nullable scrutinee") !=
+                std::string::npos &&
+            d.message.find("19.3") != std::string::npos)
+            sawRule = true;
+    BEZEL_EXPECT_TRUE(sawRule);
+}
+
+// The same program with the range arm replaced by a guarded typed binding —
+// §19.3's own prescribed spelling — still compiles and still selects the
+// in-range arm, so the coverage #738 bought is kept, not dropped.
+BEZEL_TEST(codegen_cg28, nullable_scrutinee_guarded_binding_replaces_range_3298) {
     BEZEL_EXPECT_EQ(run(
         "var x: int? := 5; "
-        "var r := (case x of null => 0, 5..10 => 1, _ => 2); "
+        "var r := (case x of null => 0, var n: int when n >= 5 and n <= 10 => 1, "
+        "_ => 2); "
         "return r;"), 1);
-}
-BEZEL_TEST(codegen_cg28, range_pattern_over_nullable_value_null_738) {
     BEZEL_EXPECT_EQ(run(
         "var x: int? := null; "
-        "var r := (case x of null => 0, 5..10 => 1, _ => 2); "
-        "return r;"), 0);  // null arm wins
+        "var r := (case x of null => 0, var n: int when n >= 5 and n <= 10 => 1, "
+        "_ => 2); "
+        "return r;"), 0);
 }
 
 // ── fix #1233 / §19.3: range patterns with NEGATIVE lower bound ───────────

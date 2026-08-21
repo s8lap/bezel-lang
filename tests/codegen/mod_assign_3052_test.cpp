@@ -167,9 +167,24 @@ BEZEL_TEST(codegen_mod_assign_3052, block_form_property_target_spec_6_6) {
 // the lifted result back into a nullable target (R = T = `int?`, so no
 // narrowing is involved). The nullable arm of the compound lowering is a
 // distinct control-flow construct, so `mod=` is pinned on it.
-BEZEL_TEST(codegen_mod_assign_3052, nullable_int_target_lifts_spec_7_11) {
-    BEZEL_EXPECT_EQ(run(
-        "var n: int? := 47; n mod= 10; return n ?? -1;"), 7);
+// §6.6 / §7.11 (v0.286, #3298) — REJECTION. `mod=` is a read-modify-write
+// compound, so §6.6's nullable-operand rule reaches it exactly as it reaches
+// `+=`; the lifted spelling this row pinned no longer exists. #3052's subject —
+// that `mod=` desugars and lowers like the rest of the family — is kept by the
+// non-nullable twin, which is the form that survives.
+BEZEL_TEST(codegen_mod_assign_3052, nullable_int_target_rejected_3298) {
+    auto r = runAot(
+        "module M; class C public static method Main(): int "
+        "  var n: int? := 47; n mod= 10; return n ?? -1; end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool sawRule = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("compound assignment") != std::string::npos &&
+            d.message.find("nullable") != std::string::npos &&
+            d.message.find("7.11") != std::string::npos)
+            sawRule = true;
+    BEZEL_EXPECT_TRUE(sawRule);
+    BEZEL_EXPECT_EQ(run("var n: int := 47; n mod= 10; return n;"), 7);
 }
 
 // §22.12: a static field is the third storage shape a compound assignment can

@@ -164,11 +164,20 @@ BEZEL_TEST(imported_nullable_property_set_2937, imported_nullable_property_compo
         "public class C2937T2 "
         "  public static method Main(): int "
         "    var acc := 0; "
+        // §6.6 / §17.6 / §7.11 (v0.286, #3298): the `p.PP += 3;` and
+        // `p.PP++;` legs are compile errors now — a read-modify-write compound
+        // and its increment form over a NULLABLE imported property. §7.11's
+        // retained set is what this row keeps: the plain `:=` store and `??=`,
+        // which §6.6 excludes by name ("`??=` is unaffected — it is not a
+        // read-modify-write"). The rejection is pinned by
+        // `codegen_nullable_property_compound_2888`; what #2937 is about — that
+        // an IMPORTED property's setter is found and called across the module
+        // boundary — is unchanged and still exercised by every leg below.
         "    using var p := new XPlain2937T2(); "
         "    p.PP := 1; "
-        "    p.PP += 3; "
+        "    p.PP := (p._p ?? 0) + 3; "
         "    if (p._p ?? -1) = 4 then acc := acc + 1; end; "
-        "    p.PP++; "
+        "    p.PP := (p._p ?? 0) + 1; "
         "    if (p._p ?? -1) = 5 then acc := acc + 2; end; "
         "    using var q := new XPlain2937T2(); "
         "    q.PP ??= 42; "

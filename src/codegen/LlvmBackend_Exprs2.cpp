@@ -9882,6 +9882,28 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             return builder_.getInt1(true);
         }
 
+        // ⚠ SLOT-PATH ONLY (v0.286, #3298). §19.3 makes a relational or range
+        // pattern over a NULLABLE scrutinee a compile error, and sema now
+        // rejects it at both `case` sites (ExprTC::
+        // checkOrderingPatternsOverNullableScrutinee) — so neither handler
+        // below is reachable from an ARM pattern any more. They are kept for
+        // the ONE caller sema's arm-level walk does not reach: a range or
+        // relational SUB-pattern in a DESTRUCTURING SLOT whose field type is
+        // nullable (`case r of R(1..5, 1) => …` where `R.X: int?`), lowered
+        // at the two slot call sites below (~line 10680 and ~10790).
+        //
+        // Deleting them without a slot-level sema gate is NOT a net deletion,
+        // it is a silent miscompile: both slot call sites do
+        // `if (subMatch) matched = AND(matched, subMatch);`, so a nullptr
+        // return SKIPS the slot's test and the arm matches unconditionally.
+        // MEASURED on the draft that deleted them: `R(1..5, 1)` against
+        // `R(99, 1)` returned the arm's value instead of falling through —
+        // exactly the "→ AND skipped → always matched" defect the slot code's
+        // own comment records. §19.3's slot-level rule needs the sema gate to
+        // resolve each slot's declared type, which the arm-level walk does not
+        // do; that gap is filed as its own issue and these handlers hold the
+        // pre-#3298 behaviour until it is closed. Do not delete them without
+        // landing that gate first.
         // §19.3 (#738): a RangePattern on a nullable value — hasValue AND the
         // unwrapped value is in range. Mirrors the non-nullable range logic
         // below, applied to innerVal. (Open-ended forms: an absent bound is

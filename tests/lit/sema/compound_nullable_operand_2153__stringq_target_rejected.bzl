@@ -11,4 +11,3 @@
 module M; class C public static method Main(): int var s: string? := null; s += "x"; return 0; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: compound assignment on a `string?` target requires a non-nullable `string` — §7.11's lifting covers nullable value types only and does not extend to `string`; narrow the target first (§7.4)
-// CHECK-SAME: (§6.6)

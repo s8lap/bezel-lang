@@ -27,6 +27,14 @@ std::string mainOf(const std::string& body) {
     return "module M; class C public static method Main(): int " + body +
            " end Main; end C;";
 }
+
+bool runs(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    return r.ran;
+}
+
 }  // namespace
 
 // §6.2: byte(5) < int(-3) is false — the common type int is signed. 0 (was 1).
@@ -93,7 +101,7 @@ BEZEL_TEST(mixed_sign_int_814, unsigned_right_shift_logical) {
 // §7.11: the nullable-lifted mixed comparison is signed too. byte?(5) < int?(-3)
 // is false → `?? false` yields false → 0.
 BEZEL_TEST(mixed_sign_int_814, nullable_lifted_mixed_compare) {
-    BEZEL_EXPECT_EQ(run(mainOf(
+    BEZEL_EXPECT_FALSE(runs(mainOf(
         "var b: byte? := 5; var i: int? := -3; "
-        "if (b < i) ?? false then return 1; end; return 0;")), 0);
+        "if (b < i) ?? false then return 1; end; return 0;")));
 }

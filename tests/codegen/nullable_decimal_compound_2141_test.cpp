@@ -48,79 +48,75 @@ int throwsDiv0(const std::string& body) {
     return r.ran ? r.exitCode : -999;
 }
 
+// ⚠ THE RULE CHANGED AT v0.267 (proposal 0114, #3298). §7.11 (v0.286) opens
+// "No operator **lifts** to a nullable type" and §6.6 makes a read-modify-write
+// compound "a **compile error** when the static type of its left-hand side, or
+// of its right operand, is a **nullable** type". Every row below asserted a
+// value the lifting produced; each now asserts the diagnosis, paired with the
+// NON-NULLABLE twin so the §6.4 decimal-runtime route and §6.1's
+// DivideByZeroException — the rules this file exists for — keep their value
+// coverage. The narrowed-`decimal?` ARITHMETIC route (not compound) is covered
+// by `codegen_lifted_ops_486_narrowed_3298`, which is where a `decimal?`
+// operand still reaches the runtime after #3298.
+
+bool rejectedCompound(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const auto& m = d.message;
+        if (m.find("compound assignment") == std::string::npos) continue;
+        if (m.find("nullable") == std::string::npos) continue;
+        if (m.find("7.11") == std::string::npos) continue;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
-// --- The exact issue repro: `decimal? := 1.0m; d += 2.0m;` no longer crashes
-// codegen and yields 3.0m. §7.11 lift over the §6.4 decimal add. FAILS WITHOUT
-// the fix (bezelc IR-verify abort — the compile never produces a binary). ---
-BEZEL_TEST(codegen_2141_nullable_decimal, plus_equals_present) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 1.0m; d += 2.0m; "
-        "if (d ?? -1.0m).CompareTo(3.0m) = 0 then return 1; end; return 0;"), 1);
+// Nullable target, nullable RHS, and both — §6.6 rejects each ("either
+// position, or both"). The `null` spellings are rejected for the same reason
+// as the present ones: the gate reads the DECLARED type.
+BEZEL_TEST(codegen_2141_nullable_decimal, nullable_target_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 1.0m; d += 2.0m; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := null; d += 2.0m; return 0;"));
+}
+BEZEL_TEST(codegen_2141_nullable_decimal, nullable_rhs_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := 1.0m; var e: decimal? := 2.0m; d += e; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal := 1.0m; var e: decimal? := 2.0m; d += e; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := null; var e: decimal? := null; d += e; return 0;"));
+}
+BEZEL_TEST(codegen_2141_nullable_decimal, sub_mul_div_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 12.0m; d /= 4.0m; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 12.0m; d *= 5.0m; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 12.0m; d -= 1.0m; return 0;"));
+}
+BEZEL_TEST(codegen_2141_nullable_decimal, int_rhs_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 3.0m; d += 5; return 0;"));
 }
 
-// §7.11: both operands nullable AND present → the op runs; 1.0m + 2.0m = 3.0m.
-BEZEL_TEST(codegen_2141_nullable_decimal, both_nullable_present) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 1.0m; var e: decimal? := 2.0m; d += e; "
-        "if (d ?? -1.0m).CompareTo(3.0m) = 0 then return 1; end; return 0;"), 1);
-}
+// --- the rules this file exists for, on the surviving (non-nullable) path ---
 
-// §7.11: a `null` LHS propagates null — no op runs, the target stays null.
-BEZEL_TEST(codegen_2141_nullable_decimal, lhs_null_stays_null) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := null; d += 2.0m; "
-        "if d = null then return 1; end; return 0;"), 1);
-}
-
-// §7.11 (the review's missing RHS-null case): a `null` nullable RHS propagates
-// null — the present LHS is discarded, the result is null.
-BEZEL_TEST(codegen_2141_nullable_decimal, rhs_null_propagates_null) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 1.0m; var e: decimal? := null; d += e; "
-        "if d = null then return 1; end; return 0;"), 1);
-}
-
-// §7.11: both operands null → null.
-BEZEL_TEST(codegen_2141_nullable_decimal, both_null_stays_null) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := null; var e: decimal? := null; d += e; "
-        "if d = null then return 1; end; return 0;"), 1);
-}
-
-// §6.4: the other operators lift too — 12/4 = 3, *5 = 15, -1 = 14.
-BEZEL_TEST(codegen_2141_nullable_decimal, sub_mul_div_present) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 12.0m; d /= 4.0m; d *= 5.0m; d -= 1.0m; "
-        "if (d ?? -1.0m).CompareTo(14.0m) = 0 then return 1; end; return 0;"), 1);
-}
-
-// §7.11 / §6.4: division-by-zero raises DivideByZeroException on the present
-// branch.
-BEZEL_TEST(codegen_2141_nullable_decimal, div_by_zero_present_throws) {
-    BEZEL_EXPECT_EQ(throwsDiv0("var d: decimal? := 10.0m; d /= 0.0m;"), 1);
-}
-
-// §7.11: the div/mod zero check is present-branch only — a `null` LHS divided by
-// zero never runs the op, so it does NOT raise; the result is null.
-BEZEL_TEST(codegen_2141_nullable_decimal, div_by_zero_null_lhs_no_throw) {
-    BEZEL_EXPECT_EQ(throwsDiv0("var d: decimal? := null; d /= 0.0m;"), 0);
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := null; d /= 0.0m; "
-        "if d = null then return 1; end; return 0;"), 1);
-}
-
-// §5.1 / §6.2: an integer RHS §5.1-converts to `decimal` — `d += 5` = 8.0m.
-BEZEL_TEST(codegen_2141_nullable_decimal, int_rhs_converts_to_decimal) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 3.0m; d += 5; "
-        "if (d ?? -1.0m).CompareTo(8.0m) = 0 then return 1; end; return 0;"), 1);
-}
-
-// Control: a non-nullable `decimal` compound is undisturbed by the nullable
-// branch (still routed through the §6.4 intercept). 1.0m + 2.0m = 3.0m.
 BEZEL_TEST(codegen_2141_nullable_decimal, non_nullable_decimal_unaffected) {
     BEZEL_EXPECT_EQ(run(
         "var d: decimal := 1.0m; d += 2.0m; "
         "if d.CompareTo(3.0m) = 0 then return 1; end; return 0;"), 1);
+}
+BEZEL_TEST(codegen_2141_nullable_decimal, non_nullable_sub_mul_div_and_int_rhs) {
+    BEZEL_EXPECT_EQ(run(
+        "var d: decimal := 12.0m; d /= 4.0m; d *= 5.0m; d -= 1.0m; "
+        "if d.CompareTo(14.0m) = 0 then return 1; end; return 0;"), 1);
+    BEZEL_EXPECT_EQ(run(
+        "var d: decimal := 3.0m; d += 5; "
+        "if d.CompareTo(8.0m) = 0 then return 1; end; return 0;"), 1);
+}
+// §6.1's DivideByZeroException — §7.11: the operators' runtime checks are
+// "unchanged and unmoved … reached after the operands are narrowed".
+BEZEL_TEST(codegen_2141_nullable_decimal, div_by_zero_throws_nonnullable) {
+    BEZEL_EXPECT_EQ(throwsDiv0("var d: decimal := 10.0m; d /= 0.0m;"), 1);
 }
