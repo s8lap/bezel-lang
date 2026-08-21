@@ -508,6 +508,67 @@ if bad:
 else:
     print(f"TABLE: clean ({len(rows36)} rows; first components and component multisets pairwise distinct; every row's Defined-in resolves to a section naming it)")
 
+# ---- 3e. SETS: a normative set's restatements agree with it ------------------
+# Added v0.275 (#3323). The FACTS check above cross-checks every FORMULA carrier
+# against the spec's phrasing. It is blind, BY CONSTRUCTION, to a passage that
+# restates a normative set's MEMBERSHIP in its own words elsewhere -- which is
+# what a teaching-oriented stdlib section does, and how the `Shared`-payload
+# synchronized set sat at seven members in the stdlib while the spec listed
+# eight, from v0.263 (which granted CancellationTokenSource and enumerated the
+# five sentences it amended, missing this one) until v0.274 found it by hand.
+#
+# This keys on MEMBERS, not phrasing: find every passage naming the set and
+# enumerating it after "currently", extract the backticked type names, and fail
+# when a restatement's member set differs from the specification's. The changelog
+# is exempt -- pinned history, whose enumerations are quotations of their own
+# revision.
+SET_MARK = 'synchronized set'
+
+def _set_members(seg):
+    """The membership a passage ENUMERATES, or None if it only mentions the set.
+
+    An enumeration is 'currently' followed immediately by three or more
+    comma-separated backticked names. Requiring the run (rather than any
+    backticks after any nearby 'currently') is what separates a restatement
+    from a passing reference -- e.g. the rationale's "joining the §28.13
+    synchronized set", which names the set and enumerates nothing."""
+    m = re.search(r'currently\s+((?:`[^`]+`(?:,\s*(?:and\s+)?)?){3,})', seg[:700], re.S)
+    if not m:
+        return None
+    return frozenset(re.findall(r'`([A-Za-z_][A-Za-z0-9_]*(?:<[^`>]*>)?)`', m.group(1)))
+
+set_sites = {}
+for _k, _p in DOCS.items():
+    if _k == 'changelog':
+        continue
+    for _m in re.finditer(re.escape(SET_MARK), text[_k]):
+        _mem = _set_members(text[_k][_m.start():_m.start() + 700])
+        if _mem:
+            set_sites.setdefault(_k, []).append((text[_k][:_m.start()].count('\n') + 1, _mem))
+
+if 'spec' not in set_sites:
+    print("SETS: cannot find the specification's enumeration of the "
+          f"'{SET_MARK}' -- the check has lost its anchor")
+    fail = 1
+else:
+    _norm = set_sites['spec'][0][1]
+    _bad = []
+    for _k, _sites in set_sites.items():
+        for _line, _mem in _sites:
+            if _mem != _norm:
+                _miss = ', '.join(sorted(_norm - _mem)) or '(none)'
+                _extra = ', '.join(sorted(_mem - _norm)) or '(none)'
+                _bad.append(f"  [{_k}] line {_line}: missing {_miss}; unexpected {_extra}")
+    _total = sum(len(v) for v in set_sites.values())
+    if _bad:
+        print(f"SETS: {len(_bad)} restatement(s) disagree with the specification's "
+              f"{len(_norm)}-member set:")
+        print("\n".join(_bad))
+        fail = 1
+    else:
+        print(f"SETS: clean ({_total} enumeration(s) of the {SET_MARK} across "
+              f"{len(set_sites)} document(s); all agree on {len(_norm)} members)")
+
 sys.exit(1 if fail else 0)
 PY
 STRUCT=$?
