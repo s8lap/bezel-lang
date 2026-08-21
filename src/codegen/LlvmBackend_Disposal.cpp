@@ -157,6 +157,58 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         stringReleaseEligibleFn_ = fn;
         retainAssignedStringParams(dd->body, /*params=*/{});
         //
+        // fix #2887 / §28.4 / §27.5 / §28.3 / §28.9 (v0.240): the `var` CLOSURE-
+        // LOCAL refcount analysis and the captured-cell free analysis must
+        // describe this disposer fn too. EVERY consumer of the three closure
+        // sets gates on `currentFn_` matching the analysed function —
+        // `lowerLocalDecl` registers the scope-end `bz_closure_release` of a
+        // non-escaping `var` closure local (and its `boxedCellFree` for any
+        // captured local's cell, #429) ONLY when `currentFn_ ==
+        // closureReleaseEligibleFn_` / `currentFn_ == cellFreeEligibleFn_`.
+        // This function set `currentFn_` to the freshly-created disposer
+        // function but never armed the two tokens, so the gate was false for
+        // every closure local and every captured cell in any destructor body
+        // — both allocations (closure cell + env block on the local path;
+        // capture cell on the captured path) leaked, per local, per disposal
+        // (measured 48 B / 20 allocations for 20 disposals of one closure
+        // local). The #2817 / #422 / #429 template transfers: classify the
+        // body's own `var` closure locals, classify its captured cells (in the
+        // documented dependency order — `collectCellFreeEligible` consumes
+        // `closureReleaseEligible_`'s result, so it MUST run AFTER it), and
+        // pin all three fn tokens to `fn`. The pin unlocks the scope-end
+        // release registrations the consumers emit during `lowerScopedBlock`
+        // below, which run BEFORE the post-body field-disposal cascade
+        // (the only ordering §28.4 step 1 ↔ step 2 constrains). The
+        // `unwindUnsafeCellFree_` set is the #2334 escape gate; the
+        // `boxCaptureLocals_` / `singleCaptureLocals_` / `assignedCaptureVars_`
+        // / `definitelyEscapingLambdas_` clears are the #694 / #2706 / #2960
+        // invariants the analysers' preconditions assume (a stale entry from
+        // a previous body would otherwise mis-admit a local whose
+        // lifetime-escape verdict was already computed for THAT body). The
+        // `boxReleaseEligible_` / `boxReassignedLocals_` clears are the
+        // parallel invariants for the #672 / #8.6 / #28.9 Object-typed value
+        // box release path. Mirrors `buildSpecializedMethodFn` (Setup.cpp
+        // ~8425-8482) and `emitAsyncLambda` (Async.cpp ~1268-1309) verbatim
+        // modulo the `*ci.stmts` → `dd->body` substitution.
+        closureReleaseEligible_.clear();
+        closureReleaseEligibleFn_ = fn;
+        boxReleaseEligible_.clear();
+        boxReassignedLocals_.clear();
+        boxCaptureLocals_.clear();
+        singleCaptureLocals_.clear();
+        assignedCaptureVars_.clear();
+        definitelyEscapingLambdas_.clear();
+        boxCaptureLocalsFn_ = fn;
+        cellFreeEligible_.clear();
+        unwindUnsafeCellFree_.clear();
+        cellFreeEligibleFn_ = fn;
+        collectClosureReleaseEligible(dd->body);
+        collectBoxReleaseEligible(dd->body);
+        collectBoxCaptureLocals(dd->body);
+        collectDefinitelyEscapingLambdas(dd->body);
+        // Must run AFTER collectClosureReleaseEligible (uses its result).
+        collectCellFreeEligible(dd->body);
+        //
         // fix #1468 / §28.3 "Exception-path discharge" / §28.4: capture bz_exc as
         // it stands at disposer entry. When this destructor runs as an owned
         // local/field is disposed DURING stack unwinding, bz_exc already holds the
