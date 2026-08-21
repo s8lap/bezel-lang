@@ -314,33 +314,35 @@ BEZEL_TEST(ctor_out_var_string_recipient_3305,
 }
 
 // -----------------------------------------------------------------------------
-// CONTROL — a PRE-DECLARED (non-inline) `out n: string` recipient at a
-// CONSTRUCTOR call site never reaches `ensureCtorOutVarSlots`' inline arm
-// at all: its slot already exists (created by its own `LocalDecl`), so the
-// arm's "skip if slot already created" guard fires, and its call-site
-// modifier is `out`, not `out var`. It is therefore structurally outside
-// this fix.
+// fix #3321 — a PRE-DECLARED (non-inline) `out n: string` recipient at a
+// CONSTRUCTOR call site leaks at scope end unless the escape walk knows
+// `out`-modified arguments at a non-nullable `string` formal are a WRITE
+// into the slot, not an escape of the local. Same 39 B leak as #3305's
+// inline form, different cause: #3305's `registerCtorOutVarStringRelease`
+// arm structurally never runs for a pre-declared recipient (its slot
+// already exists, and the call-site modifier is `out`, not `out var`), so
+// the fix is in `StringEscapeWalker::walkNewArgs` instead — see that arm's
+// `out`-modifier relaxation comment in `src/codegen/LlvmBackend_Setup.cpp`.
 //
-// ⚠ IT LEAKS THE SAME 39 B, and that is a SEPARATE PRE-EXISTING DEFECT
-// (#3304), measured here rather than assumed. `scripts/agent_check.sh
-// --probe --asan` on this exact program reports "39 byte(s) leaked in 2
-// allocation(s)" from `bz$M.Widget$ctor` — the same signature as the
-// inline case. The cause is the same as the METHOD-call pre-declared case
-// at #2641: the pre-declared recipient IS an ordinary `var` string local,
-// and the existing escape walk treats an `out`-modified argument as a
-// conservative escape, so `armStringLocalRefcount` never arms its
-// scope-end release. Fixing it means teaching that walk about the `out`
-// position, not touching this file's arm — filed separately.
+// ORACLE — LeakSanitizer (the leak is invisible on the plain build, exactly
+// as #3305's leak was). Pre-fix: "39 byte(s) leaked in 2 allocation(s)"
+// from `bz$M.Widget$ctor` (measured). Post-fix: zero leaks. Value (6) is
+// pinned too to catch a fix that over-reached and registered a SECOND
+// release on a slot whose own machinery may already own one (a double-free
+// would crash under ASan).
 //
-// So this control asserts on the PLAIN oracle. Its job is to catch a fix
-// that over-reached into the pre-declared shape and registered a SECOND
-// release on a slot whose own machinery may already own one — a
-// double-free. Upgrade it to `runChecked` when the separate defect lands.
-// per §22.3, §28.9
+// This test was previously the "control unaffected" placeholder for the
+// #3305 fix (which deliberately did not cover the pre-declared shape); the
+// issue #3321 body noted that it would be upgraded to `runChecked` once the
+// separate defect landed. That landing is this lane. See
+// `tests/codegen/predeclared_ctor_out_var_string_recipient_3321_test.cpp`
+// for the comprehensive regression net (loop, borrow-assigned, twice-
+// assigned, two-recipients, escape guards, primitive control).
+// per §22.3, §22.7, §28.9
 // -----------------------------------------------------------------------------
 BEZEL_TEST(ctor_out_var_string_recipient_3305,
            predeclared_ctor_out_recipient_control_unaffected) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(runChecked(
         "module M; class Widget "
         "  public ok: bool; "
         "  public constructor(s: string, out n: string) "
