@@ -13675,6 +13675,29 @@ private:
                                      const sema::MethodSymbol* ms,
                                      std::size_t pos, llvm::AllocaInst* slot);
 
+    // fix #3305 / §22.4 / §22.3 / §28.9 (v0.268): constructor analogue of
+    // `registerOutVarStringRelease` (above) — same five gates, same Disposal
+    // registration, same `nullSlotAfterRelease` shape. The #2641 fix
+    // (sibling #2641 / #3305) deliberately left the constructor form for a
+    // follow-up because the callee is a `sema::ConstructorSymbol` (not a
+    // `MethodSymbol`) and the dual-sourcing story is `ctorDecl->params[pos]`
+    // (AST) + `ctorSym->params[pos]` (imported `ParameterSymbol`), not
+    // `md->params[pos]` + `ms->params[pos]`. The gate surface therefore
+    // doubles (two sources per question) but the predicate is the same — the
+    // callee owns ONE reference the caller solely owns (§22.3's "An
+    // implementation may pass a hidden reference" + §28.9's runtime-managed
+    // string lifetime), so the caller's slot must release it at scope end.
+    // The full rationale (and the WHY of each gate) is at the definition in
+    // LlvmBackend_Calls2.cpp; a no-op whenever any gate fails, which leaves
+    // the pre-existing leak untouched — the deliberate leak-over-UAF
+    // direction carried over from #2641.
+    void registerCtorOutVarStringRelease(
+        const ast::IdentifierExpr& id,
+        const sema::LocalSymbol* loc,
+        const ast::ConstructorDecl* ctorDecl,
+        const sema::ConstructorSymbol* ctorSym,
+        std::size_t pos, llvm::AllocaInst* slot);
+
     // §22.4 / §7.9 (v0.235, #2395; extended #2402): recursively pre-create
     // (and, via ensureOutVarSlots / ensureCtorOutVarSlots,
     // §7.9-default-zero-initialize) the slot for every inline `out var` call

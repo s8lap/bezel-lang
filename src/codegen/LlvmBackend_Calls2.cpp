@@ -2042,6 +2042,129 @@ void Emitter::registerOutVarStringRelease(const ast::IdentifierExpr& id,
     disposeStack_.back().push_back(d);
 }
 
+// fix #3305 / §22.4 / §22.3 / §28.9 (v0.268) — see the declaration in
+// LlvmBackend_impl.hpp. CONSTRUCTOR sibling of `registerOutVarStringRelease`
+// (above) — same five gates, same disposal registration, same
+// `nullSlotAfterRelease` flag.
+//
+// THE DEFECT. `ensureCtorOutVarSlots` (below) registers a scope-end disposal
+// for the `out owned var` and `out using var` inline forms at a constructor
+// call site, but the PLAIN `out var` arm registered nothing at all. For a
+// `string` recipient that is a leak of one heap string per call, and — as
+// documented at `registerOutVarStringRelease` — it is a leak of a reference
+// the CALLER solely owns. §22.3 (v0.268) makes `out` "copy-out-on-normal-
+// return" and licenses the hidden-reference implementation this backend uses;
+// the constructor's `n := ...` store (here via the same `lowerStringRefParamStore`
+// — #2321 covers the constructor lowering identically) therefore stores
+// through the CALLER's slot, leaving it holding exactly one independent
+// reference the caller must release. The METHOD form was fixed at #2641; the
+// constructor form was explicitly left out of #2641 ("the callee is a
+// `ConstructorSymbol` — gate 1 would have to widen and be re-verified"),
+// and this is that re-verification.
+//
+// WHY THE EXISTING `out owned var` / `out using var` ARMS' SHAPE IS NOT
+// REUSABLE VERBATIM. Those arms dispose an OWNED CLASS object and take their
+// normal-exit-vs-unwind-only decision from the ownership pass's
+// `autoDropAtScopeEnd`. A `string` is not an owned object at all — §28.1
+// makes `owned` a compile error on `string`, so the ownership pass never
+// classifies this recipient and has no verdict to read. The applicable
+// §28.9 machinery is the runtime-managed-string one, whose scope-end form is
+// `Disposal::stringRelease` — fired on BOTH exits, gated on a conservative
+// NON-ESCAPE proof rather than on an ownership verdict. (And the
+// `outOwnedRecipientDisposes(recipTy)` predicate that gates the `out owned
+// var` arm would itself reject a `string` recipient for the same reason —
+// the gating function classifies objects, not runtime-managed strings.)
+//
+// THE FIVE GATES, each closing a way the release could be unbalanced:
+//
+//  1. A RESOLVED CONSTRUCTOR CALLEE. Either `ctorDecl` (local) or `ctorSym`
+//     (imported — `ctorDecl` is null for an imported ctor, see the
+//     resolution at the top of `ensureCtorOutVarSlots`). The Bezel language
+//     does not admit `extern` constructors, so the FFI/raw-`char*` concern
+//     that gates the method variant does not apply here — but the gate is
+//     still load-bearing: a synthesized callee (BuiltinRegistry etc.)
+//     without an `ast::Param` list would land here with no `out` to read.
+//     The fix uses the same "anything resolved is fine" stance as the
+//     method variant — only the constructor's RESOLVED formal is ever
+//     `out`-modified, and only the resolved formal's type is ever "string".
+//
+//  2. The FORMAL is `out`-modified and its DECLARED type is non-nullable
+//     `string`. Read the FORMAL (not the recipient's substituted type) to
+//     keep a GENERIC `out T` instantiated at `string` OUT of scope — the
+//     specialized callee's assignment is typed by `T`, so whether
+//     #2321 fires there is a separate question and leaving it to leak is
+//     the safe direction. The non-nullable restriction is not cosmetic:
+//     `lowerStringRefParamStore` itself bails on a nullable target
+//     (`tt->nullable → return false`), so an `out n: string?` slot receives
+//     a PLAIN store carrying no reference for the caller — releasing it
+//     would be an over-release of the callee's own value. This mirrors that
+//     helper's surface exactly, and must keep mirroring it. The dual
+//     sourcing — `ctorSym->params[pos]` (imported) AND `ctorDecl->params[pos]`
+//     (local) — is the constructor analogue of the method variant's
+//     `ms->params[pos]` + `md->params[pos]`; the AST source wins on
+//     declared type to keep parity with the method variant, which
+//     deliberately reads the AST-declared type (not the symbol's resolved
+//     type) when both exist.
+//
+//  3. `currentFn_ == stringReleaseEligibleFn_` — the analyzed-body gate
+//     every other string-refcount site uses. A body no pin names was never
+//     escape-walked, so no verdict about it can be trusted.
+//
+//  4. A conservative NON-ESCAPE proof (`outVarStringReleaseEligible`). If
+//     the recipient is returned, stored in a field, captured by a lambda,
+//     or passed anywhere that may retain it, a scope-end release would
+//     dangle that alias. The walk is the same over-approximation used for
+//     a `var` string local: any use that is not a proven-safe read ⇒
+//     escaped ⇒ no release ⇒ the pre-existing leak, unchanged.
+//     Leak-over-UAF is the deliberate direction.
+//
+//  5. Not inside a disposer body, and some scope is open to register into.
+//
+// The `Disposal::nullSlotAfterRelease` flag is set for the same reason the
+// method variant sets it: unlike a `var` local's slot, this one is READ
+// BACK after the release — the alloca is entry-block hoisted, so the next
+// iteration of an enclosing loop has the callee load it to release what it
+// displaces. Without the null that load sees freed memory. See that flag's
+// comment for the full rationale.
+void Emitter::registerCtorOutVarStringRelease(
+    const ast::IdentifierExpr& id,
+    const sema::LocalSymbol* loc,
+    const ast::ConstructorDecl* ctorDecl,
+    const sema::ConstructorSymbol* ctorSym,
+    std::size_t pos, llvm::AllocaInst* slot) {
+    if (!slot || !loc) return;                                      // gate 1
+    if (!ctorDecl && !ctorSym) return;                              // gate 1
+    if (disposeStack_.empty() || emittingDisposerBody_) return;    // gate 5
+    if (currentFn_ != stringReleaseEligibleFn_) return;            // gate 3
+    // gate 2 — read the FORMAL's own modifier + declared type, mirroring
+    // registerOutVarStringRelease's exact dual-sourcing (imported symbol
+    // first, AST decl second, AST-declared type wins on the type).
+    std::string_view formalMod;
+    const sema::TypeRef* formalTy = nullptr;
+    if (ctorSym && pos < ctorSym->params.size()) {
+        if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(
+                ctorSym->params[pos])) {
+            formalMod = ps->modifier;
+            formalTy = ps->resolvedDeclType;
+        }
+    }
+    if (ctorDecl && pos < ctorDecl->params.size()) {
+        formalMod = ctorDecl->params[pos].modifier;
+        if (!formalTy && ctorDecl->params[pos].type)
+            formalTy = ctx_.resolvedType(*ctorDecl->params[pos].type);
+    }
+    if (formalMod != "out") return;
+    if (!formalTy || formalTy->nullable ||
+        formalTy->kind != sema::TypeRef::Kind::Primitive ||
+        formalTy->primitive != sema::PrimitiveType::String)
+        return;
+    if (!outVarStringReleaseEligible(&id)) return;                 // gate 4
+    Disposal d{slot, nullptr};
+    d.stringRelease = true;
+    d.nullSlotAfterRelease = true;
+    disposeStack_.back().push_back(d);
+}
+
 // §22.4 / §7.9 (v0.235, #2395) — see the declaration in LlvmBackend_impl.hpp.
 // ensureOutVarSlots is idempotent (its "skip if slot already created" guard),
 // so hoisting it early here and letting the call's own normal lowering call
@@ -2399,6 +2522,20 @@ void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
         }
         locals_[id] = slot;
         if (loc && loc->decl) locals_[loc->decl] = slot;
+        // fix #3305 / §22.4 / §22.3 / §28.9 (v0.268): constructor sibling
+        // of the #2641 method-call string release. The `out owned var` (above)
+        // and `out using var` (above) arms already register a scope-end
+        // disposal, but the PLAIN `out var` arm — this one — registered
+        // nothing, so a `string` recipient at a constructor call site leaked
+        // one heap string per call. The full gating + rationale is at
+        // registerCtorOutVarStringRelease; on the kind of recipient this
+        // arm actually creates (a fresh, never-pre-declared local at a
+        // constructor call site), gates 1/3/5 always pass and gate 2 is what
+        // decides. The escape walk (gate 4) is the same
+        // `outVarStringReleaseEligible` walk the method variant uses,
+        // keyed on the introducing `IdentifierExpr` which IS the recipient's
+        // `LocalSymbol::decl` for the inline form.
+        registerCtorOutVarStringRelease(*id, loc, ctorDecl, ctorSym, pos, slot);
         pos++;
     }
 }
