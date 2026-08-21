@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.272 — August 2026**
+**Companion to the Bezel Language Specification, v0.273 — August 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -8251,3 +8251,40 @@ Three tests pin the under-included shape as **accepted and executing**, one asse
 - **Doc-only:** `DECLINED.md` **415 → 416** rows (R3). Proposal 0115 flips to `graduated-v0.272` and its README row moves to Graduated.
 - **Guides:** untouched; none names either span family in a collection-literal context.
 - **Conformance corpus:** no case added or removed; the corpus remains at its v0.247 regeneration with the drift v0.269 measured, tracked by #3262 and #3297.
+
+---
+
+### v0.273 changelog (v0.272 → v0.273)
+
+**Two contradictions closed, and both issues' framings were wrong in the same way: each named the right defect at the wrong address.** Class: **ruling** for the freeze scope, **clarification** for the range-pattern reason.
+
+**§28.14's admission freeze on captured sources lifts at the bounding local's scope exit; v1 bound 2(a) is the defect ([#3318](https://github.com/s8lap/bezel-lang/issues/3318)).**
+
+The issue reported this as a dispute about **§28.3's consume-site freeze**. It is not. §28.3's freeze is **live-range-scoped** — *"A borrow is live at a consume site when some path from the site reaches a later use of it"*, a backward dataflow question — so it is neither method- nor block-scoped and needs no edit under any reading. The dispute is entirely about §28.14's **admission freeze** (K5.7), a separate rule with a separate compiler mechanism. Correcting the address is what made the answer visible.
+
+- **The split is three to one, and the outlier says so about itself.** Three normative sites state that the freeze ends at the bounding local's scope exit — §28.14's own admission text (*"Until `L`'s scope exits, the captured local sources are **frozen**"*), the `scoped`-argument rule, and §22.3's parameter-modifier entry. Against them stands only v1 bound 2(a), which says the freeze *"persists to the end of the enclosing method body, not merely to the bound's scope exit"* and concedes in the same breath that it is *"conservative — may over-reject mutation after an inner block closes."*
+- **Bound 2(a) is mis-filed.** The v1 bounds are licensed as covering *"corners the original text left silent."* This corner was never silent: the admission text states the rule. 2(a) is an implementation shortfall recorded as though it were a design bound — no rationale entry defends it, and `DECLINED.md`'s §28.14 row scopes itself to bounds 3, 5 and 6.
+- **Nothing is protected by the excess.** Quiescence plus `using var` scope-end disposal means no captured source can be observed after the bounding block closes, so a freeze extending past that point guards nothing. Narrowing costs one stored `SourceLocation` — spans are already stamped on every statement — not "more analysis."
+- **Blast radius: zero.** The `do … end` lift idiom appears in **no** test and **no** conformance case; all six existing §28.14 freeze tests are flat bodies where the two readings coincide.
+- **Proposal 0099 repeated this rule; it did not decide it.** It quotes the admission text, derives the `do … end` remedy, mandates it into Guide 01 and into its own acceptance tests — and never quotes, cites, or reasons about the v1 admission bounds; its one mention of a "bound" is about `scoped` on a constructor parameter. Under the precedent v0.271 set, that makes this ruling a **confirmation** of 0099 rather than an override, so it takes no `DECLINED.md` row and 0099 gains a confirming landing note rather than a correction.
+- **Consequence for the teaching documents: they were right.** Guide 01 §10 and stdlib §2.21 both taught the `do … end` lift, and both followed the three-site majority. Neither is rewritten. **Guide 01's pin moves to v0.273** — it was held at v0.259 through the v0.271 guide pass precisely because its §10 taught a shape bound 2(a) rejected, and that blocker is now removed by ruling the spec wrong rather than the guide.
+- **Kernel classification: derivation.** K5.7 is unchanged; what changes is the interval over which it is applied. The axiom register stands at eleven axioms and four tombstones. **Body-locality: local** — the interval is the bounding local's own scope.
+- **One residual, shipped with an explicit clause rather than left implicit.** Bound 2(b) claims back-edge moves are caught by the general moved-from rules, but a test in the tree calls capturing a moved-from local *"a pre-existing general capture gap"* and asserts no error. The narrowed rule therefore states the loop case explicitly, and the capture gap is filed separately.
+
+**§19.3's nullable-scrutinee rejection keeps its verdict, gains an honest reason, and the bare `..` pattern's meaning is stated for the first time (the [#3315](https://github.com/s8lap/bezel-lang/issues/3315) item-3 residual).**
+
+The residual reported that §19.3 over-reaches: a **bare** `..` performs no ordering test, yet §19.3 rejects it citing *"ordering admits no absent participant."* The premise is correct, and correct **normatively** rather than by appeal to the compiler — §16.3's own `Contains` formula says a `null` endpoint *"imposes no bound on its side and never makes the range empty"*, so with both bounds absent the ordering test is vacuous.
+
+- **Narrowing the rejection was nonetheless declined, because it would re-open rather than correct.** v0.267 deliberately overrode proposal 0114's D5, and the graduating commit recorded that with a `DECLINED.md` row naming D5's position and carrying no reopening bar. That row says *"range patterns"*, unqualified. And **v0.271's own accounting already counted the two bare-`..` test blocks** among the eight the landed rule newly rejects. So the unbounded form is inside the decline as landed; narrowing it is a design change requiring a proposal, not a clarification.
+- **The alternative's cost decided it.** Narrowing would make the verdict depend on **how many bounds are written**: `case n of ..` would compile over an `int?` while `case n of int.MinValue..int.MaxValue` would not, at identical extent. That is a fresh instance of the *"same shape, opposite answers, decided by spelling"* defect proposal 0114 gives as its own motivation — the very defect the rule exists to remove.
+- **The real defect underneath was silence.** The spec never stated what a bare `..` *means*. §19.3 illustrates only `..<0` and `31..`; §16.6 gives the match rule only for bounded forms; the code-generation reference omits it; the guides never mention range patterns. The bare leg existed only in the Appendix A grammar. That is why the rule's reason and its verdict drifted apart, and it is now written down.
+- **The honest cost, stated rather than hidden:** the rejection of the unbounded form is now defended by uniformity rather than by the ordering argument, and the text says so instead of implying a reason that does not reach it. Appendix C.1 and §7.11 need no edit — both are already form-independent — and the grammar is untouched, so the conformance corpus is untouched.
+
+**Migration.**
+
+- **Newly accepted: one shape.** Mutation of a captured source after the bounding local's scope exits, where an enclosing method body continues. Nothing in the corpus writes it, so no test changes; the *reference implementation* rejects it today and is now behind the spec.
+- **Newly rejected: nothing.**
+- **Unchanged in meaning:** §19.3's verdict, in every form; §28.3's consume-site freeze, which this revision does not touch and which the issue mistakenly named.
+- **Spec-ahead-of-impl: one delta.** `scopedFrozen_` is a per-method map with no scope hook — three references in the whole tree, no clear, no erase — and `checkScopedFreeze` is a one-sided offset test whose own diagnostic string already claims the block-scoped rule it does not implement. Filed.
+- **Guides:** Guide 01 re-pinned to **v0.273** and otherwise untouched by this revision; the other five keep their pins.
+- **Conformance corpus:** no case added, edited, or invalidated. The grammar is unchanged and no fenced example moves.

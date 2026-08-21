@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.259.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.273.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning (§2's trivial-dispose classes excepted). A use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
