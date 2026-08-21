@@ -219,17 +219,17 @@ BEZEL_TEST(codegen_ffi_pointer_2825, cstring_pointer_field_receiver_spec_32_13) 
 // disposal — "after every use of it within that expression has completed" — so
 // the read is still in-bounds when `string.FromCStringPointer` copies through it.
 //
-// Plain `runAot`, deliberately: the §10 member-read RECEIVER site has no
-// `registerFfiExprTemp` registration, so the temporary leaks 21 B.  That is
-// PRE-EXISTING and independent of this fix — the identical leak reproduces on
-// the already-working `.Length` receiver (`CString.From("hello").Length` in a
-// 20-iteration loop: 420 B / 20 objects, measured before and after this commit).
-// Filed separately; arming LSan here would fail this row for that unrelated
-// reason, and the VALUE assertion is what pins #2825's half.
+// fix #2828 / §28.3 (v0.240): the §10 member-read RECEIVER site is now wired
+// through `registerFfiExprTemp`, so the temporary is reclaimed at the K8
+// boundary — `runAotChecked` (LSan) passes. Before #2828, the slot was
+// dropped and the temporary leaked 21 B; #2828's companion row
+// (ffi_buffer_member_read_receiver_release_2828_test.cpp:row D) exercises
+// the same site in a 20-iteration loop to amplify the leak to LSan-
+// observable.
 // per spec §28.3 / stdlib §10.4, v0.240
 // ===========================================================================
 BEZEL_TEST(codegen_ffi_pointer_2825, cstring_pointer_temp_receiver_spec_28_3) {
-    auto r = runAot(
+    auto r = runAotChecked(
         "module M; class C "
         "  public static method Main(): int "
         "    var s := string.FromCStringPointer(CString.From(\"hello\").Pointer); "
