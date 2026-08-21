@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.274 — August 2026**
+**Companion to the Bezel Language Specification, v0.275 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -594,16 +594,19 @@ public sealed class Type
   public readonly property FullName: string;        // qualified: "BankingApp.BankAccount"
 
   // Kind predicates. Exactly one of IsClass, IsInterface, IsRecord, IsEnum,
-  // IsPrimitive, IsInlineArray, IsFunctionType is true for any Type.
+  // IsChoice, IsPrimitive, IsInlineArray, IsFunctionType is true for any Type.
   public readonly property IsClass: bool;
   public readonly property IsInterface: bool;
   public readonly property IsRecord: bool;
   public readonly property IsEnum: bool;
+  public readonly property IsChoice: bool;          // any §35 choice, at every
+                                                    //   §35.4 classification
   public readonly property IsPrimitive: bool;       // int, bool, char, float, ...
   public readonly property IsInlineArray: bool;     // [N]T, [N owned]T?, ...
   public readonly property IsFunctionType: bool;    // (A, B) -> R
   public readonly property IsValueType: bool;       // = IsPrimitive or IsEnum
-                                                    //   or IsRecord or IsInlineArray
+                                                    //   or IsRecord or IsChoice
+                                                    //   or IsInlineArray
 
   // Lattice queries.
   public readonly property BaseType: Type?;         // direct superclass; null for
@@ -625,7 +628,7 @@ public sealed class Type
 end Type;
 ```
 
-**Kind predicates.** For any `Type`, exactly one of `IsClass`, `IsInterface`, `IsRecord`, `IsEnum`, `IsPrimitive`, `IsInlineArray`, `IsFunctionType` holds. These map the type kinds of language spec [§3.1](Bezel_Language_Spec.md#sec-type-kinds) onto a runtime predicate surface, with two deliberate flattenings: `string` and the heap array types (`Array<T>`, `OwningArray<T>`) report `IsClass` (they are reference types — language spec [§3.1](Bezel_Language_Spec.md#sec-type-kinds) lists `string` and heap arrays as reference types reaching `Object` directly, and treating them as classes here is consistent with how the language and standard library describe them elsewhere); the unit type `()` reports `IsValueType` with none of the seven primary predicates true (it is a degenerate value type and the rare `typeof(())` is not expected in practice, but the surface does not claim a primary kind for it). `IsValueType` is a derived convenience equal to `IsPrimitive or IsEnum or IsRecord or IsInlineArray` (and additionally true for the unit type); it does not add a primary category. The "exactly one of seven" guarantee therefore holds for every type a program can name with `typeof` or obtain from `GetType` except the unit type, which no realistic program reifies.
+**Kind predicates.** For any `Type`, exactly one of `IsClass`, `IsInterface`, `IsRecord`, `IsEnum`, `IsChoice`, `IsPrimitive`, `IsInlineArray`, `IsFunctionType` holds. These map the type kinds of language spec [§3.1](Bezel_Language_Spec.md#sec-type-kinds) onto a runtime predicate surface, with two deliberate flattenings: `string` and the heap array types (`Array<T>`, `OwningArray<T>`) report `IsClass` (they are reference types — language spec [§3.1](Bezel_Language_Spec.md#sec-type-kinds) lists `string` and heap arrays as reference types reaching `Object` directly, and treating them as classes here is consistent with how the language and standard library describe them elsewhere); the unit type `()` reports `IsValueType` with none of the eight primary predicates true (it is a degenerate value type and the rare `typeof(())` is not expected in practice, but the surface does not claim a primary kind for it). **`IsChoice` is the predicate for language spec [§35](Bezel_Language_Spec.md#sec-choices) choices** (v0.275): it holds for a choice type whatever its [§35.4](Bezel_Language_Spec.md#sec-choice-classification) classification — value-like, borrow-bearing, or owning — because the classification governs copy/move/dispose semantics and borrow obligations, never type *kind*, exactly as `IsInlineArray` holds alike for `[N]T` and for the move-only `[N owned]T`. `IsValueType` is a derived convenience equal to `IsPrimitive or IsEnum or IsRecord or IsChoice or IsInlineArray` (and additionally true for the unit type); it does not add a primary category. Its choice disjunct is required by language spec [§3.2](Bezel_Language_Spec.md#sec-reference-vs-value-types), which classifies every choice — owning ones included, as move-only value types ([§15.3](Bezel_Language_Spec.md#sec-move-only-value-types)) — as a value type. The "exactly one of eight" guarantee therefore holds for every type a program can name with `typeof` or obtain from `GetType` except the unit type, which no realistic program reifies.
 
 **`Name` and `FullName` rendering (normative, v0.222, #1812).** Both properties render the type's canonical source-level type expression; the produced strings are exact — they are what diagnostics print and registries key on. `Name` renders named components unqualified; `FullName` renders every named component qualified by its declaring module path (`"BankingApp.BankAccount"`); the distinction is carried recursively. Rules: **(1)** a named non-generic type renders its declared identifier (Name) / module-qualified identifier (FullName); **(2)** the keyword-aliased types (language spec [§3.4](Bezel_Language_Spec.md#sec-keyword-aliases-for-built-in-types)) render as their lowercase keyword in *both* properties (`typeof(int).FullName = "int"`; `typeof(String)` renders `"string"`) — the keyword is the canonical name, a recorded exception to qualification; **(3)** a generic instantiation renders the head followed by `<`, its arguments joined by `", "`, and `>`, each argument rendered recursively in the same property's form (`"Dictionary<string, Array<int>>"`; FullName: `"System.Collections.Generic.Dictionary<string, System.Collections.Generic.Array<int>>"`) — no arity markers; a nullable argument renders with a trailing `?` (`"Array<int?>"`, a distinct `Type` from `"Array<int>"`); **(4)** an inline array renders its canonical type expression `"[N]T"` / `"[N owned]T?"` (language spec §15), the element recursing; **(5)** a function type renders its canonical type expression `"(A, B) -> R"` (parameters `", "`-joined, one space around `->`, modifiers as written, unit as `"()"`), components recursing — a function type has no module of its own, so Name and FullName differ only through the components; **(6)** the unit type renders `"()"`. **Nullability is erased at reification**: no `Type` exists for a top-level nullable form — a `null` has no runtime type and `GetType` requires a narrowed receiver ([§8.2](Bezel_Language_Spec.md#sec-gettype)) — and `typeof(T)` at a substitution `U?` returns `typeof(U)`; `typeof(int?)` is a compile error ([§17.10](Bezel_Language_Spec.md#sec-the-typeof-operator)'s accepted forms). The language-spec side of this contract — substitution distinctness scoped up to top-level nullability, and the `U?` reification — is stated normatively in [§17.10](Bezel_Language_Spec.md#sec-the-typeof-operator)'s identity paragraph (as amended in the same revision, #1812). Nullability inside a composite's identity (rules 3–5) is part of that identity and renders.
 
@@ -1613,12 +1616,19 @@ public class Array<T>: IList<T>
   // Range slicing (language spec §15.6): `arr[r]` — arr[a..b], arr[..b], arr[a..], arr[..] —
   // is the compiler-recognized equivalent of this method (v0.182):
   public method Slice(r: Range<int>): owned Array<T>;   // fresh array; the range's values, or copies of the element borrows
+
+  // Natural order; admitted only where `T: IComparable<T>` (see the note below).
+  public method Sort();                    // in place
+  public method Sorted(): owned Array<T>;  // fresh sorted copy
 end Array;
 
-// No `Array<T>` extension supplies a default-comparer `Sort`/`Sorted`. Spec §26.5
-// rule 1 commits instance resolution by *name* — of any arity — and `Array<T>`
-// declares `Sort`/`Sorted` above, so an extension member of either name is never
-// consulted on an `Array<T>` receiver. Callers pass a comparer.
+// Natural-order sorting is declared on `Array<T>` itself, NOT as an extension:
+// spec §26.5 rule 1 commits instance resolution by *name* — of any arity — so an
+// extension member spelled `Sort`/`Sorted` would never be consulted on an `Array<T>`
+// receiver. These are arity-0 overloads of the names above (§22.6), admitted only
+// where `T: IComparable<T>`; the condition is checked at the call's instantiation
+// and reported there, the same shape `OwningBuffer<T>.DangerousPointer()` uses
+// (§4.14). `OwningArray<T>` has no such form.
 ```
 
 A collection literal `[1, 2, 3]` constructs an `Array<T>` when the target type is `Array<T>`; it constructs an inline array `[N]T` when the target is an inline array. See language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals) for the contextual-typing rules.
@@ -1731,7 +1741,12 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
                                                //   pure-declared, and spec §22.15
                                                //   dispatch rule 1 makes dropping it
                                                //   at an implementation a compile error
-  public property Capacity: int => _storage.Length;
+  public pure property Capacity: int => _storage.Length;   // `pure` is mandatory: the
+                                                //   declared surface above pure-declares
+                                                //   Capacity, and the body's only call —
+                                                //   OwningBuffer<T>.Length (§4.14) — is
+                                                //   pure-declared, so spec §22.15 rule 6
+                                                //   admits it
 
   public property [i: int]: T
     get => do
@@ -2418,7 +2433,7 @@ A runtime-sized storage primitive and two non-owning view types built over it. T
 The slot semantics dispatch on T's category:
 
 - **Class-typed T** (classes, interfaces): slots hold `T?` (nullable references) and the buffer owns each non-null slot's referent. Setter takes `owned T?` and disposes the previous value before storing the new one. `move buf[i]` is admitted; the field-restoration rule applies. The buffer's destructor cascades through slots, disposing every non-null one.
-- **Value-typed T** (primitives, records without owned fields, enums, non-move-only inline arrays): slots hold `T` directly (no nullability wrapper). Setter takes `T` and simply overwrites the slot. `move buf[i]` is *not* admitted (values have no ownership to transfer; reading is sufficient). The buffer's destructor releases its backing storage but performs no per-slot disposal.
+- **Value-typed T** (primitives, records, enums, **value-like and borrow-bearing choices** ([§35.4](Bezel_Language_Spec.md#sec-choice-classification)), non-move-only inline arrays — language spec [§15.3](Bezel_Language_Spec.md#sec-move-only-value-types)'s copyable set, whose complement is the exclusion list below): slots hold `T` directly (no nullability wrapper). Setter takes `T` and simply overwrites the slot. `move buf[i]` is *not* admitted (values have no ownership to transfer; reading is sufficient). The buffer's destructor releases its backing storage but performs no per-slot disposal. A **value-like** choice slot is an ordinary copyable value ([§35.4](Bezel_Language_Spec.md#sec-choice-classification) rule 3) and needs nothing further; a **borrow-bearing** choice slot carries the borrow obligations of *Borrow-bearing slots* below. The **owning** classification is a move-only value type and is not admitted (the exclusion list below). (v0.275; the category was written at v0.102, before choices existed.)
 
 The two categories share the same `Length`, indexer-access, `AsSpan`/`AsReadOnlySpan` factories, and other category-agnostic surface; they differ in the slot type, the setter modifier, and the admissibility of `move`. (`Slice` is a member of the span *views*, not of the buffer — a buffer is range-restricted by taking a span of it.)
 
@@ -2434,7 +2449,9 @@ public class OwningBuffer<T>: IEnumerable<T?>            // class T only
   public constructor(length: int);                       // all slots null
   public constructor(length: int, init: (int) -> owned T);
 
-  public readonly property Length: int;
+  public pure readonly property Length: int;    // stored extent, immutable once
+                                                //   allocated; pure per spec §22.15
+                                                //   *Intrinsic purity*
 
   public property [i: int]: T?
     get;                                                  // borrow of slot
@@ -2466,7 +2483,9 @@ public class OwningBuffer<T>                              // no IEnumerable conf
                                                           //   requires T to have a default value
   public constructor(length: int, init: (int) -> T);     // init returns T (no `owned`)
 
-  public readonly property Length: int;
+  public pure readonly property Length: int;    // stored extent, immutable once
+                                                //   allocated; pure per spec §22.15
+                                                //   *Intrinsic purity*
 
   public property [i: int]: T
     get;                                                  // borrow of slot (value copy
@@ -2499,7 +2518,7 @@ The two presentations are different specializations of the same generic class. T
 
 **Class-typed T.** `OwningBuffer<T>` is a class with fixed-at-construction storage of N slots, each holding `T?` (a nullable reference). Once allocated, `Length` is immutable. Non-null slots are owned by the buffer; the buffer's destructor disposes every non-null slot in implementation-defined order. The single-argument constructor produces a buffer with all slots initialized to `null`. The two-argument constructor calls `init(i)` for each `i` in `0..<length`, taking ownership of each returned value. The indexer's setter takes ownership of the assigned value and disposes whatever the slot previously held. `move buf[i]` is admitted and produces an owned `T?` value, leaving the slot in moved-from state; the field-restoration rule of [§28.8.1](Bezel_Language_Spec.md#sec-the-move-expression) applies. The natural restoration for a nullable slot is `buf[i] := null`.
 
-**Value-typed T (v0.102).** `OwningBuffer<T>` is a class with fixed-at-construction storage of N slots, each holding `T` directly (no nullability wrapper). Once allocated, `Length` is immutable. The single-argument constructor requires T to be **defaultable** (language spec [§17.11](Bezel_Language_Spec.md#sec-the-default-operator)) — every primitive is; a record is when every declared field is and the record is not constructor-only (language spec [§9.9](Bezel_Language_Spec.md#sec-constructor-only-records)); an enum is when it declares a zero-valued constant; any type §17.11 does not admit has no default. It initializes every slot to `default(T)`. For types without a default, only the two-argument constructor with an explicit init function is admitted. The two-argument constructor calls `init(i)` for each `i` in `0..<length`, copying the returned value into the slot. The indexer's setter overwrites the slot's previous value with the new one — no disposal is performed (values are not owned). `move buf[i]` is not admitted; values are read with the plain indexer and copied at the use site.
+**Value-typed T (v0.102).** `OwningBuffer<T>` is a class with fixed-at-construction storage of N slots, each holding `T` directly (no nullability wrapper). Once allocated, `Length` is immutable. The single-argument constructor requires T to be **defaultable** — note that **no choice type is defaultable** (language spec [§17.11](Bezel_Language_Spec.md#sec-the-default-operator), [§35.10](Bezel_Language_Spec.md#sec-choice-default-with): *"`default(C)` is a compile error for every choice type"*), so a choice-element buffer is always built with the two-argument init-function constructor below — (language spec [§17.11](Bezel_Language_Spec.md#sec-the-default-operator)) — every primitive is; a record is when every declared field is and the record is not constructor-only (language spec [§9.9](Bezel_Language_Spec.md#sec-constructor-only-records)); an enum is when it declares a zero-valued constant; any type §17.11 does not admit has no default. It initializes every slot to `default(T)`. For types without a default, only the two-argument constructor with an explicit init function is admitted. The two-argument constructor calls `init(i)` for each `i` in `0..<length`, copying the returned value into the slot. The indexer's setter overwrites the slot's previous value with the new one — no disposal is performed (values are not owned). `move buf[i]` is not admitted; values are read with the plain indexer and copied at the use site.
 
 The "Owning" in the name refers to the buffer-class's ownership of *its allocated storage* — and, for class-typed T, of its slot contents (the semantics that motivated the name). For value-typed T, the buffer owns only its allocation; the slot contents are just data. In both cases the buffer is `IDisposable`: its destructor releases the allocation.
 
@@ -2513,7 +2532,7 @@ The "Owning" in the name refers to the buffer-class's ownership of *its allocate
 
 **Disposal.** For class-typed T, the buffer's destructor disposes every non-null slot. Slot-disposal order within a single buffer is implementation-defined. For value-typed T, the destructor releases the backing storage but performs no per-slot work. Both cases satisfy the `IDisposable` contract; both are non-trivial-dispose ([§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types) of the language spec) in the sense that the user must discharge the buffer (typically via `using var` or by storing it as an `owned` field of a longer-lived class).
 
-**Borrow-bearing slots.** When T is a class type whose instances themselves carry borrows from external sources (a class with a borrow-bearing record field, an interface backed by such a class, or any class whose fields include reachable borrows), the buffer participates in the same borrow-lifetime tracking as any other class-typed storage: the buffer may not outlive any source from which a slot borrows. The compiler tracks slot-borrow sources element-wise where possible and falls back to whole-buffer tracking when slot-borrow sources cannot be statically separated. For value-typed T whose values may themselves carry borrows (records with borrow-bearing fields), the same rule applies to the values stored in slots.
+**Borrow-bearing slots.** When T is a class type whose instances themselves carry borrows from external sources (a class with a borrow-bearing record field, an interface backed by such a class, or any class whose fields include reachable borrows), the buffer participates in the same borrow-lifetime tracking as any other class-typed storage: the buffer may not outlive any source from which a slot borrows. The compiler tracks slot-borrow sources element-wise where possible and falls back to whole-buffer tracking when slot-borrow sources cannot be statically separated. For value-typed T whose values may themselves carry borrows — records with borrow-bearing fields, and **choices that hold borrows** (language spec [§35.4](Bezel_Language_Spec.md#sec-choice-classification)'s holds-borrows property; within the admitted set this is exactly the borrow-bearing classification, an owning choice being inadmissible as T) — the same rule applies to the values stored in slots. For a choice the obligations are language spec [§9.7](Bezel_Language_Spec.md#sec-records-and-disposal)'s borrow-lifetime bullets, which that section applies to choices verbatim *"with "record" read as "record or choice" throughout"*; nothing choice-specific is added here.
 
 <a id="sec-spant"></a>
 #### `Span<T>`
@@ -2586,7 +2605,8 @@ For value-typed T:
 
 ```bezel
 public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
-  // value T (primitive, record, enum, non-move-only inline array)
+  // value T (primitive, record, enum, value-like or borrow-bearing choice,
+  //   non-move-only inline array — spec §15.3's copyable set)
 
   // Indexer (bounds-checked against span Length).
   public property [i: int]: T
@@ -3864,7 +3884,7 @@ end AtomicInteger;
 <a id="sec-events-ievent-eventsource"></a>
 ### 6.5 Events: `IEvent`, `EventSource`, `ISharedEvent`, `SharedEventSource`
 
-An **event** is a named publication point on a class: the class controls when the event fires; external code subscribes but cannot fire the event or inspect the subscriber list. Events are not a member kind (language spec [§24](Bezel_Language_Spec.md#sec-events), rationale §13.6); an event is the following **pattern** over the types of this section, and this section is the normative home of event semantics. The generic parameter `T` is the event's **payload type** — the type of value passed to handlers when the event fires. The payload type may be any type. Two interactions are worth knowing, and neither is a rule of this section: an async handler *written as an `async` lambda* cannot take a **borrow-bearing** payload, because [§30.1](Bezel_Language_Spec.md#sec-async-methods) rejects such a parameter there — a plain lambda or a method reference returning an already-completed task is unaffected; and a **move-only** payload is passed by value-move ([§15.3](Bezel_Language_Spec.md#sec-move-only-value-types)), leaving the argument moved-from after the call, which does not compose with more than one subscriber. Whether either should become a restriction on `EventSource<T>`/`AsyncEventSource<T>` instantiation is an open question, not settled here. For a synchronous event the handler type is `(T) -> ()`; for an asynchronous event, `(T) -> Task`.
+An **event** is a named publication point on a class: the class controls when the event fires; external code subscribes but cannot fire the event or inspect the subscriber list. Events are not a member kind (language spec [§24](Bezel_Language_Spec.md#sec-events), rationale §13.6); an event is the following **pattern** over the types of this section, and this section is the normative home of event semantics. The generic parameter `T` is the event's **payload type** — the type of value passed to handlers when the event fires. The payload type may be any type. Three interactions are worth knowing, and none is a rule of this section: an async handler *written as an `async` lambda* cannot take a **borrow-bearing** payload, because [§30.1](Bezel_Language_Spec.md#sec-async-methods) rejects such a parameter there — a plain lambda or a method reference returning an already-completed task is unaffected; a **move-only** payload is passed by value-move ([§15.3](Bezel_Language_Spec.md#sec-move-only-value-types)), leaving the argument moved-from after the call, which does not compose with more than one subscriber; and **`RaiseAsync` retains its payload until the returned task settles** — it awaits each handler's task before invoking the next (*Raising*, below), so the payload outlives `RaiseAsync`'s synchronous return exactly as an `async` method's parameters outlive theirs ([§30.1](Bezel_Language_Spec.md#sec-async-methods)); the absence of an `async` marker on the declaration is a fact about signatures ([§28.12](Bezel_Language_Spec.md#sec-asynchronous-disposal)), not about the frame. That retention is normative, and so is the obligation it places on the **raiser**: every borrow the payload carries must outlive the settlement of the task `RaiseAsync` returns, and the borrowed object must not be transferred to another domain before that settlement — [§30.1](Bezel_Language_Spec.md#sec-async-methods)'s held-until-settlement obligation, in its entirety, discharged trivially by `await`ing the raise in the scope that owns the borrow sources and carried live only by the abandonment shapes ([§30.10](Bezel_Language_Spec.md#sec-standard-library-task-helpers)). Where the payload's carried borrows are class- or interface-typed, the obligation has the ordinary checked-mode backstop ([§28.2](Bezel_Language_Spec.md#sec-the-idisposable-contract)); where the payload carries a borrow reachable through no tracked reference — a span ([§4.14](#sec-owned-buffers-and-spans), [§4.15](#sec-arrayspant-readonlyarrayspant)) — there is **no backstop of any kind**, and an abandoned raise at such a payload is undefined behavior in unchecked mode. Whether any of the three should become a restriction on `EventSource<T>`/`AsyncEventSource<T>` instantiation is an open question, not settled here: the restriction was declined at v0.274 and the reopening bar its record states ([`DECLINED.md`](proposals/DECLINED.md)) stands. For a synchronous event the handler type is `(T) -> ()`; for an asynchronous event, `(T) -> Task`.
 
 **The event pattern.** One `owned readonly` field holding the source, and — for a public event — one expression-bodied property exposing the subscribe-only interface face:
 
@@ -5317,7 +5337,14 @@ It returns the declared constant whose underlying value equals `value`, or `null
 ```bezel
 /// Compiler-intrinsic; pointer-sized integer (32 or 64 bits depending on target).
 public record IntPtr
-  public static const Zero: IntPtr;
+  public static readonly property Zero: IntPtr;
+
+  // Equality is declared, not synthesized: with no auto-properties the §9.2
+  // synthesis would be the zero-property "every-pair-equal" form. The four
+  // members are the language spec §25.2 co-declaration set; the implementations
+  // are compiler intrinsics comparing the pointer-sized representation.
+  public method Equals(other: IntPtr): bool;
+  public override method GetHashCode(): int;
 
   public static method operator =(a: IntPtr, b: IntPtr): bool;
   public static method operator <>(a: IntPtr, b: IntPtr): bool;
@@ -5325,14 +5352,17 @@ end IntPtr;
 
 /// Compiler-intrinsic; unsigned pointer-sized integer.
 public record UIntPtr
-  public static const Zero: UIntPtr;
+  public static readonly property Zero: UIntPtr;
+
+  public method Equals(other: UIntPtr): bool;        // §25.2 co-declaration set, as IntPtr above
+  public override method GetHashCode(): int;
 
   public static method operator =(a: UIntPtr, b: UIntPtr): bool;
   public static method operator <>(a: UIntPtr, b: UIntPtr): bool;
 end UIntPtr;
 ```
 
-`IntPtr` and `UIntPtr` are opaque pointer-sized integers. They are not dereferenced from Bezel code; their purpose is to flow opaque addresses through FFI calls (the result of `dlopen`, the `void*` argument of a callback, etc.). `Zero` is the null-pointer value, declared as a compiler-provided `const` per the [§1](#sec-conventions) convention for compiler-intrinsic types.
+`IntPtr` and `UIntPtr` are opaque pointer-sized integers. They are not dereferenced from Bezel code; their purpose is to flow opaque addresses through FFI calls (the result of `dlopen`, the `void*` argument of a callback, etc.). `Zero` is the null-pointer value. It is a `static readonly` property, not a `const`: language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) restricts `const` to a primitive value type or `string`, and `IntPtr` is a record — the same spelling `Guid.Empty` ([§2.6](#sec-guid)), `DateTime.MinValue` and `TimeSpan.Zero` ([§2.5](#sec-datetime-timespan-dateonly-timeonly)), and `CancellationToken.None` ([§6.1](#sec-cancellationtoken-and-cancellationtokensource)) use for a record-typed sentinel. The value is compiler-provided; the property spelling constrains the surface, not the lowering ([§1](#sec-conventions)).
 
 The `=` and `<>` operators support null tests (`if handle = IntPtr.Zero then ...`). Unlike the primitive value-type wrappers in [§9.1](#sec-integer-types)–[§9.5](#sec-char), `IntPtr` and `UIntPtr` cannot rely on the language-intrinsic comparison rule for primitive types (language spec [§3.5](Bezel_Language_Spec.md#sec-operators-on-primitive-types)): that rule applies to the keyword-aliased primitive types (`int`, `long`, etc.) and to `string`, not to general record types. Nor can the auto-equality machinery (language spec [§9.2](Bezel_Language_Spec.md#sec-body-records)) supply meaningful equality — `IntPtr` and `UIntPtr` have no auto-properties exposing their underlying pointer-sized value, so the auto-generated `=` would be the zero-property "every-pair-equal" form, which is wrong for pointer comparison. Equality for these types is therefore declared explicitly as operator overloads; the implementations are compiler intrinsics that compare the underlying pointer-sized integer representation.
 
@@ -5450,7 +5480,7 @@ Each FFI-boundary type has a corresponding `string.From` overload ([§9.6](#sec-
 // double, bool, IntPtr, UIntPtr — and C-compatible records (language spec
 // §32.13). Nested Ptr<Ptr<T>> is NOT admitted (language spec §32.12).
 public record Ptr<T>
-  public static const Zero: Ptr<T>;                    // compiler-provided, like IntPtr.Zero
+  public static readonly property Zero: Ptr<T>;        // the null pointer, like IntPtr.Zero
 
   public static method FromIntPtr(p: IntPtr): Ptr<T>;  // the only untyped->typed entry: EXPLICIT
   public method ToIntPtr(): IntPtr;
@@ -5473,9 +5503,9 @@ public record Ptr<T>
   // intrinsic compares the address representation.
   public method Equals(other: Ptr<T>): bool;           // §25.2 co-declaration rule: a record
   public override method GetHashCode(): int;           //   overloading homogeneous =/<> declares
-                                                       //   both. §25.2's exemption names IntPtr
-                                                       //   and UIntPtr only — Ptr<T> postdates
-                                                       //   the rule (v0.186 vs v0.158).
+                                                       //   both. §25.2 admits no intrinsic
+                                                       //   exemption; §10.0's IntPtr/UIntPtr
+                                                       //   declare the same four members.
   public static method operator =(a: Ptr<T>, b: Ptr<T>): bool;
   public static method operator <>(a: Ptr<T>, b: Ptr<T>): bool;
 end Ptr;
@@ -5485,7 +5515,7 @@ The pointee gate mirrors language spec [§32.12](Bezel_Language_Spec.md#sec-fore
 
 `CopyToArray(count)` copies `count` elements from foreign memory into a fresh Bezel-owned `Array<T>`; `CopyFromArray(source)` writes `source.Count` elements at `p`. Both are explicit whole-copies — foreign data becomes Bezel data at exactly one visible point.
 
-Equality is declared explicitly rather than left to record synthesis for the same reason as `IntPtr`'s ([§10.0](#sec-intptr-and-uintptr)): `Ptr<T>` has no auto-properties, so the synthesized `=` would be the zero-property "every-pair-equal" form. `Zero` is the null pointer, a compiler-provided `const` per the [§1](#sec-conventions) convention for compiler-intrinsic types.
+Equality is declared explicitly rather than left to record synthesis for the same reason as `IntPtr`'s ([§10.0](#sec-intptr-and-uintptr)): `Ptr<T>` has no auto-properties, so the synthesized `=` would be the zero-property "every-pair-equal" form. `Zero` is the null pointer, a `static readonly` property at record type for the reason [§10.0](#sec-intptr-and-uintptr) gives — language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) admits `const` only at a primitive value type or `string`. The value is compiler-provided.
 
 `Ptr<T>` computes **sendable** under language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)'s value-type rule — ratified at v0.186 with the cross-domain trust bullet of language spec [§32.10](Bezel_Language_Spec.md#sec-boundary-contract): foreign memory reached through a crossed pointer is outside domain isolation, and unsynchronized cross-domain access to the same address is a data race and undefined behavior.
 
