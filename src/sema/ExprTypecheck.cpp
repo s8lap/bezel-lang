@@ -9963,6 +9963,63 @@ static bool isSec154BorrowingFamilyHead(std::string_view n) {
            n == "Queue" || n == "Dictionary";
 }
 
+// per §15.4 (v0.268, fix #3307): §15.4's third fresh-producer form is "a
+// nested collection literal targeting a non-trivial-dispose collection type".
+// This predicate answers only the half it owns — is the TARGET a builtin
+// collection head whose non-trivial-dispose verdict is positive? — by
+// delegating the user-class half to `common::isNonTrivialDisposeClass` so
+// #2673's single-class verdict stays the single source of truth.
+//
+// THE OWNING FAMILY IS NON-TRIVIAL-DISPOSE IFF ITS ELEMENT IS. A borrowing-
+// family head (`Array<T>`, `Set<T>`, `LinkedList<T>`, `Stack<T>`, `Queue<T>`,
+// `Dictionary<K, V>`) borrows its elements and never owns storage (§15.4
+// carries this from §28.6), so it is trivial-dispose regardless of T — and
+// therefore NOT a §15.4 fresh-producer target. An owning-family head
+// (`OwningArray<T>`, `OwningSet<T>`, `OwningLinkedList<T>`, `OwningStack<T>`,
+// `OwningQueue<T>`, and the VALUE position of `OwningDictionary<K, V>`) owns
+// its elements and is non-trivial-dispose iff the owned element type is a
+// non-trivial-dispose class. `OwningDictionary`'s KEY position is borrowing
+// exactly like `Dictionary`'s, so the verdict there reads the value (index 1).
+//
+// WHAT IS DELIBERATELY OUT OF SCOPE. (a) A user type (a class with a
+// `declaration`, e.g. an opt-in `FromCollectionLiteral` per §15.4.1) is not on
+// §15.4's list as a builtin borrowing/owning head — its verdict is the
+// ordinary `isNonTrivialDisposeClass` one, which is not consulted here nor
+// needed (the §15.4 borrowing-family predicate above already excludes it).
+// (b) A literal TYPE WITHOUT A §28.9-OWNED ELEMENT (e.g. `OwningArray<int>`,
+// or `OwningArray<Box>` where `Box` is trivial-dispose) is trivial-dispose
+// and therefore NOT a fresh-producer target — important so the literal-tree
+// ownership rule's "nested literal node" admission stays intact. (c) A bare
+// `T` type-parameter element is conservative-fail (returns false) — a
+// monomorphized body will reclassify it through the §14.1 substitution pass.
+//
+// fix #3307: the verdict is OWNED-element-indexed for the owning head, so
+// the caller can reuse it for diagnostic formatting. Splits from
+// `isSec154BorrowingFamilyHead` so the two are independently testable.
+static bool isSec154BuiltinCollectionNonTrivialDispose(const TypeRef* t) {
+    if (!t || t->kind != TypeRef::Kind::Named) return false;
+    if (t->declaration) return false;  // user type — verdict lives elsewhere
+    if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
+        return false;
+    const std::string_view head = t->headName();
+    // Borrowing-family is trivial-dispose regardless of T — half of §15.4's
+    // nesting rule is the trivial-dispose literal-tree carve-out of the next
+    // paragraph, which is what this classifies *negatively*.
+    if (isSec154BorrowingFamilyHead(head)) return false;
+    // Owning family: read the OWNED element type. `OwningDictionary` owns
+    // only its VALUE position (`K` borrows, like `Dictionary`), so the
+    // verdict looks at index 1; every other head owns one element at index 0.
+    if (!common::isOwningCollectionHead(head)) return false;
+    const std::size_t elemIdx = (head == "OwningDictionary") ? 1 : 0;
+    if (t->genericArgs.size() <= elemIdx) return false;
+    const TypeRef* elem = t->genericArgs[elemIdx];
+    if (!elem || elem->kind != TypeRef::Kind::Named || !elem->declaration)
+        return false;  // bare `T` / builtin element — verdict needs substitution
+    if (elem->declaration->kind != ast::TypeDeclKind::Class) return false;
+    if (elem->declaration->isValueBuiltin) return false;
+    return common::isNonTrivialDisposeClass(elem->declaration);
+}
+
 // per §15.4 (v0.268, fix #2673): "For **borrowing-family** targets …, each
 // element expression of **non-trivial-dispose class type** (§28.9) must be a
 // **borrow** whose source satisfies the store rule of §28.11; an element
@@ -9990,15 +10047,23 @@ static bool isSec154BorrowingFamilyHead(std::string_view n) {
 // free rather than by a second, drift-prone carve-out here.
 //
 // SCOPE — the spec's clause names THREE fresh-producer forms; this implements
-// the two that `exprIsOwnedProducerOfNonTrivialDisposeClass` decides (`new`
-// and the `owned`-returning call). The third, "a nested collection literal
-// targeting a non-trivial-dispose collection type", needs a non-trivial-
-// dispose verdict for a BUILTIN collection head (`OwningArray<Conn>` is
-// non-trivial-dispose by way of its implicit owned element slot), and no such
-// authority exists today — `common::isNonTrivialDisposeClass` takes a
-// `sema::TypeSymbol*`, which every builtin collection head lacks. Rather than
-// invent a second classification that would drift from the first, that arm is
-// declined-with-reasons and filed as a follow-up.
+// all three. The first two (`new` and the `owned`-returning call) are decided
+// by `exprIsOwnedProducerOfNonTrivialDisposeClass` directly above. The third,
+// "a nested collection literal targeting a non-trivial-dispose collection
+// type", needs a non-trivial-dispose verdict for a BUILTIN collection head
+// (`OwningArray<Conn>` is non-trivial-dispose by way of its implicit owned
+// element slot), and no such verdict exists in `common::isNonTrivialDisposeClass`
+// — that function takes a `sema::TypeSymbol*`, which every builtin collection
+// head lacks (it has no user TypeDecl). The verdict is supplied by
+// `isSec154BuiltinCollectionNonTrivialDispose` directly above, which delegates
+// to `isNonTrivialDisposeClass` for the user-class element half so the
+// §28.9 classification stays the single source of truth (the #1414 / #2666
+// "duplicated classification predicates are the dominant defect generator"
+// discipline). The owning-family head's element type is the only thing that
+// matters — `OwningArray<Conn>` is non-trivial-dispose, `OwningArray<int>`
+// is trivial-dispose, and the borrowing family is trivial-dispose regardless
+// of T. This is what `#3307` lands; the previous decline-with-reasons was
+// filed with `#2673`.
 //
 // The rejection is LITERAL-ONLY: §15.4's own resolution 5 ("`Add` after
 // construction is not a literal position") records the asymmetry, so
@@ -10017,12 +10082,69 @@ void ExprTC::checkBorrowingFamilyLiteralElements(
     if (!isSec154BorrowingFamilyHead(head)) return;
 
     auto checkOne = [&](const ast::Expr* el, const char* position,
-                        bool owningFamilyIsARemedy) {
-        if (!el || !exprIsOwnedProducerOfNonTrivialDisposeClass(*el)) return;
-        const TypeRef* t = ctx_.exprType(*el);
-        const std::string elemName =
-            (t && t->declaration) ? std::string(t->declaration->name)
-                                  : std::string("<element type>");
+                        bool owningFamilyIsARemedy,
+                        const TypeRef* elemTarget) {
+        if (!el) return;
+        // Two of §15.4's three fresh-producer forms — `new` and the `owned`-
+        // returning call — are decided by the predicate #2673 reused (see the
+        // SCOPE comment above). The third, a nested collection literal at a
+        // non-trivial-dispose collection target, is per-#3307: the element IS
+        // a `CollectionLiteralExpr` AND its static result type is an owning-
+        // family head whose element is a non-trivial-dispose class
+        // (e.g. `OwningArray<Conn>`). The `else if` arm is conservative-
+        // negative on any other shape (a non-element literal form, an
+        // identifier, a `BorrowExpr`, a record, a value type, an empty
+        // literal at the inner level), so adding it here does not change
+        // any accepted program.
+        //
+        // The inner literal's static type is NOT set by the visitor (only
+        // `NewExpr`/`CallExpr` get their type during visit); pre-set it from
+        // the outer literal's element type so the inner-literal arm can read
+        // `ctx_.exprType(*el)` and find the right target. This is the same
+        // type that would be set by checkAssignable's downstream thread,
+        // advanced here so the §15.4 fresh-producer check sees it.
+        const TypeRef* innerTy = ctx_.exprType(*el);
+        if (!innerTy && dynamic_cast<const ast::CollectionLiteralExpr*>(el) &&
+            elemTarget) {
+            ctx_.setExprType(const_cast<ast::Expr*>(el),
+                             const_cast<TypeRef*>(elemTarget));
+            innerTy = ctx_.exprType(*el);
+        }
+        const bool isFreshProducer =
+            exprIsOwnedProducerOfNonTrivialDisposeClass(*el) ||
+            (dynamic_cast<const ast::CollectionLiteralExpr*>(el) &&
+             isSec154BuiltinCollectionNonTrivialDispose(innerTy));
+        if (!isFreshProducer) return;
+        const TypeRef* t = innerTy;
+        // For the nested-literal arm the element TYPE is a builtin collection
+        // head (no `declaration`), so the bare declaration-name lookup misses
+        // and the message would name "<element type>". Build a more useful
+        // name from the head + generic args.
+        std::string elemName;
+        if (t && t->declaration) {
+            elemName = std::string(t->declaration->name);
+        } else if (t && t->kind == TypeRef::Kind::Named && t->astNode &&
+                   t->astNode->name && !t->astNode->name->parts.empty()) {
+            elemName = std::string(t->headName());
+            if (!t->genericArgs.empty()) {
+                elemName += "<";
+                for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                    if (i) elemName += ", ";
+                    const TypeRef* a = t->genericArgs[i];
+                    if (a && a->declaration)
+                        elemName += std::string(a->declaration->name);
+                    else if (a && a->kind == TypeRef::Kind::Named &&
+                             a->astNode && a->astNode->name &&
+                             !a->astNode->name->parts.empty())
+                        elemName += std::string(a->headName());
+                    else
+                        elemName += "<type argument>";
+                }
+                elemName += ">";
+            }
+        } else {
+            elemName = "<element type>";
+        }
         // §15.4 prints TWO remedies, and the second is not universal: the
         // owning family takes ownership "uniformly [for] `OwningArray<T>`,
         // `OwningLinkedList<T>`, `OwningStack<T>`, `OwningQueue<T>`,
@@ -10049,11 +10171,19 @@ void ExprTC::checkBorrowingFamilyLiteralElements(
             owningRemedy + " (§15.4)");
     };
     // Dictionary: BOTH the key and the value position are borrowing (§15.4).
+    // The OUTER literal's element type is `target->genericArgs[0]` for sequence
+    // form, `target->genericArgs[1]` for the value position of a dict, and
+    // `target->genericArgs[0]` for the key position. These are the inner
+    // literal's target type when the element is a nested literal.
+    const TypeRef* elemElementTy = target->genericArgs.empty()
+        ? nullptr : target->genericArgs[0];
+    const TypeRef* valueElementTy = (cl.isDict && target->genericArgs.size() >= 2)
+        ? target->genericArgs[1] : elemElementTy;
     for (const auto& k : cl.keys)
-        checkOne(k.get(), "key", /*owningFamilyIsARemedy=*/false);
+        checkOne(k.get(), "key", /*owningFamilyIsARemedy=*/false, elemElementTy);
     for (const auto& v : cl.elements)
         checkOne(v.get(), cl.isDict ? "value" : "element",
-                 /*owningFamilyIsARemedy=*/true);
+                 /*owningFamilyIsARemedy=*/true, valueElementTy);
 }
 
 // stdlib §4.13 (v0.196, #1645): the owning-enumeration interfaces
