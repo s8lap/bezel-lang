@@ -5334,7 +5334,26 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // is released via bz_rawbytes_free, which frees the buffer THEN the
         // struct, exactly once. The disposal contract (stdlib §10.x destructor)
         // says "releases the underlying buffer when this instance allocated it".
+        //
+        // fix #2823 / §28.3 / §32.5 (v0.273): the same arm also serves an
+        // `owned c: CString` / `owned w: WString` / `owned b: RawBytes`
+        // PARAMETER registered by `registerUnwindOwnedParam`'s new sibling
+        // branch (#2823, Setup.cpp ~16156). The `releaseOnUnwindOnly && !
+        // dropUndischarged` skip gate mirrors the collection / dict /
+        // channelSender / channel / shared / mutex / lock / semaphore /
+        // semaphoreToken / tcs / subscription arms (#3036 / #2869): a discharged
+        // owned parameter (explicit Dispose(), returned, or moved out on the
+        // normal path) registers `releaseOnUnwindOnly = true`, so the disposal
+        // fires only on the unwind edge — the normal-path discharge site is
+        // the sole release on its edge; an auto-dropped owner leaves the flag
+        // false and frees on both exits. Without this gate, a disposed-then-
+        // thrown parameter would dispose AGAIN here on its normal-path scope-
+        // end (or on the unwind edge if the throw precedes the explicit
+        // Dispose), and free() / bz_rawbytes_free on a freed pointer is a
+        // genuine double-free (NOT idempotent — malloc'd buffers have no
+        // released-flag machinery). // per §28.3, §32.5; stdlib §10.1–§10.3.
         if (it->ffiBuffer) {
+            if (it->releaseOnUnwindOnly && !dropUndischarged) continue;   // fix #2823 / #3036 / #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* fbuf = builder_.CreateLoad(ptrTy(), addr, "ffibuf.load");

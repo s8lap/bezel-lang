@@ -16153,6 +16153,43 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
         disposeStack_.front().push_back(d);
         return;
     }
+    // fix #2823 / §32.5 / §32.6 / §28.3 / §28.9 (v0.273): the FFI-buffer trio
+    // CString / WString / RawBytes has NEITHER a user TypeSymbol NOR a builtin
+    // class type — it is a malloc'd byte buffer (or, for RawBytes, a { ptr, len
+    // } struct whose `ptr` owns a buffer; stdlib §10.3) — so `isClassOrInterfaceRef`
+    // below rejects it and the §28.3 auto-drop / unwind-only registration was
+    // SKIPPED ENTIRELY. The §28.3 "auto-drop" diagnostic the compiler prints at
+    // this very site ("owned parameter `c` is implicitly disposed at the end of
+    // the method") promised a release that never ran: an `owned c: CString` (or
+    // WString / RawBytes) parameter that is never discharged on the normal
+    // path leaked its malloc'd buffer at every call site; an explicit
+    // `c.Dispose()` followed by a throw also leaked (the dispose ran, the
+    // unwind edge had no entry to skip-on-unwind). The using-var sibling
+    // (#977 / #985, Setup.cpp ~14513) has the corresponding arm — a
+    // `Disposal{slot, nullptr}` with `ffiBuffer = true` / `rawBytes = isRaw`,
+    // already null-guarded + null-after-free by the `ffiBuffer` arm in
+    // `emitDisposals` (Disposal.cpp ~5285, #2733) — and `emitDisposals`'s
+    // `ffiBuffer` arm is exactly the existing sink we register for, so the fix
+    // is symmetric, not new infrastructure: one more sibling branch that
+    // detects the family through `isFfiBufferTypeRef` (#2809 / #2757's single
+    // home for {CString, WString, RawBytes}, reading `builtinTypeName` so it
+    // answers correctly for BOTH the declaration-less annotation TypeRef and
+    // the `builtinClassSym` factory-result TypeRef — same shape the `using var`
+    // arm and #2825/#2823's Pointer fix ride on), registers the same Disposal
+    // shape, and mirrors the #1957 / #3033 releaseOnUnwindOnly discipline
+    // exactly: auto-drop releases on both exits (the sole release); a
+    // discharged owned param (moved/returned/explicitly Dispose()'d on the
+    // normal path) releases only on the unwind exit, so the normal-path
+    // discharge site is the sole release on that edge. // per §28.3, §32.5,
+    // §32.6; stdlib §10.1 / §10.2 / §10.3, v0.273.
+    if (isFfiBufferTypeRef(rt)) {
+        Disposal d{slot, nullptr};
+        d.ffiBuffer = true;
+        d.rawBytes = builtinTypeName(rt) == "RawBytes";
+        d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
+        disposeStack_.front().push_back(d);
+        return;
+    }
     if (!isClassOrInterfaceRef(rt) && !isClassOrInterfaceRef(resolveTypeParamRef(rt)))
         return;
     Disposal d{slot, nullptr};
