@@ -1084,6 +1084,21 @@ private:
     void checkCasePatternConstantRanges(const std::vector<ast::CaseArm>& arms,
                                         TypeRef* scrutTy);
 
+    // §26.4 (v0.277, #3336): per-`where`-clause-item applicability test for
+    // an extension block. Returns true ONLY on a PROVABLE violation
+    // (decided = true && !ok); a satisfied/undecidable item keeps. The lookup
+    // is intentionally a SILENT applicability filter (§26.5.1 "A `where`
+    // clause is an *applicability* filter, never a ranking signal").
+    bool extConstraintItemProvablyViolated(
+        const ast::ConstraintItem& item, const TypeRef* arg);
+    // §26.4 (v0.277, #3336): per-extension-block applicability test. Walks
+    // every `where T: c1, c2` clause and drops the block on any provable item
+    // violation. `binding` is the block-level type-param → concrete TypeRef
+    // substitution built by collectFreeVarBinding.
+    bool extWhereClauseProvablyViolated(
+        const ast::ExtensionDecl& decl,
+        const std::vector<std::pair<std::string, TypeRef*>>& binding);
+
     // §19.3 (#1847): validate a TOP-LEVEL bare-identifier `case`/`when` pattern.
     // The grammar leaves a single-/qualified-identifier pattern ambiguous (§A.7):
     // it is a TYPE TEST when the name resolves to a type (or a type parameter,

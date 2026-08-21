@@ -7074,6 +7074,105 @@ static std::string spellExtWhereClause(
     return out;
 }
 
+// §26.4 (v0.277, #3336): per-`where`-clause-item applicability test for an
+// extension block. Mirrors the §14.2 reported-violation conditions of
+// Resolver::checkOneConstraint and ExprTC::leafSolutionViolatesScalarConstraint's
+// `violates` lambda — but returns true ONLY on a PROVABLE violation (decided =
+// true && !ok), never on a satisfied or undecidable item. Deferring is the
+// sound direction here: a satisfied/undecidable item MUST keep the candidate,
+// and the late `where`-clause checks (e.g. `sendable` requires the expression
+// walk to have populated primary-ctor-storage bits, §30.14) fire downstream
+// and surface real failures with better messages — the lookup is intentionally
+// a SILENT applicability filter (§26.5.1 "A `where` clause is an
+// *applicability* filter, never a ranking signal"), not an additional
+// diagnostic site.
+bool ExprTC::extConstraintItemProvablyViolated(
+    const ast::ConstraintItem& item, const TypeRef* arg) {
+    if (!arg || arg->kind == TypeRef::Kind::Error) return false;
+    if (item.kind == "notnull") {
+        // §14.2: a `where T: notnull` excludes every nullable type.
+        return arg->nullable;
+    }
+    if (item.kind == "class") {
+        // §14.2: non-nullable reference types only. A nullable arg provably
+        // fails; a value-kind arg provably fails; everything else (reference
+        // / unknown) keeps.
+        if (arg->nullable) return true;
+        GroundCat c = groundCategorize(arg);
+        return c == GroundCat::Value;
+    }
+    if (item.kind == "value") {
+        // §14.2: non-nullable value types only. Mirror of the `class` arm.
+        if (arg->nullable) return true;
+        GroundCat c = groundCategorize(arg);
+        return c == GroundCat::Reference;
+    }
+    if (item.kind == "new") {
+        // §14.2 / §17.11: provably no accessible parameterless ctor /
+        // well-defined default. The predicate's `decided` out-parameter
+        // distinguishes "provably fails" from "can't verify" — only the first
+        // is a real violation here (the second must KEEP the candidate, per
+        // the soundness direction above).
+        bool decided = false;
+        bool ok = groundSatisfiesNew(arg, decided);
+        return decided && !ok;
+    }
+    if (item.kind == "type") {
+        // §14.2 type-bound `where T: IFoo`. Resolve the bound's AST node to a
+        // TypeRef (resolveTypes populates ctx.resolvedType for every visitable
+        // type node). The bound's own generic args may still name block-level
+        // type parameters — fine, because declaration-based subtyping
+        // (groundSatisfiesTypeBound's `isSubtype` walk, §14.2) IGNORES generic
+        // args, which is the SOUND direction for our purposes (a
+        // wrong-generic-arg conformer reads as SATISFYING — a spurious KEEP,
+        // never a false drop). An unbound bound (null astBound) keeps.
+        TypeRef* bound = nullptr;
+        if (item.typeArg) bound = ctx_.resolvedType(*item.typeArg);
+        bool decided = false;
+        bool ok = groundSatisfiesTypeBound(arg, bound, decided);
+        return decided && !ok;
+    }
+    // §14.2 derived-property constraints (`sendable`, `hashable`) and the
+    // §14.4 modifier form (`is owned` / `is not owned`, removed at v0.97) all
+    // reach here as undecidable inputs for our ground-decision subset; the
+    // late pass at the tail of typecheckExpressions() (cf. #3235 for
+    // `sendable`) replays them with full data and surfaces real violations
+    // with better messages. Keep the candidate.
+    return false;
+}
+
+// §26.4 (v0.277, #3336): per-extension-block applicability test. Walks every
+// `where T: c1, c2` clause, looks up T's substitution in `binding` (built from
+// the matched ancestor's generic args by collectFreeVarBinding), and asks
+// `extConstraintItemProvablyViolated` whether each item is satisfied. ANY
+// provable violation drops the entire block (the §26.5.1 wording "A `where`
+// clause is an *applicability* filter" is a single-clause conjunction at the
+// item level: every clause is independently required). An unbound constraint
+// type parameter (no entry in `binding`) keeps — the extension simply has
+// nothing to check against at this call site, which can only happen for a
+// malformed extension whose target introduces a free var the `where` clause
+// doesn't name (a parse-level oddity no diagnostic is owed for here).
+bool ExprTC::extWhereClauseProvablyViolated(
+    const ast::ExtensionDecl& decl,
+    const std::vector<std::pair<std::string, TypeRef*>>& binding) {
+    for (const auto& gc : decl.genericConstraints) {
+        // §14.4 modifier-constraint form (`where T is owned` / `is not owned`)
+        // — REMOVED at v0.97; populators filter this out, so a non-empty
+        // modifierConstraint shouldn't reach here. Treat conservatively.
+        if (!gc.modifierConstraint.empty()) continue;
+        const TypeRef* arg = nullptr;
+        for (const auto& kv : binding) {
+            if (kv.first == gc.typeParam) { arg = kv.second; break; }
+        }
+        if (!arg) continue;  // unbound — keep (see header note)
+        for (const auto& item : gc.items) {
+            if (extConstraintItemProvablyViolated(item, arg))
+                return true;
+        }
+    }
+    return false;
+}
+
 Symbol* ExprTC::lookupExtensionMember(
     const TypeRef* receiver,
     std::string_view name,
@@ -7181,6 +7280,36 @@ Symbol* ExprTC::lookupExtensionMember(
         const TypeRef* matchedAnc = extensionFindMatchingAncestor(
             target, receiver, freeVars, ownedAncs);
         if (!matchedAnc) continue;
+        // §26.5 (#714/#773): when the extension has free type variables,
+        // compute the binding (T → concrete TypeRef) from the matched
+        // ancestor's generic args. This binding lets typeCall substitute
+        // the return type and codegen emit a specialized body — and now, per
+        // §26.4 (v0.277, #3336), also lets extWhereClauseProvablyViolated
+        // evaluate the block-level `where` clauses against the receiver's
+        // instantiation (the keystone delta the §26.5.1 wording names an
+        // "applicability filter" but #3336 proved the compiler never enforced).
+        // Hoisted out of the per-member loop because the applicability test
+        // is a PER-BLOCK decision — a violating block never contributes any
+        // candidate regardless of which name-matched member the loop would
+        // have picked.
+        std::vector<std::pair<std::string, TypeRef*>> binding;
+        if (!freeVars.empty()) {
+            // Collect T→concrete mapping positionally from matched ancestor.
+            collectFreeVarBinding(target, matchedAnc, freeVars, binding);
+        }
+        // §26.4 (v0.277, #3336): block-level `where` clause is an
+        // applicability FILTER (§26.5.1) — drop the entire block when ANY
+        // clause is provably violated at the receiver's instantiation. The
+        // lookup is intentionally a SILENT filter (the rationale here is the
+        // §26.5.1 wording: an extension that fails its `where` simply
+        // doesn't apply — there is no "extension candidate" to diagnose,
+        // the same way a private member isn't a candidate from outside its
+        // class). When ALL surviving candidates are dropped this way, the
+        // caller (resolveMemberAccess) emits the existing "no such member"
+        // diagnostic, which is the §26.4-correct behavior.
+        if (!freeVars.empty() && decl &&
+            extWhereClauseProvablyViolated(*decl, binding))
+            continue;
         // Determine whether the extension target is a builtin (null-decl) type.
         // For builtin-target extensions (e.g. `extension IEnumerable<T>`), the
         // full binding-and-codegen path is implemented (#714). For user-declared
@@ -7213,15 +7342,6 @@ Symbol* ExprTC::lookupExtensionMember(
                         if (extSignatureUsesFreeVar(md, freeVars)) continue;
                     }
                 }
-            }
-            // §26.5 (#714/#773): when the extension has free type variables,
-            // compute the binding (T → concrete TypeRef) from the matched
-            // ancestor's generic args. This binding lets typeCall substitute
-            // the return type and codegen emit a specialized body.
-            std::vector<std::pair<std::string, TypeRef*>> binding;
-            if (!freeVars.empty()) {
-                // Collect T→concrete mapping positionally from matched ancestor.
-                collectFreeVarBinding(target, matchedAnc, freeVars, binding);
             }
             // fix #2328 (§26.5, v0.236): per-block same-name overloads are
             // arity-filtered ABOVE (when `arity >= 0`), so the first surviving
