@@ -1,6 +1,6 @@
 # Bezel Guide 6: Contracts and Purity
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.260.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.270.*
 
 Bezel lets a signature state obligations the compiler enforces: **`requires(...)`** for what the caller must guarantee, **`ensures(...)`** for what the member guarantees back, **`invariant(...);`** for what an object maintains at its public boundary (spec §22.16), and **`pure`** for members that promise no effects at all (spec §22.15). The syntax is small; the *postures* are what this guide teaches. Contracts are grammar, not a debug-mode assertion library: `requires` runs in every build, and a violation is a bug report, not an outcome (§1). Two postures will break habits you may bring along, and each is headed **How Bezel does it**. First: `requires` states only what a *correct caller already guarantees* — never validation of trust-boundary input, which is value-shape territory Guide 2 owns (§2). Second: `pure` is a promise you *declare* and the compiler verifies — never inferred from a body (§5). If you skim everything else, read those two and the table in §9.
 
@@ -35,13 +35,13 @@ public class Account
 end Account;
 ```
 
-A clause's expression is `bool` and is checked under the pure-body discipline of §22.15, so it can call only `pure` members (§7). It can neither write state, consume a value, nor suspend. And unlike a pure *body*, a clause may not `throw`: a clause states a proposition, and the mechanism and blame of a violation belong to §22.16's own machinery. (The throw carve-out stays available to a clause's pure *callees*.) A clause that evaluates `false` raises **`ContractViolationException`** (spec §31.4). It is catchable, and its `Message` names the clause kind, the member, and the clause's source text — but it is never a control-flow tool. It reports a **bug**: a caller bug for `requires`, an implementation bug for `ensures`/`invariant`.
+A clause's expression is `bool` and is checked under the pure-body discipline of §22.15, so it can call only members that are `pure`-declared or pure-classified (§7). It can neither write state, consume a value, nor suspend. And unlike a pure *body*, a clause may not `throw`: a clause states a proposition, and the mechanism and blame of a violation belong to §22.16's own machinery. (The throw carve-out stays available to a clause's pure *callees*.) A clause that evaluates `false` raises **`ContractViolationException`** (spec §31.4). It is catchable, and its `Message` names the clause kind, the member, and the clause's source text — but it is never a control-flow tool. It reports a **bug**: a caller bug for `requires`, an implementation bug for `ensures`/`invariant`.
 
 **Contracts are not compiled out.** The habit from environments where assertion machinery vanishes in release builds does not transfer. A `requires` clause is **always-on**: evaluated on every invocation, in every build mode. The only elision is elision-by-*proof* — a statically discharged clause compiles to nothing. `requires` replaces the always-on `throw new ArgumentException(...)` prologue, so it keeps that idiom's posture; the remedy for a hot path is the proven tier (§3), not a knob. `ensures` and `invariant` run under **checked-contracts mode**, off by default in release. But that relaxation is *defined* non-evaluation: because clauses are pure (spec §22.16), it is unobservable for any program whose clauses hold and never fault (§3).
 
 Clauses are part of the member's contract in the fullest sense. They are carried by the artifact interface (spec §2.8.2), so a caller compiling against your module sees them — API documentation the compiler enforces. And they are **slot-bound** (spec §22.16): a clause on a virtual, abstract, or interface member binds every override and implementation, inherited verbatim and never restated. An override may *add* `ensures` clauses — strengthening its guarantee, which is always sound for callers. It may **not** declare `requires` clauses: strengthening a precondition would break every caller dispatching through the base contract.
 
-Two practical notes. First, write **one condition per clause**: the clause is the unit of blame, evaluation order (first `false` wins), and interface identity, so `requires(a) requires(b)` gives better diagnostics than `requires(a and b)`. Second, know the edges of the scope (spec §22.16). An `async` method takes `requires` only, evaluated synchronously before the first suspension — a violation surfaces on the caller's own stack, not through the task. Iterator methods, accessors, operators, and lambdas take no clauses in this revision.
+Two practical notes. First, write **one condition per clause**: the clause is the unit of blame, evaluation order (first `false` wins), and interface identity, so `requires(a) requires(b)` gives better diagnostics than `requires(a and b)`. Second, know the edges of the scope (spec §22.16). An `async` method takes `requires` only, evaluated synchronously before the first suspension — a violation surfaces on the caller's own stack, not through the task. Iterator methods, accessors, operators, and lambdas take no clauses in this revision. One edge is not a rejection but a reclassification: a clause on a **record's** constructor — `requires`, `ensures`, either visibility, any tier — makes that record **constructor-only** (spec §9.9, v0.268), a §3.6 derived type property whose two consequences are static and hold in every build mode: the record is not defaultable (`default(R)`, an uninitialized `R` slot, `where T: new()` at `R`) and `with` over it is a compile error. A record declaring **positional** fields may not declare such a constructor at all — a compile error at the record declaration, whose diagnostic names the two remedies: move the storage to auto-properties in a body record, or state the condition on a static factory method instead. And because §3.6 rule 3 makes a derived type property part of the public contract, adding *or removing* that clause is a breaking delta in both directions (spec §2.8.6) — the one case where a clause is more than the member's own contract.
 
 ---
 
@@ -49,7 +49,7 @@ Two practical notes. First, write **one condition per clause**: the clause is th
 
 This is the boundary that matters most, and it mirrors Guide 2 §7's table exactly. The failure-signal rule (stdlib §1) puts every fault condition in one band. Band 1 is the **caller bug** — a condition a correct caller already guarantees. That is `requires` territory, with defect exceptions like `ArgumentException` as the pre-contract residual. Bands 2–3 are **expected outcomes**: absence, bad input, a failure the caller branches on. Those are returned as values — `T?`, a Try shape, `Result<T, E>`, a domain choice. A contract on an expected outcome misclassifies it as a bug.
 
-A good `requires` — an index precondition. No correct caller ever passes an out-of-range index, so an out-of-range index is a bug, and the clause says so in the signature:
+A good `requires` — an index precondition. No correct caller ever passes an out-of-range index, so an out-of-range index is a bug, and the clause says so in the signature. (Where the bound is a literal range rather than a live `Count`, the `in` spelling is clause material too: `Range<T>.Contains`, `IsEmpty`, and `IsOpenEnded` carry `pure` as of v0.263, so `requires(port in 0..65535)` compiles — stdlib §9.8, spec §16.3.)
 
 ```bezel
 public class SampleWindow
@@ -240,7 +240,7 @@ The remedies are standard: hoist the effect to the (impure) caller, or drop the 
 
 ## 7. What `pure` buys
 
-The immediate payoff is **contract material**: a clause expression may call only pure members (§1), so every predicate you mark `pure` becomes usable in `requires`, `ensures`, and `invariant` — including on other members of the same type:
+The immediate payoff is **contract material**: a clause expression may call only pure members (§1), so every predicate that is `pure` — marked, or pure by classification, as a stored-slot auto-property getter is (a marker there is the redundant spelling §22.15 rejects) — becomes usable in `requires`, `ensures`, and `invariant` — including on other members of the same type:
 
 ```bezel
 public pure method Accepts(state: int): bool
@@ -262,7 +262,7 @@ What it does **not** buy: pure calls are not compile-time evaluated — a pure c
 
 ## 8. `Debug.Assert`: the landed assertion surface
 
-`System.Diagnostics` requires an explicit `import System.Diagnostics;`. At v0.247 its surface is `Stopwatch` (stdlib §8.1) and the static `Debug` class (stdlib §8.2) — `Assert(condition)`, `Assert(condition, message)`, and `WriteLine(message)`. That is the whole in-body assertion vocabulary the library ships today. Anything richer is not landed, and this guide teaches only what exists.
+`System.Diagnostics` requires an explicit `import System.Diagnostics;`. Its surface, unchanged from v0.247 through v0.270, is `Stopwatch` (stdlib §8.1) and the static `Debug` class (stdlib §8.2) — `Assert(condition)`, `Assert(condition, message)`, and `WriteLine(message)`. That is the whole in-body assertion vocabulary the library ships today. Anything richer is not landed, and this guide teaches only what exists.
 
 ```bezel
 import System.Diagnostics;
@@ -291,10 +291,11 @@ This table classifies the *condition*; Guide 2 §7's table — the home for fail
 |---|---|
 | Something a correct caller already guarantees (argument range, index bounds, protocol order) | `requires(...)` — always-on, faults `ContractViolationException` (spec §22.16; stdlib §1 band 1) |
 | A guarantee your implementation makes back to its callers | `ensures(...)` — checked-contracts mode, or proven where the prover reaches (§3) |
-| A consistency property of an object's state at its public boundary | `invariant(...);` — checked at construction exit and public entry/exit only (§4) |
+| A consistency property of a **class** instance's state at its public boundary | `invariant(...);` — checked at construction exit and public entry/exit only (§4); the member is class-only (spec §22.16 *Scope*) |
+| The same property on a **record** | a clause on the record's constructor — which makes the record constructor-only: not defaultable, no `with` (spec §9.9) — or, where that property is unwanted, the condition on a static factory method |
 | An expected outcome at a trust boundary — absence, malformed input, a branchable failure | never a contract: `T?`, a Try shape, `Result<T, E>`, or a domain choice (Guide 2 §2–§3, §7) — or, when the failure is consumed at a boundary rather than branched on, a typed exception (stdlib §1 band 4; §2's `Listen` rewrite) |
 | A boundary fault — I/O, environment, anything logged or retried rather than branched on | a typed exception (Guide 2 §4) |
 | A mid-body sanity check on your own algorithm's intermediate state | `Debug.Assert` — maybe elided, terminates on failure, never throws (stdlib §8.2) |
-| Invalid input at a pre-contract boundary (interop, code without clauses) | `throw new ArgumentException(...)` — the residual idiom `requires` replaces where a contract is possible |
+| An invalid *argument* at a pre-contract boundary (interop, code without clauses) — a caller bug that no clause can state | `throw new ArgumentException(...)` — the residual idiom `requires` replaces where a contract is possible |
 
 A few habits carry most of it. Before writing `requires`, ask whether a correct caller could always guarantee the condition — if not, it is an outcome, and Guide 2's shapes apply. Put the obligations callers must know in clauses, where the compiler carries and enforces them; keep `Debug.Assert` for interior claims. Mark every effect-free predicate and getter `pure` at declaration time — purity is the admission ticket to clause-land, and it cannot be retrofitted by inference. And when the purity checker or a contract violation pushes back, treat it as §1 treats it: not friction, but a misclassified condition or a real bug, found early.

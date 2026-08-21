@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.270. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.271. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -471,7 +471,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 **`ref` / `out`** (§22.3, §22.4). Written at the declaration **and** at the call site. `out` is copy-out-on-normal-return: the callee must assign on every normal-completion path; on the exception edge the recipient is untouched.
 
 - `out owned p: T` is the only modifier compound. At the call site it accepts **only** `out using var x` or `out owned var x`; plain `out var x` is rejected.
-- `ref`/`out` arguments may **not** name a location of owned state (an owned local, an `owned` parameter, an `owned` field, an owning slot), nor a `using var`, nor a `readonly` field outside its assignable context. Pass a borrow instead, or use `owned` parameters/returns and `move`.
+- `ref`/`out` arguments may **not** name a location of owned state (an owned local, an `owned` parameter, an `owned` field, an owning slot), nor a `using var`, nor a `readonly` field outside its assignable context. **That context is per-instance and at-most-once** (§22.8, v0.270/v0.271): a `readonly` field or auto-property is assignable only through an lvalue chain rooted at `this` — so a constructor may not write *another* value's `readonly` storage, and binding one to a `ref`/`out` parameter inside a constructor is the same store by other syntax — and at most once on any path through one instance construction, counting the field initializer and every constructor body in the `this(...)` chain together. Pass a borrow instead, or use `owned` parameters/returns and `move`.
 - `ref`/`out` are **forbidden** on `async` methods, on lambdas, on iterator methods and on indexers (§30.1, §29.3, §23.5). The argument's static type must match the referent type exactly. `out var _` is an error; write `out _`.
 
 **`scoped`** (§28.14) declares **storage-bounded retention** — the callee may store the thing, bounded by the storing object's life.
