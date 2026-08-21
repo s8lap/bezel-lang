@@ -635,6 +635,20 @@ private:
     // produced instance would have no owner to discharge it.
     bool exprIsOwnedProducerOfNonTrivialDisposeClass(const ast::Expr& e) const;
 
+    // §15.4 (v0.268, fix #2673): for a BORROWING-FAMILY target (`Array<T>`,
+    // `Set<T>`, `LinkedList<T>`, `Stack<T>`, `Queue<T>`, and both the key and
+    // value positions of `Dictionary<K, V>`), reject every element expression
+    // that is a fresh producer of non-trivial-dispose class type — the
+    // temporary is disposed at statement end and the collection holds a
+    // dangling borrow from birth. No-op for owning-family targets, for
+    // trivial-dispose elements, and for borrows. Delegates the
+    // fresh-producer × non-trivial-dispose question to
+    // exprIsOwnedProducerOfNonTrivialDisposeClass above rather than
+    // re-deriving it. See the .cpp definition for the declined third
+    // fresh-producer form (nested literal at a non-trivial-dispose target).
+    void checkBorrowingFamilyLiteralElements(
+        const ast::CollectionLiteralExpr& cl, const TypeRef* target);
+
     // stdlib §5 (D7): the source element type T of a LINQ operator/aggregate
     // call whose lambda argument is `(T) -> …` (Where/Select/Count/Any/All/
     // First/OrderBy/…), or null otherwise. Used to set pendingLambdaParamType_

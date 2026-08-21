@@ -14875,29 +14875,30 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ctx_.setExprType(&ma, ip);
                 return;
             }
-            // §10.3 `Length: int` — deliberately left on the RawBytes-only,
-            // declaration-only test it has carried since #985. Widening it is a
-            // separate, larger change than #2825's `Pointer` defect: `CString`/
-            // `WString` `.Length` is untyped in sema today (codegen lowers it
-            // correctly via strlen / bz_wstrlen), and giving it a type changes
-            // what the §5.1 no-implicit-conversion rule sees at every existing
-            // use site. Measured, not inferred, and filed rather than folded in.
-            // fix #3022 (§11.3, v0.240): gate the RawBytes-specific `.Length`
-            // typing on moduleName.empty() so a USER class named RawBytes
-            // does not get the builtin pointer-length typing — the FFI
-            // pointer-length lowering is built-in specific. Without this
-            // gate a user `class RawBytes { method Length(): int … }`
-            // with a method returning int was previously typed int by
-            // this branch (silently overriding the user's own method
-            // dispatch) and short-circuited the real method lookup. The
-            // Pointer leg above uses `common::isFfiBufferBuiltinName`
-            // (which already has its own user-type exclusion, see
-            // comment); this is the matching leg for the §10.3
-            // RawBytes-only spelling the comment block above describes.
-            if (tt && tt->kind == TypeRef::Kind::Named && tt->declaration &&
-                tt->declaration->name == "RawBytes" &&
-                tt->declaration->moduleName.empty() &&
-                ma.member == "Length") {
+            // §10.1 / §10.2 / §10.3 `Length: int` — typed on all three FFI
+            // buffer builtins (fix #2831), mirroring the sibling `Pointer`
+            // arm above. Pre-fix, the `Length` arm was a RawBytes-only
+            // declaration-only test that fired on the FACTORY result shape
+            // (`CString.From(s)` carries declaration = builtinClassSym) but
+            // missed the ANNOTATION shape (`c: CString` on a parameter or
+            // field, declaration = null, head name only), and it fired on
+            // `RawBytes` alone — `CString.Length` and `WString.Length` were
+            // untyped on BOTH shapes. Codegen lowered the call correctly via
+            // `isFfiBufferTypeRef` (Exprs.cpp:3628), so the runtime value was
+            // right, but the sema view was untyped and any downstream
+            // pass that read the expression's type (e.g. the §5.1 implicit-
+            // conversion rule, definite-assignment) saw an untyped
+            // expression. The same both-shapes read the Pointer arm uses
+            // (the `isFfiBuf` predicate computed above) handles the TYPE
+            // name correctly across both shapes, and the user-type
+            // exclusion (a `declaration->decl != nullptr` is a real user
+            // TypeDecl) is the same — so a `class CString` / `class WString`
+            // / `class RawBytes` user class with its own `Length` member
+            // (#3022) keeps its own typing and is not claimed here. This
+            // is the STRICT SAFE widening the issue brief calls for: it
+            // only adds a type, never rejects a site that was accepted
+            // before.
+            if (isFfiBuf && ma.member == "Length") {
                 ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                 return;
             }

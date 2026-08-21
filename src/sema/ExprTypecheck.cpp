@@ -9949,6 +9949,113 @@ bool ExprTC::exprIsOwnedProducerOfNonTrivialDisposeClass(
     return isNonTrivialDisposeClass(t->declaration);
 }
 
+// per §15.4 (v0.268, fix #2673): the BORROWING-FAMILY collection heads named
+// by §15.4's fresh-producer clause, verbatim — "`Array<T>`, `Set<T>`,
+// `LinkedList<T>`, `Stack<T>`, `Queue<T>`, and the key and value positions of
+// `Dictionary<K, V>`". Deliberately NOT `common::isOwningCollectionHead`'s
+// complement: that set is the §28.6 element-OWNING family, and its complement
+// would also sweep in heads §15.4 does not name here (`SortedSet`,
+// `SortedDictionary`) — the verbatim list is the authority, and a head §15.4
+// omits is left admissible rather than rejected on an inferred generalisation
+// (see the follow-up filed with this fix).
+static bool isSec154BorrowingFamilyHead(std::string_view n) {
+    return n == "Array" || n == "Set" || n == "LinkedList" || n == "Stack" ||
+           n == "Queue" || n == "Dictionary";
+}
+
+// per §15.4 (v0.268, fix #2673): "For **borrowing-family** targets …, each
+// element expression of **non-trivial-dispose class type** (§28.9) must be a
+// **borrow** whose source satisfies the store rule of §28.11; an element
+// expression that is a **fresh producer** of such a type — an unbound owned
+// temporary (§28.3): a `new` expression, a nested collection literal targeting
+// a non-trivial-dispose collection type, or an `owned`-returning call — is
+// rejected at the literal site."
+//
+// Left un-rejected, the temporary is disposed at the end of the declaration
+// statement and the constructed collection holds a dangling borrow from birth
+// (§9.7's no-temporary-source dangle, and a §28.6 escape of a fresh owned
+// value into a non-owning location). Measured on `756fc8c` before the fix,
+// BOTH of the issue's shapes compiled clean AND leaked — the destructor never
+// ran and `owned` fields were never released.
+//
+// AUTHORITY REUSE — the fresh-producer × non-trivial-dispose question is not
+// re-derived here. `exprIsOwnedProducerOfNonTrivialDisposeClass` (directly
+// above) already answers exactly it: `new T(...)` or a `calleeReturnsOwned`
+// call, whose static result type is a class `common::isNonTrivialDisposeClass`
+// says is non-trivial. That predicate excludes a `BorrowExpr`, an identifier /
+// field / property read (a named binding is a borrow, not a fresh producer),
+// and every trivial-dispose class — which is precisely §15.4's next paragraph
+// ("A fresh element of trivial-dispose class type is admitted … as a fresh
+// node of the literal tree"), so trivial-dispose elements stay admissible for
+// free rather than by a second, drift-prone carve-out here.
+//
+// SCOPE — the spec's clause names THREE fresh-producer forms; this implements
+// the two that `exprIsOwnedProducerOfNonTrivialDisposeClass` decides (`new`
+// and the `owned`-returning call). The third, "a nested collection literal
+// targeting a non-trivial-dispose collection type", needs a non-trivial-
+// dispose verdict for a BUILTIN collection head (`OwningArray<Conn>` is
+// non-trivial-dispose by way of its implicit owned element slot), and no such
+// authority exists today — `common::isNonTrivialDisposeClass` takes a
+// `sema::TypeSymbol*`, which every builtin collection head lacks. Rather than
+// invent a second classification that would drift from the first, that arm is
+// declined-with-reasons and filed as a follow-up.
+//
+// The rejection is LITERAL-ONLY: §15.4's own resolution 5 ("`Add` after
+// construction is not a literal position") records the asymmetry, so
+// `coll.Add(new Conn("a"))` stays admissible and is NOT touched here.
+void ExprTC::checkBorrowingFamilyLiteralElements(
+    const ast::CollectionLiteralExpr& cl, const TypeRef* target) {
+    if (!target || target->kind != TypeRef::Kind::Named) return;
+    // The borrowing collections are builtin named types with no user TypeDecl;
+    // a user type (including a `FromCollectionLiteral` opt-in, §15.4.1) is not
+    // on §15.4's borrowing-family list and is left alone.
+    if (target->declaration) return;
+    if (!target->astNode || !target->astNode->name ||
+        target->astNode->name->parts.empty())
+        return;
+    const std::string_view head = target->headName();
+    if (!isSec154BorrowingFamilyHead(head)) return;
+
+    auto checkOne = [&](const ast::Expr* el, const char* position,
+                        bool owningFamilyIsARemedy) {
+        if (!el || !exprIsOwnedProducerOfNonTrivialDisposeClass(*el)) return;
+        const TypeRef* t = ctx_.exprType(*el);
+        const std::string elemName =
+            (t && t->declaration) ? std::string(t->declaration->name)
+                                  : std::string("<element type>");
+        // §15.4 prints TWO remedies, and the second is not universal: the
+        // owning family takes ownership "uniformly [for] `OwningArray<T>`,
+        // `OwningLinkedList<T>`, `OwningStack<T>`, `OwningQueue<T>`,
+        // `OwningSet<T>`, and `OwningDictionary<K, V>` (VALUE position)" —
+        // so a rejected DICTIONARY KEY has no owning-family remedy, and
+        // naming one would send the reader to `OwningDictionary`, whose key
+        // position is borrowing exactly like `Dictionary`'s. A diagnostic
+        // that names a remedy which does not work is worse than one that
+        // names none, so the owning half is printed only where it applies.
+        const std::string owningRemedy =
+            owningFamilyIsARemedy
+                ? std::string(" or use the owning family (`Owning") +
+                      std::string(head) + "`), which takes ownership"
+                : std::string();
+        ctx_.diagnostics().report(
+            Severity::Error, el->span.begin,
+            std::string("collection-literal ") + position +
+            " is a fresh producer of the non-trivial-dispose class type `" +
+            elemName + "` — the borrowing-family target `" +
+            std::string(head) + "` does not take ownership, so the temporary "
+            "would be disposed at the end of this statement and the collection "
+            "would hold a dangling borrow from birth; name the source first "
+            "(`using var c := new " + elemName + "(...); … := [c];`)" +
+            owningRemedy + " (§15.4)");
+    };
+    // Dictionary: BOTH the key and the value position are borrowing (§15.4).
+    for (const auto& k : cl.keys)
+        checkOne(k.get(), "key", /*owningFamilyIsARemedy=*/false);
+    for (const auto& v : cl.elements)
+        checkOne(v.get(), cl.isDict ? "value" : "element",
+                 /*owningFamilyIsARemedy=*/true);
+}
+
 // stdlib §4.13 (v0.196, #1645): the owning-enumeration interfaces
 // `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, and the async pair each
 // constrain `where T: class` — ownership transfer through iteration is
@@ -11129,6 +11236,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         currentScope_->names[ld->name] = lsym;
                         return;  // reported; skip the assignability check below
                     }
+                    // per §15.4 (v0.268, fix #2673): the target IS on §15.4's
+                    // list. If it is on the BORROWING-FAMILY sub-list, an
+                    // element (or dictionary key) that is a fresh producer of
+                    // non-trivial-dispose class type is rejected at the
+                    // literal site. Runs after the admissibility gate above so
+                    // a literal at an off-list target reports only that, and
+                    // is a no-op for the owning family — `OwningArray<Conn>
+                    // := [new Conn(1)]` takes ownership and stays admissible.
+                    checkBorrowingFamilyLiteralElements(*cl, lsym->declType);
                 }
                 // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
                 // type-argument inference. When the initializer is a call to a

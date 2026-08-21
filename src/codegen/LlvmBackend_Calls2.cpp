@@ -1930,8 +1930,116 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
         }
         locals_[id] = slot;
         if (loc && loc->decl) locals_[loc->decl] = slot;
+        registerOutVarStringRelease(*id, loc, ms, pos, slot);
         pos++;
     }
+}
+
+
+// fix #2641 / §22.4 / §22.3 / §28.9 — see the declaration in
+// LlvmBackend_impl.hpp.
+//
+// THE DEFECT. `ensureOutVarSlots` above registers a scope-end disposal for the
+// `out owned var` and `out using var` inline forms, but the PLAIN `out var` arm
+// registered nothing at all. For a `string` recipient that is a leak of one
+// heap string per call, and it is a leak of a reference the CALLER solely owns:
+// §22.3 (v0.268) makes `out` "copy-out-on-normal-return … on normal return the
+// slot's value is copied to the caller's recipient", and licenses exactly what
+// this backend does — "An implementation may pass a hidden reference". Passing
+// a hidden reference to THIS slot makes the callee's store go through
+// `lowerStringRefParamStore` (#2321), which always leaves the slot owning ONE
+// independent reference: it TRANSFERS a `+1` producer's or RETAINS a borrow,
+// then releases what it displaced. So the caller's slot is the sole owner of
+// exactly one reference and nothing ever decremented it. #2629's loop
+// measurement recorded the residue precisely: 39 B in 2 allocations, "a
+// PRE-EXISTING leak of the FINAL iteration's value at scope exit".
+//
+// The EXCEPTION edge needs nothing from this fix: §22.3 says "on an exception
+// exit the recipient is untouched — an inline `out var` recipient stays
+// unassigned", so the slot still holds the null this function stored and the
+// release is a documented no-op there.
+//
+// WHY THE `out owned var` ARMS' SHAPE IS NOT REUSABLE VERBATIM. Those arms
+// dispose an OWNED CLASS object and take their normal-exit-vs-unwind-only
+// decision from the ownership pass's `autoDropAtScopeEnd`. A `string` is not an
+// owned object at all — §28.1 makes `owned` a compile error on `string`, so the
+// ownership pass never classifies this recipient and has no verdict to read.
+// The applicable §28.9 machinery is the runtime-managed-string one, whose
+// scope-end form is `Disposal::stringRelease` — fired on BOTH exits, gated on a
+// conservative NON-ESCAPE proof rather than on an ownership verdict.
+//
+// THE FIVE GATES, each closing a way the release could be unbalanced:
+//
+//  1. A resolved `sema::MethodSymbol` callee. An EXTERN (FFI) callee writes a
+//     raw `char*` through the out slot with no refcount discipline at all
+//     (§32.5) — releasing that would free memory the C side owns. A Bezel
+//     method, local or imported, is compiled by this same backend and therefore
+//     by #2321. Builtin `TryParse`-family callees reach here with no
+//     MethodSymbol and are excluded on the same conservative footing.
+//
+//  2. The FORMAL is `out`-modified and its DECLARED type is non-nullable
+//     `string`. Reading the formal (not the recipient's substituted type) keeps
+//     a GENERIC `out T` instantiated at `string` OUT of scope: the specialized
+//     callee's assignment is typed by `T`, so whether #2321 fires there is a
+//     separate question — leaving it to leak is the safe direction. The
+//     non-nullable restriction is not cosmetic: `lowerStringRefParamStore`
+//     itself bails on a nullable target (`tt->nullable → return false`), so an
+//     `out n: string?` slot receives a PLAIN store carrying no reference for the
+//     caller — releasing it would be an over-release of the callee's own value.
+//     This mirrors that helper's surface exactly, and must keep mirroring it.
+//
+//  3. `currentFn_ == stringReleaseEligibleFn_` — the analyzed-body gate every
+//     other string-refcount site uses. A body no pin names was never escape-
+//     walked, so no verdict about it can be trusted.
+//
+//  4. A conservative NON-ESCAPE proof (`outVarStringReleaseEligible`). If the
+//     recipient is returned, stored in a field, captured by a lambda, or passed
+//     anywhere that may retain it, a scope-end release would dangle that alias.
+//     The walk is the same over-approximation used for a `var` string local:
+//     any use that is not a proven-safe read ⇒ escaped ⇒ no release ⇒ the
+//     pre-existing leak, unchanged. Leak-over-UAF is the deliberate direction.
+//
+//  5. Not inside a disposer body, and some scope is open to register into.
+//
+// The Disposal carries `nullSlotAfterRelease` because — unlike a `var` local's —
+// this slot is READ BACK after the release: the recipient's alloca is entry-
+// block hoisted, so the next iteration of an enclosing loop has the callee load
+// it to release what it displaces. See that flag's comment.
+void Emitter::registerOutVarStringRelease(const ast::IdentifierExpr& id,
+                                          const sema::LocalSymbol* loc,
+                                          const sema::MethodSymbol* ms,
+                                          std::size_t pos,
+                                          llvm::AllocaInst* slot) {
+    if (!slot || !loc || !ms) return;                              // gate 1
+    if (disposeStack_.empty() || emittingDisposerBody_) return;    // gate 5
+    if (currentFn_ != stringReleaseEligibleFn_) return;            // gate 3
+    // gate 2 — read the FORMAL's own modifier + declared type.
+    std::string_view formalMod;
+    const sema::TypeRef* formalTy = nullptr;
+    if (pos < ms->params.size()) {
+        if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(
+                ms->params[pos])) {
+            formalMod = ps->modifier;
+            formalTy = ps->resolvedDeclType;
+        }
+    }
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        if (pos < md->params.size()) {
+            formalMod = md->params[pos].modifier;
+            if (!formalTy && md->params[pos].type)
+                formalTy = ctx_.resolvedType(*md->params[pos].type);
+        }
+    }
+    if (formalMod != "out") return;
+    if (!formalTy || formalTy->nullable ||
+        formalTy->kind != sema::TypeRef::Kind::Primitive ||
+        formalTy->primitive != sema::PrimitiveType::String)
+        return;
+    if (!outVarStringReleaseEligible(&id)) return;                 // gate 4
+    Disposal d{slot, nullptr};
+    d.stringRelease = true;
+    d.nullSlotAfterRelease = true;
+    disposeStack_.back().push_back(d);
 }
 
 // §22.4 / §7.9 (v0.235, #2395) — see the declaration in LlvmBackend_impl.hpp.
