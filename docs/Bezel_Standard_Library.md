@@ -1685,10 +1685,10 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
   public method Contains(item: T): bool;
   public method IndexOf(item: T): int;
 
+  public method Sort(comparer: (T, T) -> int);          // comparer takes borrows
   public method Sort();                                 // natural order; conditionally
                                                         //   admitted where `T: IComparable<T>`
                                                         //   (language spec §14.2) -- see #3325,
-                                                        //   the gate is Array-only today
                                                         //   the gate is Array-only today
   public method Reverse();
 

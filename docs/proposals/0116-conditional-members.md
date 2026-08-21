@@ -28,7 +28,7 @@ Four facts, each established in this proposal's §1 and §4:
 
 5. **Users are not as helpless as the framing assumes.** §26.4's own worked example is a constrained extension declaring `Sort()` — *"`extension IEnumerable<T> where T: IComparable<T>`"* (`Bezel_Language_Spec.md:5870`) — and §26.4 states its meaning normatively: *"A `where` clause on the block constrains which instantiations of the extended type the extension applies to."* A user **can** write a conditional member today, under any name the receiver type does not already declare, whenever the condition is a §14.2 constraint. The stdlib's five are precisely the cases where one of those two conditions fails.
 
-**Draft 2 recommends a fourth option the framing did not contain, and that Draft 1 argued against: retire four of the five, and register the one that is left.**
+**Draft 2 recommends a fourth option the framing did not contain, and that Draft 1 argued against: retire four of the five, and register what is left.**
 
 Draft 1 recommended option (b) — register all four surviving rows as a standing privilege. A costing of option (c) (this proposal's §5.3, rebuilt) found that Draft 1 had argued the weak version of it. Option (c) is not *"delete the members"*; it is **remove the conditionality**, and on that reading four of the five rows leave the census on their own evidence:
 
@@ -213,7 +213,7 @@ The practice is small enough to enumerate on one screen and old enough that no r
 
 ### D1 — A conditional member is a **standing, stated, compiler-known-standard-library privilege**, defined once in §14.2 and carried in a closed register ▲
 
-**Decision (Draft 2).** **Retire four, register one.** Draft 1's decision — option (b) over all four surviving rows — is superseded; what remains of it is the mechanism, applied to a single row.
+**Decision (Draft 2).** **Retire two, register three — and no row is a standing grant** (this proposal's §0, corrected before graduation). Draft 1's decision — option (b) over all four surviving rows — is superseded; what remains of it is the mechanism, applied to a single row.
 
 1. **C4 and C2 are deleted from the standard library**, as ordinary corrections: C4 because §4.14 documents a call the compiler rejects (the defect class v0.275 corrected in the opposite direction), C2 because ninety revisions of zero implementation and zero call sites is what process §10's subtraction review exists to act on. Neither deletion needs this proposal's mechanism, and neither is a design change — see §5.3.
 2. **C5 is respelled** as `extension IEnumerable<T> where T: hashable` (D9, unchanged from Draft 1), which needs no privilege.
@@ -422,7 +422,7 @@ Draft 2's remaining findings on this row stand. Draft 2 adds that the presentati
 
 **C3 — routed, not deleted, and this is where Draft 1's decline actually fails.** Draft 1 declined option (c) partly because *"the removal does not achieve its own goal — C3 stays regardless"*. That is true of deletion and false of the strong reading. §26.2's own exclusion sentence names the way out:
 
-> Choices. The extendable list above is closed against the choice kind — **no [§14.2] constraint names the value-like classification** a payload-generic extension surface would need, and the value-payload combinator surface of stdlib `Result<T, E>` is **compiler-provided** ([§35.2]), not an extension block.
+> Choices. The extendable list above is closed against the choice kind — **no [§14.2] constraint names the value-like **classification bound** a payload-generic extension surface would need, and the value-payload combinator surface of stdlib `Result<T, E>` is **compiler-provided** ([§35.2]), not an extension block.
 
 The privilege exists *because* the constraint vocabulary is too narrow — stated in the section that closes the escape route, added at **the same v0.233 landing that created C3**, citing C3 as its reason. Admit the constraint and the exclusion's own stated ground evaporates. Proposal 0075 §3.3 **Option B** specified exactly this and was declined at v0.233 as *"permanent user-facing constraint vocabulary bought on one program's evidence"*.
 
@@ -486,7 +486,7 @@ That does not meet R1's bar as worded — R1 asks for evidence that the *predica
 
 ⚠ **Draft 2 replaces this table.** Draft 1's version scored option C at *"2 of 5 rows resolved"* and *"contradicts a recorded decision — v0.275, hours old"*, both of which priced the deletion reading. The strong reading of C resolves four and contradicts nothing: v0.275's decision is about **C1**, which Draft 2 also declines to remove.
 
-| | A (user feature) | B (register all four) | **C′ (retire four, register one)** | D (nothing) |
+| | A (user feature) | B (register all four) | **C′ (retire two, register three with routes)** | D (nothing) |
 |---|---|---|---|---|
 | Census rows resolved | 1 of 5 | 5 of 5, by registering 2 fictions | **5 of 5: one deleted, one respelled, three registered with routes** | 0 |
 | Normative claim made | a new admissibility form | a standing four-row privilege | **three rows, none standing: one expiry, two routes** | none |
@@ -767,7 +767,7 @@ stdlib §4.14 records the gap in this proposal's own vocabulary (`Bezel_Standard
 
 ## 9. Reopening bars, collected
 
-⚠ **Draft 2 changes R3 and suspends R1.** R3 routed `DangerousPointer()`'s removal to the v0.283 subtraction review and declined removing it *as a side effect of defining a mechanism*; Draft 2 **recommends the removal outright** (§5.3.1), so R3 is no longer a decline — it is a proposed deletion, and the row below is kept only as the record of Draft 1's position. R1 is **suspended, not withdrawn**: its bar asks for evidence about the predicate vocabulary rather than the name, and [#3336](https://github.com/s8lap/bezel-lang/issues/3336) shows the mechanism the bar presumes does not currently function, so the bar can be neither met nor missed until #3336 lands. §5.5's prior art suggests it is aimed at the wrong thing and should be re-drawn at graduation. **R2 and R4 are unchanged.**
+⚠ **Draft 2 changes R3 and suspends R1.** R3 routed `DangerousPointer()`'s removal to the v0.283 subtraction review and declined removing it *as a side effect of defining a mechanism*; an intermediate wording of Draft 2 recommended removing it outright; that was reversed on the BLAS/argv evidence (§5.3.1, C2), so **R3 stands as written** and is the row `DECLINED.md` indexes. R1 is **suspended, not withdrawn**: its bar asks for evidence about the predicate vocabulary rather than the name, and [#3336](https://github.com/s8lap/bezel-lang/issues/3336) shows the mechanism the bar presumes does not currently function, so the bar can be neither met nor missed until #3336 lands. §5.5's prior art suggests it is aimed at the wrong thing and should be re-drawn at graduation. **R2 and R4 are unchanged.**
 
 **Draft 2 adds one bar of its own:**
 
@@ -790,7 +790,7 @@ stdlib §4.14 records the gap in this proposal's own vocabulary (`Bezel_Standard
 
 ### Questions
 
-⚠ **Draft 2 supersedes Q1, Q2 and Q4.** **Q1** — D1's option — is now answered by §5.3's costing rather than put to the owner as an open choice: retire four, register one. **Q2** (D3's branch) was landed at v0.276. **Q4** (should `DangerousPointer()` be a subtraction-review candidate) is **answered yes** by §5.3.1 — an intermediate wording of Draft 2 recommended deleting it outright and was reversed on the evidence; Draft 1's R3 stands. **Q3 and Q5 stand.**
+⚠ **Draft 2 supersedes Q1, Q2 and Q4.** **Q1** — D1's option — is now answered by §5.3's costing rather than put to the owner as an open choice: retire two, register three, no row a standing grant. **Q2** (D3's branch) was landed at v0.276. **Q4** (should `DangerousPointer()` be a subtraction-review candidate) is **answered yes** by §5.3.1 — an intermediate wording of Draft 2 recommended deleting it outright and was reversed on the evidence; Draft 1's R3 stands. **Q3 and Q5 stand.**
 
 **Draft 2's questions:**
 
