@@ -35,7 +35,7 @@ Draft 1 recommended option (b) — register all four surviving rows as a standin
 | Row | What the compiler does today | Disposition |
 |---|---|---|
 | **C4** `ReadOnlySpan<T>.ToArray()` | **The member does not exist and the call is rejected** | **Delete.** Zero cost — the documents assert a call that does not compile |
-| **C2** `OwningBuffer<T>.DangerousPointer()` | Ships nothing, ninety revisions | **Delete**, or name it at the v0.283 subtraction review |
+| **C2** `OwningBuffer<T>.DangerousPointer()` | Ships nothing, ninety revisions | **Route to the v0.283 subtraction review** with its motivating evidence attached — *not* deleted here (§5.3.1) |
 | **C5** LINQ hashable-element set | No gate found | **Respell** as a constrained extension (D9, unchanged from Draft 1) |
 | **C3** `Result<T, E>`'s four combinators | Shipped, ~455 lines | **Route to its own ruling** — proposal 0075 §3.3 Option B makes it an ordinary constrained extension |
 | **C1** `Array<T>.Sort()`/`Sorted()` | Shipped, hardened, five issues | **Register it** — the one true residue |
@@ -395,7 +395,23 @@ The honest weakness: a register is a *record*, not an *enforcement*. Nothing mec
 
 **C4 — delete. Zero cost, and the strongest row of the five.** The member does not exist in the compiler and the call is rejected (§2.1, corrected). Call sites are zero everywhere. The replacement is the one the standard library already prescribes for the sibling family — *"a loop or an explicit `Array<T>`"* — and v0.272's decline of the mirror on `ReadOnlyArraySpan<T>` priced the resulting asymmetry as *"the migration's one genuine loss"*: **that loss is zero**, because the `ReadOnlySpan` side does not compile either. Deleting C4 removes a documents-only asymmetry rather than creating one.
 
-**C2 — delete, or name it at the v0.283 subtraction review.** Draft 1's own §5.3 concedes this row *"ships nothing at all"*. Draft 2 adds that the presentation-split alternative is **not available in principle**: §32.12 `:9820` states the pointee set *"is an enumerated closed set plus one derived property; it is deliberately not a second §3.6 table row"*, so the device has nothing to split on, and §14.2 admits only §3.6 properties. The honest residual is runtime-sized Bezel-owned pointer storage (§2.1, corrected) — a capability the compiler has never provided, no program has used, and whose absence costs a missing-member error rather than a wrong answer.
+**C2 — route to the v0.283 subtraction review; do *not* delete it here.** ⚠ **This reverses Draft 2's own first recommendation**, on evidence found after that recommendation was written: the question *why was this needed in the first place* was put to proposal [0033](0033-ffi-v2.md), and the answer defeats the deletion.
+
+`DangerousPointer()` was not a convenience. It came out of the **2026-07-07 owner-commissioned FFI design review**, which ran the three canonical real bindings against §32 and found all three failing — sqlite3, libcurl, and **BLAS**. This member is the BLAS fix, and 0033 §3.5 names it as such: *"the double-copy exemplar **dissolved by `DangerousPointer`**"*. Its worked example is
+
+```bezel
+var c := new OwningBuffer<double>(m * n);
+cblas_dgemm(…, a.DangerousPointer(), k, b.DangerousPointer(), n, 0.0, c.DangerousPointer(), n);
+return c;                                              // zero copies, zero swizzling
+```
+
+against v1's only route: *"per-element `BitConverter` swizzling into `Array<byte>`, `RawBytes.From` (a copy), the call, `CopyTo` (a copy), per-element reassembly — per matrix, per direction."* The second motivating case is argv marshalling for `execve`/`posix_spawn`, which proposal [0011](0011-process.md) needs and which 0033 §9 routes through `CString.Pointer` + `OwningBuffer<IntPtr>.DangerousPointer()`.
+
+**Both motivating cases are runtime-sized** — `m * n`, and an argv whose length is not a literal — which is precisely the residual §2.1 identifies as having **no alternative spelling**. §32.5's `[N]IntPtr` at a by-address `extern` parameter covers the static case and neither of these. So the residual is not a marginal leftover: it is the whole of what the member was built for.
+
+That does not make the row healthy — ninety revisions of zero implementation is exactly what a subtraction review is for, and §2.8.5's *"real programs hitting real walls"* bar is unmet because there are no real programs. But **"ships nothing" is evidence about implementation priority, not about design merit**, and Draft 1 said so in terms: *"the spec-ahead-of-impl gap is process §5 item 3's ordinary condition, not evidence of an unwanted member."* Draft 2 overrode that on the strength of the census alone and was wrong to; the subtraction review is the forum that can weigh the BLAS evidence against the ninety revisions, and this proposal is not. **Draft 1's R3 is restored, with the motivating evidence now attached to it.**
+
+Draft 2's remaining findings on this row stand. Draft 2 adds that the presentation-split alternative is **not available in principle**: §32.12 `:9820` states the pointee set *"is an enumerated closed set plus one derived property; it is deliberately not a second §3.6 table row"*, so the device has nothing to split on, and §14.2 admits only §3.6 properties. The honest residual is runtime-sized Bezel-owned pointer storage (§2.1, corrected) — a capability the compiler has never provided, no program has used, and whose absence costs a missing-member error rather than a wrong answer.
 
 **C5 — respell.** Unchanged from D9.
 
@@ -774,7 +790,7 @@ stdlib §4.14 records the gap in this proposal's own vocabulary (`Bezel_Standard
 **Draft 2's questions:**
 
 - **Q6 — the C3 ruling.** Take proposal 0075 §3.3 Option B now, as its own ruling (one §14.2 constraint + the §26.2 amendment), or defer until the constraint is wanted on its own merits? Draft 2 recommends taking it: §26.2's exclusion names the missing constraint as its reason, and the *"one program's evidence"* ground of its v0.233 decline no longer describes the case.
-- **Q7 — C2's disposition.** Delete now as part of this proposal's landing, or name it at the v0.283 subtraction review as Draft 1's R3 routed? Draft 2 recommends deleting now — the residual capability (runtime-sized Bezel-owned pointer storage) was never implemented — but the subtraction review is the more conservative forum and costs one revision of delay.
+- **Q7 — C2's disposition.** ⚠ **Re-answered.** Draft 2 first recommended deleting it now; §5.3.1 reverses that. The member is the fix for the BLAS double-copy exemplar and for `execve` argv marshalling, both **runtime-sized** and therefore both inside the residual that has no alternative spelling. The recommendation is Draft 1's R3: **route it to the v0.283 subtraction review**, with 0033 §3.5's worked example as the evidence that review needs on the keep side, and ninety revisions of zero implementation as the evidence on the drop side. The owner may still prefer deletion now; what changed is that deletion is no longer this proposal's recommendation.
 - **Q8 — C1's expiry.** Should the register row's re-examination be bound to proposal 0005 landing, as §0 proposes, or left as an open review item with no trigger?
 
 **Draft 1's questions:**
@@ -822,6 +838,8 @@ Draft 1 recommended registering four conditional members as a standing compiler 
 **One lane disagreement, resolved here.** The `c24-spans` lane held that C3's route still needs a member-level `where` naming the enclosing `T`, so option (a) would have to land too. That is wrong for the extension spelling: in `extension Result<T, E> where T: <neutral>` the clause names the **extension's** parameters (an ordinary §26.4 block clause), and `Map<U>(…) where U: <neutral>` names the **method's own** parameter (an ordinary §14.2 clause). Neither is a member-level clause on an enclosing parameter, so **D7 stands and C3 can still leave the census**. The `c3-result` lane's reading is adopted.
 
 **Conformance-corpus accounting** (process §6's deletion-shaped-proposal rule). C2: `tests/conformance/manifest.tsv:492` (`stdlib_0068`, `skip:signature`) — delete the row, no case to convert. C4: manifest `:496–497`, both listings `skip:signature-listing` — delete both rows. **No exercised case is affected, because neither member ever compiled.**
+
+**One correction made after Draft 2 was first written**, recorded rather than folded in silently. Draft 2 initially recommended **deleting** C2 outright, on the census evidence that it ships nothing. Asked *why it was needed in the first place*, proposal 0033 answers: it is the fix for the BLAS double-copy exemplar and for `execve` argv marshalling, both runtime-sized, and therefore both squarely inside the residual §2.1 identifies as having no alternative spelling. The recommendation is now Draft 1's R3 — route it to the v0.283 subtraction review. **The lesson generalizes past this row:** the census measured what each member *costs* and never asked what any of them was *for*, and for four of the five rows that was harmless because the answer is in the same document. For C2 the answer was in a graduated proposal the census never opened — the same class of research gap Draft 2 charges Draft 1 with at finding 2.
 
 **Still not verified** (no build available in any lane): #3336's probe, C2's and C4's rejection behaviour, and whether §5.1's hand-written gate becomes deletable once #3336 lands. Seven build-gated probes are named across the three lane memos.
 
