@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.275 — August 2026**
+**Companion to the Bezel Language Specification, v0.276 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1630,13 +1630,15 @@ end Array;
 // and reported there, the same shape `OwningBuffer<T>.DangerousPointer()` uses
 // (§4.14).
 //
-// `OwningArray<T>`: NOT DOCUMENTED HERE, AND DELIBERATELY NOT DENIED. Sema's
-// admissibility arm is `Array`-only, but codegen's `Sort()` arm carries no
-// receiver guard and a regression test comments that "OwningArray<T> in-place
-// Reverse()/Sort() work". Whether the call is admitted could not be settled
-// without building the compiler, and v0.275's own headline finding is that
-// v0.274 wrote an absence into this document for a call that works. So the
-// question is filed, not answered here.
+// `OwningArray<T>` has the same parameterless `Sort()`, declared in its own block
+// below. It was documented from v0.242 to v0.273 and removed by the same v0.274
+// ruling this one reverses -- a two-type deletion of which v0.275 undid only half.
+// Three sema sites admit it positively (the §22.5 owning-container allow-list names
+// `Sort`; the result-typing arm names `OwningArray` explicitly; the sole rejection
+// arm covers `Reversed`/`Sorted` and omits `Sort`), and codegen reaches it because
+// `OwningArray` is array-backed. NOTE: the `T: IComparable<T>` gate is `Array`-only
+// in the compiler today, so an owning array of a class without `CompareTo` is
+// admitted where it should be rejected -- #3325, the owning-side twin of #2790.
 ```
 
 A collection literal `[1, 2, 3]` constructs an `Array<T>` when the target type is `Array<T>`; it constructs an inline array `[N]T` when the target is an inline array. See language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals) for the contextual-typing rules.
@@ -1679,6 +1681,9 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
   public method IndexOf(item: T): int;
 
   public method Sort(comparer: (T, T) -> int);          // comparer takes borrows
+  public method Sort();                                 // natural order; only where
+                                                        //   `T: IComparable<T>` -- see #3325,
+                                                        //   the gate is Array-only today
   public method Reverse();
 
   // Drain methods — transfer ownership of elements out of the collection
@@ -1693,7 +1698,8 @@ end OwningArray;
 // No `OwningArray<T>` extension supplies a default-comparer `Sort`. Spec §26.5
 // rule 1 commits instance resolution by *name*, and `OwningArray<T>` declares
 // `Sort` above, so an extension member of that name is never consulted. Callers
-// pass a comparer.
+// pass a comparer, or call the parameterless `Sort()` declared above, admitted
+// where `T: IComparable<T>` (restored v0.276).
 ```
 
 `OwningArray<T>` owns each element. `Add`, `Insert`, and the indexer setter take ownership; `RemoveAt`, `Remove`, `Clear`, and the array's own `Dispose()` dispose the affected elements. `Sort`'s comparer parameter takes borrows of T (the comparer doesn't consume; it inspects).
@@ -5347,13 +5353,19 @@ It returns the declared constant whose underlying value equals `value`, or `null
 public record IntPtr
   public static readonly property Zero: IntPtr;
 
-  // §25.2's co-declaration rule would require `Equals`/`GetHashCode` beside these
-  // operator overloads; §25.2 exempts `IntPtr`/`UIntPtr`, and v0.275 established
-  // that the exemption's stated ground (that they PREDATE the rule) does not
-  // describe the set it covers. Retiring it is blocked on §9.2's own
-  // contradiction about whether an equality-OPERATOR overload already strips
-  // auto-hashable -- which decides whether co-declaring is a no-op or a breaking
-  // change for every user record with an `IntPtr` field. Routed, not applied.
+  // §25.2's co-declaration rule, with no intrinsic exemption (retired v0.275):
+  // a record overloading homogeneous =/<> declares Equals(T) and
+  // `override GetHashCode` beside them. The homogeneous overload already
+  // strips auto-hashable (§9.2's membership list and its third disqualifier,
+  // ruled v0.276), so these two members ADD the correct address-based equality
+  // surface rather than replacing a synthesized one -- ADDING them reclassifies
+  // no type, because the operators already did. (A record with an `IntPtr`
+  // component is not auto-hashable under that ruling; see the language spec
+  // §9.2 recursive component rule and the v0.276 changelog entry's stated cost.)
+  // The §10.5 `Ptr<T>` spelling, verbatim.
+  public method Equals(other: IntPtr): bool;
+  public override method GetHashCode(): int;
+
   public static method operator =(a: IntPtr, b: IntPtr): bool;
   public static method operator <>(a: IntPtr, b: IntPtr): bool;
 end IntPtr;
@@ -5362,6 +5374,9 @@ end IntPtr;
 public record UIntPtr
   public static readonly property Zero: UIntPtr;
 
+  public method Equals(other: UIntPtr): bool;        // §25.2 co-declaration set, as `IntPtr` above
+  public override method GetHashCode(): int;
+
   public static method operator =(a: UIntPtr, b: UIntPtr): bool;
   public static method operator <>(a: UIntPtr, b: UIntPtr): bool;
 end UIntPtr;
@@ -5369,7 +5384,7 @@ end UIntPtr;
 
 `IntPtr` and `UIntPtr` are opaque pointer-sized integers. They are not dereferenced from Bezel code; their purpose is to flow opaque addresses through FFI calls (the result of `dlopen`, the `void*` argument of a callback, etc.). `Zero` is the null-pointer value. It is a `static readonly` property, not a `const`: language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) restricts `const` to a primitive value type or `string`, and `IntPtr` is a record — the same spelling `Guid.Empty` ([§2.6](#sec-guid)), `DateTime.MinValue` and `TimeSpan.Zero` ([§2.5](#sec-datetime-timespan-dateonly-timeonly)), and `CancellationToken.None` ([§6.1](#sec-cancellationtoken-and-cancellationtokensource)) use for a record-typed sentinel. The value is compiler-provided; the property spelling constrains the surface, not the lowering ([§1](#sec-conventions)).
 
-The `=` and `<>` operators support null tests (`if handle = IntPtr.Zero then ...`). Unlike the primitive value-type wrappers in [§9.1](#sec-integer-types)–[§9.5](#sec-char), `IntPtr` and `UIntPtr` cannot rely on the language-intrinsic comparison rule for primitive types (language spec [§3.5](Bezel_Language_Spec.md#sec-operators-on-primitive-types)): that rule applies to the keyword-aliased primitive types (`int`, `long`, etc.) and to `string`, not to general record types. Nor can the auto-equality machinery (language spec [§9.2](Bezel_Language_Spec.md#sec-body-records)) supply meaningful equality — `IntPtr` and `UIntPtr` have no auto-properties exposing their underlying pointer-sized value, so the auto-generated `=` would be the zero-property "every-pair-equal" form, which is wrong for pointer comparison. Equality for these types is therefore declared explicitly as operator overloads; the implementations are compiler intrinsics that compare the underlying pointer-sized integer representation.
+The `=` and `<>` operators support null tests (`if handle = IntPtr.Zero then ...`). Unlike the primitive value-type wrappers in [§9.1](#sec-integer-types)–[§9.5](#sec-char), `IntPtr` and `UIntPtr` cannot rely on the language-intrinsic comparison rule for primitive types (language spec [§3.5](Bezel_Language_Spec.md#sec-operators-on-primitive-types)): that rule applies to the keyword-aliased primitive types (`int`, `long`, etc.) and to `string`, not to general record types. Nor can the auto-equality machinery (language spec [§9.2](Bezel_Language_Spec.md#sec-body-records)) supply meaningful equality — `IntPtr` and `UIntPtr` have no auto-properties exposing their underlying pointer-sized value, so a synthesized `=` over them could only be the zero-property "every-pair-equal" form, which is wrong for pointer comparison. (Since v0.276 no synthesis reaches these types at all: the homogeneous `=` overload below strips them of **auto-hashable** by itself, language spec [§9.2](Bezel_Language_Spec.md#sec-body-records). The zero-property form is what synthesis *would* produce for a version of these records carrying no operators — the reason the operators are declared, not a description of what §9.2 does to them today.) Equality for these types is therefore declared explicitly, as the four members [§10.5](#sec-system-interop-ptr)'s `Ptr<T>` declares: the `=`/`<>` overloads plus the `Equals(T)` and `override GetHashCode` that language spec [§25.2](Bezel_Language_Spec.md#sec-operator-overloading-restrictions)'s co-declaration rule requires beside them (there is no intrinsic exemption; the date-scoped one these types formerly carried was retired at v0.275). All four implementations are compiler intrinsics that compare or hash the underlying pointer-sized integer representation. The overload strips these records of **auto-hashable** (language spec [§9.2](Bezel_Language_Spec.md#sec-body-records)) on its own (v0.276), so the co-declared pair adds the correct address-based `Equals`/`GetHashCode` rather than displacing a synthesized one — which is what admits `Dictionary<IntPtr, V>` and `Set<IntPtr>` at all, keyed on the address: without the co-declared pair these records would be neither auto-hashable nor user-equality-declaring, hence outside **hashable** (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)) and rejected as a key type.
 
 Explicit conversions to and from `long` and `ulong` (language spec [§32.7](Bezel_Language_Spec.md#sec-pointers-and-intptr)) are also compiler intrinsics: `IntPtr(longValue)` and `long(ptr)` use the standard explicit-conversion syntax ([§5.2](Bezel_Language_Spec.md#sec-explicit-conversions) of the language spec) and are not declared as operator overloads on the record. See language spec [§32.7](Bezel_Language_Spec.md#sec-pointers-and-intptr) for FFI usage.
 

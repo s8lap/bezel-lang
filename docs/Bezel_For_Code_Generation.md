@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.275. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.276. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -152,6 +152,7 @@ visibility  static  (async|pure)  (abstract|virtual|override|sealed override)  (
 | Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;` | §22.7 |
 | Destructor | `destructor` … `end destructor;` — no visibility, no name, no parameters | §28.4 |
 | Operator | `public static pure method operator +(a: V, b: V): V => …;` closes `end operator +;` | §25.1 |
+| Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `override GetHashCode` beside them (a record; an enum or choice writes a plain `GetHashCode(): int`), and by itself strips the record of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. | §25.2, §9.2 |
 | Invariant | `invariant(_bal + _limit >= 0m);` — class bodies only, no visibility, keeps its `;` | §22.16 |
 | Nested type | `public record Token(…);` inside a class body — visibility **required** | §11.6 |
 
@@ -834,14 +835,17 @@ public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
   method Insert(index: int, owned item: T);
   method RemoveAt(index: int);   Remove(item: T): bool;   Clear();      // all dispose
   method Contains(item: T): bool;   IndexOf(item: T): int;
-  method Sort(comparer: (T, T) -> int);   Reverse();     // the comparer takes borrows
+  method Sort(comparer: (T, T) -> int);   Sort();   Reverse();   // comparer takes borrows;
+                                                                //   bare Sort() is natural order,
+                                                                //   only where T: IComparable<T>
   method PopAt(index: int): owned T;   PopFirst(): owned T;   PopLast(): owned T;   // raise if empty
   method TryPopFirst(out owned item: T?): bool;   TryPopLast(out owned item: T?): bool;
   method Drain(): IOwningEnumerable<T>;
 end
 // No `OwningArray<T>` extension supplies a default-comparer `Sort`: §26.5 rule 1
 // commits instance resolution by *name*, and the class declares `Sort` above, so an
-// extension member of that name is never consulted. Callers pass a comparer.
+// extension member of that name is never consulted. Callers pass a comparer, or
+// call the parameterless `Sort()` above where `T: IComparable<T>` (v0.276).
 ```
 
 There is **no `TryPopAt`**, and `OwningArray<T>` declares **no `Reversed`, no `Sorted`, no `ToArray`** — an *owning* copy is inexpressible. Reorder in place with `Reverse()`/`Sort()`; move elements to a new owning collection with `Drain()`. `move arr[i]` takes an element out, leaving the slot moved-from (reassign it before the next exit point). `Drain()` mints a fresh drain-view frame — disposing the frame does not dispose the collection, and partial iteration leaves the remainder.
