@@ -11609,6 +11609,81 @@ bool Emitter::emitSpecializedImplicitBaseCtor(const sema::TypeSymbol* cls,
     // requires an ast::ConstructorDecl and reads no arguments here (an implicit
     // base chain is always arity 0), so nothing needs binding in paramSlots_.
     if (!target->params.empty()) return false;
+    // fix #2890 (§2.5 / §22.8 step 1 / §14.1, v0.240): the IMPORTED sibling of
+    // #2882's own-generic case. An imported generic base's parameterless ctor
+    // has no live ast::ConstructorDecl — the #783 mechanism does not
+    // reconstruct ctors across the boundary today (only methods, in the cases
+    // the re-parse succeeds for), so the obligation-1 dynamic_cast below
+    // would silently decline and the caller's `declareImportedCtor + CreateCall`
+    // would invoke the exporter's placeholder-layout `bz$<Base>$ctor` against
+    // an object laid out for the instantiation. Every store in that body lands
+    // 8 bytes early (or wherever the placeholder's offset points) over a
+    // different storage slot, the first owned-field initialization corrupts an
+    // adjacent field's header, and a SEGV follows with no diagnostic at any
+    // severity. This is the issue's repro on `GCtor<T> { v: T; owned cell:
+    // Cell; a: int }` at T = string, reached through `class DCtor :
+    // GCtor<string>` with NO derived constructor: the base ctor's `cell := new
+    // Cell()` wrote over `v`, and `d.cell` read the still-zero slot. Detect
+    // the EXACT layout question the inline path below asks (so the accept-
+    // controls — `T = int` and any imported generic base with no parameter-
+    // typed storage — keep compiling with no behaviour change) and reject when
+    // it differs. A located compile error is the honest fallback the #783
+    // design note promises and is strictly better than the SEGV. Scoped to
+    // the IMPORTED case so the existing local-class path is untouched; it has
+    // its own live decl and the inline path below takes it from here.
+    if (ctx_.isImported(base)) {
+        // SEAM-ACCESSOR: target->decl is the AST gate — for imported bases this
+        // is null (ModuleLoader doesn't reconstruct ctor decls across the
+        // boundary yet, #783), so the dynamic_cast returns nullptr and the
+        // layout-mismatch diagnostic fires. This is the precise condition
+        // #2890 detects; the read is intentional and gated by isImported.
+        if (!dynamic_cast<const ast::ConstructorDecl*>(target->decl)) {
+            sema::TypeRef synth;
+            synth.kind = sema::TypeRef::Kind::Named;
+            synth.declaration = const_cast<sema::TypeSymbol*>(cls);
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (computeAncestorGenericSubst(&synth, base, ancSubst, ancSema)) {
+                auto savedSubst = genericSubst_;
+                auto savedSema = genericSubstSemaTy_;
+                genericSubst_.clear();
+                genericSubstSemaTy_.clear();
+                std::vector<llvm::Type*> tmplLayout = instanceStorageTypes(base);
+                genericSubst_ = ancSubst;
+                genericSubstSemaTy_ = ancSema;
+                std::vector<llvm::Type*> specLayout = instanceStorageTypes(base);
+                genericSubst_ = std::move(savedSubst);
+                genericSubstSemaTy_ = std::move(savedSema);
+                if (tmplLayout != specLayout) {
+                    SourceLocation loc;
+                    // SEAM-ACCESSOR: cls->decl is null for imports; the guard handles
+                    // that — we only read span.begin when non-null, so the read is
+                    // sound under the AST gate.
+                    if (cls->decl) loc = cls->decl->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        "implicit base chain into imported generic class `" +
+                            std::string(base->name) +
+                            "` is not yet monomorphized for this instantiation "
+                            "(\xC2\xA7""14.1 / \xC2\xA7""2.5 / #783, #2890): this "
+                            "class's parameterless constructor body could not be "
+                            "reconstructed importer-side, so the only available "
+                            "callee is the defining module's placeholder-compiled "
+                            "`bz$" + std::string(base->name) +
+                            "$ctor` — and this instantiation does not lay `" +
+                            std::string(base->name) +
+                            "` out the way that placeholder (`int` for every type "
+                            "parameter) does, so the callee would write this "
+                            "object's storage at the placeholder's offsets and "
+                            "silently corrupt it. Use an instantiation whose "
+                            "layout matches the placeholder (an `int` argument, "
+                            "or any base with no parameter-typed storage), until "
+                            "importer-side ctor monomorphization lands");
+                    return true;  // skip the declareImportedCtor + CreateCall.
+                }
+            }
+        }
+    }
     if (!dynamic_cast<const ast::ConstructorDecl*>(target->decl)) return false;
 
     // Obligation 2: the base instantiation's substitution.
