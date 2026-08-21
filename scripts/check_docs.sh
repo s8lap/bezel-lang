@@ -113,7 +113,15 @@ else:
         head = '\n'.join(text[key].split('\n')[:6])
         pm = PIN_RE.search(head)
         if not pm:
-            rows.append(f"{os.path.basename(path)}: no pin"); continue
+            # A missing pin is a violation for CODEGEN, not a free pass: the one
+            # document this check exists to fail must not become unfailable by
+            # deleting the assertion (found by the v0.269 composition gate).
+            if path == CODEGEN:
+                pin_fail.append(f"  {os.path.basename(path)} has NO pin line -- it must declare "
+                                f"the revision it was validated against, in line 3")
+            else:
+                rows.append(f"{os.path.basename(path)}: no pin")
+            continue
         minor = int(pm.group(2) or pm.group(4))
         stale = cur - minor
         rows.append(f"{os.path.basename(path)}: v0.{minor} ({stale} behind)" if stale else
