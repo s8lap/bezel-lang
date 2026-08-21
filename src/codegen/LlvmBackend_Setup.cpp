@@ -21644,6 +21644,31 @@ void Emitter::collectRecordCallResultReleaseEligible(
                             candidates.push_back(ld);
                     }
                 }
+                // fix #2866 / §9.7 / §28.3 / §28.9 (v0.240): a `new P(...)`
+                // initializer IS in scope as a fresh-construction candidate
+                // too — the +1 string producer argument's reference is bound
+                // to no local (§28.3's unbound owned temporary), and §9.7
+                // makes the record's reference fields BORROWS, so the
+                // construction-site store transfers the +1 to the slot and
+                // the slot's scope-end release (Disposal.cpp ~4234,
+                // `emitRecordStringFieldReleases`) is what balances it.
+                // Without this admission the per-iteration +1 leaks at
+                // program exit — #2866's loop-amplified repro shows 675
+                // bytes / 38 allocations. Eligibility proof reuses
+                // isFreshRecordConstructionOfExactType (#2448), so a NewExpr
+                // whose constructor is opaque (explicit ctor, nested value
+                // type, non-producer string arg, etc.) still falls to the
+                // safe-direction leak, identical to the CallExpr arm above.
+                if (auto* ne = dynamic_cast<const ast::NewExpr*>(
+                        ld->initializer.get())) {
+                    const sema::TypeRef* tr = nullptr;
+                    if (ld->type) tr = ctx_.resolvedType(*ld->type);
+                    if (!tr) tr = ctx_.exprType(*ld->initializer);
+                    if (tr && isRecordWithStringFieldsTypeRef(tr) && ne->type &&
+                        isFreshRecordConstructionOfExactType(ne, tr->declaration)) {
+                        candidates.push_back(ld);
+                    }
+                }
             }
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {

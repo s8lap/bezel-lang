@@ -387,6 +387,87 @@ const char* kConstructorProducerArgFieldStoreLoop =
     "  if total = 400000 then return 0; end; return 1; "
     "end Main; end C;";
 
+// ---- Programs (#2866): record-ctor literal positional arg (CONTROL) --------
+//
+// §9.7 / §28.9: a literal at a positional record-ctor argument position is a
+// sentinel — no producer, no leak, no release. Pins the literal path against
+// any future over-broad fix that would release a sentinel and corrupt it.
+const char* kRecordCtorLiteralPositionalArg =
+    "module M; public record Named(Tag: string, N: int); "
+    "class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 1000 do "
+    "    i := i + 1; "
+    "var nm := new Named(\"literal\", i); "
+    "    total := total + nm.N; "
+    "  end; "
+    "  if total = 500500 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// ---- Programs (#2866): record-ctor concat positional arg (LEAKING BEFORE) ----
+//
+// §9.7 / §28.3 / §28.9: a +1 string producer (`\"ct\" + \"or\"`) passed directly
+// as a positional record-ctor argument. §9.7 makes record reference fields
+// BORROWS — the record neither retains nor disposes — and §28.3 makes the
+// temporary an unbound owned temporary bound to no local. Before the fix: 675
+// bytes leaked across 19 of 20 allocations in the issue's loop-amplified repro.
+// After the fix: the stored +1 is transferred to the slot via retain+release;
+// the slot's scope-end string-field release closes the loop. Per-iteration
+// `nm.Tag.Length` proves the field survives the construction-site release.
+const char* kRecordCtorConcatPositionalArg =
+    "module M; public record Named(Tag: string, N: int); "
+    "class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 1000 do "
+    "    i := i + 1; "
+    "    var nm := new Named(\"ct\" + \"or\", i); "
+    "    total := total + nm.Tag.Length + nm.N; "  // "ctor" => 4
+    "  end; "
+    "  if total = 500500 + 4000 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// ---- Programs (#2866): record-ctor interpolation positional arg --------------
+//
+// §9.7 / §28.3 / §28.9: sister test of the concat case, exercising the
+// interpolation branch of `isPlusOneStringProducer`. The interpolated string
+// `\"t={i}\"` is a fresh rc=1 producer, passed directly as a positional
+// record-ctor argument — same fix, different producer shape. The total is the
+// sum of (length of "t=" + decimal-width(i)) over i=1..1000: 9*3 + 90*4 +
+// 900*5 + 1*6 = 4893, plus the sum of i (500500).
+const char* kRecordCtorInterpPositionalArg =
+    "module M; public record Named(Tag: string, N: int); "
+    "class C public static method Main(): int "
+    "  var i: int := 0; var total: int := 0; "
+    "  while i < 1000 do "
+    "    i := i + 1; "
+    "    var nm := new Named($\"t={i}\", i); "
+    "    total := total + nm.Tag.Length + nm.N; "
+    "  end; "
+    "  if total = 500500 + 4893 then return 0; end; return 1; "
+    "end Main; end C;";
+
+// ---- Programs (#2866 CARDINAL): explicit ctor with field-store, no double-free
+//
+// §9.7 / §28.3 / §28.9: a +1 string producer (`\"ct\" + \"or\"`) passed as an
+// EXPLICIT-ctor argument. The inlined ctor body field-stores the parameter
+// into the record's `Tag` field (retains, rc→2 by #2712's
+// `retainAssignedStringParams`). The post-ctor release takes rc→1 — the field's
+// +1 survives, and a read-back `r.Tag.Length` proves the value is live. No UAF,
+// no double-free. detect_leaks=0 tolerates any unrelated residual leak.
+const char* kRecordCtorExplicitCtorFieldStoreNoDoubleFree =
+    "module M; public record Named "
+    "  public Tag: string; "
+    "  public N: int; "
+    "  public constructor(t: string, n: int) "
+    "    this.Tag := t; this.N := n; "
+    "  end constructor; "
+    "end Named; "
+    "class C public static method Main(): int "
+    "  var r := new Named(\"ct\" + \"or\", 7); "
+    "  if r.Tag.Length = 4 and r.N = 7 then return 0; end; "
+    "  return 1; "
+    "end Main; end C;";
+
 // ---- Programs: method-return arg to field-store callee (double-free canary) -
 //
 // §28.9: `Build()` returns +1; `h.Set(C.Build())` passes it to Set, which
@@ -616,4 +697,39 @@ BEZEL_TEST(codegen_argpass_string_429, local_arg_field_store_no_double_free_1430
 // runs later. The conservative retained +1 may leak — tolerated by design.
 BEZEL_TEST(codegen_argpass_string_429, local_arg_inside_lambda_stays_escaped_1430) {
     expectValueAndNoCorruption(kLocalArgInsideLambdaStaysEscaped, 0);
+}
+
+// ============= Tests: record-construction #2866 §9.7 / §28.3 / §28.9 =========
+
+// §28.9 / §9.7 (CONTROL — literal positional record-ctor arg): a literal is a
+// sentinel — no producer, no leak before the fix and no release under it. Pins
+// the literal path against any future over-broad fix that would release it.
+BEZEL_TEST(codegen_argpass_string_2866, literal_positional_record_ctor_arg_9_7) {
+    expectValueAndLeakFree(kRecordCtorLiteralPositionalArg, 0);
+}
+
+// §9.7 / §28.3 / §28.9: a +1 string producer passed DIRECTLY as a positional
+// record-ctor argument. §9.7 makes the record's reference fields BORROWS — the
+// record neither retains nor disposes — and §28.3 makes the temporary an unbound
+// owned temporary bound to no local. Before the fix: 675 bytes / 38 alloc leaked
+// across 19 of 20 iterations in the issue's loop-amplified repro. After: clean.
+BEZEL_TEST(codegen_argpass_string_2866, concat_positional_record_ctor_arg_9_7) {
+    expectValueAndLeakFree(kRecordCtorConcatPositionalArg, 0);
+}
+
+// §9.7 / §28.3 / §28.9: interpolated-string producer passed directly as a
+// positional record-ctor argument. Same fix shape as the concat case — sister
+// test pinning the interpolation branch of `isPlusOneStringProducer`.
+BEZEL_TEST(codegen_argpass_string_2866, interp_positional_record_ctor_arg_9_7) {
+    expectValueAndLeakFree(kRecordCtorInterpPositionalArg, 0);
+}
+
+// §9.7 / §28.3 / §28.9 (CARDINAL double-free canary): a +1 string producer
+// passed as an EXPLICIT-ctor argument that the inlined body field-stores into
+// the record's own string field. The body-side retain (#2712's
+// `retainAssignedStringParams`) bumps rc→2; the post-ctor release takes rc→1;
+// the field's +1 survives. No UAF / double-free. detect_leaks=0 tolerates any
+// residual bookkeeping leak from unrelated disposal paths.
+BEZEL_TEST(codegen_argpass_string_2866, explicit_ctor_field_store_no_double_free_9_7) {
+    expectValueAndNoCorruption(kRecordCtorExplicitCtorFieldStoreNoDoubleFree, 0);
 }
