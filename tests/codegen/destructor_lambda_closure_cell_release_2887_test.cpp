@@ -115,6 +115,12 @@ bool wasSkipped(const JitResult& r) {
 // 20 disposals, each adds `tag + 1` (the lambda's tag is `i`, so the
 // contribution is `i + 1` per iteration). Sigma_{i=1..20} (i+1) = 230.
 constexpr int kSum20 = 230;
+// (B) captured-cell case: each disposal increments Sink by 1 (after verifying
+// the lambda returns `Tag + s.Length`, which is the captured-cell equality).
+// The accumulator stays inside the 8-bit WEXITSTATUS range (20 << 256) — the
+// harness cannot round-trip an accumulator sum > 255 through the exit code,
+// and using `f(Tag)` directly would push the sum to 321 (truncated to 65).
+constexpr int kCount20 = 20;
 
 // (A) THE ISSUE'S REPRO. 20 disposals, 1 closure local each, returns the
 // summed lambda-applied value. Pre-fix: 48 B / 20 allocations leaked per
@@ -128,7 +134,7 @@ const char* kDestructorBodyLambdaReleases =
     "    Tag := i; "
     "  end constructor; "
     "  destructor "
-    "    var f := (x: int) => x + 1; "
+    "    var f := lambda(x: int) => x + 1; "
     "    R.Sink := R.Sink + f(Tag); "
     "  end destructor; "
     "end R; "
@@ -148,7 +154,11 @@ const char* kDestructorBodyLambdaReleases =
 // (captures are borrows of the cell, not of the source — the cell is the
 // per-capture scope). Pre-fix: the cell leaks too, on top of the closure cell.
 // Post-fix: both freed exactly once. The sink value verifies the lambda runs
-// correctly so the leak is independent of the lambda's value.
+// correctly (the `f(Tag) = Tag + s.Length` equality check pins the captured
+// `s.Length` value the cell holds) and increments by 1 each iteration so the
+// accumulator stays inside the 8-bit WEXITSTATUS range the test harness
+// requires (a 20×(Tag + s.Length) sum would truncate and lose the equality
+// signal). // per §27.5, §28.4, §28.3, §28.9, v0.240, #2887
 const char* kDestructorBodyCapturesCell =
     "module M; class R "
     "  public Tag: int := 0; "
@@ -158,8 +168,10 @@ const char* kDestructorBodyCapturesCell =
     "  end constructor; "
     "  destructor "
     "    var s := $\"cap-{Tag}\"; "
-    "    var f := (x: int) => s.Length + x; "
-    "    R.Sink := R.Sink + f(Tag); "
+    "    var f := lambda(x: int) => s.Length + x; "
+    "    if f(Tag) = Tag + s.Length then "
+    "      R.Sink := R.Sink + 1; "
+    "    end; "
     "  end destructor; "
     "end R; "
     "class C "
@@ -195,18 +207,23 @@ BEZEL_TEST(codegen_destructor_lambda_closure_cell_release_2887,
 // (B) Captured cell. Both the closure cell AND the captured cell must be
 // freed. The lambda captures a runtime-built string held in a scope-local.
 // The fix's `cellFreeEligible_`/`cellFreeEligibleFn_` pin is what unlocks
-// the captured-cell free, so this test pins the OTHER half of the fix.
+// the captured-cell free, so this test pins the OTHER half of the fix. The
+// expected accumulator is `kCount20` (1 per iteration), NOT `f(Tag)`, because
+// the harness masks exit codes to 8 bits and a 20×(Tag + s.Length) sum would
+// truncate. The `if f(Tag) = Tag + s.Length then Sink += 1` form in the source
+// pins the captured-cell value through the equality check, so the captured
+// cell's behaviour is verified without using its value as the sum.
 BEZEL_TEST(codegen_destructor_lambda_closure_cell_release_2887,
            destructor_body_captured_cell_is_freed_spec_27_5) {
     JitResult r = runAotChecked(kDestructorBodyCapturesCell);
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, kSum20);
+    BEZEL_EXPECT_EQ(r.exitCode, kCount20);
 }
 
 BEZEL_TEST(codegen_destructor_lambda_closure_cell_release_2887,
            destructor_body_captured_cell_value_invariant_spec_27_5) {
     JitResult r = runAot(kDestructorBodyCapturesCell);
     BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, kSum20);
+    BEZEL_EXPECT_EQ(r.exitCode, kCount20);
 }
