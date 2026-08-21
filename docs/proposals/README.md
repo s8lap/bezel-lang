@@ -142,7 +142,7 @@ Proposals whose accepted design has been amended *into* the normative documents 
 
 ## Declined and superseded-without-graduation
 
-No numbered proposal currently carries the `declined` token: declined *directions* are recorded in [`DECLINED.md`](DECLINED.md) (D-0001, D-0002, and the gap review's eight), and no numbered proposal has been declined or superseded without graduating. A future declined proposal's row moves here, token `declined`, its cells kept verbatim.
+No numbered proposal currently carries the `declined` token: declined *directions* are recorded in [`DECLINED.md`](DECLINED.md), which since the 2026-08-20 completeness sweep is a **register of every recorded decline** (410 rows across five homes), not only its own D-numbers and gap review, and no numbered proposal has been declined or superseded without graduating. A future declined proposal's row moves here, token `declined`, its cells kept verbatim.
 
 Supporting records (not numbered proposals):
 

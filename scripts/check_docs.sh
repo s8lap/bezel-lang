@@ -67,6 +67,7 @@ DOCS = {
     'stdlib':    'docs/Bezel_Standard_Library.md',
     'rationale': 'docs/Bezel_Design_Rationale.md',
     'changelog': 'docs/Bezel_Changelog.md',
+    'codegen':   'docs/Bezel_For_Code_Generation.md',
     'guide01':   'docs/Bezel_Guide_01_Memory_and_Ownership.md',
     'guide02':   'docs/Bezel_Guide_02_Errors_and_Nullability.md',
     'guide03':   'docs/Bezel_Guide_03_Modeling_Data.md',
@@ -83,6 +84,94 @@ for k, p in DOCS.items():
 
 fail = 0
 base = {os.path.basename(p): k for k, p in DOCS.items()}
+
+# ---- 0. PIN: derived documents declare the revision they were validated at ----
+# Added v0.268. The guides carry pins and nothing checked them, which is how
+# Guide 02 sat NINE revisions stale (v0.259 against a v0.268 spec) with both
+# gates green. A pin is an assertion that someone re-traced the document; an
+# unchecked assertion is the failure mode this project keeps rediscovering.
+#
+# Policy: report every pin and its staleness. FAIL only for documents whose
+# staleness produces WRONG CODE rather than stale prose -- currently
+# Bezel_For_Code_Generation.md, which exists to be copied from. Guides are
+# reported, not failed: a guide teaching a still-valid idiom at an older pin is
+# imprecise, not incorrect, and forcing a re-trace every revision would buy
+# ceremony rather than accuracy.
+PIN_RE = re.compile(r're-validated against v(\d+)\.(\d+)|[Vv]alidated against v(\d+)\.(\d+)')
+CODEGEN = 'docs/Bezel_For_Code_Generation.md'
+CODEGEN_MAX_STALE = 3      # revisions; beyond this the document is a liability
+
+m = re.search(r'^\*\*Version (\d+)\.(\d+)', text['spec'], re.M)
+if not m:
+    print("PIN: cannot parse the spec version header"); fail = 1
+else:
+    cur = int(m.group(2))
+    rows, pin_fail = [], []
+    for key, path in sorted(DOCS.items()):
+        if key in ('spec', 'stdlib', 'rationale', 'changelog'):
+            continue                      # versioned headers, covered by VERSION
+        head = '\n'.join(text[key].split('\n')[:6])
+        pm = PIN_RE.search(head)
+        if not pm:
+            # A missing pin is a violation for CODEGEN, not a free pass: the one
+            # document this check exists to fail must not become unfailable by
+            # deleting the assertion (found by the v0.269 composition gate).
+            if path == CODEGEN:
+                pin_fail.append(f"  {os.path.basename(path)} has NO pin line -- it must declare "
+                                f"the revision it was validated against, in line 3")
+            else:
+                rows.append(f"{os.path.basename(path)}: no pin")
+            continue
+        minor = int(pm.group(2) or pm.group(4))
+        stale = cur - minor
+        rows.append(f"{os.path.basename(path)}: v0.{minor} ({stale} behind)" if stale else
+                    f"{os.path.basename(path)}: v0.{minor} (current)")
+        if path == CODEGEN and stale > CODEGEN_MAX_STALE:
+            pin_fail.append(f"  {os.path.basename(path)} is {stale} revisions stale "
+                            f"(v0.{minor} vs v0.{cur}); max {CODEGEN_MAX_STALE} -- "
+                            f"re-validate it and move its pin, or the code it teaches is wrong")
+    if pin_fail:
+        fail = 1
+        print(f"PIN: {len(pin_fail)} violation(s):"); print("\n".join(pin_fail))
+    else:
+        print("PIN: clean (" + "; ".join(rows) + ")")
+
+# ---- 0b. FENCE: every opening code fence carries a language tag ---------------
+# Added v0.269. A bare ``` opening fence is ambiguous in a way that hides defects:
+# nothing distinguishes "untagged because it is not Bezel" from "untagged because
+# somebody forgot". The 2026-08-20 example sweep partitioned the spec by ```bezel
+# and so assigned 10 blocks to no lane at all; a further 4 were invisible to the
+# partition's keyword filter. All 14 turned out to be EBNF or schematics -- but
+# that was luck, not a guarantee, and the next one might be real Bezel that no
+# reviewer and no extractor ever looks at.
+#
+# Closing fences are bare by definition and are not checked; only openers are.
+fbad = []
+for key, path in DOCS.items():
+    # The changelog is exempt: it is pinned history, written at each revision and
+    # never retroactively edited (spec-change-process §5). Its fences are historical
+    # quotations, and re-tagging them would edit a record that is meant to be fixed.
+    if key == 'changelog':
+        continue
+    lines = text[key].split("\n")
+    inblock = False
+    for i, ln in enumerate(lines, 1):
+        m = re.match(r'^\s*```(\S*)\s*$', ln)
+        if not m:
+            continue
+        if inblock:                     # this is the closer
+            inblock = False
+            continue
+        inblock = True
+        if m.group(1) == "":
+            fbad.append(f"  {os.path.basename(path)}:{i}: opening code fence has no language tag "
+                        f"(use `bezel` for Bezel, or `text`/`ebnf`/`json` for anything else)")
+if fbad:
+    fail = 1
+    print(f"FENCE: {len(fbad)} violation(s):")
+    print("\n".join(fbad))
+else:
+    print("FENCE: clean (every opening code fence is tagged)")
 
 # ---- 1. Anchor resolution -------------------------------------------------
 # The repo uses TWO anchor styles: explicit <a id="sec-..."> for cross-refs, and

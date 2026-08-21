@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.268 — August 2026**
+**Companion to the Bezel Language Specification, v0.269 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -5495,7 +5495,7 @@ end Interop;
 
 The following standard library modules are anticipated but not specified in this version. Their absence is intentional; the current scope focuses on what the language specification depends on.
 
-- `System.Net` and `System.Net.Http` — networking and HTTP. The language specification's async examples use a hypothetical `HttpClient`; a real one will live here.
+- `System.Net` and `System.Net.Http` — networking and HTTP. A real HTTP client will live here. (The language specification's async examples formerly used a hypothetical `HttpClient`; v0.269 rewrote them over declared members, so no normative example names an unlanded type.)
 - `System.Text.Json` and `System.Text.Regex` — a general JSON DOM/streaming API and regular expressions. Note this is distinct from the serialization JSON *format agent* (`JsonSerializer`/`JsonDeserializer` and the one-shot `Json` facade in `System.Serialization`, [§2.15](#sec-concrete-serialization-formats)), which is provided: `System.Serialization` maps the [§2.14](#sec-serialization-vocabulary) token stream to and from JSON for whole-value (de)serialization, whereas a future `System.Text.Json` would offer document-tree navigation and ad-hoc querying of arbitrary JSON not driven by a target type. The two are complementary, as they are in other ecosystems that provide both a serializer and a document API.
 - `System.Security.Cryptography` — cryptographic primitives.
 - `System.Globalization` — culture-aware formatting and comparison.
