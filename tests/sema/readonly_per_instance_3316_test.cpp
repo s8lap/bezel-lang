@@ -51,6 +51,7 @@
 #include "test_harness.hpp"
 
 #include "sema/ExprTypecheck.hpp"
+#include "sema/PureChecker.hpp"
 #include "sema/TypeResolution.hpp"
 
 namespace {
