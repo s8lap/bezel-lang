@@ -12424,8 +12424,23 @@ bool MethodOwnership::builtinScopedCallbackFormal(const ast::Expr* callee,
 
 void MethodOwnership::scopedPreScan(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    // §28.14 v0.273: seed the block-end stack with the method body's
+    // effective end — the last statement's `span.end` (if any). A
+    // `using var` declared at the top of the method body takes this as its
+    // scope-exit offset; a `using var` declared inside a `do … end` block
+    // pushes its block's `span.end` on top of this during the recursive
+    // `scopedPreScanStmt` walk. // per §28.14 (v0.273)
+    scopedLocalScopeEnd_.clear();
+    scopedBlockEndStack_.clear();
+    SourceLocation methodBodyEnd{};
+    for (const auto& s : body) {
+        if (!s) continue;
+        methodBodyEnd = s->span.end;
+    }
+    scopedBlockEndStack_.push_back(methodBodyEnd);
     for (const auto& s : body)
         if (s) scopedPreScanStmt(*s);
+    scopedBlockEndStack_.pop_back();
     // §32.5 (#1719): run after the whole walk so a callback local's lambda /
     // method-reference initializer and the flow-insensitive reassignment set are
     // complete. One pass over the queued extern calls yields one diagnostic per
@@ -12449,6 +12464,17 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         // for bounding forms 1/2 the initializer's captures are checked
         // against THIS local's index. // per §28.14
         scopedDeclOrder_[ld] = scopedDeclCounter_++;
+        // §28.14 v0.273: the bounding local's scope-exit offset is the
+        // current top of the block-end stack — the END of L's enclosing
+        // block. Recorded here so `checkScopedAdmission` can stamp
+        // `ScopedFreeze::scopeEndLoc` when populating the freeze map.
+        // (Only the `using var`/`await using var` form matters — §28.14's
+        // bounding is always one of those — but we record any LocalDecl
+        // whose parent block is on the stack; the absence-keyed lookup at
+        // the freeze site filters by isUsing.)
+        if (ld->isUsing && !scopedBlockEndStack_.empty()) {
+            scopedLocalScopeEnd_[ld] = scopedBlockEndStack_.back();
+        }
         if (ld->initializer) {
             if (ld->isUsing)
                 scopedInitOfUsingLocal_[ld->initializer.get()] = ld;
@@ -12550,8 +12576,13 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        // §28.14 v0.273: a `using var` declared inside a `do … end` has
+        // its scope ending at the block's `span.end` (past the `end`).
+        // Push before scanning children, pop after. // per §21.6, §28.14
+        scopedBlockEndStack_.push_back(db->span.end);
         for (const auto& bs : db->body)
             if (bs) scopedPreScanStmt(*bs);
+        scopedBlockEndStack_.pop_back();
         return;
     }
     if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
@@ -13601,10 +13632,31 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
             }
         }
         // §28.14 freeze: no move / dispose / reassign of the source until the
-        // bounding local's scope exits. Keep the FIRST admission site.
+        // bounding local's scope exits (v0.273 — formerly the rest of the
+        // method, v1 over-rejecting the `do … end` lift idiom). Keep the
+        // FIRST admission site; record L's block-end as the freeze's upper
+        // bound. If for any reason L's scope-end was not stamped (an
+        // admission bound to a LocalDecl the pre-scan did not see — recorded
+        // shape: it shouldn't happen, but fall back to a sentinel end offset
+        // so the diagnostic fires the same way it always did).
+        SourceLocation scopeEndLoc{};
+        if (auto it = scopedLocalScopeEnd_.find(bounding);
+            it != scopedLocalScopeEnd_.end()) {
+            scopeEndLoc = it->second;
+        } else {
+            // Sentinel: offset = (uint32_t)-1 means "no upper bound" — the
+            // pre-fix v1 behavior. Only reached if the bounding is not a
+            // `using var`, which §28.14's rule disallows, or if pre-scan
+            // missed it (defensive; the existing diagnostic is the
+            // backstop).
+            scopeEndLoc.offset = UINT32_MAX;
+            scopeEndLoc.line = UINT32_MAX;
+            scopeEndLoc.column = UINT32_MAX;
+        }
         scopedFrozen_.emplace(src.sym,
                               ScopedFreeze{bounding->name,
-                                           callNode.span.begin});
+                                           callNode.span.begin,
+                                           scopeEndLoc});
     }
 }
 
@@ -13618,6 +13670,16 @@ void MethodOwnership::checkScopedFreeze(std::string_view name,
         // ordinary §28.3 regime). Loop-carried mutation that lexically
         // precedes the admission is not caught here — recorded residual.
         if (loc.offset < fr.admissionLoc.offset) continue;
+        // §28.14 v0.273: the freeze ends at L's scope exit, not at the
+        // end of the method. Test the interval
+        // [admissionLoc.offset, scopeEndLoc.offset). The sentinel
+        // UINT32_MAX (recorded as "no upper bound" — the v1 fallback for
+        // an unstamped bounding) preserves the pre-v0.273 behavior on
+        // that defensive path only.
+        if (fr.scopeEndLoc.offset != UINT32_MAX &&
+            loc.offset >= fr.scopeEndLoc.offset) {
+            continue;
+        }
         report(Severity::Error, loc,
                std::string("cannot ") + std::string(action) + " `" +
                    std::string(name) +
@@ -13625,7 +13687,8 @@ void MethodOwnership::checkScopedFreeze(std::string_view name,
                    "parameter bounded by `" +
                    std::string(fr.boundingName) +
                    "`, and captured sources are frozen until that scope "
-                   "exits (§28.14, v0.175)");
+                   "exits (§28.14, v0.273; v0.175 admitted the freeze but "
+                   "v1's method-wide bound was over-restrictive)");
         return;
     }
 }

@@ -3263,17 +3263,37 @@ private:
     // inherited declaration. Empty when no params were threaded (rare —
     // constructors/destructors).
     std::vector<sema::Symbol*> paramSyms_;
-    // §28.14 freeze: source symbol -> {bounding local's name, admission call
-    // site}. A frozen source may not be moved from, disposed, or reassigned
-    // AFTER the admission site (source-offset ordered; the pre-scan records,
-    // the dataflow transfer functions enforce). The freeze nominally ends when
-    // L's scope exits; v1 keeps it for the rest of the method — sound (only
-    // over-rejects mutation after L's block closed, a rare shape).
+    // §28.14 freeze (v0.273): source symbol -> {bounding local's name,
+    // admission call site, scope-exit offset}. A frozen source may not be
+    // moved from, disposed, or reassigned in the INTERVAL
+    // [admissionLoc.offset, scopeEndLoc.offset). The freeze ends at L's
+    // scope exit (v0.273); L's scope-exit offset is the end of L's enclosing
+    // block, computed at pre-scan time (scopedLocalScopeEnd_ below) and
+    // stamped here. v0.273 corrects the v1 bound that kept the freeze for
+    // the rest of the method — sound but over-rejecting mutation after L's
+    // block closed (the `do … end` lift idiom Guide 1 §10 and stdlib §2.21
+    // teach). // per §28.14 (v0.273)
     struct ScopedFreeze {
         std::string_view boundingName;
         SourceLocation admissionLoc;
+        SourceLocation scopeEndLoc;
     };
     std::unordered_map<sema::Symbol*, ScopedFreeze> scopedFrozen_;
+    // §28.14 v0.273: a `using var`/`await using var` local's scope-exit
+    // offset is the END of its enclosing block — the offset just past the
+    // `end` (or, at the outermost level, past the last body statement).
+    // Populated by `scopedPreScan` (and the recursive `scopedPreScanStmt`)
+    // using `scopedBlockEndStack_`; consulted at the freeze-emplace site in
+    // `checkScopedAdmission`. Keys: the LocalDecl* of a using-var local.
+    std::unordered_map<const ast::Node*, SourceLocation> scopedLocalScopeEnd_;
+    // §28.14 v0.273: stack of enclosing-block `span.end` offsets maintained
+    // during pre-scan. Initialized with the method body's effective end (the
+    // last statement's `span.end`); pushed when entering a `do … end` block
+    // (its `span.end` is the offset past the `end`); popped on exit. Other
+    // block forms (if/while/for/try/case) currently share the enclosing
+    // stack frame — the loop case (bound 2(b)) is filed separately and not
+    // implemented in this lane. // per §28.14 (v0.273)
+    std::vector<SourceLocation> scopedBlockEndStack_;
 
     // §28.14 verifiable-subset widening (#1420 triage): a local initialized
     // with a LAMBDA LITERAL and never reassigned is a verifiable function
