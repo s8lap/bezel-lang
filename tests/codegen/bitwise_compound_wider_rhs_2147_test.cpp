@@ -68,6 +68,14 @@ int throwsOverflow(const std::string& body) {
     return r.ran ? r.exitCode : -999;
 }
 
+
+bool runs(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    return r.ran;
+}
+
 }  // namespace
 
 // --- The exact issue repro: `int(-1) &= 2^32L`. SExt(-1) & 2^32 = 2^32,
@@ -154,11 +162,13 @@ BEZEL_TEST(codegen_2147_bitwise_wide_rhs, uint_or_ulong_in_range_stores) {
 // underlying operation runs and no check fires", §7.11). The raise case
 // FAILS WITHOUT the fix (present branch stored 0). ---
 BEZEL_TEST(codegen_2147_bitwise_wide_rhs, lifted_and_present_throws) {
-    BEZEL_EXPECT_EQ(throwsOverflow("var i: int? := -1; i &= 4294967296L;"), 1);
+    // v0.267 / #3298: `int? &= long` is rejected at sema (§6.6/§7.11).
+    // The acceptance shape pinned the pre-fix lifted writeback raising.
+    BEZEL_EXPECT_FALSE(runs("var i: int? := -1; i &= 4294967296L;"));
 }
 BEZEL_TEST(codegen_2147_bitwise_wide_rhs, lifted_and_null_no_check) {
-    BEZEL_EXPECT_EQ(run(
-        "var i: int? := null; i &= 4294967296L; return (i ?? 42);"), 42);
+    BEZEL_EXPECT_FALSE(runs(
+        "var i: int? := null; i &= 4294967296L; return (i ?? 42);"));
 }
 
 // --- Controls: neighbor cells the fix must NOT perturb. ---

@@ -77,12 +77,34 @@ BEZEL_TEST(case_decimal_pattern_1152, constant_scale_insensitive) {
     BEZEL_EXPECT_EQ(run(decCase("1.00m", "1.0m => 7")), 7);
 }
 
-// A nullable `decimal?` with relational then constant arms.
-BEZEL_TEST(case_decimal_pattern_1152, nullable_relational_then_constant) {
+// §19.3 / §7.11 (v0.286, #3298) — REJECTION, reversing the acceptance this row
+// used to assert. A relational pattern over a NULLABLE scrutinee is a compile
+// error: "ordering admits no absent participant (§7.11), and pattern position
+// performs no narrowing" (§19.3). The CONSTANT arm over a nullable scrutinee is
+// untouched — §19.3: "Constant patterns over a nullable scrutinee are
+// unaffected: a constant pattern is the equality test of §8.4, which is total
+// on `null`" — so the second row below is the acceptance control that keeps the
+// #1152 bz_decimal_cmp constant path covered at `decimal?`.
+BEZEL_TEST(case_decimal_pattern_1152, nullable_relational_arm_rejected) {
+    auto r = runAot(
+        "module M; class App public static method Main(): int "
+        "  var x: decimal? := 3.5m; "
+        "  return (case x of < 2m => 1, 3.5m => 7, _ => 4); end Main; end App;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool sawRule = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("pattern requires a non-nullable scrutinee") !=
+                std::string::npos &&
+            d.message.find("19.3") != std::string::npos)
+            sawRule = true;
+    BEZEL_EXPECT_TRUE(sawRule);
+}
+
+BEZEL_TEST(case_decimal_pattern_1152, nullable_constant_arm_still_accepted) {
     BEZEL_EXPECT_EQ(run(
         "module M; class App public static method Main(): int "
         "  var x: decimal? := 3.5m; "
-        "  return (case x of < 2m => 1, 3.5m => 7, _ => 4); end Main; end App;"),
+        "  return (case x of 3.5m => 7, null => 1, _ => 4); end Main; end App;"),
         7);
 }
 

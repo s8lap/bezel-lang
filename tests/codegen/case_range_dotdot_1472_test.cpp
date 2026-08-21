@@ -60,22 +60,49 @@ BEZEL_TEST(case_range_dotdot_1472, dotdot_matches_any_value) {
         "end Main; end App;"), 3);
 }
 
-// §19.5: on a nullable scrutinee holding a PRESENT value, `..` matches (a range
-// pattern matches every present value).
-BEZEL_TEST(case_range_dotdot_1472, nullable_present_value_matches_dotdot) {
-    BEZEL_EXPECT_EQ(runFull(
+// §19.3 / §16.6 (v0.286, #3298) — REJECTION, reversing the two acceptance rows
+// that used to live here. These pinned proposal 0114's D5 reading (a range
+// pattern over a nullable scrutinee matches every PRESENT value and never
+// `null`), which v0.267 deliberately overrode and v0.273 declined to re-open:
+// "A nullable scrutinee — value or reference — is a compile error at a
+// relational pattern, and at a range pattern (§16.6) alike ... The rejection is
+// keyed on the KIND of pattern, not on which bounds are written, so it reaches
+// the open-ended forms and the fully open `..` with the closed ones" (§19.3).
+// The bare `..` is inside the decline: v0.271's own accounting counted these
+// two blocks among the eight the landed rule newly rejects.
+//
+// The non-nullable bare-`..` rows above are UNAFFECTED — #1472's actual
+// subject is the both-bounds-absent codegen guard, and it stays fixed.
+namespace {
+// A rejection whose diagnostic is the §19.3 one, not merely "did not run".
+bool rejectedAsNullableScrutineePattern(const std::string& program) {
+    auto r = runAot(program);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const auto& m = d.message;
+        if (m.find("pattern requires a non-nullable scrutinee") ==
+                std::string::npos)
+            continue;
+        if (m.find("19.3") == std::string::npos) continue;
+        if (m.find("7.11") == std::string::npos) continue;
+        return true;
+    }
+    return false;
+}
+}  // namespace
+
+BEZEL_TEST(case_range_dotdot_1472, nullable_present_value_dotdot_rejected) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableScrutineePattern(
         "module M; class App public static method Main(): int "
         "  var x: int? := 5; "
         "  return (case x of .. => 7, null => 9); "
-        "end Main; end App;"), 7);
+        "end Main; end App;"));
 }
 
-// §19.5: on a nullable scrutinee holding `null`, `..` does NOT match (a range
-// pattern never matches null) — the explicit `null` arm fires instead.
-BEZEL_TEST(case_range_dotdot_1472, nullable_null_value_does_not_match_dotdot) {
-    BEZEL_EXPECT_EQ(runFull(
+BEZEL_TEST(case_range_dotdot_1472, nullable_null_value_dotdot_rejected) {
+    BEZEL_EXPECT_TRUE(rejectedAsNullableScrutineePattern(
         "module M; class App public static method Main(): int "
         "  var x: int? := null; "
         "  return (case x of .. => 7, null => 9); "
-        "end Main; end App;"), 9);
+        "end Main; end App;"));
 }

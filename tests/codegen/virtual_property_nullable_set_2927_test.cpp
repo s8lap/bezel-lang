@@ -237,10 +237,18 @@ BEZEL_TEST(codegen_virtual_property_nullable_set_2927, other_callers_of_the_sett
         "    var i2: IHasQ := b2; "
         "    M.BumpQ(ref i2.IP); "
         "    if (b2._v ?? -1) = 5 and b2._z = 0 then acc := acc + 2; end; "
+        // §6.6 / §7.11 (v0.286, #3298): the third leg used to be
+        // `i3.IP += 3;` — a read-modify-write compound over a nullable
+        // interface property, which is a compile error now (a property is
+        // never narrowable under §7.4, so no guard rescues it). #2927's
+        // subject is that OTHER CALLERS of the itable setter route through it
+        // without disturbing `_z`, so the leg is respelled as the plain
+        // assignment that survives; the rejection itself is pinned by
+        // `codegen_nullable_property_compound_2888`.
         "    using var b3 := new Box(); "
         "    b3._v := 1; "
         "    var i3: IHasQ := b3; "
-        "    i3.IP += 3; "
+        "    i3.IP := (b3._v ?? 0) + 3; "
         "    if (b3._v ?? -1) = 4 and b3._z = 0 then acc := acc + 4; end; "
         "    return acc; "
         "  end Main; "

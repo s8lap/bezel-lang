@@ -98,18 +98,29 @@ BEZEL_TEST(case_pattern_range_divergence_3319,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §19.6 / §19.3 / #3319: a nullable int scrutinee with a bare-`..` arm is
-// non-exhaustive even when the `..` covers every present value — §19.6
-// requires an explicit `null` arm for nullable scrutinees, and §19.6's
-// closed list does not let `..` discharge the requirement.
+// §19.3 / §16.6 (v0.286, #3298) — SUPERSEDED VERDICT. This row used to assert
+// that a bare `..` over an `int?` warns (§19.6) and produces NO error. The
+// §19.6 half is unchanged and still asserted below; the "no error" half is
+// now false: §19.3 rejects a range pattern over a nullable scrutinee, "keyed
+// on the KIND of pattern, not on which bounds are written, so it reaches the
+// open-ended forms and the fully open `..` with the closed ones". The
+// exhaustiveness warning and the §19.3 error are two independent verdicts on
+// the same program and BOTH are asserted here, so a regression that silences
+// either one fails.
 BEZEL_TEST(case_pattern_range_divergence_3319,
-           bare_dotdot_over_nullable_warns_spec_19_6) {
+           bare_dotdot_over_nullable_warns_and_is_rejected_19_3) {
     auto r = parseSemaAll(
         "module M; class C public static method M(x: int?): int "
         "  return (case x of .. => 7); "
         "end M; end C;");
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    bool sawRangeOverNullable = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("range pattern requires a non-nullable scrutinee") !=
+                std::string::npos &&
+            d.message.find("19.3") != std::string::npos)
+            sawRangeOverNullable = true;
+    BEZEL_EXPECT_TRUE(sawRangeOverNullable);
 }
 
 // §19.6 / #3319: a bare `..` followed by an unguarded `_` is exhaustive
@@ -147,7 +158,15 @@ BEZEL_TEST(case_pattern_range_divergence_3319,
         "  return (case x of .. => 7, null => 9); "
         "end M; end C;");
     BEZEL_EXPECT_TRUE(hasNonExhaustiveWarning(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // §19.3 (v0.286, #3298): the `..` arm is ALSO a compile error here — the
+    // §19.6 verdict this row exists for is unaffected by it, but asserting
+    // "no errors" would now be false. Pin the coexistence instead.
+    bool sawRangeOverNullable = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("range pattern requires a non-nullable scrutinee") !=
+                std::string::npos)
+            sawRangeOverNullable = true;
+    BEZEL_EXPECT_TRUE(sawRangeOverNullable);
 }
 
 // §19.6 / #3319: a bare `..` followed by an unguarded `_` is exhaustive

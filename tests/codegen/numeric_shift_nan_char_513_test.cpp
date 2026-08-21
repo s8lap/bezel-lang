@@ -385,8 +385,30 @@ BEZEL_TEST(codegen_cg_1094, nullable_byte_shr_logical) {
 }
 
 // byte?(null) << int: null propagates (no shift performed).
-BEZEL_TEST(codegen_cg_1094, nullable_byte_shl_null_propagates) {
+// §7.11 (v0.286, #3298) — REJECTION. This row asserted the lift's
+// null-propagation ("`a << n` is null when `a` is"); §7.11 now opens "No
+// operator **lifts** to a nullable type" and an absent operand "is diagnosed at
+// compile time". `a` is initialised with `null`, so §7.4 narrows nothing.
+// The NARROWED spelling still shifts and still obeys §6.5's count domain —
+// that is `shift_count_domain_3045.nullable_lifted_uses_underlying_domain`.
+BEZEL_TEST(codegen_cg_1094, nullable_byte_shl_null_rejected_3298) {
+    auto r = runAot(
+        "module M; class C public static method Main(): int "
+        "  var a: byte? := null; var n: int := 1; var c: byte? := a << n; "
+        "  return (if c = null then 0 else 99); end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool sawRule = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("is not defined on a nullable value type") !=
+                std::string::npos &&
+            d.message.find("7.11") != std::string::npos)
+            sawRule = true;
+    BEZEL_EXPECT_TRUE(sawRule);
+}
+
+// The non-nullable neighbour keeps #1094's shift lowering covered.
+BEZEL_TEST(codegen_cg_1094, byte_shl_nonnullable_control_3298) {
     BEZEL_EXPECT_EQ(run(
-        "var a: byte? := null; var n: int := 1; var c: byte? := a << n; "
-        "return (if c = null then 0 else 99);"), 0);
+        "var a: byte := 5; var n: int := 1; var c: byte := byte(a << n); "
+        "return int(c);"), 10);
 }

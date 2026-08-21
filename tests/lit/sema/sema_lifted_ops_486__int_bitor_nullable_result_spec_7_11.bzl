@@ -1,14 +1,11 @@
+// RUN: %not %bezelc -c %s 2>&1 | FileCheck %s
+
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: operator `|` is not defined on a nullable value type — narrow first
+
 // Ported from tests/sema/lifted_operators_486_sema_test.cpp
-//   (BEZEL_TEST sema_lifted_ops_486, int_bitor_nullable_result_spec_7_11).
+// (BEZEL_TEST ['int', 'bitor']int_bitor_nullable_result_spec_7_11).
 //
-// §7.11: int? | int? → result is int? (bitwise lift).
-//
-// Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
-//
-// RUN: %bezelc -c -o %t.o %s
-// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
+// #3298 / v0.267 / proposal 0114 (override of pre-v0.267 lift acceptance):
+// the operator is now REJECTED for a nullable value type operand (§7.11).
 
 module M; class C public method M(a: int?, b: int?) _ := a | b; end M; end C;
-
-// NODIAG-NOT: error
-// NODIAG-NOT: §

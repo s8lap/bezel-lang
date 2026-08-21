@@ -67,6 +67,23 @@ int runProg(const std::string& src) {
     return r.ran ? r.exitCode : -999;
 }
 
+// §6.6 / §7.11 (v0.286, #3298): a read-modify-write compound over a nullable
+// indexer slot is a compile error. Asserts the diagnostic, not just "did not
+// run" — these are multi-declaration programs where an unrelated failure would
+// otherwise pass.
+bool rejectedCompound2859(const std::string& src) {
+    auto r = runAot(src);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const auto& m = d.message;
+        if (m.find("compound assignment") == std::string::npos) continue;
+        if (m.find("nullable") == std::string::npos) continue;
+        if (m.find("7.11") == std::string::npos) continue;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -132,8 +149,13 @@ BEZEL_TEST(codegen_virtual_indexer_nullable_set_2859, class_indexer_vtable_null_
 // must re-wrap into the slot — see the `lowerIndexerCompoundCore` vtable
 // compound site). §6.6 / §7.11 / §7.2 / §23.4. Post-fix: 1.
 // ===========================================================================
-BEZEL_TEST(codegen_virtual_indexer_nullable_set_2859, class_indexer_vtable_compound_op_6_6) {
-    BEZEL_EXPECT_EQ(runProg(
+// §6.6 / §7.11 (v0.286, #3298) — REJECTION. #2859's subject is the vtable
+// dispatch of a nullable indexer SETTER, which the plain `b[0] := v` rows in
+// this file still cover; the COMPOUND spelling is a compile error now, because
+// §6.6 rejects a nullable target and an indexer slot is not narrowable storage
+// under §7.4 at all.
+BEZEL_TEST(codegen_virtual_indexer_nullable_set_2859, class_indexer_vtable_compound_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedCompound2859(
         "module I2859c; "
         "public class Box "
         "  public _v: int? := 1; "
@@ -150,7 +172,7 @@ BEZEL_TEST(codegen_virtual_indexer_nullable_set_2859, class_indexer_vtable_compo
         "    if (b._v ?? -1) = 8 then acc := acc + 1; end; "
         "    return acc; "
         "  end Main; "
-        "end M;"), 1);
+        "end M;"));
 }
 
 // ===========================================================================
@@ -217,8 +239,8 @@ BEZEL_TEST(codegen_virtual_indexer_nullable_set_2859, interface_indexer_itable_s
 // §6.6 + itable compound site in `lowerIndexerCompoundCore`). §6.6 / §13
 // / §23.4 / §7.11. Post-fix: 1.
 // ===========================================================================
-BEZEL_TEST(codegen_virtual_indexer_nullable_set_2859, interface_indexer_compound_op_6_6) {
-    BEZEL_EXPECT_EQ(runProg(
+BEZEL_TEST(codegen_virtual_indexer_nullable_set_2859, interface_indexer_compound_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedCompound2859(
         "module I2859f; "
         "public interface IHasIdx "
         "  property [k: int]: int?; "
@@ -239,5 +261,5 @@ BEZEL_TEST(codegen_virtual_indexer_nullable_set_2859, interface_indexer_compound
         "    if (b._v ?? -1) = 7 then acc := acc + 1; end; "
         "    return acc; "
         "  end Main; "
-        "end M;"), 1);
+        "end M;"));
 }

@@ -22,6 +22,12 @@ std::string mainOf(const std::string& body) {
     return "module M; class C public static method Main(): int " + body +
            " end Main; end C;";
 }
+
+bool runs(const std::string& prog) {
+    auto r = runAot(prog);
+    return r.ran;
+}
+
 }  // namespace
 
 // int? → double?: the value is widened (SIToFP), not lost. d! > 4.0 holds for 5.
@@ -67,6 +73,17 @@ BEZEL_TEST(nullable_lifted_widening_840, same_type_regression) {
 // wrap. (The nullable operand is proven non-null here, so §7.11/#914 types the
 // result as the non-nullable `long`; the result must still hold the full value.)
 
+// §7.11 (v0.286, #3298): each `a` below is a LOCAL initialized with a non-null
+// literal, so §7.4 narrows it at the initializer and §7.11 reads it at the
+// non-nullable `int` — "an operand that §7.4 has narrowed non-null is a
+// non-nullable operand and the ordinary operator applies to it unchanged". So
+// these keep #1117's ORIGINAL value assertions: the operator is admitted, and
+// what is being pinned is that it computes in the PROMOTED width. (A draft of
+// #3298 flipped all three to "expect rejection" — wrong on the spec, and it
+// would have deleted #1117's coverage of the width. The `param_*` row below is
+// the un-narrowed control: a PARAMETER `a: int?` is not narrowed and IS
+// rejected.)
+
 // int? + long: 2e9 + 2e9 = 4e9 must NOT wrap to a 32-bit value.
 BEZEL_TEST(nullable_lifted_widening_840, int_q_plus_long_no_wrap_1117) {
     BEZEL_EXPECT_EQ(run(mainOf(
@@ -83,9 +100,8 @@ BEZEL_TEST(nullable_lifted_widening_840, int_q_times_long_wide_1117) {
         "if (c ?? 0L) = 10000000000L then return 1; else return 0; end;")), 1);
 }
 
-// Nested lifted arithmetic `int? + long + long` must not IR-fail: the inner
-// (int? + long) narrowed result is a {i8,i64} struct, unwrapped to a scalar i64
-// for the outer `+ long`. 1 + 2 + 2 = 5.
+// Nested arithmetic `int? + long + long`: the inner narrowed sum is an i64
+// scalar that the outer `+ long` consumes. 1 + 2 + 2 = 5.
 BEZEL_TEST(nullable_lifted_widening_840, nested_int_q_plus_long_no_irfail_1117) {
     BEZEL_EXPECT_EQ(run(mainOf(
         "var a: int? := 1; var b: long := 2L; "
@@ -96,22 +112,22 @@ BEZEL_TEST(nullable_lifted_widening_840, nested_int_q_plus_long_no_irfail_1117) 
 // A genuinely-nullable (non-narrowed) int? + long via params still lifts to
 // long? and preserves the wide value when both operands are present.
 BEZEL_TEST(nullable_lifted_widening_840, param_int_q_plus_long_wide_1117) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_FALSE(runs(
         "module M; class C "
         "  private static method Add(a: int?, b: long): long? => a + b; "
         "  public static method Main(): int "
         "    var c: long? := Add(2000000000, 2000000000L); "
         "    if (c ?? 0L) = 4000000000L then return 1; else return 0; end; "
-        "  end Main; end C;"), 1);
+        "  end Main; end C;"));
 }
 
 // Null still propagates through the widened lifted op (a is null → result null).
 BEZEL_TEST(nullable_lifted_widening_840, wide_lifted_null_propagates_1117) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_FALSE(runs(
         "module M; class C "
         "  private static method Add(a: int?, b: long): long? => a + b; "
         "  public static method Main(): int "
         "    var c: long? := Add(null, 2000000000L); "
         "    if c = null then return 1; else return 0; end; "
-        "  end Main; end C;"), 1);
+        "  end Main; end C;"));
 }

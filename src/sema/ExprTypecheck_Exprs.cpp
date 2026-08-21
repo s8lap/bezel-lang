@@ -4889,13 +4889,17 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 }
             }
         }
-        // §7.11 (#1132): user-defined operator lifting over nullable operands is
-        // DEFERRED. The operator did NOT resolve above (the nullability gate in
-        // operandMatchesParam), but it IS declared on the operand's underlying
-        // type and an operand is nullable. Emit a precise diagnostic rather than
-        // the generic "operator not defined" message below — the operator exists;
-        // only its lifting over `T?` is unsupported. (`=`/`<>` are excluded: they
-        // are already null-safe per §8.4.)
+        // §7.11 (#1132) / proposal 0114 D8 (v0.267): user-defined operator
+        // lifting over nullable operands is REJECTED — the same compile
+        // error as the primitive gate above (mirrored per §7.11 v0.277: "such an
+        // operand at a user-defined-operator position is the same compile
+        // error, naming the same remedies"). The operator did NOT resolve above
+        // (the nullability gate in operandMatchesParam), but it IS declared on
+        // the operand's underlying type and an operand is nullable. Emit the
+        // same-wording diagnostic rather than the generic "operator not
+        // defined" message below — the operator exists; only its lifting
+        // over `T?` is unsupported. (`=`/`<>` are excluded: they are already
+        // null-safe per §8.4.)
         if (op != "=" && op != "<>") {
             auto nullableUserOperand = [&](const ast::Expr* operand) -> bool {
                 if (!operand) return false;
@@ -4917,11 +4921,11 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 nullableUserOperand(be.right.get())) {
                 ctx_.diagnostics().report(
                     Severity::Error, be.span.begin,
-                    "operator `" + std::string(op) + "` does not lift over a "
-                    "nullable operand of a user-defined-operator type — lifting "
-                    "of user-defined operators over `T?` is deferred (\xC2\xA7"
-                    "7.11); unwrap the operand(s) with `!` or `??` to the "
-                    "non-nullable type first");
+                    std::string("operator `") + std::string(op) +
+                    "` is not defined on a nullable value type — narrow first "
+                    "(`x <> null and …` (\xC2\xA7""7.4), `??` (\xC2\xA7""7.7), "
+                    "or `!` (\xC2\xA7""7.8)); user-defined operators do not "
+                    "lift over `T?` (\xC2\xA7""7.11, v0.267)");
                 // Error recovery: type the result as the left operand's type so
                 // downstream uses do not cascade an "untyped expression" error.
                 if (TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr)
@@ -5097,19 +5101,10 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 return false;
             // §7.4: a null-narrowed (`x <> null`) simple local/parameter is
             // known non-null even though exprType keeps the nullable flag
-            // (null-narrowing does not rewrite exprType). Mirror
-            // resolveMemberAccess's isKnownNonNull gate so a narrowed operand
-            // compares like a non-nullable `string`.
-            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(operand)) {
-                if (id->name != "this" && id->name != "base") {
-                    Symbol* sym = lookupName(id->name);
-                    if (sym && (dynamic_cast<LocalSymbol*>(sym) ||
-                                 dynamic_cast<ParameterSymbol*>(sym)) &&
-                        isKnownNonNull(sym))
-                        return false;
-                }
-            }
-            return true;
+            // (null-narrowing does not rewrite exprType). This is the same
+            // question §7.11's own gates ask, so it is the same predicate
+            // (#3298) rather than a fifth copy of the lookup.
+            return !isNarrowedNonNullRead(operand);
         };
         if (nullableStringOperand(be.left.get()) ||
             nullableStringOperand(be.right.get())) {
@@ -5372,6 +5367,52 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     }
     if (op == "=" || op == "<>" || op == "<" || op == ">" ||
         op == "<=" || op == ">=" || op == "and" || op == "or") {
+        // §7.11 / proposal 0114 / v0.267 (#3298): relational operators do not
+        // lift over a nullable value type — reject BEFORE the §8.4 relational
+        // result-type rule below, which would silently type it `bool` on the
+        // old read and is the spec's "fail-open guard" defect §18.5 names. A
+        // nullable primitive operand (`int?`, `byte?`, `double?`, …) read as
+        // non-nullable by §7.4 flow narrowing is a non-nullable operand here
+        // and the operator applies; the `narrowedNonNull` gate mirrors the
+        // #1575 nullable-string guard's static-type approach.
+        if (op == "<" || op == ">" || op == "<=" || op == ">=") {
+            TypeRef* ltN = be.left  ? ctx_.exprType(*be.left)  : nullptr;
+            TypeRef* rtN = be.right ? ctx_.exprType(*be.right) : nullptr;
+            // §7.11: "an operand whose static type is a nullable VALUE type
+            // is a compile error at every … relational operator". An ENUM is a
+            // value type (§10), and §10.3 gives it `<`/`<=`/`>`/`>=` over the
+            // underlying integer — so `Code? < Code?` is inside this rule, not
+            // beside it. Keying on `Primitive` alone let it through to a
+            // codegen that no longer has a lift path, and it died in IR
+            // verification (`icmp ult {i8,i8}`). Records and choices reach the
+            // user-defined-operator gate above instead, which already rejects
+            // a nullable operand with the same §7.11 wording.
+            auto isNullableValueOperand = [](const TypeRef* t) {
+                if (!t || !t->nullable) return false;
+                if (t->kind == TypeRef::Kind::Primitive) return true;
+                return t->kind == TypeRef::Kind::Named && t->declaration &&
+                       t->declaration->kind == ast::TypeDeclKind::Enum;
+            };
+            // §7.11 reads the operand's STATIC type at this program point, so a
+            // §7.4-narrowed operand is a non-nullable operand here — the ONE
+            // narrowing predicate (#3298), not a local copy of it.
+            bool lNull = isNullableValueOperand(ltN) &&
+                         !isNarrowedNonNullRead(be.left.get());
+            bool rNull = isNullableValueOperand(rtN) &&
+                         !isNarrowedNonNullRead(be.right.get());
+            if (lNull || rNull) {
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    std::string("operator `") + std::string(op) +
+                    "` is not defined on a nullable value type \xE2\x80\x94 narrow "
+                    "first (`x <> null and \xE2\x80\xA6` (\xC2\xA7""7.4), `??` "
+                    "(\xC2\xA7""7.7), or `!` (\xC2\xA7""7.8)); the relational "
+                    "operators do not lift over `T?` (\xC2\xA7""7.11, v0.267)");
+                ctx_.setExprType(&be,
+                                 ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                return;
+            }
+        }
         // per §6.2/§5.1 (#1204): relational/equality operators require that
         // the two operand types be compatible (one must implicitly widen to
         // the other, §5.1).  When both operands are non-nullable, non-literal
@@ -5414,6 +5455,45 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
     }
     // `in` is a membership test → bool.
     if (op == "in") {
+        // §17.5 / §16.6 / §7.11 (v0.286, #3298): `x in c` IS the call
+        // `c.Contains(x)`, so the left operand is admitted exactly when that
+        // call's argument admits it — `in` states no nullability rule of its
+        // own (v0.270, #3312.2). For a RANGE right operand the selected member
+        // is stdlib §9.8's `Contains(value: T)` over the NON-NULLABLE `T` of
+        // §16.3, `T?` does not implicitly convert to `T` (§5.1), and range
+        // membership is an ORDERING test which admits no absent participant
+        // (§16.3, §7.11) — so a nullable left operand is a compile error,
+        // naming §7.11's standing remedies. Without this gate the operand
+        // reached codegen as a `{i8, T}` box and `n in 1..5` over an `int?`
+        // died in IR verification (`icmp {i8,i32}, i32`).
+        //
+        // The gate is deliberately keyed on the RANGE receiver and NOT on `in`
+        // as such: v0.270 ruled that a `Contains` whose parameter is ITSELF
+        // nullable — `Array<int?>.Contains(item: int?)`, the `Span`/
+        // `ReadOnlySpan` forms at class-typed `T` — still admits a nullable
+        // left operand, because that test is §8.4 equality, which §7.11
+        // retains. A blanket rule would make `arr.Contains(n)` compile and
+        // `n in arr` not, for the same question.
+        //
+        // §16.6's parity claim is what this delivers: `n in 1..5` and
+        // `case n of 1..5` over an `int?` now give the SAME verdict (the
+        // diagnostics differ, as §16.6 says they may; the verdict agrees).
+        TypeRef* inLt = be.left ? ctx_.exprType(*be.left) : nullptr;
+        TypeRef* inRt = be.right ? ctx_.exprType(*be.right) : nullptr;
+        if (inLt && inLt->nullable && inRt &&
+            inRt->kind == TypeRef::Kind::Named &&
+            inRt->declaration == ctx_.builtinClassSym("Range") &&
+            !isNarrowedNonNullRead(be.left.get())) {
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "the left operand of `in` over a range is nullable \xE2\x80\x94 "
+                "a range's `Contains` takes the non-nullable element type "
+                "(stdlib \xC2\xA7""9.8) and range membership is an ordering "
+                "test, which admits no absent participant (\xC2\xA7""16.3, "
+                "\xC2\xA7""16.6, \xC2\xA7""7.11); narrow first "
+                "(`x <> null and \xE2\x80\xA6` (\xC2\xA7""7.4), `??` "
+                "(\xC2\xA7""7.7), or `!` (\xC2\xA7""7.8))");
+        }
         ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         return;
     }
@@ -5595,83 +5675,80 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             if ((op == "<<" || op == ">>") && be.right)
                 checkShiftCountDomain(lt, *be.right, op, be.span.begin);
         }
-        // §7.11 lifted operators: when EITHER operand is a nullable value
-        // primitive (`int?`, `double?`, `bool?`, …), the arithmetic / bitwise /
-        // shift result is lifted to `T?` — `null` when either operand is `null`,
-        // otherwise the underlying operator applied to the present payloads. A
-        // mixed `T?` + `T` expression also lifts (the non-nullable operand is
-        // treated as present), and the result is still `T?`. The result's
-        // underlying type is computed exactly as the non-nullable case would
-        // (so `int? + int?` is `int?`, and a future widening pair such as
-        // `int? + long?` widens identically), then marked nullable. (Equality
-        // `=`/`<>` does not reach this block — it returns `bool` above per §8.4
-        // — and relational ops also return `bool`, never lift to `bool?`.) The
-        // codegen lowering for these operators lives in
-        // LlvmBackend_Exprs.cpp::lowerBinary.
-        {
+        // §7.11 / proposal 0114 / v0.267 (#3298): arithmetic, bitwise, shift,
+        // and relational operators do not lift over a nullable value type.
+        // Either operand's static type being a nullable primitive (`int?`,
+        // `double?`, `bool?`, …) is a compile error; `=`/`<>` are excluded
+        // above (§8.4) and `and`/`or`/`not` above (§17.2). The diagnostic
+        // names the three remedies the language uses at every other nullable-
+        // meets-non-nullable position: a §7.4 narrowing check, `??` (§7.7),
+        // or `!` (§7.8). Because the rule reads the operand's static type at
+        // that program point, an operand narrowed non-null by §7.4 flow
+        // narrowing is a non-nullable operand here and the ordinary operator
+        // applies unchanged — no separate rule is needed for that case.
+        if (be.op != "=" && be.op != "<>") {
+            TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
             TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
             auto isNullablePrim = [](const TypeRef* t) {
                 return t && t->kind == TypeRef::Kind::Primitive && t->nullable;
             };
-            bool lNull = isNullablePrim(lt);
-            bool rNull = isNullablePrim(rt);
+            // An operand narrowed non-null by §7.4 is a non-nullable operand
+            // at this program point even though exprType keeps the nullable
+            // flag; `isNarrowedNonNullRead` is the ONE predicate that decides
+            // that (#3298) — mutable fields and properties never narrow (§7.4),
+            // and `this`/`base` are not narrowable operands.
+            bool lNull = isNullablePrim(lt) &&
+                         !isNarrowedNonNullRead(be.left.get());
+            bool rNull = isNullablePrim(rt) &&
+                         !isNarrowedNonNullRead(be.right.get());
+            // Per §3.5 only the §7.11-gated operator families are subject to
+            // this rule. Equality (`=`/`<>`) is excluded above. User-declared
+            // operators on a nullable user-type operand are rejected at the
+            // candidate-set gate further up (operandMatchesParam's nullability
+            // gate for primitives, the existing user-operator diagnostic above
+            // for Named types). A nullable reference type (`string?`) is
+            // already rejected for relational operators above (#1575).
             if ((lNull || rNull) && lt && rt &&
                 lt->kind == TypeRef::Kind::Primitive &&
                 rt->kind == TypeRef::Kind::Primitive) {
-                // Determine the underlying (non-nullable) result primitive using
-                // the same §6.2 widening rule as the non-nullable path. For
-                // shift ops the result follows the left operand. For same-prim
-                // operands the result is that primitive.
-                PrimitiveType resultPrim = lt->primitive;
-                if (op != "<<" && op != ">>" &&
-                    lt->primitive != rt->primitive) {
-                    if (primitiveWidens(lt->primitive, rt->primitive))
-                        resultPrim = rt->primitive;       // left widens to right
-                    else if (primitiveWidens(rt->primitive, lt->primitive))
-                        resultPrim = lt->primitive;       // right widens to left
-                    else if (isPromotablePrimitive(lt->primitive) &&
-                             isPromotablePrimitive(rt->primitive)) {
-                        // §6.2: no implicit conversion in either direction — a
-                        // compile error, mirroring the non-nullable branch below.
-                        ctx_.diagnostics().report(
-                            Severity::Error, be.span.begin,
-                            std::string("operator `") + std::string(op) +
-                            "` has no implicit conversion between operand types `" +
-                            primitiveSpelling(lt->primitive) + "` and `" +
-                            primitiveSpelling(rt->primitive) +
-                            "` (§6.2); add an explicit cast (§5.2) to convert one"
-                            " operand to the other's type.");
-                        return;
-                    }
-                }
-                TypeRef* res = ctx_.makeTypeRef();
-                res->kind = TypeRef::Kind::Primitive;
-                res->primitive = resultPrim;
-                // §7.11 / §7.4 / §12.7 (#914): the lifted result is `T?` UNLESS
-                // every nullable operand is a simple variable proved non-null by
-                // null-flow narrowing (`nullNarrowed_`) — then both payloads are
-                // definitely present, so the result is the non-nullable `T`. (A
-                // non-nullable operand is trivially present.) Codegen still emits
-                // the lifted {flag,value} value; the non-nullable-target coercion
-                // sites unwrap it (#914 unwrapNarrowedNullable), and its flag is
-                // 1 for a narrowed operand, so the extracted value is correct.
-                auto narrowedPresent = [&](const ast::Expr* e,
-                                           const TypeRef* t) -> bool {
-                    if (!t || t->kind != TypeRef::Kind::Primitive ||
-                        !t->nullable)
-                        return true;   // non-nullable operand: present
-                    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e))
-                        if (Symbol* s = ctx_.exprSymbol(*id))
-                            return nullNarrowed_.count(s) > 0;
-                    return false;
-                };
-                bool bothPresent = narrowedPresent(be.left.get(), lt) &&
-                                   narrowedPresent(be.right.get(), rt);
-                res->nullable = !bothPresent;   // §7.11: lifted result is T?
-                ctx_.setExprType(&be, res);
+                // Identify the operator family for the diagnostic. Binary
+                // shifts (`<<`/`>>`) are family "shift"; relational (`<`
+                // `<=` `>` `>=`) are "relational"; everything else on the
+                // primitive arithmetic/bitwise set is "arithmetic / bitwise".
+                const char* opFamily =
+                    (op == "<<" || op == ">>") ? "shift" :
+                    (op == "<" || op == "<=" ||
+                     op == ">" || op == ">=") ? "relational" :
+                    "arithmetic, bitwise, or shift";
+                ctx_.diagnostics().report(
+                    Severity::Error, be.span.begin,
+                    std::string("operator `") + std::string(op) +
+                    "` is not defined on a nullable value type — narrow first "
+                    "(`x <> null and …` (\xC2\xA7""7.4), `??` (\xC2\xA7""7.7), "
+                    "or `!` (\xC2\xA7""7.8)); the " + opFamily +
+                    " operators do not lift over `T?` (\xC2\xA7""7.11, v0.267)");
+                // Error recovery: type the result as the non-nullable T of the
+                // non-nullable operand (or `int` if both are nullable) so
+                // downstream uses do not cascade an untyped-expression error.
+                TypeRef* recTy = nullptr;
+                if (lt && !lt->nullable) recTy = lt;
+                else if (rt && !rt->nullable) recTy = rt;
+                else recTy = ctx_.primitiveTypeRef(PrimitiveType::Int);
+                ctx_.setExprType(&be, recTy);
                 return;
             }
         }
+        // §7.11 (v0.286, #3298): past the gate above, a surviving nullable
+        // primitive operand is one §7.4 has narrowed non-null, and §7.11 reads
+        // it as a NON-NULLABLE operand to which "the ordinary operator applies
+        // unchanged". Normalize both operand types ONCE here so that §6.2's
+        // promotion and the result type below need no narrowing special case:
+        // without this, `if n <> null then m := n + 1;` types the sum `int?`
+        // and the store into `m: int` is a false reject, and a narrowed
+        // `int? + long` never reaches §6.2's widening at all.
+        TypeRef* rtNorm = be.right ? ctx_.exprType(*be.right) : nullptr;
+        lt      = operandStaticTypeAt(be.left.get(), lt);
+        rtNorm  = operandStaticTypeAt(be.right.get(), rtNorm);
         // §6.2 mixed-type arithmetic: "the smaller-range operand is implicitly
         // promoted to the larger type using §5.1. The result has the larger
         // type." For the non-shift operators, when both operands are primitive
@@ -5683,7 +5760,7 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         // different types, the result is the wider operand. Shift ops `<<`/`>>`
         // keep the left operand's type (right is the shift count, no promotion).
         if (op != "<<" && op != ">>") {
-            TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
+            TypeRef* rt = rtNorm;   // §7.11-normalized (#3298), not the declared type
             if (lt && rt &&
                 lt->kind == TypeRef::Kind::Primitive &&
                 rt->kind == TypeRef::Kind::Primitive &&
@@ -5716,6 +5793,10 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 }
             }
         }
+        // The result follows the (normalized) left operand: `lt` is already
+        // the non-nullable T for a §7.4-narrowed operand, so the both-narrowed
+        // `int? + int?` case and the mixed narrowed/non-nullable case take one
+        // path instead of two (#3298).
         if (lt) ctx_.setExprType(&be, lt);
         return;
     }
@@ -6172,6 +6253,34 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                     "numeric types (§3.5)");
                 return;
             }
+        }
+        // §7.11 / proposal 0114 / v0.267 (#3298): unary `+`, `-`, `~` do not
+        // lift over a nullable value type — they are defined on the underlying
+        // `T` only (`bool`-shaped `not` is §17.2 and excluded above). An operand
+        // narrowed non-null by §7.4 (locals/parameters in `nullNarrowed_` / the
+        // lookup-time narrowing analysis, #914) is a non-nullable operand here
+        // and the ordinary unary operator applies. Mirror the §7.11 binary
+        // operator's narrower rejection family so the diagnostic matches.
+        if (ot && ot->kind == TypeRef::Kind::Primitive && ot->nullable) {
+            if (!isNarrowedNonNullRead(ue.operand.get())) {
+                const char* opWord =
+                    (op == "~") ? "bitwise complement (`~`)" :
+                    (op == "-") ? "negation (unary `-`)" :
+                    /* + */       "the identity (unary `+`)";
+                ctx_.diagnostics().report(
+                    Severity::Error, ue.span.begin,
+                    std::string("unary operator `") + std::string(op) +
+                    "` is not defined on a nullable value type — narrow first "
+                    "(`x <> null and …` (\xC2\xA7""7.4), `??` (\xC2\xA7""7.7), "
+                    "or `!` (\xC2\xA7""7.8)); " + opWord +
+                    " does not lift over `T?` (\xC2\xA7""7.11, v0.267)");
+                ctx_.setExprType(&ue, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                return;
+            }
+            // §7.11 (v0.286, #3298): the surviving operand is §7.4-narrowed, so
+            // it is read at the non-nullable T and `-n` / `~n` / `+n` is a `T`,
+            // not a `T?` — the same normalization the binary path performs.
+            ot = operandStaticTypeAt(ue.operand.get(), ot);
         }
         if (ot) ctx_.setExprType(&ue, ot);
         return;
@@ -8594,6 +8703,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         TypeRef* scrutTy =
             ce->scrutinee ? ctx_.exprType(*ce->scrutinee) : nullptr;
         scrutTy = recoverChoiceThisScrutTy(ce->scrutinee.get(), scrutTy);
+        // §19.3 / §16.6 / §7.11 (v0.286, #3298): a relational or range
+        // pattern requires a NON-NULLABLE scrutinee — value or reference, and
+        // keyed on the pattern's KIND rather than on which bounds are written
+        // (§19.3, v0.286). One shared checker with the CaseStmt site below.
+        checkOrderingPatternsOverNullableScrutinee(scrutTy, ce->arms);
         // §10.6 (#772): "Inside a `case` whose scrutinee is an enum, the enum
         // prefix may be omitted." This holds throughout the construct, INCLUDING
         // arm bodies (`Red => Green`), not only patterns. Inject the scrutinee

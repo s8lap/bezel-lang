@@ -102,11 +102,6 @@ std::string program2888(const std::string& body) {
            "end Main2888;";
 }
 
-int run(const std::string& body) {
-    auto r = runAot(program2888(body));
-    return r.ran ? r.exitCode : -999;
-}
-
 // A body-only program with no Box2888 (for the local/collection cases).
 int runPlain(const std::string& body) {
     auto r = runAot(
@@ -119,160 +114,202 @@ int runPlain(const std::string& body) {
 }  // namespace
 
 // ===========================================================================
-// T1 — the issue's three reported rows, in one program: the block-form `int?`
-// property, the `long?` user indexer and the `double?` INTERFACE property, each
-// under §6.6's compound desugaring. §6.6, verbatim (the document's hard line
-// wrap joined with a single space): "the statement `x op= e` is equivalent to
-// `x := x op e` with the target evaluated **once**".
-// Pre-fix: the compile ABORTED with three IR-verifier errors. Post-fix: 15 —
-// (1+3) + (1+4) + (1.0+5.0).
+// §7.11 / §6.6 / §17.6 AT v0.286 (#3298) — WHY EVERY NULLABLE ROW BELOW IS NOW
+// A REJECTION, AND WHAT #2888's COVERAGE BECAME.
+//
+// #2888 landed at v0.240 against a §7.11 that LIFTED: "a lifted binary
+// operator produces `null` if either operand is `null`". Proposal 0114
+// graduated at v0.267 and DELETED that rule. §7.11 (v0.286) now opens "No
+// operator **lifts** to a nullable type", §6.6 makes a read-modify-write
+// compound "a **compile error** when the static type of its left-hand side, or
+// of its right operand, is a **nullable** type — either position, or both, a
+// nullable **reference**-typed target included", and §17.6 says the same of
+// `++`/`--`. Every row in T1–T11 asserted a VALUE produced by the deleted
+// rule, so each is inverted here to assert the diagnosis that replaced it.
+//
+// This is not a bulk repair: #2888's actual subject was TWO one-definition
+// holes — (1) the §7.11 lifting arm that had one copy and five callers that
+// lacked it, and (2) §17.6's implicit `1`, which had six hand-written copies.
+// Hole (1) no longer exists as a rule, so its coverage is not lost but
+// RETIRED. Hole (2) is about the NON-nullable path too, and every one of its
+// six spellings — block-form property, user indexer, interface property,
+// imported property, heap-collection element, plain local — is still exercised
+// with its value by T12 below, which is why T12 is untouched and why it is now
+// this file's load-bearing row rather than its control.
+//
+// §7.4 does NOT rescue any of these: a property and an indexer slot are never
+// narrowable (§7.4 admits a local, a parameter and a `readonly` field only),
+// and for a nullable-typed local target #3298 implements the reading that §6.6
+// and §17.6 enumerate by DECLARED type — recorded, with the alternative and
+// the reason, as issue 3686.
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, accessor_compound_7_11) {
-    BEZEL_EXPECT_EQ(run(
+
+namespace {
+
+// Rejected, and by the §6.6/§17.6 family rather than by any compile error:
+// "did not run" alone would pass on an unrelated failure in these long
+// programs. Every message this file expects names §7.11's remedies.
+bool rejected2888(const std::string& program) {
+    auto r = runAot(program);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const auto& m = d.message;
+        const bool compound =
+            m.find("compound assignment") != std::string::npos &&
+            m.find("nullable") != std::string::npos;
+        const bool increment =
+            m.find("is not defined on a nullable") != std::string::npos;
+        if (!compound && !increment) continue;
+        if (m.find("7.11") == std::string::npos) continue;
+        return true;
+    }
+    return false;
+}
+bool rejectedBody(const std::string& body) {
+    return rejected2888(program2888(body));
+}
+bool rejectedPlain(const std::string& body) {
+    return rejected2888(
+        std::string("module MP2888; public class C2888 "
+                    "  public static method Main(): int ") +
+        body + "  end Main; end C2888;");
+}
+
+}  // namespace
+
+// ===========================================================================
+// T1 — the issue's three reported rows (block-form `int?` property, user
+// `long?` indexer, interface-dispatched `double?` property). Each was an ICE
+// at v0.240 and a lifted VALUE from the #2888 fix until v0.267; each is a §6.6
+// compile error now. The three shapes are kept in ONE program because what is
+// being pinned is that no accessor shape escapes the gate.
+// ===========================================================================
+BEZEL_TEST(codegen_nullable_property_compound_2888, accessor_compound_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedBody(
         "    using var b := new Box2888(); "
         "    b.NP += 3; "
+        "    return (b.NP ?? -100); "));
+    BEZEL_EXPECT_TRUE(rejectedBody(
+        "    using var b := new Box2888(); "
         "    b[0] += 4; "
+        "    return int(b[0] ?? -100L); "));
+    BEZEL_EXPECT_TRUE(rejectedBody(
+        "    using var b := new Box2888(); "
         "    var iv: IHasD2888 := b; "
         "    iv.DP += 5.0; "
-        "    return (b.NP ?? -100) + int(b[0] ?? -100L) "
-        "           + int(iv.DP ?? -100.0); "), 15);
+        "    return int(iv.DP ?? -100.0); "));
 }
 
 // ===========================================================================
-// T2 — §17.6 on the same three accessor shapes: "For built-in numeric types,
-// `x++` is equivalent to `x := x + 1` (and likewise `x--` to `x := x - 1`)".
-// Pre-fix these failed THREE DIFFERENT WAYS — `b.NP++` dropped the write with
-// no diagnostic at all, `b[0]++` was rejected with an internal "#1386" error,
-// and `iv.DP++` aborted the compile on a fabricated `i37 1`. Post-fix: 6 —
-// (1+1) + (1+1) + (1.0+1.0).
+// T2 — §17.6 on the same three accessor shapes. §17.6 (v0.286): "An operand
+// whose static type is a nullable type is a compile error … this form and
+// §6.6's compound assignments are one rule read through one desugaring."
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, accessor_increment_17_6) {
-    BEZEL_EXPECT_EQ(run(
+BEZEL_TEST(codegen_nullable_property_compound_2888, accessor_increment_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedBody(
+        "    using var b := new Box2888(); b.NP++; return 0; "));
+    BEZEL_EXPECT_TRUE(rejectedBody(
+        "    using var b := new Box2888(); b[0]++; return 0; "));
+    BEZEL_EXPECT_TRUE(rejectedBody(
         "    using var b := new Box2888(); "
-        "    b.NP++; "
-        "    b[0]++; "
-        "    var iv: IHasD2888 := b; "
-        "    iv.DP++; "
-        "    return (b.NP ?? -100) + int(b[0] ?? -100L) "
-        "           + int(iv.DP ?? -100.0); "), 6);
+        "    var iv: IHasD2888 := b; iv.DP++; return 0; "));
 }
 
 // ===========================================================================
-// T3 — §7.11's null rule through every accessor shape and both spellings.
-// §7.11, verbatim: "A lifted binary operator produces `null` if *either*
-// operand is `null`". A `null` target stays `null` under `+=` AND under `++`.
-// (NOT vacuous: T1/T2 prove the same statements produce a VALUE when the target
-// is present, so "still null" here is the lifted rule, not a dropped write —
-// the pre-fix `b.NP++` also left the field unchanged, but T2 catches that.)
-// Post-fix: 63 — all six checks.
+// T3 — the absent-target case. It used to assert "null stays null"; §7.11 now
+// says the absent operand "is diagnosed at COMPILE time", so the program never
+// runs and there is no runtime answer to check. The rejection does not depend
+// on what the target holds — which is the point: the gate reads the static
+// type, so a `null` target and a present one are rejected alike.
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, accessor_null_propagates_7_11) {
-    BEZEL_EXPECT_EQ(run(
-        "    var acc := 0; "
+BEZEL_TEST(codegen_nullable_property_compound_2888, accessor_null_target_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedBody(
         "    using var b := new Box2888(); "
-        "    b._n := null; b._l := null; b._d := null; "
-        "    var iv: IHasD2888 := b; "
+        "    b._n := null; "
         "    b.NP += 3; "
-        "    b[0] += 4; "
-        "    iv.DP += 5.0; "
-        "    if b.NP = null then acc := acc + 1; end; "
-        "    if b[0] = null then acc := acc + 2; end; "
-        "    if iv.DP = null then acc := acc + 4; end; "
-        "    b.NP++; "
-        "    b[0]++; "
-        "    iv.DP++; "
-        "    if b.NP = null then acc := acc + 8; end; "
-        "    if b[0] = null then acc := acc + 16; end; "
-        "    if iv.DP = null then acc := acc + 32; end; "
-        "    return acc; "), 63);
-}
-
-// ===========================================================================
-// T4 — §7.11's null rule from the RIGHT operand: "produces `null` if *either*
-// operand is `null`", and "A mixed expression in which one operand is `T?` and
-// the other is the non-nullable `T` lifts as well — the non-nullable operand is
-// treated as present (never `null`)". A PRESENT target plus a NULL nullable RHS
-// yields `null`; a present target plus a PRESENT nullable RHS yields the value.
-// Post-fix: 7.
-// ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, nullable_rhs_7_11) {
-    BEZEL_EXPECT_EQ(run(
-        "    var acc := 0; "
+        "    return 0; "));
+    BEZEL_EXPECT_TRUE(rejectedBody(
         "    using var b := new Box2888(); "
-        "    var some: int? := 41; "
-        "    b.NP += some; "
-        "    if (b.NP ?? -100) = 42 then acc := acc + 1; end; "
-        "    using var c := new Box2888(); "
-        "    var none: int? := null; "
-        "    c.NP += none; "
-        "    if c.NP = null then acc := acc + 2; end; "
-        "    using var d := new Box2888(); "
-        "    d.NP += 7; "
-        "    if (d.NP ?? -100) = 8 then acc := acc + 4; end; "
-        "    return acc; "), 7);
+        "    b._n := null; "
+        "    b.NP++; "
+        "    return 0; "));
 }
 
 // ===========================================================================
-// T5 — the LOCAL `n++` on a nullable value. The issue placed the whole defect
-// on the accessor paths because `n += 1` on a local was already lifted; the
-// `++` SPELLING of the same statement was not, and aborted the compile on a
-// fabricated `i5 1` constant. §17.6 identifies the two, so they must agree.
-// Post-fix: 21 — 6 (`n++`) + 4 (`n--`) + 11 (`n += 1` control on the same
-// local, which passes both ways and pins that the two spellings agree).
+// T4 — §6.6's RIGHT-operand half: "the static type of its left-hand side, OR
+// of its right operand". A non-nullable target with a nullable RHS is the same
+// compile error, which is what makes the rule symmetric rather than a
+// target-only check.
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, local_increment_17_6) {
-    BEZEL_EXPECT_EQ(runPlain(
-        "    var a: int? := 5; a++; "
-        "    var b: int? := 5; b--; "
-        "    var c: int? := 10; c += 1; "
-        "    return (a ?? -100) + (b ?? -100) + (c ?? -100); "), 21);
+BEZEL_TEST(codegen_nullable_property_compound_2888, nullable_rhs_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedPlain(
+        "    var n: int? := null; "
+        "    var t: int := 5; "
+        "    t += n; "
+        "    return t; "));
+    BEZEL_EXPECT_TRUE(rejectedPlain(
+        "    var n: int? := 3; "
+        "    var t: int := 5; "
+        "    t += n; "
+        "    return t; "));
 }
 
 // ===========================================================================
-// T6 — the LOCAL `n++` on a NULL nullable value stays `null` (§7.11 read
-// through §17.6's `x := x + 1` identity: the implicit `1` is a present
-// non-nullable operand, so the result is null only by reason of the target).
-// Post-fix: 3.
+// T5 — the plain LOCAL. §17.6's desugaring is §6.6's, so `a++` on an `int?`
+// takes the same verdict as `a += 1`. ⚠ This is the row where #3298's recorded
+// interpretation bites (issue 3686): `a` here IS §7.4-narrowed by its non-null
+// literal initialiser, and the equivalent `a := a + 1` IS admitted — §6.6 and
+// §17.6 are read as enumerations over the DECLARED type. The asymmetry is
+// deliberate, recorded, and filed; if 3686 rules the other way, THIS row is
+// the one that flips back.
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, local_increment_null_7_11) {
+BEZEL_TEST(codegen_nullable_property_compound_2888, local_increment_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedPlain("    var a: int? := 5; a++; return 0; "));
+    BEZEL_EXPECT_TRUE(rejectedPlain("    var b: int? := 5; b--; return 0; "));
+    BEZEL_EXPECT_TRUE(rejectedPlain("    var c: int? := 10; c += 1; return 0; "));
+    // …while the desugared spelling on the SAME narrowed local compiles and
+    // gives the value, which is what issue 3686 is about. Asserted here so the
+    // asymmetry is visible at the site rather than only in the issue.
     BEZEL_EXPECT_EQ(runPlain(
-        "    var acc := 0; "
-        "    var a: int? := null; a++; "
-        "    if a = null then acc := acc + 1; end; "
-        "    var d: double? := null; d--; "
-        "    if d = null then acc := acc + 2; end; "
-        "    return acc; "), 3);
+        "    var a: int? := 5; a := a + 1; return (a ?? -100); "), 6);
 }
 
 // ===========================================================================
-// T7 — the HEAP-COLLECTION element spellings, which the issue did not list:
-// `Array<int?>` and `Dictionary<int,int?>` reach emitCompoundOp through
-// `lowerCollectionIndexerCompound` / `lowerCollectionIndexerIncrDecr` and were
-// the same ICE. stdlib §4.4/§4.8. Post-fix: 39 — 14 (array 10+3, then ++) +
-// 25 (dict 20+4, then ++).
+// T6 — the same two spellings on an ABSENT local. Un-narrowed (a `null`
+// initialiser establishes nothing), so both the compound form and the
+// desugared form are rejected — the desugared escape hatch in T5 exists only
+// because §7.4 proved the operand present.
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, collection_element_6_6) {
-    BEZEL_EXPECT_EQ(runPlain(
+BEZEL_TEST(codegen_nullable_property_compound_2888, local_increment_null_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedPlain("    var a: int? := null; a++; return 0; "));
+    BEZEL_EXPECT_TRUE(rejectedPlain("    var d: double? := null; d--; return 0; "));
+    BEZEL_EXPECT_TRUE(rejectedPlain(
+        "    var a: int? := null; a := a + 1; return 0; "));
+}
+
+// ===========================================================================
+// T7 — the heap-collection element slots (`Array<int?>`, `Dictionary<K,int?>`).
+// An element slot is not narrowable storage under §7.4 at all, so the verdict
+// here does not depend on issue 3686's reading either way.
+// ===========================================================================
+BEZEL_TEST(codegen_nullable_property_compound_2888, collection_element_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedPlain(
         "    using var a := new Array<int?>(); "
-        "    a.Add(10); "
-        "    a[0] += 3; "
-        "    a[0]++; "
+        "    a.Add(10); a[0] += 3; return 0; "));
+    BEZEL_EXPECT_TRUE(rejectedPlain(
+        "    using var a := new Array<int?>(); "
+        "    a.Add(10); a[0]++; return 0; "));
+    BEZEL_EXPECT_TRUE(rejectedPlain(
         "    using var d := new Dictionary<int, int?>(); "
-        "    d.Add(1, 20); "
-        "    d[1] += 4; "
-        "    d[1]++; "
-        "    return (a[0] ?? -100) + (d[1] ?? -100); "), 39);
+        "    d.Add(1, 20); d[1] += 4; return 0; "));
 }
 
 // ===========================================================================
-// T8 — §5.2's `char` code-point write-back survives the lift, on EVERY branch.
-// §6.6 desugars a `char` target to `c := char(c OP e)`, and §5.2 raises
-// OverflowException outside U+0000–U+10FFFF. §7.11: that check "appl[ies] only
-// when both operands are present". This is the case that pins the
-// `isCharTargetExpr` widening — with `char?` excluded the present branch would
-// store an out-of-range `char` with no raise at all. Post-fix: 7.
+// T8 — `char?`. §5.2's code-point write-back was the subject; it is unreachable
+// through a nullable target now, and T12 keeps the NON-nullable `char`
+// write-back (both the in-range value and the OverflowException) covered.
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, char_nullable_property_5_2) {
+BEZEL_TEST(codegen_nullable_property_compound_2888, char_nullable_property_rejected_3298) {
     const char* boxC =
         "public class CBox2888 "
         "  public _c: char? := char('A'); "
@@ -281,39 +318,25 @@ BEZEL_TEST(codegen_nullable_property_compound_2888, char_nullable_property_5_2) 
         "    set => do _c := value; end; "
         "  end; "
         "end CBox2888; ";
-    auto r = runAot(
+    BEZEL_EXPECT_TRUE(rejected2888(
         std::string("module MC2888; ") + boxC +
         "public class MainC2888 "
         "  public static method Main(): int "
-        "    var acc := 0; "
-        // present: 'A' + 1 = 'B' (66)
         "    using var b := new CBox2888(); "
         "    b.CP += 1; "
-        "    if int(b.CP ?? char(0)) = 66 then acc := acc + 1; end; "
-        // present and out of range: §5.2 raises
-        "    using var b2 := new CBox2888(); "
-        "    b2._c := char(0x10FFFF); "
-        "    try b2.CP += 1; catch OverflowException => acc := acc + 2; end; "
-        // null at the same code point: §7.11 — no underlying op, no check
-        "    using var b3 := new CBox2888(); "
-        "    b3._c := null; "
-        "    try b3.CP += 1; acc := acc + 4; "
-        "    catch OverflowException => acc := acc + 0; end; "
-        "    return acc; "
+        "    return 0; "
         "  end Main; "
-        "end MainC2888;");
-    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 7);
+        "end MainC2888;"));
 }
 
 // ===========================================================================
-// T9 — `decimal?` through a property: the payload is the `%bz.decimal` struct
-// rather than a scalar, so the lift routes it to the §6.4 intrinsic. §6.4:
-// decimal arithmetic "raises `OverflowException` on overflow and
-// `DivideByZeroException` on division by zero"; §7.11 names decimal
-// DivideByZeroException explicitly as a present-branch-only check.
-// Post-fix: 7 (value 9 = 5 + 3 + 1 checked separately on stdout).
+// T9 — `decimal?` through a property. The §6.4 runtime route for a decimal
+// operand is NOT lost with this row: `codegen_lifted_ops_486_narrowed_3298`
+// (tests/codegen/lifted_operators_486_test.cpp) exercises it on a §7.4-narrowed
+// `decimal?` and checks the produced value, and T12 keeps the non-nullable
+// property route.
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, decimal_nullable_property_6_4) {
+BEZEL_TEST(codegen_nullable_property_compound_2888, decimal_nullable_property_rejected_3298) {
     const char* boxM =
         "public class MBox2888 "
         "  public _m: decimal? := 5m; "
@@ -325,94 +348,54 @@ BEZEL_TEST(codegen_nullable_property_compound_2888, decimal_nullable_property_6_
     auto head = std::string("module MM2888; ") + boxM +
                 "public class MainM2888 "
                 "  public static method Main(): int ";
-    // The lifted value itself, on stdout (a decimal does not fit an exit code).
-    BEZEL_EXPECT_EQ(runAotOut(
+    BEZEL_EXPECT_TRUE(rejected2888(
         head +
         "    using var b := new MBox2888(); "
         "    b.MP += 3m; "
-        "    b.MP++; "
-        "    Console.WriteLine((b.MP ?? 0m).ToString()); "
         "    return 0; "
         "  end Main; "
-        "end MainM2888;"), "9");
-    // The §6.4 raise, present branch only.
-    auto r = runAot(
+        "end MainM2888;"));
+    BEZEL_EXPECT_TRUE(rejected2888(
         head +
-        "    var acc := 0; "
         "    using var b := new MBox2888(); "
-        "    try b.MP /= 0m; catch DivideByZeroException => acc := acc + 1; end; "
-        "    using var c := new MBox2888(); "
-        "    c._m := null; "
-        "    try c.MP /= 0m; acc := acc + 2; "
-        "    catch DivideByZeroException => acc := acc + 0; end; "
-        "    if c.MP = null then acc := acc + 4; end; "
-        "    return acc; "
+        "    b.MP++; "
+        "    return 0; "
         "  end Main; "
-        "end MainM2888;");
-    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 7);
+        "end MainM2888;"));
 }
 
 // ===========================================================================
-// T10 — §6.6's CHECKED narrow-integer write-back and §6.2's signedness survive
-// the lift through an accessor. §6.6, verbatim (hard line wraps joined with a
-// single space): "`b += 10` on `b: byte` is `b := byte(b + 10)` — the addition
-// runs in `int` per §6.2, and a result outside `byte`'s range raises
-// `OverflowException`". And an UNSIGNED payload
-// must select unsigned arithmetic, or `uint? += 1` near the top of the range
-// would report a false overflow. Post-fix: 7.
+// T10 — §6.6's checked narrow-integer write-back and §6.2's signedness, which
+// this file reached through nullable targets. §6.6's write-back paragraph is
+// explicit that it "is unreached here: no operation types" once the operand is
+// nullable, so the rule is now exercised on the NON-nullable path only (T12).
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, checked_writeback_and_signedness_6_6) {
-    const char* boxN =
-        "public class NBox2888 "
-        "  public _b: byte? := null; "
-        "  public _u: uint? := 4000000000U; "
-        "  public property BP: byte? "
-        "    get => _b; "
-        "    set => do _b := value; end; "
-        "  end; "
-        "  public property UP: uint? "
-        "    get => _u; "
-        "    set => do _u := value; end; "
-        "  end; "
-        "end NBox2888; ";
-    auto r = runAot(
-        std::string("module MN2888; ") + boxN +
-        "public class MainN2888 "
-        "  public static method Main(): int "
-        "    var acc := 0; "
-        // 200 + 100 = 300, out of byte range -> OverflowException
-        "    using var b := new NBox2888(); "
-        "    b._b := 200; "
-        "    try b.BP += 100; catch OverflowException => acc := acc + 1; end; "
-        // null byte?: no underlying op, no check (§7.11)
-        "    using var c := new NBox2888(); "
-        "    try c.BP += 100; acc := acc + 2; "
-        "    catch OverflowException => acc := acc + 0; end; "
-        // unsigned: 4000000000 + 1 must NOT be read as a signed overflow
-        "    using var d := new NBox2888(); "
-        "    d.UP += 1; "
-        "    if (d.UP ?? 0U) = 4000000001U then acc := acc + 4; end; "
-        "    return acc; "
-        "  end Main; "
-        "end MainN2888;");
-    BEZEL_EXPECT_EQ(r.ran ? r.exitCode : -999, 7);
+BEZEL_TEST(codegen_nullable_property_compound_2888, checked_writeback_nullable_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedPlain(
+        "    var y: byte? := 250; y += 10; return 0; "));
+    BEZEL_EXPECT_TRUE(rejectedPlain(
+        "    var u: uint? := 5; u -= 10; return 0; "));
 }
 
 // ===========================================================================
-// T11 — §7.4 NARROWED spelling. §7.4 narrowing deliberately does not rewrite
-// the target's `exprType`, so the compound inside a narrowed branch still sees
-// a `T?` target and must take the lifted path (and still produce the value).
-// Post-fix: 42.
+// T11 — §7.4 NARROWED spelling through a PROPERTY. Unchanged in verdict and
+// now for a reason that does not depend on issue 3686: §7.4 narrows a local, a
+// parameter and a `readonly` field — never a property, whose getter could
+// return a different value on the second call (the TOCTOU hazard §7.4's
+// readonly rule exists to exclude). So `b.NP` is a nullable operand inside the
+// guard exactly as it is outside it.
 // ===========================================================================
-BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_target_7_4) {
-    BEZEL_EXPECT_EQ(run(
+BEZEL_TEST(codegen_nullable_property_compound_2888, narrowed_property_target_still_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedBody(
         "    using var b := new Box2888(); "
         "    b._n := 40; "
-        "    if b.NP <> null then "
-        "      b.NP += 1; "
-        "      b.NP++; "
-        "    end; "
-        "    return (b.NP ?? -100); "), 42);
+        "    if b.NP <> null then b.NP += 1; end; "
+        "    return (b.NP ?? -100); "));
+    BEZEL_EXPECT_TRUE(rejectedBody(
+        "    using var b := new Box2888(); "
+        "    b._n := 40; "
+        "    if b.NP <> null then b.NP++; end; "
+        "    return (b.NP ?? -100); "));
 }
 
 // ===========================================================================

@@ -46,92 +46,86 @@ int run(const std::string& body) {
     return r.ran ? r.exitCode : -999;
 }
 
+// ⚠ THE RULE CHANGED AT v0.267 (proposal 0114, #3298). §6.6 (v0.286) makes a
+// read-modify-write compound "a **compile error** when the static type of its
+// left-hand side, OR of its right operand, is a **nullable** type — either
+// position, or both". This file's whole subject is a nullable decimal target
+// with a nullable INTEGER right operand, i.e. both positions at once, so every
+// row is now a rejection. The §5.1 integer→decimal promotion the file was
+// really pinning is kept on the surviving non-nullable path at the bottom, and
+// the decimal RUNTIME route for a §7.4-narrowed `decimal?` operand (the
+// non-compound form, which #3298 does admit) is covered by
+// `codegen_lifted_ops_486_narrowed_3298`.
+
+bool rejectedCompound(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        const auto& m = d.message;
+        if (m.find("compound assignment") == std::string::npos) continue;
+        if (m.find("nullable") == std::string::npos) continue;
+        if (m.find("7.11") == std::string::npos) continue;
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
-// --- The exact issue repro: `decimal? += int?` (both present) no longer
-// miscompiles; 1.0m + 2 = 3.0m. FAILS WITHOUT the fix (the whole `{i8; i32}`
-// struct is fed to emitDecimalArith → wrong sum → returns 0). ---
-BEZEL_TEST(codegen_2149_nullable_decimal_int, int_rhs_present) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 1.0m; var n: int? := 2; d += n; "
-        "if (d ?? -1.0m).CompareTo(3.0m) = 0 then return 1; end; return 0;"), 1);
+// Nullable decimal target + nullable integer RHS, across the integer widths
+// this file enumerates and across the present/absent combinations. §6.6
+// rejects on either position, so all sixteen shapes take one verdict.
+BEZEL_TEST(codegen_2149_nullable_decimal_int, int_rhs_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := 1.0m; var n: int? := 2; d += n; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := null; var n: int? := 2; d += n; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := 1.0m; var n: int? := null; d += n; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := null; var n: int? := null; d += n; return 0;"));
+}
+BEZEL_TEST(codegen_2149_nullable_decimal_int, long_and_uint_rhs_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := 1.0m; var n: long? := 2; d += n; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := 1.0m; var n: long? := null; d += n; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := null; var n: long? := 5; d += n; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := 1.0m; var n: uint? := 7; d += n; return 0;"));
+}
+BEZEL_TEST(codegen_2149_nullable_decimal_int, sub_mul_div_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := 12.0m; var a: int? := 4; d /= a; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := 12.0m; var b: int? := 5; d *= b; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound(
+        "var d: decimal? := 12.0m; var c: int? := 1; d -= c; return 0;"));
+}
+// The two "neighbour" rows: a nullable decimal target with a NON-nullable RHS
+// is rejected on the target's side alone — which is the half of §6.6 the
+// pre-#3298 rule did not have.
+BEZEL_TEST(codegen_2149_nullable_decimal_int, neighbour_nonnullable_rhs_rejected_3298) {
+    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 2.0m; d += 3.0m; return 0;"));
+    BEZEL_EXPECT_TRUE(rejectedCompound("var d: decimal? := 4.0m; d += 6; return 0;"));
 }
 
-// §7.11: a `null` LHS propagates null even with a present int? RHS — no op runs.
-BEZEL_TEST(codegen_2149_nullable_decimal_int, int_rhs_lhs_null) {
+// --- §5.1's integer→decimal promotion, on the surviving non-nullable path ---
+BEZEL_TEST(codegen_2149_nullable_decimal_int, nonnullable_int_rhs_promotes) {
     BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := null; var n: int? := 2; d += n; "
-        "if d = null then return 1; end; return 0;"), 1);
-}
-
-// §7.11: a `null` int? RHS propagates null — the present decimal? LHS is
-// discarded. Pre-fix the RHS tag was never read (always-present), so this
-// silently kept the LHS instead of yielding null.
-BEZEL_TEST(codegen_2149_nullable_decimal_int, int_rhs_rhs_null) {
+        "var d: decimal := 1.0m; var n: int := 2; d += n; "
+        "if d.CompareTo(3.0m) = 0 then return 1; end; return 0;"), 1);
     BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 1.0m; var n: int? := null; d += n; "
-        "if d = null then return 1; end; return 0;"), 1);
-}
-
-// §7.11: both null → null.
-BEZEL_TEST(codegen_2149_nullable_decimal_int, int_rhs_both_null) {
+        "var d: decimal := 1.0m; var n: long := 2; d += n; "
+        "if d.CompareTo(3.0m) = 0 then return 1; end; return 0;"), 1);
     BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := null; var n: int? := null; d += n; "
-        "if d = null then return 1; end; return 0;"), 1);
-}
-
-// §6.2 / §5.1: a `long?` RHS §5.1-widens (long→decimal) and lifts — 1.0m + 2 =
-// 3.0m.
-BEZEL_TEST(codegen_2149_nullable_decimal_int, long_rhs_present) {
+        "var d: decimal := 1.0m; var n: uint := 7; d += n; "
+        "if d.CompareTo(8.0m) = 0 then return 1; end; return 0;"), 1);
     BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 1.0m; var n: long? := 2; d += n; "
-        "if (d ?? -1.0m).CompareTo(3.0m) = 0 then return 1; end; return 0;"), 1);
-}
-
-// §7.11: `long?` RHS null propagation.
-BEZEL_TEST(codegen_2149_nullable_decimal_int, long_rhs_rhs_null) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 1.0m; var n: long? := null; d += n; "
-        "if d = null then return 1; end; return 0;"), 1);
-}
-
-// §7.11: `long?` RHS with null LHS stays null.
-BEZEL_TEST(codegen_2149_nullable_decimal_int, long_rhs_lhs_null) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := null; var n: long? := 5; d += n; "
-        "if d = null then return 1; end; return 0;"), 1);
-}
-
-// §5.1: an UNSIGNED nullable-int RHS zero-interprets int→decimal — 1.0m + 7 =
-// 8.0m (exercises coerceNumericToType's srcUnsigned int→decimal path).
-BEZEL_TEST(codegen_2149_nullable_decimal_int, uint_rhs_present) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 1.0m; var n: uint? := 7; d += n; "
-        "if (d ?? -1.0m).CompareTo(8.0m) = 0 then return 1; end; return 0;"), 1);
-}
-
-// §6.4: the other operators lift over the mixed nullable-int RHS too —
-// 12/4 = 3, *5 = 15, -1 = 14, all with `int?` operands.
-BEZEL_TEST(codegen_2149_nullable_decimal_int, int_rhs_sub_mul_div) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 12.0m; var a: int? := 4; var b: int? := 5; "
-        "var c: int? := 1; d /= a; d *= b; d -= c; "
-        "if (d ?? -1.0m).CompareTo(14.0m) = 0 then return 1; end; return 0;"), 1);
-}
-
-// Neighbor control (#2141): `decimal? += decimal` (bare non-nullable) stays the
-// non-nullable-RHS lift — the widened rNullable test must NOT reclassify the bare
-// %bz.decimal RHS (== decimalStructType()) as nullable. 2.0m + 3.0m = 5.0m.
-BEZEL_TEST(codegen_2149_nullable_decimal_int, neighbor_bare_decimal_rhs) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 2.0m; d += 3.0m; "
-        "if (d ?? -1.0m).CompareTo(5.0m) = 0 then return 1; end; return 0;"), 1);
-}
-
-// Neighbor control (#2141): `decimal? += int` (plain non-nullable int) stays
-// green — 4.0m + 6 = 10.0m.
-BEZEL_TEST(codegen_2149_nullable_decimal_int, neighbor_plain_int_rhs) {
-    BEZEL_EXPECT_EQ(run(
-        "var d: decimal? := 4.0m; d += 6; "
-        "if (d ?? -1.0m).CompareTo(10.0m) = 0 then return 1; end; return 0;"), 1);
+        "var d: decimal := 12.0m; var a: int := 4; var b: int := 5; var c: int := 1; "
+        "d /= a; d *= b; d -= c; "
+        "if d.CompareTo(14.0m) = 0 then return 1; end; return 0;"), 1);
 }

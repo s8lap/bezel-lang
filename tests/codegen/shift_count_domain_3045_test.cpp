@@ -98,6 +98,14 @@ bool accepts(const std::string& body) {
     return r.ran && !r.diagnostics.hasErrors();
 }
 
+
+bool runs(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    return r.ran;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -418,6 +426,14 @@ BEZEL_TEST(shift_count_domain_3045, spec_6_6_example_short_shl_2) {
 // ===========================================================================
 
 BEZEL_TEST(shift_count_domain_3045, nullable_lifted_uses_underlying_domain) {
+    // §7.11 / §7.4 (v0.286, #3298): `a` is a local initialised with a non-null
+    // literal, so §7.4 narrows it and §7.11 reads it at the non-nullable `byte`
+    // — "the ordinary operator applies to it unchanged". The COUNT-DOMAIN rule
+    // this row exists for is therefore unchanged and still asserted with its
+    // original values: §6.5's domain is the LEFT operand's own width, so `<< 8`
+    // on a `byte` faults and `<< 7` gives 128. (A draft of #3298 flipped all
+    // three arms to "expect rejection", which deleted #3045's coverage of the
+    // domain and was wrong on the spec besides.)
     BEZEL_EXPECT_EQ(throwsOverflow(
         "var a: byte? := 1; var k: int := 8; var c: byte? := a << k;"), 1);
     BEZEL_EXPECT_EQ(run(
@@ -430,10 +446,17 @@ BEZEL_TEST(shift_count_domain_3045, nullable_lifted_uses_underlying_domain) {
 // §7.11: "the runtime checks each operator already performs … apply only when
 // [both operands are present]". A null operand yields null and never faults,
 // however out-of-domain the count is.
+//
+// §7.11 (v0.286, #3298) — REJECTION, and the row keeps its name's point in a
+// stronger form: the question "does an absent operand fault?" no longer
+// arises, because an UN-narrowed operand (`:= null`, so §7.4 narrows nothing)
+// is diagnosed at COMPILE time. §7.11 says exactly that — "This section
+// introduces no fault of its own … an absent operand is diagnosed at compile
+// time". The narrowed sibling above keeps the runtime-domain coverage.
 BEZEL_TEST(shift_count_domain_3045, nullable_null_operand_never_faults) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_FALSE(runs(
         "var a: byte? := null; var k: int := 40; var c: byte? := a << k; "
-        "return (if c = null then 7 else 0);"), 7);
+        "return (if c = null then 7 else 0);"));
 }
 
 // ===========================================================================

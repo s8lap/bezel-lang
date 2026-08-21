@@ -64,6 +64,14 @@ int runApplyNullableDouble(const std::string& mainBody) {
         " end Main; end C;");
 }
 
+
+bool runs(const std::string& body) {
+    auto r = runAot(
+        std::string("module M; class C public static method Main(): int ") +
+        body + " end Main; end C;");
+    return r.ran;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------

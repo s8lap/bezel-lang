@@ -22,4 +22,3 @@ class C
 end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: compound assignment `+=` has no valid result: no built-in operator `+` is defined between `decimal?` and record type `P?` (§6.2's promotion covers primitive numeric operands only), and user-defined operators do not lift over a nullable operand (§7.11 — deferred)
-// CHECK-SAME: (§6.6)

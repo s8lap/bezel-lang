@@ -10,5 +10,4 @@
 
 module M; class C public static method Main(): int var i: int := 5; var n: int? := 3; i += n; return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: compound assignment `+=` has a nullable right-hand operand (`int?`) with a non-nullable target (`int`): the result of `int + int?` is nullable where defined (§7.11) and cannot store back into the non-nullable target — narrow the right-hand operand first (`?? <fallback>`, `!`, or a §7.4 check)
-// CHECK-SAME: (§6.6)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: compound assignment `+=` is not defined when the right-hand operand is nullable (`int?`) — the arithmetic, bitwise, or shift operators do not lift over a nullable value type (§7.11, v0.267); narrow first (§7.4 check, `?? <fallback>` (§7.7), or `!` (§7.8)) and use the non-nullable compound form (e.g. `b := (b ?? 0) + 1;`) (§6.6)

@@ -9,4 +9,3 @@
 module M; class C public static method Main(): int var b: bool? := true; var c: bool? := false; b += c; return 0; end Main; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: compound assignment `+=` is not valid on a `bool?` target — the arithmetic operators are not defined on `bool` (§3.5); boolean combinations use `and`/`or`/`not` (§17.2)
-// CHECK-SAME: (§6.6)
