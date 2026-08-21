@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.273. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.274. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
