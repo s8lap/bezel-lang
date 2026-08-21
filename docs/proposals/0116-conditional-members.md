@@ -40,7 +40,12 @@ Draft 1 recommended option (b) — register all four surviving rows as a standin
 | **C3** `Result<T, E>`'s four combinators | Shipped, ~455 lines | **Route to its own ruling** — proposal 0075 §3.3 Option B makes it an ordinary constrained extension |
 | **C1** `Array<T>.Sort()`/`Sorted()` | Shipped, hardened, five issues | **Register it** — the one true residue |
 
-So the register lands with **one row, carrying a recorded expiry**, not four as a standing privilege. That is a materially smaller normative claim than Draft 1 made, and it is the difference between *"the standard library may do what users cannot"* and *"one member does, for a reason that is written down and will lapse."*
+⚠ **Corrected before graduation.** An earlier wording of this paragraph said the register lands with *"one row"*. That was true only of the version in which C2 was **deleted** and C3's ruling landed simultaneously. §5.3.1 reverses the first, and D1 item 3 routes the second, so **both remain conditional members until their own forums decide them — and a member that remains is a member that must be anchored, which is the entire purpose of the register.** The true shape is:
+
+- **Retired from the census: two.** C4 is deleted; C5 is respelled.
+- **Registered: three.** C1, C2, C3.
+
+**What makes this different from Draft 1 is not the count — it is that no row is a standing privilege.** Draft 1 would have registered four members with a growth discipline and nothing else. Every row here carries its own disposition off the register: C1 an **expiry** (re-examined when proposal 0005 self-hosts the collections), C2 a **route** (the v0.283 subtraction review, with its status as unimplemented on the row's face — D8's discipline), C3 a **route** (its own ruling, per proposal 0075 §3.3 Option B). The register is a holding pen with three occupants and three exit doors, not a grant of four permanent privileges. If all three routes complete, it empties.
 
 **What C1's residue actually is.** Its predicate `T: IComparable<T>` is already a writable §14.2 constraint; it is blocked only by §26.5 rule 1's name rule. Renaming does not rescue it, because `Array<T>` is a declaration-less builtin (`src/common/BuiltinRegistry.cpp:679`) and `src/runtime/` is C — the sort stays a compiler intrinsic under any spelling. **C1 is an artifact of the standard library not being self-hosted, not a language design commitment**, and its register row says so and points at proposal [0005](0005-selfhost-stdlib-collections.md).
 
@@ -200,7 +205,7 @@ Five members. Four families. Eighty-nine revisions between the first (v0.186) an
 
 The practice is small enough to enumerate on one screen and old enough that no revision has enumerated it. Draft 1 read that as the argument for a **register** over either a general feature or a removal.
 
-**Draft 2 reads it differently, because the costing changed two of the five facts above.** An enumerable practice with no enumeration does grow silently — but three of these five rows are not a *practice* at all: C4 is a member the compiler rejects, C2 is a member the compiler never had, and C5 needs no privilege by this proposal's own D9. What the census actually shows is **one shipped conditional member (C1), one shipped-and-anchored one (C3), and three documents-only entries**. Registering all four would have written three fictions into a normative table and given them a growth discipline. The register is still right for what is left; what is left is one row.
+**Draft 2 reads it differently, because the costing changed two of the five facts above.** An enumerable practice with no enumeration does grow silently — but three of these five rows are not a *practice* at all: C4 is a member the compiler rejects, C2 is a member the compiler never had, and C5 needs no privilege by this proposal's own D9. What the census actually shows is **one shipped conditional member (C1), one shipped-and-anchored one (C3), and three documents-only entries**. Registering all four would have written two fictions into a normative table and given them a growth discipline — C4, which the compiler rejects, and C5, which needs no privilege at all. The register is still right for what is left; what is left is **three rows, each with a route or an expiry off it** (this proposal's §0).
 
 ---
 
@@ -483,8 +488,8 @@ That does not meet R1's bar as worded — R1 asks for evidence that the *predica
 
 | | A (user feature) | B (register all four) | **C′ (retire four, register one)** | D (nothing) |
 |---|---|---|---|---|
-| Census rows resolved | 1 of 5 | 5 of 5, by registering 3 fictions | **5 of 5, by deleting 2 and routing 1** | 0 |
-| Normative claim made | a new admissibility form | a standing four-row privilege | **one row, with a recorded expiry** | none |
+| Census rows resolved | 1 of 5 | 5 of 5, by registering 2 fictions | **5 of 5: one deleted, one respelled, three registered with routes** | 0 |
+| Normative claim made | a new admissibility form | a standing four-row privilege | **three rows, none standing: one expiry, two routes** | none |
 | Contradicts a recorded decision | v0.56, v0.97 (weakly) | no | **no** — v0.275 governs C1, which C′ keeps | no |
 | New grammar / tokens | new semantics for an existing form | none | **none here**; C3's routed ruling costs one contextual keyword | none |
 | Undefined interactions opened | four | none | **none** | four already open |
@@ -785,7 +790,7 @@ stdlib §4.14 records the gap in this proposal's own vocabulary (`Bezel_Standard
 
 ### Questions
 
-⚠ **Draft 2 supersedes Q1, Q2 and Q4.** **Q1** — D1's option — is now answered by §5.3's costing rather than put to the owner as an open choice: retire four, register one. **Q2** (D3's branch) was landed at v0.276. **Q4** (should `DangerousPointer()` be a subtraction-review candidate) is superseded by §5.3.1's recommendation to delete it outright, which the owner may still prefer to route to v0.283 instead. **Q3 and Q5 stand.**
+⚠ **Draft 2 supersedes Q1, Q2 and Q4.** **Q1** — D1's option — is now answered by §5.3's costing rather than put to the owner as an open choice: retire four, register one. **Q2** (D3's branch) was landed at v0.276. **Q4** (should `DangerousPointer()` be a subtraction-review candidate) is **answered yes** by §5.3.1 — an intermediate wording of Draft 2 recommended deleting it outright and was reversed on the evidence; Draft 1's R3 stands. **Q3 and Q5 stand.**
 
 **Draft 2's questions:**
 
