@@ -16153,6 +16153,43 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
         disposeStack_.front().push_back(d);
         return;
     }
+    // fix #2823 / §32.5 / §32.6 / §28.3 / §28.9 (v0.273): the FFI-buffer trio
+    // CString / WString / RawBytes has NEITHER a user TypeSymbol NOR a builtin
+    // class type — it is a malloc'd byte buffer (or, for RawBytes, a { ptr, len
+    // } struct whose `ptr` owns a buffer; stdlib §10.3) — so `isClassOrInterfaceRef`
+    // below rejects it and the §28.3 auto-drop / unwind-only registration was
+    // SKIPPED ENTIRELY. The §28.3 "auto-drop" diagnostic the compiler prints at
+    // this very site ("owned parameter `c` is implicitly disposed at the end of
+    // the method") promised a release that never ran: an `owned c: CString` (or
+    // WString / RawBytes) parameter that is never discharged on the normal
+    // path leaked its malloc'd buffer at every call site; an explicit
+    // `c.Dispose()` followed by a throw also leaked (the dispose ran, the
+    // unwind edge had no entry to skip-on-unwind). The using-var sibling
+    // (#977 / #985, Setup.cpp ~14513) has the corresponding arm — a
+    // `Disposal{slot, nullptr}` with `ffiBuffer = true` / `rawBytes = isRaw`,
+    // already null-guarded + null-after-free by the `ffiBuffer` arm in
+    // `emitDisposals` (Disposal.cpp ~5285, #2733) — and `emitDisposals`'s
+    // `ffiBuffer` arm is exactly the existing sink we register for, so the fix
+    // is symmetric, not new infrastructure: one more sibling branch that
+    // detects the family through `isFfiBufferTypeRef` (#2809 / #2757's single
+    // home for {CString, WString, RawBytes}, reading `builtinTypeName` so it
+    // answers correctly for BOTH the declaration-less annotation TypeRef and
+    // the `builtinClassSym` factory-result TypeRef — same shape the `using var`
+    // arm and #2825/#2823's Pointer fix ride on), registers the same Disposal
+    // shape, and mirrors the #1957 / #3033 releaseOnUnwindOnly discipline
+    // exactly: auto-drop releases on both exits (the sole release); a
+    // discharged owned param (moved/returned/explicitly Dispose()'d on the
+    // normal path) releases only on the unwind exit, so the normal-path
+    // discharge site is the sole release on that edge. // per §28.3, §32.5,
+    // §32.6; stdlib §10.1 / §10.2 / §10.3, v0.273.
+    if (isFfiBufferTypeRef(rt)) {
+        Disposal d{slot, nullptr};
+        d.ffiBuffer = true;
+        d.rawBytes = builtinTypeName(rt) == "RawBytes";
+        d.releaseOnUnwindOnly = !ps->autoDropAtScopeEnd;
+        disposeStack_.front().push_back(d);
+        return;
+    }
     if (!isClassOrInterfaceRef(rt) && !isClassOrInterfaceRef(resolveTypeParamRef(rt)))
         return;
     Disposal d{slot, nullptr};
@@ -22160,12 +22197,13 @@ void Emitter::collectValueLikeChoiceCallResultReleaseEligible(
 
 // #1003 / stdlib §5 / §28: is `ld` a plain `var` binding a FRESHLY-MATERIALIZED
 // borrowing `Array<T>` from a LINQ/copy materializer call (`ToArray` / `Sorted`
-// / `Reversed`)? These are the exact shapes codegen lowers to a fresh
-// `bz_array_t` whose single reference the local solely owns. Per §28 a borrowing
-// `Array<T>` is trivial-dispose — its backing must be reclaimed at scope end but
-// the sema/ownership pass imposes no disposal obligation (the result is "Borrowed"
-// — name-head "Array", not "OwningArray", and the materializer has no `owned`-
-// returning user MethodDecl), so codegen alone must emit the implicit reclaim.
+// / `Reversed`) or a §28.3 range-slice INDEX (`arr[r]` per #2753)? These are
+// the exact shapes codegen lowers to a fresh `bz_array_t` whose single
+// reference the local solely owns. Per §28 a borrowing `Array<T>` is trivial-
+// dispose — its backing must be reclaimed at scope end but the sema/ownership
+// pass imposes no disposal obligation (the result is "Borrowed" — name-head
+// "Array", not "OwningArray", and the materializer has no `owned`-returning
+// user MethodDecl), so codegen alone must emit the implicit reclaim.
 //   Excluded by construction (so the producer/consumer balance stays inside
 //   codegen, never a UAF on a borrowed/aliased value):
 //     * a `using var` (already disposed via registerUsingDisposal's collection
@@ -22176,7 +22214,9 @@ void Emitter::collectValueLikeChoiceCallResultReleaseEligible(
 //     * a non-materializer call (a method returning a BORROWED field-array) —
 //       freeing it would be a UAF, so only the whitelisted fresh-producers count;
 //     * any result type other than the borrowing `Array<T>` (Owned*, Set/
-//       Dictionary/LinkedList are dict-/llist-backed and freed differently).
+//       Dictionary/LinkedList are dict-/llist-backed and freed differently);
+//     * a single-element index `arr[i]` (§28.3 indexer row, Borrowed — NOT a
+//       slice; common::isBuiltinArrayRangeSliceIndex rejects this shape).
 bool Emitter::isFreshBorrowingArrayMaterializerLocal(
         const ast::LocalDecl* ld) const {
     if (!ld || ld->isUsing || !ld->initializer) return false;
@@ -22189,28 +22229,46 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
     if (builtinTypeName(rt) != "Array") return false;
-    // The initializer must be a fresh-array MATERIALIZER call: `recv.ToArray()`,
-    // `recv.Sorted(...)`, or `recv.Reversed()` — a CallExpr whose callee is a
-    // member access naming one of those methods. (These are stdlib builtins with
-    // no resolved user MethodSymbol; recognized structurally by member name.)
-    auto* call = dynamic_cast<const ast::CallExpr*>(ld->initializer.get());
-    if (!call || !call->callee) return false;
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
-    if (!ma) return false;
-    std::string_view mm = ma->member;
-    // #1027 / stdlib §9.6: `string.Split(...)` returns a fresh `owned Array<string>`
-    // whose substrings are created at rc=1 (the array is their sole owner). A plain
-    // `var parts := s.Split(...)` was neither flagged for the §28.3 affine auto-drop
-    // nor reclaimed here, so the backing + every substring leaked. It is recognized
-    // alongside the ToArray/Sorted/Reversed materializers: the scope-end reclaim
-    // (bz_array_free with the Array<string> string-release per-element disposer,
-    // selected above by element type) frees the backing AND releases each substring
-    // exactly once — the same disposal the `using var` form already performs, so
-    // plain `var` and `using var` reach parity. No double-free: the substrings are
-    // freshly created (no source alias retains them, unlike ToArray's +1 co-owned
-    // borrow), so the single release frees each exactly once.
-    return mm == "ToArray" || mm == "Sorted" || mm == "Reversed" ||
-           mm == "Split";
+    // Branch A: a fresh-array MATERIALIZER call — `recv.ToArray()`,
+    // `recv.Sorted(...)`, or `recv.Reversed()` — a CallExpr whose callee is
+    // a member access naming one of those methods. (These are stdlib builtins
+    // with no resolved user MethodSymbol; recognized structurally by member name.)
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(ld->initializer.get())) {
+        if (!call->callee) return false;
+        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+        if (!ma) return false;
+        std::string_view mm = ma->member;
+        // #1027 / stdlib §9.6: `string.Split(...)` returns a fresh `owned Array<string>`
+        // whose substrings are created at rc=1 (the array is their sole owner). A plain
+        // `var parts := s.Split(...)` was neither flagged for the §28.3 affine auto-drop
+        // nor reclaimed here, so the backing + every substring leaked. It is recognized
+        // alongside the ToArray/Sorted/Reversed materializers: the scope-end reclaim
+        // (bz_array_free with the Array<string> string-release per-element disposer,
+        // selected above by element type) frees the backing AND releases each substring
+        // exactly once — the same disposal the `using var` form already performs, so
+        // plain `var` and `using var` reach parity. No double-free: the substrings are
+        // freshly created (no source alias retains them, unlike ToArray's +1 co-owned
+        // borrow), so the single release frees each exactly once.
+        return mm == "ToArray" || mm == "Sorted" || mm == "Reversed" ||
+               mm == "Split";
+    }
+    // Branch B (#2753): a §28.3 RANGE SLICE on `Array<T>` — `arr[r]` (the
+    // compiler-recognized `Slice(r: Range<int>): owned Array<T>` form, stdlib
+    // §4.4). The slice is a FRESH `Array<T>` the local solely owns, distinct
+    // from the indexer row above (single-element `arr[i]`, Borrowed). The same
+    // predicate the sema `producerState` and the §21.1 `const` rejection consult
+    // (common::isBuiltinArrayRangeSliceIndex) gives the same answer here — a
+    // single fact for the three visible channels — so a future predicate change
+    // cannot skew the disposal path. The shape is gated as narrowly as the
+    // sema classification: declaration-less `Array` receiver head, range-typed
+    // (or RangeExpr) index, and sema setting the index TypeRef to the receiver
+    // TypeRef by identity. The reclaim is `bz_array_free` with the per-element
+    // disposer selected by element type (null for class/value, string-release
+    // for `Array<string>`) — the same path ToArray/Sorted/Reversed/Split already
+    // use, so the three end up at parity. // per §28.3, §15.6, #2753
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(ld->initializer.get()))
+        return common::isBuiltinArrayRangeSliceIndex(*ix, ctx_);
+    return false;
 }
 
 

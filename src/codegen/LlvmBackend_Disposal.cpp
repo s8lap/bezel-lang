@@ -157,6 +157,58 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         stringReleaseEligibleFn_ = fn;
         retainAssignedStringParams(dd->body, /*params=*/{});
         //
+        // fix #2887 / §28.4 / §27.5 / §28.3 / §28.9 (v0.240): the `var` CLOSURE-
+        // LOCAL refcount analysis and the captured-cell free analysis must
+        // describe this disposer fn too. EVERY consumer of the three closure
+        // sets gates on `currentFn_` matching the analysed function —
+        // `lowerLocalDecl` registers the scope-end `bz_closure_release` of a
+        // non-escaping `var` closure local (and its `boxedCellFree` for any
+        // captured local's cell, #429) ONLY when `currentFn_ ==
+        // closureReleaseEligibleFn_` / `currentFn_ == cellFreeEligibleFn_`.
+        // This function set `currentFn_` to the freshly-created disposer
+        // function but never armed the two tokens, so the gate was false for
+        // every closure local and every captured cell in any destructor body
+        // — both allocations (closure cell + env block on the local path;
+        // capture cell on the captured path) leaked, per local, per disposal
+        // (measured 48 B / 20 allocations for 20 disposals of one closure
+        // local). The #2817 / #422 / #429 template transfers: classify the
+        // body's own `var` closure locals, classify its captured cells (in the
+        // documented dependency order — `collectCellFreeEligible` consumes
+        // `closureReleaseEligible_`'s result, so it MUST run AFTER it), and
+        // pin all three fn tokens to `fn`. The pin unlocks the scope-end
+        // release registrations the consumers emit during `lowerScopedBlock`
+        // below, which run BEFORE the post-body field-disposal cascade
+        // (the only ordering §28.4 step 1 ↔ step 2 constrains). The
+        // `unwindUnsafeCellFree_` set is the #2334 escape gate; the
+        // `boxCaptureLocals_` / `singleCaptureLocals_` / `assignedCaptureVars_`
+        // / `definitelyEscapingLambdas_` clears are the #694 / #2706 / #2960
+        // invariants the analysers' preconditions assume (a stale entry from
+        // a previous body would otherwise mis-admit a local whose
+        // lifetime-escape verdict was already computed for THAT body). The
+        // `boxReleaseEligible_` / `boxReassignedLocals_` clears are the
+        // parallel invariants for the #672 / #8.6 / #28.9 Object-typed value
+        // box release path. Mirrors `buildSpecializedMethodFn` (Setup.cpp
+        // ~8425-8482) and `emitAsyncLambda` (Async.cpp ~1268-1309) verbatim
+        // modulo the `*ci.stmts` → `dd->body` substitution.
+        closureReleaseEligible_.clear();
+        closureReleaseEligibleFn_ = fn;
+        boxReleaseEligible_.clear();
+        boxReassignedLocals_.clear();
+        boxCaptureLocals_.clear();
+        singleCaptureLocals_.clear();
+        assignedCaptureVars_.clear();
+        definitelyEscapingLambdas_.clear();
+        boxCaptureLocalsFn_ = fn;
+        cellFreeEligible_.clear();
+        unwindUnsafeCellFree_.clear();
+        cellFreeEligibleFn_ = fn;
+        collectClosureReleaseEligible(dd->body);
+        collectBoxReleaseEligible(dd->body);
+        collectBoxCaptureLocals(dd->body);
+        collectDefinitelyEscapingLambdas(dd->body);
+        // Must run AFTER collectClosureReleaseEligible (uses its result).
+        collectCellFreeEligible(dd->body);
+        //
         // fix #1468 / §28.3 "Exception-path discharge" / §28.4: capture bz_exc as
         // it stands at disposer entry. When this destructor runs as an owned
         // local/field is disposed DURING stack unwinding, bz_exc already holds the
@@ -5282,7 +5334,26 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // is released via bz_rawbytes_free, which frees the buffer THEN the
         // struct, exactly once. The disposal contract (stdlib §10.x destructor)
         // says "releases the underlying buffer when this instance allocated it".
+        //
+        // fix #2823 / §28.3 / §32.5 (v0.273): the same arm also serves an
+        // `owned c: CString` / `owned w: WString` / `owned b: RawBytes`
+        // PARAMETER registered by `registerUnwindOwnedParam`'s new sibling
+        // branch (#2823, Setup.cpp ~16156). The `releaseOnUnwindOnly && !
+        // dropUndischarged` skip gate mirrors the collection / dict /
+        // channelSender / channel / shared / mutex / lock / semaphore /
+        // semaphoreToken / tcs / subscription arms (#3036 / #2869): a discharged
+        // owned parameter (explicit Dispose(), returned, or moved out on the
+        // normal path) registers `releaseOnUnwindOnly = true`, so the disposal
+        // fires only on the unwind edge — the normal-path discharge site is
+        // the sole release on its edge; an auto-dropped owner leaves the flag
+        // false and frees on both exits. Without this gate, a disposed-then-
+        // thrown parameter would dispose AGAIN here on its normal-path scope-
+        // end (or on the unwind edge if the throw precedes the explicit
+        // Dispose), and free() / bz_rawbytes_free on a freed pointer is a
+        // genuine double-free (NOT idempotent — malloc'd buffers have no
+        // released-flag machinery). // per §28.3, §32.5; stdlib §10.1–§10.3.
         if (it->ffiBuffer) {
+            if (it->releaseOnUnwindOnly && !dropUndischarged) continue;   // fix #2823 / #3036 / #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* fbuf = builder_.CreateLoad(ptrTy(), addr, "ffibuf.load");

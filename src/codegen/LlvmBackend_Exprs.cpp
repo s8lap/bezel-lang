@@ -3634,6 +3634,40 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (isCStr || isWStr || isRaw) {
                 llvm::Value* buf = lowerExpr(*ma->target);
                 if (!buf) return nullptr;
+                // fix #2828 / §28.3 (v0.240) *Unbound owned temporaries*:
+                // the receiver is borrowed across the member read (§28.3 names
+                // a member access as one of the listed borrowing uses), so the
+                // §32.5/§32.6 owned buffer the factory minted must be reclaimed
+                // "at the end of the full expression in which it is produced,
+                // after every use of it within that expression has completed".
+                // The use here is the read itself; the disposal runs at the K8
+                // boundary via flushFfiExprTemps. Pre-fix the slot was simply
+                // dropped, leaking the malloc'd buffer (LSan: 6 B per `CString`
+                // iteration, 12 B per `WString` iteration, plus the {ptr,len}
+                // struct and inner buffer for `RawBytes`).
+                //
+                // `isFfiBufferFactoryCall` admits ONLY a directly-written
+                // `CString.From/FromBytes` / `WString.From` / `RawBytes.From`
+                // — by construction bound to no name, exactly §28.3's
+                // *unbound* case. A `using var`-bound receiver is a plain
+                // `IdentifierExpr` and never matches, so the `using var`'s own
+                // discharge is untouched (row G of the regression test pins
+                // this with runAotChecked).
+                //
+                // The RawBytes arm sets `isRawBytes=true`, so the slot reaches
+                // the RawBytes free (the {ptr,len} struct, not the inner
+                // buffer alone). Deferred to a follow-up wave:
+                // `LlvmBackend_Calls.cpp` sites for `.ToBytes` and `.CopyTo`
+                // (the method arms of the same family) — file-disjoint with
+                // this one.
+                {
+                    bool recvIsRawBytes = false;
+                    if (isFfiBufferFactoryCall(*ma->target, recvIsRawBytes)) {
+                        auto* tmpSlot = entryAllocaNullPtr();
+                        builder_.CreateStore(buf, tmpSlot);
+                        registerFfiExprTemp(tmpSlot, recvIsRawBytes);
+                    }
+                }
                 llvm::Value* len;
                 if (isRaw) {
                     // §10.3: Length is the explicit `len` field of the struct.
@@ -3688,6 +3722,26 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (isFfiBufferTypeRef(tt)) {
                 llvm::Value* buf = lowerExpr(*ma->target);
                 if (!buf) return nullptr;
+                // fix #2828 / §28.3 (v0.240) *Unbound owned temporaries*:
+                // mirror of the `.Length` arm directly above. `CString.From(s)`
+                // mints an owned §32.5/§32.6 buffer that the member read
+                // borrows — the buffer is owed a §28.3 reclaim at the K8
+                // boundary of the full expression. Pre-fix the slot was
+                // dropped, leaking the malloc'd buffer (LSan: 6 B per
+                // `CString.Pointer` iteration, 12 B per `WString.Pointer`,
+                // plus the {ptr,len} struct for `RawBytes.Pointer`).
+                // `isFfiBufferFactoryCall` admits only a directly-written
+                // factory call — by construction bound to no name — so the
+                // `using var` spelling (a plain `IdentifierExpr`) is
+                // untouched.
+                {
+                    bool recvIsRawBytes = false;
+                    if (isFfiBufferFactoryCall(*ma->target, recvIsRawBytes)) {
+                        auto* tmpSlot = entryAllocaNullPtr();
+                        builder_.CreateStore(buf, tmpSlot);
+                        registerFfiExprTemp(tmpSlot, recvIsRawBytes);
+                    }
+                }
                 llvm::Value* p;
                 if (builtinTypeName(tt) == "RawBytes") {
                     // §10.3: the value is a { ptr, len } struct — read field 0.
