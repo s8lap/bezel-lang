@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.268. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.269. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -429,7 +429,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 
 **`owned` is never admissible** on a record field (§9.7), on a local (use `using var`), on a generic type argument (`Array<owned T>` does not exist — use `OwningArray<T>`), on an inline-array element type, or doubled with an owning-inline-array slot marker. It is **redundant but admitted** on a mint-announcing return type (`GetEnumerator(): owned IEnumerator<T>`) and on a return of a move-only value type (an owning choice, §35.3).
 
-**`move` — the use-site transfer marker** (§22.3, §28.8.1). Three operands only: `move x` (a named local or `owned` parameter), `move obj.f` (an `owned` field), `move coll[i]` (an owning slot).
+**`move` — the use-site transfer marker** (§22.3, §28.8.1). Four operand shapes: `move x` (a named local or `owned` parameter), `move obj.f` (an `owned` field), `move coll[i]` (an owning slot), and `move obj.f!` over a **nullable** owned field — §28.8.1's detach pattern, `move _slot!` then `_slot := null`.
 
 *Required* — omitting it is a compile error ("this call consumes `x`; write `M(move x)`") — when a **named owned binding** feeds an `owned` argument (`M(move x)`), a local binding (`var y := move x;`, `using var y := move x;`), an assignment (`y := move x;`), an if-expression branch or expression-arm result (`(if c then move a else move b)`), or an owning-match scrutinee (`case move outcome of …`).
 

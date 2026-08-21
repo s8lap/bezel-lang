@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.268 — August 2026**
+**Version 0.269 — August 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -320,7 +320,7 @@ end Program;
 //   var m: Money := Payroll.Net(1, 1);           — type ascription
 //   using var m2 := new Money(500);              — `new`
 //   if pay is Money then … end;                  — type test
-//   var box := new OwningArray<Money>();         — generic type argument
+//   using var box := new OwningArray<Money>();   — generic type argument
 ```
 
 The build compiles `Base` first, then `Lib1` and `Lib2` against `Base`'s artifact, and finally compiles `App` presenting the artifacts of `Lib1`, `Lib2`, **and `Base`** — the closure of rule 1 — even though `app.bzl` never writes `import Base;`; omitting `Base`'s artifact is the rule-1 build error naming `Base` and the artifacts that reference it. `Money` arrives in `App`'s compilation three ways — embedded in `Lib1`'s interface, embedded in `Lib2`'s, and directly from `Base`'s artifact — and all three descriptions are `(Base, Money, arity 0)`: **one type** (rule 3); `pay` flows from `Lib1`'s surface into `Lib2`'s parameter with no conversion. Had `Lib1` been compiled against an older, different `Base.Money`, the descriptions would disagree and the build fails naming the stale artifact — and supplying both an old and a new artifact for `Base` is two distinct artifacts declaring one module name, the [§2.8.1](#sec-module-identity-and-closure) rule 3 error. (`Money` is trivial-dispose — no destructor, no owned fields ([§28.9](#sec-runtime-managed-types)) — so the disposal the `using var` inserts runs no user code here; the legality of the binding is the point. A `Base` type with an owned field behaves identically under rule 2 — disposal of the transitive value is still use, not naming.)
@@ -777,8 +777,8 @@ Casting a nullable to its non-nullable form requires the value to be non-null at
 Enums require explicit casts to and from their underlying integer type:
 
 ```bezel
-var n: int := int(p);                 // enum to int
 var p: Priority := Priority(1);       // int to enum
+var n: int := int(p);                 // enum to int
 ```
 
 <a id="sec-out-of-range-integer-to-enum-casts"></a>
@@ -1091,6 +1091,7 @@ The result type is nullable (or `()` for procedure-typed values). **Evaluation**
 
 ```bezel
 var displayName: string := user?.Name ?? "Anonymous";
+// with `private owned _cache: Cache?;` — a fresh `new` requires an `owned` field (§28.6)
 _cache ??= new Cache();             // assign only if currently null
 ```
 
@@ -1304,7 +1305,7 @@ record Point(X: int, Y: int);
 <a id="sec-body-records"></a>
 ### 9.2 Body records
 
-A body record declares members in a block. The body may contain methods, expression-bodied properties, additional constructors, and operator overloads:
+A body record declares members in a block. The body may contain auto-properties, methods, expression-bodied properties, constructors, and operator overloads:
 
 ```bezel
 record Rectangle
@@ -1715,6 +1716,8 @@ enum Priority
     Medium => "Medium",
     High => "High");
 
+  // FrozenArray<T> is stdlib §4.19 — not among §2.3's always-available names;
+  //   naming it requires `import System.Collections.Generic;` (§2.8.3 rule 2).
   public static owned readonly All: FrozenArray<Priority> :=
       FrozenArray<Priority>.From([Low, Medium, High]);
 
@@ -2219,9 +2222,9 @@ interface IEnumerable<out T>
   method GetEnumerator(): owned IEnumerator<T>;
 end IEnumerable;
 
-interface IComparer<in T>
-  method Compare(a: T, b: T): int;
-end IComparer;
+interface IComparer<in T>            // illustrative: the standard library declares no
+  method Compare(a: T, b: T): int;   //   contravariant interface (`IEqualityComparer<T>`
+end IComparer;                       //   is invariant)
 ```
 
 `out` requires T to appear only in output positions (return types, read-only property types, `out` parameters). `in` requires T to appear only in input positions. The compiler enforces position constraints.
@@ -2241,7 +2244,7 @@ A generic interface may extend a generic base whose variance is different from i
 
 ```bezel
 public interface IReadOnlyCollection<out T>: IEnumerable<T>
-  readonly property Count: int;
+  pure readonly property Count: int;
 end IReadOnlyCollection;
 
 public interface IReadOnlyList<out T>: IReadOnlyCollection<T>
@@ -2642,7 +2645,7 @@ one **agreement rule** stated after them.
    the call's **target type**, where the call site has one, by unifying the
    method's declared return type — current bindings applied — against the
    target; this unification may bind through the return type's base-class or
-   implemented-interface positions (`Util.Empty<T>(): Array<T>` against a
+   implemented-interface positions (`Util.Empty<T>(): owned Array<T>` against a
    target `IEnumerable<int>` binds `T` to `int`) and through the nullable
    wrapping. The **target contexts** are: the initializer of a typed
    declaration (field or local), an assignment to a typed location, a `return`
@@ -2840,7 +2843,7 @@ data.Add(1); data.Add(2); data.Add(3);
 
 // Fixed-size discipline — pre-allocate via literal, don't resize
 using var snapshot: Array<int> := [1, 2, 3];
-// snapshot.Count == 3 throughout its lifetime; no Add calls
+// snapshot.Count = 3 throughout its lifetime; no Add calls
 
 // Owning heap array
 using var pool: OwningArray<Connection> := [
@@ -3432,8 +3435,8 @@ When the indexer's element type is a class T whose `operator ++` / `operator --`
 A field initializer or typed local declaration may use the `new()` shorthand when the type is unambiguous:
 
 ```bezel
-private _items: Array<int> := new();
-private _config: Config := new(verbose := true);
+private owned _items: Array<int> := new();          // class-typed field taking a fresh
+private owned _config: Config := new(verbose := true);   //   value is `owned` (§28.6)
 var xs: Array<int> := new();
 ```
 
@@ -3580,7 +3583,7 @@ public property [i: int]: double => (case i of
 var name := (if user <> null then user.Name
              else throw new InvalidOperationException("user is null"));
 
-var config := LoadConfig() ?? throw new InvalidOperationException("no config");
+using var config := LoadConfig() ?? throw new InvalidOperationException("no config");
 
 try
   DoWork();
@@ -3634,7 +3637,7 @@ The discard statement's legality depends on the static type of `expression`:
 
 - **Move-only values:** `_ := expression;` where `expression` produces a move-only value (an owning inline array `[N owned]T?`/`[N owned]T`, or an owning-classified choice — [§15.3](#sec-move-only-value-types), [§35.4](#sec-choice-classification)) is **permitted** and disposes the value at the end of the discard statement — the discard is an *unbound owned temporary* ([§28.3](#sec-unbound-owned-temporaries)), reclaimed once the statement completes. Its owned slots — for a choice, the active case's owned payloads — are disposed in the usual order. (This is the explicit "dispose this owned result now" form, parallel to the non-trivial-dispose class case below.)
 
-- **Trivial-dispose class types ([§28.9](#sec-runtime-managed-types)):** discard is permitted. The value is freed at the end of the discard statement — the same unbound-owned-temporary timing as the non-trivial case below ([§28.3](#sec-unbound-owned-temporaries)) — and the free runs no user code (the class has none to run, [§28.9](#sec-runtime-managed-types)). The discard therefore remains purely cosmetic in the sense that it changes nothing: an undiscarded trivial-dispose result is freed at the same boundary, with no warning either way (the ceremony exemption).
+- **Trivial-dispose class types ([§28.9](#sec-runtime-managed-types)):** discard is permitted. The value is freed at the end of the discard statement — the same unbound-owned-temporary timing as the non-trivial case below ([§28.3](#sec-unbound-owned-temporaries)) — and the free runs no user code (the class has none to run, [§28.9](#sec-runtime-managed-types)). The discard therefore runs no cleanup the language would not already run: an undiscarded trivial-dispose result is freed at the same boundary, and neither form draws the ownership-discharge warning (the ceremony exemption). As in the first bullet, the discard still suppresses [§21.9](#sec-statement-form-of-expressions)'s *unused result* warning where the undiscarded expression statement would draw one.
 
   ```bezel
   _ := new Random();                     // Random is trivial-dispose
@@ -3655,7 +3658,8 @@ The discard statement's legality depends on the static type of `expression`:
 - **`Task` and `Task<T>`:** discard is a compile error (Tasks have a destructor that handles continuation cleanup and exception propagation). Use `Task.FireAndForget(expression)` for supervised fire-and-forget, or `using var _ := expression;` to dispose at scope end. The error message names `Task.FireAndForget` specifically.
 
 ```bezel
-_ := DoTelemetryAsync();                 // ERROR: Task is non-trivial-dispose
+_ := DoTelemetryAsync();                 // ERROR: a Task may not be discarded — disposing
+                                         //   a task abandons a running operation
 Task.FireAndForget(DoTelemetryAsync());  // OK — supervised
 
 using var _ := new FileStream(path, FileMode.Open);     // OK — disposed at scope end
@@ -4582,8 +4586,9 @@ The variable's scope is the enclosing block, from the call onward. It is in scop
 For disposal-aware inline declarations, use `out using var`:
 
 ```bezel
-factory.TryCreate(config, out using var conn);
-// conn disposed at end of enclosing block
+if factory.TryCreate(config, out using var conn) then
+  // conn is owned and non-null here; disposed at end of enclosing block
+end;
 ```
 
 When a method parameter is declared `out owned`, the callee produces an owned value through the output parameter, and the caller's call-site syntax must reflect this. The accepted forms at the call site of an `out owned` parameter are `out using var x` (a scope-bound owned local) and `out owned var x` (an owned local with the standard owned-local discharge rules applying); both produce an owned location for the callee to write through. Plain `out var x` is **not** accepted at the call site of an `out owned` parameter — the resulting value's ownership would have nowhere to go. The full call-site / parameter-modifier compatibility rules are given in [§22.6](#sec-overloading).
@@ -4819,7 +4824,7 @@ This mirrors the resolution of overloaded method references ([§27.6](#sec-metho
 **Example 1 — exact match preferred over a conversion.**
 
 ```bezel
-public class Logger
+public class Logger  // declaration sketch; method bodies elided
   public method Log(level: int);
   public method Log(level: long);
 end Logger;
@@ -4899,7 +4904,7 @@ calc.Compute(x, y);
 **Example 5 — no reachable candidate: error with no candidates cited.**
 
 ```bezel
-public class Transformer
+public class Transformer  // declaration sketch; method bodies elided
   public method Transform(x: int);
   public method Transform(x: decimal);
 end Transformer;
@@ -5265,10 +5270,12 @@ public static class AppConfig                    // LoadConfigAsync(): Task<Conf
   end GetConfig;
 end AppConfig;
 
-public static async method Main(): Task<int>
-  AppConfig.Preload();                           // eager: assigned before any spawn
-  return Run(await AppConfig.GetConfig());       // Run(cfg: Config): int — first use; fail-fast at startup
-end Main;
+class Program
+  public static async method Main(): Task<int>
+    AppConfig.Preload();                         // eager: assigned before any spawn
+    return Run(await AppConfig.GetConfig());     // Run(cfg: Config): int — first use; fail-fast at startup
+  end Main;
+end Program;
 ```
 
 There is deliberately **no** synchronous-access, async-initialized, plain class-typed static: rule 2 admits no such form, and a write-once-before-first-use form would not be checkable at the declaration (rule 2's admission is keyed to the declared type so it stays decidable). Consumers pay one `await` against the cache and then hold borrows of the process-lived result.
@@ -5376,7 +5383,7 @@ Prohibited, as the closed list's contrapositive: any store whose target root is 
 
 Inside a pure body, `new E(args)` is admitted **only** as the immediate operand of a `throw` statement or `throw` expression, and only when **(a)** the invoked constructor of `E` is `pure`-declared — covering, transitively, its chained constructors and `E`'s field initializers — and **(b)** `E` is a **trivial-dispose** class ([§28.9](#sec-runtime-managed-types); the diagnostic names the property). Condition (a) fences the constructor's code; for the destructor, ownership of the operand transfers to the exception machinery at the throw ([§31.1](#sec-the-throw-operand)) and disposal runs after the matching catch arm — condition (b) makes every dispose-after-arm reachable inside a pure region provably run no user code — for a trivial-dispose operand the after-arm disposal is the compiler-inserted flag-setting free ([§28.9](#sec-runtime-managed-types), [§28.2](#sec-checked-disposal)) — since every exception in flight within the region is either a carve-out throw from the region's own call subtree or a runtime-raised built-in ([§31.4](#sec-standard-exception-types) — all trivial-dispose). The carve-out follows §31.1's operand rule otherwise (`E` must, like every throwable, be `Exception`-derived — [§31.1](#sec-the-throw-operand); `Exception` itself and every built-in are trivial-dispose, so the requirement subtracts nothing from the carve-out's reachable set). Without it a pure method could fault only through provoked built-in exceptions — the validation idiom (`throw new ArgumentException(…)`) would be unwritable in the entire pure fragment. The trace capture the exception machinery performs at the throw ([§31.1](#sec-the-throw-operand)) is the runtime's own bookkeeping, not a store the body performs; it does not violate this section's rules.
 
-**Intrinsic purity (the stdlib contract).** A standard-library member whose body is runtime-provided may carry `pure` — including on intrinsic auto-properties and indexer getters, where an authored body would be required otherwise. For a **compiler-intrinsic record**, the declared auto-property surface that [§9.2](#sec-body-records) fixes for the generated members does not by itself decide purity: a declared property whose value the intrinsic **recomputes** takes the marker under this paragraph, since the classification rule below reaches only a body that reads a stored slot; a declared property that does read one is classified and the marker on it is the redundant spelling rejected above. The marker is the library's *stated contract*, normative for the implementation (the runtime body must satisfy this section's rules — the [§32.10](#sec-boundary-contract)-style documented-contract posture) and trusted by the checker rather than verified from source. An exception raised by a pure intrinsic must be a **trivial-dispose** class ([§28.9](#sec-runtime-managed-types)) — extending the enumeration above, so that every exception in flight within a pure region remains disposal-inert. Every built-in exception type's `()` and `(message)`-form constructors are `pure` ([§31.4](#sec-standard-exception-types)); user-authored `extern` declarations remain outside `pure` entirely.
+**Intrinsic purity (the stdlib contract).** A standard-library member whose body is runtime-provided may carry `pure` — including on intrinsic auto-properties and indexer getters, where an authored body would be required otherwise. For a **compiler-intrinsic record**, the declared auto-property surface that [§9.2](#sec-body-records) fixes for the generated members does not by itself decide purity: a declared property whose value the intrinsic **recomputes** takes the marker under this paragraph, since the classification rule below reaches only a body that reads a stored slot; a declared property that does read one is classified and the marker on it is the redundant spelling rejected above. The marker is the library's *stated contract*, normative for the implementation (the runtime body must satisfy this section's rules — the [§32.10](#sec-boundary-contract)-style documented-contract posture) and trusted by the checker rather than verified from source. An exception raised by a pure intrinsic must be a **trivial-dispose** class ([§28.9](#sec-runtime-managed-types)) — extending the enumeration above, so that every exception in flight within a pure region remains disposal-inert. Every built-in exception type's `()` and `(message)`-form constructors (and `ArgumentException`/`ArgumentOutOfRangeException`'s `(message, paramName)` forms) are `pure` ([§31.4](#sec-standard-exception-types)); user-authored `extern` declarations remain outside `pure` entirely.
 
 ```bezel
 public static pure method Checked(x: int, low: int, high: int): int
@@ -5849,6 +5856,8 @@ What cannot be extended:
 **Type-parameter binding.** In the extended type's argument positions, each **bare single-segment non-nullable identifier** introduces a fresh block-level type parameter — *always*, shadowing any same-named type in scope (the compiler warns on such shadowing). This is the only implicit type-parameter binding in the language, so the rule is stated exactly: multiple parameters are permitted (`extension Dictionary<K, V>`); a **concrete** instantiation is written with keyword/primitive types, qualified names, or generic instantiations (`extension IEnumerable<int>`, `extension IEnumerable<Array<byte>>`), none of which are bare single-segment identifiers. The alternative — resolving the identifier against scope and only binding when unresolved — is declined: it would let an unrelated type declaration elsewhere silently re-mean an extension block (action at a distance). The binding rule applies at **any nesting depth** of the extended type's argument positions: `extension IEnumerable<Array<T>>` binds `T`, and `extension Dictionary<K, Array<V>>` binds `K` and `V`. A **nullable-marked** identifier in an argument position (`extension Array<T?>`) binds nothing and is a compile error naming this rule — only the bare non-nullable identifier introduces a parameter. Nothing is lost by the rejection: a bare `T` already unifies with nullable arguments (`extension Array<T>` applies to `Array<int?>` with `T = int?`); the only capability a `T?` head would add — constraining a block to *only* nullable instantiations — is deferred until a need is recorded.
 
 ```bezel
+import System.Collections.Linq;      // ToArray is a Linq extension (stdlib §5)
+
 extension IEnumerable<T> where T: IComparable<T>
   public method Sort(): owned Array<T>
     var items := this.ToArray();
@@ -6019,7 +6028,8 @@ Assignability under this rule preserves **identity**: the value is the same func
 Lambda parameters may carry the same modifiers when the target function type expects them:
 
 ```bezel
-var attach: (owned EventHandler) -> () := lambda(owned h) => _handlers.Add(h);
+// _pool is a field of the enclosing class: private owned _pool: OwningArray<Connection>;
+var adopt: (owned Connection) -> () := lambda(owned c) => _pool.Add(move c);
 ```
 
 When the target type is known from context, the lambda's parameter modifiers may be omitted in source — the compiler infers them from the target. When inferring is not possible (a `var` introduction with no target context), the modifier must be written explicitly to produce a function value of the modified type.
@@ -6586,8 +6596,7 @@ To compile a mixed merge, the program must equalize the branches before the merg
 // that outlives the merge.
 var x: Stream;                       // x will be a borrow at the merge
 if condition then
-  using var scratch := new Stream(); // owned: used and discharged in-branch
-  scratch.WarmUp();
+  using var scratch := new FileStream(path, FileMode.Create);  // owned: used and discharged in-branch
   primary.Reset(scratch);            // scratch's work is done here
   x := primary.Stream;               // x borrows primary (outlives the if)
 else
@@ -6600,7 +6609,7 @@ end;
 // Pattern 2: produce an owned value on both branches.
 var x: Stream;
 if condition then
-  x := new Stream();
+  x := new FileStream(path, FileMode.Create);
 else
   x := otherSource.CloneStream();   // returns owned Stream
 end;
@@ -6608,7 +6617,7 @@ end;
 // x reaches an owned slot, is disposed, or auto-drops at scope end (§28.3).
 ```
 
-Where one branch is a **named owned binding**, the marked arm transfer ([K3.4](#sec-kernel-k3)) writes the same equalization as one expression: `var x := (if useFresh then new Stream() else move cached);` — both arms owned, `cached` consumed only on the selected path and per-path consumed after the construct ([K7.4](#sec-kernel-k7)).
+Where one branch is a **named owned binding**, the marked arm transfer ([K3.4](#sec-kernel-k3)) writes the same equalization as one expression: `var x := (if useFresh then new FileStream(path, FileMode.Create) else move cached);` — both arms owned, `cached` consumed only on the selected path and per-path consumed after the construct ([K7.4](#sec-kernel-k7)).
 
 Equalizing to borrowed (Pattern 1) does not merely require both branches to *be* borrows — it requires each branch's borrow source to outlive the merge point ([K2.1](#sec-kernel-k2)). Binding `x` in one branch to a borrow of a `using var` that is discharged at that branch's end does **not** equalize the merge: it produces a borrow whose source is already gone by the time `x` is read after the `if`, and the borrow-lifetime rule rejects it exactly as it rejects any other use of a borrow past its source's scope. The `using var` in such a branch must complete its own work and be discharged *within* the branch; `x` must take its post-merge value from a source that lives past the `if` (as `primary` and `otherSource` do above).
 
@@ -6733,14 +6742,15 @@ end;
 ```
 
 ```bezel
-public method Wrap(s: Stream): owned Wrapper
-  using var copy := s.Clone();      // copy is owned + scope-bound
-  return new Wrapper(copy);          // ERROR: copy is using-var, cannot move out
+// Wrapper's constructor takes `owned inner: Buffer`; CloneBuffer(): owned Buffer.
+public method Wrap(s: Buffer): owned Wrapper
+  using var copy := s.CloneBuffer();   // copy is owned + scope-bound
+  return new Wrapper(move copy);       // ERROR: cannot move out of a `using var`
 end Wrap;
 
-public method Wrap2(owned s: Stream): owned Wrapper
-  return new Wrapper(s);             // OK: s is moved into Wrapper's constructor
-                                     // s is now in moved-from state
+public method Wrap2(owned s: Buffer): owned Wrapper
+  return new Wrapper(move s);          // OK: s is moved into Wrapper's constructor
+                                       // s is now in moved-from state
 end Wrap2;
 ```
 
@@ -6946,7 +6956,7 @@ These rules apply to **trivial-dispose** class types unchanged ([§28.9](#sec-ru
 ```bezel
 public method GetTransactions(): OwningArray<Transaction>
   return _transactions;     // OK: borrows the field — the caller may
-                            //   read/iterate it but not dispose or drain it.
+                            //   read/iterate/mutate/drain it but not dispose it.
 end GetTransactions;
 
 public method TakeTransactions(): owned OwningArray<Transaction>
@@ -7062,7 +7072,7 @@ Moving an owned field's contents *out* of the field uses the `move` expression f
 
 ```bezel
 public method ReplaceAndReturn(): owned Stream
-  var fresh := new Stream();         // build replacement first
+  var fresh := new FileStream(_path, FileMode.Open);   // build replacement first
   var old := move _resource;          // take from field
   _resource := fresh;                  // restore field
   return old;                          // return the taken value
@@ -7093,7 +7103,7 @@ The error message identifies the move site, the unrestored exit path, and the th
 public method Wrong(replace: bool): owned Stream
   var old := move _resource;
   if replace then
-    _resource := new Stream();
+    _resource := new FileStream(_path, FileMode.Open);
   end;
   return old;
 end Wrong;
@@ -7103,7 +7113,7 @@ The fix is to reassign on every path:
 
 ```bezel
 public method Right(replace: bool): owned Stream
-  var fresh := new Stream();
+  var fresh := new FileStream(_path, FileMode.Open);
   var old := move _resource;
   _resource := fresh;
   return old;
@@ -7115,7 +7125,7 @@ Or to scope the move to the branch where reassignment is mandatory:
 ```bezel
 public method Right2(replace: bool): owned Stream?
   if not replace then return null; end;
-  var fresh := new Stream();
+  var fresh := new FileStream(_path, FileMode.Open);
   var old := move _resource;
   _resource := fresh;
   return old;
@@ -7144,7 +7154,8 @@ The fix is to perform any throwable construction *before* the move, leaving only
 public method RightOrder(): owned Stream
   var fresh := DangerousFactory();   // may throw — but no move yet
   var old := move _resource;          // cannot throw
-  _resource := fresh;                  // cannot throw (assignment, not call)
+  _resource := fresh;                  // cannot throw (the slot is moved-from:
+                                       //   no drop-on-overwrite runs)
   return old;                          // cannot throw
 end RightOrder;
 ```
@@ -7164,7 +7175,7 @@ Method calls; indexer accesses (on inline arrays `[N]T`, on resizable collection
 
 The `as` operator is **not** throwable: a failed `as` cast returns `null` rather than raising ([§12.7](#sec-type-tests-is-is-not-as), [§17.4](#sec-the-is-is-not-and-as-operators)). Code that uses `as` between a move and the field-restoration point does not introduce an unrestored exception edge.
 
-A `new T(...)` expression is likewise **not** in the throwable inventory (v0.255, [#3240](https://github.com/s8lap/bezel-lang/issues/3240)). This section already separates *can raise* from *analysis-throwable* — `!` is throwable only when the target is null, `as` not at all — and `new` joins that stated family: a constructor body is ordinary code and may throw, but a constructor that throws completes no object, so there is no restored-with value the analysis loses on that edge, and the hazard the throw does create — the partially-constructed object's owned state — is the constructor's own exception-safety territory ([§22.9](#sec-owned-fields-and-exception-safety); [§28.3](#sec-local-variables-ownership-and-borrows)/[§28.6](#sec-leak-prevention)), not the field-restoration analysis's. The common restoration idiom is therefore legal: `var old := move _r; _r := new Res();` restores on every path this rule counts. That is the reading the `Wrong` example above has always encoded — its stated error names only the false branch of `if replace`, because the true branch's `_resource := new Stream();` is a valid restoration, not an unrestored exception edge — and the hoisted `new`s in the compiling examples above are the uniform build-before-take spelling, kept for stylistic uniformity — none of those examples has a call edge between the move and the restoration for the hoist to guard — not evidence that `new` itself is throwable. The exclusion covers the construction only: a `new` expression's **argument** expressions classify on their own, so `_r := new Res(Fetch());` still puts `Fetch()`'s exception edge between the move and the restoration.
+A `new T(...)` expression is likewise **not** in the throwable inventory (v0.255, [#3240](https://github.com/s8lap/bezel-lang/issues/3240)). This section already separates *can raise* from *analysis-throwable* — `!` is throwable only when the target is null, `as` not at all — and `new` joins that stated family: a constructor body is ordinary code and may throw, but a constructor that throws completes no object, so there is no restored-with value the analysis loses on that edge, and the hazard the throw does create — the partially-constructed object's owned state — is the constructor's own exception-safety territory ([§22.9](#sec-owned-fields-and-exception-safety); [§28.3](#sec-local-variables-ownership-and-borrows)/[§28.6](#sec-leak-prevention)), not the field-restoration analysis's. The common restoration idiom is therefore legal: `var old := move _r; _r := new Res();` restores on every path this rule counts. That is the reading the `Wrong` example above has always encoded — its stated error names only the false branch of `if replace`, because the true branch's `_resource := new FileStream(_path, FileMode.Open);` is a valid restoration, not an unrestored exception edge — and the hoisted `new`s in the compiling examples above are the uniform build-before-take spelling, kept for stylistic uniformity — none of those examples has a call edge between the move and the restoration for the hoist to guard — not evidence that `new` itself is throwable. The exclusion covers the construction only: a `new` expression's **argument** expressions classify on their own, so `_r := new Res(Fetch());` still puts `Fetch()`'s exception edge between the move and the restoration.
 
 <a id="sec-loops-and-conditional-control-flow"></a>
 #### Loops and conditional control flow
@@ -7214,7 +7225,7 @@ Inside a destructor body, the field is being read for final disposal. `move x.f`
 
 ```bezel
 public method ProcessAndReplace()
-  var fresh := new Stream();
+  var fresh := new FileStream(_path, FileMode.Open);
   using var old := move _resource;        // moved into using var; disposed at scope end
   _resource := fresh;                      // restore
   // ... use old ...
@@ -7253,7 +7264,7 @@ For non-nullable owned fields, "leave the field empty" is not expressible — by
 // ERROR: TakeOwnership may throw (method calls are throwable, above) — on that
 //        edge _resource is moved but never reassigned: the WrongOrder shape.
 public method TransferToHelper()
-  var fresh := new Stream();
+  var fresh := new FileStream(_path, FileMode.Open);
   TakeOwnership(move _resource);          // owned argument; helper consumes
   _resource := fresh;                      // restores the normal edge only
 end TransferToHelper;
@@ -7263,7 +7274,7 @@ The argument expression `move _resource` runs as part of argument evaluation. Th
 
 ```bezel
 public method TransferToHelperSafe()
-  var fresh := new Stream();
+  var fresh := new FileStream(_path, FileMode.Open);
   var taken := move _resource;
   _resource := fresh;                      // restore before the call that may throw
   TakeOwnership(move taken);               // owned argument (call-site marker, §22.3), no field state at risk
@@ -8064,16 +8075,15 @@ A method declared `async` may use `await`. The return type must be one of:
 - `IOwningAsyncEnumerator<T>` for class T — single-use owned-yielding async iterator.
 
 ```bezel
-public async method DownloadAsync(url: string): Task<string>
-  using var client := new HttpClient();
-  using var task := client.GetAsync(url);
+public async method LoadAsync(path: string): Task<string>
+  using var task := File.ReadAllTextAsync(path);   // stdlib §7.3
   return await task;
-end DownloadAsync;
+end LoadAsync;
 ```
 
 Calling an async method begins execution synchronously on the calling thread until the first `await` of an incomplete task, at which point the method suspends and returns its `Task` to the caller. If the method completes before encountering an incomplete `await`, the returned task is already in a completed state.
 
-The returned task is a **fresh, caller-owned** value at every call site — the `Task`-family production rule of [§28.3](#sec-producers), keyed on the declared return type, so it holds through interfaces and function values and for instance methods exactly as for static ones (`async` itself is invisible in signatures, [§28.12](#sec-asynchronous-disposal)). This is what entitles `DownloadAsync`'s body above to bind `client.GetAsync(url)` with an obligation-assuming `using var`, and `DownloadAsync`'s own caller to do the same with its result. The signature carries no `owned` marker; the `Task`-family return type is the announcement (type-announced, [K6.2](#sec-kernel-k6)).
+The returned task is a **fresh, caller-owned** value at every call site — the `Task`-family production rule of [§28.3](#sec-producers), keyed on the declared return type, so it holds through interfaces and function values and for instance methods exactly as for static ones (`async` itself is invisible in signatures, [§28.12](#sec-asynchronous-disposal)). This is what entitles `LoadAsync`'s body above to bind `File.ReadAllTextAsync(path)` with an obligation-assuming `using var`, and `LoadAsync`'s own caller to do the same with its result. The signature carries no `owned` marker; the `Task`-family return type is the announcement (type-announced, [K6.2](#sec-kernel-k6)).
 
 `async` may appear on instance methods, static methods, and lambdas. It may not appear on constructors, destructors, or property/indexer accessors.
 
@@ -8308,7 +8318,7 @@ using var token := await semaphore.AcquireAsync();
 DoCriticalWork();
 // At end of scope: token disposed, releasing the semaphore.
 
-// Plain var binding — x is an owned local subject to standard discharge rules
+// Plain var binding — token is an owned local subject to standard discharge rules
 var token := await semaphore.AcquireAsync();
 TransferToHelper(move token);     // owned local consumed by owned parameter
 
@@ -8387,6 +8397,8 @@ There is no factory for producing a Pattern A `Task<T>` of class T from an exter
 The combination of `OwningTask<T>` and Pattern B is what makes resource-acquisition APIs natural:
 
 ```bezel
+// Abbreviated from stdlib §6.3: the declared parameter list also carries
+//   `token: CancellationToken := CancellationToken.None`.
 public class Semaphore
   public async method AcquireAsync(): OwningTask<SemaphoreToken>;
 end Semaphore;
@@ -8403,9 +8415,8 @@ The owned-result task expresses the intent directly; no separate synchronous all
 ### 30.6 Async lambdas
 
 ```bezel
-var fetcher: (string) -> Task<string> := async lambda(url) => do
-  using var client := new HttpClient();
-  using var task := client.GetAsync(url);
+var reader: (string) -> Task<string> := async lambda(path) => do
+  using var task := File.ReadAllTextAsync(path);   // stdlib §7.3
   return await task;
 end;
 
@@ -8429,6 +8440,8 @@ An async iterator combines `yield` and `await`. The method is `async` and return
 public async method ReadLinesAsync(path: string): owned IAsyncEnumerable<string>
   // OpenAsync, ReadLineAsync, and AtEnd are illustrative; the example shows
   // the async-iterator shape, not a stream API in the standard library.
+  // OpenAsync's result is a concrete class declaring a destructor, so `fs` may
+  // be live across the `yield return` (the yield-liveness rule below).
   await using var fs := await OpenAsync(path);
   while not fs.AtEnd do
     yield return await fs.ReadLineAsync();
@@ -8514,11 +8527,15 @@ public record CancellationToken
   public method Register(scoped callback: () -> ()): owned Subscription;
 end CancellationToken;
 
-public class CancellationTokenSource: IDisposable
+public class CancellationTokenSource
+  public constructor();
   public readonly property Token: CancellationToken;
   public readonly property IsCancellationRequested: bool;
   public method Cancel();
   public method CancelAfter(delay: TimeSpan);
+  public static method CreateLinked(a: CancellationToken, b: CancellationToken): owned CancellationTokenSource;
+  public static method CreateLinkedAll(parents: Array<CancellationToken>): owned CancellationTokenSource;
+  destructor;       // cancel-on-dispose: signals cancellation to observing tokens
 end CancellationTokenSource;
 ```
 
@@ -8707,7 +8724,7 @@ The proof is structural: the `await tcs.Task` blocks the enclosing method's cont
 
 This reasoning is **specific to the TCS callback-registration pattern** and not a general closure-escape exception. **The admitted shape is defined by compiler-checkable conditions:**
 
-1. the captured local is a `using var` of one of the four TaskCompletionSource classes;
+1. the captured local is a `using var` of one of the three TaskCompletionSource classes (stdlib §6.6);
 2. the lambda is passed **directly** as an argument to exactly one call in the same block (the registration site) and does not otherwise escape — not stored, not returned, not captured again;
 3. an `await` of that local's `.Task` post-dominates the registration and dominates every normal exit of the local's scope;
 4. the lambda's only use of the capture is invoking TCS members.
@@ -8889,13 +8906,13 @@ Sendability of a generic instantiation is checked at the instantiation or call s
 Domain.Spawn(entry: () -> ()): owned Task
 Domain.Spawn<R>(entry: () -> owned R): owned OwningTask<R>            // R: sendable class
 Domain.Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwningTask<R>
-Domain.Spawn<R>(entry: () -> R): owned Task<R>                       // R: sendable value type
+Domain.Spawn<R>(entry: () -> R): owned Task<R>                       // R: sendable non-class
 
 // Async entries: the runtime awaits the returned task inside the
 // spawned domain; the join handle tracks that task.
 Domain.Spawn(entry: () -> Task): owned Task
 Domain.Spawn<R>(entry: () -> OwningTask<R>): owned OwningTask<R>      // R: sendable class
-Domain.Spawn<R>(entry: () -> Task<R>): owned Task<R>                  // R: sendable value type
+Domain.Spawn<R>(entry: () -> Task<R>): owned Task<R>                  // R: sendable non-class
 ```
 
 The compiler enforces at the call site:
@@ -8972,6 +8989,8 @@ using var worker := Domain.Spawn(ProcessAll, inbox.NewSender());   // sender mov
 
 // in this domain:
 using var first := await inbox.Receive();          // ownership of one Report transfers in
+await worker;                                      // join: a fault in the spawned domain
+                                                   //   surfaces here as DomainFaultedException (§30.14)
 
 // in the spawned domain (static method):
 public static method ProcessAll(owned tx: ChannelSender<Report>)
@@ -9136,7 +9155,7 @@ The bare re-raise re-throws the currently-handled exception with its stack trace
   ```bezel
   catch
     var ex: TransientException => Retry(ex),
-    var ex: Exception => throw            // re-raise unrecognized exceptions
+    Exception => throw                   // re-raise unrecognized exceptions
   end;
   ```
 
@@ -9316,7 +9335,7 @@ Empty `extern` blocks are a compile error.
 ```bezel
 import FFIExample;
 
-FFIExample.strdup(cname);
+using var copy := FFIExample.strdup(cname);   // owned CString? — discharge it (§32.6)
 ```
 
 `internal extern` methods are invisible outside their declaring module.
@@ -9472,7 +9491,7 @@ public static class DynamicLoader
     if handle = IntPtr.Zero then
       throw new IOException("Library failed to load");
     end;
-    var result := dlclose(handle);
+    _ := dlclose(handle);
   end LoadAndClose;
 end DynamicLoader;
 ```
@@ -9569,6 +9588,7 @@ Worked — instance state updated from result rows, directly:
 
 ```bezel
 import System.Interop;
+import System.IO;                    // IOException (§31.4; stdlib §7.5)
 
 public class RowCollector
   private _rows: int := 0;
@@ -9689,6 +9709,7 @@ Native functions do not throw Bezel exceptions. They report errors via return co
 
 ```bezel
 import System.Interop;
+import System.IO;                    // IOException (§31.4; stdlib §7.5)
 
 public static class FileOps
   public static method OpenChecked(path: CString): int
@@ -9833,6 +9854,7 @@ Worked — `clock_gettime` (a two-`long` record, boundary `out`, the errno windo
 
 ```bezel
 import System.Interop;
+import System.IO;                    // IOException (§31.4; stdlib §7.5)
 
 // C (POSIX, Linux x86-64): struct timespec { time_t tv_sec; long tv_nsec; };
 public record TimeSpec(Sec: long, Nsec: long);          // C-compatible: two longs
@@ -9875,7 +9897,7 @@ Passing a statement where a database belongs is now a compile error — rational
 public class Database(handle: Sqlite3Db)
   private _handle: Sqlite3Db := handle;
 
-  public readonly property Raw: Sqlite3Db => _handle;
+  public property Raw: Sqlite3Db => _handle;
 
   destructor
     _ := sqlite3_close(_handle);           // policy lives HERE: this binding chooses to
@@ -10017,6 +10039,9 @@ Documentation comments are meaningful only immediately before a declaration.
 /// Represents a bank account with deposit and withdrawal functionality.
 /// </summary>
 public class BankAccount: IBankAccount
+  /// <summary>The current balance.</summary>
+  public property Balance: decimal;
+
   /// <summary>
   /// Deposits the specified amount into the account.
   /// </summary>
@@ -10431,7 +10456,7 @@ ClassDecl       ::= Visibility? Modifier* "class" Identifier GenericParams?
                     GenericConstraints*
                     ClassBody
 PolymorphicMember ::= "polymorphic" "(" PolyCase ("," PolyCase)* ","? ")" ";"
-PolyCase ::= StringLiteral ":" TypeName
+PolyCase ::= StringLiteral ":" QualifiedName
                               /* A `polymorphic` registry is a class-body member
                                  (at most one per class; takes no visibility).
                                  Each PolyCase maps a wire discriminator string
@@ -10967,8 +10992,9 @@ InlineArrayType ::= "[" ConstIntExpr "owned"? "]" Type
                                  a move-only value type. See §15.1, §15.3.
                                  The inner Type is parsed greedily — `[3]int?`
                                  means an inline array of nullable int, not
-                                 a nullable inline array. Nullable inline-array
-                                 types are not provided in this revision. */
+                                 a nullable inline array. An inline array has
+                                 no nullable form: a "null" inline array would
+                                 have no natural representation (§15.1). */
 ConstIntExpr    ::= Expression           /* a §17.14 constant expression of
                        integer type; see §15.1 "Size" */
 GenericArgs     ::= "<" GenericArg ("," GenericArg)* ","? ">"
@@ -11275,7 +11301,9 @@ PrimarySuffix   ::= "." Identifier GenericArgs?
                               /* The `with` suffix is the record copy-with-
                                  overrides expression (§9.5). It requires a
                                  record-typed source; a class-typed source is
-                                 rejected semantically (§9.5) — the
+                                 rejected semantically (§9.5), and so is a
+                                 constructor-only record source, which is not
+                                 defaultable and admits no `with` (§9.9) — the
                                  grammar over-admits and the type checker
                                  rejects, the same pattern A.4 uses throughout. */
 
