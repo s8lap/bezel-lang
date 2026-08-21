@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.271 — August 2026**
+**Version 0.272 — August 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -2933,7 +2933,7 @@ The **sequence literal** form `[e1, e2, ...]` (bare expressions) targets every s
 
 For owning targets, the literal's element expressions must produce owned values; ownership transfers from each expression into the constructed collection. This applies uniformly to `OwningArray<T>`, `OwningLinkedList<T>`, `OwningStack<T>`, `OwningQueue<T>`, `OwningSet<T>`, and `OwningDictionary<K, V>` (value position). (For fresh trivial-dispose nodes transferred into owning element slots, the literal-tree ownership rule below assigns each node's aggregate to its owning slot.)
 
-For **borrowing-family** targets (`Array<T>`, `Set<T>`, `LinkedList<T>`, `Stack<T>`, `Queue<T>`, and the key and value positions of `Dictionary<K, V>`), each element expression of **non-trivial-dispose class type** ([§28.9](#sec-runtime-managed-types)) must be a **borrow** whose source satisfies the store rule of [§28.11](#sec-borrowing-collections); an element expression that is a **fresh producer** of such a type — an unbound owned temporary ([§28.3](#sec-unbound-owned-temporaries)): a `new` expression, a nested collection literal targeting a non-trivial-dispose collection type (built-in, or a user-declared target of the [§15.4.1](#sec-the-user-defined-sequence-literal-protocol) protocol, whose `FromCollectionLiteral` result is `owned`), or an `owned`-returning call — is rejected at the literal site. The temporary would be disposed at the end of the declaration statement, leaving the constructed collection holding a dangling borrow from birth — the statically-certain dangle of [§9.7](#sec-records-and-disposal)'s no-temporary-source rule, and an escape of a fresh owned value into a non-owning location ([§28.6](#sec-leak-prevention)). The remedy names the source first — `using var c := new Connection("a"); var conns: Array<Connection> := [c];` — or uses the owning family (`OwningArray<Connection>`), which takes ownership.
+For **borrowing-family** targets (`Array<T>`, `Set<T>`, `LinkedList<T>`, `Stack<T>`, `Queue<T>`, the key and value positions of `Dictionary<K, V>`, and a user-defined type whose `FromCollectionLiteral` declares the borrowing form ([§15.4.1](#sec-the-user-defined-sequence-literal-protocol))), each element expression of **non-trivial-dispose class type** ([§28.9](#sec-runtime-managed-types)) must be a **borrow** whose source satisfies the store rule of [§28.11](#sec-borrowing-collections); an element expression that is a **fresh producer** of such a type — an unbound owned temporary ([§28.3](#sec-unbound-owned-temporaries)): a `new` expression, a nested collection literal targeting a non-trivial-dispose collection type (built-in, or a user-declared target of the [§15.4.1](#sec-the-user-defined-sequence-literal-protocol) protocol, whose `FromCollectionLiteral` result is `owned`), or an `owned`-returning call — is rejected at the literal site. The temporary would be disposed at the end of the declaration statement, leaving the constructed collection holding a dangling borrow from birth — the statically-certain dangle of [§9.7](#sec-records-and-disposal)'s no-temporary-source rule, and an escape of a fresh owned value into a non-owning location ([§28.6](#sec-leak-prevention)). The remedy names the source first — `using var c := new Connection("a"); var conns: Array<Connection> := [c];` — or uses the owning family (`OwningArray<Connection>`), which takes ownership.
 
 A fresh element of **trivial-dispose** class type ([§28.9](#sec-runtime-managed-types)) is admitted — not as a borrow, and not as an unbound temporary of its own, but as a **fresh node of the literal tree**, owned and freed under the **literal-tree ownership rule**:
 
@@ -3016,8 +3016,10 @@ A user-defined type opts into sequence-literal construction by declaring a stati
 **Borrowing form.** For a type `C<T>` whose elements are borrows (the type does not own its elements):
 
 ```bezel
-public static method FromCollectionLiteral(elements: ReadOnlySpan<T>): owned C<T>;
+public static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned C<T>;
 ```
+
+The carrier is the **borrowing family's** read-only view (stdlib [§4.15](Bezel_Standard_Library.md#sec-arrayspant-readonlyarrayspant)), whose source `Array<T>` borrows its class-`T` slots — matching this form's own definition. The owning family's `ReadOnlySpan<T>` is not a carrier for either form: its source `OwningBuffer<T>` owns those slots (stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)), and the two span families are not interchangeable.
 
 **Owning form.** For a type `C<T>` that owns its elements (`where T: class`):
 
@@ -3029,10 +3031,10 @@ Exactly one of the two forms may be declared on a given type. Declaring both is 
 
 **Lowering.** For a sequence literal `[e1, e2, ..., en]` with determined target type `C<U>` that declares `FromCollectionLiteral`:
 
-- *Borrowing form.* The compiler materializes a temporary `ReadOnlySpan<U>` over the n element values (the storage for the span may be stack-allocated; its lifetime encloses only the `FromCollectionLiteral` call) and emits `C<U>.FromCollectionLiteral(thatSpan)`. Each `ei` is type-checked against `U` and must be implicitly convertible to it. The temporary span and its backing storage are released after the call returns; the factory must not retain the span beyond its own execution (the span is a borrow-bearing value subject to [§28.6](#sec-leak-prevention) — storing it in the constructed collection's field is a borrow-lifetime violation, diagnosed in the factory body, not at the literal site).
+- *Borrowing form.* The compiler materializes a temporary `Array<U>` holding the n element values and a `ReadOnlyArraySpan<U>` over it (the backing array is compiler-owned and named by no binding; its lifetime encloses only the `FromCollectionLiteral` call) and emits `C<U>.FromCollectionLiteral(thatSpan)`. Each `ei` is type-checked against `U`, must be implicitly convertible to it, and — for class-typed `U` — is subject to [§15.4](#sec-collection-literals)'s borrowing-family element rule. The temporary span and its backing array are released after the call returns; the factory must not retain the span beyond its own execution (the span is a borrow-bearing value subject to [§28.6](#sec-leak-prevention) — storing it in the constructed collection's field is a borrow-lifetime violation, diagnosed in the factory body, not at the literal site).
 - *Owning form.* The compiler materializes a temporary `owned OwningArray<U>`, evaluates each `ei` (which must produce an owned `U`) and transfers it into the temporary in textual order, then emits `C<U>.FromCollectionLiteral(thatArray)` transferring ownership of the temporary array into the call. The factory drains the array (typically via the array's `move`-based element extraction) and is responsible for the array's discharge per the standard owned-parameter rules ([§28.3](#sec-local-variables-ownership-and-borrows)). If element evaluation throws partway, the already-evaluated owned elements and the partially-filled temporary array are disposed by the standard exception-path discharge ([§28.3](#sec-local-variables-ownership-and-borrows)), exactly as for an `OwningArray<U>` literal.
 
-The empty literal `[]` targeting such a type is admitted: the borrowing form receives an empty `ReadOnlySpan<U>`; the owning form receives an empty `OwningArray<U>`. The factory is responsible for handling the empty case (it always must, since an empty collection is a valid general input).
+The empty literal `[]` targeting such a type is admitted: the borrowing form receives an empty `ReadOnlyArraySpan<U>`; the owning form receives an empty `OwningArray<U>`. The factory is responsible for handling the empty case (it always must, since an empty collection is a valid general input).
 
 **Result ownership.** `FromCollectionLiteral` returns `owned C<U>`; the literal expression therefore produces an owned value, subject to the standard owned-result discharge rules ([§28.3](#sec-local-variables-ownership-and-borrows)) — identical to the ownership treatment of a built-in `Array<U>` / `OwningArray<U>` literal.
 
@@ -3052,7 +3054,7 @@ public class RingBuffer<T>
 
   public method Push(item: T) ... end;
 
-  public static method FromCollectionLiteral(elements: ReadOnlySpan<T>): owned RingBuffer<T>
+  public static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned RingBuffer<T>
     var rb := new RingBuffer<T>(elements.Length);
     for var i in 0..<elements.Length do
       rb.Push(elements[i]);
