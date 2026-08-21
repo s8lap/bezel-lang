@@ -5625,14 +5625,35 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // overload — suggesting `Sorted(comparer)` to
                                 // someone who called `Sort()` sends them to a
                                 // different operation (a copy, not in place).
+                                //
+                                // fix #3329 / proposal 0116 §3 D2 (spec §14.2,
+                                // stdlib §4.4, v0.276): the pre-fix text
+                                // printed unsubstituted `T` (defect 1), cited
+                                // the retired stdlib §3 (defect 2), and stated
+                                // an accept-list ("is not a built-in comparable
+                                // type") rather than the structural reason
+                                // (defect 3). D2's four-part contract: name
+                                // the receiver with the substituted type
+                                // argument, name the condition in §14.2's
+                                // words, name the structural reason (the
+                                // substituted type does not conform to
+                                // `IComparable<Self>`), and name the remedy
+                                // (the compare-overload for the form the user
+                                // actually wrote, with the substituted type
+                                // substituted).
+                                const std::string elemName =
+                                    typeNameForDiag(elemTy472);
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
-                                    "Array<T>." + std::string(m) +
-                                    "() requires T to implement "
-                                    "IComparable<T> (§3 / #472); T is not a "
-                                    "built-in comparable type. "
+                                    "Array<" + elemName + ">." +
+                                    std::string(m) +
+                                    "() requires T: IComparable<T> "
+                                    "(spec §14.2, stdlib §4.4, v0.276); " +
+                                    elemName + " does not implement "
+                                    "IComparable<" + elemName + ">. "
                                     "Use " + std::string(m) +
-                                    "(comparer: (T, T) -> int) instead.");
+                                    "(comparer: (" + elemName + ", " +
+                                    elemName + ") -> int) instead.");
                             } else if (m == "Sorted") {
                                 ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                     "Array", recvTy->genericArgs[0]));

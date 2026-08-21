@@ -86,6 +86,14 @@ std::string main_(const char* preamble, const std::string& body) {
 // #2790 / stdlib §4.4 — the repro.  Before the fix this compiled and silently
 // left the array unsorted.
 BEZEL_TEST(array_sort_constraint_gate_2790, sort_non_comparable_class_rejected) {
+    // ⚠ UPDATED BY #3329 / proposal 0116 §3 D2 (spec §14.2, stdlib §4.4,
+    // v0.276).  The pre-fix needle was `"Array<T>.Sort() requires T to
+    // implement"` — that text never matched the substituted form
+    // (`Array<Plain>`) and quoted the retired stdlib §3 via the message
+    // body.  The current needle pin the FOUR parts of D2: the substituted
+    // receiver (`Array<Plain>`), the §14.2 condition wording, the
+    // structural reason (`Plain does not implement IComparable<Plain>`),
+    // and the form the user wrote.
     BEZEL_EXPECT_TRUE(rejectsWith(main_(kPlain,
         "    using var a := new Plain(3); "
         "    using var b := new Plain(1); "
@@ -93,13 +101,18 @@ BEZEL_TEST(array_sort_constraint_gate_2790, sort_non_comparable_class_rejected) 
         "    var arr: Array<Plain> := [a, b, c]; "
         "    arr.Sort(); "
         "    return arr[0].V() * 16 + arr[1].V() * 4 + arr[2].V(); "),
-        "Array<T>.Sort() requires T to implement"));
+        "Array<Plain>.Sort() requires T: IComparable<T> "
+        "(spec §14.2, stdlib §4.4, v0.276); Plain does not implement "
+        "IComparable<Plain>"));
 }
 
 // The diagnostic must name the form the USER WROTE and point at THAT form's
 // comparer overload.  Telling someone who called `Sort()` to use
 // `Sorted(comparer)` sends them to a different operation — a copy, not an
 // in-place sort — so the message is parameterised rather than hardcoded.
+// ⚠ UPDATED BY #3329: the pre-fix needle was
+// `"Use Sort(comparer: (T, T) -> int) instead"` — the substituted type
+// name `Plain` now appears in the parenthetical.
 BEZEL_TEST(array_sort_constraint_gate_2790, diagnostic_names_the_form_written) {
     BEZEL_EXPECT_TRUE(rejectsWith(main_(kPlain,
         "    using var a := new Plain(3); "
@@ -107,11 +120,12 @@ BEZEL_TEST(array_sort_constraint_gate_2790, diagnostic_names_the_form_written) {
         "    var arr: Array<Plain> := [a, b]; "
         "    arr.Sort(); "
         "    return 7; "),
-        "Use Sort(comparer: (T, T) -> int) instead"));
+        "Use Sort(comparer: (Plain, Plain) -> int) instead"));
 }
 
 // ...and `Sorted()` keeps naming ITSELF — the shared gate must not have made
-// both forms report one name.
+// both forms report one name. ⚠ UPDATED BY #3329: the substituted type
+// `Plain` appears in the remed overload's parenthetical.
 BEZEL_TEST(array_sort_constraint_gate_2790, sorted_still_names_itself) {
     BEZEL_EXPECT_TRUE(rejectsWith(main_(kPlain,
         "    using var a := new Plain(3); "
@@ -119,7 +133,88 @@ BEZEL_TEST(array_sort_constraint_gate_2790, sorted_still_names_itself) {
         "    var arr: Array<Plain> := [a, b]; "
         "    var s := arr.Sorted(); "
         "    return 7; "),
-        "Use Sorted(comparer: (T, T) -> int) instead"));
+        "Use Sorted(comparer: (Plain, Plain) -> int) instead"));
+}
+
+// #3329 / proposal 0116 §3 D2 (spec §14.2, stdlib §4.4, v0.276):
+// the FIRST of the diagnostic's three defects is that the receiver
+// type is printed UNSUBSTITUTED — `Array<T>.Sort()` tells the user the
+// rule but not which of their types broke it.  This test pins the
+// substituted form: `Array<Widget>` for a receiver on the user-named
+// class `Widget`.  Without the fix the substring would not match; the
+// existing #2790 tests are coarse enough that the fix could regress
+// item 1 of D2 without their noticing.
+BEZEL_TEST(array_sort_constraint_gate_2790,
+           diagnostic_names_substituted_type_array_3329) {
+    BEZEL_EXPECT_TRUE(rejectsWith(
+        "module M; "
+        "class Widget "
+        "  public constructor() end constructor; "
+        "  public method Tag(): int => 1; "
+        "end Widget; "
+        "class C  public static method Main(): int "
+        "  using var a := new Widget(); "
+        "  var arr: Array<Widget> := [a]; "
+        "  arr.Sort(); "
+        "  return 7; "
+        "end Main; end C; ",
+        "Array<Widget>.Sort()"));
+}
+
+// #3329 — the STRUCTURAL reason must name the substituted type in
+// the constraint position, not "T is not a built-in comparable type".
+// The pre-fix text printed an accept-list (the implementation's
+// internal shortlist of primitives and class types), which goes stale
+// every time the list grows and never names the remedy.  The current
+// form names the substituted type and the constraint it fails to
+// satisfy.
+BEZEL_TEST(array_sort_constraint_gate_2790,
+           diagnostic_states_structural_reason_3329) {
+    BEZEL_EXPECT_TRUE(rejectsWith(
+        "module M; "
+        "class Widget "
+        "  public constructor() end constructor; "
+        "  public method Tag(): int => 1; "
+        "end Widget; "
+        "class C  public static method Main(): int "
+        "  using var a := new Widget(); "
+        "  var arr: Array<Widget> := [a]; "
+        "  arr.Sort(); "
+        "  return 7; "
+        "end Main; end C; ",
+        "Widget does not implement IComparable<Widget>"));
+}
+
+// #3329 — the diagnostic must NOT cite the retired stdlib §3.  The
+// live homes are stdlib §4.4 (the declarations and the condition) and
+// spec §14.2 (the constraint vocabulary).  A diagnosis that quotes
+// retired §3 sends the reader to a nonexistent section.
+BEZEL_TEST(array_sort_constraint_gate_2790,
+           diagnostic_cites_current_stdlib_section_3329) {
+    auto r = runAot(
+        "module M; "
+        "class Widget "
+        "  public constructor() end constructor; "
+        "  public method Tag(): int => 1; "
+        "end Widget; "
+        "class C  public static method Main(): int "
+        "  using var a := new Widget(); "
+        "  var arr: Array<Widget> := [a]; "
+        "  arr.Sort(); "
+        "  return 7; "
+        "end Main; end C; ");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool sawCurrent = false;
+    bool sawRetired = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("stdlib §4.4") != std::string::npos)
+            sawCurrent = true;
+        if (d.message.find("§3 / #472") != std::string::npos)
+            sawRetired = true;
+    }
+    BEZEL_EXPECT_TRUE(sawCurrent);
+    BEZEL_EXPECT_FALSE(sawRetired);
 }
 
 // CONTROL — a class that DOES implement IComparable<T> must still sort in place.
