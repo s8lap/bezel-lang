@@ -4407,22 +4407,18 @@ bool MethodOwnership::localDropOnOverwriteCovered(const sema::Symbol* sym) {
     if (!ls) return false;
     auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
     if (!ld) return false;
-    // §28.7 / §28.3 (#1625): a null-INITIALIZED plain local (`var x: T? := null;`)
-    // that BECOMES owned via reassignment is covered by codegen's drop-on-overwrite
-    // once unwindOwnedLocalClass recognises the becomesOwnedViaReassign flag — so
-    // the FINAL value is exactly-once-safe to auto-drop at scope end, exactly like
-    // the owned-initializer locals the path below admits. The flag is set ONLY for
-    // a null-initialized local (handleAssignment), so this branch does NOT fire for
-    // a no-initializer local (`var x: Stream;`) that becomes owned on both branches
-    // of a join — that case CARRIES the §28.3 obligation and stays a hard error
-    // absent explicit discharge (own_join.owned_on_both_branches_carries_obligation)
-    // — nor for a borrow-initialized local (its overwrite must not auto-drop). The
-    // DECLARED type (not the `null` initializer's type) is the class/interface;
-    // exclude owning collections/wrappers/tasks (their overwrite does not dispose
-    // via class dispatch — codegen's unwindOwnedLocalClass excludes them too),
+    // §28.7 / §28.3 (#1625): a plain local that becomes owned via reassignment
+    // is covered by codegen's drop-on-overwrite, so the FINAL value is exactly-
+    // once-safe to auto-drop at scope end. A null-initialized local uses the
+    // becomesOwnedViaReassign marker; a no-initializer local (`var x: T;`) has
+    // the same adoption and §28.3 K3.14 warning+auto-drop obligation, but no
+    // initializer to mark (spec §28.3 Pattern 2, v0.277). The declared type (not
+    // the `null` initializer's type) is the class/interface; exclude owning
+    // collections, wrappers and tasks (their overwrite does not dispose via
+    // class dispatch — codegen's unwindOwnedLocalClass excludes them too),
     // mirroring the initializer-based checks below. Falls through when not a
     // covered class/interface local.
-    if (ld->becomesOwnedViaReassign) {
+    if (ld->becomesOwnedViaReassign || !ld->initializer) {
         const sema::TypeRef* dt =
             ld->type ? ctx_.resolvedType(*ld->type) : nullptr;
         if (isClassOrInterfaceResult(dt)) {
