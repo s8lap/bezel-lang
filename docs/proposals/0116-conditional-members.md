@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | `draft` (2026-08-21), authored against **v0.275**. Origin is the closing comment on [#3324](https://github.com/s8lap/bezel-lang/issues/3324), which carried the question forward explicitly: *"The `OwningArray<T>` half and the conditional-member question are being carried forward as their own work rather than left implicit here."* |
+| **Status** | `draft`, **Draft 2** (2026-08-21), re-argued against **v0.276** after a three-lane costing of option (c). **Draft 2 reverses Draft 1's recommendation** — see this proposal's §11. Draft 1 was authored against v0.275. Origin is the closing comment on [#3324](https://github.com/s8lap/bezel-lang/issues/3324), which carried the question forward explicitly: *"The `OwningArray<T>` half and the conditional-member question are being carried forward as their own work rather than left implicit here."* |
 | **Tracking issue** | [**#3328**](https://github.com/s8lap/bezel-lang/issues/3328) (opened at the v0.276 landing). The issues this proposal's §10 asks for are filed: [#3329](https://github.com/s8lap/bezel-lang/issues/3329) (the C1 diagnostic), [#3330](https://github.com/s8lap/bezel-lang/issues/3330) (is a member-level `where` inert?), [#3331](https://github.com/s8lap/bezel-lang/issues/3331) (the unenforced conditions), [#3332](https://github.com/s8lap/bezel-lang/issues/3332) (can `check_docs.sh` police the register?). |
 | **Target module(s)** | **spec** — [§14.2](../Bezel_Language_Spec.md#sec-constraints) gains one subsection (*Conditionally-admitted members*, with a register table: the whole normative payload); [§35.2](../Bezel_Language_Spec.md#sec-choice-members)'s v0.233 paragraph is **narrowed to its choice-specific half** and cites the general rule for the rest; [§3.6](../Bezel_Language_Spec.md#sec-derived-type-properties)'s reservation paragraph gains one sentence (D5). **stdlib** — four prose sites gain a citation apiece; §5's six hashable-requiring operators move to a constrained extension block (D9); [§4.5](../Bezel_Standard_Library.md#sec-ownedarrayt) gains two declaration lines under D3's branch A. **rationale** — [§5.15](../Bezel_Design_Rationale.md#sec-owned-buffers-and-spans) one decision record. **`Bezel_For_Code_Generation.md`** — one line, D3-dependent (§9 obligation). **guides** — Guide 02 teaches C3's combinators but states no rule this proposal moves, so no pin moves (verified, this proposal's §6, *Not edited*). **Appendix A** — untouched: **no grammar changes, no new tokens** (D7 is a semantic rejection of an already-grammatical form). **Appendix C** — one row (D7's rejection). **`DECLINED.md`** — four decline-index rows (this proposal's §9). |
-| **Written against** | spec/stdlib/rationale/changelog **v0.275**, HEAD `17db9bee`. Every quotation was re-verified against that tree. Compiler citations are `file:line` at that commit and were obtained **by reading only** — this proposal's author could not build or run `bezelc`, and every claim that would require a build is marked as such and left unasserted. |
+| **Written against** | Draft 2: spec/stdlib/rationale/changelog **v0.276**, HEAD `b26ad189`. ⚠ **Every `file:line` written in Draft 1 has drifted 1–6 lines** under v0.276's edits to §9.2, §25.2 and §35.7; citations in sections Draft 2 rewrote are re-verified, and those in sections it did not are marked *(Draft 1 numbering)*. Draft 1: **v0.275**, HEAD `17db9bee`. Every quotation was re-verified against that tree. Compiler citations are `file:line` at that commit and were obtained **by reading only** — this proposal's author could not build or run `bezelc`, and every claim that would require a build is marked as such and left unasserted. |
 | **Currency** | v0.275. **Quoted:** spec §3.6, §14.2, §14.4, §26.4, §26.5, §35.2, §35.4, Appendix A.4; stdlib §2.20, §4.4, §4.5, §4.14, §5; changelog v0.55→v0.56, v0.96→v0.97, v0.274, v0.275. **Cited without quotation:** spec §11.8, §22.6, §28.11, §32.12, §32.13; stdlib §4.8, §4.10, §4.15. **Re-verify before graduation:** §35.2's v0.233 paragraph (this proposal rewrites it), §14.2's *Derived-property constraints* subsection (the new subsection sits beside it and borrows its growth discipline), and stdlib §4.4's comment block (rewritten at v0.275 and again here). |
 | **Origin** | [#3324](https://github.com/s8lap/bezel-lang/issues/3324) asked whether *"the per-member constraint form [is] admissible on an unconstrained generic class."* v0.275 answered *no* and shipped the capability anyway, by a mechanism it named only by example. This proposal asks what that mechanism **is**. |
 
@@ -24,9 +24,27 @@ Four facts, each established in this proposal's §1 and §4:
 1. **The standard library has five of them**, not the two the framing question named (this proposal's §2). The three additions are `Result<T, E>`'s four value-payload combinators, `ReadOnlySpan<T>.ToArray()`, and §5's six hashable-element LINQ operators; a sixth candidate is discharged as an ordinary missing `where` clause. Only the `Result` row has a normative definition.
 2. **That definition already exists** — §35.2's *"Compiler-provided per-instantiation members (v0.233)"* paragraph (`Bezel_Language_Spec.md:10105`) states the admissibility rule, the rejection site, the diagnostic contract, and the reservation. It is complete. It is also filed in the **Choices** chapter and written entirely about `Result<T, E>`, so nothing in the language points the other four at it.
 3. **v0.275 did not know it was there.** Its entry states that *"a conditional-member reading exists **nowhere**"* (`Bezel_Changelog.md:8351`). Read as a claim about a **`where`-clause** reading that is exactly right; read as the claim it makes, it is false, and the false reading is what left the restored `Array<T>.Sort()` with prose and no anchor.
-4. **Users are not as helpless as the framing assumes.** §26.4's own worked example is a constrained extension declaring `Sort()` — *"`extension IEnumerable<T> where T: IComparable<T>`"* (`Bezel_Language_Spec.md:5870`) — and §26.4 states its meaning normatively: *"A `where` clause on the block constrains which instantiations of the extended type the extension applies to."* A user **can** write a conditional member today, under any name the receiver type does not already declare, whenever the condition is a §14.2 constraint. The stdlib's five are precisely the cases where one of those two conditions fails.
+4. ⚠ **The escape hatch does not work today, which Draft 1 did not know.** Spec §26.4 states that a block `where` clause *"constrains which instantiations of the extended type the extension applies to"*. The compiler does not implement it: `ExprTC::lookupExtensionMember` (`src/sema/ExprTypecheck.cpp:6937-7218`) reads `genericConstraints` only to collect free variables for target matching (`:6994`) and to spell the clause in an ambiguity diagnostic (`:7181`) — **no candidate is ever discarded for failing its `where` clause**, and no test in the tree asserts that one is. The proof is in the standard library: §5.1's shipped `extension IEnumerable<T> where T: IComparable<T>` still needs a hand-written gate at `src/sema/ExprTypecheck_Calls.cpp:5249-5295` to enforce its own clause. Filed as **[#3336](https://github.com/s8lap/bezel-lang/issues/3336)**, and it is the **keystone**: both C3's route and C5's respell run through constrained extensions, so neither works until it lands. Point 5 below is therefore true of the *language* and false of the *implementation*.
 
-The proposal therefore recommends **option (b)** of the framing question — a standing, *stated*, compiler-known-standard-library privilege — implemented as a **register**: §14.2 gains a subsection that lifts §35.2's rule to a general one and carries a closed table of the conditional members the standard library has — **four** of the five, because the fifth turns out to need no privilege and is respelled (D9) — growing **only by recorded ruling**, exactly as §14.2's admitted derived-property set already does. Option (a) (a user-writable per-member `where`) is declined with a reopening bar; option (c) (remove the capability) is declined, and this proposal argues it at full strength first, because it is not obviously wrong — one of the five ships nothing at all.
+5. **Users are not as helpless as the framing assumes.** §26.4's own worked example is a constrained extension declaring `Sort()` — *"`extension IEnumerable<T> where T: IComparable<T>`"* (`Bezel_Language_Spec.md:5870`) — and §26.4 states its meaning normatively: *"A `where` clause on the block constrains which instantiations of the extended type the extension applies to."* A user **can** write a conditional member today, under any name the receiver type does not already declare, whenever the condition is a §14.2 constraint. The stdlib's five are precisely the cases where one of those two conditions fails.
+
+**Draft 2 recommends a fourth option the framing did not contain, and that Draft 1 argued against: retire four of the five, and register the one that is left.**
+
+Draft 1 recommended option (b) — register all four surviving rows as a standing privilege. A costing of option (c) (this proposal's §5.3, rebuilt) found that Draft 1 had argued the weak version of it. Option (c) is not *"delete the members"*; it is **remove the conditionality**, and on that reading four of the five rows leave the census on their own evidence:
+
+| Row | What the compiler does today | Disposition |
+|---|---|---|
+| **C4** `ReadOnlySpan<T>.ToArray()` | **The member does not exist and the call is rejected** | **Delete.** Zero cost — the documents assert a call that does not compile |
+| **C2** `OwningBuffer<T>.DangerousPointer()` | Ships nothing, ninety revisions | **Delete**, or name it at the v0.283 subtraction review |
+| **C5** LINQ hashable-element set | No gate found | **Respell** as a constrained extension (D9, unchanged from Draft 1) |
+| **C3** `Result<T, E>`'s four combinators | Shipped, ~455 lines | **Route to its own ruling** — proposal 0075 §3.3 Option B makes it an ordinary constrained extension |
+| **C1** `Array<T>.Sort()`/`Sorted()` | Shipped, hardened, five issues | **Register it** — the one true residue |
+
+So the register lands with **one row, carrying a recorded expiry**, not four as a standing privilege. That is a materially smaller normative claim than Draft 1 made, and it is the difference between *"the standard library may do what users cannot"* and *"one member does, for a reason that is written down and will lapse."*
+
+**What C1's residue actually is.** Its predicate `T: IComparable<T>` is already a writable §14.2 constraint; it is blocked only by §26.5 rule 1's name rule. Renaming does not rescue it, because `Array<T>` is a declaration-less builtin (`src/common/BuiltinRegistry.cpp:679`) and `src/runtime/` is C — the sort stays a compiler intrinsic under any spelling. **C1 is an artifact of the standard library not being self-hosted, not a language design commitment**, and its register row says so and points at proposal [0005](0005-selfhost-stdlib-collections.md).
+
+Option (a) — a user-writable per-member `where` — remains declined, on Draft 1's reasons, which Draft 2 did not disturb. But **R1's reopening bar is suspended**: it asks for evidence that the predicate vocabulary rather than the name blocks users, and #3336 establishes that the mechanism the bar presumes does not currently function (fact 4 above).
 
 ---
 
@@ -159,9 +177,9 @@ B1 is a naming problem with a known cost. **B2 is the real one**, and it is what
 | # | Member(s) | Declared at | Condition on the enclosing parameter | Normative anchor today | Compiler |
 |---|---|---|---|---|---|
 | **C1** | `Array<T>.Sort()`, `Array<T>.Sorted()` | stdlib §4.4, `Bezel_Standard_Library.md:1620–1622`; note `:1626–1633`; prose `:1646` | `T: IComparable<T>` | **none** — prose only, defined by reference to C2 | **shipped**: `src/sema/ExprTypecheck_Calls.cpp:5521–5636`; five hardening issues (#472, #1195, #2768, #2790, #3139); **ten** test files exercise the parameterless forms — `grep -rln '\.Sort()\|\.Sorted()' tests/`, across three areas (codegen 6, module 2, ownership 2). ⚠ v0.275 says *"twelve test files across four areas"* (`Bezel_Changelog.md:8346`); that count does not reproduce under this recipe and no recipe was recorded beside it. The divergence is stated rather than resolved — the fourth area is plausibly `tests/lit/sema`, whose five `Sort`/`Sorted` cases are all **comparer**-form and so exercise a different member |
-| **C2** | `OwningBuffer<T>.DangerousPointer()` | stdlib §4.14, `:2506–2510`; prose `:2535` | `T` in the §32.12 **FFI-pointee set** (and the value-typed presentation) | **none** — prose only | **not implemented.** No sema arm, no codegen arm. The only occurrences in the tree are one comment (`src/codegen/LlvmBackend_Exprs.cpp:3672`) and one conformance row that never compiles (`tests/conformance/manifest.tsv:492`, `stdlib_0068 … skip:signature`) |
+| **C2** | `OwningBuffer<T>.DangerousPointer()` | stdlib §4.14, `:2506–2510`; prose `:2535` | `T` in the §32.12 **FFI-pointee set** (and the value-typed presentation) | **none** — prose only | **not implemented**, confirmed by exhaustive grep at Draft 2: one comment in `src/` (`src/codegen/LlvmBackend_Exprs.cpp:3672`), one comment in `tests/`, one never-compiled conformance listing (`tests/conformance/manifest.tsv:492`, `stdlib_0068 … skip:signature`). ⚠ **Draft 2 corrects two Draft 1 claims here.** The citation surface is **five** spec sites, not four — Draft 1 misses `Bezel_Language_Spec.md:9764` — plus a stdlib site Draft 1 does not cite at all, §10.1 `:5420`, where `CString.Pointer`'s *stated purpose* is argv-building over `OwningBuffer<IntPtr>`. And Draft 1's *"no other spelling"* is **overstated**: `[N]IntPtr` at a by-address `extern` parameter (§32.5 `:9398`, §15.1.3 `:2828`) covers the statically-sized case normatively today, and the read direction (`Ptr<IntPtr>.LoadAt`, `:9825`) never needed this member. The genuine residual is **runtime-sized** Bezel-owned pointer storage only |
 | **C3** | `Result<T, E>.Map`, `.MapError`, `.AndThen`, `.UnwrapOr` | stdlib §2.20, `:1172–1175`; prose `:1186` | receiver **and** result instantiation both **value-like** (§35.4 rule 3) | **§35.2** (`Bezel_Language_Spec.md:10105`) — the only anchored instance | **shipped**: `src/sema/ExprTypecheck_Calls.cpp:8932–9090`, with the classification diagnostic |
-| **C4** | `ReadOnlySpan<T>.ToArray()` | stdlib §4.14, `:2780–2783`; prose `:2795` | value-typed `T` **and** `T` not **borrow-bearing** | partial — cites *"§3.6 rule 2"* for the borrow-bearing half; the value-typed half rides the two-presentation split | **no gate found by reading.** No `ToArray` arm in `src/sema/ExprTypecheck_Calls.cpp` tests the element for borrow-bearing; the nearest borrow-bearing per-instantiation re-check in that file (`:2960–3050`) is §30.1's `async`-signature rule, a different subject. Not asserted without a build; filed (this proposal's §10, issue D) |
+| **C4** | `ReadOnlySpan<T>.ToArray()` | stdlib §4.14, `:2780–2783`; prose `:2795` | value-typed `T` **and** `T` not **borrow-bearing** | partial — cites *"§3.6 rule 2"* for the borrow-bearing half; the value-typed half rides the two-presentation split | ⚠ **Draft 1 understated this, and Draft 2 corrects it: the member does not exist and the call is rejected.** The span family's member surface is a closed allow-list ending in a *"no member"* report (`src/sema/ExprTypecheck_Calls.cpp:7903–8188`, terminal diagnostic `:8174–8185`, which enumerates the surface and omits `ToArray`), reachable for every span head; codegen's `tryLowerArraySpanCall` (`LlvmBackend_Calls3.cpp:3145+`) has no arm either. **Call sites are zero** in `docs/**`, zero in `tests/**`, and zero exercised in `tests/conformance/cases/` (both listings `skip:signature-listing`, manifest `:496–497`). Draft 1 said *"no gate found by reading"*, which reads as *the member works and is ungated*; the opposite is true |
 | **C5** *(respelled by D9 — needs no privilege)* | LINQ `Distinct`, `Union`, `Intersect`, `Except`, `Contains`, `ToSet` on `extension IEnumerable<T>` | stdlib §5, `:3489` (the extension head), `:3504`, `:3544–3547`, `:3566`; prose `:3588` | `T` **hashable** | partial — *"enforced at the operator's instantiation site exactly as for `Set<T>`/`Dictionary<K, V>` (§4.8/§4.10; spec §3.6 rule 2)"* | **no gate found by reading.** `checkHashContainerKeys` (`src/sema/TypeResolution_Checks.cpp:2323`) runs over hash-container *key positions*, not over these operators' call sites. Not asserted without a build; filed (this proposal's §10, issue D) |
 | **C6** | LINQ `GroupBy<TKey>`, `ToDictionary` | stdlib §5, `:3560`, `:3564–3565` | `TKey` **hashable** | same sentence, `:3588` | as C5 |
 
@@ -180,7 +198,9 @@ That leaves **five** true conditional members, in four families, of which **one*
 
 Five members. Four families. Eighty-nine revisions between the first (v0.186) and the newest ruling about one (v0.275). **One anchored.** Two of the five — C2 and C4 — are in the buffer/span family, which is also the family §3.6's reservation names as its worked example; one more (C5) turns out not to need the privilege at all (D9). So the practice is neither scattered nor uniform: it is a small set with one member that is properly a language question (C1's name collision), two that are properly compiler-known-primitive questions (C2, C4), one that is already ruled (C3), and one that is a stdlib spelling choice (C5).
 
-The practice is small enough to enumerate on one screen and old enough that no revision has enumerated it. That combination is the argument for a **register** rather than either a general feature or a removal: an enumerable practice with no enumeration is exactly the shape that grows silently.
+The practice is small enough to enumerate on one screen and old enough that no revision has enumerated it. Draft 1 read that as the argument for a **register** over either a general feature or a removal.
+
+**Draft 2 reads it differently, because the costing changed two of the five facts above.** An enumerable practice with no enumeration does grow silently — but three of these five rows are not a *practice* at all: C4 is a member the compiler rejects, C2 is a member the compiler never had, and C5 needs no privilege by this proposal's own D9. What the census actually shows is **one shipped conditional member (C1), one shipped-and-anchored one (C3), and three documents-only entries**. Registering all four would have written three fictions into a normative table and given them a growth discipline. The register is still right for what is left; what is left is one row.
 
 ---
 
@@ -188,7 +208,20 @@ The practice is small enough to enumerate on one screen and old enough that no r
 
 ### D1 — A conditional member is a **standing, stated, compiler-known-standard-library privilege**, defined once in §14.2 and carried in a closed register ▲
 
-**Decision.** Option (b) of the framing question, executed as a lift rather than as a fresh rule:
+**Decision (Draft 2).** **Retire four, register one.** Draft 1's decision — option (b) over all four surviving rows — is superseded; what remains of it is the mechanism, applied to a single row.
+
+1. **C4 and C2 are deleted from the standard library**, as ordinary corrections: C4 because §4.14 documents a call the compiler rejects (the defect class v0.275 corrected in the opposite direction), C2 because ninety revisions of zero implementation and zero call sites is what process §10's subtraction review exists to act on. Neither deletion needs this proposal's mechanism, and neither is a design change — see §5.3.
+2. **C5 is respelled** as `extension IEnumerable<T> where T: hashable` (D9, unchanged from Draft 1), which needs no privilege.
+3. **C3 is routed to its own ruling**, not carried here. Proposal [0075](0075-result-ergonomics.md) §3.3 **Option B** already specifies it: admit the classification-neutral payload set as **one** §14.2 derived-property constraint, amend §26.2 to open extensions to the choice kind, and the four combinators become an ordinary §26.4 constrained extension — the block clause carrying the receiver half, an ordinary method-level `where U:` carrying the result half. **No member-level `where` on an enclosing parameter is needed, so D7 stands.**
+4. **C1 alone gets the register row**, in the new §14.2 subsection, and the row **carries its own expiry**: the member is a compiler intrinsic because `Array<T>` is a declaration-less builtin (`src/common/BuiltinRegistry.cpp:679`) and the standard library is written in C, not because the language decided a member may be conditional. When proposal [0005](0005-selfhost-stdlib-collections.md) self-hosts the collections, the row is re-examined; §26.5 rule 1's name rule is then the only remaining obstacle, and that is a §26 question.
+
+Everything below in this D1 — the lift of §35.2's rule into §14.2, the narrowing of §35.2 to its choice-specific half, the growth discipline, and the register's shape — is **unchanged and still recommended**. Only the table's size changes, from four rows to one.
+
+⚠ **Sequencing.** Items 2 and 3 both produce constrained extensions, and [#3336](https://github.com/s8lap/bezel-lang/issues/3336) establishes that the compiler does not enforce a block `where` clause at all. **#3336 lands first**, or C5's respell silently admits every instantiation and C3's route has nothing to stand on.
+
+**What Draft 1 got right and Draft 2 keeps:** that §35.2 already contains the complete rule and the move is a *lift* rather than an invention; that the rule belongs in §14.2 beside the derived-property constraints; the diagnostic contract (D2); the §3.6 boundary (D5); and the rejection of a member-level `where` (D7).
+
+**Draft 1's decision, for the record — option (b) over four rows, executed as a lift rather than as a fresh rule:**
 
 1. §35.2's v0.233 paragraph is **generalized** and rehomed. Its rule — admissibility per instantiation, rejection at the use site, the diagnostic contract, the compiler-known footing, the no-user-declaration clause — becomes a new §14.2 subsection, ▲ **"Conditionally-admitted members"**, sitting beside *Derived-property constraints* and borrowing its growth discipline verbatim: *"The admitted set grows only by recorded ruling — one property, one decision; there is no negated form and no user-extensible mechanism"* (`Bezel_Language_Spec.md:2443`).
 2. §35.2 keeps only what is choice-specific — the four combinators' identity, the value-like condition, the §35.11 body-discipline exemption, and the ordinary-call clause — and cites the general rule for the rest.
@@ -354,9 +387,44 @@ D1. Costs: one spec subsection, one register table, one narrowing of §35.2, one
 
 The honest weakness: a register is a *record*, not an *enforcement*. Nothing mechanically stops a future revision from writing "admitted only where…" into the stdlib without a row. Two mitigations, both cheap: the growth clause is normative (*"only by recorded ruling"*, borrowed verbatim from §14.2's neighbouring subsection), and `scripts/check_docs.sh` grew a **SETS** check at v0.275 precisely for *"a passage naming the set and enumerating it"* — the register is exactly that shape. Whether SETS can be parameterized to this register is a tooling question, filed (this proposal's §10, issue E), not claimed.
 
-### 5.3 Option C — remove the capability (framing option (c)) — **declined, argued at strength first**
+### 5.3 Option C — remove the capability (framing option (c)) — ⚠ **Draft 2: substantially ADOPTED**
 
-This deserves better than a dismissal, and one of its premises is *stronger* than the framing knew.
+**Draft 1 declined this, and Draft 1 argued the wrong version of it.** Draft 1 read option (c) as *delete the members*, priced that, and declined it — correctly, for that reading. The strong version is different: **keep every capability that exists and remove the *conditionality*,** by re-homing each member onto a device the language already has or by deleting what the compiler never had. A three-lane costing against v0.276 (`c1-rename`, `c3-result`, `c24-spans`) settled it row by row.
+
+#### 5.3.1 What the costing found, row by row
+
+**C4 — delete. Zero cost, and the strongest row of the five.** The member does not exist in the compiler and the call is rejected (§2.1, corrected). Call sites are zero everywhere. The replacement is the one the standard library already prescribes for the sibling family — *"a loop or an explicit `Array<T>`"* — and v0.272's decline of the mirror on `ReadOnlyArraySpan<T>` priced the resulting asymmetry as *"the migration's one genuine loss"*: **that loss is zero**, because the `ReadOnlySpan` side does not compile either. Deleting C4 removes a documents-only asymmetry rather than creating one.
+
+**C2 — delete, or name it at the v0.283 subtraction review.** Draft 1's own §5.3 concedes this row *"ships nothing at all"*. Draft 2 adds that the presentation-split alternative is **not available in principle**: §32.12 `:9820` states the pointee set *"is an enumerated closed set plus one derived property; it is deliberately not a second §3.6 table row"*, so the device has nothing to split on, and §14.2 admits only §3.6 properties. The honest residual is runtime-sized Bezel-owned pointer storage (§2.1, corrected) — a capability the compiler has never provided, no program has used, and whose absence costs a missing-member error rather than a wrong answer.
+
+**C5 — respell.** Unchanged from D9.
+
+**C3 — routed, not deleted, and this is where Draft 1's decline actually fails.** Draft 1 declined option (c) partly because *"the removal does not achieve its own goal — C3 stays regardless"*. That is true of deletion and false of the strong reading. §26.2's own exclusion sentence names the way out:
+
+> Choices. The extendable list above is closed against the choice kind — **no [§14.2] constraint names the value-like classification** a payload-generic extension surface would need, and the value-payload combinator surface of stdlib `Result<T, E>` is **compiler-provided** ([§35.2]), not an extension block.
+
+The privilege exists *because* the constraint vocabulary is too narrow — stated in the section that closes the escape route, added at **the same v0.233 landing that created C3**, citing C3 as its reason. Admit the constraint and the exclusion's own stated ground evaporates. Proposal 0075 §3.3 **Option B** specified exactly this and was declined at v0.233 as *"permanent user-facing constraint vocabulary bought on one program's evidence"*.
+
+**That stated ground no longer holds, which is the new evidence a reopening requires.** It is not one program's evidence: it is five standard-library members across four types, unenumerated for eighty-nine revisions, three of them unimplemented, plus one closed extension kind, plus three consecutive revisions of churn over the practice. The demand side is unchanged; the **cost** side is what the census measured for the first time.
+
+⚠ **Draft 1 cites neither §26.2 nor proposal 0075 anywhere** — verified by grep at Draft 2. For a proposal whose central claim is why the privilege is necessary, missing the section that says why it exists, and the prior proposal that specified the alternative, is a research defect and is recorded as one in §11.
+
+**C1 — stays, and the reason is not what Draft 1 assumed.** The obvious removal is a rename: the predicate `T: IComparable<T>` is already a writable §14.2 constraint, so if the name `Sort` were free, a constrained extension would do. It does not work, for two reasons independent of the name. **There is no Bezel-source standard library** — `Array<T>` is a declaration-less builtin (`src/common/BuiltinRegistry.cpp:679`), `src/runtime/` is C — so the sort stays a compiler intrinsic lowered from a name-keyed arm under any spelling; the compiler line delta of either rename direction is ≈ zero. And **the constrained-extension mechanism is itself unenforced** ([#3336](https://github.com/s8lap/bezel-lang/issues/3336)). A rename would disturb five hardening suites and two spec worked examples to relocate a privilege rather than remove it.
+
+#### 5.3.2 The two hypotheses that failed, recorded so they are not re-tried
+
+**The two-presentation device does not absorb these gates.** `OwningBuffer<T>`/`Span<T>`/`ReadOnlySpan<T>` are each declared twice by `T`'s category, and §2.2 excludes that device from the census as *"a stronger and separately-recorded device"*. Draft 2 tested whether a finer split could absorb the second gate. It fails for C2 categorically (§32.12 `:9820`, above) and for C3 four times over — `Result<T, E>` is a **choice**, and §26.2 closes extensions against choices; the split axis is wrong (category, not the three-way choice classification); the **result** half is structurally invisible to a receiver-keyed split, since `Map<U>` returns `Result<U, E>` and `U` is inferred at the call site, so a value-like `T` with an owning `U` sits inside the admitting presentation; and the device is not privilege-free anyway — §3.6 `:536` reserves *behavior* dispatch to compiler-known standard-library types, and respelling C3 that way moves it from the weaker dispatch to the **stronger** one. For C4 a split is structurally available but buys one row, a worse diagnostic, and a third duplicated listing.
+
+**Widening §14.2 wholesale is not the answer either.** The admitted set is `sendable` and `hashable` only (`:2446`) out of §3.6's twelve rows. C1 and C5 are already writable. C2 is unreachable in principle. **C4 is unreachable as an admission** — its predicate is a *negation*, and §14.2 says *"there is no negated form"* categorically; reaching it would need a new positively-spelled §3.6 row plus a §2.8.6 row of inverted polarity. Only **C3** is a clean *one property, one decision*. Three permanent contextual keywords to make two of five rows writable is not a trade the §2.8.5 evidence bar supports; **one**, for the row that is shipped, anchored, and guide-taught, is.
+
+#### 5.3.3 What survives of Draft 1's decline
+
+Two things, and both are load-bearing:
+
+- **C1's removal stays declined**, on Draft 1's reasons in full: v0.275 reversed exactly this deletion hours before Draft 1 was written, the capability ships with five hardening issues behind it, and reopening needs new evidence against those stated reasons. Draft 2 has none — the costing *strengthens* the decline by showing a rename does not even relocate the problem. R2's bar is unchanged.
+- **The mechanism is still needed.** Retiring four rows does not retire the practice: C1 remains, and until #3336 lands and C3's ruling is taken, C3 does too. A register of one with a stated expiry is a smaller claim than Draft 1's four, not an absent one.
+
+*(Draft 1's argument, superseded but kept because its premises are the record Draft 2 argues against:)*
 
 **The case for C, at full strength.**
 
@@ -377,7 +445,37 @@ This deserves better than a dismissal, and one of its premises is *stronger* tha
 
 The status quo is not stable. v0.275 restored C1 with prose that defines the condition by pointing at C2, and C2 defines it by pointing at nothing; #3325 has since found the same condition unenforced on a third receiver. Each of the last three revisions has touched this practice without naming it, and each has been corrected by the next. The cost of "nothing" is measured, not hypothetical.
 
-### 5.5 The comparison
+### 5.5 Prior art — what other languages do ▲
+
+⚠ **Draft 1 contained none of this**, which matters because it declines option (a) without recording that option (a) is the mainstream design. Three strategies exist:
+
+**(1) Constrain the member itself — option (a).** **Rust** does it two ways: conditional inherent impls (`impl<T: Ord> Vec<T> { fn sort(&mut self) }`) and `where` clauses on individual methods naming the *enclosing* impl's parameter (`impl<T> Container<T> { fn dedup(&mut self) where T: PartialEq }`) — which is D7's form, admitted. **Swift**: constrained extensions (`extension Array where Element: Comparable`), plus conditional *conformance*, which is this proposal's R4. **C++20**: a `requires` clause on a non-template member of a class template; before concepts, `enable_if` SFINAE plus the lazy-instantiation rule, which made members of class templates *accidentally* conditional — ill-formed for some `T`, but only when called.
+
+**(2) Constrain a separate extension or free function** — Bezel's §26.4 today. **C#** is the closest relative and has **Bezel's exact gap**: a `where` clause on a non-generic method of `Class<T>` is a hard error (CS0080), so C# routes everything through constrained extension methods — and hits the same collision, because instance methods beat extension methods in resolution, which is §26.5 rule 1 by another name. **Java** and **Go** are in this family (`Collections.sort`; Go forbids method-level type parameters outright).
+
+**(3) Require evidence at the call.** **Scala**'s `def sorted(implicit ord: Ordering[A])`, **Haskell**'s instance contexts. The member always exists; the call needs a witness. Bezel has no analogue.
+
+**The finding that bears on D1.** Rust cannot express these cases with separate impl blocks either — two inherent impls defining the same method name on one type are a duplicate-definition error *even when their bounds are disjoint*, because Rust has no overlap-based inherent resolution. The method-level `where` clause exists in Rust **because the separate-block route collides on the name**, which is precisely why C1 needs a privilege here. A mature language facing the identical obstacle chose option (a).
+
+That does not meet R1's bar as worded — R1 asks for evidence that the *predicate vocabulary*, not the name, blocks users — but it suggests R1 is aimed at the wrong thing: the name collision is not a lesser problem Rust worked around, it is the reason Rust built the feature. Combined with #3336 (the constrained-extension route does not currently function at all), **R1 should be re-drawn at graduation rather than defended as written.**
+
+**And what no one else does is the status quo.** C++ standard libraries leaned on lazy instantiation and C# has runtime intrinsics, but no mainstream language adopts *"the standard library may do what users cannot"* as a **stated** design. Draft 1's option (b) makes that honest by writing it down, which is a real improvement over an unstated privilege; Draft 2's point is that it should be written down for **one** member with an expiry, not four as a standing grant.
+
+### 5.6 The comparison
+
+⚠ **Draft 2 replaces this table.** Draft 1's version scored option C at *"2 of 5 rows resolved"* and *"contradicts a recorded decision — v0.275, hours old"*, both of which priced the deletion reading. The strong reading of C resolves four and contradicts nothing: v0.275's decision is about **C1**, which Draft 2 also declines to remove.
+
+| | A (user feature) | B (register all four) | **C′ (retire four, register one)** | D (nothing) |
+|---|---|---|---|---|
+| Census rows resolved | 1 of 5 | 5 of 5, by registering 3 fictions | **5 of 5, by deleting 2 and routing 1** | 0 |
+| Normative claim made | a new admissibility form | a standing four-row privilege | **one row, with a recorded expiry** | none |
+| Contradicts a recorded decision | v0.56, v0.97 (weakly) | no | **no** — v0.275 governs C1, which C′ keeps | no |
+| New grammar / tokens | new semantics for an existing form | none | **none here**; C3's routed ruling costs one contextual keyword | none |
+| Undefined interactions opened | four | none | **none** | four already open |
+| Compiler work | large | none for the rule | **#3336 (a fix owed anyway), then two deletions** | none |
+| Documents a member the compiler rejects | — | **yes (C4)** | no | yes |
+
+*(Draft 1's table, superseded:)*
 
 | | A (user feature) | **B (register)** | C (remove) | D (nothing) |
 |---|---|---|---|---|
@@ -648,6 +746,16 @@ stdlib §4.14 records the gap in this proposal's own vocabulary (`Bezel_Standard
 
 ## 9. Reopening bars, collected
 
+⚠ **Draft 2 changes R3 and suspends R1.** R3 routed `DangerousPointer()`'s removal to the v0.283 subtraction review and declined removing it *as a side effect of defining a mechanism*; Draft 2 **recommends the removal outright** (§5.3.1), so R3 is no longer a decline — it is a proposed deletion, and the row below is kept only as the record of Draft 1's position. R1 is **suspended, not withdrawn**: its bar asks for evidence about the predicate vocabulary rather than the name, and [#3336](https://github.com/s8lap/bezel-lang/issues/3336) shows the mechanism the bar presumes does not currently function, so the bar can be neither met nor missed until #3336 lands. §5.5's prior art suggests it is aimed at the wrong thing and should be re-drawn at graduation. **R2 and R4 are unchanged.**
+
+**Draft 2 adds one bar of its own:**
+
+| # | Declined | Reopening bar |
+|---|---|---|
+| **R5** | **Registering a conditional member that the compiler does not implement** (Draft 1 would have registered C2 and C4) | A register row must name a member the compiler admits, or say on its face that it does not — D8's discipline, applied as a precondition rather than an annotation. Draft 1 would have written two members the compiler rejects into a normative table and given them a growth discipline; that is the defect class v0.275 corrected in the opposite direction, and §5 item 3b of the change process now forbids the asserting half of it. Reopened only by a decision to register aspirational surface deliberately, which would need its own reasons. |
+
+**Draft 1's bars, R1–R4:**
+
 | # | Declined | Reopening bar |
 |---|---|---|
 | **R1** | **Option A** — a user-writable per-member `where` on an enclosing type parameter (this proposal's §5.1) | Real Bezel code in which §26.4's constrained extension is reached for and **fails for a reason other than the §26.5-rule-1 name collision** — that is, evidence that the *predicate vocabulary* (B2), not the *name*, is what blocks users. A wish for `Sort` over `SortNatural` is not that evidence. |
@@ -660,6 +768,16 @@ stdlib §4.14 records the gap in this proposal's own vocabulary (`Bezel_Standard
 ## 10. Questions for the owner, and what the coordinator must do
 
 ### Questions
+
+⚠ **Draft 2 supersedes Q1, Q2 and Q4.** **Q1** — D1's option — is now answered by §5.3's costing rather than put to the owner as an open choice: retire four, register one. **Q2** (D3's branch) was landed at v0.276. **Q4** (should `DangerousPointer()` be a subtraction-review candidate) is superseded by §5.3.1's recommendation to delete it outright, which the owner may still prefer to route to v0.283 instead. **Q3 and Q5 stand.**
+
+**Draft 2's questions:**
+
+- **Q6 — the C3 ruling.** Take proposal 0075 §3.3 Option B now, as its own ruling (one §14.2 constraint + the §26.2 amendment), or defer until the constraint is wanted on its own merits? Draft 2 recommends taking it: §26.2's exclusion names the missing constraint as its reason, and the *"one program's evidence"* ground of its v0.233 decline no longer describes the case.
+- **Q7 — C2's disposition.** Delete now as part of this proposal's landing, or name it at the v0.283 subtraction review as Draft 1's R3 routed? Draft 2 recommends deleting now — the residual capability (runtime-sized Bezel-owned pointer storage) was never implemented — but the subtraction review is the more conservative forum and costs one revision of delay.
+- **Q8 — C1's expiry.** Should the register row's re-examination be bound to proposal 0005 landing, as §0 proposes, or left as an open review item with no trigger?
+
+**Draft 1's questions:**
 
 - **Q1 — D1's option.** Register (B) recommended. The proposal argues (A) and (C) at strength in §5 and declines both; the owner may prefer (C) for `DangerousPointer` alone, which R3 routes to the v0.283 subtraction review rather than deciding here.
 - **Q2 — D3's branch.** Branch A (declare `OwningArray<T>.Sort()`) is recommended and appears to be what the parallel investigation found, but the working-tree evidence is uncommitted and this proposal does not assume it. If a build contradicts #3325's reading, Edit 6 is dropped and §4.4's comment states the absence with the rejecting site named.
@@ -687,7 +805,29 @@ stdlib §4.14 records the gap in this proposal's own vocabulary (`Bezel_Standard
 
 ## 11. Revision record
 
-**Draft 1 (2026-08-21), against v0.275 at `17db9bee`.** Authored from #3324's closing comment. Four findings changed the shape of the document as it was written, and are recorded because each contradicts a premise the drafting started from:
+### Draft 2 (2026-08-21), against v0.276 at `b26ad189` — **the recommendation reverses**
+
+Draft 1 recommended registering four conditional members as a standing compiler privilege. Draft 2 recommends retiring four and registering **one**, with an expiry. The reversal came from costing option (c) properly — three read-only lanes, one per row family — after the owner said they were *"leaning into not allowing conditional members."* Draft 1 had declined option (c) after arguing only its weak form (*delete the members*) rather than its strong one (*remove the conditionality*).
+
+**Five findings changed the recommendation. Four contradict something Draft 1 asserted.**
+
+1. **C4 does not merely lack a gate — the member does not exist and the call is rejected.** Draft 1's *"no gate found by reading"* reads as *the member works and is ungated*; the opposite is true (`src/sema/ExprTypecheck_Calls.cpp:7903–8188`). Zero call sites anywhere. This turns C4 from the hardest row to price into the easiest: deleting it costs nothing and stops the documents asserting a call that does not compile.
+2. **§26.2 says why the privilege exists, and Draft 1 never cites it.** Extensions are closed against the choice kind *because* no §14.2 constraint names the classification — added at the same v0.233 landing that created C3, citing C3 as its reason. Draft 1 cites neither §26.2 nor proposal **0075**, whose §3.3 Option B already specified the way out. Verified by grep: zero hits for either. For a proposal about why the privilege is necessary, that is a research defect, and it is the single largest one in Draft 1.
+3. **The escape hatch Draft 1 leans on does not function.** §26.4's block `where` clause is not enforced by the compiler ([#3336](https://github.com/s8lap/bezel-lang/issues/3336)) — no extension candidate is ever discarded for failing it, and §5.1's shipped constrained extension needs a hand-written gate to enforce its own clause. Draft 1's refuted-premise 3 (*users are not helpless*) is true of the language and false of the implementation, and R1's bar presumes a mechanism that does not work.
+4. **A rename cannot rescue C1**, which Draft 2 tested in both directions before accepting Draft 1's conclusion by a different route. There is no Bezel-source standard library; `Array<T>` is a declaration-less builtin and the sort stays a compiler intrinsic under any spelling. Draft 2 also withdraws a naming argument it started from: this standard library has no `MinBy`/`MaxBy`/`DistinctBy`, and its `-By` names all take a **key selector**, never a comparer, so `SortBy(comparer)` would give the suffix two meanings.
+5. **Two Draft 1 claims about C2 are overstated**: the citation surface is five spec sites plus an uncited stdlib site, not four; and *"no other spelling"* holds only for **runtime-sized** pointer storage — §32.5's `[N]IntPtr` at a by-address `extern` parameter covers the static case normatively today.
+
+**What Draft 2 did not disturb.** D2, D5, D6, D7, D8, D9 stand as written. Option (a) stays declined on Draft 1's reasons. C1's removal stays declined on v0.275's reasons, which the costing *strengthens*. §35.2 is still the complete rule and the move is still a lift.
+
+**One lane disagreement, resolved here.** The `c24-spans` lane held that C3's route still needs a member-level `where` naming the enclosing `T`, so option (a) would have to land too. That is wrong for the extension spelling: in `extension Result<T, E> where T: <neutral>` the clause names the **extension's** parameters (an ordinary §26.4 block clause), and `Map<U>(…) where U: <neutral>` names the **method's own** parameter (an ordinary §14.2 clause). Neither is a member-level clause on an enclosing parameter, so **D7 stands and C3 can still leave the census**. The `c3-result` lane's reading is adopted.
+
+**Conformance-corpus accounting** (process §6's deletion-shaped-proposal rule). C2: `tests/conformance/manifest.tsv:492` (`stdlib_0068`, `skip:signature`) — delete the row, no case to convert. C4: manifest `:496–497`, both listings `skip:signature-listing` — delete both rows. **No exercised case is affected, because neither member ever compiled.**
+
+**Still not verified** (no build available in any lane): #3336's probe, C2's and C4's rejection behaviour, and whether §5.1's hand-written gate becomes deletable once #3336 lands. Seven build-gated probes are named across the three lane memos.
+
+### Draft 1 (2026-08-21), against v0.275 at `17db9bee`
+
+Authored from #3324's closing comment. Four findings changed the shape of the document as it was written, and are recorded because each contradicts a premise the drafting started from:
 
 1. **The framing said "two members"; there are five** (plus one near-miss, C6, which is an ordinary missing `where` clause). The three additions — `Result<T, E>`'s combinators, `ReadOnlySpan<T>.ToArray()`, and §5's hashable-element operators — were found by the `§3.6 rule 2` and `rejected at the call site` search terms rather than by `admitted only where`, which is why prose-keyed searching alone would have reproduced the framing's count.
 2. **The framing said "no conditional-member reading exists anywhere", quoting v0.275. §35.2 is one**, complete, since v0.233. The proposal's central move — lift rather than invent — follows from that and from nothing else.
