@@ -861,6 +861,39 @@ void Resolver::checkGenericConstraintConsistency() {
                 for (const auto& gp : mdl->genericParams)
                     methodParams.push_back(gp.name);
                 for (std::string_view p : typeParams) methodParams.push_back(p);
+                // §14.2 (Conditionally-admitted members, rule 1, proposal 0116
+                // D7, fix #3330): the *constrained identifier* of a method's
+                // `where` clause must be one of the method's OWN type
+                // parameters. The bound may name any type parameter in scope
+                // (`where U: T` on `class Box<T>` is the ordinary type-
+                // parameter-bound form, fully defined and unaffected), but
+                // constraining the *enclosing* type's T on a member is a parse
+                // that means nothing: SymbolCollection's collectGenericParams
+                // keys constraints by parameter name and finds no match, so
+                // the clause is silently dropped — the inert-looking-but-load-
+                // bearing failure mode spec §9.2 names. Reject at the
+                // declaration so the form is never written.
+                std::unordered_set<std::string_view> methodOwnParams;
+                for (const auto& gp : mdl->genericParams)
+                    methodOwnParams.insert(gp.name);
+                std::unordered_set<std::string> memberWhereReported;
+                for (const auto& gc : mdl->genericConstraints) {
+                    if (methodOwnParams.count(gc.typeParam)) continue;
+                    if (!memberWhereReported.insert(std::string(gc.typeParam))
+                             .second)
+                        continue;  // one diagnostic per offending identifier
+                    ctx_.diagnostics().report(
+                        Severity::Error, mdl->span.begin,
+                        std::string("method-level `where` clause names `") +
+                        std::string(gc.typeParam) +
+                        "`, which is a type parameter of the enclosing "
+                        "declaration, not of this method (§14.2 "
+                        "*Conditionally-admitted members*, rule 1 — a "
+                        "`where` clause on a member may constrain only the "
+                        "member's own type parameters; constraining an "
+                        "enclosing type parameter on a member is meaningless "
+                        "and not a user-extensible mechanism)");
+                }
                 checkList(mdl->genericConstraints, methodParams, mdl->span.begin);
             }
     }
