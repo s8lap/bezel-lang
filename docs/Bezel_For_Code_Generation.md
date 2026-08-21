@@ -819,7 +819,6 @@ public class Array<T>: IList<T>                      // borrowing, resizable
   method AsReadOnlySpan([start[, length]] | r: Range<int>): ReadOnlyArraySpan<T>;
   method Slice(r: Range<int>): owned Array<T>;       // `arr[r]` is the compiler-recognized form
 end
-public extension Array<T> where T: IComparable<T>   method Sort();  Sorted(): owned Array<T>;  end
 ```
 
 `[1, 2, 3]` targets `Array<T>` (or an inline array). `Dispose()` is a no-op; elements are not disposed. `Sort`/`Sorted` are **not stable**; `OrderBy`/`OrderByDescending`/`ThenBy`/`ThenByDescending` are. Structural mutation inside a comparer raises `InvalidOperationException`.
