@@ -1628,14 +1628,22 @@ end Array;
 // receiver. These are arity-0 overloads of the names above (§22.6), admitted only
 // where `T: IComparable<T>`; the condition is checked at the call's instantiation
 // and reported there, the same shape `OwningBuffer<T>.DangerousPointer()` uses
-// (§4.14). `OwningArray<T>` has no such form.
+// (§4.14).
+//
+// `OwningArray<T>`: NOT DOCUMENTED HERE, AND DELIBERATELY NOT DENIED. Sema's
+// admissibility arm is `Array`-only, but codegen's `Sort()` arm carries no
+// receiver guard and a regression test comments that "OwningArray<T> in-place
+// Reverse()/Sort() work". Whether the call is admitted could not be settled
+// without building the compiler, and v0.275's own headline finding is that
+// v0.274 wrote an absence into this document for a call that works. So the
+// question is filed, not answered here.
 ```
 
 A collection literal `[1, 2, 3]` constructs an `Array<T>` when the target type is `Array<T>`; it constructs an inline array `[N]T` when the target is an inline array. See language spec [§15.4](Bezel_Language_Spec.md#sec-collection-literals) for the contextual-typing rules.
 
 `Array<T>` stores borrows: when the element type is a class, the elements are references whose ownership remains with whoever passed them in. The array's `Dispose()` is a no-op — `Array<T>` is trivial-dispose (language spec [§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types), v0.184): the backing storage is part of the instance's single allocation, released with it by the compiler-inserted free at the array's owner's release point — and the elements are not disposed. To have elements disposed, use `OwningArray<T>` ([§4.5](#sec-ownedarrayt)) — element disposal never happens through the borrowing type (spec §28.6, v0.213).
 
-`Reverse`/`Sort` versus `Reversed`/`Sorted` follow a uniform naming convention: the imperative-verb form (`Reverse`, `Sort`) mutates the receiver in place and returns nothing; the past-participle form (`Reversed`, `Sorted`) leaves the receiver unchanged and returns a fresh `owned Array<T>` with the elements in the new order. The result's ownership mirrors `ToArray(): owned Array<T>` — it is a borrowing array (a fresh backing buffer holding the same element borrows), so the caller is responsible for disposing the array itself, not its elements. `Sorted` has exactly one form: the comparer-taking method on `Array<T>`. There is **no** parameterless natural-order form, and none can be supplied by an extension: [§26.5](Bezel_Language_Spec.md#sec-resolution) rule 1 commits instance resolution by *name* — of any arity — so an extension member spelled `Sort` or `Sorted` would never be consulted on an `Array<T>` receiver, and the call would be a compile error rather than a fallback. Callers pass a comparer; `IComparable<T>.CompareTo` is the natural-order one. `OwningArray<T>` **declares** no copy-forms of its own — no `Reversed`, no `Sorted`, no `ToArray` — because no *owning* copy is expressible: an owning copy would either double-own each element (two arrays claiming the same owned instances) or drain the source (leaving it empty). That is a statement about the type's **declared surface**, not about what is reachable on a receiver of it. `Reversed`/`Sorted` are declared only on `Array<T>` (above) and on nothing `OwningArray<T>` conforms to, so neither resolves on an owning array. `ToArray` is different: [§5](#sec-system-collections-linq) declares it as an extension on `IEnumerable<T>`, which `OwningArray<T>` implements ([§4.13](#sec-owning-enumeration-interfaces)), and [§26.5](Bezel_Language_Spec.md#sec-resolution) rule 1 blocks an extension only where the receiver's type *declares* the name — so with `import System.Collections.Linq;` in scope `pool.ToArray()` resolves and is sound, returning a **borrowing** snapshot rather than an owning copy ([§4.5](#sec-ownedarrayt) states the form and its lifetime obligation). To reorder an `OwningArray<T>`, use the in-place `Reverse()`/`Sort()`; to move its elements into a new owning array, drain it (`Drain()`), which transfers ownership and empties the original. (v0.266, [#3286](https://github.com/s8lap/bezel-lang/issues/3286).)
+`Reverse`/`Sort` versus `Reversed`/`Sorted` follow a uniform naming convention: the imperative-verb form (`Reverse`, `Sort`) mutates the receiver in place and returns nothing; the past-participle form (`Reversed`, `Sorted`) leaves the receiver unchanged and returns a fresh `owned Array<T>` with the elements in the new order. The result's ownership mirrors `ToArray(): owned Array<T>` — it is a borrowing array (a fresh backing buffer holding the same element borrows), so the caller is responsible for disposing the array itself, not its elements. `Sorted` comes in two forms on `Array<T>`: the comparer-taking method, and the parameterless natural-order overload declared above, admitted where `T: IComparable<T>` and checked at the call's instantiation. Neither can be supplied by an **extension**: [§26.5](Bezel_Language_Spec.md#sec-resolution) rule 1 commits instance resolution by *name* — of any arity — so an extension member spelled `Sort` or `Sorted` is never consulted on an `Array<T>` receiver. For an element type that is not `IComparable<T>`, pass a comparer; for a concrete element type the natural-order comparer is that type's own `CompareTo` (for example `int.CompareTo`). `OwningArray<T>` **declares** no copy-forms of its own — no `Reversed`, no `Sorted`, no `ToArray` — because no *owning* copy is expressible: an owning copy would either double-own each element (two arrays claiming the same owned instances) or drain the source (leaving it empty). That is a statement about the type's **declared surface**, not about what is reachable on a receiver of it. `Reversed`/`Sorted` are declared only on `Array<T>` (above) and on nothing `OwningArray<T>` conforms to, so neither resolves on an owning array. `ToArray` is different: [§5](#sec-system-collections-linq) declares it as an extension on `IEnumerable<T>`, which `OwningArray<T>` implements ([§4.13](#sec-owning-enumeration-interfaces)), and [§26.5](Bezel_Language_Spec.md#sec-resolution) rule 1 blocks an extension only where the receiver's type *declares* the name — so with `import System.Collections.Linq;` in scope `pool.ToArray()` resolves and is sound, returning a **borrowing** snapshot rather than an owning copy ([§4.5](#sec-ownedarrayt) states the form and its lifetime obligation). To reorder an `OwningArray<T>`, use the in-place `Reverse()`/`Sort()`; to move its elements into a new owning array, drain it (`Drain()`), which transfers ownership and empties the original. (v0.266, [#3286](https://github.com/s8lap/bezel-lang/issues/3286).)
 
 **Sorting contract.** (1) **Stability.** `Array<T>`/`OwningArray<T>` `Sort`/`Sorted` (both the comparer and comparerless forms) are **not guaranteed stable** — equal elements may be reordered. `OrderBy`, `OrderByDescending`, `ThenBy`, and `ThenByDescending` ([§5](#sec-system-collections-linq)) **are stable** — equal keys retain source order (`ThenBy`'s compositional semantics require it). (2) **Comparer contract.** A comparer (or `CompareTo`) must induce a **total order**; under an inconsistent comparer the result is an **unspecified permutation of the original elements** — memory-safe, no element lost or duplicated. (3) **A comparer that throws mid-sort** propagates the exception and leaves the collection holding **exactly the original elements in unspecified order** (none lost, none duplicated). For `OwningArray<T>` this is the Appendix C disposed-exactly-once guarantee: every owned slot remains present and singly-held on the throw edge. (4) **Re-entrancy.** Structurally mutating a collection from inside its own sort comparer raises `InvalidOperationException` (the loud-failure discipline of language spec [§29.12](Bezel_Language_Spec.md#sec-concurrent-modification), extended from enumerator invalidation to sort callbacks).
 
@@ -5339,13 +5347,13 @@ It returns the declared constant whose underlying value equals `value`, or `null
 public record IntPtr
   public static readonly property Zero: IntPtr;
 
-  // Equality is declared, not synthesized: with no auto-properties the §9.2
-  // synthesis would be the zero-property "every-pair-equal" form. The four
-  // members are the language spec §25.2 co-declaration set; the implementations
-  // are compiler intrinsics comparing the pointer-sized representation.
-  public method Equals(other: IntPtr): bool;
-  public override method GetHashCode(): int;
-
+  // §25.2's co-declaration rule would require `Equals`/`GetHashCode` beside these
+  // operator overloads; §25.2 exempts `IntPtr`/`UIntPtr`, and v0.275 established
+  // that the exemption's stated ground (that they PREDATE the rule) does not
+  // describe the set it covers. Retiring it is blocked on §9.2's own
+  // contradiction about whether an equality-OPERATOR overload already strips
+  // auto-hashable -- which decides whether co-declaring is a no-op or a breaking
+  // change for every user record with an `IntPtr` field. Routed, not applied.
   public static method operator =(a: IntPtr, b: IntPtr): bool;
   public static method operator <>(a: IntPtr, b: IntPtr): bool;
 end IntPtr;
@@ -5353,9 +5361,6 @@ end IntPtr;
 /// Compiler-intrinsic; unsigned pointer-sized integer.
 public record UIntPtr
   public static readonly property Zero: UIntPtr;
-
-  public method Equals(other: UIntPtr): bool;        // §25.2 co-declaration set, as IntPtr above
-  public override method GetHashCode(): int;
 
   public static method operator =(a: UIntPtr, b: UIntPtr): bool;
   public static method operator <>(a: UIntPtr, b: UIntPtr): bool;

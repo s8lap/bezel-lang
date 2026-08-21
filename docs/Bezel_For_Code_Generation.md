@@ -818,6 +818,8 @@ public class Array<T>: IList<T>                      // borrowing, resizable
   method AsSpan([start[, length]] | r: Range<int>): ArraySpan<T>;
   method AsReadOnlySpan([start[, length]] | r: Range<int>): ReadOnlyArraySpan<T>;
   method Slice(r: Range<int>): owned Array<T>;       // `arr[r]` is the compiler-recognized form
+  method Sort(); method Sorted(): owned Array<T>;    // natural order; only where T: IComparable<T>,
+                                                     //   checked at the call's instantiation (v0.275)
 end
 ```
 
