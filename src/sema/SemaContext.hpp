@@ -981,6 +981,41 @@ inline bool isValueBuiltinByName(std::string_view n) {
 // `interface` with the same shape — IEqualityComparer is a user-IMPLEMENTED
 // agent (stdlib §5); the Dictionary/Set comparer-constructor overloads that
 // would *consume* one are a separate, still-deferred feature.
+
+// fix #3308 / §22.3 / §22.4 (v0.268): the SECOND MethodSymbol-construction
+// path in builtinInterfaceSym (the IComparable / IEquatable /
+// IEqualityComparer / IReadOnlySpan synthesized-family arm, ~line 1345) used
+// to inline the ParameterSymbol construction without setting `ps->modifier`.
+// #2641's codegen fix had to install an `ast::MethodDecl`-side AST fall-
+// back for this exact reason. Centralizing the per-parameter construction in
+// this helper so BOTH the path #2 loop AND the test seam drive the same
+// `ps->modifier = param.modifier;` assignment is the fix.
+//
+// The helper is intentionally free (not a SemaContext method) so the test
+// can drive it directly with a constructed `ast::Param` carrying a non-
+// empty `modifier` (the four synthesized interfaces' parameters all carry
+// no modifier in the spec, so reading them through the helper would always
+// see "" — which is correct, but observationally equivalent to a missing
+// assignment). The test constructs an `ast::Param` with `modifier = "out"`
+// and asserts the symbol carries it through: pre-fix the helper would
+// leave `ps->modifier` default-empty (FAIL), post-fix it propagates the
+// modifier (PASS).
+inline ParameterSymbol* buildBuiltinInterfaceParamSymbol(
+    SemaContext& ctx,
+    const ast::Param& param) {
+    auto* ps = ctx.makeSymbol<ParameterSymbol>();
+    ps->name = param.name;
+    // per §22.3/§22.4 (v0.268, #3308) — populate the formal modifier from
+    // the synthesized ast::Param so downstream codegen (#2641's
+    // registerOutVarStringRelease) reads the modifier from the SYMBOL
+    // rather than falling back to the AST. Today the four synthesized
+    // builtin interfaces' parameters carry no spec-side modifier, so the
+    // value is empty; the assignment closes the seam gap.
+    ps->modifier = param.modifier;
+    ps->declType = param.type.get();
+    return ps;
+}
+
 inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
     // stdlib §2.19 / spec §11.8 (v0.176, #807): the static-abstraction
     // interfaces INumber<T> / ISteppable<T> / IParsable<T>. All members are
@@ -1352,10 +1387,8 @@ inline TypeSymbol* SemaContext::builtinInterfaceSym(std::string_view name) {
         ms->parent = ts;
         ms->decl = rm.md;
         for (std::size_t p = 0; p < spec.paramNames.size(); ++p) {
-            auto* ps = makeSymbol<ParameterSymbol>();
-            ps->name = spec.paramNames[p];
-            ps->declType = rm.paramTypes[p];
-            ms->params.push_back(ps);
+            ms->params.push_back(
+                buildBuiltinInterfaceParamSymbol(*this, rm.md->params[p]));
         }
         ts->members.push_back(ms);
 
