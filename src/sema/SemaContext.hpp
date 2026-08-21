@@ -1012,6 +1012,14 @@ inline ParameterSymbol* buildBuiltinInterfaceParamSymbol(
     // builtin interfaces' parameters carry no spec-side modifier, so the
     // value is empty; the assignment closes the seam gap.
     ps->modifier = param.modifier;
+    // per §22.4/§1585 (v0.268, #3313) — populate the `when true`/`when
+    // false` out-nullability postcondition from the synthesized
+    // ast::Param so the caller-side narrowing (narrowFromOutPostcond)
+    // sees the same postcondition path #1 (~line 1216) writes. Today
+    // the four synthesized interfaces carry no spec-side postcondition,
+    // so the value defaults to None; the assignment closes the parallel
+    // seam gap mirrored by #3308.
+    ps->outNullPostcond = param.outNullPostcond;
     ps->declType = param.type.get();
     return ps;
 }
