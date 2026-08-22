@@ -9674,6 +9674,10 @@ static bool isBorrowBearingRecordForStaticReadonly(const TypeRef* rt,
         if (fs->posParam && fs->posParam->type)
             ft = ctx.resolvedType(*fs->posParam->type);
         if (!ft && fs->decl) {
+            // SEAM-ACCESSOR: AST arm of the both-sources pattern; the
+            // importedMemberType() side-table only covers imported fields
+            // (populated by ModuleLoader), so a LOCAL body's `fd->type` is
+            // reachable only via this cast.
             if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
                 if (fd->type) ft = ctx.resolvedType(*fd->type);
         }
@@ -10478,6 +10482,8 @@ void checkStaticReadonlyRecordInit(
     std::string_view name) {
     if (!declTy || declTy->kind != TypeRef::Kind::Named || !declTy->declaration)
         return;
+    // SEAM-ACCESSOR: positional-fields / choice-cases vectors (local only;
+    // imported types have no ast::TypeDecl and accept conservatively below).
     auto* td = dynamic_cast<const ast::TypeDecl*>(declTy->declaration->decl);
     if (!td) return;  // imported: no ast::TypeDecl — accept conservatively
     if (td->kind == ast::TypeDeclKind::Record) {
@@ -10566,6 +10572,11 @@ void Resolver::checkStaticReadonlyNullSource() {
                 // primary-ctor args, not on the field symbol. Walk both
                 // shapes; the §9.7 null-source check fires from the TYPE's
                 // initializer context.
+                // SEAM-ACCESSOR: AST arm of the both-sources pattern; needed
+                // for the LOCAL body's fd->type + fd->initializer (the
+                // importedMemberType() side-table carries the type but not
+                // the initializer for an imported body field, and the
+                // positional path covers only records' primary-ctor site).
                 auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
                 if (fd && fd->type) {
                     rt = ctx_.resolvedType(*fd->type);
@@ -10586,6 +10597,10 @@ void Resolver::checkStaticReadonlyNullSource() {
                 if (ps->isIndexer || !hasMod(ps, "static") ||
                     !hasMod(ps, "readonly"))
                     continue;
+                // SEAM-ACCESSOR: AST arm of the both-sources pattern; needed
+                // for the LOCAL auto-property's pd->type + pd->autoInitializer
+                // (the importedMemberType() side-table carries the type but
+                // not the autoInitializer for an imported auto-property).
                 auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
                 if (!pd || pd->isIndexer ||
                     pd->bodyKind != ast::PropertyBodyKind::Auto ||
