@@ -9468,19 +9468,23 @@ static std::string staticRefTypeName(const TypeRef* rt) {
 // target).
 static bool isRule3ImmutableContent(const TypeRef* rt) {
     if (!rt) return false;
-    if (rt->kind == TypeRef::Kind::Primitive && !rt->nullable) return true;  // int/long/byte/...
+    // `string` and `string?` reach TypeResolution as Kind::Primitive with
+    // primitive == PrimitiveType::String (the convention the parser uses
+    // for all the primitive-keyword spellings; named types use Kind::Named
+    // even when they have no user decl, e.g. `Channel<T>`). Other
+    // primitives (int/long/byte/char/bool/double/...) are also
+    // Kind::Primitive, and rule 3 covers them as "value types of
+    // sendable-value category" — except that rule 3 names the
+    // non-nullable form; `int?` is a borrow-bearing record case
+    // (§9.7) and is not in rule 3.
+    if (rt->kind == TypeRef::Kind::Primitive) {
+        if (rt->primitive == PrimitiveType::String) return true;
+        if (!rt->nullable) return true;  // int/long/byte/char/bool/double/...
+        return false;
+    }
     // Enums reach TypeResolution as Kind::Named with declaration->kind == Enum.
     if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
         rt->declaration->kind == ast::TypeDeclKind::Enum) return true;
-    // string and string? — both take rule 3's "unrestricted" reading:
-    // a nullable string is still sendable-value, still immutable, still
-    // not a process-global instance. (The "value type" reading rule 3
-    // names includes the nullable form: a value-type field's nullable
-    // form has the same reachability profile as the non-nullable form
-    // for a read-only static — the absence of a source, not its
-    // nullability, drives the "is this a borrow" question.)
-    if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
-        rt->headName() == "string") return true;
     if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
         rt->declaration->isValueBuiltin) return true;
     return false;
