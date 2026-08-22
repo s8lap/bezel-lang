@@ -14711,9 +14711,116 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 bool hasCapacity = cn == "Array" || cn == "OwningArray";
                 bool ok = ma.member == "Count" ? hasCount : hasCapacity;
                 if (ok) {
+                    // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.278): the
+                    // receiver's declared surface includes an instance
+                    // member named `Count` / `Capacity` of arity 0, so
+                    // §26.5 rule 1 commits instance resolution by name and
+                    // a same-named extension is unreachable. A call with
+                    // arity > 0 is therefore the "instance lookup commits,
+                    // then fails — compile error" case of §26.5 rule 1
+                    // ("the call is a compile error citing the instance
+                    // member(s); it does not fall back to an extension").
+                    // Without this gate the §5 LINQ operator on the same
+                    // name would silently resolve — the worked-example
+                    // shape stdlib §4.4 names ("arr.Count(pred) does not
+                    // resolve to LINQ's predicate count on an Array<T>").
+                    //
+                    // A bare reference (no call parens) is exactly the
+                    // instance member's reference form — accept it. A
+                    // 0-arg call matches the property's arity — accept
+                    // it. Anything else: reject citing the instance member
+                    // and noting the same-named §5 operator is unreachable.
+                    if (currentCallArity_ > 0) {
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            std::string("`") + std::string(ma.member) +
+                            "` on `" + std::string(cn) +
+                            "` is an instance member of the receiver's "
+                            "declared type; an extension of the same name "
+                            "is unreachable (spec §26.5 rule 1: instance "
+                            "members block same-named extensions of any "
+                            "arity, applicability, or accessibility). The "
+                            "instance member takes no arguments, but this "
+                            "call supplies " +
+                            std::to_string(currentCallArity_) + ". " +
+                            extensionNameBlockedNote(tt, ma.member));
+                        return;
+                    }
                     ctx_.setExprType(
                         &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                     return;
+                }
+            }
+        }
+        // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.278): Array<T> (§4.5)
+        // and FrozenArray<T> (§4.19) both declare `ToArray()` (0 args,
+        // returning owned Array<T>). A same-named §5 LINQ `ToArray()`
+        // extension on IEnumerable<T> is therefore unreachable by name
+        // on these receivers. A call with arity > 0 is the "instance
+        // lookup commits, then fails — compile error" case (spec's
+        // exact wording); reject it rather than letting the LINQ
+        // lowering fire on the wrong arity. The pre-fix path typed
+        // `arr.ToArray(pred)` via the isArrLike arm in typeCall at the
+        // 0-arg ToArray signature (ignoring the extra arg) — silently
+        // wrong: a typed-owned Array<T> fell out without the predicate
+        // ever running. The pre-fix path also dropped FrozenArray's
+        // ToArray through to a generic catch-all, which is the same
+        // class but on a frozen receiver.
+        //
+        // Both shapes carry the name "Array" / "FrozenArray" but differ
+        // in how the TypeRef records it: Array<T> arrives as the
+        // declaration-less Named shape (astNode->name = "Array", no
+        // declaration), FrozenArray<T> arrives as the builtinClassSym
+        // shape (declaration = ctx_.builtinClassSym("FrozenArray"), no
+        // astNode, no importedName). The shared name accessor used here
+        // is the same one codegen's builtinTypeName consults (it accepts
+        // all three shapes — declaration, astNode, importedName) so a
+        // single guard covers both receiver shapes.
+        if (ma.target && ma.member == "ToArray") {
+            if (auto* tt = ctx_.exprType(*ma.target)) {
+                bool isBuiltin =
+                    tt->kind == TypeRef::Kind::Named &&
+                    ((tt->declaration &&
+                      !tt->declaration->decl &&
+                      tt->declaration->moduleName.empty()) ||
+                     (!tt->declaration && tt->astNode && tt->astNode->name &&
+                      !tt->astNode->name->parts.empty()) ||
+                     (!tt->declaration && !tt->importedName.empty()));
+                if (isBuiltin) {
+                    std::string_view tcn;
+                    if (tt->declaration) tcn = tt->declaration->name;
+                    else if (tt->astNode && tt->astNode->name &&
+                             !tt->astNode->name->parts.empty())
+                        tcn = tt->astNode->name->parts.back();
+                    else tcn = tt->importedName;
+                    bool declaresToArray =
+                        // §4.5 Array<T>.ToArray(): owned Array<T> (a copy).
+                        tcn == "Array" ||
+                        // §4.19 FrozenArray<T>.ToArray(): owned Array<T>
+                        // (fresh mutable copy).
+                        tcn == "FrozenArray";
+                    if (declaresToArray && currentCallArity_ > 0) {
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            std::string("`") + std::string(ma.member) +
+                            "` on `" + std::string(tcn) +
+                            "<T>` is an instance member of the receiver's "
+                            "declared type; an extension of the same name "
+                            "is unreachable (spec §26.5 rule 1: instance "
+                            "members block same-named extensions of any "
+                            "arity, applicability, or accessibility). The "
+                            "instance member takes no arguments, but this "
+                            "call supplies " +
+                            std::to_string(currentCallArity_) + ". " +
+                            extensionNameBlockedNote(tt, ma.member));
+                        return;
+                    }
                 }
             }
         }
@@ -14789,6 +14896,34 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     return;
                 }
                 if (mbr == "First" || mbr == "Last") {
+                    // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.278):
+                    // LinkedList<T>.First / .Last are 0-arg properties (the
+                    // head/tail element, or null when empty). A same-named
+                    // §5 LINQ operator (First(pred), Last(pred) on
+                    // IEnumerable<T>) is therefore unreachable by name on
+                    // this receiver (§26.5 rule 1). A call with arity > 0
+                    // is the "instance lookup commits, then fails —
+                    // compile error" case (spec's exact wording); reject
+                    // it rather than letting the §5 extension resolve.
+                    if (currentCallArity_ > 0) {
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            std::string("`") + std::string(mbr) +
+                            "` on `" + std::string(llcn) +
+                            "<T>` is an instance member of the receiver's "
+                            "declared type; an extension of the same name "
+                            "is unreachable (spec §26.5 rule 1: instance "
+                            "members block same-named extensions of any "
+                            "arity, applicability, or accessibility). The "
+                            "instance member takes no arguments, but this "
+                            "call supplies " +
+                            std::to_string(currentCallArity_) + ". " +
+                            extensionNameBlockedNote(tt, mbr));
+                        return;
+                    }
                     // returns T? (null when empty)
                     ctx_.setExprType(&ma, makeNullableElemTy());
                     return;
@@ -14847,6 +14982,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             if (scn == "SortedSet" &&
                 (ma.member == "First" || ma.member == "Last") &&
                 !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.278):
+                // SortedSet<T>.First / .Last are 0-arg properties (the
+                // least/greatest element; InvalidOperationException if
+                // empty). A same-named §5 LINQ operator (First(pred),
+                // Last(pred) on IEnumerable<T>) is therefore unreachable
+                // by name on this receiver (§26.5 rule 1). A call with
+                // arity > 0 is the "instance lookup commits, then fails
+                // — compile error" case (spec's exact wording); reject
+                // it rather than letting the §5 extension resolve. The
+                // pre-fix arm set exprType=T unconditionally — which
+                // let typeCall's SortedSet path (line ~6473) and codegen's
+                // §5 First(pred) lowering fire on `s.First(pred)`.
+                if (currentCallArity_ > 0) {
+                    auto loc = ma.span.begin;
+                    if (loc.line == 0 && ma.target)
+                        loc = ma.target->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        std::string("`") + std::string(ma.member) +
+                        "` on `SortedSet<T>` is an instance member of "
+                        "the receiver's declared type; an extension of "
+                        "the same name is unreachable (spec §26.5 rule "
+                        "1: instance members block same-named extensions "
+                        "of any arity, applicability, or accessibility). "
+                        "The instance member takes no arguments, but this "
+                        "call supplies " +
+                        std::to_string(currentCallArity_) + ". " +
+                        extensionNameBlockedNote(tt, ma.member));
+                    return;
+                }
                 ctx_.setExprType(&ma, tt->genericArgs[0]);  // element type T
                 return;
             }
@@ -17627,6 +17792,46 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             resolveExtensionMember(ma, ext);
             return;
         }
+    }
+    // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.278): for receivers whose
+    // declared surface includes an instance member `ToArray` (Array<T> per
+    // §4.5, FrozenArray<T> per §4.19), a same-named §5 LINQ operator is
+    // unreachable by name on the receiver. A call with arity > 0 is the
+    // "instance lookup commits, then fails — compile error" case (spec's
+    // exact wording); reject it rather than letting the call type
+    // through typeCall's isArrLike arm at the 0-arg ToArray signature
+    // (silently dropping the extra arg). This is the
+    // builtinClassSym-stamped path for FrozenArray<T> (the same shape
+    // codegen's builtinTypeName consults) — FrozenArray<int>'s TypeRef
+    // carries a non-null declaration pointing at the synthetic
+    // FrozenArray TypeSymbol, while Array<int>'s TypeRef carries the
+    // declaration-less Named shape (astNode-only). The receiver-keyed
+    // check below covers both. Without this guard the FrozenArray path
+    // falls through typeCall's array-backed-collection dispatch with
+    // arity ignored — silently accepting `fa.ToArray(pred)` on a
+    // receiver whose declared surface has no predicate ToArray at all.
+    if (ma.target && ma.member == "ToArray" && currentCallArity_ > 0 &&
+        targetType && targetType->decl == nullptr &&
+        targetType->moduleName.empty() &&
+        (targetType->name == "Array" ||
+         targetType->name == "FrozenArray")) {
+        auto loc = ma.span.begin;
+        if (loc.line == 0 && ma.target)
+            loc = ma.target->span.begin;
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("`") + std::string(ma.member) +
+            "` on `" + std::string(targetType->name) +
+            "<T>` is an instance member of the receiver's declared "
+            "type; an extension of the same name is unreachable (spec "
+            "§26.5 rule 1: instance members block same-named extensions "
+            "of any arity, applicability, or accessibility). The instance "
+            "member takes no arguments, but this call supplies " +
+            std::to_string(currentCallArity_) + ". " +
+            extensionNameBlockedNote(
+                ma.target ? ctx_.exprType(*ma.target) : nullptr,
+                ma.member));
+        return;
     }
     if (!member) {
         // fix #2513 / spec §35.2 (v0.236): stdlib `Result<T, E>` carries four

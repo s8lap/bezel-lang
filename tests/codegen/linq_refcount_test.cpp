@@ -232,7 +232,11 @@ const char* kEagerCountCapturingChurn =
     "    var threshold: int := 3; "
     "    var i: int := 0; var ok: int := 1; "
     "    while i < 100000 do "
-    "      if a.Count(lambda(x) => x > threshold) <> 2 then ok := 0; end; "
+    // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.277): composed spelling
+    // `Where(pred).Count()` reaches the §5 operator pipeline; the direct
+    // `arr.Count(pred)` shape is a compile error on a receiver that
+    // declares `Count`.
+    "      if a.Where(lambda(x) => x > threshold).Count() <> 2 then ok := 0; end; "
     "      i := i + 1; "
     "    end; "
     "    if ok = 1 then return 0; end; return 1; "
@@ -343,8 +347,12 @@ const char* kBorrowedPredicateEagerReuse =
     "    using var a := new Array<int>(); "
     "    a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
     "    var pred: (int) -> bool := lambda(x: int) => x > 2; "
-    "    var c1: int := a.Count(pred); "
-    "    var c2: int := a.Count(pred); "
+    // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.277): composed spelling
+    // `Where(pred).Count()` reaches the §5 operator pipeline; the direct
+    // `arr.Count(pred)` shape is a compile error on a receiver that
+    // declares `Count`.
+    "    var c1: int := a.Where(pred).Count(); "
+    "    var c2: int := a.Where(pred).Count(); "
     "    if c1 = 2 and c2 = 2 then return 0; end; return 1; "
     "  end Main; "
     "end C;";

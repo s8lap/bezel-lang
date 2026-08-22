@@ -50,12 +50,18 @@ BEZEL_TEST(linq, any_all_string) {
 
 BEZEL_TEST(linq, count_where) {
     // Count(pred) is eager (int); Where is lazy — materialize with ToArray().
+    // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.277): `Array<T>` declares
+    // `Count` as a 0-arg property, so an `arr.Count(pred)` call is now a
+    // compile error — the §5 LINQ `Count(pred)` extension is unreachable on
+    // a receiver that declares `Count` by name. The composed spelling
+    // `arr.Where(pred).Count()` (Where is shadowed nowhere) reaches the
+    // operator pipeline.
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); a.Add(5); "
         "  using var evens: Array<int> := a.Where(lambda(x) => x mod 2 = 0).ToArray(); "
-        "  return int(a.Count(lambda(x) => x mod 2 = 0) = 2 and evens.Length = 2 "
+        "  return int(a.Where(lambda(x) => x mod 2 = 0).Count() = 2 and evens.Length = 2 "
         "    and evens.Get(0) = 2 and evens.Get(1) = 4); "
         "end Main; end C;"), 1);
 }
@@ -399,13 +405,18 @@ BEZEL_TEST(linq, select_projection) {
 // §5 Count(predicate): the predicate reads a record field. Point(5,0) satisfies
 // `p.x = 5`, so Count = 1. (Load-bearing: before the fix the record param was
 // untyped, `p.x` did not resolve, and the predicate body collapsed to a no-op.)
+// fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.277): `Array<T>` declares `Count`
+// as a 0-arg property, so the direct `arr.Count(pred)` shape is a compile
+// error — the §5 LINQ operator is unreachable by name. The composed spelling
+// `arr.Where(pred).Count()` (Where is shadowed nowhere in this document)
+// reaches the operator pipeline.
 BEZEL_TEST(linq, count_predicate_record_field_spec_5) {
     BEZEL_EXPECT_EQ(run(
         "module M; record Point(x: int, y: int); "
         "class C public static method Main(): int "
         "  using var a := new Array<Point>(); "
         "  a.Add(new Point(5, 0)); a.Add(new Point(3, 9)); a.Add(new Point(5, 7)); "
-        "  return a.Count(lambda(p) => p.x = 5); "
+        "  return a.Where(lambda(p) => p.x = 5).Count(); "
         "end Main; end C;"), 2);
 }
 

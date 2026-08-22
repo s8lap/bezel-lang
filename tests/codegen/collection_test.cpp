@@ -192,11 +192,16 @@ BEZEL_TEST(linq_int, all) {
 }
 
 BEZEL_TEST(linq_int, count) {
+    // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.277): `Array<T>` declares
+    // `Count` as a 0-arg property, so the direct `arr.Count(pred)` shape is
+    // a compile error — the §5 LINQ operator is unreachable by name. The
+    // composed spelling `arr.Where(pred).Count()` (Where is shadowed nowhere
+    // in this document) reaches the operator pipeline.
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<int>(); "
         "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "  return a.Count(lambda(x) => x mod 2 = 0); "
+        "  return a.Where(lambda(x) => x mod 2 = 0).Count(); "
         "end Main; end C;"), 2);
 }
 
@@ -260,13 +265,19 @@ BEZEL_TEST(linq_int, foreach_and_select) {
 // --- LINQ on Array<string> ---
 
 BEZEL_TEST(linq_string, any_all_count) {
+    // fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.277): `Array<T>` declares
+    // `Count` as a 0-arg property, so the direct `arr.Count(pred)` shape
+    // is a compile error — the §5 LINQ operator is unreachable by name on
+    // a receiver that declares `Count`. The composed spelling
+    // `arr.Where(pred).Count()` (Where is shadowed nowhere) reaches the
+    // operator pipeline.
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var a := new Array<string>(); "
         "  a.Add(\"apple\"); a.Add(\"banana\"); a.Add(\"avocado\"); "
         "  var hasA := a.Any(lambda(s) => s[0] = 'a'); "
         "  var allNE := a.All(lambda(s) => s.Length > 0); "
-        "  var aCount := a.Count(lambda(s) => s[0] = 'a'); "
+        "  var aCount := a.Where(lambda(s) => s[0] = 'a').Count(); "
         "  return int(hasA and allNE and aCount = 2); "
         "end Main; end C;"), 1);
 }

@@ -396,12 +396,17 @@ BEZEL_TEST(linked_list_4_6, linq_max_spec_5_fix450) {
 }
 
 // §5 + §4.6 fix #450: Count(pred) on a LinkedList<int> counts matching elements.
+// fix #3342 (§26.5 rule 1 / stdlib §4.4, v0.277): `LinkedList<T>` declares
+// `Count` as a 0-arg property, so the direct `l.Count(pred)` shape is a
+// compile error — the §5 LINQ operator is unreachable by name. The composed
+// spelling `l.Where(pred).Count()` (Where is shadowed nowhere) reaches the
+// operator pipeline.
 BEZEL_TEST(linked_list_4_6, linq_count_pred_spec_5_fix450) {
     BEZEL_EXPECT_EQ(run(
         "module M; class C public static method Main(): int "
         "  using var l := new LinkedList<int>(); "
         "  l.AddLast(1); l.AddLast(2); l.AddLast(3); l.AddLast(4); l.AddLast(5); "
-        "  return l.Count(lambda(x: int) => x mod 2 = 0); "  // even: 2,4 → 2
+        "  return l.Where(lambda(x: int) => x mod 2 = 0).Count(); "  // even: 2,4 → 2
         "end Main; end C;"), 2);
 }
 
