@@ -9452,6 +9452,34 @@ static std::string staticRefTypeName(const TypeRef* rt) {
     return rt ? std::string(rt->headName()) : std::string();
 }
 
+// §22.12 rule 3's "immutable content" (narrow-fix-forward for the rule 4
+// residual's over-broad default; v0.265, #3273 / #3290): primitive value
+// types, enums, `string`, and value types of sendable-value category (the
+// compiler-known value builtins DateTime, Guid, TimeSpan, Range,
+// CancellationToken, …). Rule 3 names this set as "unrestricted" — no
+// declaration-site rule-4 warning. A `static readonly int`, `static readonly
+// string`, or `static readonly Guid` therefore takes no rule 4 diagnostic;
+// the residual paragraph's "default is warning" reading applies only to
+// kinds rule 3 does NOT cover. Records and value-like choices are NOT in
+// rule 3 (records are explicitly NOT in rule 3's "value types of sendable-
+// value category" — that phrase denotes value-typed records' sendability,
+// not records themselves; a record's process-global reachability is the
+// residual paragraph's concern, and it is the (3d) warning's intended
+// target).
+static bool isRule3ImmutableContent(const TypeRef* rt) {
+    if (!rt) return false;
+    if (rt->nullable) return false;  // `string?` / `int?` is NOT in rule 3
+    if (rt->kind == TypeRef::Kind::Primitive) return true;   // int/long/byte/...
+    // Enums reach TypeResolution as Kind::Named with declaration->kind == Enum.
+    if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+        rt->declaration->kind == ast::TypeDeclKind::Enum) return true;
+    if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+        rt->headName() == "string") return true;
+    if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+        rt->declaration->isValueBuiltin) return true;
+    return false;
+}
+
 // §22.12 rule 4 (v0.262, #3272) warning-suppression set — every type
 // declaring the **synchronized** or **immutable** fact (stdlib §1). The set
 // is named verbatim in §22.12 rule 4's prose, and the four members outside
@@ -10061,18 +10089,40 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             return;
         }
 
-        // (3d) Every other declared type — default warning. This
-        // includes user records (records with a function-typed field
-        // included — function values are runtime-managed so the record
-        // is non-borrow-bearing, but function values are not in rule 3's
-        // immutable content either), value-like choices, compiler-known
-        // value builtins (DateTime, Guid, …), and the unit type. The
-        // warning text names the kind so the diagnostic says WHAT this
-        // type is, not just "this type".
+        // (3d) Every other declared type — default warning. Per
+        // §22.12 rule 4's residual paragraph (v0.265, #3273): "Rule 4's
+        // declaration-site warning is the default … with three kinds
+        // excepted below." The excepted list (§22.12 rule 4 bullets
+        // immediately following the residual paragraph) names interface
+        // and function types (which still take the default warning per
+        // that paragraph's first bullet — they are in (3a)/(3b) above),
+        // borrow-bearing record / holds-borrows choice / plain inline
+        // array carrying borrows (which are §9.7's static-field bullet,
+        // not rule 4 — already covered by the (2) early-returns above),
+        // and owning-classified choice (which is the (1) compile error
+        // above). The default warning's *target* set, after those
+        // excepted kinds are removed, is: every other declared type the
+        // residual paragraph names — records (a plain record with no
+        // reference-typed field is borrow-free and so NOT in the §9.7
+        // excepted list, so it lands here), value-like choices (the
+        // borrow-bearing reads from (2) catch the cases that would
+        // otherwise misclassify), and the unit type.
+        //
+        // Rule 3's "immutable content" (primitives, enums, string, value
+        // types of sendable-value category) is *not* listed in the
+        // excepted kinds — it lives in rule 3 itself, and rule 3 says
+        // "static readonly and const of immutable content … are
+        // unrestricted". A `static readonly int` / `static readonly
+        // string` / `static readonly Guid` therefore takes no rule 4
+        // warning: rule 3's "unrestricted" is the load-bearing exemption
+        // and overrides the residual paragraph's "default" reading. The
+        // isRule3ImmutableContent test below defers to rule 3 before
+        // falling into the (3d) default.
+        if (isRule3ImmutableContent(rt)) return;
+
         std::string_view kindDesc;
         if (isRecordTypeRef(rt)) kindDesc = "record";
         else if (isChoiceTypeRef(rt)) kindDesc = "choice";
-        else if (isValueBuiltinTypeRef(rt)) kindDesc = "value-builtin";
         else if (rt->kind == TypeRef::Kind::Unit) kindDesc = "unit";
         else kindDesc = "value";
         ctx_.diagnostics().report(

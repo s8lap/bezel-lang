@@ -4,7 +4,10 @@
 // §9.2 v0.182 (via §9.3's combined-form application of the same rule): a
 // static field is ignored on a COMBINED-form (positional + body) record too.
 //
-// Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
+// Post-#3290 (v0.265): a plain record is not borrow-bearing, so the §9.7
+// static-field bullet does NOT except it — it takes rule 4's default
+// warning. The check below pins the new rule 4 residual diagnostic; the
+// test still passes exit-zero and has no errors.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
