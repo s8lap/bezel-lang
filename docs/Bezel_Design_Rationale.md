@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.277 — August 2026**
+**Companion to the Bezel Language Specification, v0.278 — August 2026**
 
 The spec describes the language. This document explains the choices behind it — places where two reasonable designs were possible and one was picked, places where a familiar-looking rule has a less-stated rule behind it, and places where something widely done elsewhere was deliberately left out. The spec says what the language *is*; this document says *why*, and what the alternatives would have cost.
 
@@ -63,6 +63,19 @@ The cost: no sub-package privacy. Use `internal` and put related code in the sam
 Every method, field, and constant lives inside a class, record, or enum. Classes already group code and own static state; a parallel module-level grouping mechanism doubles the surface area without solving anything. A `public static class` of static methods is the entry point for what other languages call free functions.
 
 Extension blocks are the one exception. They live at module level because their identity is the type they extend, not a surrounding class.
+
+<a id="sec-auto-imported-extension-modules"></a>
+### 2.3 A type's standard surface follows the type (v0.278)
+
+Spec §2.3 makes 26 standard-library type names visible in every file with no `import`, and §2.8.3 rule 2 lets a program *call* the public members of a value whose module it never imported. Against both, §26.5 rule 2 scoped extension-member candidacy to imported modules — so a program could hold an `IEnumerable<T>` and call its instance members with no import at all, while `xs.Where(p)` required `import System.Collections.Linq;`, a module naming neither the receiver's type nor the receiver's module. §2.3 now auto-imports the standard library's extension modules over always-available types, which today names that one module.
+
+**What decided it was not the design argument but three facts about the rule's standing.** It had never been argued: the citation the standard library carried dated the *sentence* that stated it, not the rule, and the changelog entry it pointed at is a contract sweep containing nothing about extensions or imports. The compiler had never enforced it for the standard library — §5's operators are builtins matched by name, the import set is not consulted, and thirty-four test files called `.Where(` with no import and passed the real compile-link-run path. And the specification's own examples did not follow it: eight fenced examples called §5 operators with no import, two of them inside §26, the extensions chapter, alongside a guide and a conformance case recorded as compiling.
+
+So the question was never whether to relax a rule; it was which of two things the project already did should be written down. That reframing is what disqualified the option that looks conservative — keeping the rule and correcting the documents would have meant *enforcing* an unargued restriction at a cost of thirty-four tests, nine document sites and new compiler work, for a benefit no record states. Ratifying practice made nine sites correct without editing them.
+
+**The gate is kept where it earns its keep.** An extension injects member names onto a type its author did not write, and §26.5 rule 4's ambiguity remedy — *remove or narrow a conflicting import* — is the language's only tool for choosing between two such blocks. That hazard is real for third-party modules and absent for the standard library, which is singular, compiler-known, and cannot collide with itself. Every comparable language draws the line in the same place after shipping the opposite first: C# made its `using System.Linq` implicit in the default template a decade on; Rust puts `Iterator` in the prelude while requiring `use` for other traits; Kotlin auto-imports its collections.
+
+**The cost, which is not hypothetical and is not solved here.** §2.3 has no opt-out, and Bezel's extension blocks are nameless — so unlike C#, where a colliding extension can still be called through its static class, a user block declaring a member named `Where` over `IEnumerable<T>` has no qualified spelling and no import to remove. Renaming is the only remedy. This was accepted rather than answered, on three bounds: the escape did not work before either, since the gate was unenforced; the affected population is zero; and the failure is an ambiguity diagnostic naming both origins, not a silent wrong answer. Two fixes are recorded and deliberately not taken — a **provenance** tiebreak ranking a user block above a compiler-known one, which is not the auto-ranked *specificity* §17.10 deleted, or an import-suppression form on §2.3 — because neither is designable without knowing which of them a real collision wants.
 
 <a id="sec-syntax"></a>
 ## 3. Syntax

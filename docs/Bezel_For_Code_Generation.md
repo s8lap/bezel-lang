@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.277. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.278. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -609,7 +609,7 @@ Everything below is transcribed from `Bezel_Standard_Library.md` v0.268 with its
 | `System` | auto | `Console`, `Math`, `Convert`, `Environment`, temporal types, `Guid`, `Random`, the core interfaces, `Type`, the serialization vocabulary, `Shared`/`Weak`, `Result`, `ScopeGuard`, `Subscription`, the FFI carriers |
 | `System.Text` | auto | `StringBuilder`, `Encoding`, `ReadOnlyStringSpan` |
 | `System.Collections.Generic` | **explicit** | the collections — *except* the iteration interfaces (`IEnumerable`/`IEnumerator`/`IAsyncEnumerable`/`IAsyncEnumerator`/`IOwning*`), which are auto |
-| `System.Collections.Linq` | **explicit** | the query operators. Without the import they do not resolve |
+| `System.Collections.Linq` | **auto** (v0.278) | the query operators. No `import` needed — §2.3's invariant: a stdlib extension over an always-available type is auto-imported |
 | `System.Threading` | **explicit** | *except* `CancellationToken`/`CancellationTokenSource` and the six event types, which are auto |
 | `System.IO` | **explicit** | `Stream`, `FileStream`, `File`, `TextReader`/`TextWriter`, `Directory`, `Path` |
 | `System.Diagnostics` | **explicit** | `Stopwatch`, `Debug` |
@@ -1044,7 +1044,7 @@ end
 
 The sorted collections take **no comparer parameter** — ordering is `K`/`T`'s own `IComparable`. `SortedDictionary` has no `Keys`/`Values`. **There is no `OwningSortedDictionary`/`OwningSortedSet`, no `FrozenDictionary`/`FrozenSet`.** `Counter<K>` is insertion-ordered and a key decremented to zero is not removed.
 
-### 5.5 `System.Collections.Linq` (import required)
+### 5.5 `System.Collections.Linq` (auto-imported, v0.278)
 
 ```bezel
 public extension IEnumerable<T>
