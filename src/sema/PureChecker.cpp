@@ -530,10 +530,9 @@ bool PureBodyWalker::isEnumeratorConstructingSource(
 // Pure-classified callees:
 //   - Range<T>: pure-declared on the stdlib intrinsic (stdlib §9.8;
 //     carried by the `pure` modifier on the Range declaration).
-//   - string: pure-declared on `string.Contains` (stdlib §4.6).
-//   - Span families (ReadOnlySpan<char>, ReadOnlyStringSpan, the bit-tier
-//     Reader/Writer views): pure-declared on their `Contains` (stdlib
-//     §3.3, §4.14).
+//   - string: pure-declared on `string.Contains` (stdlib §9.6).
+//   - ReadOnlyStringSpan: pure-declared on `Contains` for the three
+//     `ReadOnlyStringSpan` overloads (stdlib §3.3).
 //   - User-declared types: pure iff a member named `Contains` exists on
 //     the receiver's symbol-side member list AND that member is
 //     pure-declared (carries `pure` in its modifiers list — the same
@@ -554,34 +553,35 @@ bool PureBodyWalker::inOperatorCalleeIsPure(const ast::BinaryExpr& be) const {
     if (!be.right) return true;  // resolution error elsewhere; no double-report
     const TypeRef* recvTy = ctx_.exprType(*be.right);
     if (!recvTy) return true;
-    // The receiver's identity for stdlib-type membership testing. The
-    // RangeExpr type's `headName()` is empty (RangeExpr has no astNode
-    // and its local TypeRef carries no importedName), so we read the
-    // declaration name directly when present. headName() is the alias-
-    // transparent spelling per TypeRef.hpp, which suffices for the
-    // string/span cases.
+    // The receiver's identity for stdlib-type membership testing. Builtin
+    // TypeRefs constructed in-place (RangeExpr's Range, the string
+    // builtin, ReadOnlyStringSpan) have no astNode and no importedName,
+    // so headName() returns empty and we fall back to declaration->name.
+    // headName() is the alias-transparent spelling per TypeRef.hpp, which
+    // suffices for user-declared Named types and alias-resolved heads.
     std::string_view head = recvTy->headName();
     if (head.empty() && recvTy->declaration)
         head = recvTy->declaration->name;
     // Special cases by receiver head — these are the stdlib-declared
     // pure-Contains types whose purity is a documentation fact, not a
     // symbol-table lookup (the members may not exist as MemberSymbols on
-    // the builtin TypeSymbol — e.g. Range<T>'s decl is null).
-    if (head == "Range") return true;  // stdlib §9.8, pure-declared intrinsic.
-    if (head == "string") return true;  // stdlib §4.6, pure-declared.
-    // Span families: ReadOnlySpan, Span (subclass relationship for the
-    // bit-tier's ReadOnlyArraySpan / ArraySpan / ReadOnlyStringSpan too).
-    // Their `Contains(value: T)` is pure-declared (stdlib §3.3, §4.14).
-    // We admit by NAME rather than walking the member list, because the
-    // span family's TypeSymbol may be imported with no `Contains` member
-    // reconstructed (ModuleLoader omits some stdlib-declared members on
-    // the import side — see the §3152 umbrella, family F11/F13).
-    if (head == "ReadOnlySpan" || head == "Span" ||
-        head == "ReadOnlyArraySpan" || head == "ArraySpan" ||
-        head == "ReadOnlyStringSpan" || head == "BitReader" ||
-        head == "ReadOnlyBitReader" || head == "BitWriter" ||
-        head == "ReadOnlyBitWriter")
-        return true;
+    // the builtin TypeSymbol after ModuleLoader's import-side filtering
+    // — see the §3152 umbrella, family F11/F13).
+    //
+    // Only types whose Contains is `public pure method Contains(...)`
+    // in stdlib belong in this list. As of v0.277 the set is exactly
+    // {Range<T>, string, ReadOnlyStringSpan}. The Span<T> / ReadOnlySpan<T>
+    // family (§4.14) and ArraySpan<T> / ReadOnlyArraySpan<T> (§4.15)
+    // declare Contains as a plain `method`, NOT `pure`, so they are
+    // EXCLUDED from this list — `x in spanVal` over those receivers is
+    // REJECTED by §22.15's calls-to-pure-members rule (the same way
+    // `x in arr` over Array<T> is rejected). The BitReader/BitWriter
+    // views declare no Contains member at all; their `in` operator is
+    // rejected earlier by §17.5's structural lookup, so adding them to
+    // this list would be unreachable in practice and misleading.
+    if (head == "Range") return true;            // stdlib §9.8
+    if (head == "string") return true;           // stdlib §9.6
+    if (head == "ReadOnlyStringSpan") return true; // stdlib §3.3
     // Generic user-declared types: walk the receiver's symbol-side member
     // list looking for a `Contains` member and check its `pure` modifier.
     // This matches what `callTargetIsPure` does for an explicit

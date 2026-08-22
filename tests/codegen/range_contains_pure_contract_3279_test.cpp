@@ -242,3 +242,94 @@ BEZEL_TEST(range_contains_pure_contract_3279,
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// =========================================================================
+// §22.15 / #3279 (post-review narrow): the by-name special-case set is
+// exactly {Range<T>, string, ReadOnlyStringSpan} — the stdlib types whose
+// Contains is `public pure method Contains(...)`. The Span<T> / ReadOnlySpan<T>
+// family (§4.14) and ArraySpan<T> / ReadOnlyArraySpan<T> (§4.15) declare
+// Contains as a plain `method`, NOT `pure`, so `x in spanVal` over those
+// receivers is REJECTED — same shape as the Array<T> reject above.
+//
+// Pre-fix: the by-name list over-admitted Span / ReadOnlySpan / ArraySpan /
+// ReadOnlyArraySpan / BitReader / BitWriter / ReadOnlyBitReader /
+// ReadOnlyBitWriter. Post-fix: only the pure-declared-Contains set is
+// admitted. These tests pin the corrected predicate scope.
+// =========================================================================
+
+// Negative — `requires(x in s)` over a ReadOnlySpan<int> receiver is
+// REJECTED. ReadOnlySpan<T>.Contains is a plain method (stdlib §4.14,
+// lines 2746/2778), so `in` over a ReadOnlySpan receiver fails the
+// §22.15 calls-to-pure-members rule.
+BEZEL_TEST(range_contains_pure_contract_3279,
+           requires_in_readonly_span_rejected_spec_22_15_issue_3279) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method Foo(x: int, s: ReadOnlySpan<int>): int "
+        "    requires(x in s) "
+        "    return x; "
+        "  end Foo; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "§22.15"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "ReadOnlySpan"));
+}
+
+// Negative — `requires(x in s)` over a Span<int> receiver is REJECTED.
+// Span<T>.Contains is a plain method (stdlib §4.14, lines 2589/2652),
+// so `in` over a Span receiver fails the §22.15 rule.
+BEZEL_TEST(range_contains_pure_contract_3279,
+           requires_in_span_rejected_spec_22_15_issue_3279) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method Foo(x: int, s: Span<int>): int "
+        "    requires(x in s) "
+        "    return x; "
+        "  end Foo; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "§22.15"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "Span"));
+}
+
+// Negative — `requires(x in s)` over an ArraySpan<int> receiver is
+// REJECTED. ArraySpan<T>.Contains is a plain method (stdlib §4.15,
+// line 3119), same rule.
+BEZEL_TEST(range_contains_pure_contract_3279,
+           requires_in_array_span_rejected_spec_22_15_issue_3279) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method Foo(x: int, s: ArraySpan<int>): int "
+        "    requires(x in s) "
+        "    return x; "
+        "  end Foo; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "§22.15"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "ArraySpan"));
+}
+
+// Negative — `requires(x in s)` over a ReadOnlyArraySpan<int> receiver
+// is REJECTED. ReadOnlyArraySpan<T>.Contains is a plain method (stdlib
+// §4.15, line 3184), same rule.
+BEZEL_TEST(range_contains_pure_contract_3279,
+           requires_in_readonly_array_span_rejected_spec_22_15_issue_3279) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public method Foo(x: int, s: ReadOnlyArraySpan<int>): int "
+        "    requires(x in s) "
+        "    return x; "
+        "  end Foo; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "§22.15"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "ReadOnlyArraySpan"));
+}
