@@ -17973,18 +17973,24 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // builtin-class path (null `decl`) has no fallback "no such member"
             // reject, a fully-unknown `Math.Bogus(5)` likewise miscompiled to
             // garbage. Split per class and reject anything outside each class's
-            // own set with a §3.4 diagnostic — the valid set per class is exactly
-            // the set its codegen handler lowers (LlvmBackend_Calls.cpp).
+            // own set with a per-class stdlib-§ diagnostic — the valid set per
+            // class is exactly the set its codegen handler lowers
+            // (LlvmBackend_Calls.cpp). fix #3344: the cite is parameterized so
+            // each class can name its own stdlib section (default `§3.4` is the
+            // historic constant for callers that haven't been updated; the
+            // BitConverter caller passes `§2.12` since stdlib §2.12 is
+            // `BitConverter`, not §3.4 which is `ReadOnlyAsciiByteSpan
+            // (retired v0.188)`).
             auto setInt = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int)); };
             auto setLong = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Long)); };
             auto setDbl = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Double)); };
             auto setBool = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool)); };
             auto setStr = [&]{ ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String)); };
-            auto rejectBuiltinStatic = [&]{
+            auto rejectBuiltinStatic = [&](const char* cite = "§3.4"){
                 ctx_.diagnostics().report(
                     Severity::Error, ma.span.begin,
                     "'" + std::string(cls) + "' has no static method or property '" +
-                        std::string(m) + "' (§3.4)");
+                        std::string(m) + "' (" + std::string(cite) + ")");
             };
             if (cls == "Convert") {
                 if (m=="ToInt32") setInt();
@@ -18111,13 +18117,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // (LlvmBackend_Calls.cpp `cls == "BitConverter"`) lowers no
                     // others. Like Math/Convert (#1037), an unknown static
                     // (`BitConverter.Bogus(1)`) was previously left untyped and
-                    // silently miscompiled to a no-op; reject it with §3.4. Safe
-                    // here because BitConverter has no instances, no sub-objects,
-                    // and no unit-returning members (unlike Console/Random/Guid/
-                    // Decimal, which are instance-bearing or have untyped-unit
-                    // members and need static-vs-instance disambiguation — see
-                    // issue #1038).
-                    rejectBuiltinStatic();
+                    // silently miscompiled to a no-op; reject it with the class's
+                    // own stdlib section (§2.12 — stdlib `BitConverter`, not §3.4
+                    // which is `ReadOnlyAsciiByteSpan (retired v0.188)`; fix
+                    // #3344). Safe here because BitConverter has no instances,
+                    // no sub-objects, and no unit-returning members (unlike
+                    // Console/Random/Guid/Decimal, which are instance-bearing or
+                    // have untyped-unit members and need static-vs-instance
+                    // disambiguation — see issue #1038).
+                    rejectBuiltinStatic("§2.12");
                 }
             }
             // stdlib §9.3 / fix #521: Decimal static member types.

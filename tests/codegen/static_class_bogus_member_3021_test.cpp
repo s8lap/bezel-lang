@@ -155,21 +155,22 @@ const std::vector<StaticCase>& allStaticCases() {
          "no member `TotallyBogusMember` on `Domain`; documented surface",
          false},
         // BitConverter has its own rejectBuiltinStatic() arm (line
-        // ~17782) producing a different message that *should* cite §2.12
-        // (BitConverter's actual stdlib section — stdlib line 552, the
-        // v0.103 stdlib section header is `### 2.12 `BitConverter``,
-        // not `§3.4`, which is `ReadOnlyAsciiByteSpan (retired v0.188)`).
-        // The source-code diagnostic at line 17782 currently cites
-        // §3.4 incorrectly (out of lane scope for this test-only
-        // commit; see the follow-up issue filed below). The needle here
-        // pins the wording the source emits today so a future source-fix
-        // that flips §3.4 → §2.12 in the diagnostic also flips the
-        // needle here (the assertion is on the literal text, which is
-        // why a branch-order regression would be caught at code-review
-        // time, not silently).
+        // ~17989, fix #3344) producing a different message that now
+        // cites §2.12 (BitConverter's actual stdlib section — stdlib
+        // line 552, the v0.103 section header is
+        // `### 2.12 ``BitConverter```, not §3.4 which is
+        // `ReadOnlyAsciiByteSpan (retired v0.188)`). The needle here
+        // pins the wording the source emits today — including the §2.12
+        // cite — so a future source-fix that flips the cite (or
+        // silently reverts to §3.4) flips the needle here too
+        // (the assertion is on the literal text, which is why a
+        // branch-order regression would be caught at code-review time,
+        // not silently). This row was updated in lockstep with fix
+        // #3344 (source + needle move together per the
+        // `branch-order regression` rule).
         {"BitConverter",
          "",
-         "'BitConverter' has no static method or property 'TotallyBogusMember'",
+         "'BitConverter' has no static method or property 'TotallyBogusMember' (§2.12)",
          true},
     };
     return kCases;
