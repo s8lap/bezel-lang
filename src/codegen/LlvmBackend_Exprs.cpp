@@ -5515,18 +5515,47 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // declareImportedPropertyGetters.
         if (auto* ps =
                 dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma))) {
-            // fix #3199 (§12.3 / §23 / §2.8.2, v0.254): the imported-virtual
-            // base-property read twin of #2832's `rejectImportedVirtualBase
-            // Indexer`. Pre-fix, `base.P` on an imported VIRTUAL base property
-            // fell through this whole block with `importedPropGetterFns_.find
-            // (ps) == end()` (declareImportedPropertyGetters skips virtual
-            // properties), reached the #2491 zero/null degradation, and
-            // returned the wrong value silently — the issue's own repro
-            // measured -1 where 8 is correct, with only an `internal:`
-            // diagnostic that does not fail the build. The indexer twin
-            // (#2832) rejects this shape with a clean §12.3 error; the
-            // property analog must do the same.
-            if (rejectImportedVirtualBaseProperty(*ma, ps)) return nullptr;
+            // fix #3231 (§12.3 / §23 / §2.8.2, v0.252): `base.P` on an
+            // IMPORTED VIRTUAL base property now ROUTES through the OWNER's
+            // direct entry — `importedPropGetterDirectFns_[ps]`, populated
+            // by declareImportedPropertyGetters with the symbol the
+            // widened emitExportedPropertyGetters defines for VIRTUAL
+            // members. Runs BEFORE `rejectImportedVirtualBaseProperty`
+            // (which now only fires for an ABSTRACT virtual member whose
+            // wrapper the exporter erased — §12.5-correct, since no OWNER
+            // body exists to call from `base.P` either way).
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                    ma->target.get());
+                id && id->name == "base") {
+                if (auto dgit = importedPropGetterDirectFns_.find(ps);
+                    dgit != importedPropGetterDirectFns_.end()) {
+                    llvm::Function* fn = dgit->second;
+                    llvm::Value* obj = lowerExpr(*ma->target);
+                    if (!obj) return nullptr;
+                    // Record-receiver spill mirrors the `git` arm below:
+                    // declareImportedPropertyGetters declares the stub as
+                    // `T get(ptr %this)` (#2474's record-receiver rationale
+                    // applies here too).
+                    bool isEnumReceiver = ps->parent &&
+                                          ps->parent->kind ==
+                                              ast::TypeDeclKind::Enum;
+                    if (obj && !obj->getType()->isPointerTy() &&
+                        obj->getType()->isAggregateType() &&
+                        !isEnumReceiver) {
+                        llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+                        builder_.CreateStore(obj, tmp);
+                        obj = tmp;
+                    }
+                    llvm::Value* res = builder_.CreateCall(
+                        fn->getFunctionType(), fn, {obj});
+                    emitPendingCheck();
+                    return res;
+                }
+                if (rejectImportedVirtualBaseProperty(*ma, ps))
+                    return nullptr;
+            } else if (rejectImportedVirtualBaseProperty(*ma, ps)) {
+                return nullptr;
+            }
             // fix #2885 (§22.12/§22.13/§2.8.2 clause 1/§23, v0.240): an
             // imported STATIC property reads through its own no-`this` stub.
             // `ma->target` names a TYPE here, so the receiver lowering below

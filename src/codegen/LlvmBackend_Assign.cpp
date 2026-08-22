@@ -1570,16 +1570,32 @@ bool Emitter::rejectImportedVirtualBaseIndexer(
     // its entry point IS the direct `bz$…$idxget$…` stub.
     if (!ps || dynamic_cast<const ast::PropertyDecl*>(ps->decl)) return false;
     if (!indexTargetIsBase(ix) || !isVirtualIndexer(ps)) return false;
-    ctx_.diagnostics().report(
-        Severity::Error, ix.span.begin,
-        "cannot lower `base[...]` against the imported virtual indexer on `" +
-            std::string(ps->parent ? ps->parent->name : "") +
-            "` — §12.3 requires the base class's own implementation, but the "
-            "cross-module indexer ABI exports a direct entry point only for a "
-            "NON-virtual indexer, so the only imported entry available "
-            "dispatches virtually and would run the override "
-            "(§12.3/§23.4/§2.8.2) — #2837");
-    return true;
+    // fix #3231 (§12.3 / §23.4 / §2.8.2, v0.252): the widened
+    // emitExportedIndexerGetters / -Setters now define
+    // `bz$<Class>$idxget$<arity>` / `$idxset$<arity>` for VIRTUAL
+    // indexers too, and declareImportedIndexerGetters / -Setters
+    // populate `importedIndexerGetterDirectFns_` /
+    // `importedIndexerSetterDirectFns_` with the OWNER's direct entry.
+    // The base-rooted call site picks that up before this function is
+    // reached (or, for callers that consult this function as a gate,
+    // finds the map non-empty and lowers cleanly). Only when the
+    // OWNER-class export was erased (an ABSTRACT virtual member whose
+    // wrapper had no body to wrap) does this function still reject —
+    // and that is the §12.5-correct behaviour.
+    if (!importedIndexerGetterDirectFns_.count(ps) &&
+        !importedIndexerSetterDirectFns_.count(ps)) {
+        ctx_.diagnostics().report(
+            Severity::Error, ix.span.begin,
+            "cannot lower `base[...]` against the imported virtual indexer "
+            "on `" +
+                std::string(ps->parent ? ps->parent->name : "") +
+                "` — §12.3 requires the base class's own implementation, "
+                "but the cross-module indexer ABI exposes no direct entry "
+                "for an ABSTRACT virtual member (§12.3/§23.4/§2.8.2) — "
+                "#2837");
+        return true;
+    }
+    return false;
 }
 
 // fix #3199 (§12.3 / §23 / §2.8.2, v0.254) — the named-property twin of
@@ -1625,17 +1641,32 @@ bool Emitter::rejectImportedVirtualBaseProperty(
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma.target.get());
     if (!id || id->name != "base") return false;
     if (!isVirtualProperty(ps)) return false;
-    ctx_.diagnostics().report(
-        Severity::Error, ma.span.begin,
-        "cannot lower `base." + std::string(ps->name) +
-            "` against the imported virtual property on `" +
-            std::string(ps->parent ? ps->parent->name : "") +
-            "` — §12.3 requires the base class's own implementation, but the "
-            "cross-module property ABI exports a direct entry point only for "
-            "a NON-virtual property, so the only imported entry available "
-            "dispatches virtually and would run the override "
-            "(§12.3/§23/§2.8.2) — #3199");
-    return true;
+    // fix #3231 (§12.3 / §23 / §2.8.2, v0.252): the widened
+    // emitExportedPropertyGetters / -Setters now define
+    // `bz$<Class>$<Prop>$propget` / `$propset` for VIRTUAL members too, and
+    // declareImportedPropertyGetters / -Setters populate the
+    // `importedPropGetterDirectFns_` / `importedPropSetterDirectFns_` maps
+    // with the OWNER's direct entry. The base-rooted call site picks that
+    // up before this function is reached (or, for callers that consult
+    // this function as a gate, finds the map non-empty and lowers cleanly).
+    // Only when the OWNER-class export was erased (an ABSTRACT virtual
+    // member whose wrapper had no body to wrap) does this function still
+    // reject — and that is the §12.5-correct behaviour: an abstract base
+    // accessor has no implementation to call from `base.P` either way.
+    if (!importedPropGetterDirectFns_.count(ps) &&
+        !importedPropSetterDirectFns_.count(ps)) {
+        ctx_.diagnostics().report(
+            Severity::Error, ma.span.begin,
+            "cannot lower `base." + std::string(ps->name) +
+                "` against the imported virtual property on `" +
+                std::string(ps->parent ? ps->parent->name : "") +
+                "` — §12.3 requires the base class's own implementation, "
+                "but the cross-module property ABI exposes no direct entry "
+                "for an ABSTRACT virtual member "
+                "(§12.3/§23/§2.8.2) — #3199");
+        return true;
+    }
+    return false;
 }
 
 llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
@@ -1645,6 +1676,41 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (!recvDecl) return nullptr;
     auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return nullptr;
+    // fix #3231 (§12.3 / §23.4 / §2.8.2, v0.252): `base[i]` on an IMPORTED
+    // VIRTUAL base indexer now ROUTES through the OWNER's direct entry —
+    // `importedIndexerGetterDirectFns_[ps]`, populated by
+    // declareImportedIndexerGetters with the symbol the widened
+    // emitExportedIndexerGetters defines for VIRTUAL indexers. The check
+    // runs BEFORE `rejectImportedVirtualBaseIndexer` (which now only fires
+    // for the ABSTRACT virtual shape — §12.5-correct, since no OWNER
+    // body exists to call from `base[i]` either way).
+    if (indexTargetIsBase(ix) && isVirtualIndexer(ps) &&
+        importedIndexerGetterDirectFns_.count(ps)) {
+        llvm::Function* fn = importedIndexerGetterDirectFns_.find(ps)->second;
+        llvm::Value* obj = lowerExpr(*ix.target);
+        if (!obj) return nullptr;
+        if (!obj->getType()->isPointerTy()) {
+            if (!obj->getType()->isAggregateType()) return nullptr;
+            llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+            builder_.CreateStore(obj, tmp);
+            obj = tmp;
+        }
+        auto* fnTy = fn->getFunctionType();
+        std::vector<llvm::Value*> callArgs;
+        callArgs.push_back(obj);
+        for (std::size_t k = 0; k < ps->indexerParams.size() &&
+             k < ix.indices.size() &&
+             k + 1 < fnTy->getNumParams(); ++k) {
+            if (!ix.indices[k].value) return nullptr;
+            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            if (!argVal) return nullptr;
+            callArgs.push_back(
+                coerceNumericToType(argVal, fnTy->getParamType(k + 1), false));
+        }
+        llvm::Value* r = builder_.CreateCall(fnTy, fn, callArgs);
+        emitPendingCheck();
+        return r;
+    }
     if (rejectImportedVirtualBaseIndexer(ix, ps)) return nullptr;  // #2832
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): an
@@ -2260,6 +2326,49 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     if (!recvDecl) return false;
     auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return false;
+    // fix #3231 (§12.3 / §23.4 / §2.8.2, v0.252): the `base[i] := v`
+    // half of the widening. §12.3 bypasses virtual dispatch and writes
+    // the OWNER-class slot — the direct entry in
+    // `importedIndexerSetterDirectFns_[ps]` (populated by
+    // declareImportedIndexerSetters, defined by the widened
+    // emitExportedIndexerSetters) is the right call. Runs BEFORE
+    // `rejectImportedVirtualBaseIndexer`, which now only fires for the
+    // ABSTRACT virtual shape.
+    if (indexTargetIsBase(ix) && isVirtualIndexer(ps) &&
+        importedIndexerSetterDirectFns_.count(ps)) {
+        llvm::Function* fn = importedIndexerSetterDirectFns_.find(ps)->second;
+        llvm::Value* obj = lowerExpr(*ix.target);
+        if (!obj) return false;
+        if (!obj->getType()->isPointerTy()) {
+            if (!obj->getType()->isAggregateType()) return false;
+            llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+            builder_.CreateStore(obj, tmp);
+            obj = tmp;
+        }
+        auto* fnTy = fn->getFunctionType();
+        std::vector<llvm::Value*> callArgs;
+        callArgs.push_back(obj);
+        for (std::size_t k = 0; k < ps->indexerParams.size() &&
+             k < ix.indices.size() &&
+             k + 1 < fnTy->getNumParams(); ++k) {
+            if (!ix.indices[k].value) return false;
+            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            if (!argVal) return false;
+            callArgs.push_back(
+                coerceNumericToType(argVal, fnTy->getParamType(k + 1), false));
+        }
+        if (val) {
+            llvm::Type* valTy = fnTy->getParamType(fnTy->getNumParams() - 1);
+            val = coerceInitializerToSlot(val, valTy,
+                                          isUnsignedTargetExpr(ix));
+            val = coerceToNullableSlot(valTy, val);
+            val = boxForTarget(val, ctx_.exprType(ix), valueExpr);
+            callArgs.push_back(val);
+        }
+        builder_.CreateCall(fnTy, fn, callArgs);
+        emitPendingCheck();
+        return true;
+    }
     if (rejectImportedVirtualBaseIndexer(ix, ps)) return false;  // #2832
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     // fix #2414: the SETTER twin of lowerIndexerGet's decl-null fallback
@@ -2917,6 +3026,86 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
     if (!recvDecl) return false;
     auto* ps = selectIndexer(recvDecl, *ix);  // per §23.4 (#1172)
     if (!ps) return false;
+    // fix #3231 (§12.3 / §23.4 / §2.8.2, v0.252): the COMPOUND half of
+    // the indexer widening. `base[i] OP= v` (§12.3 bypasses virtual
+    // dispatch) reads AND writes through the OWNER's body directly, so
+    // dispatch through `importedIndexerGetterDirectFns_[ps]` for the read
+    // and `importedIndexerSetterDirectFns_[ps]` for the write — both
+    // populated by declareImportedIndexerGetters / -Setters, both
+    // pointing at the symbol the widened emitters define. Runs BEFORE
+    // `rejectImportedVirtualBaseIndexer`, which now only fires for the
+    // ABSTRACT virtual shape.
+    if (indexTargetIsBase(*ix) && isVirtualIndexer(ps) &&
+        importedIndexerGetterDirectFns_.count(ps) &&
+        importedIndexerSetterDirectFns_.count(ps)) {
+        llvm::Function* getFn =
+            importedIndexerGetterDirectFns_.find(ps)->second;
+        llvm::Function* setFn =
+            importedIndexerSetterDirectFns_.find(ps)->second;
+        llvm::Value* obj = lowerExpr(*ix->target);
+        if (!obj) return false;
+        if (!obj->getType()->isPointerTy()) {
+            if (!obj->getType()->isAggregateType()) return false;
+            llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+            builder_.CreateStore(obj, tmp);
+            obj = tmp;
+        }
+        auto* getFnTy = getFn->getFunctionType();
+        std::vector<llvm::AllocaInst*> idxSlots;
+        std::vector<llvm::Value*> idxArgVals;
+        for (std::size_t k = 0; k < ps->indexerParams.size() &&
+             k < ix->indices.size() &&
+             k + 1 < getFnTy->getNumParams(); ++k) {
+            if (!ix->indices[k].value) return false;
+            llvm::Value* argVal = lowerExpr(*ix->indices[k].value);
+            if (!argVal) return false;
+            llvm::AllocaInst* slot = entryAlloca(argVal->getType());
+            builder_.CreateStore(argVal, slot);
+            idxSlots.push_back(slot);
+            idxArgVals.push_back(argVal);
+        }
+        std::vector<llvm::Value*> getArgs;
+        getArgs.push_back(obj);
+        for (std::size_t k = 0; k < idxSlots.size() &&
+             k + 1 < getFnTy->getNumParams(); ++k) {
+            if (!idxSlots[k]) return false;
+            llvm::Value* v = builder_.CreateLoad(
+                idxSlots[k]->getAllocatedType(), idxSlots[k]);
+            getArgs.push_back(coerceNumericToType(
+                v, getFnTy->getParamType(k + 1), false));
+        }
+        llvm::Value* cur = builder_.CreateCall(getFnTy, getFn, getArgs);
+        emitPendingCheck();
+        if (!cur) return false;
+        llvm::Value* rhs = lowerRhs(cur);
+        if (!rhs) return false;
+        llvm::Value* newVal = emitCompoundOpTyped(
+            binOp, cur, rhs, opLeftTy, opRightTy,
+            cur->getType()->isFloatingPointTy(),
+            isUnsignedTargetExpr(targetExpr),
+            isCharTargetExpr(targetExpr), rhsUnsigned);
+        if (!newVal) return false;
+        auto* setFnTy = setFn->getFunctionType();
+        std::vector<llvm::Value*> setArgs;
+        setArgs.push_back(obj);
+        for (std::size_t k = 0; k < idxSlots.size() &&
+             k + 1 < setFnTy->getNumParams(); ++k) {
+            if (!idxSlots[k]) return false;
+            llvm::Value* v = builder_.CreateLoad(
+                idxSlots[k]->getAllocatedType(), idxSlots[k]);
+            setArgs.push_back(coerceNumericToType(
+                v, setFnTy->getParamType(k + 1), false));
+        }
+        newVal = coerceInitializerToSlot(newVal, setFnTy->getParamType(
+            setFnTy->getNumParams() - 1), isUnsignedTargetExpr(targetExpr));
+        newVal = coerceToNullableSlot(
+            setFnTy->getParamType(setFnTy->getNumParams() - 1), newVal);
+        newVal = boxForTarget(newVal, ctx_.exprType(targetExpr), valueExpr);
+        setArgs.push_back(newVal);
+        builder_.CreateCall(setFnTy, setFn, setArgs);
+        emitPendingCheck();
+        return true;
+    }
     if (rejectImportedVirtualBaseIndexer(*ix, ps)) return false;  // #2832
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     // fix #2509 (§9.2/§23.4, v0.236): the IMPORTED-indexer compound-assign
@@ -6473,6 +6662,36 @@ bool Emitter::lowerImportedPropertySet(const ast::Expr& target,
     if (!ma || !ma->target) return false;
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
     if (!ps || ps->isIndexer) return false;
+    // fix #3231 (§12.3 / §23 / §2.8.2, v0.252): the `base.P := v` half of
+    // the widening. §12.3 bypasses virtual dispatch and writes the
+    // OWNER-class slot — the direct entry in
+    // `importedPropSetterDirectFns_[ps]` (populated by
+    // declareImportedPropertySetters, defined by the widened
+    // emitExportedPropertySetters) is the right call. The dispatch runs
+    // BEFORE the rejection function (so the #2204 "no double-evaluation"
+    // discipline holds — a side-effect-free symbol-shape check decides
+    // the target up front, the `value` is lowered only once a successful
+    // call target is found).
+    if (auto* baseId = dynamic_cast<const ast::IdentifierExpr*>(
+            ma->target.get());
+        baseId && baseId->name == "base" &&
+        importedPropSetterDirectFns_.count(ps)) {
+        llvm::Value* v = lowerExpr(value);
+        if (!v) return false;
+        llvm::Function* fn = importedPropSetterDirectFns_.find(ps)->second;
+        // The receiver for `base.` IS the enclosing method's
+        // `currentThis_` (§12.3); the same pointer every other base-class
+        // accessor call uses in this module.
+        llvm::Value* recv = currentThis_;
+        if (!recv) return false;
+        llvm::Type* valTy = fn->getFunctionType()->getParamType(1);
+        v = coerceInitializerToSlot(v, valTy, isUnsignedTargetExpr(target));
+        v = coerceToNullableSlot(valTy, v);
+        v = boxForTarget(v, ctx_.exprType(target), &value);
+        builder_.CreateCall(fn->getFunctionType(), fn, {recv, v});
+        emitPendingCheck();
+        return true;
+    }
     // fix #3199 (§12.3 / §23 / §2.8.2, v0.254): reject `base.P := v` on an
     // IMPORTED VIRTUAL base property with a clean §12.3 error, the write twin
     // of the indexer reject (#2832) and the read path added at
@@ -6483,6 +6702,8 @@ bool Emitter::lowerImportedPropertySet(const ast::Expr& target,
     // PropertySymbol — measured `base.P := 7` left `_v` at 3 where 7 is
     // correct). Checked here, BEFORE the `value` lowering (the #2204
     // discipline), so a rejected target never double-evaluates it.
+    // fix #3231: after the direct-entry check above, this rejection now
+    // only fires when no direct entry exists (the ABSTRACT virtual shape).
     if (rejectImportedVirtualBaseProperty(*ma, ps)) return false;
     // fix #2885: the STATIC map is the second admissible shape — same #2204
     // discipline (a pure symbol-shape check with no side effects BEFORE
@@ -6534,6 +6755,59 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
     // — reaches here. Explicit rather than implied, so this can never
     // shadow the local path if the caller order ever changes.
     if (dynamic_cast<const ast::PropertyDecl*>(ps->decl)) return false;
+    // fix #3231 (§12.3 / §23 / §2.8.2, v0.252): the COMPOUND half of the
+    // property widening. `base.P OP= v` (§12.3 bypasses virtual dispatch)
+    // reads AND writes through the OWNER's body directly. Dispatch through
+    // `importedPropGetterDirectFns_[ps]` for the read and
+    // `importedPropSetterDirectFns_[ps]` for the write — both populated by
+    // declareImportedPropertyGetters / -Setters, both pointing at the
+    // symbol the widened emitters define. Runs BEFORE
+    // `rejectImportedVirtualBaseProperty`, which now only fires for the
+    // ABSTRACT virtual shape.
+    if (auto* baseId = dynamic_cast<const ast::IdentifierExpr*>(
+            ma->target.get());
+        baseId && baseId->name == "base" &&
+        importedPropGetterDirectFns_.count(ps) &&
+        importedPropSetterDirectFns_.count(ps)) {
+        llvm::Function* getFn =
+            importedPropGetterDirectFns_.find(ps)->second;
+        llvm::Function* setFn =
+            importedPropSetterDirectFns_.find(ps)->second;
+        llvm::Value* recv = currentThis_;
+        if (!recv) return false;
+        // Read the OWNER's slot for the current value.
+        auto* getFnTy = getFn->getFunctionType();
+        llvm::Value* cur = builder_.CreateCall(getFnTy, getFn, {recv});
+        emitPendingCheck();
+        if (!cur) return false;
+        // Apply the §6.6 compound operator.
+        llvm::Value* rhs = valueExpr ? lowerExpr(*valueExpr) : nullptr;
+        if (!rhs) {
+            if (valueExpr) return false;
+            rhs = emitImplicitOne(cur->getType());
+            if (!rhs) return false;
+        }
+        const sema::TypeRef* opLeftTy = ctx_.exprType(*ma);
+        const sema::TypeRef* opRightTy =
+            valueExpr ? ctx_.exprType(*valueExpr) : nullptr;
+        const bool rhsUnsigned =
+            valueExpr && isUnsignedTargetExpr(*valueExpr);
+        llvm::Value* newVal = emitCompoundOpTyped(
+            binOp, cur, rhs, opLeftTy, opRightTy,
+            cur->getType()->isFloatingPointTy(),
+            isUnsignedTargetExpr(*ma), isCharTargetExpr(*ma), rhsUnsigned);
+        if (!newVal) return false;
+        // Write the OWNER's slot with the new value.
+        auto* setFnTy = setFn->getFunctionType();
+        llvm::Type* valTy = setFnTy->getParamType(1);
+        newVal = coerceInitializerToSlot(newVal, valTy,
+                                         isUnsignedTargetExpr(*ma));
+        newVal = coerceToNullableSlot(valTy, newVal);
+        newVal = boxForTarget(newVal, ctx_.exprType(*ma), valueExpr);
+        builder_.CreateCall(setFnTy, setFn, {recv, newVal});
+        emitPendingCheck();
+        return true;
+    }
     // fix #3199 (§12.3 / §23 / §2.8.2, v0.254): reject `base.P += v` /
     // `base.P++` on an IMPORTED VIRTUAL base property with a clean §12.3
     // error, the compound/incr twin of the plain-`:=` reject just above and
@@ -6548,6 +6822,8 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
     // that put the §12.3 reject AFTER it would silently drop the increment
     // spell — measured `base.P++` compiled cleanly on HEAD with only an
     // `internal:` warning and runtime `_v` left at 3 where 4 is correct.
+    // fix #3231: after the direct-entry check above, this rejection now
+    // only fires when no direct entry exists (the ABSTRACT virtual shape).
     if (rejectImportedVirtualBaseProperty(*ma, ps)) return false;
     // An imported VIRTUAL / INTERFACE property dispatches through its vtable
     // or itable slot (#2858 for the increment spelling, #481 for the compound

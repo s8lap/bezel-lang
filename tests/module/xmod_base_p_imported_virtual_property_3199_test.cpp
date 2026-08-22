@@ -14,78 +14,84 @@
 //
 // The named-PROPERTY form (`base.P`) across a module boundary silently
 // degraded to a wrong value (or zero/null) on HEAD, where the indexer form
-// (`base[i]`) on the same shape is a clean §12.3 compile error:
+// (`base[i]`) on the same shape was a clean §12.3 compile error:
 //
 //   * `emitExportedPropertyGetters` / `-Setters` (LlvmBackend_Setup.cpp)
-//     skip a virtual property ("Skip virtual/override/abstract/static —
+//     skipped a virtual property ("Skip virtual/override/abstract/static —
 //     they have other dispatch paths"), so the dependency object's
-//     `bz$<Class>$<Prop>$propget` accessor carries InternalLinkage (a
-//     lowercase `t` in `nm` output), and the property has no
+//     `bz$<Class>$<Prop>$propget` accessor carried InternalLinkage (a
+//     lowercase `t` in `nm` output), and the property had no
 //     cross-module-stable ABI symbol;
-//   * `declareImportedPropertyGetters` / `-Setters` correspondingly skip
+//   * `declareImportedPropertyGetters` / `-Setters` correspondingly skipped
 //     it (`if (propGetSlot_.count(ps)) continue;`);
-//   * The imported-property read lowering finds nothing in
-//     `importedPropGetterFns_` and falls through to the #2491 zero/null
+//   * The imported-property read lowering found nothing in
+//     `importedPropGetterFns_` and fell through to the #2491 zero/null
 //     degradation. The WRITE half (`base.P := v`) silently dropped the
-//     write through the same hole — the setter map is empty too.
+//     write through the same hole — the setter map was empty too.
 //
 // MEASURED on HEAD with `bezelc -c lib.bzl -o lib.o` then
 // `--import lib.o app.bzl` (the issue's own repro):
 //
-//   spelling                pre-fix exit / value         post-fix
-//   base.P                  exit 0, runtime -1         clean §12.3 ERROR
-//                           (silent internal: warning)
-//   base.P := 7             exit 0, runtime 3          clean §12.3 ERROR
-//                           (write silently dropped)
-//   base.P += 1             exit 0, runtime 3          clean §12.3 ERROR
-//   base.P++                exit 0, runtime 3          clean §12.3 ERROR
+//   spelling        pre-fix exit / value         post-#3199
+//   base.P          exit 0, runtime -1          clean §12.3 ERROR
+//   base.P := 7     exit 0, runtime 3           clean §12.3 ERROR
+//   base.P += 1     exit 0, runtime 3           clean §12.3 ERROR
+//   base.P++        exit 0, runtime 3           clean §12.3 ERROR
 //
 // The twin with the module boundary removed (`module` declared once,
 // classes defined together) returns 8 — the base class's own
 // `_v + 5 = 3 + 5` — so the defect is purely a cross-module ABI gap.
-// The LOCAL (single-module) virtual `base.P` already returns 8 on HEAD
-// and post-fix.
+// The LOCAL (single-module) virtual `base.P` already returns 8 on HEAD.
 //
-// ── THE FIX ────────────────────────────────────────────────────────────────
+// ── THE FIX (TWO-PHASE) ────────────────────────────────────────────────────
 //
-// `rejectImportedVirtualBaseProperty` (LlvmBackend_Assign.cpp), the named-
-// property twin of `rejectImportedVirtualBaseIndexer` (#2832). Called from
-// the imported-property read lowering (LlvmBackend_Exprs.cpp ~5524), the
-// direct-write lowering `lowerImportedPropertySet`, and the compound /
-// increment path `lowerImportedPropertyCompoundCore`. Reports a clean §12.3
-// ERROR (not the silent `internal:` warning #2491 surfaces) — the same
-// "a clean compile error beats a silent wrong value" rationale #2832's
-// header records. The ABI addition that would actually MAKE `base.P` work
-// cross-module is the property analog of #2837's fix direction — out of
-// scope for this interim reject, which matches the indexer twin's own
-// interim (#2832) exactly.
+// Phase 1 — `rejectImportedVirtualBaseProperty` (LlvmBackend_Assign.cpp),
+// the named-property twin of `rejectImportedVirtualBaseIndexer` (#2832).
+// Called from the imported-property read lowering (LlvmBackend_Exprs.cpp
+// ~5524), the direct-write lowering `lowerImportedPropertySet`, and the
+// compound / increment path `lowerImportedPropertyCompoundCore`. Reported
+// a clean §12.3 ERROR (not the silent `internal:` warning #2491 surfaces)
+// — the same "a clean compile error beats a silent wrong value" rationale
+// #2832's header records. The ABI addition that would actually MAKE
+// `base.P` work cross-module was out of scope for the interim (#2837's
+// fix direction, property analog).
+//
+// Phase 2 (#3231, this file's current state) — the export-gate widening
+// `emitExportedPropertyGetters` / `-Setters` to emit
+// `bz$<Class>$<Prop>$propget` / `$propset` for VIRTUAL members too. The
+// importer side declares the matching external in the new
+// `importedPropGetterDirectFns_` / `importedPropSetterDirectFns_` maps,
+// and `lowerImportedPropertyRead` / `lowerImportedPropertySet` /
+// `lowerImportedPropertyCompoundCore` route `base.X` through those
+// direct-entry maps. `rejectImportedVirtualBaseProperty` is now an
+// ABSTRACT-only gate (the §12.5-correct behaviour: an abstract base
+// accessor has no OWNER body to call either way).
+//
+// T1 (all four sub-cases) is updated to assert the post-#3231 behaviour:
+// the program compiles, runs, and returns the OWNER class's own
+// implementation — the §12.3-correct answer.
 //
 // ── CONTROLS ───────────────────────────────────────────────────────────────
 //
-// T1 — the rejection. Three sub-cases (read / write / compound), each
-//      asserts the build FAILS and the diagnostic carries the spec
-//      citation and the issue tag, never the silent `internal:` warning
-//      the issue records as the bug.
+// T1 — the OWNER-direct path. Four sub-cases (read / write / compound /
+//      increment), each compiles the cross-module build, runs it, and
+//      asserts agreement with the LOCAL twin — both return the OWNER's
+//      body answer (8 for read; 7 for write `base.P := 7`; 9 for the
+//      compound/increment on the OWNER's 3+5 base value), proving the
+//      dispatch did NOT run through the vtable to the override.
 //
 // T2 — the NON-virtual control. `base.P` on an IMPORTED NON-VIRTUAL
 //      base property is the existing correct path (#503, #2414, #2489);
 //      it must still compile and link, and the program must return the
 //      base class's own getter value — the same 8 a local module would
-//      return. This pins "the reject did not over-fire and did not break
-//      the correct shape".
+//      return. This pins "the widening did not regress the correct
+//      non-virtual shape".
 //
 // T3 — the LOCAL twin control. The character-identical single-module
 //      program (no `import` boundary, `base.P` on a local virtual base
 //      property overridden locally) must STILL compile and return 8.
-//      This pins "the reject only fires for the cross-module shape; the
-//      local `base.P` on a virtual base property is not touched" — the
-//      §12.3 non-virtual lowering the LOCAL path already does correctly.
-//
-// All assertions use diagnostic TEXT (the runAotOut path returns no text;
-// the capture-stderr helper in T1 does), never the coarse `rejects()`
-// helper, because runAot's WIFSIGNALED path synthesizes an Error for a
-// runtime SIGSEGV too and would mask the silent-wrong-value class the
-// fix is intended to remove.
+//      This pins "the cross-module widening did not perturb the LOCAL
+//      `base.P` path on a virtual base property".
 
 #include <cstdio>
 #include <cstdlib>
@@ -261,14 +267,41 @@ std::string imported3199(const std::string& libBody, const std::string& appBody)
 
 // ===========================================================================
 // T1 — THE ISSUE'S OWN REPRO. Pre-fix: exit 0, runtime -1 (zero/null
-// degradation), only an `internal:` warning. Post-fix: a clean §12.3
-// compile error — the named-property twin of the indexer reject
-// (`rejectImportedVirtualBaseIndexer` / #2832).
+// degradation), only an `internal:` warning. Post-fix (#3199's interim):
+// a clean §12.3 compile error — the named-property twin of the indexer
+// reject (`rejectImportedVirtualBaseIndexer` / #2832).
+// Post-post-fix (#3231): the §12.3 reject is REPLACED by an OWNER-direct
+// call — `base.P` now compiles, runs, and returns the BASE class's own
+// implementation (8 = `_v + 5`), which is exactly what §12.3 requires.
+// The test is updated to assert the program compiles and returns 8 —
+// the §12.3-correct answer — rather than rejecting.
 // ===========================================================================
 BEZEL_TEST(xmod_base_p_imported_virtual_property_3199,
-           base_p_read_on_imported_virtual_base_is_rejected_12_3) {
-    std::string err;
-    bool success = compileImportCaptureErr3199(
+           base_p_read_on_imported_virtual_base_uses_owner_body_12_3) {
+    // Single-module twin: same declarations with the module boundary removed.
+    // Both sides must agree on the OWNER's getter value (8), proving the
+    // imported `base.P` read the BASE class's implementation, NOT a
+    // vtable-dispatched override (the override returns 200 + _w = 200) and
+    // NOT a silent zero.
+    const std::string twinSrc =
+        std::string("module LocalM6C3199; ") + kLib3199Body +
+        "public class DM6C3199: BaseM6C3199 "
+        "  private _w: int := 0; "
+        "  public override property P: int "
+        "    get => 200 + _w; "
+        "    set => _w := value; "
+        "  end; "
+        "  public method ViaBase(): int => base.P; "
+        "end DM6C3199; "
+        "public class C "
+        "  public static method Main(): int "
+        "    using var d := new DM6C3199(); "
+        "    return d.ViaBase(); "
+        "  end Main; "
+        "end C;";
+    int twin = compileLocalAndRun3199(twinSrc);
+    BEZEL_EXPECT_EQ(twin, 8);
+    int imported = compileImportAndRun3199(
         std::string(kLib3199Head) + kLib3199Body,
         imported3199("",
             "public class DM6C3199: BaseM6C3199 "
@@ -284,27 +317,45 @@ BEZEL_TEST(xmod_base_p_imported_virtual_property_3199,
             "    using var d := new DM6C3199(); "
             "    return d.ViaBase(); "
             "  end Main; "
-            "end C;"),
-        err);
-    BEZEL_EXPECT_TRUE(!success);
-    BEZEL_EXPECT_TRUE(err.find("#3199") != std::string::npos);
-    BEZEL_EXPECT_TRUE(err.find("12.3") != std::string::npos);
-    // The diagnostic must NOT be the silent `internal:` warning the issue
-    // records as the bug — pin the absence explicitly.
-    BEZEL_EXPECT_TRUE(err.find("internal: return-value expression failed") ==
-                      std::string::npos);
+            "end C;"));
+    if (imported == -2) return;  // dependency toolchain unavailable — skip
+    // §12.3: base.P must return the OWNER's body (8 = _v + 5), NOT the
+    // override (200) and NOT a silent 0.
+    BEZEL_EXPECT_EQ(imported, 8);
+    BEZEL_EXPECT_EQ(imported, twin);
 }
 
 // ===========================================================================
 // T1 (b) — the WRITE half. `base.P := v` on the same shape silently dropped
-// the write on HEAD (measured `_v` left at 3, runtime 3 where 7 is correct).
-// The reject must fire here too, BEFORE the value is lowered (the #2204
-// discipline), so the value side-effect is never realized.
+// the write on HEAD (measured `_v` left at 3, runtime 3 where 7 is correct);
+// the interim #3199 fix made it reject with §12.3. Post-#3231 the
+// OWNER-direct setter is invoked: `base.P := 7` writes 7 into the OWNER's
+// own `_v` (NOT the override's `_w`), so `return _v` reads 7.
 // ===========================================================================
 BEZEL_TEST(xmod_base_p_imported_virtual_property_3199,
-           base_p_write_on_imported_virtual_base_is_rejected_12_3) {
-    std::string err;
-    bool success = compileImportCaptureErr3199(
+           base_p_write_on_imported_virtual_base_writes_owner_slot_12_3) {
+    const std::string twinSrc =
+        std::string("module LocalM6CW3199; ") + kLib3199Body +
+        "public class DM6CW3199: BaseM6C3199 "
+        "  private _w: int := 0; "
+        "  public override property P: int "
+        "    get => 200 + _w; "
+        "    set => _w := value; "
+        "  end; "
+        "  public method ViaBaseSet(): int "
+        "    base.P := 7; "
+        "    return _v; "
+        "  end ViaBaseSet; "
+        "end DM6CW3199; "
+        "public class C "
+        "  public static method Main(): int "
+        "    using var d := new DM6CW3199(); "
+        "    return d.ViaBaseSet(); "
+        "  end Main; "
+        "end C;";
+    int twin = compileLocalAndRun3199(twinSrc);
+    BEZEL_EXPECT_EQ(twin, 7);
+    int imported = compileImportAndRun3199(
         std::string(kLib3199Head) + kLib3199Body,
         imported3199("",
             "public class DM6CW3199: BaseM6C3199 "
@@ -323,23 +374,42 @@ BEZEL_TEST(xmod_base_p_imported_virtual_property_3199,
             "    using var d := new DM6CW3199(); "
             "    return d.ViaBaseSet(); "
             "  end Main; "
-            "end C;"),
-        err);
-    BEZEL_EXPECT_TRUE(!success);
-    BEZEL_EXPECT_TRUE(err.find("#3199") != std::string::npos);
+            "end C;"));
+    if (imported == -2) return;
+    BEZEL_EXPECT_EQ(imported, 7);
+    BEZEL_EXPECT_EQ(imported, twin);
 }
 
 // ===========================================================================
-// T1 (c) — the COMPOUND half. `base.P += 1` on the same shape, the
-// §17.6 twin of the plain `:=`. The compound path was already declining
-// (its pre-fix `propGetSlot_.count(ps) || ...` gate at
-// `lowerImportedPropertyCompoundCore` returned false without a
-// diagnostic); the reject now reports cleanly instead.
+// T1 (c) — the COMPOUND half. `base.P += 1` reads the OWNER's value (8),
+// adds 1, writes back through the OWNER-direct setter: `_v` becomes 9.
+// The override's `_w` is NOT touched (proves the dispatch did not run
+// through the vtable to the override's getter/setter).
 // ===========================================================================
 BEZEL_TEST(xmod_base_p_imported_virtual_property_3199,
-           base_p_compound_on_imported_virtual_base_is_rejected_12_3) {
-    std::string err;
-    bool success = compileImportCaptureErr3199(
+           base_p_compound_on_imported_virtual_base_uses_owner_12_3) {
+    const std::string twinSrc =
+        std::string("module LocalM6CC3199; ") + kLib3199Body +
+        "public class DM6CC3199: BaseM6C3199 "
+        "  private _w: int := 0; "
+        "  public override property P: int "
+        "    get => 200 + _w; "
+        "    set => _w := value; "
+        "  end; "
+        "  public method ViaBaseCompound(): int "
+        "    base.P += 1; "
+        "    return _v; "
+        "  end ViaBaseCompound; "
+        "end DM6CC3199; "
+        "public class C "
+        "  public static method Main(): int "
+        "    using var d := new DM6CC3199(); "
+        "    return d.ViaBaseCompound(); "
+        "  end Main; "
+        "end C;";
+    int twin = compileLocalAndRun3199(twinSrc);
+    BEZEL_EXPECT_EQ(twin, 9);
+    int imported = compileImportAndRun3199(
         std::string(kLib3199Head) + kLib3199Body,
         imported3199("",
             "public class DM6CC3199: BaseM6C3199 "
@@ -358,21 +428,41 @@ BEZEL_TEST(xmod_base_p_imported_virtual_property_3199,
             "    using var d := new DM6CC3199(); "
             "    return d.ViaBaseCompound(); "
             "  end Main; "
-            "end C;"),
-        err);
-    BEZEL_EXPECT_TRUE(!success);
-    BEZEL_EXPECT_TRUE(err.find("#3199") != std::string::npos);
+            "end C;"));
+    if (imported == -2) return;
+    BEZEL_EXPECT_EQ(imported, 9);
+    BEZEL_EXPECT_EQ(imported, twin);
 }
 
 // ===========================================================================
-// T1 (d) — the INCREMENT half. `base.P++` is the §17.6 spell of the same
-// shape; the indexer reject covers increment too (#2832's call site at
-// `lowerIndexerIncrDecr`), and the named-property reject mirrors that.
+// T1 (d) — the INCREMENT half. `base.P++` reads OWNER's value (8),
+// increments, writes OWNER's slot: `_v` becomes 9 (same expected answer
+// as T1c; the difference between `+= 1` and `++` is purely §17.6 spelling).
 // ===========================================================================
 BEZEL_TEST(xmod_base_p_imported_virtual_property_3199,
-           base_p_increment_on_imported_virtual_base_is_rejected_12_3) {
-    std::string err;
-    bool success = compileImportCaptureErr3199(
+           base_p_increment_on_imported_virtual_base_uses_owner_12_3) {
+    const std::string twinSrc =
+        std::string("module LocalM6CI3199; ") + kLib3199Body +
+        "public class DM6CI3199: BaseM6C3199 "
+        "  private _w: int := 0; "
+        "  public override property P: int "
+            "    get => 200 + _w; "
+            "    set => _w := value; "
+            "  end; "
+            "  public method ViaBaseIncr(): int "
+            "    base.P++; "
+            "    return _v; "
+            "  end ViaBaseIncr; "
+            "end DM6CI3199; "
+            "public class C "
+            "  public static method Main(): int "
+            "    using var d := new DM6CI3199(); "
+            "    return d.ViaBaseIncr(); "
+            "  end Main; "
+            "end C;";
+    int twin = compileLocalAndRun3199(twinSrc);
+    BEZEL_EXPECT_EQ(twin, 9);
+    int imported = compileImportAndRun3199(
         std::string(kLib3199Head) + kLib3199Body,
         imported3199("",
             "public class DM6CI3199: BaseM6C3199 "
@@ -391,10 +481,10 @@ BEZEL_TEST(xmod_base_p_imported_virtual_property_3199,
             "    using var d := new DM6CI3199(); "
             "    return d.ViaBaseIncr(); "
             "  end Main; "
-            "end C;"),
-        err);
-    BEZEL_EXPECT_TRUE(!success);
-    BEZEL_EXPECT_TRUE(err.find("#3199") != std::string::npos);
+            "end C;"));
+    if (imported == -2) return;
+    BEZEL_EXPECT_EQ(imported, 9);
+    BEZEL_EXPECT_EQ(imported, twin);
 }
 
 // ===========================================================================

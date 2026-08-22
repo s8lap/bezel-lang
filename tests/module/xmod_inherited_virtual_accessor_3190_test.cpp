@@ -466,37 +466,52 @@ BEZEL_TEST(xmod_inherited_virtual_accessor_3190,
 }
 
 // ===========================================================================
-// T10 — OVER-REJECTION CONTROL: #2837's `base[i]` reject must STILL fire. This
-// fix forwards through the base's own vtable slot, which is the correct answer
-// for an INHERITED accessor and the wrong one for `base[i]` past a LOCAL
-// override (§12.3 requires the base's implementation, and the imported virtual
-// entry dispatches to the override). #2832 rejects that spelling cleanly; a
-// silent acceptance here would be the false accept this fix must not create.
+// T10 — the §12.3 OWNER-direct path for `base[i]` (#3231). Pre-#3231 this
+// fix's `importedVirtualAccessorSlotFn` thunk forwarded through the OWNER's
+// own vtable slot, which is the correct answer for an INHERITED accessor
+// and the WRONG one for `base[i]` past a LOCAL override (§12.3 requires
+// the OWNER's implementation, and the imported virtual entry dispatches
+// to the override). #2832 rejected that spelling cleanly; #3231 widened
+// the export gate (`emitExportedIndexerGetters` / `-Setters`) so a
+// `bz$<Class>$idxget$<arity>` / `$idxset$<arity>` ExternalLinkage symbol
+// is defined for VIRTUAL members too, and the importer side routes
+// `base[i]` through it. The thunk route stays for non-`base` accesses
+// (where vtable dispatch is correct). This test now asserts the post-
+// #3231 behaviour: the program compiles, runs, and returns the OWNER's
+// own implementation (`b[1]` on `VBase3190` is `_v + 100 + 1 = 104`)
+// — NOT the override (`500 + 1 + _w = 501`).
 // ===========================================================================
 BEZEL_TEST(xmod_inherited_virtual_accessor_3190,
-           base_indexer_on_imported_virtual_base_stays_rejected_2837_12_3) {
-    std::string err;
-    bool success = compileImportCaptureErr3190(
+           base_indexer_on_imported_virtual_base_uses_owner_body_12_3_3231) {
+    const std::string body =
+        "public class VD3190: VBase3190 "
+        "  private _w: int := 0; "
+        "  public override property [i: int]: int "
+        "    get => 500 + i + _w; "
+        "    set => _w := value; "
+        "  end; "
+        "  public method ViaBase(i: int): int => base[i]; "
+        "end VD3190; "
+        "public class C "
+        "  public static method Main(): int "
+        "    using var d := new VD3190(); "
+        "    return d.ViaBase(1); "
+        "  end Main; "
+        "end C;";
+    // Single-module twin: same declarations, no module boundary. The
+    // OWNER-direct path is what §12.3 mandates; the twin must agree.
+    const std::string twinSrc =
+        std::string("module Local3190T10; ") + kBody3190 + body;
+    int twin = compileLocalAndRun3190(twinSrc);
+    BEZEL_EXPECT_EQ(twin, 104);  // OWNER: _v + 100 + i = 3 + 100 + 1
+    int imported = compileImportAndRun3190(
         std::string(kLib3190Head) + kBody3190,
-        importedPair3190(
-            "public class VD3190: VBase3190 "
-            "  private _w: int := 0; "
-            "  public override property [i: int]: int "
-            "    get => 500 + i + _w; "
-            "    set => _w := value; "
-            "  end; "
-            "  public method ViaBase(i: int): int => base[i]; "
-            "end VD3190; "
-            "public class C "
-            "  public static method Main(): int "
-            "    using var d := new VD3190(); "
-            "    return d.ViaBase(1); "
-            "  end Main; "
-            "end C;"),
-        err);
-    BEZEL_EXPECT_TRUE(!success);
-    BEZEL_EXPECT_TRUE(err.find("#2837") != std::string::npos);
-    BEZEL_EXPECT_TRUE(err.find("12.3") != std::string::npos);
+        importedPair3190(body));
+    if (imported == -2) return;
+    // §12.3: base[i] must return the OWNER's body (104), NOT the override
+    // (501) and NOT a silent 0.
+    BEZEL_EXPECT_EQ(imported, 104);
+    BEZEL_EXPECT_EQ(imported, twin);
 }
 
 }  // namespace bezel::module

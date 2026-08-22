@@ -2454,8 +2454,40 @@ void Emitter::emitExportedPropertyGetters() {
         for (sema::Symbol* m : ts->members) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
             if (!ps || ps->isIndexer) continue;
-            // Skip virtual/override/abstract/static — they have other dispatch paths.
-            if (isVirtualProperty(ps)) continue;
+            // Skip override/abstract/static — they have other dispatch paths
+            // (or no body at all). Virtual, NON-OVERRIDE, NON-ABSTRACT
+            // properties are now exported too — see the fix #3231 banner
+            // below.
+            if (isVirtualProperty(ps)) {
+                // An `override` of a virtual base property carries the same
+                // body kind as the base (the override's body is the entry
+                // the importer's `derived-class slot` needs), so we still
+                // want its OWN direct entry exported too. But emitExported
+                // already iterates ts->members, where ts is the declaring
+                // class — every `override` here has the same `ps->name` as
+                // its base member, and emitting a SECOND wrapper with the
+                // SAME mangling as the base would collide. Filter overrides
+                // out at this gate: they don't need a fresh export (the
+                // base class's exporter already emits the symbol), and the
+                // override's body lives behind vtable dispatch on the
+                // derived side, which is what `lowerVirtualPropertyGet`
+                // already loads.
+                //
+                // An `abstract` virtual member has NO body to wrap — its
+                // slot in the OWNER's vtable is legitimately null (#3190
+                // itself documents this), and emitting a stub that just
+                // re-returned null would mislead the importer into a
+                // defined-but-empty symbol. Decline before the wrapper is
+                // created (mirrors the getter-only / setter-only shapes
+                // below).
+                bool isOverride = false;
+                bool isAbstract = false;
+                for (auto mod : ps->modifiers) {
+                    if (mod == "override") isOverride = true;
+                    if (mod == "abstract") isAbstract = true;
+                }
+                if (isOverride || isAbstract) continue;
+            }
             bool isStatic = false;
             for (auto mod : ps->modifiers) if (mod == "static") isStatic = true;
             if (isStatic) continue;
@@ -2514,6 +2546,15 @@ void Emitter::emitExportedPropertyGetters() {
 // which is InternalLinkage. A separate ExternalLinkage wrapper is used so the
 // importer can call it without touching the (potentially inlined) local accessor
 // — mirrors the getter wrapper exactly.
+//
+// fix #3231 (§12.3 / §23 / §2.8.3 rule 4, v0.252): the SETTER half of the
+// widening #3231 added to emitExportedPropertyGetters above — a VIRTUAL,
+// non-override, non-abstract property's OWNER-class body is now also exported
+// under the same `bz$<Class>$<Prop>$propset` mangling. The setter half of
+// §12.3's `base.P := v` (write) was previously rejected by
+// `rejectImportedVirtualBaseProperty` / `lowerImportedPropertySet` (silent
+// write-drop, see #3199); the imported side now finds this stub via the
+// `importedPropSetterDirectFns_` map populated below.
 //
 // Before this fix NO setter-side equivalent existed at all: `nm` on a compiled
 // library object with a settable property showed `...$propget` but no
@@ -2583,8 +2624,17 @@ void Emitter::emitExportedPropertySetters() {
         for (sema::Symbol* m : ts->members) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
             if (!ps || ps->isIndexer) continue;
-            // Skip virtual/override/abstract/static — they have other dispatch paths.
-            if (isVirtualProperty(ps)) continue;
+            // Skip override/abstract/static — same widening as the getter
+            // twin above (#3231, see banner there for the rationale).
+            if (isVirtualProperty(ps)) {
+                bool isOverride = false;
+                bool isAbstract = false;
+                for (auto mod : ps->modifiers) {
+                    if (mod == "override") isOverride = true;
+                    if (mod == "abstract") isAbstract = true;
+                }
+                if (isOverride || isAbstract) continue;
+            }
             bool isStatic = false;
             for (auto mod : ps->modifiers) if (mod == "static") isStatic = true;
             if (isStatic) continue;
@@ -2789,8 +2839,19 @@ void Emitter::emitExportedIndexerGetters() {
         for (sema::Symbol* m : ts->members) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
             if (!ps || !ps->isIndexer) continue;
-            // Skip virtual/override/abstract/interface — other dispatch paths.
-            if (isVirtualIndexer(ps)) continue;
+            // Skip override/abstract/interface — same widening #3231 made to
+            // the property twins above. The interface-member exclusion
+            // survives: an interface-parented indexer dispatches through
+            // the itable and never through the OWNER's direct call.
+            if (isVirtualIndexer(ps)) {
+                bool isOverride = false;
+                bool isAbstract = false;
+                for (auto mod : ps->modifiers) {
+                    if (mod == "override") isOverride = true;
+                    if (mod == "abstract") isAbstract = true;
+                }
+                if (isOverride || isAbstract) continue;
+            }
             bool isStatic = false;
             for (auto mod : ps->modifiers) if (mod == "static") isStatic = true;
             if (isStatic) continue;
@@ -2868,7 +2929,15 @@ void Emitter::emitExportedIndexerSetters() {
         for (sema::Symbol* m : ts->members) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
             if (!ps || !ps->isIndexer) continue;
-            if (isVirtualIndexer(ps)) continue;
+            if (isVirtualIndexer(ps)) {
+                bool isOverride = false;
+                bool isAbstract = false;
+                for (auto mod : ps->modifiers) {
+                    if (mod == "override") isOverride = true;
+                    if (mod == "abstract") isAbstract = true;
+                }
+                if (isOverride || isAbstract) continue;
+            }
             bool isStatic = false;
             for (auto mod : ps->modifiers) if (mod == "static") isStatic = true;
             if (isStatic) continue;
@@ -2970,6 +3039,42 @@ void Emitter::declareImportedPropertyGetters() {
             if (llvm::Function* fwd =
                     importedVirtualAccessorSlotFn(ps, /*isSet=*/false))
                 importedPropGetterFns_[ps] = fwd;
+            // fix #3231 (§12.3 / §23 / §2.8.3 rule 4, v0.252): ALSO populate
+            // the direct-entry map for `base.P` (§12.3 bypasses virtual
+            // dispatch and wants the OWNER's own body). The thunk above is
+            // wrong for that spelling past a local override (it loads the
+            // OWNER's slot — which IS the override if a derived class
+            // OVERRODE-filled the slot — and §12.3 requires the OWNER's
+            // implementation). The exporter's widened emitExportedPropertyGetters
+            // now defines `bz$<Class>$<Prop>$propget` for VIRTUAL members
+            // too; declare the matching external here. #3199's rejection
+            // was the interim fix; this direct entry replaces it for any
+            // non-abstract VIRTUAL property. (For an ABSTRACT virtual property
+            // the exporter side erases the incomplete wrapper, and we
+            // decline here too — leaving #3199's reject path as the only
+            // answer for that shape, which is the correct §12.5 behaviour.)
+            if (!importedPropGetterDirectFns_.count(ps)) {
+                sema::TypeRef* retRef = ctx_.importedMemberType(ps);
+                llvm::Type* retTy = retRef ? lowerTypeRef(retRef) : i32();
+                std::string clsName =
+                    ps->parent ? mangledTypeName(ps->parent) : "";
+                std::string mangled =
+                    "bz$" + clsName + "$" + std::string(ps->name) + "$propget";
+                // Re-use an existing module declaration (a double-import from
+                // two transitive deps sharing the same symbol, or the wrapper
+                // emitExportedPropertyGetters already declared for the non-
+                // virtual twin of the same name).
+                llvm::Function* fn =
+                    module_->getFunction(mangled);
+                if (!fn) {
+                    auto* fnTy =
+                        llvm::FunctionType::get(retTy, {ptrTy()}, false);
+                    fn = llvm::Function::Create(
+                        fnTy, llvm::Function::ExternalLinkage, mangled,
+                        module_.get());
+                }
+                importedPropGetterDirectFns_[ps] = fn;
+            }
             continue;
         }
         // Derive the return type from the side table.
@@ -3060,6 +3165,36 @@ void Emitter::declareImportedPropertySetters() {
             if (llvm::Function* fwd =
                     importedVirtualAccessorSlotFn(ps, /*isSet=*/true))
                 importedPropSetterFns_[ps] = fwd;
+            // fix #3231 (§12.3 / §23 / §2.8.3 rule 4, v0.252): the SETTER
+            // twin of the getter-side direct-entry population just above.
+            // `base.P := v` (§12.3) needs the OWNER's own setter body, not
+            // the vtable-dispatching thunk (which would run the local
+            // override on a derived class). The widened exporter
+            // (emitExportedPropertySetters) defines
+            // `bz$<Class>$<Prop>$propset` for VIRTUAL members too; declare
+            // the matching external here. Gated on
+            // `ctx_.importedPropertyHasSetter(ps)` for the same reason the
+            // non-virtual branch is — a getter-only virtual property has
+            // no setter stub to declare, and the exporter's erasure of its
+            // wrapper means no symbol exists to link against.
+            if (ctx_.importedPropertyHasSetter(ps) &&
+                !importedPropSetterDirectFns_.count(ps)) {
+                sema::TypeRef* retRef = ctx_.importedMemberType(ps);
+                llvm::Type* valTy = retRef ? lowerTypeRef(retRef) : i32();
+                std::string clsName =
+                    ps->parent ? mangledTypeName(ps->parent) : "";
+                std::string mangled =
+                    "bz$" + clsName + "$" + std::string(ps->name) + "$propset";
+                llvm::Function* fn = module_->getFunction(mangled);
+                if (!fn) {
+                    auto* fnTy = llvm::FunctionType::get(
+                        llvm::Type::getVoidTy(llvm_), {ptrTy(), valTy}, false);
+                    fn = llvm::Function::Create(
+                        fnTy, llvm::Function::ExternalLinkage, mangled,
+                        module_.get());
+                }
+                importedPropSetterDirectFns_[ps] = fn;
+            }
             continue;
         }
         // fix #2400: skip a genuinely getter-only imported property — see the
@@ -3232,6 +3367,31 @@ void Emitter::declareImportedIndexerGetters() {
             currentFn_ = savedFn;
             if (savedInsert) builder_.SetInsertPoint(savedInsert);
             importedIndexerGetterFns_[ps] = fn;
+            // fix #3231 (§12.3 / §23.4 / §2.8.3 rule 4, v0.252): ALSO populate
+            // the direct-entry map for `base[i]` (§12.3's `base`-rooted
+            // indexer read wants the OWNER's own body). The dispatch wrapper
+            // above loads the OWNER's slot — which IS the local override on
+            // a derived class — and §12.3 requires the OWNER's
+            // implementation. The widened emitExportedIndexerGetters
+            // defines `bz$<Class>$idxget$<arity>` for VIRTUAL indexers too;
+            // declare the matching external here. (Abstract: exporter side
+            // erases the incomplete wrapper, #2832's reject path still
+            // arms — correct §12.5 behaviour.)
+            if (!importedIndexerGetterDirectFns_.count(ps)) {
+                std::string clsName =
+                    ps->parent ? mangledTypeName(ps->parent) : "";
+                std::string mangled = "bz$" + clsName + "$idxget$" +
+                                      std::to_string(ps->indexerParams.size());
+                llvm::Function* fn = module_->getFunction(mangled);
+                if (!fn) {
+                    auto* fnTy =
+                        llvm::FunctionType::get(retTy, paramTys, false);
+                    fn = llvm::Function::Create(
+                        fnTy, llvm::Function::ExternalLinkage, mangled,
+                        module_.get());
+                }
+                importedIndexerGetterDirectFns_[ps] = fn;
+            }
             continue;
         }
         std::string clsName = ps->parent ? mangledTypeName(ps->parent) : "";
@@ -3317,6 +3477,28 @@ void Emitter::declareImportedIndexerSetters() {
             currentFn_ = savedFn;
             if (savedInsert) builder_.SetInsertPoint(savedInsert);
             importedIndexerSetterFns_[ps] = fn;
+            // fix #3231 (§12.3 / §23.4 / §2.8.3 rule 4, v0.252): the SETTER
+            // twin of the direct-entry population in
+            // declareImportedIndexerGetters above. `base[i] := v` (§12.3
+            // bypasses virtual dispatch and writes the OWNER's slot) needs
+            // the OWNER's own body, not the dispatch wrapper. The widened
+            // emitExportedIndexerSetters defines `bz$<Class>$idxset$<arity>`
+            // for VIRTUAL members too; declare the matching external here.
+            if (!importedIndexerSetterDirectFns_.count(ps)) {
+                std::string clsName =
+                    ps->parent ? mangledTypeName(ps->parent) : "";
+                std::string mangled = "bz$" + clsName + "$idxset$" +
+                                      std::to_string(ps->indexerParams.size());
+                llvm::Function* fn = module_->getFunction(mangled);
+                if (!fn) {
+                    auto* fnTy = llvm::FunctionType::get(
+                        llvm::Type::getVoidTy(llvm_), paramTys, false);
+                    fn = llvm::Function::Create(
+                        fnTy, llvm::Function::ExternalLinkage, mangled,
+                        module_.get());
+                }
+                importedIndexerSetterDirectFns_[ps] = fn;
+            }
             continue;
         }
         std::string clsName = ps->parent ? mangledTypeName(ps->parent) : "";
