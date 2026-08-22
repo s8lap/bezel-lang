@@ -8519,7 +8519,7 @@ Non-blocking, all applied: four stale *"retire four, register one"* assertions i
 
 Non-blocking, all applied: the standard library conditioned `OwningArray<T>.ToArray()`'s resolution on the import; §5's heading lacked the *(auto-imported)* marker its two siblings carry, so the stdlib and the code-generation reference disagreed in presentation; the code-generation reference's transcription pin still read v0.268 directly above the table this revision rewrote; *"roughly fifty member names"* is 42 names and ≈60 overloads; and *"26 standard-library type names"* drops the qualifier — it is 26 **non-auto-imported** names, since §2.3 also makes the whole of `System` and `System.Text` visible.
 
-**One item recorded rather than fixed.** The gate reads `ExprTC::lookupExtensionMember` as never admitting §5's builtins to the candidate vector, so the compiler would report *two* candidates where the specification now implies three. That is a spec-ahead-of-implementation delta on the very rule this revision writes, and it is filed rather than asserted — no build was available to settle it.
+**One item recorded rather than fixed.** The gate reads `ExprTC::lookupExtensionMember` as never admitting §5's builtins to the candidate vector, so the compiler would report *two* candidates where the specification now implies three. That is a spec-ahead-of-implementation delta on the very rule this revision writes, filed as [#3343](https://github.com/s8lap/bezel-lang/issues/3343) rather than asserted — no build was available to settle it.
 
 **Migration.**
 
