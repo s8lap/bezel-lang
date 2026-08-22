@@ -278,6 +278,15 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // inferred form) so isRangeType / .Start/.End / for-in codegen recognise
     // it identically to the inferred `1..5` form.
     if (n == "Range") return 1;
+    // §10.5 / stdlib: `Ptr<T>` — compiler-intrinsic FFI pointer record (the
+    // generic sibling of IntPtr/UIntPtr in stdlib §10). Arity 1; resolves to
+    // a Named TypeRef with declaration = ctx_.builtinClassSym("Ptr") below,
+    // same shape every other compiler-intrinsic arity-1 type uses here.
+    // Without this registration `record ForeignBuf(P: Ptr<byte>)` errors
+    // "unresolved type name `Ptr`" before isAdmissibleComponentType (#3327)
+    // ever sees it, so the §9.2/§25.2 reject of FFI-pointer-component records
+    // is unreachable.
+    if (n == "Ptr") return 1;
     // issue #545: Buffer<T> — fixed-capacity compiler-intrinsic primitive (arity 1).
     // T restricted to value-type primitives (int/byte/short/long/double/decimal/
     // char/bool) in this revision; class-element Buffer is the §5.20 design pass.
@@ -1734,6 +1743,14 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                                 rangeElementTypeName(ref.genericArgs[0]) +
                                 "` (\xc2\xa7""16.3)");
                     }
+                }
+                // §10.5 / stdlib: `Ptr<T>` — pin declaration to the synthesized
+                // builtin so isAdmissibleComponentType (#3327) and any future
+                // identity-based builtin predicates (the Range/Buffer pattern)
+                // see the same TypeRef as the inferred form. Mirrors the
+                // Range<T> binding immediately above.
+                if (first == "Ptr") {
+                    ref.declaration = ctx_.builtinClassSym("Ptr");
                 }
                 // per §2.5 / #1357: DateOnly and TimeOnly are value-type builtins
                 // (stored as i32). Like DateTime/TimeSpan/Guid they keep
