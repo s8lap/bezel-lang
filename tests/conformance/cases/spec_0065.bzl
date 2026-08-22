@@ -1,2 +1,3 @@
-var rgb: [3]byte       := [255, 128, 64];
-var pt:  [2]Point      := [new Point(0, 0), new Point(1, 1)];   // value-typed Point record
+var counts: [10]int;             // 10 zeros
+var maybe:  [5]Connection?;       // 5 nulls
+var verts:  [3]Vertex;            // 3 default-initialized Vertex records (if Vertex is defaultable)

@@ -1,21 +1,4 @@
-enum Priority
-  Low, Medium, High;
-
-  public method IsUrgent(): bool => this = High;
-
-  public property Name: string => (case this of
-    Low => "Low",
-    Medium => "Medium",
-    High => "High");
-
-  public static owned readonly All: FrozenArray<Priority> :=
-      FrozenArray<Priority>.From([Low, Medium, High]);
-
-  public static method Parse(text: string): Priority?
-    return (case text of
-      "Low" => Low,
-      "Medium" => Medium,
-      "High" => High,
-      _ => null);
-  end Parse;
-end Priority;
+enum HttpStatus: short
+  Ok := 200,
+  NotFound := 404;
+end HttpStatus;

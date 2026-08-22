@@ -1,24 +1,18 @@
-// curl_easy_setopt(CURL*, CURLoption, ...) — one trailing arg, type keyed by option:
-extern "libcurl"
-  public method SetOptLong(h: IntPtr, opt: int, value: long): int
-      := symbol "curl_easy_setopt" variadic(2);
-  public method SetOptStr(h: IntPtr, opt: int, value: CString): int
-      := symbol "curl_easy_setopt" variadic(2);
-  public method SetOptPtr(h: IntPtr, opt: int, value: IntPtr): int
-      := symbol "curl_easy_setopt" variadic(2);
-  public method SetOptWriteFn(h: IntPtr, opt: int,
-      cb: (Ptr<byte>, UIntPtr, UIntPtr, IntPtr) -> UIntPtr): int
-      := symbol "curl_easy_setopt" variadic(2);   // a static callback plugs in here (§32.8)
+import System.Interop;
+
+// C: int sqlite3_exec(sqlite3*, const char* sql,
+//                     int (*cb)(void*, int, char**, char**),
+//                     void* user, char** errmsg);
+extern "sqlite3"
+  public method sqlite3_exec(db: IntPtr, sql: CString,
+      cb: (env, int, Ptr<IntPtr>, Ptr<IntPtr>) -> int,   // env: where C passes user-data INTO the callback
+      env,                                               // env: which extern argument carries it
+      errmsg: Ptr<IntPtr>): int;
 end;
 
-// open(2) with O_CREAT — open is ITSELF variadic (int open(const char*, int, ...)),
-// so BOTH arities go through the clause; a bare 2-ary `method open(...)` declaration
-// would be exactly the %al trap above:
+// C: void qsort_r(void *base, size_t, size_t,
+//                 int (*compar)(const void*, const void*, void*), void* arg);
 extern "libc"
-  public method Open2(path: CString, flags: int): int
-      := symbol "open" variadic(2);          // N = declared arity: a variadic call with
-                                             //   ZERO variadic args — the SOUND spelling
-                                             //   of the fixed-arity workaround
-  public method OpenCreate(path: CString, flags: int, mode: uint): int
-      := symbol "open" variadic(2);
+  public method qsort_r(basePtr: Ptr<byte>, nmemb: UIntPtr, size: UIntPtr,
+      compar: (IntPtr, IntPtr, env) -> int, env): ();
 end;

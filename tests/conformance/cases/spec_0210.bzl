@@ -1,3 +1,2 @@
-public method ReplaceResource(owned resource: Stream)
-  _resource := resource;   // previous _resource disposed here, implicitly (§28.7)
-end ReplaceResource;
+using var sb := new StringBuilder();
+sb.Append("hello").Append(" ").Append("world");    // each Append returns a borrow of sb

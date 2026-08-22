@@ -1,19 +1,20 @@
-public extension IEnumerable<int>
-  public method Sum(): int;
-  public method Average(): double;
-end;
+/// Compiler-intrinsic; T restricted to sendable value types and `string`.
+public class FrozenArray<T>: IEnumerable<T>
+  // Construction consumes or copies its source — after either, no writer can exist.
+  public static method From(owned buffer: OwningBuffer<T>): owned FrozenArray<T>;
+      // VALUE-TYPED T ONLY: O(1) — steals the storage; the buffer is consumed
+      //   (the call-site transfer marker `move`; the proposal-0006 owned-vs-copy construction shape).
+      //   No string-element form can exist: OwningBuffer<T> does not admit string (§4.14).
+  public static method From(items: Array<T>): owned FrozenArray<T>;
+      // Copies; the only construction form for T = string.
 
-public extension IEnumerable<long>
-  public method Sum(): long;
-  public method Average(): double;
-end;
+  public readonly property Length: int;
 
-public extension IEnumerable<double>
-  public method Sum(): double;
-  public method Average(): double;
-end;
+  public property [i: int]: T
+    get;                       // bounds-checked; IndexOutOfRangeException outside 0..<Length
+  end;
 
-public extension IEnumerable<decimal>
-  public method Sum(): decimal;
-  public method Average(): decimal;
-end;
+  public method ToArray(): owned Array<T>;   // fresh mutable copy back out
+
+  destructor;                  // releases the backing storage
+end FrozenArray;

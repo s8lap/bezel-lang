@@ -1,2 +1,1 @@
-var twice := lambda(x: int) => x * 2;
-var greet := lambda(name: string) => $"Hello, {name}!";
+var handler: (itemId: int, quantity: int, priority: int) -> bool;

@@ -1,10 +1,5 @@
-public class Account
-  private _balance: decimal := 0m;
-
-  public property Balance: decimal
-    pure get => _balance;
-    set => _balance := value;
-  end Balance;
-
-  public pure property IsOverdrawn: bool => _balance < 0m;
-end Account;
+private static _cfg: Task<Config>? := null;
+public static async method GetConfig(): Task<Config>
+  if _cfg = null then _cfg := LoadConfigAsync(); end;
+  return await _cfg!;
+end GetConfig;

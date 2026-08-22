@@ -1,7 +1,17 @@
-public method ReportEachGeneric<T>(items: IEnumerable<T>) where T: class
-  for var c in items do Console.WriteLine(c.ToString()); end;   // Object's surface only under `where T: class` (§14.2)
-end ReportEachGeneric;
+public method UseEach()
+  using var pool := new OwningArray<Connection>();
+  pool.Add(Connect("primary"));      // ownership transfers in
+  pool.Add(Connect("secondary"));     // ownership transfers in
 
-// Call with Array<Connection>: T inferred as Connection.
-// Call with OwningArray<Connection>: T inferred as Connection.
-// Same generic instantiation for both source forms.
+  // Default iteration: each conn is a borrow
+  for var conn in pool do
+    conn.Ping();                      // pool still owns conn afterward
+  end;
+
+  // Drain iteration: each conn is owned
+  for var conn in pool.Drain() do
+    using var c := move conn;         // discharge each owned element
+    c.SendShutdown();
+  end;
+  // pool is now empty; using var on pool disposes the (empty) array
+end UseEach;

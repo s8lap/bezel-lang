@@ -1,7 +1,3 @@
-using var guard := await mutex.AcquireAsync();
-// critical section; guard disposed at scope end.
-
-using var maybe := await mutex.TryAcquireAsync(TimeSpan.FromSeconds(5));
-if maybe <> null then
-  // critical section
+public extension IEnumerable<T> where T: INumber<T>
+  public method Sum(): owned T;        // T.Zero()/`+` over §2.19; `owned` erased at value T (spec §28.1)
 end;

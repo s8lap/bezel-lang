@@ -1,3 +1,3 @@
-var counts: [10]int;             // 10 zeros
-var maybe:  [5]Connection?;       // 5 nulls
-var verts:  [3]Vertex;            // 3 zero-initialized Vertex records (if Vertex zero-initializes)
+var pixels: [16]byte;                    // 16 default-initialized (zero) bytes
+var matrix: [9]float;                    // 9 default-initialized (zero) floats
+var rgb:    [3]byte := [255, 128, 64];   // explicit initialization

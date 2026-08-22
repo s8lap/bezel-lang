@@ -1,7 +1,11 @@
-public async method ProcessAsync(): Task
-  // ConnectAsync and SendAsync are illustrative: the standard library's
-  // System.Net module is deferred to a future revision (std lib §11).
-  await using var connection := await ConnectAsync(url);
-  await connection.SendAsync(data);
-  // connection.DisposeAsync() awaited at scope end
-end ProcessAsync;
+public method ReportEach(items: IEnumerable<Connection>)
+  for var c in items do Console.WriteLine(c.Name); end;
+end ReportEach;
+
+public method UseOwnedPool()
+  using var pool := new OwningArray<Connection>();
+  pool.Add(Connect("a"));
+  pool.Add(Connect("b"));
+  ReportEach(pool);     // OK: OwningArray<Connection> implements IEnumerable<Connection>
+                        //     iteration yields borrows
+end UseOwnedPool;

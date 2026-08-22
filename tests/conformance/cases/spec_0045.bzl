@@ -1,3 +1,7 @@
-public static class Utils
-  public static method Max(a: int, b: int): int => (if a > b then a else b);
-end Utils;
+public class Parser
+  public record Token(Kind: TokenKind, Text: string, Line: int);
+
+  public enum TokenKind
+    Identifier, Number, Operator, EndOfFile;
+  end TokenKind;
+end Parser;

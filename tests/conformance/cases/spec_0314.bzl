@@ -1,15 +1,8 @@
-SourceFile      ::= ModuleDecl Import* TopDecl*
-ModuleDecl      ::= "module" QualifiedName ";"
-Import          ::= "import" QualifiedName ("as" Identifier)? ";"
-                              /* alias: a file-scoped qualifier for the
-                                 imported module (§2.2). */
-QualifiedName   ::= Identifier ("." Identifier)*
-
-TopDecl         ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl
-                  | ChoiceDecl
-                  | ExtensionDecl | TypeAliasDecl | ExternBlock
-TypeAliasDecl   ::= "type" Identifier GenericParams? ":=" Type
-                              /* The alias binds with `:=`, like every other
-                                 binding. No Visibility alternative: a module-level alias
-                                 is always module-internal (§27.8). */
-                    GenericConstraints* ";"
+case client.Fetch(url) of
+  Fetched(var r) => do
+    using var resp := move r;    // r moved into resp; resp disposed at arm-body end
+    Render(resp);
+  end,
+  NotModified          => RenderCached(),
+  Failed(var s, var m) => ShowError(s, m)
+end;

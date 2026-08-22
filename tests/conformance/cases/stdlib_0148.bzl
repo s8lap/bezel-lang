@@ -1,14 +1,12 @@
-/// Static intrinsics for the FFI boundary. Module System.Interop (NOT auto-imported).
-public static class Interop
-  // The calling thread's C errno, read directly. Valid only when read BEFORE the
-  // next extern call or runtime operation on this thread — and NEVER across an
-  // await: a continuation may resume on a DIFFERENT OS thread (language spec
-  // §30.13), so a post-await read is another thread's errno. Read it first,
-  // synchronously, in the same continuation as the failing call.
-  public static method LastErrno(): int;               // v0.186
+/// Compiler-intrinsic; T restricted to integer types and char.
+public record Range<T>: IEnumerable<T>
+  public readonly property Start: T?;              // null if open-ended on the lower side
+  public readonly property End: T?;                // null if open-ended on the upper side
+  public readonly property Step: long;             // default 1; signed to support descending
+  public readonly property IsEndInclusive: bool;   // true for `..`, false for `..<`
+  public pure readonly property IsOpenEnded: bool; // true if Start or End is null
+  public pure readonly property IsEmpty: bool;     // true if the range contains no values
 
-  // The process-lifetime code address of a callback admissible under the STATIC
-  // rule of language spec §32.8; F gated per-instantiation to FFI-compatible
-  // function types. One-way by design: no address→function inverse exists.
-  public static method CodeAddress<F>(callback: F): IntPtr;   // v0.186
-end Interop;
+  public pure method Contains(value: T): bool;
+  public method GetEnumerator(): owned IEnumerator<T>;
+end Range;

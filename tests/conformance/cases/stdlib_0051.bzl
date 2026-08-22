@@ -1,31 +1,99 @@
-public class OwningLinkedList<T>: IOwningCollection<T> where T: class
-  public constructor();
+public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
+  private owned _storage: OwningBuffer<T>;
+  private _count: int := 0;
 
-  public pure readonly property Count: int;
-  public pure readonly property FirstNode: LinkedListNode<T>?;       // borrow if non-null
-  public pure readonly property LastNode: LinkedListNode<T>?;
-  public pure readonly property First: T?;                           // borrow
-  public pure readonly property Last: T?;
+  public constructor()
+    this(8);
+  end constructor;
 
-  public method AddFirst(owned item: T): LinkedListNode<T>;
-  public method AddLast(owned item: T): LinkedListNode<T>;
-  public method AddBefore(node: LinkedListNode<T>, owned item: T): LinkedListNode<T>;
-  public method AddAfter(node: LinkedListNode<T>, owned item: T): LinkedListNode<T>;
-  public method RemoveFirst();                                  // disposes
-  public method RemoveLast();                                   // disposes
-  public method RemoveNode(node: LinkedListNode<T>);            // disposes
-  public method Clear();                                         // disposes every element
-  public method Contains(item: T): bool;                         // borrow-taking
-  public method Find(item: T): LinkedListNode<T>?;               // borrow-taking
-  public method Remove(item: T): bool;                           // disposes the matched
+  public constructor(capacity: int)
+    if capacity < 0 then
+      throw new ArgumentOutOfRangeException("capacity");
+    end;
+    _storage := new OwningBuffer<T>((if capacity > 0 then capacity else 1));
+  end constructor;
 
-  // Drain methods
-  public method PopFirst(): owned T;                            // raises if empty
-  public method PopLast(): owned T;
-  public method TryPopFirst(out owned item: T?): bool;   // v0.171 (#1336)
-  public method TryPopLast(out owned item: T?): bool;
-  public method Drain(): IOwningEnumerable<T>;
-  // Plus the remaining IOwningCollection<T> operations, elided per §1's marker
-  //   convention (v0.195): Add(owned item) — appends at the tail, = AddLast —
-  //   and IsReadOnly.
-end OwningLinkedList;
+  public pure property Count: int => _count;   // `pure` is mandatory: §4.1's
+                                               //   IReadOnlyCollection<T>.Count is
+                                               //   pure-declared, and spec §22.15
+                                               //   dispatch rule 1 makes dropping it
+                                               //   at an implementation a compile error
+  public pure property Capacity: int => _storage.Length;   // `pure` is mandatory: the
+                                                //   declared surface above pure-declares
+                                                //   Capacity, and the body's only call —
+                                                //   OwningBuffer<T>.Length (§4.14) — is
+                                                //   pure-declared, so spec §22.15 rule 6
+                                                //   admits it
+
+  public property [i: int]: T
+    get => do
+      BoundsCheck(i);
+      return _storage[i]!;
+    end;
+    set(owned) => do
+      BoundsCheck(i);
+      _storage[i] := value;                       // owned-setter disposes previous
+    end;
+  end;
+
+  public method Add(owned item: T)
+    if _count = _storage.Length then
+      GrowTo(_storage.Length * 2);
+    end;
+    _storage[_count] := item;
+    _count := _count + 1;
+  end Add;
+
+  public method PopAt(index: int): owned T
+    BoundsCheck(index);
+    var taken := move _storage[index];             // taken: T? (owned)
+    _storage[index] := null;                        // restore slot
+    for var j in index..<(_count - 1) do
+      var shifted := move _storage[j + 1];          // shifted: T? (owned)
+      _storage[j + 1] := null;                       // restore shifted-from slot
+      _storage[j] := shifted;                        // setter on moved-from slot;
+                                                      //   no previous to dispose
+    end;
+    _count := _count - 1;
+    return taken!;                                   // i < _count guaranteed non-null
+  end PopAt;
+
+  public method RemoveAt(index: int)
+    using var _ := PopAt(index);                  // dispose at scope end
+  end RemoveAt;
+
+  public method Clear()
+    for var i in 0..<_count do
+      var item := move _storage[i];                // item: T? (owned)
+      _storage[i] := null;                          // restore moved-from slot
+      item!.Dispose();                              // slot was non-null
+                                                     //   (i < _count guarantees it)
+    end;
+    _count := 0;
+  end Clear;
+
+  // ... and so on for Insert, Remove, Contains, IndexOf, Sort, Reverse,
+  //     PopFirst, PopLast, TryPopFirst, TryPopLast, Drain, AddRange.
+
+  private method BoundsCheck(i: int)
+    if i < 0 or i >= _count then
+      throw new IndexOutOfRangeException();
+    end;
+  end BoundsCheck;
+
+  private method GrowTo(newCapacity: int)
+    var fresh := new OwningBuffer<T>(newCapacity);
+    for var i in 0..<_count do
+      var moved := move _storage[i];                 // moved: T? (owned)
+      _storage[i] := null;                            // restore moved-from slot
+      fresh[i] := moved;                              // setter on moved-from slot of fresh
+    end;
+    _storage.Dispose();                              // dispose old buffer
+                                                      //   (now all-null, no slots leak)
+    _storage := fresh;
+  end GrowTo;
+
+  // No destructor declared; the compiler generates the default Dispose
+  // which disposes _storage's contents (every non-null slot's owned T)
+  // and the buffer's storage block, in that order.
+end OwningArray;

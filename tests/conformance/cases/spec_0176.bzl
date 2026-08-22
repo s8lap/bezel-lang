@@ -1,5 +1,9 @@
-var add: (int, int) -> int;
-var isPositive: (int) -> bool;
-var log: (string) -> ();              // procedure
-var noop: () -> ();
-var now: () -> DateTime;
+extension IEnumerable<T>
+  public method Map<U>(transform: (T) -> U): owned Array<U>
+    var result := new Array<U>();
+    for var item in this do
+      result.Add(transform(item));
+    end;
+    return result;
+  end Map;
+end;

@@ -1,1 +1,1 @@
-public static method FromCollectionLiteral(owned elements: OwningArray<T>): owned C<T>;
+public static method FromCollectionLiteral(elements: ReadOnlyArraySpan<T>): owned C<T>;

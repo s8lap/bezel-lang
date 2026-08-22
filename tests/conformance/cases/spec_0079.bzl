@@ -1,3 +1,12 @@
-var evens := 0..100 step 2;          // 0, 2, 4, …, 100
-var down := 100..0 step -1;          // 100, 99, …, 0
-var fives := 0..<50 step 5;          // 0, 5, 10, …, 45
+/// Compiler-intrinsic; T restricted to integer types and char.
+public record Range<T>: IEnumerable<T>
+  public readonly property Start: T?;
+  public readonly property End: T?;
+  public readonly property Step: long;
+  public readonly property IsEndInclusive: bool;
+  public pure readonly property IsOpenEnded: bool;
+  public pure readonly property IsEmpty: bool;
+
+  public pure method Contains(value: T): bool;
+  public method GetEnumerator(): owned IEnumerator<T>;
+end Range;

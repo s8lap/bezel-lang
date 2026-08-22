@@ -1,7 +1,10 @@
-using var buf := new OwningBuffer<byte>(4096);   // runtime-sized, value slots
-var header := buf.AsSpan(0, 64);                 // zero-copy writable view
-header.Fill(0);                                  // bulk write through the view
+public static method Load(paths: IEnumerable<string>): IEnumerable<Doc>
+  for var p in paths do
+    using var d := Parse(p);      // Parse(p: string): owned Doc — frame-owned
+    yield return d;               // adopt-then-yield: a borrow of a frame-owned binding
+  end;
+end Load;
 
-var s := "Content-Type: text/plain";
-var kind := s.AsSpan(14);                        // ReadOnlyStringSpan — no allocation
-if kind.StartsWith("text/") then Accept(); end;
+var first := Load(paths).First();  // WARNS (v0.268) — spec §29.11's adopting arm
+first.Title;                       // checked mode: DisposedAccessException — §29.7's
+                                   //   pass disposed d when First() disposed the enumerator

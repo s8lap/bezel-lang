@@ -1,2 +1,3 @@
-record UserId(Value: int);
-record OrderId(Value: int);
+_clicked += lambda(e) => UpdateStatus(e.X, e.Y);
+// later:
+_clicked -= lambda(e) => UpdateStatus(e.X, e.Y);   // a different lambda, no match

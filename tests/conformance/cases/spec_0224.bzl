@@ -1,6 +1,7 @@
-public method ProcessFile(filename: string)
-  using var fs := new FileStream(filename, FileMode.Open);
-  using var buffer := new Array<byte>(4096, 0);   // sized ctor (stdlib §4.4)
-  var data := fs.ReadAll();
-  // fs and buffer disposed here in reverse order
-end ProcessFile;
+// ERROR: TakeOwnership may throw (method calls are throwable, above) — on that
+//        edge _resource is moved but never reassigned: the WrongOrder shape.
+public method TransferToHelper()
+  var fresh := new FileStream(_path, FileMode.Open);
+  TakeOwnership(move _resource);          // owned argument; helper consumes
+  _resource := fresh;                      // restores the normal edge only
+end TransferToHelper;

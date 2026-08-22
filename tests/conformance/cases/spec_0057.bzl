@@ -1,7 +1,11 @@
-public class BankAccount
-  // ...
-end BankAccount;
+public interface IReadOnlyCollection<out T>: IEnumerable<T>
+  pure readonly property Count: int;
+end IReadOnlyCollection;
 
-class Helper           // implicitly internal
-  // ...
-end Helper;
+public interface IReadOnlyList<out T>: IReadOnlyCollection<T>
+  readonly property [i: int]: T;
+end IReadOnlyList;
+
+public interface IList<T>: IReadOnlyList<T>, ICollection<T>
+  property [i: int]: T;
+end IList;

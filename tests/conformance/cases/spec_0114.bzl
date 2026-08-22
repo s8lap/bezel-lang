@@ -1,5 +1,5 @@
-when
-  score >= 90 => Console.WriteLine("A"),
-  score >= 70 => Console.WriteLine("C"),
-  _          => Console.WriteLine("F")
-end;
+var grade := (when
+  score >= 90 => "A",
+  score >= 80 => "B",
+  score >= 70 => "C",
+  _ => "F");

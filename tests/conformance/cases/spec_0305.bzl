@@ -1,10 +1,10 @@
-public choice FetchOutcome
-  Fetched(owned response: Response),      // owned class payload
-  NotModified,                            // payload-free case
-  Failed(status: int, message: string);   // value payloads
+// glibc x86-64 layout — the raw kernel struct orders fields differently (per-platform declaration):
+public record SigAction(
+  Handler: IntPtr,          // sa_handler / sa_sigaction (union head — see the unions decline)
+  Mask: [16]ulong,          // glibc sigset_t: 1024 bits
+  Flags: int,
+  Restorer: IntPtr);        // glibc-internal; set to IntPtr.Zero
 
-  public method IsSuccess(): bool => (case this of
-    Fetched(_)   => true,
-    NotModified  => true,
-    Failed(_, _) => false);
-end FetchOutcome;
+extern "libc"
+  public method sigaction(signum: int, ref act: SigAction, out old: SigAction): int;
+end;

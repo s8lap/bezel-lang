@@ -1,3 +1,5 @@
-private _items: Array<int> := new();
-private _config: Config := new(verbose := true);
-var xs: Array<int> := new();
+do
+  var __coll := expr;
+  var __idx := i;
+  __coll[__idx] := __coll[__idx] + 1;
+end;

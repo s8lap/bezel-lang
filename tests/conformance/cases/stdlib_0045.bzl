@@ -1,8 +1,20 @@
-public method ReportEach<T>(items: IReadOnlyList<T>) where T: class
-  for var c in items do Console.WriteLine(c); end;   // Object overload -> ToString();
-                                                     //   `where T: class` exposes only Object's surface (spec §14.2)
-end ReportEach;
+public interface IReadOnlyCollection<out T>: IEnumerable<T>
+  pure readonly property Count: int;
+end IReadOnlyCollection;
 
-// Accepts both:
-ReportEach(myArray);          // Array<Connection> → IReadOnlyList<Connection> ✓
-ReportEach(myPool);            // OwningArray<Connection> → IReadOnlyList<Connection> ✓
+public interface IReadOnlyList<out T>: IReadOnlyCollection<T>
+  readonly property [i: int]: T;
+end IReadOnlyList;
+
+public interface ICollection<T>: IReadOnlyCollection<T>
+  readonly property IsReadOnly: bool;
+  method Add(item: T);
+  method Clear();
+  method Contains(item: T): bool;
+  method Remove(item: T): bool;
+end ICollection;
+
+public interface IList<T>: IReadOnlyList<T>, ICollection<T>
+  property [i: int]: T;
+  method Insert(index: int, item: T);
+end IList;

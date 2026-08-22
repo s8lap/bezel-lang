@@ -1,11 +1,7 @@
-public interface IReadOnlyCollection<out T>: IEnumerable<T>
-  readonly property Count: int;
-end IReadOnlyCollection;
+interface IEnumerable<out T>
+  method GetEnumerator(): owned IEnumerator<T>;
+end IEnumerable;
 
-public interface IReadOnlyList<out T>: IReadOnlyCollection<T>
-  readonly property [i: int]: T;
-end IReadOnlyList;
-
-public interface IList<T>: IReadOnlyList<T>, ICollection<T>
-  property [i: int]: T;
-end IList;
+interface IComparer<in T>            // illustrative: the standard library declares no
+  method Compare(a: T, b: T): int;   //   contravariant interface (`IEqualityComparer<T>`
+end IComparer;                       //   is invariant)

@@ -1,28 +1,27 @@
-public record CancellationToken
-  public static readonly property None: CancellationToken;
-  public readonly property IsCancellationRequested: bool;
-  public method ThrowIfCancellationRequested();
-  public method Register(scoped callback: () -> ()): owned Subscription;
-end CancellationToken;
+/// Compiler-intrinsic; T restricted to sendable value types and `string`.
+public class FrozenArray<T>: IEnumerable<T>
+  // Construction consumes or copies its source — after either, no writer can exist.
+  public static method From(owned buffer: OwningBuffer<T>): owned FrozenArray<T>;
+      // VALUE-TYPED T ONLY: O(1) — steals the storage; the buffer is consumed
+      //   (the call-site transfer marker `move`; the proposal-0006 owned-vs-copy construction shape).
+      //   No string-element form can exist: OwningBuffer<T> does not admit string (§4.14).
+  public static method From(items: Array<T>): owned FrozenArray<T>;
+      // Copies; the only construction form for T = string.
 
-public class CancellationTokenSource
-  public constructor();
+  public readonly property Length: int;
 
-  public static method WithCancelAfter(delay: TimeSpan): owned CancellationTokenSource;
+  public property [i: int]: T
+    get;                       // bounds-checked; IndexOutOfRangeException outside 0..<Length
+  end;
 
-  // v0.173 (#810): a source cancelled when ANY parent token cancels (or by its
-  // own Cancel/CancelAfter). Two-token form for the everyday case (caller +
-  // deadline); array form for N parents.
-  public static method CreateLinked(a: CancellationToken, b: CancellationToken): owned CancellationTokenSource;
-  public static method CreateLinkedAll(parents: Array<CancellationToken>): owned CancellationTokenSource;
+  public method ToArray(): owned Array<T>;   // fresh mutable copy back out
 
-  public readonly property Token: CancellationToken;
-  public readonly property IsCancellationRequested: bool;
+  destructor;                  // releases the backing storage
+end FrozenArray;
 
-  public method Cancel();
-  public method CancelAfter(delay: TimeSpan);
-
-  destructor;       // signals cancellation to any tokens still observing,
-                           // unregisters from linked parents (v0.173), then
-                           // releases the registered-callback list
-end CancellationTokenSource;
+var raw := LoadSamples();                                        // owned OwningBuffer<double>
+using var input := new Shared<FrozenArray<double>>(
+    FrozenArray<double>.From(move raw));                         // O(1) freeze
+using var t1 := Domain.Spawn(Program.ScanLow,  input.Clone());   // Shared<FrozenArray<double>>: sendable
+using var t2 := Domain.Spawn(Program.ScanHigh, input.Clone());
+var answer := await t1 + await t2;                               // zero bytes copied

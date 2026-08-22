@@ -1,7 +1,1 @@
-public class Parser
-  public record Token(Kind: TokenKind, Text: string, Line: int);
-
-  public enum TokenKind
-    Identifier, Number, Operator, EndOfFile;
-  end TokenKind;
-end Parser;
+visibility static (async | pure) (abstract | virtual | override | sealed override) (owned | scoped) readonly member-kind Name ...

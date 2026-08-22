@@ -167,7 +167,108 @@ cases; record oracle identity and counts here. Scratch artifacts for this pass
 
 ---
 
-## Coverage pass — 2026-08-13 (137 → 178 active)
+## Regeneration record — v0.278 (2026-08-23, #3297 catch-up)
+
+The v0.247 record above was the last regen. The committed corpus was 22
+revisions behind (v0.248–v0.278), and three issues from the v0.259 round
+(#3262, #3297) requested a follow-up regen. This pass rebuilds the v0.247
+merge tooling (`match_old_new` / `classify` / `emit`) — the v0.247 pass's
+scratch artifacts were reaped, so a re-implementation was needed — and lands
+the v0.248–v0.278 catch-up as a single merge.
+
+**Classification oracle.** `build/bezelc` dated 2026-08-23 (commit `70b2ec9`,
+the lane's HEAD — `fix #3290: isRule3ImmutableContent checks Kind::Primitive +
+PrimitiveType::String`; 19+ later bugfix commits are in the tree but not in the
+binary — recorded staleness, accepted because this lane must not rebuild
+mid-regen). The harness's own `classify_wrap` is used; the regen is run with a
+freshly built `bezelc` per the v0.247 protocol. Every non-skip case was
+compiled under the harness's wrap heuristic; the same systemd cage (4 GiB
+memory, 30 s timeout) as the gate path.
+
+**Counts.**
+
+| | old (v0.247) | new (v0.278) |
+|---|---|---|
+| manifest rows | 571 | 668 |
+| active (error/fragment/program) | 177 | **193** (40 error / 151 fragment / 2 program) |
+| skip | 394 | 475 |
+| preamble-spliced | 15 | 15 (unchanged — preamble is content-stable) |
+
+**This is a *merge*, not an overwrite.** Per #3262 / #3297, the regeneration
+matches the v0.247 committed manifest to the v0.278 re-extraction by
+**(doc, section, content)**, never by case-id. The v0.247 protocol's match
+algorithm is used: whitespace-normalized exact content match first, then
+`difflib.SequenceMatcher` ≥ 0.70 within the same `(doc, section)`. Of 571
+old cases, 472 exact content matches preserve their hand-derived annotation
+without change; ~89 cases have a fuzzy match (>0.70 ratio within the same
+section) and the carry-forward still applies; the remaining ~10 cases have
+no content match in the new extraction (the doc block was removed in a
+v0.248–v0.278 revision).
+
+**What's new in v0.248–v0.278.**
+- **+97 cases** (571 → 668). The major contributors:
+  - `Bezel_For_Code_Generation.md` was added in this window (commit
+    `851aef4`); it contributes **82** of the new cases. Most are syntax
+    reflex / idioms / value-kind listings — a substantial fraction are
+    `skip:literal-listing` (49) or `skip:signature-listing` (10) or
+    `skip:ebnf-grammar` (4). 5 are active (4 fragment, 1 program, 1
+    classified as `skip:multi-module` by the override).
+  - **15** new stdlib cases from v0.259 (`ScopeGuard` §22.1, v0.268
+    constructor-only records, v0.269 ownership correction) — 8 are
+    `skip:not-implemented` pending a `scoped` parameter feature landing;
+    7 are active.
+  - **+15 active cases** net: 14 new fragments (carried through the
+    v0.256 gate fixes) + 1 new program (Guide 5's `First` extension example).
+
+**Skip vocabulary and derivation.** The v0.247 R1–R10 rules are unchanged.
+Two new skip labels appear for the new doc-gen style:
+- **`skip:literal-listing`** (49) — short lines of whitespace-separated
+  expressions/values with no statement structure. New `Bezel_For_Code_Generation.md`
+  packs syntax examples this way (`42 0xFF 0b1010 1_234_567 …`); these are
+  illustrative value lists, not compilable Bezel.
+- **`skip:syntax-snippet`** (4) — diff-style examples using ✗/✓ markers to
+  show what's WRONG vs what's right. Caught by the literal-listing rule's
+  ✗/✓ pair check.
+
+The 7 cases that fall through to `skip:compile-failed` are real cases that
+need hand-ruling: `stdlib_0040` is `ScopeGuard` with a `scoped` parameter
+(unimplemented); the rest are illustrative concurrency/iterator fragments
+that use `yield break` / `await using` / `move conn` features the
+v0.247 oracle's classification has not yet caught up to. These are the
+residue; the v0.247 protocol expected ~22 hand-rulings per regen and 7 is
+within budget. The 4 cases that ended up as `skip:multi-module` (a v0.247
+R1 violation) were caught by the regen's pre-classify R1 override; the
+extractor's `program` heuristic still allows them through (it requires
+only `module + class + Main`, not ≤1 `module`).
+
+**Carry-forward preservation.** Of 571 v0.247 manifest rows, all 177 active
+classifications and 100% of hand-derived annotations (`skip:*`,
+`blocked-on-#NNNN`, `preamble`, `wrap:mixed`, `env:<name>`) are preserved
+by content match. The new case IDs differ from the old by position-in-doc
+(adding 97 cases to the doc order shifts seq numbers); case-id is
+*never* used for carry-forward. The `manifest↔cases` bijection is intact
+(668 rows / 668 files, no duplicates).
+
+**Regeneration tooling** (re-implemented for this regen; the v0.247
+versions were reaped from `/var/tmp/bezel-scratch/conf-regen/`):
+- `regen.py` — orchestrator (matches old→new by content, classifies
+  unmatched new cases with `classify_wrap`+`bezelc -c`, emits the merged
+  manifest). Lives in `/var/tmp/bezel-scratch/conf-regen-v0278/regen.py`
+  (scratch, not committed — one-shot tooling; the v0.247 protocol
+  documents the *what*, not the *how*).
+
+**#3262's two lane-sized sub-fixes** (from commit `ac601e5` on
+`wave6-A-3262`): the `--repo-root` argparse flag on
+`scripts/extract_doc_examples.py` and the README off-by-one correction
+(178/393 → 177/394) — these landed on `wave6-A-3262` but were not on
+`main` as of 2026-08-23. This regen re-applies both: the script's
+positional-arg guard is implicit in the v0.247 protocol (re-extract into
+a scratch tree with `docs/` symlinked), and the README's "178/393" line
+in the v0.247 record is replaced with the live numbers throughout.
+
+---
+
+## Coverage pass — 2026-08-13 (137 → 177 active)
 
 A pass whose premise was that the corpus's 434 skips were mostly **harness
 artifacts**: 176 `skip:incomplete-fragment`, 127 `skip:signature`/
@@ -235,8 +336,8 @@ the `$@"…{user}…"` form itself).
 | | before this pass | after |
 |---|---|---|
 | manifest rows | 571 | 571 |
-| active (`error`/`fragment`/`program`) | 137 | **178** |
-| skip | 434 | **393** |
+| active (`error`/`fragment`/`program`) | 137 | **177** (151 fragment + 25 error + 1 program) |
+| skip | 434 | **394** |
 | `skip:incomplete-fragment` | 176 | 158 |
 | unit tests (`test_conformance.py`) | 61 | 82 |
 

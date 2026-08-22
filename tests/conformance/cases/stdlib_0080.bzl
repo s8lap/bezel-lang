@@ -1,19 +1,74 @@
-public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> where K: IComparable<K>   // conformance added v0.165 (#1354): makes for-in/LINQ legal per spec §29; explicit IDisposable dropped v0.195 (§1 convention — implicit, trivial-dispose)
-  public constructor();
+public record BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)
 
-  public pure readonly property Count: int;
+  public pure property IsEmpty: bool => BitLength = 0;
+  public pure property IsByteAligned: bool => BitStart mod 8 = 0;
 
-  public property [key: K]: V;                  // get: KeyNotFoundException if absent
-                                                // set: insert or replace
-  public method ContainsKey(key: K): bool;
-  public method Contains(key: K): bool;         // alias for ContainsKey; enables `key in dict` (§4.8 convention; v0.195)
-  public method TryGetValue(key: K, out value: V?): bool;   // v0.171 (#1336): nullable out, matching §4.8's revised uniform Try shape
-  public method GetOrNull(key: K): V?;          // v0.231 (§1 *OrNull tier): absent -> null; present -> the
-                                                //   value under §4.8's read semantics — caveat in the prose
-                                                //   below
-  public method Remove(key: K): bool;           // false if absent
-  public method Clear();
+  // Reads — from bit 0 of the view; count in 1..64
+  public method ReadBitsBigEndianMsbFirst(count: int): ulong;
+  public method ReadBitsLittleEndianLsbFirst(count: int): ulong;
+  public method ReadBitMsbFirst(): bool;
+  public method ReadBitLsbFirst(): bool;
 
-  public pure readonly property FirstKey: K;         // least key; InvalidOperationException if empty
-  public pure readonly property LastKey: K;          // greatest key; InvalidOperationException if empty
-end SortedDictionary;
+  // Try variants — return false instead of throwing on a short view
+  public method TryReadBitsBigEndianMsbFirst(count: int, out value: ulong): bool;
+  public method TryReadBitsLittleEndianLsbFirst(count: int, out value: ulong): bool;
+  public method TryReadBitMsbFirst(out value: bool): bool;
+  public method TryReadBitLsbFirst(out value: bool): bool;
+
+  // Repositioning — the §4.14 Slice family, counted in bits
+  public pure method Slice(bitStart: int): BitReader;
+  public pure method Slice(bitStart: int, bitLength: int): BitReader;
+  public pure method Slice(r: Range<int>): BitReader; // Range form: normalized against
+                                                       //   BitLength (spec §16.3), then
+                                                       //   equivalent to Slice(start, length)
+  public pure method AlignToByte(): BitReader;        // advance to the next byte boundary
+
+  // The byte-aligned remainder — an ordinary sub-span, no bit machinery
+  public method AlignedTail(): ReadOnlySpan<byte>;
+end BitReader;
+
+public record BitWriter(Source: Span<byte>, BitStart: int, BitLength: int)
+
+  public pure property IsEmpty: bool => BitLength = 0;
+  public pure property IsByteAligned: bool => BitStart mod 8 = 0;
+
+  public method WriteBitsBigEndianMsbFirst(value: ulong, count: int);
+  public method WriteBitsLittleEndianLsbFirst(value: ulong, count: int);
+  public method WriteBitMsbFirst(value: bool);
+  public method WriteBitLsbFirst(value: bool);
+
+  // Try variants — false on a short view; the destination is not modified
+  public method TryWriteBitsBigEndianMsbFirst(value: ulong, count: int): bool;
+  public method TryWriteBitsLittleEndianLsbFirst(value: ulong, count: int): bool;
+  public method TryWriteBitMsbFirst(value: bool): bool;
+  public method TryWriteBitLsbFirst(value: bool): bool;
+
+  public pure method Slice(bitStart: int): BitWriter;
+  public pure method Slice(bitStart: int, bitLength: int): BitWriter;
+  public pure method Slice(r: Range<int>): BitWriter;
+  public pure method AlignToByte(): BitWriter;
+
+  public method AlignedTail(): Span<byte>;
+  public method AsReadOnly(): BitReader;
+end BitWriter;
+
+// Entry points, parallel to AsSpan / AsReadOnlySpan
+public extension ReadOnlySpan<byte>
+  public pure method AsBitReader(): BitReader;
+end;
+
+public extension Span<byte>
+  public method AsBitReader(): BitReader;             // delegates via AsReadOnly()
+                                                       //   (unmarked), so not `pure`
+  public pure method AsBitWriter(): BitWriter;
+end;
+
+public record BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)
+  public method ReadBitMsbFirst(): bool
+    if BitLength < 1 then
+      throw new IndexOutOfRangeException();
+    end;
+    var k := BitStart;
+    return (int(Source[k / 8]) & (1 << (7 - (k mod 8)))) <> 0;
+  end ReadBitMsbFirst;
+end BitReader;

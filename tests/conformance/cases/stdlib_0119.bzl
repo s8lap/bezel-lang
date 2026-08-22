@@ -1,5 +1,7 @@
-public class ChannelClosedException: Exception
-end ChannelClosedException;
-
-public class ChannelFullException: Exception        // v0.174: sync Send on a full bounded channel
-end ChannelFullException;
+public async method LoadAllConfigs(paths: Array<string>): OwningTask<OwningArray<Config>>
+  var tasks := new OwningArray<OwningTask<Config>>();
+  for var path in paths do
+    tasks.Add(LoadConfigAsync(path));    // each task is OwningTask<Config>; transfers in
+  end;
+  return await Task.WhenAll(move tasks);      // tasks consumed; returned array owns the configs
+end LoadAllConfigs;

@@ -1,14 +1,17 @@
-import System.Interop;
+extern "libc"
+  public method qsort(
+    basePtr: IntPtr,     // C: void *base
+    nmemb: UIntPtr,
+    size: UIntPtr,
+    compar: (IntPtr, IntPtr) -> int): ();
+end;
 
-public static class FileOps
-  public static method OpenChecked(path: CString): int
-    var fd := open(path, O_RDONLY);
-    if fd < 0 then
-      var e := Interop.LastErrno();          // read FIRST — the interpolation below allocates,
-                                             //   and allocation is a runtime operation that may
-                                             //   clobber the thread-local (stdlib §10.6)
-      throw new IOException($"open failed: errno={e}");
-    end;
-    return fd;
-  end OpenChecked;
-end FileOps;
+public static class IntSorter
+  public static method CompareInts(a: IntPtr, b: IntPtr): int
+    // ...
+  end CompareInts;
+
+  public static method SortInPlace(arrayPtr: IntPtr, count: UIntPtr, sizeOfInt: UIntPtr)
+    qsort(arrayPtr, count, sizeOfInt, IntSorter.CompareInts);
+  end SortInPlace;
+end IntSorter;

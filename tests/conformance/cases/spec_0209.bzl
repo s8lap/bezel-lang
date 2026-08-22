@@ -1,8 +1,10 @@
-public method TakeOwnership(owned resource: Stream)
-  _resource := resource;     // moves into owned field; the previous
-                             // _resource is disposed by the assignment (§28.7)
-end TakeOwnership;
+class Handle
+  private _c: Cell;            // borrow field (no `owned`)
+  public constructor()
+    _c := new Cell();          // ERROR: a fresh owned value stored into a
+  end constructor;             //   non-`owned` field has no owner — declare `owned _c`.
 
-public static method NewBuffer(size: int): owned Array<byte>
-  return new Array<byte>(size, 0);   // sized ctor (stdlib §4.4); owned by virtue of new, returned as owned
-end NewBuffer;
+  public property Item: Cell
+    get => new Cell();         // ERROR: a getter may not return a fresh owned
+  end Item;                    //   value — use `method MakeItem(): owned Cell`.
+end Handle;

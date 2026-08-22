@@ -1,5 +1,2 @@
-var processItem := lambda(item: Item) => do
-  var normalized := Normalize(item);
-  var enriched := Enrich(normalized);
-  return enriched;
-end;
+// _pool is a field of the enclosing class: private owned _pool: OwningArray<Connection>;
+var adopt: (owned Connection) -> () := lambda(owned c) => _pool.Add(move c);

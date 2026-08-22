@@ -1,17 +1,11 @@
-public class Calculator
-  public method Compute(a: int, b: long): string => "int,long";
-  public method Compute(a: long, b: int): string => "long,int";
-end Calculator;
+public class Logger  // declaration sketch; method bodies elided
+  public method Log(level: int);
+  public method Log(level: long);
+end Logger;
 
-var calc := new Calculator();
-var x: int := 5;
-var y: int := 10;
+var lg := new Logger();
+var n: int := 10;
 
-calc.Compute(x, y);
-// arg a (int): exact in Compute(int,long); int→long conversion in Compute(long,int).
-// arg b (int): int→long conversion in Compute(int,long); exact in Compute(long,int).
-// Each candidate is strictly better on a different argument; neither dominates.
-// Ambiguous call — compile error citing both candidates.
-// Disambiguate:
-//   calc.Compute(x, long(y));    // makes Compute(int,long) exact on both ⇒ selects it
-//   calc.Compute(long(x), y);    // makes Compute(long,int) exact on both ⇒ selects it
+lg.Log(n);            // n is int: exact match — calls Log(int), not the int→long widening
+lg.Log(42);           // 42 is an int literal: exact match — calls Log(int)
+lg.Log(42L);          // 42L is a long literal: exact match — calls Log(long)

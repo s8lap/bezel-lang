@@ -3,16 +3,19 @@ public sealed class Type
   public readonly property FullName: string;        // qualified: "BankingApp.BankAccount"
 
   // Kind predicates. Exactly one of IsClass, IsInterface, IsRecord, IsEnum,
-  // IsPrimitive, IsInlineArray, IsFunctionType is true for any Type.
+  // IsChoice, IsPrimitive, IsInlineArray, IsFunctionType is true for any Type.
   public readonly property IsClass: bool;
   public readonly property IsInterface: bool;
   public readonly property IsRecord: bool;
   public readonly property IsEnum: bool;
+  public readonly property IsChoice: bool;          // any §35 choice, at every
+                                                    //   §35.4 classification
   public readonly property IsPrimitive: bool;       // int, bool, char, float, ...
   public readonly property IsInlineArray: bool;     // [N]T, [N owned]T?, ...
   public readonly property IsFunctionType: bool;    // (A, B) -> R
   public readonly property IsValueType: bool;       // = IsPrimitive or IsEnum
-                                                    //   or IsRecord or IsInlineArray
+                                                    //   or IsRecord or IsChoice
+                                                    //   or IsInlineArray
 
   // Lattice queries.
   public readonly property BaseType: Type?;         // direct superclass; null for

@@ -1,5 +1,6 @@
-using var guard := mutex.TryAcquire(TimeSpan.FromSeconds(5));
-if guard <> null then
-  // critical section; guard non-null in this branch (narrowing)
+public extension IEnumerable<T> where T: IComparable<T>
+  public method Min(): T;              // throws if empty
+  public method Max(): T;              // throws if empty
+  public method MinOrNull(): T?;       // null if empty
+  public method MaxOrNull(): T?;       // null if empty
 end;
-// At scope end: guard disposed if non-null, releasing the lock; null is a no-op.

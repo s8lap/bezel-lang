@@ -1,30 +1,14 @@
-import System.Interop;
+extern "libc"
+  public method getenv(name: CString): IntPtr;     // returns a borrowed pointer
+end;
 
-public class RowCollector
-  private _rows: int := 0;
-  private _lastCell: string := "";
-
-  private method OnRow(argc: int, argv: Ptr<IntPtr>, cols: Ptr<IntPtr>): int
-    _rows := _rows + 1;                           // updating `this` — same thread, same continuation
-    var i := 0;
-    while i < argc do
-      var cell := argv.LoadAt(i);                 // char* — NULL for SQL NULL
-      if cell <> IntPtr.Zero then                 // guard required: FromCStringPointer raises on Zero (stdlib §10.4)
-        _lastCell := string.FromCStringPointer(cell);   // copies; no ownership taken
-      end;
-      i := i + 1;
+public static class Env
+  public static method GetVariable(name: string): string?
+    using var key := CString.From(name);
+    var resultPtr := getenv(key);
+    if resultPtr = IntPtr.Zero then
+      return null;
     end;
-    return 0;                                     // 0 = continue, per sqlite3_exec's contract
-  end OnRow;
-
-  public method Collect(db: IntPtr, sql: string): int
-    using var csql := CString.From(sql);
-    var rc := sqlite3_exec(db, csql, this.OnRow, Ptr<IntPtr>.Zero);
-                  // bound instance-method reference: admitted — `cb` is env-paired;
-                  // four Bezel arguments: the `env` slot is compiler-supplied
-    if rc <> 0 then
-      throw new IOException($"sqlite3_exec failed: rc={rc}");
-    end;
-    return _rows;
-  end Collect;
-end RowCollector;
+    return string.FromCStringPointer(resultPtr);   // copy; getenv buffer untouched
+  end GetVariable;
+end Env;

@@ -1,1 +1,3 @@
-visibility static (async | pure) (abstract | virtual | override | sealed override) (owned | scoped) readonly member-kind Name ...
+interface IList<T>: IReadOnlyList<T>, ICollection<T>
+  property [i: int]: T;
+end IList;

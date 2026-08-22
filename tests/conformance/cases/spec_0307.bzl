@@ -1,2 +1,11 @@
-var resp := new Response(headers, stream);
-return FetchOutcome.Fetched(move resp);       // call-site marker; resp is moved-from after
+module HelloWorld;
+
+class Program
+  public static method Main(args: Array<string>)
+    if args.Count > 0 then
+      Console.WriteLine($"Hello, {args[0]}!");
+    else
+      Console.WriteLine("Hello, Bezel!");
+    end;
+  end Main;
+end Program;

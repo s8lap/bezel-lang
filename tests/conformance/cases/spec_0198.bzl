@@ -1,1 +1,2 @@
-type IntPredicate := Predicate<int>;       // Predicate<int>, which is (int) -> bool
+record UserId(Value: int);
+record OrderId(Value: int);

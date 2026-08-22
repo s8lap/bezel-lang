@@ -1,10 +1,12 @@
-const H := int.MaxValue / 2;              // 1073741823 : int
-const Flags: long := (1 << 10) | (1 << 3); // folds under §6.5 semantics (parens for clarity;
-                                           //   shift-with-bitwise is not a §17.2 mandatory mix)
-const Greeting := "Hello, " + "world";    // constant string concatenation
-const Who := nameof(Greeting);            // "Greeting"
-const Cap := (if Flags > 0 then 64 else 32);     // constant conditional
-// const B := 2147483647 + 1;             // compile error: constant evaluation overflows (§6.1)
-// const F := 1 << 64;                    // compile error: shift count outside 0..31, the int
-//                                        //   left operand's domain (§6.5)
-// const S := $"v{H}";                    // compile error: interpolated strings are not constant
+_ := expression;            // value evaluated; if owned, disposed at END OF
+                            //   STATEMENT (an unbound owned temporary). For a
+                            //   value/runtime-managed type, dropped — the
+                            //   discard only silences the unused-result
+                            //   warning; a trivial-dispose class value is
+                            //   freed at end of statement, no user code
+                            //   running (§28.9). (Task/Task<T> excepted:
+                            //   use Task.FireAndForget.)
+
+using var _ := expression;  // value bound to an unnamed local that is
+                            //   disposed at END OF SCOPE; works for any
+                            //   class type.

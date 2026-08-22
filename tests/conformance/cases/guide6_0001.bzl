@@ -8,6 +8,7 @@ public class SampleWindow
   public method At(index: int): double
     requires(index >= 0)
     requires(index < _samples.Count)
+
     return _samples[index];
   end At;
 end SampleWindow;

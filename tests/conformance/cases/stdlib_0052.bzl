@@ -1,32 +1,27 @@
-public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
+public class LinkedList<T>: ICollection<T>
   public constructor();
-  public constructor(capacity: int);
-  public constructor(comparer: IEqualityComparer<K>);
-  public constructor(capacity: int, comparer: IEqualityComparer<K>);
+  public constructor(source: IEnumerable<T>);
 
   public pure readonly property Count: int;
-  public readonly property Keys: IReadOnlyCollection<K>;      // v0.165 (#1354): read-only views, matching §4.9
-  public readonly property Values: IReadOnlyCollection<V>;
+  public pure readonly property FirstNode: LinkedListNode<T>?;
+  public pure readonly property LastNode: LinkedListNode<T>?;
+  public pure readonly property First: T?;
+  public pure readonly property Last: T?;
 
-  public property [key: K]: V;
+  public method AddFirst(item: T): LinkedListNode<T>;
+  public method AddLast(item: T): LinkedListNode<T>;
+  public method AddBefore(node: LinkedListNode<T>, item: T): LinkedListNode<T>;
+  public method AddAfter(node: LinkedListNode<T>, item: T): LinkedListNode<T>;
+  public method RemoveFirst();
+  public method RemoveLast();
+  public method RemoveNode(node: LinkedListNode<T>);
+  public method Find(item: T): LinkedListNode<T>?;
+  // Plus the standard ICollection<T> operations: Add (appends at the tail,
+  // = AddLast — v0.195), Clear, Contains, Remove, IsReadOnly.
+end LinkedList;
 
-  public method Add(key: K, value: V);
-  public method ContainsKey(key: K): bool;
-  public method Contains(key: K): bool;            // alias for ContainsKey;
-                                                   //   enables `key in dict`
-  public method Remove(key: K): bool;
-  public method TryGetValue(key: K, out value: V?): bool;   // v0.171 (#1336): false path assigns null; value-typed V reads as V? at the call site
-  public method GetOrNull(key: K): V?;             // v0.231 (§1 *OrNull tier): absent -> null; present -> the
-                                                   //   value — read semantics and caveat in the prose below
-  public method GetOrAdd(key: K, factory: (K) -> V): V;
-
-  public method Clear();
-                                                    //   keys and values
-end Dictionary;
-
-public record DictionaryEntry<K, V>(Key: K, Value: V);
-
-public interface IEqualityComparer<T>
-  method Equals(a: T, b: T): bool;
-  method GetHashCode(value: T): int;
-end IEqualityComparer;
+public class LinkedListNode<T>
+  public readonly property Value: T;
+  public readonly property Next: LinkedListNode<T>?;
+  public readonly property Previous: LinkedListNode<T>?;
+end LinkedListNode;

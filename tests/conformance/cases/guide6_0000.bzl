@@ -6,6 +6,7 @@ public class Account
 
   public constructor(limit: decimal)
     requires(limit >= 0m)
+
     _limit := limit;
   end constructor;
 
@@ -13,6 +14,7 @@ public class Account
     requires(amount > 0m)
     requires(amount <= _balance + _limit)
     ensures(_balance = old(_balance) - amount)
+
     _balance := _balance - amount;
   end Withdraw;
 end Account;

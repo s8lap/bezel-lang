@@ -1,16 +1,5 @@
-/// Compiler-intrinsic; T restricted to primitive integer types.
-public class AtomicInteger<T> where T: value
-  public constructor(initial: T);
-
-  public property Value: T
-    get;
-    set;
-  end Value;
-
-  public method Exchange(value: T): T;
-  public method CompareExchange(expected: T, replacement: T): T;
-
-  public method Increment(): T;        // returns post-increment value
-  public method Decrement(): T;        // returns post-decrement value
-  public method Add(delta: T): T;      // returns post-add value
-end AtomicInteger;
+public class TimeoutException: Exception
+  public constructor();
+  public constructor(message: string);
+  public constructor(message: string, inner: Exception);   // borrows inner; snapshot copied into CauseChain (spec §31.4, v0.162) — no reference retained
+end TimeoutException;

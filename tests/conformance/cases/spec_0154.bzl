@@ -1,9 +1,8 @@
 public class BankAccount(name: string, initialBalance: decimal)
-  public readonly property Name: string := name;
+  private _name: string := name;
   private _balance: decimal := initialBalance;
-end BankAccount;
 
-public class SavingsAccount(name: string, initialBalance: decimal, rate: decimal)
-    : BankAccount(name, initialBalance)
-  private _rate: decimal := rate;
-end SavingsAccount;
+  public method Deposit(amount: decimal)
+    _balance := _balance + amount;
+  end Deposit;
+end BankAccount;

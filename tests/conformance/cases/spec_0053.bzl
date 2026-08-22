@@ -1,4 +1,3 @@
-var dog: Dog? := animal as Dog;
-if dog <> null then
-  Console.WriteLine(dog.Name);
+if animal is Dog then
+  animal.Bark();        // animal narrowed to Dog
 end;

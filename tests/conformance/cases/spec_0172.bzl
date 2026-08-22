@@ -1,7 +1,6 @@
-extension IEnumerable<T> where T: IComparable<T>
-  public method Sort(): owned Array<T>
-    var items := this.ToArray();
-    // ...
-    return items;
-  end Sort;
-end;
+record TriBool(Value: int)
+  public method Negate(): TriBool => (case Value of
+    0 => new TriBool(1),
+    1 => new TriBool(0),
+    _ => this);
+end TriBool;

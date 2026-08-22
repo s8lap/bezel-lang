@@ -1,3 +1,2 @@
-_clicked += OnButtonClicked;
-// later:
-_clicked -= OnButtonClicked;   // same method, same receiver: matches and unsubscribes
+import System.Collections.Linq;
+var counter: (IEnumerable<int>) -> int := IEnumerable<int>.Count;

@@ -1,6 +1,11 @@
-try
-  using var fs := new FileStream(path, FileMode.Open);
-  ProcessFile(fs);
-finally
-  Log("file processing finished");
-end;
+// Representative forms; the stdlib section declares the full set.
+Domain.Spawn(entry: () -> ()): owned Task
+Domain.Spawn<R>(entry: () -> owned R): owned OwningTask<R>            // R: sendable class
+Domain.Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwningTask<R>
+Domain.Spawn<R>(entry: () -> R): owned Task<R>                       // R: sendable non-class
+
+// Async entries: the runtime awaits the returned task inside the
+// spawned domain; the join handle tracks that task.
+Domain.Spawn(entry: () -> Task): owned Task
+Domain.Spawn<R>(entry: () -> OwningTask<R>): owned OwningTask<R>      // R: sendable class
+Domain.Spawn<R>(entry: () -> Task<R>): owned Task<R>                  // R: sendable non-class

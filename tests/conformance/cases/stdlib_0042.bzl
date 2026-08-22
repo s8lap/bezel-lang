@@ -1,52 +1,29 @@
-public record ReadOnlyStringSpan(Source: string, Start: int, Length: int): IReadOnlySpan<char>
+public class StringBuilder
+  public constructor();
+  public constructor(capacity: int);
+  public constructor(initial: string);
 
-  public property [i: int]: char
-    get => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      return Source[Start + i];
-    end;
-  end;
+  public readonly property Length: int;
+  public pure readonly property Capacity: int;
 
-  public pure property IsEmpty: bool => Length = 0;
+  public method Append(value: string): StringBuilder;
+  public method Append(value: char): StringBuilder;
+  public method Append(value: Object): StringBuilder;
+  // v0.165 (#1355): per-type overloads for bool and the numeric primitives —
+  // observable behavior = Append(value.ToString()); no Object boxing on the path.
+  public method Append(value: bool): StringBuilder;
+  public method Append(value: int): StringBuilder;      // + byte/sbyte/short/ushort/uint/long/ulong/float/double/decimal, same shape
+  public method Append(value: ReadOnlyStringSpan): StringBuilder;   // v0.222 (#1810): copies the span's
+                                                                    //   code points; = Append(value.ToString())
+                                                                    //   without the intermediate string
+  public method AppendLine(): StringBuilder;
+  public method AppendLine(value: string): StringBuilder;
+  public method AppendFormat(format: string, args: Array<Object>): StringBuilder;
 
-  // Range construction
-  public pure method Slice(start: int, length: int): ReadOnlyStringSpan =>
-    new ReadOnlyStringSpan(Source, this.Start + start, length);
-  public pure method Slice(start: int): ReadOnlyStringSpan =>       // v0.195: from offset to end
-    Slice(start, Length - start);
-  public pure method Slice(r: Range<int>): ReadOnlyStringSpan;      // v0.241 — Range form: normalized
-                                                                    //   against Length (spec §16.3), then
-                                                                    //   equivalent to Slice(start, length);
-                                                                    //   §4.14's normalization contract
+  public method Insert(index: int, value: string): StringBuilder;
+  public method Remove(startIndex: int, length: int): StringBuilder;
+  public method Replace(oldValue: string, newValue: string): StringBuilder;
+  public method Clear(): StringBuilder;
 
-  // Search by char
-  public pure method IndexOf(value: char): int;
-  public pure method Contains(value: char): bool;
-
-  // Search by substring (span and string forms)
-  public pure method IndexOf(value: ReadOnlyStringSpan): int;
-  public pure method IndexOf(value: string): int;
-  public pure method Contains(value: ReadOnlyStringSpan): bool;
-  public pure method Contains(value: string): bool;
-
-  // Prefix / suffix (span and string forms)
-  public pure method StartsWith(prefix: ReadOnlyStringSpan): bool;
-  public pure method StartsWith(prefix: string): bool;
-  public pure method EndsWith(suffix: ReadOnlyStringSpan): bool;
-  public pure method EndsWith(suffix: string): bool;
-
-  // Equality (span and string forms)
-  public pure method SequenceEqual(other: ReadOnlyStringSpan): bool;
-  public pure method SequenceEqual(other: string): bool;
-  public pure method SequenceEqual(other: IReadOnlySpan<char>): bool; // v0.108 — interface form
-
-  // Bulk copy (v0.109)
-  public method CopyTo(destination: Span<char>);    // copy chars to destination;
-                                                     //   lengths must match, else
-                                                     //   ArgumentException (the §4.14 rule)
-
-  // Materialization
-  public pure method ToString(): string;
-end ReadOnlyStringSpan;
+  public method ToString(): string;
+end StringBuilder;

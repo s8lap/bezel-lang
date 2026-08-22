@@ -1,9 +1,8 @@
-do
-  using var __source := source;
-  using var __enumerator := __source.GetOwningEnumerator();
-  while __enumerator.MoveNext() do
-    var x := __enumerator.TakeCurrent();     // x is owned; §28.3 rules apply
-                                              //   on every body-exit edge
-    // body
-  end;
-end;
+interface IEnumerable<out T>
+  method GetEnumerator(): owned IEnumerator<T>;
+end IEnumerable;
+
+interface IEnumerator<out T>: IDisposable
+  method MoveNext(): bool;
+  readonly property Current: T;
+end IEnumerator;

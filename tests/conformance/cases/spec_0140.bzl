@@ -1,10 +1,3 @@
-private owned _cache: OwningDictionary<string, Connection>;
-
-public method TryTakeCached(name: string, out owned conn: Connection? when true): bool
-  if not _cache.ContainsKey(name) then
-    conn := null;
-    return false;
-  end;
-  conn := _cache.PopValue(name);    // takes ownership, removes from dictionary
-  return true;
-end TryTakeCached;
+public method OpenAsync(path: string, timeout: TimeSpan := TimeSpan.FromSeconds(30))
+public method LogAt(message: string, at: DateTime := DateTime.Now)
+public method NewBuffer(size: int := 4096, fill: byte := 0)

@@ -1,4 +1,7 @@
-public property Name: string
-  get => _name;
-  private set => _name := value;
-end Name;
+public class BankAccount
+  // ...
+end BankAccount;
+
+class Helper           // implicitly internal
+  // ...
+end Helper;

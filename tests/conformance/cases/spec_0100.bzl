@@ -1,2 +1,2 @@
-var area := (var w := bounds.Width(); w * w);
-var label := (var n := items.Count; (if n = 1 then "one item" else $"{n} items"));
+(var name := initializer; body)
+(var a := E1; var b := E2; body)

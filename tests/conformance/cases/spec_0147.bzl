@@ -1,14 +1,14 @@
-public class Handler
-  public method Process(n: sbyte): string => "sbyte";
-  public method Process(n: ushort): string => "ushort";
-end Handler;
+public class Pair
+  public method Apply(x: int, y: long): string => "int,long";
+  public method Apply(x: int, y: int): string  => "int,int";
+end Pair;
 
-var h := new Handler();
-var val: byte := 50;
+var p := new Pair();
+var a: int := 5;
+var b: int := 9;
 
-h.Process(val);
-// byte→sbyte is NOT implicit (§5.1: signed/unsigned same-or-narrower width never implicit).
-//   ⇒ Process(sbyte) is not applicable.
-// byte→ushort IS implicit (§5.1, byte row).
-//   ⇒ Process(ushort) is the only applicable candidate.
-// Resolves to Process(ushort). No ambiguity — only one candidate survived applicability.
+p.Apply(a, b);
+// arg x (int): exact in both — tie.
+// arg y (int): exact in Apply(int,int); requires int→long in Apply(int,long).
+// Apply(int,int) is better-or-equal on x and strictly better on y ⇒ unambiguously better.
+// Resolves to Apply(int, int).

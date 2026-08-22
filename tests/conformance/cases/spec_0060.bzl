@@ -1,17 +1,12 @@
-class MyArray<T>
-  // ...
-end MyArray;
+public class Outer
+  private class NestedPrivate
+    // ...
+  end NestedPrivate;
+  
+  // ERROR: _x is internal, but NestedPrivate is private — the field's
+  //        type is not as visible as the field.
+  internal _x: NestedPrivate;
 
-interface IComparable<T>
-  method CompareTo(other: T): int;
-end IComparable;
-
-record Pair<TFirst, TSecond>(First: TFirst, Second: TSecond);
-
-static class Utils
-  public static method Swap<T>(ref a: T, ref b: T)
-    var temp := a;
-    a := b;
-    b := temp;
-  end Swap;
-end Utils;
+  // OK: also private, matches NestedPrivate's visibility.
+  private _y: NestedPrivate;
+end Outer;

@@ -1,2 +1,3 @@
-throw new ArgumentException("Amount must be positive.", nameof(amount));
-throw;          // re-throw the current exception (in a catch arm body only)
+using var r := await LoadResourceAsync("/etc/foo");
+Process(r);
+// r disposed at scope end

@@ -1,2 +1,2 @@
-var greeting := $"Hello, {name}!";
-var msg := $"({point.X}, {point.Y}) - area = {point.Area()}";
+"Hello, Bezel!"
+"Line 1\nLine 2"      // escapes processed

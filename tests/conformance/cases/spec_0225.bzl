@@ -1,9 +1,6 @@
-public method Process()
-  var result := 0;
-  do
-    using var fs := new FileStream("data.txt", FileMode.Open);
-    using var buffer := new Array<byte>(4096, 0);   // sized ctor (stdlib §4.4)
-    result := fs.Read(buffer, 0, buffer.Count);     // bytes read (stdlib §7.1)
-  end;     // fs and buffer disposed here
-  Console.WriteLine($"count = {result}");
-end Process;
+public method TransferToHelperSafe()
+  var fresh := new FileStream(_path, FileMode.Open);
+  var taken := move _resource;
+  _resource := fresh;                      // restore before the call that may throw
+  TakeOwnership(move taken);               // owned argument (call-site marker, §22.3), no field state at risk
+end TransferToHelperSafe;

@@ -1,4 +1,5 @@
-public class BankAccount(name: string, initialBalance: decimal)
-  public readonly property Name: string := name;
-  private _balance: decimal := initialBalance;
+class BankAccount
+  private _balance: decimal := 0m;
+  private owned _transactions: Array<Transaction> := new Array<Transaction>();
+  private _createdAt: DateTime := DateTime.Now;
 end BankAccount;

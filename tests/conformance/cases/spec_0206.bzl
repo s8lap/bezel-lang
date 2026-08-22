@@ -1,10 +1,15 @@
-class Handle
-  private _c: Cell;            // borrow field (no `owned`)
-  public constructor()
-    _c := new Cell();          // ERROR: a fresh owned value stored into a
-  end constructor;             //   non-`owned` field has no owner — declare `owned _c`.
+class FileStream
+  private _handle: IntPtr;
 
-  public property Item: Cell
-    get => new Cell();         // ERROR: a getter may not return a fresh owned
-  end Item;                    //   value — use `method MakeItem(): owned Cell`.
-end Handle;
+  public constructor(path: string)
+    using var cpath := CString.From(path);
+    _handle := NativeOpen(cpath);
+  end constructor;
+
+  destructor
+    if _handle <> IntPtr.Zero then
+      NativeClose(_handle);
+      _handle := IntPtr.Zero;
+    end;
+  end destructor;
+end FileStream;

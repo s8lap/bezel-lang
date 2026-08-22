@@ -1,4 +1,5 @@
-'a'         '\n'      '\t'      '\r'      '\\'      '\''
-'\u0041'              // 4 hex digits, BMP
-'\U0001F600'          // 8 hex digits, full code point range
-'\x41'                // 1–4 hex digits
+3.14                // double
+3.14f               // float
+-1.23e-4            // scientific notation, double
+1.23456789m         // decimal
+1.23e2m             // scientific notation, decimal

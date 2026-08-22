@@ -1,2 +1,5 @@
-var callback: ((int) -> bool)?;       // nullable function returning bool
-var nullableReturn: (int) -> bool?;   // non-null function returning a nullable bool
+var add: (int, int) -> int;
+var isPositive: (int) -> bool;
+var log: (string) -> ();              // procedure
+var noop: () -> ();
+var now: () -> DateTime;

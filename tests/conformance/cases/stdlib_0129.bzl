@@ -1,20 +1,12 @@
-public abstract class TextReader
-  public abstract method Read(): int;             // next char as int, or -1 at EOF
-  public abstract method ReadLine(): string?;      // null at EOF
-  public method ReadToEnd(): string;
-  destructor;       // releases the underlying resource
-end TextReader;
+public class TaskScope: IAsyncDisposable
+  public constructor();                                    // fresh internal CancellationTokenSource
+  public readonly property Token: CancellationToken;       // the scope's token — pass to children
+  public method CancelAfter(delay: TimeSpan);              // deadline for the whole scope
+  public method Cancel();                                  // cancel all children now
 
-public abstract class TextWriter
-  public abstract method Write(value: string);
-  public abstract method Write(value: char);
-  public method Write(value: Object);            // fixed base impl: Write(value.ToString()) (v0.165, #1355)
-  public method WriteLine();
-  public method WriteLine(value: string);
-  public method WriteLine(value: Object);
-  // v0.165 (#1355): per-type Write/WriteLine overloads for bool and the numeric
-  // primitives — the §2.1/§3.1 family; behavior = Write(value.ToString()); fixed
-  // base implementations over the abstract Write(string). (Block updated v0.195.)
-  public abstract method Flush();
-  destructor;       // flushes and releases the underlying resource
-end TextWriter;
+  public method Spawn(scoped body: () -> Task);            // start a child (§28.14 storage-bounded);
+                                                           //   InvalidOperationException once closed
+  public async method Join(): Task;                        // await all children; re-raise the FIRST
+                                                           //   fault (first-fault-wins, no aggregation)
+  // await using only (see below); DisposeAsync drains and never raises
+end TaskScope;

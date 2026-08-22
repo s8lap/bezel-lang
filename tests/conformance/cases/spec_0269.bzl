@@ -1,9 +1,12 @@
-class BankAccount
-  private owned _mutex: Mutex := new Mutex();
-  private _balance: decimal := 0m;
+public class OwningTaskCompletionSource<T> where T: class
+  public constructor();
+  public readonly property Task: OwningTask<T>;
 
-  public method Deposit(amount: decimal)
-    using var guard := _mutex.Acquire();
-    _balance := _balance + amount;
-  end Deposit;
-end BankAccount;
+  public method SetResult(owned result: T);
+  public method SetException(owned exception: Exception);   // the task owns its fault (§30.9)
+  public method SetCancelled();
+
+  public method TrySetResult(owned result: T): bool;
+  public method TrySetException(owned exception: Exception): bool;
+  public method TrySetCancelled(): bool;
+end OwningTaskCompletionSource;

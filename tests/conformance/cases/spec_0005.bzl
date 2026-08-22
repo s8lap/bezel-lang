@@ -53,4 +53,4 @@ end Program;
 //   var m: Money := Payroll.Net(1, 1);           — type ascription
 //   using var m2 := new Money(500);              — `new`
 //   if pay is Money then … end;                  — type test
-//   var box := new OwningArray<Money>();         — generic type argument
+//   using var box := new OwningArray<Money>();   — generic type argument

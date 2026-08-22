@@ -1,13 +1,15 @@
-public class Semaphore
-  public constructor(initialCount: int);
-  public constructor(initialCount: int, maxCount: int);
+public extension IEnumerable<int>
+  public method Average(): double;
+end;
 
-  public method Acquire(): owned SemaphoreToken;
-  public method TryAcquire(timeout: TimeSpan): owned SemaphoreToken?;
-  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwningTask<SemaphoreToken>;
-  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwningTask<SemaphoreToken?>;
-end Semaphore;
+public extension IEnumerable<long>
+  public method Average(): double;
+end;
 
-public class SemaphoreToken
-  destructor;       // releases the held permit
-end SemaphoreToken;
+public extension IEnumerable<double>
+  public method Average(): double;
+end;
+
+public extension IEnumerable<decimal>
+  public method Average(): decimal;
+end;

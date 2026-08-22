@@ -1,4 +1,4 @@
-// ConnectAsync is illustrative; see §28.12 note.
-await using var connection := await ConnectAsync(url);
-await connection.SendAsync(data);
-// At end of scope: connection.DisposeAsync() awaited.
+using var task := FetchAsync(url);
+var response := await task;              // borrowed reference, OK
+ProcessResponse(response);
+// At end of scope: task is disposed; response disposed with it.

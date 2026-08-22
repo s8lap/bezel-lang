@@ -1,4 +1,2 @@
-var grade := (if score >= 90 then "A"
-              elif score >= 80 then "B"
-              elif score >= 70 then "C"
-              else "F");
+(if condition then trueValue else falseValue)
+(if c1 then v1 elif c2 then v2 else fallback)

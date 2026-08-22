@@ -1,4 +1,3 @@
-catch
-  var ex: TransientException => Retry(ex),
-  var ex: Exception => throw          // re-raise unrecognized exceptions
+await for var line in ReadLinesAsync(path) with token do
+  Process(line);
 end;

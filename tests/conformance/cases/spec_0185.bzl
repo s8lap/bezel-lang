@@ -1,2 +1,5 @@
-var labels := entries.Select(lambda(Entry(k, v)) => $"{k}: {v}");
-var positives := points.Where(lambda(Point(x, _)) => x > 0);
+var classify := lambda(score: int): string? => do
+  if score < 0 then return null; end;
+  if score >= 90 then return "A"; end;
+  return "pass";
+end;

@@ -1,4 +1,7 @@
-using var primary := new Shared<Connection>(Connect("db"));   // consumes the owned Connection; count = 1
-using var second  := primary.Clone();                          // count = 2; an independent owned handle
-second.Get().Ping();                                           // borrow of the underlying Connection
-// scope end: second disposed (count 1), then primary disposed (count 0) → Connection disposed
+public method ReportEachGeneric<T>(items: IEnumerable<T>) where T: class
+  for var c in items do Console.WriteLine(c.ToString()); end;   // Object's surface only under `where T: class` (§14.2)
+end ReportEachGeneric;
+
+// Call with Array<Connection>: T inferred as Connection.
+// Call with OwningArray<Connection>: T inferred as Connection.
+// Same generic instantiation for both source forms.

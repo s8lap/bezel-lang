@@ -1,12 +1,4 @@
-/// Compiler-intrinsic; T restricted to integer types and char.
-public record Range<T>: IEnumerable<T>
-  public readonly property Start: T?;
-  public readonly property End: T?;
-  public readonly property Step: long;
-  public readonly property IsEndInclusive: bool;
-  public readonly property IsOpenEnded: bool;
-  public readonly property IsEmpty: bool;
-
-  public method Contains(value: T): bool;
-  public method GetEnumerator(): owned IEnumerator<T>;
-end Range;
+arr[2..5]            // elements 2 through 5 inclusive
+arr[..5]             // from start through 5
+arr[10..]            // from 10 through last
+arr[..]              // all

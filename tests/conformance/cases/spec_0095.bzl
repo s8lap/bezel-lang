@@ -1,3 +1,5 @@
-if dict.TryGetValue(key, out _) then    // we only care that it was present
-  // ...
+case shape of
+  Circle(_) => "circle",
+  Rectangle(_, _) => "rectangle",
+  _ => "other"
 end;

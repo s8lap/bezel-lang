@@ -1,18 +1,25 @@
-public class RawBytes
-  // No public constructor; obtained via factory methods.
+/// Compiler-intrinsic; aliased by the keyword `char`.
+public record Char: IComparable<char>, IEquatable<char>
+  public static const MinValue: char;             // U+0000
+  public static const MaxValue: char;             // U+10FFFF (excluding surrogates)
 
-  public static method From(buffer: Array<byte>): owned RawBytes;
-  public static method FromForeign(p: IntPtr, length: int,
-      freeOnDispose: bool := false): owned RawBytes;    // v0.186 — see prose
+  public static pure method IsDigit(c: char): bool;
+  public static pure method IsLetter(c: char): bool;
+  public static pure method IsLetterOrDigit(c: char): bool;
+  public static pure method IsWhiteSpace(c: char): bool;
+  public static pure method IsUpper(c: char): bool;
+  public static pure method IsLower(c: char): bool;
+  public static pure method IsControl(c: char): bool;
+  public static pure method IsPunctuation(c: char): bool;
 
-  public readonly property Length: int;
-  public readonly property Pointer: IntPtr;
+  public static pure method ToUpper(c: char): char;
+  public static pure method ToLower(c: char): char;
 
-  public method CopyTo(destination: Array<byte>, destOffset: int);
-      // copies Length bytes into destination[destOffset .. destOffset+Length);
-      //   a window outside destination's Count raises IndexOutOfRangeException
-      //   (the §1/§7.1 window rule); on a FromForeign view the read is over
-      //   foreign memory — spec §32.10 trust applies (v0.195)
+  public static pure method Parse(s: string): char;                 // exactly one code point
+  public static method TryParse(s: string, out result: char): bool;
+  public static pure method ParseOrNull(s: string): char?;          // v0.231: null exactly where Parse(s)
+                                                                    //   raises; otherwise the parsed value
 
-  destructor;       // releases the underlying buffer if owned by this instance
-end RawBytes;
+  public pure method ToString(): string;
+  public pure method CompareTo(other: char): int;
+end Char;

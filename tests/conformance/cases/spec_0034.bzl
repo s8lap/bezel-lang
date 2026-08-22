@@ -1,9 +1,6 @@
-enum Priority: IComparable<Priority>
-  Low, Medium, High;
-
-  public method CompareTo(other: Priority): int =>
-    (when
-      int(this) < int(other) => -1,
-      int(this) > int(other) => 1,
-      _ => 0);
-end Priority;
+// A parser validating a wire-read value (wire, trusted: int; ProtocolException
+// stands for a user exception class):
+var p := Priority.FromUnderlyingOrNull(wire)
+         ?? throw new ProtocolException($"bad priority {wire}");    // reject
+var p2 := Priority.FromUnderlyingOrNull(wire) ?? Priority.Low;      // tolerate with a default
+var p3 := Priority(trusted);   // the checked cast is the assert: failure is a bug (§5.4)

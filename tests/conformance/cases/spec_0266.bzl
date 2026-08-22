@@ -1,9 +1,12 @@
-public async method ReadSectorAsync(dev: BlockDevice, lba: long): Task<int>
-  using var tcs := new TaskCompletionSource<int>();
-
-  dev.BeginRead(lba, lambda(status) => do        // BeginRead invokes the callback ONCE
-    tcs.TrySetResult(status);
-  end);
-
-  return await tcs.Task;
-end ReadSectorAsync;
+public async method WithCleanupAsync(): Task
+  try
+    await DoWorkAsync();
+  catch
+    var ex: Exception => do
+      await LogErrorAsync(ex);
+      throw;
+    end
+  finally
+    await ReleaseResourcesAsync();
+  end;
+end WithCleanupAsync;

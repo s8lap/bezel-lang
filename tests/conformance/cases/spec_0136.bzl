@@ -1,1 +1,1 @@
-public method TryGetCached(name: string, out conn: Connection? when true): bool;
+var success := parser.TryParse("42", out var num);

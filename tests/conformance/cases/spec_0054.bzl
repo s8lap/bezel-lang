@@ -1,4 +1,4 @@
-public constructor(name: string, balance: decimal, rate: decimal)
-  base(name, balance);
-  _rate := rate;
-end constructor;
+var dog: Dog? := animal as Dog;
+if dog <> null then
+  Console.WriteLine(dog.Name);
+end;

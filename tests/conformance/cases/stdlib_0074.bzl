@@ -1,77 +1,58 @@
-public extension ReadOnlySpan<byte>                        // public: spec §26.1 defaults extensions to internal (fixed v0.195)
-  // 16-bit integers
-  public method ReadInt16LittleEndian(): short;
-  public method ReadInt16BigEndian(): short;
-  public method ReadUInt16LittleEndian(): ushort;
-  public method ReadUInt16BigEndian(): ushort;
+public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
+  // class T
 
-  // 32-bit integers
-  public method ReadInt32LittleEndian(): int;
-  public method ReadInt32BigEndian(): int;
-  public method ReadUInt32LittleEndian(): uint;
-  public method ReadUInt32BigEndian(): uint;
+  public property [i: int]: T?
+    get => do
+      if i < 0 or i >= Length then
+        throw new IndexOutOfRangeException();
+      end;
+      return Buffer[Start + i];
+    end;
+  end;
 
-  // 64-bit integers
-  public method ReadInt64LittleEndian(): long;
-  public method ReadInt64BigEndian(): long;
-  public method ReadUInt64LittleEndian(): ulong;
-  public method ReadUInt64BigEndian(): ulong;
+  public property IsEmpty: bool => Length = 0;
 
-  // IEEE 754 floating point
-  public method ReadFloatLittleEndian(): float;
-  public method ReadFloatBigEndian(): float;
-  public method ReadDoubleLittleEndian(): double;
-  public method ReadDoubleBigEndian(): double;
+  public method IndexOf(value: T?): int;
+  public method Contains(value: T?): bool;
 
-  // Try variants — return false instead of throwing on short input
-  public method TryReadInt16LittleEndian(out value: short): bool;
-  public method TryReadInt16BigEndian(out value: short): bool;
-  public method TryReadUInt16LittleEndian(out value: ushort): bool;
-  public method TryReadUInt16BigEndian(out value: ushort): bool;
-  public method TryReadInt32LittleEndian(out value: int): bool;
-  public method TryReadInt32BigEndian(out value: int): bool;
-  public method TryReadUInt32LittleEndian(out value: uint): bool;
-  public method TryReadUInt32BigEndian(out value: uint): bool;
-  public method TryReadInt64LittleEndian(out value: long): bool;
-  public method TryReadInt64BigEndian(out value: long): bool;
-  public method TryReadUInt64LittleEndian(out value: ulong): bool;
-  public method TryReadUInt64BigEndian(out value: ulong): bool;
-  public method TryReadFloatLittleEndian(out value: float): bool;
-  public method TryReadFloatBigEndian(out value: float): bool;
-  public method TryReadDoubleLittleEndian(out value: double): bool;
-  public method TryReadDoubleBigEndian(out value: double): bool;
-end;
+  public method SequenceEqual(other: ReadOnlySpan<T>): bool;
+  public method SequenceEqual(other: IReadOnlySpan<T?>): bool; // v0.108 — interface form
 
-public extension Span<byte>
-  // Reads and TryReads (delegate to AsReadOnly)
-  public method ReadInt16LittleEndian(): short =>
-    this.AsReadOnly().ReadInt16LittleEndian();
-  public method ReadInt16BigEndian(): short =>
-    this.AsReadOnly().ReadInt16BigEndian();
-  // ... (full set of 16 Read methods and 16 TryRead methods, each
-  //      delegating identically to the corresponding AsReadOnly method;
-  //      omitted here for brevity)
+  public method Slice(start: int, length: int): ReadOnlySpan<T> =>
+    new ReadOnlySpan<T>(Buffer, this.Start + start, length);
+  public method Slice(start: int): ReadOnlySpan<T> => Slice(start, Length - start);   // v0.195
+  public method Slice(r: Range<int>): ReadOnlySpan<T>;   // v0.241 — Range form: normalized against
+                                                          //   Length (spec §16.3), then equivalent to
+                                                          //   Slice(start, length); see prose
+end ReadOnlySpan;
 
-  // Writes — Span<byte> only
-  public method WriteInt16LittleEndian(value: short);
-  public method WriteInt16BigEndian(value: short);
-  public method WriteUInt16LittleEndian(value: ushort);
-  public method WriteUInt16BigEndian(value: ushort);
-  public method WriteInt32LittleEndian(value: int);
-  public method WriteInt32BigEndian(value: int);
-  public method WriteUInt32LittleEndian(value: uint);
-  public method WriteUInt32BigEndian(value: uint);
-  public method WriteInt64LittleEndian(value: long);
-  public method WriteInt64BigEndian(value: long);
-  public method WriteUInt64LittleEndian(value: ulong);
-  public method WriteUInt64BigEndian(value: ulong);
-  public method WriteFloatLittleEndian(value: float);
-  public method WriteFloatBigEndian(value: float);
-  public method WriteDoubleLittleEndian(value: double);
-  public method WriteDoubleBigEndian(value: double);
+public record ReadOnlySpan<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
+  // value T
 
-  // Try variants — return false instead of throwing on short output buffer
-  public method TryWriteInt16LittleEndian(value: short): bool;
-  public method TryWriteInt16BigEndian(value: short): bool;
-  // ... (full set of 16 TryWrite methods; omitted for brevity)
-end;
+  public property [i: int]: T
+    get => do
+      if i < 0 or i >= Length then
+        throw new IndexOutOfRangeException();
+      end;
+      return Buffer[Start + i];
+    end;
+  end;
+
+  public property IsEmpty: bool => Length = 0;
+
+  public method IndexOf(value: T): int;
+  public method Contains(value: T): bool;
+
+  public method SequenceEqual(other: ReadOnlySpan<T>): bool;
+  public method SequenceEqual(other: IReadOnlySpan<T>): bool; // v0.108 — interface form
+
+  public method Slice(start: int, length: int): ReadOnlySpan<T> =>
+    new ReadOnlySpan<T>(Buffer, this.Start + start, length);
+  public method Slice(start: int): ReadOnlySpan<T> => Slice(start, Length - start);   // v0.195
+  public method Slice(r: Range<int>): ReadOnlySpan<T>;   // v0.241 — Range form: normalized against
+                                                          //   Length (spec §16.3), then equivalent to
+                                                          //   Slice(start, length); see prose
+
+  public method CopyTo(destination: Span<T>);     // v0.109 — copy slot-by-slot to destination;
+                                                   //   lengths must match
+end ReadOnlySpan;

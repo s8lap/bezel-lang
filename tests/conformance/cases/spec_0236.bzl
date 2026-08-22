@@ -1,8 +1,4 @@
-do
-  using var __source := source;
-  using var __enumerator := __source.GetEnumerator();
-  while __enumerator.MoveNext() do
-    var x := __enumerator.Current;
-    // body
-  end;
-end;
+using var primary := new Shared<Connection>(Connect("db"));   // consumes the owned Connection; count = 1
+using var second  := primary.Clone();                          // count = 2; an independent owned handle
+second.Get().Ping();                                           // borrow of the underlying Connection
+// scope end: second disposed (count 1), then primary disposed (count 0) → Connection disposed

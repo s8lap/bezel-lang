@@ -1,6 +1,3 @@
-public method Log(message: string, level: string := "INFO", timestamp: bool := true)
-  // ...
-end Log;
-
-Log("System started", timestamp := false);
-Log(level := "ERROR", message := "Failed");
+if factory.TryCreate(config, out using var conn) then
+  // conn is owned and non-null here; disposed at end of enclosing block
+end;

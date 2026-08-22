@@ -1,16 +1,10 @@
-public method GetTransactions(): OwningArray<Transaction>
-  return _transactions;     // OK: borrows the field — the caller may
-                            //   read/iterate it but not dispose or drain it.
-end GetTransactions;
+// Wrapper's constructor takes `owned inner: Buffer`; CloneBuffer(): owned Buffer.
+public method Wrap(s: Buffer): owned Wrapper
+  using var copy := s.CloneBuffer();   // copy is owned + scope-bound
+  return new Wrapper(move copy);       // ERROR: cannot move out of a `using var`
+end Wrap;
 
-public method TakeTransactions(): owned OwningArray<Transaction>
-  var fresh := new OwningArray<Transaction>();  // build the replacement first (§28.8.1)
-  var taken := move _transactions;              // take: the field is now moved-from
-  _transactions := fresh;                       // restore — required on every exit path (§28.8.1)
-  return taken;                                 // transfer: the caller owns the taken array
-end TakeTransactions;
-
-public method LeakTransactions(): OwningArray<Transaction>
-  return move _transactions;  // ERROR: a `move`d field through a non-`owned`
-                              //   return escapes with no owner.
-end LeakTransactions;
+public method Wrap2(owned s: Buffer): owned Wrapper
+  return new Wrapper(move s);          // OK: s is moved into Wrapper's constructor
+                                       // s is now in moved-from state
+end Wrap2;

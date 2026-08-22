@@ -1,6 +1,7 @@
 public record DateTime: IComparable<DateTime>, IEquatable<DateTime>
   // v0.165 (#1357): ordering + construction. CompareTo = tick order (Kind not
-  // normalized, matching .NET); the <,>,<=,>= operator group agrees with CompareTo.
+  // normalized, matching .NET). Ordering is CompareTo only: DateTime declares no
+  // <,>,<=,>= overloads, and records auto-generate equality but never ordering (spec §9.2).
   public constructor(year: int, month: int, day: int);
   public constructor(year: int, month: int, day: int, hour: int, minute: int, second: int,
                      millisecond: int := 0, kind: DateTimeKind := DateTimeKind.Unspecified);
@@ -20,6 +21,8 @@ public record DateTime: IComparable<DateTime>, IEquatable<DateTime>
   public readonly property DayOfWeek: DayOfWeek;
   public readonly property DayOfYear: int;
   public readonly property Kind: DateTimeKind;
+  public readonly property Date: DateOnly;        // the date components (v0.165)
+  public readonly property TimeOfDay: TimeOnly;   // the time-of-day components
 
   // Now, UtcNow, Today are computed at each access (returning the current
   // date/time); MinValue, MaxValue are constants. All are "readonly" in the
@@ -68,7 +71,8 @@ public enum DateTimeKind: byte
 end DateTimeKind;
 
 public record TimeSpan: IComparable<TimeSpan>, IEquatable<TimeSpan>
-  // v0.165 (#1357): CompareTo = tick order; operator group agrees.
+  // v0.165 (#1357): CompareTo = tick order. Ordering is CompareTo only — no
+  //   <,>,<=,>= overloads are declared (spec §9.2, §25.2).
   public method CompareTo(other: TimeSpan): int;
   public readonly property Ticks: long;
   public static method FromTicks(ticks: long): TimeSpan;
@@ -115,7 +119,7 @@ public record DateOnly: IComparable<DateOnly>, IEquatable<DateOnly>
   public readonly property Year: int;
   public readonly property Month: int;
   public readonly property Day: int;
-  public method CompareTo(other: DateOnly): int;          // chronological; operator group agrees
+  public method CompareTo(other: DateOnly): int;          // chronological; ordering is CompareTo only
   public method ToDateTime(time: TimeOnly): DateTime;     // Kind = Unspecified
   public static method Parse(s: string): DateOnly;        // FormatException on invalid
   public static method TryParse(s: string, out result: DateOnly): bool;

@@ -1,8 +1,9 @@
-public method Echo(owned source: StreamReader): owned IEnumerable<string>
-  while not source.AtEnd do
-    yield return source.ReadLine();
+do
+  using var __source := source;
+  using var __enumerator := __source.GetOwningEnumerator();
+  while __enumerator.MoveNext() do
+    var x := __enumerator.TakeCurrent();     // x is owned; §28.3 rules apply
+                                              //   on every body-exit edge
+    // body
   end;
-  // No using var: source is disposed by the iterator state machine when the
-  // consumer disposes the enumerator. Legal, and carries the §28.3 must-use
-  // warning — ReadAndClose above is the warning-free spelling.
-end Echo;
+end;

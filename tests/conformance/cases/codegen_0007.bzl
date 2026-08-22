@@ -1,0 +1,3 @@
+✗ if flags & MASK = 0 then ...          ✓ if (flags & MASK) = 0 then ...
+✗ var n := a << 2 + 1;                ✓ var n := (a << 2) + 1;
+✗ var r := mask & 0..n;               ✓ var r := mask & (0..n);

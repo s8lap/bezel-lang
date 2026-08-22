@@ -1,14 +1,29 @@
-// No-result form.
-public static method WhenEach(tasks: Array<Task>): IAsyncEnumerable<Task>;
+public interface ISharedEvent<out T>
+  method Subscribe(handler: (T) -> ()): owned Subscription;
+      // capture-free admission: the handler must be a non-capturing lambda or a
+      // static method reference — a stdlib-stated position in spec §28.14's
+      // capture-free register (the same register Domain.Spawn's entries live in),
+      // NOT a `scoped` storage-bounded position.
+end ISharedEvent;
 
-// Value-typed, string, or runtime-managed result (Pattern A). Each element is an
-// already-completed Task<T>; await it to observe the result or re-raise its fault.
-public static method WhenEach<T>(tasks: Array<Task<T>>): IAsyncEnumerable<Task<T>>;
+public sealed class SharedEventSource<T>: ISharedEvent<T>
+  public constructor();
+  public method Subscribe(handler: (T) -> ()): owned Subscription;   // capture-free (as above)
+  public method Raise(payload: T);       // synchronized snapshot-raise; handlers run on the raising domain
+  public method Add(handler: (T) -> ());                             // capture-free (as above)
+  public method Remove(handler: (T) -> ());                          // call-bounded: compares only
+  destructor;                            // synchronized quiescence: severs the subscriber list under the
+                                         // same lock discipline as subscribe/raise
+end SharedEventSource;
 
-// Owning overload for class T (Pattern B; v0.250 — same name, the parameter type
-// distinguishes it, the call site is Task.WhenEach(move tasks)). Takes ownership
-// of the array and every task in it; yields each completed OwningTask<T> as an
-// owned iteration variable.
-public static method WhenEach<T>(
-    owned tasks: OwningArray<OwningTask<T>>
-): IOwningAsyncEnumerable<OwningTask<T>> where T: class;
+public static class App
+  private static owned readonly _exiting: SharedEventSource<()> := new();
+  public static property Exiting: ISharedEvent<()> => _exiting;
+
+  public static method NotifyExiting()
+    _exiting.Raise();
+  end NotifyExiting;
+end App;
+
+// consumer, any domain — handler must be capture-free (static method ref / non-capturing lambda):
+using var sub := App.Exiting.Subscribe(OnExit);

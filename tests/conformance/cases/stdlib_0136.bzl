@@ -1,21 +1,19 @@
-/// Compiler-intrinsic; aliased by the keyword `decimal`.
-public record Decimal: IComparable<decimal>, IEquatable<decimal>
-  public static const MinValue: decimal;
-  public static const MaxValue: decimal;
-  public static const Zero: decimal;
-  public static const One: decimal;
+public static class File
+  public static method ReadAllText(path: string): string;
+  public static method WriteAllText(path: string, contents: string);
+  public static method ReadAllBytes(path: string): owned Array<byte>;
+  public static method WriteAllBytes(path: string, contents: Array<byte>);
+  public static method WriteAllBytes(path: string, contents: ReadOnlySpan<byte>);   // v0.165 (#1358): serializer-output path, zero-copy
+  public static method ReadAllLines(path: string): owned Array<string>;
+  public static method WriteAllLines(path: string, lines: IEnumerable<string>);
 
-  public static pure method Parse(s: string): decimal;
-  public static method TryParse(s: string, out result: decimal): bool;
-  public static pure method ParseOrNull(s: string): decimal?;         // v0.231: null exactly where Parse(s)
-                                                                      //   raises; otherwise the parsed value
-  public static pure method Parse(s: ReadOnlyStringSpan): decimal;                 // v0.222 (#1810): span form
-  public static method TryParse(s: ReadOnlyStringSpan, out result: decimal): bool;
+  public static async method ReadAllTextAsync(path: string,
+                                                token: CancellationToken := CancellationToken.None): Task<string>;
+  public static async method WriteAllTextAsync(path: string, contents: string,
+                                                 token: CancellationToken := CancellationToken.None): Task;
 
-  public pure method ToString(): string;
-  public pure method ToString(format: string): string;
-  public pure method CompareTo(other: decimal): int;
-  public pure method Round(digits: int): decimal;    // banker's rounding (round-half-to-even), matching
-                                                //   Math.Round (§2.2); digits outside 0..28:
-                                                //   ArgumentOutOfRangeException (v0.195)
-end Decimal;
+  public static method Exists(path: string): bool;
+  public static method Delete(path: string);
+  public static method Copy(source: string, destination: string, overwrite: bool);
+  public static method Move(source: string, destination: string);
+end File;

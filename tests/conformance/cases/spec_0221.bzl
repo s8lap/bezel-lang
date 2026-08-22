@@ -1,7 +1,9 @@
-// ERROR: TakeOwnership may throw (method calls are throwable, above) — on that
-//        edge _resource is moved but never reassigned: the WrongOrder shape.
-public method TransferToHelper()
-  var fresh := new Stream();
-  TakeOwnership(move _resource);          // owned argument; helper consumes
-  _resource := fresh;                      // restores the normal edge only
-end TransferToHelper;
+public method RightLoop(): owned Stream
+  var fresh := MakeStream();
+  while SomeCondition() do
+    fresh := MakeStream();   // refine fresh in the loop
+  end;
+  var old := move _resource;
+  _resource := fresh;
+  return old;
+end RightLoop;

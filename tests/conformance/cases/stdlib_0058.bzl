@@ -35,7 +35,14 @@ public class OwningDictionary<K, V>: IDisposable where V: class
   public method GetOrAdd(key: K, factory: (K) -> owned V): V;  // returns borrow
 
   // Drain
-  public method PopValue(key: K): owned V;     // raises if not present
+  public method PopValue(key: K): owned V;     // raises if not present. The `Value` suffix carries
+                                               //   information and stays through the v0.259 egress
+                                               //   rename (§4.10): the dictionary's egress transfers
+                                               //   the *value* and consumes the *key* as a query, so
+                                               //   `PopValue(key)` says which of the two the caller
+                                               //   gets, where a bare `Pop(key)` would not — a
+                                               //   naming-carries-information ground, not an
+                                               //   exception to the rename
   public method TryPopValue(key: K, out owned value: V?): bool;   // v0.171 (#1336)
   public method Drain(): IOwningEnumerable<DrainedEntry<K, V>>;
                                                // iteration drains the dictionary;
@@ -50,8 +57,3 @@ public class DrainedEntry<K, V>: IDisposable where V: class
   public owned Value: V;                        // owned — DrainedEntry is a class,
                                                 //   so it may own its Value field
 end DrainedEntry;
-
-using var pool: OwningDictionary<string, Connection> := [
-  "primary": Connect("p"),
-  "backup":  Connect("b")
-];

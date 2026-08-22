@@ -1,13 +1,5 @@
-if amount > 0 then
-  Balance := Balance + amount;
-end;
-
-if score >= 90 then
-  grade := "A";
-elif score >= 80 then
-  grade := "B";
-elif score >= 70 then
-  grade := "C";
-else
-  grade := "F";
-end;
+var balance: decimal;                 // explicit type, no initializer
+var count: int := 0;                  // explicit type with initializer
+var greeting := "Hello";              // type inferred
+const Pi: double := 3.14159;          // const with explicit type
+const MaxUsers := 1000;               // const with inferred type

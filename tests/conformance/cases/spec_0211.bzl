@@ -1,6 +1,3 @@
-public method ReplaceAndReturn(): owned Stream
-  var fresh := new Stream();         // build replacement first
-  var old := move _resource;          // take from field
-  _resource := fresh;                  // restore field
-  return old;                          // return the taken value
-end ReplaceAndReturn;
+public method Resize(newSize: int)
+  _buffer := new Array<byte>(newSize, 0);   // sized ctor (stdlib §4.4); previous _buffer disposed here, implicitly
+end Resize;

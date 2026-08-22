@@ -1,7 +1,2 @@
-// Non-null owned slots; initializer required at declaration
-var fixed: [3 owned]Connection := [
-  Connect("primary"), Connect("secondary"), Connect("tertiary")
-];
-
-// Nullable owned slots; defaults to all null
-var pool: [16 owned]Connection?;
+var rgb: [3]byte       := [255, 128, 64];
+var pt:  [2]Point      := [new Point(0, 0), new Point(1, 1)];   // value-typed Point record

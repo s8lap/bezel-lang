@@ -1,7 +1,7 @@
 public record Guid: IComparable<Guid>, IEquatable<Guid>
   // v0.165 (#1357): CompareTo = lexicographic over the 16 canonical big-endian
   // bytes (stated explicitly — .NET's field-group order is a known trap);
-  // operator group agrees.
+  // ordering is CompareTo only — no <,>,<=,>= overloads are declared.
   public method CompareTo(other: Guid): int;
   public static method FromByteArray(bytes: Array<byte>): Guid;   // borrows; requires Count = 16, ArgumentException otherwise
   public static readonly property Empty: Guid;

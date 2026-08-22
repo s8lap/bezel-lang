@@ -1,107 +1,35 @@
-public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
-  // class T
+public class OwningBuffer<T>                              // no IEnumerable conformance
+                                                          //   (value-typed; see "Iteration" below)
+  public constructor(length: int);                       // all slots default(T)
+                                                          //   requires T to have a default value
+  public constructor(length: int, init: (int) -> T);     // init returns T (no `owned`)
 
-  // Indexer (bounds-checked against span Length).
-  public property [i: int]: T?
-    get => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      return Buffer[Start + i];
-    end;
-    set(owned) => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      Buffer[Start + i] := value;
-    end;
-  end;
+  public pure readonly property Length: int;    // stored extent, immutable once
+                                                //   allocated; pure per spec §22.15
+                                                //   *Intrinsic purity*
 
-  // Range query (v0.101).
-  public property IsEmpty: bool => Length = 0;
-
-  // Search (v0.101).
-  public method IndexOf(value: T?): int;          // -1 if not found
-  public method Contains(value: T?): bool;        // IndexOf(value) >= 0
-
-  // Equality (v0.101).
-  public method SequenceEqual(other: Span<T>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<T?>): bool; // v0.108 — interface form
-
-  // Range construction (v0.99 / v0.100).
-  public method Slice(start: int, length: int): Span<T> =>
-    new Span<T>(Buffer, this.Start + start, length);
-  public method Slice(start: int): Span<T> => Slice(start, Length - start);   // v0.195
-  public method Slice(r: Range<int>): Span<T>;   // v0.241 — Range form: normalized against
-                                                  //   Length (spec §16.3), then equivalent to
-                                                  //   Slice(start, length); see prose
-
-  public method AsReadOnly(): ReadOnlySpan<T> =>
-    new ReadOnlySpan<T>(Buffer, Start, Length);
-
-  // Bulk mutation (v0.101).
-  public method Clear();                          // set every slot to null
-                                                   //   (disposes previous contents)
-  public method MoveFrom(source: Span<T>);        // move slot-by-slot from source;
-                                                   //   source slots become null;
-                                                   //   destination's previous
-                                                   //   contents disposed;
-                                                   //   lengths must match
-  public method MoveTo(destination: Span<T>);     // v0.109 — symmetric with MoveFrom;
-                                                   //   move slot-by-slot to destination;
-                                                   //   source slots become null;
-                                                   //   destination's previous
-                                                   //   contents disposed;
-                                                   //   lengths must match
-  public method Reverse();                         // reverse slot ordering in place
-end Span;
-
-public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
-  // value T (primitive, record, enum, non-move-only inline array)
-
-  // Indexer (bounds-checked against span Length).
   public property [i: int]: T
-    get => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      return Buffer[Start + i];
-    end;
-    set => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      Buffer[Start + i] := value;
-    end;
+    get;                                                  // borrow of slot (value copy
+                                                          //   for primitives at the use site)
+    set;                                                  // overwrites slot
   end;
 
-  // Range query.
-  public property IsEmpty: bool => Length = 0;
+  // move buf[i] NOT admitted (values have no ownership; use plain read)
 
-  // Search.
-  public method IndexOf(value: T): int;
-  public method Contains(value: T): bool;
+  // Foreign-memory access (v0.186; language spec §32.12) — admitted only for
+  //   T in the language spec §32.12 FFI-pointee set; see prose. The result type
+  //   lives in System.Interop: naming Ptr<T> requires that import, using the
+  //   returned value does not (language spec §2.8.3 rule 2; v0.265).
+  public method DangerousPointer(): Ptr<T>;
 
-  // Equality.
-  public method SequenceEqual(other: Span<T>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<T>): bool; // v0.108 — interface form
+  // Span views (v0.109)
+  public method AsSpan(): Span<T>;                          // full buffer, writable
+  public method AsSpan(start: int): Span<T>;                // from offset to end
+  public method AsSpan(start: int, length: int): Span<T>;
+  public method AsSpan(r: Range<int>): Span<T>;             // parallels Range slicing
 
-  // Range construction.
-  public method Slice(start: int, length: int): Span<T> =>
-    new Span<T>(Buffer, this.Start + start, length);
-  public method Slice(start: int): Span<T> => Slice(start, Length - start);   // v0.195
-  public method Slice(r: Range<int>): Span<T>;   // v0.241 — Range form: normalized against
-                                                  //   Length (spec §16.3), then equivalent to
-                                                  //   Slice(start, length); see prose
-
-  public method AsReadOnly(): ReadOnlySpan<T> =>
-    new ReadOnlySpan<T>(Buffer, Start, Length);
-
-  // Bulk mutation (value-typed forms).
-  public method Fill(value: T);                   // copy `value` into every slot
-  public method CopyFrom(source: ReadOnlySpan<T>); // copy slot-by-slot from source
-                                                    //   lengths must match
-  public method CopyTo(destination: Span<T>);      // v0.109 — copy slot-by-slot to destination
-                                                    //   lengths must match
-  public method Reverse();
-end Span;
+  public method AsReadOnlySpan(): ReadOnlySpan<T>;
+  public method AsReadOnlySpan(start: int): ReadOnlySpan<T>;
+  public method AsReadOnlySpan(start: int, length: int): ReadOnlySpan<T>;
+  public method AsReadOnlySpan(r: Range<int>): ReadOnlySpan<T>;
+end OwningBuffer;

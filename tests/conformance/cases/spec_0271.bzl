@@ -1,12 +1,12 @@
-using var inbox := new Channel<Report>();          // unbounded; this domain receives
-using var worker := Domain.Spawn(ProcessAll, inbox.NewSender());   // sender moves to the new domain
+public async method LoadResourceAsync(path: string): OwningTask<Resource>
+  using var tcs := new OwningTaskCompletionSource<Resource>();
 
-// in this domain:
-using var first := await inbox.Receive();          // ownership of one Report transfers in
+  StartLoadInBackground(path, lambda(owned loaded: Resource) => do
+    tcs.TrySetResult(move loaded);                       // ownership moves into tcs's task
+  end);
 
-// in the spawned domain (static method):
-public static method ProcessAll(owned tx: ChannelSender<Report>)
-  using var sender := move tx;                     // marker: adopt the owned parameter
-  sender.Send(BuildReport(1));                     // ownership of each Report transfers out
-  sender.Send(BuildReport(2));
-end ProcessAll;                                    // sender disposed: last sender closes the channel
+  return await tcs.Task;                            // moves ownership out of tcs's task
+                                                    //   and into the outer Pattern B task's
+                                                    //   result slot. tcs is then disposed,
+                                                    //   but its task already has no result.
+end LoadResourceAsync;

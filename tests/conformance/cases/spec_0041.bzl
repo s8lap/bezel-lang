@@ -1,7 +1,3 @@
-interface IBankAccount
-  method Deposit(amount: decimal);
-  method Withdraw(amount: decimal);
-  property Balance: decimal;
-  readonly property AccountNumber: string;
-  readonly property BalanceChanged: IEvent<BalanceChangedEvent>;
-end IBankAccount;
+public class ResourceHolder(owned resource: Stream)
+  private owned _resource: Stream := resource;
+end ResourceHolder;

@@ -1,74 +1,37 @@
-public class OwningDictionary<K, V>: IDisposable where V: class
+public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
   public constructor();
   public constructor(capacity: int);
   public constructor(comparer: IEqualityComparer<K>);
   public constructor(capacity: int, comparer: IEqualityComparer<K>);
 
   public pure readonly property Count: int;
-  public readonly property Keys: IReadOnlyCollection<K>;       // borrowing view
-  public readonly property Values: IReadOnlyCollection<V>;     // borrowing view
+  public readonly property Keys: IReadOnlyCollection<K>;      // v0.165 (#1354): read-only views, matching §4.9
+  public readonly property Values: IReadOnlyCollection<V>;
 
-  public property [key: K]: V
-    get;                                       // borrow of stored value
-    set(owned);                                // owned-taking; disposes previous
-  end;
+  public property [key: K]: V;
 
-  public method Add(key: K, owned value: V);   // ArgumentException if the key is present; the passed
-                                                //   value was consumed at the call site and is disposed
-                                                //   on that path (v0.195) — pre-check ContainsKey when
-                                                //   the caller must keep it
+  public method Add(key: K, value: V);
   public method ContainsKey(key: K): bool;
-  public method Contains(key: K): bool;
-  public method Remove(key: K): bool;          // disposes the removed value
-  public method TryGetValue(key: K, out value: V?): bool;      // out is borrow; v0.171 (#1336)
-  public method GetOrNull(key: K): V?;                         // v0.231 (§1 *OrNull tier): absent -> null;
-                                                               //   present -> a borrow of the stored value, the
-                                                               //   indexer's get posture — ownership stays with
-                                                               //   the dictionary: a look, not a take (the take
-                                                               //   forms remain PopValue/TryPopValue). where V:
-                                                               //   class makes V statically non-nullable at
-                                                               //   every instantiation (spec §7.10), so null
-                                                               //   means absent, unambiguously. The §4.8 ??
-                                                               //   limit (spec §7.7) applies at every
-                                                               //   instantiation here: an owned fallback never
-                                                               //   meets this borrow
-  public method GetOrAdd(key: K, factory: (K) -> owned V): V;  // returns borrow
+  public method Contains(key: K): bool;            // alias for ContainsKey;
+                                                   //   enables `key in dict`
+  public method Remove(key: K): bool;
+  public method TryGetValue(key: K, out value: V?): bool;   // v0.171 (#1336): false path assigns null; value-typed V reads as V? at the call site
+  public method GetOrNull(key: K): V?;             // v0.231 (§1 *OrNull tier): absent -> null; present -> the
+                                                   //   value — read semantics and caveat in the prose below
+  public method GetOrAdd(key: K, factory: (K) -> V): V;
 
-  // Drain
-  public method PopValue(key: K): owned V;     // raises if not present
-  public method TryPopValue(key: K, out owned value: V?): bool;   // v0.171 (#1336)
-  public method Drain(): IOwningEnumerable<DrainedEntry<K, V>>;
-                                               // iteration drains the dictionary;
-                                               //   each yielded entry owns its Value
+  public method Clear();                            // drops every entry; disposes neither
+                                                    //   keys and values
+end Dictionary;
 
-  public method Clear();                        // disposes every value
-end OwningDictionary;
+public record DictionaryEntry<K, V>(Key: K, Value: V);
 
-public class DrainedEntry<K, V>: IDisposable where V: class
-  public constructor(key: K, owned value: V);  // ownership of value transfers in
-  public readonly property Key: K;             // borrow / value copy of the key
-  public owned Value: V;                        // owned — DrainedEntry is a class,
-                                                //   so it may own its Value field
-end DrainedEntry;
+public interface IEqualityComparer<T>
+  method Equals(a: T, b: T): bool;
+  method GetHashCode(value: T): int;
+end IEqualityComparer;
 
-// Borrowing key-iteration, one value taken at a time:
-public method DrainAndProcess(dict: OwningDictionary<string, Connection>)
-  using var keys := new Array<string>(dict.Count);
-  for var key in dict.Keys do
-    keys.Add(key);
-  end;
-  for var key in keys do
-    using var conn := dict.PopValue(key);     // takes ownership
-    Process(conn);
-  end;
-  // dict is now empty
-end DrainAndProcess;
-
-// Single-call drain — each entry owns its value:
-public method DrainAndProcess2(dict: OwningDictionary<string, Connection>)
-  for var entry in dict.Drain() do
-    using var e := move entry;                 // entry is owned; adopt to discharge (transfer marker)
-    Process(e.Key, e.Value);                   // e.Value is the owned Connection
-  end;
-  // dict is now empty; each entry (and its Value) disposed at loop-body end
-end DrainAndProcess2;
+using var ages: Dictionary<string, int> := [
+  "alice": 30,
+  "bob":   25
+];

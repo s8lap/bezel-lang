@@ -1,25 +1,17 @@
-/// Compiler-intrinsic; aliased by the keyword `char`.
-public record Char: IComparable<char>, IEquatable<char>
-  public static const MinValue: char;             // U+0000
-  public static const MaxValue: char;             // U+10FFFF (excluding surrogates)
+public static class Directory
+  public static method Exists(path: string): bool;
+  public static method CreateDirectory(path: string);
+  public static method Delete(path: string);                       // IOException if non-empty
+  public static method Delete(path: string, recursive: bool);
+  public static method GetFiles(path: string): owned Array<string>;
+  public static method GetDirectories(path: string): owned Array<string>;
+end Directory;
 
-  public static pure method IsDigit(c: char): bool;
-  public static pure method IsLetter(c: char): bool;
-  public static pure method IsLetterOrDigit(c: char): bool;
-  public static pure method IsWhiteSpace(c: char): bool;
-  public static pure method IsUpper(c: char): bool;
-  public static pure method IsLower(c: char): bool;
-  public static pure method IsControl(c: char): bool;
-  public static pure method IsPunctuation(c: char): bool;
-
-  public static pure method ToUpper(c: char): char;
-  public static pure method ToLower(c: char): char;
-
-  public static pure method Parse(s: string): char;                 // exactly one code point
-  public static method TryParse(s: string, out result: char): bool;
-  public static pure method ParseOrNull(s: string): char?;          // v0.231: null exactly where Parse(s)
-                                                                    //   raises; otherwise the parsed value
-
-  public pure method ToString(): string;
-  public pure method CompareTo(other: char): int;
-end Char;
+public static class Path
+  public static method Combine(a: string, b: string): string;
+  public static method GetFileName(path: string): string;
+  public static method GetExtension(path: string): string;         // "" when none
+  public static method GetFileNameWithoutExtension(path: string): string;
+  public static method GetDirectoryName(path: string): string;
+  public static method GetFullPath(path: string): string;
+end Path;

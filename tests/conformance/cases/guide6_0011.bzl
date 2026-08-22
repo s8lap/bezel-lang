@@ -4,5 +4,6 @@ end Accepts;
 
 public method Transition(state: int)
   requires(Accepts(state))
+
   _current := state;
 end Transition;

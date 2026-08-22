@@ -1,11 +1,9 @@
-// Representative forms; the stdlib section declares the full set.
-Domain.Spawn(entry: () -> ()): owned Task
-Domain.Spawn<R>(entry: () -> owned R): owned OwningTask<R>            // R: sendable class
-Domain.Spawn<A, R>(entry: (owned A) -> owned R, owned arg: A): owned OwningTask<R>
-Domain.Spawn<R>(entry: () -> R): owned Task<R>                       // R: sendable value type
+public async method ReadSectorAsync(dev: BlockDevice, lba: long): Task<int>
+  using var tcs := new TaskCompletionSource<int>();
 
-// Async entries: the runtime awaits the returned task inside the
-// spawned domain; the join handle tracks that task.
-Domain.Spawn(entry: () -> Task): owned Task
-Domain.Spawn<R>(entry: () -> OwningTask<R>): owned OwningTask<R>      // R: sendable class
-Domain.Spawn<R>(entry: () -> Task<R>): owned Task<R>                  // R: sendable value type
+  dev.BeginRead(lba, lambda(status) => do        // BeginRead invokes the callback ONCE
+    tcs.TrySetResult(status);
+  end);
+
+  return await tcs.Task;
+end ReadSectorAsync;

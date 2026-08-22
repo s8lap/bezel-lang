@@ -1,9 +1,12 @@
-public static method Render(users: Array<User>): string
-  record NameAge(Name: string, Age: int);   // local: visible only to end Render
-  var rows := users.Select(lambda(u) => new NameAge(u.Name, u.Age)).ToArray();
-  var sb := new StringBuilder();
-  for var row in rows do
-    sb.AppendLine($"{row.Name}: {row.Age}");
+public method ProcessLargeFile(filename: string)
+  var result := 0;
+
+  do
+    using var fs := new FileStream(filename, FileMode.Open);
+    var data := fs.ReadAll();
+    result := ProcessData(data);
   end;
-  return sb.ToString();
-end Render;
+  // fs has been disposed here
+
+  Console.WriteLine($"Result = {result}");
+end ProcessLargeFile;

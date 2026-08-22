@@ -1,5 +1,7 @@
-3.14                // double
-3.14f               // float
--1.23e-4            // scientific notation, double
-1.23456789m         // decimal
-1.23e2m             // scientific notation, decimal
+42                  // int
+0xFF                // hex
+0b10101010          // binary
+1_234_567           // digit separators allowed except at start/end
+42L                 // long
+42U                 // uint
+42UL                // ulong

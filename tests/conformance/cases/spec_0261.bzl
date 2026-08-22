@@ -1,13 +1,8 @@
-public record CancellationToken
-  public static readonly property None: CancellationToken;
-  public readonly property IsCancellationRequested: bool;
-  public method ThrowIfCancellationRequested();
-  public method Register(scoped callback: () -> ()): owned Subscription;
-end CancellationToken;
+interface IAsyncEnumerable<out T>
+  method GetAsyncEnumerator(token: CancellationToken := CancellationToken.None): owned IAsyncEnumerator<T>;
+end IAsyncEnumerable;
 
-public class CancellationTokenSource: IDisposable
-  public readonly property Token: CancellationToken;
-  public readonly property IsCancellationRequested: bool;
-  public method Cancel();
-  public method CancelAfter(delay: TimeSpan);
-end CancellationTokenSource;
+interface IAsyncEnumerator<out T>: IAsyncDisposable
+  method MoveNextAsync(): Task<bool>;
+  readonly property Current: T;
+end IAsyncEnumerator;

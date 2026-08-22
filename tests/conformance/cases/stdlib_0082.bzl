@@ -1,20 +1,30 @@
-/// Compiler-intrinsic; T restricted to sendable value types and `string`.
-public class FrozenArray<T>: IEnumerable<T>
-  // Construction consumes or copies its source — after either, no writer can exist.
-  public static method From(owned buffer: OwningBuffer<T>): owned FrozenArray<T>;
-      // VALUE-TYPED T ONLY: O(1) — steals the storage; the buffer is consumed
-      //   (the call-site transfer marker `move`; the proposal-0006 owned-vs-copy construction shape).
-      //   No string-element form can exist: OwningBuffer<T> does not admit string (§4.14).
-  public static method From(items: Array<T>): owned FrozenArray<T>;
-      // Copies; the only construction form for T = string.
-
-  public readonly property Length: int;
+public record ReadOnlyArraySpan<T>(Source: Array<T>, Start: int, Length: int): IReadOnlySpan<T>
 
   public property [i: int]: T
-    get;                       // bounds-checked; IndexOutOfRangeException outside 0..<Length
+    get => do
+      if i < 0 or i >= Length then
+        throw new IndexOutOfRangeException();
+      end;
+      return Source[Start + i];
+    end;
   end;
 
-  public method ToArray(): owned Array<T>;   // fresh mutable copy back out
+  public property IsEmpty: bool => Length = 0;
 
-  destructor;                  // releases the backing storage
-end FrozenArray;
+  public method Slice(start: int, length: int): ReadOnlyArraySpan<T> =>
+    new ReadOnlyArraySpan<T>(Source, this.Start + start, length);
+  public method Slice(start: int): ReadOnlyArraySpan<T> => Slice(start, Length - start);   // v0.195
+  public method Slice(r: Range<int>): ReadOnlyArraySpan<T>;   // v0.241 — Range form: normalized against
+                                                               //   Length (spec §16.3), then equivalent to
+                                                               //   Slice(start, length); §4.14's contract
+
+  public method IndexOf(value: T): int;
+  public method Contains(value: T): bool;
+
+  public method SequenceEqual(other: ReadOnlyArraySpan<T>): bool;
+  public method SequenceEqual(other: ArraySpan<T>): bool;
+  public method SequenceEqual(other: IReadOnlySpan<T>): bool; // v0.108 — interface form
+
+  public method CopyTo(destination: ArraySpan<T>);            // v0.109 — copy slot-by-slot to destination;
+                                                               //   lengths must match
+end ReadOnlyArraySpan;

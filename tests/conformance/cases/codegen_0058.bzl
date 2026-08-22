@@ -1,0 +1,3 @@
+pool.Add(move item);               // transfer first...
+var b := pool[pool.Count - 1];     // ...then re-borrow from the new owner
+b.Configure();

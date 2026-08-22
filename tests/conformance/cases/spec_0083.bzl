@@ -1,2 +1,1 @@
-var r: Range<int> := (if someCondition then 1..10 else 10..);
-for var i in r do ... end;        // InvalidOperationException if r is open-ended
+for var i in 10.. do ... end;     // WARNING: open-ended range cannot be iterated

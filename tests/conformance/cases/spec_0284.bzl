@@ -1,3 +1,3 @@
-import FFIExample;
-
-FFIExample.strdup(cname);
+public class ContractViolationException: Exception
+  public pure constructor(message: string);
+end ContractViolationException;

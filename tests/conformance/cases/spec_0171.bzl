@@ -1,4 +1,4 @@
-extension string
-  public property IsBlank: bool => this.Length = 0 or this.Trim().Length = 0;
-  public method Words(): owned Array<string> => this.Split(' ');
-end;
+record BitMask(Bits: ulong)
+  public static method operator ~(m: BitMask): BitMask =>
+    new BitMask(~m.Bits);
+end BitMask;

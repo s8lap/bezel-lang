@@ -1,27 +1,109 @@
-/// Compiler-intrinsic; T restricted to sendable value types and `string`.
-public class FrozenArray<T>: IEnumerable<T>
-  // Construction consumes or copies its source — after either, no writer can exist.
-  public static method From(owned buffer: OwningBuffer<T>): owned FrozenArray<T>;
-      // VALUE-TYPED T ONLY: O(1) — steals the storage; the buffer is consumed
-      //   (the call-site transfer marker `move`; the proposal-0006 owned-vs-copy construction shape).
-      //   No string-element form can exist: OwningBuffer<T> does not admit string (§4.14).
-  public static method From(items: Array<T>): owned FrozenArray<T>;
-      // Copies; the only construction form for T = string.
+public record BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)
 
-  public readonly property Length: int;
+  public pure property IsEmpty: bool => BitLength = 0;
+  public pure property IsByteAligned: bool => BitStart mod 8 = 0;
 
-  public property [i: int]: T
-    get;                       // bounds-checked; IndexOutOfRangeException outside 0..<Length
-  end;
+  // Reads — from bit 0 of the view; count in 1..64
+  public method ReadBitsBigEndianMsbFirst(count: int): ulong;
+  public method ReadBitsLittleEndianLsbFirst(count: int): ulong;
+  public method ReadBitMsbFirst(): bool;
+  public method ReadBitLsbFirst(): bool;
 
-  public method ToArray(): owned Array<T>;   // fresh mutable copy back out
+  // Try variants — return false instead of throwing on a short view
+  public method TryReadBitsBigEndianMsbFirst(count: int, out value: ulong): bool;
+  public method TryReadBitsLittleEndianLsbFirst(count: int, out value: ulong): bool;
+  public method TryReadBitMsbFirst(out value: bool): bool;
+  public method TryReadBitLsbFirst(out value: bool): bool;
 
-  destructor;                  // releases the backing storage
-end FrozenArray;
+  // Repositioning — the §4.14 Slice family, counted in bits
+  public pure method Slice(bitStart: int): BitReader;
+  public pure method Slice(bitStart: int, bitLength: int): BitReader;
+  public pure method Slice(r: Range<int>): BitReader; // Range form: normalized against
+                                                       //   BitLength (spec §16.3), then
+                                                       //   equivalent to Slice(start, length)
+  public pure method AlignToByte(): BitReader;        // advance to the next byte boundary
 
-var raw := LoadSamples();                                        // owned OwningBuffer<double>
-using var input := new Shared<FrozenArray<double>>(
-    FrozenArray<double>.From(move raw));                         // O(1) freeze
-using var t1 := Domain.Spawn(Program.ScanLow,  input.Clone());   // Shared<FrozenArray<double>>: sendable
-using var t2 := Domain.Spawn(Program.ScanHigh, input.Clone());
-var answer := await t1 + await t2;                               // zero bytes copied
+  // The byte-aligned remainder — an ordinary sub-span, no bit machinery
+  public method AlignedTail(): ReadOnlySpan<byte>;
+end BitReader;
+
+public record BitWriter(Source: Span<byte>, BitStart: int, BitLength: int)
+
+  public pure property IsEmpty: bool => BitLength = 0;
+  public pure property IsByteAligned: bool => BitStart mod 8 = 0;
+
+  public method WriteBitsBigEndianMsbFirst(value: ulong, count: int);
+  public method WriteBitsLittleEndianLsbFirst(value: ulong, count: int);
+  public method WriteBitMsbFirst(value: bool);
+  public method WriteBitLsbFirst(value: bool);
+
+  // Try variants — false on a short view; the destination is not modified
+  public method TryWriteBitsBigEndianMsbFirst(value: ulong, count: int): bool;
+  public method TryWriteBitsLittleEndianLsbFirst(value: ulong, count: int): bool;
+  public method TryWriteBitMsbFirst(value: bool): bool;
+  public method TryWriteBitLsbFirst(value: bool): bool;
+
+  public pure method Slice(bitStart: int): BitWriter;
+  public pure method Slice(bitStart: int, bitLength: int): BitWriter;
+  public pure method Slice(r: Range<int>): BitWriter;
+  public pure method AlignToByte(): BitWriter;
+
+  public method AlignedTail(): Span<byte>;
+  public method AsReadOnly(): BitReader;
+end BitWriter;
+
+// Entry points, parallel to AsSpan / AsReadOnlySpan
+public extension ReadOnlySpan<byte>
+  public pure method AsBitReader(): BitReader;
+end;
+
+public extension Span<byte>
+  public method AsBitReader(): BitReader;             // delegates via AsReadOnly()
+                                                       //   (unmarked), so not `pure`
+  public pure method AsBitWriter(): BitWriter;
+end;
+
+public record BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)
+  public method ReadBitMsbFirst(): bool
+    if BitLength < 1 then
+      throw new IndexOutOfRangeException();
+    end;
+    var k := BitStart;
+    return (int(Source[k / 8]) & (1 << (7 - (k mod 8)))) <> 0;
+  end ReadBitMsbFirst;
+end BitReader;
+
+public record ArrayBitReader(Source: ReadOnlyArraySpan<byte>, BitStart: int, BitLength: int)
+  public pure property IsEmpty: bool => BitLength = 0;
+  public pure property IsByteAligned: bool => BitStart mod 8 = 0;
+
+  public pure method Slice(bitStart: int): ArrayBitReader;
+  public method ReadBitsBigEndianMsbFirst(count: int): ulong;
+  // ... (the full 15-member surface of BitReader, with ArrayBitReader for
+  //      BitReader and ReadOnlyArraySpan<byte> for ReadOnlySpan<byte>
+  //      throughout; omitted here for brevity)
+  public method AlignedTail(): ReadOnlyArraySpan<byte>;
+end ArrayBitReader;
+
+public record ArrayBitWriter(Source: ArraySpan<byte>, BitStart: int, BitLength: int)
+  public pure property IsEmpty: bool => BitLength = 0;
+  public pure property IsByteAligned: bool => BitStart mod 8 = 0;
+
+  public pure method Slice(bitStart: int): ArrayBitWriter;
+  public method WriteBitsBigEndianMsbFirst(value: ulong, count: int);
+  // ... (the full 16-member surface of BitWriter, with ArrayBitWriter for
+  //      BitWriter and ArraySpan<byte> for Span<byte> throughout; omitted
+  //      here for brevity)
+  public method AlignedTail(): ArraySpan<byte>;
+  public method AsReadOnly(): ArrayBitReader;
+end ArrayBitWriter;
+
+public extension ReadOnlyArraySpan<byte>
+  public pure method AsBitReader(): ArrayBitReader;
+end;
+
+public extension ArraySpan<byte>
+  public method AsBitReader(): ArrayBitReader;        // delegates via AsReadOnly()
+                                                       //   (unmarked), so not `pure`
+  public pure method AsBitWriter(): ArrayBitWriter;
+end;

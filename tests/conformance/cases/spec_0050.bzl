@@ -1,6 +1,5 @@
-public abstract class Shape
-  public abstract method Area(): decimal;
-  public abstract property Name: string;
+public sealed override method Speak(): string => "Woof!";
 
-  public method Describe(): string => $"A {Name} with area {Area()}";
-end Shape;
+public sealed class Bulldog: Dog
+  // ...
+end Bulldog;

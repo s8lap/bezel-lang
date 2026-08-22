@@ -1,2 +1,1 @@
-using var task := Producer();
-Process(await task);
+var result := await someTask;

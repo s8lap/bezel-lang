@@ -1,10 +1,10 @@
-public class WString
-  // No public constructor; obtained via factory methods.
+/// Compiler-intrinsic; aliased by the keyword `bool`.
+public record Boolean: IEquatable<bool>
+  public static pure method Parse(s: string): bool;            // "true"/"false", case-insensitive
+  public static method TryParse(s: string, out result: bool): bool;
+  public static pure method ParseOrNull(s: string): bool?;     // v0.231 (§1 *OrNull tier): null exactly
+                                                               //   where Parse(s) raises; otherwise the
+                                                               //   parsed value
 
-  public static method From(s: string): owned WString;
-
-  public readonly property Length: int;       // length in UTF-16 code units, excluding the null terminator
-  public readonly property Pointer: IntPtr;   // v0.186; address of the buffer — see prose
-
-  destructor;       // releases the underlying buffer
-end WString;
+  public pure method ToString(): string;                       // "True" or "False"
+end Boolean;

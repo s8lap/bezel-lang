@@ -1,3 +1,3 @@
-public async method FailFast(): OwningTask<MyClass>
-  throw new InvalidOperationException("no MyClass available");
-end FailFast;
+record ValueChangedEvent(Sender: Slider, OldValue: decimal, NewValue: decimal);
+record DataReceivedEvent(Sender: Connection, Payload: Array<byte>, Timestamp: DateTime);
+record ProcessResult(Success: bool, Message: string);

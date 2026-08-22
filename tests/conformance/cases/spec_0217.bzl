@@ -1,10 +1,7 @@
-// ERROR: the while loop may run zero times, leaving _resource moved
-//        but unreassigned.
-public method WrongLoop(): owned Stream
+public method Right2(replace: bool): owned Stream?
+  if not replace then return null; end;
+  var fresh := new FileStream(_path, FileMode.Open);
   var old := move _resource;
-  while SomeCondition() do
-    _resource := MakeStream();
-    break;
-  end;
+  _resource := fresh;
   return old;
-end WrongLoop;
+end Right2;

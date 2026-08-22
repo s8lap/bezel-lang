@@ -1,1 +1,4 @@
-for var x: int in source do ... end;
+while i < 10 do
+  Console.WriteLine(i);
+  i := i + 1;
+end;

@@ -1,12 +1,17 @@
-public class OwningTaskCompletionSource<T> where T: class
+public record CancellationToken
+  public static readonly property None: CancellationToken;
+  public readonly property IsCancellationRequested: bool;
+  public method ThrowIfCancellationRequested();
+  public method Register(scoped callback: () -> ()): owned Subscription;
+end CancellationToken;
+
+public class CancellationTokenSource
   public constructor();
-  public readonly property Task: OwningTask<T>;
-
-  public method SetResult(owned result: T);
-  public method SetException(owned exception: Exception);   // the task owns its fault (§30.9)
-  public method SetCancelled();
-
-  public method TrySetResult(owned result: T): bool;
-  public method TrySetException(owned exception: Exception): bool;
-  public method TrySetCancelled(): bool;
-end OwningTaskCompletionSource;
+  public readonly property Token: CancellationToken;
+  public readonly property IsCancellationRequested: bool;
+  public method Cancel();
+  public method CancelAfter(delay: TimeSpan);
+  public static method CreateLinked(a: CancellationToken, b: CancellationToken): owned CancellationTokenSource;
+  public static method CreateLinkedAll(parents: Array<CancellationToken>): owned CancellationTokenSource;
+  destructor;       // cancel-on-dispose: signals cancellation to observing tokens
+end CancellationTokenSource;

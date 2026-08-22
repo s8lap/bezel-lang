@@ -73,7 +73,7 @@ public record Point(X: int, Y: int): ISerializable, IDeserializable
   end Serialize;
 
   public static method Deserialize(d: IDeserializer): Point
-    d.BeginObject();
+    _ := d.BeginObject();   // field count, or -1 for JSON; unused here
     var x := 0;  var y := 0;
     // field-name dispatch omitted for brevity; a real implementation
     // loops over ReadFieldName() and fills the locals

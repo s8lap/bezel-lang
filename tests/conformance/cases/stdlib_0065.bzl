@@ -1,8 +1,8 @@
-public interface IOwningEnumerable<T>: IDisposable where T: class
-  method GetOwningEnumerator(): owned IOwningEnumerator<T>;
-end IOwningEnumerable;
+public interface IEnumerable<out T>
+  method GetEnumerator(): owned IEnumerator<T>;
+end IEnumerable;
 
-public interface IOwningEnumerator<T>: IDisposable where T: class
-  method TakeCurrent(): owned T;        // transfers ownership (v0.161)
+public interface IEnumerator<out T>: IDisposable
+  readonly property Current: T;         // non-destructive: borrow of current value
   method MoveNext(): bool;
-end IOwningEnumerator;
+end IEnumerator;

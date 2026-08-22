@@ -1,5 +1,6 @@
-var grade := (case score of
-  90..100 => "A",
-  80..89 => "B",
-  70..<80 => "C",
-  _ => "F");
+case delta of
+  -10..-6 => "strongly down",
+  ..<0    => "down",
+  0       => "flat",
+  _       => "up"
+end;

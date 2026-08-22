@@ -1,3 +1,5 @@
-var t: Type := typeof(BankAccount);
-Console.WriteLine(t.Name);        // "BankAccount"
-Console.WriteLine(t.FullName);    // "BankingApp.BankAccount"
+nameof(amount)              // "amount"
+nameof(_balance)            // "_balance"
+nameof(BankAccount)         // "BankAccount"
+nameof(BankAccount.Deposit) // "Deposit"
+nameof(System.Console)      // "Console"

@@ -1,4 +1,6 @@
-enum HttpStatus: short
+enum HttpStatus
   Ok := 200,
-  NotFound := 404;
+  Created := 201,
+  NotFound := 404,
+  ServerError := 500;
 end HttpStatus;

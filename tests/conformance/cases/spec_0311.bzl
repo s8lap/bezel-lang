@@ -1,5 +1,2 @@
-case move outcome of
-  Fetched(var r) when r.IsStale() => do _ := r; RefetchLater(); end,
-  Fetched(var r)                  => do using var resp := move r; Render(resp); end,
-  _                               => ()
-end;
+var resp := new Response(headers, stream);
+return FetchOutcome.Fetched(move resp);       // call-site marker; resp is moved-from after

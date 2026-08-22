@@ -1,13 +1,18 @@
-public class Transformer
-  public method Transform(x: int);
-  public method Transform(x: decimal);
-end Transformer;
+public class Converter
+  public method Convert(n: long): string => "long";
+  public method Convert(n: float): string => "float";
+end Converter;
 
-var t := new Transformer();
-var n: float := 2.5f;
+var cvt := new Converter();
+var a: int := 10;
 
-t.Transform(n);
-// float→int is not implicit (§5.1: float's only implicit target is double).
-// float→decimal is not implicit (§5.1: decimal and binary floats never mix implicitly).
-// No candidate is applicable ⇒ compile error, no candidates cited (none reachable).
-// The caller must convert explicitly, e.g. t.Transform(int(n)) or t.Transform(decimal(n)).
+cvt.Convert(a);
+// a is int. Neither candidate is an exact match.
+//   Convert(long):  int→long  is implicit (§5.1).
+//   Convert(float): int→float is implicit (§5.1).
+// Both conversions are admitted by §5.1 and are equally ranked: neither
+// candidate is better at the single argument position.
+// Ambiguous call — compile error citing both candidates.
+// Disambiguate with an explicit cast so exactly one is exact:
+//   cvt.Convert(long(a));     // selects Convert(long)
+//   cvt.Convert(float(a));    // selects Convert(float)

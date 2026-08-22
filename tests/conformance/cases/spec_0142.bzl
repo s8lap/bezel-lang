@@ -1,11 +1,17 @@
-public class Logger
-  public method Log(level: int);
-  public method Log(level: long);
-end Logger;
+public class ConnectionPool  // declaration sketch; method bodies elided
+  // Borrow a cached connection; the pool retains ownership.
+  public method TryGetCached(name: string, out conn: Connection? when true): bool;
 
-var lg := new Logger();
-var n: int := 10;
+  // Take a cached connection out of the pool; the caller assumes ownership.
+  public method TryPopCached(name: string, out owned conn: Connection? when true): bool;
+end ConnectionPool;
 
-lg.Log(n);            // n is int: exact match — calls Log(int), not the int→long widening
-lg.Log(42);           // 42 is an int literal: exact match — calls Log(int)
-lg.Log(42L);          // 42L is a long literal: exact match — calls Log(long)
+// Caller A: borrows a cached connection (pool retains it)
+if pool.TryGetCached("primary", out var c) then
+  UseConnection(c);     // narrowed non-null by the `when true` postcondition (§22.4)
+end;
+
+// Caller B: takes ownership of a cached connection (pool no longer holds it)
+if pool.TryPopCached("primary", out using var c) then
+  UseConnection(c);     // owned, narrowed non-null; disposed at scope end
+end;

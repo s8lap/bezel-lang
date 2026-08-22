@@ -1,57 +1,27 @@
-public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
-  // class T
+public class OwningBuffer<T>: IEnumerable<T?>            // class T only
+  public constructor(length: int);                       // all slots null
+  public constructor(length: int, init: (int) -> owned T);
 
-  // Indexer (bounds-checked against span Length).
+  public pure readonly property Length: int;    // stored extent, immutable once
+                                                //   allocated; pure per spec §22.15
+                                                //   *Intrinsic purity*
+
   public property [i: int]: T?
-    get => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      return Buffer[Start + i];
-    end;
-    set(owned) => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      Buffer[Start + i] := value;
-    end;
+    get;                                                  // borrow of slot
+    set(owned);                                           // takes owned T?; disposes previous
   end;
 
-  // Range query (v0.101).
-  public property IsEmpty: bool => Length = 0;
+  // move buf[i] admitted (returns owned T?, leaves slot moved-from;
+  //   the field-restoration rule of language spec §28.8.1 applies)
 
-  // Search (v0.101).
-  public method IndexOf(value: T?): int;          // -1 if not found
-  public method Contains(value: T?): bool;        // IndexOf(value) >= 0
+  // Span views (v0.109)
+  public method AsSpan(): Span<T>;                          // full buffer, writable
+  public method AsSpan(start: int): Span<T>;                // from offset to end
+  public method AsSpan(start: int, length: int): Span<T>;
+  public method AsSpan(r: Range<int>): Span<T>;             // parallels Range slicing
 
-  // Equality (v0.101).
-  public method SequenceEqual(other: Span<T>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<T?>): bool; // v0.108 — interface form
-
-  // Range construction (v0.99 / v0.100).
-  public method Slice(start: int, length: int): Span<T> =>
-    new Span<T>(Buffer, this.Start + start, length);
-  public method Slice(start: int): Span<T> => Slice(start, Length - start);   // v0.195
-  public method Slice(r: Range<int>): Span<T>;   // v0.241 — Range form: normalized against
-                                                  //   Length (spec §16.3), then equivalent to
-                                                  //   Slice(start, length); see prose
-
-  public method AsReadOnly(): ReadOnlySpan<T> =>
-    new ReadOnlySpan<T>(Buffer, Start, Length);
-
-  // Bulk mutation (v0.101).
-  public method Clear();                          // set every slot to null
-                                                   //   (disposes previous contents)
-  public method MoveFrom(source: Span<T>);        // move slot-by-slot from source;
-                                                   //   source slots become null;
-                                                   //   destination's previous
-                                                   //   contents disposed;
-                                                   //   lengths must match
-  public method MoveTo(destination: Span<T>);     // v0.109 — symmetric with MoveFrom;
-                                                   //   move slot-by-slot to destination;
-                                                   //   source slots become null;
-                                                   //   destination's previous
-                                                   //   contents disposed;
-                                                   //   lengths must match
-  public method Reverse();                         // reverse slot ordering in place
-end Span;
+  public method AsReadOnlySpan(): ReadOnlySpan<T>;
+  public method AsReadOnlySpan(start: int): ReadOnlySpan<T>;
+  public method AsReadOnlySpan(start: int, length: int): ReadOnlySpan<T>;
+  public method AsReadOnlySpan(r: Range<int>): ReadOnlySpan<T>;
+end OwningBuffer;

@@ -1,1 +1,7 @@
-var success := parser.TryParse("42", out var num);
+public method Add(a: int, b: int): int
+  return a + b;
+end Add;
+
+public method PrintGreeting(name: string)
+  Console.WriteLine($"Hello, {name}!");
+end PrintGreeting;

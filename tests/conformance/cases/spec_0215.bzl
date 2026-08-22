@@ -1,8 +1,9 @@
-// ERROR: if DangerousFactory throws, _resource is moved but never reassigned;
-//        the exception edge is an unrestored exit.
-public method WrongOrder(): owned Stream
+// ERROR: field _resource was moved at line 2 and not reassigned
+//        on the path through the false branch of `if replace` (line 3).
+public method Wrong(replace: bool): owned Stream
   var old := move _resource;
-  var fresh := DangerousFactory();
-  _resource := fresh;
+  if replace then
+    _resource := new FileStream(_path, FileMode.Open);
+  end;
   return old;
-end WrongOrder;
+end Wrong;

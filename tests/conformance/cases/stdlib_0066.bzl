@@ -1,8 +1,8 @@
-public interface IOwningAsyncEnumerable<T>: IAsyncDisposable where T: class
-  method GetOwningAsyncEnumerator(token: CancellationToken := CancellationToken.None): owned IOwningAsyncEnumerator<T>;
-end IOwningAsyncEnumerable;
+public interface IAsyncEnumerable<out T>
+  method GetAsyncEnumerator(token: CancellationToken := CancellationToken.None): owned IAsyncEnumerator<T>;
+end IAsyncEnumerable;
 
-public interface IOwningAsyncEnumerator<T>: IAsyncDisposable where T: class
-  method TakeCurrent(): owned T;        // transfers ownership (v0.161)
+public interface IAsyncEnumerator<out T>: IAsyncDisposable
+  readonly property Current: T;
   method MoveNextAsync(): Task<bool>;
-end IOwningAsyncEnumerator;
+end IAsyncEnumerator;

@@ -1,12 +1,7 @@
-// General use — resizable
-using var data := new Array<int>();
-data.Add(1); data.Add(2); data.Add(3);
-
-// Fixed-size discipline — pre-allocate via literal, don't resize
-using var snapshot: Array<int> := [1, 2, 3];
-// snapshot.Count == 3 throughout its lifetime; no Add calls
-
-// Owning heap array
-using var pool: OwningArray<Connection> := [
-  Connect("a"), Connect("b"), Connect("c")
+// Non-null owned slots; initializer required at declaration
+var fixed: [3 owned]Connection := [
+  Connect("primary"), Connect("secondary"), Connect("tertiary")
 ];
+
+// Nullable owned slots; defaults to all null
+var pool: [16 owned]Connection?;

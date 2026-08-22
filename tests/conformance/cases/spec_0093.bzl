@@ -1,17 +1,23 @@
-public property [i: int]: double => (case i of
-  0 => X,
-  1 => Y,
-  2 => Z,
-  _ => throw new IndexOutOfRangeException());
+public sealed class Type
+  public readonly property Name: string;            // "BankAccount"
+  public readonly property FullName: string;        // "BankingApp.BankAccount"
 
-var name := (if user <> null then user.Name
-             else throw new InvalidOperationException("user is null"));
+  // Kind predicates — see stdlib §2.13 for the full set and the exact mapping
+  // to the §3.1 type kinds.
+  public readonly property IsClass: bool;
+  public readonly property IsInterface: bool;
+  public readonly property IsRecord: bool;
+  public readonly property IsEnum: bool;
+  public readonly property IsChoice: bool;
+  public readonly property IsValueType: bool;
 
-var config := LoadConfig() ?? throw new InvalidOperationException("no config");
+  // Lattice queries.
+  public readonly property BaseType: Type?;
+  public method Implements(iface: Type): bool;
+  public method IsAssignableFrom(other: Type): bool;
 
-try
-  DoWork();
-catch
-  var ex: TransientException => Retry(ex),
-  var ex: Exception => throw          // bare throw: re-raises the current exception
-end;
+  // Enum metadata (valid only when IsEnum; otherwise raises
+  // InvalidOperationException).
+  public readonly property EnumNames: IReadOnlyList<string>;
+  public readonly property EnumValues: IReadOnlyList<long>;
+end Type;

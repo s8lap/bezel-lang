@@ -1,5 +1,4 @@
-using var scratch := new OwningBuffer<byte>(4096);       // one buffer for the whole loop
-for var line in lines do
-  var n := Encoding.UTF8.GetBytes(line, scratch.AsSpan());  // zero per-call allocation
-  Send(scratch.AsReadOnlySpan(0, n));                       // hand out just the used range
-end;
+method Header(): Span<byte>
+  using var buf := new OwningBuffer<byte>(64);
+  return buf.AsSpan();           // ERROR: the span borrows buf, disposed at scope end
+end Header;

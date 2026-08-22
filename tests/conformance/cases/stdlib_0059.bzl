@@ -1,88 +1,81 @@
-// Internal entry type.
-private class Entry<K, V> where V: class
-  public Key: K;
-  public owned Value: V?;          // nullable for move-and-null restoration;
-                                    //   non-null in committed dictionary state
-  public owned Next: Entry<K, V>?;  // chain link
-  public constructor(key: K, owned value: V, owned next: Entry<K, V>?)
-    Key := key; Value := value; Next := next;
-  end constructor;
-end Entry;
-
 public class OwningDictionary<K, V>: IDisposable where V: class
-  private owned _buckets: OwningBuffer<Entry<K, V>>;
-  private _count: int := 0;
-  private _comparer: IEqualityComparer<K>;
+  public constructor();
+  public constructor(capacity: int);
+  public constructor(comparer: IEqualityComparer<K>);
+  public constructor(capacity: int, comparer: IEqualityComparer<K>);
 
-  // ... constructors, BucketIndex, Count, Keys, Values, etc.
+  public pure readonly property Count: int;
+  public readonly property Keys: IReadOnlyCollection<K>;       // borrowing view
+  public readonly property Values: IReadOnlyCollection<V>;     // borrowing view
 
-  public method Add(key: K, owned value: V)
-    var idx := BucketIndex(key);
-    // Drain the bucket's chain so we can walk it as owned local state
-    // (Bezel's borrow tracker rejects walks-with-mutation; see note below).
-    // Reverse the chain as we walk; if we don't find the key, the new entry
-    // is prepended to the reversed chain — chain reversal is unobservable
-    // because OwningDictionary doesn't promise insertion order.
-    var chain := move _buckets[idx];
-    _buckets[idx] := null;
-    var rebuilt: Entry<K, V>? := null;
-    var foundDup := false;
-    while chain <> null do
-      var rest := move chain.Next;
-      if not foundDup and _comparer.Equals(chain.Key, key) then
-        foundDup := true;              // test the key BEFORE the node is transferred
-      end;
-      chain.Next := rebuilt;           // restore (with the rebuilt-chain head)
-      rebuilt := move chain;           // ownership transfers in (transfer marker)
-      chain := move rest;              // (transfer marker)
-    end;
-    if foundDup then
-      _buckets[idx] := rebuilt;       // restore bucket with unchanged chain
-      throw new ArgumentException("duplicate key");
-      // The owned `value` parameter is auto-disposed on throw per the
-      // [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) exception-path discharge rule.
-    end;
-    _buckets[idx] := new Entry<K, V>(key, move value, move rebuilt);   // call-site markers (spec §22.3)
-    _count := _count + 1;
-    MaybeGrow();
-  end Add;
+  public property [key: K]: V
+    get;                                       // borrow of stored value
+    set(owned);                                // owned-taking; disposes previous
+  end;
 
-  public method PopValue(key: K): owned V
-    var idx := BucketIndex(key);
-    var chain := move _buckets[idx];
-    _buckets[idx] := null;
-    var rebuilt: Entry<K, V>? := null;
-    var taken: V? := null;
-    while chain <> null do
-      var rest := move chain.Next;
-      if taken = null and _comparer.Equals(chain.Key, key) then
-        // Target: take its Value, dispose the entry node.
-        taken := move chain.Value;
-        chain.Value := null;             // restore (with null)
-        chain.Next := null;              // restore (with null)
-        chain.Dispose();                  // value and next are both null;
-                                          //   destructor's auto-dispose passes are no-ops
-      else
-        chain.Next := rebuilt;            // restore (with rebuilt-chain head)
-        rebuilt := move chain;           // (transfer marker)
-      end;
-      chain := move rest;                // (transfer marker)
-    end;
-    _buckets[idx] := rebuilt;             // restore bucket
-    if taken = null then
-      throw new KeyNotFoundException();
-    end;
-    _count := _count - 1;
-    return taken!;
-  end PopValue;
+  public method Add(key: K, owned value: V);   // ArgumentException if the key is present; the passed
+                                                //   value was consumed at the call site and is disposed
+                                                //   on that path (v0.195) — pre-check ContainsKey when
+                                                //   the caller must keep it
+  public method ContainsKey(key: K): bool;
+  public method Contains(key: K): bool;
+  public method Remove(key: K): bool;          // disposes the removed value
+  public method TryGetValue(key: K, out value: V?): bool;      // out is borrow; v0.171 (#1336)
+  public method GetOrNull(key: K): V?;                         // v0.231 (§1 *OrNull tier): absent -> null;
+                                                               //   present -> a borrow of the stored value, the
+                                                               //   indexer's get posture — ownership stays with
+                                                               //   the dictionary: a look, not a take (the take
+                                                               //   forms remain PopValue/TryPopValue). where V:
+                                                               //   class makes V statically non-nullable at
+                                                               //   every instantiation (spec §7.10), so null
+                                                               //   means absent, unambiguously. The §4.8 ??
+                                                               //   limit (spec §7.7) applies at every
+                                                               //   instantiation here: an owned fallback never
+                                                               //   meets this borrow
+  public method GetOrAdd(key: K, factory: (K) -> owned V): V;  // returns borrow
 
-  // The rest of the implementation (TryGetValue with read-only chain walk,
-  // ContainsKey, indexer get/set, GetOrAdd, Clear, MaybeGrow which calls Grow
-  // when the load factor is exceeded, Grow which allocates a new larger
-  // _buckets and rehashes every entry, Keys, Values, etc.) follows the same
-  // patterns as Add and PopValue: every bucket mutation is a drain-and-rebuild.
+  // Drain
+  public method PopValue(key: K): owned V;     // raises if not present. The `Value` suffix carries
+                                               //   information and stays through the v0.259 egress
+                                               //   rename (§4.10): the dictionary's egress transfers
+                                               //   the *value* and consumes the *key* as a query, so
+                                               //   `PopValue(key)` says which of the two the caller
+                                               //   gets, where a bare `Pop(key)` would not — a
+                                               //   naming-carries-information ground, not an
+                                               //   exception to the rename
+  public method TryPopValue(key: K, out owned value: V?): bool;   // v0.171 (#1336)
+  public method Drain(): IOwningEnumerable<DrainedEntry<K, V>>;
+                                               // iteration drains the dictionary;
+                                               //   each yielded entry owns its Value
 
-  // No destructor declared; the compiler generates the default Dispose,
-  // which cascades through _buckets → each Entry → each Entry's owned
-  // Next and Value, recursively disposing the whole map.
+  public method Clear();                        // disposes every value
 end OwningDictionary;
+
+public class DrainedEntry<K, V>: IDisposable where V: class
+  public constructor(key: K, owned value: V);  // ownership of value transfers in
+  public readonly property Key: K;             // borrow / value copy of the key
+  public owned Value: V;                        // owned — DrainedEntry is a class,
+                                                //   so it may own its Value field
+end DrainedEntry;
+
+// Borrowing key-iteration, one value taken at a time:
+public method DrainAndProcess(dict: OwningDictionary<string, Connection>)
+  using var keys := new Array<string>(dict.Count);
+  for var key in dict.Keys do
+    keys.Add(key);
+  end;
+  for var key in keys do
+    using var conn := dict.PopValue(key);     // takes ownership
+    Process(conn);
+  end;
+  // dict is now empty
+end DrainAndProcess;
+
+// Single-call drain — each entry owns its value:
+public method DrainAndProcess2(dict: OwningDictionary<string, Connection>)
+  for var entry in dict.Drain() do
+    using var e := move entry;                 // entry is owned; adopt to discharge (transfer marker)
+    Process(e.Key, e.Value);                   // e.Value is the owned Connection
+  end;
+  // dict is now empty; each entry (and its Value) disposed at loop-body end
+end DrainAndProcess2;

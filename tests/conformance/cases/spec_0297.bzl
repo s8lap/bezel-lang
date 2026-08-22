@@ -1,17 +1,31 @@
 import System.Interop;
+import System.IO;                    // IOException (§31.4; stdlib §7.5)
 
-extern "sqlite3"
-  public method sqlite3_column_blob(stmt: IntPtr, col: int): Ptr<byte>;   // borrowed; valid
-  public method sqlite3_column_bytes(stmt: IntPtr, col: int): int;        //   until next step
-end;
+public class RowCollector
+  private _rows: int := 0;
+  private _lastCell: string := "";
 
-public static class Blobs
-  public static method ReadBlob(stmt: IntPtr, col: int): owned Array<byte>
-    var n := sqlite3_column_bytes(stmt, col);
-    var p := sqlite3_column_blob(stmt, col);
-    if n = 0 or p = Ptr<byte>.Zero then          // SQLite returns NULL for the empty blob
-      return new Array<byte>(0, 0);              // sized ctor (count, fill), stdlib §4.4
+  private method OnRow(argc: int, argv: Ptr<IntPtr>, cols: Ptr<IntPtr>): int
+    _rows := _rows + 1;                           // updating `this` — same thread, same continuation
+    var i := 0;
+    while i < argc do
+      var cell := argv.LoadAt(i);                 // char* — NULL for SQL NULL
+      if cell <> IntPtr.Zero then                 // guard required: FromCStringPointer raises on Zero (stdlib §10.4)
+        _lastCell := string.FromCStringPointer(cell);   // copies; no ownership taken
+      end;
+      i := i + 1;
     end;
-    return p.CopyToArray(n);                     // ONE explicit copy; result is Bezel-owned
-  end ReadBlob;
-end Blobs;
+    return 0;                                     // 0 = continue, per sqlite3_exec's contract
+  end OnRow;
+
+  public method Collect(db: IntPtr, sql: string): int
+    using var csql := CString.From(sql);
+    var rc := sqlite3_exec(db, csql, this.OnRow, Ptr<IntPtr>.Zero);
+                  // bound instance-method reference: admitted — `cb` is env-paired;
+                  // four Bezel arguments: the `env` slot is compiler-supplied
+    if rc <> 0 then
+      throw new IOException($"sqlite3_exec failed: rc={rc}");
+    end;
+    return _rows;
+  end Collect;
+end RowCollector;

@@ -1,12 +1,5 @@
-public async method WithCleanupAsync(): Task
-  try
-    await DoWorkAsync();
-  catch
-    var ex: Exception => do
-      await LogErrorAsync(ex);
-      throw;
-    end
-  finally
-    await ReleaseResourcesAsync();
+public async method ProcessFileAsync(path: string): Task
+  await for var line in ReadLinesAsync(path) do
+    Process(line);
   end;
-end WithCleanupAsync;
+end ProcessFileAsync;

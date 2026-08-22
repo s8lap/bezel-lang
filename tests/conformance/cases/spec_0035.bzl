@@ -1,4 +1,9 @@
-case p of
-  Low => Console.WriteLine("low"),
-  Medium | High => Console.WriteLine("medium or high")
-end;
+enum Priority: IComparable<Priority>
+  Low, Medium, High;
+
+  public method CompareTo(other: Priority): int =>
+    (when
+      int(this) < int(other) => -1,
+      int(this) > int(other) => 1,
+      _ => 0);
+end Priority;

@@ -1,13 +1,17 @@
-public class OwningCache<T> where T: class
-  private owned _items: OwningArray<T>;
+class MyArray<T>
+  // ...
+end MyArray;
 
-  public constructor() _items := new(); end;
+interface IComparable<T>
+  method CompareTo(other: T): int;
+end IComparable;
 
-  public method Add(owned item: T)
-    _items.Add(move item);
-  end Add;
+record Pair<TFirst, TSecond>(First: TFirst, Second: TSecond);
 
-  public method Drain(): owned IOwningEnumerable<T>
-    return _items.Drain();
-  end Drain;
-end OwningCache;
+static class Utils
+  public static method Swap<T>(ref a: T, ref b: T)
+    var temp := a;
+    a := b;
+    b := temp;
+  end Swap;
+end Utils;

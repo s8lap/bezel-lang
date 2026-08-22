@@ -1,4 +1,4 @@
-var sum := add(2, 3);
-
-var maybeHandler: ((int) -> ())? := null;
-maybeHandler?(42);                      // null-conditional call; no-op when null
+var parsed := strings.Select(int.Parse);
+var lengths := names.Select(string.Length);       // property reference
+var sorted := numbers.OrderBy(Math.Abs);          // static method
+var greetings := names.Select(greeter.Greet);    // bound instance method

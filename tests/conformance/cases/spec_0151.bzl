@@ -1,8 +1,4 @@
-public class BankAccount(name: string, initialBalance: decimal)
-  private _name: string := name;
-  private _balance: decimal := initialBalance;
-
-  public method Deposit(amount: decimal)
-    _balance := _balance + amount;
-  end Deposit;
-end BankAccount;
+public constructor(name: string, balance: decimal)
+  _name := name;
+  _balance := balance;
+end constructor;

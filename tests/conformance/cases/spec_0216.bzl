@@ -1,6 +1,6 @@
-public method RightOrder(): owned Stream
-  var fresh := DangerousFactory();   // may throw — but no move yet
-  var old := move _resource;          // cannot throw
-  _resource := fresh;                  // cannot throw (assignment, not call)
-  return old;                          // cannot throw
-end RightOrder;
+public method Right(replace: bool): owned Stream
+  var fresh := new FileStream(_path, FileMode.Open);
+  var old := move _resource;
+  _resource := fresh;
+  return old;
+end Right;

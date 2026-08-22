@@ -1,5 +1,3 @@
-nameof(amount)              // "amount"
-nameof(_balance)            // "_balance"
-nameof(BankAccount)         // "BankAccount"
-nameof(BankAccount.Deposit) // "Deposit"
-nameof(System.Console)      // "Console"
+private owned _items: Array<int> := new();          // class-typed field taking a fresh
+private owned _config: Config := new(verbose := true);   //   value is `owned` (§28.6)
+var xs: Array<int> := new();

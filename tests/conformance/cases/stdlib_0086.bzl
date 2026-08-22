@@ -1,93 +1,19 @@
-public extension IEnumerable<T>
-  // Filtering
-  public method Where(predicate: (T) -> bool): IEnumerable<T>;
-  public method OfType<U>(): IEnumerable<U>;
+public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> where K: IComparable<K>   // conformance added v0.165 (#1354): makes for-in/LINQ legal per spec §29; explicit IDisposable dropped v0.195 (§1 convention — implicit, trivial-dispose)
+  public constructor();
 
-  // Projection
-  public method Select<U>(selector: (T) -> U): IEnumerable<U>;
-  public method SelectMany<U>(selector: (T) -> IEnumerable<U>): IEnumerable<U>;
+  public pure readonly property Count: int;
 
-  // Quantifiers
-  public method Any(): bool;
-  public method Any(predicate: (T) -> bool): bool;
-  public method All(predicate: (T) -> bool): bool;
-  public method Count(): int;
-  public method Count(predicate: (T) -> bool): int;
-  public method Contains(value: T): bool;
+  public property [key: K]: V;                  // get: KeyNotFoundException if absent
+                                                // set: insert or replace
+  public method ContainsKey(key: K): bool;
+  public method Contains(key: K): bool;         // alias for ContainsKey; enables `key in dict` (§4.8 convention; v0.195)
+  public method TryGetValue(key: K, out value: V?): bool;   // v0.171 (#1336): nullable out, matching §4.8's revised uniform Try shape
+  public method GetOrNull(key: K): V?;          // v0.231 (§1 *OrNull tier): absent -> null; present -> the
+                                                //   value under §4.8's read semantics — caveat in the prose
+                                                //   below
+  public method Remove(key: K): bool;           // false if absent
+  public method Clear();
 
-  // Element access
-  public method First(): T;                                          // throws if empty
-  public method First(predicate: (T) -> bool): T;
-  public method FirstOrNull(): T?;
-  public method FirstOrNull(predicate: (T) -> bool): T?;
-  public method Last(): T;
-  public method Last(predicate: (T) -> bool): T;
-  public method LastOrNull(): T?;
-  public method LastOrNull(predicate: (T) -> bool): T?;
-  public method Single(): T;                                         // throws if not exactly one
-  public method Single(predicate: (T) -> bool): T;                   // throws unless exactly one matches
-  public method SingleOrNull(): T?;
-  public method SingleOrNull(predicate: (T) -> bool): T?;            // null if none; throws if more than one
-  public method ElementAt(index: int): T;
-
-  // Aggregation
-  public method Sum(selector: (T) -> int): int;
-  public method Sum(selector: (T) -> long): long;
-  public method Sum(selector: (T) -> uint): uint;
-  public method Sum(selector: (T) -> ulong): ulong;
-  public method Sum(selector: (T) -> float): float;
-  public method Sum(selector: (T) -> double): double;
-  public method Sum(selector: (T) -> decimal): decimal;
-  public method Min<U>(selector: (T) -> U): U where U: IComparable<U>;
-  public method Max<U>(selector: (T) -> U): U where U: IComparable<U>;
-  public method Average(selector: (T) -> int): double;
-  public method Average(selector: (T) -> long): double;
-  public method Average(selector: (T) -> uint): double;      // v0.195: completing Sum's coverage
-  public method Average(selector: (T) -> ulong): double;     // v0.195
-  public method Average(selector: (T) -> float): float;      // v0.195
-  public method Average(selector: (T) -> double): double;
-  public method Average(selector: (T) -> decimal): decimal;
-  public method Aggregate<TAccum>(seed: TAccum, fold: (TAccum, T) -> TAccum): TAccum;
-
-  // Ordering
-  public method OrderBy<TKey>(key: (T) -> TKey): IOrderedEnumerable<T> where TKey: IComparable<TKey>;
-  public method OrderByDescending<TKey>(key: (T) -> TKey): IOrderedEnumerable<T> where TKey: IComparable<TKey>;
-  public method Reverse(): IEnumerable<T>;
-
-  // Set-like
-  public method Distinct(): IEnumerable<T>;
-  public method Union(other: IEnumerable<T>): IEnumerable<T>;
-  public method Intersect(other: IEnumerable<T>): IEnumerable<T>;
-  public method Except(other: IEnumerable<T>): IEnumerable<T>;
-
-  // Slicing
-  public method Take(count: int): IEnumerable<T>;
-  public method TakeWhile(predicate: (T) -> bool): IEnumerable<T>;
-  public method Skip(count: int): IEnumerable<T>;
-  public method SkipWhile(predicate: (T) -> bool): IEnumerable<T>;
-
-  // Combination
-  public method Concat(other: IEnumerable<T>): IEnumerable<T>;
-  public method Zip<U, R>(other: IEnumerable<U>, combine: (T, U) -> R): IEnumerable<R>;
-
-  // Grouping
-  public method GroupBy<TKey>(key: (T) -> TKey): IEnumerable<IGrouping<TKey, T>>;
-
-  // Materialization (eager)
-  public method ToArray(): owned Array<T>;
-  public method ToDictionary<TKey>(key: (T) -> TKey): owned Dictionary<TKey, T>;
-  public method ToDictionary<TKey, TValue>(key: (T) -> TKey, value: (T) -> TValue): owned Dictionary<TKey, TValue>;
-  public method ToSet(): owned Set<T>;
-end;
-
-public interface IGrouping<TKey, T>: IEnumerable<T>
-  readonly property Key: TKey;
-end IGrouping;
-
-public interface IOrderedEnumerable<T>: IEnumerable<T>
-end IOrderedEnumerable;
-
-public extension IOrderedEnumerable<T>
-  public method ThenBy<TKey>(key: (T) -> TKey): IOrderedEnumerable<T> where TKey: IComparable<TKey>;
-  public method ThenByDescending<TKey>(key: (T) -> TKey): IOrderedEnumerable<T> where TKey: IComparable<TKey>;
-end;
+  public pure readonly property FirstKey: K;         // least key; InvalidOperationException if empty
+  public pure readonly property LastKey: K;          // greatest key; InvalidOperationException if empty
+end SortedDictionary;

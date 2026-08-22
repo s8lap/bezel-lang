@@ -1,13 +1,12 @@
-public record ClickedEvent(Sender: Button, X: int, Y: int);
+public class Mutex
+  public constructor();
+  public method Acquire(): owned Lock;
+  public method TryAcquire(timeout: TimeSpan): owned Lock?;
+  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwningTask<Lock>;
+  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwningTask<Lock?>;
+end Mutex;
 
-public class Button
-  private owned readonly _clicked: EventSource<ClickedEvent> := new();
-  public property Clicked: IEvent<ClickedEvent> => _clicked;
-
-  private method OnPress(x: int, y: int)
-    _clicked.Raise(new ClickedEvent(this, x, y));
-  end OnPress;
-end Button;
-
-// Subscription sites:
-using var sub := button.Clicked.Subscribe(lambda(e) => UpdateStatus(e.X, e.Y));
+public class Lock
+  // No public constructor; obtained from Mutex.Acquire / TryAcquire.
+  destructor;       // releases the held lock
+end Lock;

@@ -1,11 +1,15 @@
-public record Sqlite3Db(Raw: IntPtr);
-public record Sqlite3Stmt(Raw: IntPtr);
+import System.Interop;
+import System.IO;                    // IOException (§31.4; stdlib §7.5)
 
-extern "sqlite3"
-  public method sqlite3_open(filename: CString, out db: Sqlite3Db): int;
-  public method sqlite3_prepare_v2(db: Sqlite3Db, sql: CString, nByte: int,
-      out stmt: Sqlite3Stmt, out tail: IntPtr): int;
-  public method sqlite3_step(stmt: Sqlite3Stmt): int;
-  public method sqlite3_finalize(stmt: Sqlite3Stmt): int;
-  public method sqlite3_close(db: Sqlite3Db): int;
-end;
+public static class FileOps
+  public static method OpenChecked(path: CString): int
+    var fd := open(path, O_RDONLY);
+    if fd < 0 then
+      var e := Interop.LastErrno();          // read FIRST — the interpolation below allocates,
+                                             //   and allocation is a runtime operation that may
+                                             //   clobber the thread-local (stdlib §10.6)
+      throw new IOException($"open failed: errno={e}");
+    end;
+    return fd;
+  end OpenChecked;
+end FileOps;

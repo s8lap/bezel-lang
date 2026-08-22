@@ -1,90 +1,44 @@
 public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
-  private owned _storage: OwningBuffer<T>;
-  private _count: int := 0;
+                                     // IOwningEnumerable: stated v0.195 — §4.13/spec §29.2's both-implemented rule presupposed it
+  public constructor();
+  public constructor(capacity: int);
 
-  public constructor()
-    this(8);
-  end constructor;
-
-  public constructor(capacity: int)
-    if capacity < 0 then
-      throw new ArgumentOutOfRangeException("capacity");
-    end;
-    _storage := new OwningBuffer<T>((if capacity > 0 then capacity else 1));
-  end constructor;
-
-  public property Count: int => _count;
-  public property Capacity: int => _storage.Length;
+  public pure readonly property Count: int;
+  public pure readonly property Capacity: int;
 
   public property [i: int]: T
-    get => do
-      BoundsCheck(i);
-      return _storage[i]!;
-    end;
-    set(owned) => do
-      BoundsCheck(i);
-      _storage[i] := value;                       // owned-setter disposes previous
-    end;
+    get;                                     // borrow of slot
+    set(owned);                              // takes owned T; disposes previous value
   end;
 
-  public method Add(owned item: T)
-    if _count = _storage.Length then
-      GrowTo(_storage.Length * 2);
-    end;
-    _storage[_count] := item;
-    _count := _count + 1;
-  end Add;
+  public method Add(owned item: T);
+  public method AddRange(owned items: OwningArray<T>);   // drains items into self
+  public method Insert(index: int, owned item: T);
+  public method RemoveAt(index: int);                    // disposes the removed element
+  public method Remove(item: T): bool;                   // borrow-taking query;
+                                                          //   disposes the matched element
+  public method Clear();                                  // disposes every element
+  public method Contains(item: T): bool;
+  public method IndexOf(item: T): int;
 
-  public method PopAt(index: int): owned T
-    BoundsCheck(index);
-    var taken := move _storage[index];             // taken: T? (owned)
-    _storage[index] := null;                        // restore slot
-    for var j in index..<(_count - 1) do
-      var shifted := move _storage[j + 1];          // shifted: T? (owned)
-      _storage[j + 1] := null;                       // restore shifted-from slot
-      _storage[j] := shifted;                        // setter on moved-from slot;
-                                                      //   no previous to dispose
-    end;
-    _count := _count - 1;
-    return taken!;                                   // i < _count guaranteed non-null
-  end PopAt;
+  public method Sort(comparer: (T, T) -> int);          // comparer takes borrows
+  public method Sort();                                 // natural order; conditionally
+                                                        //   admitted where `T: IComparable<T>`
+                                                        //   (language spec §14.2) -- see #3325,
+                                                        //   the gate is Array-only today
+  public method Reverse();
 
-  public method RemoveAt(index: int)
-    using var _ := PopAt(index);                  // dispose at scope end
-  end RemoveAt;
-
-  public method Clear()
-    for var i in 0..<_count do
-      var item := move _storage[i];                // item: T? (owned)
-      _storage[i] := null;                          // restore moved-from slot
-      item!.Dispose();                              // slot was non-null
-                                                     //   (i < _count guarantees it)
-    end;
-    _count := 0;
-  end Clear;
-
-  // ... and so on for Insert, Remove, Contains, IndexOf, Sort, Reverse,
-  //     PopFirst, PopLast, TryPopFirst, TryPopLast, Drain, AddRange.
-
-  private method BoundsCheck(i: int)
-    if i < 0 or i >= _count then
-      throw new IndexOutOfRangeException();
-    end;
-  end BoundsCheck;
-
-  private method GrowTo(newCapacity: int)
-    var fresh := new OwningBuffer<T>(newCapacity);
-    for var i in 0..<_count do
-      var moved := move _storage[i];                 // moved: T? (owned)
-      _storage[i] := null;                            // restore moved-from slot
-      fresh[i] := moved;                              // setter on moved-from slot of fresh
-    end;
-    _storage.Dispose();                              // dispose old buffer
-                                                      //   (now all-null, no slots leak)
-    _storage := fresh;
-  end GrowTo;
-
-  // No destructor declared; the compiler generates the default Dispose
-  // which disposes _storage's contents (every non-null slot's owned T)
-  // and the buffer's storage block, in that order.
+  // Drain methods — transfer ownership of elements out of the collection
+  public method PopAt(index: int): owned T;             // removes and returns owned
+  public method PopFirst(): owned T;                     // = PopAt(0); raises if empty
+  public method PopLast(): owned T;                      // = PopAt(Count - 1); raises if empty
+  public method TryPopFirst(out owned item: T?): bool;   // v0.171 (#1336): the false path assigns null (§22.3)
+  public method TryPopLast(out owned item: T?): bool;
+  public method Drain(): IOwningEnumerable<T>;             // iteration drains the source
 end OwningArray;
+
+// No `OwningArray<T>` extension supplies a default-comparer `Sort`. Spec §26.5
+// rule 1 commits instance resolution by *name*, and `OwningArray<T>` declares
+// `Sort` above, so an extension member of that name is never consulted. Callers
+// pass a comparer, or call the parameterless `Sort()` declared above, admitted
+// where `T: IComparable<T>` (restored v0.276).

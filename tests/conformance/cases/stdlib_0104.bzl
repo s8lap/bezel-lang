@@ -1,7 +1,13 @@
-_dataReceived += async lambda(e) => do
-  try
-    await ProcessPayloadAsync(e.Payload);
-  catch
-    var ex: Exception => Log($"Handler failed: {ex.Message}")
-  end;
-end;
+public class Semaphore
+  public constructor(initialCount: int);
+  public constructor(initialCount: int, maxCount: int);
+
+  public method Acquire(): owned SemaphoreToken;
+  public method TryAcquire(timeout: TimeSpan): owned SemaphoreToken?;
+  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwningTask<SemaphoreToken>;
+  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwningTask<SemaphoreToken?>;
+end Semaphore;
+
+public class SemaphoreToken
+  destructor;       // releases the held permit
+end SemaphoreToken;

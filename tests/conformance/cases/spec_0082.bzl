@@ -1,1 +1,2 @@
-for var i in 10.. do ... end;     // WARNING: open-ended range cannot be iterated
+import System.Collections.Linq;
+var evenSquares := (1..20).Where(lambda(x) => x mod 2 = 0).Select(lambda(x) => x * x);

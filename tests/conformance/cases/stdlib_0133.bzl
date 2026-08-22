@@ -1,34 +1,24 @@
-/// Compiler-intrinsic; aliased by the keyword `int`.
-public record Int32: IComparable<int>, IEquatable<int>
-  public static const MinValue: int := -2_147_483_648;
-  public static const MaxValue: int := 2_147_483_647;
+public abstract class Stream
+  public abstract readonly property CanRead: bool;
+  public abstract readonly property CanWrite: bool;
+  public abstract readonly property CanSeek: bool;
 
-  public static pure method Parse(s: string): int;
-  public static method TryParse(s: string, out result: int): bool;
-  public static pure method ParseOrNull(s: string): int?;             // v0.231 (§1 *OrNull tier): null exactly
-                                                                      //   where Parse(s) raises (the
-                                                                      //   FormatException/OverflowException
-                                                                      //   contract); otherwise the parsed
-                                                                      //   value. Same strict input grammar as
-                                                                      //   Parse — no whitespace tolerance
-                                                                      //   (v0.137); string form only
-  public static pure method Parse(s: string, radix: int): int;        // radix in {2, 8, 10, 16}; any other
-                                                                      //   radix raises ArgumentException — a
-                                                                      //   caller bug, not input failure (v0.228 pin)
-  public static method TryParse(s: string, radix: int, out result: int): bool;
-                                                                      // shape (c) (v0.228): false (out = 0)
-                                                                      //   exactly where Parse(s, radix) raises
-                                                                      //   FormatException/OverflowException;
-                                                                      //   an invalid radix raises
-                                                                      //   ArgumentException from both forms
-  public static pure method Parse(s: ReadOnlyStringSpan): int;                     // v0.222 (#1810): identical contract
-  public static method TryParse(s: ReadOnlyStringSpan, out result: int): bool;     //   to the string forms; shape (c)
+  public abstract method Read(buffer: Array<byte>, offset: int, count: int): int;
+  public abstract method Write(buffer: Array<byte>, offset: int, count: int);
+  public method Read(buffer: Span<byte>): int;             // v0.165: span carries its own range
+  public method Write(buffer: ReadOnlySpan<byte>);          //   (§4.14 convention: slice first)
+  public abstract method Flush();
 
-  public pure method ToString(): string;
-  public pure method ToString(format: string): string;
-  public pure method ToString(radix: int): string;
+  public abstract method Seek(offset: long, origin: SeekOrigin): long;
+  public abstract readonly property Length: long;
+  public abstract property Position: long;
 
-  public pure method CompareTo(other: int): int;
-  // Equals(other: int): bool — auto-generated from IEquatable<int>
-  //   per language spec §9.2; not shown explicitly.
-end Int32;
+  public async virtual method ReadAsync(buffer: Array<byte>, offset: int, count: int,
+                                         token: CancellationToken := CancellationToken.None): Task<int>;
+  public async virtual method WriteAsync(buffer: Array<byte>, offset: int, count: int,
+                                          token: CancellationToken := CancellationToken.None): Task;
+
+  // Convenience methods
+  public method ReadAll(): owned Array<byte>;            // reads from current position to end
+  public async method ReadAllAsync(token: CancellationToken := CancellationToken.None): OwningTask<Array<byte>>;
+end Stream;

@@ -1,5 +1,4 @@
-do
-  using var t := semaphore.AcquireAsync();
-  // No await; nothing transferred. If t completes before we leave the block,
-  // its produced token is disposed (the semaphore is released).
-end;
+var cfg := await FetchAsync(url);        // the scoped bind…
+
+using var task2 := FetchAsync(url);      // …desugars to exactly this pair,
+var cfg2 := await task2;                 //    the slot fresh and inexpressible

@@ -1,3 +1,3 @@
-_clicked += lambda(e) => UpdateStatus(e.X, e.Y);
-// later:
-_clicked -= lambda(e) => UpdateStatus(e.X, e.Y);   // a different lambda, no match
+var sortedByAbs := numbers.OrderBy(Math.Abs);     // double or int? Resolved
+                                                  //   from numbers.ElementType
+                                                  //   and OrderBy's target type.

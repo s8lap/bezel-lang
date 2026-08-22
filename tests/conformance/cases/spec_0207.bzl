@@ -1,2 +1,5 @@
-using var sb := new StringBuilder();
-sb.Append("hello").Append(" ").Append("world");    // each Append returns a borrow of sb
+class BankAccount
+  private owned _transactions: Array<Transaction>;       // non-nullable, owned
+  private owned _cache: TransactionCache?;               // nullable, owned
+  private _owner: Customer;                              // back-reference, not owned
+end BankAccount;
