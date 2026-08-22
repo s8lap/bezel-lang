@@ -2,6 +2,7 @@
 
 #include "common/BuiltinRegistry.hpp"  // isBuiltinExceptionName — §31.4 (#2950)
 #include "sema/ConstFold.hpp"
+#include "sema/ExprTypecheck_impl.hpp"  // isValidRangeElementType / rangeElementTypeName — fix #3247 / §16.3
 
 namespace bezel::sema {
 
@@ -1709,6 +1710,30 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // the same object, preserving pointer-equality guards.
                 if (first == "Range") {
                     ref.declaration = ctx_.builtinClassSym("Range");
+                    // fix #3247 / §16.3 (v0.277): `Range<T>`'s T is restricted
+                    // by the compiler to the integer types and `char`. The
+                    // annotation site is the FIRST place a non-integer T is
+                    // visible — the range expression (which the inferred form
+                    // requires) is in ExprTypecheck_Exprs.cpp's visitExpr.
+                    // Reject at the annotation site so the user sees the §16.3
+                    // diagnostic at the type, not at every range expression
+                    // that uses the type. The generic arg has already been
+                    // resolved at this point (the `for (auto& arg : ref.genericArgs)`
+                    // walk above processes each), so the predicate reads the
+                    // post-resolution TypeRef. An unresolved T (a forward
+                    // reference) keeps the predicate's null-tolerant contract:
+                    // an Error-typed arg is not the compiler's concern at
+                    // this site, and the downstream use will re-error.
+                    if (!ref.genericArgs.empty() &&
+                        !isValidRangeElementType(ref.genericArgs[0])) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t.span.begin,
+                            std::string("`Range<T>` requires T to be one of "
+                                        "the integer types or `char` \xe2\x80\x94 "
+                                        "got `") +
+                                rangeElementTypeName(ref.genericArgs[0]) +
+                                "` (\xc2\xa7""16.3)");
+                    }
                 }
                 // per §2.5 / #1357: DateOnly and TimeOnly are value-type builtins
                 // (stored as i32). Like DateTime/TimeSpan/Guid they keep

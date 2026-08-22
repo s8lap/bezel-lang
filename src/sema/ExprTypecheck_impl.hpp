@@ -121,6 +121,16 @@ bool functionSlotTypeRefEqual(const TypeRef* a, const TypeRef* b);
 bool refOutParamTypeMentionsTypeParam(
     const TypeRef* t, const std::unordered_set<std::string_view>& tpNames);
 
+// fix #3247 / §16.3 (v0.277): `Range<T>`'s T is restricted by the compiler
+// to the integer types (byte, sbyte, short, ushort, int, uint, long, ulong)
+// and char. The predicate is read by `ExprTC::visitExpr` (the RangeExpr arm
+// at ExprTypecheck_Exprs.cpp) AND by `Resolver::resolveType` (the `Range<T>`
+// annotation at TypeResolution_Names.cpp) so the admit/reject answer stays
+// in lockstep. Lives at namespace scope so the type-resolution pass can
+// call it without going through ExprTC.
+bool isValidRangeElementType(const TypeRef* ty);
+std::string rangeElementTypeName(const TypeRef* ty);
+
 class ExprTC {
 public:
     ExprTC(SemaContext& ctx) : ctx_(ctx) {}

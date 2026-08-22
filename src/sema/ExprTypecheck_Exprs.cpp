@@ -9215,19 +9215,42 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     "`OverflowException` at the range expression if it "
                     "evaluates to zero");
         }
-        // fix #499 / §9.8: give the RangeExpr itself a Range-named type so
-        // that `var r := a..b` infers lsym->declType = Range (not null).
-        // The element type is inferred from lo (or hi if lo is absent); it is
-        // recorded as the first generic arg so codegen can read it back when
-        // choosing the integer width for the Range struct's lo/hi fields.
-        // A Named TypeRef with declaration = builtinClassSym("Range") and
-        // declaration->decl = nullptr is the same shape used for DateTime /
-        // TimeSpan (scalar/struct value builtins), and lowerTypeRef will
-        // recognise it by declaration->name == "Range".
+        // fix #3247 / §16.3 (v0.277): `Range<T>`'s T is restricted by the
+        // compiler to the integer types (byte, sbyte, short, ushort, int, uint,
+        // long, ulong) and char — "Other substitutions are rejected. This
+        // restriction is enforced as a compiler-intrinsic rule." Before this
+        // fix the rejection was *implicit* — the codegen `sext <ty> to i64`
+        // for a float/double/decimal/string element typed an `i64 sext` over
+        // a non-integer operand and the LLVM verifier rejected it ("SExt only
+        // operates on integer"); the user saw a malformed-IR / ICE-class
+        // diagnostic, not a clean §16.3 rejection. Reject at sema with the
+        // §16.3 message so the compiler's promise is loud instead of silent.
+        // The check fires AFTER lo/hi are visited (so we have their types) and
+        // BEFORE the RangeExpr's type is set, so the diagnostic points at the
+        // range expression and the TypeRef constructed below carries no
+        // out-of-policy element type.
         {
             TypeRef* elemTy = nullptr;
             if (re->lo)  elemTy = ctx_.exprType(*re->lo);
             if (!elemTy && re->hi) elemTy = ctx_.exprType(*re->hi);
+            if (elemTy && !isValidRangeElementType(elemTy)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, e.span.begin,
+                    std::string("a `Range<T>` value requires T to be one of "
+                                "the integer types or `char` \xe2\x80\x94 "
+                                "got `") + rangeElementTypeName(elemTy) +
+                        "` (\xc2\xa7""16.3)");
+            }
+            // fix #499 / §9.8: give the RangeExpr itself a Range-named type
+            // so that `var r := a..b` infers lsym->declType = Range (not null).
+            // The element type is inferred from lo (or hi if lo is absent);
+            // it is recorded as the first generic arg so codegen can read it
+            // back when choosing the integer width for the Range struct's
+            // lo/hi fields. A Named TypeRef with declaration =
+            // builtinClassSym("Range") and declaration->decl = nullptr is
+            // the same shape used for DateTime / TimeSpan (scalar/struct
+            // value builtins), and lowerTypeRef will recognise it by
+            // declaration->name == "Range".
             auto* rt = ctx_.makeTypeRef();
             rt->kind = TypeRef::Kind::Named;
             rt->declaration = builtinClassSym("Range");
@@ -9237,6 +9260,107 @@ void ExprTC::visitChildren(const ast::Expr& e) {
     }
     // Identifier / This / Base / TypeOf / NameOf / Default —
     // no expression children to recurse into.
+}
+
+// fix #3247 / §16.3 (v0.277): `Range<T>`'s T is restricted by the compiler
+// to the integer types (byte, sbyte, short, ushort, int, uint, long, ulong)
+// and char. `isValidRangeElementType` reads a resolved TypeRef and returns
+// true iff its kind is Primitive and its primitive value is one of those
+// eight integer primitives or `char`. A non-Primitive (class, interface,
+// string) is rejected at the same site — the intrinsic rule admits no
+// non-integer element type, so a class-typed T is also out of policy.
+//
+// The pre-empt carve-out: a Kind::Error element (a forward reference that
+// failed to resolve, or a type that the importer could not place) returns
+// **true** so the §16.3 gate does NOT fire on it — the resolution failure
+// is reported elsewhere as a different error class, and double-reporting
+// `Range<UndefinedType>` as both "unresolved type" and "`Range<T>` requires
+// T to be one of the integer types" would be a noisy false-positive. The
+// gate fires on the *resolution's* answer, not on the *resolution itself*.
+// Lives next to `visitExpr` because the two sites that read the answer
+// (the RangeExpr case in `visitExpr` and the `Range<T>` annotation in
+// `TypeResolution_Names.cpp`) both reach for the same predicate.
+bool isValidRangeElementType(const sema::TypeRef* ty) {
+    if (!ty) return true;  // pre-empt: no resolution yet — let the resolver fire
+    if (ty->kind == sema::TypeRef::Kind::Error) return true;  // pre-empt: don't double-report
+    if (ty->nullable) return false;  // §16.3: T is non-nullable
+    if (ty->kind != sema::TypeRef::Kind::Primitive) return false;
+    switch (ty->primitive) {
+        case sema::PrimitiveType::Byte:
+        case sema::PrimitiveType::SByte:
+        case sema::PrimitiveType::Short:
+        case sema::PrimitiveType::UShort:
+        case sema::PrimitiveType::Int:
+        case sema::PrimitiveType::UInt:
+        case sema::PrimitiveType::Long:
+        case sema::PrimitiveType::ULong:
+        case sema::PrimitiveType::Char:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// fix #3247 / §16.3: a one-line rendering of an element-type TypeRef for
+// the diagnostic above. The function name (e.g. `float`, `string`,
+// `MyClass`) is what the user sees in the message; the predicate's
+// admit/reject answer and the diagnostic text must agree, so the
+// predicate and the name helper live in the same translation unit.
+//
+// `rangeElementTypeName_inner` is the implementation; it lives at the same
+// namespace scope (not in an anonymous namespace) because the outer
+// `rangeElementTypeName` calls it from this same translation unit and
+// requires the unqualified name to resolve. Putting it in an anonymous
+// namespace would hide the symbol from the call site, the same bug the
+// earlier draft hit.
+std::string rangeElementTypeName_inner(const sema::TypeRef* ty);
+
+std::string rangeElementTypeName(const sema::TypeRef* ty) {
+    if (!ty) return "<unresolved>";
+    if (ty->nullable) {
+        // Range<T?> is rejected by the predicate's nullable guard; name the
+        // nullability so the message is not a silent `Range<T?>` omission.
+        return rangeElementTypeName_inner(ty) + "?";
+    }
+    return rangeElementTypeName_inner(ty);
+}
+
+std::string rangeElementTypeName_inner(const sema::TypeRef* ty) {
+    if (!ty) return "<unresolved>";
+    if (ty->kind == sema::TypeRef::Kind::Primitive) {
+        switch (ty->primitive) {
+            case sema::PrimitiveType::None:    return "<unresolved>";
+            case sema::PrimitiveType::Bool:    return "bool";
+            case sema::PrimitiveType::Char:    return "char";
+            case sema::PrimitiveType::String:  return "string";
+            case sema::PrimitiveType::Byte:    return "byte";
+            case sema::PrimitiveType::SByte:   return "sbyte";
+            case sema::PrimitiveType::Short:   return "short";
+            case sema::PrimitiveType::UShort:  return "ushort";
+            case sema::PrimitiveType::Int:     return "int";
+            case sema::PrimitiveType::UInt:    return "uint";
+            case sema::PrimitiveType::Long:    return "long";
+            case sema::PrimitiveType::ULong:   return "ulong";
+            case sema::PrimitiveType::Float:   return "float";
+            case sema::PrimitiveType::Double:  return "double";
+            case sema::PrimitiveType::Decimal: return "decimal";
+            case sema::PrimitiveType::Object:  return "Object";
+        }
+    }
+    if (ty->kind == sema::TypeRef::Kind::Named) {
+        if (ty->declaration) return std::string(ty->declaration->name);
+        if (ty->astNode && ty->astNode->name && !ty->astNode->name->parts.empty())
+            return std::string(ty->astNode->name->parts.back());
+        if (!ty->importedName.empty())
+            return std::string(ty->importedName);
+    }
+    if (ty->kind == sema::TypeRef::Kind::InlineArray) {
+        return "[N]" + rangeElementTypeName(ty->genericArgs.empty()
+                                                ? nullptr
+                                                : ty->genericArgs[0]);
+    }
+    if (ty->kind == sema::TypeRef::Kind::Error) return "<unresolved>";
+    return "<unknown>";
 }
 
 } // namespace bezel::sema
