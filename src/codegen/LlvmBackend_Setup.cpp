@@ -19641,7 +19641,58 @@ struct StringEscapeWalker {
         }
         // For each positional plain-arg, check the corresponding param. A
         // plain (no-modifier) param admits the #1430 call-bounded-borrow
-        // relaxation; `owned`/`ref`/`out`/named stay escaped.
+        // relaxation; `owned`/`ref`/named stay escaped.
+        //
+        // fix #3321 / §22.3 / §22.7 / §28.9 (v0.268): a pre-declared
+        // `out n: string` recipient at a CONSTRUCTOR call site — `new T(out n)`
+        // at a non-nullable `string` formal — is a WRITE into the recipient's
+        // slot, not an escape of the recipient. This is the constructor-call
+        // sibling of #3304's method-call relaxation; both rest on §22.3's
+        // "An implementation may pass a hidden reference" licence and the
+        // same `lowerStringRefParamStore` (#2321) balance that mints one +1
+        // into the caller's slot via the constructor's `n := <expr>` store.
+        // §22.7 inherits the §22.3 `out` semantics for constructor parameters
+        // verbatim (copy-out-on-normal-return through a hidden reference), so
+        // the analysis is identical to the method form. Without this the walk
+        // taints the recipient local ESCAPED, `stringBorrowRetainEligible_`
+        // excludes it, no scope-end release is armed, and the callee's +1
+        // leaks (39 B in 2 allocations, measured; same signature as #3304's
+        // method form and as #3305's inline-`out-var` constructor form).
+        //
+        // Mirroring #3304's gates, narrowly:
+        //   * A RESOLVED constructor (`chosen` was set above as the unique
+        //     arity-matching `sema::ConstructorSymbol`; ambiguity or unresolved
+        //     type already fell through to `walkAllEscape()` above, so the
+        //     callee premise is identical to the method variant's "resolved
+        //     MethodSymbol" gate).
+        //   * Formal modifier `out` (not `ref`, not `owned`, not plain) —
+        //     `ref` reads the caller's slot via a hidden reference and may
+        //     alias the value through field store / return / capture without
+        //     minting its own +1, so a scope-end release would dangle that
+        //     alias (UAF); `ref` is deliberately NOT admitted (same as #3304).
+        //   * Formal type non-nullable `string` — mirrors
+        //     `lowerStringRefParamStore`'s exact surface (it bails on a
+        //     nullable target), keeping a generic `out T` instantiated at
+        //     `string` OUT of scope: the specialized constructor's assignment
+        //     is typed by `T`, so whether #2321 fires there is a separate
+        //     question — leaving it to leak is the safe direction. The dual
+        //     sourcing is `ps->resolvedDeclType` (imported symbol) with the
+        //     AST `ConstructorDecl`'s declared type as fallback, mirroring
+        //     #3305's `registerCtorOutVarStringRelease` (which handles the
+        //     inline form at the same gate — see its gate-2 commentary).
+        //   * Gated on stringReleaseMode (the #1997 narrowing) — the shared
+        //     dict-materializer (#1028), grouping (#1930), borrowing-Array
+        //     (#1003), record-call-result (#1747) and value-like-choice
+        //     (#2115) walks reuse this walker with mode=false, so a plain
+        //     `out T` collection recipient stays their conservative ESCAPE
+        //     (their FFI / callee retain discipline is not asserted by any
+        //     test, leak-over-UAF is the safe default).
+        //
+        // The recipient's bind-time retain (a no-op on a literal sentinel,
+        // a real retain otherwise) and the constructor's #2321 store both
+        // touch the same slot; end-to-end the slot owns exactly one
+        // reference at scope end, which `armStringLocalRefcount`'s
+        // registered `bz_string_release` decrements. // per §22.3, §22.7, §28.9
         for (std::size_t i = 0; i < ne->args.size(); ++i) {
             const ast::CallArgument& a = ne->args[i];
             bool safeArg = false;
@@ -19650,6 +19701,35 @@ struct StringEscapeWalker {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     chosen->params[i]);
                 if (ps && ps->modifier.empty()) safeArg = true;
+            }
+            // fix #3321 / §22.3 / §22.7 / §28.9: pre-declared `out n: string`
+            // recipient at a constructor call site (constructor-call sibling
+            // of #3304). The ARGUMENT side must be `out`-modified, unnamed, and
+            // target-identified (the recipient IS the local we are about to
+            // declare scope-end-release-eligible). The FORMAL side must be
+            // `out`-modified and declared non-nullable `string` — read the
+            // FORMAL (not the recipient's substituted type) so a GENERIC
+            // `out T` instantiated at `string` stays out of scope.
+            if (!safeArg && stringReleaseMode &&
+                a.modifier == "out" && a.name.empty() &&
+                !a.isDiscard && isTargetIdent(a.value.get()) &&
+                i < chosen->params.size()) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    chosen->params[i]);
+                if (ps && ps->modifier == "out") {
+                    const sema::TypeRef* fty = ps->resolvedDeclType;
+                    if (!fty && chosen->decl) {
+                        // SEAM-ACCESSOR: AST-fallback — `chosen->decl` is null for every imported constructor (docs/proposals/imported-symbol-audit-2026-08-13.md §2), so this fires only for LOCAL constructors with unresolved `resolvedDeclType`. Mirrors #3304's parallel `walkCallArgs` site (same shape; same marker).
+                        if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(
+                                chosen->decl))
+                            if (i < cd->params.size() && cd->params[i].type)
+                                fty = ctx.resolvedType(*cd->params[i].type);
+                    }
+                    if (fty && !fty->nullable &&
+                        fty->kind == sema::TypeRef::Kind::Primitive &&
+                        fty->primitive == sema::PrimitiveType::String)
+                        safeArg = true;
+                }
             }
             expr(a.value.get(), safeArg);
         }

@@ -976,6 +976,38 @@ bool constructorIsPure(const ConstructorSymbol* cs) {
     return false;
 }
 
+// §9.2 (v0.276, fix #3326): the §9.2/§25.2 homogeneity test shared by both
+// record-eligibility walks. A `=`/`<>` operator overload is **homogeneous**
+// iff BOTH of its operands resolve to the declaring record/enum/choice type —
+// the third §9.2 disqualifier and the §25.2 co-declaration trigger both
+// key on this single fact. A **heterogeneous**-operand overload (`T = U`,
+// `T = int`, …) defines a comparison the synthesis never provided and takes
+// over nothing — §9.2 keeps the record auto-hashable, and §25.2 carries no
+// co-declaration obligation. Resolver::checkEqualityCoDeclaration
+// (TypeResolution_Checks.cpp:2274-2285) has the SAME predicate inlined for
+// its first-match scan; that site is left alone (its logic is slightly
+// different — it needs the *first* homogeneous overload's declLoc for
+// diagnostics, not just yes/no — and refactoring it is out of scope per the
+// fix's "reusing the existing helper" guidance: one helper for the two NEW
+// uses, the existing call site keeps its inline copy).
+static bool isHomogeneousEqualityOperatorOverload(const MethodSymbol* meth,
+                                                  const TypeSymbol* rec,
+                                                  const SemaContext& ctx) {
+    if (!meth || !rec) return false;
+    if (!meth->isOperator) return false;
+    if (meth->operatorToken != "=" && meth->operatorToken != "<>") return false;
+    if (meth->params.size() != 2) return false;
+    // Homogeneous iff BOTH operands resolve to the declaring type.
+    for (Symbol* psym : meth->params) {
+        auto* p = dynamic_cast<ParameterSymbol*>(psym);
+        const TypeRef* pt = (p && p->declType)
+            ? ctx.resolvedType(*p->declType) : nullptr;
+        if (!pt || pt->kind != TypeRef::Kind::Named ||
+            pt->declaration != rec) { return false; }
+    }
+    return true;
+}
+
 // §9.3 (v0.158, #1383): forward declaration for mutual recursion with
 // isAdmissibleComponentType — a positional field's type calls
 // isAdmissibleComponentType recursively, which in turn calls this function
@@ -1368,10 +1400,15 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
         }
         if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
             // A manually-declared equality member suppresses the auto package
-            // (§9.2): an `Equals`/`GetHashCode` method, or an `=`/`<>` operator
-            // overload.
+            // (§9.2): an `Equals`/`GetHashCode` method, or a *homogeneous*
+            // `=`/`<>` operator overload (§9.2 v0.276, fix #3326). A
+            // heterogeneous-operand `=`/`<>` overload (`T = U`) defines a
+            // comparison the synthesis never provided and takes over
+            // nothing — neither qualifies nor disqualifies, exactly as
+            // §25.2 frees it from the co-declaration obligation for the
+            // same reason.
             if (meth->isOperator) {
-                if (meth->operatorToken == "=" || meth->operatorToken == "<>")
+                if (isHomogeneousEqualityOperatorOverload(meth, rec, ctx))
                     return false;
                 continue;  // any other operator overload is fine (§9.2)
             }
@@ -1452,8 +1489,13 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
         if (dynamic_cast<const PropertySymbol*>(m)) continue;
         if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
             if (meth->isOperator) {
-                // User `=`/`<>` operator: opts the record out of auto-equality.
-                if (meth->operatorToken == "=" || meth->operatorToken == "<>")
+                // §9.2 v0.276 (fix #3326): only a HOMOGENEOUS `=`/`<>`
+                // operator overload opts the record out of auto-equality —
+                // a heterogeneous-operand overload (`T = U`) defines a
+                // comparison the synthesis never provided and takes over
+                // nothing. See isAutoEqualityBearingBodyRecord above for
+                // the same predicate.
+                if (isHomogeneousEqualityOperatorOverload(meth, rec, ctx))
                     return false;
                 continue;  // other operator overloads are benign
             }
@@ -1486,6 +1528,14 @@ bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
 // it remains a compile error (#1249).  The `.Equals`/`.GetHashCode` call path
 // is separately gated: lookupMember finds the user method and dispatches
 // directly, so that path does not reach this function.
+//
+// §9.2 v0.276 (fix #3326, see isHomogeneousEqualityOperatorOverload above):
+// for a heterogeneous-only overload (`T = U`) this function returns true but
+// the record is ALSO auto-hashable (§9.2 v0.276 keeps it); the callers
+// (isEqualityBearing, checkEqualityMemberUseSite) OR this predicate with the
+// auto-hashable one, so the verdict is unchanged. The narrower "user took
+// over equality" reading would require threading a SemaContext through this
+// function's signature — out of scope per the fix's minimal-touch posture.
 bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
     if (!rec) return false;
     for (const Symbol* m : rec->members) {
@@ -1525,12 +1575,19 @@ bool recordHasUserDeclaredEquality(const TypeSymbol* rec) {
 // does not carry over to choices — choices have no user constructors or
 // instance fields, so all equality-relevant storage IS the case payload fields.
 // Methods/computed properties declared in the choice body (§35.2) are by
-// §35.7 ruled like §9.2: they do not disqualify (a `=`/`<>` overload, an
-// `Equals`/`GetHashCode` override, would; but the choice surface is so
-// constrained that this is a non-issue in practice — flagged in case a future
-// admission widens it). The conservative mirror of the §9.2 record rule
-// dispatches on the body member list, but the result is identical for a
-// legal choice (every body member is benign).
+// §35.7 ruled like §9.2: they do not disqualify. The single body-member
+// disqualifier is a homogeneous `=`/`<>` overload (§35.7, v0.276, #3333) —
+// it strips the auto-hashable property exactly as it strips it on a record
+// (§9.2 third-bullet, fix #3326). The rescue is §25.2's co-declaration rule,
+// consulted via `choiceHasUserDeclaredEquality` from `isEqualityBearing` and
+// the use-site checks in ExprTypecheck — a value-like choice that declares
+// `=`/`<>` WITH the co-declared `Equals(T)`/`GetHashCode` is hashable, not
+// auto-hashable.
+//
+// Pre-#3333, this predicate never scanned body members and treated every
+// value-like choice with admissible payloads as auto-hashable — the
+// "non-issue in practice" note from the previous revision. v0.276 widens the
+// ruling to choices; this is that widening.
 bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
                                  const SemaContext& ctx,
                                  const TypeRef* inst) {
@@ -1556,6 +1613,23 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
     if (!verdict) return true;
     if (*verdict != common::ChoiceClassification::ValueLike)
         return false;
+    // §35.7 (v0.276, #3333): a homogeneous `=`/`<>` overload on the choice
+    // body disqualifies the choice from auto-hashable, mirroring §9.2's
+    // record rule (fix #3326). The author has taken over equality; the
+    // synthesized `=`/`<>`/`.Equals`/`.GetHashCode` are no longer present.
+    // The §25.2 co-declaration rule supplies the equality surface — see
+    // choiceHasUserDeclaredEquality below. Payload admissibility is not
+    // consulted on this branch: the overload's presence is the disqualifier,
+    // payload contents irrelevant (and a co-declaring author may have chosen
+    // payloads on that basis). Walk body members, NOT case symbols — choice
+    // cases are not member symbols, the overload rides on the choice body.
+    for (const Symbol* m : ch->members) {
+        if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
+            if (meth->isOperator &&
+                isHomogeneousEqualityOperatorOverload(meth, ch, ctx))
+                return false;
+        }
+    }
     // fix #3144 (family F9 of umbrella #3152): the payload walk is SYMBOL-side.
     // It read `dynamic_cast<const ast::TypeDecl*>(ch->decl)` and returned
     // `true` when that was null — which it is for EVERY imported choice — so an
@@ -1587,6 +1661,86 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
         }
     }
     return true;
+}
+
+// §3.6 / §35.7 (v0.276, #3333): the choice twin of
+// recordHasUserDeclaredEquality. Returns true iff the choice carries a
+// HOMOGENEOUS `=`/`<>` overload AND the §25.2 co-declared `Equals(T)` +
+// `GetHashCode` pair — i.e. the user has discharged the §25.2 obligation
+// for taking over equality. Per §3.6's hashable row, a choice with that
+// surface is **hashable** (v0.276 widened the row to choices; pre-#3333 the
+// choice arm OR'd nothing and a non-auto-hashable choice was unrescuable).
+//
+// Gate: applies ONLY to value-like choices. An owning or borrow-bearing
+// choice with the co-declared pair is NOT hashable (§3.6: "owning and
+// borrow-bearing choices are not hashable"; §35.7's rescue clause
+// contemplates the operators on every classification but the §3.6 hashable
+// row narrows the rescue to value-like — the only path through which
+// equality is meaningful, since non-value-like choices carry no value
+// equality contract).
+//
+// Imported choices (no local AST — classifyChoiceType returns nullopt) are
+// conservatively treated as NOT having user-declared equality: matching
+// isAutoEqualityBearingChoice's conservative-ACCEPT posture on the
+// opposite side. Per-instantiation discipline (the §28.1 erasure of `owned`
+// payload markers) re-checks concrete generic arguments at each
+// instantiation, exactly as in isAutoEqualityBearingChoice.
+//
+// v0.276 fix #3333: this predicate did not exist before this revision.
+// Before, the choice arm of isEqualityBearing was `return
+// isAutoEqualityBearingChoice(...)` with no OR clause — a non-auto-
+// hashable choice could not be hashable, and the spec's rescue clause was
+// structurally unreachable. The implementation gate at #3333 flagged this
+// defect class (#3144/#3152 family F9's cousin — empty-source predicate
+// silently mis-answers).
+bool choiceHasUserDeclaredEquality(const TypeSymbol* ch,
+                                   const SemaContext& ctx,
+                                   const TypeRef* inst) {
+    if (!ch || ch->kind != ast::TypeDeclKind::Choice) return false;
+    // §3.6 hashable row: gate on ValueLike. Same type-ref setup as
+    // isAutoEqualityBearingChoice so the §28.1 per-instantiation erasure
+    // of `owned` payload markers applies — a `Result<int, string>`
+    // instantiation classifies value-like (markers erase over int/string)
+    // and reaches the body-member scan, while `Result<Connection, string>`
+    // classifies owning and short-circuits to false.
+    TypeRef bare;
+    const TypeRef* rt = inst;
+    if (!rt || rt->kind != TypeRef::Kind::Named || rt->declaration != ch) {
+        bare.kind = TypeRef::Kind::Named;
+        bare.declaration = const_cast<TypeSymbol*>(ch);
+        rt = &bare;
+    }
+    auto verdict = common::classifyChoiceType(rt, ctx);
+    if (!verdict) return false;  // imported — conservative REJECT (mirrors
+                                  // isAutoEqualityBearingChoice's ACCEPT on
+                                  // the opposite half — never rule in or out
+                                  // a type we cannot inspect for the
+                                  // opposing claim).
+    if (*verdict != common::ChoiceClassification::ValueLike)
+        return false;  // owning / borrow-bearing — not hashable per §3.6
+    // Body-member scan — mirror of recordHasUserDeclaredEquality's
+    // predicate, with the §25.2 pair added. The homogeneous-only `=`/`<>`
+    // gate uses isHomogeneousEqualityOperatorOverload so a heterogeneous-
+    // operand overload (`T = U`) does NOT trip the disqualifier (mirror
+    // of fix #3326's record rule). Equals(T) and GetHashCode are the
+    // enum spelling — §35.2 carries §10.5's plain-member replacement rule
+    // over to choices, so `Equals`/`GetHashCode` carry no `override`
+    // modifier.
+    bool hasEquals = false, hasGetHashCode = false, hasHomoOp = false;
+    for (const Symbol* m : ch->members) {
+        if (auto* meth = dynamic_cast<const MethodSymbol*>(m)) {
+            if (meth->isOperator &&
+                isHomogeneousEqualityOperatorOverload(meth, ch, ctx))
+                hasHomoOp = true;
+            else if (!meth->isOperator && meth->name == "Equals" &&
+                     meth->params.size() == 1)
+                hasEquals = true;
+            else if (!meth->isOperator && meth->name == "GetHashCode" &&
+                     meth->params.empty())
+                hasGetHashCode = true;
+        }
+    }
+    return hasHomoOp && hasEquals && hasGetHashCode;
 }
 
 // §3.6 / §8.3 (v0.158, #1338): see Symbol.hpp. A type is hashable unless
@@ -1634,10 +1788,21 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
     // primitive, string, class, interface, function, enum, or inline array is
     // hashable (the `return true` fall-through applies).
     if (ts->kind == ast::TypeDeclKind::Choice)
+        // §3.6 / §35.7 (v0.276, #3333): a choice is hashable iff it is
+        // auto-hashable OR carries the §25.2 co-declared equality surface
+        // (a value-like choice with homogeneous `=`/`<>` overload AND
+        // `Equals(T)`/`GetHashCode`). Pre-#3333 the choice arm OR'd
+        // nothing — a non-auto-hashable choice was unrescuable, the exact
+        // defect the v0.276 spec ruling records against the pre-ruling
+        // implementation. The two predicates are mutually exclusive on
+        // legal input (a choice with `=`/`<>` + Equals/GetHashCode fails
+        // isAutoEqualityBearingChoice's overload scan), so the OR is
+        // exact — no risk of a double-counted verdict.
         // #2047: pass `ty` (the instantiation, with genericArgs) so a generic
         // choice is judged at its instantiation (`Result<int, string>` is
         // auto-hashable; its `owned` markers erase per §28.1).
-        return isAutoEqualityBearingChoice(ts, ctx, ty);
+        return isAutoEqualityBearingChoice(ts, ctx, ty) ||
+               choiceHasUserDeclaredEquality(ts, ctx, ty);
     return true;  // class (reference identity), interface, enum — all bear
                   // consistent Equals/GetHashCode.
 }

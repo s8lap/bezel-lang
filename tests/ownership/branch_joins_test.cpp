@@ -7,11 +7,13 @@
 //   - PolyNull ⊓ X          = X  (PolyNull absorbs into either side)
 //   - Owned ⊓ Borrowed      = ERROR (per the spec's asymmetric join)
 
+#include "support/aot_support.hpp"  // runAotChecked — AOT + LSan oracle
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
 using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -30,7 +32,49 @@ std::string wrap(const std::string& body) {
         ) + body + " end M; end C;";
 }
 
+// §28.3 Pattern 2 / K3.14, v0.277: an uninitialized plain local adopts Owned from
+// both branches, and must warn+auto-drop rather than hard-error. The destructor's
+// marker makes the AOT/LSan test verify one disposal and no double-free.
+const char* kNoInitializerOwnedJoin =
+    "module M; "
+    "class Res : IDisposable "
+    "  public Id: int; "
+    "  public constructor(id: int) Id := id; end constructor; "
+    "  destructor Console.WriteLine(\"D\" + Id.ToString()); end destructor; "
+    "end Res; "
+    "class W "
+    "  public static method Main(): int "
+    "    var cond := true; "
+    "    var x: Res; "
+    "    if cond then x := new Res(1); else x := new Res(2); end; "
+    "    Console.WriteLine(\"body\"); "
+    "    return 0; "
+    "  end Main; "
+    "end W;";
+
 } // namespace
+
+BEZEL_TEST(own_join, no_initializer_owned_join_warns_and_autodrops_spec_28_3) {
+    auto r = runAotChecked(kNoInitializerOwnedJoin);
+    bool skipped = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("SKIP") != std::string::npos) skipped = true;
+    if (skipped) return;  // ASan/LSan toolchain unavailable — skip
+
+    // Before #3317 this valid program was rejected by the no-initializer
+    // exclusion in localDropOnOverwriteCovered; now it compiles and runs
+    // with exactly one destructor marker under LSan. (The K3.14
+    // "implicitly disposed at the end of its scope" warning fires on
+    // stderr but runAotChecked's diagnostics bag carries only errors;
+    // the warning-text check lives in the parseAndCheckOwnership sibling
+    // test below, and LSan is the canonical double-free oracle here.)
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText.find("D1") != std::string::npos, true);
+    BEZEL_EXPECT_EQ(r.stdoutText.find("D2") != std::string::npos, false);
+    BEZEL_EXPECT_EQ(r.stdoutText.find("D3") != std::string::npos, false);
+}
 
 BEZEL_TEST(own_join, owned_vs_borrowed_at_merge_diagnosed) {
     auto r = parseAndCheckOwnership(wrap(
@@ -48,10 +92,16 @@ BEZEL_TEST(own_join, owned_on_both_branches_carries_obligation) {
         "if cond then x := new Stream(); "
         "else x := new Stream(); "
         "end;"));
-    // Both branches produce owned → joined as Owned with obligation.
-    // No discharge after the merge → diagnostic.
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "would be dropped here without disposal"));
+    // Both branches produce owned → the no-initializer declaration adopts
+    // Owned and §28.3 K3.14 emits a warning plus scope-end auto-drop.
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    bool warned = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Warning &&
+            d.message.find("implicitly disposed at the end of its scope") !=
+                std::string::npos)
+            warned = true;
+    BEZEL_EXPECT_TRUE(warned);
 }
 
 BEZEL_TEST(own_join, owned_on_both_branches_and_discharged_clean) {

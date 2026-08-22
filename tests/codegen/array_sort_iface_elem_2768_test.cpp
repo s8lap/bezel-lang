@@ -86,7 +86,14 @@ bool rejectsWith(const std::string& program, const std::string& needle) {
         if (d.message.find(needle) != std::string::npos) return true;
     return false;
 }
-const char* kSortNeedle = "requires T to implement";
+// ⚠ UPDATED BY #3329 / proposal 0116 §3 D2 (spec §14.2, stdlib §4.4,
+// v0.276).  The pre-fix needle was `"requires T to implement"` — the
+// message body now uses §14.2's constraint syntax (`T: IComparable<T>`)
+// and names the substituted type in the receiver position, so the
+// needle matches the new wording.  The shape of the rejection
+// (any diagnostic at all) is unchanged; what changes is the wording
+// carried by the message.
+const char* kSortNeedle = "requires T: IComparable<T>";
 
 // `interface IFoo: IComparable<IFoo>` — the §14.2 rule-3 shape, with the
 // self-recurrence stdlib §4.4's `where T: IComparable<T>` requires.
@@ -387,7 +394,14 @@ BEZEL_TEST(array_sort_iface_elem_2768,
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     bool sawSortedConstraint = false;
     for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("Sorted() requires T to implement IComparable<T>") !=
+        // ⚠ UPDATED BY #3329 / proposal 0116 §3 D2 (spec §14.2, stdlib
+        // §4.4, v0.276).  The pre-fix needle was
+        // `"Sorted() requires T to implement IComparable<T>"` — the new
+        // message body uses §14.2's constraint syntax
+        // (`T: IComparable<T>`) and names the substituted type
+        // (`I<string>`) in the reason.  The needle is tightened to the
+        // shape that uniquely identifies THIS site's contribution.
+        if (d.message.find("Sorted() requires T: IComparable<T>") !=
             std::string::npos)
             sawSortedConstraint = true;
     BEZEL_EXPECT_TRUE(sawSortedConstraint);

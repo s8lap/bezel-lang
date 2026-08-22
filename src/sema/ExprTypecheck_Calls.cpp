@@ -5504,22 +5504,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                 m == "ToSet" ? "Set" : "Array",
                                 recvTy->genericArgs[0]));
-                        // stdlib §3 / #472: Array<T>.Reversed() and
-                        // Array<T>.Sorted() / Array<T>.Sorted(comparer) —
-                        // value-returning copy-forms (past-participle convention).
-                        // Return type: owned Array<T> (same element type as receiver).
-                        // Only on Array<T> (not OwningArray<T>); OwningArray has unique
-                        // ownership semantics that make copying its elements unsound.
-                        // Sorted() without a comparer requires T: IComparable<T> —
-                        // we check here that T is int or string (the concrete types
-                        // implementing IComparable<T> in this milestone); all other
-                        // element types require the explicit-comparer form.
+                        // stdlib §3 / #472: Array<T>.Reversed() (and Array<T>.Sorted()
+                        // / Array<T>.Sorted(comparer)) — value-returning copy-forms
+                        // (past-participle convention). Return type: owned Array<T>
+                        // (same element type as receiver). Only on Array<T> (not
+                        // OwningArray<T>); OwningArray has unique ownership semantics
+                        // that make copying its elements unsound. Sorted() without a
+                        // comparer requires T: IComparable<T> — we check here that T
+                        // is int or string (the concrete types implementing
+                        // IComparable<T> in this milestone); all other element types
+                        // require the explicit-comparer form. (The Sort() / Sorted()
+                        // gate below this comment is widened to OwningArray<T>.Sort()
+                        // by #3325 — the `Reversed` arm above is Array-only by
+                        // design, and the `Sorted` arm keeps the Array-only prefix
+                        // because `Reversed`/`Sorted` are rejected on OwningArray by
+                        // the ownership-cannot-copy rejection further below.)
                         else if (colName == "Array" && !recvTy->genericArgs.empty() &&
                                  m == "Reversed" && ce.args.empty()) {
                             ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                 "Array", recvTy->genericArgs[0]));
-                        } else if (colName == "Array" && !recvTy->genericArgs.empty() &&
-                                   (m == "Sorted" || m == "Sort") &&
+                        } else if ((colName == "Array" || colName == "OwningArray") &&
+                                   !recvTy->genericArgs.empty() &&
+                                   (m == "Sort" ||
+                                    (colName == "Array" && m == "Sorted")) &&
                                    ce.args.empty()) {
                             // fix #2790 (stdlib §4.4, spec §14.2, v0.240): the
                             // PARAMETERLESS `Sort()` reached this branch under
@@ -5535,6 +5542,29 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // constraint, so both take the same gate; only the
                             // RESULT TYPE differs (Sorted() yields a new Array,
                             // Sort() is in place), which is handled below.
+                            //
+                            // fix #3325 (stdlib §4.5, spec §14.2, v0.276): the
+                            // OWNING side of #2790's defect. `OwningArray<T>`
+                            // declares its own parameterless `Sort()` (stdlib
+                            // §4.5, v0.276) carrying the same `T: IComparable<T>`
+                            // constraint, but the gate at #2790 was made inside
+                            // the `colName == "Array"` arm and never carried
+                            // over. The three sema sites that admit `Sort` on an
+                            // owning receiver (the §22.5 owning-container allow-
+                            // list, the explicit `OwningArray` name in the
+                            // result-typing arm, and the codegen arm keyed only
+                            // on name+arity) all let it through, so an
+                            // `OwningArray<Plain>.Sort()` for a `Plain` with
+                            // no `CompareTo` reached codegen and silently
+                            // `strcmp`'d each element's vtable pointer as a
+                            // `char*` — the same unbounded read #2768 fixed on
+                            // the borrowing side. The widened conjunct above
+                            // admits `OwningArray<T>.Sort()` to this gate but
+                            // NOT `OwningArray<T>.Sorted()` — that copy-form's
+                            // `Reversed`/`Sorted` rejection at line 5694 below
+                            // stays the authority for the copy-form, since the
+                            // reason `Sorted()` is absent on the owning side is
+                            // ownership (§28.3), not element comparability.
                             // Constraint check: T must be IComparable<T>.  Accepts:
                             // (a) built-in primitive comparable types (int, string,
                             //     long, byte, double, float, char — §9.x);
@@ -5625,14 +5655,33 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // overload — suggesting `Sorted(comparer)` to
                                 // someone who called `Sort()` sends them to a
                                 // different operation (a copy, not in place).
+// fix #3325 (W1B on top of W1D #3329's D2
+                                // diagnostic contract): parameterize on BOTH the
+                                // receiver name (`Array` or `OwningArray`) AND
+                                // the stdlib section that declares the member
+                                // (§4.4 for `Array<T>`, §4.5 for
+                                // `OwningArray<T>`). Element name via the
+                                // file-local `typeNameForDiag` (line 43) so the
+                                // message names the failing type and its
+                                // `IComparable<>` substitution concretely.
+                                const std::string elemName =
+                                    typeNameForDiag(elemTy472);
+                                const std::string stdlibSection =
+                                    (colName == "OwningArray")
+                                        ? "stdlib §4.5"
+                                        : "stdlib §4.4";
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
-                                    "Array<T>." + std::string(m) +
-                                    "() requires T to implement "
-                                    "IComparable<T> (§3 / #472); T is not a "
-                                    "built-in comparable type. "
-                                    "Use " + std::string(m) +
-                                    "(comparer: (T, T) -> int) instead.");
+                                    std::string(colName) + "<" + elemName +
+                                    ">." + std::string(m) +
+                                    "() requires T: IComparable<T> "
+                                    "(spec §14.2, " + stdlibSection +
+                                    ", v0.276); " +
+                                    elemName + " does not implement " +
+                                    "IComparable<" + elemName + ">. Use " +
+                                    std::string(m) +
+                                    "(comparer: (" + elemName + ", " +
+                                    elemName + ") -> int) instead.");
                             } else if (m == "Sorted") {
                                 ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                     "Array", recvTy->genericArgs[0]));
@@ -18718,17 +18767,30 @@ void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
                 " form.");
         }
     } else if (targetType->kind == ast::TypeDeclKind::Choice) {
-        // §35.7 (v0.200, #2045; v0.226, #2110): a choice rejects direct
-        // `.Equals(...)`/`.GetHashCode()` at the call site when it is NOT
-        // auto-hashable — any borrow-bearing or owning choice, AND any
-        // value-like choice whose case payload fails the §9.2 admissible-
-        // component rule. Mirrors the record gate above (and `=`/`<>`,
-        // isEqualityBearing §3.6, `where T: hashable` §14.2,
-        // checkHashContainerKeys — same predicate).
+        // §35.7 (v0.200, #2045; v0.226, #2110; v0.276, #3333): a choice
+        // rejects direct `.Equals(...)`/`.GetHashCode()` at the call site
+        // when it is NOT auto-hashable — any borrow-bearing or owning choice,
+        // AND any value-like choice whose case payload fails the §9.2
+        // admissible-component rule, AND — v0.276 — any value-like choice
+        // carrying a homogeneous `=`/`<>` overload. Mirrors the record
+        // gate above (and `=`/`<>`, isEqualityBearing §3.6, `where T:
+        // hashable` §14.2, checkHashContainerKeys — same predicate set).
+        // §35.7's rescue clause: the §25.2 co-declared `Equals(T)`/
+        // `GetHashCode` pair is the user-declared equality surface and
+        // makes the direct `.Equals(...)`/`.GetHashCode()` calls legal on
+        // a value-like choice with a homogeneous overload. v0.276 #3333
+        // wires the rescue through choiceHasUserDeclaredEquality.
         sema::TypeRef rt;
         rt.kind = sema::TypeRef::Kind::Named;
         rt.declaration = targetType;
-        if (!isAutoEqualityBearingChoice(targetType, ctx_, &rt)) {
+        // §35.7 / §3.6 (v0.276, #3333): the rescue clause — a value-like
+        // choice with the §25.2 co-declared pair is hashable, so direct
+        // `.Equals(...)`/`.GetHashCode()` are legal (they dispatch to the
+        // user's members). The OR mirrors the record gate above: `isEq ||
+        // userDeclared`. Pre-#3333 the choice arm OR'd nothing and a
+        // non-auto-hashable choice rejected even with the rescue in place.
+        if (!isAutoEqualityBearingChoice(targetType, ctx_, &rt) &&
+            !choiceHasUserDeclaredEquality(targetType, ctx_, &rt)) {
             auto verdict = common::classifyChoiceType(&rt, ctx_);
             std::string reason;
             if (verdict &&

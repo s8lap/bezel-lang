@@ -467,6 +467,33 @@ private:
     // predicate the direct check asks (degenerateAsTargetReason).
     void checkAsTargetInstantiations();
 
+    // §22.12 rule 3/4 (v0.262, #3272): classify a concrete substitution at
+    // the instantiation site for a `static readonly` bare-parameter
+    // declaration, emitting the diagnostic per §3.6 rule 2's pattern. The
+    // dispatch is rule 3 (immutable content → silent), rule 4 (class-typed
+    // warning, suppressed for the warning-suppression set), and the
+    // residual paragraph's per-instantiation cases (interface / function →
+    // warning explicitly; owning-choice → rejection; owning-inline-array
+    // → warning). Method rather than free function because it needs
+    // Resolver's diagnostic stream (the ctx_ member is private).
+    void classifyStaticReadonlySubstitution(
+        const TypeRef* rt, std::string_view paramName,
+        std::string_view memberName, bool isField,
+        SourceLocation declLoc, std::string_view enclosingTypeName);
+
+    // §22.12 rule 3/4 (v0.262, #3272): pass 2 for the `static readonly`
+    // bare-parameter classification. The declaration-site check in
+    // checkTypeStaticFieldDomains records each static readonly field/
+    // auto-property whose declared type is a bare parameter of the
+    // enclosing TYPE; this walks the recorded instantiations and applies
+    // rule 3 (immutable content → clean), rule 4 (class type → warning,
+    // suppressed for the suppression set), or the residual paragraph's
+    // per-instantiation cases (interface, function, borrow-bearing record,
+    // holds-borrows choice, owning choice → rejection, owning-inline-array
+    // → default warning). The diagnostic lands at the instantiation site
+    // per §3.6 rule 2.
+    void checkStaticReadonlyBareTInstantiations();
+
     void checkStaticClassMember(TypeSymbol* t, Symbol* m);
 
     // Slice S14: within one type, two members that aren't both
@@ -1026,6 +1053,38 @@ private:
     // TYPE; a no-op otherwise. Called from resolveTypesInExpr's TypeTestExpr
     // arm, where `t` has just been resolved.
     void recordAsTargetSite(const ast::Type& t, SourceLocation loc);
+
+    // §22.12 rule 3/4 (v0.262, #3272): a `static readonly` field or
+    // auto-property declared at a bare generic parameter of the enclosing
+    // type (`T`, `T?`) is admitted at the declaration (no classification is
+    // decidable there) and classified per instantiation, after substitution.
+    // Recorded during checkTypeStaticFieldDomains(), validated by
+    // checkStaticReadonlyBareTInstantiations() at the end of `run()`, when
+    // every instantiation has been recorded.
+    //
+    // Modelled on AsTargetSite (#2911) and OwningElementSite (#2713) — the
+    // existing per-instantiation precedents beside it. `paramName` keys the
+    // substitution the per-instantiation pass walks; `enclosingType` is the
+    // body whose instantiations_ it walks; `memberKind` discriminates field
+    // from auto-property only for the diagnostic message — the rule is the
+    // same.
+    struct StaticReadonlyBareTSite {
+        std::string_view paramName;           // the bare parameter, e.g. "T"
+        std::string_view memberName;          // the field/property name
+        bool isField;                         // field vs auto-property
+        SourceLocation declLoc;               // the field/property declaration
+        TypeSymbol* enclosingType = nullptr;  // the generic body it sits in
+    };
+    std::vector<StaticReadonlyBareTSite> staticReadonlyBareTSites_;
+
+    // Record a `static readonly` field/auto-property whose declared type is
+    // a bare parameter of the enclosing TYPE. The per-instantiation pass
+    // consumed this list at the end of `run()`.
+    void recordStaticReadonlyBareTSite(std::string_view paramName,
+                                       std::string_view memberName,
+                                       bool isField,
+                                       SourceLocation declLoc,
+                                       TypeSymbol* enclosingType);
 
     // §14.2: record deferred obligations for an inner instantiation whose
     // argument `argAst` is a generic parameter of the type currently being

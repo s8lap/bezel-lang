@@ -1239,6 +1239,26 @@ bool isAutoEqualityBearingChoice(const TypeSymbol* ch,
 // from the §9.2 non-auto-equality compile error. Returns false for null.
 bool recordHasUserDeclaredEquality(const TypeSymbol* rec);
 
+// §3.6 / §35.7 (v0.276, #3333): does this choice declare its own equality
+// surface — a HOMOGENEOUS `=`/`<>` overload alongside the §25.2 co-declared
+// `Equals(T)`/`GetHashCode` pair? When yes, the choice is **hashable** even
+// though `isAutoEqualityBearingChoice` returns false (the §35.7 disqualifier
+// fired). The rescue applies ONLY to value-like choices: per §3.6's hashable
+// row "a choice that is neither value-like auto-hashable nor declares user
+// equality (§35.7 — owning and borrow-bearing choices are not hashable; a
+// value-like choice outside auto-hashable **only** because it carries a
+// homogeneous `=`/`<>` overload is hashable on the strength of the
+// `Equals(T)`/`GetHashCode` §25.2's co-declaration rule obliges beside it,
+// v0.276)". An owning or borrow-bearing choice with the co-declared pair is
+// still NOT hashable.
+//
+// `inst` is the concrete instantiation TypeRef (with genericArgs) when known
+// — the §28.1 per-instantiation erasure of `owned` payload markers applies
+// to the classification check, exactly as in isAutoEqualityBearingChoice.
+bool choiceHasUserDeclaredEquality(const TypeSymbol* ch,
+                                   const SemaContext& ctx,
+                                   const TypeRef* inst = nullptr);
+
 // §3.6 / §8.3 (v0.158, #1338): the **hashable** derived type property —
 // the classification a hash-container key/element must satisfy (`Dictionary<K,V>`
 // / `OwningDictionary<K,V>` keys, `Set<T>` / `OwningSet<T>` elements). Per §3.6's

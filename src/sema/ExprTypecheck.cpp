@@ -1835,16 +1835,22 @@ void ExprTC::checkCaseExhaustiveness(const ast::CaseExpr& ce, TypeRef* scrutTy) 
 
 // §19.6 / §35.6: the shared exhaustiveness VERDICT — returns true iff `arms`
 // provably cover every value of the scrutinee (the spec-listed shapes: an
-// unguarded `_`/untyped-`var x` catch-all, a total `..` range, a covering typed
-// binding, and enum / bool / choice / `closed`-hierarchy coverage,
-// each in its nullable variant). Reused by BOTH the expression-position warning
-// (checkCaseExhaustiveness, quiet=false — emits the §19.6 warning and runs the
-// §5.1 pattern-range side-check exactly as before) and the statement-position
-// totality analysis (stmtAlwaysExits, quiet=true — §21.7 / #2129: a case
-// STATEMENT whose arms are exhaustive AND all diverge returns on every path,
-// because an unmatched value in statement position falls through (§19.6) rather
-// than raising, so only exhaustiveness closes the fall-through edge). In quiet
-// mode no diagnostic is emitted and the range side-check is skipped (the
+// unguarded `_`/untyped-`var x` catch-all, a covering typed binding, and
+// enum / bool / choice / `closed`-hierarchy coverage, each in its nullable
+// variant). A bare `..` range pattern does NOT discharge exhaustiveness on
+// its own: §19.6's list of what proves exhaustiveness is closed, and §19.3
+// (v0.273) makes that explicit — "`_` is the idiomatic spelling of an arm
+// that matches everything (§19.6 counts `_` and an untyped `var x`, not
+// `..`, toward a static exhaustiveness proof)." #3319.
+//
+// Reused by BOTH the expression-position warning (checkCaseExhaustiveness,
+// quiet=false — emits the §19.6 warning and runs the §5.1 pattern-range
+// side-check exactly as before) and the statement-position totality analysis
+// (stmtAlwaysExits, quiet=true — §21.7 / #2129: a case STATEMENT whose arms
+// are exhaustive AND all diverge returns on every path, because an unmatched
+// value in statement position falls through (§19.6) rather than raising, so
+// only exhaustiveness closes the fall-through edge). In quiet mode no
+// diagnostic is emitted and the range side-check is skipped (the
 // statement-position caller already ran it — re-running would double-report).
 bool ExprTC::caseArmsExhaustive(
     const std::vector<ast::CaseArm>& arms, const ast::Expr* scrutinee,
@@ -1873,28 +1879,6 @@ bool ExprTC::caseArmsExhaustive(
     // case is non-exhaustive regardless of the non-null coverage below.
     bool nullableUncovered =
         scrutTy && scrutTy->nullable && !armsCoverNull(arms);
-
-    // §19.3 / §19.5 / §19.6 (#1472): a bare `..` RangePattern (no lo/hi/step,
-    // grammar A.7) is vacuously satisfied by every value in the value domain,
-    // so an unguarded `..` arm covers all NON-NULL values — but a range pattern
-    // never matches null (§19.5: null is matched only by `null`/untyped `var
-    // x`/`_`). For a non-nullable scrutinee this is a total catch-all
-    // (exhaustive); for a nullable scrutinee the non-null domain is covered but
-    // `null` still needs its own arm (§19.6 nullable rule). Mirrors the
-    // typed-binding-covers-the-full-type logic below. Without this a valid
-    // total `..` case drew a spurious non-exhaustiveness warning.
-    for (const auto& arm : arms) {
-        if (arm.guard) continue;
-        auto* rp = dynamic_cast<const ast::RangePattern*>(arm.pattern.get());
-        if (!rp) continue;
-        auto* re = dynamic_cast<const ast::RangeExpr*>(rp->rangeExpr.get());
-        if (re && !re->lo && !re->hi && !re->step) {
-            if (!nullableUncovered) return true;  // total over the value domain
-            warn("the nullable scrutinee's non-null values are covered by a "
-                 "`..` range pattern, but `null` is not");
-            return false;
-        }
-    }
 
     // §19.5 / §19.6 (#784): an unguarded typed-binding arm `var n: T` matches
     // ALL non-null values (§19.5 — "a typed binding pattern `var n: T` matches
@@ -4444,6 +4428,73 @@ void ExprTC::typeCase(const ast::CaseExpr& cse, const ast::Expr& e) {
     if (haveValueArm && common) ctx_.setExprType(&e, common);
 }
 
+// §22.8 / §23.1 (v0.270, #3299/#3316): per-instance narrowing of the
+// readonly assignable context. Returns true iff the chain rooted at
+// `target`'s base is `this` — either the explicit spelling
+// `this.F := e` / `this[i].F := e` / `this!.F := e` (the chain walks
+// `MemberAccessExpr`/`IndexExpr`/`PostfixBangExpr` to its base, then
+// finds `IdentifierExpr("this")`) or the bare-in-scope spelling that
+// resolves to `this`'s storage (`F := e` where `F` is a `FieldSymbol`
+// or `PropertySymbol` of `currentType_`).
+//
+// The pre-fix code used a bare `if (inConstructor_) return;` at four
+// sites (the `:=`-target field and ref/out field/property operand
+// checks) and let any constructor body write any other instance's
+// readonly field — a per-type carve-out that falsifies §7.4's narrowing
+// licence ("no writer on any path, through any alias" outside the
+// construction window). The pre-fix `checkLValueChainNotCallBased`
+// helper has the same chain-walk shape; this one adds the
+// bare-implicit-this spelling check (a bare `_f := e` resolves to a
+// FieldSymbol or PropertySymbol of currentType_, which
+// `checkLValueChainNotCallBased` does not distinguish from any other
+// base).
+//
+// Static readonly carve-outs are NOT narrowed by this helper — the
+// per-instance ruling does not reach them, and v0.270 records the
+// "instance constructor may assign a `static readonly` field" case as
+// open. The four call sites handle the static-vs-instance split
+// themselves (`isStatic ? inConstructor_ : inConstructor_ && thisRooted`).
+bool ExprTC::isThisRootedLValueTarget(const ast::Expr& target) const {
+    // Walk the lvalue chain (MemberAccessExpr / IndexExpr /
+    // PostfixBangExpr) to find the chain's base — same shape as
+    // checkLValueChainNotCallBased above.
+    const ast::Expr* e = &target;
+    for (;;) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            e = ma->target.get();
+        } else if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            e = ix->target.get();
+        } else if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            e = pb->operand.get();
+        } else {
+            break;
+        }
+        if (!e) return false;
+    }
+    // The base must be an IdentifierExpr — either explicit `this` or
+    // the bare implicit-this spelling.
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+    if (!id) return false;
+    if (id->name == "this") return true;
+    // Bare implicit-this: the identifier resolves to a FieldSymbol or
+    // PropertySymbol whose parent is the current type — the §22.8
+    // in-scope spelling. Both spellings are the same store (§2.7);
+    // the PropertySymbol branch covers the §23.1 readonly
+    // auto-property case, where a bare `X := 7` resolves to the
+    // public-facing PropertySymbol not the compiler-generated backing
+    // field. A local/parameter shadowing the field resolves to
+    // LocalSymbol / ParameterSymbol (no FieldSymbol/PropertySymbol
+    // dynamic_cast), so the shadowed-bare-_f case correctly falls
+    // through to "not this-rooted" (the local/parameter is being
+    // assigned, not the field).
+    Symbol* sym = ctx_.exprSymbol(*id);
+    if (auto* fs = dynamic_cast<FieldSymbol*>(sym))
+        return fs->parent == currentType_;
+    if (auto* ps = dynamic_cast<PropertySymbol*>(sym))
+        return ps->parent == currentType_;
+    return false;
+}
+
 // Slice S7: diagnose assignment to a readonly field outside the
 // declaring class's constructor. Tracks only the `this.<field>`
 // target shape; `other.f := X` would need cross-object readonly
@@ -4534,8 +4585,14 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
         // record's constructor may initialize a positional field. The
         // existing readonly modifier branch keeps its broader
         // construction-window carve-out (a long-standing pattern, not
-        // changed here).
-        bool inDeclaringCtor = inConstructor_ && currentType_ == fs->parent;
+        // changed here). v0.270 (#3299/#3316): the carve-out is also
+        // narrowed to the per-instance this-rooted chain, so a record
+        // R's own constructor cannot write another R's positional
+        // storage through `r.X := e` (a same-instance aliasing write
+        // through read-only storage the previous fix left open).
+        bool inDeclaringCtor = inConstructor_ &&
+                               currentType_ == fs->parent &&
+                               isThisRootedLValueTarget(*as.target);
         if (!inDeclaringCtor) {
             std::string nm = std::string(fs->name);
             ctx_.diagnostics().report(
@@ -4547,7 +4604,28 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
         }
         return;
     }
-    if (inConstructor_) return;
+    // §22.8 (#747 R42) / v0.270 (#3299/#3316): a readonly field may be
+    // assigned only in a field initializer or a constructor body, AND
+    // only through an lvalue chain rooted at `this` (the explicit
+    // `this.F := e` or the bare-in-scope `F := e` that resolves to
+    // `this`'s storage). The pre-fix code used a bare
+    // `if (inConstructor_) return;`, letting any constructor write any
+    // other instance's readonly field — a per-type carve-out that
+    // falsified §7.4's narrowing licence. Narrowed here: for an
+    // INSTANCE readonly field, the carve-out fires only if the chain
+    // is this-rooted; for a static readonly field, the carve-out is
+    // preserved unchanged (per-instance vs per-type does not reach
+    // it, v0.270 records the case as open). Pre-fix: also didn't track
+    // WHICH type's constructor we were in, so an unrelated class D's
+    // constructor body writing `c._f` (where `_f` is C's readonly) was
+    // also accepted; the same this-rooted check rejects that shape
+    // (the chain's base is `c`, not `this`).
+    if (inConstructor_) {
+        bool isStatic = false;
+        for (auto mod : fs->modifiers)
+            if (mod == "static") { isStatic = true; break; }
+        if (isStatic || isThisRootedLValueTarget(*as.target)) return;
+    }
     // §22.8 (#747 R42): a readonly field may be assigned only in a field
     // initializer or a constructor body; assignment anywhere else is a compile
     // error. Resolve the target's field symbol directly so EVERY receiver shape
@@ -4718,6 +4796,20 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
                     isReadonlyAuto = true;
                     break;
                 }
+        // §22.8/§23.1 (v0.270, #3299/#3316): the per-instance
+        // narrowing of the readonly auto-property assignable context.
+        // For an INSTANCE readonly auto-property, the
+        // construction-window carve-out fires only if the chain is
+        // this-rooted (the same `isThisRootedLValueTarget` rule the
+        // field branch uses); for a `static readonly` auto-property
+        // the carve-out is preserved (per-instance vs per-type does
+        // not reach it, v0.270 records the case as open).
+        bool propIsStatic = false;
+        for (auto mod : pd->modifiers)
+            if (mod == "static") { propIsStatic = true; break; }
+        bool readonlyAllowed;
+        if (propIsStatic) readonlyAllowed = inConstructor_;
+        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
         if (!hasSetter) {
             // #2851: `propName` is empty for an indexer (its symbol name is
             // the synthetic ".this"), so name the construct rather than
@@ -4730,7 +4822,7 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
                        "§23.3)")
                     : ("cannot " + verb + "read-only property `" + propName +
                        "` — it has no setter (" + cite + "§23.3)"));
-        } else if (isReadonlyAuto && !inConstructor_) {
+        } else if (isReadonlyAuto && !readonlyAllowed) {
             ctx_.diagnostics().report(
                 Severity::Error, loc,
                 "cannot " + verb + "readonly property `" + propName +
@@ -5032,9 +5124,15 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
     // `:=`-target check (the declaring record's constructor only) —
     // without it a class C constructor could `ref r.X` where `r` is a
     // positional record, an aliasing write through read-only storage.
+    // v0.270 (#3299/#3316): the carve-out is also narrowed to the
+    // per-instance this-rooted chain, so a record R's own constructor
+    // cannot bind another R's positional storage to a ref/out
+    // parameter.
     if (fs.posParam && fs.parent &&
         fs.parent->kind == ast::TypeDeclKind::Record) {
-        bool inDeclaringCtor = inConstructor_ && currentType_ == fs.parent;
+        bool inDeclaringCtor = inConstructor_ &&
+                               currentType_ == fs.parent &&
+                               isThisRootedLValueTarget(target);
         if (!inDeclaringCtor) {
             ctx_.diagnostics().report(
                 Severity::Error, target.span.begin,
@@ -5045,17 +5143,27 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
         }
         return;
     }
-    // §22.8: a readonly field is assignable only in a field initializer or
-    // the declaring class's constructor — `inConstructor_` covers both
-    // (see checkReadonlyAssignment above, the `:=`-target sibling of this
-    // check).
-    if (isReadonly && !inConstructor_) {
-        ctx_.diagnostics().report(
-            Severity::Error, target.span.begin,
-            std::string("a `") + kind + "` argument may not be readonly "
-            "field `" + std::string(fs.name) + "` outside the declaring "
-            "class's constructor (§22.3 / §22.8)");
-        return;
+    // §22.8 / §23.1 (v0.270, #3299/#3316): a readonly field is
+    // assignable only in a field initializer or a constructor body,
+    // AND only through an lvalue chain rooted at `this`. For an
+    // INSTANCE readonly field the carve-out narrows from
+    // `inConstructor_` alone to `inConstructor_ && this-rooted`; for
+    // a STATIC readonly field the carve-out is preserved (per-instance
+    // vs per-type does not reach it, v0.270 records the case as
+    // open). `checkRefOutFieldOperand` is the ref/out twin of the
+    // `:=`-target `checkReadonlyAssignment` above.
+    if (isReadonly) {
+        bool readonlyAllowed;
+        if (isStatic) readonlyAllowed = inConstructor_;
+        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
+        if (!readonlyAllowed) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument may not be readonly "
+                "field `" + std::string(fs.name) + "` outside the declaring "
+                "class's constructor (§22.3 / §22.8)");
+            return;
+        }
     }
     // §22.12 rule 2: a mutable (non-readonly, non-`const` — `const` members
     // are ConstMemberSymbol, never reach here) static field's store
@@ -5243,14 +5351,30 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
     if (pd->bodyKind == ast::PropertyBodyKind::Auto)
         for (auto mod : pd->modifiers)
             if (mod == "readonly") { isReadonlyAuto = true; break; }
-    if (isReadonlyAuto && !inConstructor_) {
-        ctx_.diagnostics().report(
-            Severity::Error, target.span.begin,
-            std::string("a `") + kind + "` argument must be a property "
-            "with an accessible setter — this readonly property's setter "
-            "may be used only in a field initializer or constructor (§22.3 "
-            "/ §23.1)");
-        return;
+    // §23.1 (v0.270, #3299/#3316): the per-instance narrowing of the
+    // readonly auto-property's ref/out assignable context — twin of
+    // the `:=`-target `checkPropertyWriteTarget` narrowing above. For
+    // an INSTANCE readonly auto-property the carve-out narrows from
+    // `inConstructor_` alone to `inConstructor_ && this-rooted`; for
+    // a `static readonly` auto-property the carve-out is preserved
+    // (per-instance vs per-type does not reach it, v0.270 records the
+    // case as open).
+    if (isReadonlyAuto) {
+        bool propIsStatic = false;
+        for (auto mod : pd->modifiers)
+            if (mod == "static") { propIsStatic = true; break; }
+        bool readonlyAllowed;
+        if (propIsStatic) readonlyAllowed = inConstructor_;
+        else readonlyAllowed = inConstructor_ && isThisRootedLValueTarget(target);
+        if (!readonlyAllowed) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument must be a property "
+                "with an accessible setter — this readonly property's setter "
+                "may be used only in a field initializer or constructor (§22.3 "
+                "/ §23.1)");
+            return;
+        }
     }
     // §13.6: the setter accessor's own (possibly more restrictive)
     // visibility gates access, mirroring the plain-`:=` assignment check.
@@ -6934,6 +7058,105 @@ static std::string spellExtWhereClause(
     return out;
 }
 
+// §26.4 (v0.277, #3336): per-`where`-clause-item applicability test for an
+// extension block. Mirrors the §14.2 reported-violation conditions of
+// Resolver::checkOneConstraint and ExprTC::leafSolutionViolatesScalarConstraint's
+// `violates` lambda — but returns true ONLY on a PROVABLE violation (decided =
+// true && !ok), never on a satisfied or undecidable item. Deferring is the
+// sound direction here: a satisfied/undecidable item MUST keep the candidate,
+// and the late `where`-clause checks (e.g. `sendable` requires the expression
+// walk to have populated primary-ctor-storage bits, §30.14) fire downstream
+// and surface real failures with better messages — the lookup is intentionally
+// a SILENT applicability filter (§26.5.1 "A `where` clause is an
+// *applicability* filter, never a ranking signal"), not an additional
+// diagnostic site.
+bool ExprTC::extConstraintItemProvablyViolated(
+    const ast::ConstraintItem& item, const TypeRef* arg) {
+    if (!arg || arg->kind == TypeRef::Kind::Error) return false;
+    if (item.kind == "notnull") {
+        // §14.2: a `where T: notnull` excludes every nullable type.
+        return arg->nullable;
+    }
+    if (item.kind == "class") {
+        // §14.2: non-nullable reference types only. A nullable arg provably
+        // fails; a value-kind arg provably fails; everything else (reference
+        // / unknown) keeps.
+        if (arg->nullable) return true;
+        GroundCat c = groundCategorize(arg);
+        return c == GroundCat::Value;
+    }
+    if (item.kind == "value") {
+        // §14.2: non-nullable value types only. Mirror of the `class` arm.
+        if (arg->nullable) return true;
+        GroundCat c = groundCategorize(arg);
+        return c == GroundCat::Reference;
+    }
+    if (item.kind == "new") {
+        // §14.2 / §17.11: provably no accessible parameterless ctor /
+        // well-defined default. The predicate's `decided` out-parameter
+        // distinguishes "provably fails" from "can't verify" — only the first
+        // is a real violation here (the second must KEEP the candidate, per
+        // the soundness direction above).
+        bool decided = false;
+        bool ok = groundSatisfiesNew(arg, decided);
+        return decided && !ok;
+    }
+    if (item.kind == "type") {
+        // §14.2 type-bound `where T: IFoo`. Resolve the bound's AST node to a
+        // TypeRef (resolveTypes populates ctx.resolvedType for every visitable
+        // type node). The bound's own generic args may still name block-level
+        // type parameters — fine, because declaration-based subtyping
+        // (groundSatisfiesTypeBound's `isSubtype` walk, §14.2) IGNORES generic
+        // args, which is the SOUND direction for our purposes (a
+        // wrong-generic-arg conformer reads as SATISFYING — a spurious KEEP,
+        // never a false drop). An unbound bound (null astBound) keeps.
+        TypeRef* bound = nullptr;
+        if (item.typeArg) bound = ctx_.resolvedType(*item.typeArg);
+        bool decided = false;
+        bool ok = groundSatisfiesTypeBound(arg, bound, decided);
+        return decided && !ok;
+    }
+    // §14.2 derived-property constraints (`sendable`, `hashable`) and the
+    // §14.4 modifier form (`is owned` / `is not owned`, removed at v0.97) all
+    // reach here as undecidable inputs for our ground-decision subset; the
+    // late pass at the tail of typecheckExpressions() (cf. #3235 for
+    // `sendable`) replays them with full data and surfaces real violations
+    // with better messages. Keep the candidate.
+    return false;
+}
+
+// §26.4 (v0.277, #3336): per-extension-block applicability test. Walks every
+// `where T: c1, c2` clause, looks up T's substitution in `binding` (built from
+// the matched ancestor's generic args by collectFreeVarBinding), and asks
+// `extConstraintItemProvablyViolated` whether each item is satisfied. ANY
+// provable violation drops the entire block (the §26.5.1 wording "A `where`
+// clause is an *applicability* filter" is a single-clause conjunction at the
+// item level: every clause is independently required). An unbound constraint
+// type parameter (no entry in `binding`) keeps — the extension simply has
+// nothing to check against at this call site, which can only happen for a
+// malformed extension whose target introduces a free var the `where` clause
+// doesn't name (a parse-level oddity no diagnostic is owed for here).
+bool ExprTC::extWhereClauseProvablyViolated(
+    const ast::ExtensionDecl& decl,
+    const std::vector<std::pair<std::string, TypeRef*>>& binding) {
+    for (const auto& gc : decl.genericConstraints) {
+        // §14.4 modifier-constraint form (`where T is owned` / `is not owned`)
+        // — REMOVED at v0.97; populators filter this out, so a non-empty
+        // modifierConstraint shouldn't reach here. Treat conservatively.
+        if (!gc.modifierConstraint.empty()) continue;
+        const TypeRef* arg = nullptr;
+        for (const auto& kv : binding) {
+            if (kv.first == gc.typeParam) { arg = kv.second; break; }
+        }
+        if (!arg) continue;  // unbound — keep (see header note)
+        for (const auto& item : gc.items) {
+            if (extConstraintItemProvablyViolated(item, arg))
+                return true;
+        }
+    }
+    return false;
+}
+
 Symbol* ExprTC::lookupExtensionMember(
     const TypeRef* receiver,
     std::string_view name,
@@ -7041,6 +7264,36 @@ Symbol* ExprTC::lookupExtensionMember(
         const TypeRef* matchedAnc = extensionFindMatchingAncestor(
             target, receiver, freeVars, ownedAncs);
         if (!matchedAnc) continue;
+        // §26.5 (#714/#773): when the extension has free type variables,
+        // compute the binding (T → concrete TypeRef) from the matched
+        // ancestor's generic args. This binding lets typeCall substitute
+        // the return type and codegen emit a specialized body — and now, per
+        // §26.4 (v0.277, #3336), also lets extWhereClauseProvablyViolated
+        // evaluate the block-level `where` clauses against the receiver's
+        // instantiation (the keystone delta the §26.5.1 wording names an
+        // "applicability filter" but #3336 proved the compiler never enforced).
+        // Hoisted out of the per-member loop because the applicability test
+        // is a PER-BLOCK decision — a violating block never contributes any
+        // candidate regardless of which name-matched member the loop would
+        // have picked.
+        std::vector<std::pair<std::string, TypeRef*>> binding;
+        if (!freeVars.empty()) {
+            // Collect T→concrete mapping positionally from matched ancestor.
+            collectFreeVarBinding(target, matchedAnc, freeVars, binding);
+        }
+        // §26.4 (v0.277, #3336): block-level `where` clause is an
+        // applicability FILTER (§26.5.1) — drop the entire block when ANY
+        // clause is provably violated at the receiver's instantiation. The
+        // lookup is intentionally a SILENT filter (the rationale here is the
+        // §26.5.1 wording: an extension that fails its `where` simply
+        // doesn't apply — there is no "extension candidate" to diagnose,
+        // the same way a private member isn't a candidate from outside its
+        // class). When ALL surviving candidates are dropped this way, the
+        // caller (resolveMemberAccess) emits the existing "no such member"
+        // diagnostic, which is the §26.4-correct behavior.
+        if (!freeVars.empty() && decl &&
+            extWhereClauseProvablyViolated(*decl, binding))
+            continue;
         // Determine whether the extension target is a builtin (null-decl) type.
         // For builtin-target extensions (e.g. `extension IEnumerable<T>`), the
         // full binding-and-codegen path is implemented (#714). For user-declared
@@ -7073,15 +7326,6 @@ Symbol* ExprTC::lookupExtensionMember(
                         if (extSignatureUsesFreeVar(md, freeVars)) continue;
                     }
                 }
-            }
-            // §26.5 (#714/#773): when the extension has free type variables,
-            // compute the binding (T → concrete TypeRef) from the matched
-            // ancestor's generic args. This binding lets typeCall substitute
-            // the return type and codegen emit a specialized body.
-            std::vector<std::pair<std::string, TypeRef*>> binding;
-            if (!freeVars.empty()) {
-                // Collect T→concrete mapping positionally from matched ancestor.
-                collectFreeVarBinding(target, matchedAnc, freeVars, binding);
             }
             // fix #2328 (§26.5, v0.236): per-block same-name overloads are
             // arity-filtered ABOVE (when `arity >= 0`), so the first surviving
@@ -8213,6 +8457,51 @@ void ExprTC::checkCasePatternConstantRanges(
         return;
     }
     if (!scrutTy || scrutTy->kind != TypeRef::Kind::Primitive) return;
+    // §16.3 (v0.272, #3319): `Range<T>`'s T is restricted by the compiler to
+    // the integer types (`byte`, `sbyte`, `short`, `ushort`, `int`, `uint`,
+    // `long`, `ulong`) and `char` — "Other substitutions are rejected. This
+    // restriction is enforced as a compiler-intrinsic rule." A range pattern
+    // `lo..hi` / `lo..<hi` / `..` is a RangePattern with element type drawn
+    // from the scrutinee, so a range pattern over a `float`/`double`/`decimal`
+    // scrutinee is `Range<float>` / `Range<double>` / `Range<decimal>` — none
+    // of which exist per §16.3. The implementation previously routed them
+    // through codegen (decCmp / FCmp), silently implementing `Range<double>`;
+    // §16.3 forbids that. Reject the pattern at sema so a clean diagnostic
+    // replaces what would otherwise reach codegen. The same applies to a
+    // range pattern inside a `|` alternative list (§19.3 v0.183, #1584).
+    if (scrutTy->primitive == PrimitiveType::Float ||
+        scrutTy->primitive == PrimitiveType::Double ||
+        scrutTy->primitive == PrimitiveType::Decimal) {
+        const char* tyName = scrutTy->primitive == PrimitiveType::Float
+            ? "float" : scrutTy->primitive == PrimitiveType::Double
+            ? "double" : "decimal";
+        auto rejectRangeOverFloat = [&](const ast::Pattern* rp) {
+            ctx_.diagnostics().report(
+                Severity::Error, rp->span.begin,
+                std::string("a range pattern is not admitted over a `") +
+                tyName + "` scrutinee \xe2\x80\x94 `Range<T>` restricts T to "
+                "the integer types and `char` (\xc2\xa7""16.3)");
+        };
+        for (const auto& arm : arms) {
+            const ast::Pattern* p = arm.pattern.get();
+            if (!p) continue;
+            if (dynamic_cast<const ast::RangePattern*>(p)) {
+                rejectRangeOverFloat(p);
+            } else if (auto* ap =
+                           dynamic_cast<const ast::AltPattern*>(p)) {
+                for (const auto& m : ap->members)
+                    if (auto* rp =
+                            dynamic_cast<const ast::RangePattern*>(m.get()))
+                        rejectRangeOverFloat(rp);
+            }
+        }
+        // Let the integer-scrutinee range check below also run for any
+        // non-range patterns (constants / relational) — they are valid over
+        // float/double/decimal and the integer check happens to be a no-op
+        // for those primitives (caseIntScrutineeRange returns false), so the
+        // §5.1 narrowing gate is never reached for them. Falling through
+        // keeps a single code path.
+    }
     long long lo = 0, hi = 0;
     if (!caseIntScrutineeRange(scrutTy->primitive, lo, hi)) return;
     auto checkConst = [&](const ast::Expr* c) {

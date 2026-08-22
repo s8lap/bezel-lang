@@ -322,6 +322,62 @@ BEZEL_TEST(equality_v0158, codecl_enum_satisfied_with_plain_gethashcode_spec_25_
     BEZEL_EXPECT_FALSE(hasCoDeclError(r));
 }
 
+// ─── §25.2 v0.275/v0.276: no exemption for compiler-intrinsic types (#3334) ──
+
+// §25.2 (v0.275, completed v0.276): "There is no exemption for compiler-
+// intrinsic types. The pointer records of stdlib §10.0 and §10.5 — `IntPtr`,
+// `UIntPtr`, `Ptr<T>` — declare `Equals(T)` and `override GetHashCode` beside
+// their operators like any other record." A user record **named** `IntPtr`
+// (distinct from stdlib §10.0's `IntPtr`, whose `t->name == "IntPtr"`
+// exemption the v0.275 retirement removed) overloading `=`/`<>` without the
+// co-declared pair is rejected by §25.2 — the check is keyed on the
+// *declaration*, not on the type's name. Pre-fix this compiled (the guard
+// short-circuited on `t->name == "IntPtr"`); post-fix it is rejected with the
+// standard §25.2 diagnostic naming the record and the missing members.
+BEZEL_TEST(equality_v0158,
+           codecl_user_record_named_intptr_rejected_spec_25_2_v0_275) {
+    auto r = parseSema(
+        "module M; "
+        "record IntPtr(n: int) "
+        "  public static method operator =(a: IntPtr, b: IntPtr): bool => a.n = b.n; "
+        "  public static method operator <>(a: IntPtr, b: IntPtr): bool => a.n <> b.n; "
+        "end IntPtr; class F public static method Main(): int return 0; end Main; end F;");
+    BEZEL_EXPECT_TRUE(hasCoDeclError(r));
+}
+
+// §25.2 (v0.275/v0.276): the symmetric case — a user record **named** `UIntPtr`
+// overloading `=`/`<>` without the co-declared pair — is also rejected. The
+// pre-fix `t->name == "UIntPtr"` short-circuit applied to both names; the
+// v0.275 retirement removes both.
+BEZEL_TEST(equality_v0158,
+           codecl_user_record_named_uintptr_rejected_spec_25_2_v0_275) {
+    auto r = parseSema(
+        "module M; "
+        "record UIntPtr(n: int) "
+        "  public static method operator =(a: UIntPtr, b: UIntPtr): bool => a.n = b.n; "
+        "  public static method operator <>(a: UIntPtr, b: UIntPtr): bool => a.n <> b.n; "
+        "end UIntPtr; class F public static method Main(): int return 0; end Main; end F;");
+    BEZEL_EXPECT_TRUE(hasCoDeclError(r));
+}
+
+// §25.2 (v0.275/v0.276): a user record named `IntPtr` WITH the co-declared
+// pair (the four members `Ptr<T>` has always declared) satisfies the rule on
+// its own merits. The check is now keyed on the *declaration*, not the name —
+// so the rule is satisfied by the same shape that stdlib §10.0's `IntPtr`
+// uses, whether or not the name collides with stdlib's record.
+BEZEL_TEST(equality_v0158,
+           codecl_user_record_named_intptr_with_pair_accepted_spec_25_2_v0_275) {
+    auto r = parseSema(
+        "module M; "
+        "record IntPtr(n: int) "
+        "  public static method operator =(a: IntPtr, b: IntPtr): bool => a.n = b.n; "
+        "  public static method operator <>(a: IntPtr, b: IntPtr): bool => a.n <> b.n; "
+        "  public method Equals(other: IntPtr): bool => n = other.n; "
+        "  public override method GetHashCode(): int => n; "
+        "end IntPtr; class F public static method Main(): int return 0; end Main; end F;");
+    BEZEL_EXPECT_FALSE(hasCoDeclError(r));
+}
+
 // ─── §3.6 / §8.3 v0.158: hashable hash-container keys (#1338) ────────
 
 // §3.6/§8.3: an `int` key is hashable — `Dictionary<int, int>` accepted.
@@ -537,4 +593,157 @@ BEZEL_TEST(equality_v0158, dict_generic_param_key_concrete_bad_instantiation_spe
         // Concrete instantiation Outer<Bad> — the key becomes Bad at this site
         "class C public method Use(o: Outer<Bad>) end Use; end C;");
     BEZEL_EXPECT_TRUE(hasEqualityBearingError(r));
+}
+
+// ─── §9.2 v0.276: heterogeneous `=`/`<>` overload does NOT disqualify (#3326) ─
+
+// §9.2 v0.276 (fix #3326): a body record with a HETEROGENEOUS-operand
+// `=`/`<>` overload (`V = int`, `V <> int`) is still auto-hashable. The
+// overload defines a comparison the synthesis never provided and takes over
+// nothing — §9.2's third-bullet membership reads: "An overload of any
+// operator **other than a homogeneous `=`/`<>`** … A heterogeneous-operand
+// `=`/`<>` overload (`T = U`) defines a comparison the synthesis never
+// provided and takes over nothing: it neither qualifies nor disqualifies,
+// exactly as §25.2 frees it from the co-declaration obligation." So `a = b`
+// on the homogeneous form (both V) compiles via the synthesized `=` and
+// compares structurally. Pre-fix this rejected with §9.2's use-site error
+// (the broad reading treated any `=`/`<>` token as disqualifying,
+// SymbolCollection.cpp:1373-1377).
+BEZEL_TEST(equality_v0158, heterogeneous_eq_overload_keeps_auto_equality_spec_9_2_v0_276) {
+    auto r = parseSema(
+        "module M; "
+        "record V "
+        "  public property N: int; "
+        "  public constructor(n: int) N := n; end constructor; "
+        "  public static method operator =(a: V, b: int): bool => a.N = b; "
+        "  public static method operator <>(a: V, b: int): bool => a.N <> b; "
+        "end V; "
+        "class C public method M(a: V, b: V) _ := a = b; end M; end C;");
+    BEZEL_EXPECT_FALSE(hasNotAutoEqError(r));
+}
+
+// §9.2 v0.276 (fix #3326): the symmetric case — a heterogeneous `<>` overload
+// alone (without `=`) is also fine for auto-equality. The membership rule keys
+// on the operator TOKEN (`=` or `<>`), not on which side carries `=`. Same
+// pre-fix regression and same post-fix acceptance.
+BEZEL_TEST(equality_v0158, heterogeneous_ne_overload_keeps_auto_equality_spec_9_2_v0_276) {
+    auto r = parseSema(
+        "module M; "
+        "record V "
+        "  public property N: int; "
+        "  public constructor(n: int) N := n; end constructor; "
+        "  public static method operator <>(a: V, b: int): bool => a.N <> b; "
+        "end V; "
+        "class C public method M(a: V, b: V) _ := a <> b; end M; end C;");
+    BEZEL_EXPECT_FALSE(hasNotAutoEqError(r));
+}
+
+// §9.2 v0.276 (fix #3326): a HETEROGENEOUS overload on the OTHER side
+// (`int = V`) is also a heterogeneous overload — both operands need not be
+// the declaring type, only that they are not BOTH it. Same fix, same
+// expected outcome.
+BEZEL_TEST(equality_v0158, heterogeneous_eq_reversed_overload_keeps_auto_equality_spec_9_2_v0_276) {
+    auto r = parseSema(
+        "module M; "
+        "record V "
+        "  public property N: int; "
+        "  public constructor(n: int) N := n; end constructor; "
+        "  public static method operator =(a: int, b: V): bool => a = b.N; "
+        "  public static method operator <>(a: int, b: V): bool => a <> b.N; "
+        "end V; "
+        "class C public method M(a: V, b: V) _ := a = b; end M; end C;");
+    BEZEL_EXPECT_FALSE(hasNotAutoEqError(r));
+}
+
+// §9.2 v0.276 (fix #3326, control): a HOMOGENEOUS `=`/`<>` overload with the
+// §25.2 co-declared pair is still NOT auto-hashable — the pre-fix and
+// post-fix verdicts agree on this case (the helper returns true for the
+// homogeneous overload, the disqualifier fires). The regression test pins
+// that the fix did NOT widen too far: the §9.2 third-bullet disqualifier
+// still applies to the homogeneous form.
+BEZEL_TEST(equality_v0158, homogeneous_eq_overload_still_disqualifies_spec_9_2_v0_276) {
+    auto r = parseSema(
+        "module M; "
+        "record V "
+        "  public property N: int; "
+        "  public constructor(n: int) N := n; end constructor; "
+        "  public static method operator =(a: V, b: V): bool => a.N = b.N; "
+        "  public static method operator <>(a: V, b: V): bool => a.N <> b.N; "
+        "  public method Equals(other: V): bool => N = other.N; "
+        "  public override method GetHashCode(): int => N; "
+        "end V; "
+        "class C public method M(a: V, b: V) _ := a = b; end M; end C;");
+    // With the user-supplied equality members the call is dispatched
+    // directly to the user's `=` (lookupMember finds it), so the §9.2
+    // use-site error does NOT fire — `hasNotAutoEqError` is the
+    // non-auto-hashable-use-site check, distinct from the `=`/`<>` use
+    // site. We pin: no compile errors, and the record is hashable (a
+    // Dictionary<V, _> instantiation is accepted).
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    auto r2 = parseSema(
+        "module M; "
+        "record V "
+        "  public property N: int; "
+        "  public constructor(n: int) N := n; end constructor; "
+        "  public static method operator =(a: V, b: V): bool => a.N = b.N; "
+        "  public static method operator <>(a: V, b: V): bool => a.N <> b.N; "
+        "  public method Equals(other: V): bool => N = other.N; "
+        "  public override method GetHashCode(): int => N; "
+        "end V; "
+        "class C public method M(d: Dictionary<V, int>) end M; end C;");
+    BEZEL_EXPECT_FALSE(hasEqualityBearingError(r2));
+}
+
+// §9.3 v0.276 (fix #3326): the positional-record form of the heterogeneous-
+// overload case. A purely-positional record `V(n: int)` with heterogeneous
+// `=`/`<>` operators keeps its auto-generated equality (the §9.3 admissibility
+// rule applies §9.2's membership list with the same homogeneity test).
+// isPositionalRecordEqualityBearing at SymbolCollection.cpp:1453-1457 was the
+// twin of the body-record path and gets the same fix.
+BEZEL_TEST(equality_v0158, positional_heterogeneous_eq_overload_keeps_auto_equality_spec_9_3_v0_276) {
+    auto r = parseSema(
+        "module M; "
+        "record V(n: int) "
+        "  public static method operator =(a: V, b: int): bool => a.n = b; "
+        "  public static method operator <>(a: V, b: int): bool => a.n <> b; "
+        "end V; "
+        "class C public method M(a: V, b: V) _ := a = b; end M; end C;");
+    BEZEL_EXPECT_FALSE(hasNotAutoEqError(r));
+}
+
+// §9.3 v0.276 (fix #3326): the combined-form record (positional + body) —
+// same fix applies because isPositionalRecordEqualityBearing is the predicate
+// for combined form (it walks all members: positional fields AND body).
+BEZEL_TEST(equality_v0158, combined_heterogeneous_eq_overload_keeps_auto_equality_spec_9_3_v0_276) {
+    auto r = parseSema(
+        "module M; "
+        "record V(n: int, s: string) "
+        "  public method Label(): string => s; "
+        "  public static method operator =(a: V, b: int): bool => a.n = b; "
+        "  public static method operator <>(a: V, b: int): bool => a.n <> b; "
+        "end V; "
+        "class C public method M(a: V, b: V) _ := a = b; end M; end C;");
+    BEZEL_EXPECT_FALSE(hasNotAutoEqError(r));
+}
+
+// §9.2 v0.276 (fix #3326): a heterogeneous-only record is hashable — it can
+// serve as a Dictionary key. The `isEqualityBearing` OR of auto-hashable and
+// user-declared equality returns true (auto-hashable is true after the fix).
+// Pre-fix this rejected: `isAutoEqualityBearingBodyRecord` returned false on
+// the heterogeneous overload, and `recordHasUserDeclaredEquality` does return
+// true for the operator token — but the §3.6/§8.3 hashable check at the
+// Dictionary<K, V> site would still have succeeded (it ORs both predicates),
+// so this test was already passing on pre-fix code. Pin it anyway to guard
+// against the fix regressing this surface.
+BEZEL_TEST(equality_v0158, heterogeneous_overload_record_is_hashable_spec_3_6_v0_276) {
+    auto r = parseSema(
+        "module M; "
+        "record V "
+        "  public property N: int; "
+        "  public constructor(n: int) N := n; end constructor; "
+        "  public static method operator =(a: V, b: int): bool => a.N = b; "
+        "  public static method operator <>(a: V, b: int): bool => a.N <> b; "
+        "end V; "
+        "class C public method M(d: Dictionary<V, int>) end M; end C;");
+    BEZEL_EXPECT_FALSE(hasEqualityBearingError(r));
 }

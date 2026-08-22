@@ -1084,6 +1084,21 @@ private:
     void checkCasePatternConstantRanges(const std::vector<ast::CaseArm>& arms,
                                         TypeRef* scrutTy);
 
+    // §26.4 (v0.277, #3336): per-`where`-clause-item applicability test for
+    // an extension block. Returns true ONLY on a PROVABLE violation
+    // (decided = true && !ok); a satisfied/undecidable item keeps. The lookup
+    // is intentionally a SILENT applicability filter (§26.5.1 "A `where`
+    // clause is an *applicability* filter, never a ranking signal").
+    bool extConstraintItemProvablyViolated(
+        const ast::ConstraintItem& item, const TypeRef* arg);
+    // §26.4 (v0.277, #3336): per-extension-block applicability test. Walks
+    // every `where T: c1, c2` clause and drops the block on any provable item
+    // violation. `binding` is the block-level type-param → concrete TypeRef
+    // substitution built by collectFreeVarBinding.
+    bool extWhereClauseProvablyViolated(
+        const ast::ExtensionDecl& decl,
+        const std::vector<std::pair<std::string, TypeRef*>>& binding);
+
     // §19.3 (#1847): validate a TOP-LEVEL bare-identifier `case`/`when` pattern.
     // The grammar leaves a single-/qualified-identifier pattern ambiguous (§A.7):
     // it is a TYPE TEST when the name resolves to a type (or a type parameter,
@@ -1359,6 +1374,27 @@ private:
     // user→builtin residual accept.
     bool userTypeImplementsBuiltinIface(TypeRef* from,
                                         std::string_view builtinBaseName);
+
+    // §22.8 / §23.1 (v0.270, #3299/#3316): per-instance narrowing of the
+    // readonly assignable context. The pre-fix code used a bare
+    // `if (inConstructor_) return;` (and its `:=` / ref/out / property
+    // siblings), letting any constructor body write any other instance's
+    // readonly field. §22.8 v0.270: "The context is per-instance, not
+    // per-type: an instance readonly field is assignable only through an
+    // lvalue chain rooted at `this` — an explicit `this.F := e` or the
+    // bare in-scope spelling that resolves to `this`'s storage — so a
+    // constructor of the declaring type may NOT write another value's
+    // readonly storage held in a parameter, local, or field." Returns
+    // true iff the chain rooted at `target`'s base is `this` (explicit
+    // or bare-implicit-this). Used by the four construction-window
+    // carve-out sites to narrow the instance-readonly carve-out from
+    // `inConstructor_` alone to `inConstructor_ && thisRooted`; the
+    // static-readonly carve-out is preserved unchanged (per-instance vs
+    // per-type does not reach it, v0.270 records the case as open).
+    // Mirrors PureBodyWalker::targetRootSymbol's chain-walk shape but
+    // adds the bare-implicit-this spelling check (FieldSymbol of
+    // currentType_) the PureChecker walk does not.
+    bool isThisRootedLValueTarget(const ast::Expr& target) const;
 
     // Slice S7: diagnose assignment to a readonly field outside the
     // declaring class's constructor. Tracks only the `this.<field>`
