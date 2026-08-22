@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | `draft` (2026-08-21), authored against **v0.277**. Origin is the owner's reading of proposal [0116](0116-conditional-members.md) §5.3.1: a cost recorded there turned out to be a live defect governing the most-used extension surface in the language. |
-| **Tracking issue** | **none yet** — this proposal is the first artifact. Three issues it asks the coordinator to file are listed in §10. |
+| **Tracking issue** | [**#3340**](https://github.com/s8lap/bezel-lang/issues/3340). Companions filed with it: [#3341](https://github.com/s8lap/bezel-lang/issues/3341) (the import gate is not applied to the standard library) and [#3342](https://github.com/s8lap/bezel-lang/issues/3342) (`arr.Count(pred)` resolves to the §5 operator against §26.5 rule 1). |
 | **Target module(s)** | **spec** — [§2.3](../Bezel_Language_Spec.md#sec-always-available-names)'s auto-import list gains one module and one stated invariant; [§26.5](../Bezel_Language_Spec.md#sec-resolution) rule 2 gains a cross-reference; [§2.8.3](../Bezel_Language_Spec.md#sec-module-identity)'s *use without import* rule gains the sentence that names its own exception. **stdlib** — §5's *Not auto-imported* paragraph is retired; eight spec fences and one guide example become correct without being edited. **rationale** — one decision record. **`DECLINED.md`** — two rows. **Appendix A/C** — untouched: no grammar, no new token, no new compiler-enforced invariant. |
 | **Written against** | spec/stdlib/rationale/changelog **v0.277**, HEAD `c7574a8e`. Every quotation re-verified against that tree. Compiler citations were obtained **by reading only** — this author could not build or run `bezelc`, and every claim needing a build is marked and left unasserted. |
 | **Currency** | v0.277. **Quoted:** spec §2.3, §2.8.3 rule 2, §2.8.5, §17.10-adjacent rationale, §26.1, §26.5 rules 1–4, §26.6; stdlib §1, §5, §4.1/§4.2; rationale §18. **Re-verify before graduation:** §2.3's auto-import paragraph and §26.5 rule 2 (this proposal rewrites both). |
@@ -211,7 +211,7 @@ The recurring lesson is that a per-file opt-in for a library's *core* surface bu
 
 ### Issues to file
 
-- **A — this proposal's tracking issue.**
+- **A — this proposal's tracking issue.** Filed: [#3340](https://github.com/s8lap/bezel-lang/issues/3340). **B** is [#3341](https://github.com/s8lap/bezel-lang/issues/3341); **C** is [#3342](https://github.com/s8lap/bezel-lang/issues/3342).
 - **B — the compiler/spec divergence**, which is a defect on its own terms whichever option lands: the import gate is not applied to the standard library's extension members, and 34 test files depend on that. Under (a) it becomes correct-by-construction; the issue should record it either way, since today the documents and the implementation disagree.
 - **C — `arr.Count(pred)` resolves to the §5 operator on an `Array<T>` receiver**, contradicting stdlib `:44`/`:5301` and §26.5 rule 1, which say the instance `Count` property blocks it. Found while surveying this area; unrelated to this proposal's decision and should not ride it.
 
