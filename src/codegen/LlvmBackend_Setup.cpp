@@ -13608,6 +13608,24 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     bool isCall = dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) != nullptr;
     bool isNew = dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) != nullptr;
     bool ownsSource = isCall || isNew || wrappedHere;
+    // fix #2769 / §29.11 / §23.3 / §28.9: a BLOCK-BODIED property read of an
+    // iterator-format interface (IEnumerable<T>/IOwningEnumerable<T>/
+    // IAsyncEnumerable<T>/IOwningAsyncEnumerable<T>) mints a fresh WRAPPER
+    // frame inside the getter call — the #2703 representation path
+    // (wrapAsIEnumerableForTarget at the body return) wraps an Array/Set/
+    // LinkedList/class into a vtable-backed enumerator and returns it. The
+    // local bound here owns that frame; without this arm the wrapper leaks
+    // (the for-in sees a LocalSymbol and registers no loop-end dispose). An
+    // auto-property / field read of an already-existing IEnumerable mints
+    // nothing and stays un-owned — the narrower MemberAccessExpr +
+    // blockGetterOf shape matches the fact precisely. // per #2769, #2703
+    if (!ownsSource) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                ld->initializer.get())) {
+            if (blockGetterOf(ctx_.exprSymbol(*ma)))
+                ownsSource = true;
+        }
+    }
     // §28.10 / stdlib §4.5 v0.195 (#2146): a plain `var d := recv.Drain();`
     // over a NAMED owning collection does NOT own a fresh source — the drain
     // view IS the receiver at IOwningEnumerable static type ("no separate
@@ -13959,6 +13977,59 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // scope end. Honor the flag uniformly here so no disposal path can dispose a
     // pin. (The untyped bare-identifier pin was already handled inside
     // classOfLocal; this generalizes it to the typed and if/case forms.)
+    //
+    // fix #2769 / §29.11 / §23.3 / §28.9: the OWNERSHIP-pass borrow-pin
+    // (propertyGetterIsRecognizedBorrow's signature-level §28.6 verdict) is
+    // too coarse for a BLOCK-BODIED property whose declared return type is
+    // an iterator-format interface — the #2703 representation path mints a
+    // fresh wrapper frame inside the getter call, the caller OWNS that frame
+    // (slot-1 Dispose frees it), and the `using var` must register the
+    // scope-end disposal. Override the pin narrowly: only when the init is a
+    // MemberAccessExpr whose property symbol has a block-bodied getter AND
+    // the local's effective type is one of the four iterator-format
+    // interfaces. The same predicate gates `ownsSource` below (the
+    // registerIterableSourceDisposal twin already has its own equivalent
+    // arm, which the `using var` path does NOT have to gate against here
+    // — both paths reach the same `isSyncIterEnum` arm that registers the
+    // iterEnumDispose, and only ONE of them fires per LocalDecl).
+    // // per #2769, #2703
+    if (ld->usingVarSourceIsBorrow && ld->initializer) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                ld->initializer.get())) {
+            if (blockGetterOf(ctx_.exprSymbol(*ma))) {
+                // The override is FURTHER gated on the local's effective type
+                // being one of the four iterator-format interface heads —
+                // §28.6's signature-level borrow-pin remains correct for the
+                // class-typed-block-bodied case (#2137's family: a
+                // `Widget`-typed getter whose body returns `_w`, where the
+                // Widget dtor fires exactly once on the holder and the
+                // using-var's slot must NOT dispose). The §29.2 wrap-mint
+                // (and the corresponding #2703 reclaim) is specific to the
+                // declaration-less iterator-format interfaces — those are
+                // the only declared types that the §29.2 representation
+                // path produces a fresh wrapper frame for.
+                const sema::TypeRef* lt =
+                    ld->type ? ctx_.resolvedType(*ld->type)
+                             : ctx_.exprType(*ld->initializer);
+                bool isIterFmt =
+                    lt && lt->kind == sema::TypeRef::Kind::Named &&
+                    !lt->declaration && lt->astNode && lt->astNode->name &&
+                    !lt->astNode->name->parts.empty() &&
+                    (lt->headName() == "IEnumerable" ||
+                     lt->headName() == "IOwningEnumerable" ||
+                     lt->headName() == "IAsyncEnumerable" ||
+                     lt->headName() == "IOwningAsyncEnumerable");
+                if (isIterFmt) {
+                    // Re-set so the downstream arms see the correct value.
+                    // Don't write back to the AST — the OWNERSHIP pass's
+                    // verdict is the authority for everything but this one
+                    // carve-out.
+                    const_cast<ast::LocalDecl*>(ld)->usingVarSourceIsBorrow =
+                        false;
+                }
+            }
+        }
+    }
     if (ld->usingVarSourceIsBorrow) return;
 
     // fix #2975 (§29.7 / §29.3 / §28.3 / §28.2 / §8.1, v0.240): a slot declared
@@ -14059,6 +14130,22 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) ||
                 dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) ||
                 wrappedHere;
+            // fix #2769 / §29.11 / §23.3 / §28.9: the `using var` twin of
+            // registerIterableSourceDisposal's MemberAccessExpr+blockGetterOf
+            // arm. A block-bodied property read of an iterator-format
+            // interface mints a fresh wrapper frame inside the getter call
+            // (the #2703 representation path) and the local bound here owns
+            // that frame. Auto-property / field reads of an already-existing
+            // IEnumerable mints nothing and stay un-owned; the narrower
+            // MemberAccessExpr+blockGetterOf shape matches the fact
+            // precisely. // per #2769, #2703
+            if (!ownsSource) {
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        ld->initializer.get())) {
+                    if (blockGetterOf(ctx_.exprSymbol(*ma)))
+                        ownsSource = true;
+                }
+            }
             // fix #2376 / §29.11: `using var e := src.GetEnumerator()` on a
             // NAMED (IdentifierExpr) vtable-backed-IEnumerable `src` used to
             // ALIAS `src` — GetEnumerator returned the receiver's identity
