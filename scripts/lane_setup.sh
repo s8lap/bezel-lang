@@ -80,6 +80,73 @@ if [ "$_legacy" != "$TARGET" ] && [ -d "$_legacy" ] && [ ! -d "$TARGET" ]; then
   fi
 fi
 
+# AOT bincache + workdir symlinks on /mnt/fast — same rationale as the
+# build/ symlink below, applied to the AOT cache and workdir that
+# tests/support/aot_support.hpp reads by default. Without this:
+#   - `cacheDir()` (tests/support/aot_support.hpp:1014) defaults to
+#     /var/tmp/bezel-scratch/aot-bincache which is sda3 btrfs (~5 durable
+#     creates/s); each cold-test cache store pays 4 fsyncs ≈260ms
+#   - `scratchBase()` (aot_support.hpp:153) defaults to /var/tmp/bezel-scratch
+#     which is the same sda3 btrfs; cross-filesystem hardlinks to the bincache
+#     fail (EXDEV) and the harness falls back to per-test copy_file
+# Together: a cold gate times out the 1800s shard ceiling per-test
+# (~5.7s/test vs ~0.05s/test warm) — measured 2026-08-22 Wave 4 attempt-1,
+# with cache_n=14284 invalid entries from the wrong tree identity. See
+# memory: storage-layout-ssd (154x fsync gap), run-2026-08-22-impl.md
+# (Wave 4 environmental fix).
+#
+# Same idempotency pattern as the build/ symlink below: detect /mnt/fast
+# as a mount point (not just a directory — fix #3008's lesson), create
+# only if missing, refuse to clobber a real dir with cache contents.
+# Runs BEFORE the build/ block so it executes even when build/ is already
+# correctly configured (the build/ block early-exits and would otherwise
+# skip this section).
+AOT_FAST_ROOT="${BEZEL_AOT_FAST_ROOT:-}"
+# If unset, derive from BEZEL_LANE_BUILD_ROOT — the same var the build/
+# symlink uses — so build and bincache share a fast-disk location by
+# default. Override either independently if they need to live apart.
+# If BOTH are unset, AOT_FAST_ROOT stays empty and the bincache section
+# becomes a no-op (operator must opt in via env or set
+# BEZEL_AOT_CACHE_DIR / BEZEL_AOT_SCRATCH_DIR to override the harness
+# defaults at the C side).
+if [ -z "$AOT_FAST_ROOT" ]; then
+  _build_fast_root="${BEZEL_LANE_BUILD_ROOT:-}"
+  if [ -n "$_build_fast_root" ]; then
+    # FAST_ROOT is the parent of `<lane-name>` under lane-builds; strip
+    # the trailing component to get the disk root. e.g.
+    #   /mnt/fast/lane-builds       → /mnt/fast
+    #   /scratch/builds            → /scratch
+    AOT_FAST_ROOT="$(dirname "$_build_fast_root")"
+  fi
+fi
+if [ -n "$AOT_FAST_ROOT" ] && mountpoint -q "$AOT_FAST_ROOT" 2>/dev/null; then
+  for sub in aot-bincache aot-harness; do
+    _link="/var/tmp/bezel-scratch/$sub"
+    _tgt="$AOT_FAST_ROOT/$sub"
+    if [ -L "$_link" ] && [ "$(readlink "$_link")" = "$_tgt" ]; then
+      : # already correct — no-op
+    elif [ -L "$_link" ]; then
+      echo "[lane_setup] $_link -> $(readlink "$_link") != expected $_tgt — leaving alone"
+    elif [ -d "$_link" ] && [ -z "$(ls -A "$_link" 2>/dev/null)" ]; then
+      rmdir "$_link" && ln -sfn "$_tgt" "$_link" && \
+        echo "[lane_setup] $_link -> $_tgt  (was empty dir; replaced with symlink)"
+    elif [ -d "$_link" ]; then
+      echo "[lane_setup] $_link is a NON-EMPTY real dir — leaving alone (move contents to $_tgt to convert)"
+    else
+      mkdir -p "$_tgt" 2>/dev/null && ln -sfn "$_tgt" "$_link" && \
+        echo "[lane_setup] $_link -> $_tgt  (FAST_ROOT=$AOT_FAST_ROOT)"
+    fi
+  done
+elif [ -n "$AOT_FAST_ROOT" ]; then
+  echo "[lane_setup] $AOT_FAST_ROOT is NOT a mount point — bincache stays on sda3."
+  echo "[lane_setup] A cold gate will time out the 1800s shard ceiling per-test."
+  echo "[lane_setup] Mount the fast disk, or set BEZEL_AOT_FAST_ROOT / BEZEL_AOT_CACHE_DIR / BEZEL_AOT_SCRATCH_DIR."
+else
+  echo "[lane_setup] AOT fast-disk location not configured (no BEZEL_AOT_FAST_ROOT or BEZEL_LANE_BUILD_ROOT set)."
+  echo "[lane_setup] Bincache + workdir stay on the default sda3 btrfs — cold gates will time out per-test."
+  echo "[lane_setup] To enable: set BEZEL_AOT_FAST_ROOT=/your/fast/disk or BEZEL_AOT_CACHE_DIR / BEZEL_AOT_SCRATCH_DIR."
+fi
+
 if [ -L "$WT/build" ]; then
   # fix #3005: REPAIR A DANGLING LINK — this early return used to refuse to fix
   # the exact state this script creates. When /mnt/fast/lane-builds/<name> is

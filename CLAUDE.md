@@ -265,6 +265,36 @@ matching worktree, so a wave of N live lanes still holds N trees at ~3.6 GB
 each. Watch `df -h /mnt/fast` during a fan-out: five concurrent lanes took it to
 **91%**, and a lane that runs out of disk mid-build fails in ways that look like
 a compiler error. Re-run `lane_setup.sh` in a worktree whose `build/` symlink
+dangles (`scripts/lane_setup.sh` self-repairs dangling build/ symlinks).
+
+⚠ **AOT bincache + workdir must be on a fast disk** (the original `#3010`-class
+defect — silently caused a 5.7s/test cold-cache wall time on 2026-08-22 Wave
+4 attempt-1, exceeding the 1800s shard ceiling per-test). The AOT harness's
+`cacheDir()` and `scratchBase()` defaults (`tests/support/aot_support.hpp:1014`
+and `:153`) both resolve to `/var/tmp/bezel-scratch/{aot-bincache,aot-harness}`
+— `sda3 btrfs` on the machine this was measured on (~5 durable creates/s,
+~65ms fdatasync on a 1 MB file). The fast disk on that box was `/mnt/fast`
+NVMe (~846/s, ~11ms fdatasync — a 6× per-op gap, 169× on sustained creates).
+Other machines will have other "slow" and "fast" disks; the policy is
+**structural, not FS-type-specific**.
+
+**Setup is the operator's responsibility**, not something `gate.sh` probes for.
+`gate.sh` deliberately does not measure fsync speed or check filesystem type:
+thresholds are machine-dependent (a busy NVMe under contention is ~5ms,
+indistinguishable from sda3 btrfs quiet — false positives), and an unfamiliar
+slow backend (xfs-on-SATA, USB, network mount) would slip past an FS-name
+check. The cold gate's *behavior* — per-test shard phases hitting the 1800s
+ceiling with `runs/OK` counts in the 300s — is the load-bearing indicator.
+
+**The fix is `scripts/lane_setup.sh`** (run as the first command in any lane
+worktree; idempotent; refuses to clobber a real dir). It symlinks both
+`/var/tmp/bezel-scratch/aot-bincache` and `/var/tmp/bezel-scratch/aot-harness`
+to `/mnt/fast/{aot-bincache,aot-harness}` when `/mnt/fast` is a mount point.
+Override the path with `BEZEL_AOT_FAST_ROOT=/your/fast/disk` if the fast disk
+isn't named `/mnt/fast`. To opt out of symlinking entirely (e.g. you have a
+single-disk box or want to use a tmpfs), set `BEZEL_AOT_FAST_ROOT=""` or set
+`BEZEL_AOT_CACHE_DIR` / `BEZEL_AOT_SCRATCH_DIR` env vars to point at your
+chosen locations — both the harness defaults and `lane_setup.sh` respect them.
 dangles (it now self-repairs).
 
 **Waiting for a gate (this is where coordinator time actually goes).** Two rules,

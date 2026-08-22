@@ -530,6 +530,17 @@ echo "== gate[1/6]: reconfigure (glob any new test files) =="
 # the build phase tells us whether the k2 cache identity changed this gate
 # (core.a rebuilt => cold ASan pass guaranteed) — see the ceiling note above.
 CORE_MTIME_PRE=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo 0)
+
+# AOT bincache + workdir setup is the operator's responsibility — see
+# CLAUDE.md "AOT bincache + workdir must be on the fast disk too" and
+# scripts/lane_setup.sh which creates the /mnt/fast symlinks idempotently.
+# We intentionally do NOT probe fsync speed or filesystem type here:
+# thresholds are machine-dependent and would false-positive on a busy but
+# fast disk (NVMe under contention is ~5ms, not 65ms btrfs) or miss
+# an unfamiliar slow backend (xfs-on-SATA, USB drive, network mount).
+# The cold gate's behavior under a slow cache speaks for itself; if you
+# see per-test shard phases hitting the 1800s ceiling with runs/OK
+# counts in the 300s, the bincache is the first thing to check.
 PHASE_T0=$(now)
 "$DH" build cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo >"$S/gate_reconf.log" 2>&1; prc=$?
 rec_ran configure "$prc"
