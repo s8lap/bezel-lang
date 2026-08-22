@@ -2008,9 +2008,86 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                             builder_.SetInsertPoint(contBB);
                         } else {  // IterCleanup::Kind::Finally
                             // Run one finally body (§29.7 / §28.11).
+                            //
+                            // fix #2853 / §29.7 / §28.10 / §4.6 / §28.9 (v0.240):
+                            // the `finally` body lowered here is the ABANDONMENT-
+                            // side replay of the one inline in MoveNext for the
+                            // NORMAL/EXCEPTION edge (lowerTry §30.9 / §31.2, line
+                            // 4269). The two lowerings are over the SAME
+                            // LocalDecl AST nodes — keyed by node, the three
+                            // string-eligibility sets agree by construction —
+                            // but the allocas are allocated afresh in EACH
+                            // function (MoveNext in the first lowering, the
+                            // Dispose fn `targetFn` here), and each lowering
+                            // must register ITS OWN Disposal{stringRelease}
+                            // into ITS OWN disposeStack_. The two edges are
+                            // mutually exclusive: Dispose stamps the DISPOSED
+                            // sentinel (`-2`, §28.2 / §29.7) so a later
+                            // MoveNext cannot resume past the yield, and a
+                            // run-to-exhaustion iterator parks at `-1`, whose
+                            // switch default skips cleanup. So each release
+                            // fires exactly once.
+                            //
+                            // armStringLocalRefcount — the only registrar of
+                            // the scope-end Disposal{stringRelease} — gates on
+                            // `currentFn_ == stringReleaseEligibleFn_`, and
+                            // the token still named the MOVENEXT fn here
+                            // (pinned at #2817, never re-set for `targetFn`):
+                            // EVERY `var` string local declared inside a
+                            // replayed `finally` body leaked its bz_string
+                            // header + data buffer (measured 380 B / 20 for a
+                            // 10x-abandoned iterator, down from #2817's
+                            // 5112 B / 222 — #2817 closed the MoveNext-body
+                            // share and left exactly the finally-in-Dispose
+                            // share). The fix mirrors #2817's MOVE-NEXT pin
+                            // (#1897 has the unwind pin in this same fn, and
+                            // #2148/#2142/#2143 the borrowing-collection pins)
+                            // and #2852's destructor pin: save the token, run
+                            // collectStringReleaseEligible over THE FINALLY
+                            // BODY (the AST walk is pure inspection; no IR
+                            // registered), pin the token to `targetFn` for the
+                            // duration of the body lowering, restore. // per
+                            // §29.7, §28.10, §4.6, §28.9.
+                            llvm::Function* savedStringReleaseEligibleFn =
+                                stringReleaseEligibleFn_;
+                            collectStringReleaseEligible(*ac.finallyBody);
+                            stringReleaseEligibleFn_ = targetFn;
                             disposeStack_.emplace_back();
                             lowerBody(*ac.finallyBody);
+                            // The replay uses `lowerBody` (not
+                            // `lowerScopedBlock`), so the per-scope
+                            // emit-on-pop that `lowerScopedBlock` performs
+                            // does NOT run here. armStringLocalRefcount
+                            // pushes its Disposal onto this frame, and a
+                            // bare `pop_back()` would silently drop it.
+                            //
+                            // The other scope-end analysis tokens
+                            // (`unwindIneligibleFn_`,
+                            // `closureReleaseEligibleFn_`,
+                            // `borrowingArrayFreeEligibleFn_`) are likewise
+                            // not re-armed for `targetFn`, so any plain owned
+                            // local / closure-local / borrowing-collection
+                            // literal declared in a replayed `finally` is
+                            // NOT registered to this frame (their gates are
+                            // false) — but `registerUsingDisposal` is
+                            // unconditional and WOULD be on this frame if
+                            // such a local were present. Filter to ONLY the
+                            // string-release entries armStringLocalRefcount
+                            // pushed (this issue's scope); emit those. The
+                            // other / broader in-finally-body leak class is
+                            // filed separately and out of #2853's scope.
+                            std::vector<Disposal> stringReleases;
+                            stringReleases.reserve(disposeStack_.back().size());
+                            for (const auto& d : disposeStack_.back()) {
+                                if (d.stringRelease) {
+                                    stringReleases.push_back(d);
+                                }
+                            }
+                            if (!stringReleases.empty()) {
+                                emitDisposals(stringReleases);
+                            }
                             disposeStack_.pop_back();
+                            stringReleaseEligibleFn_ = savedStringReleaseEligibleFn;
                         }
                     }
                 }

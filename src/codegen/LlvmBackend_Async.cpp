@@ -3150,9 +3150,38 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                             builder_.SetInsertPoint(contBB);
                         } else {  // IterCleanup::Kind::Finally
                             // Run one finally body (§29.7 / §28.11).
+                            //
+                            // fix #2853 / §29.7 / §30.7 / §28.10 / §4.6 / §28.9
+                            // (v0.240): the ASYNC-TWIN of the sync-iterator fix
+                            // at `LlvmBackend_Iterators.cpp` —
+                            // `stringReleaseEligibleFn_` is pinned to the
+                            // RESUME fn here (line above, #2817), and the
+                            // `finally` body REPLAYED in this Dispose fn was
+                            // lowered with `currentFn_` set to `disposeFn`
+                            // (just above), so without re-pinning the token
+                            // for the replay every `var` string local
+                            // declared inside a finally body in an async
+                            // iterator leaked. Mirror the sync fix exactly:
+                            // save / analyze / pin / lower / filter-and-emit
+                            // / restore. // per §29.7, §30.7.
+                            llvm::Function* savedStringReleaseEligibleFn =
+                                stringReleaseEligibleFn_;
+                            collectStringReleaseEligible(*ac.finallyBody);
+                            stringReleaseEligibleFn_ = disposeFn;
                             disposeStack_.emplace_back();
                             lowerBody(*ac.finallyBody);
+                            std::vector<Disposal> stringReleases;
+                            stringReleases.reserve(disposeStack_.back().size());
+                            for (const auto& d : disposeStack_.back()) {
+                                if (d.stringRelease) {
+                                    stringReleases.push_back(d);
+                                }
+                            }
+                            if (!stringReleases.empty()) {
+                                emitDisposals(stringReleases);
+                            }
                             disposeStack_.pop_back();
+                            stringReleaseEligibleFn_ = savedStringReleaseEligibleFn;
                         }
                     }
                 }
