@@ -1082,6 +1082,37 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     const auto& m = ma->member;
 
     auto* recvTy = ctx_.exprType(*ma->target);
+    // fix #3345: handle the static-call form `Array.Sort(a)` /
+    // `Array.Reverse(a)` / `Array.Fill(a, v)` — the target is the TYPE
+    // NAME (IdentifierExpr "Array"), not a value; recvTy is null. Sema
+    // (ExprTypecheck_Calls) accepts the static-call shape by typing it
+    // as the first argument's array type and returns Unit for the
+    // in-place methods. Codegen's static-call sugar: re-target to the
+    // FIRST ARGUMENT (the array receiver value) for the duration of
+    // this function. The ast::MemberAccessExpr itself is const, so we
+    // shadow `ma->target` with `effectiveRecvExpr` for the one site
+    // that lowers the receiver (line ~1379 below, `recv = lowerExpr(*ma->target)`).
+    // Every other ma->target use in this function (igrouping recv,
+    // grouping reshape, freeUnboundOwnedBorrowingArrayTemp cleanup)
+    // is gated on recvTy being a non-null grouping / array type, which
+    // the static-call form never produces — they short-circuit cleanly.
+    // The `isStaticArrayCall` flag below is consulted by the in-place
+    // Sort/Reverse arms (and any other in-place static-call member
+    // that needs to know whether args[0] is the implicit receiver).
+    bool isStaticArrayCall = false;
+    const ast::Expr* effectiveRecvExpr = ma->target.get();
+    if (!recvTy) {
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get())) {
+            if ((id->name == "Array" || id->name == "OwningArray") &&
+                !call.args.empty() && call.args[0].value) {
+                recvTy = ctx_.exprType(*call.args[0].value);
+                if (recvTy) {
+                    effectiveRecvExpr = call.args[0].value.get();
+                    isStaticArrayCall = true;
+                }
+            }
+        }
+    }
     // stdlib §5 (#755, supersedes #1296): an `IGrouping<TKey, T>` receiver.
     // `IGrouping : IEnumerable<T>` (stdlib §5:3076), so every §5 eager terminal
     // (Sum/Min/Max/Average/Any/All/Aggregate/Count(pred)/First/Last/Single/
@@ -1376,7 +1407,7 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         auto* elemsFn = declareC("bz_grouping_elements", ptrTy(), {ptrTy()});
         recv = builder_.CreateCall(elemsFn, {grp}, "igrp.elems");
     } else {
-        recv = lowerExpr(*ma->target);
+        recv = lowerExpr(*effectiveRecvExpr);
     }
     if (!recv) return nullptr;
 
@@ -3504,7 +3535,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
 
         // per §3: .Sort() — in-place ascending sort for int arrays.
         // Uses bz_array_sort with a built-in i32 comparator thunk.
-        if (m == "Sort" && call.args.empty()) {
+        // fix #3345: the static-call form `Array.Sort(a)` re-binds the
+        // receiver to args[0] above; here, accept either the instance
+        // form (call.args.empty()) or the static form (call.args.size()
+        // == 1 with the array in args[0]). Both lower the same way:
+        // the receiver `recv` is the array.
+        if (m == "Sort" && (call.args.empty() ||
+                            (isStaticArrayCall && call.args.size() == 1))) {
             llvm::Type* elemTy2 = getElemTy();
             // #1195: detect class IComparable<T> BEFORE the isStringElem check —
             // class elements are ptrTy()-typed just like strings, so without this
@@ -3646,7 +3683,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             return llvm::ConstantInt::get(i32(), 0);
         }
         // per §3: .Reverse() — in-place reverse.
-        if (m == "Reverse" && call.args.empty()) {
+        // fix #3345: accept the static-call form `Array.Reverse(a)` —
+        // the static arm re-binds the receiver to args[0] above, so
+        // this arm sees recv as the array regardless of call shape.
+        if (m == "Reverse" && (call.args.empty() ||
+                               (isStaticArrayCall && call.args.size() == 1))) {
             llvm::Type* elemTy = getElemTy();
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});

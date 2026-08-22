@@ -3987,6 +3987,45 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }();
                 using P = PrimitiveType;
                 const auto& m = ma->member;
+                // fix #3345: early-return for the static-call form
+                // `Array.Sort(a)` / `Array.Reverse(a)` /
+                // `Array.Fill(a, v)` / `Array.CopyTo(...)` — the
+                // receiver is the TYPE NAME (IdentifierExpr "Array"), not
+                // a value; `recvTy` is null. The bare-name dispatch arms
+                // below all dereference `recvTy` (e.g.
+                // `!recvTy->genericArgs.empty()`) without guarding, which
+                // used to SIGSEGV at compile time, exit 139. Handle the
+                // static-call form here as a sugar for the equivalent
+                // instance call on the first argument (`Array.Sort(a)` ↔
+                // `a.Sort()`): the first argument IS the receiver, and
+                // the in-place methods return Unit. Codegen re-binds its
+                // own static-call arm (tryLowerCollectionInstanceCall:1078)
+                // using the first arg's value as the runtime receiver.
+                // Restricted to in-place static-call members
+                // (Sort/Reverse/Fill/CopyTo); the copy-form static
+                // calls (`Array.Reversed()`, `Array.Sorted()`) are
+                // arity-0 in this position and never reach here — the
+                // user must use the instance form for those.
+                if (!recvTy &&
+                    (colName == "Array" || colName == "OwningArray") &&
+                    (m == "Sort" || m == "Reverse" ||
+                     m == "Fill" || m == "CopyTo") &&
+                    !ce.args.empty() && ce.args[0].value) {
+                    const TypeRef* argTy =
+                        ctx_.exprType(*ce.args[0].value);
+                    if (argTy &&
+                        argTy->kind == TypeRef::Kind::Named &&
+                        !argTy->declaration && argTy->astNode &&
+                        argTy->astNode->name &&
+                        !argTy->astNode->name->parts.empty() &&
+                        argTy->headName() == colName &&
+                        !argTy->genericArgs.empty()) {
+                        TypeRef unitTy;
+                        unitTy.kind = TypeRef::Kind::Unit;
+                        ctx_.setExprType(&ce, &unitTy);
+                        return;
+                    }
+                }
                 // §8.5 / §8.6 (#417): `o.ToString()` where o: Object or an
                 // interface — the universal Object.ToString (no MethodSymbol,
                 // dispatched through the vtable ToString slot in codegen). The
@@ -5149,6 +5188,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         colName == "Set" || colName == "OwningSet" ||
                         colName == "LinkedList" || colName == "OwningLinkedList";
                     if (isArrLike) {
+                        // fix #3345: the static-call form
+                        // `Array.Sort(a)` / `Array.Reverse(a)` is handled
+                        // by the early-return above; the arms below are
+                        // for the instance-call form only.
                         if (m == "Length" || m == "Count")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         else if (m == "IsEmpty")
