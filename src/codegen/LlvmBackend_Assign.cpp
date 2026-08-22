@@ -9778,6 +9778,50 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
         // this shape: the `Current` here is non-virtual and class-parented,
         // so neither of `declareImportedPropertyGetters`' two skips
         // (virtual, interface-parented) applies.
+        //
+        // #3275 (§23 / §29.1+§29.2, v0.254): the loader's documented invariant
+        // is that `PropertySymbol::decl` is null for every IMPORTED
+        // PropertySymbol (ModuleLoader.cpp ~L891, the
+        // `MetaMemberKind::Property` arm of `convertMember`, only sets
+        // `parent`/`name`/`modifiers`/`scope`/`visibility`/side-table
+        // entries; never `decl`). Verified empirically for every shape
+        // the for-in driver / wrapper can land on:
+        //   - method-form `Current(): T`         → `currentMethodSym`,
+        //     never `currentPropSym`, no read.
+        //   - non-virtual class-parented `Current` → `importedPropGetterFns_`
+        //     populated, the `else` arm below reads `currentFn` from it
+        //     (no thunk build, no `pd`).
+        //   - virtual class-parented `Current`   → same path post-#3267
+        //     (`declareImportedPropertyGetters` now populates the thunk
+        //     for VIRTUAL imported properties — fix `251213d`).
+        //   - interface-parented `Current`       → `importedPropGetterFns_`
+        //     skip path; the `else` arm reads nothing.
+        // In every shape `currentPropSym->decl` is null, so the `if (pd)`
+        // arm below is unreachable on the for-in driver path. The refute
+        // commit `1a74041`'s `!ctx_.isImported(enumTs)` band-aid at this
+        // site and the parallel one at `lowerIEnumerableFor` was preserved
+        // as defensive until #3275 investigated — it was reverted by the
+        // structural fix #3267 (`251213d`).
+        //
+        // The `#ifndef NDEBUG` invariant check below pins the documented
+        // invariant: any future loader change that re-introduces `decl`
+        // on an imported PropertySymbol trips the assertion here in
+        // debug builds. The compiled-program observable is unchanged.
+#ifndef NDEBUG
+        if (ctx_.isImported(enumTs) && currentPropSym->decl != nullptr) {
+            llvm::errs() << "bezel codegen: imported-symbol invariant "
+                            "violated (§23 / #3275): imported "
+                         << enumTs->name << "."
+                         << currentPropSym->name
+                         << " carries a non-null decl. The cross-module "
+                            "thunk path below would compile against the "
+                            "WRONG class layout (importer-side offsets, "
+                            "exporter-side runtime object). Failing "
+                            "compilation early so the loader regression "
+                            "is caught at first repro, not at runtime.\n";
+            abort();
+        }
+#endif
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(currentPropSym->decl);
         if (pd) {
             if (const ast::PropertyAccessor* acc = blockGetterOf(currentPropSym)) {

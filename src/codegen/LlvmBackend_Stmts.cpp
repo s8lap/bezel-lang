@@ -7982,6 +7982,44 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             // neither of `declareImportedPropertyGetters`' two skips
             // (virtual, interface-parented) applies. Mirrors the parallel
             // change in `wrapUserClassAsIEnumerable` (LlvmBackend_Assign.cpp).
+            //
+            // #3275 (§23 / §29.1+§29.2, v0.254): the loader's documented
+            // invariant is that `PropertySymbol::decl` is null for every
+            // IMPORTED PropertySymbol (ModuleLoader.cpp ~L891, the
+            // `MetaMemberKind::Property` arm of `convertMember`, only sets
+            // `parent`/`name`/`modifiers`/`scope`/`visibility`/side-table
+            // entries; never `decl`). Verified empirically for every shape
+            // the for-in driver can land on (see the sibling comment in
+            // `wrapUserClassAsIEnumerable` at LlvmBackend_Assign.cpp ~L9782).
+            //
+            // The `#ifndef NDEBUG` invariant check below pins the invariant
+            // here too. Gated on `ctx_.isImported(enumTs)` to match the
+            // sibling pattern at LlvmBackend_Assign.cpp ~L9811 — a LOCAL
+            // enumerator class DOES have `currentPropSym->decl != nullptr`
+            // (its PropertySymbol carries a real `ast::PropertyDecl` with
+            // accessor bodies the local `if (pd)` arm reads), so a debug
+            // build must not trip this check on every single-module for-in
+            // loop over a property-form `Current` (the twin half of this
+            // regression test family). Any future loader change that
+            // re-introduces `decl` on an IMPORTED PropertySymbol trips
+            // `abort()` here in debug builds — caught at compile, not at
+            // runtime.
+#ifndef NDEBUG
+            if (ctx_.isImported(enumTs) && currentPropSym->decl != nullptr) {
+                llvm::errs() << "bezel codegen: imported-symbol invariant "
+                                "violated (§23 / #3275): property `"
+                             << currentPropSym->name
+                             << "` of imported enumerator `"
+                             << enumTs->name
+                             << "` carries a non-null decl. The cross-module "
+                                "getter thunk path below would compile against "
+                                "the WRONG class layout (importer-side offsets, "
+                                "exporter-side runtime object). Failing "
+                                "compilation early so the loader regression "
+                                "is caught at first repro, not at runtime.\n";
+                abort();
+            }
+#endif
             auto* pd = dynamic_cast<const ast::PropertyDecl*>(currentPropSym->decl);
             if (pd) {
                 // Save/restore currentThis_.
