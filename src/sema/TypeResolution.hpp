@@ -97,6 +97,17 @@ bool checkGenericConstraintsAtExpr(SemaContext& ctx,
                                    const std::vector<TypeRef*>& argRefs,
                                    TypeSymbol* tsym);
 
+// §22.12 rule 4 residual + §9.7 static-field bullet (v0.265, #3273 /
+// #3290): the §9.7 null-source value-site pass for `static readonly`
+// fields and auto-properties whose declared type is one of §9.7's three
+// deferred kinds (borrow-bearing record, non-owning choice that holds
+// borrows, plain inline array carrying borrows). Walks every such
+// initializer and emits a §9.7 diagnostic when a non-null reference-typed
+// component is statically observable. Called from `typecheckExpressions()`
+// AFTER the expression walk so positional-argument resolution has named
+// every argument; same pattern as `checkSendableConstraintsLate`.
+bool checkStaticReadonlyNullSource(SemaContext& ctx);
+
 // Structural equality of two resolved TypeRefs (§19/§22.6 "exact match").
 // Returns false (conservatively) when either is null or an Error kind.
 // Exposes the resolver's existing structural-equality utility for reuse by

@@ -152,6 +152,24 @@ public:
         const std::vector<const ast::Type*>& argAsts,
         const std::vector<TypeRef*>& argRefs, TypeSymbol* tsym);
 
+    // §22.12 rule 4 residual + §9.7 static-field bullet (v0.265, #3273 /
+    // #3290): value-site pass for `static readonly` fields/auto-properties
+    // whose declared type is a borrow-bearing record, a non-owning choice
+    // that holds borrows, or a plain inline array carrying borrows. The
+    // §9.7 null-source form requires every reference-typed field (and
+    // every reference-typed slot of every inline-array field) of the
+    // stored value to be `null`; this walk examines the initializer and
+    // emits a §9.7 diagnostic when a non-null reference-typed component
+    // is statically observable. CancellationToken's value-builtin flag
+    // makes the predicate false there, so its `None` sentinel and the
+    // every-default `token := CancellationToken.None` pass untouched.
+    // Lives on Resolver for the same reason as
+    // checkStaticReadonlyBareTInstantiations: it needs the diagnostic
+    // stream. Called from typecheckExpressions() AFTER initializers have
+    // been typechecked, so positional-argument resolution has named every
+    // argument.
+    void checkStaticReadonlyNullSource();
+
 private:
     // Lookup environment in scope. A stack of scopes (module-level + per-type
     // + per-method). Each scope contributes a small name → Symbol table.

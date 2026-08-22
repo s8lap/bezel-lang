@@ -484,4 +484,19 @@ bool checkGenericConstraintsAtExpr(SemaContext& ctx,
     return !ctx.diagnostics().hasErrors();
 }
 
+// §22.12 rule 4 residual + §9.7 static-field bullet (v0.265, #3273 /
+// #3290): the §9.7 null-source value-site pass. Same pattern as
+// `checkSendableConstraintsLate` and `checkClassSerializationEligibilityLate`:
+// a fresh Resolver wrapping `ctx` walks every static readonly field /
+// auto-property whose declared type is one of §9.7's three deferred
+// kinds and verifies the initializer is the null-source form. Called
+// from `typecheckExpressions()` (after the expression walk has named
+// every positional argument) so the constructor-shape analysis has
+// something to walk.
+bool checkStaticReadonlyNullSource(SemaContext& ctx) {
+    Resolver r(ctx);
+    r.checkStaticReadonlyNullSource();
+    return !ctx.diagnostics().hasErrors();
+}
+
 } // namespace bezel::sema

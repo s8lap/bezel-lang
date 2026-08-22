@@ -2889,6 +2889,27 @@ static bool isInSynchronizedSet(const TypeRef* rt);
 static bool isInReadonlySuppressionSet(const TypeRef* rt);
 static bool isRule4GovernedReference(const TypeRef* rt);
 static std::string describeStaticValueType(const TypeRef* rt);
+// Forward declarations for the §22.12 rule 4 residual (#3290) value-site
+// helpers; their definitions live later in this TU alongside the other
+// §22.12 predicates.
+static bool isHoldsBorrowsChoice(const TypeRef* rt,
+                                 const sema::SemaContext& ctx);
+static bool isPlainInlineArrayCarryingBorrows(
+    const TypeRef* rt, const sema::SemaContext& ctx);
+static bool isBorrowBearingRecordForStaticReadonly(const TypeRef* rt,
+                                                   SemaContext& ctx);
+// §22.12 rule 4 residual + §9.7 strict reference-type quantifier
+// (#3290): shallow check that recognises builtin reference types
+// (Object, Mutex, Channel, …) as reference-typed, not just user-
+// declared classes/interfaces. Forward-declared so the value-site pass
+// can consult it; defined alongside the other §22.12 predicates.
+static bool staticReadonlyFieldIsReferenceTyped(const TypeRef* rt,
+                                                const SemaContext& ctx);
+static bool isStaticallyNullExpr(const ast::Expr* e);
+static bool isStaticallyDefaultExpr(const ast::Expr* e);
+static void checkStaticReadonlyRecordInit(
+    SemaContext& ctx, const ast::NewExpr& nx, const TypeRef* declTy,
+    SourceLocation loc, std::string_view what, std::string_view name);
 
 // §22.12 rule 3/4 (v0.262, #3272): classify a CONCRETE substitution at the
 // instantiation site for a `static readonly` bare-parameter declaration,
@@ -9548,6 +9569,120 @@ static bool isChoiceTypeRef(const TypeRef* rt) {
            rt->declaration->kind == ast::TypeDeclKind::Choice;
 }
 
+// §22.12 rule 4 residual (v0.265, #3273 / #3290): a non-owning choice that
+// HOLDS borrows (§35.4's holds-borrows property — every borrow-bearing
+// choice and any owning choice with a borrow-carrying payload beside its
+// owned ones; the spec text "an owning choice that also holds borrows
+// takes the next bullet's rejection" lifts this case to the rejection, so
+// here `holds-borrows` is read AS `borrow-bearing` — `BorrowBearing`
+// classification under §35.4). The owning-classified-choice branch above
+// already short-circuits before this one, so a borrow-bearing OWNING
+// choice never reaches this predicate; what reaches here is a
+// `BorrowBearing`-classified choice (§35.4.2).
+static bool isHoldsBorrowsChoice(const TypeRef* rt,
+                                 const sema::SemaContext& ctx) {
+    if (!isChoiceTypeRef(rt)) return false;
+    auto verdict = common::classifyChoiceType(rt, ctx);
+    return verdict && *verdict == common::ChoiceClassification::BorrowBearing;
+}
+
+// §22.12 rule 4 residual (v0.265, #3273 / #3290): a PLAIN inline array
+// (no `owned` slot marker, §15.1.2) whose element type carries borrows.
+// The §9.7 borrow-carrying-field predicate classifies an inline-array
+// field as borrow-carrying when its element is a reference type; the
+// narrower "carries borrows" wording here matches that. Owning-inline-
+// arrays (arrayOwned) are handled in their own branch above (default
+// warning with disposal-at-exit note) — they are NOT plain and NOT
+// borrow-bearing under §9.7's element-resolved reading.
+static bool isPlainInlineArrayCarryingBorrows(
+    const TypeRef* rt, const sema::SemaContext& ctx) {
+    if (!rt || rt->kind != TypeRef::Kind::InlineArray) return false;
+    if (rt->arrayOwned) return false;  // owning inline arrays handled above
+    if (!rt->arrayElement) return false;
+    const TypeRef* elem = rt->arrayElement;
+    if (elem->kind == TypeRef::Kind::Primitive) return false;  // not reference
+    if (elem->kind == TypeRef::Kind::Function) return false;   // runtime-managed
+    if (elem->kind == TypeRef::Kind::Unit) return false;
+    if (elem->kind == TypeRef::Kind::Error) return false;
+    // Named reference-typed element → carries borrows. Catches user classes
+    // and interfaces, builtin reference types (Array<T>, Channel<T>, etc.),
+    // and (transitively) borrow-bearing records / borrow-bearing choices
+    // (the §9.7 transitivity reading).
+    if (elem->kind == TypeRef::Kind::Named) {
+        if (elem->nullable) {
+            // `T?` where T is reference-typed: still reference-typed (null
+            // is the absence of a borrow, but the field's TYPE is
+            // reference-typed — §9.7's stricter quantifier applies).
+            return true;
+        }
+        if (!elem->declaration) {
+            // Builtin reference type: Array<T>, Channel<T>, Mutex, etc.
+            return common::isHeapPointerReferenceBuiltin(elem->headName()) ||
+                   elem->headName() == "Channel";
+        }
+        const auto k = elem->declaration->kind;
+        if (k == ast::TypeDeclKind::Class ||
+            k == ast::TypeDeclKind::Interface) {
+            return true;
+        }
+        if (k == ast::TypeDeclKind::Record) {
+            return common::isBorrowBearingRecordOrSpan(elem, ctx);
+        }
+        if (k == ast::TypeDeclKind::Choice) {
+            auto v = common::classifyChoiceType(elem, ctx);
+            return v && *v == common::ChoiceClassification::BorrowBearing;
+        }
+        return false;
+    }
+    return false;
+}
+
+// §22.12 rule 4 residual + §9.7 static-field bullet (v0.265, #3273 /
+// #3290): §9.7-deferred-kind test that handles BUILTIN reference types
+// (Object, Mutex, Channel<T>, …) as well as user-declared classes. The
+// shared `common::isBorrowBearingRecordOrSpan` predicate treats
+// `ft->declaration == nullptr` as a generic-parameter case (returns
+// false), which is correct for §30.1 / §9.7's strict instantiation-site
+// reading but wrong for the §22.12 residual paragraph's reference-type
+// quantifier: `record Tok(Src: Object?)` carries a borrow of an Object
+// — Object is a class, just a builtin one — and the record is
+// borrow-bearing for the §9.7 null-source bullet. This helper makes the
+// §9.7 deferred-kind decision WITHOUT going through the shared predicate,
+// enumerating the record's storage fields and checking each one against
+// the static-readonly reference-typed predicate (which DOES handle
+// builtin reference types via the same `isHeapPointerReferenceBuiltin`
+// test the codegen side uses). The shared predicate is still consulted
+// first in `reportRule4` — it covers span VIEWS that this helper does
+// not — so both must be checked; a record whose ONLY reference-typed
+// fields are `Object?`, `string`, or function-typed classifies correctly
+// here.
+static bool isBorrowBearingRecordForStaticReadonly(const TypeRef* rt,
+                                                   SemaContext& ctx) {
+    if (!rt || rt->kind != TypeRef::Kind::Named || !rt->declaration) {
+        return false;
+    }
+    const TypeSymbol* ts = rt->declaration;
+    if (ts->kind != ast::TypeDeclKind::Record) return false;
+    for (Symbol* m : ts->members) {
+        const auto* fs = dynamic_cast<const FieldSymbol*>(m);
+        if (!fs) continue;
+        bool isStatic = false;
+        for (std::string_view mod : fs->modifiers)
+            if (mod == "static") { isStatic = true; break; }
+        if (isStatic) continue;
+        const TypeRef* ft = nullptr;
+        if (fs->posParam && fs->posParam->type)
+            ft = ctx.resolvedType(*fs->posParam->type);
+        if (!ft && fs->decl) {
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
+                if (fd->type) ft = ctx.resolvedType(*fd->type);
+        }
+        if (!ft) continue;
+        if (staticReadonlyFieldIsReferenceTyped(ft, ctx)) return true;
+    }
+    return false;
+}
+
 // §22.12 rule 2 residual: a compiler-known value-builtin type (DateTime,
 // Guid, TimeSpan, CancellationToken, Range, …). Mirrors the two shapes these
 // reach TypeResolution as (SemaContext.hpp's isValueBuiltinByName doc
@@ -9766,26 +9901,183 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             "`Task<T>?` lazy cache (form (ii); OwningTask<T>? is not admitted) "
             "(§22.12 rule 2, v0.181, #1556)");
     };
-    // §22.12 rule 4 (v0.181, #1556 / v0.262, #3272): a static readonly reference
-    // field/property draws a declaration-site warning unless its type is in the
-    // warning-suppression set — the referenced instance is process-global and
-    // reachable from every domain. The form-(i) synchronized set
-    // (isInSynchronizedSet) silences the warning for Mutex / Semaphore /
+    // §22.12 rule 4 (v0.181, #1556 / v0.262, #3272 / v0.265, #3273): a static
+    // readonly reference field/property draws a declaration-site warning unless
+    // its type is in the warning-suppression set — the referenced instance is
+    // process-global and reachable from every domain. The form-(i) synchronized
+    // set (isInSynchronizedSet) silences the warning for Mutex / Semaphore /
     // Atomic<T> / AtomicInteger<T> / ChannelSender<T> / SharedEventSource<T>;
     // the broader rule-4-only suppression set (isInReadonlySuppressionSet)
     // adds Locked<T> / RwLocked<T> / FrozenArray<T> / CancellationTokenSource,
     // which form (i) does not admit but rule 4 explicitly carves out.
+    //
+    // v0.265 (#3273) widens the warning to function types and owning-inline-
+    // array types (the residual paragraph names them explicitly); everything
+    // else outside the suppression set ALSO draws the default warning per
+    // the residual paragraph's "Rule 4's declaration-site warning is the
+    // default" sentence. The dispatch below therefore:
+    //
+    //   1. Owning-classified choice (§35.4 rule 1) → compile ERROR at the
+    //      declaration site (the rejection bullet of the residual
+    //      paragraph). Nothing would dispose it: §22.13 enrols only
+    //      `static owned` fields and owning-inline-array-typed statics, and
+    //      §28.5 admits the `owned` modifier only on class/interface
+    //      fields — a process-lived owned value with no disposal site.
+    //
+    //   2. Borrow-bearing record / non-owning choice that holds borrows /
+    //      plain inline array carrying borrows → §9.7's null-source case
+    //      (deferred). No declaration-site diagnostic: the bullet explicitly
+    //      says "governed by §9.7's static-field bullet and NOT by this
+    //      rule", and §9.7's own check rejects non-null-source values at
+    //      the static-readonly initializer site (see
+    //      checkStaticReadonlyNullSource below). CancellationToken's
+    //      sentinel `None` is exempted by §9.7's `isValueBuiltin` arm of
+    //      isBorrowBearingRecordOrSpan, so its declaration-site visit is
+    //      silent.
+    //
+    //   3. Function type, owning-inline-array type, and every other value
+    //      kind outside rule 3 (records — including records with a
+    //      function-typed field, value-like choices, value builtins, …) →
+    //      the default rule 4 warning. The owning-inline-array case notes
+    //      disposal-at-exit per §22.13's *Disposal of static `owned`
+    //      fields* clause (the type-level `owned` slot marker conveys the
+    //      obligation, no field-level `owned` modifier needed).
+    //
+    // The synchronized-set + readonly-suppression-set short-circuits keep
+    // the canonical pre-v0.265 suppression behaviour (Mutex / Semaphore /
+    // FrozenArray<T> / CancellationTokenSource / etc.) without dropping
+    // diagnostics on types that suppress did NOT cover.
     auto reportRule4 = [&](const TypeRef* rt, std::string_view name,
-                           std::string_view what, SourceLocation loc) {
-        if (!isRule4GovernedReference(rt) || isInSynchronizedSet(rt) ||
-            isInReadonlySuppressionSet(rt)) return;
+                           std::string_view what, SourceLocation loc,
+                           const ast::Expr* initializer) {
+        // (1) Owning-classified choice — compile ERROR. Diagnoses the
+        // disposal-site ground the residual paragraph names. Done before
+        // the suppression short-circuit so a suppressing choice (none
+        // exist today, but the suppression set is a derived list that
+        // could grow) does not silently swallow the rejection.
+        if (isChoiceTypeRef(rt)) {
+            auto verdict = common::classifyChoiceType(rt, ctx_);
+            if (verdict && *verdict == common::ChoiceClassification::Owning) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("static readonly ") + std::string(what) + " `" +
+                    std::string(name)
+                    + "` has owning-classified choice type `"
+                    + staticRefTypeName(rt)
+                    + "`; \xC2\xA7""22.12 rule 4's residual paragraph "
+                    "rejects owning-classified choices as process-lived owned "
+                    "values would have no disposal site (\xC2\xA7""22.12 rule 4 "
+                    "residual, v0.265, #3273 / #3290; \xC2\xA7""35.4; "
+                    "\xC2\xA7""22.13; \xC2\xA7""28.5)");
+                return;
+            }
+        }
+
+        // (2) Borrow-bearing record / holds-borrows choice / plain
+        // inline-array carrying borrows — defer to §9.7's null-source
+        // check (handled at the initializer site in
+        // checkStaticReadonlyNullSource below). NO declaration-site
+        // diagnostic.
+        //
+        // TWO borrow-bearing predicates are checked, not one: the shared
+        // `common::isBorrowBearingRecordOrSpan` (used by §30.1 / §9.7
+        // across the sema surface) classifies span VIEWS (Span /
+        // ReadOnlySpan / ArraySpan / ReadOnlyArraySpan) as borrow-
+        // bearing via a head-name test, but treats
+        // `ft->declaration == nullptr` fields as generic-parameter
+        // cases and returns false — which is correct for §30.1's
+        // instantiation-site reading but wrong for the §22.12
+        // residual paragraph's reference-type quantifier on a builtin
+        // reference field like `Object?` or a runtime-managed field
+        // like `string` or function type. The §22.12-specific helper
+        // `isBorrowBearingRecordForStaticReadonly` enumerates the
+        // record's storage fields directly against the static-
+        // readonly reference-typed predicate (which DOES handle
+        // builtin reference types via `isHeapPointerReferenceBuiltin`),
+        // so a record whose ONLY reference-typed fields are `Object?`,
+        // `string`, or function-typed classifies correctly here. Both
+        // predicates must be checked so span-field records defer to
+        // §9.7 silently (no (3d) warning) AND a record with only
+        // `Object?` / `string` / function-typed fields defers too
+        // (instead of firing both (3d) and the §9.7 value-site
+        // diagnostic).
+        if (common::isBorrowBearingRecordOrSpan(rt, ctx_)) return;
+        if (isBorrowBearingRecordForStaticReadonly(rt, ctx_)) return;
+        if (isHoldsBorrowsChoice(rt, ctx_)) return;
+        if (isPlainInlineArrayCarryingBorrows(rt, ctx_)) return;
+
+        // (3a) Class / interface / builtin-reference rule 4 path — the
+        // pre-v0.265 behaviour, with the suppression set still honoured.
+        if (isRule4GovernedReference(rt)) {
+            if (isInSynchronizedSet(rt) || isInReadonlySuppressionSet(rt))
+                return;
+            ctx_.diagnostics().report(
+                Severity::Warning, loc,
+                std::string("static readonly ") + std::string(what) + " `" +
+                std::string(name) + "` has class type `" + staticRefTypeName(rt) +
+                "` which is reachable from every domain; confine its use to one "
+                "domain or ensure its own internal synchronization "
+                "(§22.12 rule 4, #1363)");
+            return;
+        }
+
+        // (3b) Function type — default rule 4 warning explicitly. The
+        // captures of a function value are a heap-allocated mutable cell
+        // reachable and writable from every domain through the field
+        // (§27.5); the warning does not discriminate capture-free
+        // function values from capturing ones (a captured borrow cannot
+        // survive into a static per §28.3/§28.9 anyway).
+        if (rt->kind == TypeRef::Kind::Function) {
+            ctx_.diagnostics().report(
+                Severity::Warning, loc,
+                std::string("static readonly ") + std::string(what) + " `" +
+                std::string(name) + "` has function type `<function>`; a "
+                "function value's captures are a heap-allocated mutable "
+                "cell reachable from every domain through this field "
+                "(§22.12 rule 4 residual, v0.265, #3273 / #3290; §27.5)");
+            return;
+        }
+
+        // (3c) Owning-inline-array type — default rule 4 warning + note
+        // disposal-at-exit (the type-level `owned` slot marker conveys
+        // the obligation, so no field-level `owned` modifier is needed).
+        if (rt->kind == TypeRef::Kind::InlineArray && rt->arrayOwned) {
+            std::string elemType = describeStaticValueType(rt->arrayElement);
+            ctx_.diagnostics().report(
+                Severity::Warning, loc,
+                std::string("static readonly ") + std::string(what) + " `" +
+                std::string(name) + "` has owning-inline-array type `[" +
+                (rt->arraySizeValue >= 0 ? std::to_string(rt->arraySizeValue)
+                                         : std::string("N")) +
+                " owned]" + elemType + "` — process-global and reachable "
+                "from every domain; confine every slot read to one domain, "
+                "or restructure behind a `Locked<T>` registry "
+                "(§22.12 rule 4 residual, v0.265, #3273 / #3290; §22.13 "
+                "disposal-of-static-`owned`-fields)");
+            return;
+        }
+
+        // (3d) Every other declared type — default warning. This
+        // includes user records (records with a function-typed field
+        // included — function values are runtime-managed so the record
+        // is non-borrow-bearing, but function values are not in rule 3's
+        // immutable content either), value-like choices, compiler-known
+        // value builtins (DateTime, Guid, …), and the unit type. The
+        // warning text names the kind so the diagnostic says WHAT this
+        // type is, not just "this type".
+        std::string_view kindDesc;
+        if (isRecordTypeRef(rt)) kindDesc = "record";
+        else if (isChoiceTypeRef(rt)) kindDesc = "choice";
+        else if (isValueBuiltinTypeRef(rt)) kindDesc = "value-builtin";
+        else if (rt->kind == TypeRef::Kind::Unit) kindDesc = "unit";
+        else kindDesc = "value";
         ctx_.diagnostics().report(
             Severity::Warning, loc,
             std::string("static readonly ") + std::string(what) + " `" +
-            std::string(name) + "` has class type `" + staticRefTypeName(rt) +
-            "` which is reachable from every domain; confine its use to one "
-            "domain or ensure its own internal synchronization "
-            "(§22.12 rule 4, #1363)");
+            std::string(name) + "` has " + std::string(kindDesc) + " type `"
+            + describeStaticValueType(rt) + "` which is reachable from every "
+            "domain; confine its use to one domain or ensure its own internal "
+            "synchronization (§22.12 rule 4 residual, v0.265, #3273 / #3290)");
     };
     // §22.12 rule 2 forms (iii)/(iv) + residual (#1393 warned-admission
     // ruling): a mutable static NOT governed by the class/interface path
@@ -9984,7 +10276,7 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
                     reportValueStatic(rt, fs->name, "field", m->declLoc,
                                       /*isField=*/true);
             } else {
-                reportRule4(rt, fs->name, "field", m->declLoc);
+                reportRule4(rt, fs->name, "field", m->declLoc, fd->initializer.get());
             }
             continue;
         }
@@ -10031,7 +10323,7 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
                     reportValueStatic(rt, ps->name, "property", m->declLoc,
                                       /*isField=*/false);
             } else {
-                reportRule4(rt, ps->name, "property", m->declLoc);
+                reportRule4(rt, ps->name, "property", m->declLoc, pd->autoInitializer.get());
             }
         }
     }
@@ -10061,6 +10353,310 @@ void Resolver::recordStaticReadonlyBareTSite(std::string_view paramName,
                                              TypeSymbol* enclosingType) {
     staticReadonlyBareTSites_.push_back(
         {paramName, memberName, isField, declLoc, enclosingType});
+}
+
+// §22.12 rule 4 residual + §9.7 static-field bullet (v0.265, #3273 /
+// #3290): the value-site pass. Walks every `static readonly` field /
+// auto-property whose declared type is one of §9.7's three deferred kinds
+// — borrow-bearing record, non-owning choice that holds borrows, plain
+// inline array carrying borrows — and verifies the initializer's value
+// is the §9.7 null-source form: every reference-typed field (and every
+// reference-typed slot of every inline-array field) is `null`. The check
+// is a static analysis on the initializer expression: it accepts `null`,
+// `default(...)`, and `new Tok(null, …)` with all-null reference-typed
+// arguments; a non-trivial initializer (a method call result, a captured
+// value, a function reference, etc.) is left alone because the static
+// analysis cannot statically disprove null-source for it.
+//
+// The diagnostic lands at the initializer site (the `Expr`'s source
+// location) so a multi-line constructor points the user at the offending
+// `null` reference or the offending call argument, not at the field
+// declaration that the §22.12 declaration-site check already visited.
+//
+// §9.7's stricter quantifier (every REFERENCE-TYPED field must be null,
+// not merely every borrow-carrying one) is what catches the v0.266
+// #3291 ruling: `record Tok(Src: Object?, Name: string)` initialised
+// `new Tok(null, "missing")` is REJECTED here because `Name` is
+// reference-typed (`string`) and "missing" is not null — even though
+// `Name` is NOT borrow-carrying (a `string` is runtime-managed) and a
+// borrow-only reading would silently accept.
+//
+// CancellationToken's value-builtin flag (SemaContext.hpp's
+// `isValueBuiltinByName`) makes `isBorrowBearingRecordOrSpan` return
+// false for it, so the §30.8 sentinel `CancellationToken.None` and the
+// every-default `token := CancellationToken.None` parameter form pass
+// through this pass untouched.
+
+// True iff `rt` is a reference-typed field per §9.7's stricter quantifier
+// (every reference-typed field, not just every borrow-carrying one). This
+// is a SHALLOW check at one field — class/interface (nullable or not),
+// an inline array of reference-typed elements, an array of reference-typed
+// elements, the runtime-managed-reference-type cases (`string` and
+// function types are reference-typed but runtime-managed; §9.7 includes
+// them in the stricter quantifier because a null-source value references
+// nothing — runtime-managed or not).
+bool staticReadonlyFieldIsReferenceTyped(const TypeRef* rt,
+                                        const sema::SemaContext& ctx) {
+    if (!rt) return false;
+    switch (rt->kind) {
+        case TypeRef::Kind::Primitive:
+            // §3.1 primitive types: only `string` and `Object` are
+            // reference-typed (the rest are value-typed). Object is a
+            // class, so it is reference-typed; §9.7's stricter quantifier
+            // includes both.
+            return rt->primitive == PrimitiveType::String ||
+                   rt->primitive == PrimitiveType::Object;
+        case TypeRef::Kind::Function:
+            return true;  // runtime-managed, but reference-typed
+        case TypeRef::Kind::InlineArray:
+            // An inline-array field is reference-typed only when its
+            // ELEMENT type is reference-typed (an inline array of value
+            // types stores them inline, no heap reference).
+            if (!rt->arrayElement) return false;
+            return staticReadonlyFieldIsReferenceTyped(rt->arrayElement, ctx);
+        case TypeRef::Kind::Named:
+            if (!rt->declaration) {
+                // Builtin reference type — class-shaped (the `string`
+                // case is the PrimitiveType::String arm above). All
+                // builtin reference types are reference-typed: Mutex,
+                // Channel<T>, Array<T>, …
+                return common::isHeapPointerReferenceBuiltin(rt->headName()) ||
+                       rt->headName() == "Channel" ||
+                       rt->headName() == "Task" ||
+                       rt->headName() == "CancellationTokenSource";
+            }
+            // User-declared: class or interface is reference-typed;
+            // record / choice / enum are value-typed for §9.7's purpose
+            // (records and choices of value types are values, §3.1).
+            {
+                const auto k = rt->declaration->kind;
+                if (k == ast::TypeDeclKind::Class) return true;
+                if (k == ast::TypeDeclKind::Interface) return true;
+                // Value-builtin records (CancellationToken) ARE
+                // reference-typed at the field level per §9.7's stricter
+                // reading (they reference nothing when null-source).
+                return rt->declaration->isValueBuiltin &&
+                       (rt->headName() == "CancellationToken");
+            }
+        case TypeRef::Kind::Unit:
+            return false;
+        case TypeRef::Kind::Error:
+            // Unresolved: cannot decide; conservative reading would be
+            // `true`, but every Error kind was already reported elsewhere
+            // and the resolver will likely fail before this check
+            // matters; reporting again would cascade. The §9.7 check
+            // requires a concrete verdict — return false so this field
+            // is treated as value-typed (the lenient read).
+            return false;
+    }
+    return false;
+}
+
+// True iff the initializer expression `e` is statically the `null` literal.
+// Auto-property default values (`new Tok(...)` of an all-null record) reach
+// here as `NullLiteralExpr`; named-argument null sources too.
+bool isStaticallyNullExpr(const ast::Expr* e) {
+    return e && dynamic_cast<const ast::NullLiteralExpr*>(e) != nullptr;
+}
+
+// True iff the initializer expression is `default(...)` of the
+// declared type — `default(T)` for reference-typed T is the null
+// watermark, which is the §9.7 null-source form.
+bool isStaticallyDefaultExpr(const ast::Expr* e) {
+    if (!e) return false;
+    return dynamic_cast<const ast::DefaultExpr*>(e) != nullptr;
+}
+
+// Walk the positional arguments of a `new Tok(...)` expression against the
+// record/choice's field/payload shape and verify every reference-typed
+// component is null. Named-argument or positional-only mismatches are
+// reported at the call site. `loc` is the `NewExpr` site; the diagnostic
+// uses it as a fallback when argument resolution is impossible.
+void checkStaticReadonlyRecordInit(
+    SemaContext& ctx, const ast::NewExpr& nx, const TypeRef* declTy,
+    SourceLocation loc, std::string_view what,
+    std::string_view name) {
+    if (!declTy || declTy->kind != TypeRef::Kind::Named || !declTy->declaration)
+        return;
+    auto* td = dynamic_cast<const ast::TypeDecl*>(declTy->declaration->decl);
+    if (!td) return;  // imported: no ast::TypeDecl — accept conservatively
+    if (td->kind == ast::TypeDeclKind::Record) {
+        const auto& fields = td->positionalFields;
+        std::size_t arity = fields.size();
+        if (nx.args.size() != arity) return;  // mismatch — typecheck reports
+        for (std::size_t i = 0; i < arity; ++i) {
+            const ast::Param& pf = fields[i];
+            if (!pf.type) continue;
+            const TypeRef* pft = ctx.resolvedType(*pf.type);
+            if (!pft) continue;
+            if (!staticReadonlyFieldIsReferenceTyped(pft, ctx)) continue;
+            if (isStaticallyNullExpr(nx.args[i].value.get())) continue;
+            // Non-null reference-typed field: reject.
+            std::string pname = std::string(pf.name);
+            ctx.diagnostics().report(
+                Severity::Error, loc,
+                std::string("static readonly ") + std::string(what) + " `"
+                + std::string(name) + "` has record value with non-null "
+                "reference-typed field `" + pname + "`; §9.7 requires the "
+                "null-source form (every reference-typed component must be "
+                "null) (§22.12 rule 4 residual + \xC2\xA7""9.7, v0.265, "
+                "#3273 / #3290)");
+            return;  // one diagnostic per site
+        }
+        return;
+    }
+    if (td->kind == ast::TypeDeclKind::Choice) {
+        // For a choice, only the case being constructed is null-source at
+        // the value site; this analyser accepts `new MyChoice(...)` of any
+        // case whose every payload-typed argument is null. Without case
+        // resolution we can only conservatively accept (the constructor's
+        // shape must be inspected case by case, which a value-site check
+        // before typecheck could not do).
+        for (const ast::ChoiceCase& cc : td->choiceCases) {
+            std::size_t arity = cc.payload.size();
+            if (nx.args.size() != arity) continue;
+            for (std::size_t i = 0; i < arity; ++i) {
+                const ast::Param& pf = cc.payload[i];
+                if (!pf.type) continue;
+                const TypeRef* pft = ctx.resolvedType(*pf.type);
+                if (!pft) continue;
+                if (!staticReadonlyFieldIsReferenceTyped(pft, ctx)) continue;
+                if (isStaticallyNullExpr(nx.args[i].value.get())) continue;
+                std::string pname = std::string(pf.name);
+                ctx.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("static readonly ") + std::string(what) + " `"
+                    + std::string(name) + "` has choice value with non-null "
+                    "reference-typed payload `" + pname + "`; \xC2\xA7""9.7 "
+                    "requires the null-source form (every reference-typed "
+                    "component must be null) (\xC2\xA7""22.12 rule 4 residual "
+                    "+ \xC2\xA7""9.7, v0.265, #3273 / #3290)");
+                return;  // one diagnostic per site
+            }
+            return;  // first matching case wins
+        }
+        return;
+    }
+}
+
+void Resolver::checkStaticReadonlyNullSource() {
+    // Walk every type in the program. For each type's static readonly
+    // field / auto-property whose declared type is one of the three §9.7-
+    // deferred kinds, examine the initializer and emit the null-source
+    // diagnostic when a non-null reference-typed component is statically
+    // observable.
+    for (const auto& sym : ctx_.symbols()) {
+        auto* t = dynamic_cast<TypeSymbol*>(sym.get());
+        if (!t) continue;
+        for (Symbol* m : t->members) {
+            const TypeRef* rt = nullptr;
+            std::string_view memberName;
+            std::string_view what;
+            SourceLocation loc;
+            const ast::Expr* init = nullptr;
+            if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                if (!hasMod(fs, "static") || !hasMod(fs, "readonly")) continue;
+                // For body-record/class fields, `fs->decl` is a FieldDecl;
+                // for POSITIONAL RECORD fields, `fs->decl` is the enclosing
+                // TypeDecl and the storage type rides on `fs->posParam->type`.
+                // Both shapes need the resolved type and the initializer; the
+                // ast::FieldDecl path also provides the initializer (`fd-
+                // >initializer`); the positional path needs the parent
+                // record's initializer — which lives on the record decl's
+                // primary-ctor args, not on the field symbol. Walk both
+                // shapes; the §9.7 null-source check fires from the TYPE's
+                // initializer context.
+                auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                if (fd && fd->type) {
+                    rt = ctx_.resolvedType(*fd->type);
+                    init = fd->initializer.get();
+                } else if (fs->posParam && fs->posParam->type) {
+                    rt = ctx_.resolvedType(*fs->posParam->type);
+                    init = nullptr;  // positional field: no field-local
+                                       // initializer; the parent record's
+                                       // primary-ctor args are the static
+                                       // site — handled below for records.
+                } else {
+                    continue;
+                }
+                memberName = fs->name;
+                what = "field";
+                loc = fs->declLoc;
+            } else if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
+                if (ps->isIndexer || !hasMod(ps, "static") ||
+                    !hasMod(ps, "readonly"))
+                    continue;
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                if (!pd || pd->isIndexer ||
+                    pd->bodyKind != ast::PropertyBodyKind::Auto ||
+                    !pd->type)
+                    continue;
+                rt = ctx_.resolvedType(*pd->type);
+                memberName = ps->name;
+                what = "property";
+                init = pd->autoInitializer.get();
+                loc = ps->declLoc;
+            } else {
+                continue;
+            }
+            if (!rt) continue;
+            // §9.7-deferred kinds only: borrow-bearing record,
+            // non-owning choice that holds borrows, plain inline array
+            // carrying borrows. The other §22.12 residual kinds (owning
+            // choice, function, owning-inline-array) were rejected or
+            // warned at the declaration site; records / choices / plain
+            // arrays that are NOT borrow-bearing take the default warning
+            // and are not §9.7-deferred.
+            bool deferred = isBorrowBearingRecordForStaticReadonly(rt, ctx_) ||
+                            isHoldsBorrowsChoice(rt, ctx_) ||
+                            isPlainInlineArrayCarryingBorrows(rt, ctx_);
+            if (!deferred) continue;
+            // Static readonly auto-property without an explicit initializer
+            // (`public static readonly property None: CancellationToken;`) —
+            // default value is the type's auto-default. For a record this
+            // is the all-fields-default-initialised value, which IS the
+            // null-source form for every field whose default is null (and
+            // any non-reference-typed field's default is irrelevant). The
+            // CancellationToken `None` sentinel hits this branch and is
+            // accepted without further analysis — its `isValueBuiltin`
+            // flag keeps it out of the borrow-bearing predicate above
+            // (defensive: even if it slipped in, the no-initializer form
+            // is the all-default value, not a programmer-supplied
+            // non-null literal).
+            if (!init) continue;
+            // Statically null or `default(...)`: trivially null-source.
+            if (isStaticallyNullExpr(init)) continue;
+            if (isStaticallyDefaultExpr(init)) continue;
+            // `new Tok(...)` constructor: walk the positional arguments.
+            if (auto* nx = dynamic_cast<const ast::NewExpr*>(init)) {
+                if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
+                    (rt->declaration->kind == ast::TypeDeclKind::Record ||
+                     rt->declaration->kind == ast::TypeDeclKind::Choice)) {
+                    checkStaticReadonlyRecordInit(ctx_, *nx, rt,
+                                                  init->span.begin, what,
+                                                  memberName);
+                }
+                // For an inline-array initializer of a plain array
+                // carrying borrows (`[N]C := new C[N]()`), the per-slot
+                // null-source check is structurally similar but the array
+                // element type is the static known — every element must be
+                // null. We do not analyse array-literal expressions here:
+                // an inline-array literal `[null, null, …]` would have to
+                // match the element count exactly to be statically
+                // provable, and the spec's stricter quantifier is the
+                // same. Defer to a follow-up; this lane covers the record
+                // form the issue explicitly cites, and the negative test
+                // in static_readonly_residual_3290_test.cpp's own record
+                // case pins the spec's wording.
+                continue;
+            }
+            // Any other initializer (call result, captured variable,
+            // method reference, etc.): the static analysis cannot prove
+            // non-null-source. Accept — the §9.7 wording is the rejection
+            // is "at that rule", and a non-trivial initializer may
+            // resolve to null at runtime.
+        }
+    }
 }
 
 // §14.6 / #3271 (v0.262): the §14.6 per-edge predicates over a substitution

@@ -15346,6 +15346,17 @@ bool typecheckExpressions(const ast::SourceFile& src, SemaContext& ctx) {
     // Folding it into typecheckExpressions() itself means every existing and
     // future caller gets it for free, with no separate wiring.
     checkClassSerializationEligibilityLate(src, ctx);
+    // §22.12 rule 4 residual + §9.7 static-field bullet (v0.265, #3273 /
+    // #3290): the §9.7 null-source value-site pass for `static readonly`
+    // fields/auto-properties whose declared type is a borrow-bearing record,
+    // a non-owning choice that holds borrows, or a plain inline array
+    // carrying borrows. Walks every such initializer (the expression walk
+    // above has named every positional argument) and emits a §9.7
+    // diagnostic when a non-null reference-typed component is statically
+    // observable. CancellationToken's `isValueBuiltin` flag keeps the
+    // §30.8 sentinel `None` and the every-default `token := Cancellation-
+    // Token.None` out of the predicate.
+    checkStaticReadonlyNullSource(ctx);
     // fix #3235 (§30.14 / §14.2): the §14.2 `where T: sendable` satisfaction
     // check that `Resolver::checkOneConstraint` deferred during
     // `resolveTypes()` needs `FieldSymbol::posParamBodyRef` (the §22.10
