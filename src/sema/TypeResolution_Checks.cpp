@@ -9468,11 +9468,17 @@ static std::string staticRefTypeName(const TypeRef* rt) {
 // target).
 static bool isRule3ImmutableContent(const TypeRef* rt) {
     if (!rt) return false;
-    if (rt->nullable) return false;  // `string?` / `int?` is NOT in rule 3
-    if (rt->kind == TypeRef::Kind::Primitive) return true;   // int/long/byte/...
+    if (rt->kind == TypeRef::Kind::Primitive && !rt->nullable) return true;  // int/long/byte/...
     // Enums reach TypeResolution as Kind::Named with declaration->kind == Enum.
     if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
         rt->declaration->kind == ast::TypeDeclKind::Enum) return true;
+    // string and string? — both take rule 3's "unrestricted" reading:
+    // a nullable string is still sendable-value, still immutable, still
+    // not a process-global instance. (The "value type" reading rule 3
+    // names includes the nullable form: a value-type field's nullable
+    // form has the same reachability profile as the non-nullable form
+    // for a read-only static — the absence of a source, not its
+    // nullability, drives the "is this a borrow" question.)
     if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
         rt->headName() == "string") return true;
     if (rt->kind == TypeRef::Kind::Named && rt->declaration &&
@@ -10119,6 +10125,18 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
         // isRule3ImmutableContent test below defers to rule 3 before
         // falling into the (3d) default.
         if (isRule3ImmutableContent(rt)) return;
+
+        // Rule 4's warning-suppression set (Mutex, Semaphore, Atomic<T>,
+        // AtomicInteger<T>, ChannelSender<T>, SharedEventSource<T>,
+        // Locked<T>, RwLocked<T>, FrozenArray<T>, CancellationTokenSource)
+        // — the synchronized / immutable-fact types whose process-global
+        // reachability is the canonical use of static statics. The set
+        // is consulted at every static-readonly kind, not just the
+        // (3a) class/interface/Channel arm; a `static readonly Mutex`
+        // is silent because Mutex declares the **synchronized** fact,
+        // regardless of which arm of the dispatch would otherwise fire.
+        if (isInSynchronizedSet(rt) || isInReadonlySuppressionSet(rt))
+            return;
 
         std::string_view kindDesc;
         if (isRecordTypeRef(rt)) kindDesc = "record";
