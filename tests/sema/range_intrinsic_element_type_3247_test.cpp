@@ -284,3 +284,62 @@ BEZEL_TEST(range_intrinsic_element_type_3247,
         "end Main; end C;");
     BEZEL_EXPECT_FALSE(r2.diagnostics.hasErrors());
 }
+
+// fix #3247 (narrow-fix-forward for #3242 / v0.277): an UNRESOLVED generic
+// type-parameter T — a `Range<T>` reference inside a generic body, before
+// the §29.3 substitution lands at the instantiation site — is ADMITTED at
+// the type-annotation site. The §16.3 restriction applies to the SUBSTITUTED
+// T (T=int, T=char, T=float, ...), not to the bare T: rejecting the bare T
+// at the declaration would bar every `public method Wrap<T>(r: Range<T>)`
+// whose T will later be bound to char / int (the supported substitutions),
+// even though the #3242 codegen tests cover exactly that generic-substitution
+// shape. Detection at this site is "kind == Named and declaration == nullptr"
+// — resolveNamed (TypeResolution_Names.cpp:1548-1554) records an unresolved
+// generic param as a Named TypeRef with no declaration because type-param
+// substitution is the SEMANTIC pass's job, not the resolver's. The downstream
+// instantiation site re-runs the §16.3 predicate on the substituted T and
+// rejects there if the bound violates §16.3 (the float/double generic
+// negative cases below).
+//
+// Pre-fix: the gate over-fired on bare T and rejected every Range<T> in a
+// generic body. Post-fix: the bare T is admitted; substituted T continues
+// to gate as before.
+
+// §16.3 / #3247 (carve-out, positive): `Range<T>` in a generic body, before
+// the substitution lands, is admitted. The annotation `r: Range<T>` must
+// pass without diagnostics; the runtime bound at the instantiation site is
+// not this layer's concern.
+BEZEL_TEST(range_intrinsic_element_type_3247,
+           annotation_range_generic_param_admitted_spec_16_3) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Wrap<T>(r: Range<T>): string "
+        "    return r.ToString(); "
+        "  end Wrap; "
+        "  public static method Main(): int return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §16.3 / #3247 (carve-out, negative guard): the carve-out is for the
+// UNRESOLVED generic type parameter — a concrete substituted type that
+// violates §16.3 (here: `Range<float>` passed as the generic substitution)
+// must STILL be rejected at the type-annotation site. The substitution
+// resolution at the call site is the layer where the substituted T's
+// type (double) becomes visible; the §16.3 gate fires then, not at the
+// generic declaration. A naive carve-out that also admitted concrete
+// non-integer types would lose this guarantee.
+BEZEL_TEST(range_intrinsic_element_type_3247,
+           annotation_range_float_via_substitution_still_rejected_spec_16_3) {
+    auto r = parseSemaAll(
+        "module M; class C "
+        "  public static method Main(): int "
+        "    var s := Wrap(1.5..3.5); "
+        "  end Main; "
+        "  public static method Wrap<T>(r: Range<T>): string "
+        "    return r.ToString(); "
+        "  end Wrap; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasRangeElementTypeRejected(r));
+}

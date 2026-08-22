@@ -9283,6 +9283,42 @@ void ExprTC::visitChildren(const ast::Expr& e) {
 bool isValidRangeElementType(const sema::TypeRef* ty) {
     if (!ty) return true;  // pre-empt: no resolution yet — let the resolver fire
     if (ty->kind == sema::TypeRef::Kind::Error) return true;  // pre-empt: don't double-report
+    // per #3242 (narrow-fix-forward on #3247 / v0.277): an unresolved
+    // generic type-parameter T — a `Range<T>` reference inside a generic
+    // body, before the §29.3 substitution lands at the instantiation site
+    // — is ADMITTED. The §16.3 rule applies to the SUBSTITUTED T (T=int,
+    // T=char, T=float, ...); rejecting the bare T at the source site would
+    // bar every `public method Wrap<T>(r: Range<T>)` whose T will later be
+    // bound to char / int (the supported substitutions), even though the
+    // #3242 codegen tests for exactly that generic-substitution shape.
+    // Detected via the TypeRef's declaration being a GenericParamSymbol —
+    // the same shape `resolveTypeParamRef` and the §14.2 generic-param
+    // machinery produce for an unresolved `T`. Carve-out, not bypass: the
+    // downstream instantiation site re-runs this predicate on the
+    // substituted T (e.g. `Range<char>``) and rejects there if the bound
+    // violates §16.3.
+    if (ty->kind == sema::TypeRef::Kind::Named) {
+        // per #3242 (narrow-fix-forward on #3247 / v0.277): an unresolved
+        // generic type-parameter T — a `Range<T>` reference inside a generic
+        // body, before the §29.3 substitution lands at the instantiation site
+        // — is ADMITTED. The §16.3 rule applies to the SUBSTITUTED T (T=int,
+        // T=char, T=float, ...); rejecting the bare T at the source site would
+        // bar every `public method Wrap<T>(r: Range<T>)` whose T will later be
+        // bound to char / int (the supported substitutions), even though the
+        // #3242 codegen tests for exactly that generic-substitution shape.
+        //
+        // resolveNamed (TypeResolution_Names.cpp:1548-1554) records an
+        // unresolved generic param as a Named TypeRef with **declaration =
+        // nullptr** — it cannot pre-resolve T to a GenericParamSymbol because
+        // type-param substitution is the SEMANTIC pass's job, not the
+        // resolver's. The detection here is therefore: kind == Named AND
+        // declaration == nullptr (and the AST is a single-part bare
+        // identifier, which is the only shape resolveNamed produces with no
+        // declaration). Carvement, not bypass: the downstream instantiation
+        // site re-runs this predicate on the SUBSTITUTED T (e.g. `Range<char>``)
+        // and rejects there if the bound violates §16.3.
+        if (!ty->declaration) return true;
+    }
     if (ty->nullable) return false;  // §16.3: T is non-nullable
     if (ty->kind != sema::TypeRef::Kind::Primitive) return false;
     switch (ty->primitive) {
