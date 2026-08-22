@@ -3291,9 +3291,20 @@ private:
     // last statement's `span.end`); pushed when entering a `do … end` block
     // (its `span.end` is the offset past the `end`); popped on exit. Other
     // block forms (if/while/for/try/case) currently share the enclosing
-    // stack frame — the loop case (bound 2(b)) is filed separately and not
-    // implemented in this lane. // per §28.14 (v0.273)
+    // stack frame — `for`/`while` ALSO push their own `span.end` onto the
+    // sibling `scopedLoopEndStack_` (below) for bound 2(b); the
+    // freeze-interval upper bound for a `using var` is the MAX of the two
+    // stacks' tops at declaration time. // per §28.14 (v0.273)
     std::vector<SourceLocation> scopedBlockEndStack_;
+    // §28.14 v0.273 bound 2(b): stack of enclosing-LOOP `span.end` offsets.
+    // When a `using var` is declared inside a loop body, its scope-exit is
+    // pushed out to the innermost enclosing loop's end (the loop ends AFTER
+    // the inner block, and a lift at the block's end would otherwise re-admit
+    // the capture over a source the previous iteration consumed). Pushed at
+    // while/for entry, popped at exit. Empty when no enclosing loop; in that
+    // case the freeze interval uses `scopedBlockEndStack_.back()` alone.
+    // // per §28.14 (v0.273, bound 2(b))
+    std::vector<SourceLocation> scopedLoopEndStack_;
 
     // §28.14 verifiable-subset widening (#1420 triage): a local initialized
     // with a LAMBDA LITERAL and never reassigned is a verifiable function

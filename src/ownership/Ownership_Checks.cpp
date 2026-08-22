@@ -12432,6 +12432,7 @@ void MethodOwnership::scopedPreScan(
     // `scopedPreScanStmt` walk. // per §28.14 (v0.273)
     scopedLocalScopeEnd_.clear();
     scopedBlockEndStack_.clear();
+    scopedLoopEndStack_.clear();
     SourceLocation methodBodyEnd{};
     for (const auto& s : body) {
         if (!s) continue;
@@ -12464,16 +12465,39 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         // for bounding forms 1/2 the initializer's captures are checked
         // against THIS local's index. // per §28.14
         scopedDeclOrder_[ld] = scopedDeclCounter_++;
-        // §28.14 v0.273: the bounding local's scope-exit offset is the
-        // current top of the block-end stack — the END of L's enclosing
-        // block. Recorded here so `checkScopedAdmission` can stamp
-        // `ScopedFreeze::scopeEndLoc` when populating the freeze map.
-        // (Only the `using var`/`await using var` form matters — §28.14's
-        // bounding is always one of those — but we record any LocalDecl
-        // whose parent block is on the stack; the absence-keyed lookup at
-        // the freeze site filters by isUsing.)
+        // §28.14 v0.273: the bounding local's scope-exit offset is the END
+        // of L's enclosing block (top of `scopedBlockEndStack_`) — OR,
+        // when no inner `do … end` block was pushed but L IS inside a
+        // loop, the innermost enclosing LOOP's `span.end` (the loop body
+        // is the narrower scope); OR, when an inner `do … end` block AND
+        // an enclosing loop both apply, the LATER of the two ends (bound
+        // 2(b): a lift at the inner block's end would otherwise re-admit
+        // the capture over a source the next iteration would still see
+        // alive). The two stacks are walked in parallel during pre-scan;
+        // a single `using var` is either in a do-block, in a loop body, in
+        // both, or at method-top — only the latter falls through to
+        // `methodEnd`. (Only the `using var` / `await using var` form
+        // matters — §28.14's bounding is always one of those — but we
+        // record any LocalDecl whose parent block is on the stack; the
+        // absence-keyed lookup at the freeze site filters by isUsing.)
+        // // per §28.14 (v0.273, bound 2(b))
         if (ld->isUsing && !scopedBlockEndStack_.empty()) {
-            scopedLocalScopeEnd_[ld] = scopedBlockEndStack_.back();
+            SourceLocation scopeEndLoc = scopedBlockEndStack_.back();
+            if (!scopedLoopEndStack_.empty()) {
+                const SourceLocation loopEndLoc =
+                    scopedLoopEndStack_.back();
+                if (scopedBlockEndStack_.size() == 1) {
+                    // Only `methodEnd` on the block stack — L is not in
+                    // an inner `do … end`. The innermost loop body's end
+                    // is the narrower scope; use it.
+                    scopeEndLoc = loopEndLoc;
+                } else if (loopEndLoc.offset > scopeEndLoc.offset) {
+                    // Inner `do … end` exists; the enclosing loop extends
+                    // further out — bound 2(b) widens the interval.
+                    scopeEndLoc = loopEndLoc;
+                }
+            }
+            scopedLocalScopeEnd_[ld] = scopeEndLoc;
         }
         if (ld->initializer) {
             if (ld->isUsing)
@@ -12562,8 +12586,16 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
     }
     if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
         if (ws->condition) scopedPreScanExpr(*ws->condition);
+        // §28.14 v0.273 bound 2(b): a `using var` declared inside this loop's
+        // body takes the LOOP's `span.end` as the freeze interval's upper
+        // bound (not the inner block's end — a lift at the inner block's end
+        // would otherwise re-admit a capture over a source the next iteration
+        // would still see alive). Push onto `scopedLoopEndStack_` before
+        // recursing, pop after. // per §28.14 (v0.273, bound 2(b))
+        scopedLoopEndStack_.push_back(ws->span.end);
         for (const auto& bs : ws->body)
             if (bs) scopedPreScanStmt(*bs);
+        scopedLoopEndStack_.pop_back();
         return;
     }
     if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
@@ -12571,8 +12603,13 @@ void MethodOwnership::scopedPreScanStmt(const ast::Stmt& s) {
         scopedDeclOrder_[fs] = scopedDeclCounter_++;
         if (fs->iterable) scopedPreScanExpr(*fs->iterable);
         if (fs->withExpr) scopedPreScanExpr(*fs->withExpr);
+        // §28.14 v0.273 bound 2(b): same as WhileStmt above — push the
+        // loop's `span.end` for any `using var` declared in the body. // per
+        // §28.14 (v0.273, bound 2(b))
+        scopedLoopEndStack_.push_back(fs->span.end);
         for (const auto& bs : fs->body)
             if (bs) scopedPreScanStmt(*bs);
+        scopedLoopEndStack_.pop_back();
         return;
     }
     if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
