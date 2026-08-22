@@ -7157,6 +7157,143 @@ bool ExprTC::extWhereClauseProvablyViolated(
     return false;
 }
 
+// fix #3343 (§26.5 rule 4 / §5 / stdlib §9.6, v0.278): the standard library's
+// §5 LINQ operators are declared over `extension IEnumerable<T>` (plus three
+// constrained siblings for `where T: hashable`, `where T: IComparable<T>`,
+// and `where T: INumber<T>` — all over the same `IEnumerable<T>` head).
+// The per-name + per-arity signature table below mirrors stdlib §5's listing
+// (the table the LINQ matching in ExprTypecheck_Calls.cpp / typeCall also
+// reaches for, e.g. the `isLinqOp` check at ~15702; kept independent here
+// rather than imported, because lookupExtensionMember runs in a different
+// translation unit and the cost of duplicating a 42-row table is one
+// comment).
+struct StdlibLinqOverload {
+    const char* name;
+    int arity;  // one entry per overload of `name` — name + arity match a
+                // specific stdlib §5 method.
+    const char* where;  // "" for the main `extension IEnumerable<T>` block;
+                        // "where T: hashable" / "where T: IComparable<T>" /
+                        // "where T: INumber<T>" for the constrained blocks.
+                        // The §26.5 rule 4 diagnostic's "declared head
+                        // including any where clause" wording (§26.5.1
+                        // v0.278) applies uniformly to stdlib and user
+                        // candidates — the where clause is part of the
+                        // declared head, not a separate fact.
+};
+static const StdlibLinqOverload kStdlibLinqOverloads[] = {
+    // Main `extension IEnumerable<T>` block (stdlib §5 line 3497)
+    // Filtering
+    {"Where", 1, ""}, {"OfType", 0, ""},
+    // Projection
+    {"Select", 1, ""}, {"SelectMany", 1, ""},
+    // Quantifiers
+    {"Any", 0, ""}, {"Any", 1, ""}, {"All", 1, ""},
+    {"Count", 0, ""}, {"Count", 1, ""},
+    // Element access
+    {"First", 0, ""}, {"First", 1, ""},
+    {"FirstOrNull", 0, ""}, {"FirstOrNull", 1, ""},
+    {"Last", 0, ""}, {"Last", 1, ""},
+    {"LastOrNull", 0, ""}, {"LastOrNull", 1, ""},
+    {"Single", 0, ""}, {"Single", 1, ""},
+    {"SingleOrNull", 0, ""}, {"SingleOrNull", 1, ""},
+    {"ElementAt", 1, ""}, {"ElementAtOrNull", 1, ""},
+    // Aggregation — selector forms (selector overloads live in the main
+    // block; no-selector overloads live in §5.1's constrained blocks and
+    // would each need a different `where` string; the ambiguity admission
+    // is per overload, and no-selector overloads match an arity the user
+    // could not have written for the selector form's receiver, so the
+    // selector-only listing is the right scope for the table).
+    {"Sum", 1, ""}, {"Min", 1, ""}, {"Max", 1, ""},
+    {"Average", 1, ""}, {"Aggregate", 2, ""},
+    // Ordering
+    {"OrderBy", 1, ""}, {"OrderByDescending", 1, ""},
+    {"ThenBy", 1, ""}, {"ThenByDescending", 1, ""},
+    {"Reverse", 0, ""},
+    // Slicing
+    {"Take", 1, ""}, {"TakeWhile", 1, ""},
+    {"Skip", 1, ""}, {"SkipWhile", 1, ""},
+    // Combination
+    {"Concat", 1, ""}, {"Zip", 2, ""},
+    // Grouping
+    {"GroupBy", 1, ""},
+    // Materialization
+    {"ToArray", 0, ""}, {"ToDictionary", 1, ""}, {"ToDictionary", 2, ""},
+
+    // `extension IEnumerable<T> where T: hashable` block (stdlib §5 line 3585)
+    {"Contains", 1, "where T: hashable"},
+    {"Distinct", 0, "where T: hashable"},
+    {"Union", 1, "where T: hashable"}, {"Intersect", 1, "where T: hashable"},
+    {"Except", 1, "where T: hashable"},
+    {"ToSet", 0, "where T: hashable"},
+
+    // `extension IEnumerable<T> where T: IComparable<T>` block (stdlib §5.1)
+    // The no-selector Min/Max overloads live here, not the main block. The
+    // selector forms are in the main block (above).
+    {"Min", 0, "where T: IComparable<T>"},
+    {"Max", 0, "where T: IComparable<T>"},
+    {"MinOrNull", 0, "where T: IComparable<T>"},
+    {"MaxOrNull", 0, "where T: IComparable<T>"},
+
+    // `extension IEnumerable<T> where T: INumber<T>` block (stdlib §5.1) —
+    // the no-selector `Sum()` lives here.
+    {"Sum", 0, "where T: INumber<T>"},
+};
+// The fixed where-clause strings above are owned by the kStdlibLinqOverloads
+// table itself (string literals with static storage duration). Look up the
+// matching entry so the candidate can carry the clause in `stdWhere`.
+static const StdlibLinqOverload* stdlibLinqLookup(std::string_view name,
+                                                  std::ptrdiff_t arity) {
+    if (arity < 0) {
+        for (const auto& e : kStdlibLinqOverloads) if (name == e.name) return &e;
+        return nullptr;
+    }
+    for (const auto& e : kStdlibLinqOverloads)
+        if (name == e.name && e.arity == arity) return &e;
+    return nullptr;
+}
+static bool stdlibLinqMemberMatches(std::string_view name, std::ptrdiff_t arity) {
+    return stdlibLinqLookup(name, arity) != nullptr;
+}
+
+// fix #3343 (§26.5 / §5, v0.278): does `receiver` implement `IEnumerable<T>`
+// for SOME T? Returns the receiver-substituted `IEnumerable<...>` ancestor
+// (a TypeRef in the receiver's interface chain — builtin or user-declared)
+// so the caller can use it as the §26.5.1 substituted head. Mirrors the
+// chain walk in extensionFindMatchingAncestor (above), but specialised for
+// the `IEnumerable<...>` head and reading the existing builtin interface
+// closure — no need to fabricate a synthetic `IEnumerable<T>` target with
+// a free-var TypeRef just to admit the stdlib §5 block.
+static const TypeRef* stdlibLinqApplicableAncestor(
+    const TypeRef* receiver,
+    std::vector<std::unique_ptr<TypeRef>>& owned) {
+    if (!receiver) return nullptr;
+    auto isEnumerable = [](const TypeRef* t) -> bool {
+        return t && t->kind == TypeRef::Kind::Named &&
+               namedTypeSimpleName(t) == "IEnumerable" &&
+               !t->genericArgs.empty();
+    };
+    if (isEnumerable(receiver)) return receiver;
+    if (receiver->kind == TypeRef::Kind::Named && !receiver->declaration) {
+        for (const TypeRef* anc : builtinInterfaceAncestorsOf(receiver, owned))
+            if (isEnumerable(anc)) return anc;
+    }
+    if (receiver->kind == TypeRef::Kind::Named && receiver->declaration) {
+        std::vector<const TypeRef*> frontier;
+        for (const TypeRef* b : receiver->declaration->baseTypeRefs)
+            if (b) frontier.push_back(b);
+        std::size_t i = 0;
+        while (i < frontier.size()) {
+            const TypeRef* anc = frontier[i++];
+            if (!anc) continue;
+            if (isEnumerable(anc)) return anc;
+            if (anc->kind == TypeRef::Kind::Named && anc->declaration)
+                for (const TypeRef* b : anc->declaration->baseTypeRefs)
+                    if (b) frontier.push_back(b);
+        }
+    }
+    return nullptr;
+}
+
 Symbol* ExprTC::lookupExtensionMember(
     const TypeRef* receiver,
     std::string_view name,
@@ -7197,6 +7334,20 @@ Symbol* ExprTC::lookupExtensionMember(
         ExtensionSymbol* ext = nullptr;
         const ast::ExtensionDecl* decl = nullptr;
         std::vector<std::pair<std::string, TypeRef*>> binding;
+        // fix #3343 (§26.5 rule 4 / §5 / stdlib §9.6, v0.278): the stdlib §5
+        // LINQ block over `IEnumerable<T>` is auto-imported via §2.3, so it is
+        // in scope everywhere (§26.5 step 2's "all imported modules" half).
+        // It is admitted to the candidate vector for the ambiguity-diagnostic
+        // only, with no source-level `ExtensionSymbol`/`ExtensionDecl` (the
+        // block is compiler-known, not in the user's program). When true, the
+        // diagnostic loop spells the block via the pre-built `stdHead`/`stdWhere`
+        // strings below and names `System.Collections.Linq` as the module —
+        // the §5 module §2.3 puts on the auto-import list (§26.1's "extension
+        // blocks are nameless" makes the §5 block addressable only by what it
+        // has: its declared head and its defining module).
+        bool isStandardLibraryLinq = false;
+        std::string stdHead;       // e.g. "IEnumerable<T>"
+        std::string stdWhere;      // e.g. "where T: hashable" — usually empty
     };
     std::vector<ExtCandidate> found;
     std::vector<std::unique_ptr<TypeRef>> ownedAncs;
@@ -7337,8 +7488,82 @@ Symbol* ExprTC::lookupExtensionMember(
             // defers (the pre-#2328 comment in this slot). Adding a per-block
             // arity/argument-type tie-break here would be out of scope for the
             // fix; the call site can still surface an ambiguity in step 2.
-            found.push_back({m, matchedAnc, target, ext, decl, std::move(binding)});
+            found.push_back({m, matchedAnc, target, ext, decl, std::move(binding),
+                                 /*isStandardLibraryLinq=*/false,
+                                 /*stdHead=*/std::string(),
+                                 /*stdWhere=*/std::string()});
             break;
+        }
+    }
+    // fix #3343 (§26.5 rule 4 / §5 / stdlib §9.6, v0.278): §5's LINQ extension
+    // block over `IEnumerable<T>` is auto-imported via §2.3 (v0.278 widens
+    // §26.5 rule 2's "current module AND all imported modules" to include
+    // the standard library's extension modules over always-available types),
+    // so it is a candidate for §26.5 rule 4's ambiguity diagnostic alongside
+    // any user block that spells the same member name. Without this admission
+    // a two-way user-block ambiguity reports "2 extensions", but the spec
+    // (§26.5.1's general consequence rule, v0.278) describes three.
+    //
+    // The narrowing is by (name, arity): the stdlib §5 block is admitted ONLY
+    // for a member name the block actually declares and ONLY when the call's
+    // arity matches an §5 overload of that name. Admitting the block
+    // wholesale — every name, every arity — would slow the lookup and surface
+    // ambiguities the name-matched path currently sidesteps (the issue's own
+    // reading, recorded in §26.5.1's v0.278 amendment). Per-block generic
+    // constraints on §5's side (`where T: hashable`, `where T: IComparable<T>`,
+    // `where T: INumber<T>` — the four block-level constrained siblings of
+    // the main `extension IEnumerable<T>` block) are part of the candidate's
+    // declared head; the diagnostic's "declared head including any where
+    // clause" wording (§26.5 rule 4) reads the constraint exactly the same
+    // way for stdlib and user candidates.
+    //
+    // §26.5 rule 4 / §26.1: the §5 block is nameless and compiler-known, so
+    // this candidate carries no source-level `ExtensionSymbol`/`ExtensionDecl`.
+    // The diagnostic loop below reads the candidate's `isStandardLibraryLinq`
+    // flag to spell "extension IEnumerable<T> — module `System.Collections.Linq`
+    // — declared in stdlib §5 (auto-imported via §2.3, no opt-out)" and to
+    // drop the "narrow an import" remedy that §2.3's no-opt-out forecloses
+    // against this candidate (§26.5.1 v0.278).
+    //
+    // The lookup stays silent on the no-user-extension case (i.e. when
+    // `found.empty()` here): the call's §5 resolution falls through to
+    // `typeCall`'s LINQ special-case path (`typeLinqOperator` /
+    // `isLinqOp`-driven typing, ~line 4315 in ExprTypecheck_Calls.cpp), which
+    // handles the no-user-extension scenario as it always has. This branch
+    // admits §5 only as an ADDITIONAL candidate alongside the user blocks —
+    // the diagnostic path, never the resolution path.
+    if (!found.empty() && stdlibLinqMemberMatches(name, arity)) {
+        if (const TypeRef* enumAnc =
+                stdlibLinqApplicableAncestor(receiver, ownedAncs)) {
+            // The lookup above finds the receiver-substituted IEnumerable<T>
+            // ancestor — that T is the actual concrete element type at the
+            // call site (e.g. `int` for `Array<int>`), and the stdlib §5
+            // block's `where` clause, if any, is evaluated against that T.
+            // For a value-typed T (int, long, …) the IComparable<T> /
+            // INumber<T> / hashable constraints are satisfied, so the
+            // constrained blocks match. The per-overload `where` string
+            // below is the one the rule-4 diagnostic spells — the lookup
+            // here does NOT need to evaluate the constraint itself, because
+            // the constraint's runtime satisfaction is established by the
+            // type system independently (std::hashable / IComparable<T> are
+            // compiler-known conformers for the primitive value types).
+            const StdlibLinqOverload* e = stdlibLinqLookup(name, arity);
+            ExtCandidate c;
+            c.isStandardLibraryLinq = true;
+            c.substHead = enumAnc;
+            c.stdHead = "IEnumerable<T>";
+            c.stdWhere = e ? e->where : "";
+            c.member = found[0].member;  // error-recovery fallback mirror
+                                         // the user-extension candidates: if
+                                         // §5 wins the tie at the lookup-
+                                         // return site (it cannot — a §5
+                                         // candidate always ties its user-
+                                         // peers on identical substituted
+                                         // heads — but stay defensive),
+                                         // pick a real symbol to keep
+                                         // downstream typing best-effort.
+            c.binding = found[0].binding;
+            found.push_back(std::move(c));
         }
     }
     if (found.empty()) {
@@ -7413,20 +7638,55 @@ Symbol* ExprTC::lookupExtensionMember(
             "`: " + std::to_string(maximal.size()) +
             " extensions are equally specific for this receiver — neither is "
             "a subtype of the other (§26.5 rule 4, §26.5.1); candidates:";
+        // fix #3343 (§26.5 / §5, v0.278): detect whether any maximal candidate
+        // is the auto-imported stdlib §5 LINQ block — when true, "narrow an
+        // import" is not a remedy (§2.3 has no opt-out and §26.1 makes
+        // extension blocks nameless, so the §5 candidate is not removable),
+        // and the diagnostic names the candidate with the stdlib module
+        // `System.Collections.Linq` instead of the current/imported module
+        // (the §26.5.1 v0.278 amendment states this explicitly).
+        bool hasStdlibLinq = false;
+        for (std::size_t idx : maximal)
+            if (found[idx].isStandardLibraryLinq) { hasStdlibLinq = true; break; }
         for (std::size_t idx : maximal) {
             const ExtCandidate& c = found[idx];
             std::string moduleName;
-            if (auto it = importedExtensionModule_.find(c.ext);
-                it != importedExtensionModule_.end())
-                moduleName = it->second;
-            else if (ctx_.module())
-                moduleName = std::string(ctx_.module()->name);
-            std::string head = "extension " + spellExtHeadTypeRef(c.declaredHead);
-            std::string where = c.decl ? spellExtWhereClause(c.decl->genericConstraints)
-                                       : std::string();
+            if (c.isStandardLibraryLinq) {
+                // §2.3 v0.278 / §26.5.1 v0.278: the §5 block is auto-imported
+                // under `System.Collections.Linq`, the module §2.3 puts on the
+                // always-visible list specifically so its extension blocks are
+                // reachable everywhere. There is no other module home for it.
+                moduleName = "System.Collections.Linq";
+            } else {
+                if (auto it = importedExtensionModule_.find(c.ext);
+                    it != importedExtensionModule_.end())
+                    moduleName = it->second;
+                else if (ctx_.module())
+                    moduleName = std::string(ctx_.module()->name);
+            }
+            std::string head;
+            std::string where;
+            if (c.isStandardLibraryLinq) {
+                head = "extension " + c.stdHead;
+                where = c.stdWhere;
+            } else {
+                head = "extension " + spellExtHeadTypeRef(c.declaredHead);
+                where = c.decl
+                    ? spellExtWhereClause(c.decl->genericConstraints)
+                    : std::string();
+            }
             if (!where.empty()) head += " " + where;
             std::string site;
-            if (c.decl && c.decl->span.begin.line != 0) {
+            if (c.isStandardLibraryLinq) {
+                // §5 has no source-span payload — it is compiler-known and
+                // lives in stdlib. Name the spec section so the reader can
+                // look up the declaration, and flag the auto-import so the
+                // "narrow an import" remedy (which the reader might try first)
+                // is pre-empted in the candidate line itself.
+                site = "declared in stdlib §5 (auto-imported via §2.3, "
+                       "no opt-out — `narrow an import` is not available "
+                       "against this candidate; §26.5.1, v0.278)";
+            } else if (c.decl && c.decl->span.begin.line != 0) {
                 site = "declared at ";
                 if (!c.decl->sourceFile.empty())
                     site += c.decl->sourceFile + ":";
@@ -7438,18 +7698,35 @@ Symbol* ExprTC::lookupExtensionMember(
                 else
                     site += ", column " +
                             std::to_string(c.decl->span.begin.column);
-            } else
+            } else {
                 // A dependency produced before #2329 has no source-span
                 // payload. Keep the established explicit degradation instead
                 // of fabricating 0:0.
                 site = "declaration site not tracked across module imports";
+            }
             msg += "\n  " + head + " — module `" + moduleName + "`, " + site;
         }
-        msg += "\nremedies: narrow the import bringing in one of these "
-               "extension blocks; hoist the intended behavior into a "
-               "static-class helper method that takes the receiver as a "
-               "parameter; or, if both blocks are under your control, give "
-               "the colliding members distinct names (§26.5 rule 4).";
+        if (hasStdlibLinq) {
+            // §26.5.1 v0.278 / §2.3 v0.278: the §5 candidate is not removable
+            // (no opt-out on the auto-import, extension blocks nameless per
+            // §26.1), so "narrow an import" is not a remedy against it. The
+            // user's only moves are hoist-into-helper and rename — and rename
+            // applies to the user block(s), not the stdlib one (the §5 name
+            // is fixed by the language surface). Drop "narrow an import" so
+            // the remedies list is sound: every option listed is reachable.
+            msg += "\nremedies: hoist the intended behavior into a "
+                   "static-class helper method that takes the receiver as a "
+                   "parameter; or, if your extension blocks are under your "
+                   "control, give the colliding members distinct names (the "
+                   "stdlib §5 name is fixed and not removable, §26.5.1 "
+                   "v0.278) (§26.5 rule 4).";
+        } else {
+            msg += "\nremedies: narrow the import bringing in one of these "
+                   "extension blocks; hoist the intended behavior into a "
+                   "static-class helper method that takes the receiver as a "
+                   "parameter; or, if both blocks are under your control, "
+                   "give the colliding members distinct names (§26.5 rule 4).";
+        }
         ctx_.diagnostics().report(Severity::Error, loc, msg);
     }
     // Error-recovery (mirrors resolveOverload's OverloadOutcome::Ambiguous
