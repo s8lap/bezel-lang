@@ -494,6 +494,17 @@ private:
     // per §3.6 rule 2.
     void checkStaticReadonlyBareTInstantiations();
 
+    // §14.6 (v0.262, #3271): expanding in-SCC instantiation edges are a
+    // compile error at the declaration holding the edge. Walks the
+    // instantiations_ record (one edge per generic-type instantiation
+    // resolved in the program), builds the instantiation-request graph over
+    // generic-type nodes, computes strongly-connected components, and
+    // rejects every in-SCC edge whose substitution is neither a bare
+    // in-scope parameter of the source declaration nor a closed type (the
+    // §14.6 per-edge condition). The diagnostic names the cycle and the
+    // growing argument and lands at the declaration holding the edge.
+    void checkExpandingInstantiationEdges();
+
     void checkStaticClassMember(TypeSymbol* t, Symbol* m);
 
     // Slice S14: within one type, two members that aren't both

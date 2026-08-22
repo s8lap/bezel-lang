@@ -425,6 +425,12 @@ void Resolver::run(const ast::SourceFile& src) {
     // checkOwningElementInstantiations / checkAsTargetInstantiations above:
     // every instantiation site has been recorded by now.
     checkStaticReadonlyBareTInstantiations();
+    // §14.6 (v0.262, #3271): expanding in-SCC instantiation edges are a
+    // compile error at the declaration. Runs after every instantiation
+    // has been recorded (instantiations_ is fully populated by now) so
+    // the SCC walk sees the whole graph. Placed LAST so the diagnostic
+    // lands after every other declaration-site check has fired.
+    checkExpandingInstantiationEdges();
 }
 
 bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx) {

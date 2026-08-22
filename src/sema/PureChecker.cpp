@@ -136,6 +136,21 @@ private:
     // §22.15 rule 5: is `rt` an IEnumerable<T>-typed source that the `for`
     // desugaring expands into an enumerator-constructing loop?
     bool isEnumeratorConstructingSource(const TypeRef* rt) const;
+
+    // fix #3279 (v0.263, stdlib §9.8 + spec §22.15): the `in` membership
+    // operator (§17.5) is semantically `r.Contains(value)`. This helper
+    // reports whether the receiver `r`'s `Contains` member is pure-
+    // classified for the purposes of §22.15's calls-to-pure-members rule.
+    // Admitted shapes: Range<T> (intrinsic-purity contract; its Contains is
+    // pure-declared in stdlib §9.8), string and the various ReadOnlySpan /
+    // ArraySpan variants (Contains is pure-declared in stdlib §3.3 and
+    // §4.14), and any user-declared type whose `Contains(value: T)` member
+    // carries the `pure` modifier (looked up on the receiver's member
+    // list). All other receivers (Array<T>, OwningArray<T>, user-defined
+    // non-pure Contains, unresolved) are rejected — the operator is
+    // semantically an impure call and §22.15 admits it only when its
+    // callee is pure-classified.
+    bool inOperatorCalleeIsPure(const ast::BinaryExpr& be) const;
 };
 
 bool PureBodyWalker::isTrivialDisposeClass(TypeSymbol* decl) const {
@@ -504,6 +519,90 @@ bool PureBodyWalker::isEnumeratorConstructingSource(
         head == "Queue" || head == "LinkedList" || head == "OwningStack" ||
         head == "OwningQueue" || head == "OwningLinkedList")
         return true;
+    return false;
+}
+
+// fix #3279 (v0.263, stdlib §9.8 + spec §22.15): the `in` membership
+// operator's callee is `r.Contains(value)` (spec §17.5). The
+// calls-to-pure-members rule (spec §22.15) admits the operator iff the
+// callee is pure-classified.
+//
+// Pure-classified callees:
+//   - Range<T>: pure-declared on the stdlib intrinsic (stdlib §9.8;
+//     carried by the `pure` modifier on the Range declaration).
+//   - string: pure-declared on `string.Contains` (stdlib §4.6).
+//   - Span families (ReadOnlySpan<char>, ReadOnlyStringSpan, the bit-tier
+//     Reader/Writer views): pure-declared on their `Contains` (stdlib
+//     §3.3, §4.14).
+//   - User-declared types: pure iff a member named `Contains` exists on
+//     the receiver's symbol-side member list AND that member is
+//     pure-declared (carries `pure` in its modifiers list — the same
+//     check `callTargetIsPure` runs at a CallExpr to `Contains`).
+//
+// Rejected:
+//   - Array<T>, OwningArray<T> (Contains not pure-declared in stdlib).
+//   - Any user-declared type whose `Contains` does NOT carry `pure`.
+//   - Unresolved receivers (the resolution error was reported elsewhere;
+//     this check does not double-report).
+//
+// The helper does NOT descend into codegen's `in`-operator lowering
+// (which is inlined to a range-membership scan in LlvmBackend_Exprs.cpp).
+// The §22.15 rule fires on the SEMANTIC callee — what the operator means,
+// not how codegen lowers it — so a future lowering change cannot
+// silently relax this check.
+bool PureBodyWalker::inOperatorCalleeIsPure(const ast::BinaryExpr& be) const {
+    if (!be.right) return true;  // resolution error elsewhere; no double-report
+    const TypeRef* recvTy = ctx_.exprType(*be.right);
+    if (!recvTy) return true;
+    // The receiver's identity for stdlib-type membership testing. The
+    // RangeExpr type's `headName()` is empty (RangeExpr has no astNode
+    // and its local TypeRef carries no importedName), so we read the
+    // declaration name directly when present. headName() is the alias-
+    // transparent spelling per TypeRef.hpp, which suffices for the
+    // string/span cases.
+    std::string_view head = recvTy->headName();
+    if (head.empty() && recvTy->declaration)
+        head = recvTy->declaration->name;
+    // Special cases by receiver head — these are the stdlib-declared
+    // pure-Contains types whose purity is a documentation fact, not a
+    // symbol-table lookup (the members may not exist as MemberSymbols on
+    // the builtin TypeSymbol — e.g. Range<T>'s decl is null).
+    if (head == "Range") return true;  // stdlib §9.8, pure-declared intrinsic.
+    if (head == "string") return true;  // stdlib §4.6, pure-declared.
+    // Span families: ReadOnlySpan, Span (subclass relationship for the
+    // bit-tier's ReadOnlyArraySpan / ArraySpan / ReadOnlyStringSpan too).
+    // Their `Contains(value: T)` is pure-declared (stdlib §3.3, §4.14).
+    // We admit by NAME rather than walking the member list, because the
+    // span family's TypeSymbol may be imported with no `Contains` member
+    // reconstructed (ModuleLoader omits some stdlib-declared members on
+    // the import side — see the §3152 umbrella, family F11/F13).
+    if (head == "ReadOnlySpan" || head == "Span" ||
+        head == "ReadOnlyArraySpan" || head == "ArraySpan" ||
+        head == "ReadOnlyStringSpan" || head == "BitReader" ||
+        head == "ReadOnlyBitReader" || head == "BitWriter" ||
+        head == "ReadOnlyBitWriter")
+        return true;
+    // Generic user-declared types: walk the receiver's symbol-side member
+    // list looking for a `Contains` member and check its `pure` modifier.
+    // This matches what `callTargetIsPure` does for an explicit
+    // `r.Contains(x)` CallExpr, so the two paths agree (fix #3279's
+    // stated invariant: "the marker is what admits a range test inside a
+    // contract clause; the same marker admits `r.Contains(x)` in the
+    // same position").
+    if (recvTy->kind == TypeRef::Kind::Named && recvTy->declaration) {
+        for (Symbol* m : recvTy->declaration->members) {
+            auto* ms = dynamic_cast<MethodSymbol*>(m);
+            if (!ms) continue;
+            if (ms->name != "Contains") continue;
+            // Same predicate as callTargetIsPure's MethodSymbol arm.
+            if (ms->isPure) return true;
+            for (std::string_view mod : ms->modifiers)
+                if (mod == "pure") return true;
+            return false;
+        }
+    }
+    // No matching Contains found, or non-Named receiver. Conservatively
+    // reject: the operator's semantic callee is unprovably pure.
     return false;
 }
 
@@ -965,6 +1064,43 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
         return;
     }
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
+        // fix #3279 (v0.263, stdlib §9.8 + spec §22.15): `x in r` is the
+        // §17.5 membership operator, semantically equivalent to the call
+        // `r.Contains(x)`. §22.15's calls-to-pure-members rule requires
+        // the called member to be pure-classified, so the operator's
+        // receiver's Contains member must be pure for the operator to be
+        // admitted in a pure body or contract clause. Range<T>.Contains is
+        // pure-classified via its `pure` modifier (stdlib §9.8,
+        // intrinsic-purity contract); string/span Contains members are
+        // pure-declared in stdlib; user types' Contains members are
+        // admitted iff `pure`-declared on the receiving type. Any other
+        // receiver (Array<T>, OwningArray<T>, user types without a pure
+        // Contains, etc.) is rejected — the operator is rejected at this
+        // site, named "in" over the receiver, citing §22.15 and the issue.
+        //
+        // Pre-fix state: the walker only descended into left and right
+        // operands, never inspecting the operator itself, so an `in` over
+        // Array<T> was admitted silently in pure bodies even though
+        // Array<T>.Contains is not pure-declared. The fix closes the gap.
+        if (be->op == "in") {
+            if (!inOperatorCalleeIsPure(*be)) {
+                const TypeRef* recvTy = be->right ? ctx_.exprType(*be->right)
+                                                  : nullptr;
+                std::string recvName = recvTy ? std::string(recvTy->headName())
+                                              : std::string("<expr>");
+                if (recvName.empty()) recvName = "<expr>";
+                reportPureViolation(
+                    be->span.begin,
+                    std::string("`in` over `") + recvName + "`",
+                    "the `in` operator is semantically equivalent to the "
+                    "callee `Contains(value)` (\xC2\xA7""17.5); "
+                    "\xC2\xA7""22.15's calls-to-pure-members rule requires "
+                    "the receiver's Contains member to be "
+                    "pure-classified \xE2\x80\x94 `" + recvName +
+                    ".Contains` is not declared `pure` "
+                    "(\xC2\xA7""22.15, #3279, stdlib \xC2\xA7""9.8)");
+            }
+        }
         checkExpr(be->left.get());
         checkExpr(be->right.get());
         return;

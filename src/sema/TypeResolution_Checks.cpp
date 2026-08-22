@@ -5,6 +5,7 @@
 
 #include "sema/ConstFold.hpp"
 #include "sema/EnumValues.hpp"  // enumHasZeroConstant — §17.11 default(E) (#3044)
+#include "sema/GenericParams.hpp"  // detail::astGenericParams — §14.6 in-scope name set (#3271)
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation
 #include "sema/TypeResolution.hpp"
 
@@ -10060,6 +10061,451 @@ void Resolver::recordStaticReadonlyBareTSite(std::string_view paramName,
                                              TypeSymbol* enclosingType) {
     staticReadonlyBareTSites_.push_back(
         {paramName, memberName, isField, declLoc, enclosingType});
+}
+
+// §14.6 / #3271 (v0.262): the §14.6 per-edge predicates over a substitution
+// and an in-scope parameter set. Two functions share one scope of work and
+// are intentionally co-located: the closed-type walk (`typeContainsNoInScope`)
+// and the bare-parameter check (`isBareInScopeParam`) partition the admitted
+// shapes ("either a bare in-scope parameter or a closed type"). A substitution
+// that is neither — typically a constructed type (`Pair<T, T>`, `Box<U>`,
+// `T?` even when T is bare) containing one or more in-scope parameters
+// nested inside it — is the expanding shape §14.6 rejects.
+//
+// Both walk the TypeRef tree. We do not consult `instantiations_` here; this
+// predicate is reusable from any future per-edge check (e.g., an override-
+// contributed edge audit) without re-binding to the resolution state.
+namespace {
+
+// Is `ref` a BARE reference to a parameter that is in scope at the source
+// declaration? "Bare" means the TypeRef has no `declaration` (it resolves to
+// no TypeSymbol — it is the syntactic parameter placeholder), is a Named
+// shape, has a single-part name, and is not a primitive or builtin (the
+// same predicate as #2713's `isBareGenericParamBinding` in
+// TypeResolution_Checks.cpp). The name is then looked up in `inScope`.
+//
+// The nullable form `T?` is NOT a bare in-scope parameter — spec §14.6
+// explicitly excludes it ("the nullable form `T?` included"). The call site
+// checks `ref->nullable` first.
+bool isBareInScopeParam(const TypeRef* ref, const ast::Type* refAst,
+                        const std::set<std::string_view>& inScope) {
+    if (!ref || !refAst) return false;
+    if (ref->nullable) return false;
+    if (ref->kind != TypeRef::Kind::Named) return false;
+    if (ref->declaration != nullptr) return false;
+    if (refAst->kind != ast::TypeKind::Named || !refAst->name ||
+        refAst->name->parts.size() != 1)
+        return false;
+    return inScope.count(refAst->name->parts.front()) > 0;
+}
+
+// Does `ref` contain NO reference to a parameter in `inScope` at all? A
+// closed type by definition contains no type parameter. The recursive walk
+// rejects:
+//   * the nullable form `T?` (spec text: "the nullable form `T?` included" —
+//     this is the conservative reading: even T being in scope does not save
+//     the substitution; the substitution itself must be the bare T, not T?),
+//   * any Named type whose generic args recursively contain an in-scope
+//     parameter,
+//   * any Named type whose own declaration is a generic parameter (declaration
+//     == null but the name is in scope — handled as the bare arm, NOT here),
+//   * any InlineArray whose element contains an in-scope parameter,
+//   * any Function whose parameter or return types contain an in-scope
+//     parameter.
+// Primitives and unit are closed.
+bool typeContainsNoInScope(const TypeRef* ref,
+                           const std::set<std::string_view>& inScope) {
+    if (!ref) return true;
+    if (ref->nullable) return false;
+    switch (ref->kind) {
+        case TypeRef::Kind::Error:
+        case TypeRef::Kind::Unit:
+            return true;
+        case TypeRef::Kind::Primitive:
+            return true;  // int, string, double, … — all closed.
+        case TypeRef::Kind::Named:
+            if (ref->declaration == nullptr) {
+                // Bare parameter reference. The closed arm applies only when
+                // the parameter is NOT in scope (so it is unresolvable and
+                // would already be a separate error). For the §14.6 check,
+                // a bare in-scope parameter is admitted by the OTHER arm
+                // (isBareInScopeParam) — we are the closed-type arm and the
+                // param is "not closed" by definition.
+                return false;
+            }
+            for (const TypeRef* arg : ref->genericArgs) {
+                if (!typeContainsNoInScope(arg, inScope)) return false;
+            }
+            return true;
+        case TypeRef::Kind::InlineArray:
+            return typeContainsNoInScope(ref->arrayElement, inScope);
+        case TypeRef::Kind::Function:
+            for (const auto& p : ref->funcParams) {
+                if (!typeContainsNoInScope(p.type, inScope)) return false;
+            }
+            return typeContainsNoInScope(ref->funcReturn, inScope);
+    }
+    return true;
+}
+
+// The §14.6 per-substitution verdict: `true` iff this substitution at a
+// single target-parameter position is EITHER a bare in-scope parameter of
+// the source declaration OR a closed type. The shape the spec calls
+// "expanding" (an argument containing an in-scope parameter other than as
+// the bare argument itself, the nullable form `T?` included) returns false.
+bool substitutionIsAdmitted(const TypeRef* sub, const ast::Type* subAst,
+                            const std::set<std::string_view>& inScope) {
+    // Skip unresolved args (Error kind); the resolution diagnostic was
+    // already reported elsewhere, and re-reporting here would cascade.
+    if (!sub || sub->kind == TypeRef::Kind::Error) return true;
+    return isBareInScopeParam(sub, subAst, inScope) ||
+           typeContainsNoInScope(sub, inScope);
+}
+
+// Compute the in-scope parameter NAME set at the source of an
+// `instantiations_` edge. The source is the enclosing TYPE (when the
+// instantiation site is at type-level, e.g., field types, base clauses,
+// signature types AT the type level, OR inside a non-generic method's
+// body) — the set is then the type's generic-parameter names. When the
+// site sits inside a generic METHOD's body, the in-scope set is the
+// union of the method's generic-parameter names and the enclosing
+// type's. (The methodGenericParams field carries the method's name list;
+// see #2713's mirror in checkOwningElementInstantiations.)
+//
+// Takes the fields directly (rather than the Resolver-private
+// GenericInstantiation struct) so this helper can live at namespace
+// scope in the anonymous namespace above.
+std::set<std::string_view> inScopeParamNamesFor(
+        TypeSymbol* enclosingType,
+        const std::vector<ast::GenericParam>* methodGenericParams) {
+    std::set<std::string_view> names;
+    if (enclosingType) {
+        for (const ast::GenericParam& gp :
+             *bezel::sema::detail::astGenericParams(enclosingType)) {
+            names.insert(gp.name);
+        }
+        if (names.empty()) {
+            // Fallback to symbol-side for imported types (no AST). See
+            // GenericParams.hpp for the precedence rule.
+            for (Symbol* gp : enclosingType->genericParams) {
+                if (gp) names.insert(gp->name);
+            }
+        }
+    }
+    if (methodGenericParams) {
+        for (const ast::GenericParam& gp : *methodGenericParams) {
+            names.insert(gp.name);
+        }
+    }
+    return names;
+}
+
+// Render a TypeRef to a stable, user-readable spelling for the diagnostic.
+// Reuses the AST node's syntactic form when available; otherwise falls back
+// to "T<…>" using the imported-name or headName. The spelling is best-
+// effort; the diagnostic's load-bearing part is the cycle (named by the
+// target's symbol name) and the source's name, not the precise type print.
+std::string substitutionSpelling(const TypeRef* sub, const ast::Type* subAst) {
+    if (subAst) {
+        // Best effort: walk the AST's name and generic-args.
+        // We don't reconstruct the full grammar — just the head and any
+        // immediate generic args — because the diagnostic's purpose is
+        // identifying the cycle and the growing argument, not printing
+        // arbitrary types.
+        std::string out;
+        if (subAst->name) {
+            for (std::size_t i = 0; i < subAst->name->parts.size(); ++i) {
+                if (i != 0) out += '.';
+                out += std::string(subAst->name->parts[i]);
+            }
+        }
+        if (!subAst->genericArgs.empty()) {
+            out += '<';
+            for (std::size_t i = 0; i < subAst->genericArgs.size(); ++i) {
+                if (i != 0) out += ", ";
+                out += substitutionSpelling(nullptr,
+                                            subAst->genericArgs[i].get());
+            }
+            out += '>';
+        }
+        if (subAst->nullable) out += '?';
+        return out;
+    }
+    if (!sub) return "<missing>";
+    std::string out;
+    if (!sub->headName().empty()) out += std::string(sub->headName());
+    if (!sub->genericArgs.empty()) {
+        out += '<';
+        for (std::size_t i = 0; i < sub->genericArgs.size(); ++i) {
+            if (i != 0) out += ", ";
+            out += substitutionSpelling(sub->genericArgs[i], nullptr);
+        }
+        out += '>';
+    }
+    if (sub->nullable) out += '?';
+    return out;
+}
+
+}  // namespace
+
+// §14.6 / #3271 (v0.262): expanding in-SCC instantiation edges are a
+// compile error at the declaration holding the edge.
+//
+// Algorithm:
+//   1. Build the instantiation-request graph from `instantiations_`. Nodes
+//      are the generic TypeSymbols that appear either as a target (`type`)
+//      or as a source (the `enclosingType` of any entry). Edges run from
+//      source to target. The substitution is the recorded argRefs/argAsts
+//      tuple (one edge per recorded instantiation, so a single program
+//      position with two different targets yields two edges, both captured).
+//   2. Compute strongly-connected components over the graph via Tarjan's
+//      algorithm (recursive form, depth bound by the node count). The graph
+//      is small (every generic declaration is at most one node) so the
+//      recursion is bounded.
+//   3. For each edge whose source and target are in the same SCC, apply
+//      the §14.6 per-edge condition: every target parameter position must
+//      be substituted with either (a) a bare type parameter in scope at
+//      the source declaration or (b) a closed type. Any other substitution
+//      — an argument containing an in-scope parameter other than as the
+//      bare argument itself, the nullable form `T?` included — is a
+//      compile error at the declaration holding the edge.
+//
+// Edge attribution (source side). The spec attributes each edge to a
+// specific node ("each generic type is a node, and each generic member is
+// its own node; a non-generic member's edges attach to its declaring
+// type's node"). The instantiations_ record carries the enclosing TYPE
+// (currentOuterType_) and an optional methodGenericParams pointer, so the
+// natural decomposition is:
+//
+//   * enclosingType is null: the edge is at module scope. Such edges are
+//     trivially not in any SCC and are skipped — there is no cycle to
+//     bound.
+//   * enclosingType is non-null, methodGenericParams is null: the edge
+//     attaches to the enclosing type's node. The in-scope parameter set
+//     is the enclosing type's generic-parameter names.
+//   * enclosingType is non-null, methodGenericParams is non-null: the
+//     edge sits inside a generic METHOD's body. Per spec, the edge
+//     attaches to that generic member's node. The in-scope parameter set
+//     is the union of the method's and the enclosing type's parameter
+//     names.
+//
+// For the generic-member attribution path, this implementation v1 keeps
+// the graph at TYPE granularity: it attributes the edge to the enclosing
+// type's node regardless of methodGenericParams, and computes the in-
+// scope set as the union. This is the conservative reading — the type's
+// in-scope set is a SUBSET of the method's (it lacks the method's own
+// parameters), so a substitution admitted at the method level may be
+// over-rejected at the type level. The known over-rejection is recorded
+// below; for the two reproducing shapes from #0104 §4.2 (call route via
+// a NON-generic method, data route via a field), the substitution uses
+// the type's own parameter — so the verdict is identical. The
+// generic-method-body case is left as a recorded follow-up. This matches
+// the spec's "per-edge over the component" posture: the rule fires
+// independently of dynamic reachability, so over-rejecting an admitted
+// shape is preferable to missing an expanding one.
+//
+// Diagnostic placement: at the declaration holding the edge — the AST
+// node of the recorded instantiation site (`inst.site`). The shape the
+// spec names is "the declaration-site shape of §14.2's bound-cycle rule
+// and §27.8's alias rule", so the message names the cycle (the SCC's
+// representative target), the growing argument (the failing substitution
+// at one target parameter position), and the spec section. One diagnostic
+// per (edge, position) so the user sees every position that violates the
+// rule; the SCC and the position are both in the diagnostic.
+void Resolver::checkExpandingInstantiationEdges() {
+    if (instantiations_.empty()) return;
+
+    // ----- 1. Build the graph -------------------------------------------------
+    // Nodes are TypeSymbol* that appear as either source or target. Edges
+    // are tuples (source, target, instPtr, paramIdx, subPtr, subAstPtr)
+    // — we keep the per-position data because the per-edge verdict is
+    // position-specific (§14.6: "every edge … must substitute each type
+    // parameter of its target with …").
+    struct EdgeInfo {
+        std::size_t instIdx;        // index into instantiations_
+        std::size_t paramIdx;       // which target parameter position
+    };
+    std::unordered_map<TypeSymbol*, std::vector<TypeSymbol*>> adj;
+    std::unordered_map<TypeSymbol*, std::vector<EdgeInfo>> edgesBySrc;
+    std::unordered_set<TypeSymbol*> nodes;
+    for (std::size_t i = 0; i < instantiations_.size(); ++i) {
+        const GenericInstantiation& inst = instantiations_[i];
+        if (!inst.enclosingType || !inst.type) continue;
+        // Edge source = enclosingType (conservative type-level attribution
+        // — see header comment for the known over-rejection in the generic-
+        // method-body case). Target = type.
+        TypeSymbol* src = inst.enclosingType;
+        TypeSymbol* tgt = inst.type;
+        nodes.insert(src);
+        nodes.insert(tgt);
+        adj[src].push_back(tgt);
+        // One EdgeInfo per TARGET PARAMETER POSITION so the per-position
+        // verdict can be reported individually (the diagnostic names the
+        // growing argument at the failing position).
+        const std::size_t n = inst.argRefs.size();
+        for (std::size_t k = 0; k < n; ++k) {
+            edgesBySrc[src].push_back({i, k});
+        }
+    }
+    if (nodes.empty()) return;
+
+    // ----- 2. Compute SCCs via Tarjan -----------------------------------------
+    // Iterative Tarjan (the recursive form overflows on large graphs; this
+    // codebase has at most a few hundred generic declarations, but using
+    // the iterative form here keeps the depth-bounded invariant). The
+    // index/counter gives the visitation order; lowlink tracks the
+    // smallest index reachable from the subtree. A node joins the current
+    // SCC when lowlink[index] == index. The result is the SCC list in
+    // reverse topological order (post-order on the condensation graph).
+    std::unordered_map<TypeSymbol*, int> indexOf;
+    std::unordered_map<TypeSymbol*, int> lowlinkOf;
+    std::vector<TypeSymbol*> stack;
+    std::unordered_set<TypeSymbol*> onStack;
+    std::vector<std::vector<TypeSymbol*>> sccs;
+    int counter = 0;
+    struct Frame {
+        TypeSymbol* node;
+        std::vector<TypeSymbol*>::iterator it;
+    };
+    for (TypeSymbol* root : nodes) {
+        if (indexOf.count(root)) continue;
+        std::vector<Frame> work;
+        work.push_back({root, adj[root].begin()});
+        indexOf[root] = counter;
+        lowlinkOf[root] = counter;
+        ++counter;
+        stack.push_back(root);
+        onStack.insert(root);
+        while (!work.empty()) {
+            Frame& f = work.back();
+            TypeSymbol* u = f.node;
+            auto& a = adj[u];
+            if (f.it != a.end()) {
+                TypeSymbol* w = *f.it;
+                ++f.it;
+                if (!indexOf.count(w)) {
+                    indexOf[w] = counter;
+                    lowlinkOf[w] = counter;
+                    ++counter;
+                    stack.push_back(w);
+                    onStack.insert(w);
+                    work.push_back({w, adj[w].begin()});
+                } else if (onStack.count(w)) {
+                    if (indexOf[w] < lowlinkOf[u]) lowlinkOf[u] = indexOf[w];
+                }
+            } else {
+                // Children exhausted — finalize u.
+                if (lowlinkOf[u] == indexOf[u]) {
+                    std::vector<TypeSymbol*> scc;
+                    while (true) {
+                        TypeSymbol* x = stack.back();
+                        stack.pop_back();
+                        onStack.erase(x);
+                        scc.push_back(x);
+                        if (x == u) break;
+                    }
+                    sccs.push_back(std::move(scc));
+                }
+                work.pop_back();
+                if (!work.empty()) {
+                    TypeSymbol* parent = work.back().node;
+                    if (lowlinkOf[u] < lowlinkOf[parent])
+                        lowlinkOf[parent] = lowlinkOf[u];
+                }
+            }
+        }
+    }
+
+    // ----- 3. For each edge, apply the per-edge verdict ------------------------
+    // Map each node to its SCC representative (the node itself in a single-
+    // node SCC, or any node in a multi-node SCC; we use the SCC's first
+    // element as the canonical "this is the cycle"). A node is "in an SCC
+    // with another" iff its SCC has size > 1 OR it is a self-loop (the
+    // latter is a property of the EDGES, not the SCC: a single-node SCC
+    // has a self-loop iff some edge runs from the node to itself).
+    std::unordered_map<TypeSymbol*, int> sccId;  // canonical SCC id per node
+    for (std::size_t i = 0; i < sccs.size(); ++i) {
+        for (TypeSymbol* n : sccs[i]) sccId[n] = static_cast<int>(i);
+    }
+
+    // Per-source bookkeeping for the source's in-scope parameter set. The
+    // set is the same for every edge sourced from a given enclosingType
+    // (the in-scope names come from the type and the optional method
+    // params of the recorded site); cache it.
+    std::unordered_map<TypeSymbol*, std::set<std::string_view>> inScopeCache;
+    // Dedup set: one diagnostic per (source, target, param-position) — a
+    // single expanding edge may be recorded multiple times if the same
+    // declaration names the same target with the same substitution at
+    // multiple sites, and we want one error per offending position rather
+    // than a flood.
+    std::set<std::tuple<TypeSymbol*, TypeSymbol*, std::size_t>> reported;
+
+    for (auto& entry : edgesBySrc) {
+        TypeSymbol* src = entry.first;
+        if (!sccId.count(src)) continue;  // not in any SCC? shouldn't happen
+        int srcScc = sccId[src];
+        for (const EdgeInfo& e : entry.second) {
+            const GenericInstantiation& inst = instantiations_[e.instIdx];
+            TypeSymbol* tgt = inst.type;
+            if (!sccId.count(tgt)) continue;
+            int tgtScc = sccId[tgt];
+            // In-SCC test: same SCC AND (multi-node SCC OR self-loop).
+            bool sameScc = (srcScc == tgtScc);
+            bool selfLoop = (src == tgt);
+            if (!sameScc && !selfLoop) continue;
+            // Fetch / compute the in-scope parameter set.
+            auto itScope = inScopeCache.find(src);
+            if (itScope == inScopeCache.end()) {
+                itScope = inScopeCache.emplace(src,
+                    inScopeParamNamesFor(inst.enclosingType,
+                                         inst.methodGenericParams)).first;
+            }
+            const std::set<std::string_view>& inScope = itScope->second;
+            // Per-position verdict.
+            if (e.paramIdx >= inst.argRefs.size()) continue;
+            const TypeRef* sub = inst.argRefs[e.paramIdx];
+            const ast::Type* subAst = (e.paramIdx < inst.argAsts.size())
+                                          ? inst.argAsts[e.paramIdx]
+                                          : nullptr;
+            if (substitutionIsAdmitted(sub, subAst, inScope)) continue;
+            // Emit a diagnostic. One per (src, tgt, position) — the user
+            // sees every offending position on a single declaration.
+            if (!reported.insert({src, tgt, e.paramIdx}).second) continue;
+            const std::string targetName = std::string(tgt->name);
+            // Locate the target's parameter name at this position so the
+            // diagnostic names the SPECIFIC parameter being substituted
+            // with the growing argument. Walk target's genericParams
+            // positionally (matches the substitution at position e.paramIdx).
+            std::string paramName = "?";
+            const std::vector<ast::GenericParam>* tgtAst =
+                bezel::sema::detail::astGenericParams(tgt);
+            if (tgtAst && e.paramIdx < tgtAst->size())
+                paramName = std::string((*tgtAst)[e.paramIdx].name);
+            else if (e.paramIdx < tgt->genericParams.size() &&
+                     tgt->genericParams[e.paramIdx])
+                paramName = std::string(tgt->genericParams[e.paramIdx]->name);
+            // Span of the recording site (the AST node carrying the
+            // instantiation).
+            SourceLocation loc = inst.site ? inst.site->span.begin
+                                           : SourceLocation{};
+            std::string message =
+                "the type parameter `" + paramName +
+                "` of generic type `" + targetName +
+                "` is substituted with a constructed type containing a "
+                "type parameter of the enclosing declaration in a "
+                "recursive generic instantiation: `" +
+                targetName + "<" + substitutionSpelling(sub, subAst) +
+                ">` (this declaration) requires `" + targetName +
+                "` instantiated at a growing argument, whose instantiation "
+                "closure has no bound (\xC2\xA7""14.6, #3271); a "
+                "recursive generic may not nest a type parameter inside a "
+                "constructed type argument";
+            if (sub && sub->nullable)
+                message += " \xE2\x80\x94 the nullable form `T?` is "
+                           "explicitly excluded by the rule";
+            ctx_.diagnostics().report(Severity::Error, loc, message);
+        }
+    }
 }
 
 // §22.15 (v0.202, #2052): true iff `rt` is a user-declared CLASS TypeRef
