@@ -1294,16 +1294,39 @@ static bool isAdmissibleComponentType(const TypeRef* ty, const SemaContext& ctx,
             return isAdmissibleComponentType(ty->arrayElement, ctx, depth + 1);
         case K::Named: {
             const TypeSymbol* decl = ty->declaration;
-            if (!decl) return true;           // unresolved generic param / imported builtin
+            if (!decl) {
+                // fix #3327 (§9.2 / §25.2 v0.276): the compiler-intrinsic FFI
+                // pointer records `IntPtr` / `UIntPtr` / `Ptr<T>` (§10.0/§10.5)
+                // resolve to a Named TypeRef with no user-side TypeDecl, so the
+                // null-declaration path above would otherwise admit them as
+                // components. Each declares its own homogeneous `=`/`<>`
+                // overload (§25.2's co-declaration rule, retired-exemption
+                // v0.275), which v0.276's third disqualifier uses to strip
+                // auto-hashable — and §9.2's recursive component rule reads
+                // "another record that is itself auto-hashable", so an
+                // enclosing record carrying one of these as a component is
+                // likewise not auto-hashable. Reject explicitly; let every
+                // *other* null-declaration case (unresolved generic
+                // parameter, imported builtin) stay conservative-true so a
+                // generic body / an imported record is never over-rejected.
+                std::string_view h = ty->headName();
+                if (h == "IntPtr" || h == "UIntPtr" || h == "Ptr")
+                    return false;
+                return true;
+            }
             if (decl->kind == ast::TypeDeclKind::Enum) return true;
             if (decl->kind == ast::TypeDeclKind::Record) {
                 // Another record — admissible iff it is itself
-                // hashable. §9.3 (v0.158, #1383): a positional or
+                // auto-hashable. §9.3 (v0.158, #1383): a positional or
                 // combined-form record synthesizes equality only when every
                 // positional field (and body member for combined form) is
                 // admissible; the blind `return true` for all positional
                 // records was the pre-#1383 bug (over-accept). Imported
                 // positional records (no ast::TypeDecl) remain conservative.
+                // v0.276: the spec reads "auto-hashable" here, NOT
+                // "hashable"; widening to "hashable" is deferred (DECLINED.md
+                // row 320) because it would smuggle reference equality
+                // through user-equality records carrying a class-typed field.
                 if (decl->hasPositionalFields)
                     return isPositionalRecordEqualityBearing(decl, ctx);
                 if (auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl))

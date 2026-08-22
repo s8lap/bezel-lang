@@ -747,3 +747,160 @@ BEZEL_TEST(equality_v0158, heterogeneous_overload_record_is_hashable_spec_3_6_v0
         "class C public method M(d: Dictionary<V, int>) end M; end C;");
     BEZEL_EXPECT_FALSE(hasEqualityBearingError(r));
 }
+
+// ─── fix #3327 (§9.2 / §25.2 v0.276): intrinsic FFI pointer records as ────────
+// components — they are NOT auto-hashable (their own homogeneous `=` overload
+// is the v0.276 third disqualifier), so a record whose component type is
+// IntPtr/UIntPtr/Ptr<T> is itself not auto-hashable. Pre-fix the null-
+// declaration fallthrough at SymbolCollection.cpp:1297 admitted every null-
+// declaration Named type as an admissible component — including the three
+// FFI intrinsics — so a record like `Sqlite3Db(Raw: IntPtr)` slipped through
+// the recursive component rule and synthesized an every-pair-equal `=` (the
+// zero-property form, since IntPtr has no user-visible auto-property). Post-
+// fix, the intrinsic pointer records are excluded explicitly and the
+// standard §9.2 use-site error fires.
+//
+// Spec authorities: §9.2 (auto-generated equality; admissible-component rule;
+// v0.276 strips auto-hashable on a homogeneous `=`/`<>` overload), §25.2
+// (the intrinsic pointer records overload `=`/`<>` homogeneously, retired-
+// exemption v0.275), §3.6 / §8.3 (hashable key/element at the call site).
+// See DECLINED.md row 320 for the deferred widening of §9.2 from
+// "auto-hashable" to "hashable".
+
+// fix #3327: the headline case. `record Sqlite3Db(Raw: IntPtr)` is a body
+// positional record (combined form) whose single component is `IntPtr`. The
+// component is NOT admissible (IntPtr's own homogeneous `=` strips it of
+// auto-hashable per v0.276), so the §9.2 use-site error fires on `=` and the
+// §3.6 hashable-instantiation error fires on the Dictionary.
+BEZEL_TEST(equality_v0158, intptr_component_body_record_eq_rejected_spec_9_2_v0_276_3327) {
+    auto r = parseSema(
+        "module M; "
+        "record Sqlite3Db(Raw: IntPtr); "
+        "class C public method M(a: Sqlite3Db, b: Sqlite3Db) _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(hasNotAutoEqError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// fix #3327: the §3.6 / §8.3 Dictionary-side rejection. A `Sqlite3Db` key is
+// neither auto-hashable nor user-equality-declaring, so the Dictionary<K, V>
+// instantiation rejects it with §3.6's "is not hashable" diagnostic. Pre-fix
+// the Dictionary compiled (the fallthrough admitted IntPtr as a component
+// and the synthesized every-pair-equal `=` slipped past §3.6 too).
+BEZEL_TEST(equality_v0158, intptr_component_dict_key_rejected_spec_3_6_3327) {
+    auto r = parseSema(
+        "module M; "
+        "record Sqlite3Db(Raw: IntPtr); "
+        "class C public method M(d: Dictionary<Sqlite3Db, int>) end M; end C;");
+    BEZEL_EXPECT_TRUE(hasEqualityBearingError(r));
+}
+
+// fix #3327: the symmetric Set<T> rejection — a Set<Sqlite3Db> element is
+// subject to the same hashable requirement as a Dictionary key.
+BEZEL_TEST(equality_v0158, intptr_component_set_element_rejected_spec_3_6_3327) {
+    auto r = parseSema(
+        "module M; "
+        "record Sqlite3Db(Raw: IntPtr); "
+        "class C public method M(s: Set<Sqlite3Db>) end M; end C;");
+    BEZEL_EXPECT_TRUE(hasEqualityBearingError(r));
+}
+
+// fix #3327: UIntPtr has the same shape as IntPtr (homogeneous `=`/`<>`
+// declared in stdlib §10.0), so the v0.276 disqualifier and the §9.2
+// recursive rule apply identically. Pin the symmetry.
+BEZEL_TEST(equality_v0158, uintptr_component_body_record_eq_rejected_spec_9_2_v0_276_3327) {
+    auto r = parseSema(
+        "module M; "
+        "record Handle(Raw: UIntPtr); "
+        "class C public method M(a: Handle, b: Handle) _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(hasNotAutoEqError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// fix #3327: the §10.5 generic FFI pointer record `Ptr<T>`. The head name
+// `Ptr` alone is enough to identify the intrinsic (the `T` generic arg
+// is just a pointee set gate, not a `=` overload). The post-fix null-
+// declaration branch rejects it the same way. `Ptr<T>` lives in
+// `System.Interop`, which is not auto-imported, so the test module declares
+// the import explicitly.
+BEZEL_TEST(equality_v0158, ptr_component_body_record_eq_rejected_spec_9_2_v0_276_3327) {
+    auto r = parseSema(
+        "module M; import System.Interop; "
+        "record ForeignBuf(P: Ptr<byte>); "
+        "class C public method M(a: ForeignBuf, b: ForeignBuf) _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(hasNotAutoEqError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// fix #3327: the body-record form (auto-property, not positional). The
+// `isAdmissibleComponentType` predicate runs from `isAutoEqualityBearingBodyRecord`
+// at the auto-property storage arm (SymbolCollection.cpp:1383-1387) — same
+// predicate, same rejection. Without the fix this synthesized `=` over the
+// IntPtr auto-property, which is exactly the every-pair-equal `=` the spec
+// forbids.
+BEZEL_TEST(equality_v0158, intptr_auto_property_body_record_eq_rejected_spec_9_2_v0_276_3327) {
+    auto r = parseSema(
+        "module M; "
+        "record Sqlite3Db "
+        "  public property Raw: IntPtr; "
+        "  public constructor(raw: IntPtr) Raw := raw; end constructor; "
+        "end Sqlite3Db; "
+        "class C public method M(a: Sqlite3Db, b: Sqlite3Db) _ := a = b; "
+        "end M; end C;");
+    BEZEL_EXPECT_TRUE(hasNotAutoEqError(r));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+}
+
+// fix #3327: control — `Dictionary<IntPtr, int>` itself is NOT rejected.
+// IntPtr is hashable (it declares `Equals(T)` and `override GetHashCode`
+// beside its homogeneous `=` overload, stdlib §10.0 / §25.2's co-declaration
+// rule), so it keys a Dictionary on its address — the documented FFI shape.
+// The fix only affects records whose COMPONENT type is IntPtr/UIntPtr/Ptr<T>;
+// it does not change IntPtr's own hashable verdict.
+BEZEL_TEST(equality_v0158, intptr_itself_dict_key_accepted_spec_3_6_3327) {
+    auto r = parseSema(
+        "module M; "
+        "class C public method M(d: Dictionary<IntPtr, int>) end M; end C;");
+    BEZEL_EXPECT_FALSE(hasEqualityBearingError(r));
+}
+
+// fix #3327: control — a record whose component type is `string` (an
+// admissible component per §9.2's membership list) is still auto-hashable.
+// The fix narrows the null-declaration branch to the three FFI intrinsics;
+// nothing else is touched.
+BEZEL_TEST(equality_v0158, string_component_body_record_still_auto_eq_spec_9_2_3327_control) {
+    auto r = parseSema(
+        "module M; "
+        "record N(Name: string); "
+        "class C public method M(a: N, b: N) _ := a = b; end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// fix #3327: control — a record with one IntPtr field can be MADE
+// hashable by declaring user equality (§25.2's co-declaration rule: a
+// homogeneous `=` overload plus `Equals(T)` and `override GetHashCode`).
+// That is the documented escape for a record that wants to compare
+// pointer-shaped components — the §9.2 error guides the user to it. The
+// test exercises only `=` and `<>` use sites (not Dict-keying) so it does
+// not depend on the separate #2457 universal-Object GetHashCode call on
+// IntPtr; the user-equality route's verdict against the §9.2 disqualified
+// base is what the fix turns around, and that verdict is independent of
+// the runtime codegen path.
+BEZEL_TEST(equality_v0158, intptr_component_record_user_equality_hashes_spec_25_2_3327) {
+    auto r = parseSema(
+        "module M; "
+        "record Sqlite3Db(Raw: IntPtr) "
+        "  public static method operator =(a: Sqlite3Db, b: Sqlite3Db): "
+        "      bool => a.Raw = b.Raw; "
+        "  public static method operator <>(a: Sqlite3Db, b: Sqlite3Db): "
+        "      bool => a.Raw <> b.Raw; "
+        "  public method Equals(other: Sqlite3Db): bool => Raw = other.Raw; "
+        "  public override method GetHashCode(): int => 0; "
+        "end Sqlite3Db; "
+        "class C public method M(a: Sqlite3Db, b: Sqlite3Db) "
+        "  _ := a = b; _ := a <> b; "
+        "end M; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
