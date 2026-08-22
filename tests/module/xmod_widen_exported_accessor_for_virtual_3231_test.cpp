@@ -142,36 +142,6 @@ int compileLocalAndRun3231R(const std::string& src) {
     int status = std::system(aExe.path.c_str());
     return (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
 }
-
-// Run one app body BOTH ways and require the two builds to AGREE (the twin
-// is the oracle, not a hand-written value).
-void expectAgree3231R(const std::string& libSrc,
-                      const std::string& appBody) {
-    // The twin is the lib declarations + appBody concatenated with a single
-    // module prefix. (libSrc/appSrc themselves carry the cross-module
-    // `module X; import Y;` header; concatenating verbatim would emit two
-    // module declarations which the parser rejects. The strip pattern
-    // matches the same one the sibling tests in
-    // xmod_imported_virtual_enumerator_forin_3231_test.cpp use.)
-    const std::size_t libBodyStart = libSrc.find("public class");
-    const std::size_t appBodyStart = appBody.find("public class");
-    const std::string twinSrc =
-        std::string("module Twin3231R; ") +
-        (libBodyStart != std::string::npos
-            ? libSrc.substr(libBodyStart)
-            : std::string{}) +
-        (appBodyStart != std::string::npos
-            ? appBody.substr(appBodyStart)
-            : std::string{});
-    int twin = compileLocalAndRun3231R(twinSrc);
-    BEZEL_EXPECT_TRUE(twin >= 0);
-    int imported = compileImportAndRun3231R(
-        libSrc, std::string("module App3231R; import Lib3231R; ") + appBody);
-    if (imported == -2) return;
-    BEZEL_EXPECT_TRUE(imported >= 0);
-    BEZEL_EXPECT_EQ(imported, twin);
-}
-
 }  // namespace
 
 // ===========================================================================
