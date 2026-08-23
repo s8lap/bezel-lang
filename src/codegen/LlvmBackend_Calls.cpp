@@ -845,6 +845,7 @@ std::unordered_map<std::string_view, llvm::Type*>
 Emitter::setupReceiverGenericSubst(const ast::Expr* target,
                                    const sema::TypeSymbol* parent) {
     auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
     if (!target || !parent) return savedSubst;
     // fix #3143 (§14.1 / §2.5, v0.254): the parameter names through the one
     // both-sources accessor. The old `!parent->decl` early-out plus the AST-only
@@ -852,19 +853,112 @@ Emitter::setupReceiverGenericSubst(const ast::Expr* target,
     // so the callee ran against the erased T→i32 template layout. The cheap
     // ARITY question is asked first and the name list is built only once every
     // guard has passed — `genericParamCount` allocates nothing.
+    //
+    // fix #3346 / #3348 (§14.1 / §23.4 / §23.3, v0.278): do NOT short-circuit on
+    // `nGP == 0` — even if ps->parent is non-generic (an indexer/property
+    // declared on the derived class whose body touches an INHERITED generic-base
+    // type-parameter field), the SETTER body needs the inherited base's
+    // substitution installed for its implicit field lookup (`(_v: T)`) to land
+    // at the right offset. The nGP == 0 short-circuit would skip the inherited-
+    // ancestor walk below and silently re-emit the body against the T→i32
+    // placeholder — exactly the SETTER half of the silent-corruption family
+    // #3346 names. The nGP == 0 path here was originally a fast-path for
+    // non-generic DECLARER classes with no substitution work; with #3346 the
+    // work often IS required, just to a different ancestor.
     const std::size_t nGP = sema::genericParamCount(parent);
-    if (nGP == 0) return savedSubst;
     sema::TypeRef* recvTy = ctx_.exprType(*target);
     if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named ||
-        recvTy->declaration != parent || recvTy->genericArgs.empty())
+        recvTy->declaration != parent || recvTy->genericArgs.empty()) {
+        // fix #3346 / #3348 (§14.1 / §23.4 / §23.3, v0.278): three
+        // independent cases land here:
+        //
+        //   (a) `recvTy->declaration != parent`: an INHERITED accessor on
+        //       a generic base reached via a derived receiver (`g[i]` /
+        //       `g.P` where `g: GD`, the indexer/property is in
+        //       `GBase<T>`, and the receiver's static type is NOT the
+        //       generic base). The inlined body lowers against `GBase`'s
+        //       T→i32 placeholder, and the read returns only the first 4
+        //       bytes of a `%record.Pt`-shaped _v field (#3346's measured
+        //       silent corruption on `class GD<U>: GBase<U>` + `g[0]`
+        //       returning 11 where 23 is correct). Walk the base chain.
+        //
+        //   (b) `recvTy->declaration == parent` BUT
+        //       `recvTy->genericArgs` is empty: a non-generic receiver of
+        //       the generic base's accessor, e.g. `GD: GBase<Pt>`
+        //       accessing `P` declared on `GBase<T>` itself. The DIRECT
+        //       gate bails because `nGP != recvTy->genericArgs.size()`,
+        //       leaving the inherited body's implicit field lookup
+        //       `(_v: T)` at the T→i32 erased placeholder.
+        //
+        //   (c) `recvTy->declaration == parent` (non-generic parent
+        //       declared on a class that is itself a derived class, e.g.
+        //       `class GD` declares `[i: int]: T` whose body touches
+        //       the INHERITED `_v: T` from `GBase<T>`). The body's
+        //       implicit field lookup needs GBase's T→Pt binding, which
+        //       lives on GBase (not on `parent = GD`). Walk ALL generic
+        //       ancestors of recvTy->declaration and add their
+        //       substitutions.
+        //
+        // All three walk via `computeAncestorGenericSubst`, the SAME
+        // helper the inherited-METHOD-CALL site uses (#585/#902/#3347
+        // closed METHOD in single- and cross-module form). The set of
+        // ancestor walks this function may now perform is strictly
+        // additive: paths that were never reachable before remain
+        // untouched; paths that were reachable install a substitution
+        // where they previously did not.
+        if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+            recvTy->declaration) {
+            // Path (a) — direct walk from receiver declaration to the
+            // accessor-declaring class.
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*>
+                ancSema;
+            if (computeAncestorGenericSubst(recvTy, parent, ancSubst,
+                                            ancSema)) {
+                genericSubst_ = std::move(ancSubst);
+                genericSubstSemaTy_ = std::move(ancSema);
+                return savedSubst;
+            }
+            // Path (c) — accessor declared on a non-generic class whose
+            // body touches INHERITED generic-base type-parameter fields;
+            // walk every generic ancestor of recvTy->declaration.
+            std::unordered_map<std::string_view, llvm::Type*> addSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*>
+                addSema;
+            for (const sema::TypeSymbol* anc = baseClassOf(recvTy->declaration);
+                 anc; anc = baseClassOf(anc)) {
+                if (anc->genericParams.empty()) continue;
+                std::unordered_map<std::string_view, llvm::Type*> aSubst;
+                std::unordered_map<std::string_view, const sema::TypeRef*>
+                    aSema;
+                if (!computeAncestorGenericSubst(recvTy, anc, aSubst, aSema))
+                    continue;
+                for (const auto& [nm, ty] : aSubst) {
+                    if (addSubst.count(nm) == 0) addSubst[nm] = ty;
+                    auto sit = aSema.find(nm);
+                    if (sit != aSema.end() && addSema.count(nm) == 0)
+                        addSema[nm] = sit->second;
+                }
+            }
+            if (!addSubst.empty()) {
+                genericSubst_ = std::move(addSubst);
+                genericSubstSemaTy_ = std::move(addSema);
+                return savedSubst;
+            }
+        }
         return savedSubst;
+    }
     if (nGP != recvTy->genericArgs.size())
         return savedSubst;
     const std::vector<std::string_view> gpNames =
         sema::genericParamNames(parent);
     std::unordered_map<std::string_view, llvm::Type*> newSubst;
-    for (std::size_t gi = 0; gi < gpNames.size(); ++gi)
-        newSubst[gpNames[gi]] = lowerTypeRef(recvTy->genericArgs[gi]);
+    std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+    for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+        const sema::TypeRef* arg = recvTy->genericArgs[gi];
+        newSubst[gpNames[gi]] = lowerTypeRef(arg);
+        newSema[gpNames[gi]] = resolveTypeParamRef(arg);
+    }
     // A still-unresolved positional arg (i32 fallback) — recover the local's
     // stored concrete substitution, the same fallback fieldAddr / the property
     // getter path use for a generic receiver bound through a `var` local.
@@ -882,6 +976,8 @@ Emitter::setupReceiverGenericSubst(const ast::Expr* target,
         }
     }
     genericSubst_ = std::move(newSubst);
+    genericSubstSemaTy_ = std::move(newSema);
+    (void)savedSemaTy;
     return savedSubst;
 }
 

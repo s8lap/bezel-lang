@@ -5404,6 +5404,39 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                                 genericSubst_ = std::move(newSubst);
                                 genericSubstSemaTy_ = std::move(newSema);
                             }
+                        } else if (recvTy &&
+                                   recvTy->kind == sema::TypeRef::Kind::Named &&
+                                   recvTy->declaration &&
+                                   recvTy->declaration != ps->parent &&
+                                   !ps->parent->genericParams.empty()) {
+                            // fix #3346 / #3348 (§14.1 / §23.3 / §23.4, v0.278):
+                            // an INHERITED NAMED PROPERTY on a generic base reached
+                            // through a derived receiver (`g.P` where `g: GD`,
+                            // the property P is in `GBase<T>`). The DIRECT gate
+                            // above (`recvTy->declaration == ps->parent`) returns
+                            // unchanged, the getter body lowers against the
+                            // T→i32 placeholder, and `P` reads only the first 4
+                            // bytes of the substituted `_v: T` field (where `T=Pt`
+                            // is an 8-byte record). The INDEXER twin of this gate
+                            // is `setupReceiverGenericSubst` (LlvmBackend_Calls.cpp),
+                            // which `lowerIndexerGet`'s inline path already routes
+                            // through. The NAMED-PROPERTY inline path uses an
+                            // INLINED copy of the same gate here — the two were
+                            // out of sync and #3346/#3348 measured the divergence
+                            // (NAME returns 22 where 23 is correct; INDEXER
+                            // returns 11). Walk the base chain via
+                            // `computeAncestorGenericSubst` — same vehicle the
+                            // inherited METHOD-call path uses (#585/#902/#3347).
+                            std::unordered_map<std::string_view, llvm::Type*>
+                                ancSubst;
+                            std::unordered_map<std::string_view,
+                                               const sema::TypeRef*>
+                                ancSema;
+                            if (computeAncestorGenericSubst(recvTy, ps->parent,
+                                                            ancSubst, ancSema)) {
+                                genericSubst_ = std::move(ancSubst);
+                                genericSubstSemaTy_ = std::move(ancSema);
+                            }
                         }
                     }
                 }
