@@ -1059,6 +1059,11 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 auto n = rt->importedName;
                 // Value types — mirror the astNode guards above.
                 if (n == "DateTime" || n == "TimeSpan") return i64();
+                // fix #2829 / §32.7 / stdlib §10.0: IntPtr/UIntPtr are
+                // pointer-sized INTEGER value types (i64 on the host), not
+                // C-boundary reference types — mirror the astNode arm at
+                // line ~944-945 (IntPtr/UIntPtr → i64()).
+                if (n == "IntPtr" || n == "UIntPtr") return i64();
                 if (n == "Guid")  return guidStructType();
                 if (n == "Range") return rangeStructType();
                 // §4.15 (#549) / §4.14 (#779) / §3.3 (#883): span value structs.
@@ -1074,9 +1079,16 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 // stay explicit here. (This path has no OwningBuffer entry —
                 // preserved: it was never in the imported list.)
                 if (common::isHeapPointerReferenceBuiltin(n) ||
-                    // §32.5 / stdlib §10: imported FFI-boundary reference types.
-                    n == "IntPtr"  || n == "UIntPtr" || n == "CString" ||
-                    n == "WString" || n == "RawBytes") {
+                    // §32.5 / stdlib §10: imported FFI-boundary REFERENCE types
+                    // — opaque pointers at the C boundary (char*, wchar*, void*).
+                    // IntPtr/UIntPtr are deliberately absent: per §32.7 and stdlib
+                    // §10.0 they are pointer-sized INTEGER value types (i64 on the
+                    // host), lowered above by the value-types branch.
+                    // fix #2829 / §32.7 / stdlib §10.0: lumping IntPtr/UIntPtr in
+                    // here returned `ptr` on the imported-name path, mismatching
+                    // the astNode-path `i64` and tripping ICmpInst::AssertOK /
+                    // cast<IntegerType> at the caller.
+                    n == "CString" || n == "WString" || n == "RawBytes") {
                     return ptrTy();
                 }
             }
