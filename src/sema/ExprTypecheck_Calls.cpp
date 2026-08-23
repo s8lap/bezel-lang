@@ -6853,22 +6853,101 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         if (m == "From" && ce.args.size() == 1 &&
                             ce.args[0].value) {
                             TypeRef* at = ctx_.exprType(*ce.args[0].value);
+                            bool isCStringOrWString =
+                                isFfiBuiltin(at, "CString") ||
+                                isFfiBuiltin(at, "WString");
                             bool ok = false;
                             if (at && at->kind == TypeRef::Kind::Primitive &&
-                                at->primitive == P::Char)
+                                at->primitive == P::Char) {
                                 ok = true;
-                            else if (isFfiBuiltin(at, "CString") ||
-                                     isFfiBuiltin(at, "WString"))
-                                ok = true;
-                            if (at && !ok)
-                                ctx_.diagnostics().report(
-                                    Severity::Error, ce.span.begin,
-                                    "no matching overload of `String.From` — "
-                                    "the single-argument form takes a `char` "
-                                    "(or an FFI `CString`/`WString`); to build "
-                                    "a string from a char array use "
-                                    "`String.From(buffer, start, count)` "
-                                    "(§9.6)");
+                            } else if (isCStringOrWString) {
+                                // §7.4 (v0.240, #2811): `String.From` consumes
+                                // a non-nullable `CString`/`WString` (stdlib
+                                // §9.6), so a nullable `CString?`/`WString?`
+                                // must be narrowed first — the same
+                                // use-requires-narrowing discipline as member
+                                // access on a nullable reference (§7.4 "Member
+                                // access on nullable values"). The pre-#2734
+                                // form had the same omission; before #2734 the
+                                // whole call was uncompilable (TypeRef head
+                                // name mismatch), so it never surfaced.
+                                //
+                                // Naively rejecting whenever `at->nullable` is
+                                // true would falsely reject the §7.4-narrowed
+                                // shape — `if d <> null then string.From(d)
+                                // end;` is legal because the narrowing state
+                                // lives in this pass's `nullNarrowed_` /
+                                // `narrowings_` side-sets and does NOT rewrite
+                                // `exprType`. Mirror the resolveMemberAccess
+                                // gate: consult the argument's symbol (via
+                                // `lookupName` for a simple-var
+                                // IdentifierExpr) and admit when
+                                // `isKnownNonNull` proves the value non-null at
+                                // this call site.
+                                if (!at->nullable) {
+                                    ok = true;
+                                } else if (auto* aid =
+                                    dynamic_cast<const ast::IdentifierExpr*>(
+                                        ce.args[0].value.get())) {
+                                    if (aid->name != "this" &&
+                                        aid->name != "base") {
+                                        Symbol* asym = lookupName(aid->name);
+                                        bool isSimpleVar =
+                                            asym &&
+                                            (dynamic_cast<LocalSymbol*>(asym) ||
+                                             dynamic_cast<ParameterSymbol*>(
+                                                 asym));
+                                        if (isSimpleVar &&
+                                            isKnownNonNull(asym))
+                                            ok = true;
+                                    }
+                                }
+                            }
+                            if (at && !ok) {
+                                // Two distinct reasons the call can be wrong.
+                                // First, an argument whose static type is not
+                                // an FFI builtin `CString`/`WString` (and not
+                                // `char`) — the pre-#2811 no-overload case.
+                                if (!isCStringOrWString &&
+                                    (!at ||
+                                     at->kind != TypeRef::Kind::Primitive ||
+                                     at->primitive != P::Char)) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "no matching overload of "
+                                        "`String.From` — the single-argument "
+                                        "form takes a `char` (or an FFI "
+                                        "`CString`/`WString`); to build a "
+                                        "string from a char array use "
+                                        "`String.From(buffer, start, count)` "
+                                        "(§9.6)");
+                                } else {
+                                    // §7.4 narrowing hole (#2811): the
+                                    // argument is an FFI builtin CString/
+                                    // WString, but it is nullable and §7.4
+                                    // narrowing does not establish it as
+                                    // non-null at this call site. Coming
+                                    // here from the #1145 widening pass —
+                                    // previously the call was silently
+                                    // accepted and the un-narrowed null
+                                    // reached the conversion at runtime (the
+                                    // `#2734` runtime entry points are
+                                    // null-guarded and turned NULL into a
+                                    // `FormatException` — the wrong
+                                    // exception for a null reference, §31.4
+                                    // / §7.4 say `NullReferenceException`,
+                                    // and the whole situation should have
+                                    // been a compile-time rejection).
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "`String.From` argument is a nullable "
+                                        "`CString?`/`WString?` (§32.6 / §7.4): "
+                                        "narrow it to non-null first — guard "
+                                        "with `if c <> null then ... end;`, "
+                                        "force-unwrap with `c!`, or pass a "
+                                        "non-nullable value");
+                                }
+                            }
                         }
                         // spec §32.6 / stdlib §9.6 + §10.4 (v0.240, #2734):
                         // `string.FromCStringPointer(p: IntPtr): string` and
