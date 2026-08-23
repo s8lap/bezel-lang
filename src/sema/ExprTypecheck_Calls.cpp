@@ -708,6 +708,67 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
 }
 
 namespace {
+// fix #3331 (C5, stdlib §5 + proposal 0116 D9): the six LINQ operators
+// `Distinct`, `Union`, `Intersect`, `Except`, `Contains`, `ToSet` are
+// declared in the constrained `extension IEnumerable<T> where T:
+// hashable` block (v0.277). The stdlib spelling is correct, but the
+// COMPILER never enforced the `where T: hashable` clause at the call
+// site — every call typed cleanly regardless of T (probe_c5 / probe_c5_
+// toSet / probe_c5_contains / probe_c5_union all compiled clean on HEAD
+// before this fix). This helper is the applicability gate; every call
+// site that types one of the six hashable-requiring operators consults
+// it BEFORE setting the call's exprType, and emits a §14.2 diagnostic
+// naming the operator and the `hashable` property when T is provably
+// non-hashable. The predicate is `isEqualityBearing` — the SAME §3.6
+// computation the type-instantiation site (Resolver::checkOneConstraint),
+// the §3.6 rule-2 hash-container-key check, and the use-site `=`/`<>`
+// equality error use (no second definition of the property — §14.2's
+// "adds no second definition"). The §3.6 rule-4 component-path fragment
+// is appended for the record/choice failure shape (the two shapes that
+// are not hashable; §3.6 hashable row, v0.214/v0.215). Returns true to
+// type the call, false to reject; defers (returns true) on unresolved
+// generic parameters so an extension body is not spuriously rejected
+// before its per-instantiation gate runs.
+bool linqHashableCheck(std::string_view m, const TypeRef* srcElem,
+                       SourceLocation loc, SemaContext& ctx) {
+    if (!srcElem) return true;
+    if (srcElem->kind == TypeRef::Kind::Error) return true;
+    // Defer on an unresolved generic-parameter placeholder (extension
+    // bodies, `this`-typed receivers): the per-instantiation gate
+    // applies when T is bound, not now. The §3.6 hashable property
+    // surfaces its failure at the top-level type, so deferring at a
+    // parameter placeholder is safe — the constraint failure will fire
+    // at the call site that supplies a concrete T (§14.2's "the check
+    // runs at instantiation").
+    if (srcElem->kind == TypeRef::Kind::Named && !srcElem->declaration) {
+        // Builtin primitives (int, string, …) have null-decl Named refs
+        // with a non-null astNode — `isEqualityBearing` reports them
+        // hashable. A bare block-level type-parameter placeholder has a
+        // null astNode (the §26.4 "fresh block-level type parameter"
+        // rule's shape) — defer those.
+        if (!srcElem->astNode) return true;
+    }
+    if (isEqualityBearing(srcElem, ctx)) return true;
+    std::string msg =
+        std::string("operator `") + std::string(m) +
+        "` requires `T: hashable` (\xC2\xA7""14.2; stdlib \xC2\xA7""5, "
+        "proposal 0116 D9)";
+    const std::string detail = hashableFailureComponentPath(srcElem, ctx);
+    if (!detail.empty()) msg += detail;
+    ctx.diagnostics().report(Severity::Error, loc, msg);
+    return false;
+}
+
+// The six hashable-requiring §5 LINQ operators (stdlib §5 + proposal
+// 0116 D9). Any call that types one of these on a non-lazy IEnumerable<T>
+// / concrete-collection / unspecialized-extension receiver MUST consult
+// `linqHashableCheck` BEFORE setting the call's exprType; a silent
+// acceptance pre-fix is the C5 row of #3331.
+bool isLinqHashableOperator(std::string_view m) {
+    return m == "Distinct" || m == "Union" || m == "Intersect" ||
+           m == "Except"   || m == "Contains" || m == "ToSet";
+}
+
 // #1937 / §14.1 / §2.5: does `rt` structurally reference any of the
 // type-parameter names in `paramNames` — as a bare parameter reference, or
 // nested inside a generic argument (`Pair<A, B>`), an inline-array element
@@ -3987,6 +4048,41 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }();
                 using P = PrimitiveType;
                 const auto& m = ma->member;
+                // fix #3331 (C2, stdlib §4.14 + proposal 0116 D8, v0.278):
+                // `OwningBuffer<T>.DangerousPointer()` is the FFI buffer
+                // address accessor documented in stdlib §4.14 (proposal 0033),
+                // but the compiler carries NO admissibility arm and NO
+                // lowering arm — the diagnostic lands at codegen's catch-all
+                // "no value" path as a generic miss. Per proposal 0116 D8 the
+                // gate is the v0.283 subtraction-review loud-reject stub,
+                // NOT a per-T predicate: a per-T FFI-pointee-set gate would
+                // route the member's deletion to the subtraction review
+                // rather than publish a mechanism, and the register's D8
+                // discipline records the row as "not implemented". Emit a
+                // sema-side diagnostic so the rejection is visible to
+                // `parseSemaAll`-driven tests (and so the user sees a
+                // citation before codegen's catch-all), then return
+                // without typing the call. The codegen mirror is in
+                // LlvmBackend_Calls2.cpp — both fire on the same call site
+                // and read the same way to a user; the codegen mirror is
+                // defense-in-depth for the case where sema is skipped (the
+                // in-process JIT path is retired but the AOT path's codegen
+                // arm can in principle reach the catch-all without sema).
+                if (colName == "OwningBuffer" && m == "DangerousPointer") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "`DangerousPointer()` on `OwningBuffer<T>` is documented "
+                        "in stdlib \xC2\xA7""4.14 (spec \xC2\xA7""32.12 / "
+                        "\xC2\xA7""32.13) but is NOT IMPLEMENTED in this compiler: "
+                        "the admissibility arm and the lowering arm both ship "
+                        "empty. Per proposal 0116 D8, the disposition is the "
+                        "v0.283 subtraction-review candidate (#2457; #3331, C2); "
+                        "use `OwningBuffer<IntPtr>` (argv-shaped) or `[N]IntPtr` "
+                        "at a by-address \xC2\xA7""32.5 `extern` parameter for the "
+                        "runtime-sized and statically-sized FFI pointer cases that "
+                        "this member would have served");
+                    return;
+                }
                 // fix #3345: early-return for the static-call form
                 // `Array.Sort(a)` / `Array.Reverse(a)` /
                 // `Array.Fill(a, v)` / `Array.CopyTo(...)` — the
@@ -4352,6 +4448,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // downstream member access). Returns true if `m` was a LINQ
                 // operator (typed) — caller falls through otherwise.
                 auto typeLinqOperator = [&](TypeRef* srcElem) -> bool {
+                    // fix #3331 (C5, stdlib §5 + proposal 0116 D9, v0.277):
+                    // the six `where T: hashable` LINQ operators must consult
+                    // the hashable gate BEFORE setting exprType. A silent
+                    // acceptance pre-fix is the C5 row of #3331; the gate is
+                    // the §14.2 applicability filter the stdlib respell was
+                    // always supposed to mean (proposal 0116's status note:
+                    // "§26.4's block where clause does not filter extension
+                    // applicability" — the keystone, #3336). Returns false
+                    // on a hashable rejection (the diagnostic was reported by
+                    // `linqHashableCheck`; the caller falls through and the
+                    // catch-all "no member" path will run later — but
+                    // `hasErrors()` short-circuits codegen so the rejected
+                    // call is fatal anyway). Returning false (rather than
+                    // true) prevents the caller from OVERWRITING the exprType
+                    // with a lazy-enumerable sentinel on a rejected call.
+                    if (isLinqHashableOperator(m) &&
+                        !linqHashableCheck(m, srcElem, ce.span.begin, ctx_))
+                        return false;  // diagnostic reported; do not type
                     // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T) is
                     // typed explicitly (owned T, above in the isArrLike chain)
                     // and must NOT be re-typed here as the LINQ Take(count:
@@ -4651,20 +4765,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, nullTy);
                         }
                     }
-                    else if (m == "ToArray" || m == "ToSet")
-                        // Materializers (stdlib §5 + §14 inference fix).
-                        // Return a concrete Array<T>/Set<T> TypeRef so that
-                        // an un-annotated inferred local (`var b :=
-                        // seq.ToArray()`) carries the right type for downstream
-                        // `.Get(i)`, `.Length`, for-in, etc. Previously this
-                        // returned the lazy sentinel (no astNode), causing:
-                        //   • int element → wrong slot layout → wrong value
-                        //   • record element → ICmp type mismatch → SIGABRT
-                        // Codegen already knows to materialise via
-                        // bz_lazy_to_array (via tryLowerLazyLinqCall); the
-                        // concrete TypeRef here is only for sema inference.
-                        ctx_.setExprType(&ce, makeConcreteCollectionResult(
-                            m == "ToSet" ? "Set" : "Array", srcElem));
+                    else if (m == "ToArray" || m == "ToSet") {
+                        // fix #3331 (C5, stdlib §5 + proposal 0116 D9):
+                        // `ToSet` is one of the six `where T: hashable`
+                        // operators; on the lazy receiver the element type is
+                        // a concrete `srcElem` (the lazy enumerable's
+                        // `genericArgs[0]`), so the gate fires here the same
+                        // way it does on the concrete-collection receiver.
+                        if (m == "ToSet" &&
+                            !linqHashableCheck(m, srcElem, ce.span.begin, ctx_))
+                            ;  // diagnostic reported; skip typing
+                        else
+                            // Materializers (stdlib §5 + §14 inference fix).
+                            // Return a concrete Array<T>/Set<T> TypeRef so that
+                            // an un-annotated inferred local (`var b :=
+                            // seq.ToArray()`) carries the right type for downstream
+                            // `.Get(i)`, `.Length`, for-in, etc. Previously this
+                            // returned the lazy sentinel (no astNode), causing:
+                            //   • int element → wrong slot layout → wrong value
+                            //   • record element → ICmp type mismatch → SIGABRT
+                            // Codegen already knows to materialise via
+                            // bz_lazy_to_array (via tryLowerLazyLinqCall); the
+                            // concrete TypeRef here is only for sema inference.
+                            ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                                m == "ToSet" ? "Set" : "Array", srcElem));
+                    }
                     // stdlib §5 ToDictionary — typed as Dictionary<K,V> sentinel
                     // (fix #459 / §5 / §22): use makeDictResult so that inferred
                     // locals (`var d := seq.ToDictionary(keyFn)`) produce a type
@@ -4721,9 +4846,28 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     recvTy->headName() == "IEnumerable";
                 if (ienumRecv) {
                     TypeRef* srcElem2 = recvTy->genericArgs[0];
-                    if ((m == "ToArray" || m == "ToSet") && ce.args.empty())
-                        ctx_.setExprType(&ce, makeConcreteCollectionResult(
-                            m == "ToSet" ? "Set" : "Array", srcElem2));
+                    // fix #3331 (C5, stdlib §5 + proposal 0116 D9): the
+                    // unspecialized-extension `this`-typed receiver carries
+                    // the block's type-parameter T as `srcElem2`. When T is
+                    // a generic-parameter placeholder (the ordinary
+                    // `extension IEnumerable<T>` body shape), `linqHashable
+                    // Check` DEFERs and the per-instantiation gate applies
+                    // when the extension is called at a concrete T. When T
+                    // happens to be a concrete resolved TypeRef (e.g. the
+                    // body of `extension IEnumerable<Widget> where Widget:
+                    // class` — a body-of-body that resolved T to a class
+                    // and is now operating at that class), the gate fires
+                    // immediately. Same as the lazy / concrete-collection
+                    // paths, with the defer behaviour the §14.2 check-runs-
+                    // at-instantiation rule mandates.
+                    if ((m == "ToArray" || m == "ToSet") && ce.args.empty()) {
+                        if (m == "ToSet" &&
+                            !linqHashableCheck(m, srcElem2, ce.span.begin, ctx_))
+                            ;  // diagnostic reported; skip typing
+                        else
+                            ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                                m == "ToSet" ? "Set" : "Array", srcElem2));
+                    }
                     else if ((m == "Any" || m == "All") && ce.args.size() <= 1)
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                     else if (m == "Count")
@@ -5187,6 +5331,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         colName == "Queue" || colName == "OwningQueue" ||
                         colName == "Set" || colName == "OwningSet" ||
                         colName == "LinkedList" || colName == "OwningLinkedList";
+                    // fix #3331 (C5, stdlib §5 + proposal 0116 D9): the
+                    // `where T: hashable` gate can fire inside the isArrLike
+                    // chain (for the `Contains` and `ToSet` arms, ~line
+                    // 5388/5831) AND again from the `typeLinqOperator`
+                    // fallback at ~line 6080, both on the SAME call. The
+                    // flag below tracks that the gate has already fired
+                    // in the isArrLike arm so the typeLinqOperator fallback
+                    // suppresses its duplicate check — and so the
+                    // fallback does not OVERWRITE the concrete Set<T>
+                    // type with a lazy enumerable sentinel either.
+                    bool linqHashableRejected = false;
                     if (isArrLike) {
                         // fix #3345: the static-call form
                         // `Array.Sort(a)` / `Array.Reverse(a)` is handled
@@ -5233,7 +5388,28 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  m == "TryPeek" ||
                                  m == "TryPopFirst" || m == "TryPopLast" ||
                                  m == "TryTake")
-                            ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                            // fix #3331 (C5, stdlib §5 + proposal 0116 D9):
+                            // `Contains` is one of the six `where T: hashable`
+                            // operators (stdlib §5's `extension IEnumerable<T>
+                            // where T: hashable` block, v0.277). The
+                            // extension-resolution machinery never enforced the
+                            // `where` clause for stdlib candidates (the C5 row
+                            // of #3331; the keystone #3336), so the
+                            // concrete-collection `Contains` arm — which
+                            // `Array<T>.Contains` reaches as an instance
+                            // lookup of a stdlib-declared member — must
+                            // re-check `T: hashable` here. The set/dictionary
+                            // `Contains` arms reach a hashable receiver
+                            // (Set<T>/Dictionary<K,V> require hashable T per
+                            // §4.10/§4.8 / §3.6 rule 2), so the check
+                            // gates the `Array<T>.Contains` / `List<T>.Contains`
+                            // / etc. shape and lets Set/Dictionary through.
+                            if (m == "Contains" &&
+                                !linqHashableCheck(m, recvTy->genericArgs[0],
+                                                   ce.span.begin, ctx_))
+                                linqHashableRejected = true;  // gate fired — suppress typeLinqOperator fallback's duplicate
+                            else
+                                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         // fix #1476 / stdlib §4.10: OwningSet<T>.Take(query: T):
                         // owned T. Gated to colName == "OwningSet" — every other
                         // isArrLike collection's "Take" is the LINQ Take(count:
@@ -5543,10 +5719,25 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // Array<T>/Set<T> TypeRef so that un-annotated inferred
                         // locals resolve downstream `.Get(i)`, `.Length`, etc.
                         else if ((m == "ToArray" || m == "ToSet") &&
-                                 !recvTy->genericArgs.empty())
-                            ctx_.setExprType(&ce, makeConcreteCollectionResult(
-                                m == "ToSet" ? "Set" : "Array",
-                                recvTy->genericArgs[0]));
+                                 !recvTy->genericArgs.empty()) {
+                            // fix #3331 (C5, stdlib §5 + proposal 0116 D9):
+                            // `ToSet` is one of the six `where T: hashable`
+                            // operators. `Array<T>.ToSet()` produces a
+                            // `Set<T>`; `Set<T>` requires hashable T (§3.6
+                            // rule 2), so the `T: hashable` gate must fire
+                            // here. `LinkedList<T>` / `OwningArray<T>` etc.
+                            // route through the same §5 extension block, so
+                            // the same gate applies; an `OwningArray<T>.ToSet()`
+                            // at a non-hashable T is exactly the bug class.
+                            if (m == "ToSet" &&
+                                !linqHashableCheck(m, recvTy->genericArgs[0],
+                                                   ce.span.begin, ctx_))
+                                linqHashableRejected = true;  // gate fired — suppress typeLinqOperator fallback's duplicate
+                            else
+                                ctx_.setExprType(&ce, makeConcreteCollectionResult(
+                                    m == "ToSet" ? "Set" : "Array",
+                                    recvTy->genericArgs[0]));
+                        }
                         // stdlib §3 / #472: Array<T>.Reversed() (and Array<T>.Sorted()
                         // / Array<T>.Sorted(comparer)) — value-returning copy-forms
                         // (past-participle convention). Return type: owned Array<T>
@@ -5895,6 +6086,21 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // are LAZY — they return a deferred IEnumerable<T>, not
                         // a materialized Array<T> (stdlib §5).
                         else if (!recvTy->genericArgs.empty() &&
+                                 !linqHashableRejected &&  // fix #3331 (C5):
+                                                       // the isArrLike arm
+                                                       // already fired the
+                                                       // hashable gate for
+                                                       // `Contains`/`ToSet`;
+                                                       // skip this fallback's
+                                                       // duplicate check
+                                                       // (otherwise a single
+                                                       // non-hashable call
+                                                       // emits two diagnostics
+                                                       // and the lazy-enumerable
+                                                       // typing here would also
+                                                       // clobber the concrete
+                                                       // Set<T> type the earlier
+                                                       // arm typed)
                                  typeLinqOperator(recvTy->genericArgs[0])) {
                             /* typed as lazy IEnumerable<T> */
                         }

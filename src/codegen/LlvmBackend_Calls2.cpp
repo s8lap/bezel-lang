@@ -7926,6 +7926,52 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             if (at.line == 0) at = ma->span.begin;
                             if (at.line == 0 && ma->target)
                                 at = ma->target->span.begin;
+                            // fix #3331 (C2, stdlib §4.14 + proposal 0116 D8,
+                            // v0.278): `OwningBuffer<T>.DangerousPointer()` is
+                            // documented in stdlib §4.14 as the FFI buffer
+                            // address accessor (proposal 0033), but the
+                            // compiler carries NO admissibility arm and NO
+                            // lowering arm — the diagnostic lands here as a
+                            // catch-all "no value". Per proposal 0116 D8 the
+                            // gate is the v0.283 subtraction-review loud-
+                            // reject stub, not a per-T predicate: a per-T
+                            // FFI-pointee-set gate would route the member's
+                            // deletion to the subtraction review rather than
+                            // publish a mechanism, and the register's D8
+                            // discipline records the row as "not
+                            // implemented". Emit a diagnostic that names the
+                            // stdlib section + the v0.283 subtraction-review
+                            // status (so a user reading the error can see
+                            // WHY their call is rejected, not just THAT the
+                            // rejection is a generic "no value" miss), and
+                            // keep the §4.14 / §32.12 / §32.13 citation so
+                            // the FFI-pointee-set precondition is visible
+                            // for the day a per-T predicate lands. The
+                            // sema mirror in ExprTypecheck_Calls.cpp fires
+                            // first; this is defense-in-depth for the
+                            // in-process JIT path (retired but still in the
+                            // tree) and any future path that bypasses sema.
+                            if (ftMember == "DangerousPointer" &&
+                                ftRecv == "OwningBuffer") {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, at,
+                                    "`DangerousPointer()` on `OwningBuffer<T>` "
+                                    "is documented in stdlib \xC2\xA7""4.14 "
+                                    "(spec \xC2\xA7""32.12 / \xC2\xA7""32.13) "
+                                    "but is NOT IMPLEMENTED in this compiler: "
+                                    "the admissibility arm and the lowering "
+                                    "arm both ship empty. Per proposal 0116 "
+                                    "D8, the disposition is the v0.283 "
+                                    "subtraction-review candidate "
+                                    "(#2457; #3331, C2); use "
+                                    "`OwningBuffer<IntPtr>` (argv-shaped) "
+                                    "or `[N]IntPtr` at a by-address "
+                                    "\xC2\xA7""32.5 `extern` parameter for "
+                                    "the runtime-sized and statically-sized "
+                                    "FFI pointer cases that this member "
+                                    "would have served");
+                                return nullptr;
+                            }
                             ctx_.diagnostics().report(
                                 Severity::Error, at,
                                 "`" + ftMember + "` on built-in type `" +
