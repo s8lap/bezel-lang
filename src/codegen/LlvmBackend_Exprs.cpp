@@ -168,6 +168,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // a named local/field, §28.9) and must NOT be released. A literal / "null"
         // sentinel has a sentinel rc, so the release is a harmless no-op. The rule
         // `pv != srcEv` distinguishes the fresh-render case from the borrow case.
+        //
+        // fix #3352 (§8.6 / §23.4 / §28.3 / §28.9, v0.240): `inlineBoxMint` is
+        // captured by the save/clear/restore around `lowerExpr(*part.expr)` in
+        // the for-loop below — when set, it is the inline §8.6 box mint the
+        // indexer/property inline-body path (`boxForTarget` →
+        // `lastBoxMint_`) produced for this part. The `appendPart` lambda
+        // reads it (captured by reference) and discharges the box alongside
+        // the rendered string — see the lambda's `inlineBoxMint` arm. Declared
+        // up here so the lambda can capture by reference and reset to nullptr
+        // at the top of each iteration.
+        llvm::Value* inlineBoxMint = nullptr;
         auto appendPart = [&](llvm::Value* pv, llvm::Value* srcEv,
                               const ast::Expr* srcExpr) {
             llvm::Value* prev = acc;
@@ -223,6 +234,45 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (srcExpr && isUserMethodBoxReturnCall(srcExpr)) {
                 emitBoxRelease(srcEv);
             }
+            // fix #3352 (spec §8.6 / §23.4 / §28.3 / §28.9, v0.240): the inline
+            // §8.6 box mint in a §18.5 interpolation hole — the
+            // indexer/property inline-body half of the residual. `$"[{e[k]}]"`
+            // where `E.property [i: int]: Object => i;` lowers as:
+            // lowerExpr(e[k]) → lowerIndexerGet → boxForTarget mints a fresh
+            // box AND records it in `lastBoxMint_`; `inlineBoxMint` captures
+            // that pointer (set by the save/clear/restore around `lowerExpr`
+            // in the loop below); `srcEv` IS the inline mint; the existing
+            // `pv != srcEv` arm above discharges the rendered string's +1.
+            // `lowerObjectToString` does NOT retain the box (only the string
+            // arm retains, per #2846), so the box's +1 is orphaned unless
+            // we release it here. Without this the box leaks 24 B/call
+            // (480 B / 20 iterations measured on the issue's repro).
+            //
+            // Gating (parallel to the `isUserMethodBoxReturnCall` arm just
+            // above, with a disjoint predicate):
+            //   * `inlineBoxMint` — captured by the save/clear/restore
+            //     around `lowerExpr(*part.expr)` in the for-loop below;
+            //     positive ONLY when `lastBoxMint_` was set DURING THIS
+            //     part's lowering;
+            //   * `inlineBoxMint == srcEv` — the inline mint IS this part's
+            //     lowered expression (the indexer/property inline-body
+            //     result, not a converted intermediate);
+            //   * `srcEv->getType()->isPointerTy()` — defensive guard, the
+            //     inline mint is always a pointer;
+            //   * the two predicates — `isUserMethodBoxReturnCall`
+            //     (cross-frame mint, callee returns the box) and
+            //     `inlineBoxMint` (inline mint at this hole's read site) —
+            //     classify disjoint sets: a `CallExpr` is not an
+            //     `IndexExpr`, so the `isUserMethodBoxReturnCall(srcExpr)`
+            //     arm above is negative exactly when `inlineBoxMint == srcEv`
+            //     is positive. The two arms never both fire for the same
+            //     hole; the release count is exactly 1 (the box's +1) plus
+            //     the rendered string's +1 discharged by `pv != srcEv`.
+            if (inlineBoxMint && srcEv &&
+                inlineBoxMint == srcEv &&
+                srcEv->getType()->isPointerTy()) {
+                emitBoxRelease(srcEv);
+            }
         };
         for (const auto& part : is->parts) {
             llvm::Value* pv = nullptr;
@@ -268,7 +318,21 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             } else if (part.expr) {
                 // Expression part: lower the expression, then convert to
                 // string. If a format spec is present (§18.5), apply it.
+                //
+                // fix #3352 (§8.6 / §23.4 / §28.3 / §28.9, v0.240): save/
+                // clear/restore `lastBoxMint_` around the part lowering so
+                // `inlineBoxMint` records ONLY this part's inline §8.6
+                // mint (a sibling part's `boxForTarget` cannot leak in,
+                // and a previous part's mint cannot leak out). The pattern
+                // mirrors the #2952 call-arg `boxForTarget` site
+                // (LlvmBackend_Assign.cpp:11296) and the sibling
+                // `tryLowerConsoleCall` arm this commit also adds — one
+                // discipline, three call sites.
+                llvm::Value* savedBoxMint = lastBoxMint_;
+                lastBoxMint_ = nullptr;
                 ev = lowerExpr(*part.expr);
+                inlineBoxMint = lastBoxMint_;
+                lastBoxMint_ = savedBoxMint;
                 if (!ev) {
                     // #1386: ICE — lowerExpr returned null for a non-null
                     // interpolated-string expression part; the expression kind

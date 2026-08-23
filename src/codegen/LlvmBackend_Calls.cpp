@@ -186,7 +186,27 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
 
     // Evaluate the argument. If it's a string, use directly; if it's a
     // primitive, convert via emitPrimitiveToString first.
+    //
+    // fix #3352 (§8.6 / §23.4 / §28.3 / §28.9, v0.240): capture an inline
+    // §8.6 box mint from this argument's lowering. The inline
+    // indexer/property expression-body path (`lowerIndexerGet` line 2141 /
+    // `lowerVirtualPropertyGet`'s `boxForTarget` at ~line 5505) mints a
+    // fresh box for a value-typed body delivered where `Object` is expected
+    // and records the mint in `lastBoxMint_`. #2865's `lowerTypeTest` is the
+    // only existing reader; the call-arg position (`Console.WriteLine(e[k])`
+    // where `e: E` and `E.property [i: int]: Object => i;`) reaches here
+    // with `arg` IS the inline mint (`arg == lastBoxMint_`). Save/clear/
+    // restore isolates THIS argument's mint from any sibling
+    // `boxForTarget`, exactly as the existing #2952 call-arg
+    // `boxForTarget`-site pattern in `LlvmBackend_Assign.cpp:11296`. The
+    // discharge fires inside the `releaseRender` arm below, gated on
+    // `inlineBoxMint && arg == lastBoxMint_` — see that arm's note for the
+    // over-release safety.
+    llvm::Value* savedBoxMint = lastBoxMint_;
+    lastBoxMint_ = nullptr;
     llvm::Value* arg = lowerExpr(*call.args[0].value);
+    bool inlineBoxMint = (lastBoxMint_ && arg == lastBoxMint_);
+    lastBoxMint_ = savedBoxMint;
     // fix #3104 (§4.7 / §8.5 / stdlib §2.1, v0.255): `lowerExpr` for a unit-
     // typed argument returns a `Value*` with LLVM `void` type, NOT a null
     // pointer — `builder_.CreateCall(callee, args)` at Calls2.cpp:10688
@@ -654,6 +674,48 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         // double-release on the same call.
         if (call.args[0].value &&
             isUserMethodBoxReturnCall(call.args[0].value.get())) {
+            emitBoxRelease(arg);
+        }
+        // fix #3352 (spec §8.6 / §23.4 / §28.3 / §28.9, v0.240): the inline
+        // §8.6 box mint in call-arg position — the indexer/property inline-
+        // body half of the residual. `Console.WriteLine(e[k])` where
+        // `E.property [i: int]: Object => i;` lowers as: lowerExpr(e[k]) →
+        // lowerIndexerGet → boxForTarget mints a fresh box AND records it in
+        // `lastBoxMint_`; `arg` IS the inline mint; lowerObjectToString
+        // dispatches the box's vtable ToString, which mints a fresh STRING
+        // (released by the `releaseRender` arm above), and does NOT retain
+        // the box — so the box's +1 is orphaned unless we discharge it here.
+        // Pre-fix, the box leaks 24 B/eval (480 B / 20 allocations measured
+        // on the issue's repro).
+        //
+        // Gating (parallel to the `isUserMethodBoxReturnCall` arm just
+        // above, with a disjoint predicate):
+        //   * `inlineBoxMint` — captured by the save/clear/restore around
+        //     `lowerExpr` at the top of this function; positive ONLY when
+        //     `lastBoxMint_` was set DURING THIS argument's lowering and
+        //     `arg == lastBoxMint_` (i.e., the inline mint IS this
+        //     argument);
+        //   * `arg->getType()->isPointerTy()` — the inline mint is always a
+        //     pointer; a non-pointer `arg` means a different lowering path
+        //     fired and there is no box to release (defensive guard,
+        //     matching the same shape the sibling arm implicitly trusts);
+        //   * the two predicates — `isUserMethodBoxReturnCall` (cross-frame
+        //     mint at the callee's return edge, `arg` is the callee's box)
+        //     and `inlineBoxMint` (inline mint at this argument's read
+        //     site, `arg` is the locally minted box) — classify disjoint
+        //     sets: a method returning `Object` either mints cross-frame
+        //     (no inline mint at this site, since the callee already
+        //     produced a box) or its body is value-typed at an inline
+        //     indexer/property site (no cross-frame callee-mint), so they
+        //     never both fire for the same `arg`. The `arg == lastBoxMint_`
+        //     gate is the strictest over-release safety: a plain IDENTIFIER
+        //     read of a bound Object local is just a slot load, leaves
+        //     `lastBoxMint_` null, and correctly declines (the local's
+        //     scope-end release handles its borrow). The pre-pass
+        //     `collectBoxReturnMethods` rejects methods whose body isn't a
+        //     provably boxable-value producer, so the inline mint path
+        //     never sees a borrowed box pointer from a callee.
+        if (inlineBoxMint && arg && arg->getType()->isPointerTy()) {
             emitBoxRelease(arg);
         }
     } else if (strPtr == arg && call.args[0].value &&
