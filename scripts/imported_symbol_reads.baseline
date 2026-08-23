@@ -39,7 +39,15 @@
 7    src/codegen/LlvmBackend_Exprs2.cpp
 3    src/codegen/LlvmBackend_Layout.cpp
 8    src/codegen/LlvmBackend_Serialization.cpp
-55   src/codegen/LlvmBackend_Setup.cpp
+# 56 — #2879 (object-typed +1 string producer-temp leak fix, Wave 3 Lane C):
+# `collectObjectStringReturnMethods` introduces one read at Setup.cpp:25790,
+# `dynamic_cast<const ast::MethodDecl*>(sym->decl)`. Structurally safe:
+# the loop body is preceded by `if (ctx_.isImported(sym)) continue;` at :25789,
+# so the cast only runs over LOCAL method symbols — same guard pattern as
+# the 55 grandfathered reads in `collectBoxReturnMethods` / sibling pre-passes.
+# Re-baselined with `--force`; commit message of edfe983/4b59708 carries the
+# load-bearing reasoning.
+56   src/codegen/LlvmBackend_Setup.cpp
 4    src/codegen/LlvmBackend_Stmts.cpp
 2    src/codegen/LlvmBackend_String.cpp
 20   src/codegen/LlvmBackend_impl.hpp
