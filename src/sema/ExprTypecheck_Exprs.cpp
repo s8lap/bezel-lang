@@ -397,25 +397,40 @@ TypeRef* ExprTC::bindLambdaDestructure(const ast::DestructuringPattern& dp,
     std::string_view lastName = dp.typeName && !dp.typeName->parts.empty()
         ? dp.typeName->parts.back() : std::string_view{};
     // Resolve the head to a record TypeSymbol. Prefer module-local types
-    // (matches the CaseStmt/CaseExpr lookup) and fall back to the full
-    // symbol table (imported/builtin records), same widening the nested
-    // case-pattern `fieldsOfRecord` helper uses.
+    // (matches the CaseStmt/CaseExpr lookup), then the broader local symbol
+    // table, then `importedSymbols()` — the imported record's TypeSymbol
+    // lives there, not in `symbols()` (which is local-only per
+    // SemaContext.hpp:90's `symbols_`). The pre-fix comment claimed
+    // `ctx_.symbols()` covered "imported/builtin records"; that was
+    // incorrect, and the lambda-destructure shape over an IMPORTED record
+    // hit the §27.4 §"name does not name a known positional record type"
+    // diagnostic instead of lowering. Same widening the #2844 fix
+    // applied to patternMatches and bindLambdaDestructureParam in
+    // LlvmBackend_Exprs2.cpp.
     TypeSymbol* recTy = nullptr;
     bool foundClass = false;
+    auto considerSym = [&](Symbol* s) {
+        auto* ts = dynamic_cast<TypeSymbol*>(s);
+        if (!ts || ts->name != lastName) return;
+        if (ts->kind == ast::TypeDeclKind::Record) { recTy = ts; return; }
+        if (ts->kind == ast::TypeDeclKind::Class) foundClass = true;
+    };
     if (ctx_.module()) {
         for (Symbol* child : ctx_.module()->children) {
-            auto* ts = dynamic_cast<TypeSymbol*>(child);
-            if (!ts || ts->name != lastName) continue;
-            if (ts->kind == ast::TypeDeclKind::Record) { recTy = ts; break; }
-            if (ts->kind == ast::TypeDeclKind::Class) foundClass = true;
+            if (recTy) break;
+            considerSym(child);
         }
     }
     if (!recTy) {
         for (const auto& sym : ctx_.symbols()) {
-            auto* ts = dynamic_cast<TypeSymbol*>(sym.get());
-            if (!ts || ts->name != lastName) continue;
-            if (ts->kind == ast::TypeDeclKind::Record) { recTy = ts; break; }
-            if (ts->kind == ast::TypeDeclKind::Class) foundClass = true;
+            if (recTy) break;
+            considerSym(sym.get());
+        }
+    }
+    if (!recTy) {
+        for (Symbol* s : ctx_.importedSymbols()) {
+            if (recTy) break;
+            considerSym(s);
         }
     }
     if (!recTy) {
@@ -8782,20 +8797,49 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         std::vector<FieldSymbol*> out;
                         if (!tn || tn->parts.empty()) return out;
                         std::string_view nm = tn->parts.back();
+                        // fix #2844 / §19.3 / §2.8.3 rule 4 (v0.240): an
+                        // imported record's TypeSymbol lives in
+                        // `ctx_.importedSymbols()` — `ctx_.symbols()` is
+                        // local-only (SemaContext.hpp:90's `symbols_`).
+                        // Without this widening, a NESTED destructuring
+                        // (`Outer(Inner(x))`) where `Outer` and `Inner`
+                        // are both imported left `ndFields` empty and
+                        // `fieldTy` null — the nested binding's `declType`
+                        // stayed null, the arm body's `x.Id` couldn't
+                        // resolve, and the case-expr's `case.end` ended
+                        // up unterminated (the same defect class the
+                        // #2844 issue reports at the top level). The
+                        // top-level case-pattern lookup is fixed in
+                        // patternMatches' DestructuringPattern branch
+                        // (LlvmBackend_Exprs2.cpp) and the parallel
+                        // CaseStmt lambda below.
+                        TypeSymbol* ts = nullptr;
                         for (const auto& sym : ctx_.symbols()) {
-                            auto* ts = dynamic_cast<TypeSymbol*>(sym.get());
-                            if (!ts || ts->name != nm ||
-                                ts->kind != ast::TypeDeclKind::Record)
-                                continue;
-                            for (Symbol* m : ts->members) {
-                                auto* fs = dynamic_cast<FieldSymbol*>(m);
-                                if (!fs) continue;
-                                bool isStatic = false;
-                                for (auto& md : fs->modifiers)
-                                    if (md == "static") { isStatic = true; break; }
-                                if (!isStatic) out.push_back(fs);
+                            auto* c = dynamic_cast<TypeSymbol*>(sym.get());
+                            if (c && c->name == nm &&
+                                c->kind == ast::TypeDeclKind::Record) {
+                                ts = c;
+                                break;
                             }
-                            break;
+                        }
+                        if (!ts) {
+                            for (Symbol* s : ctx_.importedSymbols()) {
+                                auto* c = dynamic_cast<TypeSymbol*>(s);
+                                if (c && c->name == nm &&
+                                    c->kind == ast::TypeDeclKind::Record) {
+                                    ts = c;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!ts) return out;
+                        for (Symbol* m : ts->members) {
+                            auto* fs = dynamic_cast<FieldSymbol*>(m);
+                            if (!fs) continue;
+                            bool isStatic = false;
+                            for (auto& md : fs->modifiers)
+                                if (md == "static") { isStatic = true; break; }
+                            if (!isStatic) out.push_back(fs);
                         }
                         return out;
                     };

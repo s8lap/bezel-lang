@@ -9790,13 +9790,30 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
         std::string_view lastName = dp->typeName->parts.empty()
             ? std::string_view{} : dp->typeName->parts.back();
         const sema::TypeSymbol* recTy = nullptr;
-        for (const auto& sym : ctx_.symbols()) {
-            if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get())) {
-                if (ts->name == lastName &&
-                    ts->kind == ast::TypeDeclKind::Record) {
-                    recTy = ts; break;
-                }
-            }
+        // fix #2844 / §19.3 / §2.8.3 rule 4 (v0.240): an imported record's
+        // TypeSymbol lives in `ctx_.importedSymbols()` — `ctx_.symbols()` is
+        // local-only (SemaContext.hpp:90's `symbols_`), so a destructuring
+        // pattern over an imported record (`case o of Pt(x, y) => …` with
+        // `import Lib`) failed to resolve the head. With `recTy` null this
+        // function returns `nullptr`, the case-pattern caller treats it as
+        // "degraded to no-match" and never emits the binding alloca for the
+        // arm body's `x`/`y` reads — the body lowers, but its reads of the
+        // never-defined locals strand `case.end` with no terminator (the
+        // IR-verification error the issue reproduces). Walk imported
+        // symbols after the local pass, mirroring the established pattern
+        // in LlvmBackend_Stmts.cpp:7657-7666 and LlvmBackend_Assign.cpp:
+        // 10008-10020 (the same widening the #3197 fix applied for the
+        // §29.2 enumerable case).
+        auto considerSym = [&](const sema::Symbol* s) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(s);
+            if (!ts || ts->name != lastName ||
+                ts->kind != ast::TypeDeclKind::Record) return;
+            recTy = ts;
+        };
+        for (const auto& sym : ctx_.symbols()) considerSym(sym.get());
+        if (!recTy) {
+            for (const sema::Symbol* sym : ctx_.importedSymbols())
+                considerSym(sym);
         }
         if (!recTy) return nullptr;
         // fix #1254 / §19.3 / §14.1: for a concrete generic-record scrutinee
@@ -10037,20 +10054,33 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
 
 // per §27.4 (v0.183, #1408) — see declaration (LlvmBackend_impl.hpp) for the
 // contract. Resolves the record TypeSymbol the same way patternMatches'
-// DestructuringPattern branch does (by name over ctx_.symbols(), just above);
-// there is no sema-attached back-pointer on the AST node to reuse.
+// DestructuringPattern branch does (by name, falling back to
+// `ctx_.importedSymbols()` after the local pass; see #2844 / §2.8.3 rule 4).
+// There is no sema-attached back-pointer on the AST node to reuse.
 void Emitter::bindLambdaDestructureParam(const ast::DestructuringPattern& dp,
                                          llvm::Value* structVal) {
     if (!dp.typeName || !structVal) return;
     std::string_view lastName = dp.typeName->parts.empty()
         ? std::string_view{} : dp.typeName->parts.back();
     const sema::TypeSymbol* recTy = nullptr;
-    for (const auto& sym : ctx_.symbols()) {
-        if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get())) {
-            if (ts->name == lastName && ts->kind == ast::TypeDeclKind::Record) {
-                recTy = ts; break;
-            }
-        }
+    // fix #2844 / §27.4 / §2.8.3 rule 4 (v0.240): see the matching note
+    // in patternMatches' DestructuringPattern branch above — imported
+    // records must be considered, or the lookup returns null and the
+    // binding silently degrades (the arm body's `x` reads strand the
+    // basic block without a terminator, exactly as the case-pattern
+    // shape). The sema bindLambdaDestructure site at
+    // ExprTypecheck_Exprs.cpp:395 was the same defect on the
+    // typecheck side; both widen in this commit.
+    auto considerSym = [&](const sema::Symbol* s) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(s);
+        if (!ts || ts->name != lastName ||
+            ts->kind != ast::TypeDeclKind::Record) return;
+        recTy = ts;
+    };
+    for (const auto& sym : ctx_.symbols()) considerSym(sym.get());
+    if (!recTy) {
+        for (const sema::Symbol* sym : ctx_.importedSymbols())
+            considerSym(sym);
     }
     if (!recTy) return;
     recordStruct(recTy);  // ensure fieldIndex_ is populated for this record

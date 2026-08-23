@@ -15471,20 +15471,40 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         std::vector<FieldSymbol*> out;
                         if (!tn || tn->parts.empty()) return out;
                         std::string_view nm = tn->parts.back();
+                        // fix #2844 / §19.3 / §2.8.3 rule 4 (v0.240): an
+                        // imported record's TypeSymbol lives in
+                        // `ctx_.importedSymbols()` — `ctx_.symbols()` is
+                        // local-only. The CaseExpr twin below (and the
+                        // sibling CaseStmt lambda in ExprTypecheck.cpp)
+                        // have the same widening for the nested
+                        // destructuring case.
+                        TypeSymbol* ts = nullptr;
                         for (const auto& sym : ctx_.symbols()) {
-                            auto* ts = dynamic_cast<TypeSymbol*>(sym.get());
-                            if (!ts || ts->name != nm ||
-                                ts->kind != ast::TypeDeclKind::Record)
-                                continue;
-                            for (Symbol* m : ts->members) {
-                                auto* fs = dynamic_cast<FieldSymbol*>(m);
-                                if (!fs) continue;
-                                bool isStatic = false;
-                                for (auto& md : fs->modifiers)
-                                    if (md == "static") { isStatic = true; break; }
-                                if (!isStatic) out.push_back(fs);
+                            auto* c = dynamic_cast<TypeSymbol*>(sym.get());
+                            if (c && c->name == nm &&
+                                c->kind == ast::TypeDeclKind::Record) {
+                                ts = c;
+                                break;
                             }
-                            break;
+                        }
+                        if (!ts) {
+                            for (Symbol* s : ctx_.importedSymbols()) {
+                                auto* c = dynamic_cast<TypeSymbol*>(s);
+                                if (c && c->name == nm &&
+                                    c->kind == ast::TypeDeclKind::Record) {
+                                    ts = c;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!ts) return out;
+                        for (Symbol* m : ts->members) {
+                            auto* fs = dynamic_cast<FieldSymbol*>(m);
+                            if (!fs) continue;
+                            bool isStatic = false;
+                            for (auto& md : fs->modifiers)
+                                if (md == "static") { isStatic = true; break; }
+                            if (!isStatic) out.push_back(fs);
                         }
                         return out;
                     };
