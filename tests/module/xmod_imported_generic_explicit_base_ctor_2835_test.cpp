@@ -259,7 +259,7 @@ BEZEL_TEST(xmod_imported_generic_explicit_base_ctor_2835,
 // ===========================================================================
 BEZEL_TEST(xmod_imported_generic_explicit_base_ctor_2835,
            t3_same_module_pin_14_1) {
-    std::string stem = unique_stem("bz2835_t4_");
+    std::string stem = unique_stem("bz2835_t3_");
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
     std::string srcPath = (dir / (stem + ".bzl")).string();
