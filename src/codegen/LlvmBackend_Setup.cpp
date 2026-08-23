@@ -23939,10 +23939,46 @@ void Emitter::collectSafeViewAliases(
 // handing a class instance to bz_box_release. This one predicate is shared by
 // collectBoxReleaseEligible and the AssignmentStmt store path so their box-vs-
 // class decisions cannot drift.
+//
+// fix #3351 (§8.6 / §17.4 / §28.3 / §28.9, v0.240): the `<box producer> as
+// <reference type>` shape (`var ob: Object := h.M() as Object;` where
+// `M(): Object => _n;`). `lowerTypeTest`'s `as`-to-a-reference-target arm
+// RETURNS the operand (the box), per §17.4; the cast hand-off does not
+// transfer ownership — the receiver IS the box, the bound local is the +1
+// owner. Without this extension case (a) misses (`srcTy` is `Object`, not
+// boxable) and case (b) misses (the initializer is a `TypeTestExpr`, not a
+// `CallExpr`); `isPlusOneBoxProducer` answers false, the local never joins
+// `boxReleaseEligible_`, and the box the callee minted leaks at scope end
+// (24 B/evaluation, unbounded in a loop — measured 480 B / 20 allocations
+// for the issue's repro). #2865 closed the inline / `lastBoxMint_` shape
+// and the call-argument / interpolation-hole shapes via `tryLowerConsoleCall`
+// and `appendPart`; this is the LOCAL-BIND twin of #2876's residual 3.
+//
+// Gate: `isUserMethodBoxReturnCall(tt->operand.get())` — the SAME pre-pass
+// `boxReturnMethods_` the existing case (b) uses, so a method that returns
+// `Object` whose body provably always returns a boxable value admits its
+// `as Object` cast and nothing else does. The `op == "as"` and
+// `isObjectOrInterfaceTarget(testType)` clauses are LOAD-BEARING, not
+// defensive: `as <value type>` UNBOXES (walks the descriptor, copies
+// payload bytes out of the wrapper — the receiver is the VALUE, not the
+// box), and #2865's `lastBoxMint_` mint-identity check at `lowerTypeTest`
+// already handles that shape; admitting it here would over-fire and double-
+// free. An IDENTIFIER operand (`o as Object` where `o: int` is a local) is
+// correctly negative — `isUserMethodBoxReturnCall` wants a `CallExpr` —
+// so the borrow case keeps the pre-existing conservative leak (the safe
+// direction).
 int Emitter::boxLocalAssignmentSourceKind(const ast::Expr* valueExpr) {
     if (!valueExpr) return -1;
     const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
     if (!srcTy) return -1;
+    if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(valueExpr)) {
+        if (tt->op == "as" && tt->testType && tt->operand &&
+            isUserMethodBoxReturnCall(tt->operand.get())) {
+            const sema::TypeRef* ttTy = ctx_.resolvedType(*tt->testType);
+            if (isObjectOrInterfaceTarget(ttTy))
+                return 1;
+        }
+    }
     if (isBoxableValueType(srcTy) || isNullableValueTy(srcTy) ||
         isUserMethodBoxReturnCall(valueExpr))
         return 1;
