@@ -417,12 +417,32 @@ bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
     // per spec whether or not it leaks. So the measurement is evidence of
     // SEVERITY, not of APPLICABILITY, and this list UNDER-APPROXIMATES the rule
     // rather than tracking it. Under-approximating is the right call for a
-    // diagnostic-only change — the residual names are filed as #2749, one of
-    // them (`ToBytes`) additionally needs a result-head widening to
-    // `owned OwningBuffer<byte>`, and the file-I/O names are hard to probe.
+    // diagnostic-only change — the file-I/O names are hard to probe.
+    //
+    // fix #2826 (§28.9 / §28.10, v0.240, stdlib §10.1): `ToBytes` enters the
+    // allowlist. Per stdlib §10.1, `CString.ToBytes()` returns `owned
+    // Array<byte>` — a fresh `bz_array_t*` (the runtime `bz_cstring_to_bytes`
+    // allocates a new buffer and copies the CString's bytes into it, so the
+    // returned array's `data` does NOT alias the source; see
+    // bezel_runtime_strings.cpp:1050-1061 and the round-trip comment).
+    // codegen's collection-family arm reclaims the result regardless of how
+    // the receiver was constructed (parameter annotation vs. local-from-factory
+    // — the result's TypeRef is the same `Array<byte>` Named/declaration-null
+    // shape in both), so the lint and §21.1 must both classify it as an
+    // owned production. Adding it here closes BOTH halves at once — the
+    // spurious §28.10 vacuity warning on `using var b := c.ToBytes();` (#2826)
+    // and the would-be-leak the lint steered authors toward
+    // (`const b := c.ToBytes();`, accepted by the pre-fix compiler but a leak
+    // under LSan). The result-head gate below (`head == "Array"`) still
+    // excludes BinarySerializer.ToBytes / JsonSerializer.ToBytes (those return
+    // `OwningBuffer<byte>`, head `OwningBuffer` — already covered by
+    // `isDisposableBuiltinHeadName` and the chain's `OwningBuffer` disposal
+    // arm, #2992). The remaining #2749 items (ToCharArray / ToByteArray /
+    // CopyToArray / ReadAll* / GetFiles / GetDirectories) keep their
+    // measurement-gated philosophy and are filed separately.
     if (mm != "ToArray" && mm != "ToSet" && mm != "ToDictionary" &&
         mm != "Sorted" && mm != "Reversed" && mm != "Slice" &&
-        mm != "Split" && mm != "GetBytes")
+        mm != "Split" && mm != "GetBytes" && mm != "ToBytes")
         return false;
     // BUILTIN only, and the test is "NO symbol at all" — not "no MethodSymbol".
     // The builtin member-call typing path in sema lives entirely inside
