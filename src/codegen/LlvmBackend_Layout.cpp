@@ -5128,19 +5128,42 @@ llvm::Value* Emitter::implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy)
     auto savedSubst = genericSubst_;
     auto savedSemaTy = genericSubstSemaTy_;
     if (!ms->parent->genericParams.empty()) {
-        // Recover the enclosing class: reverse-look up currentFn_ in methodFns_,
-        // then try currentSpecMethodSymbol_ (for specialised bodies).
+        // Recover the enclosing class. Two cases:
+        //  (a) emitting a method's STANDALONE body (currentFn_ is the method's
+        //      own compiled function): the enclosing class is the method's
+        //      declaring class.
+        //  (b) inlining a method body via emitInlineGenericMethod: currentFn_
+        //      is the CALLER's function (e.g. main()), and currentSpecMethodSymbol_
+        //      names the method being inlined. The semantically correct
+        //      enclosing class is the INLINED method's class — `this` in the
+        //      inlined body is an instance of that class, and the base-chain
+        //      walk must START from it to find the right inherited generic
+        //      param binding.
+        //
+        // fix #3347: prefer currentSpecMethodSymbol_->parent when it is set
+        // (case b). The previous `currentSpecMethodSymbol_` was only a FALLBACK
+        // to the currentFn_ lookup, which finds the CALLER's class — not the
+        // inlined method's. For `new GD<Pt>(new Pt(7, 8))` against
+        //   class GD<U> : GBase<U> { method V(): U => _v; }
+        // the inlined V() body reads `_v` from GBase<T>; the active
+        // genericSubst_ binds U→Pt but does not bind GBase's T, so the
+        // computeAncestorGenericSubst walk must START from GD (the inlined
+        // method's class) to derive T→Pt. Starting from main()'s C
+        // (case b's caller) finds no path to GBase and returns false, leaving
+        // the substitution empty — classStruct(GBase) returns the
+        // T→i32 placeholder spec, the inlined GEP reads only the first 4 bytes
+        // of `_v`, and `V()` returns X=7 with Y=garbage. Case (a) is unaffected:
+        // currentSpecMethodSymbol_ is unset during standalone body emission.
         const sema::TypeSymbol* enclosingCls = nullptr;
-        if (currentFn_) {
+        if (currentSpecMethodSymbol_ && currentSpecMethodSymbol_->parent)
+            enclosingCls = currentSpecMethodSymbol_->parent;
+        if (!enclosingCls && currentFn_) {
             for (const auto& [sym, fn] : methodFns_)
                 if (fn == currentFn_ && sym->parent) {
                     enclosingCls = sym->parent;
                     break;
                 }
         }
-        if (!enclosingCls && currentSpecMethodSymbol_ &&
-            currentSpecMethodSymbol_->parent)
-            enclosingCls = currentSpecMethodSymbol_->parent;
         if (enclosingCls && enclosingCls != ms->parent) {
             // Build a synthetic TypeRef for the enclosing class (concrete,
             // no generic args of its own) and walk the base chain to bind
