@@ -5591,9 +5591,25 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     // pin warning on a real disposal (measured). The two now consult one table;
     // the rationale for each name's disposal obligation lives in the shared
     // table's own comments. // per §28.3 / §28.9 / §28.10, fix #2992
-    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
-        return false;
-    return common::isDisposableBuiltinHeadName(rt->headName());
+    //
+    // fix #2812 (§28.9 / §28.10 / §32.6, v0.240): an IMPORTED named type has
+    // no astNode (the loader has no AST to set it on; #495's `importedName`
+    // side channel carries the textual name instead). The pre-fix early-return
+    // below answered false for every imported type, so a `using var c :=
+    // L.dup(…)` over an imported method's `owned CString` return — exactly
+    // the FFI-buffer shape §32.6 names — was misclassified as not-disposable
+    // and the §28.10 vacuity warning fired with a `const c := …` remedy that
+    // would leak the malloc'd buffer (#2826 sibling). Fix: also read the
+    // importedName field and consult the same predicate, so the result is
+    // the SAME verbatim membership test the local-occurrence path produces
+    // (headName already routes through importedName when astNode is null;
+    // reusing the same field keeps the two paths incapable of drifting).
+    // // per §28.9, §28.10, §32.6, #2812
+    if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+        return common::isDisposableBuiltinHeadName(rt->headName());
+    if (!rt->importedName.empty())
+        return common::isDisposableBuiltinHeadName(rt->importedName);
+    return false;
 }
 
 void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
