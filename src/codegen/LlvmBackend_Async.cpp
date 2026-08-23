@@ -975,6 +975,12 @@ bool Emitter::chainedReturnBorrowedTaskSource(const ast::Expr& operand) {
 void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                               const CallableInfo& ci) {
     if (!ci.stmts) return;
+    // fix #2895 (§29.3 / §30.1 / §30.7, v0.240): retract the entire
+    // suspend/resume frame on every exit (including the diagnostic early
+    // returns below). Replaces the partial clear inside the Resume body
+    // block, which left smStateGEP_/smKind_/smStateBBs_/smDoneBB_/
+    // smNextSuspendState_/smForInSrcFields_ live for the next function.
+    StateMachineFrameScope smFrameScope(*this);
     smKind_ = SuspendKind::Await;
 
     // §30.9 / §31.2 (#438): `await` is now supported in a try BODY, a catch ARM
@@ -1557,6 +1563,12 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
     // through builder_ / currentFn_, so `fn` itself is referenced only for the
     // contract (kept as a parameter for clarity / future use).
     (void)fn;
+    // fix #2895 (§30.6 / §30.1, v0.240): retract the entire suspend/resume
+    // frame at every exit (the partial clear at ~1977 left smKind_/smStateGEP_/
+    // smStateBBs_/smDoneBB_/smNextSuspendState_/smForInSrcFields_/asyncOuter/
+    // asyncPending/asyncSpillPtrField_ live for the next function compiled
+    // into the module).
+    StateMachineFrameScope smFrameScope(*this);
     smKind_ = SuspendKind::Await;
 
     // §30.6 result element type T (from the lambda's Task<T>/OwningTask<T> return
@@ -1996,6 +2008,13 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
 void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                                       const CallableInfo& ci) {
     if (!ci.stmts) return;
+    // fix #2895 (§29.3 / §30.1 / §30.7, v0.240): retract the entire
+    // suspend/resume frame on every exit from this emitter (the partial
+    // clear at ~2767 happens BEFORE the Dispose body and is defensive; this
+    // guard handles the leak that survived into the next function compiled
+    // into the module). Spans MoveNextAsync AND the Dispose body — the
+    // Dispose body re-publishes the members it reads just-in-time.
+    StateMachineFrameScope smFrameScope(*this);
     smKind_ = SuspendKind::AsyncYield;
 
     // §29.6 / §30.7 (#554): check for FORBIDDEN suspend positions in this async

@@ -441,6 +441,41 @@ bool Emitter::containsYield(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
 }
 
 
+// fix #2895 (§29.3 / §30.1 / §30.7, v0.240): retract the entire suspend/resume
+// frame in one place. Sets every member to the documented neutral value —
+// containers cleared, pointers null, indices zero, smKind_ set to Yield (the
+// kind with no neutral value but the only one that does not itself OPEN a
+// consumer gate once smStateGEP_ is null; see the NestedBodyScope comment on
+// the constructor reset, LlvmBackend_Assign.cpp ~4602). Called by the
+// StateMachineFrameScope RAII guard at every exit from a state-machine emitter
+// (normal return and every diagnostic early-return path).
+void Emitter::clearSmFrame() {
+    smKind_                    = SuspendKind::Yield;
+    smStateStruct_             = nullptr;
+    smSelf_                    = nullptr;
+    smStateGEP_                = nullptr;
+    smStateBBs_.clear();
+    smDoneBB_                  = nullptr;
+    smNextSuspendState_        = 0;
+    smLocalFields_.clear();
+    smForInSrcFields_.clear();
+    smAllocaToField_.clear();
+    iterCurrentValField_       = 0;
+    iterElemTy_                = nullptr;
+    iterElemSemaTy_            = nullptr;
+    iterElemIsOwnedClass_      = false;
+    iterCurrentValOwnedField_  = 0;
+    asyncOuterTaskField_       = 0;
+    asyncPendingTaskField_     = 0;
+    asyncSpillPtrField_        = 0;
+    asyncResultTy_             = nullptr;
+    asyncResultSemaType_       = nullptr;
+    asyncPatternAResultDisposer_ = nullptr;
+    asyncOwnedParamFrame_      = nullptr;
+    asyncResumeFn_             = nullptr;
+}
+
+
 void Emitter::collectYields(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
                            std::vector<const ast::YieldStmt*>& out) {
     for (const auto& s : stmts) {
@@ -662,6 +697,15 @@ static void collectYieldStatesForOwnedLocals(
 void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                          const CallableInfo& ci) {
     if (!ci.stmts) return;
+    // fix #2895 (§29.3 / §30.1 / §30.7, v0.240): retract the entire
+    // suspend/resume frame on every exit from this emitter (the partial
+    // clear at ~1585 happens BEFORE the Dispose body and is defensive; this
+    // guard handles the leak that survived into the next function compiled
+    // into the module). Spans MoveNext AND the Dispose body — the Dispose
+    // body re-publishes the two members it reads (smStateStruct_,
+    // asyncSpillPtrField_) just-in-time, so retracting the frame at scope
+    // exit does not break it.
+    StateMachineFrameScope smFrameScope(*this);
     smKind_ = SuspendKind::Yield;
 
     // §29.6: a SYNCHRONOUS iterator (returning IEnumerable<T>/IEnumerator<T>)

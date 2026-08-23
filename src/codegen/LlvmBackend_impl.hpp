@@ -9920,6 +9920,44 @@ private:
     void emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                                  const CallableInfo& ci);
 
+    // fix #2895 (§29.3 "Iterator methods" / §30.1 "`async` methods" / §30.7
+    // "`async` iterators", v0.240): retract the ENTIRE suspend/resume frame in
+    // one place, rather than each emitter clearing a different subset on the
+    // way out (the subset pattern left `smKind_`/`smStateGEP_`/`smStateBBs_`/
+    // `smDoneBB_`/`smNextSuspendState_`/iter/async-iterator fields/asyncTask/
+    // asyncResult* live for the NEXT function compiled into the module, and
+    // each one has its own consumer gated on a member that the next emitter's
+    // prologue does not reset — #2170, #2274/#2281, #2694, #2701, #2702,
+    // #2731, #2872, #2891 are all the same shape). Sets every member to the
+    // documented neutral value: containers cleared, pointers null, indices
+    // zero, kinds set to `Yield` (`SuspendKind` has no neutral value; Yield
+    // opens the kind-1/2 gate at LlvmBackend_Stmts.cpp ~3620 by virtue of being
+    // a member of the enum — the gate is then closed by nulling smStateGEP_).
+    void clearSmFrame();
+
+    // fix #2895 (sequential analogue of NestedBodyScope, §29.3/§30.1/§30.7,
+    // v0.240): RAII guard that retracts the suspend/resume frame at every
+    // exit from a state-machine emitter (normal return AND any early-return
+    // diagnostic path — every emitter has at least one, each of which would
+    // otherwise leave the published frame live for the next function). The
+    // guard does NOT save/restore: the caller (an emitter) is the LAST code
+    // that may legitimately read the frame, and the next caller's prologue
+    // expects every member at its neutral value. Spans the emitter's whole
+    // run (MoveNext/Resume AND the Dispose body emitted from inside the
+    // iterator emitters); the Dispose body re-publishes the two members it
+    // reads (smStateStruct_, asyncSpillPtrField_) just-in-time, so retracting
+    // the frame at scope exit does not break it.
+    struct StateMachineFrameScope {
+        explicit StateMachineFrameScope(Emitter& e) : e_(e) {}
+        ~StateMachineFrameScope() { e_.clearSmFrame(); }
+        StateMachineFrameScope(const StateMachineFrameScope&) = delete;
+        StateMachineFrameScope& operator=(const StateMachineFrameScope&) =
+            delete;
+
+    private:
+        Emitter& e_;
+    };
+
     // §30.7: complete the in-flight async iterator's PER-ADVANCE Task<bool> with
     // `hasValue` (true = a value was yielded into current_val; false = exhausted).
     // Unlike emitAsyncComplete, it does NOT free the frame (the frame persists
