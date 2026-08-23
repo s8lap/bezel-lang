@@ -2123,6 +2123,59 @@ private:
     std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
         importedIndexerSetterFns_;
 
+    // fix #3353 (§14.1 / §22.7 / §23.3 / §23.4, v0.240): the cross-module
+    // INHERITED-base indexer/property wrapper. The importer's exported-stub
+    // dispatch (`importedIndexerGetterFns_` / `-SetterFns_`) calls into the
+    // LIB's `bz$<GBase>$idxget$<arity>` stub, which lowers its body against
+    // GBase's T→i32 erased placeholder. For a derived receiver
+    // (`g: GD: GBase<Pt>`) the runtime layout is GBase<Pt> (8-byte slot for
+    // the Pt record), so the stub reads only the first 4 bytes — silent
+    // corruption (X correct, Y garbage, ASan stack-buffer-overflow). The
+    // importer synthesises a per-(ps, recvTy) InternalLinkage wrapper that
+    // recomputes the inherited-base's storage offset under the importer's
+    // own substitution (T→Pt) and GEPs THERE, bypassing the stub's wrong
+    // layout. Pre-condition: the body must be a single field read on an
+    // inherited type-parameter slot — the common case. See #3353 for the
+    // full rationale and the non-trivial-body limitation. Keyed by
+    // `(ps, recvTy)` because the substitution depends on the receiver's
+    // static type (e.g. `GD<U>: GBase<U>` vs `GD: GBase<Pt>` produce
+    // different wrapper bodies under the same `ps`).
+    //
+    // We use a `std::unordered_map<std::pair<...>, ...>` with a custom
+    // hash (the standard library does not specialise `std::hash` for
+    // pairs) — see `PairPtrHash` below. The key combines a PropertySymbol*
+    // and a TypeRef*, both pointer-hashed; equality is by-pointer.
+    struct PairPtrHash {
+        std::size_t operator()(const std::pair<const sema::PropertySymbol*,
+                                               const sema::TypeRef*>& p) const {
+            std::size_t h1 = std::hash<const void*>{}(p.first);
+            std::size_t h2 = std::hash<const void*>{}(p.second);
+            // Boost-style combine (matches the project convention elsewhere
+            // for `hash_combine`-style mixing).
+            return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+        }
+    };
+    std::unordered_map<
+        std::pair<const sema::PropertySymbol*, const sema::TypeRef*>,
+        llvm::Function*, PairPtrHash>
+        importedIndexerGetterInheritedWrappers_;
+    std::unordered_map<
+        std::pair<const sema::PropertySymbol*, const sema::TypeRef*>,
+        llvm::Function*, PairPtrHash>
+        importedIndexerSetterInheritedWrappers_;
+    // ... and the named-property twins. Property reads (`g.P` where P is
+    // declared on the generic base) have the same defect as the indexer
+    // getter; property writes (`g.P := v`) likewise. The wrappers share the
+    // same per-(ps, recvTy) cache key shape.
+    std::unordered_map<
+        std::pair<const sema::PropertySymbol*, const sema::TypeRef*>,
+        llvm::Function*, PairPtrHash>
+        importedPropGetterInheritedWrappers_;
+    std::unordered_map<
+        std::pair<const sema::PropertySymbol*, const sema::TypeRef*>,
+        llvm::Function*, PairPtrHash>
+        importedPropSetterInheritedWrappers_;
+
     // fix #3231 (§12.3 / §23 / §23.4 / §2.8.3 rule 4, v0.252): the
     // NON-DISPATCHING direct-entry maps for imported VIRTUAL properties and
     // indexers — the cross-module ABI for `base.P` / `base[i]`. §12.3
@@ -14188,6 +14241,37 @@ private:
         const sema::TypeRef* recvTy, const sema::TypeSymbol* ancestor,
         std::unordered_map<std::string_view, llvm::Type*>& outSubst,
         std::unordered_map<std::string_view, const sema::TypeRef*>& outSema);
+
+    // fix #3353 (§14.1 / §22.7 / §23.3 / §23.4, v0.240): emit a per-call-site
+    // InternalLinkage wrapper that reads the inherited-base indexer's body
+    // slot at the SUBSTITUTED offset, replacing the wrong-layout
+    // `bz$<GBase>$idxget$<arity>` stub the LIB exports against the T→i32
+    // placeholder. Pre-condition: the accessor body must be a single field
+    // read on an inherited type-parameter slot. The wrapper is cached by
+    // (ps, recvTy) — different receivers instantiate the wrapper under
+    // different substitutions and therefore read at different struct
+    // offsets. Returns nullptr if the case does not apply (no inherited
+    // base, no substitution, accessor return type is not T, body is not a
+    // single-field read, etc.). For getter wrappers only (setter is below).
+    llvm::Function* emitImportedIndexerGetterInheritedWrapper(
+        const sema::PropertySymbol* ps,
+        const sema::TypeRef* recvTy);
+
+    // fix #3353 setter twin: emit the inherited-base indexer setter
+    // wrapper. Body: GEP inherited slot, store `value`. Same
+    // pre-conditions as the getter twin.
+    llvm::Function* emitImportedIndexerSetterInheritedWrapper(
+        const sema::PropertySymbol* ps,
+        const sema::TypeRef* recvTy);
+
+    // fix #3353 named-property twins: same defect shape, same fix.
+    llvm::Function* emitImportedPropGetterInheritedWrapper(
+        const sema::PropertySymbol* ps,
+        const sema::TypeRef* recvTy);
+
+    llvm::Function* emitImportedPropSetterInheritedWrapper(
+        const sema::PropertySymbol* ps,
+        const sema::TypeRef* recvTy);
 
     // fix #2896 (§14.1 / §12 / §12.9, v0.240): one level of the descendant walk
     // — a class on the chain and the concrete TypeRef bound to each of ITS OWN

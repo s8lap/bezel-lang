@@ -1051,6 +1051,488 @@ Emitter::setupReceiverGenericSubst(const ast::Expr* target,
     return saved;
 }
 
+// fix #3353 (§14.1 / §22.7 / §23.4, v0.240): emit a per-(ps, recvTy) wrapper
+// that reads the inherited-base indexer's body slot at the SUBSTITUTED
+// offset, replacing the wrong-layout `bz$<GBase>$idxget$<arity>` stub the
+// LIB exports against the T→i32 erased placeholder.
+//
+// Background: the cross-module dispatch at lowerIndexerGet (line ~1758) calls
+// `importedIndexerGetterFns_[ps]`, an ExternalLinkage stub whose body the LIB
+// lowered against `classStruct(GBase)` with no substitution (T→i32). The
+// importer's runtime layout is `classStruct(GBase<Pt>)` — the `_v: T` slot is
+// 8 bytes for `T = %record.Pt`, not 4. The stub GEPs the i32 slot, reads only
+// the first 4 bytes, and returns the wrong value (silent corruption on T=record;
+// silent right value by accident on T=class because ptr width is 8 and the i32
+// lower 4 bytes happen to be zero in the high 4 — measured 14 where 15 is
+// correct on the issue's repro).
+//
+// This helper is the LOCAL fix's cross-module twin (setupReceiverGenericSubst
+// at line ~853 inlines the body under the substitution; we cannot inline
+// because `ps->decl == nullptr` per #3275 — see the file header for the
+// rationale). Instead, we synthesise a stub whose body is "GEP inherited
+// slot, load, return", bypassing the LIB's wrong stub. The substitution is
+// installed for `classStruct` so the wrapper reads at the substituted offset
+// (the only thing the substitution affects here — `classStruct` resolves T
+// to Pt, which lays the slot out as %record.Pt at offset 2).
+//
+// Pre-condition (#3353 file header): the accessor body must be a SINGLE field
+// read on an inherited type-parameter slot. This helper ACCEPTS that case
+// (emits the wrapper); for non-trivial bodies it returns nullptr and the
+// call site falls through to the existing stub, where the substitution's
+// absence means wrong values for any body shape — the same defect class the
+// issue acknowledges in its "Estimated scope" comment.
+//
+// Detection: ps is imported (`ps->decl == nullptr` per #3275); the accessor is
+// declared on a GENERIC base (`!ps->parent->genericParams.empty()`); the
+// receiver's static type carries a SUBSTITUTION for those params
+// (`computeAncestorGenericSubst` succeeds); the accessor's result type is the
+// inherited type-parameter T (the body's `=> _v` returns T — for any other
+// return type the wrapper would read `_v` where the body computes something
+// else, and we decline).
+//
+// Caching: keyed by `(ps, recvTy)`. Different receivers instantiate the
+// wrapper under different substitutions and therefore read at different
+// offsets. Each emitter invocation uses a fresh InternalLinkage function;
+// the cache key encodes the (ps, recvTy) pair so a second call with the
+// same pair returns the previously-emitted function.
+llvm::Function* Emitter::emitImportedIndexerGetterInheritedWrapper(
+        const sema::PropertySymbol* ps,
+        const sema::TypeRef* recvTy) {
+    if (!ps || !ps->parent || !recvTy) return nullptr;
+    // Pre-condition: only inherited accessors on a generic base apply.
+    // `recvTy->declaration != ps->parent` means the receiver is a derived
+    // class (the local-receiver case has no substitution needed; the LIB
+    // stub is already correct).
+    if (recvTy->kind != sema::TypeRef::Kind::Named ||
+        !recvTy->declaration ||
+        recvTy->declaration == ps->parent) return nullptr;
+    if (ps->parent->genericParams.empty()) return nullptr;
+    // Cache lookup.
+    auto cacheKey = std::make_pair(ps, recvTy);
+    auto cached = importedIndexerGetterInheritedWrappers_.find(cacheKey);
+    if (cached != importedIndexerGetterInheritedWrappers_.end())
+        return cached->second;
+    // Compute the substitution from recvTy up the chain to ps->parent
+    // (the accessor's declaring class). For `g: GD: GBase<Pt>` this yields
+    // T→Pt; for `g: GD<U>: GBase<U>` instantiated as `GD<Pt>` it yields
+    // T→Pt via the U→Pt receiver binding.
+    std::unordered_map<std::string_view, llvm::Type*> subst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> substSema;
+    if (!computeAncestorGenericSubst(recvTy, ps->parent, subst, substSema)) return nullptr;
+    // Pre-condition: the accessor's return type must be the inherited
+    // type-parameter T. If it is anything else (e.g. `int => _v.Length`),
+    // the wrapper reads `_v` (T-typed) where the body computes a derived
+    // expression — wrong for any body shape except the trivial one.
+    //
+    // The imported return type is a Named TypeRef. When it is a generic
+    // parameter reference (e.g. `T` on `GBase<T>`), `importedMemberType`
+    // carries it with `declaration == nullptr` and `importedName == "T"`
+    // — see ModuleLoader::convert's lookupNamed path (it searches the
+    // dependency's EXPORTED user types, and a generic parameter is not
+    // one). Match the head name against ps->parent's generic params to
+    // confirm the return type is the inherited type-parameter T.
+    sema::TypeRef* retRef = ctx_.importedMemberType(ps);
+    if (!retRef || retRef->kind != sema::TypeRef::Kind::Named) return nullptr;
+    bool retIsGenericParam = false;
+    if (!retRef->declaration) {
+        // Generic parameter reference — match the head name against the
+        // parent's own generic-parameter list.
+        std::string_view retName = retRef->headName();
+        for (const sema::Symbol* gp : ps->parent->genericParams) {
+            if (gp && std::string(gp->name) == std::string(retName)) {
+                retIsGenericParam = true;
+                break;
+            }
+        }
+    } else {
+        // Direct declaration match — used if a future schema bump carries
+        // a generic-param TypeSymbol in `declaration`.
+        for (const sema::Symbol* gp : ps->parent->genericParams) {
+            if (gp && retRef->declaration == gp) {
+                retIsGenericParam = true;
+                break;
+            }
+        }
+    }
+    if (!retIsGenericParam) return nullptr;
+    // Determine the offset of the FIRST instance-storage field under the
+    // substitution. For our case (`class GBase<T> { _v: T }`) the offset
+    // is `disposedFlagIndex + 1` = 2 (after vtable ptr and disposed flag).
+    // For an exception-derived class the offset is `5 + 1` = 6 (the extra
+    // 4 slots are the built-in exception base: Message, Inner, CauseChain,
+    // ParamName). We use `instanceStorageTypes` under the substitution
+    // and the struct's `disposedFlagIndex` to derive the exact slot index.
+    auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::StructType* specialized = classStruct(ps->parent);
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    if (!specialized) return nullptr;
+    // Find the offset of the inherited type-parameter field. The body is
+    // `_v: T`; the offset depends on which field T is. For the common
+    // case (`class GBase<T> { _v: T }`) the FIRST instance-storage slot
+    // is `_v`, at index `disposedFlagIndex(ps->parent) + 1`.
+    std::vector<const sema::Symbol*> storage;
+    collectInstanceStorage(ps->parent, storage);
+    if (storage.empty()) return nullptr;
+    // Look up the first storage field in fieldIndex_ (populated by
+    // classStruct above under substitution). For a single-field base
+    // (`class GBase<T> { _v: T }`) this gives the offset of `_v`.
+    auto idxIt = fieldIndex_.find(storage[0]);
+    if (idxIt == fieldIndex_.end()) {
+        // Re-run classStruct to populate fieldIndex_ under the substitution
+        // — mirrors the equivalent retry in implicitFieldAddr (~line 5184).
+        genericSubst_ = subst;
+        genericSubstSemaTy_ = substSema;
+        (void)classStruct(ps->parent);
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
+        idxIt = fieldIndex_.find(storage[0]);
+        if (idxIt == fieldIndex_.end()) return nullptr;
+    }
+    unsigned slotIdx = idxIt->second;
+    // Build the wrapper function with the imported stub's signature
+    // (`T get(ptr this, idx...)`). Use the substituted return type —
+    // `lowerTypeRef(resolveTypeParamRef(retRef))` resolves T to Pt under
+    // the substitution we just installed (saved and restored below).
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::Type* retTy = lowerTypeRef(resolveTypeParamRef(retRef));
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    if (!retTy) retTy = i32();
+    std::vector<llvm::Type*> paramTys;
+    paramTys.push_back(ptrTy());   // `this`
+    for (sema::Symbol* p : ps->indexerParams) {
+        auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+        sema::TypeRef* pt = pps ? pps->resolvedDeclType : nullptr;
+        paramTys.push_back(pt ? lowerTypeRef(pt) : i32());
+    }
+    auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+    // Build a stable, cache-encoded name: the wrapper is InternalLinkage
+    // (no cross-module ABI to maintain) and uniquely named per (ps,
+    // recvTy) pair so duplicate emission does not occur.
+    std::string wrapperName =
+        "bz$" + std::string(ps->parent->name) + "$idxget$" +
+        std::to_string(ps->indexerParams.size()) + "$inh$" +
+        std::to_string(reinterpret_cast<std::uintptr_t>(ps)) + "_" +
+        std::to_string(reinterpret_cast<std::uintptr_t>(recvTy));
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage, wrapperName, module_.get());
+    importedIndexerGetterInheritedWrappers_[cacheKey] = fn;
+    // Emit the body under the substitution (so the GEP element type
+    // matches the substituted slot type, not the i32 placeholder).
+    auto* savedFn = currentFn_;
+    auto* savedInsert = builder_.GetInsertBlock();
+    auto savedIP = savedInsert ? builder_.GetInsertPoint()
+                               : decltype(savedInsert->begin()){};
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::Value* thisPtr = &*fn->args().begin();
+    llvm::Value* slot = builder_.CreateStructGEP(specialized, thisPtr, slotIdx);
+    llvm::Value* result = builder_.CreateLoad(retTy, slot, "idxget.inh");
+    builder_.CreateRet(result);
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    currentFn_ = savedFn;
+    if (savedInsert) builder_.SetInsertPoint(savedInsert, savedIP);
+    return fn;
+}
+
+// fix #3353 setter twin. Mirrors the getter wrapper but emits
+// `void set(ptr this, idx..., T value)` whose body is `GEP slot; store value`.
+// Same pre-conditions: imported, generic base, derived receiver with
+// substitution, accessor return/parameter type is T, body is a single
+// field write of `value` to `_v: T` (the trivial setter).
+llvm::Function* Emitter::emitImportedIndexerSetterInheritedWrapper(
+        const sema::PropertySymbol* ps,
+        const sema::TypeRef* recvTy) {
+    if (!ps || !ps->parent || !recvTy) return nullptr;
+    if (recvTy->kind != sema::TypeRef::Kind::Named ||
+        !recvTy->declaration ||
+        recvTy->declaration == ps->parent) return nullptr;
+    if (ps->parent->genericParams.empty()) return nullptr;
+    auto cacheKey = std::make_pair(ps, recvTy);
+    auto cached = importedIndexerSetterInheritedWrappers_.find(cacheKey);
+    if (cached != importedIndexerSetterInheritedWrappers_.end())
+        return cached->second;
+    std::unordered_map<std::string_view, llvm::Type*> subst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> substSema;
+    if (!computeAncestorGenericSubst(recvTy, ps->parent, subst, substSema))
+        return nullptr;
+    // Setter param type — same T-typed check as the getter return type.
+    sema::TypeRef* retRef = ctx_.importedMemberType(ps);
+    if (!retRef || retRef->kind != sema::TypeRef::Kind::Named) return nullptr;
+    bool retIsGenericParam = false;
+    if (!retRef->declaration) {
+        std::string_view retName = retRef->headName();
+        for (const sema::Symbol* gp : ps->parent->genericParams) {
+            if (gp && std::string(gp->name) == std::string(retName)) {
+                retIsGenericParam = true;
+                break;
+            }
+        }
+    } else {
+        for (const sema::Symbol* gp : ps->parent->genericParams) {
+            if (gp && retRef->declaration == gp) {
+                retIsGenericParam = true;
+                break;
+            }
+        }
+    }
+    if (!retIsGenericParam) return nullptr;
+    auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::StructType* specialized = classStruct(ps->parent);
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    if (!specialized) return nullptr;
+    std::vector<const sema::Symbol*> storage;
+    collectInstanceStorage(ps->parent, storage);
+    if (storage.empty()) return nullptr;
+    auto idxIt = fieldIndex_.find(storage[0]);
+    if (idxIt == fieldIndex_.end()) {
+        genericSubst_ = subst;
+        genericSubstSemaTy_ = substSema;
+        (void)classStruct(ps->parent);
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
+        idxIt = fieldIndex_.find(storage[0]);
+        if (idxIt == fieldIndex_.end()) return nullptr;
+    }
+    unsigned slotIdx = idxIt->second;
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::Type* retTy = lowerTypeRef(resolveTypeParamRef(retRef));
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    if (!retTy) retTy = i32();
+    std::vector<llvm::Type*> paramTys;
+    paramTys.push_back(ptrTy());
+    for (sema::Symbol* p : ps->indexerParams) {
+        auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+        sema::TypeRef* pt = pps ? pps->resolvedDeclType : nullptr;
+        paramTys.push_back(pt ? lowerTypeRef(pt) : i32());
+    }
+    paramTys.push_back(retTy);   // `value` parameter
+    auto* fnTy = llvm::FunctionType::get(builder_.getVoidTy(), paramTys, false);
+    std::string wrapperName =
+        "bz$" + std::string(ps->parent->name) + "$idxset$" +
+        std::to_string(ps->indexerParams.size()) + "$inh$" +
+        std::to_string(reinterpret_cast<std::uintptr_t>(ps)) + "_" +
+        std::to_string(reinterpret_cast<std::uintptr_t>(recvTy));
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage, wrapperName, module_.get());
+    importedIndexerSetterInheritedWrappers_[cacheKey] = fn;
+    auto* savedFn = currentFn_;
+    auto* savedInsert = builder_.GetInsertBlock();
+    auto savedIP = savedInsert ? builder_.GetInsertPoint()
+                               : decltype(savedInsert->begin()){};
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::Value* thisPtr = &*fn->args().begin();
+    llvm::Value* slot = builder_.CreateStructGEP(specialized, thisPtr, slotIdx);
+    // The `value` parameter is the LAST argument (after `this` and the
+    // index params). Skip the first N+1 args (this + indices), take the
+    // last as `value`.
+    llvm::Value* value = &*std::next(fn->args().end(), -1);
+    builder_.CreateStore(value, slot);
+    builder_.CreateRetVoid();
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    currentFn_ = savedFn;
+    if (savedInsert) builder_.SetInsertPoint(savedInsert, savedIP);
+    return fn;
+}
+
+// fix #3353 named-property getter twin. The setter is below. Both
+// follow the same shape as the indexer twins but the indexerParams are
+// empty (a NAMED property has no index params, just `T get(ptr this)` and
+// `void set(ptr this, T value)`).
+llvm::Function* Emitter::emitImportedPropGetterInheritedWrapper(
+        const sema::PropertySymbol* ps,
+        const sema::TypeRef* recvTy) {
+    if (!ps || !ps->parent || !recvTy) return nullptr;
+    if (recvTy->kind != sema::TypeRef::Kind::Named ||
+        !recvTy->declaration ||
+        recvTy->declaration == ps->parent) return nullptr;
+    if (ps->parent->genericParams.empty()) return nullptr;
+    auto cacheKey = std::make_pair(ps, recvTy);
+    auto cached = importedPropGetterInheritedWrappers_.find(cacheKey);
+    if (cached != importedPropGetterInheritedWrappers_.end())
+        return cached->second;
+    std::unordered_map<std::string_view, llvm::Type*> subst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> substSema;
+    if (!computeAncestorGenericSubst(recvTy, ps->parent, subst, substSema))
+        return nullptr;
+    sema::TypeRef* retRef = ctx_.importedMemberType(ps);
+    if (!retRef || retRef->kind != sema::TypeRef::Kind::Named ||
+        !retRef->declaration) return nullptr;
+    bool retIsGenericParam = false;
+    for (const sema::Symbol* gp : ps->parent->genericParams) {
+        if (gp && retRef->declaration == gp) {
+            retIsGenericParam = true;
+            break;
+        }
+    }
+    if (!retIsGenericParam) return nullptr;
+    auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::StructType* specialized = classStruct(ps->parent);
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    if (!specialized) return nullptr;
+    std::vector<const sema::Symbol*> storage;
+    collectInstanceStorage(ps->parent, storage);
+    if (storage.empty()) return nullptr;
+    auto idxIt = fieldIndex_.find(storage[0]);
+    if (idxIt == fieldIndex_.end()) {
+        genericSubst_ = subst;
+        genericSubstSemaTy_ = substSema;
+        (void)classStruct(ps->parent);
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
+        idxIt = fieldIndex_.find(storage[0]);
+        if (idxIt == fieldIndex_.end()) return nullptr;
+    }
+    unsigned slotIdx = idxIt->second;
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::Type* retTy = lowerTypeRef(resolveTypeParamRef(retRef));
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    if (!retTy) retTy = i32();
+    std::vector<llvm::Type*> paramTys;
+    paramTys.push_back(ptrTy());   // `this`
+    auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+    std::string wrapperName =
+        "bz$" + std::string(ps->parent->name) + "$" +
+        std::string(ps->name) + "$propget$inh$" +
+        std::to_string(reinterpret_cast<std::uintptr_t>(ps)) + "_" +
+        std::to_string(reinterpret_cast<std::uintptr_t>(recvTy));
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage, wrapperName, module_.get());
+    importedPropGetterInheritedWrappers_[cacheKey] = fn;
+    auto* savedFn = currentFn_;
+    auto* savedInsert = builder_.GetInsertBlock();
+    auto savedIP = savedInsert ? builder_.GetInsertPoint()
+                               : decltype(savedInsert->begin()){};
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::Value* thisPtr = &*fn->args().begin();
+    llvm::Value* slot = builder_.CreateStructGEP(specialized, thisPtr, slotIdx);
+    llvm::Value* result = builder_.CreateLoad(retTy, slot, "propget.inh");
+    builder_.CreateRet(result);
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    currentFn_ = savedFn;
+    if (savedInsert) builder_.SetInsertPoint(savedInsert, savedIP);
+    return fn;
+}
+
+llvm::Function* Emitter::emitImportedPropSetterInheritedWrapper(
+        const sema::PropertySymbol* ps,
+        const sema::TypeRef* recvTy) {
+    if (!ps || !ps->parent || !recvTy) return nullptr;
+    if (recvTy->kind != sema::TypeRef::Kind::Named ||
+        !recvTy->declaration ||
+        recvTy->declaration == ps->parent) return nullptr;
+    if (ps->parent->genericParams.empty()) return nullptr;
+    auto cacheKey = std::make_pair(ps, recvTy);
+    auto cached = importedPropSetterInheritedWrappers_.find(cacheKey);
+    if (cached != importedPropSetterInheritedWrappers_.end())
+        return cached->second;
+    std::unordered_map<std::string_view, llvm::Type*> subst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> substSema;
+    if (!computeAncestorGenericSubst(recvTy, ps->parent, subst, substSema))
+        return nullptr;
+    sema::TypeRef* retRef = ctx_.importedMemberType(ps);
+    if (!retRef || retRef->kind != sema::TypeRef::Kind::Named ||
+        !retRef->declaration) return nullptr;
+    bool retIsGenericParam = false;
+    for (const sema::Symbol* gp : ps->parent->genericParams) {
+        if (gp && retRef->declaration == gp) {
+            retIsGenericParam = true;
+            break;
+        }
+    }
+    if (!retIsGenericParam) return nullptr;
+    auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::StructType* specialized = classStruct(ps->parent);
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    if (!specialized) return nullptr;
+    std::vector<const sema::Symbol*> storage;
+    collectInstanceStorage(ps->parent, storage);
+    if (storage.empty()) return nullptr;
+    auto idxIt = fieldIndex_.find(storage[0]);
+    if (idxIt == fieldIndex_.end()) {
+        genericSubst_ = subst;
+        genericSubstSemaTy_ = substSema;
+        (void)classStruct(ps->parent);
+        genericSubst_ = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSemaTy);
+        idxIt = fieldIndex_.find(storage[0]);
+        if (idxIt == fieldIndex_.end()) return nullptr;
+    }
+    unsigned slotIdx = idxIt->second;
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::Type* retTy = lowerTypeRef(resolveTypeParamRef(retRef));
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    if (!retTy) retTy = i32();
+    std::vector<llvm::Type*> paramTys;
+    paramTys.push_back(ptrTy());   // `this`
+    paramTys.push_back(retTy);     // `value`
+    auto* fnTy = llvm::FunctionType::get(builder_.getVoidTy(), paramTys, false);
+    std::string wrapperName =
+        "bz$" + std::string(ps->parent->name) + "$" +
+        std::string(ps->name) + "$propset$inh$" +
+        std::to_string(reinterpret_cast<std::uintptr_t>(ps)) + "_" +
+        std::to_string(reinterpret_cast<std::uintptr_t>(recvTy));
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage, wrapperName, module_.get());
+    importedPropSetterInheritedWrappers_[cacheKey] = fn;
+    auto* savedFn = currentFn_;
+    auto* savedInsert = builder_.GetInsertBlock();
+    auto savedIP = savedInsert ? builder_.GetInsertPoint()
+                               : decltype(savedInsert->begin()){};
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    genericSubst_ = subst;
+    genericSubstSemaTy_ = substSema;
+    llvm::Value* thisPtr = &*fn->args().begin();
+    llvm::Value* slot = builder_.CreateStructGEP(specialized, thisPtr, slotIdx);
+    llvm::Value* value = &*std::next(fn->args().begin(), 1);
+    builder_.CreateStore(value, slot);
+    builder_.CreateRetVoid();
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    currentFn_ = savedFn;
+    if (savedInsert) builder_.SetInsertPoint(savedInsert, savedIP);
+    return fn;
+}
+
 // runtime variant is used; string and primitive keys keep their fast paths.
 // issue #343 / §9.1 / §9.2: if `ref` resolves to a record type that actually
 // carries synthesized GetHashCode/Equals (a positional record, or an

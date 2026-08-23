@@ -1776,6 +1776,31 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
             builder_.CreateStore(obj, tmp);
             obj = tmp;
         }
+        // fix #3353 (§14.1 / §22.7 / §23.4, v0.240): for a DERIVED
+        // receiver (`g: GD: GBase<Pt>`) accessing an inherited indexer on
+        // a GENERIC base (`property [i]: T => _v` on `GBase<T>`), the
+        // LIB's `bz$<GBase>$idxget$<arity>` stub reads only the first 4
+        // bytes of the substituted `_v: T` slot (the stub's body was
+        // lowered against `classStruct(GBase)`'s T→i32 placeholder).
+        // Detect this case and substitute a per-(ps, recvTy)
+        // InternalLinkage wrapper that GEPs the inherited slot under the
+        // importer's own T→Pt substitution. Pre-condition: the body must
+        // be a single field read on the inherited type-parameter slot —
+        // the helper returns nullptr otherwise and we fall through to
+        // the original stub (which still produces wrong values for any
+        // non-trivial body shape; that limitation is acknowledged in
+        // #3353). See emitImportedIndexerGetterInheritedWrapper's header.
+        llvm::Function* inhWrapper = nullptr;
+        if (sema::TypeRef* recvTy = ctx_.exprType(*ix.target)) {
+            inhWrapper = emitImportedIndexerGetterInheritedWrapper(ps, recvTy);
+        }
+        if (inhWrapper) fn = inhWrapper;
+        // CRITICAL: fetch fnTy AFTER the wrapper swap. The wrapper has a
+        // DIFFERENT return type (the substituted T, e.g. %record.Pt, not
+        // the stub's i32 placeholder), so the call site must read fnTy
+        // off the actual `fn` we are calling — otherwise CreateCall
+        // interprets the call as returning i32 and the substituted value
+        // (an 8-byte Pt struct) is read as only its low 4 bytes.
         auto* fnTy = fn->getFunctionType();
         std::vector<llvm::Value*> callArgs;
         std::vector<llvm::Value*> idxArgVals;   // fix #2717
@@ -2437,6 +2462,18 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
                 return false;
             }
         }
+        // fix #3353 setter twin (§14.1 / §22.7 / §23.4, v0.240): mirror the
+        // getter branch — substitute a per-(ps, recvTy) InternalLinkage
+        // wrapper when the receiver is a derived class with a substitution
+        // for the inherited generic base's T parameter. Same pre-condition
+        // and same fallback semantics as the getter: the wrapper is emitted
+        // only when the setter's `value` parameter is the inherited
+        // type-parameter T and the body is a trivial single-field write.
+        llvm::Function* inhWrapper = nullptr;
+        if (sema::TypeRef* recvTy = ctx_.exprType(*ix.target)) {
+            inhWrapper = emitImportedIndexerSetterInheritedWrapper(ps, recvTy);
+        }
+        if (inhWrapper) fn = inhWrapper;
         auto* fnTy = fn->getFunctionType();
         std::vector<llvm::Value*> callArgs;
         std::vector<llvm::Value*> idxArgVals;   // fix #2717
