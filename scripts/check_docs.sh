@@ -652,7 +652,7 @@ PY
 SCRATCH=/var/tmp/bezel-scratch/check_docs.$$
 mkdir -p "$SCRATCH/docs" "$SCRATCH/tests/conformance"
 cp docs/*.md "$SCRATCH/docs/"
-EX=$(python3 scripts/extract_doc_examples.py "$SCRATCH" 2>&1)
+EX=$(python3 scripts/extract_doc_examples.py --repo-root "$SCRATCH" 2>&1)
 EXRC=$?
 # A genuine failure is a non-zero exit or a Python traceback. The extractor's
 # "error: N" classification line counts examples that are EXPECTED to compile-
