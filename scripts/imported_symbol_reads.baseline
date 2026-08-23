@@ -39,18 +39,24 @@
 7    src/codegen/LlvmBackend_Exprs2.cpp
 3    src/codegen/LlvmBackend_Layout.cpp
 8    src/codegen/LlvmBackend_Serialization.cpp
-# 56 — #2879 (object-typed +1 string producer-temp leak fix, Wave 3 Lane C):
-# `collectObjectStringReturnMethods` introduces one read at Setup.cpp:25790,
-# `dynamic_cast<const ast::MethodDecl*>(sym->decl)`. Structurally safe:
-# the loop body is preceded by `if (ctx_.isImported(sym)) continue;` at :25789,
-# so the cast only runs over LOCAL method symbols — same guard pattern as
-# the 55 grandfathered reads in `collectBoxReturnMethods` / sibling pre-passes.
-# Re-baselined with `--force`; commit message of edfe983/4b59708 carries the
-# load-bearing reasoning.
 56   src/codegen/LlvmBackend_Setup.cpp
 4    src/codegen/LlvmBackend_Stmts.cpp
 2    src/codegen/LlvmBackend_String.cpp
-20   src/codegen/LlvmBackend_impl.hpp
+# 21 — #2830 (owned FFI-buffer FIELD leak, Wave 2 Lane G): the new
+# `isOwnedFfiBufferField` predicate (LlvmBackend_impl.hpp:6693) introduces
+# one read at :6714, `dynamic_cast<const ast::FieldDecl*>(fs->decl)`.
+# Structurally safe: the cast is preceded by `if (!fs->decl) { rt =
+# ctx_.importedMemberType(fs); ... return ...; }` at :6711, so the cast
+# only runs over LOCAL field symbols — the same guard pattern as the 20
+# grandfathered reads in `isOwnedBuiltinExceptionField` (line 6656) /
+# `isOwnedIteratorInterfaceField` (line 6749) / `isCapturedOwnedPrimary
+# Param` (line 8548). The predicate is also wrapped in
+# `isFfiBufferTypeRef(ctx_.importedMemberType(...))` which returns
+# `nullptr` for the import path's {CString, WString, RawBytes} names —
+# same shape as #2823's `registerUnwindOwnedParam` ffiBuffer arm.
+# Re-baselined with `--force`; commit message of f3c20aa carries the
+# load-bearing reasoning.
+21   src/codegen/LlvmBackend_impl.hpp
 1    src/common/OwnershipFacts.cpp
 2    src/module/ModuleLoader.cpp
 9    src/module/ModuleMetadataBuilder.cpp
