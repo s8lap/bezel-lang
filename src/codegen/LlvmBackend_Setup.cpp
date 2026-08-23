@@ -5164,14 +5164,33 @@ llvm::GlobalVariable* Emitter::descriptorForPatternName(
         const ast::QualifiedName* name) {
     if (!name || name->parts.empty()) return nullptr;
     std::string_view last = name->parts.back();
-    for (const auto& sym : ctx_.symbols()) {
-        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-        if (!ts || ts->name != last) continue;
+    // fix #2845 / §19.3 / §2.8.3 rule 4 (v0.240): an IMPORTED class's
+    // TypeSymbol lives in `ctx_.importedSymbols()` — `ctx_.symbols()` is
+    // local-only (SemaContext.hpp:90's `symbols_`), so a bare type-test
+    // pattern over an imported class (`case o of Dog` with `import Lib`
+    // declaring `class Dog`) never matched the local pass and the caller
+    // saw the #1847 "is not supported by the backend" diagnostic. The
+    // descriptor itself is already declared by the imported-types pass
+    // above (the ExternalLinkage `td$<Type>` entry) — we just have to
+    // look it up. Mirrors the widening the #2844 fix applied to the
+    // DestructuringPattern head lookup (patternMatches, Exprs2.cpp:9793)
+    // and the established pattern in LlvmBackend_Stmts.cpp:7657-7666 and
+    // LlvmBackend_Assign.cpp:10008-10020.
+    auto considerSym = [&](const sema::Symbol* s) -> llvm::GlobalVariable* {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(s);
+        if (!ts || ts->name != last) return nullptr;
         if (ts->kind != ast::TypeDeclKind::Class &&
             ts->kind != ast::TypeDeclKind::Interface)
             return nullptr;  // record/enum name — not a reference type test
         auto it = descArray_.find(ts);
         if (it != descArray_.end()) return it->second;
+        return nullptr;
+    };
+    for (const auto& sym : ctx_.symbols()) {
+        if (auto* g = considerSym(sym.get())) return g;
+    }
+    for (const sema::Symbol* sym : ctx_.importedSymbols()) {
+        if (auto* g = considerSym(sym)) return g;
     }
     auto bit = builtinDesc_.find(std::string(last));
     if (bit != builtinDesc_.end()) return bit->second;
@@ -5201,10 +5220,27 @@ llvm::Value* Emitter::constValueForPatternName(
     if (!np || !np->name || np->name->parts.empty()) return nullptr;
     const ast::QualifiedName* name = np->name.get();
     std::string_view last = name->parts.back();
+    // fix #2845 / §19.3 / §2.8.3 rule 4 (v0.240): an imported ConstMemberSymbol
+    // has `decl == nullptr` (ModuleLoader never re-parses non-generic const
+    // bodies), so the local-const `lowerExpr` path would return nullptr. The
+    // textual value travels in the dependency metadata
+    // (`ctx_.importedConstValue(cs)`), foldable through the same
+    // `foldImportedConstText` helper constMemberValue uses for an imported
+    // const READ. Drives the const's primitive type from
+    // `ctx_.importedMemberType(cs)` — no expression side is available on a
+    // Pattern node.
     auto fold = [&](sema::ConstMemberSymbol* cs) -> llvm::Value* {
         auto* cd = dynamic_cast<const ast::ConstDecl*>(cs->decl);
         if (cd && cd->value) return lowerExpr(*cd->value);
-        return nullptr;  // imported const w/o AST decl — decline (loud)
+        if (!cs->decl) {
+            if (const std::string* text = ctx_.importedConstValue(cs)) {
+                if (!text->empty()) {
+                    const sema::TypeRef* rt = ctx_.importedMemberType(cs);
+                    return foldImportedConstText(*text, rt);
+                }
+            }
+        }
+        return nullptr;  // no foldable value — leave to other handlers
     };
     // §19.3 (v0.226, #1853): a BARE name resolving to a LOCAL compile-time
     // const. constValueForPatternName previously searched only ConstMemberSymbol
@@ -5229,10 +5265,24 @@ llvm::Value* Emitter::constValueForPatternName(
         }
     }
     // Qualified `C.K`: `K` is a const member of the type named just before it.
+    // fix #2845: walk imported symbols after the local pass — an IMPORTED
+    // type's members live under the imported TypeSymbol (ModuleLoader
+    // populates them from MetaMember records), and an imported ConstMember
+    // has no AST decl (so the local `lowerExpr` path was the loud "no
+    // foldable value" dead-end). The imported-const textual fold above
+    // recovers the value.
     if (name->parts.size() >= 2) {
         std::string_view typeName = name->parts[name->parts.size() - 2];
         for (const auto& sym : ctx_.symbols()) {
             auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+            if (!ts || ts->name != typeName) continue;
+            for (sema::Symbol* m : ts->members)
+                if (m && m->name == last)
+                    if (auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(m))
+                        return fold(cs);
+        }
+        for (const sema::Symbol* sym : ctx_.importedSymbols()) {
+            auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym);
             if (!ts || ts->name != typeName) continue;
             for (sema::Symbol* m : ts->members)
                 if (m && m->name == last)
@@ -5245,6 +5295,11 @@ llvm::Value* Emitter::constValueForPatternName(
     // is left deferred — never mis-resolved to an unrelated class's const). The
     // same symbol can appear both flat in ctx_.symbols() and under its owning
     // type's `members`, so dedup by pointer before counting.
+    // fix #2845: walk imported symbols too — a module-level `const K := 7` in
+    // a dependency surfaces as a ConstMemberSymbol under that module's
+    // imported TypeSymbol (and, for a class-level const, in `ts->members`),
+    // and the same uniqueness discipline keeps the resolution correct when
+    // local AND imported candidates are both visible.
     std::unordered_set<const sema::ConstMemberSymbol*> seen;
     auto consider = [&](sema::Symbol* m) {
         if (auto* cs = dynamic_cast<sema::ConstMemberSymbol*>(m))
@@ -5253,6 +5308,11 @@ llvm::Value* Emitter::constValueForPatternName(
     for (const auto& sym : ctx_.symbols()) {
         consider(sym.get());
         if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get()))
+            for (sema::Symbol* m : ts->members) consider(m);
+    }
+    for (const sema::Symbol* sym : ctx_.importedSymbols()) {
+        consider(const_cast<sema::Symbol*>(sym));
+        if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym))
             for (sema::Symbol* m : ts->members) consider(m);
     }
     return seen.size() == 1
