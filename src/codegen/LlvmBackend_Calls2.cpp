@@ -11357,6 +11357,18 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     auto savedValueLikeChoiceStrReleaseEligible =
         valueLikeChoiceStrReleaseEligible_;
     llvm::Function* savedStringReleaseEligibleFn = stringReleaseEligibleFn_;
+    // fix #2854 / #422 / §27.5 / §28.9: the same save/restore for the
+    // CLOSURE-release eligibility, for the same reason #1483 needed it for
+    // the unwind sets and #2807 needed it for the string sets — this wrapper
+    // may run MID-EMISSION of an outer body (a lazy specialization is built
+    // at its first call site), and both the set and its fn token are
+    // per-function state owned by that outer body. Without the restore, the
+    // outer body's own `var f := <lambda>` (case (B) of #2854's regression
+    // test) would silently lose its scope-end `bz_closure_release` once
+    // emission returned to it — the leak-direction, but a regression this
+    // fix would have introduced.
+    auto savedClosureReleaseEligible = closureReleaseEligible_;
+    llvm::Function* savedClosureReleaseEligibleFn = closureReleaseEligibleFn_;
     // fix #568 / §8.6: the specialized body's ReturnStmt lowering consults
     // currentReturnTypeNode_ (return-value boxing, nullable-value coercion). It
     // must name THIS method's declared return type while the body is emitted —
@@ -11581,6 +11593,30 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
         collectStringReleaseEligible(*ci.stmts);
         stringReleaseEligibleFn_ = specFn;
         retainAssignedStringParams(*ci.stmts, ms->params);
+        // fix #2854 / #422 / §27.5 / §28.9 / §28.3 (v0.240): populate the
+        // CLOSURE-release eligibility for THIS specialized function, mirroring
+        // the non-specialized method-body prolog (LlvmBackend_Setup.cpp
+        // ~8607: `closureReleaseEligible_.clear(); closureReleaseEligibleFn_
+        // = fn;`) and emitAsyncMethod's resume-fn setup (LlvmBackend_Async.cpp
+        // ~1268). The scope-end `bz_closure_release` for a `var f := <lambda>`
+        // local is registered by `lowerLocalDecl` (Setup.cpp ~13472) ONLY when
+        // `currentFn_ == closureReleaseEligibleFn_`; specFn is a freshly-
+        // created llvm::Function, so without this pin the gate was false for
+        // the whole specialized body and the closure cell (+ its env block)
+        // leaked, once per call, for every `var f := <lambda>` in any
+        // generic specialization (measured 400 B / 10 allocations on the
+        // issue's repro). The walk is a pure traversal of the shared body
+        // AST keyed on `const ast::LocalDecl*`, so a local whose declared
+        // type is the type parameter (e.g. `var f := lambda(): T => ...`) is
+        // conservatively not admitted as a +1 closure producer — the safe
+        // direction, no UAF; a concretely function-typed local is classified
+        // identically in every instantiation. The set and its fn token are
+        // saved/restored around this whole emission (see the save above), so
+        // a specialization built mid-emission of an outer body cannot clobber
+        // the outer's own `var f := <lambda>` release path (case (B) of the
+        // #2854 regression test).
+        collectClosureReleaseEligible(*ci.stmts);
+        closureReleaseEligibleFn_ = specFn;
     }
 
     // Emit the body. fix #580: handle both EXPRESSION and block bodies, so a
@@ -11660,6 +11696,9 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     valueLikeChoiceStrReleaseEligible_ =
         std::move(savedValueLikeChoiceStrReleaseEligible);
     stringReleaseEligibleFn_ = savedStringReleaseEligibleFn;
+    // fix #2854: restore the outer body's closure-release state (see the save).
+    closureReleaseEligible_ = std::move(savedClosureReleaseEligible);
+    closureReleaseEligibleFn_ = savedClosureReleaseEligibleFn;
     currentReturnTypeNode_ = savedRetNode;
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628
     emittingGenericTemplateBody_ = savedGenTemplate;  // #817
