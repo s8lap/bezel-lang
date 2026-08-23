@@ -319,6 +319,15 @@ public:
         // boxReturnMethods_, and the disposer (emitted after all method bodies)
         // sees a fully-populated boxStorageFields_.
         collectBoxReturnMethods();
+        // fix #2879: the STRING twin of boxReturnMethods_. Must run before
+        // any caller of isUserMethodObjectStringReturnCall — currently the
+        // Console.WriteLine / Debug.WriteLine path (tryLowerConsoleCall) and
+        // the §18.5 interpolation hole path (appendPart in
+        // LlvmBackend_Exprs.cpp). The pre-pass depends only on ctx_ and
+        // methodFns_, both populated above, so placing it next to its box
+        // sibling is sound (and isUserMethodObjectStringReturnCall is
+        // consulted only at emission time below).
+        collectObjectStringReturnMethods();
         collectBoxStorageFields();
         declareVtables();  // CG17: after functions exist (needs fn ptrs)
         // fix #2864 (§8.6 "Boxing" / §23.2 / §2.5, v0.240): MOVED UP from just
@@ -11657,6 +11666,34 @@ private:
     // expression body is of boxable type. Called once from run() before the
     // method-body emission loop.
     void collectBoxReturnMethods();
+    // fix #2879 (spec §8.5 / §28.3 / §28.9, v0.240): an analogous classification
+    // for OBJECT/INTERFACE-RETURNING METHODS WHOSE BODY ALWAYS RETURNS A +1
+    // STRING PRODUCER. The string twin of boxReturnMethods_: a call to such a
+    // method hands back EXACTLY +1 (a freshly-minted string, e.g. the runtime
+    // concat `"x" + S`, an interpolated string, a numeric `.ToString()`, a string
+    // `+`, or a nested call to another +1 string producer). At consumption
+    // positions that retain+release via `lowerObjectToString` (`Console.Write`
+    // and §18.5 interpolation), the producer's own +1 needs an extra discharge
+    // or it leaks — see #2879 for the measured 38 B/call (760 B / 40
+    // allocations over 20 iterations). isUserMethodObjectStringReturnCall
+    // recognizes a CallExpr to one of these methods; the consumer sites use it
+    // to gate the second release (the first being the render's +1, already
+    // discharged by `releaseRender` for the `P::Object` primitive path).
+    std::unordered_set<const sema::MethodSymbol*> objectStringReturnMethods_;
+    // Populate objectStringReturnMethods_. A method is added iff its declared
+    // return type is Object/interface, it is locally compiled (not imported),
+    // not an operator, and every ReturnStmt in its body carries a value whose
+    // AST is a +1 string producer (isPlusOneStringProducer). An arrow-body
+    // method counts iff its expression body itself is a +1 string producer.
+    // Called once from run() before any caller of isUserMethodObjectStringReturnCall.
+    void collectObjectStringReturnMethods();
+    // Predicate: is `init` a call to a locally-compiled, non-operator method
+    // whose declared return type is Object/interface AND whose body provably
+    // always returns a +1 string producer (every ReturnStmt value passes
+    // isPlusOneStringProducer; arrow body is itself a +1 string producer)?
+    // If yes, the call returns exactly +1 — the callee mints a fresh string and
+    // transfers ownership to the caller. Parallel to isUserMethodBoxReturnCall.
+    bool isUserMethodObjectStringReturnCall(const ast::Expr* init) const;
     // Scan all method / constructor bodies AND field initializers for stores
     // to Object/interface-typed CLASS instance fields. A field is added to
     // boxStorageFields_ ONLY if EVERY store to it (across all methods and

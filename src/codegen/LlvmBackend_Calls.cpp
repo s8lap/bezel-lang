@@ -594,6 +594,34 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     // arms that free() corrupted (see the `releaseRender` declaration above).
     if (releaseRender) {
         emitStringRelease(strPtr);
+        // fix #2879 (spec §8.5 / §28.3 / §28.9, v0.240): an OBJECT-typed argument
+        // that is itself a +1 string producer METHOD CALL (`m.Fresh()` where
+        // `Fresh(): Object => "x" + S`) transfers exactly +1 from the callee —
+        // the fresh string the callee's body minted. `lowerObjectToString`
+        // (#2846) RETAINs the receiver, which `releaseRender` above discharges
+        // (the render's +1); but the callee's OWN +1 is now orphaned unless the
+        // caller explicitly releases it. Without this extra discharge the
+        // string leaks (38 B/call measured on 564b6d1: 760 B / 40 allocations
+        // over 20 iterations, both in a Console.WriteLine(h.Fresh()) and in a
+        // `$"{h.Fresh()}"` interpolation — the bug is a string twin of #2865's
+        // BOX residual).
+        //
+        // Gating: `isUserMethodObjectStringReturnCall` is positive ONLY for a
+        // call to a LOCALLY-COMPILED, NON-OPERATOR method declared to return
+        // Object/interface whose body provably always returns a +1 string
+        // producer (every ReturnStmt passes isPlusOneStringProducer — runtime
+        // concat, interpolation, string `+`, `.ToString()`, etc.; an arrow body
+        // is itself a +1 string producer). An IDENTIFIER read (`var o := …;
+        // Console.WriteLine(o);`) is NOT a producer call — `o`'s own disposal
+        // handles its borrow — so the predicate is correctly negative and we
+        // don't over-release. `arg` and `strPtr` are the SAME runtime pointer
+        // (lowerObjectToString's PHI returns the retained receiver), so this is
+        // a second rc-aware release on the same string: rc goes from 2 to 1
+        // (render) to 0 (producer) → free at the second decrement.
+        if (call.args[0].value &&
+            isUserMethodObjectStringReturnCall(call.args[0].value.get())) {
+            emitStringRelease(arg);
+        }
     } else if (strPtr == arg && call.args[0].value &&
                isPlusOneStringProducer(call.args[0].value.get())) {
         // #1031 / §4.6 / §28.9: a fresh +1 STRING argument ($"..." interpolation,
@@ -9381,8 +9409,22 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
         }
         if (m == "WriteLine" && call.args.size() == 1 && call.args[0].value) {
             llvm::Value* msgPtr = lowerExpr(*call.args[0].value);
+            // fix #2879 (spec §8.5 / §28.3 / §28.9, v0.240): the OBJECT-typed
+            // call arm — a CallExpr to a method whose body provably always
+            // returns a +1 string producer (`m.Fresh()` where
+            // `Fresh(): Object => "x" + S`) — transfers exactly +1 from the
+            // callee. Debug.WriteLine is special-lowered and bypasses normal
+            // call-arg disposal; without an explicit release here the callee's
+            // +1 leaks (38 B/call measured on 564b6d1, the string twin of
+            // #2865). isPlusOneStringProducer on its own cannot recognize a
+            // user method returning Object whose body is a string producer —
+            // isUserMethodObjectStringReturnCall does. A borrow (IdentifierExpr
+            // read of an Object local holding a string) is NOT a producer call,
+            // so the predicate is correctly negative there.
             bool freshStr = msgPtr &&
-                            isPlusOneStringProducer(call.args[0].value.get());
+                            (isPlusOneStringProducer(call.args[0].value.get()) ||
+                             isUserMethodObjectStringReturnCall(
+                                 call.args[0].value.get()));
             if (!msgPtr) msgPtr = llvm::ConstantPointerNull::get(ptrTy());
             auto* wlFn = declareC("bz_debug_writeline",
                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});

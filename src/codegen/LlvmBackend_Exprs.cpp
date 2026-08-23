@@ -185,9 +185,24 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // is false and `pv` survives as the shared reference it is. A
             // freshly-rendered non-string part keeps the original `pv != srcEv`
             // release. (Mirrors the string `+` operand discipline, Exprs.cpp:6055.)
+            //
+            // fix #2879 (spec §8.5 / §28.3 / §28.9, v0.240): an OBJECT-typed hole
+            // that is a +1 string producer METHOD CALL (`$"{m.Fresh()}"` where
+            // `Fresh(): Object => "x" + S`) is the string twin of #2865's box
+            // residual. `lowerObjectToString` RETAINs the receiver (per #2846),
+            // so `pv != srcEv` is true here (the PHI is a new Value*) — the
+            // existing `pv != srcEv` arm above discharges the render's +1. The
+            // callee's OWN +1 (the fresh string the body minted) is then
+            // orphaned and leaks, identical to the Console.WriteLine sibling.
+            // `isUserMethodObjectStringReturnCall` recognizes the same method
+            // shape `tryLowerConsoleCall` recognizes, so both consumption
+            // positions close the leak in lockstep.
             if (pv != srcEv ||
                 (srcExpr && isPlusOneStringProducer(srcExpr)))
                 emitStringRelease(pv);
+            if (srcExpr && isUserMethodObjectStringReturnCall(srcExpr)) {
+                emitStringRelease(srcEv);
+            }
         };
         for (const auto& part : is->parts) {
             llvm::Value* pv = nullptr;

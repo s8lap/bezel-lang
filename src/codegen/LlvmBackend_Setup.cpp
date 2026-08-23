@@ -25727,6 +25727,122 @@ void Emitter::collectBoxReturnMethods() {
 }
 
 
+// fix #2879 (spec §8.5 / §28.3 / §28.9, v0.240): the STRING twin of
+// collectBoxReturnMethods. Populate objectStringReturnMethods_ BEFORE any
+// method bodies are lowered, so isUserMethodObjectStringReturnCall has a
+// complete set when its callers (`tryLowerConsoleCall` and the interpolation
+// `appendPart` lambda in LlvmBackend_Exprs.cpp) query it.
+//
+// A MethodSymbol is added to objectStringReturnMethods_ iff:
+//   (1) its declared return type is Object or an interface
+//       (isObjectOrInterfaceTarget) — same shape as the box pre-pass;
+//   (2) it is not imported — the callee body runs THIS module's codegen, so
+//       the +1 producer classification holds;
+//   (3) it is not an operator — operators are special-lowered and may have
+//       hidden call-arg lifetimes (mirroring the box pre-pass's exclusion);
+//   (4) every ReturnStmt in its body carries a value whose AST is a +1
+//       string producer (isPlusOneStringProducer); the boolean predicate
+//       mirrors the box pre-pass's isBoxableValueType / isNullableValueTy
+//       gate, but for strings: a runtime concat, an interpolation, a
+//       numeric `.ToString()`, a string `+`, a string slice, an `??` /
+//       `case` / `if` expression of the same kind, or — recursively — a
+//       call to another method in objectStringReturnMethods_.
+//
+// An arrow-body method counts iff its expression body itself is a +1 string
+// producer. A method with no ReturnStmt (empty body or fall-off) is NOT
+// added (it has no returns to count). A method whose body has a single
+// missing-value ReturnStmt is also excluded (its return is the void/default
+// `()`). Local naming follows the box pre-pass's `Scanner` struct: a closure
+// walks the body and ANDs "every return is a producer" while ORing
+// "any return exists" (a body with no returns cannot be classified).
+void Emitter::collectObjectStringReturnMethods() {
+    struct Scanner {
+        const sema::SemaContext& ctx;
+        Emitter& em;
+        bool allProducer = true;
+        bool hasReturn = false;
+
+        void scanStmts(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
+            for (auto& s : stmts) scanStmt(s.get());
+        }
+        void scanStmt(const ast::Stmt* s) {
+            if (!s || !allProducer) return;
+            if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+                if (rs->value) {
+                    hasReturn = true;
+                    if (!em.isPlusOneStringProducer(rs->value.get())) {
+                        allProducer = false;
+                    }
+                }
+                return;
+            }
+            if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+                scanStmts(is->ifBranch.body);
+                for (auto& br : is->elifBranches) scanStmts(br.body);
+                scanStmts(is->elseBody);
+            } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+                scanStmts(ws->body);
+            } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+                scanStmts(fs->body);
+            } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+                scanStmts(d->body);
+            } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+                scanStmts(ts->body);
+                for (auto& c : ts->catches)
+                    if (c.body) scanStmt(c.body.get());
+                scanStmts(ts->finallyBody);
+            } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+                for (auto& arm : cs->arms) scanStmts(arm.stmts);
+            }
+        }
+    };
+
+    for (auto& [sym, fn] : methodFns_) {
+        if (ctx_.isImported(sym)) continue;
+        auto* md = dynamic_cast<const ast::MethodDecl*>(sym->decl);
+        if (!md || !md->returnType) continue;
+        const sema::TypeRef* rt = ctx_.resolvedType(*md->returnType);
+        if (!rt || !isObjectOrInterfaceTarget(rt)) continue;
+
+        if (md->bodyKind == ast::MethodBodyKind::Expression && md->exprBody) {
+            // Arrow body: the body expression itself is the returned value.
+            if (isPlusOneStringProducer(md->exprBody.get()))
+                objectStringReturnMethods_.insert(sym);
+        } else if (md->bodyKind == ast::MethodBodyKind::Block && !md->stmts.empty()) {
+            Scanner sc{ctx_, *this};
+            sc.scanStmts(md->stmts);
+            if (sc.allProducer && sc.hasReturn)
+                objectStringReturnMethods_.insert(sym);
+        }
+        // Abstract or empty block body: not an object string return method.
+    }
+}
+
+
+// fix #2879 (spec §8.5 / §28.3 / §28.9, v0.240): predicate form of
+// objectStringReturnMethods_. A CallExpr whose resolved callee is a USER-
+// DEFINED, LOCALLY-COMPILED MethodSymbol (backed by an ast::MethodDecl, not
+// imported, not an operator) that appears in objectStringReturnMethods_ —
+// i.e. a method whose declared return type is Object/interface AND whose body
+// provably always returns a +1 string producer. Such a call hands back
+// EXACTLY +1: the fresh string the callee's body minted. The caller is the
+// +1 owner.
+//
+// Parallel to isUserMethodBoxReturnCall for boxes. Cross-module imported
+// methods are excluded (their callee does NOT run THIS module's
+// collectObjectStringReturnMethods classification).
+bool Emitter::isUserMethodObjectStringReturnCall(const ast::Expr* init) const {
+    auto* call = dynamic_cast<const ast::CallExpr*>(init);
+    if (!call || !call->callee) return false;
+    auto* sym = ctx_.exprSymbol(*call->callee);
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+    if (!ms) return false;
+    if (ms->isOperator) return false;
+    if (ctx_.isImported(ms)) return false;
+    return objectStringReturnMethods_.count(ms) != 0;
+}
+
+
 // #429 (box FIELD-STORE / disposal) / §8.6 / §28.9: see the declaration in
 // LlvmBackend_impl.hpp. For every class TypeSymbol, find all Object/interface-
 // typed instance fields and auto-properties. Then scan EVERY method and
