@@ -6660,6 +6660,66 @@ private:
         return isBuiltinExceptionTypeRef(ctx_.resolvedType(*fd->type));
     }
 
+    // fix #2830: an `owned` field whose type is a §10 FFI-boundary buffer
+    // (`CString` / `WString` / `RawBytes`). These are headerless malloc'd byte
+    // buffers (or, for RawBytes, a { ptr, len } struct whose `ptr` owns a
+    // malloc'd byte buffer, §10.3) — no object header, no vtable, no
+    // user TypeDecl reachable through rt->declaration (a §10 annotation
+    // `c: CString` resolves as a declaration-less Named TypeRef whose name
+    // rides headName() / importedName, the same shape #2809/#2823/#2825's
+    // isFfiBufferTypeRef reads through). Every other owned-field predicate
+    // — isOwnedReferenceField (requires class/interface declaration),
+    // isOwnedBuiltinExceptionField, isOwnedIteratorInterfaceField,
+    // isOwnedSharedWeakField, isOwnedSubscriptionField,
+    // isOwnedEventSourceField, taskFamilyTypeFromField,
+    // ownedCollectionFieldType — rejects this case, so before #2830 the
+    // field was silently SKIPPED by emitOwnedFieldDisposals and the malloc'd
+    // buffer leaked at every Holder disposal (measured: 21 B per Holder from
+    // bz_string_to_utf8z in Holder$ctor). Disposal here mirrors the
+    // `using var`-bound FFI buffer's `ffiBuffer` arm (Disposal.cpp, the
+    // ffiBuffer entry's flush path) and #2823's `registerUnwindOwnedParam`
+    // `ffiBuffer` arm: a null-guarded free / bz_rawbytes_free call.
+    //
+    // `isRawBytes` is set true for RawBytes fields so the iteration loop
+    // emits bz_rawbytes_free (which frees the byte buffer THEN the struct,
+    // stdlib §10.3 / fix #985), and false for CString/WString fields
+    // (which are a single malloc'd byte buffer, freed via libc free()).
+    //
+    // #662 foundation B: for IMPORTED fields (fs->decl == nullptr), the field's
+    // type rides ctx_.importedMemberType(fs) — same imported-MemberType path
+    // the other builtin-field predicates use, so an imported class with
+    // `public owned _c: CString` is repaired too (measured cross-module leak
+    // in the issue: 420 B / 20 constructions in a loop).
+    bool isOwnedFfiBufferField(const sema::FieldSymbol* fs,
+                               bool* isRawBytes = nullptr) const {
+        if (isRawBytes) *isRawBytes = false;
+        // §22.10 (v0.180) / #1594: a captured `owned` primary-ctor parameter
+        // typed as a §10 FFI buffer. Mirrors isOwnedReferenceField /
+        // isOwnedBuiltinExceptionField / isOwnedIteratorInterfaceField's
+        // posParam branch — capturedOwnedPrimaryParamType is defined further
+        // below, alongside isCapturedOwnedPrimaryParam; forward-declared use
+        // here is fine since this is a member function of the same class.
+        if (fs->posParam) {
+            const sema::TypeRef* pt = capturedOwnedPrimaryParamType(fs);
+            if (!isFfiBufferTypeRef(pt)) return false;
+            if (isRawBytes) *isRawBytes = (builtinTypeName(pt) == "RawBytes");
+            return true;
+        }
+        if (!hasOwnedModifier(fs)) return false;
+        const sema::TypeRef* rt = nullptr;
+        // #662 foundation B: imported field — type from importedMemberType.
+        if (!fs->decl) {
+            rt = ctx_.importedMemberType(fs);
+        } else {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->type) return false;
+            rt = ctx_.resolvedType(*fd->type);
+        }
+        if (!isFfiBufferTypeRef(rt)) return false;
+        if (isRawBytes) *isRawBytes = (builtinTypeName(rt) == "RawBytes");
+        return true;
+    }
+
     // #1643 / §28 / §29.7: an `owned` field whose type is a builtin ITERATOR
     // interface (IEnumerable<T> / IOwningEnumerable<T>) — a declaration-less
     // Named type whose runtime value is the iterator-vtable object

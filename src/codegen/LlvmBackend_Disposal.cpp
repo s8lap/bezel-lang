@@ -789,6 +789,24 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // iterField / eventSourceField / sharedField / weakField / subscription
         // companions for the other builtin-handle owned-field families.
         bool taskField = false;
+        // fix #2830: true for an owned field of a §10 FFI-boundary buffer type
+        // (CString / WString / RawBytes — stdlib §10.1–§10.3). These are
+        // headerless malloc'd byte buffers (or, for RawBytes, a { ptr, len }
+        // struct whose `ptr` owns a malloc'd byte buffer) with no object header
+        // and no vtable, so isOwnedReferenceField's vtable-Dispose path would
+        // either skip them entirely (the declaration-less annotation shape) or
+        // crash on a raw-buffer vtable dispatch. Released below via a null-
+        // guarded free() (CString/WString) or bz_rawbytes_free (RawBytes) —
+        // the SAME call the `using var`-bound FFI buffer's `ffiBuffer` arm and
+        // #2823's `registerUnwindOwnedParam` `ffiBuffer` arm emit, so the bound
+        // and unbound spellings free identically. RawBytes is dispatched via
+        // bz_rawbytes_free which frees the byte buffer THEN the struct
+        // (stdlib §10.3 / fix #985), and CString/WString via libc free().
+        bool ffiBufferField = false;
+        // fix #2830: RawBytes uses bz_rawbytes_free; CString/WString use
+        // libc free(). Mirrors the `rawBytes` flag on the `ffiBuffer` Disposal
+        // entry used by the local-scope / parameter paths.
+        bool rawBytes = false;
     };
     std::vector<OwnedField> owned;
     for (const sema::Symbol* m : ts->members) {
@@ -852,6 +870,32 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             of.taskField = true;
             owned.push_back(of);
         } else {
+            // fix #2830: an `owned` field of §10 FFI-buffer type (CString /
+            // WString / RawBytes — stdlib §10.1–§10.3). The companion arms
+            // (subscriptionField, iterField, eventSourceField, sharedField,
+            // weakField, taskField) all reject this case: the runtime value is
+            // a headerless malloc'd byte buffer (or, for RawBytes, a { ptr,
+            // len } struct whose `ptr` owns a malloc'd byte buffer, §10.3)
+            // with no object header and no vtable, so the vtable-Dispose path
+            // is wrong AND isOwnedReferenceField's declaration-based test
+            // misses the declaration-less annotation shape (§10 names
+            // resolve as a declaration-less Named TypeRef, #2809). The result
+            // pre-#2830 was that the field was silently SKIPPED here and the
+            // malloc'd buffer leaked at every disposal (measured: 21 B per
+            // Holder from bz_string_to_utf8z in Holder$ctor; 420 B / 20
+            // constructions in a loop for an imported Holder cross-module).
+            // Released below via a null-guarded free() (CString/WString) or
+            // bz_rawbytes_free (RawBytes) — the SAME call the using-var-bound
+            // FFI buffer's ffiBuffer arm (#2733) and the owned-parameter
+            // ffiBuffer arm (#2823) emit, so bound / field / parameter paths
+            // free identically.
+            bool isRaw = false;
+            if (isOwnedFfiBufferField(fs, &isRaw)) {
+                OwnedField of{fs, nullptr};
+                of.ffiBufferField = true;
+                of.rawBytes = isRaw;
+                owned.push_back(of);
+            } else {
             // §28.13 / stdlib §2.16 (#620): an `owned` field of Shared<T> or
             // Weak<T> type.  These are compiler-known ref-counted heap objects
             // with no user TypeDecl / no vtable; release via the appropriate
@@ -863,6 +907,7 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 else        of.sharedField = true;
                 owned.push_back(of);
             }
+        }
         }
     }
     for (auto it = owned.rbegin(); it != owned.rend(); ++it) {
@@ -1051,6 +1096,43 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(iterContBB);
             builder_.SetInsertPoint(iterContBB);
+            continue;
+        }
+        // fix #2830: owned FFI-buffer field (CString / WString / RawBytes — stdlib
+        // §10.1–§10.3). The runtime value is a headerless malloc'd byte buffer
+        // (or, for RawBytes, a { ptr, len } struct whose `ptr` owns a malloc'd
+        // byte buffer, §10.3) — no object header, no vtable. Released via a
+        // null-guarded free() (CString/WString) or bz_rawbytes_free (RawBytes,
+        // stdlib §10.3 / fix #985 — frees the byte buffer THEN the struct).
+        // The shape mirrors emitFfiBufferTempFree's null-guarded free and the
+        // iterField / taskField branches above (null-guard + null-after-store
+        // so a re-entrant / second pass is a no-op, per the #396 slot-null
+        // precedent). A `using var`-bound FFI buffer uses the SAME call
+        // (Disposal.cpp's ffiBuffer arm / #2733), so a `using var c := …` and
+        // a `_c := …; … _c.Dispose();` field dispose identically.
+        if (it->ffiBufferField) {
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                val, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* ffbDispBB = llvm::BasicBlock::Create(
+                llvm_, "owned.ffibuf.free", currentFn_);
+            auto* ffbContBB = llvm::BasicBlock::Create(
+                llvm_, "owned.ffibuf.cont", currentFn_);
+            builder_.CreateCondBr(isNull, ffbContBB, ffbDispBB);
+            builder_.SetInsertPoint(ffbDispBB);
+            if (it->rawBytes) {
+                // stdlib §10.3 / fix #985: a RawBytes is a { ptr, len } struct
+                // whose buffer is a separate allocation — both are reclaimed
+                // by the runtime helper.
+                auto* fn = declareC("bz_rawbytes_free",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(fn, {val});
+            } else {
+                builder_.CreateCall(freeFn(), {val});
+            }
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(ffbContBB);
+            builder_.SetInsertPoint(ffbContBB);
             continue;
         }
         // §28.6 / §30.5 (#1889): an owned Task / Task<T> / OwningTask<T>
