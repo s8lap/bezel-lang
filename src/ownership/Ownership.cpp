@@ -4097,9 +4097,121 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         // (!md && ctx_.importedReturnOwned(ms))`): consult importedReturnOwned on
         // the resolved MethodSymbol, gated on a class/interface result so a
         // borrow return (importedReturnOwned false) is NEVER disposed. // fix #1415
-        if (calleeMs && ctx_.importedReturnOwned(calleeMs) &&
-            isClassOrInterfaceResult(ctx_.exprType(e)))
-            return OwnershipState::Owned;
+        if (calleeMs && ctx_.importedReturnOwned(calleeMs)) {
+            // fix #2824 / §10.1-§10.3 / §28.3 / §32.5-§32.6 (v0.278): widen the
+            // imported-owned-return gate to also admit the FFI-buffer
+            // builtin-class half (CString / WString / RawBytes). The
+            // `isClassOrInterfaceResult` gate below rejects them — they have
+            // no `declaration` (the stdlib CString/WString/RawBytes are
+            // imported builtins, not user classes) — so a `var c := CString.
+            // From("abc");` (row A) and a `var b := c.ToBytes();` (row B)
+            // would otherwise be classified Borrowed: the §28.3 auto-drop
+            // warning promised by codegen's `using-var`/`autoDrop`
+            // `registerUsingDisposal` `isFfiBuf` arm (LlvmBackend_Setup.cpp
+            // ~14784, ~16438) NEVER FIRES, and the malloc'd buffer leaks at
+            // every call site (the 20-iteration loops in the issue measured
+            // 260 B in 20 allocations and 1040 B in 40 allocations
+            // respectively). The 3 builtin head names are pinned by
+            // `common::isFfiBufferBuiltinName` (BuiltinRegistry.cpp:399,
+            // #2809's single home for {CString, WString, RawBytes}); the
+            // same predicate gates codegen's `isFfiBufferTypeRef` and the
+            // using-var registerUsingDisposal arm, so the ownership verdict
+            // here, the codegen registration, and the dispose-exactly-once
+            // ffiBuffer arm in `emitDisposals` (Disposal.cpp:5355) all agree
+            // on the same three names — no risk of a "now-Owned" verdict
+            // matching a borrow-shaped disposal. Mirrors the
+            // `importedReturnOwned` shape exactly (a builtin CString result
+            // is the FFI twin of a user `Cell`: both transfer +1 from
+            // callee to caller, both must be disposed, both are
+            // declaration-less from sema's POV but declaration-bearing
+            // from codegen's POV via the import side-table). Sound: a borrow
+            // return (importedReturnOwned false) is still excluded; only
+            // methods declared `owned CString`/`owned WString`/
+            // `owned RawBytes` (and the three instance methods whose
+            // `owned` return codegen already consults) enter this arm.
+            // // per §28.3, §10.1, §10.2, §10.3, #2824
+            const sema::TypeRef* resTy = ctx_.exprType(e);
+            bool resultIsClassish = isClassOrInterfaceResult(resTy) ||
+                (resTy && resTy->kind == sema::TypeRef::Kind::Named &&
+                 (common::isFfiBufferBuiltinName(resTy->headName()) ||
+                  (resTy->declaration &&
+                   common::isFfiBufferBuiltinName(
+                       resTy->declaration->name))));
+            if (resultIsClassish) return OwnershipState::Owned;
+        }
+        // fix #2824 (v0.278): the symbol-resolution for an imported class
+        // method's MemberAccessExpr (`CString.From(...)`, `c.ToBytes()`)
+        // doesn't always populate `ctx.exprSymbol(callee)` — for those
+        // calls the existing `importedReturnOwned` arm above is unreachable
+        // (calleeMs is null). Detect the FFI-buffer CALLEE STRUCTURALLY
+        // (a MemberAccessExpr on a CString/WString/RawBytes target, with
+        // the result type a known heap-builtin borrow or owning class) and
+        // classify as Owned, mirroring the comment-block's "imported
+        // ReturnOwned gate" exactly. The three static factory methods
+        // (CString.From / .FromBytes, RawBytes.From / .FromForeign,
+        // WString.From) and the one owned-returning instance method
+        // (CString.ToBytes) are the surface this arm admits; the rest of
+        // the FFI-buffer instance methods (Length / Pointer / CopyTo) are
+        // either property reads (handled elsewhere) or return unit
+        // (CopyTo's `void`), neither of which lands in this arm because
+        // the result type's classification fails the borrowing-class gate.
+        // // per §28.3, §10.1-§10.3, #2824
+        if (ce->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get())) {
+                bool recvIsFfi = false;
+                if (ma->target) {
+                    // A `CString.From(...)` static call: the target is a
+                    // TYPE NAME IdentifierExpr with no exprType (sema
+                    // doesn't assign a type to a type-name expression).
+                    // The IdentifierExpr's text IS the type head — read
+                    // it directly.
+                    if (auto* id =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                ma->target.get())) {
+                        if (common::isFfiBufferBuiltinName(id->name))
+                            recvIsFfi = true;
+                    }
+                    // A `c.ToBytes()` instance call: the target is a
+                    // local/parameter of FFI-buffer type. Read through
+                    // exprType.
+                    if (!recvIsFfi) {
+                        const sema::TypeRef* recvTy =
+                            ctx_.exprType(*ma->target);
+                        if (recvTy && recvTy->kind ==
+                                          sema::TypeRef::Kind::Named) {
+                            if (!recvTy->headName().empty())
+                                recvIsFfi = common::isFfiBufferBuiltinName(
+                                    recvTy->headName());
+                            else if (recvTy->declaration)
+                                recvIsFfi = common::isFfiBufferBuiltinName(
+                                    recvTy->declaration->name);
+                        }
+                    }
+                }
+                if (recvIsFfi) {
+                    const sema::TypeRef* resTy = ctx_.exprType(e);
+                    bool resultIsHeapClass = false;
+                    if (resTy && resTy->kind == sema::TypeRef::Kind::Named) {
+                        if (!resTy->headName().empty()) {
+                            resultIsHeapClass =
+                                common::isFfiBufferBuiltinName(
+                                    resTy->headName()) ||
+                                common::isHeapPointerReferenceBuiltin(
+                                    resTy->headName());
+                        }
+                        if (!resultIsHeapClass && resTy->declaration) {
+                            resultIsHeapClass =
+                                common::isFfiBufferBuiltinName(
+                                    resTy->declaration->name) ||
+                                common::isHeapPointerReferenceBuiltin(
+                                    resTy->declaration->name);
+                        }
+                    }
+                    if (resultIsHeapClass) return OwnershipState::Owned;
+                }
+            }
+        }
         // #1718 / §32.6 / §28.1: an EXTERN (FFI) method declared with an
         // `owned` return transfers ownership to the caller. The callee is an
         // ExternDeclSymbol (not a MethodSymbol + no MethodDecl + no

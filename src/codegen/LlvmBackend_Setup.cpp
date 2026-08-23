@@ -19631,6 +19631,73 @@ struct StringEscapeWalker {
                     dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
                 if (ps && ps->modifier.empty()) safeArg = true;
             }
+            // fix #2824 / §10.1-§10.3 / §28.3 (v0.278): an instance method on
+            // an FFI-buffer receiver (CString.ToBytes / WString. ... /
+            // RawBytes.CopyTo) — `rb.CopyTo(dst, 0)` over `dst: Array<byte>` —
+            // is not resolvable to a MethodSymbol (the receiver's type is an
+            // imported builtin, the instance method is an imported builtin),
+            // so the ms-gated #1430 relaxation above does not fire and the
+            // walker would conservatively mark `dst` as escape. For the
+            // borrowing-Array walk that taints the local out of the scope-end
+            // free eligibility, so the `var dst: Array<byte> := [...];
+            // rb.CopyTo(dst, 0);` pattern leaks the backing (issue #2824
+            // row C: 56-byte direct + 16-byte indirect leak, 1 object each).
+            // The destination parameter is `Array<byte>` (a borrow by §28.3
+            // and stdlib §10.3: `CopyTo` copies INTO it) — the call cannot
+            // extend the local's lifetime past the synchronous call. The
+            // receiver is an FFI buffer (its own borrowed-malloc'd backing,
+            // not a borrowing Array), so treating the arg as a call-bounded
+            // borrow is sound: the callee does not retain the destination,
+            // and the receiver's lifetime is unrelated. Gated on
+            // `borrowingArrayMode` (the walks without the relaxation's
+            // matched counterpart fall through to conservative ESCAPE — the
+            // dict-materializer / grouping / record-call-result walks have
+            // no release-old-on-reassign step, and the same scope-end
+            // release arm doesn't fire on them). Mirrors the soundness
+            // rationale of #1430 (the resolved-method twin) and #2222 (the
+            // FFI extern twin) above. // per §28.3, §10.3, #2824
+            if (!safeArg && borrowingArrayMode && a.modifier.empty() &&
+                a.name.empty() && isTargetIdent(a.value.get()) && callee) {
+                if (auto* ma =
+                        dynamic_cast<const ast::MemberAccessExpr*>(callee)) {
+                    if (ma->target) {
+                        const sema::TypeRef* recvTy =
+                            ctx.exprType(*ma->target);
+                        // The receiver is a builtin FFI-buffer class
+                        // (CString/WString/RawBytes) — a borrow-shaped
+                        // receiver. Look up the type name through either
+                        // `headName` (covers the declaration-less builtin
+                        // TypeRef shape) or `declaration->name` (covers the
+                        // resolved-imports shape, where the imported class
+                        // gets a real TypeSymbol whose `name` field is
+                        // "CString" / "WString" / "RawBytes"). Either path
+                        // produces the same identifier set for the three
+                        // FFI-buffer classes (per #2809's `isFfiBufferTypeRef`
+                        // discipline, LlvmBackend_Calls.cpp:711).
+                        std::string_view recvName;
+                        if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named) {
+                            if (!recvTy->headName().empty())
+                                recvName = recvTy->headName();
+                            else if (recvTy->declaration)
+                                recvName = recvTy->declaration->name;
+                        }
+                        if (common::isFfiBufferBuiltinName(recvName)) {
+                            // Call is to a method on a CString/WString/RawBytes
+                            // receiver; stdlib §10.1-§10.3 documents every
+                            // instance method on these as borrow-taking. The
+                            // declared parameter modifier for these (when
+                            // resolvable) is plain (no `owned`), and the
+                            // codegen lowers them as plain bz_array_t* / void*
+                            // borrows (see RawBytes.CopyTo arm in
+                            // LlvmBackend_Calls.cpp:7264 — `dest` is
+                            // `lowerExpr`ed as a bare pointer with no
+                            // ownership transfer). Sound: the destination is
+                            // copied into, not retained.
+                            safeArg = true;
+                        }
+                    }
+                }
+            }
             // fix #2222 residue: a string local passed in a plain
             // (no-modifier, no-name) parameter position of an EXTERN
             // (FFI) callee is a CALL-BOUNDED borrow — the C side does
