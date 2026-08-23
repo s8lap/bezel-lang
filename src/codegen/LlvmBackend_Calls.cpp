@@ -622,6 +622,40 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
             isUserMethodObjectStringReturnCall(call.args[0].value.get())) {
             emitStringRelease(arg);
         }
+        // fix #2876 (spec §8.6 / §28.3 / §28.9, v0.278): the BOX twin of #2879.
+        // An Object-typed argument that is a +1 BOX producer method call
+        // (`h.M()` where `M(): Object => _n;`) transfers exactly +1 from the
+        // callee — the fresh box the callee's body minted. The strPtr above is
+        // a fresh +1 STRING the render (`lowerObjectToString`'s vtable thunk)
+        // minted and `releaseRender` already discharged; the callee's OWN +1
+        // (the BOX) is now orphaned unless we release it here. Without this
+        // extra discharge the box leaks (24 B/call measured on `f693622`: 480 B
+        // in 20 allocations over 20 iterations, both for `Console.WriteLine
+        // (h.M())` and `$"[{h.M()}]"` interpolation — the box twin of #2865's
+        // residual, since #2865 only closed the inline / `lastBoxMint_` and
+        // bound-local shapes; this is the box twin of #2879's string fix).
+        //
+        // Gating: `isUserMethodBoxReturnCall` is positive ONLY for a call to a
+        // LOCALLY-COMPILED, NON-OPERATOR method declared to return Object/
+        // interface whose body provably always returns a boxable value (every
+        // ReturnStmt passes isBoxableValueType / isNullableValueTy per the
+        // #2865 pre-pass `collectBoxReturnMethods`). An IDENTIFIER read
+        // (`var o: Object := box; Console.WriteLine(o);`) is NOT a producer
+        // call — `o`'s own scope-end disposal handles its borrow — so the
+        // predicate is correctly negative and we don't over-release. The BOX
+        // (`arg`) and the RENDERED STRING (`strPtr`) are DISTINCT runtime
+        // pointers (unlike #2879's string twin, where `arg` is its own string
+        // and `strPtr == arg`); `lowerObjectToString` does NOT retain the box
+        // (only the string arm retains, per #2846), so a SINGLE release on
+        // `arg` drops rc from 1 to 0 → free. The two predicates
+        // (`isUserMethodObjectStringReturnCall` and `isUserMethodBoxReturnCall`)
+        // classify disjoint sets (a method's body returns either a boxable
+        // value or a +1 string, never both), so this branch does not
+        // double-release on the same call.
+        if (call.args[0].value &&
+            isUserMethodBoxReturnCall(call.args[0].value.get())) {
+            emitBoxRelease(arg);
+        }
     } else if (strPtr == arg && call.args[0].value &&
                isPlusOneStringProducer(call.args[0].value.get())) {
         // #1031 / §4.6 / §28.9: a fresh +1 STRING argument ($"..." interpolation,

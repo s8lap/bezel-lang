@@ -203,6 +203,26 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (srcExpr && isUserMethodObjectStringReturnCall(srcExpr)) {
                 emitStringRelease(srcEv);
             }
+            // fix #2876 (spec §8.6 / §28.3 / §28.9, v0.278): the BOX twin of
+            // #2879. An Object-typed hole that is a +1 BOX producer method call
+            // (`$"[{h.M()}]"` where `M(): Object => _n;`) transfers exactly +1
+            // from the callee. `lowerObjectToString` does NOT retain the box
+            // (only the string arm retains, per #2846); `pv` is the rendered
+            // string (PHI result, distinct from `srcEv`) and the existing
+            // `pv != srcEv` arm above discharges the render's +1. The callee's
+            // OWN +1 (the BOX pointed to by `srcEv`) is orphaned unless we
+            // release it here. Without this the box leaks 24 B/call (480 B / 20
+            // iterations measured on `f693622`) — the interpolation twin of the
+            // Console.WriteLine sibling in LlvmBackend_Calls.cpp. The
+            // `isUserMethodBoxReturnCall` predicate is positive ONLY for a call
+            // to a method in `boxReturnMethods_`, the SAME pre-pass #2865 and
+            // the Console fix above use; the two predicates
+            // (`isUserMethodObjectStringReturnCall` and
+            // `isUserMethodBoxReturnCall`) classify disjoint sets, so this
+            // branch does not double-release on the same hole.
+            if (srcExpr && isUserMethodBoxReturnCall(srcExpr)) {
+                emitBoxRelease(srcEv);
+            }
         };
         for (const auto& part : is->parts) {
             llvm::Value* pv = nullptr;
