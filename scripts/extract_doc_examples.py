@@ -29,7 +29,7 @@ v2 improvements over v1:
   3. Re-extracted from the current docs (v0.138).
 
 Usage:
-  python3 scripts/extract_doc_examples.py [repo-root]
+  python3 scripts/extract_doc_examples.py [--repo-root PATH]
 """
 
 import os
@@ -48,7 +48,27 @@ DOCS = [
     ("stdlib", "docs/Bezel_Standard_Library.md"),
 ]
 
-REPO_ROOT = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DEFAULT_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Argument handling: the script used to take sys.argv[1] verbatim as the output
+# root, which silently turned `python3 scripts/extract_doc_examples.py --help`
+# into an extraction to `./--help/cases` and `./--help/manifest.tsv` and littered
+# the repo root three times across two sessions. argparse refuses flag shapes
+# upfront with exit code 2; only a `--repo-root PATH` (or its absence) is
+# admitted. Default behavior (no flag, default repo-root) is unchanged. (per #3262)
+import argparse
+_argparser = argparse.ArgumentParser(
+    description="Extract fenced bezel code blocks from the normative docs into "
+                "tests/conformance/cases/<doc-tag>_<seq>.bzl and write "
+                "tests/conformance/manifest.tsv.",
+    usage="%(prog)s [--repo-root PATH]",
+)
+_argparser.add_argument(
+    "--repo-root", default=_DEFAULT_REPO_ROOT, metavar="PATH",
+    help="Repository root to extract into (default: parent of this script).",
+)
+_args = _argparser.parse_args()
+REPO_ROOT = os.path.abspath(_args.repo_root)
 CASES_DIR = os.path.join(REPO_ROOT, "tests", "conformance", "cases")
 MANIFEST   = os.path.join(REPO_ROOT, "tests", "conformance", "manifest.tsv")
 
