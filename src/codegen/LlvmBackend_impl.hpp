@@ -8596,6 +8596,20 @@ private:
         return nullptr;
     }
 
+    // Saved state from `setupReceiverGenericSubst`: both the LLVM-type map
+    // (`genericSubst_`) AND the sema-type map (`genericSubstSemaTy_`) must
+    // be returned so the caller can restore them after the inlined body
+    // finishes. Restoring only the LLVM-type map leaves the sema-type map
+    // polluted with the inner receiver's bindings — a subsequent generic-
+    // subst lookup (e.g. a DIFFERENT generic receiver read in the same Main)
+    // would then resolve its `_v: T` field at the wrong offset. This
+    // mirrors the METHOD twin (Calls.cpp:~8980 / #3347) and the property
+    // inline-body twin (Exprs.cpp:~5360) — both save/restore BOTH maps.
+    struct SavedReceiverSubst {
+        std::unordered_map<std::string_view, llvm::Type*> subst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> semaTy;
+    };
+
     // per §11.8's strategy latitude (this implementation monomorphizes; proposal 0103 records the choice): install `genericSubst_` for a
     // member access / call / indexer get whose RECEIVER expression `target` has
     // a concrete instantiation of the generic class `parent` (e.g. the getter
@@ -8604,10 +8618,13 @@ private:
     // the receiver's `genericArgs`, falling back to the local's stored
     // `localGenericSubst_` when a positional arg is still the i32 fallback (the
     // identical pattern fieldAddr / the property getter path use). Returns the
-    // previous `genericSubst_` so the caller restores it after lowering the
-    // member; a no-op (returns the current map unchanged) when the receiver is
-    // not a concrete instantiation of `parent`.
-    std::unordered_map<std::string_view, llvm::Type*>
+    // previous BOTH maps (`genericSubst_` AND `genericSubstSemaTy_`) so the
+    // caller restores both after lowering the member — see `SavedReceiverSubst`
+    // above. Restoring only `genericSubst_` would leave the sema-type map
+    // polluted with the inner receiver's bindings. A no-op (returns the
+    // current maps unchanged) when the receiver is not a concrete
+    // instantiation of `parent`.
+    SavedReceiverSubst
     setupReceiverGenericSubst(const ast::Expr* target,
                               const sema::TypeSymbol* parent);
 

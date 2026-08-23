@@ -83,6 +83,13 @@
 //  T6 control: non-generic concrete derived class — already correct on
 //     HEAD, no regression.
 //  T7 ASan/LSan oracle: pre-fix poisoned-load, post-fix clean.
+//  T8 save/restore symmetry regression guard for
+//     `setupReceiverGenericSubst` (narrowed at pre-gate review): the
+//     function now returns BOTH maps (`SavedReceiverSubst`) and all four
+//     call sites restore both — see the §14.1 / #3346+#3348 narrow-fix
+//     commit message and the T8 cell body comment for the latent-defect
+//     analysis and the (intentional) non-fail-without-on-this-shape
+//     rationale.
 //
 // ── RELATED ──────────────────────────────────────────────────────────────
 //
@@ -373,6 +380,8 @@ BEZEL_TEST(xmod_imported_generic_indexer_property_3346_3348,
         10);
 }
 
+
+
 // ===========================================================================
 // T7 — ASan oracle: pre-fix the Y read overflowed the T→i32 slot
 // (the second `i32` of the `%record.Pt` slot is poisoned under ASan),
@@ -409,4 +418,74 @@ BEZEL_TEST(xmod_imported_generic_indexer_property_3346_3348,
     // 0 = ASan-clean AND value correct; 1 = value wrong; non-zero other =
     // ASan flagged a violation (typically exit 1, but libasan default).
     BEZEL_EXPECT_EQ(rc, 0);
+}
+
+// ===========================================================================
+// T8 — REGRESSION GUARD for the `setupReceiverGenericSubst` save/restore
+// symmetry narrowed at pre-gate review of #3346/#3348. Two INDEPENDENT
+// generic receivers in the same Main: the first read walks the inherited-
+// base substitution for `g[0]` (the T→Pt binding the prior T1–T7 exercise);
+// the second read walks a DIFFERENT generic receiver `q` whose own base
+// binding is `Q→Qt` (a different generic receiver, NOT a `GBase<Pt>`-shaped
+// one). Pre-fix the function returned only `savedSubst` (the LLVM-type
+// map) for the caller to restore, leaving `genericSubstSemaTy_` polluted
+// with the inner receiver's bindings — a symmetry break with the METHOD
+// twin (Calls.cpp:~8980 / #3347 path) and the property inline-body twin
+// (Exprs.cpp:~5360), both of which save and restore BOTH maps. The
+// narrow fix changes the function signature to return BOTH maps (struct
+// `SavedReceiverSubst`) and updates all four call sites to restore both,
+// mirroring the proven-correct discipline of those twins.
+//
+// This cell does NOT deterministically fail pre-fix on the simple
+// `g[0]; q[0]` interleaving — the second inherited-base call's
+// setupReceiverGenericSubst re-overwrites the polluted semaTy map
+// with its own bindings. The defect is LATENT and the pre-gate reviewer
+// flagged it as a contract violation: the function's stated return
+// semantic ("returning the previous map for the caller to restore") did
+// not match its side-effect semantic (it modifies BOTH maps). The cell
+// is here as a SHAPE GUARD: a future regression that re-introduces a
+// one-sided restore would surface as either a wrong-value read or an
+// ASan-flagged slot-overflow on the second receiver — and the
+// second-inherited-receiver shape (T1–T7 only exercise ONE such
+// receiver per Main) is the canonical shape any future symmetry-break
+// would manifest in. §14.1, v0.278.
+// ===========================================================================
+BEZEL_TEST(xmod_imported_generic_indexer_property_3346_3348,
+           t8_state_restoration_second_generic_receiver_in_same_main_14_1) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; "
+        "public record Pt "
+        "  public X: int; "
+        "  public Y: int; "
+        "end Pt; "
+        "public record Qt "
+        "  public A: int; "
+        "end Qt; "
+        "public class GBase<T> "
+        "  protected _v: T; "
+        "  public constructor(v: T) _v := v; end constructor; "
+        "  public property [i: int]: T => _v; "
+        "end GBase; "
+        "public class GD: GBase<Pt> "
+        "  public constructor(p: Pt) base(p); end constructor; "
+        "end GD; "
+        "public class QBase<Q> "
+        "  protected _v: Q; "
+        "  public constructor(v: Q) _v := v; end constructor; "
+        "  public property [i: int]: Q => _v; "
+        "end QBase; "
+        "public class QD: QBase<Qt> "
+        "  public constructor(q: Qt) base(q); end constructor; "
+        "end QD; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var g := new GD(new Pt(11, 12)); "
+        "    var first: Pt := g[0]; "
+        "    var q := new QD(new Qt(7)); "
+        "    var second: Qt := q[0]; "
+        "    return (if first.X = 11 and first.Y = 12 and second.A = 7 "
+        "            then 0 else 1); "
+        "  end Main; "
+        "end C;"),
+        0);
 }

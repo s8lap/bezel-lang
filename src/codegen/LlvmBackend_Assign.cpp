@@ -2106,7 +2106,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // the getter body (`=> _v`) loads the concrete record (§9: a record is a
     // value type), not its i32 erasure (which would truncate the multi-field
     // record to one word).
-    auto savedSubst = setupReceiverGenericSubst(ix.target.get(), ps->parent);
+    auto savedSubstPair = setupReceiverGenericSubst(ix.target.get(), ps->parent);
     // §9.2 / #794: a RECORD receiver is a by-value struct; the getter body reads
     // its fields through `this` as a pointer, so spill the value to a stack slot
     // and bind the address. (A class receiver is already a pointer — skip.) This
@@ -2166,7 +2166,8 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
-    genericSubst_ = std::move(savedSubst);
+    genericSubst_ = std::move(savedSubstPair.subst);
+    genericSubstSemaTy_ = std::move(savedSubstPair.semaTy);
     // fix #2814 (§28.3 "Unbound owned temporaries", v0.240): the INDEX half
     // of the same sentence the property half (#2751) covers — "used only by
     // borrowing operations within the expression … as a member or INDEX
@@ -2848,7 +2849,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     // §14.1 / #794: install the receiver's generic substitution (mirrors the
     // getter path) so a `T`-typed field read/write inside the setter body uses
     // the concrete layout, not the i32 erasure.
-    auto savedSubst = setupReceiverGenericSubst(ix.target.get(), ps->parent);
+    auto savedSubstPair = setupReceiverGenericSubst(ix.target.get(), ps->parent);
     // fix #2502: `obj` is already pointer-typed at this point — resolved
     // above via `lvalueAddr` (the receiver's own storage) or, for a
     // non-addressable temporary, via `lowerExpr` + spill. The old bare
@@ -2940,7 +2941,8 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
-    genericSubst_ = std::move(savedSubst);
+    genericSubst_ = std::move(savedSubstPair.subst);
+    genericSubstSemaTy_ = std::move(savedSubstPair.semaTy);
     return true;
 }
 
@@ -3717,7 +3719,7 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
         llvm::Value* savedThis = currentThis_;
         auto savedLocals = locals_;
         auto savedParams = paramSlots_;
-        auto savedSubst = setupReceiverGenericSubst(ix->target.get(), ps->parent);
+        auto savedSubstPair = setupReceiverGenericSubst(ix->target.get(), ps->parent);
         currentThis_ = obj;
         locals_.clear();
         paramSlots_.clear();
@@ -3730,7 +3732,8 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
         paramSlots_ = std::move(savedParams);
-        genericSubst_ = std::move(savedSubst);
+        genericSubst_ = std::move(savedSubstPair.subst);
+        genericSubstSemaTy_ = std::move(savedSubstPair.semaTy);
     }
     if (!cur) return false;
 

@@ -840,13 +840,22 @@ bool Emitter::isCollectionInterfaceName(const sema::TypeRef* rt) {
 // auto-hashable body records — §9.1 / §9.2). For such keys the generic
 // per §11.8's strategy latitude (this implementation monomorphizes; proposal 0103 records the choice): see the header comment. Build and
 // install `genericSubst_` from the receiver `target`'s concrete instantiation
-// of `parent`, returning the previous map for the caller to restore.
-std::unordered_map<std::string_view, llvm::Type*>
+// of `parent`, returning the previous BOTH maps (`genericSubst_` AND
+// `genericSubstSemaTy_`) for the caller to restore. Restoring only
+// `genericSubst_` would leave the sema-type map polluted with the inner
+// receiver's bindings — a subsequent generic-subst lookup on a DIFFERENT
+// generic receiver in the same Main would then resolve its `_v: T` field at
+// the wrong offset. Latent bug surfaced by the pre-gate review of the
+// #3346/#3348 narrow fix; the METHOD twin (Calls.cpp:~8980) and the property
+// inline-body twin (Exprs.cpp:~5360) already save and restore BOTH maps —
+// this function now mirrors that discipline.
+Emitter::SavedReceiverSubst
 Emitter::setupReceiverGenericSubst(const ast::Expr* target,
                                    const sema::TypeSymbol* parent) {
-    auto savedSubst = genericSubst_;
-    auto savedSemaTy = genericSubstSemaTy_;
-    if (!target || !parent) return savedSubst;
+    SavedReceiverSubst saved;
+    saved.subst = genericSubst_;
+    saved.semaTy = genericSubstSemaTy_;
+    if (!target || !parent) return saved;
     // fix #3143 (§14.1 / §2.5, v0.254): the parameter names through the one
     // both-sources accessor. The old `!parent->decl` early-out plus the AST-only
     // read meant an IMPORTED generic receiver installed NO substitution at all,
@@ -917,7 +926,7 @@ Emitter::setupReceiverGenericSubst(const ast::Expr* target,
                                             ancSema)) {
                 genericSubst_ = std::move(ancSubst);
                 genericSubstSemaTy_ = std::move(ancSema);
-                return savedSubst;
+                return saved;
             }
             // Path (c) — accessor declared on a non-generic class whose
             // body touches INHERITED generic-base type-parameter fields;
@@ -943,13 +952,13 @@ Emitter::setupReceiverGenericSubst(const ast::Expr* target,
             if (!addSubst.empty()) {
                 genericSubst_ = std::move(addSubst);
                 genericSubstSemaTy_ = std::move(addSema);
-                return savedSubst;
+                return saved;
             }
         }
-        return savedSubst;
+        return saved;
     }
     if (nGP != recvTy->genericArgs.size())
-        return savedSubst;
+        return saved;
     const std::vector<std::string_view> gpNames =
         sema::genericParamNames(parent);
     std::unordered_map<std::string_view, llvm::Type*> newSubst;
@@ -977,8 +986,7 @@ Emitter::setupReceiverGenericSubst(const ast::Expr* target,
     }
     genericSubst_ = std::move(newSubst);
     genericSubstSemaTy_ = std::move(newSema);
-    (void)savedSemaTy;
-    return savedSubst;
+    return saved;
 }
 
 // runtime variant is used; string and primitive keys keep their fast paths.
@@ -6887,10 +6895,11 @@ llvm::Value* Emitter::tryLowerResultCombinatorCall(const ast::CallExpr& call) {
     // struct the receiver's value actually has, AND so the element-type
     // derivations below (tLL/eLL) line up with the payload structs. Save and
     // restore mirrors the rest of codegen's per-call substitution convention.
-    auto savedRecvSubst =
+    auto savedRecvSubstPair =
         setupReceiverGenericSubst(ma->target.get(), recvTy->declaration);
     llvm::StructType* recvStSpec = choiceStruct(recvTy->declaration);
-    genericSubst_ = savedRecvSubst;
+    genericSubst_ = std::move(savedRecvSubstPair.subst);
+    genericSubstSemaTy_ = std::move(savedRecvSubstPair.semaTy);
     if (recvStSpec) recvSt = recvStSpec;
     // Lower the receiver expression. A local/parameter receiver lowers to a
     // pointer (the spilled struct slot); a fresh construction or match
