@@ -4842,7 +4842,7 @@ void Emitter::declareVtables() {
 
 
 void Emitter::collectTypeAndBases(const sema::TypeSymbol* ts,
-                         std::vector<const sema::TypeSymbol*>& out) {
+                         std::vector<const sema::TypeSymbol*>& out) const {
     std::vector<const sema::TypeSymbol*> frontier{ts};
     std::unordered_set<const sema::TypeSymbol*> seen{ts};
     std::size_t i = 0;
@@ -25831,6 +25831,24 @@ void Emitter::collectObjectStringReturnMethods() {
 // Parallel to isUserMethodBoxReturnCall for boxes. Cross-module imported
 // methods are excluded (their callee does NOT run THIS module's
 // collectObjectStringReturnMethods classification).
+//
+// fix #3349 (spec §8.5 / §28.3 / §28.9, v0.240): INTERFACE-DISPATCH sibling.
+// The direct-Object shape (a CallExpr whose exprSymbol is a concrete class
+// MethodSymbol in objectStringReturnMethods_) is admitted by the fast path
+// above. The interface-dispatch shape (`var o: IFoo := h; o.Fresh()`) sees
+// the abstract interface MethodSymbol, not the concrete implementation —
+// the predicate is correctly negative there in #2879, and the call leaks the
+// callee's +1. Extend the predicate to walk the receiver's static type to
+// the concrete MethodSymbol, gated on the receiver being statically
+// resolvable to a single concrete implementation:
+//   * class receiver: findMethodByName walks the class hierarchy to the
+//     override (mirrors the #2879 sibling at one indirection deeper).
+//   * interface receiver: enumerate locally-compiled implementer classes;
+//     admit ONLY when EXACTLY ONE such class's method is in
+//     objectStringReturnMethods_ (multi-implementor interfaces could dispatch
+//     to a non-producer override and over-release — that gate is what keeps
+//     the fix conservative; see the (F) NO-ADMIT ORACLE shape in
+//     object_temp_string_leak_interface_dispatch_3349_test.cpp).
 bool Emitter::isUserMethodObjectStringReturnCall(const ast::Expr* init) const {
     auto* call = dynamic_cast<const ast::CallExpr*>(init);
     if (!call || !call->callee) return false;
@@ -25839,7 +25857,61 @@ bool Emitter::isUserMethodObjectStringReturnCall(const ast::Expr* init) const {
     if (!ms) return false;
     if (ms->isOperator) return false;
     if (ctx_.isImported(ms)) return false;
-    return objectStringReturnMethods_.count(ms) != 0;
+    // Fast path: the #2879 direct-Object shape (concrete-method call).
+    if (objectStringReturnMethods_.count(ms)) return true;
+
+    // fix #3349: walk the receiver's static type to the concrete MethodSymbol.
+    // Both the class-typed and interface-typed receivers feed through this
+    // single indirection — `findMethodByName` resolves a class hierarchy
+    // member, the interface arm resolves the implementer enumeration.
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target) return false;
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named || !recvTy->declaration)
+        return false;
+    if (recvTy->declaration->kind == ast::TypeDeclKind::Class) {
+        // Receiver is statically a class — findMethodByName walks the class
+        // hierarchy for the override (or the method itself, when not
+        // overridden). Admit iff THAT concrete MethodSymbol is in
+        // objectStringReturnMethods_ — the producer classification is per-
+        // concrete-method, not per-interface-method, so the (E) OVER-RELEASE
+        // ORACLE (a method returning a stored field) is naturally excluded.
+        if (auto* concrete = findMethodByName(recvTy->declaration, ms->name))
+            return objectStringReturnMethods_.count(concrete) != 0;
+        return false;
+    }
+    if (recvTy->declaration->kind == ast::TypeDeclKind::Interface) {
+        // Receiver is statically an interface — enumerate LOCALLY-COMPILED
+        // implementer classes (skipping imported ones — their bodies do not
+        // run THIS module's collectObjectStringReturnMethods). The
+        // "single-implementor gate": admit ONLY when EXACTLY ONE such
+        // implementer exists in the entire program AND that one is a
+        // producer (its method is in objectStringReturnMethods_). Multi-
+        // implementor interfaces could dispatch to a non-producer override
+        // and over-release, so we leave that case deliberately un-admitted
+        // — even if one of the multiple is a producer. Counting the TOTAL
+        // implementers (rather than just producer-implementers) is the
+        // conservative direction: with one implementer, dispatch always
+        // reaches that one; with two or more, dispatch could land on any.
+        int total = 0;
+        sema::MethodSymbol* admit = nullptr;
+        for (const auto& symI : ctx_.symbols()) {
+            auto* c = dynamic_cast<const sema::TypeSymbol*>(symI.get());
+            if (!c || c->kind != ast::TypeDeclKind::Class) continue;
+            if (ctx_.isImported(c)) continue;
+            std::vector<const sema::TypeSymbol*> supers;
+            collectTypeAndBases(c, supers);
+            bool implIface = false;
+            for (auto* s2 : supers)
+                if (s2 == recvTy->declaration) { implIface = true; break; }
+            if (!implIface) continue;
+            total++;
+            if (auto* concrete = findMethodByName(c, ms->name))
+                if (objectStringReturnMethods_.count(concrete)) admit = concrete;
+        }
+        return total == 1 && admit != nullptr;
+    }
+    return false;
 }
 
 

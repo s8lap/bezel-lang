@@ -6034,7 +6034,7 @@ private:
     // CG35: the class's (or its bases') method implementing interface
     // method `name`, by name match (signatures match per §11.2).
     sema::MethodSymbol* findMethodByName(const sema::TypeSymbol* cls,
-                                         std::string_view name) {
+                                         std::string_view name) const {
         for (const sema::TypeSymbol* t = cls; t;) {
             for (sema::Symbol* m : t->members) {
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
@@ -6452,7 +6452,7 @@ private:
     // CG19: `ts` and all its transitive base types (classes + interfaces),
     // BFS, cycle-guarded.
     void collectTypeAndBases(const sema::TypeSymbol* ts,
-                             std::vector<const sema::TypeSymbol*>& out);
+                             std::vector<const sema::TypeSymbol*>& out) const;
 
     llvm::GlobalVariable* vtableOf(const sema::TypeSymbol* t);
 
