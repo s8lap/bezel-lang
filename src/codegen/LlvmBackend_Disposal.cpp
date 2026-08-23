@@ -3767,6 +3767,50 @@ llvm::Function* Emitter::valueBoxFreeThunk() {
 }
 
 
+// fix #2791 / §8.6 / §15.4 (v0.240): a standalone `void(void*)` thunk that
+// releases a §8.6 BOX element of a collection literal (a value type boxed into
+// an Object/interface slot by the #2771 fix's `boxForTarget` arm). Distinct
+// from valueBoxFreeThunk — the dict-value box is NOT refcounted (records are
+// value types — §3.2 / §9 — and the box is malloc+memcpy of value bytes), so
+// the dict-value thunk just `free`s; the element box IS refcounted (boxValue
+// sets rc=1, §8.6 / §28.9), so the element thunk goes through the runtime
+// refcount path — a box that has been RETAINED elsewhere (lambda capture,
+// field store, an outer OwningArray holding a borrowing inner) is not freed
+// underneath its other owner.
+//
+// Null-safe: bz_box_release treats a null pointer as a no-op, so an
+// already-moved / null slot in the array is safe (matches elementDisposerThunk
+// and sharedReleaseThunk on this point).
+//
+// Built once per module with its own IRBuilder so the active `builder_` insert
+// point is untouched (mirrors elementDisposerThunk / sharedReleaseThunk /
+// valueBoxFreeThunk on this point).
+llvm::Function* Emitter::boxElementDisposerThunk() {
+    if (boxElementDisposerThunk_) return boxElementDisposerThunk_;
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$boxElemDispose", module_.get());
+    llvm::Argument* b_arg = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    auto* relBB  = llvm::BasicBlock::Create(llvm_, "box.rel",  fn);
+    auto* retBB  = llvm::BasicBlock::Create(llvm_, "box.ret",  fn);
+    llvm::IRBuilder<> b(entry);
+    b.CreateCondBr(
+        b.CreateICmpEQ(b_arg, llvm::ConstantPointerNull::get(ptrTy())),
+        retBB, relBB);
+    b.SetInsertPoint(relBB);
+    auto* relFn = declareC("bz_box_release",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    b.CreateCall(relFn, {b_arg});
+    b.CreateBr(retBB);
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+    boxElementDisposerThunk_ = fn;
+    return fn;
+}
+
+
 llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
     // #401 / stdlib §4.8: only a BORROWING Dictionary<K,V> whose value type V is
     // a RECORD or a NULLABLE VALUE TYPE stores a heap box per value (the encode in

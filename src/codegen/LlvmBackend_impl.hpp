@@ -1634,6 +1634,18 @@ private:
     // #401 / stdlib §4.8: the cached value-box-free thunk (built lazily) for a
     // borrowing Dictionary<K, record>'s heap-boxed record values.
     llvm::Function* valueBoxFreeThunk_ = nullptr;
+    // fix #2791 / §8.6 / §15.4 (v0.240): the cached per-element box-release
+    // thunk (built lazily) for a collection literal whose elements are all
+    // boxed value types. The thunk calls bz_box_release per element, mirroring
+    // the existing per-element-string-release / per-element-class-vtable-dispatch
+    // thunks the array backend dispatches to at dispose time. Distinct from
+    // valueBoxFreeThunk_ — the dict-value box is NOT refcounted (records are
+    // value types — §3.2 / §9 — and the box is just malloc+memcpy), so the
+    // dict-value thunk just `free`s; the element box IS refcounted (boxValue
+    // sets rc=1, §8.6 / §28.9), so the element thunk goes through the runtime
+    // refcount path so a retained box (lambda capture, etc.) is not freed
+    // underneath its other owner.
+    llvm::Function* boxElementDisposerThunk_ = nullptr;
 
     // CG21c (§31.2): when a `return`/`break`/`continue` exits a `try`-with-
     // `finally` block, the finally body must run before the actual jump.
@@ -8534,6 +8546,17 @@ private:
     // box (nothing extra to free). The two are mutually exclusive, so the
     // value box is never freed twice.
     llvm::Function* dictValueBoxFreer(const sema::TypeRef* dictTy);
+
+    // fix #2791 / §8.6 / §15.4 (v0.240): a standalone `void(void*)` thunk that
+    // releases a §8.6 BOX element of a collection literal (a value type boxed
+    // into an Object/interface slot by the #2771 fix's `boxForTarget` arm).
+    // Calls bz_box_release per element — the runtime refcount path — so a
+    // retained box (lambda capture, an outer OwningArray holding a borrowing
+    // inner, etc.) is not freed underneath its other owner. Null-safe
+    // (bz_box_release is null-safe). Mirrors the shape of elementDisposerThunk
+    // and sharedReleaseThunk (own IRBuilder, doesn't disturb the active insert
+    // point) and is built once per module and cached.
+    llvm::Function* boxElementDisposerThunk();
 
     // #362 / stdlib §4.5: is genericArgs[idx] of `collTy` a class type (whose
     // runtime objects carry a vtable with a Dispose at slot 1)?

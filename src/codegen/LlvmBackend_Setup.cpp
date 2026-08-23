@@ -12475,6 +12475,40 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         if (llvm::Function* nodeFree =
                                 literalTreeNodeDisposerFor(declNode, collTy))
                             d.collectionElemDisposer = nodeFree;
+                        // fix #2791 / §8.6 / §15.4 (v0.240): the literal's elements
+                        // are all §8.6 boxes (the #2771 `boxForTarget` minted them)
+                        // when the declared element type is Object/interface AND
+                        // every element source is a boxable value type. The header
+                        // disposer was stamped by materializeHeapCollectionLiteral
+                        // above; mirror it here so the scope-end bz_array_free call
+                        // actually invokes it (the default null disposer for a
+                        // ClassBorrow element policy would leave the boxes leaked —
+                        // exactly 24 B/element under LSan). Set BEFORE the
+                        // literalTreeNodeDisposerFor branch above only when the
+                        // literal isn't a tree aggregate, so the two never collide.
+                        if (!d.collectionElemDisposer) {
+                            const sema::TypeRef* elt =
+                                (!collTy->genericArgs.empty())
+                                    ? collTy->genericArgs[0] : nullptr;
+                            bool litAllBoxes =
+                                elt && isObjectOrInterfaceTarget(elt) &&
+                                !cl->elements.empty();
+                            if (litAllBoxes) {
+                                for (const auto& elPtr : cl->elements) {
+                                    if (!elPtr) continue;
+                                    const sema::TypeRef* srcTy =
+                                        ctx_.exprType(*elPtr);
+                                    if (!srcTy ||
+                                        (!isBoxableValueType(srcTy) &&
+                                         !isNullableValueTy(srcTy))) {
+                                        litAllBoxes = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (litAllBoxes)
+                                d.collectionElemDisposer = boxElementDisposerThunk();
+                        }
                         disposeStack_.back().push_back(d);
                     }
                     // fix #2142 / §28.9 / §28.11 (v0.220): reclaim the backing of
@@ -26965,6 +26999,71 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     // never tagged and keeps a NULL header, i.e. today's behaviour exactly.
     stampOwningElemDisposer(arr, elemRef, common::isOwningPrefixedName(name));
 
+    // fix #2791 / §8.6 / §15.4 (v0.240): a literal whose element TYPE is
+    // Object/interface AND whose every element SOURCE is a boxable value type
+    // (§8.6: a record / primitive / enum / inline-array / span / unit / Range
+    // / nullable-value source) stores a heap-allocated §8.6 box in every slot
+    // (the #2771 fix's `boxForTarget` arm below mints it, rc=1). Without a
+    // disposer the box leaks — exactly 24 bytes / element, measured by LSan.
+    //
+    // §15.4 governs who owns the box:
+    //   - OWNING literal (OwningArray<IRank> := [new Pt(3)]): the array fully
+    //     owns the box. The element disposer must call bz_box_release per
+    //     element at array-dispose time. The existing elementDisposerThunk
+    //     routes through the element's vtable Dispose slot, which for a BOX
+    //     vtable is a no-op `builtinDisposeFn_`; the thunk then `free(box)`s
+    //     the wrapper, which works for rc=1 boxes but bypasses the refcount
+    //     (a retained box — by a lambda capture, a field store, or an outer
+    //     OwningArray holding a borrowing inner — would be UAF'd) and skips
+    //     the bz_obj_identity_hash_forget side-table erase.
+    //   - BORROWING literal (Array<IRank> := [new Pt(3)]): the array co-owns
+    //     the box exactly like it co-owns Array<string> strings — every
+    //     element is the +1 producer's reference, transferred into the array
+    //     slot. The element disposer must call bz_box_release per element at
+    //     array-dispose time, mirroring stringElementReleaseThunk. Today's
+    //     ClassBorrow policy stamps a NULL disposer for an interface-typed
+    //     element, so the box leaks — the §2791 defect.
+    //
+    // Both cases use the same box-release thunk (`boxElementDisposerThunk`):
+    // it calls bz_box_release (the runtime refcount path), which is null-safe
+    // (already-moved / null slots are no-ops) and respects any other retain
+    // of the box. The two cases differ only in WHETHER the header was already
+    // stamped — owning has the class-vtable disposer installed above, so this
+    // site OVERRIDES it (stamp-then-override is supported: bz_array_set_elem_disposer
+    // is idempotent — #2608 noted this for the erased free path); borrowing
+    // has a NULL header, so this site INSTALLS it for the first time.
+    //
+    // Mixed literals (some elements boxed, some class instances) are
+    // deliberately NOT covered by this branch: a single void(void*) disposer
+    // cannot distinguish a class instance from a box at runtime (they share
+    // the same pointer shape; calling bz_box_release on a class instance would
+    // treat the vtable word as a refcount and corrupt it). For mixed literals
+    // the existing elementDisposerThunk stays correct for the class slots
+    // and incidentally frees the rc=1 boxes via its tail `free(obj)` — same
+    // bypass as the all-box owning case, the same standing trade.
+    bool allBoxesAreBoxable = false;
+    if (elemRef && isObjectOrInterfaceTarget(elemRef) && !cl->elements.empty()) {
+        allBoxesAreBoxable = true;
+        for (const auto& elemPtr2 : cl->elements) {
+            if (!elemPtr2) continue;
+            const sema::TypeRef* srcTy = ctx_.exprType(*elemPtr2);
+            if (!srcTy || (!isBoxableValueType(srcTy) && !isNullableValueTy(srcTy))) {
+                allBoxesAreBoxable = false;
+                break;
+            }
+        }
+    }
+    if (allBoxesAreBoxable) {
+        // fix #2791: install the box-release disposer. For an owning literal
+        // this overrides the class-vtable disposer stampOwningElemDisposer
+        // installed above; for a borrowing literal it sets the (previously
+        // NULL) header for the first time, closing the leak.
+        llvm::Function* boxDisp = boxElementDisposerThunk();
+        auto* setFn = declareC("bz_array_set_elem_disposer",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+        builder_.CreateCall(setFn, {arr, boxDisp});
+    }
+
     // Store each element in textual order via bz_array_add (same as `.Add`).
     auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
                            {ptrTy(), ptrTy(), i64()});
@@ -26986,13 +27085,24 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         auto* clitSavedInsert = builder_.GetInsertBlock();
         llvm::BasicBlock* clitEnclosing = unwindBB();
         bool clitOwnsElems = common::isOwningPrefixedName(name);
+        // fix #2791: the throw-mid-literal cleanup MUST release the boxes it
+        // has already stored. For an all-box literal (owning OR borrowing) the
+        // boxes in `arr` at the throw site are co-owned by `arr` exactly like
+        // the boxes that survive to scope end; passing elementDisposerArg here
+        // would use the static-type policy (ClassOwned → vtable disposer for
+        // owning, ClassBorrow → NULL for borrowing) and either mis-dispose the
+        // boxes (the no-op Dispose + tail-free path) or leak them (the NULL
+        // disposer path). The same box-release thunk installed in the header
+        // above is the correct per-element disposer here.
+        llvm::Value* throwDisp = allBoxesAreBoxable
+            ? llvm::cast<llvm::Value>(boxElementDisposerThunk())
+            : elementDisposerArg(elemRef, clitOwnsElems);
         auto* clitCleanup =
             llvm::BasicBlock::Create(llvm_, "clit.elem.cleanup", currentFn_);
         builder_.SetInsertPoint(clitCleanup);
         auto* clitFreeFn = declareC("bz_array_free",
             llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-        builder_.CreateCall(clitFreeFn,
-            {arr, elementDisposerArg(elemRef, clitOwnsElems)});
+        builder_.CreateCall(clitFreeFn, {arr, throwDisp});
         builder_.CreateBr(clitEnclosing);
         builder_.SetInsertPoint(clitSavedInsert);
         unwindTarget_ = clitCleanup;

@@ -76,8 +76,20 @@ int runChecked(const std::string& program) {
 // `BEZEL_AOT_FORCE_SANITIZE=address` build of the same program reported no leak
 // while the harness's build reported it reliably.  Measure with the harness's
 // own options (`detect_leaks=1:exitcode=99:abort_on_error=0`).
+//
+// fix #2791 / §8.6 / §15.4 (v0.240): the boxed cases are now clean under LSan
+// — the literal materializer installs the bz_box_release disposer for any
+// all-boxes literal, and the borrowing/owning distinction in
+// `materializeHeapCollectionLiteral`'s `allBoxesAreBoxable` branch routes both
+// Array<IRank> (ClassBorrow → NULL disposer pre-fix → 24 B/elem leak) and
+// OwningArray<IRank> (ClassOwned → vtable dispose + tail-free pre-fix, which
+// incidentally freed rc=1 boxes but bypassed the refcount + side-table erase)
+// to a per-element bz_box_release thunk. The full LSan oracle (`runAotChecked`
+// with `detect_leaks=1:exitcode=99:abort_on_error=0`) now asserts the
+// dispose-exactly-once claim the original lenient oracle declined to make;
+// promote the helpers here.
 int runBoxed(const std::string& program) {
-    auto r = bezel::test::runAotCheckedLenient(program);
+    auto r = bezel::test::runAotChecked(program);
     return r.ran ? r.exitCode : -999;
 }
 
