@@ -50,6 +50,7 @@
 
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
@@ -58,7 +59,7 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/. An earlier
+// Per-process unique working dir under the shared scratch base. An earlier
 // partial pass added a LOCAL copy of unique_stem + g_temp_stem_counter (now
 // superseded by the canonical tests/support/unique_stem.hpp header included
 // above) and dropped the counter, but kept fs::temp_directory_path() — which
@@ -69,12 +70,7 @@ namespace fs = std::filesystem;
 // canonical header. popen() is kept — per-stem uniqueness already mitigates
 // the file-overwrite race; full fork isolation is a separate concern.
 const std::filesystem::path& wtDir3177w() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-3177w");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-3177w");
 }
 
 struct TempFile3177W {

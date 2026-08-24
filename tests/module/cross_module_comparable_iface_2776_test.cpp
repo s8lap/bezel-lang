@@ -47,24 +47,20 @@
 
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 namespace fs = std::filesystem;
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// Per-process unique working dir under the shared scratch base. The previous
 // fs::temp_directory_path() (== /tmp tmpfs) + non-atomic counter pattern was
 // race-prone: parallel shards overwrote each other's source/object files
 // mid-compile, garbling the in-flight child read. The atomic unique_stem
 // + /var/tmp/bezel-scratch parent fixes that class of flake (#3002-class).
 const std::filesystem::path& wtDir2776() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-2776");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-2776");
 }
 
 struct TempFile {

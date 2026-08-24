@@ -44,6 +44,7 @@
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
 #include "support/codegen_support.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
@@ -58,15 +59,10 @@ using bezel::test::parseAndCheckOwnership;
 namespace {
 namespace fs = std::filesystem;
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
-// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+// Per-process unique working dir, under the shared scratch base (never
+// /tmp — see support/scratch_dir.hpp) and reaped at process exit.
 static const std::filesystem::path& wtDir1388() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-1388");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-1388");
 }
 
 // Full pipeline (DA + ownership) for value-observable disposal checks.

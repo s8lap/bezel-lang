@@ -48,6 +48,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
@@ -59,15 +60,10 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
-// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+// Per-process unique working dir, under the shared scratch base (never
+// /tmp — see support/scratch_dir.hpp) and reaped at process exit.
 static const std::filesystem::path& wtDir429ap() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-429ap");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-429ap");
 }
 
 // Compile + run natively; return exit code or -1 on failure.

@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
@@ -34,7 +35,7 @@
 namespace bezel::module {
 namespace {
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// Per-process unique working dir under the shared scratch base. The previous
 // std::filesystem::temp_directory_path() (== /tmp tmpfs) was race-prone even
 // with unique_stem: parallel shards racing on the SAME /tmp parent dir
 // overwrote each other's .bzl / .o mid-compileObject. The
@@ -42,12 +43,7 @@ namespace {
 // COVERAGE SHORT). popen() at L51 is kept — per-stem uniqueness already
 // mitigates the file-overwrite race; full fork isolation is a separate concern.
 const std::filesystem::path& wtDir1485() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-1485");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-1485");
 }
 
 struct TempFile {

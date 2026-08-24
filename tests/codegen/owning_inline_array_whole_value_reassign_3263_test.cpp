@@ -59,6 +59,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
@@ -73,14 +74,9 @@ using bezel::test::runAot;
 namespace {
 namespace fs = std::filesystem;
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// Per-process unique working dir under the shared scratch base (DISK-backed per CLAUDE.md).
 static const std::filesystem::path& wtDir3263() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-3263");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-3263");
 }
 
 // Cell: destructor-counter idiom (the dispose-exactly-once oracle).

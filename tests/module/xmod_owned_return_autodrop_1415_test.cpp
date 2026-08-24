@@ -53,13 +53,14 @@
 #include "llvm/IR/Module.h"
 
 #include "native_test_harness.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 
 
 namespace bezel::module {
 namespace {
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/. The hardcoded
+// Per-process unique working dir under the shared scratch base. The hardcoded
 // shared /var/tmp/bezel-scratch/wt-1415/ path was the cause of the #3002-class
 // xmod COVERAGE SHORT: every shard that ran this test wrote its dep.bzl /
 // rt_asan.o to the same directory, so concurrent attempts overwrote each other's
@@ -67,12 +68,7 @@ namespace {
 // shard crashed with SIGBUS. Process-unique stem (atomic counter + ::getpid)
 // gives every shard its own directory under the same parent.
 const std::filesystem::path& wtDir1415() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-1415");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-1415");
 }
 
 

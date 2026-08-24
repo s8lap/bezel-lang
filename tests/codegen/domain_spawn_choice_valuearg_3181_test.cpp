@@ -47,6 +47,7 @@
 #include "driver/Driver.hpp"
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "native_test_harness.hpp"
 #include "test_harness.hpp"
@@ -71,14 +72,10 @@ using bezel::test::runAot;
 
 namespace {
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed
+// Per-process unique working dir under the shared scratch base (DISK-backed
 // per CLAUDE.md; /tmp tmpfs races across shards).
 static const fs::path& wtDir3181() {
-    static const fs::path dir =
-        fs::path("/var/tmp/bezel-scratch") / unique_stem("wt-3181");
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-3181");
 }
 
 int run(const std::string& program) {

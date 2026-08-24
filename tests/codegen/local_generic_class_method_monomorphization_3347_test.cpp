@@ -68,6 +68,7 @@
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 #include "native_test_harness.hpp"
@@ -90,15 +91,11 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// ── Per-test workdir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
+// ── Per-test workdir under the shared scratch base (DISK-backed per CLAUDE.md).
 // The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races
 // across shards.
 static const fs::path& wtDir3347() {
-    static const fs::path dir =
-        fs::path("/var/tmp/bezel-scratch") / unique_stem("wt-3347");
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-3347");
 }
 
 int run(const std::string& prog) {

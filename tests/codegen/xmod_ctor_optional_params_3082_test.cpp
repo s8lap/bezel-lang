@@ -126,6 +126,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
@@ -133,16 +134,11 @@
 namespace bezel::codegen {
 namespace {
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/ (same rationale
+// Per-process unique working dir under the shared scratch base (same rationale
 // as the sibling imported-record test: /tmp tmpfs races between fork'd shards
 // would silently destroy the lib.o the app build needs to link against).
 const std::filesystem::path& wtDir3082() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-3082");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-3082");
 }
 
 struct TempFile {

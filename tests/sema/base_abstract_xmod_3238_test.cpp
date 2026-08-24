@@ -64,6 +64,7 @@
 #include "driver/Driver.hpp"
 #include "test_harness.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the ONE sanitizer-honouring compileFile wrapper
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 
 namespace bezel::sema {
@@ -72,11 +73,7 @@ namespace {
 namespace fs = std::filesystem;
 
 const fs::path& wtDir3238() {
-    static const fs::path dir =
-        fs::path("/var/tmp/bezel-scratch") / unique_stem("wt-3238");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-3238");
 }
 
 struct TempFile3238 {

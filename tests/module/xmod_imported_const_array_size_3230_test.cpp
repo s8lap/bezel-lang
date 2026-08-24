@@ -63,6 +63,7 @@
 
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
@@ -73,12 +74,7 @@ namespace {
 namespace fs = std::filesystem;
 
 const std::filesystem::path& wtDir3230() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-3230");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-3230");
 }
 
 struct TempFile3230 {

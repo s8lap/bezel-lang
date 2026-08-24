@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
+#include <system_error>
 #include <unistd.h>
 
 #include <fcntl.h>
@@ -14,6 +16,7 @@
 #include <unordered_set>
 
 #include "support/force_sanitize.hpp"
+#include "support/scratch_dir.hpp"
 #include "test_harness.hpp"
 
 // Test entry point — compiled into EVERY per-area test binary
@@ -152,6 +155,27 @@ static void atomicWriteShardSummary(const std::string& path,
 }
 
 int main(int argc, char** argv) {
+    // ── Point TMPDIR at the disk-backed scratch base, before any test runs ──
+    // 247 test TUs place their temp files with std::filesystem::temp_directory_path(),
+    // which is TMPDIR-or-/tmp — and /tmp here is a 16 GB tmpfs (RAM) with a
+    // per-user quota. Those files leaked: on 2026-08-24 the accumulated debris
+    // hit the 12,774 MB quota, every write to /tmp began failing EDQUOT, and
+    // that wedged the session tooling itself for three sessions. Rather than
+    // edit 247 call sites (and trust every future one to remember), set the
+    // variable the standard function reads, once, in the entry point every
+    // per-area test binary shares. temp_directory_path() is not cached, so
+    // setting it here covers every later call — and child processes the
+    // harness forks (clang, ld) inherit it, keeping their temporaries off the
+    // tmpfs too. CLAUDE.md: scratch must never live in /tmp.
+    //
+    // overwrite=0: an operator who exported TMPDIR deliberately keeps it.
+    {
+        std::error_code ec;
+        const std::string& base = bezel::test::aot_detail::scratchBase();
+        std::filesystem::create_directories(base, ec);
+        if (!ec) ::setenv("TMPDIR", base.c_str(), /*overwrite=*/0);
+    }
+
     // Wall-clock start for the structured summary's elapsed_s field (#3012
     // Phase 2a). Captured before any test work so it reflects the whole shard.
     const auto t0 = std::chrono::steady_clock::now();

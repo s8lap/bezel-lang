@@ -60,6 +60,7 @@
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "native_test_harness.hpp"
 #include "test_harness.hpp"
@@ -85,11 +86,7 @@ using bezel::test::runAot;
 namespace {
 
 static const fs::path& wtDir3237() {
-    static const fs::path dir =
-        fs::path("/var/tmp/bezel-scratch") / unique_stem("wt-3237");
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-3237");
 }
 
 int run(const std::string& program) {

@@ -31,24 +31,20 @@
 #include <string>
 
 #include "runtime/bezel_runtime.h"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
 namespace {
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// Per-process unique working dir under the shared scratch base. The previous
 // hardcoded /tmp/bzt_*.bin literal paths (== /tmp tmpfs) were race-prone:
 // parallel shards running sibling tests with the same hardcoded name
 // overwrote each other's files mid-test. The atomic unique_stem +
 // /var/tmp/bezel-scratch parent fixes that class of flake (#3002-class
 // COVERAGE SHORT).
 const std::filesystem::path& wtDir() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-fileio-errpaths");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-fileio-errpaths");
 }
 
 // A path that is guaranteed not to exist (nested under a nonexistent dir, so

@@ -19,6 +19,7 @@
 // destObj.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fcntl.h>
 #include <filesystem>
@@ -29,6 +30,8 @@
 #include <system_error>
 #include <unistd.h>
 #include <vector>
+
+#include "support/scratch_dir.hpp"  // the ONE scratch-root policy
 
 namespace bezel::native_test {
 
@@ -68,14 +71,47 @@ inline std::string runtimeSourcePath() { return runtimeSourceDir().string(); }
 // -fsanitize=<san>, `ld -r`-combined. Returns the cached master object path,
 // or "" if the toolchain is unavailable or any step fails (callers then SKIP).
 //
-// The master lives under /var/tmp/bezel-scratch (DISK-backed — never
-// fs::temp_directory_path(): per-shard TMPDIRs are tmpfs, and 16 shards each
-// rebuilding ~100MB of ASan objects into RAM both thrashes the box and costs
-// minutes per shard), keyed by a hash of the source dir so parallel worktrees
+// The master lives beside the shared scratch base (DISK-backed — never
+// fs::temp_directory_path(): that is tmpfs, and 16 shards each rebuilding
+// ~100MB of ASan objects into RAM both thrashes the box and costs minutes per
+// shard), keyed by a hash of the source dir so parallel worktrees
 // get distinct masters. Cross-process safety + dedup via flock on a sibling
 // lock file: the first process builds, the rest wait then reuse. Freshness is
 // mtime-based against every file in src/runtime (sources AND headers), so an
 // edited runtime invalidates the shared master without a manual clean.
+// Age-gated eviction for the rt-objs cache. The key is a hash of the runtime
+// SOURCE DIR, i.e. of the worktree path — so every lane worktree ever created
+// mints a fresh key that is never reused once that worktree is reaped. Without
+// eviction the cache only grows: measured 2026-08-24 at 717 keys / 8.7 GB, of
+// which 563 belonged to worktrees that no longer existed. Entries are pure
+// build products (a `ld -r` of the runtime under one sanitizer), so dropping a
+// live one costs a rebuild, never correctness.
+//
+// Runs once per process, and only removes keys untouched for
+// BEZEL_RT_OBJS_MAX_AGE_DAYS (default 14) — far longer than any single run, so
+// it can never race a concurrent shard's in-flight build.
+inline void evictStaleRtObjs(const std::filesystem::path& rtRoot) {
+    namespace fs = std::filesystem;
+    static const bool once = [&] {
+        const char* e = std::getenv("BEZEL_RT_OBJS_MAX_AGE_DAYS");
+        const int days = (e && *e) ? std::atoi(e) : 14;
+        if (days <= 0) return true;  // 0 disables
+        const auto maxAge = std::chrono::hours(24 * days);
+        std::error_code ec;
+        const auto now = fs::file_time_type::clock::now();
+        for (fs::directory_iterator it(rtRoot, ec), end; !ec && it != end;
+             it.increment(ec)) {
+            std::error_code e2;
+            if (!it->is_directory(e2) || e2) continue;
+            const auto mt = fs::last_write_time(it->path(), e2);
+            if (e2) continue;
+            if (now - mt > maxAge) fs::remove_all(it->path(), e2);
+        }
+        return true;
+    }();
+    (void)once;
+}
+
 inline const std::string& sanitizerRuntimeMaster(const std::string& san) {
     static std::map<std::string, std::string> cache;
     auto it = cache.find(san);
@@ -89,9 +125,15 @@ inline const std::string& sanitizerRuntimeMaster(const std::string& san) {
 
     std::error_code ec;
     const fs::path srcDir = runtimeSourceDir();
-    fs::path dir = fs::path("/var/tmp/bezel-scratch/rt-objs") /
+    // Derived from the ONE scratch-root policy rather than hardcoded, so this
+    // cache can never be pointed at /tmp by accident (support/scratch_dir.hpp).
+    const fs::path rtRoot =
+        fs::path(bezel::test::aot_detail::scratchBase()).parent_path() /
+        "rt-objs";
+    fs::path dir = rtRoot /
                    std::to_string(std::hash<std::string>{}(srcDir.string()));
     fs::create_directories(dir, ec);
+    evictStaleRtObjs(rtRoot);
     if (ec) return out;
 
     const std::string combined =

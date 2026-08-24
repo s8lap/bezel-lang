@@ -73,13 +73,14 @@
 #include "driver/Driver.hpp"
 #include "support/driver_run_support.hpp"  // #3156: the sanitizer-honouring compileFile wrapper
 #include "test_harness.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 
 
 namespace bezel::module {
 namespace {
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/. The hardcoded
+// Per-process unique working dir under the shared scratch base. The hardcoded
 // shared /var/tmp/bezel-scratch/wt-3189/ path was the cause of the #3002-class
 // xmod COVERAGE SHORT: every shard that ran this test wrote its dep.bzl /
 // rt_asan.o to the same directory, so concurrent attempts overwrote each other's
@@ -87,12 +88,7 @@ namespace {
 // shard crashed with SIGBUS. Process-unique stem (atomic counter + ::getpid)
 // gives every shard its own directory under the same parent.
 const std::filesystem::path& wtDir3189() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-3189");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-3189");
 }
 
 

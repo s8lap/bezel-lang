@@ -14,6 +14,7 @@
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
 #include "support/ownership_support.hpp" // parseAndCheckOwnership — #1718 vacuous-lint verifier
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
@@ -22,15 +23,10 @@ using bezel::test::runAotChecked;
 
 namespace {
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
-// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+// Per-process unique working dir, under the shared scratch base (never
+// /tmp — see support/scratch_dir.hpp) and reaped at process exit.
 static const std::filesystem::path& wtDirCg26() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-cg26");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-cg26");
 }
 
 int run(const std::string& program) {

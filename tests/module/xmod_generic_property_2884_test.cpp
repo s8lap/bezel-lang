@@ -87,6 +87,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
@@ -96,7 +97,7 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/. The previous
+// Per-process unique working dir under the shared scratch base. The previous
 // fs::temp_directory_path() (== /tmp tmpfs) was race-prone even with
 // unique_stem: parallel shards racing on the SAME /tmp parent dir overwrote
 // each other's _a.bzl / _a.o / _b.bzl mid-compileObject. The
@@ -104,12 +105,7 @@ namespace fs = std::filesystem;
 // COVERAGE SHORT). popen() at L179 is kept — per-stem uniqueness already
 // mitigates the file-overwrite race; full fork isolation is a separate concern.
 const std::filesystem::path& wtDir2884() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-2884");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-2884");
 }
 
 struct TempFile2884 {

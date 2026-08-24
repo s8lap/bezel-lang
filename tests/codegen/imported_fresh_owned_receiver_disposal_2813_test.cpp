@@ -115,6 +115,7 @@
 
 #include "codegen/LlvmBackend.hpp"
 #include "driver/Driver.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
@@ -123,17 +124,12 @@ namespace {
 
 namespace fs = std::filesystem;
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed
+// Per-process unique working dir under the shared scratch base (DISK-backed
 // per CLAUDE.md). The library object MUST outlive the app build — a removed
 // .o shows up as `bezelc: error: cannot load module metadata from ...`. The
 // `TempFile` shared_ptrs in the helpers below keep it open.
 static const std::filesystem::path& wtDir2813() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-2813");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-2813");
 }
 
 struct TempFile {

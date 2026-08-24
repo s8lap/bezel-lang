@@ -36,6 +36,7 @@
 #include "support/Diagnostic.hpp"
 #include "support/aot_support.hpp"      // runAot — AOT oracle (JIT->AOT migration)
 #include "support/codegen_support.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "native_test_harness.hpp"
 #include "test_harness.hpp"
@@ -48,15 +49,10 @@ using bezel::test::runAot;
 namespace {
 namespace fs = std::filesystem;
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
-// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+// Per-process unique working dir, under the shared scratch base (never
+// /tmp — see support/scratch_dir.hpp) and reaped at process exit.
 static const std::filesystem::path& wtDir1328() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-1328");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-1328");
 }
 
 // AOT oracle: drop-on-overwrite (§28.7) is disposal codegen, but the programs

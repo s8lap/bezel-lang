@@ -49,22 +49,19 @@
 #include "llvm/IR/Module.h"
 
 #include "native_test_harness.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 
 
 namespace bezel::module {
 namespace {
 
-// Per-process unique working dir. The hardcoded /tmp/wt-707/ path was
-// flaky across shards (concurrent overwrites race the in-flight compileObject
-// child's read). Process-unique stem (atomic counter + ::getpid) gives every
-// shard its own directory under the same parent.
+// Per-process unique working dir, under the shared scratch base (never
+// /tmp — see support/scratch_dir.hpp) and reaped at process exit. The
+// process-unique stem is what keeps concurrent shards from racing each
+// other's files mid-compile.
 const std::filesystem::path& wtDir707() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/tmp") / unique_stem("wt-707");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-707");
 }
 
 

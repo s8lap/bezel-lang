@@ -28,6 +28,7 @@
 #include "driver/Driver.hpp"
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
 #include "support/codegen_support.hpp"
+#include "support/scratch_dir.hpp"
 #include "support/unique_stem.hpp"
 #include "test_harness.hpp"
 
@@ -623,15 +624,10 @@ BEZEL_TEST(codegen_521_overflow, normal_add_still_exact_regression_spec_6_4) {
 
 namespace {
 
-// Per-process unique working dir under /var/tmp/bezel-scratch/ (DISK-backed per CLAUDE.md).
-// The hardcoded /tmp tmpfs and std::to_string(counter++) anti-pattern races across shards.
+// Per-process unique working dir, under the shared scratch base (never
+// /tmp — see support/scratch_dir.hpp) and reaped at process exit.
 static const std::filesystem::path& wtDir521() {
-    static const std::filesystem::path dir =
-        std::filesystem::path("/var/tmp/bezel-scratch") /
-        unique_stem("wt-521");
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir;
+    return wtScratchDir("wt-521");
 }
 
 // Compile `source` to a temp native executable and run it; returns the
