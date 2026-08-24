@@ -5860,10 +5860,30 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // The only extra obligation is #1918's transfer bookkeeping (null
             // the caller's slot at the "call about to run" point), performed
             // explicitly at the call below since this hand-rolled path does not
-            // use buildOrderedArgs. `scoped` stays excluded — it is a different
-            // (lifetime, not transfer) obligation and is filed, not guessed at.
+            // use buildOrderedArgs.
+            //
+            // fix #2687 (a) / §22.3 "Parameter modifiers" / §28.14 (v0.278):
+            // the by-value `scoped` CALL-SITE MARKER against a `scoped` formal
+            // is admitted on the same one-line predicate. §22.3: "a class- or
+            // interface-typed `scoped` argument is written `M(scoped x)` —
+            // the same mark-it-at-the-site discipline as the `move` marker
+            // above, though `scoped` remains an *argument modifier*." Lowering
+            // is again identical to a plain positional argument — `scoped` is
+            // by value, `isByRefMod("scoped")` is false, the loop below takes
+            // its `lowerExpr` path, and the pointer the callee stores in a
+            // non-`owned` field of the constructed instance is the same value
+            // a borrow would yield. The freeze obligation is enforced
+            // statically by `MethodOwnership::scopedFormalAt`'s NewExpr arm
+            // (Ownership_Checks.cpp), which #3176 widened to the resolved
+            // ConstructorSymbol, so the call-shape is fully checked before
+            // lowering — there is no runtime freeze-call this predicate has to
+            // guard. Pre-fix this combination fell through to the bare
+            // `return obj` branch and tripped #2658's loudness warning, so
+            // the field the ctor body would have set kept its default — a
+            // program that compiled but with a degraded instance.
             if (!a.modifier.empty() && !isByRefMod(a.modifier) &&
-                !(a.modifier == "owned" && importedFormalMod(ai) == "owned"))
+                !(a.modifier == "owned" && importedFormalMod(ai) == "owned") &&
+                !(a.modifier == "scoped" && importedFormalMod(ai) == "scoped"))
                 { allPositional = false; break; }
         }
         // fix #2658: whether the `bz$T$ctor` call was actually emitted. Every
