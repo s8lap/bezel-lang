@@ -313,6 +313,13 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // §2.8.2 / #2351: static field initializer source text for generic
     // classes — same staleness reasoning as ctorBodyText/methodBodyText.
     hashStr(h, m.fieldInitText);
+    // §14.1 / §23 / §2.8.2 / §2.8.3 rule 4 (#2893): property/indexer body
+    // source text for generic classes — same staleness reasoning as
+    // ctorBodyText/methodBodyText (a body change must mark dependents
+    // stale, since the importer monomorphizes it per instantiation; the
+    // #2884 commit message documents the silent wrong-value measurement
+    // that would result if the importer cached a stale body).
+    hashStr(h, m.propertyBodyText);
     // §11.3 (issue #502): hash nested type when present.
     hashBool(h, m.nestedType != nullptr);
     if (m.nestedType) hashTypeDecl(h, *m.nestedType);
@@ -540,6 +547,10 @@ MetaMember::MetaMember(const MetaMember& o)
       modifiers(o.modifiers), type(o.type), valueText(o.valueText),
       ctorBodyText(o.ctorBodyText), methodBodyText(o.methodBodyText),
       fieldInitText(o.fieldInitText),
+      // fix #2893 (§14.1 / §23 / §2.8.2 / §2.8.3 rule 3): property /
+      // indexer body source text — additive to the existing body-text
+      // trio (ctor/method/fieldInit), same staleness role.
+      propertyBodyText(o.propertyBodyText),
       isPure(o.isPure), hasSetter(o.hasSetter),
       setterVisibility(o.setterVisibility), isAutoProperty(o.isAutoProperty),
       hasGetter(o.hasGetter), isEventStatic(o.isEventStatic),
@@ -563,6 +574,10 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         modifiers = o.modifiers; type = o.type; valueText = o.valueText;
         ctorBodyText = o.ctorBodyText; methodBodyText = o.methodBodyText;
         fieldInitText = o.fieldInitText;
+        // fix #2893 (§14.1 / §23 / §2.8.2 / §2.8.3 rule 3): property
+        // / indexer body source text — additive to the existing
+        // body-text trio, same staleness role.
+        propertyBodyText = o.propertyBodyText;
         isPure = o.isPure; hasSetter = o.hasSetter;
         setterVisibility = o.setterVisibility;
         isAutoProperty = o.isAutoProperty; hasGetter = o.hasGetter;
@@ -637,6 +652,13 @@ bool MetaMember::operator==(const MetaMember& o) const {
            valueText == o.valueText && ctorBodyText == o.ctorBodyText &&
            methodBodyText == o.methodBodyText &&
            fieldInitText == o.fieldInitText &&
+           // fix #2893 (§14.1 / §23 / §2.8.2 / §2.8.3 rule 3): the
+           // property/indexer body source text is part of a Property's
+           // signature identity — same reasoning as ctorBodyText /
+           // methodBodyText / fieldInitText above (a body change must
+           // mark dependents stale, since the importer monomorphizes
+           // the body per instantiation).
+           propertyBodyText == o.propertyBodyText &&
            nestedEq;
 }
 
@@ -930,6 +952,19 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // byte-identical metadata to before this fix.
     if (m.kind == MetaMemberKind::Field && !m.fieldInitText.empty())
         emitString(w, m.fieldInitText);
+    // §14.1 / §23 / §2.8.2 / §2.8.3 rule 4 (#2893, schema v7 additive):
+    // for a Property or Indexer member of a GENERIC class or record, a
+    // second trailing REC_STRING carries the property/indexer body source
+    // text. Emitted ONLY when non-empty, mirroring methodBodyText's own
+    // additive shape — a module with no generic-class property/indexer
+    // body produces byte-identical metadata to before this fix.
+    // (valueText is the FIRST trailing string for any member kind; for a
+    // Property that is the auto-property initializer text, #2467; this
+    // is the SECOND.)
+    if ((m.kind == MetaMemberKind::Property ||
+         m.kind == MetaMemberKind::Indexer) &&
+        !m.propertyBodyText.empty())
+        emitString(w, m.propertyBodyText);
     // fix #3140 (§9.8 / §10, schema v7 additive): for an EnumConstant member
     // carrying a `serialized "<name>"` rename, a second trailing REC_STRING
     // holds the wire name. Emitted ONLY when non-empty, exactly as
@@ -1790,6 +1825,15 @@ bool readMemberBody(Reader& r, MetaMember& m) {
         // present) is the static field's initializer EXPRESSION source text.
         else if (m.kind == MetaMemberKind::Field)
             caps[1] = &m.fieldInitText;
+        // §14.1 / §23 / §2.8.2 / §2.8.3 rule 4 (#2893): a Property or
+        // Indexer member's second trailing REC_STRING (when present) is
+        // the generic-class property/indexer body source text. Absent
+        // for a non-generic class (the existing ABI is correct), for an
+        // Auto-bodied property/indexer (no user body — the #2478
+        // isAutoProperty bit is enough), and for any pre-#2893 blob.
+        else if (m.kind == MetaMemberKind::Property ||
+                 m.kind == MetaMemberKind::Indexer)
+            caps[1] = &m.propertyBodyText;
         // fix #3140 (§9.8 / §10): an EnumConstant member's second trailing
         // REC_STRING (when present) is its `serialized "<name>"` wire rename.
         // Absent for a constant with no clause and for any pre-#3140 blob, in

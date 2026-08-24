@@ -1451,6 +1451,71 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 sv = pd->autoAccessorVis;
             }
             out.setterVisibility = toMetaVisibility(sv, inInterface);
+            // §14.1 / §23 / §23.1 / §23.3 / §23.4 / §2.5 / §2.8.2 /
+            // §2.8.3 rule 4 (fix #2893, v0.240): export the FULL
+            // PropertyDecl source text (from the visibility/modifier
+            // prefix through the terminating `;` — `pd->span` is stamped
+            // since #2418's parser-side change) for a Property or Indexer
+            // member of a GENERIC class. Mirrors ctorBodyText /
+            // methodBodyText exactly: the importer re-parses it in a
+            // fresh SemaContext (ModuleLoader.cpp parseAndAttachPropertyBody,
+            // the property/indexer twin of parseAndAttachCtorBody /
+            // -MethodBody), attaches the resulting ast::PropertyDecl to
+            // the imported PropertySymbol, and the existing
+            // computedGetterOf / blockGetterOf / computedSetterOf /
+            // lowerPropertyCompound call-site code falls through to the
+            // inline-body path on `pd != null`, with the active
+            // `genericSubst_` lowering `pd->type` / `pd->indexerParams`
+            // to the substituted layout (T → %record.Pt, not T → i32).
+            // This is the cross-module equivalent of the local
+            // generic-property lowering that #2884's own T8 control
+            // pinned (the same generic class, used inside its OWN
+            // module, is fully correct in every spelling — proving the
+            // codegen path is right; the only gap is the body-text
+            // carriage this fix adds).
+            //
+            // SCOPE — only an Expression-bodied or Block-bodied
+            // property/indexer of a GENERIC class carries a body worth
+            // re-parsing:
+            //   * Auto body (`property X: T := v;` / `property X: T;`)
+            //     — no user body to inline; the storage layout is the
+            //     existing `propIsAutoStorage_` /
+            //     `isAutoPropertyStorageSymbol` path (#2478). The
+            //     exporter exports `isAutoProperty=true` instead.
+            //   * abstract (`public abstract property X: T;`) — no body
+            //     by §12.5; the §12.5 abstract-shorthand path is the
+            //     `isAutoProperty=true` flag above (#2939).
+            //   * non-generic class — uses the external
+            //     `bz$<Class>$<Prop>$propget` ABI; no per-instantiation
+            //     body needed.
+            // Same predicate the ctor/method carriages use. The
+            // `isGenericType` gate (the parent's `genericParams` is
+            // non-empty) is the only predicate; the per-class shape
+            // guards above are folded into the bodyKind check. The
+            // span gate (`begin.offset < end.offset && end.offset <=
+            // source.size()`) matches the ctor/method arms — a
+            // degenerate span (zero-width or out of range) is silently
+            // skipped, leaving `propertyBodyText` empty (the safe
+            // pre-fix state — the §14.1/#783 sema gate for methods
+            // stays in force).
+            //
+            // fix #2893 (v0.240): this block MUST live INSIDE the
+            // `if (auto* pd = ...)` arm above so `pd` is in scope
+            // (the original commit `5116fc0` placed it outside the
+            // `if (pd)` close, and the salvage WIP for the parallel
+            // #3348 scaffolding re-applied that placement — both
+            // failed to compile with "use of undeclared identifier
+            // 'pd'" at the `pd->span` access).
+            if (isGenericType &&
+                (pd->bodyKind == ast::PropertyBodyKind::Expression ||
+                 pd->bodyKind == ast::PropertyBodyKind::Block) &&
+                !source.empty() &&
+                pd->span.begin.offset < pd->span.end.offset &&
+                pd->span.end.offset <= source.size()) {
+                out.propertyBodyText = std::string(
+                    source.substr(pd->span.begin.offset,
+                                  pd->span.end.offset - pd->span.begin.offset));
+            }
         }
         return true;
     }

@@ -13322,51 +13322,93 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
     // monomorphization, which needs the accessor bodies carried in the
     // artifact the way `methodBodyText`/`ctorBodyText` already carry
     // method and constructor bodies (#2884, #428 family).
+    //
+    // fix #2893 (§14.1 / §23 / §2.5 / §2.8.2 / §2.8.3 rule 4, v0.240):
+    // the propertyBodyText carriage (ModuleMetadataBuilder's
+    // propertyBodyText span-extraction + ModuleLoader's
+    // parseAndAttachPropertyBody) closes #2884's decline for the
+    // COMPUTED/BLOCK-bodied non-virtual, non-static case. With a real
+    // ast::PropertyDecl attached to the imported PropertySymbol, codegen's
+    // `computedGetterOf` / `blockGetterOf` / `computedSetterOf` /
+    // `blockSetterOf` / `lowerPropertyCompound` paths engage, the same
+    // paths the LOCAL generic-class property path uses (the one #2884's
+    // own T8 control test pins), and monomorphize per instantiation
+    // with `genericSubst_` active — including the layout-moving case the
+    // #2945 narrow-predicate used to refuse (a `T`-typed field on the
+    // receiver moves the layout, but the re-parsed body is lowered
+    // against the substituted layout exactly the way the local twin is).
+    //
+    // What still has no working path:
+    //   * VIRTUAL / OVERRIDE / ABSTRACT on an imported generic base —
+    //     the exporter skips the accessor stub for the virtual case
+    //     (the vtable slot for the generic base is NULL by #2894's
+    //     refusal, kept by #2943's codegen-side partial fix). The
+    //     interface-typed shape that reaches a virtual on the generic
+    //     base via the itable is the #2943 / #3170 arm below; this arm
+    //     fires for the direct (non-interface) case.
+    //   * STATIC on an imported generic class — the exporter skips
+    //     static properties (`mod == "static"` gate at
+    //     LlvmBackend_Setup.cpp ~2459), so the `$propget`/`$propset`
+    //     symbols are not emitted.
+    //
+    // The decline now fires for THREE shapes:
+    //   (1) VIRTUAL / OVERRIDE / ABSTRACT on an imported generic base —
+    //     the exporter skips the accessor stub (the vtable slot for the
+    //     generic base is NULL by #2894's refusal, kept by #2943's
+    //     codegen-side partial fix).
+    //   (2) STATIC on an imported generic class — the exporter skips
+    //     static properties (`mod == "static"` gate at
+    //     LlvmBackend_Setup.cpp ~2459), so the `$propget`/`$propset`
+    //     symbols are not emitted.
+    //   (3) PROPERTY'S OWN TYPE references a generic param of the
+    //     receiver class — the carried body's read of the property
+    //     type uses the substituted T (a string here), but the read
+    //     path for a reference-typed T (a property whose declared type
+    //     IS the generic param, on a layout-moving receiver) has an
+    //     independent SEGV today (measured at HEAD on the local twin
+    //     `class GLocalT5<T> { _t: T; property P: T get=>_t;
+    //     set=>do _t := value; end; }` + `g.P := "hi"` at `T = string`:
+    //     exits 139 — the read of `_t` for the property's return type
+    //     substitution works, but the WRITE for a reference-typed T
+    //     does not). Until that lands, keep the own-type-uses-T arm
+    //     as the conservative refusal.
+    //
+    // The LAYOUT-MOVING arm from #2945 (own or any ancestor's field
+    // references the receiver class's own generic param) is DROPPED —
+    // the codegen re-lowers the carried body under the substitution,
+    // and a body that doesn't reference T directly (e.g. `=> _w + 100`
+    // when only `_w` is read) monomorphizes correctly, the field's
+    // storage width at substitution time being invisible to the body.
+    // Measured on the #2945 T4 (`_t: T; _w: int; property P: int
+    // get => _w + 100`) re-pinned: returns 100.
     if (!ips->isIndexer && ips->parent &&
         ctx_.isImported(ips->parent) &&
         !ips->parent->genericParams.empty() &&
         (ips->parent->kind == ast::TypeDeclKind::Class ||
          ips->parent->kind == ast::TypeDeclKind::Record) &&
-        // fix #2945 (§14.1 / §2.8.3 rule 4 / §2.5 / §23, v0.252): narrow
-        // #2884's decline to admit the layout-identical, non-virtual,
-        // non-static case whose accessor #2894's export-side lift made
-        // correct. The cheap sema-side proxy "no field of the class or any
-        // ancestor declares a generic-parameter-typed type, and the
-        // property's own type also does not" mirrors the codegen-side
-        // `instanceLayoutDiffersFromErasedTemplate` (#2894's own gate) —
-        // conservative in the right direction (it admits nothing that
-        // #2894's gate would refuse, and refuses some admissible cases
-        // the codegen gate would admit, e.g. `List<int>` vs `List<T>`-on-
-        // erased-but-ptr-when-substituted shapes). The virtual and static
-        // arms stay declined because the exporter skips both
-        // (`isVirtualProperty(ps)` and `mod == "static"` gates in
-        // `emitExportedProperty{Getters,Setters}`), so the symbol genuinely
-        // does not exist for either shape. The property's-own-type-uses-T
-        // arm stays declined because the exported stub's ABI is the i32
-        // placeholder (the T-erased template type), which would silently
-        // mis-represent a non-int substitution. All four predicates are
-        // local reads of `ips`, `ips->parent` and the parent chain — no
-        // sema pass ordering beyond what #2884 already assumes.
+        // (3) the property's own TYPE uses a generic param of the
+        // receiver class. Build a name → index map of THIS CLASS's
+        // generic params (the only param-name set in scope here) and
+        // refuse if the property's declared type references one of
+        // them — a `T -> string` substitution would silently read a
+        // pointer-sized value at the i32 stub's ABI.
+        // Decline fires when the lambda returns FALSE (the property
+        // IS virtual/abstract/static OR its own type uses T).
+        // Otherwise the `!` suppresses the decline — codegen's
+        // re-parsed PropertyDecl monomorphizes the accessor per
+        // instantiation.
         ![&]() -> bool {
-            // (1) virtual / override / abstract: importer-side the symbol
-            // is statically known to be virtual, exporter-side the stub is
-            // skipped, so the symbol genuinely does not exist.
+            // (1) virtual / override / abstract.
             for (auto mod : ips->modifiers) {
                 if (mod == "virtual" || mod == "override" ||
                     mod == "abstract")
                     return false;
             }
-            // (2) static: the exporter skips static properties
-            // (`mod == "static"` gate at LlvmBackend_Setup.cpp ~2459),
-            // so the `$propget`/`$propset` symbols are not emitted.
+            // (2) static.
             for (auto mod : ips->modifiers) {
                 if (mod == "static") return false;
             }
-            // Build a name → index map of THIS CLASS's generic params —
-            // this is the only param-name set whose substitution moves a
-            // field's or property's type at this access site (the field
-            // / property is declared on this class, so any other class's
-            // params are not in scope here).
+            // (3) property's own TYPE uses a generic param.
             std::unordered_map<std::string_view, std::size_t> gpIndex;
             for (std::size_t gi = 0; gi < ips->parent->genericParams.size();
                  ++gi) {
@@ -13375,55 +13417,7 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
                             ips->parent->genericParams[gi]))
                     gpIndex[gp->name] = gi;
             }
-            if (gpIndex.empty()) return false;  // sanity: a non-empty
-                                               // genericParams should
-                                               // always carry names.
-            // Walk the base chain (own + ancestors) and refuse if any
-            // class in it declares a field whose TYPE references one of
-            // its own generic params (an ancestor's field's T is bound
-            // to the ANCESTOR's T, but the substitution still moves the
-            // field's storage width — `T -> i32` vs `T -> ptr` — so the
-            // gate stays refused).
-            std::vector<const TypeSymbol*> work;
-            work.push_back(ips->parent);
-            for (std::size_t wi = 0; wi < work.size(); ++wi) {
-                const TypeSymbol* cur = work[wi];
-                if (!cur) continue;
-                std::unordered_map<std::string_view, std::size_t>
-                    curGpIndex;
-                for (std::size_t gi = 0; gi < cur->genericParams.size();
-                     ++gi) {
-                    if (auto* gp =
-                            dynamic_cast<const GenericParamSymbol*>(
-                                cur->genericParams[gi]))
-                        curGpIndex[gp->name] = gi;
-                }
-                for (Symbol* m : cur->members) {
-                    auto* fs = dynamic_cast<FieldSymbol*>(m);
-                    if (!fs) continue;
-                    TypeRef* fty = nullptr;
-                    if (auto* fd =
-                            dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-                        if (fd->type)
-                            fty = ctx_.resolvedType(*fd->type);
-                    } else if (!fs->decl) {
-                        // IMPORTED field: ride the loader's
-                        // importedMemberType side table, exactly as
-                        // #2943's predicate below does.
-                        fty = ctx_.importedMemberType(fs);
-                    }
-                    if (!typeRefReferencesAnyNameIn(fty, curGpIndex))
-                        continue;
-                    return false;
-                }
-                for (const TypeSymbol* b : cur->baseTypes) work.push_back(b);
-            }
-            // (3) the property's own TYPE uses a generic param of the
-            // receiver class — the exported stub's ABI is the i32
-            // placeholder, so a non-int substitution would silently
-            // mis-represent the value (e.g. `property P: T` on
-            // `GBox<T>` instantiates to `P: ptr` at runtime but the
-            // stub's lowerType(T) lowered to `i32`).
+            if (gpIndex.empty()) return false;  // sanity
             TypeRef* pty = nullptr;
             if (auto* pd =
                     dynamic_cast<const ast::PropertyDecl*>(ips->decl)) {

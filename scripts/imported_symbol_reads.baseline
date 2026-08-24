@@ -42,30 +42,16 @@
 56   src/codegen/LlvmBackend_Setup.cpp
 4    src/codegen/LlvmBackend_Stmts.cpp
 2    src/codegen/LlvmBackend_String.cpp
-# 21 — #2830 (owned FFI-buffer FIELD leak, Wave 2 Lane G): the new
-# `isOwnedFfiBufferField` predicate (LlvmBackend_impl.hpp:6693) introduces
-# one read at :6714, `dynamic_cast<const ast::FieldDecl*>(fs->decl)`.
-# Structurally safe: the cast is preceded by `if (!fs->decl) { rt =
-# ctx_.importedMemberType(fs); ... return ...; }` at :6711, so the cast
-# only runs over LOCAL field symbols — the same guard pattern as the 20
-# grandfathered reads in `isOwnedBuiltinExceptionField` (line 6656) /
-# `isOwnedIteratorInterfaceField` (line 6749) / `isCapturedOwnedPrimary
-# Param` (line 8548). The predicate is also wrapped in
-# `isFfiBufferTypeRef(ctx_.importedMemberType(...))` which returns
-# `nullptr` for the import path's {CString, WString, RawBytes} names —
-# same shape as #2823's `registerUnwindOwnedParam` ffiBuffer arm.
-# Re-baselined with `--force`; commit message of f3c20aa carries the
-# load-bearing reasoning.
 21   src/codegen/LlvmBackend_impl.hpp
 1    src/common/OwnershipFacts.cpp
-2    src/module/ModuleLoader.cpp
+3    src/module/ModuleLoader.cpp
 9    src/module/ModuleMetadataBuilder.cpp
 5    src/ownership/Ownership.cpp
 3    src/ownership/Ownership_Checks.cpp
 1    src/sema/DefiniteAssignment.cpp
 1    src/sema/EntryPoint.cpp
 12   src/sema/ExprTypecheck.cpp
-17   src/sema/ExprTypecheck_Calls.cpp
+16   src/sema/ExprTypecheck_Calls.cpp
 18   src/sema/ExprTypecheck_Exprs.cpp
 10   src/sema/PureChecker.cpp
 5    src/sema/StaticInitCycles.cpp

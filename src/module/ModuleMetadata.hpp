@@ -162,6 +162,27 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // wired up stayed zero forever). No bump: purely additive, same rule as
 // methodBodyText.
 //
+// §14.1 / §23 / §23.1 / §23.3 / §23.4 / §2.5 / §2.8.2 / §2.8.3 rule 4
+// (#2893, additive within v7 — sibling of ctorBodyText/methodBodyText):
+// MetaMember::propertyBodyText — for a Property (or Indexer) member
+// belonging to a GENERIC class or record, the FULL property/indexer
+// declaration source text. Mirrors the ctor/method carriages exactly:
+// a SECOND trailing REC_STRING in MEMBER_BLOCK after valueText for
+// Property/Indexer members (valueText itself stays empty for these
+// shapes — it is reserved for a const value, §22.12, or an instance
+// auto-property's constant-foldable initializer, #2467), emitted ONLY
+// when non-empty, so a module with no generic-class property/indexer
+// body produces byte-identical metadata to before. Closes the
+// capability gap #2884 left open as a DECLINE: every spelling of a
+// property access on an imported generic class or record was BROKEN
+// (computed read → link error, computed `:=` → link error, auto
+// read/`:=` → same link error, virtual read/`:=` → SIGSEGV, `+=`/`++`
+// → silent dropped write), and the cheap alternative — exporting one
+// placeholder-layout stub for the open type — was prototyped and
+// MEASURED unsound (the #2884 commit message documents the silent
+// wrong-value measurement on `Off<string>`). No bump: purely additive,
+// same rule as methodBodyText and fieldInitText.
+//
 // §22.4 / §12.1 (#2392, additive within v7): MetaParam::outNullWhen — the
 // `when true`/`when false` out-nullability postcondition (0/1/2 mirroring
 // ast::OutNullWhen), a SECOND scalar appended to PARAM_BLOCK's existing
@@ -504,6 +525,43 @@ struct MetaMember {
     // instance field (which uses valueText instead), and for a static field
     // with no initializer.
     std::string fieldInitText;        // §2.8.2/#2351: static field init text
+
+    // §14.1 / §23 / §23.1 / §23.3 / §23.4 / §2.5 / §2.8.2 / §2.8.3 rule 4
+    // (fix #2893, v0.240): for a Property (or Indexer) member belonging to
+    // a GENERIC class or record, the FULL property-declaration source text
+    // (from the visibility/modifier prefix through the terminating `;`).
+    // Emitted as a second trailing REC_STRING in MEMBER_BLOCK, exactly
+    // mirroring `methodBodyText` (the #783 precedent, lines 480-497 above)
+    // and `ctorBodyText` (the #662c precedent) — a current reader ignores
+    // it for Property/Indexer members (caps[1] is null), and a v7 reader
+    // rejects a v8 blob outright. Non-empty ONLY when the property/indexer
+    // has a body worth re-parsing AND the parent class is generic — same
+    // scope as the ctor/method carriages, which the parent commit's
+    // measurements (a generic class's METHODS fall back to a placeholder
+    // stub that #2884 measured UNSOUND — `Off<string>` answered 100/8
+    // where 108/21 are correct because the placeholder layout does not
+    // match the instantiated layout) prove MUST NOT apply to properties
+    // either. Empty for a non-generic class (the exporter's
+    // `bz$<Class>$<Prop>$propget` ABI is correct), for an Auto-bodied
+    // property/indexer (no user body — the #2478 `isAutoProperty` bit is
+    // enough), for an abstract property/indexer (no body by §12.5), and
+    // for any whose body could not be span-extracted (degenerate span).
+    //
+    // The importer re-parses this in a fresh SemaContext
+    // (ModuleLoader.cpp parseAndAttachPropertyBody, the property/indexer
+    // twin of parseAndAttachMethodBody), attaches the resulting
+    // ast::PropertyDecl to the imported PropertySymbol, and the existing
+    // `computedGetterOf`/`blockGetterOf`/`computedSetterOf` codegen paths
+    // take over — monomorphizing the accessor body per instantiation the
+    // same way `buildSpecializedMethodFn` already does for methods. The
+    // cheap-looking alternative — exporting ONE placeholder-layout stub
+    // for the open type, which is what a generic class's METHODS fall back
+    // to — was prototyped and MEASURED to be unsound, which is why #2884
+    // declined rather than exported stubs: with `class Off<T> _t: T; _s:
+    // int;` the stub read and wrote `_s` at the placeholder offset,
+    // returning 100/8 for `Off<string>` where 108/21 are correct
+    // (a SILENT wrong value replacing a loud link error).
+    std::string propertyBodyText;     // §14.1/#2893: property/indexer source for generics
 
     // §22.15 / §2.8.2: whether this member is declared pure. It is kept as
     // an explicit bit in addition to the general modifier list so consumers

@@ -274,13 +274,19 @@ BEZEL_TEST(xmod_imported_generic_layout_identical_propget_2945,
 }
 
 // ===========================================================================
-// T4 — NEGATIVE CONTROL: a `GBox<T>` that DOES carry a T-typed storage
-// field (`_t: T`). The layout MOVES for a reference-type instantiation, so
-// the exported stub's offsets are wrong — the decline must stay.
+// T4 — FORMERLY NEGATIVE CONTROL (fix #2893, v0.240): a `GBox<T>` that
+// DOES carry a T-typed storage field (`_t: T`). The layout MOVES for a
+// reference-type instantiation, so the exported stub's offsets are wrong —
+// the decline USED to stay (the pre-#2893 fix #2945 kept the layout-moving
+// arm). Post-#2893 the propertyBodyText carriage closes it: the re-parsed
+// PropertyDecl is monomorphized per instantiation with `genericSubst_`
+// active, the body reads `_w` against the SUBSTITUTED layout (the T→ptr
+// offset, not the T→i32 erased placeholder), and the read returns the right
+// value.
 // ===========================================================================
 BEZEL_TEST(xmod_imported_generic_layout_identical_propget_2945,
-           tparam_storage_field_still_declined) {
-    auto r = compileImportCaptureErr2945(
+           tparam_storage_field_now_works) {
+    auto [code, out] = compileImportRun2945(
         "module Lib2945T4; "
         "public class GBox2945T4<T> "
         "  public _t: T; "
@@ -294,23 +300,34 @@ BEZEL_TEST(xmod_imported_generic_layout_identical_propget_2945,
         "public class C "
         "  public static method Main(): int "
         "    using var g := new GBox2945T4<string>(); "
-        "    return g.P; "
+        "    Console.WriteLine(\"p=\" + g.P.ToString()); "
+        "    return 0; "
         "  end Main; "
         "end C;",
         "t4");
-    if (!r.depOk) return;
-    BEZEL_EXPECT_FALSE(r.success);
-    BEZEL_EXPECT_TRUE(has2945(r.err, "property `P`"));
-    BEZEL_EXPECT_TRUE(has2945(r.err, "imported generic type"));
-    BEZEL_EXPECT_TRUE(has2945(r.err, "not yet monomorphized"));
+    if (code == -2) return;
+    BEZEL_EXPECT_EQ(code, 0);
+    BEZEL_EXPECT_TRUE(has2945(out, "p=100"));
 }
 
 // ===========================================================================
 // T5 — NEGATIVE CONTROL: a property whose own TYPE uses T (`property P: T`).
 // The exported stub's ABI is the i32 placeholder, so admitting this would
-// silently read a pointer-sized value as i32. Decline stays. We instantiate
-// at `string` (a non-int) so a wrong-value admit would be observably wrong;
-// if the predicate is dropped, the linker error from the missing `$propset`
+// silently read a pointer-sized value as i32. Decline stays (the
+// pre-#2893 fix #2945 kept the own-type-uses-T arm). The fix #2893
+// narrows the CLASS arm to VIRTUAL/ABSTRACT/STATIC, but this case is
+// non-virtual/non-static and so WOULD be admitted — the propertyBodyText
+// carriage attaches a re-parsed PropertyDecl, the inline-body path
+// engages — except the codegen path for a property whose own type
+// references a generic parameter, on a receiver whose layout MOVES, has
+// an independent reference-type-store SEGV today (measured at HEAD on
+// the local twin `class GLocalT5<T> { _t: T; property P: T get=>_t;
+// set=>do _t := value; end; }` + `g.P := "hi"` at `T = string`: exits
+// 139). That's a separate #2893-follow-up — the substitution works
+// for the read (`=> _t`), the WRITE for a reference-typed T does not.
+// Until that lands, keep the decline here. We instantiate at `string`
+// and `int` so a wrong-value admit would be observably wrong; if the
+// predicate is dropped, the linker error from the missing `$propset`
 // is also acceptable evidence that the property is rejected.
 // ===========================================================================
 BEZEL_TEST(xmod_imported_generic_layout_identical_propget_2945,

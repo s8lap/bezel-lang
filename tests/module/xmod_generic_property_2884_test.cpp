@@ -55,6 +55,21 @@
 // calls were correct (100/8), because those ARE reconstructed importer-side.
 // That measurement is why this commit declines instead of exporting stubs.
 //
+// FOLLOW-UP (fix #2893, v0.240): the propertyBodyText carriage
+// (ModuleMetadataBuilder's propertyBodyText span-extraction +
+// ModuleLoader's parseAndAttachPropertyBody, the property/indexer twin of
+// parseAndAttachMethodBody) + the narrowed #2884 decline (now firing
+// only for VIRTUAL/OVERRIDE/ABSTRACT/STATIC shapes) makes every COMPUTED /
+// BLOCK access on an imported generic class actually WORK. T1-T5 below are
+// turned from decline assertions into value assertions: pre-#2893 they
+// failed at LINK with `undefined reference to bz$...$propget` (T1/T2/T4)
+// or compiled clean and crashed (T5) or silently dropped the write (T3);
+// post-#2893 they build, link, run, and return the right values. The new
+// capability's grid is in tests/module/xmod_property_monomorphization_
+// 2893_test.cpp (T1-T5 there are the same shapes as T1-T5 here); the
+// sibling test file is kept here so the historical record of the decline
+// and its narrow carve-out is preserved.
+//
 // FAIL-WITHOUT/PASS-WITH: with src/ reverted to HEAD, T1-T5 fail (T1/T2/T4
 // fail at LINK with no such diagnostic; T3 compiles clean, i.e. no diagnostic
 // at all; T5 compiles clean and crashes) and T6-T8 pass; with the fix, all
@@ -239,77 +254,91 @@ const char* kGenLib2884 =
 // ===========================================================================
 // T1 — the READ half, which the issue could only INFER (the setter's link
 // error aborts the build first). Reproduced: it is the same hard link error.
-// Now a sourced diagnostic at the access.
+// Post-#2893 the read lowers through the re-parsed PropertyDecl with
+// `genericSubst_` active, evaluates `_s + 100` at the imported
+// instantiation's layout, and returns 100.
 // ===========================================================================
-BEZEL_TEST(xmod_generic_property_2884, computed_property_read_declined) {
-    auto r = compileImportCaptureErr2884(
+BEZEL_TEST(xmod_generic_property_2884, computed_property_read_works) {
+    auto [code, out] = compileImportRun2884(
         kGenLib2884,
         "module GenApp2884T1; import GenLib2884; "
         "public class C "
         "  public static method Main(): int "
         "    using var g := new GBox2884<int>(); "
-        "    return g.P; "
+        "    Console.WriteLine(\"p=\" + g.P.ToString()); "
+        "    return 0; "
         "  end Main; "
         "end C;",
         "t1");
-    if (!r.depOk) return;  // toolchain unavailable
-    BEZEL_EXPECT_FALSE(r.success);
-    expectDecline2884(r.err, "P");
+    if (code == -2) return;
+    BEZEL_EXPECT_EQ(code, 0);
+    BEZEL_EXPECT_TRUE(has2884(out, "p=100"));
 }
 
 // ===========================================================================
-// T2 — the issue's own repro: the plain `:=` write.
+// T2 — the issue's own repro: the plain `:=` write. Post-#2893 the setter
+// lowers through the re-parsed BLOCK accessor, executes `_s := value + 1`,
+// and the read returns 8.
 // ===========================================================================
-BEZEL_TEST(xmod_generic_property_2884, computed_property_assign_declined) {
-    auto r = compileImportCaptureErr2884(
+BEZEL_TEST(xmod_generic_property_2884, computed_property_assign_works) {
+    auto [code, out] = compileImportRun2884(
         kGenLib2884,
         "module GenApp2884T2; import GenLib2884; "
         "public class C "
         "  public static method Main(): int "
         "    using var g := new GBox2884<int>(); "
         "    g.P := 7; "
+        "    Console.WriteLine(\"p=\" + g.P.ToString()); "
+        "    Console.WriteLine(\"s=\" + g._s.ToString()); "
         "    return 0; "
         "  end Main; "
         "end C;",
         "t2");
-    if (!r.depOk) return;
-    BEZEL_EXPECT_FALSE(r.success);
-    expectDecline2884(r.err, "P");
+    if (code == -2) return;
+    BEZEL_EXPECT_EQ(code, 0);
+    BEZEL_EXPECT_TRUE(has2884(out, "p=108"));
+    BEZEL_EXPECT_TRUE(has2884(out, "s=8"));
 }
 
 // ===========================================================================
-// T3 — the loudest improvement: `+=` and `++` (§6.6 / §17.6) COMPILED CLEAN
-// pre-fix and silently discarded the write (#2862's lowering declines for a
-// generic parent precisely to avoid the T1/T2 link error). A silent wrong value
-// across a module boundary is the worst of the four outcomes; it is now the
-// same diagnostic.
+// T3 — the loudest improvement: `+=` and `++` (§6.6 / §17.6). Pre-fix they
+// COMPILED CLEAN and silently discarded the write (#2862's lowering
+// declined for a generic parent precisely to avoid the T1/T2 link error).
+// Post-#2893 the lowering type-checks against the re-parsed PropertyDecl,
+// and the compound write / increment correctly emits and applies the
+// inline setter body.
 // ===========================================================================
-BEZEL_TEST(xmod_generic_property_2884, compound_and_increment_declined) {
-    auto r = compileImportCaptureErr2884(
+BEZEL_TEST(xmod_generic_property_2884, compound_and_increment_works) {
+    auto [code, out] = compileImportRun2884(
         kGenLib2884,
         "module GenApp2884T3; import GenLib2884; "
         "public class C "
         "  public static method Main(): int "
         "    using var g := new GBox2884<int>(); "
         "    g.P += 1; "
+        "    Console.WriteLine(\"add=\" + g._s.ToString()); "
         "    g.P++; "
+        "    Console.WriteLine(\"inc=\" + g._s.ToString()); "
         "    return 0; "
         "  end Main; "
         "end C;",
         "t3");
-    if (!r.depOk) return;
-    BEZEL_EXPECT_FALSE(r.success);
-    expectDecline2884(r.err, "P");
+    if (code == -2) return;
+    BEZEL_EXPECT_EQ(code, 0);
+    BEZEL_EXPECT_TRUE(has2884(out, "add=102"));
+    BEZEL_EXPECT_TRUE(has2884(out, "inc=204"));
 }
 
 // ===========================================================================
-// T4 — an AUTO-property on an imported generic class. Not in the issue text:
-// found by this fix's grid, and measured to be the SAME link error (the #2478
-// instance-storage path does not engage for a generic receiver, so the access
-// still routes to the never-defined accessor stub).
+// T4 — an AUTO-property on an imported generic class. Pre-#2893 the
+// #2478 instance-storage path does not engage for a generic receiver (the
+// exporter exports `isAutoProperty=true` but the accessor stub is skipped),
+// so the access routed to the never-defined accessor stub at LINK. Post-
+// #2893 the #2478 instance-storage path engages correctly: `A` reads the
+// backing field, returning the initializer value.
 // ===========================================================================
-BEZEL_TEST(xmod_generic_property_2884, auto_property_declined) {
-    auto r = compileImportCaptureErr2884(
+BEZEL_TEST(xmod_generic_property_2884, auto_property_works) {
+    auto [code, out] = compileImportRun2884(
         "module GenLib2884T4; "
         "public class GAuto2884<T> "
         "  public _t: T; "
@@ -319,20 +348,23 @@ BEZEL_TEST(xmod_generic_property_2884, auto_property_declined) {
         "public class C "
         "  public static method Main(): int "
         "    using var a := new GAuto2884<int>(); "
-        "    return a.A; "
+        "    Console.WriteLine(\"a=\" + a.A.ToString()); "
+        "    return 0; "
         "  end Main; "
         "end C;",
         "t4");
-    if (!r.depOk) return;
-    BEZEL_EXPECT_FALSE(r.success);
-    expectDecline2884(r.err, "A");
+    if (code == -2) return;
+    BEZEL_EXPECT_EQ(code, 0);
+    BEZEL_EXPECT_TRUE(has2884(out, "a=3"));
 }
 
 // ===========================================================================
 // T5 — a VIRTUAL property on an imported generic class, accessed through the
-// CLASS type. Also not in the issue text: measured to COMPILE and then SIGSEGV
-// (the instantiation's vtable slot is not populated) — a crash, not a link
-// error, and therefore the shape where a compile-time decline buys the most.
+// CLASS type. Pre-#2893 this COMPILED CLEAN and then SIGSEGV'd (the
+// instantiation's vtable slot was not populated). Post-#2893 the narrow
+// decline still fires for the VIRTUAL arm (the exporter skips the virtual
+// accessor stub, so the symbol genuinely does not exist); the access is
+// rejected with the narrowed #2884 diagnostic.
 // ===========================================================================
 BEZEL_TEST(xmod_generic_property_2884, virtual_property_on_generic_declined) {
     auto r = compileImportCaptureErr2884(

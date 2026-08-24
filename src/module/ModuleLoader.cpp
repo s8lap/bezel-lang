@@ -2699,6 +2699,242 @@ static bool parseAndAttachMethodBody(
     return true;
 }
 
+// §14.1 / §23 / §2.8.2 / §2.8.3 rule 4 (fix #2893): build a synthetic class
+// source for re-parsing ONE imported generic class's PROPERTY or INDEXER
+// body text. Shape mirrors buildSyntheticMethodSource (every field is
+// (re)declared with its type so field references resolve, every other
+// method is emitted as a signature-only stub so self-calls resolve), but
+// the TARGET member is a Property/Indexer and its body is taken from
+// `target.propertyBodyText` verbatim instead of being re-emitted. Other
+// properties/indexers on the same class become signature-only stubs (so
+// a body that references a sibling property resolves the lookup).
+static std::string buildSyntheticPropertySource(const MetaTypeDecl& td,
+                                                const MetaMember& target) {
+    std::string src = "module _2893_reparsed_property_;\n";
+    src += metaVisibilityToKeyword(td.visibility);
+    src += " ";
+    // §14.1 / §23: a record and a class have the same property syntax,
+    // but the synthetic declaration must use the right kind to bind
+    // `this` correctly (record by-value vs. class pointer receiver,
+    // §9.4 / §9.7). Mirrors buildSyntheticClassSource's record/class
+    // branch exactly.
+    src += (td.kind == MetaTypeDeclKind::Record ? "record " : "class ");
+    src += td.name;
+    if (!td.genericParams.empty()) {
+        src += "<";
+        for (std::size_t i = 0; i < td.genericParams.size(); ++i) {
+            if (i) src += ", ";
+            if (!td.genericParams[i].variance.empty() &&
+                td.genericParams[i].variance != "none")
+                src += td.genericParams[i].variance + " ";
+            src += td.genericParams[i].name;
+        }
+        src += ">";
+    }
+    src += "\n";
+    // Fields (needed so implicit field references inside the body resolve).
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Field) continue;
+        src += "  " + metaVisibilityToKeyword(mm.visibility);
+        for (const std::string& mod : mm.modifiers) src += " " + mod;
+        src += " " + mm.name + " : " + metaTypeToSourceText(mm.type) + ";\n";
+    }
+    // Methods: signature-only stubs, so self-calls from the body resolve.
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Method) continue;
+        std::string stub = buildMethodStub(mm, td, /*importsModule=*/false);
+        if (!stub.empty()) src += stub + "\n";
+    }
+    // Properties / Indexers: the TARGET carries its real body; every other
+    // property/indexer is a signature-only stub so a body that references
+    // a sibling property resolves the lookup.
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Property &&
+            mm.kind != MetaMemberKind::Indexer) continue;
+        if (&mm == &target) {
+            src += "  " + target.propertyBodyText + "\n";
+        } else {
+            // Inline property/indexer stub — mirrors
+            // `buildSyntheticClassSource`'s sibling-property arm (line
+            // 1589-1598): `public [readonly] property NAME: TYPE;` (auto
+            // form, no body) for a Property, or `public property [params]:
+            // TYPE;` for an Indexer. The body of a sibling property is
+            // NOT re-parsed — only the target's body needs to lower.
+            // Sibling reads dispatch through the existing
+            // `importedPropGetterFns_` / `-Setters` path; writes are
+            // rejected by the read-only modifier upstream.
+            src += "  " + metaVisibilityToKeyword(mm.visibility);
+            for (const std::string& mod : mm.modifiers) src += " " + mod;
+            if (mm.kind == MetaMemberKind::Indexer) {
+                src += " property [";
+                for (std::size_t i = 0; i < mm.params.size(); ++i) {
+                    if (i) src += ", ";
+                    src += mm.params[i].name + ": " +
+                           metaTypeToSourceText(mm.params[i].type);
+                }
+                src += "]: " + metaTypeToSourceText(mm.type);
+                if (!mm.valueText.empty()) src += " := " + mm.valueText;
+            } else {
+                src += " property " + mm.name + " : " +
+                       metaTypeToSourceText(mm.type);
+                if (!mm.valueText.empty()) src += " := " + mm.valueText;
+            }
+            src += ";\n";
+        }
+    }
+    src += "end " + td.name + ";\n";
+    return src;
+}
+
+// §14.1 / §23 / §2.8.2 / §2.8.3 rule 4 (fix #2893): parse
+// `target.propertyBodyText` for an imported generic class
+// property/indexer, run the three sema passes in a FRESH SemaContext, remap
+// the body's exprSymbols (field / self-method) into mainCtx keyed on the
+// re-parsed expression pointers, and attach the re-parsed
+// ast::PropertyDecl to the imported PropertySymbol's `decl` slot. After
+// this, codegen's `computedGetterOf` / `blockGetterOf` /
+// `computedSetterOf` / `blockSetterOf` / `lowerPropertyCompound` paths
+// take over — monomorphizing the accessor body per instantiation with
+// genericSubst_ active, exactly the local-generic-property path #2884's
+// own T8 control pinned. Returns false (leaving decl untouched) on any
+// parse/sema failure, so the #2884 decline stays in force for that
+// shape (a clean reject, never a wrong value).
+static bool parseAndAttachPropertyBody(
+    const MetaTypeDecl& td,
+    const MetaMember& target,
+    sema::PropertySymbol* importedPs,
+    const sema::TypeSymbol& importedType,
+    sema::SemaContext& mainCtx) {
+    std::string source = buildSyntheticPropertySource(td, target);
+
+    DiagnosticEngine freshDiag;
+    Lexer freshLex(source, freshDiag);
+    Parser freshParser(freshLex, freshDiag);
+    auto sf = freshParser.parseCompilationUnit();
+    if (!sf || freshDiag.hasErrors()) return false;
+
+    // §14.1 / #2893: the fresh context AND its diagnostics must OUTLIVE
+    // this function — codegen monomorphizes the accessor body per
+    // instantiation and queries resolvedType/exprType on the body's
+    // nodes, whose TypeRefs live in the fresh context's arena.
+    auto semaDiag = std::make_shared<DiagnosticEngine>();
+    auto freshCtxPtr = std::make_shared<sema::SemaContext>(*semaDiag);
+    sema::SemaContext& freshCtx = *freshCtxPtr;
+    sema::collectSymbols(*sf, freshCtx);
+    if (semaDiag->hasErrors()) return false;
+    sema::resolveTypes(*sf, freshCtx);
+    if (semaDiag->hasErrors()) return false;
+    sema::typecheckExpressions(*sf, freshCtx);
+    // §14.1 / #2893 SOUNDNESS GATE: a PROPERTY body can reference sibling
+    // module functions or other imports. A body that references any of
+    // those fails to resolve in the fresh context and the unresolved
+    // call is silently DROPPED at codegen → a wrong value. Require a
+    // fully clean typecheck: any error means the body uses something
+    // the importer-side reconstruction cannot faithfully reproduce →
+    // do NOT attach the decl, leaving the §14.1/#2884 sema gate in
+    // force.
+    if (semaDiag->hasErrors()) return false;
+
+    // Locate the fresh TypeSymbol.
+    sema::TypeSymbol* freshType = nullptr;
+    if (freshCtx.module()) {
+        for (sema::Symbol* child : freshCtx.module()->children) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(child);
+            if (ts && std::string(ts->name) == td.name) { freshType = ts; break; }
+        }
+    }
+    if (!freshType) return false;
+
+    // Locate the fresh PropertySymbol (matched by NAME and isIndexer
+    // flag — properties are not overloadable, §22.6).
+    sema::PropertySymbol* freshPs = nullptr;
+    for (sema::Symbol* m : freshType->members) {
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+        if (!ps) continue;
+        if (std::string(ps->name) != target.name) continue;
+        bool wantIndexer = (target.kind == MetaMemberKind::Indexer);
+        if (ps->isIndexer != wantIndexer) continue;
+        freshPs = ps;
+        break;
+    }
+    if (!freshPs) return false;
+
+    // The parsed declaration must be an ast::PropertyDecl.
+    auto* parsedPd = dynamic_cast<const ast::PropertyDecl*>(freshPs->decl);
+    if (!parsedPd) return false;
+
+    // Field remap map.
+    std::unordered_map<std::string_view, sema::Symbol*> importedFields;
+    for (sema::Symbol* m : importedType.members) {
+        if (dynamic_cast<sema::FieldSymbol*>(m) && !m->name.empty())
+            importedFields[m->name] = m;
+    }
+
+    // Self-method remap map (signature-keyed, as in the method path).
+    std::unordered_map<std::string, sema::Symbol*> importedMethods;
+    {
+        std::size_t importedIdx = 0;
+        for (const MetaMember& mmItem : td.members) {
+            if (!metaMemberProducesSymbol(mmItem)) continue;
+            if (importedIdx >= importedType.members.size()) break;
+            sema::Symbol* sym = importedType.members[importedIdx++];
+            if (mmItem.kind == MetaMemberKind::Method && !mmItem.isOperator)
+                importedMethods[metaMemberSigKey(mmItem.name, mmItem.params)] =
+                    sym;
+        }
+    }
+
+    for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
+        if (!expr || !freshSym) continue;
+        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+            auto it = importedFields.find(freshSym->name);
+            if (it != importedFields.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        } else if (auto* fms = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
+            auto it = importedMethods.find(freshMethodSigKey(fms));
+            if (it != importedMethods.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
+            // A `var`/`const` local, `for`/`for-in` iteration variable,
+            // or `using var` declared INSIDE the accessor body has NO
+            // importer-side counterpart to remap to. Copy verbatim, as
+            // #2818 does for method bodies.
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
+            // A property accessor's `value` parameter (setter only) or
+            // indexer's index parameter is bound by codegen's
+            // lowerPropertySet / lowerIndexerGet directly; the
+            // typecheck-time exprSymbol carry is harmless and rare.
+            mainCtx.setExprSymbol(expr, freshSym);
+        }
+    }
+
+    // Copy resolved-type and expr-type entries from the fresh context,
+    // rebinding SELF references (the fresh class declaration) to the
+    // imported TypeSymbol (#2954 precedent).
+    rebindSelfTypeRefsIn(freshCtx, freshType,
+                         const_cast<sema::TypeSymbol*>(&importedType));
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        if (expr && ref) mainCtx.setExprType(expr, ref);
+    // Copy the pattern-symbols side table (#2857 precedent).
+    for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
+        if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
+
+    // Attach the parsed PropertyDecl to the imported PropertySymbol and
+    // keep the backing source + AST alive (string_view fields point
+    // into them), plus the fresh context + diagnostics that own the
+    // copied TypeRefs.
+    importedPs->decl = parsedPd;
+    mainCtx.ownImportedSource(std::move(source));
+    mainCtx.ownImportedAst(std::move(sf));
+    // Keep the fresh context + diagnostics alive.
+    mainCtx.ownImportedAuxiliary(semaDiag);
+    mainCtx.ownImportedAuxiliary(freshCtxPtr);
+    return true;
+}
+
 // §2.8.2 / §22.12 / §22.13 (#2351): build a synthetic class source for
 // re-parsing an imported generic class's static field INITIALIZER
 // expression(s). Shape mirrors buildSyntheticMethodSource: every field is
@@ -3337,6 +3573,57 @@ static void loadMetadataPass2(
             }
             if (importedMs)
                 parseAndAttachMethodBody(td, mm, importedMs, *t, ctx);
+        }
+
+        // §14.1 / §23 / §2.8.2 / §2.8.3 rule 4 (fix #2893): property bodies —
+        // find each Property member with a non-empty propertyBodyText and
+        // attach the re-parsed ast::PropertyDecl to the matching imported
+        // PropertySymbol. With the attached decl, codegen's
+        // computedGetterOf / blockGetterOf / computedSetterOf /
+        // blockSetterOf / lowerPropertyCompound paths engage (the same
+        // paths the local generic-class property path uses, pinned by
+        // #2884's own T8 control test) and monomorphize per instantiation
+        // with genericSubst_ active.
+        //
+        // Properties are not overloadable (§22.6), so a name match is
+        // sufficient. The loop runs AFTER the method loop so any sibling
+        // method a property body references resolves against an
+        // already-attached MethodDecl (the method path's own keep-alive
+        // discipline applies in reverse: parseAndAttachPropertyBody keeps
+        // the fresh context alive past this loop).
+        //
+        // SCOPE — PROPERTY only, not INDEXER. The cross-module INDEXER
+        // path (#2946) exports an `bz$<Class>$idxget$<arity>` ExternalLinkage
+        // symbol whose body is the erased `T -> i32` template accessor; the
+        // itable fill (buildImportedGenericVtable in
+        // LlvmBackend_Setup.cpp) installs that symbol in the iface slot.
+        // Attaching a live `ast::PropertyDecl` here would (correctly) trip
+        // the itable-fill's "local body" guard at line ~6584 of
+        // LlvmBackend_Setup.cpp and leave the slot NULL — a regression of
+        // the iface-indexer shape that #2946 fixed. Cross-module INDEXER
+        // monomorphization is filed as a follow-up: the proper fix is the
+        // same propertyBodyText carriage + a per-instantiation accessor
+        // symbol the importer-side rewrite can substitute, parallel to
+        // #3346/#3348's METHOD half. Until that lands, leave indexers
+        // alone — the exported `bz$<Class>$idxget$<arity>` ABI (the
+        // #2946 status quo) carries the layout-identical case, which is
+        // the one #2946 pinned.
+        for (const MetaMember& mm : td.members) {
+            if (mm.kind != MetaMemberKind::Property ||
+                mm.propertyBodyText.empty())
+                continue;
+            // Match by name (no signature, properties don't overload).
+            sema::PropertySymbol* importedPs = nullptr;
+            for (sema::Symbol* m : t->members) {
+                auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+                if (!ps) continue;
+                if (ps->isIndexer) continue;
+                if (std::string(ps->name) != mm.name) continue;
+                importedPs = ps;
+                break;
+            }
+            if (importedPs)
+                parseAndAttachPropertyBody(td, mm, importedPs, *t, ctx);
         }
 
         // §2.8.2 / §22.12 / §22.13 (#2351): static field initializers — find
