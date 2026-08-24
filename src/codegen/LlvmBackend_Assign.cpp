@@ -3511,17 +3511,90 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
         setArgs.push_back(newVal);
         builder_.CreateCall(sFnTy, setPtr, setArgs);
         emitPendingCheck();
-        // RECORDED SCOPE LIMIT, not an oversight: no producer release fires on
-        // this branch. The runtime implementor behind an interface may be
-        // RECORD-backed, whose setter PLAIN-STORES (§9/§9.7), and releasing
-        // there would drop the field's only reference — a UAF. Distinguishing
-        // the two needs lowerIndexerSet's #2506/#2535 runtime itable owner-kind
-        // flag; until that is carried here a `string`-element compound through
-        // an interface leaks its concatenation (MEASURED: 355 B / 20 allocs
-        // over 5 iterations, no UAF — a bounded leak, the safe direction; filed
-        // as #2847). `releaseIndexArgStringProducers` reaches
-        // the same conclusion on its own (it early-returns for a non-Class
-        // recvDecl), so it is not called here.
+        // fix #2847 (§23.4 / §6.6 / §9.7, v0.240): the INTERFACE-itable
+        // compound-assign twin of the class-vtable branch's
+        // `releaseCompoundProducers(newVal, rhs, /*classBacked=*/true)` below
+        // (this file, line ~3623 — #2567's own structure for the same
+        // desugaring's +1s on a class-backed path). The runtime implementor
+        // behind an interface may be RECORD-backed, whose setter PLAIN-STORES
+        // (§9/§9.7 — a record's reference fields are borrows stored plainly,
+        // no disposer), so releasing newVal on the record path would drop the
+        // field's only reference (UAF). Distinguish class- vs record-backed at
+        // runtime through lowerIndexerSet's #2506/#2535 owner-kind flag —
+        // itab[ifaceItabSlotCount_[ps->parent]] (NULL = record plain-store,
+        // non-NULL = class retaining setter), which that function already reads
+        // here (its own `idxset.class` / `idxset.record` block, ~line 2700).
+        // Mirror that block one-for-one: on classBB release newVal's doubled
+        // +1 (the emitCompoundOp/emitStringConcat result, rc=1 per #422; the
+        // setter's retain bumped it to 2) and, when the compound RHS is itself
+        // a +1 string producer AST (a BinaryExpr / interpolation / call —
+        // emitStringConcat memcpy's rhs's bytes and leaves rhs's +1
+        // untouched, so the rhs's strand has to be dropped separately), drop
+        // rhs's +1 too; on recordBB emit no release — the record path's leak
+        // is the safe direction this issue records rather than papers over,
+        // exactly as #2548's own "Only sound on a CLASS-backed store" note
+        // scopes `releaseCompoundProducers`. The flag is absent for an
+        // interface whose itable has no owner-kind word; fall through (no
+        // release) in that case — the pre-fix behaviour, also the safe
+        // direction. Mirrors `lowerIndexerSet`'s interface branch's classBB
+        // `emitProducerRelease` (this file, line ~2736) — `lowerIndexerSet`
+        // already discharges the same `val` doubling on the class side; this
+        // site is the COMPOUND-TWIN release that site is the plain-set twin
+        // of. The new `releaseIndexArgStringProducers` early-returns for a
+        // non-Class recvDecl (`Interface`, here), so the index-arg producers
+        // (the `idxArgVals`) are not touched here — the pre-fix posture, also
+        // unchanged by this fix.
+        auto cntIt = ifaceItabSlotCount_.find(ps->parent);
+        if (cntIt != ifaceItabSlotCount_.end() && !diverged_) {
+            // The owner-kind flag lives at itab[ifaceItabSlotCount_[iface]]
+            // (the LAST word in the itable, appended by #2506). Read it HERE
+            // from the `itab` we already have in scope (the same value
+            // computed for the fn-ptr load above; do not reload it
+            // post-call — the receiver has been mutated by the setter and
+            // reload could race).
+            llvm::Value* flagAddr = builder_.CreateGEP(
+                ptrTy(), itab,
+                {builder_.getInt32(cntIt->second)}, "idxget.flagaddr");
+            llvm::Value* flag = builder_.CreateLoad(
+                ptrTy(), flagAddr, "idxget.flagval");
+            llvm::Value* isClassBacked = builder_.CreateICmpNE(
+                flag, llvm::ConstantPointerNull::get(ptrTy()),
+                "idxget.isclass");
+            llvm::BasicBlock* curBB = builder_.GetInsertBlock();
+            llvm::Function* fn = curBB->getParent();
+            llvm::BasicBlock* classBB =
+                llvm::BasicBlock::Create(llvm_, "idxset.class", fn);
+            llvm::BasicBlock* recordBB =
+                llvm::BasicBlock::Create(llvm_, "idxset.record", fn);
+            llvm::BasicBlock* doneBB =
+                llvm::BasicBlock::Create(llvm_, "idxset.done", fn);
+            builder_.CreateCondBr(isClassBacked, classBB, recordBB);
+            // CLASS-backed branch: setter retained → release the desugaring's
+            // two +1s. Mirrors the class-vtable compound branch's
+            // `releaseCompoundProducers(newVal, rhs, /*classBacked=*/true)`
+            // one-for-one (this file, line ~3623).
+            builder_.SetInsertPoint(classBB);
+            if (newVal && newVal->getType()->isPointerTy())
+                emitStringRelease(newVal);   // emitStringConcat's rc=1 (#422)
+            // RHS is a +1 producer only when the AST is a BinaryExpr /
+            // interpolation / call (isPlusOneStringProducer); a literal RHS
+            // is a sentinel (no +1), a named-local RHS is a borrow (no +1
+            // owned by the compound). Gate on the AST shape, not the LLVM
+            // pointer type, mirroring the inline-body release at line ~3874.
+            if (rhs && rhs->getType()->isPointerTy() && valueExpr &&
+                isPlusOneStringProducer(valueExpr))
+                emitStringRelease(rhs);
+            builder_.CreateBr(doneBB);
+            // RECORD-backed branch: setter plain-stored → field aliases
+            // newVal's heap (the field IS newVal's only reference). Emit
+            // NO release — dropping newVal here would drop the field's
+            // only reference (UAF, exactly the bug the flag is here to
+            // prevent). The bounded leak this leaves behind on the record
+            // path is the issue's recorded scope, not an oversight.
+            builder_.SetInsertPoint(recordBB);
+            builder_.CreateBr(doneBB);
+            builder_.SetInsertPoint(doneBB);
+        }
         return true;
     }
 
