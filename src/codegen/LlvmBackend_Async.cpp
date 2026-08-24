@@ -3319,8 +3319,21 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
     if (freeTaskAfter && resultTy)
         deferTaskFree =
             patternAResultDisposerFor(ctx_.exprType(*un.operand)) != nullptr;
+    // fix #2750 / §30.5 Pattern A kind 2 chained return (v0.240): on the
+    // SUCCESS path, lowerStmt chains the source task to the outer task via
+    // bz_task_set_chained (so its destructor frees it transitively). The FAULT
+    // path never reaches that code (control diverts to unwindBB() before any
+    // return-statement lowering runs), so the source task leaks. Reclaim it
+    // on the fault path. Only fires for the ANONYMOUS PRODUCER row
+    // (CallExpr operand — a fresh `Producer()` result with no other owner).
+    // The owned-LOCAL row (chainedReturnOwnedTaskSource) is reclaimed by
+    // emitUnwindDisposals on the unwind edge; the owned-PARAMETER row
+    // (chainedReturnOwnedTaskParamSource) by emitAsyncOwnedParamAutoDispose.
+    // Reclaiming those rows here would double-free.
+    bool freeOnFault = asyncChainedReturn_ &&
+        dynamic_cast<const ast::CallExpr*>(un.operand.get()) != nullptr;
     return emitAwaitSuspend(task, resultTy, freeTaskAfter, takeResultAfter,
-                            markSpentAfter, deferTaskFree);
+                            markSpentAfter, deferTaskFree, freeOnFault);
 }
 
 
@@ -3336,7 +3349,8 @@ llvm::Value* Emitter::lowerAwait(const ast::UnaryExpr& un) {
 llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                        bool freeTaskAfter, bool takeResultAfter,
                                        bool markSpentAfter,
-                                       bool deferTaskFree) {
+                                       bool deferTaskFree,
+                                       bool freeOnFault) {
     if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
@@ -3495,6 +3509,49 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
             auto* freeTaskFn = declareC("bz_task_free",
                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(freeTaskFn, {awaitedTask});
+        }
+        // fix #2750 / §30.5 Pattern A kind 2 chained return (v0.240): when
+        // this await is the operand of `return await Producer()` (the
+        // anonymous-producer row of the chained-slot table), the SUCCESS path
+        // chains the source task to the outer task via bz_task_set_chained in
+        // lowerStmt (so the outer task's destructor frees it transitively).
+        // The FAULT path never reaches that code — control diverts to
+        // unwindBB() (catch.dispatch inside a try, or async.fault otherwise)
+        // before any return-statement lowering runs — so the source task leaks
+        // unless we reclaim it here. Use the same null-after-free guard
+        // pattern as #2733's ffiBuffer arm: reload from the frame slot, check
+        // for null, free and null the slot. Idempotence is required because
+        // bz_task_set_chained (called only on the success path) is not
+        // reachable from here — the null-check is defensive against any
+        // future code path that might race this reclaim with another. For the
+        // owned-LOCAL / owned-PARAMETER rows of the chained-slot table,
+        // freeOnFault is false: emitUnwindDisposals (local) and
+        // emitAsyncOwnedParamAutoDispose (parameter) reclaim on the unwind
+        // edge, and reclaiming here would double-free.
+        if (freeOnFault) {
+            llvm::Value* pendField = builder_.CreateStructGEP(
+                smStateStruct_, smSelf_, asyncPendingTaskField_);
+            llvm::Value* tk = builder_.CreateLoad(
+                ptrTy(), pendField, "chain.fault.src");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                tk, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB = llvm::BasicBlock::Create(
+                llvm_, "chain.fault.free", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(
+                llvm_, "chain.fault.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* freeTaskFn = declareC("bz_task_free",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(freeTaskFn, {tk});
+            // fix #2733 / §30.5 null-after-free: clear the slot so any future
+            // load sees null (defensive — this slot has no live reader on the
+            // fault path, but the guard costs nothing and matches the
+            // ffiBuffer / awaitTaskTemp shapes).
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), pendField);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
         }
         // §30.5 (v0.162 / #1352): mark OwningTask spent BEFORE the unwind so any
         // catch arm that re-awaits the same variable gets IOE, not the re-raised
