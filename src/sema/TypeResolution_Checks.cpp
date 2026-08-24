@@ -2554,8 +2554,24 @@ std::string Resolver::owningElementBadDesc(const TypeRef* el) {
                 return "a record (value type)";
             if (ts->kind == ast::TypeDeclKind::Enum)
                 return "an enum (value type)";
-            // Class or Interface (and, unchanged from the pre-#2713 behaviour,
-            // Choice) → admitted; empty description.
+            // fix #2744 (§28.11 / §35.4, v0.240): a choice is a value type
+            // (§3.2) — and §28.11's element-slot-policy table rejects choices
+            // in the owning family in BOTH rows, the "value type (non-move-
+            // only)" row (copies in the borrowing column, rejected in the
+            // owning column) and the "move-only value type" row (rejected in
+            // both columns — owning-classified choices, §35.4). The pre-fix
+            // fall-through admitted both, and a value-like choice carrying a
+            // `string` payload reproduced #2713's elementPolicyFor Value-row
+            // dangling-slot shape (collection takes no reference on insert
+            // while `owned` argument transfer releases the caller's — a
+            // heap-use-after-free on read-back, not a leak). The borrowing
+            // family's "copies" cell is unaffected because the predicate
+            // only runs against owning collections; an `OwningDictionary`'s
+            // KEY slot is also unaffected because the borrowed element goes
+            // through `checkHashContainerKeys`, not this predicate.
+            if (ts->kind == ast::TypeDeclKind::Choice)
+                return "a choice (value type; §35.4 classifies owning variants as move-only)";
+            // Class or Interface → admitted; empty description.
             return {};
         }
         // No TypeSymbol: a builtin type or a generic parameter.
