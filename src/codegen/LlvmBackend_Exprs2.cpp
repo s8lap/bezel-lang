@@ -1132,6 +1132,17 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     llvm::Value* savedCaught = currentCaughtExc_;
     std::size_t savedUnwindDepth = unwindScopeDepth_;
     bool savedDiverged = diverged_;
+    // fix #2886 (§23.3/§27.3/§28.3, v0.240): a lambda emitted inside an
+    // INLINED block-bodied property setter must not inherit
+    // `inlinedAccessorEnd_` — that block belongs to the enclosing (caller)
+    // function, and a bare `return;` inside the lambda body would otherwise
+    // branch to it (`LlvmBackend_Stmts.cpp` ~1719), a cross-function `br`
+    // the LLVM verifier rejects as `Referring to a basic block in another
+    // function!`. Mirror the `unwindTarget_` save/clear/restore pattern: save
+    // the enclosing body's value, null it across lambda emission, restore on
+    // exit. (A bare `return;` inside the lambda body now falls through to
+    // the ordinary void-return path the lambda's own function emits.)
+    llvm::BasicBlock* savedInlinedAccessorEnd = inlinedAccessorEnd_;
     // #2515 / §27.3 / §28.9: save the enclosing method's return-type node and
     // reset it for the lambda body (see the nullptr assignment at body-entry
     // below).  Without this, a block-bodied lambda compiled inside a method
@@ -1735,6 +1746,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     unwindTarget_ = nullptr;
     propagateBB_ = nullptr;
     currentCaughtExc_ = nullptr;
+    // fix #2886: clear the caller's accessor-end block so a bare `return;`
+    // inside the lambda body does not branch to the enclosing function.
+    inlinedAccessorEnd_ = nullptr;
     unwindScopeDepth_ = 0;
     diverged_ = false;
     builder_.SetInsertPoint(
@@ -2266,6 +2280,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     currentCaughtExc_ = savedCaught;
     unwindScopeDepth_ = savedUnwindDepth;
     diverged_ = savedDiverged;
+    // fix #2886: restore the enclosing body's accessor-end block (the
+    // lambda body emit nulled this above its own emission).
+    inlinedAccessorEnd_ = savedInlinedAccessorEnd;
     if (savedBB) builder_.SetInsertPoint(savedBB);
 
     // --- Build the closure struct { fn_ptr, env_ptr, rc, envdtor, kind } ---
