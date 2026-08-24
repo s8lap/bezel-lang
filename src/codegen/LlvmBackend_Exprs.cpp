@@ -5567,6 +5567,20 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // still installed, like the nullable wrap above, so a `T`-typed
             // body under monomorphisation boxes as its CONCRETE type (#1279).
             v = boxForTarget(v, ctx_.exprType(*ma), getter);
+            // fix #2815 / §23.2 / §29.2 (v0.240): an expression-bodied
+            // property whose declared type is a pure `IEnumerable<T>` /
+            // `IOwningEnumerable<T>` but whose getter body yields an
+            // Array-backed collection (`public property Items: IEnumerable<int>
+            // get => _items;` where `_items: Array<int>`) lowers the raw
+            // `bz_array_t*`, not a vtable-backed IEnumerable. Every consumer
+            // (a local-decl-init / argument / return / direct for-in over the
+            // read) would otherwise drive vtable dispatch on the raw array
+            // descriptor — issue #2815's SIGSEGV at slot 4. `wrapPropertyArray
+            // AsIEnumerable` is a no-op when the declared type is not a pure
+            // IEnumerable-family interface or the getter's type is not in the
+            // array-backed family, so it composes with the nullable / box
+            // wraps above without re-doing their work.
+            v = wrapPropertyArrayAsIEnumerable(v, ctx_.exprType(*ma), getter);
             currentEnumMethod_ = savedEnumMethod;
             currentThis_ = saved;
             genericSubst_ = std::move(savedSubst);
@@ -6042,7 +6056,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // fix #2761 (§8.6 "Boxing", v0.240): the BARE (`implicit this`)
             // spelling of the same read — `var o := O;` inside the declaring
             // class was silently unboxed too. See the qualified path above.
-            return boxForTarget(bv, ctx_.exprType(e), getter);
+            bv = boxForTarget(bv, ctx_.exprType(e), getter);
+            // fix #2815 / §23.2 / §29.2 (v0.240): the bare-`this` spelling of
+            // #2815 — `for var x in P` where `P` is a property of the current
+            // class declared `IEnumerable<T>` and `=> _items` / `_items` field
+            // shares the same crash as the qualified `obj.P` path. See the
+            // qualified site above for the full rationale and the no-op
+            // guard list (the helper does nothing when the declared type is
+            // not a pure IEnumerable-family interface or the getter's type is
+            // not array-backed, so the bare read keeps its existing shape for
+            // every other property).
+            return wrapPropertyArrayAsIEnumerable(bv, ctx_.exprType(e), getter);
         }
         // CG33b: block-form getter (`get => do … end;`) accessed bare.
         if (const ast::PropertyAccessor* acc = blockGetterOf(ctx_.exprSymbol(e))) {

@@ -13866,6 +13866,51 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
                 ld->initializer.get())) {
             if (blockGetterOf(ctx_.exprSymbol(*ma)))
                 ownsSource = true;
+            // fix #2815 / §23.2 / §29.2 (v0.240): the EXPRESSION-BODIED
+            // sibling of #2769. `public property P: IEnumerable<int> get =>
+            // _items;` where `_items: Array<int>` — the wrap happens at the
+            // property-read site (wrapPropertyArrayAsIEnumerable), so the
+            // local bound here owns a freshly minted wrapper frame. Without
+            // this arm the wrapper leaks (the for-in sees a LocalSymbol and
+            // registers no loop-end dispose, and the local-decl site is the
+            // only place that can claim ownership of the frame). The
+            // declaration-less pure-IEnumerable / array-backed-getter-body
+            // conjunction matches #2703's RETURN-side wrap target exactly,
+            // so the ownsSource verdict agrees by construction.
+            else if (const ast::Expr* cg = computedGetterOf(ctx_.exprSymbol(*ma))) {
+                // Local declared (explicitly OR via inference) as pure
+                // IEnumerable<T> and the getter body yields an Array-backed
+                // collection — same wrap-creator case #2703 handles on the
+                // RETURN side. Re-derive the local's effective-type test
+                // (declIsPureIEnum is in the inner block above and only fires
+                // when `ld->type` is set; an inferred `var it := s.Items;`
+                // has a null `ld->type` but the same ownership claim). Use
+                // `tr` — the explicit annotation OR the initializer's
+                // inferred type, already computed near the top of this
+                // function — so an un-annotated local participates in the
+                // claim. The conjunction matches the property-read wrap's
+                // positive list verbatim.
+                bool declIsPureIEnum = tr && tr->kind ==
+                    sema::TypeRef::Kind::Named && !tr->declaration &&
+                    tr->astNode && tr->astNode->name &&
+                    !tr->astNode->name->parts.empty() &&
+                    tr->headName() == "IEnumerable";
+                if (declIsPureIEnum) {
+                    const sema::TypeRef* getterTy =
+                        ctx_.exprType(*cg);
+                    if (getterTy && getterTy->kind ==
+                            sema::TypeRef::Kind::Named &&
+                        getterTy->astNode && getterTy->astNode->name &&
+                        !getterTy->astNode->name->parts.empty()) {
+                        std::string_view gn = getterTy->headName();
+                        if (gn == "Array" || gn == "OwningArray" ||
+                            gn == "OwningBuffer" ||
+                            gn == "Stack" || gn == "OwningStack" ||
+                            gn == "Queue" || gn == "OwningQueue")
+                            ownsSource = true;
+                    }
+                }
+            }
         }
     }
     // §28.10 / stdlib §4.5 v0.195 (#2146): a plain `var d := recv.Drain();`

@@ -7621,6 +7621,53 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     return v;
 }
 
+// fix #2815 / §23.2 / §29.2 (v0.240): see the declaration in
+// LlvmBackend_impl.hpp. The shape we care about is `public property P:
+// IEnumerable<int> get => _items;` (or its block-bodied / bare-identifier
+// spellings) where the getter body's sema type is an Array-backed collection
+// — the `actualIsArray` / `initIsArray` predicates in `wrapAsIEnumerableForTarget`
+// and `lowerLocalDecl` look at the EXPRESSION's sema type, which for a property
+// read IS the property's declared `IEnumerable<T>` (the very type the wrap
+// helper is trying to reach), so the wrap is missed. Reach the getter body
+// directly and wrap when its declared type is one of the array-backed
+// collections.
+//
+// BORROWING wrap (wrapArrayAsIEnumerable). The source has an existing owner:
+//   * `owned _items: Array<int>` field → owning object disposes it (#1840's
+//     same-source path, the issue's repro)
+//   * `_items: Array<int>` (borrowing field) → same, just on a different
+//     lifetime tier
+//   * parameter / local → the parameter / local's scope-end disposes it
+// A fresh `new Array<int>(...)` getter body is OUT-OF-SCOPE here — its
+// symptom is a leak (no owner), not the crash #2815 pins; classifying it
+// requires AST shape (a `NewExpr` at the property-read site, not at the
+// field) and is left as a follow-up. Returns `v` unchanged when the declared
+// type is not a pure `IEnumerable<T>` / `IOwningEnumerable<T>` or the
+// getter's type is not an array-backed collection.
+llvm::Value* Emitter::wrapPropertyArrayAsIEnumerable(
+        llvm::Value* v, const sema::TypeRef* declTy,
+        const ast::Expr* getter) {
+    if (!v || !declTy || !getter) return v;
+    if (declTy->kind != sema::TypeRef::Kind::Named || declTy->declaration)
+        return v;
+    if (!declTy->astNode || !declTy->astNode->name ||
+        declTy->astNode->name->parts.empty())
+        return v;
+    std::string_view dn = declTy->headName();
+    if (dn != "IEnumerable" && dn != "IOwningEnumerable") return v;
+    sema::TypeRef* getterTy = ctx_.exprType(*getter);
+    if (!getterTy || getterTy->kind != sema::TypeRef::Kind::Named) return v;
+    if (!getterTy->astNode || !getterTy->astNode->name ||
+        getterTy->astNode->name->parts.empty())
+        return v;
+    std::string_view gn = getterTy->headName();
+    if (gn != "Array" && gn != "OwningArray" && gn != "OwningBuffer" &&
+        gn != "Stack" && gn != "OwningStack" &&
+        gn != "Queue" && gn != "OwningQueue")
+        return v;
+    return wrapArrayAsIEnumerable(v, declTy);
+}
+
 // fix #2299 / §28.9: emit an immediate bz_array_free(v, null) for the
 // source Array-family collection, right at the RETURN coercion (NOT at
 // scope end — the return is about to hand the wrapping enumerator to the

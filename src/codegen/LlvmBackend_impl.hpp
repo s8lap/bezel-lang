@@ -7747,6 +7747,31 @@ private:
                                             bool ownLazyPipeline = false,
                                             bool* outWrapMade = nullptr,
                                             bool srcOwnedByCallee = false);
+
+    // fix #2815 / §23.2 / §29.2 (v0.240): a property whose declared type is
+    // `IEnumerable<T>` (or `IOwningEnumerable<T>`) but whose COMPUTED getter
+    // body yields an Array-backed collection — `public property Items:
+    // IEnumerable<int> get => _items;` where `owned _items: Array<int>` — has
+    // the runtime shape of a raw `bz_array_t*`, not a vtable-backed
+    // IEnumerable<T>. The for-in then drives vtable-dispatch on the raw array
+    // descriptor → SIGSEGV at slot 4 (GetEnumerator, NULL).
+    //
+    // This helper is applied at the EXPRESSION-BODIED (§23.2 `=> expr;`),
+    // BLOCK-BODIED (§23.3 `get => expr;` in `{ … }`), and BARE-IDENTIFIER
+    // (`this.P` / implicit-this `P`) property-read sites, AFTER every other
+    // wrap (nullable/box) has run, so every consumer (local-decl-init,
+    // argument, return, direct for-in) sees a properly wrapped value. The
+    // borrow-wrap is correct for the owning-field source (the field's own
+    // owner retains the disposal); the fresh-`new`-in-getter case is
+    // OUT-OF-SCOPE here — its symptom is a leak, not a crash, and its fix is
+    // a separate concern that must classify the AST and pick the owning
+    // variant. A no-op when the property's declared type is not a pure
+    // `IEnumerable<T>`/`IOwningEnumerable<T>` or the getter body's type is
+    // not an Array-family collection (mirrors the same positive-list #1840 /
+    // #2485 already uses in `isAutoPropertyStorageSymbol`).
+    llvm::Value* wrapPropertyArrayAsIEnumerable(
+        llvm::Value* v, const sema::TypeRef* declTy,
+        const ast::Expr* getter);
     // fix #2299 / §28.9 (RETURN-coercion source-ownership probe): is `src`
     // the OWNED producer of a heap-allocated collection whose RETURN transfer
     // moves ownership into the callee? Returns true for `new Array<int>()`,
