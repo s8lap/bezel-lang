@@ -769,6 +769,49 @@ bool Emitter::isNullableValueBuiltinTy(const sema::TypeRef* rt) {
 }
 
 
+// fix #2763 / §7.2 / §2.5–§2.6 / §4.14–§4.15 / §2.15 / §9.8 / §31.4: is rt a
+// NULLABLE VALUE-STRUCT BUILTIN? Spans (§4.14/§4.15/§3.3) — Span/ReadOnlySpan/
+// ArraySpan/ReadOnlyArraySpan/ReadOnlyStringSpan — and JsonOptions (§2.15),
+// ExceptionInfo (§31.4), and Range (§9.8) all lower to bare STRUCT value types
+// where no field records "this is null"; a `Range<int>? := 1..5;` would
+// overwrite the 24-byte Range payload into a placeholder slot and the
+// `= null` check would read a wrong element. The same family as the five
+// value-builtins (isNullableValueBuiltinTy) but with their OWN set — adding
+// them to valueBuiltinBoxNameStr (the BOX-key set) would route their Object
+// boxing to a missing primBoxDesc_ entry and silently break boxing. Resolves
+// the name across the three TypeRef shapes (declaration, astNode head,
+// importedName) the same way isRangeType / isSpanLikeTypeName do, and gates on
+// rt->nullable so the non-nullable case keeps its bare-struct lowering.
+bool Emitter::isNullableValueStructBuiltinTy(const sema::TypeRef* rt) {
+    if (!rt || !rt->nullable || rt->kind != sema::TypeRef::Kind::Named)
+        return false;
+    std::string_view n;
+    if (rt->declaration) {
+        n = rt->declaration->name;
+    } else if (rt->astNode && rt->astNode->name &&
+               !rt->astNode->name->parts.empty()) {
+        n = rt->astNode->name->parts[0];
+    } else if (!rt->importedName.empty()) {
+        n = rt->importedName;
+    } else {
+        return false;
+    }
+    // §4.14 / §4.15 / §3.3 — the array-span value-struct family (owning +
+    // borrowing + the string-backed read-only twin); all share the
+    // arraySpanStructType {ptr,i32,i32} shape.
+    if (n == "Span" || n == "ReadOnlySpan" ||
+        n == "ArraySpan" || n == "ReadOnlyArraySpan" ||
+        n == "ReadOnlyStringSpan") return true;
+    // §9.8 — Range<T> with its {i64,i64,i64,i8} struct shape.
+    if (n == "Range") return true;
+    // §2.15 — JsonOptions, the 5-field compiler-known value record.
+    if (n == "JsonOptions") return true;
+    // §31.4 — ExceptionInfo, the {ptr,ptr,ptr} causechain element.
+    if (n == "ExceptionInfo") return true;
+    return false;
+}
+
+
 // per §8.3/§9.1: a nullable reference type lowers to a plain `ptr` whose null
 // is a real null pointer (no hasValue tag). The synthesized value-semantics
 // members must null-guard a field of such a type before dereferencing it.
@@ -2284,6 +2327,26 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
     // Primitive slot below (rt->kind is Named, not Primitive — its `primitive`
     // field is unset, which is exactly what produced the malformed layout/GEP).
     if (isNullableValueBuiltinTy(rt)) {
+        sema::TypeRef nn = *rt;
+        nn.nullable = false;
+        return llvm::StructType::get(
+            llvm_, {nullablePrimHasValTy(), lowerTypeRef(&nn)});
+    }
+    // fix #2763 / §7.2 / §2.5–§2.6 / §4.14–§4.15 / §2.15 / §9.8 / §31.4: the
+    // nullable VALUE-STRUCT BUILTIN family (Span/ReadOnlySpan/ArraySpan/
+    // ReadOnlyArraySpan/ReadOnlyStringSpan → arraySpanStructType {ptr,i32,i32};
+    // Range → rangeStructType {i64,i64,i64,i8}; JsonOptions → jsonOptionsStructType
+    // {i1,i32,i1,i1,i32}; ExceptionInfo → {ptr,ptr,ptr}). Same shape as the
+    // value-builtin arm above — the leading `hasValue` tag + the non-nullable
+    // payload — but routed via isNullableValueStructBuiltinTy (which sees its
+    // own name set, distinct from valueBuiltinName's, so the BOX-key set in
+    // valueBuiltinBoxNameStr is unaffected). The bare-struct fall-through below
+    // (`nullablePrimStructTy(rt->primitive)`) was the previous behavior and is
+    // exactly the wrong-shape bug: a `Range<int>? := 1..5;` overwrote a 24-byte
+    // Range into a 9-byte `{i8, i32}` placeholder slot, and the `= null` read
+    // extracted a struct field rather than the non-existent tag, crashing
+    // `bezelc` with SIGSEGV on the present-value initializer (measured on HEAD).
+    if (isNullableValueStructBuiltinTy(rt)) {
         sema::TypeRef nn = *rt;
         nn.nullable = false;
         return llvm::StructType::get(

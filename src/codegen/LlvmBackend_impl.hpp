@@ -4061,6 +4061,24 @@ private:
     // Guid {i64,i64}. Defined in LlvmBackend_Layout.cpp (delegates to
     // valueBuiltinName); the four unify under isNullableValueTy below.
     bool isNullableValueBuiltinTy(const sema::TypeRef* rt);
+    // fix #2763 / §7.2 / §2.5–§2.6 / §4.14–§4.15 / §2.15 / §9.8 / §31.4: is rt a
+    // NULLABLE VALUE-STRUCT BUILTIN — a nullable Named TypeRef naming one of
+    // Span / ReadOnlySpan / ArraySpan / ReadOnlyArraySpan / ReadOnlyStringSpan /
+    // JsonOptions / ExceptionInfo / Range? These lower to bare STRUCT value
+    // types (a {ptr,i32,i32} array-span, a {i64,i64,i64,i8} Range, the 5-field
+    // JsonOptions, a {ptr,ptr,ptr} ExceptionInfo) — multi-field shapes where
+    // the bare struct has no slot that records "this is null". Like the
+    // DateTime/TimeSpan/DateOnly/TimeOnly/Guid set (isNullableValueBuiltinTy
+    // above), these need the tagged `{i8 hasValue; <payload>}` lowering
+    // (nullableValueStructTy) so `null` is representable and distinct from
+    // every value. The set is intentionally EXENT of `valueBuiltinBoxNameStr`:
+    // Span boxes into IReadOnlySpan<T> (§4.16) via its own vtable, Range boxes
+    // via `rangeBoxable`, and JsonOptions/ExceptionInfo have no Object box at
+    // all — so adding them to the BOX-key set would route their box lookup to a
+    // missing `primBoxDesc_` entry and silently break boxing. Defined in
+    // LlvmBackend_Layout.cpp; joins isNullableValueTy alongside the other
+    // value-builtin forms.
+    bool isNullableValueStructBuiltinTy(const sema::TypeRef* rt);
     // fix #3095 / §4.7 (v0.252): is `rt` the NULLABLE UNIT type `()?`? §4.7,
     // verbatim: "Wrapping the unit type with `?` (yielding `()?`) is permitted
     // by the grammar and produces an optional with **two values**, `null` and
@@ -4097,7 +4115,9 @@ private:
     // A nullable VALUE type — a value primitive (isNullablePrimTy), an enum
     // (isNullableEnumTy), a record (isNullableRecordTy), a CHOICE
     // (isNullableChoiceTy, fix #2447), a value-builtin
-    // (isNullableValueBuiltinTy, #1954), or the UNIT type (isNullableUnitTy,
+    // (isNullableValueBuiltinTy, #1954), a VALUE-STRUCT BUILTIN
+    // (isNullableValueStructBuiltinTy, fix #2763 — Span/Range/JsonOptions/
+    // ExceptionInfo/ReadOnlyStringSpan), or the UNIT type (isNullableUnitTy,
     // fix #3095). All lower to the tagged {i8 hasValue; T
     // value} struct; the only difference is T (the primitive's LLVM type, i32 for
     // an enum, the bare record struct, the bare choice struct, the
@@ -4108,7 +4128,8 @@ private:
     bool isNullableValueTy(const sema::TypeRef* rt) {
         return isNullablePrimTy(rt) || isNullableEnumTy(rt) ||
                isNullableRecordTy(rt) || isNullableChoiceTy(rt) ||
-               isNullableValueBuiltinTy(rt) || isNullableUnitTy(rt);
+               isNullableValueBuiltinTy(rt) ||
+               isNullableValueStructBuiltinTy(rt) || isNullableUnitTy(rt);
     }
     // The tagged struct for a nullable value type (prim, enum, or record). For
     // an enum the value slot is the underlying integer (i32 — CG44); for a record
