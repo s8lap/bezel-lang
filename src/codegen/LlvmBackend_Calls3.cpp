@@ -1705,6 +1705,26 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy2, elemRef, elemRec);
         llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy2, nullptr, elemRec,
                                                         elemRef);  // #2773
+        // fix #2803 / §4.10 / §28.9: a CLASS or INTERFACE element takes the
+        // ARRAY-backed Set<T> path — the same shape `new Set<C>()` / `new
+        // OwningSet<C>()` builds (a `bz_array_t` scanned with §8.3 equality
+        // via `emitArrayBackedSetInsert`). The disposal site at
+        // LlvmBackend_Disposal.cpp:3375 frees an `OwningSet<T>` as
+        // `bz_array_free`; the dict-backed `bz_lazy_to_set` result disagreed
+        // with that contract and was freed by `bz_array_free` (or UAF'd on a
+        // subsequent `Equals`/`GetHashCode` read of the freed region —
+        // #2773's trampolines are the load-bearing reader). The dict path is
+        // preserved for every element type the §4.10/§4.8 generic-key dict
+        // backing admits (record, primitive, enum, choice, string).
+        // genericBackingType returns null for class/interface set elements
+        // (the `isSet` exclusion at `genericBackingType`'s line 405).
+        const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+        if (!genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)) {
+            auto* toSetArr = declareC("bz_lazy_to_set_arraybacked", ptrTy(),
+                                      {ptrTy(), i64(), ptrTy()});
+            return builder_.CreateCall(toSetArr,
+                {lazy, builder_.getInt64(esz), eqTramp}, "linq.toset.arr");
+        }
         auto* toSet = declareC("bz_lazy_to_set", ptrTy(),
                                {ptrTy(), i64(), ptrTy(), ptrTy()});
         return builder_.CreateCall(toSet,
