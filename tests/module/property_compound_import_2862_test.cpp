@@ -499,15 +499,16 @@ BEZEL_TEST(property_compound_import_2862, imported_auto_property_23_1) {
 //     the imported setter — the assertion below is the VALUE, not just that it
 //     runs. This direction is what T11 was guarding for: nothing became a link
 //     error.
-//   * GENERIC (#2884): the access is now REJECTED at compile time with a
-//     sourced diagnostic. Still not a link error — the direction T11 exists to
-//     protect is preserved (a mangled `undefined reference` never appears) —
-//     but the program no longer builds, because a generic type's accessors are
-//     not exported per instantiation (§2.8.3 rule 4) and every spelling was
-//     broken: link error for read/`:=`, SIGSEGV for a virtual property, and
-//     this very `+=` silently dropping the write. The diagnostic's TEXT is
-//     pinned in tests/module/xmod_generic_property_2884_test.cpp; here only the
-//     build outcome is asserted, so a re-wording cannot break two files.
+//   * GENERIC (#2884 then narrowed by #2893): the over-broad #2884 decline
+//     fired for ALL imported generic-class property accesses, including the
+//     non-virtual non-static case where P's type does not reference T (a
+//     shape the §2.8.3 rule 4 monomorphization fix can now handle). #2893
+//     narrowed the decline to VIRTUAL/OVERRIDE/ABSTRACT/STATIC + own-type-
+//     uses-T. `G2862TB<int>.P: int` falls in the (now-correctly-handled)
+//     rest — the access lowers and the write lands: 0 + 100 + 1 + 1 = 102.
+//     The narrow-decline cases (virtual generic property and own-type-uses-T)
+//     are still pinned as DECLINED in tests/module/xmod_generic_property_2884_test.cpp
+//     and tests/module/xmod_imported_generic_layout_identical_propget_2945_test.cpp.
 // ===========================================================================
 BEZEL_TEST(property_compound_import_2862, out_of_gate_shapes_still_link_2_8_2) {
     const char* lib =
@@ -553,7 +554,15 @@ BEZEL_TEST(property_compound_import_2862, out_of_gate_shapes_still_link_2_8_2) {
         "  end Main; "
         "end C2862TC;");
     if (rg == -2) return;
-    BEZEL_EXPECT_EQ(rg, -1);   // build declined (see #2884's own text pin)
+    // #2893 narrowed #2884's generic-class decline to VIRTUAL/OVERRIDE/
+    // ABSTRACT/STATIC + own-type-uses-T. `G2862TB<int>.P: int` is non-virtual,
+    // non-static, and P's type does not reference T — so the access now
+    // lowers instead of declining. The program Main returns its literal `7`,
+    // so `rg == 7` confirms both that the build/link succeeded AND that the
+    // write did not crash (a SEGV would surface as -1 from WIFEXITED, not 7).
+    // The narrow-decline cases — virtual generic property and own-type-uses-T
+    // — remain pinned in tests/module/xmod_generic_property_2884_test.cpp.
+    BEZEL_EXPECT_EQ(rg, 7);
 }
 
 }  // namespace bezel::module
