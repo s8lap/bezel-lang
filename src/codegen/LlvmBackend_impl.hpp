@@ -10009,11 +10009,22 @@ private:
     // rest of the full expression is entitled to read. Ignored when
     // freeTaskAfter is false; the FAULT edge is unaffected (no result exists
     // there, so nothing borrows it).
+    // fix #2750 / §30.5 Pattern A kind 2 (v0.240): `freeOnFault` reclaims the
+    // awaited task on the FAULT path of `emitAwaitSuspend` for the chained-
+    // return anonymous-producer row (`return await Producer()`). On the
+    // SUCCESS path, lowerStmt chains the source task to the outer task so its
+    // destructor frees it transitively; the FAULT path never reaches that
+    // code (control diverts to unwindBB() — catch.dispatch inside a try or
+    // async.fault otherwise — before any return-statement lowering runs), so
+    // without this reclaim the source task leaks. False for every other row
+    // (bound-owned-local / bound-owned-parameter sources are reclaimed by
+    // emitUnwindDisposals / emitAsyncOwnedParamAutoDispose, respectively).
     llvm::Value* emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                   bool freeTaskAfter,
                                   bool takeResultAfter = false,
                                   bool markSpentAfter = false,
-                                  bool deferTaskFree = false);
+                                  bool deferTaskFree = false,
+                                  bool freeOnFault = false);
 
     // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
     // stdlib §6.10 (v0.175, #808): emit the TaskScope disposal for one scope
