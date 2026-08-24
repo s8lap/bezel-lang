@@ -374,7 +374,7 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
         // (sema rejects a non-value-like one). Stored as the choice struct's
         // bytes; hashed/compared by tag + active payload (build*ChoiceTrampoline).
         eligible = true;
-    else if (!isSet && !ty->nullable && hasObjectHeaderEquality(ty))
+    else if (!ty->nullable && hasObjectHeaderEquality(ty))
         // fix #2773 (rows A3/A4) / §3.6 / §8.3 / stdlib §4.8: a DICTIONARY key
         // that carries the §8.3 object header — a class, an interface, or
         // `Object`. §3.6's hashable row admits "every type except (a) a
@@ -402,9 +402,29 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
         // — so BUILD mode and READ mode disagreed; converging on generic is
         // what makes the two agree.
         //
-        // `isSet` is excluded deliberately: a class/interface SET element keeps
-        // its ARRAY-backed linear-scan machinery (emitArrayBackedSetInsert,
-        // #1070), a separate and working design.
+        // fix #2773 (B1) / stdlib §4.18 / spec §14.2 (v0.240): the B-row
+        // widening lifts the prior `!isSet` carve-out, so a SET element with
+        // a §8.3 header (class, interface, `Object`) is now also admitted.
+        // SortedSet<T> has no ARRAY-backed linear-scan fallback
+        // (emitArrayBackedSetInsert, #1070, handles Set/OwningSet<T> for any
+        // element type, but SortedSet<T> cannot reuse it — SortedSet is
+        // hash-backed or it is nothing), so pre-fix `new SortedSet<Item>()`
+        // was rejected at codegen with the "produced no value" #2974 message,
+        // masking the actual B-row defect (NULL comparator → insertion-order
+        // iteration, the comparator fix at buildSortedKeyComparator then
+        // unreachable). Admitting the class element here lets both SortSet
+        // families instantiate, after which buildSortedKeyComparator's new
+        // `bz$classcmp$<Name>` and `bz$ifacecmp$<Iface>` arms can do their
+        // §4.18 work.
+        //
+        // Set/OwningSet<Class> switches from the ARRAY path to the DICT
+        // path — same observable Set semantics (unique elements, content-
+        // based dedup), with an O(1)-vs-O(n) membership improvement. The
+        // OLD `emitArrayBackedSetInsert` arm in `lowerNew`'s Set/OwningSet
+        // section was the dedup-via-equals fallback ONLY when the
+        // codegen dict allocation failed (a class/interface element); the
+        // equality machinery it forwards to
+        // (`lowerNew`'s elem-size / runtime path) is unchanged.
         eligible = true;
     if (!eligible) return nullptr;
     if (byteSize) {
@@ -575,13 +595,108 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
 // Signature: int cmp(const void* a, const void* b)
 //   a, b = direct pointers to key bytes (NOT void** of void*).
 // Returns null for unsupported key types (record, decimal, unresolved param).
-// Supported: integer types (i32, i64, i8, i16, i1), float/double.
+// Supported: integer types (i32, i64, i8, i16, i1), float/double, a CLASS or
+// INTERFACE element naming a single-arg `CompareTo` (§14.2 rule 3 —
+// `where T: IComparable<T>`), and (via the wrapper at Calls2.cpp:13194) `string`.
 // String-key SortedDictionary uses a dedicated bz_sort_kv_str/bz_dict_min_key_str
 // path and does NOT use this comparator.
 llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
     if (!keyTy) return nullptr;
     llvm::Type* kllvm = lowerTypeRef(keyTy);
     if (!kllvm) return nullptr;
+
+    // Fix #2773 (B1) / stdlib §4.18 (v0.240): a CLASS element whose `CompareTo`
+    // is named `IComparable<Self>` — every SortedSet<T> satisfies
+    // `where T: IComparable<T>` (§4.18) — must dispatch the comparator through
+    // the user-defined order, not be silently returned as NULL.  Pre-fix this
+    // branch was absent: `wrapSortedSetAsIEnumerable` (Calls2.cpp:13181) saw
+    // cmpFn==null and fell through to an insertion-order iteration, violating
+    // §4.18's "iteration in ascending order" contract for any non-primitive
+    // SortedSet element.  Match the existing Array.Sort class comparator
+    // (Calls.cpp:4301 `bz$classcmp$<Name>`): each thunk arg is `ptr*` — a
+    // pointer to a malloc(key_size) buffer holding the class instance pointer
+    // — and the body dereferences once then dispatches `a.CompareTo(b)` via
+    // vtable slot if virtual, else direct compiled call.  The thunk name is
+    // keyed on the class so re-entry (e.g. from both First/Last and the
+    // GetEnumerator path) returns the same module-cached function.
+    if (keyTy->kind == sema::TypeRef::Kind::Named && keyTy->declaration &&
+        !keyTy->nullable &&
+        keyTy->declaration->kind == ast::TypeDeclKind::Class) {
+        sema::MethodSymbol* cmpMs =
+            findMethodByName(keyTy->declaration, "CompareTo");
+        if (cmpMs && cmpMs->params.size() == 1) {
+            std::string thunkName = std::string("bz$classcmp$") +
+                                    std::string(keyTy->declaration->name);
+            if (auto* existing = module_->getFunction(thunkName))
+                return existing;
+            auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+            auto* fn = llvm::Function::Create(fnTy,
+                                              llvm::Function::InternalLinkage,
+                                              thunkName, module_.get());
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+            llvm::IRBuilder<> thunkB(bb);
+            // aPtr/bPtr each point to malloc(key_size) bytes holding the
+            // class instance pointer (8 bytes for a pointer-typed element).
+            // Dereference once to recover the instance, then dispatch
+            // CompareTo.  This mirrors the Array.Sort bz_array_sort ABI at
+            // Calls.cpp:4311-4339 exactly, so the comparator contract is the
+            // same one test_helpers already exercise for Array<T>.
+            llvm::Value* aSlot = &*fn->arg_begin();
+            llvm::Value* bSlot = &*std::next(fn->arg_begin());
+            llvm::Value* aPtr = thunkB.CreateLoad(ptrTy(), aSlot);
+            llvm::Value* bPtr = thunkB.CreateLoad(ptrTy(), bSlot);
+            auto* cmpToTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+            llvm::Value* result = nullptr;
+            auto vsIt = vtableSlot_.find(cmpMs);
+            if (vsIt != vtableSlot_.end()) {
+                // Virtual dispatch: load vtable from receiver (field 0),
+                // then load the function pointer from the slot.  §12.
+                unsigned vtSlot = vsIt->second;
+                llvm::Value* vtable = thunkB.CreateLoad(ptrTy(), aPtr);
+                llvm::Value* slotPtr = thunkB.CreateGEP(
+                    ptrTy(), vtable, {thunkB.getInt32(vtSlot)});
+                llvm::Value* fnPtr = thunkB.CreateLoad(ptrTy(), slotPtr);
+                result = thunkB.CreateCall(cmpToTy, fnPtr, {aPtr, bPtr});
+            } else {
+                // Non-virtual: direct call to the compiled method body.
+                auto fnIt = methodFns_.find(cmpMs);
+                if (fnIt != methodFns_.end()) {
+                    result = thunkB.CreateCall(
+                        fnIt->second->getFunctionType(),
+                        fnIt->second, {aPtr, bPtr});
+                } else {
+                    // No body available — fall back to a neutral zero so the
+                    // sort degrades to insertion order rather than aborting
+                    // mid-compile.  Mirrors Calls.cpp:4337-4338.
+                    result = llvm::ConstantInt::get(i32(), 0);
+                }
+            }
+            thunkB.CreateRet(result);
+            return fn;
+        }
+    }
+
+    // Fix #2773 (B1) / stdlib §4.18 / spec §14.2 rule 3 (v0.240): an
+    // INTERFACE element `IFoo: IComparable<IFoo>` (the §14.2 self-recurrence
+    // stdlib §5.1's `where T: IComparable<T>` admits as a substitution) must
+    // dispatch through the §13 itable, exactly as Array.Sort and Array.Min/Max
+    // already do (#2768 / #2770 — `bz$ifacecmp$<Iface>`).  Reuses
+    // ensureIfaceCmpThunk UNCHANGED: its `bz_array_sort` ABI takes the
+    // ADDRESS of each element slot, and the keys[i] we hand it for an
+    // interface element are also `void*`-pointing-to-instance-pointer buffers
+    // (the hash-table's `bz_dict_set_gen` already stored them that way at
+    // insert time).  The arm is selected by the exact stdlib §4.18
+    // constraint via selfComparableIfaceCompareTo, so no other element
+    // category can be mis-routed into it.
+    if (keyTy->kind == sema::TypeRef::Kind::Named && keyTy->declaration &&
+        !keyTy->nullable &&
+        keyTy->declaration->kind == ast::TypeDeclKind::Interface) {
+        if (sema::MethodSymbol* ifm = selfComparableIfaceCompareTo(keyTy)) {
+            if (llvm::Function* ifaceThunk =
+                    ensureIfaceCmpThunk(keyTy->declaration, ifm))
+                return ifaceThunk;
+        }
+    }
 
     // Build a unique name per key LLVM type to cache it per module.
     std::string name = "bz$sdcmp$";
