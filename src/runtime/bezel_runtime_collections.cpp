@@ -2983,6 +2983,53 @@ extern "C" void* bz_lazy_to_set(void* lazy, int64_t esz, void* hashfn, void* eqf
     return set;
 }
 
+// fix #2803 / §4.10 / §28.9: a CLASS or INTERFACE element takes the ARRAY-backed
+// Set<T> path — the same shape `new Set<C>()` / `new OwningSet<C>()` builds
+// (a `bz_array_t` scanned with §8.3 equality via `emitArrayBackedSetInsert`).
+// The disposal site at LlvmBackend_Disposal.cpp:3375 frees an `OwningSet<T>`
+// as `bz_array_free`; the dict-backed `bz_lazy_to_set` result disagreed with
+// that contract and was freed by `bz_array_free` (or UAF'd on a subsequent
+// `Equals`/`GetHashCode` read of the freed region — #2773's trampolines are
+// the load-bearing reader). The dict path is preserved for every element
+// type that the §4.10/§4.8 generic-key dict backing admits (record, primitive,
+// enum, choice, string) — those go through `bz_lazy_to_set` and that path is
+// unchanged. Codegen dispatches via `genericBackingType(collTy, 0, isSet=true)`
+// returning null for class/interface elements (the `isSet` exclusion at
+// `genericBackingType`'s line 405).
+//
+// Drain the lazy enumerator into a fresh `bz_array_t`. For each element,
+// linear-scan the existing array using `eqfn` (the element equality trampoline
+// built the same way Distinct/Union/Intersect/Except build theirs — §8.3
+// for a class, `Equals` override or reference identity; §8.4 when an override
+// is declared; §9.2 for an auto-hashable record; content equality for a
+// string). On a duplicate, silently drop the new one (no disposer — `Set<T>`
+// is the borrowing family, the element's source owns its +1). On a fresh
+// element, append via `bz_array_add` (the array becomes the sole owner of
+// the borrowed element's reference, the same contract `emitArrayBackedSet-
+// Insert` honours). Returns the array as `void*`, cast to the `Set<T>` it
+// shape-matches. Consumes (drains + disposes) the pipeline.
+extern "C" void* bz_lazy_to_set_arraybacked(void* lazy, int64_t esz, void* eqfn) {
+    auto* e = (bz_lazy_t*)lazy;
+    void* set = bz_array_alloc(esz, 8);
+    void** vt = (void**)e->vtable;
+    typedef int32_t (*mn_t)(void*);
+    typedef void*   (*cur_t)(void*);
+    typedef int32_t (*eq_t)(const void*, const void*);
+    eq_t eq = (eq_t)eqfn;
+    while (((mn_t)vt[2])(e)) {
+        void* item = ((cur_t)vt[3])(e);
+        int64_t len = bz_array_len(set);
+        bool found = false;
+        for (int64_t i = 0; i < len; ++i) {
+            void* existing = bz_array_ptr_at(set, i, esz);
+            if (eq(existing, item)) { found = true; break; }
+        }
+        if (!found) bz_array_add(set, item, esz);
+    }
+    bz_lazy_dispose(e);
+    return set;
+}
+
 // stdlib §5 ToDictionary<TKey>(key: (T)->TKey): materialize into a fresh
 // Dictionary<TKey, T>. Each element T is stored as value; the key is extracted
 // by the `keyfn` trampoline. Uses the generic-key dict path — EXCEPT when
