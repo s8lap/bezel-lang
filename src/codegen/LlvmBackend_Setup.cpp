@@ -13924,6 +13924,16 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
                 // function — so an un-annotated local participates in the
                 // claim. The conjunction matches the property-read wrap's
                 // positive list verbatim.
+                //
+                // fix #2777 (§29.2 / §23.2, v0.240): extended the positive
+                // list to Set/OwningSet/LinkedList — the same families
+                // #2703's BLOCK-BODIED RETURN wrap covers and that
+                // #2777's extended EXPRESSION-BODIED property-read wrap now
+                // also covers (wrapPropertyArrayAsIEnumerable dispatched to
+                // wrapAsIEnumerableForTarget for the non-Array case). A user
+                // class implementing IEnumerable<T> (declaration-carrying) is
+                // included via `getterTy->declaration != nullptr` — its
+                // enumerator struct is also freshly minted at the wrap site.
                 bool declIsPureIEnum = tr && tr->kind ==
                     sema::TypeRef::Kind::Named && !tr->declaration &&
                     tr->astNode && tr->astNode->name &&
@@ -13933,14 +13943,24 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
                     const sema::TypeRef* getterTy =
                         ctx_.exprType(*cg);
                     if (getterTy && getterTy->kind ==
-                            sema::TypeRef::Kind::Named &&
-                        getterTy->astNode && getterTy->astNode->name &&
-                        !getterTy->astNode->name->parts.empty()) {
-                        std::string_view gn = getterTy->headName();
-                        if (gn == "Array" || gn == "OwningArray" ||
-                            gn == "OwningBuffer" ||
-                            gn == "Stack" || gn == "OwningStack" ||
-                            gn == "Queue" || gn == "OwningQueue")
+                            sema::TypeRef::Kind::Named) {
+                        if (getterTy->astNode && getterTy->astNode->name &&
+                            !getterTy->astNode->name->parts.empty()) {
+                            std::string_view gn = getterTy->headName();
+                            if (gn == "Array" || gn == "OwningArray" ||
+                                gn == "OwningBuffer" ||
+                                gn == "Stack" || gn == "OwningStack" ||
+                                gn == "Queue" || gn == "OwningQueue" ||
+                                gn == "Set" || gn == "OwningSet" ||
+                                gn == "LinkedList")
+                                ownsSource = true;
+                        }
+                        // A declaration-carrying user class implementing
+                        // IEnumerable<T>: wrapAsIEnumerableForTarget mints a
+                        // fresh wrapper frame (wrapUserClassAsIEnumerable),
+                        // so the local owns it and must register slot-1
+                        // iterEnumDispose at scope end.
+                        if (!ownsSource && getterTy->declaration != nullptr)
                             ownsSource = true;
                     }
                 }

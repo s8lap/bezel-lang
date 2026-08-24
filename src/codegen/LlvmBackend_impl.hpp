@@ -7801,7 +7801,11 @@ private:
     // variant. A no-op when the property's declared type is not a pure
     // `IEnumerable<T>`/`IOwningEnumerable<T>` or the getter body's type is
     // not an Array-family collection (mirrors the same positive-list #1840 /
-    // #2485 already uses in `isAutoPropertyStorageSymbol`).
+    // #2485 already uses in `isAutoPropertyStorageSymbol`). #2777 extended
+    // the non-Array branch to dispatch to `wrapAsIEnumerableForTarget` for
+    // the Set / LinkedList / user-class-IEnumerable families the BLOCK-
+    // BODIED §29.2 wrap already handles — IOwningEnumerable + non-Array
+    // remains a no-op (no wrap variant exists for that shape today).
     llvm::Value* wrapPropertyArrayAsIEnumerable(
         llvm::Value* v, const sema::TypeRef* declTy,
         const ast::Expr* getter);

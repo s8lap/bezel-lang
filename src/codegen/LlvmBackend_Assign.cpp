@@ -7701,16 +7701,30 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     return v;
 }
 
-// fix #2815 / §23.2 / §29.2 (v0.240): see the declaration in
-// LlvmBackend_impl.hpp. The shape we care about is `public property P:
-// IEnumerable<int> get => _items;` (or its block-bodied / bare-identifier
-// spellings) where the getter body's sema type is an Array-backed collection
-// — the `actualIsArray` / `initIsArray` predicates in `wrapAsIEnumerableForTarget`
-// and `lowerLocalDecl` look at the EXPRESSION's sema type, which for a property
-// read IS the property's declared `IEnumerable<T>` (the very type the wrap
-// helper is trying to reach), so the wrap is missed. Reach the getter body
-// directly and wrap when its declared type is one of the array-backed
-// collections.
+// fix #2815 / §23.2 / §29.2 (v0.240) and #2777 (§29.2 / §23.2, v0.240):
+// see the declaration in LlvmBackend_impl.hpp.
+//
+// #2815 — the shape we care about is `public property P: IEnumerable<int>
+// get => _items;` (or its block-bodied / bare-identifier spellings) where
+// the getter body's sema type is an Array-backed collection. The
+// `actualIsArray` / `initIsArray` predicates in `wrapAsIEnumerableForTarget`
+// and `lowerLocalDecl` look at the EXPRESSION's sema type, which for a
+// property read IS the property's declared `IEnumerable<T>` (the very type
+// the wrap helper is trying to reach), so the wrap is missed. Reach the
+// getter body directly and wrap when its declared type is one of the
+// array-backed collections.
+//
+// #2777 — the EXPRESSION-BODIED twin of #2703's BLOCK-BODIED §29.2 wrap.
+// #2703 wrapped the BLOCK form on the RETURN edge via
+// `wrapAsIEnumerableForTarget`, which handles Array/Set/LinkedList/user-
+// class sources uniformly. #2815 extended the EXPRESSION-BODIED form to
+// the Array family only — a Set/LinkedList/user-class-IEnumerable getter
+// body (`=> _s;` where `_s: OwningSet<Item>`) fell through unwrapped and
+// the caller's for-in drove vtable dispatch on the raw Set/LinkedList
+// descriptor → SIGSEGV at slot 4 (GetEnumerator, NULL). Dispatch to
+// `wrapAsIEnumerableForTarget` for the non-Array case (IEnumerable target
+// only — IOwningEnumerable has no wrap variant for Set/LinkedList today
+// and stays a no-op here; see the deferred follow-up note).
 //
 // BORROWING wrap (wrapArrayAsIEnumerable). The source has an existing owner:
 //   * `owned _items: Array<int>` field → owning object disposes it (#1840's
@@ -7741,11 +7755,37 @@ llvm::Value* Emitter::wrapPropertyArrayAsIEnumerable(
         getterTy->astNode->name->parts.empty())
         return v;
     std::string_view gn = getterTy->headName();
-    if (gn != "Array" && gn != "OwningArray" && gn != "OwningBuffer" &&
-        gn != "Stack" && gn != "OwningStack" &&
-        gn != "Queue" && gn != "OwningQueue")
-        return v;
-    return wrapArrayAsIEnumerable(v, declTy);
+    if (gn == "Array" || gn == "OwningArray" || gn == "OwningBuffer" ||
+        gn == "Stack" || gn == "OwningStack" ||
+        gn == "Queue" || gn == "OwningQueue")
+        return wrapArrayAsIEnumerable(v, declTy);
+    // fix #2777 (§29.2 / §23.2, v0.240): the EXPRESSION-BODIED sibling of
+    // #2703's BLOCK-BODIED §29.2 wrap. The block form wraps on the RETURN
+    // edge through `wrapAsIEnumerableForTarget` (handles Set, LinkedList,
+    // user-class IEnumerable in addition to Array/Stack/Queue); the
+    // expression-bodied form has no RETURN and must wrap at the read site,
+    // so dispatch to the same helper the block form uses. Mirrors the
+    // block form's RETURN-edge call verbatim: `ownLazyPipeline=true`
+    // (caller owns the returned enumerator — same as a RETURN position)
+    // and `srcOwnedByCallee = returnSourceIsCalleeOwnedCollection(getter)`
+    // (only `new T(...)`, `move e`, or a producer-init LOCAL transfers
+    // ownership into the wrapper — a plain field/parameter/local borrow
+    // keeps the wrap BORROWING, exactly as the block form does).
+    // `wrapAsIEnumerableForTarget` keys on `headName() == "IEnumerable"`
+    // (its gate at the function head) and declines every other name, so
+    // IOwningEnumerable falls through here unchanged; the IOwningEnumerable
+    // + Array family is already wrapped above, and IOwningEnumerable +
+    // non-Array has no wrap variant today and stays unwrapped (the SIGSEGV
+    // for that shape is a separate, pre-existing defect — not fixed here).
+    if (dn == "IEnumerable") {
+        return wrapAsIEnumerableForTarget(
+            v, declTy, getter,
+            /*ownLazyPipeline=*/true,
+            /*outWrapMade=*/nullptr,
+            /*srcOwnedByCallee=*/
+            returnSourceIsCalleeOwnedCollection(getter));
+    }
+    return v;
 }
 
 // fix #2299 / §28.9: emit an immediate bz_array_free(v, ?) for the
