@@ -7175,11 +7175,26 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     // issues #343 / D8: a Set is dict-backed (records,
                     // primitives, strings — see lowerNew), so it frees with
                     // bz_dict_free, not bz_array_free.
+                    // fix #3360 / spec §28.2 (v0.135, #2967), stdlib §4.18
+                    // (v0.278, #1426): the Set family headName match must
+                    // admit SortedSet — its runtime IS the bz_dict_t* with
+                    // sorted-ordering layered on (#1426); bz_dict_free
+                    // disposes both equivalently. Without SortedSet in this
+                    // predicate, an explicit `s.Dispose()` on a SortedSet
+                    // fell past `dictBackedSet` into the vtableless-BuiltinClass
+                    // fall-through at line 7429 → `emitVtablelessBuiltinRelease`
+                    // had no SortedSet case → emitted NOTHING (a bounded leak
+                    // — the trade #2874/#2823 record). Narrow residue of the
+                    // broader #2726 SortedSet/family thesis, which stays open
+                    // (the Set-family misclassification in lowerToLazyEnumerator
+                    // / kArrayBackedCollections is a separate problem with a
+                    // different scope of consumer #1426/#2693/#2721 touches).
                     bool isSetName = recvTy && recvTy->astNode &&
                         recvTy->astNode->name &&
                         !recvTy->astNode->name->parts.empty() &&
                         (recvTy->headName() == "Set" ||
-                         recvTy->headName() == "OwningSet");
+                         recvTy->headName() == "OwningSet" ||
+                         recvTy->headName() == "SortedSet");
                     bool dictBackedSet = isSetName &&
                         genericBackingType(recvTy, 0, /*isSet=*/true, nullptr)
                             != nullptr;
