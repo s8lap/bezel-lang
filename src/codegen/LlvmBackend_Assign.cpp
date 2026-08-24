@@ -8,9 +8,16 @@ namespace {
 // type and the index argument's type — by primitive for value/string types and
 // by declaration for named types. Used to pick the right overload; the
 // checkTypeOverloads distinctness check (sema) guarantees at most one indexer
-// matches any concrete argument type exactly.
+// matches any concrete argument type exactly. fix #2834 (§23.4 / §7.1,
+// v0.240): compare `nullable` too — an `int?` argument and an `int`
+// parameter are NOT the same type under §7.1, so the structural match must
+// reject that mismatch, otherwise an exact full-list match reports a
+// `Nullable` parameter and a `NonNull` parameter as the same shape and the
+// resolver picks the wrong one (mirrors the identically-shaped fix in
+// ExprTypecheck_Exprs.cpp's sema-side `allParamsMatch`).
 bool indexerArgMatches(const sema::TypeRef* p, const sema::TypeRef* a) {
     if (!p || !a || p->kind != a->kind) return false;
+    if (p->nullable != a->nullable) return false;
     if (p->kind == sema::TypeRef::Kind::Primitive)
         return p->primitive == a->primitive;
     if (p->kind == sema::TypeRef::Kind::Named)

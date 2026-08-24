@@ -2607,12 +2607,32 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         }
                         return nullptr;
                     };
+                    // fix #2834 (§23.4 / §7.1, v0.240): an indexer is
+                    // OVERLOADED by its parameter TYPE LIST (§23.4), and §7.1
+                    // says `T` and `T?` are distinct types. The prior
+                    // structural check (kinds + primitive/declaration) did
+                    // NOT compare `nullable` — so an `int?` argument
+                    // structurally matched `[i: int]` and the resolver
+                    // picked whichever candidate the `t->members` walk
+                    // reached first (typically `[i: int]`), bypassing the
+                    // exact-match `[n: int?]` overload and then triggering
+                    // §7's "nullable argument to non-nullable target"
+                    // reject (#2619's gate (4) would have exempted `[n:
+                    // int?]` entirely). Compare `nullable` on both the
+                    // Primitive and the Named arm so a nullable-parameter
+                    // candidate is preferred for a nullable argument; the
+                    // arity-only fallback below is preserved untouched so
+                    // implicit-conversion spellings like `a[someLong]`
+                    // continue to work and a nullable argument still falls
+                    // to §7 only when NO nullable-parameter overload
+                    // exists.
                     auto allParamsMatch =
                         [&](const PropertySymbol* cand) -> bool {
                         for (std::size_t k = 0; k < nargs; ++k) {
                             const TypeRef* a = argTys[k];
                             const TypeRef* p = candParamResolvedType(cand, k);
                             if (!p || !a || p->kind != a->kind) return false;
+                            if (p->nullable != a->nullable) return false;
                             if (p->kind == TypeRef::Kind::Primitive) {
                                 if (p->primitive != a->primitive) return false;
                             } else if (p->kind == TypeRef::Kind::Named) {
