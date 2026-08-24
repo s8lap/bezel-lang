@@ -1364,6 +1364,131 @@ static std::string metaVisibilityToKeyword(MetaVisibility v) {
     }
 }
 
+// fix #2842 (§14.1/§2.5/#783, v0.240): per-STUB skip, paralleling the #2820
+// shape. The synthetic single-class source declares only the type being
+// reconstructed — sibling types of the exporting module are not in scope
+// (UNLESS the source begins with `import <moduleName>;`, which is only
+// buildSyntheticFieldInitSource's path — see #2351/#2375). A method stub
+// whose SIGNATURE (return type or any parameter type) names a sibling Named
+// type therefore fails at resolveTypes of the fresh context — and that
+// failure is reported by the SAME error channel as the body being
+// reconstructed. parseAndAttachMethodBody's #783 soundness gate (and its
+// ctor/dtor siblings) then refuses to attach the BODY under reconstruction
+// for the WHOLE class, even though the defect is in one unrelated sibling's
+// stub. Today the whole-class disable surfaces as a clean REJECTED compile
+// via the §14.1/#2821 layout gate; before #2821 it was a silent wrong value.
+//
+// The fix is the per-stub equivalent of #2820's per-stub shape. Skip a stub
+// whose signature references a Named type other than the enclosing class
+// (which IS declared) — the stub is omitted from the synthetic source, so the
+// fresh context's resolveTypes succeeds for the remaining members. A body
+// that referenced the skipped sibling would fail at typecheckExpressions (the
+// resolution target does not exist) and parseAndAttachMethodBody correctly
+// declines to attach THAT body — the OTHER methods of the class still
+// reconstruct, which is exactly the per-stub granularity this fix aims at.
+//
+// The ctor/dtor-body paths are TOLERANT of post-typecheck sema errors (a
+// base(...) chain on an unknown base is benign — only the field/param/method
+// remap matters there), so a body that CALLED the skipped sibling would be
+// silently attached with the call dropped — a #2290-bug-2-shaped wrong value.
+// The parse-and-attach functions therefore mirror the helper: if ANY method
+// stub was skipped, the ctor/dtor body is NOT attached (return false), so the
+// §14.1/#783/#2821 gate stays in force for that body. The method-body path's
+// existing soundness gate covers its own case.
+//
+// buildSyntheticFieldInitSource declares `import <moduleName>;` (#2375), so
+// sibling types ARE visible in its synthetic context — the helper is told so
+// via the `importsModule` flag, and the per-stub skip is suppressed on that
+// path (an existing test surface depends on the import-resolved form).
+//
+// InScope names: the enclosing class (`selfName`) AND its generic-parameter
+// names — both are bound by the synthetic source's class header (`class
+// Box<T>` declares both `Box` and `T`). A method signature like `Get(): T`
+// uses the type parameter `T` and is therefore safe — without this carve-out
+// the check would spuriously skip every method that references a type
+// parameter of its own class (regression-measured against the #783 test
+// surface — xmod_generic_method_783's T1–T3 all use `Box<T>` with a
+// `Get(): T` member, and treating `T` as "non-self Named" leaves the class
+// with no methods to reconstruct).
+static bool metaTypeReferencesNonSelfNamed(
+    const MetaType& mt,
+    const std::string& selfName,
+    const std::unordered_set<std::string>& inScopeGenericParams) {
+    switch (mt.kind) {
+        case TypeKind::Primitive:
+        case TypeKind::Error:
+        case TypeKind::Unit:
+            return false;
+        case TypeKind::Named: {
+            // A Named type that names the enclosing class IS declared in the
+            // synthetic source, so it is safe; a Named type that names a
+            // generic parameter (`T`) is bound by the class header, so it is
+            // also safe. Anything else (a sibling type like `Cell16`) is not
+            // declared and the stub must be skipped. We recurse through
+            // generic args (`Box<Cell16>` is not safe even though `Box` is).
+            for (const MetaType& arg : mt.genericArgs) {
+                if (metaTypeReferencesNonSelfNamed(arg, selfName,
+                                                   inScopeGenericParams))
+                    return true;
+            }
+            if (mt.namedName.empty()) return false;
+            if (mt.namedName == selfName) return false;
+            if (inScopeGenericParams.count(mt.namedName)) return false;
+            return true;
+        }
+        case TypeKind::InlineArray:
+            // InlineArray's element type is `children[0]`. Empty `children` is
+            // the unresolved sentinel — treat as safe.
+            if (mt.children.empty()) return false;
+            return metaTypeReferencesNonSelfNamed(mt.children[0], selfName,
+                                                  inScopeGenericParams);
+        case TypeKind::Function: {
+            // Function's children are params followed by the return type
+            // (mirrors ModuleMetadata.hpp's schema comment on MetaType).
+            for (const MetaType& c : mt.children) {
+                if (metaTypeReferencesNonSelfNamed(c, selfName,
+                                                   inScopeGenericParams))
+                    return true;
+            }
+            return false;
+        }
+    }
+    return false;
+}
+
+// True iff emitting a stub for `mm` in a synthetic source whose enclosing
+// class is `td.name` would not reference any Named type that source does not
+// declare. False (skip the stub) iff the signature names another Named type
+// of the exporting module.
+static bool methodSignatureIsStubSafe(const MetaMember& mm,
+                                      const MetaTypeDecl& td) {
+    std::unordered_set<std::string> inScopeGenericParams;
+    for (const auto& gp : td.genericParams) {
+        if (!gp.name.empty()) inScopeGenericParams.insert(gp.name);
+    }
+    // fix #2842 (gap fill — found at per-fix review): also include THIS
+    // method's own generic-parameter names. The synthetic stub declares them
+    // as part of `mm`'s own header (`<U>` in `method Bar<U>(x: U): U`,
+    // emitted by buildMethodStub's "Generic type params (method-level `<T>`)"
+    // arm below). Without this they would be misread as "non-self Named" by
+    // metaTypeReferencesNonSelfNamed — the stub would be incorrectly skipped,
+    // and any sibling method whose body references `Bar` would itself become
+    // unattached when the synthetic source fails to resolve the call. No
+    // existing test exercises the shape, but the carve-out is structural and
+    // matches what the stub actually emits on the wire.
+    for (const auto& gp : mm.genericParams) {
+        if (!gp.name.empty()) inScopeGenericParams.insert(gp.name);
+    }
+    const std::string& selfName = td.name;
+    if (metaTypeReferencesNonSelfNamed(mm.type, selfName,
+                                       inScopeGenericParams)) return false;
+    for (const MetaParam& p : mm.params) {
+        if (metaTypeReferencesNonSelfNamed(p.type, selfName,
+                                           inScopeGenericParams)) return false;
+    }
+    return true;
+}
+
 // §14/#662c / #695: build a stub declaration for a method whose body is not
 // available.  The stub only carries the signature — enough for sema to register
 // a MethodSymbol so a self-call inside the body being reconstructed (a ctor
@@ -1396,13 +1521,35 @@ static std::string metaVisibilityToKeyword(MetaVisibility v) {
 // (not `this.`) is used so one spelling covers static and instance members
 // alike, and because a `this.`-rooted call inside an `async` stub takes a
 // different receiver-recovery path.
-static std::string buildMethodStub(const MetaMember& mm) {
+//
+// fix #2842 (§14.1/§2.5/#783, v0.240): per-stub skip when the SIGNATURE
+// references a sibling Named type AND the synthetic source does not import the
+// exporting module (so the sibling type is undeclared). The stub is OMITTED
+// entirely (returns an empty string) — the caller-side parse-and-attach
+// function mirrors the predicate (so the ctor/dtor body paths stay sound
+// against a silently-dropped self-call to the omitted sibling). The target
+// method whose body IS being reconstructed is rendered verbatim from its
+// methodBodyText, never from this helper, so it is not affected by the skip.
+// `importsModule` is true for buildSyntheticFieldInitSource (its `import
+// <moduleName>;` line makes the sibling types visible — see #2375), and false
+// for every other builder (which omit the import — see the ctor/dtor/method
+// header comments there). `td` provides the enclosing-class name AND the
+// class's own generic-parameter names (both are bound by the synthetic
+// class header) so the per-stub check recognizes `T` and friends as in scope.
+static std::string buildMethodStub(const MetaMember& mm,
+                                   const MetaTypeDecl& td,
+                                   bool importsModule) {
     std::string s;
     // Visibility and non-body modifiers (skip abstract — it suppresses the body).
     bool isAbstract = false;
     for (const std::string& mod : mm.modifiers)
         if (mod == "abstract") isAbstract = true;
     if (isAbstract) return s;  // abstract methods have no body; skip stub
+    // fix #2842: per-stub skip when the signature names a sibling type that the
+    // synthetic source does not declare. Returning the empty string here is the
+    // per-stub equivalent of the `isAbstract` arm above. Suppressed when the
+    // source imports the module — see header comment.
+    if (!importsModule && !methodSignatureIsStubSafe(mm, td)) return s;
     s += "  " + metaVisibilityToKeyword(mm.visibility);
     // Emit only the modifiers the parser accepts before `method`.
     for (const std::string& mod : mm.modifiers) {
@@ -1604,7 +1751,7 @@ static std::string buildSyntheticClassSource(
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Method) continue;
         if (mm.isOperator) continue;
-        std::string stub = buildMethodStub(mm);
+        std::string stub = buildMethodStub(mm, td, /*importsModule=*/false);
         if (!stub.empty()) src += stub + "\n";
     }
     // The ctor body (verbatim from the exporter's span extraction).
@@ -1634,6 +1781,23 @@ static bool parseAndAttachCtorBody(
     sema::ConstructorSymbol* importedCs,
     const sema::TypeSymbol& importedType,
     sema::SemaContext& mainCtx) {
+    // fix #2842 (§14.1/§2.5, v0.240): if any sibling method's signature names a
+    // type the synthetic source does not declare, that method's stub is skipped
+    // (so resolveTypes succeeds for the class). A ctor body that CALLED the
+    // skipped sibling would now silently fail at typecheckExpressions — and the
+    // ctor path tolerates that error, so the body would be attached with the
+    // call DROPPED (a #2290-bug-2-shaped wrong value). Mirror the predicate
+    // and decline to attach the ctor body when any stub was skipped, so the
+    // §14.1/#783/#2821 gate stays in force — exactly the trade documented in
+    // the #2842 issue body. parseAndAttachMethodBody does not need this check
+    // because its own post-typecheck soundness gate (semaDiag->hasErrors()
+    // → return false) already keeps a body that references a skipped sibling
+    // from attaching.
+    for (const MetaMember& mmItem : td.members) {
+        if (mmItem.kind != MetaMemberKind::Method) continue;
+        if (mmItem.isOperator) continue;
+        if (!methodSignatureIsStubSafe(mmItem, td)) return false;
+    }
     std::string source = buildSyntheticClassSource(td, ctorBodyText);
 
     // Fresh diagnostics/lexer/parser for the mini class.
@@ -1934,7 +2098,7 @@ static std::string buildSyntheticDtorSource(
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Method) continue;
         if (mm.isOperator) continue;
-        std::string stub = buildMethodStub(mm);
+        std::string stub = buildMethodStub(mm, td, /*importsModule=*/false);
         if (!stub.empty()) src += stub + "\n";
     }
     src += "  " + dtorBodyText + "\n";
@@ -1947,6 +2111,15 @@ static bool parseAndAttachDtorBody(
     const std::string& dtorBodyText,
     sema::TypeSymbol& importedType,
     sema::SemaContext& mainCtx) {
+    // fix #2842 (§14.1/§2.5, v0.240): mirror the ctor-body predicate (see the
+    // identical comment at parseAndAttachCtorBody) — the dtor path is equally
+    // TOLERANT of post-typecheck sema errors, so a dtor body that referenced a
+    // skipped sibling stub would be attached with the call silently dropped.
+    for (const MetaMember& mmItem : td.members) {
+        if (mmItem.kind != MetaMemberKind::Method) continue;
+        if (mmItem.isOperator) continue;
+        if (!methodSignatureIsStubSafe(mmItem, td)) return false;
+    }
     std::string source = buildSyntheticDtorSource(td, dtorBodyText);
 
     DiagnosticEngine freshDiag;
@@ -2235,7 +2408,7 @@ static std::string buildSyntheticMethodSource(const MetaTypeDecl& td,
         if (&mm == &target) {
             src += "  " + target.methodBodyText + "\n";
         } else {
-            std::string stub = buildMethodStub(mm);
+            std::string stub = buildMethodStub(mm, td, /*importsModule=*/false);
             if (!stub.empty()) src += stub + "\n";
         }
     }
@@ -2587,7 +2760,10 @@ static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td,
     for (const MetaMember& mm : td.members) {
         if (mm.kind != MetaMemberKind::Method) continue;
         if (mm.isOperator) continue;
-        std::string stub = buildMethodStub(mm);
+        // fix #2842: the field-init synthetic source declares
+        // `import <moduleName>;` (#2375), so sibling Named types are visible
+        // and the per-stub skip on sibling-type signatures does NOT apply.
+        std::string stub = buildMethodStub(mm, td, /*importsModule=*/true);
         if (!stub.empty()) src += stub + "\n";
     }
     src += "end " + td.name + ";\n";
