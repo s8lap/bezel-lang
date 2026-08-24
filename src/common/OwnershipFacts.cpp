@@ -322,24 +322,73 @@ bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
     return false;
 }
 
+// fix #2749 item 3 / #2767: a builtin INSTANCE-call callee is EITHER a
+// `MemberAccessExpr` (`recv.M(..)`) OR a `NullCondMemberExpr` (`recv?.M(..)`).
+// The two are SIBLING `Expr` kinds — not one a subclass of the other — that
+// share identical `target`/`member` fields, so a `dynamic_cast<
+// MemberAccessExpr*>`-only gate silently misses every `?.` spelling.
+//
+// This is sema's own precedent, added for #2581 for exactly this reason
+// (`ExprTC::builtinInstanceCallee`, sema/ExprTypecheck_Calls.cpp) — duplicated
+// rather than shared because that one is a file-local static inside the sema
+// translation unit. Returns the (target, member) pair, or (nullptr, {}) when
+// the callee is neither kind. Shared between `isOwningCollectionDrainAliasCall`
+// (#2767) and `isBuiltinOwnedMaterializerCall` (#2749) so the two predicates
+// cannot drift on the callee shape — a `?.`-widening in one but not the other
+// would silently route `recv?.Drain()` through the disposal path while leaving
+// `recv?.Split(",")` as a diagnostic gap (or vice versa). Defined here, ahead
+// of both predicates, so they can use it without a forward declaration.
+// // per §7.5, §21.1, §28.10, §28.11, §29.11, #2581, #2749, #2767
+static std::pair<const ast::Expr*, std::string_view> builtinInstanceCallee(
+    const ast::Expr* callee) {
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        return {ma->target.get(), ma->member};
+    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+        return {ncm->target.get(), ncm->member};
+    return {nullptr, {}};
+}
+
 bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
                                       const sema::SemaContext& ctx) {
-    // See the header contract. // per §28.10, §28.11, stdlib §4.5 v0.195, #2146
+    // See the header contract. // per §28.10, §28.11, stdlib §4.5 v0.195,
+    // #2146, #2767
     if (!call.args.empty()) return false;
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
-    if (!ma || ma->member != "Drain" || !ma->target) return false;
+    // fix #2767: the callee is EITHER `recv.M(..)` (MemberAccessExpr) OR
+    // `recv?.M(..)` (NullCondMemberExpr) — the two are SIBLING Expr kinds, so
+    // a `dynamic_cast<MemberAccessExpr*>`-only gate silently missed every
+    // `?.` spelling and the §21.1 / §29.11 rejection of `const q :=
+    // a?.Drain();` never fired. The shape is the same #2749 item 3 closed
+    // for the builtin-materializer predicate (which is diagnostic-only) —
+    // here the predicate ALSO feeds codegen's registerUsingDisposal /
+    // registerIterableSourceDisposal (#2146's bz_array double-dispose SEGV)
+    // and ownership::MethodOwnership's producerState Borrowed carve /
+    // usingVarSourceIsBorrow, so widening has disposal consequences, not
+    // diagnostic-only ones, and the narrowness premise (the `?.` form
+    // attaches a MethodSymbol for user methods, none for builtins — same
+    // `ExprTC::resolveNullCondMember` reasoning #2749 item 3 verified for
+    // the materializer predicate) must apply unchanged. The shared
+    // builtinInstanceCallee helper below is exactly that extraction;
+    // re-using it keeps the two predicates from drifting on the callee
+    // shape. // per §21.1 v0.201, §28.10, §28.11, §29.11, #2581, #2749, #2767
+    auto [maTarget, mm] = builtinInstanceCallee(call.callee.get());
+    if (!maTarget || mm != "Drain") return false;
     // The BUILTIN Drain only: a USER method named `Drain` resolves a
     // MethodSymbol on the callee and is classified by the ordinary user-call
     // rules (returnOwned / borrow-body scan), never by the alias fact. (The
     // `MethodSymbol` cast — not a bare non-null test — mirrors producerState's
-    // builtin-transfer guard: sema may attach non-method symbols to a callee.)
+    // builtin-transfer guard: sema may attach non-method symbols to a callee.
+    // On the `?.` path, `ExprTC::resolveNullCondMember` attaches a
+    // MethodSymbol for user methods and FieldSymbol for function-typed
+    // fields, both excluded here on the same line that excludes their `.`
+    // spellings — the narrowness #2749 measured and pinned for the
+    // materializer predicate transfers unchanged to this predicate.)
     if (call.callee &&
         dynamic_cast<sema::MethodSymbol*>(ctx.exprSymbol(*call.callee)))
         return false;
     // Receiver type head must be an owning-collection (alias-resolved, the
     // same extraction as isBuiltinOwnedTransferCall above — #1462).
     std::string_view rcn;
-    if (const sema::TypeRef* rt = ctx.exprType(*ma->target)) {
+    if (const sema::TypeRef* rt = ctx.exprType(*maTarget)) {
         if (!rt->aliasResolvedHead.empty())
             rcn = rt->aliasResolvedHead;
         else if (rt->astNode && rt->astNode->name &&
@@ -354,7 +403,7 @@ bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
     // own (separate) obligation story (#2169) and is not recognized; the gate
     // is on the receiver form only — an index slot or field member-access is
     // recognized even over a temporary chain ROOT (see the header).
-    const ast::Expr* recv = ma->target.get();
+    const ast::Expr* recv = maTarget;
     if (dynamic_cast<const ast::IndexExpr*>(recv)) return true;
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(recv)) {
         sema::Symbol* s = ctx.exprSymbol(*id);
@@ -366,26 +415,6 @@ bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
         return dynamic_cast<sema::FieldSymbol*>(ctx.exprSymbol(*rma)) !=
                nullptr;
     return false;
-}
-
-// fix #2749 item 3: a builtin INSTANCE-call callee is EITHER a
-// `MemberAccessExpr` (`recv.M(..)`) OR a `NullCondMemberExpr` (`recv?.M(..)`).
-// The two are SIBLING `Expr` kinds — not one a subclass of the other — that
-// share identical `target`/`member` fields, so a `dynamic_cast<
-// MemberAccessExpr*>`-only gate silently misses every `?.` spelling.
-//
-// This is sema's own precedent, added for #2581 for exactly this reason
-// (`ExprTC::builtinInstanceCallee`, sema/ExprTypecheck_Calls.cpp) — duplicated
-// rather than shared because that one is a file-local static inside the sema
-// translation unit. Returns the (target, member) pair, or (nullptr, {}) when
-// the callee is neither kind. // per §7.5, #2581, #2749
-static std::pair<const ast::Expr*, std::string_view> builtinInstanceCallee(
-    const ast::Expr* callee) {
-    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
-        return {ma->target.get(), ma->member};
-    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
-        return {ncm->target.get(), ncm->member};
-    return {nullptr, {}};
 }
 
 bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
