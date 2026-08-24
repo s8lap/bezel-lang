@@ -7808,9 +7808,9 @@ private:
     // OWNING wrap owns the source via its slot-1 Dispose; for Stack and
     // LinkedList the source is freed here and the caller disposes only the
     // wrapper frame; for dict-backed Set the snapshot is independent).
-    void freeCollectionSourceNow(llvm::Value* v);
+    void freeCollectionSourceNow(llvm::Value* v, const sema::TypeRef* srcTy);
     void freeDictSourceNow(llvm::Value* v);
-    void freeLinkedListSourceNow(llvm::Value* v);
+    void freeLinkedListSourceNow(llvm::Value* v, const sema::TypeRef* srcTy);
 
     // #1916 / #1911 / stdlib §5 / §29.11: drain a lazy LINQ pipeline (bz_lazy_t*)
     // once into a fresh owned Array<T> (bz_lazy_to_array also disposes the

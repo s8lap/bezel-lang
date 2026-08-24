@@ -7207,6 +7207,23 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // per §4.6/§4.7: LinkedList<T>.Dispose() → bz_llist_free.
                         // OwningLinkedList<T> cascades disposal into class elements.
                         // #602 / §28.11 v0.135: route directly through elementPolicyFor.
+                        // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): a borrowing
+                        // `string` element is the RuntimeManaged row — its inserter
+                        // (the four `.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter`
+                        // arms in LlvmBackend_Calls3.cpp, #2686) already retains
+                        // the list's +1, so the disposer MUST release it too —
+                        // `elementPolicyFor` returns a NULL thunk for that row
+                        // (no ownable backing, §28.11 v0.135). Without the fallback
+                        // every explicit `LinkedList<string>.Dispose()` leaked one
+                        // +1 per element (bounded leak, not unsoundness). The same
+                        // one-liner `.RemoveFirst`/`.RemoveLast`/`.Clear`/`.Remove`/
+                        // `.RemoveNode` already carry at LlvmBackend_Calls3.cpp and
+                        // `#2692` family-wide. The `!nullable` guard mirrors Site 3
+                        // (`patternAResultCollectionDisposer`'s asymmetry, recorded
+                        // in #2710) and the `litIsStrArr`/`llitIsStrElem`
+                        // siblings in materializeHeapCollectionLiteral — a nullable
+                        // string element is never retained at construction so
+                        // releasing here would be a stray double-free direction.
                         {
                             const sema::TypeRef* llElem =
                                 (!recvTy->genericArgs.empty())
@@ -7215,8 +7232,21 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty() &&
                                 common::isOwningPrefixedName(recvTy->headName());
-                            llvm::Function* elemDisp =
-                                elementPolicyFor(llElem, llIsOwning).disposerThunk;
+                            ElementPolicy llElemPol =
+                                elementPolicyFor(llElem, llIsOwning);
+                            llvm::Function* elemDisp = llElemPol.disposerThunk;
+                            // RuntimeManaged + non-nullable string primitive —
+                            // verbatim mirror of `llIsStrElem` in
+                            // LlvmBackend_Calls3.cpp. The retain path that
+                            // paired this release (#2686) uses the same predicate,
+                            // so the release is provably paired.
+                            bool llIsStringElem =
+                                !llIsOwning && llElem && !llElem->nullable &&
+                                llElemPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                                llElem->kind == sema::TypeRef::Kind::Primitive &&
+                                llElem->primitive == sema::PrimitiveType::String;
+                            if (!elemDisp && llIsStringElem)
+                                elemDisp = stringElementReleaseThunk();
                             llvm::Value* disp = elemDisp
                                 ? llvm::cast<llvm::Value>(elemDisp)
                                 : llvm::ConstantPointerNull::get(ptrTy());
@@ -7271,9 +7301,25 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                             const sema::TypeRef* arrElem =
                                 (!recvTy->genericArgs.empty())
                                     ? recvTy->genericArgs[0] : nullptr;
-                            llvm::Function* elemDisp =
-                                elementPolicyFor(arrElem, listIfaceOwning)
-                                    .disposerThunk;
+                            ElementPolicy arrElemPol =
+                                elementPolicyFor(arrElem, listIfaceOwning);
+                            llvm::Function* elemDisp = arrElemPol.disposerThunk;
+                            // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): the
+                            // IList<T> / IReadOnlyList<T> arm's runtime is the
+                            // same bz_array_t* as the concrete Array<T> arm
+                            // above, so the string-element disposer fallback
+                            // (#2710's Site 1) applies here verbatim. The
+                            // `!nullable` guard mirrors Site 3 and the
+                            // `litIsStrArr` / `arrIsStringElem` siblings.
+                            bool arrIsStringElem =
+                                arrElemPol.cat ==
+                                    ElementPolicy::Category::RuntimeManaged &&
+                                arrElem &&
+                                arrElem->kind == sema::TypeRef::Kind::Primitive &&
+                                arrElem->primitive == sema::PrimitiveType::String &&
+                                !arrElem->nullable;
+                            if (!elemDisp && arrIsStringElem)
+                                elemDisp = stringElementReleaseThunk();
                             llvm::Value* disp = elemDisp
                                 ? llvm::cast<llvm::Value>(elemDisp)
                                 : llvm::ConstantPointerNull::get(ptrTy());
@@ -7367,6 +7413,22 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // §28.2 v0.135 / #621: checked-disposal mode quarantines
                         // via bz_array_mark_disposed (flag stays readable for the
                         // indexer guard); unchecked mode frees as before.
+                        // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): a borrowing
+                        // `string` element is the RuntimeManaged row — its
+                        // inserter (`emitArrayRetainStringsIfStringArray` /
+                        // `materializeHeapCollectionLiteral`'s `litIsStrArr`)
+                        // already retains the array's +1, so the disposer MUST
+                        // release it too. `elementPolicyFor` returns a NULL thunk
+                        // for that row (no ownable backing, §28.11 v0.135).
+                        // Without the fallback every explicit
+                        // `Array<string>.Dispose()` leaked one +1 per element
+                        // (bounded leak, not unsoundness). The same one-liner
+                        // `.RemoveAt`/`.Remove`/`.Clear` already carry at
+                        // LlvmBackend_Calls.cpp. The `!nullable` guard mirrors
+                        // Site 3 (recorded in #2710) and the `litIsStrArr`
+                        // sibling — a nullable string element is never retained
+                        // at construction, so releasing here would be a stray
+                        // double-free direction.
                         {
                             const sema::TypeRef* arrElem =
                                 (!recvTy->genericArgs.empty())
@@ -7375,8 +7437,22 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 recvTy->astNode && recvTy->astNode->name &&
                                 !recvTy->astNode->name->parts.empty() &&
                                 common::isOwningPrefixedName(recvTy->headName());
-                            llvm::Function* elemDisp =
-                                elementPolicyFor(arrElem, arrIsOwning).disposerThunk;
+                            ElementPolicy arrElemPol =
+                                elementPolicyFor(arrElem, arrIsOwning);
+                            llvm::Function* elemDisp = arrElemPol.disposerThunk;
+                            // RuntimeManaged + non-nullable string primitive —
+                            // verbatim mirror of `arrIsStringElem` at
+                            // LlvmBackend_Calls.cpp (the predicate the existing
+                            // retain / `.Remove*` / `.Clear` releases use).
+                            bool arrIsStringElem =
+                                arrElemPol.cat ==
+                                    ElementPolicy::Category::RuntimeManaged &&
+                                arrElem &&
+                                arrElem->kind == sema::TypeRef::Kind::Primitive &&
+                                arrElem->primitive == sema::PrimitiveType::String &&
+                                !arrElem->nullable;
+                            if (!elemDisp && arrIsStringElem)
+                                elemDisp = stringElementReleaseThunk();
                             llvm::Value* disp = elemDisp
                                 ? llvm::cast<llvm::Value>(elemDisp)
                                 : llvm::ConstantPointerNull::get(ptrTy());

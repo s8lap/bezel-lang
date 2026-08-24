@@ -7585,7 +7585,7 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
                 // caller will dispose the wrapper frame (free(self)).
                 llvm::Value* wrap =
                     wrapNestedArrayAsIEnumerable(v, actualTy, targetTy);
-                freeCollectionSourceNow(v);
+                freeCollectionSourceNow(v, actualTy);
                 return wrap;
             }
             return wrapNestedArrayAsIEnumerable(v, actualTy, targetTy);
@@ -7619,7 +7619,7 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         if (srcOwnedByCallee) {
             if (an == "Stack" || an == "OwningStack") {
                 llvm::Value* wrap = wrapStackAsIEnumerator(v, targetTy);
-                freeCollectionSourceNow(v);
+                freeCollectionSourceNow(v, actualTy);
                 return wrap;
             }
             return wrapOwnedArrayAsIEnumerable(v, targetTy);
@@ -7662,7 +7662,7 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         if (outWrapMade) *outWrapMade = true;
         if (srcOwnedByCallee) {
             llvm::Value* wrap = wrapLinkedListAsIEnumerable(v, targetTy);
-            freeLinkedListSourceNow(v);
+            freeLinkedListSourceNow(v, actualTy);
             return wrap;
         }
         return wrapLinkedListAsIEnumerable(v, targetTy);
@@ -7748,7 +7748,7 @@ llvm::Value* Emitter::wrapPropertyArrayAsIEnumerable(
     return wrapArrayAsIEnumerable(v, declTy);
 }
 
-// fix #2299 / §28.9: emit an immediate bz_array_free(v, null) for the
+// fix #2299 / §28.9: emit an immediate bz_array_free(v, ?) for the
 // source Array-family collection, right at the RETURN coercion (NOT at
 // scope end — the return is about to hand the wrapping enumerator to the
 // caller, and any scope-end disposal would fire before the caller
@@ -7758,15 +7758,59 @@ llvm::Value* Emitter::wrapPropertyArrayAsIEnumerable(
 // the disposal obligation). The wrapper's slot-1 Dispose runs on the
 // caller's side and frees only the wrapper frame (the backing was
 // already reclaimed here).
-void Emitter::freeCollectionSourceNow(llvm::Value* v) {
+// fix #2710 (§28.2 / §28.9 / §28.11, v0.240): the element disposer is
+// derived from the SOURCE type's element, not hardcoded to null. The
+// borrowing-family `string` element is the RuntimeManaged row — its
+// inserter (the literal arm's `litIsStrArr` and the four `.Add` arms in
+// `LlvmBackend_Calls.cpp`) already retains the array's +1, so the
+// RETURN-coercion free MUST release it too. A null disposer was leaking
+// one +1 per string element (bounded leak, not unsoundness). The
+// `!nullable` guard mirrors Site 3 — a nullable string element is never
+// retained at construction, so releasing here would be a stray
+// double-free direction. The predicate is the verbatim mirror of
+// `arrIsStringElem` at LlvmBackend_Calls.cpp (the predicate the existing
+// `.Remove*`/`.Clear` releases use), so the release is provably paired.
+void Emitter::freeCollectionSourceNow(llvm::Value* v,
+                                      const sema::TypeRef* srcTy) {
     if (!v) return;
+    llvm::Function* elemDisp = nullptr;
+    if (srcTy && !srcTy->genericArgs.empty()) {
+        const sema::TypeRef* elTy = srcTy->genericArgs[0];
+        ElementPolicy elPol = elementPolicyFor(elTy, /*owning=*/false);
+        elemDisp = elPol.disposerThunk;
+        bool arrIsStringElem =
+            elPol.cat == ElementPolicy::Category::RuntimeManaged &&
+            elTy && elTy->kind == sema::TypeRef::Kind::Primitive &&
+            elTy->primitive == sema::PrimitiveType::String && !elTy->nullable;
+        if (!elemDisp && arrIsStringElem)
+            elemDisp = stringElementReleaseThunk();
+    }
+    llvm::Value* disp = elemDisp
+        ? llvm::cast<llvm::Value>(elemDisp)
+        : llvm::ConstantPointerNull::get(ptrTy());
     auto* fn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
                         {ptrTy(), ptrTy()});
-    builder_.CreateCall(fn, {v, llvm::ConstantPointerNull::get(ptrTy())});
+    builder_.CreateCall(fn, {v, disp});
 }
 
 // fix #2299 / §28.9: emit an immediate bz_dict_free(v, null) for the
 // source dict-backed Set after the snapshot.
+//
+// fix #2710 note (§28.2 / §28.9 / §28.11, v0.240): this helper is ONLY
+// called for a dict-backed Set (the local-decl-init Set arm at
+// LlvmBackend_Setup.cpp and the return-coercion Set arm in
+// wrapAsIEnumerableForTarget). Set's string keys are released by
+// `bz_set_string_keys_release` (a separate pre-free pass registered in
+// registerUsingDisposal — the dictStringKeys flag, Disposal.cpp:4819),
+// NOT by the value disposer argument — `freeDictSourceNow` therefore
+// passes a null disposer (the Set has no values to release through the
+// disposer slot). For Set<string> this means a borrow-parameter
+// return-coercion has a separate, pre-existing leak: the source Set is
+// freed here WITHOUT calling `bz_set_string_keys_release` (the
+// scope-end path does, the return-coercion path does not). Filed as a
+// follow-up — out of #2710's stated scope (Array AND LinkedList); the
+// set-key release lives at the scope-end-disposal layer, not the
+// RETURN-coercion one.
 void Emitter::freeDictSourceNow(llvm::Value* v) {
     if (!v) return;
     auto* fn = declareC("bz_dict_free", llvm::Type::getVoidTy(llvm_),
@@ -7774,13 +7818,40 @@ void Emitter::freeDictSourceNow(llvm::Value* v) {
     builder_.CreateCall(fn, {v, llvm::ConstantPointerNull::get(ptrTy())});
 }
 
-// fix #2299 / §28.9: emit an immediate bz_llist_free(v, null) for the
+// fix #2299 / §28.9: emit an immediate bz_llist_free(v, ?) for the
 // source LinkedList after the wrap.
-void Emitter::freeLinkedListSourceNow(llvm::Value* v) {
+// fix #2710 (§28.2 / §28.9 / §28.11, v0.240): the element disposer is
+// derived from the SOURCE type's element, not hardcoded to null. The
+// borrowing-family `string` element is the RuntimeManaged row — its
+// inserter (the four `.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter`
+// arms in LlvmBackend_Calls3.cpp, #2686) already retains the list's +1,
+// so the RETURN-coercion free MUST release it too. A null disposer was
+// leaking one +1 per string element (bounded leak, not unsoundness).
+// The `!nullable` guard mirrors Site 3 — a nullable string element is
+// never retained at construction. The predicate is the verbatim mirror
+// of `llIsStrElem` in LlvmBackend_Calls3.cpp, so the release is
+// provably paired.
+void Emitter::freeLinkedListSourceNow(llvm::Value* v,
+                                      const sema::TypeRef* srcTy) {
     if (!v) return;
+    llvm::Function* elemDisp = nullptr;
+    if (srcTy && !srcTy->genericArgs.empty()) {
+        const sema::TypeRef* elTy = srcTy->genericArgs[0];
+        ElementPolicy elPol = elementPolicyFor(elTy, /*owning=*/false);
+        elemDisp = elPol.disposerThunk;
+        bool llIsStringElem =
+            elPol.cat == ElementPolicy::Category::RuntimeManaged &&
+            elTy && elTy->kind == sema::TypeRef::Kind::Primitive &&
+            elTy->primitive == sema::PrimitiveType::String && !elTy->nullable;
+        if (!elemDisp && llIsStringElem)
+            elemDisp = stringElementReleaseThunk();
+    }
+    llvm::Value* disp = elemDisp
+        ? llvm::cast<llvm::Value>(elemDisp)
+        : llvm::ConstantPointerNull::get(ptrTy());
     auto* fn = declareC("bz_llist_free", llvm::Type::getVoidTy(llvm_),
                         {ptrTy(), ptrTy()});
-    builder_.CreateCall(fn, {v, llvm::ConstantPointerNull::get(ptrTy())});
+    builder_.CreateCall(fn, {v, disp});
 }
 
 // fix #2299 / §28.9: at the RETURN coercion, decide whether the source
@@ -7948,7 +8019,20 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
     std::string plainPrefix = "bz$arrenum$" + elemName + "$";
     std::string prefix = "bz$arrenumown$" + elemName + "$";
 
-    // Owning Dispose: bz_array_free(self->arr, null); free(self).
+    // Owning Dispose: bz_array_free(self->arr, ?); free(self).
+    // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): the element disposer is
+    // derived from the ENUMERATOR's element type (the T in IEnumerable<T>),
+    // not hardcoded to null. The borrowing-family `string` element is the
+    // RuntimeManaged row — its inserter (the literal arm's `litIsStrArr`
+    // and the four `.Add` arms in `LlvmBackend_Calls.cpp`) already retains
+    // the array's +1, so the OWNING-wrap's slot-1 Dispose (the caller's
+    // scope-end free) MUST release it too. A null disposer was leaking
+    // one +1 per string element (bounded leak, not unsoundness). The
+    // `!nullable` guard mirrors Site 3 — a nullable string element is never
+    // retained at construction, so releasing here would be a stray
+    // double-free direction. The predicate is the verbatim mirror of
+    // `arrIsStringElem` at LlvmBackend_Calls.cpp (the predicate the existing
+    // `.Remove*`/`.Clear` releases use), so the release is provably paired.
     auto* dispFn = module_->getFunction(prefix + "Dispose");
     if (!dispFn) {
         dispFn = llvm::Function::Create(
@@ -7959,6 +8043,24 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
         llvm::Value* self = dispFn->arg_begin();
         llvm::Value* arrPtr =
             b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
+        // Element-type-derived disposer (the same shape #2710 Site 2's
+        // `freeCollectionSourceNow` carries): RuntimeManaged +
+        // non-nullable string primitive → stringElementReleaseThunk.
+        const sema::TypeRef* iEnumElTy =
+            (iEnumTy && !iEnumTy->genericArgs.empty())
+                ? iEnumTy->genericArgs[0] : nullptr;
+        ElementPolicy iEnumElPol =
+            elementPolicyFor(iEnumElTy, /*owning=*/false);
+        bool iEnumElIsString =
+            iEnumElPol.cat == ElementPolicy::Category::RuntimeManaged &&
+            iEnumElTy && iEnumElTy->kind == sema::TypeRef::Kind::Primitive &&
+            iEnumElTy->primitive == sema::PrimitiveType::String &&
+            !iEnumElTy->nullable;
+        llvm::Function* elDisp = iEnumElPol.disposerThunk;
+        if (!elDisp && iEnumElIsString) elDisp = stringElementReleaseThunk();
+        llvm::Value* elDispVal = elDisp
+            ? llvm::cast<llvm::Value>(elDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
         auto* freeArrFn = module_->getOrInsertFunction(
             "bz_array_free", llvm::FunctionType::get(
                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false))
@@ -7966,7 +8068,7 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
         b.CreateCall(
             llvm::FunctionType::get(
                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false),
-            freeArrFn, {arrPtr, llvm::ConstantPointerNull::get(ptrTy())});
+            freeArrFn, {arrPtr, elDispVal});
         auto* freeFn = module_->getOrInsertFunction(
             "free", llvm::FunctionType::get(
                 llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
