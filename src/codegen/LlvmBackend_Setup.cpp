@@ -4246,6 +4246,50 @@ void Emitter::declareVtables() {
                 allVtables_.push_back(gv);  // §8.6 #417: string discriminator
         }
     }
+    // fix #2797 (§2.8.3 rule 4, §12.7, §8.6 #417; v0.240): the IMPORTED
+    // record/enum half of the box-vtable problem — #2792 fixed the class
+    // half, this fixes the box half (#2792's "remaining half").
+    //
+    // A box vtable the dependency mints for a public, non-generic record or
+    // enum is now emitted with ExternalLinkage and a module-qualified name
+    // (setupBoxDescriptors, just below the box-vtable emission); the consumer
+    // DECLARES that symbol here and pushes the resulting declaration into
+    // `allVtables_`, so `bz_obj_is_string`'s whitelist contains the address of
+    // the vtable the dependency actually emits and a value the dependency
+    // boxed is recognized as such (its word 0 is the box vtable, which is in
+    // the table; without this fix the table has no entry for it and the
+    // discriminator's "not a vtable ⇒ a string" premise mis-fires).
+    //
+    // Same export gate as #2792's class-vtable fix above (public and
+    // non-generic). A non-public or generic record/enum keeps Internal
+    // linkage in the exporter — referencing it here would be an undefined
+    // symbol at link time — so it is skipped.
+    if (ctx_.hasImports()) {
+        for (sema::Symbol* sym : ctx_.importedSymbols()) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(sym);
+            if (!ts) continue;
+            if (ts->kind != ast::TypeDeclKind::Record &&
+                ts->kind != ast::TypeDeclKind::Enum)
+                continue;
+            if (ts->visibility != ast::Visibility::Public) continue;
+            if (!ts->genericParams.empty()) continue;
+            std::string boxVtName = "bvt$box$" + mangledTypeName(ts);
+            llvm::GlobalVariable* gv = module_->getNamedGlobal(boxVtName);
+            if (!gv) {
+                // Element count is unknown here (it is the exporter's slot
+                // count) and irrelevant: the global is only ever taken as an
+                // opaque address. A zero-length array declaration keeps the
+                // type well-formed without asserting a size.
+                gv = new llvm::GlobalVariable(
+                    *module_, llvm::ArrayType::get(ptrTy(), 0),
+                    /*isConstant=*/true, llvm::GlobalValue::ExternalLinkage,
+                    /*init=*/nullptr, boxVtName);
+            }
+            if (std::find(allVtables_.begin(), allVtables_.end(), gv) ==
+                allVtables_.end())
+                allVtables_.push_back(gv);  // §8.6 #417: string discriminator
+        }
+    }
     // fix #2387 (§2.8.2/§2.8.3 rule 4; v0.235): declareImportedPropertyGetters
     // populates importedPropGetterFns_, which ensurePropertyAccessorFn's
     // imported-property fallback (LlvmBackend_Assign.cpp) now consults from
@@ -28741,9 +28785,53 @@ void Emitter::setupBoxDescriptors() {
         extraInstOf[ts] = collectConcreteGenericBaseInsts(ts);
         auto* arrTy = llvm::ArrayType::get(
             ptrTy(), supers.size() + extraInstOf[ts].size() + 1);
+        // fix #2797 (§2.8.3 rule 4, v0.240): record/enum type descriptors
+        // `btd$<R>` need program-wide one-address identity for the same
+        // reason #2797 already promotes the box vtable to ExternalLinkage.
+        // The descriptor chain the dependency writes into ITS `bvt$box$<R>`
+        // contains the dependency's own `btd$<R>` (`internal constant` per
+        // the pre-fix state), which has a different address from the
+        // consumer's local `btd$<R>` once the program is linked — so a value
+        // the dependency boxed can still fail `is Pt` even AFTER the box
+        // vtable is in the consumer's `bz$vtable$table` (the discriminator
+        // stops mis-firing "string", but `emitIsA`'s descriptor-chain walk
+        // finds the wrong address).
+        //
+        // LinkOnceODR is the right shape: every compilation unit's `btd$<R>`
+        // is a deterministic content — `[self, transitive-bases, …, null]`
+        // where `self` is `btd$<R>` itself — so the linker can ODR-merge the
+        // copies into one canonical address without a per-module module
+        // qualifier (mirrors #2301's `ptd$<nm>` LinkOnceODR precedent;
+        // #1488's module-qualified mangling would be wrong here because
+        // two modules declaring same-named records must NOT share an
+        // identity — §2.8.3 rule 3 — so a name that does not carry a
+        // module qualifier is what makes the merge sound).
+        //
+        // Applied to BOTH local AND imported records/enums: a record/enum
+        // declared in one module and IMPORTED by another must share one
+        // descriptor address across artifacts (§2.8.3 rule 4), so the
+        // importer's `btd$<R>` (minted here, per #2796, because a local
+        // boxing site needs a descriptor to write at vtable[0]) must be
+        // ODR-mergeable with the exporter's. The exporter already emits
+        // `btd$<R>` from this same code on its own compilation; the names
+        // are identical, the contents are identical, and LinkOnceODR merges
+        // them into one canonical address.
+        //
+        // Restricted to public, non-generic records/enums — the same
+        // export-gate Pass D applies for class vtables (#2792). A non-public
+        // or generic record's descriptor is not exported anywhere; merging
+        // its copies would be incorrect if two modules both declared
+        // same-named non-public records (which #2796's enumeration lets
+        // happen — the importer walks imported symbols too).
+        llvm::GlobalValue::LinkageTypes descLinkage =
+            llvm::GlobalValue::InternalLinkage;
+        if (ts->visibility == ast::Visibility::Public &&
+            ts->genericParams.empty()) {
+            descLinkage = llvm::GlobalValue::LinkOnceODRLinkage;
+        }
         descArray_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
-            llvm::GlobalValue::InternalLinkage, nullptr,
+            descLinkage, nullptr,
             "btd$" + std::string(ts->name));
     }
     // Pass B: fill each descriptor with [self + transitive bases, null]. A base
@@ -29126,11 +29214,45 @@ void Emitter::setupBoxDescriptors() {
         elems[kEqualsSlot]      = boxRecordEqualsThunk(ts);
         elems[kGetHashCodeSlot] = boxRecordHashThunk(ts);
         auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
+        // fix #2797 (§2.8.3 rule 4, v0.240): for a record/enum LOCAL to this
+        // module that is PUBLIC and NON-GENERIC, promote the box vtable to
+        // ExternalLinkage and give it a module-QUALIFIED name. Without this,
+        // the exporter's `bvt$box$<R>` is `d` (Internal) in the .o,
+        // unreachable from any other artifact, and the consumer's
+        // `bz$vtable$table` cannot list it — so a value the dependency boxed
+        // is misreported as a string at every discriminator site
+        // (`is`/§19 pattern/`ToString`/`Equals` wrong; the same mechanism as
+        // #2792, but no escape hatch because a box vtable has no inherent
+        // "declare me in the importer" path). The qualified name avoids the
+        // "two modules both boxing same-named records" collision #1488's
+        // `vt$<module>.<Type>` already resolves for class vtables.
+        // Visibility matches the gate Pass D applies when it DEFINES the
+        // corresponding class vtable (#2792): non-public and generic vtables
+        // stay internal (their symbols are not exported anywhere).
+        //
+        // IMPORTANT — gate on LOCAL types only. The IMPORTER side of #2796's
+        // box-vtable fix also walks this loop (the `importedSymbols` arm of
+        // `boxCandidates`), minting its OWN box vtable for an imported record
+        // so a local boxing site has a vtable to point at. That local copy
+        // must stay InternalLinkage (the consumer declares the EXPORTER's
+        // `bvt$box$<module>.<R>` separately, in declareVtables below), so
+        // giving the importer's local copy ExternalLinkage here would
+        // produce a duplicate-symbol error at link time.
+        llvm::GlobalValue::LinkageTypes boxLinkage =
+            llvm::GlobalValue::InternalLinkage;
+        std::string boxVtName =
+            "bvt$box$" + std::string(ts->name);
+        if (!ctx_.isImported(ts) &&
+            ts->visibility == ast::Visibility::Public &&
+            ts->genericParams.empty()) {
+            boxLinkage = llvm::GlobalValue::ExternalLinkage;
+            boxVtName = "bvt$box$" + mangledTypeName(ts);
+        }
         boxVtable_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
-            llvm::GlobalValue::InternalLinkage,
+            boxLinkage,
             llvm::ConstantArray::get(arrTy, elems),
-            "bvt$box$" + std::string(ts->name));
+            boxVtName);
         allVtables_.push_back(boxVtable_[ts]);  // §8.6 #417
     }
 
