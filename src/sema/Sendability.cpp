@@ -149,138 +149,35 @@ bool forEachStorageMember(const TypeSymbol* ts, const SemaContext& ctx,
                           const std::function<bool(const StorageMember&)>& fn,
                           const common::RecordSubstEnv* env = nullptr) {
     if (!ts) return true;
-    // A `posParam` FieldSymbol is either a RECORD's §9.1 positional field
-    // (storage) or a CLASS's §22.10 primary-constructor parameter.
+    // fix #3169: the storage-walk logic is now centralized in
+    // `sema::recordStorageMembers` (SymbolCollection.cpp, the unified
+    // primitive of #3145/#3152). This file used to carry a SECOND COPY of
+    // the field branch + the auto-property branch + the `static` exclusion +
+    // the §28.1 `owned` both-source read + the #3171 generic-base
+    // substitution; #3169 makes the unified primitive the single source of
+    // truth and this a thin adapter that materialises a `StorageMember` from
+    // the per-member facts the primitive yields. The §30.14 rule 2 verdict
+    // walks (this file's only callers) need name / type / `isOwned`; the
+    // other facts (`isPositional`, `isStatic`, `isAutoProperty`) are
+    // computed by the primitive but not re-exposed here — see Symbol.hpp's
+    // `RecordStorageMember` for the full set.
     //
-    // For records: every positional field is storage — unchanged from the
-    // umbrella fix #3152.
-    //
-    // For classes (fix #3165): a primary-ctor parameter becomes storage iff
-    // §22.10 captures it into a private field — i.e., the parameter is
-    // referenced in a body position. The capture bit
-    // (`FieldSymbol::posParamBodyRef`) is computed by ExprTypecheck on the
-    // local side and rides the wire as `MetaMember::posParamBodyRef` (#3221)
-    // so the imported side has the same answer. Uncaptured parameters are
-    // still not storage, exactly as before. Reading the bit during the §14.2
-    // constraint route (which runs inside `resolveTypes()`, BEFORE the
-    // ExprTypecheck walk) reads `false` for every class — so the §14.2
-    // constraint check still has its pre-#3165 accept-hole for captured
-    // parameters of non-sendable type; closing that route needs a late pass
-    // analogous to `checkClassSerializationEligibilityLate`, which is the
-    // umbrella's noted follow-up and out of scope here (this commit closes
-    // the call-site route, which is the §30.15 / Domain.Spawn site).
-    const bool recordPositionalIsStorage =
-        ts->kind == ast::TypeDeclKind::Record;
-    // Two passes so a §9.1 positional field is visited before a body member,
-    // matching the order the AST copies used (SymbolCollection appends the
-    // positional FieldSymbols AFTER the body members, so a single pass over
-    // `members` would reverse the two groups). Only the diagnostic walkers can
-    // observe an order — the verdict walks require every member to pass — but
-    // they pin which component a §14.2 message names.
-    // fix #3165: pass 0 is now also entered for a class — the inner field
-    // filter below decides per-field whether a class posParam is captured
-    // (storage) or not (skipped). For a record, all posParams are storage as
-    // before. The order guarantee is preserved.
-    for (int pass = 0; pass < 2; ++pass) {
-        if (pass == 0 && !recordPositionalIsStorage) {
-            // For a class, fall through: the inner filter decides per field.
-            // For a non-class (e.g., enum / interface), skip pass 0 — there
-            // are no §9.1 positional fields in either kind today.
-            if (ts->kind != ast::TypeDeclKind::Class) continue;
-        }
-        for (Symbol* ms : ts->members) {
-            const MemberSymbol* mem = nullptr;
-            const ast::Param* posParam = nullptr;
+    // The pre-#3169 duplicate walked a CLASS parent's primary-ctor parameter
+    // only when §22.10 captured it (`posParamBodyRef`); #3165, #3221 (the
+    // 18th trailing scalar, additive within v7 — same shape as
+    // `isPositional` at #2516 / 17th scalar) made the bit ride the wire.
+    // The unified primitive owns that filter; this adapter is unchanged in
+    // verdict.
+    return recordStorageMembers(
+        ts, ctx,
+        [&](const RecordStorageMember& rsm) {
             StorageMember sm;
-            if (auto* fs = dynamic_cast<const FieldSymbol*>(ms)) {
-                const bool positional = fs->posParam != nullptr;
-                if (positional != (pass == 0)) continue;
-                // For a CLASS parent (fix #3165), the §22.10 captured-vs-uncaptured
-                // distinction filters the positional pass: only a CAPTURED primary-
-                // ctor parameter (body-referenced) is storage. An uncaptured one is
-                // skipped entirely (it has no field on the instance, so rule 2 has
-                // nothing to weigh). For records, every positional field is storage
-                // — `recordPositionalIsStorage` is the outer guard below.
-                if (positional && ts->kind == ast::TypeDeclKind::Class &&
-                    !fs->posParamBodyRef) {
-                    continue;
-                }
-                // §30.14 rule 2 "instance field". The modifier list is
-                // populated identically on both sides (SymbolCollection from
-                // the `ast::FieldDecl`, ModuleLoader from
-                // `MetaMember::modifiers`), so this reads the same on a local
-                // and an imported field.
-                bool isStatic = false;
-                for (auto mod : fs->modifiers)
-                    if (mod == "static") { isStatic = true; break; }
-                if (isStatic) continue;
-                mem = fs;
-                posParam = fs->posParam;
-                sm.name = (fs->posParam && !fs->posParam->name.empty())
-                              ? fs->posParam->name
-                              : fs->name;
-            } else if (auto* ps = dynamic_cast<const PropertySymbol*>(ms)) {
-                if (pass == 0) continue;  // properties are never positional
-                if (!isAutoPropertyStorageSymbol(ps, ctx)) continue;
-                mem = ps;
-                sm.name = ps->name;
-            } else {
-                continue;  // methods/ctors/consts/events/nested: not storage
-            }
-            sm.type = storageComponentType(ms, ctx);
-            // #3171: the §30.14 class branch must weigh a generic base's fields as
-            // the SUBSTITUTED type, not the bare declaration-template parameter.
-            // `env` is seeded by the class branch from `rt->genericArgs` (own
-            // frame) and from `baseTypeRefs[i]->genericArgs` (each base frame);
-            // for a non-generic class / base, `env` is null and this is a no-op.
-            if (env) {
-                sm.type = common::resolveRecordFieldSubst(sm.type, env).ty;
-            }
-            // The `owned` marker lives in two DIFFERENT places and a caller
-            // that reads only one silently gets "not owned" for the other
-            // (bc0edd5's warning on `anyRecordStorageField`, earned by this
-            // very walk): `MemberDecl::modifiers` for a body field or
-            // auto-property, `ast::Param::modifier` for a positional one.
-            // Read both.
-            //
-            // ⚠ This comment used to add "`FieldSymbol::modifiers` is never
-            // populated for a positional field". That was true when written and
-            // is FALSE as of #3164: the metadata builder now exports an
-            // IMPORTED positional field's `owned` marker into
-            // `MetaMember::modifiers`, and the loader interns it straight onto
-            // `FieldSymbol::modifiers`. So for an imported positional field
-            // BOTH spellings are populated and they agree; for a local one only
-            // `posParam` is. The `posParam` branch is taken first either way,
-            // which is why no verdict moved — but the invariant the old
-            // sentence stated no longer holds, and a later reader relying on it
-            // would be wrong.
-            //
-            // Today only the record arm can reach the positional branch and
-            // §9.7 forbids an `owned` record field, so this changes no verdict;
-            // it is here so that whoever makes positional storage reachable
-            // from the class arm does not have to rediscover the split.
-            //
-            // fix #3165: with a CLASS's captured primary-ctor parameter now
-            // also reaching this branch, the `owned` marker must be read from
-            // BOTH channels — for a local class the marker rides on
-            // `posParam->modifier` (ModuleLoader does NOT currently populate
-            // it on the synthetic param for an imported class's positional);
-            // for an imported class it rides on `FieldSymbol::modifiers`
-            // (set from `MetaMember::modifiers` by #3164). Take either.
-            if (posParam) {
-                sm.isOwned = posParam->modifier == "owned";
-                if (!sm.isOwned) {
-                    for (auto mod : mem->modifiers)
-                        if (mod == "owned") { sm.isOwned = true; break; }
-                }
-            } else {
-                for (auto mod : mem->modifiers)
-                    if (mod == "owned") { sm.isOwned = true; break; }
-            }
-            if (!fn(sm)) return false;
-        }
-    }
-    return true;
+            sm.name = rsm.name;
+            sm.type = rsm.type;
+            sm.isOwned = rsm.isOwned;
+            return fn(sm);
+        },
+        env);
 }
 
 // §30.14 rule 2's "including inherited fields" — every ANCESTOR of `ts`, not

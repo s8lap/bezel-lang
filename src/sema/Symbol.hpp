@@ -23,6 +23,14 @@
 #include "ast/Node.hpp"
 #include "support/SourceLocation.hpp"
 
+// fix #3169: `sema::recordStorageMembers` takes an optional
+// `const common::RecordSubstEnv*` default-arg (#3171 generic-base
+// substitution). Forward-declared in the OUTER `bezel::` namespace so the
+// function's signature — `const common::RecordSubstEnv*` — resolves to the
+// real type. Full definition lives in bezel::common::RecordSubstEnv
+// (common/OwnershipFacts.hpp), included only by the .cpp.
+namespace bezel::common { struct RecordSubstEnv; }
+
 namespace bezel::sema {
 
 struct TypeRef;  // see TypeRef.hpp; forward-declared so LocalSymbol can
@@ -891,6 +899,61 @@ bool anyRecordStorageField(
 // `ts`'s §9.1 positional fields, in declaration order — the indexed view, for
 // the sites that pair constructor argument i with positional field i.
 std::vector<const Symbol*> recordPositionalFieldSymbols(const TypeSymbol* ts);
+
+// fix #3169 (§9.1 / §9.2 / §30.14 rule 2, v0.242; refactor of #3145/#3152): the
+// unified symbol-side storage enumeration. One primitive that yields per-member
+// FACTS — `symbol`, `name`, `type`, `isPositional`, `isStatic`, `isOwned`,
+// `isAutoProperty` — for every §30.14 rule 2 storage member of `ts`. The three
+// callers that previously walked `members` in three different ways
+// (`anyRecordStorageField` for fields-only-existential, `recordPositionalFieldSymbols`
+// for the positional-only-indexed view, and `forEachStorageMember` in
+// Sendability.cpp for the full per-member walk with the §28.1 `owned` marker)
+// now each delegate to this one enumeration.
+//
+// WHAT IT YIELDS, per member:
+//   - `member`:        the symbol (FieldSymbol or PropertySymbol); never null.
+//   - `name`:          the member's identifier (posParam name for a §9.1
+//                      positional field, else the symbol's declared name).
+//   - `type`:          `sema::storageComponentType(m, ctx)`, with optional
+//                      substitution via `env` for a generic base (#3171).
+//                      Null when the type is not resolvable; callers treat
+//                      that conservatively.
+//   - `isPositional`:  §9.1 positional field — for a record, every positional
+//                      field; for a class, a captured primary-ctor parameter
+//                      (uncaptured are filtered, per #3165).
+//   - `isStatic`:      per-TYPE storage; the walk filters these out and never
+//                      yields them (§30.14 rule 2 is "every INSTANCE field").
+//   - `isOwned`:       the §28.1 `owned` marker, read from BOTH
+//                      `ast::Param::modifier` (positional) AND
+//                      `MemberSymbol::modifiers` (body / auto-prop). A reader
+//                      that consults only one silently answers "not owned" for
+//                      the other — bc0edd5's warning, the exact defect this
+//                      primitive closes.
+//   - `isAutoProperty`: true for an auto-property; the §9.2 storage member.
+//                      For a record's positional field this is always false
+//                      (a positional field is a FieldSymbol).
+//
+// ORDER: positional pass first, then non-positional pass — matching the order
+// the AST walks the umbrella #3152 collapse chose, so a §14.2 component-path
+// diagnostic names a positional field before a body one. For a non-class
+// non-record the positional pass is skipped (there are no §9.1 positional
+// fields).
+//
+// `env` is the optional substitution environment for generic bases (#3171).
+// A non-generic type passes `nullptr` and the walk is unchanged.
+struct RecordStorageMember {
+    const Symbol* member = nullptr;
+    std::string_view name;
+    const TypeRef* type = nullptr;
+    bool isPositional = false;
+    bool isStatic = false;
+    bool isOwned = false;
+    bool isAutoProperty = false;
+};
+bool recordStorageMembers(
+    const TypeSymbol* ts, const SemaContext& ctx,
+    const std::function<bool(const RecordStorageMember&)>& fn,
+    const common::RecordSubstEnv* env = nullptr);
 
 // §35.1 / §35.4 / §2.8.2 clause 1 (fix #3144, family F9 of umbrella #3152):
 // `t`'s choice cases in DECLARATION ORDER — which is the case's tag value, so

@@ -1049,28 +1049,139 @@ const TypeRef* storageComponentType(const Symbol* m,
     return nullptr;
 }
 
-// fix #3145 (§9.1 / §9.2 / §2.8.3 rule 4, v0.252): the symbol-side storage-field
-// walk. See the contract in sema/Symbol.hpp.
+// fix #3169 (§9.1 / §9.2 / §30.14 rule 2, v0.242; refactor of #3145/#3152):
+// the unified symbol-side storage enumeration. See the contract in
+// sema/Symbol.hpp. This is the ONE storage walk; the three overlapping
+// accessors (`anyRecordStorageField` below, `recordPositionalFieldSymbols`
+// further down, `forEachStorageMember` in Sendability.cpp) each delegate to
+// it. Per-member FACTS are computed once — including the §28.1 `owned` marker
+// from BOTH `ast::Param::modifier` (positional) and `MemberSymbol::modifiers`
+// (body / auto-prop), per #3145's both-source rule.
 //
-// `static` is excluded because a static field is per-TYPE storage, not part of a
-// VALUE — the same exclusion Resolver::recordValueContainsSelf and the AST walk
-// this replaces both make. Positional fields carry no modifiers and are never
-// static, so one filtered loop over `members` is exactly equivalent to the old
-// "positionalFields, then non-static body FieldDecls" pair.
+// `static` is excluded because a static field is per-TYPE storage, not part of
+// a VALUE — the same exclusion Resolver::recordValueContainsSelf and the AST
+// walk this replaces both make. §30.14 rule 2 is "every INSTANCE field,
+// including inherited fields", so a static never travels with a transferred
+// instance and is not yielded.
+//
+// For a CLASS parent's primary-ctor parameter, the capture bit
+// `FieldSymbol::posParamBodyRef` (#3165/#3221) decides: only a CAPTURED
+// parameter (body-referenced) is storage; an uncaptured one is skipped
+// entirely. For a RECORD, every §9.1 positional field is storage — the
+// `recordPositionalIsStorage` guard at the outer loop expresses that.
+//
+// ORDER: positional pass first, then non-positional pass — matching the order
+// the AST walks the umbrella #3152 collapse chose, so a §14.2 component-path
+// diagnostic names a positional field before a body one. Only the diagnostic
+// walks can observe the order (verdict walks require every member to pass),
+// but it pins which component a §14.2 message names.
+bool recordStorageMembers(
+    const TypeSymbol* ts, const SemaContext& ctx,
+    const std::function<bool(const RecordStorageMember&)>& fn,
+    const common::RecordSubstEnv* env) {
+    if (!ts) return true;
+    const bool recordPositionalIsStorage =
+        ts->kind == ast::TypeDeclKind::Record;
+    for (int pass = 0; pass < 2; ++pass) {
+        if (pass == 0 && !recordPositionalIsStorage) {
+            // For a class, fall through: the inner filter decides per field.
+            // For a non-class non-record, skip pass 0 — there are no §9.1
+            // positional fields in either kind today.
+            if (ts->kind != ast::TypeDeclKind::Class) continue;
+        }
+        for (Symbol* ms : ts->members) {
+            const MemberSymbol* mem = nullptr;
+            const ast::Param* posParam = nullptr;
+            RecordStorageMember rsm;
+            rsm.member = ms;
+            if (auto* fs = dynamic_cast<const FieldSymbol*>(ms)) {
+                const bool positional = fs->posParam != nullptr;
+                if (positional != (pass == 0)) continue;
+                // For a CLASS parent (fix #3165): a primary-ctor parameter is
+                // storage iff §22.10 captures it (body-referenced). An
+                // uncaptured one has no field on the instance and rule 2 has
+                // nothing to weigh. For records, every positional is storage.
+                if (positional && ts->kind == ast::TypeDeclKind::Class &&
+                    !fs->posParamBodyRef) {
+                    continue;
+                }
+                bool isStatic = false;
+                for (std::string_view mod : fs->modifiers)
+                    if (mod == "static") { isStatic = true; break; }
+                if (isStatic) continue;
+                mem = fs;
+                posParam = fs->posParam;
+                rsm.name = (posParam && !posParam->name.empty())
+                               ? posParam->name
+                               : fs->name;
+            } else if (auto* ps = dynamic_cast<const PropertySymbol*>(ms)) {
+                if (pass == 0) continue;  // properties are never positional
+                if (!isAutoPropertyStorageSymbol(ps, ctx)) continue;
+                bool isStatic = false;
+                for (std::string_view mod : ps->modifiers)
+                    if (mod == "static") { isStatic = true; break; }
+                if (isStatic) continue;
+                mem = ps;
+                rsm.isAutoProperty = true;
+                rsm.name = ps->name;
+            } else {
+                continue;  // methods/ctors/consts/events/nested: not storage
+            }
+            rsm.type = storageComponentType(ms, ctx);
+            // #3171: weigh a generic base's fields as the SUBSTITUTED type,
+            // not the bare declaration-template parameter.
+            if (env) {
+                rsm.type = common::resolveRecordFieldSubst(rsm.type, env).ty;
+            }
+            // The `owned` marker lives in two DIFFERENT places — bc0edd5's
+            // warning, earned by the prior `anyRecordStorageField` walker.
+            // `MemberDecl::modifiers` for a body field or auto-property,
+            // `ast::Param::modifier` for a positional one. Read both.
+            if (posParam) {
+                rsm.isOwned = posParam->modifier == "owned";
+                if (!rsm.isOwned) {
+                    for (std::string_view mod : mem->modifiers)
+                        if (mod == "owned") { rsm.isOwned = true; break; }
+                }
+            } else {
+                for (std::string_view mod : mem->modifiers)
+                    if (mod == "owned") { rsm.isOwned = true; break; }
+            }
+            if (!fn(rsm)) return false;
+        }
+    }
+    return true;
+}
+
+// fix #3145 (§9.1 / §9.2 / §2.8.3 rule 4, v0.252) — refactor #3169: the
+// fields-only existential. Delegates to `recordStorageMembers` (the unified
+// primitive); auto-properties are skipped, only FieldSymbols are visited.
+//
+// `static` is excluded because a static field is per-TYPE storage, not part of
+// a VALUE — `recordStorageMembers` already filters it. Positional fields
+// carry no modifiers and are never static, so one filtered loop is exactly
+// equivalent to the old "positionalFields, then non-static body FieldDecls"
+// pair. ⚠ ORDER IS `members` ORDER, WHICH IS NOT DECLARATION ORDER for a
+// combined-form record: this predicate is an existential, so order cannot
+// change its answer — but a future caller that needs order must not take it
+// from here. Use `recordPositionalFieldSymbols` for the index-aligned
+// positional view.
 bool anyRecordStorageField(
     const TypeSymbol* ts, const SemaContext& ctx,
     const std::function<bool(const Symbol*, const TypeRef*)>& pred) {
     if (!ts) return false;
-    for (Symbol* m : ts->members) {
-        const auto* fs = dynamic_cast<const FieldSymbol*>(m);
-        if (!fs) continue;  // methods / ctors / consts / properties: not a field
-        bool isStatic = false;
-        for (std::string_view mod : fs->modifiers)
-            if (mod == "static") { isStatic = true; break; }
-        if (isStatic) continue;
-        if (pred(m, storageComponentType(m, ctx))) return true;
-    }
-    return false;
+    bool result = false;
+    recordStorageMembers(
+        ts, ctx,
+        [&](const RecordStorageMember& rsm) {
+            if (rsm.isAutoProperty) return true;  // fields-only existential
+            if (pred(rsm.member, rsm.type)) {
+                result = true;
+                return false;  // stop
+            }
+            return true;
+        });
+    return result;
 }
 
 // fix #3140 (§9.8, family F2 of umbrella #3152): the ONE reader of a storage
