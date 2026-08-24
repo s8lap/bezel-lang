@@ -7655,15 +7655,24 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     }
     // fix #2298 / §28.9: LinkedList<T> widened to `IEnumerable<T>` here uses
     // the plain borrow wrap (slot-1 Dispose = `free(self)`, the wrapper frame
-    // only). fix #2299 / §28.9: LinkedList has no OWNING-wrap variant in
-    // this fix; for a callee-owned return, free the source immediately after
-    // the wrap is built (the caller disposes the wrap frame only).
+    // only) for the BORROWED source — the source's binder still disposes its
+    // backing at its own scope end. fix #3354 / §28.2 / §28.9 / §28.11: a
+    // callee-OWNED source (a return-coerced value whose ownership transfers
+    // out of this scope) now uses the OWNING sibling wrapOwnedLinkedListAsIEnumerable
+    // — its slot-1 Dispose frees the backing bz_llist AND the wrapper frame
+    // at the CALLER's scope end, AFTER iteration. The previous shape (plain
+    // borrow wrap + `freeLinkedListSourceNow` immediately after) freed the
+    // backing right here, so the caller's `for x in e do ...` walked
+    // `bz_llist_first_node` / `bz_llist_node_next` on already-freed memory —
+    // confirmed UAF under ASan/LSan (see the #3354 regression test). The
+    // OWNING-wrap's slot-4 GetEnumerator stamps fresh NON-owning clones with
+    // the PLAIN vtable, so a per-loop enumerator frees only its own struct
+    // (#2987's protocol). The companion #2710 owned-array path is the
+    // structural template for this fix.
     if (actualTy && isLinkedListTypeName(actualTy)) {
         if (outWrapMade) *outWrapMade = true;
         if (srcOwnedByCallee) {
-            llvm::Value* wrap = wrapLinkedListAsIEnumerable(v, targetTy);
-            freeLinkedListSourceNow(v, actualTy);
-            return wrap;
+            return wrapOwnedLinkedListAsIEnumerable(v, targetTy);
         }
         return wrapLinkedListAsIEnumerable(v, targetTy);
     }
