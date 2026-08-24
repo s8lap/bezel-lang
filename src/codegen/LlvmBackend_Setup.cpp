@@ -4994,8 +4994,19 @@ void Emitter::setupBuiltinExceptions() {
     // Shared no-op Dispose (built-in exceptions own nothing).
     auto* dispTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
                                            {ptrTy()}, false);
+    // #2301 (§8.6 / §2.8.3 rule 4 / §28.9): LinkOnceODR so the per-module
+    // §8.6 box vtable's slot [2] (Dispose) is byte-identical in every
+    // compilation unit. That, in turn, makes `pvt$<nm>` (the §8.6 box vtable)
+    // itself LinkOnceODR-mergeable across --import edges — the link step merges
+    // both modules' `pvt$Int` to ONE address, both modules' `bz$vtable$table`s
+    // then list that single address, and `bz_obj_is_string` correctly
+    // recognises a cross-module box (`is int` answers true instead of the
+    // pre-fix false; see LlvmBackend_Setup.cpp's setupBoxDescriptors for the
+    // matching `pvt$<nm>` LinkOnceODR change). The body is the trivial no-op
+    // below, byte-identical across modules regardless of the source tree
+    // state.
     builtinDisposeFn_ = llvm::Function::Create(
-        dispTy, llvm::Function::InternalLinkage, "bz$exDispose",
+        dispTy, llvm::Function::LinkOnceODRLinkage, "bz$exDispose",
         module_.get());
     {
         // The SHARED no-op disposer for every VALUE-TYPE box (record / primitive
@@ -29296,16 +29307,23 @@ void Emitter::setupBoxDescriptors() {
         // objects now emit `ptd$int` as `V` (weak/ODR, merges at link) and the
         // link succeeds with no duplicate-definition error, so THIS specific
         // descriptor is provably deduplicated — yet the observable symptom is
-        // UNCHANGED. This means #2301 has at least one MORE component beyond
-        // ptd$<prim> linkage (the box's construction path, or emitIsA's
-        // comparison for this exact shape, does not yet route through the
-        // now-shared descriptor the way the issue's diagnosis predicted) — the
-        // box VTABLE (pvt$<nm>, below) stays InternalLinkage per the issue's
-        // own suggested fix (only slot [0] should matter), which did not
-        // change the outcome either. Left in as a necessary-but-INSUFFICIENT,
-        // spec-correct step (§2.8.3 rule 4 is unambiguous that two identity
-        // copies are wrong regardless), with a follow-up filed for the
-        // residual — see this commit's message / the tracker.
+        // UNCHANGED. The box VTABLE `pvt$<nm>` (below) was the residual —
+        // every compilation unit emitted its OWN `pvt$Int_<module>` with
+        // `InternalLinkage`, and `bz_obj_is_string`'s `bz$vtable$table`
+        // discriminator is per-module, so a box carrying another module's
+        // `pvt$Int_<module>` was mis-classified as a string and `emitIsA`
+        // never ran for it. The #2301 fix pairs THIS descriptor's
+        // `LinkOnceODRLinkage` with the matching `LinkOnceODRLinkage` on
+        // `pvt$<nm>` itself AND on every thunk the vtable's initializer
+        // references (Dispose, ToString, Equals, GetHashCode — their bodies
+        // are deterministic per primitive, so ODR-mergeable; see each thunk's
+        // matching comment). One address per box vtable program-wide → both
+        // modules' `bz$vtable$table`s list that merged address → the
+        // discriminator correctly identifies cross-module boxes as not-string
+        // → `emitIsA` walks the (already-merged) `ptd$<prim>` chain → match.
+        // (The matching comment on the `pvt$<nm>` creation below carries the
+        // ODR-safety derivation; the comment on each thunk lists its
+        // byte-identicality rationale.)
         auto* desc = new llvm::GlobalVariable(
             *module_, descTy, /*isConstant=*/true,
             llvm::GlobalValue::LinkOnceODRLinkage, nullptr,
@@ -29357,9 +29375,23 @@ void Emitter::setupBoxDescriptors() {
         vtElems[4] = eqThunk;        // Equals
         vtElems[5] = hashThunk;      // GetHashCode
         auto* vtTy = llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase);
+        // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR (matching the descriptor
+        // above and the per-slot thunks — `builtinDisposeFn_`,
+        // `primBox{ToString,Equals,Hash}Thunk`, and the empty itmap all now
+        // emit as LinkOnceODR). The vtable initializer `{descriptor, itmap,
+        // Dispose, ToString, Equals, GetHashCode}` is byte-identical in every
+        // compilation unit (the descriptor is shared; the thunks' bodies are
+        // deterministic; the itmap is empty/constant), so ODR-mergeable. ONE
+        // address per box vtable program-wide → `bz$vtable$table` lists that
+        // merged address in BOTH modules → `bz_obj_is_string` correctly
+        // recognises a cross-module box → `emitIsA` runs and `o is int`
+        // answers true (the headline #2301 symptom). `pvt$<nm>` is therefore
+        // the load-bearing piece, not just slot [0] as the original issue
+        // hypothesised — every reader (the discriminator AND `emitIsA`) must
+        // land on the SAME storage.
         primBoxVtable_[nm] = new llvm::GlobalVariable(
             *module_, vtTy, /*isConstant=*/true,
-            llvm::GlobalValue::InternalLinkage,
+            llvm::GlobalValue::LinkOnceODRLinkage,
             llvm::ConstantArray::get(vtTy, vtElems),
             std::string("pvt$") + nm);
         allVtables_.push_back(primBoxVtable_[nm]);  // §8.6 #417
@@ -29416,9 +29448,16 @@ void Emitter::setupBoxDescriptors() {
         primBoxDesc_[nm] = desc;
         if (!vbEmptyItmap) {
             auto* itmapTy = llvm::ArrayType::get(ptrTy(), 1);
+            // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the empty itmap
+            // initializer is the single null pointer, byte-identical in every
+            // compilation unit, so ODR-mergeable. This is the value-builtin
+            // twin of the `pvt$<nm>` LinkOnceODR change: both modules'
+            // `pvt$<DateTime>` etc. must reference the SAME itmap global so
+            // the vtable initializer is byte-identical and the vtable itself
+            // can be LinkOnceODR.
             vbEmptyItmap = new llvm::GlobalVariable(
                 *module_, itmapTy, /*isConstant=*/true,
-                llvm::GlobalValue::InternalLinkage,
+                llvm::GlobalValue::LinkOnceODRLinkage,
                 llvm::ConstantArray::get(
                     itmapTy, {llvm::ConstantPointerNull::get(ptrTy())}),
                 "itmap$box$valuebuiltin");
@@ -29433,9 +29472,18 @@ void Emitter::setupBoxDescriptors() {
         vtElems[kEqualsSlot]      = boxDefaultEqualsThunk();
         vtElems[kGetHashCodeSlot] = boxDefaultHashCodeThunk();
         auto* vtTy = llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase);
+        // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the value-builtin
+        // box vtable is the twin of the primitive one. All six slots are now
+        // LinkOnceODR (the descriptor `td$<nm>` for value-builtins is
+        // ExternalLinkage on a per-class TypeSymbol so already shared; the
+        // itmap is the LinkOnceODR `itmap$box$valuebuiltin` above; Dispose is
+        // the LinkOnceODR `builtinDisposeFn_`; ToString is the
+        // LinkOnceODR `valueBuiltinBoxToStringThunk(nm)`; Equals / HashCode are
+        // the LinkOnceODR `boxDefault{Equals,HashCode}Thunk`). The initializer
+        // is byte-identical across compilations, so ODR-mergeable.
         primBoxVtable_[nm] = new llvm::GlobalVariable(
             *module_, vtTy, /*isConstant=*/true,
-            llvm::GlobalValue::InternalLinkage,
+            llvm::GlobalValue::LinkOnceODRLinkage,
             llvm::ConstantArray::get(vtTy, vtElems),
             std::string("pvt$") + nm);
         allVtables_.push_back(primBoxVtable_[nm]);  // §8.6 #417
@@ -29488,8 +29536,14 @@ struct ThunkScope {
 // boxed value-builtins in this revision carry no generic parameters.
 llvm::Constant* Emitter::valueBuiltinBoxToStringThunk(const char* name) {
     auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
+    // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the per-name value-builtin
+    // ToString thunk returns the type's qualified-name literal; the body is
+    // `ret <global string literal>` regardless of which module emitted it, so
+    // byte-identical across modules. ODR-merging makes the value-builtin
+    // `pvt$<nm>` (slot [3] = this thunk) byte-identical across compilations,
+    // which is what lets `pvt$<nm>` itself be LinkOnceODR.
     auto* thunk = llvm::Function::Create(
-        fnTy, llvm::Function::InternalLinkage,
+        fnTy, llvm::Function::LinkOnceODRLinkage,
         std::string("bz$vbtostr$") + name, module_.get());
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
@@ -29763,8 +29817,13 @@ llvm::Constant* Emitter::boxDefaultEqualsThunk() {
     if (boxDefaultEqualsFn_) return boxDefaultEqualsFn_;
     auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
                                          /*isVarArg=*/false);
+    // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the default identity-equals
+    // thunk is a one-instruction body, byte-identical in every module, so
+    // ODR-mergeable. See the matching comment on `builtinDisposeFn_` and on
+    // the `pvt$<nm>` construction for the discriminator / cross-module `is`
+    // rationale.
     auto* thunk = llvm::Function::Create(
-        fnTy, llvm::Function::InternalLinkage, "bz$box$eq", module_.get());
+        fnTy, llvm::Function::LinkOnceODRLinkage, "bz$box$eq", module_.get());
     boxDefaultEqualsFn_ = thunk;
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
@@ -29783,8 +29842,13 @@ llvm::Constant* Emitter::boxDefaultEqualsThunk() {
 llvm::Constant* Emitter::boxDefaultHashCodeThunk() {
     if (boxDefaultHashCodeFn_) return boxDefaultHashCodeFn_;
     auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
+    // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the default identity-hash
+    // thunk is a one-call body (`bz_obj_identity_hash`, ExternalLinkage),
+    // byte-identical in every module, so ODR-mergeable. See the matching
+    // comment on `builtinDisposeFn_` and on the `pvt$<nm>` construction for
+    // the discriminator / cross-module `is` rationale.
     auto* thunk = llvm::Function::Create(
-        fnTy, llvm::Function::InternalLinkage, "bz$box$hash", module_.get());
+        fnTy, llvm::Function::LinkOnceODRLinkage, "bz$box$hash", module_.get());
     boxDefaultHashCodeFn_ = thunk;
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
     {
@@ -30023,8 +30087,13 @@ llvm::Constant* Emitter::primBoxEqualsThunk(sema::PrimitiveType prim,
 
     auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
                                          /*isVarArg=*/false);
+    // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the per-primitive box
+    // Equals thunk body is deterministic (a load/compare/branch on the payload
+    // via `lowerPrimitive(prim)`, which is module-independent), so
+    // byte-identical across compilations. ODR-merging makes `pvt$<nm>` slot [4]
+    // byte-identical, which is what lets `pvt$<nm>` itself be LinkOnceODR.
     auto* thunk = llvm::Function::Create(
-        fnTy, llvm::Function::InternalLinkage,
+        fnTy, llvm::Function::LinkOnceODRLinkage,
         std::string("bz$primeq$") + nm, module_.get());
     primBoxEqualsFns_[nm] = thunk;
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
@@ -30115,8 +30184,14 @@ llvm::Constant* Emitter::primBoxHashThunk(sema::PrimitiveType prim,
     if (it != primBoxHashFns_.end()) return it->second;
 
     auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
+    // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the per-primitive box
+    // GetHashCode thunk body is deterministic (load payload via
+    // `lowerPrimitive(prim)`, dispatch to `emitValueHashCode` with a fixed
+    // TypeRef), so byte-identical across compilations. ODR-merging makes
+    // `pvt$<nm>` slot [5] byte-identical, which is what lets `pvt$<nm>`
+    // itself be LinkOnceODR.
     auto* thunk = llvm::Function::Create(
-        fnTy, llvm::Function::InternalLinkage,
+        fnTy, llvm::Function::LinkOnceODRLinkage,
         std::string("bz$primhash$") + nm, module_.get());
     primBoxHashFns_[nm] = thunk;
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
@@ -30222,8 +30297,14 @@ llvm::GlobalVariable* Emitter::buildPrimBoxItmap(sema::PrimitiveType prim,
     llvm::Function* cmpFn = nullptr;
     if (haveCmp) {
         auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy(), valTy}, false);
+        // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the per-primitive box
+        // CompareTo thunk body is deterministic (load payload, then signed-/
+        // unsigned-/FP-compare or bz_decimal_cmp), byte-identical across
+        // compilations. ODR-merging makes the IComparable itable byte-
+        // identical, which is what lets the itmap (and ultimately `pvt$<nm>`)
+        // itself be LinkOnceODR.
         cmpFn = llvm::Function::Create(
-            fnTy, llvm::Function::InternalLinkage,
+            fnTy, llvm::Function::LinkOnceODRLinkage,
             std::string("bz$primcmp$") + nm, module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
         llvm::IRBuilder<> tb(entry);
@@ -30263,8 +30344,13 @@ llvm::GlobalVariable* Emitter::buildPrimBoxItmap(sema::PrimitiveType prim,
     llvm::Function* eqFn = nullptr;
     if (haveEq) {
         auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), valTy}, false);
+        // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the per-primitive
+        // IEquatable.Equals thunk body is deterministic, byte-identical across
+        // compilations. ODR-merging makes the IEquatable itable byte-
+        // identical, which is what lets the itmap (and `pvt$<nm>`) itself be
+        // LinkOnceODR. See `cmpFn` above for the matching rationale.
         eqFn = llvm::Function::Create(
-            fnTy, llvm::Function::InternalLinkage,
+            fnTy, llvm::Function::LinkOnceODRLinkage,
             std::string("bz$primeqT$") + nm, module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqFn);
         llvm::IRBuilder<> tb(entry);
@@ -30294,9 +30380,14 @@ llvm::GlobalVariable* Emitter::buildPrimBoxItmap(sema::PrimitiveType prim,
     auto buildItable = [&](llvm::Function* fn,
                            const char* iname) -> llvm::GlobalVariable* {
         auto* arrTy = llvm::ArrayType::get(ptrTy(), 1);
+        // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the itable is a
+        // single-function array; with the thunk itself LinkOnceODR
+        // (`cmpFn`/`eqFn` above), the itable's initializer is byte-identical
+        // across compilations. Lets the itmap (and `pvt$<nm>`) itself be
+        // LinkOnceODR.
         return new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
-            llvm::GlobalValue::InternalLinkage,
+            llvm::GlobalValue::LinkOnceODRLinkage,
             llvm::ConstantArray::get(
                 arrTy, {llvm::cast<llvm::Constant>(fn)}),
             std::string("itab$prim$") + nm + "$" + iname);
@@ -30316,9 +30407,17 @@ llvm::GlobalVariable* Emitter::buildPrimBoxItmap(sema::PrimitiveType prim,
     pairs.push_back(llvm::ConstantPointerNull::get(ptrTy()));  // null terminator
 
     auto* itmapArrTy = llvm::ArrayType::get(ptrTy(), pairs.size());
+    // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the itmap is the
+    // descriptor→itable pair list; the descriptor pointers (built-in
+    // interface `btd$IComparable`/`btd$IEquatable`) are ExternalLinkage and
+    // already shared; the itables themselves are LinkOnceODR above; so the
+    // itmap's initializer is byte-identical across compilations, and the
+    // itmap can be merged. The merged itmap is what `pvt$<nm>` slot [1]
+    // then references — a single address per binary, used by every
+    // module's `bz$vtable$table` discriminator.
     auto* itmapGV = new llvm::GlobalVariable(
         *module_, itmapArrTy, /*isConstant=*/true,
-        llvm::GlobalValue::InternalLinkage,
+        llvm::GlobalValue::LinkOnceODRLinkage,
         llvm::ConstantArray::get(itmapArrTy, pairs),
         std::string("itmap$prim$") + nm);
     return itmapGV;
@@ -30512,8 +30611,14 @@ llvm::Constant* Emitter::primBoxToStringThunk(sema::PrimitiveType prim,
     if (it != primBoxToStringFns_.end()) return it->second;
 
     auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
+    // #2301 (§8.6 / §2.8.3 rule 4): LinkOnceODR — the per-primitive box
+    // ToString thunk body is deterministic (load payload via
+    // `lowerPrimitive(prim)`, dispatch to `emitPrimitiveToString`, which calls
+    // only ExternalLinkage runtime helpers), so byte-identical across
+    // compilations. ODR-merging makes `pvt$<nm>` slot [3] byte-identical,
+    // which is what lets `pvt$<nm>` itself be LinkOnceODR.
     auto* thunk = llvm::Function::Create(
-        fnTy, llvm::Function::InternalLinkage,
+        fnTy, llvm::Function::LinkOnceODRLinkage,
         std::string("bz$primtostr$") + name, module_.get());
     primBoxToStringFns_[name] = thunk;
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
