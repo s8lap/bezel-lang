@@ -7558,10 +7558,55 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         bool* outWrapMade, bool srcOwnedByCallee) {
     if (outWrapMade) *outWrapMade = false;
     if (!v || !targetTy || !srcExpr) return v;
+    // fix #3355 / §29.2 / §23.2 (v0.278) — interim SIGSEGV-elimination fix:
+// widen the gate to also accept `IOwningEnumerable` as the target head.
+// Pre-fix this gate keyed on `headName() == "IEnumerable"` and declined
+// every other name, so an `IOwningEnumerable<T>`-returning source returned
+// the raw backing pointer (no vtable at offset 0 — the for-in at the
+// call site read slot 4 of the raw backing as a function pointer →
+// SIGSEGV). #2769's commentary at line 193 names this defect as a
+// separate pre-existing issue: "the IOwningEnumerable arm of the wrap
+// function itself is broken upstream of #2769's scope. Filed as a
+// separate issue" — that issue is #3355.
+//
+// SCOPE AND LIMITATIONS. This fix eliminates the SIGSEGV but does NOT
+// implement spec-correct IOwningEnumerable semantics. The downstream
+// dispatch reuses the existing wrap helpers (`wrapOwnedArrayAsIEnumerable`
+// at line 7689, `wrapOwnedLinkedListAsIEnumerable` at line 7739,
+// `drainLazyPipelineToOwnedIEnumerable` at line 7717,
+// `wrapUserClassAsIEnumerable` at line 7771), each of which installs
+// the BORROWING `Current` (slot 3) — a function that returns the
+// element pointer at the current index without transferring ownership
+// out of the underlying collection. The IOwningEnumerable<T> spec
+// (§29.1 / §29.11) requires slot 3 to be `TakeCurrent` — a function
+// that transfers ownership of the pending element AND nulls the
+// pending slot, so the collection's slot is empty after each yield
+// (single-consumption drain per §29.11). With this commit, slot 3
+// remains the borrowing Current; the for-in desugaring marks the loop
+// variable as `owned` (sema enforces auto-disposal at iteration end,
+// LlvmBackend_Stmts.cpp:7602-7607), and the array's element disposer
+// is null for non-string class elements — so the test under
+// `tests/codegen/iowningenumerable_getter_value_arm_3355_test.cpp`
+// observes exact-once disposal even though the ownership is being
+// discharged by the LOOP'S auto-dispose rather than the slot-3
+// TakeCurrent. Re-iterating the same IOwningEnumerable reads the same
+// items twice (the array's slots are not nulled), violating
+// single-consumption.
+//
+// The class-element follow-up (#3364) is the right home for the
+// TakeCurrent-primitive fix: a distinct slot-3 primitive that nulls
+// the pending slot on transfer AND updates the wrap helpers to install
+// it for IOwningEnumerable targets. The "value-element arm" framing
+// in the lane brief does not apply — `IOwningEnumerable<T>` constrains
+// `where T: class` (Bezel_Standard_Library.md §4.13, v0.278) and so
+// has no value-element arm; the wrap helpers' slot-3 reuse of the
+// borrowing Current is the SAME defect for both class and (hypothetical)
+// value elements.
     if (!(targetTy->kind == sema::TypeRef::Kind::Named &&
           !targetTy->declaration && targetTy->astNode &&
           targetTy->astNode->name && !targetTy->astNode->name->parts.empty() &&
-          targetTy->headName() == "IEnumerable"))
+          (targetTy->headName() == "IEnumerable" ||
+           targetTy->headName() == "IOwningEnumerable")))
         return v;
     sema::TypeRef* actualTy = ctx_.exprType(*srcExpr);
     // #1916 / stdlib §5 / §29.11: a lazy LINQ pipeline (Select/Where/… → a
@@ -7905,13 +7950,13 @@ llvm::Value* Emitter::wrapPropertyArrayAsIEnumerable(
     // (only `new T(...)`, `move e`, or a producer-init LOCAL transfers
     // ownership into the wrapper — a plain field/parameter/local borrow
     // keeps the wrap BORROWING, exactly as the block form does).
-    // `wrapAsIEnumerableForTarget` keys on `headName() == "IEnumerable"`
-    // (its gate at the function head) and declines every other name, so
-    // IOwningEnumerable falls through here unchanged; the IOwningEnumerable
-    // + Array family is already wrapped above, and IOwningEnumerable +
-    // non-Array has no wrap variant today and stays unwrapped (the SIGSEGV
-    // for that shape is a separate, pre-existing defect — not fixed here).
-    if (dn == "IEnumerable") {
+    //
+    // fix #3355 / §29.2 / §23.2 (v0.278) — interim SIGSEGV-elimination:
+    // the same dispatch for the `IOwningEnumerable<T>` head. See the
+    // gate comment at line 7561-7594 for the scope and limitations; the
+    // wrap helpers' slot-3 Current-vs-TakeCurrent gap is the
+    // class-element follow-up #3364.
+    if (dn == "IEnumerable" || dn == "IOwningEnumerable") {
         return wrapAsIEnumerableForTarget(
             v, declTy, getter,
             /*ownLazyPipeline=*/true,
