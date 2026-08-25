@@ -1,6 +1,6 @@
 # 0118 — Completing the kernel absorption: one definition site per ownership rule
 
-**Status:** accepted — owner-directed 2026-08-25; graduation targeted at v0.281
+**Status:** graduated-v0.281 — superseded — graduated v0.281 (owner-directed 2026-08-25); acceptance audit at [`0118-audit-v0.281.md`](0118-audit-v0.281.md)
 **Tracking issue:** [#3368](https://github.com/s8lap/bezel-lang/issues/3368)
 **Target module(s):** Docs-only. Spec [§28](../Bezel_Language_Spec.md#sec-resource-management) (all subsections), the [§30.5](../Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal) tagged satellites, Appendix C.3/C.6 (sync), rationale (terminology note), Guide 01 revalidation, `Bezel_For_Code_Generation.md` §4 sync. **No grammar change. No stdlib API change. No compiler work.**
 **Written against:** v0.279

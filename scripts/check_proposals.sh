@@ -8,7 +8,7 @@
 #   1. Bijection  — every numbered proposal file (`NNNN-*.md`) has exactly one
 #                   row in the README's status-sectioned tables, and every
 #                   row's number links to an existing proposal file. One named
-#                   non-proposal exception: `0046-audit-v0.199.md` (the 0046
+#                   non-proposal exceptions: `0046-audit-v0.199.md` and `0118-audit-v0.281.md` (the 0046/0118
 #                   acceptance audit, a supporting record linked from proposal
 #                   0046's own Status row — not itself a proposal).
 #   2. Token      — every proposal's Status row leads with a canonical token
@@ -38,7 +38,7 @@ README = os.path.join(PROPDIR, 'README.md')
 
 # Named non-proposal exception(s): numbered files that are supporting records,
 # not proposals (see the header comment).
-EXCLUDE = {'0046-audit-v0.199.md'}
+EXCLUDE = {'0046-audit-v0.199.md', '0118-audit-v0.281.md'}
 
 TOKEN_RE = re.compile(r'^(under-review|accepted|graduated-v0\.\d+|declined|study)(?: — |$)')
 LIVE_TOKENS = ('under-review', 'accepted', 'study')
