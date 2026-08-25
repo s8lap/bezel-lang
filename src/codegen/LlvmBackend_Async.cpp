@@ -2698,6 +2698,49 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         smSelf_ = self;
         smStateGEP_ = stateGEP;
 
+        // fix #2627 / §29.1 v0.236: on every async-iterator exhaustion transition
+        // — the resume-dispatch "Done" lambda (state >= numSuspends, hit on any
+        // subsequent MoveNextAsync after exhaustion), the fault path (uncaught
+        // throw / faulted await in the body), AND the body-runs-off-its-end path
+        // — dispose-then-null current_val BEFORE marking state -1 so a later
+        // TakeCurrent() sees null and raises InvalidOperationException per the
+        // §29.1 owning contract (transfers only at TakeCurrent). Mirrors the
+        // sync head's exhaustion pass (#1349 + #2616, LlvmBackend_Iterators.cpp)
+        // and the async Dispose's #2591 disposeYieldedVal (this file at
+        // emitFreeAndReturn): the enumerator owns the yielded value until
+        // TakeCurrent transfers it; if the consumer abandoned the protocol
+        // (MoveNextAsync false without a prior TakeCurrent, or faulted before
+        // TakeCurrent, or body returned off the end without the consumer taking
+        // the last value), the value is leaked if we just null — so dispose it
+        // first. Null-guarded: TakeCurrent-nulled slot is a no-op. Only fires
+        // for IOwningAsyncEnumerable<T> / IOwningAsyncEnumerator<T> with a
+        // pointer element type — the same predicate as the async Dispose's
+        // disposeYieldedVal; the async frame carries no separate
+        // current_val_owned flag (collapsed into the owning-form dispose under
+        // #2591). Exactly-once: the abandon-then-Dispose pass at #2591 and
+        // these new exhaustion passes are all dispose-then-null under the same
+        // null guard, so whichever runs first leaves the slot null for the
+        // other.
+        auto disposeCurrentValOnExhaust = [&]() {
+            if (!isOwningIter || !elemTy->isPointerTy()) return;
+            llvm::Value* cvField = builder_.CreateStructGEP(
+                stateStructTy, self, CURRENT_VAL_FIELD);
+            llvm::Value* yv = builder_.CreateLoad(elemTy, cvField, "aity.ex.yv");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                yv, llvm::ConstantPointerNull::get(ptrTy()), "aity.ex.yvnull");
+            auto* nonNullBB = llvm::BasicBlock::Create(
+                llvm_, "aity.ex.yv.nonnull", resumeFn);
+            auto* contBB = llvm::BasicBlock::Create(
+                llvm_, "aity.ex.yv.cont", resumeFn);
+            builder_.CreateCondBr(isNull, contBB, nonNullBB);
+            builder_.SetInsertPoint(nonNullBB);
+            emitDisposeAndReclaim(yv);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), cvField);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+        };
+
         // "Done" (exhausted / fall-off / state -1): complete the per-advance task
         // with FALSE and return. The frame is NOT freed here (it persists for the
         // next MoveNextAsync / until Dispose).
@@ -2705,6 +2748,15 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             frame, self, stateGEP, numSuspends,
             [&]() {
                 emitAsyncIterComplete(/*hasValue=*/false);
+                // fix #2627 / §29.1 v0.236: dispose-then-null current_val before
+                // marking state -1 so a later TakeCurrent() raises IOE. Defensive
+                // here — every transition into state -1 below already nulls the
+                // slot, but the "Done" lambda also fires on subsequent
+                // MoveNextAsync calls past the original exhaustion site, and a
+                // stale current_val would re-hand back the old value. Null-
+                // guarded; under the dominant `await for` protocol current_val
+                // is already null and this is a no-op.
+                disposeCurrentValOnExhaust();
                 // Mark state -1 so a further MoveNextAsync stays exhausted.
                 builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
                 builder_.CreateRetVoid();
@@ -2731,6 +2783,12 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             builder_.CreateCall(completeErrObjFn, {task, excObj});
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
                                  emitExcSlot());
+            // fix #2627 / §29.1 v0.236: dispose-then-null current_val before
+            // marking state -1 — a fault in the body may have left a pending
+            // yielded value (the last `yield return` before the throw) that the
+            // consumer never took. Without this null the post-fault TakeCurrent
+            // returns the stale value instead of raising IOE.
+            disposeCurrentValOnExhaust();
             // Stay exhausted on any later advance.
             builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
             builder_.CreateRetVoid();
@@ -2747,6 +2805,14 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             // in the Dispose body below. State is set to -1 so a later advance /
             // Dispose stays a no-op → each resource is disposed exactly once.
             emitDisposals(disposeStack_.back());
+            // fix #2627 / §29.1 v0.236: dispose-then-null current_val before
+            // marking state -1 on normal completion. Reachable via the manual
+            // protocol (the dominant `await for` always TakeCurrent's the last
+            // value so current_val is already null and this is a no-op) — when
+            // the consumer abandons the last value and drives to exhaustion,
+            // current_val holds a stale owned value that would otherwise leak
+            // (per #2616) AND be re-handed-out by a subsequent TakeCurrent.
+            disposeCurrentValOnExhaust();
             emitAsyncIterComplete(/*hasValue=*/false);
             builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
             builder_.CreateRetVoid();
