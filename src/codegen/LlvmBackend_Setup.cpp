@@ -8168,9 +8168,24 @@ llvm::GlobalVariable* Emitter::instanceDescriptorFor(
         readable = descReadableMangle(tmp.get());
         descArena_.push_back(std::move(tmp));
     }
+    // fix #3359 (§2.8.3 rule 4, §14.1, §2.8.2 clause 2, v0.278): the
+    // per-instantiation descriptor minted by `instanceDescriptorFor` carries
+    // the importer's and exporter's `vt$<C>$specN` slot 0 reference; the
+    // runtime `is`/`as`/`catch`/§19 test site reads slot 0 of the object's
+    // vtable (the EXPORTER's) and compares it to the test target resolved by
+    // `perInstDescriptorForTarget` (the IMPORTER's), so the two addresses
+    // MUST collapse. Promote to LinkOnceODR — same name (the structural
+    // `descReadableMangle` is deterministic across modules), same contents
+    // (the BFS over `ts->baseTypes` and the `directBuiltinExceptionBase`
+    // walk produce identical chains for the same `(ts, args)` from each
+    // side; §2.5/§2.8.2 mirrors the type-shape across the boundary), and
+    // §2.8.3 rule 3 requires same-named distinct-declarations NOT to
+    // collapse (no module qualifier on the name, exactly the `btd$<R>`
+    // precedent #2797 set). Mirrors `btd$<R>` from #2797.
     auto* gv = new llvm::GlobalVariable(
         *module_, arrTy, /*isConstant=*/true,
-        llvm::GlobalValue::InternalLinkage, /*init=*/nullptr, "td$" + readable);
+        llvm::GlobalValue::LinkOnceODRLinkage, /*init=*/nullptr,
+        "td$" + readable);
     instanceDesc_[key] = gv;  // cache BEFORE phase 2 (self / diamond / cycle)
 
     // Phase 2: fill the elements. Element for ts itself is the global (self);
