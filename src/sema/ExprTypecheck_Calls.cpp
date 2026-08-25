@@ -5140,7 +5140,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "ThenByDescending" || mm == "GroupBy" ||
                                 mm == "Aggregate" || mm == "All" || mm == "Any" ||
                                 mm == "Average" || mm == "Sum" || mm == "Min" ||
-                                mm == "Max" || mm == "FirstOrNull" ||
+                                mm == "Max" || mm == "MinOrNull" ||
+                                mm == "MaxOrNull" || mm == "FirstOrNull" ||
                                 mm == "LastOrNull" || mm == "Single" ||
                                 mm == "SingleOrNull" || mm == "ElementAt" ||
                                 mm == "Concat" || mm == "Append" || mm == "Union" ||
@@ -5263,7 +5264,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "ThenByDescending" || mm == "GroupBy" ||
                                 mm == "Aggregate" || mm == "All" || mm == "Any" ||
                                 mm == "Average" || mm == "Sum" || mm == "Min" ||
-                                mm == "Max" || mm == "FirstOrNull" ||
+                                mm == "Max" || mm == "MinOrNull" ||
+                                mm == "MaxOrNull" || mm == "FirstOrNull" ||
                                 mm == "LastOrNull" || mm == "Single" ||
                                 mm == "SingleOrNull" || mm == "ElementAt" ||
                                 mm == "Concat" || mm == "Append" || mm == "Union" ||

@@ -3678,6 +3678,223 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             freeLazyTemp();  // FINDING [5]: release materialized lazy snapshot
             return builder_.CreateLoad(accLLTy, accSlot, "mm.r");
         }
+        // fix #2783 (stdlib §5.1, v0.240): .MinOrNull() / .MaxOrNull() —
+        // sibling of Min()/Max() that returns T? (null on empty source)
+        // instead of throwing InvalidOperationException. stdlib §5.1
+        // declares both in `extension IEnumerable<T> where T:
+        // IComparable<T>`; Array<T>'s Min/Max (handled above) already
+        // compiles, so this handler mirrors its no-selector numeric arm
+        // for the most common element types and returns T? as a tagged
+        // {hasValue, value} struct for value types or a nullable pointer
+        // for class/string/interface elements (mirroring FirstOrNull at
+        // ~line 3987). Selector overloads (`MinOrNull<U>(sel: (T)->U)`)
+        // and decimal elements are out of scope here — file a follow-up
+        // if needed. No-arg form only.
+        if ((m == "MinOrNull" || m == "MaxOrNull") && call.args.empty() &&
+            isArr) {
+            bool isMaxOrNull = (m == "MaxOrNull");
+            sema::TypeRef* elemTypeRef =
+                (recvTy && !recvTy->genericArgs.empty())
+                    ? recvTy->genericArgs[0] : nullptr;
+            llvm::Type* elemLLTy = getElemTy();
+            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+            llvm::Value* len = builder_.CreateCall(lenFn, {recv});
+            // Empty path: return null T? (skip the scan entirely).
+            auto* emptyBB  = llvm::BasicBlock::Create(llvm_, "mon.e", currentFn_);
+            auto* seedBB   = llvm::BasicBlock::Create(llvm_, "mon.s", currentFn_);
+            auto* condBB   = llvm::BasicBlock::Create(llvm_, "mon.c", currentFn_);
+            auto* bodyBB   = llvm::BasicBlock::Create(llvm_, "mon.b", currentFn_);
+            auto* updBB    = llvm::BasicBlock::Create(llvm_, "mon.u", currentFn_);
+            auto* nextBB   = llvm::BasicBlock::Create(llvm_, "mon.n", currentFn_);
+            auto* endBB    = llvm::BasicBlock::Create(llvm_, "mon.x", currentFn_);
+            llvm::Value* isEmpty =
+                builder_.CreateICmpEQ(len, builder_.getInt64(0));
+            builder_.CreateCondBr(isEmpty, emptyBB, seedBB);
+
+            // Seed block: load element[0] as the initial accumulator and
+            // start scanning from index 1. (Seeding avoids comparing
+            // against a null/zero accumulator on the first iteration.)
+            builder_.SetInsertPoint(seedBB);
+            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                   {ptrTy(), i64(), i64()});
+            llvm::Value* p0 = builder_.CreateCall(
+                ptrFn, {recv, builder_.getInt64(0), builder_.getInt64(esz)});
+            llvm::AllocaInst* accSlot = entryAlloca(elemLLTy);
+            llvm::AllocaInst* idxSlot = entryAlloca(i64());
+            builder_.CreateStore(builder_.CreateLoad(elemLLTy, p0), accSlot);
+            builder_.CreateStore(builder_.getInt64(1), idxSlot);
+            builder_.CreateBr(condBB);
+
+            // Compare-loop body.
+            builder_.SetInsertPoint(condBB);
+            llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+            // Load the accumulator before branching — needed by the
+            // endBB PHI when the loop exits. LLVM DCEs this on the
+            // true branch (bodyBB).
+            llvm::Value* exitVal =
+                builder_.CreateLoad(elemLLTy, accSlot, "mon.exitv");
+            builder_.CreateCondBr(builder_.CreateICmpSLT(idx, len),
+                                  bodyBB, endBB);
+            builder_.SetInsertPoint(bodyBB);
+            llvm::Value* ep = builder_.CreateCall(
+                ptrFn, {recv, idx, builder_.getInt64(esz)});
+            llvm::Value* el  = builder_.CreateLoad(elemLLTy, ep, "mon.el");
+            llvm::Value* acc = builder_.CreateLoad(elemLLTy, accSlot, "mon.acc");
+            // For class/string/interface (pointer) elements, use
+            // ordinal strcmp (string), itable CompareTo (interface,
+            // #2770), or direct CompareTo call (class). For numeric
+            // primitive elements, use direct icmp/fcmp.
+            llvm::Value* shouldUpdate;
+            bool isStrElem = isStringTypeRefNonNull(elemTypeRef);
+            sema::MethodSymbol* cmpMs = nullptr;
+            llvm::Function* ifaceCmpFn = nullptr;
+            if (!isStrElem && elemTypeRef &&
+                elemTypeRef->kind == sema::TypeRef::Kind::Named &&
+                (elemTypeRef->declaration == nullptr ||
+                 elemTypeRef->declaration->kind ==
+                     ast::TypeDeclKind::Class ||
+                 elemTypeRef->declaration->kind ==
+                     ast::TypeDeclKind::Interface)) {
+                if (elemTypeRef->declaration) {
+                    if (sema::MethodSymbol* cm =
+                            findMethodByName(elemTypeRef->declaration,
+                                             "CompareTo"))
+                        if (cm->params.size() == 1) cmpMs = cm;
+                }
+                if (!cmpMs) {
+                    if (sema::MethodSymbol* ifm =
+                            selfComparableIfaceCompareTo(elemTypeRef))
+                        ifaceCmpFn =
+                            ensureIfaceCmpThunk(
+                                elemTypeRef->declaration, ifm);
+                }
+            }
+            if (isStrElem || cmpMs || ifaceCmpFn) {
+                // Pointer-typed element: string-ordinal strcmp (string),
+                // itable CompareTo (interface, #2770), or direct
+                // CompareTo call (class).
+                llvm::Value* cmp = nullptr;
+                if (isStrElem) {
+                    llvm::Value* elData = builder_.CreateLoad(ptrTy(),
+                        builder_.CreateStructGEP(stringType(), el, 0));
+                    llvm::Value* accData = builder_.CreateLoad(ptrTy(),
+                        builder_.CreateStructGEP(stringType(), acc, 0));
+                    auto* strcmpFn = module_->getFunction("strcmp");
+                    if (!strcmpFn) {
+                        auto* ft = llvm::FunctionType::get(
+                            i32(), {ptrTy(), ptrTy()}, false);
+                        strcmpFn = llvm::Function::Create(
+                            ft, llvm::Function::ExternalLinkage, "strcmp",
+                            module_.get());
+                    }
+                    cmp = builder_.CreateCall(strcmpFn,
+                                              {elData, accData},
+                                              "mon.cmp");
+                } else if (ifaceCmpFn) {
+                    cmp = builder_.CreateCall(ifaceCmpFn, {ep, accSlot},
+                                              "mon.cmp");
+                } else {
+                    std::vector<llvm::Value*> cargs{el, acc};
+                    cmp = emitMethodCall(cmpMs, cargs,
+                                         /*baseQualified=*/false);
+                    if (!cmp) return nullptr;
+                }
+                llvm::Value* zero = llvm::ConstantInt::get(
+                    cmp->getType(), 0);
+                shouldUpdate = isMaxOrNull
+                    ? builder_.CreateICmpSGT(cmp, zero)
+                    : builder_.CreateICmpSLT(cmp, zero);
+            } else if (elemLLTy->isIntegerTy()) {
+                shouldUpdate = isMaxOrNull
+                    ? builder_.CreateICmpSGT(el, acc)
+                    : builder_.CreateICmpSLT(el, acc);
+            } else if (elemLLTy->isFloatTy() ||
+                       elemLLTy->isDoubleTy()) {
+                shouldUpdate = isMaxOrNull
+                    ? builder_.CreateFCmpOGT(el, acc)
+                    : builder_.CreateFCmpOLT(el, acc);
+            } else {
+                // Unknown element type (record/decimal/etc.) — reject
+                // loudly rather than silently miscompare.
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    std::string("`") + std::string(m) +
+                    "()` on `Array<" +
+                    (elemTypeRef ? std::string(elemTypeRef->headName())
+                    : std::string("T")) +
+                    ">` is not yet implemented for this element type "
+                    "(stdlib §5.1, #2783): supported element types for "
+                    "the no-selector overload are numeric primitives "
+                    "(int/long/uint/ulong/float/double), string, and "
+                    "class/interface types implementing `IComparable<T>`.");
+                return llvm::Constant::getNullValue(elemLLTy);
+            }
+            builder_.CreateCondBr(shouldUpdate, updBB, nextBB);
+            builder_.SetInsertPoint(updBB);
+            builder_.CreateStore(el, accSlot);
+            builder_.CreateBr(nextBB);
+            builder_.SetInsertPoint(nextBB);
+            builder_.CreateStore(
+                builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+            builder_.CreateBr(condBB);
+
+            // Empty path: T? = null.
+            builder_.SetInsertPoint(emptyBB);
+            // Determine whether this is a value-type element (tagged
+            // {hasValue, value} nullable struct) or a pointer-typed
+            // element (nullable pointer — null = empty).
+            sema::TypeRef nullRT;
+            if (elemTypeRef) {
+                nullRT = *elemTypeRef;
+                nullRT.nullable = true;
+            }
+            bool isValTy = elemTypeRef && isNullableValueTy(&nullRT);
+            llvm::Value* nullResult;
+            if (isValTy) {
+                auto* nst = nullableValueStructTy(&nullRT);
+                auto* hv = llvm::ConstantInt::get(
+                    nullablePrimHasValTy(), 0);
+                auto* vv = llvm::Constant::getNullValue(elemLLTy);
+                llvm::Value* res = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(nst), hv, {0u});
+                nullResult = builder_.CreateInsertValue(
+                    res, vv, {1u});
+            } else {
+                nullResult = llvm::Constant::getNullValue(elemLLTy);
+            }
+            builder_.CreateBr(endBB);
+
+            // End block: PHI for the accumulator value + hasValue flag.
+            builder_.SetInsertPoint(endBB);
+            llvm::Value* resultV;
+            if (isValTy) {
+                auto* nst = nullableValueStructTy(&nullRT);
+                auto* valPhi = builder_.CreatePHI(elemLLTy, 2, "mon.val");
+                valPhi->addIncoming(exitVal, condBB);
+                valPhi->addIncoming(
+                    llvm::Constant::getNullValue(elemLLTy), emptyBB);
+                auto* hvPhi = builder_.CreatePHI(
+                    nullablePrimHasValTy(), 2, "mon.hv");
+                hvPhi->addIncoming(
+                    llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                    condBB);
+                hvPhi->addIncoming(
+                    llvm::ConstantInt::get(nullablePrimHasValTy(), 0),
+                    emptyBB);
+                freeLazyTemp();
+                llvm::Value* res = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(nst), hvPhi, {0u});
+                resultV = builder_.CreateInsertValue(
+                    res, valPhi, {1u});
+            } else {
+                auto* ptrPhi = builder_.CreatePHI(elemLLTy, 2, "mon.ptr");
+                ptrPhi->addIncoming(exitVal, condBB);
+                ptrPhi->addIncoming(nullResult, emptyBB);
+                freeLazyTemp();
+                resultV = ptrPhi;
+            }
+            return resultV;
+        }
         // per §5 LINQ: .First(pred: (T)->bool): T  (throws if empty/not found)
         // stdlib §5 line 2446 + 2515: throws InvalidOperationException if no
         // element satisfies the predicate.
