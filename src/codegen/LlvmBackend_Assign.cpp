@@ -2231,6 +2231,47 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // target is a reference type, so isNullableValueTy is false there) and
     // while the receiver's generic substitution is still installed.
     result = wrapNullableGetterResult(ctx_.exprType(ix), result);
+    // fix #3356 / §29.2 / §23.4 (v0.278): the INDEXER spelling of the
+    // EXPRESSION-BODIED PROPERTY GETTER's IEnumerable-family wrap. The
+    // indexer inline body (`property [i: int]: IEnumerable<T> => coll;`)
+    // has no RETURN edge the BLOCK-BODIED §29.2 wrap (#2703's
+    // `wrapAsIEnumerableForTarget` at `lowerReturn`) can fire on, so
+    // the wrap must live at the read site — exactly where the property
+    // GETTER inline path (`wrapPropertyArrayAsIEnumerable`,
+    // LlvmBackend_Exprs.cpp ~5596) already calls it. Pre-fix the
+    // indexer read returned the raw backing pointer of the source
+    // collection — a `bz_llist_t*` / `bz_dict_t*` / user-class
+    // descriptor whose first word is the backing's count field, NOT a
+    // vtable pointer — and the caller's `for x in obj[i]` drove §29.2
+    // vtable dispatch on the raw descriptor, jumped through vtable
+    // slot 4 (GetEnumerator, NULL) and SIGSEGV'd (`pc 0x0`, exit 139).
+    // The PROPERTY GETTER inline path (#2777/#2815/#3355) fixed the
+    // same defect for the non-indexer accessor by adding this exact
+    // call there; the indexer shape (takes an `[i]` parameter list,
+    // inlines its body against `this`+indexer-params rather than just
+    // `this`) is structurally distinct — the wrap was never mirrored.
+    // `wrapPropertyArrayAsIEnumerable` is the existing helper (its
+    // `headName() == "IEnumerable"` / `"IOwningEnumerable"` gate and
+    // its dispatch to `wrapAsIEnumerableForTarget` for the non-Array
+    // family — LinkedList, Set, user-class IEnumerable — are exactly
+    // what the indexer body needs); composing it AFTER `boxForTarget`
+    // (a value-typed source is boxed before the IEnumerable wrap, so
+    // a `property [i: int]: IEnumerable<Object>` shape still wraps
+    // correctly) and AFTER `wrapNullableGetterResult` (the two are
+    // disjoint: a nullable value type never reaches a pure
+    // IEnumerable target) keeps the order the property inline path
+    // established. Done BEFORE `releaseIndexArgStringProducers`
+    // because that helper concerns the INDEX ARGUMENTS, never the
+    // result. Done BEFORE the receiver's generic-substitution restore
+    // at line ~2244 so a `T`-typed body under monomorphisation wraps
+    // against the substituted `T` rather than the erased placeholder
+    // (#1279); `wrapPropertyArrayAsIEnumerable` is type-blind on its
+    // third argument (it only reads the declared `declTy`'s
+    // headName), so the substitution does not reach the helper, but
+    // the position parity with the property inline path is what makes
+    // a future spec change to that helper apply uniformly.
+    result = wrapPropertyArrayAsIEnumerable(result, ctx_.exprType(ix),
+                                            getterExpr);
     // fix #2717: release a `+1` string producer index temporary now the getter
     // body has read it. The helper's element-type gate is what makes this safe
     // on the GETTER side: an inlined `get => k;` lowers to a bare load of the

@@ -7406,6 +7406,39 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
              dynamic_cast<sema::PropertySymbol*>(sym)) &&
             (n == "IEnumerable" || n == "IOwningEnumerable"))
             isArrayBacked = false;
+    } else if (dynamic_cast<const ast::IndexExpr*>(fs.iterable.get())) {
+        // fix #3356 / §29.2 / §23.4 (v0.278): an INDEXER read `obj[i]` whose
+        // declared return type is `IEnumerable<T>` / `IOwningEnumerable<T>` —
+        // the EXPRESSION-BODIED indexer inline path (LlvmBackend_Assign.cpp
+        // `lowerIndexerGet`, the §23.4 inline body lowering) now wraps the
+        // raw backing collection (LinkedList / Set / user-class
+        // IEnumerable) into a vtable-backed enumerator via
+        // `wrapPropertyArrayAsIEnumerable` (#3356's fix); a BLOCK-BODIED
+        // indexer was already wrapped via `wrapAsIEnumerableForTarget` on its
+        // RETURN edge (#2703's family). Either way the slot now holds a
+        // proper vtable-backed wrapper (first 8 bytes = vtable pointer, NOT
+        // a `bz_array_t.data`), and the array-backed protocol
+        // (`bz_array_len` / `bz_array_ptr_at`) would read past the wrapper
+        // and out of bounds — measured as a global-buffer-overflow on
+        // `bz$llenum$i32$vtable` (the wrapper's slot-0 = vtable, mis-read
+        // as `data`, then `bz_array_ptr_at(vtable, 0, 8)` reads slot 5 of
+        // the 5-slot vtable). Pre-#3356 the array-backed path was the only
+        // safe dispatch (the raw backing was a `bz_array_t*` /
+        // `bz_llist_t*`, whose first word is count / node-pointer — both
+        // would also mis-dispatch, but to a heap-buffer-overflow rather
+        // than a global-buffer-overflow; either way, SIGSEGV-class). The
+        // detection reads `iterTy` — the iterable EXPRESSION's own static
+        // type, computed at the head as `ctx_.exprType(*fs.iterable)` — and
+        // gates on the head-name being `IEnumerable` / `IOwningEnumerable`
+        // (the same head-name gate the MemberAccessExpr arm above uses, and
+        // the same gate the wrap helpers themselves key on; an
+        // `IReadOnlyList<T>` / `IList<T>` iterable stays array-backed so
+        // its indexer protocol still works). A NON-`IEnumerable<T>`
+        // indexer return (the standard `property [i: int]: T` shape, the
+        // `Object`-returning indexer, etc.) is intentionally NOT widened —
+        // its array protocol is correct.
+        if (n == "IEnumerable" || n == "IOwningEnumerable")
+            isArrayBacked = false;
     }
 
     if (isArrayBacked) {
