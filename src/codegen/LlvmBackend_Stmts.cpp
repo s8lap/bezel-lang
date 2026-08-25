@@ -3293,6 +3293,67 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             builder_.CreateStore(
                                 builder_.getInt8(yieldIsNew ? 1 : 0), ownedFld);
                         }
+                        // fix #2621 / §29.1 (v0.236): sync IOwningEnumerable<T> /
+                        // IOwningEnumerator<T> — the enumerator ALWAYS owns a
+                        // non-null current_val (the §29.1 contract: ownership
+                        // transfers to the consumer only at TakeCurrent). On a
+                        // subsequent yield, the store below would otherwise DROP
+                        // the still-owned displaced value — the second leak site
+                        // from #2616 (which fixed the exhaustion transition). The
+                        // borrowing head (iterElemIsOwnedClass_) is handled by the
+                        // block above with its owned-flag gate; this block is the
+                        // unconditional-on-non-null twin for the owning head.
+                        //
+                        // Why an UNCONDITIONAL dispose is sound even for
+                        // `yield return ownedLocal` / `yield return ownedParam`:
+                        // the §29.7 (#2306) / §29.8 (#2154) state-keyed discharge
+                        // gates on `state < transferredAtState` / `state < yieldState`,
+                        // both FALSE at the moment of the next yield (we're already
+                        // at or past the transfer state — the local/param was
+                        // transferred through the previous yield). So this dispose
+                        // is the sole releaser for the displaced transferred value
+                        // — no double-free against the state-keyed discharge.
+                        //
+                        // Narrow gate on pointer elemTy mirrors the existing
+                        // disposeYieldedVal (#1837 / §29.1 v0.196) so an
+                        // unspecialized generic template (T unresolved → i32
+                        // placeholder) elides cleanly. Mirrors the
+                        // `isOwningIter && elemTy->isPointerTy()` guards at
+                        // TakeCurrent (§29.1) and MoveNext-exhaustion (line 1390
+                        // / #2616).
+                        if (smKind_ == SuspendKind::Yield && iterIsOwningIter_ &&
+                            iterElemTy_->isPointerTy()) {
+                            llvm::Value* prevVal2 = builder_.CreateLoad(
+                                iterElemTy_, cvField, "ityo.prev");
+                            llvm::Value* prevIsNull2 = builder_.CreateICmpEQ(
+                                prevVal2,
+                                llvm::ConstantPointerNull::get(ptrTy()),
+                                "ityo.prevnull");
+                            auto* dispBB2 = llvm::BasicBlock::Create(
+                                llvm_, "ityo.prev.disp", currentFn_);
+                            auto* contBB2 = llvm::BasicBlock::Create(
+                                llvm_, "ityo.prev.cont", currentFn_);
+                            builder_.CreateCondBr(
+                                prevIsNull2, contBB2, dispBB2);
+                            builder_.SetInsertPoint(dispBB2);
+                            emitDisposeAndReclaim(prevVal2);
+                            // Null the slot so a subsequent dispose site
+                            // (disposeYieldedVal at iterator-Dispose,
+                            // MoveNext-exhaustion at line 1390) no-ops. The
+                            // three sites — here, exhaustion, iterator-Dispose —
+                            // are all dispose-then-null under the same null
+                            // guard, so whichever runs first leaves the slot
+                            // null for the others. Exactly-once, not a
+                            // double-free. (#2616 line 1511-1531 made the
+                            // exhaustion/Dispose pair exactly-once; this lane
+                            // extends the same invariant to the yield-store
+                            // site.)
+                            builder_.CreateStore(
+                                llvm::ConstantPointerNull::get(ptrTy()),
+                                cvField);
+                            builder_.CreateBr(contBB2);
+                            builder_.SetInsertPoint(contBB2);
+                        }
                         builder_.CreateStore(v, cvField);
                     }
                 }

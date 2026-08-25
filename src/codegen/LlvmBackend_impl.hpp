@@ -10294,6 +10294,16 @@ private:
         const sema::TypeRef* iterElemSemaTy_;
         bool                 iterElemIsOwnedClass_;
         unsigned             iterCurrentValOwnedField_;
+        // fix #2621 / §29.1 (v0.236): true when the return type is an
+        // IOwningEnumerable<T> / IOwningEnumerator<T> — the enumerator
+        // ALWAYS owns the most-recently-yielded value (the §29.1 contract:
+        // ownership transfers only at TakeCurrent). Mutually exclusive with
+        // iterElemIsOwnedClass_ (a plain IEnumerable<owned T>): for the
+        // borrowing head the previous-current_val dispose at the YieldStmt
+        // store is owned-flag-gated, for the owning head it must be
+        // UNCONDITIONAL on non-null. Read by the YieldStmt handler in
+        // lowerStmt (LlvmBackend_Stmts.cpp).
+        bool                 iterIsOwningIter_;
         // --- async-specific frame state ---
         unsigned             asyncOuterTaskField_;
         unsigned             asyncPendingTaskField_;
@@ -10336,6 +10346,10 @@ private:
     // meaningful when iterElemIsOwnedClass_ is true.  Set alongside
     // iterCurrentValField_ in emitIteratorMethod; cleared to 0 after MoveNext.
     unsigned iterCurrentValOwnedField_ = 0;
+    // fix #2621 / §29.1 (v0.236): true when the return type is an
+    // IOwningEnumerable<T> / IOwningEnumerator<T>. Mutually exclusive with
+    // iterElemIsOwnedClass_ by construction. Cleared to false after MoveNext.
+    bool iterIsOwningIter_ = false;
 
     // ---- Async-specific live state (used only when smKind_ == Await) ----
     // Frame field indices for the two trailing async slots (see emitAsyncMethod):

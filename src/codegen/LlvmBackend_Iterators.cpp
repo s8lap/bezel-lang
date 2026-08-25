@@ -465,6 +465,7 @@ void Emitter::clearSmFrame() {
     iterElemSemaTy_            = nullptr;
     iterElemIsOwnedClass_      = false;
     iterCurrentValOwnedField_  = 0;
+    iterIsOwningIter_          = false;    // fix #2621
     asyncOuterTaskField_       = 0;
     asyncPendingTaskField_     = 0;
     asyncSpillPtrField_        = 0;
@@ -1430,6 +1431,14 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         iterElemTy_ = elemTy;
         iterElemSemaTy_ = elemSemaTy;  // #1102B (nullable-value element coercion)
         iterElemIsOwnedClass_ = elemIsOwnedClass;  // §29 (#1120)
+        // fix #2621 / §29.1 (v0.236): mirror iterElemIsOwnedClass_ with the
+        // OWNING-head flag. Mutually exclusive by construction (elemIsOwnedClass
+        // is set only when retName is neither owning head, lines 879-882). The
+        // YieldStmt handler in lowerStmt gates the new yield-store dispose on
+        // this flag — for the owning head the enumerator always owns a
+        // non-null current_val (the §29.1 contract), so the displaced value
+        // must be disposed BEFORE the next yield store overwrites the slot.
+        iterIsOwningIter_ = isOwningIter;
         // #747: enable for-loop frame-spill for THIS MoveNext, reusing the async
         // spill-area mechanism. registerForLoopSpillSlots records a suspending
         // for-loop's implicit allocas (index / array-ptr / enumerator) into
@@ -1589,6 +1598,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         smAllocaToField_.clear();
         iterElemIsOwnedClass_ = false;      // §29 (#1120)
         iterCurrentValOwnedField_ = 0;      // §29 (#1120)
+        iterIsOwningIter_ = false;          // fix #2621 / §29.1 (v0.236)
     }
 
     // --- Dispose(ptr self) -> void (real body, §29.7 #623) ---
