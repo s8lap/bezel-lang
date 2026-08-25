@@ -1517,12 +1517,34 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     // snapshots the element keys. Only the generic dict-backed Sets (record /
     // primitive / enum / string elements) need this; a plain class-element
     // OwningSet is array-backed and takes the ARRAY path below.
+    //
+    // fix #2726 / stdlib §4.18 (v0.278): admit SortedSet alongside Set/OwningSet
+    // here — its runtime IS the bz_dict_t* (the same `bz_dict_alloc_generic`
+    // lowerNew mints for Set/OwningSet, with sorted-ordering presentation
+    // layered on, #1426), and `bz_lazy_from_set` snapshots its element keys
+    // identically. Without SortedSet in this predicate, a `sortedSet.ToArray()`
+    // (Calls3.cpp:1668) — or `new LinkedList<T>(sortedSet)` (Exprs2.cpp:3965) —
+    // fell through to `bz_lazy_from_array` over a `bz_dict_t*` at line 1565:
+    // a silent misread where `bz_array_t`/`bz_dict_t` struct-prefix coincidence
+    // aliased the count slot but `bz_array_ptr_at` read `bz_entry_t` header
+    // bytes as element slots. Narrow residue of the broader Set-family thesis
+    // (the prior registry move regressed 30+ tests, per-fix-review verdict);
+    // this commit widens ONLY this one predicate, mirroring the SortedSet
+    // membership already in Calls.cpp:2238, Calls2.cpp:6231, Exprs.cpp:4364, and
+    // Setup.cpp:15101 / 16034 / 23682. The class-element case is preserved
+    // unchanged: SortedSet's `where T: IComparable<T>` constraint excludes
+    // class elements (#2773), so every reachable SortedSet hits
+    // `genericBackingType` non-null and enters bz_lazy_from_set.
     elemRef = (recvTy && !recvTy->genericArgs.empty()) ? recvTy->genericArgs[0]
                                                        : nullptr;
     if (recvTy && recvTy->astNode && recvTy->astNode->name &&
         !recvTy->astNode->name->parts.empty() &&
         (recvTy->headName() == "Set" ||
-         recvTy->headName() == "OwningSet")) {
+         recvTy->headName() == "OwningSet" ||
+         // stdlib §4.18 (#1426): SortedSet shares the bz_dict_t* rep of
+         // Set/OwningSet (sorting is a presentation layer over the hash table,
+         // #1426); bz_lazy_from_set walks it the same way.
+         recvTy->headName() == "SortedSet")) {
         uint64_t ksz = 0;
         if (genericBackingType(recvTy, 0, /*isSet=*/true, &ksz)) {
             auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
