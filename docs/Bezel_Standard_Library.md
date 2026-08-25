@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.281 — August 2026**
+**Companion to the Bezel Language Specification, v0.282 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -62,6 +62,8 @@ The band-3/band-4 boundary, stated once: what distinguishes them is **where cons
 **Naming conventions for acronyms and widths (recorded v0.165, #1359, generalizing the v0.148 ruling).** Acronyms in Bezel-coined names are PascalCase (`IeeeEquals`); names inherited verbatim from .NET keep the .NET spelling (`IEEERemainder`, `Encoding.UTF8`, `ToInt64`) — so `Math.IEEERemainder` and `Double.IeeeEquals` are both *correct* under one rule, not an inconsistency. Where a bit-width is the point of the name, the width-bearing .NET type words are used (`Int32`, `Int64` — e.g. `Random.NextInt64`, `BitConverter`'s family). The owning enumeration interfaces carry the `I-` prefix since the v0.168 family rename (#1372).
 
 **`Count` vs `Length` (v0.231).** `Length` measures a fixed or contiguous extent — text (`String`, `StringBuilder`, `ReadOnlyStringSpan`), buffers and spans (§4.14–§4.16), `FrozenArray<T>`, `Stream`, and the §10 FFI carriers; `Count` counts the elements of a collection whose membership grows and shrinks (the `Add`/`Remove`/`Push`/`Enqueue` families). A type declares one or the other, never both, and new types follow the same line — which is why the resizable `Array<T>` says `Count` where .NET's fixed array says `Length`.
+
+**Window parameters (v0.282).** A parameter pair naming a sub-range of a sequence is spelled **`(start, length)`** — `startIndex` stands as the string family's established spelling of the start position — and every new windowed signature follows it; parameter names are API surface (named arguments, spec §22.5). The one recorded exception is the **`Stream` byte-window family** (`Read`/`Write(buffer, offset, count)`, §7.1), which keeps `(offset, count)` deliberately: those are the signatures C-family muscle memory types unprompted. Renamed to the convention at v0.282: `String.From(buffer, start, length)`, `String.Remove(startIndex, length)`, `Encoding.GetString(bytes, start, length)`. (`destOffset` on `RawBytes.CopyTo` names a write *position*, not a window, and is untouched.)
 
 **Replay intercept points (v0.204).** The members of this library that consult the world outside the process — the clock and elapsed-time reads (§2.5, §8.1), entropy (§2.6, and §2.7's parameterless constructor), environment, argument, and process information (§2.4), console input (§2.1), and the file system (§7) — together with the scheduling and synchronized-object operations the language spec enumerates (language spec [§30.13](Bezel_Language_Spec.md#sec-determinism), *Determinism*) — are **intercept points**: a conforming runtime may record their results and later substitute the recorded values, and no program may observe the substitution except through the values themselves. Everything not so designated is pure computation and is deliberately not interceptable. A future addition to this library that reads the world must declare itself an intercept point in its own section at the time it is added.
 
@@ -1339,7 +1341,7 @@ Methods return `this` to allow chaining.
 public abstract class Encoding
   public abstract method GetBytes(s: string): owned Array<byte>;
   public abstract method GetString(bytes: Array<byte>): string;
-  public abstract method GetString(bytes: Array<byte>, index: int, count: int): string;
+  public abstract method GetString(bytes: Array<byte>, start: int, length: int): string;   // params renamed v0.282 (§1 window convention)
                               // window over Count; IndexOutOfRangeException out of range (v0.165)
   public abstract method GetString(bytes: ReadOnlySpan<byte>): string;       // v0.222 (#1809): buffer-backed source
   public abstract method GetString(bytes: ReadOnlyArraySpan<byte>): string;  // v0.222 (#1809): Array-backed twin (#1358)
@@ -1947,7 +1949,8 @@ Borrowing hash-based map. `K` must be **hashable** (spec §3.6/§8.3) — enforc
 public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
   public constructor();
   public constructor(capacity: int);
-  public constructor(comparer: IEqualityComparer<K>);
+  public constructor(comparer: IEqualityComparer<K>);      // relocates identity whole — see §4.17's
+                                                           //   single-order note (rationale §17.12)
   public constructor(capacity: int, comparer: IEqualityComparer<K>);
 
   public pure readonly property Count: int;
@@ -1957,6 +1960,8 @@ public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
   public property [key: K]: V;
 
   public method Add(key: K, value: V);
+  public method TryAdd(key: K, value: V): bool;    // v0.282 (§1 shape (d)): false and no
+                                                   //   mutation if the key is present
   public method ContainsKey(key: K): bool;
   public method Contains(key: K): bool;            // alias for ContainsKey;
                                                    //   enables `key in dict`
@@ -2039,7 +2044,11 @@ public class OwningDictionary<K, V>: IDisposable where V: class
   public method Add(key: K, owned value: V);   // ArgumentException if the key is present; the passed
                                                 //   value was consumed at the call site and is disposed
                                                 //   on that path (v0.195) — pre-check ContainsKey when
-                                                //   the caller must keep it
+                                                //   the caller must keep it; TryAdd (below) when it
+                                                //   only needs the outcome
+  public method TryAdd(key: K, owned value: V): bool;   // v0.282 (§1 shape (d)): false on duplicate, and the
+                                                        //   passed value is disposed on that path — the
+                                                        //   OwningSet<T>.TryAdd contract (§4.10) verbatim
   public method ContainsKey(key: K): bool;
   public method Contains(key: K): bool;
   public method Remove(key: K): bool;          // disposes the removed value
@@ -3310,6 +3319,11 @@ public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> 
 
   public property [key: K]: V;                  // get: KeyNotFoundException if absent
                                                 // set: insert or replace
+  public method Add(key: K, value: V);          // v0.282: ArgumentException if the key is present —
+                                                //   the §4.8 duplicate-is-a-bug tier, restored so the
+                                                //   sorted map carries the same three insert stances
+                                                //   as SortedSet (§4.18)
+  public method TryAdd(key: K, value: V): bool; // v0.282 (§1 shape (d)): false and no mutation if present
   public method ContainsKey(key: K): bool;
   public method Contains(key: K): bool;         // alias for ContainsKey; enables `key in dict` (§4.8 convention; v0.195)
   public method TryGetValue(key: K, out value: V?): bool;   // v0.171 (#1336): nullable out, matching §4.8's revised uniform Try shape
@@ -3324,7 +3338,7 @@ public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> 
 end SortedDictionary;
 ```
 
-Ordering is defined by `K`'s `IComparable<K>.CompareTo` — there is no separate comparer parameter; a type that needs a different order wraps its key in a record with the desired `CompareTo` (the single-order rule keeps equality, ordering, and hashing in one place, on the type). Two keys are the same key exactly when `CompareTo` returns `0`. Point operations (`[k]`, `ContainsKey`, `TryGetValue`, `GetOrNull`, `Remove`) are **O(log n)**; iteration is **O(n)** in ascending key order and is the single-pass borrowing form of [§4.8](#sec-dictionaryk-v) (`for var e in sd` yields entries with `e.Key`/`e.Value` borrows, one live pass at a time, structural modification during iteration raises `InvalidOperationException`).
+Ordering is defined by `K`'s `IComparable<K>.CompareTo` — there is no separate comparer parameter; a type that needs a different order wraps its key in a record with the desired `CompareTo` (the single-order rule keeps equality, ordering, and hashing in one place, on the type; why the hash family's `IEqualityComparer<K>` constructors are *not* the same case is recorded at rationale §17.12, v0.282). `Keys`/`Values` views are deliberately absent (v0.282, recorded): iteration already yields entries in ascending key order, so a one-line loop substitutes; the views would earn their place only with a use the entry iteration cannot serve. Two keys are the same key exactly when `CompareTo` returns `0`. Point operations (`[k]`, `ContainsKey`, `TryGetValue`, `GetOrNull`, `Remove`) are **O(log n)**; iteration is **O(n)** in ascending key order and is the single-pass borrowing form of [§4.8](#sec-dictionaryk-v) (`for var e in sd` yields entries with `e.Key`/`e.Value` borrows, one live pass at a time, structural modification during iteration raises `InvalidOperationException`).
 
 Value semantics match `Dictionary<K, V>`: values are copied in and out for value types and `string`, borrowed for class types. `GetOrNull` (v0.231) follows the same read semantics. (When the value type is itself nullable, `?` is idempotent under substitution — spec §7.10, v0.159 — so a `GetOrNull` result cannot distinguish "absent" from "a present `null`"; use `ContainsKey` or the `Try` shape when the distinction matters.) The tree backing is intrinsic — part of the instance's single allocation, released by the instance's one compiler-inserted free (spec §28.9; the [§1](#sec-conventions) intrinsic-backing device) — which is what the class comment's trivial-dispose note records. There is no owning `OwningSortedDictionary` in this revision — owning sorted collections ride the self-hosted-collections work (changelog, v0.136).
 
@@ -5189,7 +5203,7 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
 
   // Construction
   public static pure method From(value: char): string;
-  public static pure method From(buffer: Array<char>, start: int, count: int): string;
+  public static pure method From(buffer: Array<char>, start: int, length: int): string;   // params renamed v0.282 (§1 window convention)
   public static method From(value: CString): string;                  // FFI-boundary, owned-instance source
   public static method From(value: WString): string;                  // FFI-boundary, owned-instance source
   public static method FromCStringPointer(p: IntPtr): string;         // FFI-boundary, raw-pointer source
@@ -5252,7 +5266,7 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
 
   public pure method Insert(startIndex: int, value: string): string;
   public pure method Remove(startIndex: int): string;
-  public pure method Remove(startIndex: int, count: int): string;
+  public pure method Remove(startIndex: int, length: int): string;   // param renamed v0.282 (§1 window convention)
 
   // Splitting
   public method Split(separator: char): owned Array<string>;

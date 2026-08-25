@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.281 — August 2026**
+**Companion to the Bezel Language Specification, v0.282 — August 2026**
 
 The spec describes the language. This document explains the choices behind it — places where two reasonable designs were possible and one was picked, places where a familiar-looking rule has a less-stated rule behind it, and places where something widely done elsewhere was deliberately left out. The spec says what the language *is*; this document says *why*, and what the alternatives would have cost.
 
@@ -2184,6 +2184,11 @@ A statement registering an action to run at scope exit (`defer`), or only on the
 **Reopening condition:** field evidence from external users that the `ScopeGuard` spelling is systematically forgotten or mis-placed in a way a statement form would prevent — together with a proposal for the uncaught-exception predicate that names its interaction with `finally`, nested unwinds, and async continuations. Absent that predicate the failure half is not designable, whatever its ergonomics.
 
 <a id="sec-contract-carrying-type-aliases"></a>
+
+<a id="sec-comparer-injection"></a>
+### 17.12 Ordering comparers on sorted collections — and why equality-comparer constructors are not the same case (v0.282)
+
+The sorted collections take no per-instance ordering comparer (declined at v0.136: the single-order rule — equality, ordering, and hashing live in one place, on the type; the workaround is a wrapper record with the desired `CompareTo`). The hash collections *do* take `constructor(comparer: IEqualityComparer<K>)`. Until v0.282 the two postures never cited each other, and the single-order rule, read alone, indicts the constructors. The ruling that reconciles them: **they are not the same operation.** An `IEqualityComparer<K>` carries *both* facets a hash container consults — `Equals` and `GetHashCode` — as one object, so injection relocates the container's identity **whole**: the two functions that must agree travel together, and the type's `CompareTo` is never consulted, so no observable facet can disagree with another. An injected *ordering* comparer would do the opposite: the container would find by the instance's order while the element's own equality stayed the type's — and since a sorted container's identity *is* `CompareTo`-equality (stdlib §4.18), the split would be directly observable in `Contains`/`TryAdd`. The single-order rule's real content is *identity must not fork*; the equality-comparer constructors satisfy it, the ordering injection would not. Both postures stand, and stdlib §4.8/§4.17 now cite this record.
 ### 17.12 Contract-carrying type aliases (v0.263)
 
 An alias declaration carrying a predicate — `type Port = int requires(value in 0..65535)` in sketch — so that a constrained scalar can be spelled once and reused, the Ada constrained-subtype shape. Declined as spelled (proposal 0106 §6.2(a)), on three grounds, any one of which is fatal.

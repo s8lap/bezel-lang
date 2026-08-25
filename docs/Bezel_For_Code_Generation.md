@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.281. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.282. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -627,7 +627,7 @@ Exactly four sanctioned shapes; nothing else is a Try (stdlib §1).
 | **(a)** bool + **nullable** out | `TryX(…, out item: T? when true): bool` (`out owned` where the payload transfers) | generic or **class**-typed payload | `Dictionary`/`OwningDictionary`/`SortedDictionary`.`TryGetValue`; `Stack`/`OwningStack`.`TryPop`,`TryPeek`; `Queue`/`OwningQueue`.`TryDequeue`,`TryPeek`; `OwningArray`/`OwningLinkedList`.`TryPopFirst`,`TryPopLast`; `OwningSet.TryPop`; `OwningDictionary.TryPopValue`; `Channel<T>.TryReceive`; `IParsable<T>.TryParse` |
 | **(b)** nullable **return** | `TryX(…): owned T?` | acquisition-shaped, payload statically non-nullable | `Mutex.TryAcquire`, `Semaphore.TryAcquire`, `Weak<T>.TryUpgrade`, `Locked<T>.TryLock`, `RwLocked<T>.TryRead`/`TryWrite`, and their `*Async` forms |
 | **(c)** bool + **non-nullable value** out (`default(T)` on false) | `TryX(…, out result: T): bool` | concrete **value**-type payload | the primitive `TryParse` family; `Convert.TryTo*`; `DateTime`/`DateOnly`/`TimeOnly`/`Guid`.`TryParse`; the span/bit `TryRead*` accessors |
-| **(d)** bool only, no out | `TryX(…): bool` | succeeded/declined; the payload was passed *in* | `Set.TryAdd`, `OwningSet.TryAdd`, `SortedSet.TryAdd`, `TaskCompletionSource.TrySet*`, the span/bit `TryWrite*` |
+| **(d)** bool only, no out | `TryX(…): bool` | succeeded/declined; the payload was passed *in* | `Set.TryAdd`, `OwningSet.TryAdd`, `SortedSet.TryAdd`, the three dictionary `TryAdd`s (v0.282), `TaskCompletionSource.TrySet*`, the span/bit `TryWrite*` |
 
 **The `when true` postcondition is normative on every shape-(a) member** even though the per-type listings elide it: inside a `true`-narrowed region the recipient needs no `!`.
 
@@ -776,7 +776,7 @@ end
 
 `StringBuilder` — `constructor()`, `(capacity: int)`, `(initial: string)`; `Length: int`, `pure Capacity: int`; `Append(string|char|Object|bool|int|byte|sbyte|short|ushort|uint|long|ulong|float|double|decimal|ReadOnlyStringSpan): StringBuilder`; `AppendLine()`, `AppendLine(value: string)`; `AppendFormat(format: string, args: Array<Object>)`; `Insert(index, value: string)`, `Remove(startIndex, length)`, `Replace(oldValue, newValue: string)`, `Clear()` — all returning `StringBuilder`; `ToString(): string`.
 
-`Encoding` (`public abstract class`) — `abstract GetBytes(s: string): owned Array<byte>`; `abstract GetString(bytes: Array<byte>)`, `GetString(bytes, index, count)`, `GetString(bytes: ReadOnlySpan<byte>)`, `GetString(bytes: ReadOnlyArraySpan<byte>)`; `abstract GetByteCount(s: string): int`; `abstract GetBytes(s: string, destination: Span<byte>): int`; `abstract GetByteCount(s: ReadOnlyStringSpan): int`; `abstract GetBytes(s: ReadOnlyStringSpan, destination: Span<byte>): int`; `abstract GetBytes(s: ReadOnlyStringSpan): owned Array<byte>`; `abstract readonly property Name: string`; `static readonly property UTF8, UTF16, UTF32, ASCII: Encoding`. Malformed input raises `FormatException`, **never** a replacement character. UTF8 emits no BOM; UTF16/UTF32 are little-endian only.
+`Encoding` (`public abstract class`) — `abstract GetBytes(s: string): owned Array<byte>`; `abstract GetString(bytes: Array<byte>)`, `GetString(bytes, start, length)` (params renamed v0.282), `GetString(bytes: ReadOnlySpan<byte>)`, `GetString(bytes: ReadOnlyArraySpan<byte>)`; `abstract GetByteCount(s: string): int`; `abstract GetBytes(s: string, destination: Span<byte>): int`; `abstract GetByteCount(s: ReadOnlyStringSpan): int`; `abstract GetBytes(s: ReadOnlyStringSpan, destination: Span<byte>): int`; `abstract GetBytes(s: ReadOnlyStringSpan): owned Array<byte>`; `abstract readonly property Name: string`; `static readonly property UTF8, UTF16, UTF32, ASCII: Encoding`. Malformed input raises `FormatException`, **never** a replacement character. UTF8 emits no BOM; UTF16/UTF32 are little-endian only.
 
 `ReadOnlyStringSpan` — `public record (Source: string, Start: int, Length: int): IReadOnlySpan<char>`; **ordinary record, not borrow-bearing**. `property [i: int]: char { get }`; `pure IsEmpty: bool`; `pure Slice(start, length) / Slice(start) / Slice(r: Range<int>)`; `pure IndexOf(char|ReadOnlyStringSpan|string): int`; `pure Contains(…): bool`; `pure StartsWith`/`EndsWith(ReadOnlyStringSpan|string): bool`; `pure SequenceEqual(ReadOnlyStringSpan|string|IReadOnlySpan<char>): bool`; `CopyTo(destination: Span<char>)` (**not pure**); `pure ToString(): string`. `ReadOnlyAsciiByteSpan` was **retired** and does not exist.
 
@@ -878,6 +878,7 @@ public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>    // K must b
   readonly property Keys: IReadOnlyCollection<K>;   Values: IReadOnlyCollection<V>;   // live views
   property [key: K]: V;                             // get: KeyNotFoundException; set: add-or-update
   method Add(key: K, value: V);                     // ArgumentException if present
+  method TryAdd(key: K, value: V): bool;            // v0.282: false, no mutation, if present
   method ContainsKey(key: K): bool;   Contains(key: K): bool;     // Contains enables `key in dict`
   method Remove(key: K): bool;
   method TryGetValue(key: K, out value: V?): bool;
@@ -893,6 +894,7 @@ public class OwningDictionary<K, V>: IDisposable where V: class
   pure readonly property Count: int;   readonly property Keys, Values;
   property [key: K]: V { get; set(owned); }         // get = borrow; set disposes previous
   method Add(key: K, owned value: V);               // if present: ArgumentException AND the value is disposed
+  method TryAdd(key: K, owned value: V): bool;      // v0.282: false on duplicate — value still DISPOSED on that path
   method ContainsKey(key)/Contains(key): bool;   method Remove(key: K): bool;   // Remove disposes
   method TryGetValue(key: K, out value: V?): bool;  // the out is a BORROW
   method GetOrNull(key: K): V?;                      // a look, not a take
@@ -1042,7 +1044,7 @@ public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable
 end
 ```
 
-The sorted collections take **no comparer parameter** — ordering is `K`/`T`'s own `IComparable`. `SortedDictionary` has no `Keys`/`Values`. **There is no `OwningSortedDictionary`/`OwningSortedSet`, no `FrozenDictionary`/`FrozenSet`.** `Counter<K>` is insertion-ordered and a key decremented to zero is not removed.
+The sorted collections take **no comparer parameter** — ordering is `K`/`T`'s own `IComparable` (the hash family's `IEqualityComparer` ctors are a recorded different case — rationale §17.12). `SortedDictionary` has `Add`/`TryAdd` (v0.282) but no `Keys`/`Values` (recorded: iterate entries). **There is no `OwningSortedDictionary`/`OwningSortedSet`, no `FrozenDictionary`/`FrozenSet`.** `Counter<K>` is insertion-ordered and a key decremented to zero is not removed.
 
 ### 5.5 `System.Collections.Linq` (auto-imported, v0.278)
 
@@ -1303,7 +1305,7 @@ The integer types (`Int32`, `Int64`, `Byte`, `SByte`, `Int16`, `UInt16`, `UInt32
 public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
   pure readonly property Length: int;   IsEmpty: bool;   IsAscii: bool;
   pure readonly property [i: int]: char;      pure readonly property [r: Range<int>]: string;
-  static pure From(value: char): string;   static pure From(buffer: Array<char>, start: int, count: int): string;
+  static pure From(value: char): string;   static pure From(buffer: Array<char>, start: int, length: int): string;
   static From(value: CString|WString): string;   static FromCStringPointer/FromWStringPointer(p: IntPtr): string;
   static pure Repeat(c: char, count: int): string;    static pure Repeat(unit: string, count: int): string;
   static Join(separator: string, items: IEnumerable<string>): string;
@@ -1315,7 +1317,7 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
   pure Trim() / Trim(chars: IEnumerable<char>) / TrimStart() / TrimEnd() / ToUpper() / ToLower(): string;
   pure Replace(oldChar: char, newChar: char) / Replace(oldValue: string, newValue: string): string;
   pure PadLeft/PadRight/PadCenter(totalWidth: int[, paddingChar: char]): string;
-  pure Insert(startIndex: int, value: string): string;   pure Remove(startIndex[, count]): string;
+  pure Insert(startIndex: int, value: string): string;   pure Remove(startIndex[, length]): string;
   method Split(separator: char): owned Array<string>;
   method Split(separator: string): owned Array<string>;
   method Split(separators: Array<char>): owned Array<string>;
