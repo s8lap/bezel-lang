@@ -343,6 +343,10 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         if (!spanVal) return nullptr;
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);
         if (!idx) return nullptr;
+        // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before the
+        // trunc (same soundness story as the Array<string> indexer fix above;
+        // checkIndexArgNullability already rejects the un-narrowed form).
+        idx = unwrapNarrowedNullableOperand(idx, ix.indices[0].value.get());
         auto* spanSt = arraySpanStructType();
         auto* slot = entryAlloca(spanSt);
         builder_.CreateStore(spanVal, slot);
@@ -401,6 +405,10 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
         if (!spanVal) return nullptr;
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);
         if (!idx) return nullptr;
+        // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before the
+        // trunc (same soundness story as the ReadOnlyStringSpan fix above;
+        // checkIndexArgNullability already rejects the un-narrowed form).
+        idx = unwrapNarrowedNullableOperand(idx, ix.indices[0].value.get());
         // Unpack span fields.
         auto* spanSt = arraySpanStructType();
         auto* slot = entryAlloca(spanSt);
@@ -460,6 +468,12 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
             if (!buf) return nullptr;
             llvm::Value* idx = lowerExpr(*ix.indices[0].value);
             if (!idx) return nullptr;
+            // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before
+            // the sext (same soundness story as the Array<int> indexer fix
+            // above; checkIndexArgNullability already rejects the un-narrowed
+            // form). The Buffer<T> family is conjectured (issue §B) but the
+            // unwrap is unconditional — the gate covers it.
+            idx = unwrapNarrowedNullableOperand(idx, ix.indices[0].value.get());
             // Widen idx to i64 for comparison and bz_buffer_get_ptr.
             llvm::Value* idx64 = idx->getType()->isIntegerTy(64)
                 ? idx : builder_.CreateSExt(idx, i64(), "buf.idx64");
@@ -528,6 +542,14 @@ llvm::Value* Emitter::lowerCollectionIndexerGet(const ast::IndexExpr& ix) {
             return sliced;
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);
         if (!idx) return nullptr;
+        // fix #2799 / §7.4: a §7.4-flow-narrowed `int?` index arrives here
+        // still wearing its `{i8 hasVal; i32 payload}` box (sema left the
+        // expression's declared type as `int?` and recorded the narrowing in
+        // checkAssignable — see #2614's docs). Unwrap the payload before the
+        // sext; checkIndexArgNullability already rejects the un-narrowed form,
+        // so this is sound. Twin of the string indexer's fix (#2799) and of
+        // #2614's getIntArg helper.
+        idx = unwrapNarrowedNullableOperand(idx, ix.indices[0].value.get());
         idx = idx->getType()->isIntegerTy(64) ? idx
             : builder_.CreateSExt(idx, i64());
         // §31.2: out-of-range raises IndexOutOfRangeException.
@@ -685,6 +707,10 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
             builder_.CreateStructGEP(spanSt, slot, 2), "spm.len");
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);   // evaluate once
         if (!idx) return nullptr;
+        // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before the
+        // trunc (same soundness story as the ArraySpan<T> indexer fix above;
+        // checkIndexArgNullability already rejects the un-narrowed form).
+        idx = unwrapNarrowedNullableOperand(idx, ix.indices[0].value.get());
         if (!idx->getType()->isIntegerTy(32))
             idx = builder_.CreateTrunc(idx, i32());
         llvm::Value* idxNeg = builder_.CreateICmpSLT(idx, builder_.getInt32(0));
@@ -737,6 +763,10 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
         if (!recv) return nullptr;
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);   // evaluate once
         if (!idx) return nullptr;
+        // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before the
+        // sext (same soundness story as the Array<T> indexer fix above;
+        // checkIndexArgNullability already rejects the un-narrowed form).
+        idx = unwrapNarrowedNullableOperand(idx, ix.indices[0].value.get());
         idx = idx->getType()->isIntegerTy(64) ? idx
             : builder_.CreateSExt(idx, i64());
         // §31.2 / §28.11: out-of-range raises before any slot is moved-from.
@@ -869,6 +899,10 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         if (!spanVal) return false;
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);
         if (!idx) return false;
+        // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before the
+        // trunc (same soundness story as the Span<…> indexer-get fix above;
+        // checkIndexArgNullability already rejects the un-narrowed form).
+        idx = unwrapNarrowedNullableOperand(idx, ix.indices[0].value.get());
         auto* spanSt = arraySpanStructType();
         auto* slot = entryAlloca(spanSt);
         builder_.CreateStore(spanVal, slot);
@@ -927,6 +961,11 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
             if (!buf) return false;
             llvm::Value* idx = lowerExpr(*ix.indices[0].value);
             if (!idx) return false;
+            // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before
+            // the sext (same soundness story as the Buffer<T> indexer-get
+            // fix above; checkIndexArgNullability already rejects the
+            // un-narrowed form).
+            idx = unwrapNarrowedNullableOperand(idx, ix.indices[0].value.get());
             llvm::Value* idx64 = idx->getType()->isIntegerTy(64)
                 ? idx : builder_.CreateSExt(idx, i64(), "buf.sidx64");
             // Load header len for bounds check.
@@ -991,6 +1030,10 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     if (isArr) {
         llvm::Value* idx = lowerExpr(*ix.indices[0].value);
         if (!idx) return false;
+        // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before the
+        // sext (same soundness story as the Array<T> indexer-get fix above;
+        // checkIndexArgNullability already rejects the un-narrowed form).
+        idx = unwrapNarrowedNullableOperand(idx, ix.indices[0].value.get());
         idx = idx->getType()->isIntegerTy(64) ? idx
             : builder_.CreateSExt(idx, i64());
         auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
@@ -4159,6 +4202,10 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
     if (!recv) return false;
     llvm::Value* idx = lowerExpr(*ix->indices[0].value);
     if (!idx) return false;
+    // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before the
+    // sext (same soundness story as the Array<T> indexer-set fix above;
+    // checkIndexArgNullability already rejects the un-narrowed form).
+    idx = unwrapNarrowedNullableOperand(idx, ix->indices[0].value.get());
     idx = idx->getType()->isIntegerTy(64) ? idx
         : builder_.CreateSExt(idx, i64());
 
@@ -4422,6 +4469,11 @@ bool Emitter::lowerCollectionIndexerIncrDecr(
         if (!recv) return false;
         llvm::Value* idx = lowerExpr(*ix->indices[0].value);
         if (!idx) return false;
+        // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before the
+        // sext (same soundness story as the Array<T> compound-assign fix
+        // above; checkIndexArgNullability already rejects the un-narrowed
+        // form).
+        idx = unwrapNarrowedNullableOperand(idx, ix->indices[0].value.get());
         idx = idx->getType()->isIntegerTy(64) ? idx
             : builder_.CreateSExt(idx, i64());
 

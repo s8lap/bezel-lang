@@ -1841,6 +1841,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 llvm::Value* strPtr = lowerExpr(*ix->target);
                 llvm::Value* idx = lowerExpr(*ix->indices[0].value);
                 if (!strPtr || !idx) return nullptr;
+                // fix #2799 / §7.4: a §7.4-flow-narrowed `int?` arrives here
+                // still wearing its `{i8 hasVal; i32 payload}` box (sema left
+                // the expression's declared type as `int?` and recorded the
+                // narrowing in checkAssignable — see #2614's docs). Unwrap the
+                // payload before the sext; checkIndexArgNullability already
+                // rejects the un-narrowed form, so this is sound. Mirror of
+                // #2614's getIntArg helper (codegen half — sema half is the
+                // existing checkIndexArgNullability gate, v0.236).
+                idx = unwrapNarrowedNullableOperand(idx, ix->indices[0].value.get());
                 llvm::Value* idx64 = idx->getType() == i64() ? idx
                     : builder_.CreateSExt(idx, i64(), "str.idx64");
                 // §4.1 / §4.6 / §31.2 (R33): bounds-check the index. Without
@@ -1873,6 +1882,10 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (!arrTy) return nullptr;
         llvm::Value* idx = lowerExpr(*ix->indices[0].value);
         if (!idx) return nullptr;
+        // fix #2799 / §7.4: unwrap a §7.4-narrowed nullable index before the
+        // sext (same soundness story as the string indexer fix above;
+        // checkIndexArgNullability already rejects the un-narrowed form).
+        idx = unwrapNarrowedNullableOperand(idx, ix->indices[0].value.get());
         // §15.1 / §31.2: bounds-check idx against the array's compile-time
         // size; out-of-range raises IndexOutOfRangeException.
         {
