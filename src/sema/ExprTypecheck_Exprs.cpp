@@ -2393,6 +2393,18 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // borrow and falsely rejected `return buf[0]` for a
                         // value-type T (§28.3 borrow-lifetime).
                         cn == "OwningBuffer" ||
+                        // fix #3249 (§4.19, v0.240): FrozenArray<T>[i]'s
+                        // result type is the element T (a sendable value
+                        // type or string per §4.19). Mirrors Array<T>'s
+                        // shape; codegen lowers the indexer get against the
+                        // shared bz_array_get path. The bare-annotation
+                        // shape (`var f: FrozenArray<T> := ...` produces a
+                        // declaration-less Named TypeRef with an astNode,
+                        // so reaches THIS branch via `cn == "FrozenArray"`;
+                        // the From(...) static-factory result is caught by
+                        // the builtinClassSym branch added immediately
+                        // before the user-defined indexer fallback below.
+                        cn == "FrozenArray" ||
                         // issue #401: list interfaces are array-backed; their
                         // indexer result type is the element T = genericArgs[0].
                         cn == "IReadOnlyList" || cn == "IList" ||
@@ -2585,6 +2597,45 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                         td->genericParams,
                                         td->genericConstraints);
                     }
+                }
+                // fix #3249 (§23.4 / §4.19, v0.240): FrozenArray<T>'s indexer
+                // result type is its element T (a sendable value type or
+                // string per §4.19). The receiver arrives as a Named TypeRef
+                // whose declaration is the synthesized builtinClassSym
+                // ("FrozenArray") (stamped by ExprTypecheck_Calls.cpp for the
+                // `FrozenArray<T>.From(...)` static-factory result; the bare
+                // annotation `var f: FrozenArray<T> := ...` produces a
+                // declaration-less Named TypeRef with an astNode instead —
+                // caught by the broader branch at line 2378 once we teach it
+                // to admit `FrozenArray` as an array-like head, as is done
+                // for the buffer/span/list family below). Codegen's
+                // lowerCollectionIndexerGet already lowers the indexer get
+                // against `isCollectionTypeName(recvTy)` (BuiltinRegistry.cpp's
+                // kArrayBackedCollections admits "FrozenArray"), so once the
+                // type is set the runtime path produces the bz_array_get
+                // load. Without this branch the indexer fell through to the
+                // user-defined indexer path below, which walks
+                // `tt->declaration->members` looking for an `isIndexer`
+                // PropertySymbol; builtinClassSym's TypeSymbol declares no
+                // members, so `anyIndexer` stayed false and the §23.4 reject
+                // "type `FrozenArray` does not declare an indexer" fired
+                // (the regression #3249 captures). REJECTED upstream by the
+                // §4.19 / §3.6 element-type restriction (a non-sendable T
+                // never reaches this site — ExprTypecheck_Calls.cpp enforces
+                // it at the From(...) call site).
+                else if (tt->kind == TypeRef::Kind::Named && tt->declaration ==
+                         builtinClassSym("FrozenArray") &&
+                         !tt->genericArgs.empty() && tt->genericArgs[0]) {
+                    // Range slicing is not admitted on FrozenArray<T> — it is
+                    // fixed-size, deeply-immutable, shared-read (§4.19). The
+                    // §15.6 Array<T>/OwningArray<T> range-slicing branch
+                    // above intentionally excludes other array-backed
+                    // receivers ("Slicing is not admitted on
+                    // OwningArray<T>"); the same exclusion applies here, so
+                    // a range subscript falls through and is rejected by the
+                    // typecheck's bounds-check path or codegen — not by this
+                    // site. We simply type the result as the element T.
+                    ctx_.setExprType(&e, tt->genericArgs[0]);
                 }
                 // §23.4: USER-DEFINED indexer `obj[i]` on a class/record/
                 // interface type. The result type is the indexer property's
