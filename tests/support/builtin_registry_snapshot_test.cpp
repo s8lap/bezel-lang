@@ -498,8 +498,10 @@ BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3
     // IN: every name in kDisposableBuiltinHeadNames — the lint's pre-#2992 Path 2
     // population, lifted verbatim. A `using var` of any of these is the canonical
     // §28.10 pattern (not vacuous), and the auto-drop chain MUST claim each one.
+    // #2269 (cycle-3) removed StringBuilder from kDisposableBuiltinHeadNames
+    // because §28.9 L7363 classifies it as TRIVIAL-DISPOSE — no chain claim
+    // needed. The string is documented in the OUT-list below.
     for (std::string_view n : {
-        "StringBuilder",
         "BinarySerializer", "BinaryDeserializer",
         "JsonSerializer", "JsonDeserializer",
         "CString", "WString", "RawBytes",
