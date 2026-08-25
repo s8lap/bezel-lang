@@ -403,6 +403,30 @@ public:
     void applyUsingVarBorrowPinInLambdas(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // fix #2674 / §28.3 / §28.9 (v0.282): the four OWNERSHIP-pass-set
+    // end-of-statement reclaim flags — DiscardStmt::disposeOwnedValue
+    // (#1009), disposeOwnedCollectionValue (#1909), disposeOwnedBuilder-
+    // Value (#2655), disposeInlineOwnedArray (#1016) — are set inside
+    // MethodOwnership::visitStmt's DiscardStmt arm, which the dataflow
+    // drives for every METHOD-body statement. Lambda bodies are reached
+    // only by narrow checks (never by visitStmt), so the four flags are
+    // silently absent inside every lambda body — every `_ := new T();`
+    // / `_ := owning-collection-proc;` / `_ := [N owned]T();` discard in a
+    // block-bodied lambda leaks at lambda exit. This pre-pass mirrors
+    // `applyUsingVarBorrowPinInLambdas`'s shape — collect every LambdaExpr
+    // in `body`, walk each lambda body with a fresh state map, and for
+    // each `DiscardStmt` apply the SAME four flag-setting predicates
+    // visitStmt's DiscardStmt arm applies. Runs BEFORE the dataflow so
+    // the flags are stamped by the time codegen reads them. `discardOut-
+    // OwnedVar` (#1387/#1651) is intentionally NOT set here — it gates on
+    // `lookupState` returning Owned, and the lambda body's dataflow state
+    // is empty under the ownership pass, so the gate cannot fire today.
+    // // per §28.3, §17.13, §28.9, #2674
+    void applyLambdaBodyDiscardStmtFlags(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void applyLambdaBodyDiscardStmtFlagsBody(const ast::LambdaExpr& lam);
+    void applyLambdaBodyDiscardStmtFlagsStmt(const ast::Stmt& s);
+
     // #1066 / §9.7 (v0.153) + §28.3: a borrow-bearing record may not be
     // constructed from a TEMPORARY bound to one of its borrow-carrying fields —
     // the temporary's lifetime ends at the construction expression, so the record

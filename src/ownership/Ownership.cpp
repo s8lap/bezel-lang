@@ -289,6 +289,19 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // saves/restores member state per lambda so the method body's state is
     // unmodified. // per §28.10 v0.220, #2166
     applyUsingVarBorrowPinInLambdas(body);
+    // fix #2674 / §28.3 / §17.13 / §28.9 (v0.282): the four OWNERSHIP-pass-
+    // set end-of-statement reclaim flags (DiscardStmt::disposeOwnedValue /
+    // disposeOwnedCollectionValue / disposeOwnedBuilderValue /
+    // disposeInlineOwnedArray) are set inside visitStmt's DiscardStmt arm,
+    // which the dataflow drives for METHOD-body statements but never
+    // reaches lambda bodies (`lam->stmts`). Mirror
+    // `applyUsingVarBorrowPinInLambdas`'s shape: collect every LambdaExpr
+    // in `body`, walk each lambda body with a FRESH state map, and for
+    // every DiscardStmt reached stamp the four flags using the SAME
+    // predicates visitStmt's DiscardStmt arm applies. Runs BEFORE the
+    // dataflow so the flags are populated by the time codegen reads them.
+    // // per §28.3, §17.13, §28.9, #2674
+    applyLambdaBodyDiscardStmtFlags(body);
     // §15.3 (#1549): the move-only inline-array whole-value-reassignment leak
     // warning. A syntactic pre-pass like the ones above — see the header
     // comment on moveOnlyArrayLeakScan for why it runs outside the CFG
@@ -7599,6 +7612,344 @@ void MethodOwnership::applyUsingVarBorrowPinInLambdaBody(
         if (s) applyUsingVarBorrowPinInLambdaStmt(*s);
     states_ = std::move(savedStates);
     fieldMovedFrom_ = std::move(savedFieldMovedFrom);
+}
+
+
+// fix #2674 / §28.3 / §28.9 (v0.282): the ownership pass's
+// end-of-statement reclaim flags — DiscardStmt::disposeOwnedValue (#1009),
+// disposeOwnedCollectionValue (#1909), disposeInlineOwnedArray (#1016),
+// disposeOwnedBuilderValue (#2655) — are SET inside
+// MethodOwnership::visitStmt's DiscardStmt arm, which the dataflow drives
+// for every METHOD-body statement. Lambda bodies (`lam->stmts`) are reached
+// by narrow purpose-built checks (checkLambdaTaskFamilyBorrowReturns… and
+// friends, never by visitStmt), so the four flags above are silently absent
+// inside every lambda body: a `_ := new Box(9);` discard in a block-bodied
+// lambda is the SAME unbound-owned-temporary at end-of-statement as the
+// same line at method-body scope (§28.3, §17.13), but codegen
+// (LlvmBackend_Stmts.cpp ExpressionStmt / DiscardStmt arms, gated on the
+// flag) emits no free, and the allocation leaks at lambda exit (measured:
+// 24 B per iteration under LSan — `SUMMARY: AddressSanitizer: 24 byte(s)
+// leaked in 1 allocation(s)`).
+//
+// The fix is structural: run a parallel pre-pass that mirrors
+// `applyUsingVarBorrowPinInLambdas`'s shape — collect every LambdaExpr in
+// the method body, walk each lambda body with a FRESH state map (a lambda
+// is its own scope), and for each `DiscardStmt` reached, apply the SAME
+// four flag-setting predicates visitStmt's DiscardStmt arm applies. The
+// `discardOutOwnedVar` flag (#1387/#1651) is intentionally NOT set here:
+// it gates on `lookupState` returning Owned for a named binding, and the
+// lambda body's dataflow state is empty (the ownership pass does not run
+// the dataflow for lambdas — that's the substantial cross-cutting fix
+// the issue body defers), so the gate cannot fire today and replicating it
+// would only be a future no-op.
+//
+// `disposeOwnedValue` for `ExpressionStmt` (#2655) is set by SEMA
+// (ExprTypecheck.cpp:12842) and sema's `visitStmt` DOES descend into lambda
+// bodies via ExprTypecheck_Exprs.cpp:8066 (`for (const auto& s : lam->stmts)
+// if (s) visitStmt(*s);`), so that case is already wired. This pre-pass is
+// deliberately scoped to the OWNERSHIP-pass-set flags.
+//
+// The four predicates read here are the SAME predicates visitStmt's
+// DiscardStmt arm reads (producerState, ctx_.exprType, the
+// kind==Class/Interface check, the OwningArray head check, the
+// InlineArray+arrayOwned check) — under-collecting here merely misses a
+// flag (a leak), so the pre-pass is conservative by construction. Nested
+// lambdas are walked recursively with their own save/restore.
+// per §28.3, §17.13, §28.9, #2674
+void MethodOwnership::applyLambdaBodyDiscardStmtFlags(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    std::vector<const ast::LambdaExpr*> lambdas;
+    for (const auto& s : body) {
+        if (s) collectBodyLambdas(*s, lambdas);
+    }
+    for (const ast::LambdaExpr* lam : lambdas)
+        applyLambdaBodyDiscardStmtFlagsBody(*lam);
+}
+
+// #2674: per-lambda body walker — saves/restores `states_` and
+// `fieldMovedFrom_` (a lambda body is its own scope, and the pre-pass
+// runs before the dataflow so the outer scope's state is mid-pre-pass),
+// then walks the lambda's stmts. Mirrors `applyUsingVarBorrowPinInLambda-
+// Body`'s save/clear/walk/restore shape, recursing into nested lambdas.
+void MethodOwnership::applyLambdaBodyDiscardStmtFlagsBody(
+        const ast::LambdaExpr& lam) {
+    BlockState savedStates = states_;
+    auto savedFieldMovedFrom = fieldMovedFrom_;
+    states_.clear();
+    fieldMovedFrom_.clear();
+    if (lam.exprBody) {
+        std::vector<const ast::LambdaExpr*> nestedLambdas;
+        collectBodyLambdasExpr(*lam.exprBody, nestedLambdas);
+        for (const ast::LambdaExpr* nested : nestedLambdas)
+            applyLambdaBodyDiscardStmtFlagsBody(*nested);
+    }
+    for (const auto& s : lam.stmts)
+        if (s) applyLambdaBodyDiscardStmtFlagsStmt(*s);
+    states_ = std::move(savedStates);
+    fieldMovedFrom_ = std::move(savedFieldMovedFrom);
+}
+
+// #2674: per-statement walker for the lambda-body discard-flag pre-pass.
+// Mirrors `applyUsingVarBorrowPinInLambdaStmt`'s shape-for-shape (every
+// Stmt kind the lambda body can contain) so under-collecting merely misses
+// a flag (conservative over-adopt — the leak this pre-pass exists to
+// close), never over-rejects. Only the `DiscardStmt` arm does real work
+// (sets the four flags); the rest of the cases descend into nested
+// control flow / nested lambdas so every DiscardStmt reachable from a
+// lambda body has its flags set.
+void MethodOwnership::applyLambdaBodyDiscardStmtFlagsStmt(
+        const ast::Stmt& s) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+        // A LocalDecl's initializer may embed a nested lambda; descend so
+        // the nested lambda's body is walked too. The LocalDecl itself
+        // cannot be a DiscardStmt — discard flag-setting does not apply.
+        if (ld->initializer) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*ld->initializer, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        return;
+    }
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(&s)) {
+        if (lc->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*lc->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        return;
+    }
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*rs->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        return;
+    }
+    if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        // ExpressionStmt::disposeOwnedValue (#2655) is set by sema, and
+        // sema descends into lambda bodies — this case is already wired.
+        // We deliberately do NOT replicate the §21.9 trivial-dispose
+        // classification here: that walk inspects the producer's class
+        // hierarchy (destructors, owned members, imported-carrier flag)
+        // and would be a FOURTH independent copy of the predicate. Sema's
+        // copy already runs for every lambda body statement; trusting it
+        // here keeps the four predicates in this pre-pass in lockstep with
+        // the OWNERSHIP-pass-set flags they shadow.
+        if (es->expr) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*es->expr, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        return;
+    }
+    if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+        // The four OWNERSHIP-pass-set end-of-statement reclaim flags, in
+        // the SAME order visitStmt's DiscardStmt arm applies them, with
+        // the SAME gates (producerState, ctx_.exprType, kind checks). The
+        // expressions are already type-checked by sema (sema descends
+        // into lambda bodies via ExprTypecheck_Exprs.cpp:8066), so the
+        // exprType / headName / kind queries are populated here.
+        if (ds->value) {
+            // #1009 / §17.13 / §28.3 / §28.9: disposeOwnedValue — a USER
+            // class/interface producer. sharpen #3081 widens the gate to
+            // admit imported user types (kind check + moduleName.empty()
+            // discriminator). Builtin handles (Task, Subscription, …) and
+            // Owning* collections are excluded; their own arms below
+            // catch the cases where the reclaim machinery exists.
+            if (producerState(*ds->value) == OwnershipState::Owned) {
+                if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
+                    if (rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+                        (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                         rt->declaration->kind == ast::TypeDeclKind::Interface) &&
+                        !rt->declaration->isValueBuiltin &&
+                        (rt->declaration->decl != nullptr ||
+                         !rt->declaration->moduleName.empty()))
+                        const_cast<ast::DiscardStmt*>(ds)->disposeOwnedValue = true;
+            }
+            // #1909 / §17.13 / §28.3 / §28.11: disposeOwnedCollectionValue —
+            // an OWNING-COLLECTION producer (OwningArray/OwningDictionary/
+            // OwningSet/OwningStack/OwningQueue/OwningLinkedList).
+            if (producerState(*ds->value) == OwnershipState::Owned) {
+                if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
+                    if (rt->kind == sema::TypeRef::Kind::Named &&
+                        isOwningCollectionNameHead(rt->headName()))
+                        const_cast<ast::DiscardStmt*>(ds)
+                            ->disposeOwnedCollectionValue = true;
+            }
+            // #2655 / §17.13 / §28.3 / §28.9: disposeOwnedBuilderValue —
+            // StringBuilder specifically (the only decl-null builtin with
+            // an already-proven free path, #1185's `using var` wiring).
+            if (producerState(*ds->value) == OwnershipState::Owned) {
+                if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
+                    if (rt->kind == sema::TypeRef::Kind::Named &&
+                        !rt->declaration && rt->headName() == "StringBuilder")
+                        const_cast<ast::DiscardStmt*>(ds)
+                            ->disposeOwnedBuilderValue = true;
+            }
+            // #1016 / §17.13 / §15.3: disposeInlineOwnedArray — a move-only
+            // owning inline array (`[N owned]T` / `[N owned]T?`). Type-only
+            // gate; producerState not consulted (the inline-array reclaim
+            // path is unconditional once the type is identified).
+            if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
+                if (rt->kind == sema::TypeRef::Kind::InlineArray && rt->arrayOwned)
+                    const_cast<ast::DiscardStmt*>(ds)->disposeInlineOwnedArray = true;
+        }
+        // A discard's RHS may embed a nested lambda (rare — `lambda` is
+        // an expression and a discard can hold any expression) — descend
+        // so the nested lambda's body is also walked.
+        if (ds->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*ds->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        return;
+    }
+    if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+        if (as->target) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*as->target, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        if (as->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*as->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        return;
+    }
+    if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(&s)) {
+        if (ts->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*ts->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        if (ifs->ifBranch.condition) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*ifs->ifBranch.condition, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) applyLambdaBodyDiscardStmtFlagsStmt(*bs);
+        for (const auto& el : ifs->elifBranches) {
+            if (el.condition) {
+                std::vector<const ast::LambdaExpr*> nestedLambdas;
+                collectBodyLambdasExpr(*el.condition, nestedLambdas);
+                for (const ast::LambdaExpr* nested : nestedLambdas)
+                    applyLambdaBodyDiscardStmtFlagsBody(*nested);
+            }
+            for (const auto& bs : el.body)
+                if (bs) applyLambdaBodyDiscardStmtFlagsStmt(*bs);
+        }
+        for (const auto& bs : ifs->elseBody)
+            if (bs) applyLambdaBodyDiscardStmtFlagsStmt(*bs);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        if (ws->condition) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*ws->condition, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        for (const auto& bs : ws->body)
+            if (bs) applyLambdaBodyDiscardStmtFlagsStmt(*bs);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        if (fs->iterable) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*fs->iterable, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        if (fs->withExpr) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*fs->withExpr, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        for (const auto& bs : fs->body)
+            if (bs) applyLambdaBodyDiscardStmtFlagsStmt(*bs);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) applyLambdaBodyDiscardStmtFlagsStmt(*bs);
+        return;
+    }
+    if (auto* is = dynamic_cast<const ast::IncrementStmt*>(&s)) {
+        if (is->target) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*is->target, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        return;
+    }
+    if (auto* ys = dynamic_cast<const ast::YieldStmt*>(&s)) {
+        if (ys->value) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*ys->value, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) applyLambdaBodyDiscardStmtFlagsStmt(*bs);
+        for (const auto& arm : trys->catches) {
+            if (arm.guard) {
+                std::vector<const ast::LambdaExpr*> nestedLambdas;
+                collectBodyLambdasExpr(*arm.guard, nestedLambdas);
+                for (const ast::LambdaExpr* nested : nestedLambdas)
+                    applyLambdaBodyDiscardStmtFlagsBody(*nested);
+            }
+            if (arm.body) applyLambdaBodyDiscardStmtFlagsStmt(*arm.body);
+        }
+        for (const auto& bs : trys->finallyBody)
+            if (bs) applyLambdaBodyDiscardStmtFlagsStmt(*bs);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        if (cs->scrutinee) {
+            std::vector<const ast::LambdaExpr*> nestedLambdas;
+            collectBodyLambdasExpr(*cs->scrutinee, nestedLambdas);
+            for (const ast::LambdaExpr* nested : nestedLambdas)
+                applyLambdaBodyDiscardStmtFlagsBody(*nested);
+        }
+        for (const auto& arm : cs->arms) {
+            if (arm.guard) {
+                std::vector<const ast::LambdaExpr*> nestedLambdas;
+                collectBodyLambdasExpr(*arm.guard, nestedLambdas);
+                for (const ast::LambdaExpr* nested : nestedLambdas)
+                    applyLambdaBodyDiscardStmtFlagsBody(*nested);
+            }
+            if (arm.exprBody) {
+                std::vector<const ast::LambdaExpr*> nestedLambdas;
+                collectBodyLambdasExpr(*arm.exprBody, nestedLambdas);
+                for (const ast::LambdaExpr* nested : nestedLambdas)
+                    applyLambdaBodyDiscardStmtFlagsBody(*nested);
+            }
+            for (const auto& bs : arm.stmts)
+                if (bs) applyLambdaBodyDiscardStmtFlagsStmt(*bs);
+        }
+        return;
+    }
+    // Break / Continue / etc.: no child expressions reachable.
 }
 
 
