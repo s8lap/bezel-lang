@@ -3961,82 +3961,126 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     llvm::FunctionType* methTy =
         origFn ? origFn->getFunctionType() : methodFnType(ms);
     if (!methTy) return nullptr;
-    // fix #2766 / §27.6 / §14.1: an INTERFACE-dispatch thunk (no concrete
-    // origFn) must use the INSTANTIATED parameter types of the receiver's static
-    // interface type, not methodFnType(ms)'s erased ones. methodFnType lowers
-    // the interface's DECLARED parameter types, and for a generic interface
-    // (`IEquatable<T>.Equals(other: T)`) the unbound `T` lowers to a placeholder
-    // `i32` for EVERY instantiation. That is the ABI the emitted thunk then
-    // advertises, while both the call site (which types the call from the
-    // reference's static `(string) -> bool`) and the itable target
-    // (`bz$M.SC$Equals(ptr, ptr)`) use the real one.
+    // fix #2766 / fix #2780 / §27.6 / §14.1: an INTERFACE-dispatch thunk (no
+    // concrete origFn) must use the INSTANTIATED parameter types AND RETURN
+    // TYPE of the receiver's static interface type, not methodFnType(ms)'s
+    // erased ones. methodFnType lowers the interface's DECLARED parameter
+    // types; for a generic interface (`IEquatable<T>.Equals(other: T)`,
+    // `IBox<T>.Get(): T`) the unbound type-parameter reference lowers to a
+    // placeholder `i32` for EVERY instantiation. That is the ABI the emitted
+    // thunk then advertises, while both the call site (which types the call
+    // from the reference's static `(string) -> bool` / `(string) -> string`)
+    // and the itable target use the real one.
     //
     // The consequence is not cosmetic — it was measured on the generated code:
-    // the thunk compiled to `mov %esi,%ebx` / `mov %ebx,%esi`, i.e. it TRUNCATED
-    // the reference argument to 32 bits before forwarding it. A string argument
-    // whose address happens to be below 4 GiB (a literal in a small, non-PIE
-    // executable) survives the round trip, which is why this went unnoticed; a
-    // HEAP string does not. A probe passing a runtime-concatenated string to a
-    // `IEquatable<string>` method group over a user class SEGVs inside the
-    // callee at the truncated address under ASan (whose allocator returns high
-    // addresses), and only "works" on the plain oracle by allocator luck.
+    // for #2766 the thunk compiled to `mov %esi,%ebx` / `mov %ebx,%esi`, i.e.
+    // it TRUNCATED the reference argument to 32 bits before forwarding it. A
+    // string argument whose address happens to be below 4 GiB (a literal in a
+    // small, non-PIE executable) survives the round trip, which is why this
+    // went unnoticed; a HEAP string does not. For #2780 the same defect at the
+    // RETURN position (a user-defined `IBox<string>.Get(): string` thunk
+    // advertised `i32 (...)` while the callee returned `ptr`) manifested as a
+    // plain-oracle "Both operands to ICmp instruction are not of the same
+    // type" IR-verification failure — the caller compared the i32 result to a
+    // string pointer.
     //
-    // It is also what makes #2766's string-receiver guard below possible at all:
-    // with the erased signature, ONE cached thunk serves `IEquatable<string>`
-    // and `IEquatable<int>` alike, so the argument cannot be tested as a pointer
-    // (for `IEquatable<int>` it is a raw `i32` value, and calling
-    // bz_obj_is_string on it would dereference the integer as an address).
-    // Taking the instantiated types separates those instantiations into distinct
-    // thunks — see the widened methodThunks_ key — after which the
-    // reference-shaped ones carry real pointers and the value-shaped ones are
-    // excluded by the `isPointerTy()` gate.
+    // Generalised for #2780: rather than the prior hardcoded special case
+    // (scoped to the two stdlib-stated single-parameter signatures
+    // IEquatable<T>.Equals / IComparable<T>.CompareTo), the substitution keys
+    // on EACH parameter AND the RETURN type whose DECLARED type is a bare
+    // type-parameter reference matching `ms->parent->genericParams[i]->name`
+    // — substituted with `recvStaticTy->genericArgs[i]`. Skips by-ref
+    // parameters (§22.3) — methodFnType already passes those as a pointer-to-
+    // slot, which is correct. A non-generic interface (`IFoo.Do(n: int): int`)
+    // is bit-for-bit unaffected: every parameter and the return type has a
+    // concrete declared type, so the predicate does not match.
     //
-    // Deliberately narrow: only when there is NO concrete origFn (a virtual
-    // method's thunk already takes its signature from the real function), only
-    // for a bound instance reference whose static receiver type IS this
-    // interface with resolved generic arguments, only for a parameter whose
-    // DECLARED type is a bare type-parameter name of that interface, and never
-    // for a by-ref parameter (§22.3 — methodFnType passes those as a
-    // pointer-to-slot, which is already correct). A parameter with a concrete
-    // declared type keeps the type it already had, so a non-generic interface
-    // (`IFoo.Do(n: int): int`) is bit-for-bit unaffected. The RETURN type is
-    // left alone here: a generic-returning interface method has the same latent
-    // defect, but fixing it is a separate change and is filed rather than
-    // bundled.
+    // Detecting a generic-parameter reference uses EITHER the parameter
+    // symbol's `resolvedDeclType` (set on imported methods by ModuleLoader)
+    // OR the AST node's `declType->name->parts[0]` (the synthetic builtin
+    // interface methods carry no `resolvedDeclType` — which is precisely why
+    // `methodFnType` fell back to the `i32` placeholder — but their
+    // `ps->declType` AST node carries the bare name `T`). Both feed
+    // `isBareTypeParamRef`, which is the same predicate every other generic-
+    // substitution site uses, so the substitution shape is uniform.
     if (!origFn && dynamicDispatch && instMethod && !extRef && recvStaticTy &&
         ms->parent && recvStaticTy->kind == sema::TypeRef::Kind::Named &&
         recvStaticTy->declaration == ms->parent &&
-        recvStaticTy->genericArgs.size() == 1 &&
-        ms->parent->genericParams.size() == 1 && ms->params.size() == 1 &&
-        methTy->getNumParams() == 2 &&
-        ((ms->parent->name == "IEquatable"  && ms->name == "Equals") ||
-         (ms->parent->name == "IComparable" && ms->name == "CompareTo"))) {
-        // These two, and ONLY these two, are substituted — because the STDLIB
-        // states their signatures, so the mapping "the single parameter is the
-        // interface's single type argument" is read off the document rather than
-        // guessed. stdlib §9.4 declares `IComparable<T>` with
-        //   `public method CompareTo(other: T): int;`
-        // and §9.6's `String` satisfies `IEquatable<string>` with
-        //   `public method Equals(other: string?): bool;`
-        //
-        // Every OTHER generic interface method is deliberately left alone. The
-        // reason is not caution for its own sake: a SYNTHETIC builtin interface
-        // records NO resolved declared type for its parameters at all
-        // (ParameterSymbol::resolvedDeclType is null — which is precisely why
-        // methodFnType fell back to the `i32` placeholder), so for an arbitrary
-        // method there is no evidence in the symbol table for WHICH type
-        // parameter a given parameter position corresponds to. Inventing a
-        // positional mapping (`IDictionary<K,V>.Add(k: K, v: V)`…) would be
-        // exactly the silent interpretation this project forbids. The remaining
-        // methods keep today's erased ABI — unchanged, still latently wrong —
-        // and that residue is FILED rather than guessed at here.
-        if (sema::TypeRef* arg = recvStaticTy->genericArgs[0]) {
-            if (llvm::Type* t = lowerTypeRef(arg)) {
-                if (t != methTy->getParamType(1))
-                    methTy = llvm::FunctionType::get(
-                        methTy->getReturnType(),
-                        {methTy->getParamType(0), t}, /*isVarArg=*/false);
+        recvStaticTy->genericArgs.size() == ms->parent->genericParams.size()) {
+        // Map type-param name -> generic-args index. Linear scan over a small
+        // list (stdlib interfaces: 1-2 entries; no realistic size limit for
+        // user interfaces, but the position-by-name lookup is still cheap).
+        auto findGenericArgIdx = [&](std::string_view pname) -> int {
+            for (std::size_t i = 0; i < ms->parent->genericParams.size(); ++i) {
+                if (ms->parent->genericParams[i] &&
+                    ms->parent->genericParams[i]->name == pname)
+                    return static_cast<int>(i);
             }
+            return -1;
+        };
+        // Resolve a parameter position to the GENERIC-PARAMETER NAME its
+        // declared type refers to ("" when the declared type is concrete).
+        // Two evidence sources: the symbol-side `resolvedDeclType` (imported
+        // methods), and the AST-side `declType->name` (synthetic builtin
+        // interface methods whose resolvedDeclType is null by design).
+        auto paramGenericParamName = [&](std::size_t i) -> std::string_view {
+            if (i >= ms->params.size()) return {};
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
+            if (!ps) return {};
+            if (ps->resolvedDeclType &&
+                isBareTypeParamRef(ps->resolvedDeclType))
+                return ps->resolvedDeclType->headName();
+            const ast::Type* dt = ps->declType;
+            if (dt && dt->name && dt->name->parts.size() == 1 &&
+                !isBuiltinTypeRefName(dt->name->parts[0]))
+                return dt->name->parts[0];
+            return {};
+        };
+        bool changed = false;
+        std::vector<llvm::Type*> newParamTys(methTy->param_begin(),
+                                             methTy->param_end());
+        for (std::size_t i = 0; i < ms->params.size(); ++i) {
+            // Skip by-ref parameters (§22.3): methodFnType lowers them as
+            // pointer-to-slot, which is already correct for the thunk's ABI.
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[i]);
+            if (ps && isByRefMod(ps->modifier)) continue;
+            std::string_view pname = paramGenericParamName(i);
+            if (pname.empty()) continue;
+            int gi = findGenericArgIdx(pname);
+            if (gi < 0 ||
+                gi >= static_cast<int>(recvStaticTy->genericArgs.size()))
+                continue;
+            sema::TypeRef* arg = recvStaticTy->genericArgs[gi];
+            if (!arg) continue;
+            llvm::Type* nt = lowerTypeRef(arg);
+            if (!nt || nt == newParamTys[i + 1]) continue;
+            newParamTys[i + 1] = nt;  // +1: param 0 is the `this` ptr
+            changed = true;
+        }
+        // Return type — substitute when the declared return is a bare
+        // type-parameter reference (e.g. `IBox<T>.Get(): T` with T = string).
+        llvm::Type* newRetTy = methTy->getReturnType();
+        if (const ast::MethodDecl* md =
+                dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            if (md->returnType) {
+                const sema::TypeRef* retRt = ctx_.resolvedType(*md->returnType);
+                if (isBareTypeParamRef(retRt)) {
+                    int gi = findGenericArgIdx(retRt->headName());
+                    if (gi >= 0 &&
+                        gi < static_cast<int>(recvStaticTy->genericArgs.size())) {
+                        if (sema::TypeRef* arg = recvStaticTy->genericArgs[gi]) {
+                            if (llvm::Type* nt = lowerTypeRef(arg)) {
+                                if (nt != newRetTy) newRetTy = nt;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (newRetTy != methTy->getReturnType()) changed = true;
+        if (changed) {
+            methTy = llvm::FunctionType::get(newRetTy, newParamTys,
+                                             /*isVarArg=*/false);
         }
     }
     // A non-virtual, non-interface method ref must have a concrete origFn.
