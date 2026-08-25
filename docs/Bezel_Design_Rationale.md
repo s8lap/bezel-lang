@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.278 — August 2026**
+**Companion to the Bezel Language Specification, v0.279 — August 2026**
 
 The spec describes the language. This document explains the choices behind it — places where two reasonable designs were possible and one was picked, places where a familiar-looking rule has a less-stated rule behind it, and places where something widely done elsewhere was deliberately left out. The spec says what the language *is*; this document says *why*, and what the alternatives would have cost.
 
