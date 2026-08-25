@@ -14639,6 +14639,206 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // method is not in methodFns_ yet, leave disposeAsyncFn null — emitDisposals
     // will use the sync fallback.
     if (ld->isAwaitUsing) {
+        // fix #2739 (§30.5/§30.6, v0.240): an `await using var` bound to a
+        // borrowing BUILTIN collection literal (`await using var xs: Array<int> :=
+        // [k, k, k]`) MUST NOT route through the generic asyncDispose path below
+        // — there is no user DisposeAsync to resolve (classOfLocal returns null
+        // for the declaration-less builtin heads), so the slot's `disposeAsyncFn`
+        // stays null and emitDisposals falls back to emitDisposeAndReclaim →
+        // emitDynamicDispose → reads word 0 of the bz_array_t* / bz_dict_t* /
+        // bz_llist_t* as a class vtable pointer, then calls vtable slot 2 — a
+        // null function pointer in practice (`pc 0x0`, ASan: SEGV on unknown
+        // address). The plain `using var` path is clean because it routes
+        // through the linkedList/listInterface/collection/dict disposal branches
+        // below (bz_array_free / bz_llist_free / bz_dict_free); an `await using
+        // var` over a builtin collection has no user-async-disposable shape
+        // (no DisposeAsync to await) so the `await` is a no-op — apply the same
+        // synchronous collection disposal. Detected by the same name checks
+        // collectionTypeOfLocal / dictTypeOfLocal / linkedListTypeOfLocal /
+        // listInterfaceTypeOfLocal use, plus the iterator-format and TaskScope
+        // carve-outs above stay where they are (their disposals are async-
+        // format specific). Falls through if the local type does not match a
+        // builtin collection / dict / linked-list / list-interface / iterator-
+        // enumerator / TaskScope shape — i.e. the genuine user-class case the
+        // generic asyncDispose arm below is built for.
+        // // per #2739, #2695
+        if (ld->initializer) {
+            // §6.10 / #808: TaskScope — handled in the dedicated branch above
+            // (search "TaskScope"). Falls into the generic path below and would
+            // vtable-dispose a bz_task_scope_t (garbage). The d.taskScope arm
+            // already covers plain and await using both, so the early return
+            // there is what reaches this point.
+            // §29.11 / #759 / #1268: IAsyncEnumerator / IOwningAsyncEnumerator —
+            // also handled in the branch immediately below this comment. Both
+            // short-circuit before reaching the generic path.
+            //
+            // Borrowing collection shapes (mirrors the four sync branches later
+            // in this function: linkedListTypeOfLocal / listInterfaceTypeOfLocal
+            // / collectionTypeOfLocal / dictTypeOfLocal).
+            bool isAwaitCollection = false;
+            // Dictionary / OwningDictionary / SortedDictionary — bz_dict_t*.
+            // Mirrors the sync sibling branch's full disposal build: Set<string>
+            // releases string KEYS, owning/borrowing Dictionary<K,V> releases
+            // string or class VALUES, and the #2660 literal-tree node path
+            // covers aggregate roots like ["primes": [...]].
+            if (const sema::TypeRef* dt = dictTypeOfLocal(ld)) {
+                Disposal d{it->second, nullptr};
+                d.dict = true;
+                bool dictIsOwning =
+                    dt->astNode && dt->astNode->name &&
+                    !dt->astNode->name->parts.empty() &&
+                    dt->headName() == "OwningDictionary";
+                bool isSetNameD =
+                    dt->astNode && dt->astNode->name &&
+                    !dt->astNode->name->parts.empty() &&
+                    dt->headName() == "Set";
+                auto isStrKey = [&]() {
+                    if (dt->genericArgs.empty() || !dt->genericArgs[0]) return false;
+                    const sema::TypeRef* k = dt->genericArgs[0];
+                    if (k->nullable) return false;
+                    ElementPolicy p = elementPolicyFor(k, /*owning=*/false);
+                    return p.cat == ElementPolicy::Category::RuntimeManaged &&
+                           k->kind == sema::TypeRef::Kind::Primitive &&
+                           k->primitive == sema::PrimitiveType::String;
+                };
+                if (isSetNameD && isStrKey()) {
+                    d.dictStringKeys = true;
+                } else {
+                    // #602 / §28.11 v0.135: owning dict value disposer from policy.
+                    {
+                        const sema::TypeRef* dictVal =
+                            (dt->genericArgs.size() > 1) ? dt->genericArgs[1]
+                                                        : nullptr;
+                        d.dictValueDisposer =
+                            elementPolicyFor(dictVal, dictIsOwning).disposerThunk;
+                    }
+                    if (!d.dictValueDisposer)
+                        d.dictValueDisposer = dictValueBoxFreer(dt);
+                    // #429 / §28.9: a borrowing Dictionary<K, string> co-owns a
+                    // +1 per stored value — release each at scope-end free.
+                    if (!d.dictValueDisposer && !dictIsOwning) {
+                        const sema::TypeRef* dictVal =
+                            (dt->genericArgs.size() > 1) ? dt->genericArgs[1]
+                                                        : nullptr;
+                        if (dictVal && !dictVal->nullable) {
+                            ElementPolicy dvp = elementPolicyFor(dictVal, false);
+                            if (dvp.cat == ElementPolicy::Category::RuntimeManaged &&
+                                dictVal->kind == sema::TypeRef::Kind::Primitive &&
+                                dictVal->primitive == sema::PrimitiveType::String)
+                                d.dictValueDisposer = stringElementReleaseThunk();
+                        }
+                    }
+                }
+                // fix #2660 / §15.4: a literal-tree root — ["primes": [...]] etc.
+                if (!d.dictValueDisposer && !d.dictStringKeys)
+                    if (llvm::Function* nodeFree =
+                            literalTreeNodeDisposerFor(ld, dt))
+                        d.dictValueDisposer = nodeFree;
+                disposeStack_.back().push_back(d);
+                isAwaitCollection = true;
+            }
+            // LinkedList / OwningLinkedList — bz_llist_t*. Same predicate as
+            // the sync sibling.
+            else if (const sema::TypeRef* llTy = linkedListTypeOfLocal(ld)) {
+                Disposal d{it->second, nullptr};
+                d.linkedList = true;
+                const sema::TypeRef* llEl =
+                    (!llTy->genericArgs.empty()) ? llTy->genericArgs[0] : nullptr;
+                bool llIsOwning =
+                    llTy->astNode && llTy->astNode->name &&
+                    !llTy->astNode->name->parts.empty() &&
+                    common::isOwningPrefixedName(llTy->headName());
+                d.collectionElemDisposer =
+                    elementPolicyFor(llEl, llIsOwning).disposerThunk;
+                // #2686: borrowing LinkedList<string> releases the +1 each
+                // element took on insert (mirrors the sync sibling arm).
+                if (!d.collectionElemDisposer && !llIsOwning && llEl &&
+                    !llEl->nullable &&
+                    llEl->kind == sema::TypeRef::Kind::Primitive &&
+                    llEl->primitive == sema::PrimitiveType::String &&
+                    elementPolicyFor(llEl, /*owning=*/false).cat ==
+                        ElementPolicy::Category::RuntimeManaged)
+                    d.collectionElemDisposer = stringElementReleaseThunk();
+                disposeStack_.back().push_back(d);
+                isAwaitCollection = true;
+            }
+            // IReadOnlyList / IList / IOwningList — interface-typed backing;
+            // free via the array-shaped disposal with the disposer determined
+            // by element policy (#2630). Mirrors listInterfaceTypeOfLocal.
+            else if (const sema::TypeRef* liTy = listInterfaceTypeOfLocal(ld)) {
+                bool ifaceIsOwning = isOwningListInterfaceName(liTy);
+                const sema::TypeRef* liEl =
+                    (!liTy->genericArgs.empty()) ? liTy->genericArgs[0] : nullptr;
+                ElementPolicy cp = elementPolicyFor(liEl, ifaceIsOwning);
+                Disposal d{it->second, nullptr};
+                d.collection = true;
+                d.collectionElemDisposer = cp.disposerThunk;
+                if (!d.collectionElemDisposer && !ifaceIsOwning && liEl &&
+                    !liEl->nullable &&
+                    liEl->kind == sema::TypeRef::Kind::Primitive &&
+                    liEl->primitive == sema::PrimitiveType::String &&
+                    cp.cat == ElementPolicy::Category::RuntimeManaged)
+                    d.collectionElemDisposer = stringElementReleaseThunk();
+                d.collArrayDynamicFree = !d.collectionElemDisposer && !ifaceIsOwning;
+                disposeStack_.back().push_back(d);
+                isAwaitCollection = true;
+            }
+            // Array / OwningArray / Set / OwningSet / SortedSet / OwningBuffer /
+            // Stack / OwningStack / Queue / OwningQueue / FrozenArray —
+            // bz_array_t*-backed (Set/SortedSet route through bz_dict_free via
+            // the setDictBacked path the sync sibling mirrors). Mirrors
+            // collectionTypeOfLocal's predicate and disposal-build.
+            else if (const sema::TypeRef* collTy = collectionTypeOfLocal(ld)) {
+                if (isCollectionTypeName(collTy)) {
+                    // #602: derive element category from elementPolicyFor.
+                    auto isStrElem = [&](const sema::TypeRef* ty, bool owning) {
+                        if (!ty || ty->genericArgs.empty() ||
+                            !ty->genericArgs[0]) return false;
+                        const sema::TypeRef* el = ty->genericArgs[0];
+                        if (el->nullable) return false;
+                        ElementPolicy p = elementPolicyFor(el, owning);
+                        return p.cat == ElementPolicy::Category::RuntimeManaged &&
+                               el->kind == sema::TypeRef::Kind::Primitive &&
+                               el->primitive == sema::PrimitiveType::String;
+                    };
+                    bool collIsOwning =
+                        collTy->astNode && collTy->astNode->name &&
+                        !collTy->astNode->name->parts.empty() &&
+                        common::isOwningPrefixedName(collTy->headName());
+                    bool isSetName =
+                        collTy->astNode && collTy->astNode->name &&
+                        !collTy->astNode->name->parts.empty() &&
+                        (collTy->headName() == "Set" ||
+                         collTy->headName() == "OwningSet" ||
+                         collTy->headName() == "SortedSet");
+                    bool setDictBacked = isSetName &&
+                        genericBackingType(collTy, 0, /*isSet=*/true, nullptr) != nullptr;
+                    if (setDictBacked) {
+                        Disposal d{it->second, nullptr};
+                        d.dict = true;
+                        if (isStrElem(collTy, /*owning=*/false))
+                            d.dictStringKeys = true;
+                        disposeStack_.back().push_back(d);
+                    } else {
+                        Disposal d{it->second, nullptr};
+                        d.collection = true;
+                        const sema::TypeRef* collEl =
+                            (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
+                        ElementPolicy cp = elementPolicyFor(collEl, collIsOwning);
+                        d.collectionElemDisposer = cp.disposerThunk;
+                        if (!d.collectionElemDisposer && !collIsOwning && collEl &&
+                            !collEl->nullable &&
+                            collEl->kind == sema::TypeRef::Kind::Primitive &&
+                            collEl->primitive == sema::PrimitiveType::String &&
+                            cp.cat == ElementPolicy::Category::RuntimeManaged)
+                            d.collectionElemDisposer = stringElementReleaseThunk();
+                        disposeStack_.back().push_back(d);
+                    }
+                    isAwaitCollection = true;
+                }
+            }
+            if (isAwaitCollection) return;
+        }
         // issue #759 (UNMASK): an async-iterator enumerator frame
         // (IAsyncEnumerator<T> / IOwningAsyncEnumerator<T>) has the iterator vtable
         // layout [0]=td,[1]=Dispose,[2]=MoveNextAsync,[3]=Current. The generic
