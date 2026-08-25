@@ -2254,6 +2254,66 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 }
             }
             if (tt) {
+                // fix #2800 (§7.4, v0.240): a NULLABLE indexer receiver is a
+                // compile error unless the compiler has narrowed it to
+                // non-null — §7.4 names "indexing" verbatim alongside member
+                // access and method calls. The IndexExpr typing block read
+                // `ctx_.exprType(*ix->target)` and never consulted
+                // `tt->nullable`, so a nullable receiver typed exactly like its
+                // non-nullable form and the program compiled (the program ran
+                // the null array as empty for Array<int>?, faulting at
+                // runtime). Mirror the §7.4 member-access gate in
+                // ExprTypecheck_Calls.cpp:13664 — a SIMPLE VARIABLE
+                // IdentifierExpr is gated by `isKnownNonNull`; everything
+                // else (fields, properties, method results) is never
+                // narrowable — TOCTOU, copy to a local first. `tt->nullable`
+                // is the receiver-type flag, distinct from the IndexExpr
+                // RESULT type (an `Array<T?>` element read is still
+                // nullable-per-§7.1 even when the array is non-nullable, and
+                // that case is handled by the existing #1161 gate in
+                // ExprTypecheck_Calls.cpp:13792, not here). The diagnostic
+                // fires but does NOT return — codegen is gated on
+                // `hasErrors()` (Driver.cpp), so the rest of this block's
+                // typing is harmless when the program will not compile.
+                if (tt->nullable) {
+                    bool receiverNarrowed = false;
+                    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                            ix->target.get())) {
+                        if (tid->name != "this" && tid->name != "base") {
+                            Symbol* tsym = lookupName(tid->name);
+                            if (tsym && (dynamic_cast<LocalSymbol*>(tsym) ||
+                                          dynamic_cast<ParameterSymbol*>(tsym)))
+                                receiverNarrowed = isKnownNonNull(tsym);
+                        }
+                    }
+                    if (!receiverNarrowed) {
+                        std::string recvName;
+                        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                                ix->target.get()))
+                            recvName = std::string(tid->name);
+                        // Distinguish a SIMPLE-VAR gate from the TOCTOU /
+                        // non-narrowable form so the user gets a remedy
+                        // that matches the receiver's category — copy to a
+                        // local is the standard fix for the field case.
+                        std::string msg =
+                            recvName.empty()
+                                ? std::string("indexing on a nullable value "
+                                              "requires narrowing it to "
+                                              "non-null first (§7.4): guard "
+                                              "with `if x <> null`, force-"
+                                              "unwrap with `x!`, or copy to "
+                                              "a local first")
+                                : (std::string("indexing on nullable `") +
+                                   recvName +
+                                   "` requires narrowing it to non-null "
+                                   "first (§7.4): guard with `if " +
+                                   recvName +
+                                   " <> null`, force-unwrap with `" +
+                                   recvName + "!, or copy to a local first");
+                        ctx_.diagnostics().report(
+                            Severity::Error, e.span.begin, msg);
+                    }
+                }
                 if (tt->kind == TypeRef::Kind::InlineArray && tt->arrayElement) {
                     // §15.6 (#746 R41-E): "Slicing is not supported on inline
                     // arrays in this version." A range index on an inline array
@@ -3043,6 +3103,31 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 std::to_string(nargs) +
                                 (nargs == 1 ? " argument" : " arguments") +
                                 " (§23.4)");
+                    } else if (!anyIndexer) {
+                        // fix #2800 (§23.4, v0.240): the receiver declares NO
+                        // indexer at all (no `isIndexer` member on the type
+                        // or any of its bases — `tt->declaration` is set so
+                        // the receiver is a user-defined class/record/
+                        // interface, not a builtin collection which has its
+                        // own above-branch). The `anyIndexer && nargs > 0`
+                        // branch fires only when indexers exist but none
+                        // matches the argument count; the `!anyIndexer`
+                        // shape previously fell through with no diagnostic,
+                        // leaving the IndexExpr untyped and codegen
+                        // degrading to a zero value (#2434's `internal:
+                        // ... zero-initialized value` note). Reject cleanly
+                        // with a §23.4 "no indexer" message so the user
+                        // gets a sourced error instead of a silent zero.
+                        std::string tn = (tt->declaration &&
+                                          !tt->declaration->name.empty())
+                                              ? std::string(tt->declaration->name)
+                                              : std::string();
+                        ctx_.diagnostics().report(
+                            Severity::Error, e.span.begin,
+                            std::string("type `") +
+                                (tn.empty() ? std::string("?") : tn) +
+                                "` does not declare an indexer — "
+                                "`a[i]` requires an indexer (§23.4)");
                     }
                 }
                 // fix #2619 (§7.1 / §7.4 / §23.4, v0.240): run the §7
