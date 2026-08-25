@@ -80,9 +80,12 @@ bool compileFails(const std::string& source) {
 
 // A Cell with a disposal counter, and a Holder owning an OwningArray<Cell> field
 // with a read-only BORROW accessor `GetItems` (return type `Array<Cell>`, the
-// spec-correct non-owning counterpart of `OwningArray<Cell>`; per #1760 a
-// borrow return through a non-`owned` owning-collection type is rejected, so
-// the borrow is exposed through the non-owning view instead).
+// non-owning counterpart of `OwningArray<Cell>` — the §28.6 L7003 / L7363
+// remedy for read-only borrow through the non-owning view, still required at
+// v0.240 since the §28.6 carve-out only admits a return of an OWNED field of
+// THE RECEIVER; `Holder._items` here is `owned` and `GetItems` reads it as
+// the borrow admitted by the §28.6 carve-out — the return TYPE itself is
+// `Array<Cell>` so the borrow is on the non-owning view).
 const char* prelude =
     "module M; "
     "class Cell public static n: int := 0; "
@@ -127,22 +130,33 @@ BEZEL_TEST(borrowed_owning_1008c, borrow_field_read_disposed_once) {
 // `owning_collection_borrow_return_indirect_dispatch_1760_test.cpp` cover the
 // reject half of the rule, and tests (1)/(4)–(7) cover the rest.
 
-// (3) #1760 SOUNDNESS REGRESSION GUARD — the coverage gap the issue cites:
-// the original test exercised a DIRECT call to a borrow-returning
+// (3) §28.6 admission under INDIRECT dispatch (interface) — REPINNED by #2269.
+// The original test (pre-#1760) exercised a DIRECT call to a borrow-returning
 // `OwningArray<Cell>` method, where the carve-out (since removed) masked the
 // double-free. The hard double-free only manifests under INDIRECT dispatch
-// (interface / virtual-override / imported / function-value), where the call
-// site cannot resolve the concrete borrow-returning method and falls to the
-// name-head Owned fallback. The def-site check runs on the concrete override
-// REGARDLESS of how it is called, so the fix is that the concrete method's
-// borrow return is rejected at its definition — no compiling program can
-// then contain the borrow-returning method, and no caller can double-free.
-// The test asserts the reject on the SAME native-AOT repro the issue
-// reproduces; it FAILS on the pre-fix admit (compiles -> SEGV in the caller's
-// disposal) and PASSES on the fix (the override's `return _items;` is
-// rejected).
-BEZEL_TEST(borrowed_owning_1008c, owning_array_borrow_return_via_interface_rejected) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// (interface / virtual-override / imported / function-value Dispatch), where
+// the call site cannot resolve the concrete borrow-returning method and falls
+// to the name-head Owned fallback. #1760 added the def-site reject so the
+// concrete method's `return _items;` could never compile, but that reject
+// also forbade the §28.6 worked example (`return _transactions;` from
+// `method GetTransactions(): OwningArray<Transaction>`, spec L7000–L7003).
+// #2269 restored the carve-out per the spec admission; the indirect-dispatch
+// double-free hazard the carve-out reintroduces is filed separately as a
+// spec-amendment follow-up (not a definition-site rejection — the spec
+// admits the pattern, the soundness adjudication belongs in the spec). This
+// test pins the §28.6 admission under interface dispatch: the program
+// COMPILES (the def-site carve-out admits `return field;` from `Holder.Get()`),
+// even though the runtime double-free under `Consume`'s `using var t := src.Get();`
+// remains. Tracking the runtime fix in a follow-up issue.
+BEZEL_TEST(borrowed_owning_1008c, owning_array_borrow_return_via_interface_admitted_2269) {
+    // Spec admission: the def-site carve-out admits the pattern (the
+    // interface method's override body is `return field;` — a bare read of
+    // an `owned` field of the receiver, exactly the §28.6 shape). The
+    // runtime double-free under indirect dispatch is the open spec-amendment
+    // follow-up. A compile-time assertion is the load-bearing one for the
+    // spec-correctness half of the fix; the runtime half is the test the
+    // follow-up will add.
+    BEZEL_EXPECT_FALSE(compileFails(
         "module M; "
         "class Cell public constructor() end constructor; "
         "  destructor end destructor; end Cell; "

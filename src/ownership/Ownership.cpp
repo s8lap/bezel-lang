@@ -7166,64 +7166,82 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
     }
     // §28.6 / §5.11 (#1008 Part C): a non-`owned` owning-collection return is a
     // BORROW (the `Owned*` name denotes ELEMENT ownership, orthogonal to the
-    // container ownership the `owned` qualifier governs). A bare read of an
-    // `owned` owning-collection field of THE RECEIVER (`this`) — `return this.f;`
-    // — was the one formerly-admissible borrow form, justified by "the caller
-    // holds the receiver across the call, so the borrow is safe". That
-    // reasoning only holds for a DIRECT call, where `producerState` resolves
+    // container ownership the `owned` qualifier governs). The receiver-owned-
+    // field borrow form §28.6 admits — `return _transactions;` from `method
+    // GetTransactions(): OwningArray<Transaction>` (spec L7000–L7003) — has the
+    // "caller holds the receiver across the call, so the borrow is safe"
+    // justification, which holds for a DIRECT call: `producerState` resolves
     // the concrete all-borrow method and downgrades the result to `Borrowed`
     // (no disposal). Under interface / virtual-override / imported /
     // function-value dispatch the callee is bodyless or null
     // (`common::calleeMethodDecl`), `producerState` falls to the name-head
     // Owned fallback, and the caller disposes the borrow — a HARD double-free
-    // of the field's real owner (the same hazard #1660 closed for the owning
-    // deferred-activation heads). Owning collections are not
+    // of the field's real owner. Owning collections are not
     // Dispose-idempotent (their `Dispose()` is a hard free; verified for every
     // entry in `kOwningCollectionHeads`), so unlike Shared/Weak/ChannelSender/
-    // CancellationTokenSource there is no safe no-op fallback. Because the
-    // caller cannot in general resolve the concrete method, and the name-head
-    // Owned fallback is load-bearing for fresh owning-collection returns
-    // through the SAME signature (flipping it to Borrowed would leak those), no
-    // call-site classification is both sound and non-regressing — every
-    // receiver-owned-field borrow return through an owning collection is
-    // therefore REJECTED at the definition site, mirroring #1660. The borrowed
-    // result would carry the read-only capability restriction at its use sites
-    // ([§28.6](#sec-borrowed-owning-collections)) — but only if the borrow is
-    // ever sound to return, which (under indirect dispatch) it is not. The
-    // remedy is the spec's own: return the borrow through the non-owning
-    // collection type (e.g. `Array<T>` instead of `OwningArray<T>`) for a
-    // consumer-disposed false-positive class, or declare `owned` for a fresh
-    // value. A field of ANOTHER object (`obj._items`, `local._items`) was
-    // already rejected below (its source need not outlive the call). // per
-    // §28.6, §28.3, §5.11
+    // CancellationTokenSource there is no safe no-op fallback. The unsoundness
+    // under indirect dispatch is REAL and is filed separately as a spec-
+    // amendment follow-up to #2269 (a per-instantiation or per-dispatch
+    // adjudication, NOT a definition-site rejection — #2269 restored the
+    // carve-out the spec admits). The borrow carries the read-only capability
+    // restriction ([§28.6](#sec-borrowed-owning-collections)) at its use sites.
+    // A field of ANOTHER object (`obj._items`, `local._items`) has a source
+    // that need not outlive the call and is already rejected below (its source
+    // is a scope-bound local — a use-after-free).
+    // // per §28.6, §28.3, §5.11
     //
-    // #1760 (the wider owning-collection analogue of #1660): the receiver-
-    // owned-field carve-out that the original #1493 family introduced for
-    // these heads is unsound — the `IOwningEnumerable<T>` wrapper carve-out
-    // was already removed by #1660; this removes the parallel carve-out for
-    // the owning *collections*. // per §28.3
+    // fix #2269 (§28.6, v0.228/v0.240): RESTORE the receiver-owned-field
+    // carve-out for the OWNING COLLECTIONS (the parallel of the WRAPPER branch
+    // above's `exprIsReceiverOwnedFieldBorrow(e)` admission, applied here to
+    // the six `kOwningCollectionHeads`). #1760 had removed the carve-out citing
+    // an interface-dispatch unsoundness; that unsoundness is REAL but the fix
+    // is not — the spec admits the pattern (worked example `return
+    // _transactions;` from `method GetTransactions(): OwningArray<Transaction>`,
+    // spec L7000–L7003), and rejecting it leaves the §28.6 "Borrowed owning
+    // collections" subsection (which governs "a borrow of an owning collection
+    // — produced by returning a bare owning-collection field (above)") with no
+    // producer. Restore the carve-out here at the definition site (the same
+    // this-restricted receiver-field predicate the WRAPPER branch above uses);
+    // the indirect-dispatch unsoundness the carve-out reintroduces is filed
+    // separately for a spec amendment (#2269 follow-up — a per-instantiation or
+    // per-dispatch adjudication, not a definition-site rejection). The
+    // narrowed scope (receiver-owned-field only, NOT a borrowed parameter /
+    // local / another-object field) is the predicate `exprIsReceiverOwned
+    // FieldBorrow(e)` already encodes. // per §28.6 (v0.228/v0.240),
+    // fix #2269 (restoring #1008 Part C / #1493 family, narrowed over #1760)
     // `move field` is the field-TRANSFER form — diagnosed by
     // checkOwnedFieldReturn (#1005, "declare the return type `owned`"); skip
     // here to avoid double-reporting it.
     if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e))
         if (un->op == "move") return;
-    // A borrowed PARAMETER or LOCAL, or a field of the receiver or another
-    // object — a borrow whose source does not outlive the call
+    // §28.6 / §5.11 (#1008 Part C, #1493 family, restored by #2269): a bare
+    // read of an `owned` owning-collection field of THE RECEIVER (`this`) is
+    // the §28.6 admission — the caller holds the receiver across the call,
+    // the field's real owner (the receiver's destructor) still disposes it,
+    // and the borrowed result carries the read-only capability restriction
+    // ([§28.6](#sec-borrowed-owning-collections)) at its use sites.
+    // exprIsReceiverOwnedFieldBorrow restricts the allowance to a RECEIVER
+    // field — a bare identifier (implicit `this.f`) or an explicit
+    // `this.f`; a field of another object (`obj._items`, `local._items`)
+    // has a source that need not outlive the call (a scope-bound local
+    // would dangle — a use-after-free) and falls through to the borrow
+    // rejection below. // per §28.6, §5.11
+    if (exprIsReceiverOwnedFieldBorrow(e)) return;
+    // A borrowed PARAMETER or LOCAL, or a field of ANOTHER object — a borrow
+    // whose source does not outlive the call
     // (`Identity(a: OwningArray<T>): OwningArray<T> => a`,
-    // `return this._items;`, or `return local._items`).
-    if (ownedArgSourceIsBorrow(e) || exprIsOwnedFieldRead(e)) {
+    // `return local._items`). The receiver-owned-field case was admitted
+    // by the carve-out above; the indirect-dispatch hazard the carve-out
+    // reintroduces for the receiver case is tracked separately (#2269
+    // follow-up — not a definition-site rejection).
+    if (ownedArgSourceIsBorrow(e)) {
         report(
             Severity::Error, e.span.begin,
             std::string("a borrowed `") + head +
             "<…>` value may not be returned — its source does not outlive the "
-            "call under interface / virtual-override / imported / "
-            "function-value dispatch (the caller cannot resolve the concrete "
-            "borrow-returning method and so disposes the borrow, double-freeing "
-            "the field's real owner — owning collections are not "
-            "Dispose-idempotent); return the value through the non-owning "
-            "collection type (e.g. `Array<T>` instead of `OwningArray<T>`), or "
-            "declare the return type `owned` to transfer ownership of a "
-            "freshly-produced value (§28.3 / §28.6 / §5.11, #1760)");
+            "call; return a bare owning-collection field of the receiver "
+            "(`this`), or declare the return type `owned` to transfer ownership "
+            "of a freshly-produced value (§28.3 / §28.6 / §5.11)");
         return;
     }
     // Otherwise: a freshly-produced value (`new`, an owned-returning call)
