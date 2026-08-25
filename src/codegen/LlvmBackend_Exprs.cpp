@@ -5835,11 +5835,16 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // non-local target to a fresh alloca before GEP-ing into the field,
         // so the same field-access path serves both `for var entry in dict`
         // (entry is a local) and `e.Current.Value` (e.Current is a temporary).
+        // fix #2794: written `DictionaryEntry<K,V>` annotations carry an astNode
+        // (their `importedName` is empty); the old synthetic-only importedName
+        // check now uses `headName()`, which reads the syntactic head from the
+        // astNode for written refs and falls back to importedName for the
+        // synthetic iterator TypeRef.
         if (ma->target && (ma->member == "Key" || ma->member == "Value")) {
             if (auto* tt = ctx_.exprType(*ma->target)) {
                 if (tt->kind == sema::TypeRef::Kind::Named &&
                     !tt->declaration &&
-                    tt->importedName == "DictionaryEntry" &&
+                    tt->headName() == "DictionaryEntry" &&
                     tt->genericArgs.size() >= 2) {
                     // The entry alloca type is a 2-element struct {K, V}.
                     llvm::Type* kTy = lowerTypeRef(tt->genericArgs[0]);
@@ -5874,9 +5879,11 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // DrainedEntry<K,V> loop variable (from lowerDictDrainFor).
                 // The entry alloca is a {K, V*} struct — same layout as
                 // DictionaryEntry: field 0 = Key, field 1 = Value (owned ptr).
+                // fix #2794: headName() rather than importedName — same
+                // written-vs-synthetic carve-out as DictionaryEntry above.
                 if (tt->kind == sema::TypeRef::Kind::Named &&
                     !tt->declaration &&
-                    tt->importedName == "DrainedEntry" &&
+                    tt->headName() == "DrainedEntry" &&
                     tt->genericArgs.size() >= 2) {
                     if (llvm::AllocaInst* slot = localSlot(*ma->target)) {
                         unsigned fi = ma->member == "Key" ? 0 : 1;

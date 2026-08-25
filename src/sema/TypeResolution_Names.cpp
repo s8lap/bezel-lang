@@ -258,6 +258,21 @@ int Resolver::builtinTypeArity(std::string_view n) {
     // for-in / LINQ / member-call type-checking proceed without "unresolved type".
     if (n == "SortedDictionary") return 2;
     if (n == "SortedSet") return 1;
+    // issue #2794 (stdlib §4.8 / §4.9 / §5): the three 2-parameter built-in
+    // entry/grouping types the compiler knows but `builtinTypeArity`'s hand
+    // list was missing. Each is in a documented public surface
+    // (`DictionaryEntry<K,V>` record, §4.8; `DrainedEntry<K,V>` class, §4.9;
+    // `IGrouping<TKey,T>` interface, §5) yet was unresolvable as a WRITTEN
+    // type annotation — `unresolved type name`, no exception for arity or
+    // member-call surface — which prevented any helper method whose
+    // signature names one from compiling. The same shape as EventSource
+    // (#1536) and the Channel<T> family: arity 2, no user TypeDecl,
+    // declaration stays null, codegen lowers via the dedicated arm at
+    // LlvmBackend_Layout.cpp:1353 (DictionaryEntry / DrainedEntry — {K,V}
+    // struct) or the §4 heap-pointer builtin arm (IGrouping — ptrTy(),
+    // already a member of `kHeapPointerReferenceBuiltins`).
+    if (n == "DictionaryEntry" || n == "DrainedEntry" ||
+        n == "IGrouping") return 2;
     // §30.14 / §30.15 (#600): Channel<T> and ChannelSender<T> (arity 1).
     // Domain is a static class (arity 0); ChannelClosedException is a nullary
     // exception type (§30.15); DomainFaultedException is a nullary exception.

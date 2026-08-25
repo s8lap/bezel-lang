@@ -1342,17 +1342,25 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 }
                 return choiceStruct(rt->declaration);
             }
-            // fix #1220 (residual) / stdlib §4.8 / §5: DictionaryEntry<K,V> is
-            // the element type for a Dictionary LINQ pipeline. It is a synthetic
-            // Named TypeRef (importedName="DictionaryEntry", no declaration/astNode)
-            // with genericArgs=[K,V]. Lower it as a 2-field struct {K, V} — the
-            // same layout lowerDictEntryFor and lowerExpr's DictionaryEntry GEP
-            // path expect. Without this it fell to `i32`, so lowerLazyLinqFor
-            // allocated a 4-byte slot and the loop-body GEP on the DictionaryEntry
-            // fields crashed or loaded garbage.
-            if (!rt->declaration && !rt->astNode &&
-                (rt->importedName == "DictionaryEntry" ||
-                 rt->importedName == "DrainedEntry") &&
+            // fix #1220 (residual) / stdlib §4.8 / §5 / issue #2794:
+            // DictionaryEntry<K,V> is the element type for a Dictionary LINQ
+            // pipeline. Pre-#2794 it was a synthetic Named TypeRef
+            // (importedName="DictionaryEntry", no declaration/astNode) with
+            // genericArgs=[K,V]; #2794 added it to `builtinTypeArity` so it
+            // resolves as a WRITTEN type annotation too — that written form
+            // carries an astNode, so the guard had to be relaxed to match
+            // either path via headName() (which reads astNode->name->parts[0]
+            // for written refs and falls back to importedName for synthetic).
+            // DrainedEntry<K,V> is the OwningDictionary.Drain() iterator's
+            // element type — same shape, same lowering. Both lower as a
+            // 2-field struct {K, V} — the layout lowerDictEntryFor,
+            // lowerDictDrainFor, and lowerExpr's DictionaryEntry GEP path
+            // expect. Without this it fell to `i32`, so lowerLazyLinqFor
+            // allocated a 4-byte slot and the loop-body GEP on the
+            // DictionaryEntry fields crashed or loaded garbage.
+            if (!rt->declaration &&
+                (rt->headName() == "DictionaryEntry" ||
+                 rt->headName() == "DrainedEntry") &&
                 rt->genericArgs.size() >= 2 &&
                 rt->genericArgs[0] && rt->genericArgs[1]) {
                 llvm::Type* kTy = lowerTypeRef(rt->genericArgs[0]);
