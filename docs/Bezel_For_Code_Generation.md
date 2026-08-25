@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.280. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.281. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -434,7 +434,7 @@ The declared type, nullability stripped, must be a class type, an interface type
 
 *Required* — omitting it is a compile error ("this call consumes `x`; write `M(move x)`") — when a **named owned binding** feeds an `owned` argument (`M(move x)`), a local binding (`var y := move x;`, `using var y := move x;`), an assignment (`y := move x;`), an if-expression branch or expression-arm result (`(if c then move a else move b)`), or an owning-match scrutinee (`case move outcome of …`).
 
-*An error* — the marker is **rejected as redundant** — at a **target-announced position**, where the target already says "consume". Memorize this list; "mark every transfer" is the wrong generalization and produces exactly these errors (§28.3, §22.3):
+*An error* — the marker is **rejected as redundant** — at a **marker-free position**, where the target already says "consume". Memorize this list; "mark every transfer" is the wrong generalization and produces exactly these errors (§28.3, §22.3):
 
 - **`return` operand** under an `owned` or mint-announcing return: `return x;` — ✗ `return move x;`
 - **`throw` operand**: `throw x;` — ✗ `throw move x;`
@@ -549,7 +549,7 @@ Records also cannot have destructors, `owned` fields, owning-inline-array fields
 | Types | `Array<T>`, `LinkedList<T>`, `Dictionary<K,V>`, `Set<T>`, `Stack<T>`, `Queue<T>`, `SortedDictionary<K,V>`, `SortedSet<T>` | `OwningArray<T>`, `OwningLinkedList<T>`, `OwningDictionary<K,V>`, `OwningSet<T>`, `OwningStack<T>`, `OwningQueue<T>` |
 | Element slots at class T | **borrows** — the caller keeps ownership | **owned** |
 | `Add`/`Insert`/indexer-set | stores the borrow | `Add(owned item: T)`; indexer-set disposes the previous value |
-| `Remove`/`RemoveAt`/`Clear` | drops the borrow | **disposes** the element(s) |
+| `Remove`/`RemoveAt`/`Clear` | removes the borrow | **disposes** the element(s) |
 | `Dispose()` | no user-visible work | disposes **every** element, then frees storage |
 | Ownership out | *none* | `move coll[i]`, `PopAt`/`PopFirst`/`PopLast`/`Pop`/`Dequeue`, `Drain()` |
 
@@ -1442,7 +1442,7 @@ public static class Pooling
     var pool := new OwningArray<Connection>();
     pool.Add(Connect("a"));                      // fresh producer, unmarked; the slot takes ownership
     pool.Add(new Connection("b"));
-    return pool;                                 // target-announced: NOT `return move pool;`
+    return pool;                                 // marker-free position: NOT `return move pool;`
   end BuildPool;
 
   public static method Shutdown()
@@ -1787,7 +1787,7 @@ method TryGet(k: string, out v: Conn?): bool;
 method TryGet(k: string, out owned v: Conn?): bool;   // ERROR at the second declaration
 seen.Add(candidate);                     // ERROR when Add takes `owned`: write Add(move candidate)
 r.Append(move new Widget());             // ERROR: a fresh producer announces itself
-return move fresh;                       // ERROR: `return` under `owned` is target-announced
+return move fresh;                       // ERROR: `return` under `owned` is a marker-free position
 ```
 
 > §22.6: ordinary-parameter `owned` distinguishes overloads (under the erasure declaration guard — `where T: class` does **not** qualify, since it admits `string`); `owned` on an `out` parameter and `scoped` never do. The library's convention is **distinct names** for the borrow/take pair: `TryGetValue` vs `TryPopValue`, `TryPeek` vs `TryPop`/`TryDequeue`.
@@ -2037,7 +2037,7 @@ Through v0.245 the marker was spelled `owned` at binding positions. After v0.246
 
 - **`Task` / `Task<T>` for a value, `string`, or runtime-managed T:** no ownership crosses the await. Any form is permitted, and the awaited expression may be a bare producer call.
 - **`Task<T>` for class T — Pattern A:** the task may be awaited from multiple places; every awaiter receives a **borrow** of the same underlying result, whose lifetime is the task's ("disposing the task disposes the result"). The awaited operand must be a **named location** — a `using var`/`await using var` local, an `owned` parameter, an owning-collection slot, a borrowing-iteration variable, admitted static task storage — or an unbound temporary whose borrowed result is used **within that same full expression**. The result borrow may flow to a `var` binding, a non-owned argument, or a `return` under the same Pattern A type; it may **not** flow to a `using var` binding, an `owned` field or slot, an `owned` argument, or an `owned T` return. `var x := await Producer();` — a fresh `var`/`const` whose initializer is *exactly* the await — is the **scoped await-bind**, desugared to a hidden pinned slot; `using var x := await …`, assignment to an existing local, and compositions like `(await E).Name` are not.
-- **`OwningTask<T>` for class T — Pattern B:** the task produces a single **owned** result; awaiting transfers ownership, and the await must appear in an owned-consuming context (`using var x := await …`, `var x := await …`, an `owned` argument or slot store, a `return` under `owned T`, an owning `yield return`, or `_ := await …;`). The task may be awaited at most once for a successful result; a second await raises `InvalidOperationException`. The await **consumes its operand** when that operand is an owned task value — and the position is target-announced, so it takes **no `move`**.
+- **`OwningTask<T>` for class T — Pattern B:** the task produces a single **owned** result; awaiting transfers ownership, and the await must appear in an owned-consuming context (`using var x := await …`, `var x := await …`, an `owned` argument or slot store, a `return` under `owned T`, an owning `yield return`, or `_ := await …;`). The task may be awaited at most once for a successful result; a second await raises `InvalidOperationException`. The await **consumes its operand** when that operand is an owned task value — and the position is marker-free, so it takes **no `move`**.
 - `OwningTask<T>` over a value, `string`, or runtime-managed T is a compile error, as is either task type over a **move-only** value (an owning choice, an owning inline array).
 
 Choose by intent: `OwningTask<T>` for resource acquisition (one fresh single-consumer result), `Task<T>` for fan-out (several subscribers reading the same eventual result).
