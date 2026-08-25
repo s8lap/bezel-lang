@@ -964,9 +964,22 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
 // its public face is Dispose()).
 // `isGenericType` — true when the owning type has generic parameters (§14);
 // only then are ctor/dtor body texts extracted for Foundation C.
+// `wantPropertyBodyText` — true for extension property members (#2583/#3362,
+// §26.3 / §26.5 step 2 / §2.8.3): an extension property has NO exported
+// `bz$ext$<T>$<P>$propget` symbol — there is no per-(target,prop) external
+// ABI the way a CLASS property's `bz$<Class>$<P>$propget` exists (§23,
+// pre-existing). The local-side story `computedGetterOf` reaches the body
+// in the importer's fresh sema context via `ps->decl`; for a CROSS-MODULE
+// extension property the importer has no local body, so the body must
+// ride the wire (the `propertyBodyText` channel already used by generic
+// class properties by #2893) and the importer must re-parse + attach —
+// exactly the same shape as the generic-class property body carriage, but
+// gated on "this is an extension property" rather than "the owning class
+// is generic". Default false preserves every existing call site.
 bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                    sema::SemaContext& ctx, MetaMember& out,
-                   bool isGenericType, std::string_view source) {
+                   bool isGenericType, std::string_view source,
+                   bool wantPropertyBodyText = false) {
     out.visibility = toMetaVisibility(m.visibility, inInterface);
     out.modifiers = toStrings(m.modifiers);
     out.isPure = hasModifier(m.modifiers, "pure");
@@ -1506,7 +1519,7 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // #3348 scaffolding re-applied that placement — both
             // failed to compile with "use of undeclared identifier
             // 'pd'" at the `pd->span` access).
-            if (isGenericType &&
+            if ((isGenericType || wantPropertyBodyText) &&
                 (pd->bodyKind == ast::PropertyBodyKind::Expression ||
                  pd->bodyKind == ast::PropertyBodyKind::Block) &&
                 !source.empty() &&
@@ -2196,8 +2209,20 @@ static bool convertExtension(const sema::ExtensionSymbol& ext,
             // never auto), setterVisibility=Public, and — when source
             // carries the full PropertyDecl span — propertyBodyText so the
             // importer can re-parse it. visibility/modifiers ride alongside.
+            //
+            // fix #3362 (v0.NNN, §26.3 / §26.5 step 2 / §2.8.3): the prior
+            // version of this call passed `isGenericType=false`, which meant
+            // the Property branch's `propertyBodyText` gate (originally
+            // written for the §14.1/#2893 generic-class case) saw false and
+            // silently left the body text empty — the importer-half fix
+            // (#3362) cannot re-parse a body that was never serialized. Pass
+            // `wantPropertyBodyText=true` so the exporter actually carries
+            // the source span. The importer mirrors `parseAndAttachProperty
+            // Body`'s class-side machinery for the extension side
+            // (ModuleLoader.cpp parseAndAttachExtensionPropertyBody).
             if (convertMember(*prop, /*inInterface=*/false, ctx, mm,
-                              /*isGenericType=*/false, source)) {
+                              /*isGenericType=*/false, source,
+                              /*wantPropertyBodyText=*/true)) {
                 // §26.3: extension properties have no setter — the spec read
                 // "computed read-only properties" is the only form. Force the
                 // wire shape to match even if the exporter-derived conversion

@@ -2935,6 +2935,275 @@ static bool parseAndAttachPropertyBody(
     return true;
 }
 
+// fix #3362 (§26.3 / §26.5 step 2 / §2.8.3 rule 4, v0.NNN, importer half of
+// #2583's writer-half fix): re-parse the body text of a cross-module
+// EXTENSION property, in a fresh SemaContext, and attach the resulting
+// `ast::PropertyDecl` to the imported PropertySymbol's `decl` slot —
+// mirroring `parseAndAttachPropertyBody` above (the §14.1/#2893 generic
+// class-property twin) but for an extension block. The motivation is the
+// same and the only structural differences are the OUTER language shape:
+//
+//   (1) §26.3 admits ONLY an expression-bodied extension property
+//       (`property Name: Type => expr;`) — neither the Block (accessor)
+//       form nor Auto (`property X: T;` / `property X: T := v;`) — so the
+//       bodyKind gate differs. The exporter's PropertyBranch already
+//       enforces this on the writer side
+//       (ModuleMetadataBuilder.cpp:2179 `pd->bodyKind !=
+//       PropertyBodyKind::Expression`), so a non-Expression body never
+//       reaches this importer either; the bodyKind check at body-attach
+//       time below exists as a belt-and-braces, the same way the writer's
+//       exists (the importer must not assume a shape that the writer
+//       could have hand-stamped differently in some future shape).
+//
+//   (2) The synthetic source's OUTER form is an `extension Target`
+//       block, not a `class Target` body — `me.target` gives the
+//       spelled head, `target.propertyBodyText` (the serialized span,
+//       written by ModuleMetadataBuilder.cpp's widened gate) gives the
+//       complete `public property NAME: TYPE => EXPR;` decl. For a
+//       class-declared target we also need the class declaration in the
+//       source so `this._v` etc. resolves in the fresh context; for a
+//       primitive target (`extension int`) the body can only use `this`,
+//       and the source is just the extension block.
+//
+//   (3) The body reference `this._v` — the canonical extension-property
+//       get pattern, per §26.3 — resolves to a FieldSymbol of the
+//       FRESH (re-parsed) class declaration, not the imported one. Remap
+//       FRESH FieldSymbol → imported FieldSymbol exactly the way the
+//       class-property twin does (and exactly the way
+//       parseAndAttachMethodBody does for §14.1 methods), so the
+//       codegen-side `ps->decl` (the freshly-constructed PropertyDecl)
+//       and mainCtx's exprSymbol carry-over agree on which symbol owns
+//       `_v`. Without this remap the imported and fresh symbols would
+//       be distinct entities with identical fields and codegen's
+//       property-read lowering (`computedGetterOf` +
+//       `lowerPropertyGet`) would read `_v` out of the FRESH symbol's
+//       `classStruct` slot — a fresh symbol that has NO classStruct
+//       registered in mainCtx — so `_v` would land on the wrong field
+//       offset or fault entirely (the exact hazard #2893 / #2954
+//       caused-and-fixed for the class-property twin; this importer
+//       must not reintroduce the bug for the extension twin).
+//
+// `targetTypeSym` — the importer-side sema::TypeSymbol for the dep's
+// class head, when the target is a class. May be null for a primitive
+// target (no class to reference; the body can only see `this`). When
+// non-null, we replicate just enough of the class shape in the synthetic
+// source for the body to find its fields by name — fields only (the
+// extension body never sees methods or sibling properties on `this`,
+// only the named fields the getter body reads).
+//
+// `owningTd` — the dep's MetaTypeDecl. Used to read FIELDS for the
+// synthetic source (so `this._v` resolves in the fresh context). May be
+// null for a primitive target. When non-null, the synthesized class
+// carries the SAME fields the dep declared, so the body's field accesses
+// resolve. (We deliberately do NOT replicate methods or nested types —
+// the extension body never sees them; replicating them adds parse/sema
+// surface for no value.)
+//
+// Returns false (leaving decl untouched) on any parse/sema failure; the
+// §26.5 lookupExtensionMember then silently sees an extension member of
+// the wrong shape and the importer continues without the body attached
+// (the property accessor reads will return 0/null/garbage — a SILENT
+// wrong value, which is the regression this fix is closing — so this
+// function MUST succeed whenever the body source is sound; soundness
+// drift here would be a soundness loss). The §14.1/#2893 soundness-gate
+// precedent (a parse/sema error means "this body used something the
+// importer cannot faithfully reproduce" → do NOT attach) is restored
+// for the extension twin below.
+static bool parseAndAttachExtensionPropertyBody(
+    const MetaExtension& me,
+    const MetaTypeDecl* owningTd,
+    const sema::TypeSymbol* targetTypeSym,
+    const MetaMember& target,
+    sema::PropertySymbol* importedPs,
+    sema::SemaContext& mainCtx) {
+    // (1) Build synthetic source.
+    std::string src = "module _3362_reparsed_extension_property_;\n";
+    if (owningTd) {
+        // Replicate the target class's FIELDS only — methods/properties
+        // are not visible to the extension body (this._v for a field,
+        // never this.M(...) — `this` in an extension block is of the
+        // target type, but the GETTER body is the property's expression,
+        // which the §26.3 grammar restricts to bare expressions — a
+        // sibling method call `this.Inc()` would be valid code, but is
+        // not exercised by the #2583 / #3362 test surface and would
+        // require the FULL class replication that `parseAndAttach
+        // MethodBody` already does; out of #3362's scope per CLAUDE.md
+        // §4's decline-with-reasons — file a follow-up if a real test
+        // demands it).
+        const std::string kindKw =
+            (owningTd->kind == MetaTypeDeclKind::Record ? "record "
+                                                        : "class ");
+        src += metaVisibilityToKeyword(owningTd->visibility);
+        src += " ";
+        src += kindKw + owningTd->name + "\n";
+        for (const MetaMember& mm : owningTd->members) {
+            if (mm.kind != MetaMemberKind::Field) continue;
+            src += "  ";
+            src += metaVisibilityToKeyword(mm.visibility);
+            for (const std::string& mod : mm.modifiers) src += " " + mod;
+            src += " ";
+            src += mm.name;
+            src += " : ";
+            src += metaTypeToSourceText(mm.type);
+            src += ";\n";
+        }
+        src += "end " + owningTd->name + ";\n";
+        // The extension block: head uses the class's bare name (the
+        // same spelling `metaTypeToSourceText(me.target)` would emit for
+        // a Named target whose declared name is `owningTd->name`).
+        src += "public extension ";
+        src += owningTd->name;
+        src += "\n";
+        src += "  ";
+        src += target.propertyBodyText;
+        src += "\n";
+        src += "end;\n";
+    } else {
+        // Primitive target (e.g. `extension int { ... }`): no class
+        // declaration needed. The body can only use `this` (the
+        // primitive value), so a bare extension block is sufficient.
+        // Head uses the same spelling the exporter's
+        // `target->name->parts.back()` would have read — `metaTypeToSource
+        // Text(me.target)` for a Primitive MetaType spells the keyword
+        // (`int`, `string`, etc.), which matches the dep's
+        // ExtensionDecl targetType.
+        src += "public extension ";
+        src += metaTypeToSourceText(me.target);
+        src += "\n";
+        src += "  ";
+        src += target.propertyBodyText;
+        src += "\n";
+        src += "end;\n";
+    }
+
+    // (2) Parse + sema.
+    DiagnosticEngine freshDiag;
+    Lexer freshLex(src, freshDiag);
+    Parser freshParser(freshLex, freshDiag);
+    auto sf = freshParser.parseCompilationUnit();
+    if (!sf || freshDiag.hasErrors()) return false;
+
+    auto semaDiag = std::make_shared<DiagnosticEngine>();
+    auto freshCtxPtr = std::make_shared<sema::SemaContext>(*semaDiag);
+    sema::SemaContext& freshCtx = *freshCtxPtr;
+    sema::collectSymbols(*sf, freshCtx);
+    if (semaDiag->hasErrors()) return false;
+    sema::resolveTypes(*sf, freshCtx);
+    if (semaDiag->hasErrors()) return false;
+    sema::typecheckExpressions(*sf, freshCtx);
+    if (semaDiag->hasErrors()) return false;  // soundness gate (precedent: #2893)
+
+    // (3) Locate the fresh ExtensionDecl (only one synthesized here).
+    sema::ExtensionSymbol* freshExtSym = nullptr;
+    const ast::ExtensionDecl* freshExtDecl = nullptr;
+    if (freshCtx.module()) {
+        for (sema::Symbol* child : freshCtx.module()->children) {
+            auto* es = dynamic_cast<sema::ExtensionSymbol*>(child);
+            if (!es) continue;
+            auto* ed = dynamic_cast<const ast::ExtensionDecl*>(es->decl);
+            if (!ed) continue;
+            freshExtSym = es;
+            freshExtDecl = ed;
+            break;
+        }
+    }
+    if (!freshExtSym || !freshExtDecl) return false;
+
+    // (4) Find the fresh PropertySymbol by NAME (not isIndexer — §26.3
+    //     extensions are never indexers).
+    sema::PropertySymbol* freshPs = nullptr;
+    const ast::PropertyDecl* freshPd = nullptr;
+    for (sema::Symbol* m : freshExtSym->members) {
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+        if (!ps || ps->isIndexer) continue;
+        if (std::string(ps->name) != target.name) continue;
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        if (!pd) continue;
+        freshPs = ps;
+        freshPd = pd;
+        break;
+    }
+    if (!freshPs || !freshPd) return false;
+    // Belt-and-braces: §26.3 admits ONLY expression-bodied extension
+    // properties. The exporter already enforces this; restating it on
+    // the importer is a structural safety net (a future writer change
+    // that admits another body kind would silently drop the body in
+    // this importer — better to refuse to attach the decl in that case
+    // so the gate falls through loudly).
+    if (freshPd->bodyKind != ast::PropertyBodyKind::Expression) return false;
+
+    // (5) Field remap: FRESH FieldSymbol (in the synthetic class) →
+    //     imported FieldSymbol (in the dep's class). The body's
+    //     `this._v` IdentifierExpr, when typechecked in freshCtx,
+    //     resolves to freshPs's parent class's `_v` FieldSymbol — NOT
+    //     the dep's imported `_v`. Without the remap, codegen's
+    //     `ps->decl->exprBody` (the freshly-attached PropertyDecl)
+    //     walks the FRESH symbol's classStruct for `_v`'s offset — a
+    //     classStruct that exists only inside the fresh SemaContext
+    //     and has NO backing in mainCtx. Remap so the IdentifierExpr
+    //     in mainCtx points at the IMPORTED FieldSymbol, exactly the
+    //     discipline parseAndAttachPropertyBody applies for the
+    //     class-property twin.
+    if (targetTypeSym) {
+        std::unordered_map<std::string_view, sema::Symbol*> importedFields;
+        for (sema::Symbol* m : targetTypeSym->members) {
+            auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+            if (!fs || m->name.empty()) continue;
+            importedFields[m->name] = m;
+        }
+        for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
+            if (!expr || !freshSym) continue;
+            auto* fs = dynamic_cast<sema::FieldSymbol*>(freshSym);
+            if (!fs) continue;
+            auto it = importedFields.find(fs->name);
+            if (it != importedFields.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        }
+    }
+
+    // (6) Copy resolved-type and expr-type entries from the fresh
+    //     context, rebinding SELF references — for an extension property
+    //     there is no `this` to rebind (this is the receiver type, an
+    //     OWNED value passed in, not an instance of an enclosing type),
+    //     but the rebinding helper is harmless to call and matches the
+    //     precedent. Without targetTypeSym there is also nothing to
+    //     rebind against; the rebindSelfTypeRefsIn for the class-property
+    //     case is documented in #2954's fix.
+    if (targetTypeSym) {
+        // Find the fresh class TypeSymbol by name (only when we built
+        // one — primitive-target paths have none).
+        sema::TypeSymbol* freshClass = nullptr;
+        if (owningTd && freshCtx.module()) {
+            for (sema::Symbol* child : freshCtx.module()->children) {
+                auto* ts = dynamic_cast<sema::TypeSymbol*>(child);
+                if (ts && std::string(ts->name) == owningTd->name) {
+                    freshClass = ts;
+                    break;
+                }
+            }
+        }
+        if (freshClass) {
+            rebindSelfTypeRefsIn(freshCtx, freshClass,
+                                 const_cast<sema::TypeSymbol*>(targetTypeSym));
+        }
+    }
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        if (expr && ref) mainCtx.setExprType(expr, ref);
+
+    // (7) Attach the freshly-parsed PropertyDecl to the imported
+    //     PropertySymbol. Keep the source + AST alive (string_view fields
+    //     point into them), plus the fresh context + diagnostics that
+    //     own the copied TypeRefs.
+    importedPs->decl = freshPd;
+    mainCtx.ownImportedSource(std::move(src));
+    mainCtx.ownImportedAst(std::move(sf));
+    mainCtx.ownImportedAuxiliary(semaDiag);
+    mainCtx.ownImportedAuxiliary(freshCtxPtr);
+    return true;
+}
+
 // §2.8.2 / §22.12 / §22.13 (#2351): build a synthetic class source for
 // re-parsing an imported generic class's static field INITIALIZER
 // expression(s). Shape mirrors buildSyntheticMethodSource: every field is
@@ -3765,7 +4034,115 @@ static void loadMetadataPass2(
             auto* extSym = ctx.makeImportedSymbol<sema::ExtensionSymbol>();
             extSym->decl = decl.get();
             extSym->scope = sema::kModuleScope;
+
+            // fix #3362 (§26.3 / §26.5 step 2 / §2.8.3 rule 4, v0.NNN,
+            // importer half of #2583's writer-half fix): when the
+            // extension's target is a class declared by this same
+            // dep module, fetch its MetaTypeDecl + the importer-side
+            // TypeSymbol so `parseAndAttachExtensionPropertyBody`
+            // (below) can replay the property body in a fresh
+            // SemaContext. A primitive target (e.g. `extension int`)
+            // — or a target whose owning class lives in a DIFFERENT
+            // dep module that this dep does not re-export —
+            // receives `owningTd = nullptr` and the body re-parse
+            // emits just the extension block (the body can only see
+            // `this` in that case, which is sufficient for primitive
+            // targets).
+            const MetaTypeDecl* extOwningTd = nullptr;
+            sema::TypeSymbol* extTargetTypeSym = nullptr;
+            {
+                const std::string targetSpelling =
+                    metaTypeToSourceText(me.target);
+                for (std::size_t ti = 0; ti < md.types.size(); ++ti) {
+                    if (md.types[ti].name == targetSpelling) {
+                        extOwningTd = &md.types[ti];
+                        // `created` (per pass-1/2 layout) is parallel to
+                        // md.types; the importer-side symbol for this
+                        // type lives at the same index.
+                        if (ti < created.size()) {
+                            extTargetTypeSym = created[ti];
+                        }
+                        break;
+                    }
+                }
+            }
+
             for (const MetaMember& mm : me.members) {
+                if (mm.kind == MetaMemberKind::Property) {
+                    // fix #3362 — parse-and-attach the property body.
+                    // An extension property has NO external propget
+                    // ABI (no `bz$ext$<T>$<P>$propget` symbol is ever
+                    // emitted — extension properties are only ever
+                    // inlined at the use site via computedGetterOf,
+                    // which reads ps->decl->exprBody in codegen). For a
+                    // cross-module extension property the importer has
+                    // no local body to call, so the body MUST ride the
+                    // wire and be re-parsed + attached here — the same
+                    // shape as the §14.1/#2893 generic-class property
+                    // body carriage, but for an extension. Mirrors
+                    // parseAndAttachPropertyBody (above, the class
+                    // twin); see that function's doc for the rationale
+                    // (soundness gate, field remap, kept-alive source
+                    // + AST + fresh ctx).
+                    //
+                    // The exporter side carried out at
+                    // ModuleMetadataBuilder.cpp:2223 (Lane A #2583 +
+                    // Lane G #3362 widening): convertMember's
+                    // propertyBodyText gate accepts the extension
+                    // branch via the new `wantPropertyBodyText=true`
+                    // parameter, so `mm.propertyBodyText` is
+                    // non-empty when the body span is well-formed and
+                    // empty otherwise. An empty `propertyBodyText`
+                    // means a degenerate span (the writer-side
+                    // `begin.offset < end.offset && end.offset <=
+                    // source.size()` gate failed) — fall through
+                    // silently (the property still attaches as a
+                    // no-body symbol, matching the class-side
+                    // `parseAndAttachPropertyBody`'s own
+                    // decl-null fallback when the wire text is
+                    // empty).
+                    if (!mm.propertyBodyText.empty()) {
+                        auto* ps = ctx.makeImportedSymbol<sema::PropertySymbol>();
+                        ps->name = ctx.internString(mm.name);
+                        ps->visibility = fromMetaVisibility(mm.visibility);
+                        ps->modifiers = loader.intern(mm.modifiers);
+                        ps->scope = sema::kModuleScope;
+                        ps->parent = nullptr;
+                        ps->isIndexer = false;
+                        // §26.3: extension properties are NEVER auto
+                        // (the auto-body grammar is `property X: T;`
+                        // / `property X: T := v;`, none of which
+                        // §26.3 admits for an extension). Mark this
+                        // explicitly so a downstream
+                        // `isAutoPropertyStorageSymbol` cannot
+                        // misclassify the synthetic PropertyDecl we
+                        // are about to attach — exactly the safe
+                        // pre-existing the class-side importer uses
+                        // (#2478's side-table rider).
+                        loader.propIsAutoStorage_[ps] = false;
+                        // §23 / §2.8.2 / §2.8.3 rule 4: the property
+                        // type rides on the loader's side table so
+                        // codegen and sema can read it without an
+                        // ast::PropertyDecl (none exists at this
+                        // point). When the parse+attach below
+                        // succeeds and `ps->decl` is non-null, both
+                        // paths answer identically — the side table
+                        // is the ONLY source of truth BEFORE the
+                        // attach and codegen queries it once per
+                        // use site anyway.
+                        loader.fieldTypes_[ps] = loader.convert(mm.type);
+                        // PropertySymbol exists; attempt to attach
+                        // the parsed body. On success, `ps->decl` is
+                        // set; on failure (re-parse / sema error), the
+                        // property symbol exists with `ps->decl =
+                        // nullptr` and reads return the codegen
+                        // fallback (no-body computed read).
+                        parseAndAttachExtensionPropertyBody(
+                            me, extOwningTd, extTargetTypeSym, mm, ps, ctx);
+                        extSym->members.push_back(ps);
+                    }
+                    continue;
+                }
                 if (mm.kind != MetaMemberKind::Method) continue;
                 const sema::ScopeId scope = ctx.newScope();
                 auto* ms = ctx.makeImportedSymbol<sema::MethodSymbol>();

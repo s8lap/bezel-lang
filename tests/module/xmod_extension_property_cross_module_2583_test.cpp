@@ -1,5 +1,5 @@
-// Cross-module extension PROPERTY dispatch (#2583; §26.3 / §26.5 step 2,
-// spec v0.236).
+// Cross-module extension PROPERTY dispatch (#2583 / #3362; §26.3 / §26.5
+// step 2, spec v0.236).
 //
 // §26.3 admits expression-bodied computed read-only properties on extension
 // blocks (`property Name: Type => expr;`). §26.5 step 2 makes imported
@@ -12,47 +12,64 @@
 //
 //   1. ModuleMetadataBuilder.cpp's `convertExtension` (the builder side that
 //      serializes an extension block into the cross-module wire form)
-//      iterates ext.members and discards anything that is not a MethodSymbol,
-//      with a code comment that asserts "A property has no exported accessor
-//      symbol (it is inlined at the use site), so only methods cross". So the
-//      builder emits ZERO members for an extension whose only member is a
-//      property — its block decodes to an empty members vector.
+//      used to iterate `ext.members` and discard anything that is not a
+//      MethodSymbol — fixed in #2583 (Lane A commit `053cc36`), which
+//      admitted `MetaMemberKind::Property` members into `out.members` BUT
+//      left the WRITER's `propertyBodyText` gate at its pre-#2583
+//      `isGenericType && …` premise, so the wire's `propertyBodyText`
+//      stayed empty (the writer never sent the body source even after
+//      admitting the property member).
 //   2. ModuleLoader.cpp's extension reconstruction (the importer side that
-//      rebuilds the extension from the metadata) then iterates
-//      `md.extensions` and, for every MetaMember, refuses non-Method kinds
-//      with `if (mm.kind != MetaMemberKind::Method) continue;`. Combined
-//      with (1), even on the case where the property IS in the wire form
-//      (a future-friendly source the builder never populates today), the
-//      importer would silently drop it.
-//   3. Net effect: the importer's `lookupExtensionMember` searches
-//      `ext->members` for a property named Dbl, finds nothing, and the
-//      expression `w.Dbl` is rejected by the sema layer with a clean
-//      "no member Dbl on type W" diagnostic. This is a feature gap, not a
-//      miscompile — but per #735's cross-module extension carriage the
-//      property shape was supposed to ride alongside the method shape the
-//      same way.
+//      rebuilds the extension from the metadata) used to iterate
+//      `md.extensions` and, for every MetaMember, refuse non-Method kinds
+//      with `if (mm.kind != MetaMemberKind::Method) continue;`. After
+//      #2583 the loop was widened to `kind == Property` but the property
+//      symbol attached with `decl = nullptr`. After #3362 (this lane) the
+//      loop additionally calls `parseAndAttachExtensionPropertyBody`
+//      which re-parses the body in a fresh SemaContext and attaches the
+//      resulting `ast::PropertyDecl` to the imported `PropertySymbol`'s
+//      `decl` slot. Mirrors the class-property twin
+//      `parseAndAttachPropertyBody` (#2893).
+//   3. Net effect BEFORE the fix: the importer's `lookupExtensionMember`
+//      finds the imported PropertySymbol (an empty decl-null symbol)
+//      but `computedGetterOf(importedPs)` returns null (decl is null),
+//      so the read lowers via an external `$propget` ABI that DOES NOT
+//      EXIST for extensions (no `bz$ext$<T>$<P>$propget` symbol is
+//      emitted). Result: either a SILENT wrong value (0 by default) or a
+//      link-time undefined-symbol error — neither is acceptable per
+//      §26.3.
 //
-// PIN: FAIL-WITHOUT ONLY — the importer-side fix at #3362 will turn this on.
+// PIN: FAIL-WITHOUT + PASS-WITH on the importer half (#3362's
+// `parseAndAttachExtensionPropertyBody`). T1 and T2 (and T4 below) assert
+// the importer-side observable: 42 (or 2100) returned from `importRun2583`.
+// On an unfixed build, `importRun2583` returns -1 (a silent link error from
+// the undefined extern, or the original "no member Dbl" reject when the
+// importer-half was also missing — BOTH regress to -1; either re-imports
+// correctly with the fix).
 //
-// This commit (the BUILDER half of #2583) lands the wire-format precondition
-// but not the importer's `parseAndAttachExtensionPropertyBody` machinery that
-// re-parses and attaches the property body. Without the importer fix, T1 and
-// T2 still reproduce the original "no member Dbl on type W" reject at the
-// importer. The assertions in T1 and T2 are therefore gated off by
-// `#if defined(BEZEL_2583_EXTENSION_PROPERTY_LOADER_FIX)` below so the gate
-// does not see them as REAL regressions on this commit; the follow-up lane
-// for #3362 removes the gate when it lands `parseAndAttachExtensionProperty
-// Body` and turns the assertion on. T3 and T4 are regression controls
-// (method-path and instance-member-wins respectively) and PASS even on the
-// unfixed build — they are not gated, so they run and pin the unaffected
-// paths continuously.
+// Two halves of the carriage:
+//   - #2583 (Lane A commit `053cc36`): writer-side admission + wire-format
+//     inclusion of the property decl. The writer's `propertyBodyText` gate
+//     is widened to also fire for extension properties via a new
+//     `wantPropertyBodyText=true` parameter.
+//   - #3362 (Lane G, this commit): importer-side parse-and-attach,
+//     populating `importedPs->decl` with a freshly-parsed
+//     `ast::PropertyDecl` whose `exprBody` carries the body's expression
+//     so codegen's `computedGetterOf` returns it at the use site.
 //
-// WHY THESE FAIL WITHOUT THE FIX: the importer's compileFile fails with the
-// member-not-found diagnostic before any executable is produced; importRun2583
-// returns -1, which never equals the expected 42.
+// T3 is a regression control (method-path of the same dep module that
+// carries the property) and PASSES on every build — it is NOT gated.
 //
-// These pin the property CARRIAGE on BOTH SIDES. The #2573 sibling test pins
-// the analogous METHOD gating in the same cross-module scene for comparability.
+// WHY THESE FAIL WITHOUT THE FIX: a stale or pre-fix build either
+// (a) drops the property at the importer (the pre-#2583 state,
+// `importRun2583 == -1`) or (b) attaches the symbol with `decl = nullptr`,
+// `computedGetterOf` returns null, and codegen lowers via an external
+// ABI that does not exist (`importRun2583 == -1` from the link error).
+// Either way the runtime returns 42 only when both halves land together.
+//
+// These pin the property CARRIAGE on BOTH SIDES. The #2573 sibling test
+// pins the analogous METHOD gating in the same cross-module scene for
+// comparability.
 
 #include <cstdio>
 #include <cstdlib>
@@ -143,15 +160,15 @@ BEZEL_TEST(xmod_extension_property_2583,
         "  return w.Dbl; "
         "end Main; end C;");
 
-#if defined(BEZEL_2583_EXTENSION_PROPERTY_LOADER_FIX)
-    // GATED: PASS-WITH only when #3362's parseAndAttachExtensionPropertyBody
-    // lands. Without the importer-side fix, importRun2583 returns -1 (the
-    // original "no member Dbl on type W" reject), which does not equal 42.
-    // The follow-up lane removes this gate.
+    // PASS-WITH on the FULL fixed build (#2583 + #3362 together). On a
+    // pre-#2583 build the importer drops the property and
+    // `importRun2583 == -1`. On a #2583-only build (writer admits the
+    // property, importer attaches `decl = nullptr`) codegen lowers via
+    // an external `$propget` ABI that does not exist for extensions,
+    // producing a link error → `importRun2583 == -1` from
+    // `WIFEXITED`/exec failure. FAIL-WITHOUT either way; PASS-WITH
+    // when both halves are present.
     BEZEL_EXPECT_EQ(importRun2583(bSrc.path, bExe.path, aObj.path), 42);
-#else
-    (void)bSrc.path; (void)bExe.path; (void)aObj.path;
-#endif
 }
 
 // ===========================================================================
@@ -194,17 +211,17 @@ BEZEL_TEST(xmod_extension_property_2583,
         "  return x.Doubled; "
         "end Main; end C;");
 
-#if defined(BEZEL_2583_EXTENSION_PROPERTY_LOADER_FIX)
-    // GATED: same as T1 above — extension-only-dep shape from #2573 + #2583.
-    // PASS-WITH only when #3362 lands. Without the importer fix, the
-    // `hasImports() || hasImportedExtensions()` codegen gate in
-    // LlvmBackend_Setup.cpp:2278 still admits this (the dep carries
-    // extensions), but the importer-side filter at ModuleLoader.cpp:3769
-    // drops the property, so importRun2583 returns -1, not 42.
+    // PASS-WITH on the FULL fixed build (#2573 + #2583 + #3362). The
+    // extension-only-dep shape: dep carries NO exported type, only an
+    // extension block on a built-in target (`extension int`). The
+    // `importedMemberType` lookup path codegen uses (verified by
+    // #2573's follow-up) still admits this; the importer-side
+    // `parseAndAttachExtensionPropertyBody` (#3362) re-parses the
+    // primitive-target body without needing a class declaration (the
+    // primitive path's synthetic source is just `extension int { ... }`).
+    // FAIL-WITHOUT on pre-#2583 + post-#2583-only builds
+    // (`importRun2583 == -1`); PASS-WITH on the joined fix.
     BEZEL_EXPECT_EQ(importRun2583(bSrc.path, bExe.path, aObj.path), 42);
-#else
-    (void)bSrc.path; (void)bExe.path; (void)aObj.path;
-#endif
 }
 
 // ===========================================================================
@@ -265,6 +282,14 @@ BEZEL_TEST(xmod_extension_property_2583,
     TempFile2583 aSrc((dir / (stem + "_a.bzl")).string());
     TempFile2583 aObj((dir / (stem + "_a.o")).string());
 
+    // NOTE: `_v = 2` (not the natural 21) because §2.6 / CLAUDE.md
+    // §runet-vs-exit: WEXITSTATUS truncates the Main return to the
+    // low 8 bits. With `_v = 21` the instance-win value would be
+    // 21 * 100 = 2100, which appears as 2100 % 256 = 52 in the
+    // harness — false-LOOKING exit code (and ambiguous with arbitrary
+    // extension-side wrong-value residue). With `_v = 2`, instance-win
+    // gives 200 and extension-win gives 4 — both fit cleanly in 8 bits
+    // and are unambiguous.
     write2583(aSrc.path,
         "module BothProp2583T4; "
         "public class W "
@@ -285,21 +310,25 @@ BEZEL_TEST(xmod_extension_property_2583,
         "module App2583T4; "
         "import BothProp2583T4; "
         "class C public static method Main(): int "
-        "  using var w := new W(21); "
+        "  using var w := new W(2); "
         "  return w.Dbl; "
         "end Main; end C;");
 
-#if defined(BEZEL_2583_EXTENSION_PROPERTY_LOADER_FIX)
-    // GATED: §26.5's "instance member wins over extension member" rule is
-    // a separate concern from the BUILDER-half wire-format fix in this
-    // commit. The importer-side #3362 must land before this assertion can
-    // resolve `w.Dbl` at all (the unfixed build's importRun2583 returns -1
-    // because the importer drops the property; even after #3362 lands, the
-    // instance-precedence lookup in the importer's extension resolution is
-    // a separate spec amendment). Flip on when the importer fix AND
-    // instance-wins precedence both land.
-    BEZEL_EXPECT_EQ(importRun2583(bSrc.path, bExe.path, aObj.path), 2100);
-#else
-    (void)bSrc.path; (void)bExe.path; (void)aObj.path;
-#endif
+    // PASS-WITH on the FULL fixed build. §26.5's "instance member wins
+    // over extension member" rule (precedence with class property at
+    // top). On the unfixed build the importer drops the extension
+    // property, so `w.Dbl` resolves to the class's instance Dbl
+    // (returning 200 = 2 * 100) — but importRun2583 returns -1
+    // (not 200) because the importer-half STILL drops the member
+    // before even reaching the instance-wins lookup, so the read
+    // fails with "no member Dbl" or an external-propget link error.
+    // After #3362 the extension property IS in the candidate set; the
+    // instance-wins rule then picks the class Dbl and returns 200.
+    // This pins BOTH halves of the precedence:
+    //   1. #2583 + #3362 admit the extension property into
+    //      `ext->members` so `lookupExtensionMember` finds it.
+    //   2. The §26.5 instance-wins rule selects the class Dbl over
+    //      the extension Dbl (returning 200, NOT 4 which would be the
+    //      extension-wins value).
+    BEZEL_EXPECT_EQ(importRun2583(bSrc.path, bExe.path, aObj.path), 200);
 }
