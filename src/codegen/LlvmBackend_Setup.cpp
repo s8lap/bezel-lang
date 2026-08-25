@@ -22479,7 +22479,7 @@ void Emitter::collectClosureReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
-    for (const ast::LocalDecl* ld : candidates) {
+    for (const ast::Node* ld : candidates) {
         ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         // fix #2481 (consumer 3/3): OPT-IN the case-scrutinee relaxation —
         // see the scrutineeBorrowMode flag comment (struct ClosureEscapeWalker,
@@ -22586,7 +22586,7 @@ void Emitter::collectStringReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
-    for (const ast::LocalDecl* ld : producerCandidates) {
+    for (const ast::Node* ld : producerCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.stringReleaseMode = true;  // #1997: OPT-IN the plain-`:=` relaxation
         // fix #2481 (consumer 1/3): OPT-IN the case-scrutinee relaxation — see
@@ -22621,7 +22621,7 @@ void Emitter::collectStringReleaseEligible(
     // (no escaping alias exists past the scope) and of double-free (once per
     // exit). An ESCAPING borrow local is still RETAINED (in armStringLocalRefcount)
     // but NOT released — its +1 leaks, which is safe.
-    for (const ast::LocalDecl* ld : borrowCandidates) {
+    for (const ast::Node* ld : borrowCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.stringReleaseMode = true;  // #1997: OPT-IN the plain-`:=` relaxation
         // fix #2481 (consumer 1/3): mirrors the producer-candidates loop
@@ -22666,7 +22666,7 @@ void Emitter::collectStringReleaseEligible(
     // #2428 residual where the local's ONLY use is as a case scrutinee. See
     // the scrutineeBorrowMode flag comment (struct StringEscapeWalker, above)
     // for the full soundness argument.
-    for (const ast::LocalDecl* ld : valueLikeChoiceCandidates) {
+    for (const ast::Node* ld : valueLikeChoiceCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         // stringReleaseMode stays false — see the rationale above.
         w.scrutineeBorrowMode = true;  // fix #2450
@@ -22843,7 +22843,7 @@ void Emitter::collectRecordCallResultReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
-    for (const ast::LocalDecl* ld : candidates) {
+    for (const ast::Node* ld : candidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         // recordFieldReleaseMode = true (the gate above); the other modes
         // stay false so the string-release / borrowing-Array / value-like-
@@ -23139,7 +23139,7 @@ void Emitter::collectValueLikeChoiceCallResultReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
-    for (const ast::LocalDecl* ld : candidates) {
+    for (const ast::Node* ld : candidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         // Every OTHER mode stays false, mirroring #2115's OWN value-like-choice
         // release walk (collectStringReleaseEligible's valueLikeChoiceCandidates
@@ -23187,14 +23187,14 @@ void Emitter::collectValueLikeChoiceCallResultReleaseEligible(
 //     * a single-element index `arr[i]` (§28.3 indexer row, Borrowed — NOT a
 //       slice; common::isBuiltinArrayRangeSliceIndex rejects this shape).
 bool Emitter::isFreshBorrowingArrayMaterializerLocal(
-        const ast::LocalDecl* ld) const {
-    if (!ld || ld->isUsing || !ld->initializer) return false;
+        const LocalDeclInitView& view) const {
+    if (view.isUsing || !view.init) return false;
     // The result type must be a borrowing `Array<T>` (name-head exactly "Array").
     // ToArray/Sorted/Reversed all return `Array<T>`; restrict to that to avoid the
     // dict-backed (Set) / llist-backed (LinkedList) / owning (OwningArray) families.
     const sema::TypeRef* rt = nullptr;
-    if (ld->type) rt = ctx_.resolvedType(*ld->type);
-    if (!rt) rt = ctx_.exprType(*ld->initializer);
+    if (view.type) rt = ctx_.resolvedType(*view.type);
+    if (!rt) rt = ctx_.exprType(*view.init);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
     if (builtinTypeName(rt) != "Array") return false;
@@ -23202,7 +23202,7 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
     // `recv.Sorted(...)`, or `recv.Reversed()` — a CallExpr whose callee is
     // a member access naming one of those methods. (These are stdlib builtins
     // with no resolved user MethodSymbol; recognized structurally by member name.)
-    if (auto* call = dynamic_cast<const ast::CallExpr*>(ld->initializer.get())) {
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(view.init)) {
         if (!call->callee) return false;
         auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
         if (!ma) return false;
@@ -23235,7 +23235,7 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
     // disposer selected by element type (null for class/value, string-release
     // for `Array<string>`) — the same path ToArray/Sorted/Reversed/Split already
     // use, so the three end up at parity. // per §28.3, §15.6, #2753
-    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(ld->initializer.get()))
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(view.init))
         return common::isBuiltinArrayRangeSliceIndex(*ix, ctx_);
     return false;
 }
@@ -23250,18 +23250,18 @@ bool Emitter::isFreshBorrowingArrayMaterializerLocal(
 // gate is the RESULT TYPE (IGrouping, possibly nullable for the *OrNull forms) plus
 // the receiver being a bare GroupBy — matching exactly the terminals the codegen
 // keep-path (LlvmBackend_Calls.cpp) reclaims siblings for.
-bool Emitter::isFreshGroupingTerminalLocal(const ast::LocalDecl* ld) const {
-    if (!ld || ld->isUsing || !ld->initializer) return false;
+bool Emitter::isFreshGroupingTerminalLocal(const LocalDeclInitView& view) const {
+    if (view.isUsing || !view.init) return false;
     // Result type must be a synthetic declaration-less IGrouping<…> (the element a
     // bare-GroupBy element-returning terminal yields; nullable for *OrNull).
-    const sema::TypeRef* rt = ctx_.exprType(*ld->initializer);
+    const sema::TypeRef* rt = ctx_.exprType(*view.init);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
     if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
         return false;
     if (rt->headName() != "IGrouping") return false;
     // The initializer must be a terminal CALL whose RECEIVER is a bare `GroupBy(sel)`.
-    auto* call = dynamic_cast<const ast::CallExpr*>(ld->initializer.get());
+    auto* call = dynamic_cast<const ast::CallExpr*>(view.init);
     if (!call || !call->callee) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
     if (!ma || !ma->target) return false;
@@ -23573,15 +23573,30 @@ void Emitter::collectBorrowingArrayFreeEligible(
     setLiteralFreeEligible_.clear();        // #2142
     dictLiteralFreeEligible_.clear();       // #2143
     literalTreeAggregateEligible_.clear();  // #2660
-    std::vector<const ast::LocalDecl*> candidates;
-    std::vector<const ast::LocalDecl*> dictCandidates;  // #1028
-    std::vector<const ast::LocalDecl*> groupingCandidates;  // #1930
-    std::vector<const ast::LocalDecl*> setLiteralCandidates;   // #2142
-    std::vector<const ast::LocalDecl*> dictLiteralCandidates;  // #2143
-    std::vector<const ast::LocalDecl*> aggregateCandidates;    // #2660
+    // fix issue 2802 / §21.1: the eligibility sets are keyed on the AST node pointer (const void*), and the consumers (escape walker's `target`, collectSafeViewAliases, lowerLocalDecl's `dictLiteralFreeEligible_` lookup, ...) all compare via `const void*` — so widening the candidate vector type from `const ast::LocalDecl*` to `const ast::Node*` admits §21.1 `const` locals (LocalConstDecl, a different Stmt subtype) without changing any downstream pointer-identity comparison. The pre-issue-2802 type was the local reason the dict-literal form below elided a `const` binding: collectBorrowingArrayFreeEligible's scan lambda only matched LocalDecl, so a `const d: Dictionary<K,V> := [k:v, ...]` (the issue's measured repro: 832 KB / 10000 allocs leaked per 2000 iters) was never added to dictLiteralCandidates, the escape-walk never ran for it, and dictLiteralFreeEligible_ never received it — the literal's table was allocated by materializeHeapDictLiteral but never reclaimed, exactly the issue's defect. Admitting const locals here is the fix for issue 2802.
+    std::vector<const ast::Node*> candidates;
+    std::vector<const ast::Node*> dictCandidates;  // #1028
+    std::vector<const ast::Node*> groupingCandidates;  // #1930
+    std::vector<const ast::Node*> setLiteralCandidates;   // #2142
+    std::vector<const ast::Node*> dictLiteralCandidates;  // #2143
+    std::vector<const ast::Node*> aggregateCandidates;    // #2660
+    // fix #2802: build the LocalDeclInitView from whichever AST node kind
+    // the scanner hit — a plain `var` (LocalDecl) supplies initializer/type/
+    // isUsing from its own fields; a §21.1 `const` (LocalConstDecl) supplies
+    // value/type from its own fields and isUsing=false (a `const` is never
+    // a `using var`, by grammar). Null on neither — anything else is ignored.
+    auto viewFor = [](const ast::Stmt* s) -> LocalDeclInitView {
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s))
+            return {ld->initializer.get(), ld->type.get(), ld->isUsing};
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s))
+            return {lc->value.get(), lc->type.get(), false};
+        return {};
+    };
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+        LocalDeclInitView v = viewFor(s);
+        if (v.init) {
+            const ast::Node* node = s;
             // fix #2660 / §15.4: an INDEPENDENT candidacy test (not part of the
             // if/else chain below — a nested dict literal is simultaneously a
             // #2143 flat-reclaim candidate and an aggregate root, and needs
@@ -23589,21 +23604,21 @@ void Emitter::collectBorrowingArrayFreeEligible(
             // `using var`: §15.4's own nested examples are all written with it,
             // and the using form's root disposal comes from
             // registerUsingDisposal rather than the eligibility sets.
-            if (ld->initializer && ld->type) {
+            if (v.type) {
                 if (auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(
-                        ld->initializer.get())) {
-                    if (const sema::TypeRef* rt = ctx_.resolvedType(*ld->type))
+                        v.init)) {
+                    if (const sema::TypeRef* rt = ctx_.resolvedType(*v.type))
                         if (isLiteralTreeAggregate(lit, rt))
-                            aggregateCandidates.push_back(ld);
+                            aggregateCandidates.push_back(node);
                 }
             }
             // #1930: a plain `var g := <src>.GroupBy(sel).First()/…` — a bare-GroupBy
             // element-returning terminal binding the returned IGrouping. A `using var`
             // never reaches here (IGrouping has no user Dispose; it is a plain `var`).
-            if (isFreshGroupingTerminalLocal(ld))
-                groupingCandidates.push_back(ld);
-            if (isFreshBorrowingArrayMaterializerLocal(ld))
-                candidates.push_back(ld);
+            if (isFreshGroupingTerminalLocal(v))
+                groupingCandidates.push_back(node);
+            if (isFreshBorrowingArrayMaterializerLocal(v))
+                candidates.push_back(node);
             // #1871 / §28.9 / §28.11: a plain `var xs: Array<T> := [ ... ]` — a
             // collection literal whose backing the local solely owns. `Array<T>`
             // is trivial-dispose (its Dispose is a no-op) but its backing storage
@@ -23613,22 +23628,21 @@ void Emitter::collectBorrowingArrayFreeEligible(
             // backing-only element policies (value / class-or-interface borrows,
             // null disposer) via isBorrowingArrayLiteralLocal; string/fn-element
             // literals (their +1/element release differs) are excluded.
-            else if (isBorrowingArrayLiteralLocal(ld))
-                candidates.push_back(ld);
+            else if (isBorrowingArrayLiteralLocal(v))
+                candidates.push_back(node);
             // #1028: a plain `var d := src.ToDictionary(...)` — a fresh
             // `owned Dictionary<K,V>` materializer the local solely owns. Excluded:
             // a `using var` (disposed via registerUsingDisposal → would double-free).
-            else if (ld && !ld->isUsing && ld->initializer &&
-                     isFreshOwnerlessDictMaterializerExpr(ld->initializer.get()))
-                dictCandidates.push_back(ld);
+            else if (!v.isUsing && isFreshOwnerlessDictMaterializerExpr(v.init))
+                dictCandidates.push_back(node);
             // #2142 / §28.9 / §28.11: a plain `var s: Set<T> := [ ... ]` — a
             // dict-backed collection literal whose backing the local solely
             // owns (see isBorrowingSetLiteralLocal). Previously in NEITHER
             // reclaim eligibility set (the Array-literal check above requires
             // name-head "Array"; the dict-materializer check above requires a
             // CallExpr initializer) — leaked unconditionally, sync AND async.
-            else if (isBorrowingSetLiteralLocal(ld))
-                setLiteralCandidates.push_back(ld);
+            else if (isBorrowingSetLiteralLocal(v))
+                setLiteralCandidates.push_back(node);
             // #2143 / §28.9 / §28.11: a plain `var d: Dictionary<K,V> :=
             // [k:v, …]` (or the empty `[]` form) — a dict-literal whose backing
             // the local solely owns (see isBorrowingDictLiteralLocal). Distinct
@@ -23637,8 +23651,8 @@ void Emitter::collectBorrowingArrayFreeEligible(
             // all (leaked in BOTH sync and async — corrected finding, #2143's
             // filed "sync clean" claim was an LSan false-negative on a
             // single-shot repro; a looped repro shows it leaking in sync too).
-            else if (isBorrowingDictLiteralLocal(ld))
-                dictLiteralCandidates.push_back(ld);
+            else if (isBorrowingDictLiteralLocal(v))
+                dictLiteralCandidates.push_back(node);
         }
         // Recurse into nested blocks (mirrors collectStringReleaseEligible).
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -23663,7 +23677,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     };
     for (auto& s : body) scan(s.get());
 
-    for (const ast::LocalDecl* ld : candidates) {
+    for (const ast::Node* ld : candidates) {
         // #1871: gather this array's pure-`IEnumerable<T>` VIEW aliases that are
         // themselves proven non-escaping — a binding into such a view is a borrow,
         // not an escape (the view wrapper borrows the backing; its Dispose frees
@@ -23681,7 +23695,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     // #1028: same conservative type-agnostic escape walk for dict-materializer
     // locals — a local proven never to escape is the sole owner of the fresh
     // dict, so a scope-end bz_dict_free runs exactly once (no UAF, no double-free).
-    for (const ast::LocalDecl* ld : dictCandidates) {
+    for (const ast::Node* ld : dictCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
@@ -23699,7 +23713,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     // outlives the scope (UAF), and `arr.Add(g)` into an owning Array<IGrouping>
     // that also frees it (double-free) — both surface as a non-safe-read occurrence
     // and taint the local out of eligibility.
-    for (const ast::LocalDecl* ld : groupingCandidates) {
+    for (const ast::Node* ld : groupingCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
@@ -23713,7 +23727,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     // iterating the set is a borrow-read, not an escape (same reasoning as
     // #1871's array pass — the walker's borrowingArrayMode branch is written
     // generically over the target LocalDecl, not array-IR-specific).
-    for (const ast::LocalDecl* ld : setLiteralCandidates) {
+    for (const ast::Node* ld : setLiteralCandidates) {
         std::unordered_set<const void*> safeViews;
         collectSafeViewAliases(body, ld, safeViews);
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
@@ -23726,7 +23740,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     // #2143 / §28.9 / §28.11: same conservative escape walk for Dictionary-
     // literal locals (borrowingArrayMode — a `for var x in d` over a Dictionary
     // is likewise a borrow-read of the backing table, never a retaining escape).
-    for (const ast::LocalDecl* ld : dictLiteralCandidates) {
+    for (const ast::Node* ld : dictLiteralCandidates) {
         std::unordered_set<const void*> safeViews;
         collectSafeViewAliases(body, ld, safeViews);
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
@@ -23749,7 +23763,7 @@ void Emitter::collectBorrowingArrayFreeEligible(
     //       this: it tracks the root identifier only, and treats
     //       `var inner := groups["primes"];` as a safe read of `groups`.
     // Failing either leaves the interior nodes leaking exactly as today.
-    for (const ast::LocalDecl* ld : aggregateCandidates) {
+    for (const ast::Node* ld : aggregateCandidates) {
         std::unordered_set<const void*> safeViews;
         collectSafeViewAliases(body, ld, safeViews);
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
@@ -23775,16 +23789,16 @@ void Emitter::collectBorrowingArrayFreeEligible(
 // separate rule). A `new Array<T>(...)` / alias / materializer initializer is not
 // a CollectionLiteralExpr, so it is not matched (those are handled elsewhere, or
 // carry their own disposal obligation).
-bool Emitter::isBorrowingArrayLiteralLocal(const ast::LocalDecl* ld) {
-    if (!ld || ld->isUsing || !ld->initializer) return false;
+bool Emitter::isBorrowingArrayLiteralLocal(const LocalDeclInitView& view) {
+    if (view.isUsing || !view.init) return false;
     const sema::TypeRef* rt = nullptr;
-    if (ld->type) rt = ctx_.resolvedType(*ld->type);
-    if (!rt) rt = ctx_.exprType(*ld->initializer);
+    if (view.type) rt = ctx_.resolvedType(*view.type);
+    if (!rt) rt = ctx_.exprType(*view.init);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
     if (builtinTypeName(rt) != "Array") return false;
     auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(
-        ld->initializer.get());
+        view.init);
     if (!lit || lit->isDict) return false;
     // Backing-only element policy gate (same disposer the reclaim block derives):
     // a null per-element disposer AND not a runtime-managed (string/fn) element.
@@ -23812,16 +23826,16 @@ bool Emitter::isBorrowingArrayLiteralLocal(const ast::LocalDecl* ld) {
 // materializer initializer is not a CollectionLiteralExpr, so it is not
 // matched (those carry their own disposal obligation or are handled
 // elsewhere).
-bool Emitter::isBorrowingSetLiteralLocal(const ast::LocalDecl* ld) const {
-    if (!ld || ld->isUsing || !ld->initializer) return false;
+bool Emitter::isBorrowingSetLiteralLocal(const LocalDeclInitView& view) const {
+    if (view.isUsing || !view.init) return false;
     const sema::TypeRef* rt = nullptr;
-    if (ld->type) rt = ctx_.resolvedType(*ld->type);
-    if (!rt) rt = ctx_.exprType(*ld->initializer);
+    if (view.type) rt = ctx_.resolvedType(*view.type);
+    if (!rt) rt = ctx_.exprType(*view.init);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
     if (builtinTypeName(rt) != "Set") return false;
     auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(
-        ld->initializer.get());
+        view.init);
     if (!lit || lit->isDict) return false;
     return true;
 }
@@ -23837,16 +23851,16 @@ bool Emitter::isBorrowingSetLiteralLocal(const ast::LocalDecl* ld) const {
 // derives the correct bz_dict_free wiring (dictValueDisposer for a record/
 // string/class value) for every K/V combination materializeHeapDictLiteral
 // supports.
-bool Emitter::isBorrowingDictLiteralLocal(const ast::LocalDecl* ld) const {
-    if (!ld || ld->isUsing || !ld->initializer) return false;
+bool Emitter::isBorrowingDictLiteralLocal(const LocalDeclInitView& view) const {
+    if (view.isUsing || !view.init) return false;
     const sema::TypeRef* rt = nullptr;
-    if (ld->type) rt = ctx_.resolvedType(*ld->type);
-    if (!rt) rt = ctx_.exprType(*ld->initializer);
+    if (view.type) rt = ctx_.resolvedType(*view.type);
+    if (!rt) rt = ctx_.exprType(*view.init);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
     if (builtinTypeName(rt) != "Dictionary") return false;
     auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(
-        ld->initializer.get());
+        view.init);
     if (!lit) return false;
     bool emptyLiteral = lit->keys.empty() && lit->elements.empty();
     if (!lit->isDict && !emptyLiteral) return false;
@@ -24328,7 +24342,7 @@ struct InteriorAliasWalker {
 
 bool Emitter::literalTreeInteriorAliasSafe(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
-        const ast::LocalDecl* ld) const {
+        const ast::Node* ld) const {
     InteriorAliasWalker w{ctx_, static_cast<const void*>(ld)};
     // fix #2660 (send-back): the depth-independent half of the gate. An
     // expression aliases an interior node when its RESOLVED TYPE is one of the
@@ -24363,7 +24377,7 @@ bool Emitter::literalTreeInteriorAliasSafe(
 // not reclaimed (the safe direction, a leak not a UAF).
 void Emitter::collectSafeViewAliases(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
-        const ast::LocalDecl* arrLd,
+        const ast::Node* arrLd,
         std::unordered_set<const void*>& out) {
     std::vector<const ast::LocalDecl*> views;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
@@ -25285,7 +25299,7 @@ void Emitter::collectObjectStringReleaseEligible(
     // left as the SHARED `stringBorrowAll_` so a copy-of-an-alias (`var p
     // := o;` with `o: Object := s`) is also a borrow, exactly as a
     // copy-of-a-string is.
-    for (const ast::LocalDecl* ld : candidates) {
+    for (const ast::Node* ld : candidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.stringReleaseMode = true;
         w.scrutineeBorrowMode = true;

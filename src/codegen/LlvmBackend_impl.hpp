@@ -11224,7 +11224,7 @@ private:
     // returns false. Unrecognised shapes therefore LEAK, never dangle.
     bool literalTreeInteriorAliasSafe(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
-        const ast::LocalDecl* ld) const;
+        const ast::Node* ld) const;
     // fix #2660: the `void(void*)` thunk that reclaims ONE interior node of a
     // literal-tree aggregate whose node type is `nodeTy` (bz_array_free /
     // bz_dict_free / bz_llist_free, with the node's OWN element disposer derived
@@ -11245,54 +11245,87 @@ private:
     // literalTreeAggregateEligible_) for a block body (see the .cpp).
     void collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
-    // #1930 / stdlib §5 / §28.9: true if `ld` is a plain `var g := <expr>` whose
-    // initializer is a bare-GroupBy element-RETURNING terminal (result type
-    // IGrouping<…>): `<src>.GroupBy(sel).First()/.Single()/.Last()/.ElementAt(i)/
-    // .FirstOrNull()/.LastOrNull()/.SingleOrNull()/no-seed .Aggregate(...)`. Such a
-    // local binds the returned grouping (freed at scope end when non-escaping).
-    bool isFreshGroupingTerminalLocal(const ast::LocalDecl* ld) const;
-    // #1871 / §28.9 / §28.11: true if `ld` is a plain `var xs: Array<T> := [ ... ]`
-    // (a borrowing `Array<T>` local initialised by a collection literal) whose
-    // element policy is backing-only (null per-element disposer; value or
-    // class/interface borrows). Such a literal's backing is reclaimed at scope end
-    // via a single bz_array_free(backing, null) — the §28.9 "reclaimed with the
-    // instance" mechanism. Non-const: calls elementPolicyFor.
-    bool isBorrowingArrayLiteralLocal(const ast::LocalDecl* ld);
-    // #2142 / §28.9 / §28.11: true if `ld` is a plain `var s: Set<T> := [ ... ]`
-    // — a borrowing `Set<T>` local (name-head exactly "Set", not OwningSet/
-    // SortedSet — kept minimal per #2142) initialised by a LIST-form collection
-    // literal (Set<T> never uses the ":" dict-literal syntax). Such a literal's
-    // backing (a bz_dict_t*) is reclaimed at scope end via a single
-    // bz_dict_free — the §28.9 "reclaimed with the instance" mechanism, mirrored
-    // from isBorrowingArrayLiteralLocal.
-    bool isBorrowingSetLiteralLocal(const ast::LocalDecl* ld) const;
-    // #2143 / §28.9 / §28.11: true if `ld` is a plain `var d: Dictionary<K,V> :=
-    // [k:v, …]` (or the empty `[]` literal targeting a Dictionary) — a borrowing
-    // `Dictionary<K,V>` local (name-head exactly "Dictionary", not
-    // "OwningDictionary" — that family owns its values and requires `using`,
-    // already handled by registerUsingDisposal) initialised by a collection
-    // literal. Such a literal's backing (a bz_dict_t*) is reclaimed at scope end
-    // via a single bz_dict_free, mirroring isBorrowingArrayLiteralLocal.
-    bool isBorrowingDictLiteralLocal(const ast::LocalDecl* ld) const;
+    // fix #2802 / §21.1 / §28.9 / §15.4: a tiny POD view over a local
+    // declaration's initialization, holding exactly the fields every
+    // eligibility recognizer (isFreshGroupingTerminalLocal,
+    // isBorrowingArrayLiteralLocal, isFreshBorrowingArrayMaterializerLocal,
+    // isBorrowingSetLiteralLocal, isBorrowingDictLiteralLocal) consults. Lives
+    // at class scope so the recognizer signatures can take it directly without
+    // coupling each call site to the LocalDecl/LocalConstDecl split — both
+    // forms build the same view from their respective (init/value, type,
+    // isUsing) fields, and `isUsing` is fixed false for a `const` since a
+    // `const` is never a `using var`. The struct is value-cheap and trivially
+    // copyable.
+    struct LocalDeclInitView {
+        const ast::Expr* init = nullptr;   // LocalDecl::initializer / LocalConstDecl::value
+        const ast::Type* type = nullptr;   // LocalDecl::type      / LocalConstDecl::type
+        bool isUsing = false;              // LocalDecl::isUsing   / always false for `const`
+    };
+    // #1930 / stdlib §5 / §28.9: true if the local described by `view` is a plain
+    // `var g := <expr>` whose initializer is a bare-GroupBy element-RETURNING
+    // terminal (result type IGrouping<…>): `<src>.GroupBy(sel).First()/.Single()/
+    // .Last()/.ElementAt(i)/.FirstOrNull()/.LastOrNull()/.SingleOrNull()/no-seed
+    // .Aggregate(...)`. Such a local binds the returned grouping (freed at scope
+    // end when non-escaping). Takes a view (not a LocalDecl) so a §21.1
+    // `const` local (LocalConstDecl) is recognized identically — fix #2802.
+    bool isFreshGroupingTerminalLocal(const LocalDeclInitView& view) const;
+    // #1871 / §28.9 / §28.11: true if the local described by `view` is a plain
+    // `var xs: Array<T> := [ ... ]` (a borrowing `Array<T>` local initialised by
+    // a collection literal) whose element policy is backing-only (null per-
+    // element disposer; value or class/interface borrows). Such a literal's
+    // backing is reclaimed at scope end via a single bz_array_free(backing,
+    // null) — the §28.9 "reclaimed with the instance" mechanism. Non-const:
+    // calls elementPolicyFor. fix #2802: takes a view so a `const xs: Array<T>
+    // := […]` (LocalConstDecl) is recognized identically.
+    bool isBorrowingArrayLiteralLocal(const LocalDeclInitView& view);
+    // #2142 / §28.9 / §28.11: true if the local described by `view` is a plain
+    // `var s: Set<T> := [ ... ]` — a borrowing `Set<T>` local (name-head exactly
+    // "Set", not OwningSet/SortedSet — kept minimal per #2142) initialised by a
+    // LIST-form collection literal (Set<T> never uses the ":" dict-literal
+    // syntax). Such a literal's backing (a bz_dict_t*) is reclaimed at scope end
+    // via a single bz_dict_free — the §28.9 "reclaimed with the instance"
+    // mechanism, mirrored from isBorrowingArrayLiteralLocal. fix #2802: takes a
+    // view so a `const s: Set<T> := […]` (LocalConstDecl) is recognized
+    // identically.
+    bool isBorrowingSetLiteralLocal(const LocalDeclInitView& view) const;
+    // #2143 / §28.9 / §28.11: true if the local described by `view` is a plain
+    // `var d: Dictionary<K,V> := [k:v, …]` (or the empty `[]` literal targeting
+    // a Dictionary) — a borrowing `Dictionary<K,V>` local (name-head exactly
+    // "Dictionary", not "OwningDictionary" — that family owns its values and
+    // requires `using`, already handled by registerUsingDisposal) initialised
+    // by a collection literal. Such a literal's backing (a bz_dict_t*) is
+    // reclaimed at scope end via a single bz_dict_free, mirroring
+    // isBorrowingArrayLiteralLocal. fix #2802: takes a view so a `const d:
+    // Dictionary<K,V> := […]` (LocalConstDecl) is recognized identically — that
+    // shape is precisely #2802's measured leak (832 KB / 10000 allocs / 2000
+    // iters), §28.9/§15.4.
+    bool isBorrowingDictLiteralLocal(const LocalDeclInitView& view) const;
     // #1871 / §28.9 / §28.11: collect the `var v: IEnumerable<T> := <arrLd>` VIEW
     // locals in `body` that are proven never to escape — a binding of the array
     // into such a borrowing view does not extend the backing's lifetime, so it
-    // does not disqualify the array from scope-end reclaim.
+    // does not disqualify the array from scope-end reclaim. fix #2802: takes a
+    // `const ast::Node*` so the same walker accepts either a LocalDecl or a
+    // LocalConstDecl root — both kinds live in the eligibility sets keyed by
+    // node pointer identity.
     void collectSafeViewAliases(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
-        const ast::LocalDecl* arrLd,
+        const ast::Node* arrLd,
         std::unordered_set<const void*>& out);
-    // #1003: true if `ld` binds a plain `var` whose resolved type is a borrowing
-    // bz_array_t-backed collection (`Array`/`Stack`/`Queue`, NOT an `Owned*`
-    // family, NOT dict-backed Dictionary/Set/LinkedList) AND whose initializer is
-    // a fresh-array materializer CALL (`ToArray`/`Sorted`/`Reversed`). These are
-    // the exact shapes codegen lowers to a fresh `bz_array_t` the local solely
-    // owns. A `new Array<T>(...)` initializer is excluded (a NewExpr carries a
-    // sema disposal obligation → rejected as a plain undisposed `var`, never
-    // reaching this discardable path). The per-element disposer for the scope-end
-    // free is derived via elementPolicyFor (null for value/class borrows; the
-    // string-release thunk for `Array<string>` whose ToArray retained a +1/elem).
-    bool isFreshBorrowingArrayMaterializerLocal(const ast::LocalDecl* ld) const;
+    // #1003: true if the local described by `view` binds a plain `var` whose
+    // resolved type is a borrowing bz_array_t-backed collection (`Array`/`Stack`/
+    // `Queue`, NOT an `Owned*` family, NOT dict-backed Dictionary/Set/
+    // LinkedList) AND whose initializer is a fresh-array materializer CALL
+    // (`ToArray`/`Sorted`/`Reversed`). These are the exact shapes codegen
+    // lowers to a fresh `bz_array_t` the local solely owns. A `new
+    // Array<T>(...)` initializer is excluded (a NewExpr carries a sema disposal
+    // obligation → rejected as a plain undisposed `var`, never reaching this
+    // discardable path). The per-element disposer for the scope-end free is
+    // derived via elementPolicyFor (null for value/class borrows; the string-
+    // release thunk for `Array<string>` whose ToArray retained a +1/elem).
+    // fix #2802: takes a view so a `const xs: Array<T> := recv.ToArray()`
+    // (LocalConstDecl) is recognized identically.
+    bool isFreshBorrowingArrayMaterializerLocal(
+        const LocalDeclInitView& view) const;
     // #1004: true if `e` is an EXPRESSION codegen lowers to a FRESH, OWNERLESS
     // borrowing `Array<T>` temporary — a fresh-array materializer CALL
     // (`recv.ToArray()`/`recv.Sorted(...)`/`recv.Reversed()`) whose result no
