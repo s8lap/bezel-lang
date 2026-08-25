@@ -96,8 +96,8 @@ BEZEL_TEST(section_28_6_2269, worked_example_get_transactions_borrows_field) {
         "  public constructor() _transactions := new OwningArray<Cell>(); end constructor; "
         "  destructor end destructor; "
         "  public method GetTransactions(): OwningArray<Cell> "
-        "    return _transactions;     // OK: borrows the field — caller reads/iterates/mutates/drains\n"
-        "  end GetTransactions;                       //   but may not dispose it (§28.6 L7001-7002). "
+        "    return _transactions; "
+        "  end GetTransactions; "
         "end Account;"));
     // §28.6 admission — must compile, no diagnostics. FAILS without the #2269
     // carve-out restoration (pre-#2269 rejected `return _transactions;`
