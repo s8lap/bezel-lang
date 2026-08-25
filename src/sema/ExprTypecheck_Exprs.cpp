@@ -9324,6 +9324,41 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                    dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
         for (const auto& k : cl->keys) if (k) visitExpr(*k);
         for (const auto& v : cl->elements) if (v) visitExpr(*v);
+        // fix #2678 / §28.11 / §15.4 (v0.282): a NESTED `CollectionLiteralExpr`
+        // in a dictionary-literal KEY position is degenerate at run time — the
+        // literal mints a FRESH mutable collection (§15.4's literal-tree rule),
+        // the dictionary would then key by reference identity of that fresh
+        // node (§4.8's `=`/`<>GetHashCode` contract expects content equality),
+        // and a fresh mutable aggregate has no content-equality semantics that
+        // survive mutation. Codegen ICEs when `materializeHeapDictLiteral`
+        // falls through `lowerExpr(*cl->keys[i])` for the nested literal (#1386
+        // call). Reject at the literal site so the user gets a clear message
+        // naming the §28.11 / §4.8 / §15.4 authority instead of an internal
+        // diagnostic — every nested CollectionLiteralExpr-in-dict-key program
+        // produces the same shape, and the same code path underneath.
+        //
+        // LITERAL-ONLY: mirrors §15.4's resolution 5 ("`Add` after construction
+        // is not a literal position"). The literal here lives at the literal
+        // site, mints a fresh node, and would become a stable dictionary
+        // entry's hash source — which is exactly the well-definedness that
+        // §4.8 cannot supply for a freshly-minted mutable aggregate. A call-
+        // argument `[k: v]` passed to `Dictionary<…>.Add(...)` is a transient
+        // node too, but the call is *not* a literal position (§15.4 resolution
+        // 5's recorded asymmetry) and stays admissible here.
+        if (!cl->keys.empty()) {
+            for (const auto& k : cl->keys) {
+                if (!k) continue;
+                if (dynamic_cast<const ast::CollectionLiteralExpr*>(k.get())) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, k->span.begin,
+                        "a nested collection literal is not admissible as a "
+                        "dictionary KEY: the literal mints a fresh mutable "
+                        "collection whose hashing contract is undefined "
+                        "(\xC2\xA7""28.11); use a value-typed key instead");
+                    break;
+                }
+            }
+        }
         // §15.4 (#1297): a Dictionary<K,V> / OwningDictionary<K,V> literal (the
         // dict form has a non-empty `keys` vector) with DUPLICATE keys is a
         // compile error when all the duplicates are compile-time constants;
