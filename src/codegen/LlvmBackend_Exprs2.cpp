@@ -2045,6 +2045,21 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     llvm::Function* savedAsyncPatternAResultDisposerSync =
         asyncPatternAResultDisposer_;
     const StateMachineFrame* savedAsyncOwnedParamFrameSync = asyncOwnedParamFrame_;
+    // fix #2747: the SYNC lambda body's `lowerReturnStmt` reads and RESETS the
+    // outer `return await` Pattern A detection flags (`asyncChainedReturn_` /
+    // `asyncBorrowedReturn_`) at lines 1928-1937 unconditionally — even when
+    // the inner `return` is NOT itself an `await`. If the enclosing async
+    // method's `return await <call>` already set these flags BEFORE entering
+    // the lambda body (the lambda sits in the operand of the awaited call,
+    // e.g. `return await C.Inner(C.Apply(lambda(...) => do return x + 1; end,
+    // 6))`), the inner ReturnStmt reads the outer's flag and clobbers it back
+    // to false, so the outer return-statement sees a false flag and treats
+    // its chained-return slot as a plain borrow — the source task gets
+    // free-on-completion (it should have been chained) and the caller sees
+    // a freed cell on its own scope-end dispose (SEGV). Save and reset them
+    // across the sync body so the inner ReturnStmt sees a clean slate.
+    bool savedAsyncChainedReturnSync = asyncChainedReturn_;
+    bool savedAsyncBorrowedReturnSync = asyncBorrowedReturn_;
     smKind_ = SuspendKind::Yield;  // placeholder (no neutral value, mirrors
                                     // NestedBodyScope / getter reset pattern;
                                     // smSelf_=null makes emitAsyncComplete
@@ -2068,6 +2083,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     asyncResultSemaType_ = nullptr;
     asyncPatternAResultDisposer_ = nullptr;
     asyncOwnedParamFrame_ = nullptr;
+    asyncChainedReturn_ = false;
+    asyncBorrowedReturn_ = false;
     // Emit body.
     if (lam.exprBody) {
         llvm::Value* v = nullptr;
@@ -2242,6 +2259,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     asyncResultSemaType_ = savedAsyncResultSemaTypeSync;
     asyncPatternAResultDisposer_ = savedAsyncPatternAResultDisposerSync;
     asyncOwnedParamFrame_ = savedAsyncOwnedParamFrameSync;
+    asyncChainedReturn_ = savedAsyncChainedReturnSync;       // fix #2747
+    asyncBorrowedReturn_ = savedAsyncBorrowedReturnSync;     // fix #2747
     }
 
     // --- Restore emitter state ---
