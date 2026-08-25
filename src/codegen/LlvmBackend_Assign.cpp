@@ -6103,6 +6103,24 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
     auto  savedUD       = unwindScopeDepth_;
     auto  savedDiv      = diverged_;
     auto  savedGSubst   = genericSubst_;
+    // fix #2748 (§23.4 / §23.2, v0.240): the vtable/itable slot for an
+    // expression-bodied INDEXER GETTER sits on the same memoised-standalone-
+    // function face as `ensurePropertyBlockGetter` / `ensureIndexerBlockGetter`
+    // / `ensurePropertyAccessorFn`, but unlike those three the module-level
+    // path here was never wrapped in `NestedBodyScope`. The four already-
+    // guarded emitters share `NestedBodyScope`'s reset of the per-body
+    // channels (#2170, #2694, #2701, #2702, #2703, #2731 item 1, #2731
+    // item 3, #3125) — every member the guard owns, and which the caller's
+    // emission may have left set, is reset on entry and restored on exit. The
+    // issue verified that every reachable entry to THIS emitter is module-
+    // level (it is called only from `declareVtables`, `setupBoxDescriptors`
+    // and `emitExportedIndexerGetters`, all above the method-body loop), so
+    // every member the guard resets is ALREADY neutral at every reachable
+    // entry — adopting the guard is pure hardening, identical in shape to
+    // the three already-guarded emitters. `genericSubst_` is one of the six
+    // deliberately-INHERITED members (#2702); the explicit save/restore
+    // below stays.
+    NestedBodyScope nestedScope(*this);
 
     currentFn_ = fn;
     builder_.SetInsertPoint(entryBB);
@@ -6249,6 +6267,17 @@ llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
     auto  savedUD       = unwindScopeDepth_;
     auto  savedDiv      = diverged_;
     auto  savedGSubst   = genericSubst_;
+    // fix #2748 (§23.4 / §23.2, v0.240): the SETTER twin of the indexer getter
+    // just above — the vtable/itable slot for an expression-bodied INDEXER
+    // SETTER was also unwrapped. The setter returns void and may legitimately
+    // contain a bare `return;` that runs through `LlvmBackend_Stmts.cpp` ~1795,
+    // so the inherited-state hazard is not just an `inlinedAccessorEnd_`
+    // cross-function `br` waiting to happen on a state-machine emitter — it is
+    // the same module-level pattern, and the same hardening applies. See the
+    // sibling comment at `ensureIndexerGetterFn` for the per-channel
+    // inventory. `genericSubst_` stays in the explicit save/restore below;
+    // `NestedBodyScope` leaves it inherited (#2702).
+    NestedBodyScope nestedScope(*this);
 
     currentFn_ = fn;
     builder_.SetInsertPoint(entryBB);
@@ -10381,6 +10410,35 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
     auto  savedUD       = unwindScopeDepth_;
     auto  savedDiv      = diverged_;
     auto  savedGSubst   = genericSubst_;
+    // fix #2748 (§23.2 / §29.2, v0.240): the THUNK for an EXPRESSION-bodied
+    // getter, built on demand by `wrapUserClassAsIEnumerable` when an
+    // `IEnumerable<T>`-implementing class's `Current` accessor is an `=>`
+    // expression. This is the REACHABLE one of the three unguarded lazy
+    // emitters (#2731 item 1): unlike the two indexer builders above, this
+    // thunk is reachable from ordinary expression lowering via seven caller
+    // chains enumerated in the issue (the most load-bearing are the
+    // `emitFunctionBody` / `buildSpecializedMethodFn` /
+    // `emitInlineGenericMethod` paths, which is also exactly the context in
+    // which `genericSubst_` is non-empty). All three unguarded emitters
+    // share `NestedBodyScope`'s reset of the per-body channels (#2170,
+    // #2694, #2701, #2702, #2703, #2731 item 1, #2731 item 3, #3125), and
+    // each leaves `genericSubst_` inherited as one of the six deliberate-
+    // inherit members (#2702).
+    //
+    // The body must resolve its type parameters under the same substitution
+    // its signature was built with — `retTy` is passed IN by the caller,
+    // computed under the caller's substitution, which is exactly the
+    // argument #2702 used to justify NOT clearing. The original code here
+    // cleared `genericSubst_` (`diverged_ = false; genericSubst_.clear();`),
+    // making this thunk the odd one out of the six lazy emitters and the
+    // only one that would have left a desynced `genericSubst_`/`genericSubstSemaTy_`
+    // pair under the new guard: `NestedBodyScope` saves the sema twin and
+    // leaves it inherited, while the explicit clear still runs, so the two
+    // would have pointed at different substitutions — the opposite direction
+    // of the desync #2702 fixed. The clear is removed; `genericSubst_` is
+    // now inherited like every other per-body emitter. `genericSubst_`
+    // restore-on-exit stays.
+    NestedBodyScope nestedScope(*this);
 
     currentFn_         = fn;
     builder_.SetInsertPoint(entryBB);
@@ -10390,7 +10448,7 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
     finallyBodyStack_.clear();
     unwindTarget_      = nullptr; propagateBB_ = nullptr;
     currentCaughtExc_  = nullptr; unwindScopeDepth_ = 0;
-    diverged_          = false; genericSubst_.clear();
+    diverged_          = false;
 
     llvm::Value* val = lowerExpr(*getterExpr);
     // fix #2761 (§8.6 "Boxing" / §23.2, v0.240): the THUNK face of an
