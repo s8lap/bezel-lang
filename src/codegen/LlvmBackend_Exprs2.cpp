@@ -3970,19 +3970,27 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 llvm::Value* snap = builder_.CreateCall(
                     toArrFn, {lazy, builder_.getInt64(elemSize)}, "ll.ctor.snap");
                 llvm::Value* list = allocEmpty();
-                // fix #2686/#2692 invariant: this is a SIXTH insert path into a
-                // bz_llist_t, so it must take the same +1 per `string` element
-                // that `.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter` and the
-                // collection-literal arm take — otherwise bz_llist_free's
-                // bz$strElemRelease over-releases (the ASan SEGV #2686 fixed).
-                // The predicate is a verbatim mirror of Calls3.cpp's
-                // `llIsStrElem`, minus its isPlusOneStringProducer escape: that
-                // guard exists because an `.AddLast($"…")` argument is a fresh +1
-                // being TRANSFERRED, whereas every element here is loaded out of
-                // a snapshot slot and is never a syntactic producer, so the
-                // retain is unconditional. bz_lazy_to_array itself does not
-                // retain (ToArray has to call bz_array_retain_strings after it),
-                // so the snapshot holds BORROWED references throughout.
+                // fix #2727 (§28.9 / §28.3, v0.240): a fresh-minting lazy source
+                // (any LINQ operator that mints heap strings, e.g. `.Select($"…")`)
+                // yields elements with rc=1 that the snapshot "inherits" from the
+                // pipeline — the pipeline takes no reference on its end
+                // (`bz_lazy_to_array` does not retain, per the existing ToArray
+                // convention). For a borrowed source this +1 belongs to the
+                // upstream collection and is released by it at scope end; for a
+                // fresh-minting source the snapshot is the SOLE owner of that +1
+                // and MUST release it, or the pipeline's "+1 per element" leaks
+                // (#2727's measured rc = 2 - 1 list release = 1 leftover).
+                //
+                // The fix mirrors what ToArray already does: retain all string
+                // elements on the snapshot (bz_array_retain_strings) so the
+                // snapshot EXPLICITLY owns +1 per element, then release that
+                // explicit +1 by freeing the snapshot with the string disposer
+                // (stringElementReleaseThunk) instead of a NULL disposer. For a
+                // borrowed source this is balanced by the source's own release
+                // (the source kept its independent +1), so total = +3 - 3 = 0.
+                // For a fresh-minting source this consumes the snapshot's +1,
+                // and the pipeline's "+1" is released by bz_lazy_dispose's own
+                // path on the materialized/owned array it drained.
                 const ElementPolicy ctorPol =
                     elementPolicyFor(rt->genericArgs[0], /*owningFamily=*/false);
                 const bool ctorRetainStr =
@@ -3990,6 +3998,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     rt->genericArgs[0]->primitive == sema::PrimitiveType::String &&
                     !rt->genericArgs[0]->nullable &&
                     ctorPol.cat == ElementPolicy::Category::RuntimeManaged;
+                if (ctorRetainStr) {
+                    auto* retainFn = declareC("bz_array_retain_strings",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                    // void return — name is illegal (LLVM would reject the IR);
+                    // see also the free call below.
+                    builder_.CreateCall(retainFn, {snap});
+                }
                 auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
                 auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
                                        {ptrTy(), i64(), i64()});
@@ -4026,13 +4041,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     builder_.CreateBr(cBB);
                 }
                 builder_.SetInsertPoint(eBB);
-                // The snapshot never took ownership of the elements it copied —
-                // free its shell only, with a NULL disposer (the same "consumed
-                // snapshot" idiom ExceptWith/IntersectWith use).
+                // fix #2727 (§28.9 / §28.3, v0.240): the snapshot explicitly
+                // retains a +1 per string element (above) and so MUST release
+                // that +1 at free time — a NULL disposer (the "consumed snapshot"
+                // idiom ExceptWith/IntersectWith use) leaks the snapshot's own
+                // +1 for every fresh-minting element. A borrowed source still
+                // balances: the source keeps its independent +1 and releases it
+                // at scope end, so the total is +3 (source +1, snapshot retain
+                // +1, list retain +1) − 3 (snapshot release, list release, source
+                // release) = 0.
                 auto* freeSnapFn = declareC("bz_array_free",
                     llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-                builder_.CreateCall(freeSnapFn,
-                    {snap, llvm::ConstantPointerNull::get(ptrTy())});
+                llvm::Value* snapDisp = ctorRetainStr
+                    ? llvm::cast<llvm::Value>(stringElementReleaseThunk())
+                    : llvm::ConstantPointerNull::get(ptrTy());
+                builder_.CreateCall(freeSnapFn, {snap, snapDisp});
                 return list;
             }
             if (colName == "Array" || colName == "OwningArray" ||
