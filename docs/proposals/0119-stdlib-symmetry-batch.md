@@ -1,6 +1,6 @@
 # 0119 — Stdlib symmetry batch: dictionary `TryAdd`, the window-parameter convention, and the comparer-injection ruling
 
-**Status:** accepted — owner-directed 2026-08-25 (the three items announced as batch (d) of the elegance-review program); graduation targeted at v0.282
+**Status:** graduated-v0.282 — superseded — graduated v0.282 (owner-directed 2026-08-25). Landed with one gate correction to this proposal's own §1: the restored `SortedDictionary` insert tier mirrors `Dictionary` (§4.8) — throwing `Add`/`TryAdd`/indexer upsert — not `SortedSet`, whose `Add` discards silently; the v0.282 changelog records it.
 **Tracking issue:** [#3369](https://github.com/s8lap/bezel-lang/issues/3369)
 **Target module(s):** stdlib [§1](../Bezel_Standard_Library.md#sec-conventions) (one convention paragraph), [§4.8](../Bezel_Standard_Library.md#sec-dictionaryk-v)/[§4.9](../Bezel_Standard_Library.md#sec-owningdictionaryk-v)/[§4.17](../Bezel_Standard_Library.md#sec-sorted-dictionary) (members), [§2.7](../Bezel_Standard_Library.md#sec-string)/[§3.2](../Bezel_Standard_Library.md#sec-encoding) (parameter renames), rationale (one ruling record). **No language-spec rule changes. Compiler catch-up issues filed at graduation.**
 **Written against:** v0.279

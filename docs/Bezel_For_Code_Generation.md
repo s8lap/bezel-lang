@@ -600,7 +600,7 @@ Section 7 lists each with its remedy. In frequency order they are: the **must-us
 
 ## 5. The standard-library index
 
-Everything below is transcribed from `Bezel_Standard_Library.md` v0.278 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
+Everything below is transcribed from `Bezel_Standard_Library.md` v0.282 with its markers intact. **A signature with its markers stripped is worse than no signature**: `owned`, `pure`, `ref`, `out`, `scoped`, nullability and constraints are load-bearing. **If a name is not here, look it up in the stdlib document; if it is not there either, it does not exist.**
 
 ### 5.0 Modules and imports
 
@@ -1017,6 +1017,8 @@ end                                             // `Slice` is deliberately NOT o
 public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> where K: IComparable<K>
   constructor();   pure readonly property Count: int;
   property [key: K]: V;                          // get: KeyNotFoundException;  set: insert or replace
+  method Add(key: K, value: V);                  // v0.282: ArgumentException if present
+  method TryAdd(key: K, value: V): bool;         // v0.282: false, no mutation, if present
   method ContainsKey(key)/Contains(key): bool;   TryGetValue(key, out value: V?): bool;
   method GetOrNull(key: K): V?;   Remove(key: K): bool;   Clear();
   pure readonly property FirstKey: K;   LastKey: K;        // InvalidOperationException if empty
@@ -1044,7 +1046,7 @@ public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable
 end
 ```
 
-The sorted collections take **no comparer parameter** — ordering is `K`/`T`'s own `IComparable` (the hash family's `IEqualityComparer` ctors are a recorded different case — rationale §17.12). `SortedDictionary` has `Add`/`TryAdd` (v0.282) but no `Keys`/`Values` (recorded: iterate entries). **There is no `OwningSortedDictionary`/`OwningSortedSet`, no `FrozenDictionary`/`FrozenSet`.** `Counter<K>` is insertion-ordered and a key decremented to zero is not removed.
+The sorted collections take **no comparer parameter** — ordering is `K`/`T`'s own `IComparable` (the hash family's `IEqualityComparer` ctors are a recorded different case — rationale §17.14). `SortedDictionary` has `Add`/`TryAdd` (v0.282) but no `Keys`/`Values` (recorded: iterate entries). **There is no `OwningSortedDictionary`/`OwningSortedSet`, no `FrozenDictionary`/`FrozenSet`.** `Counter<K>` is insertion-ordered and a key decremented to zero is not removed.
 
 ### 5.5 `System.Collections.Linq` (auto-imported, v0.278)
 
@@ -1349,7 +1351,7 @@ Every absence below was verified by a full-document search. Reaching for one of 
 
 **Query operators.** `ToList`, `ToLookup`, `Join`, `GroupJoin`, `Cast<T>`, `AsEnumerable`, `DefaultIfEmpty`, `Prepend`, `Append`, `Chunk`, `DistinctBy`, `UnionBy`/`IntersectBy`/`ExceptBy`, `MinBy`, `MaxBy`, `Order()`/`OrderDescending()`, `TakeLast`, `SkipLast`, `LongCount`, `Enumerable.Empty`/`Range`/`Repeat` (**there is no `Enumerable` class at all**), `SequenceEqual` over `IEnumerable<T>` (it exists only on the span types), `SelectMany` with a result selector, `Zip` without a combiner, `Where`/`Select` with an index. Replacements: `ToList` → `ToArray()`; `MinBy(f)` → `OrderBy(f).First()`; `Enumerable.Range` → the language's `1..n`, which is `IEnumerable<T>` (`(1..100).Sum()` works); `Append`/`Prepend` → `Concat` with a one-element `Array<T>`.
 
-**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) and no `TryAdd`; `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`.
+**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) — it *does* have `TryAdd` since v0.282; `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`.
 
 **Text.** `string.Format`/`String.Format` (**use interpolation**), `String.Empty` (use `""`), `string.Concat`, `Split` with a remove-empty option, `Regex`, `ToTitleCase`, `Normalize`, the `StringBuilder.Length` setter, the `C` format specifier, any culture-aware formatting.
 

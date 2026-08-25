@@ -2185,10 +2185,6 @@ A statement registering an action to run at scope exit (`defer`), or only on the
 
 <a id="sec-contract-carrying-type-aliases"></a>
 
-<a id="sec-comparer-injection"></a>
-### 17.12 Ordering comparers on sorted collections — and why equality-comparer constructors are not the same case (v0.282)
-
-The sorted collections take no per-instance ordering comparer (declined at v0.136: the single-order rule — equality, ordering, and hashing live in one place, on the type; the workaround is a wrapper record with the desired `CompareTo`). The hash collections *do* take `constructor(comparer: IEqualityComparer<K>)`. Until v0.282 the two postures never cited each other, and the single-order rule, read alone, indicts the constructors. The ruling that reconciles them: **they are not the same operation.** An `IEqualityComparer<K>` carries *both* facets a hash container consults — `Equals` and `GetHashCode` — as one object, so injection relocates the container's identity **whole**: the two functions that must agree travel together, and the type's `CompareTo` is never consulted, so no observable facet can disagree with another. An injected *ordering* comparer would do the opposite: the container would find by the instance's order while the element's own equality stayed the type's — and since a sorted container's identity *is* `CompareTo`-equality (stdlib §4.18), the split would be directly observable in `Contains`/`TryAdd`. The single-order rule's real content is *identity must not fork*; the equality-comparer constructors satisfy it, the ordering injection would not. Both postures stand, and stdlib §4.8/§4.17 now cite this record.
 ### 17.12 Contract-carrying type aliases (v0.263)
 
 An alias declaration carrying a predicate — `type Port = int requires(value in 0..65535)` in sketch — so that a constrained scalar can be spelled once and reused, the Ada constrained-subtype shape. Declined as spelled (proposal 0106 §6.2(a)), on three grounds, any one of which is fatal.
@@ -2213,6 +2209,12 @@ Owner-ratified decline-with-reasons, 2026-08-20 (proposal 0106 §5bis, Q6). Beze
 **Reopening bar — narrow and named.** Not a general reconsideration of ocap, which would be a different language. What could reopen is a **capability-scoped standard-library profile**: a bounded, opt-in surface for the multi-tenant and plugin-host cases, where untrusted code runs in-process and the host must bound what it reaches, justified by real demand from such a host rather than by the general principle. Such a profile would still have to answer the FFI boundary before it could claim confinement.
 
 <a id="sec-things-deferred"></a>
+
+<a id="sec-comparer-injection"></a>
+### 17.14 Ordering comparers on sorted collections — and why equality-comparer constructors are not the same case (v0.282)
+
+The sorted collections take no per-instance ordering comparer (declined at v0.136: the single-order rule — equality, ordering, and hashing live in one place, on the type; the workaround is a wrapper record with the desired `CompareTo`). The hash collections *do* take `constructor(comparer: IEqualityComparer<K>)`. Until v0.282 the two postures never cited each other, and the single-order rule, read alone, indicts the constructors. The ruling that reconciles them: **they are not the same operation.** An `IEqualityComparer<K>` carries *both* facets a hash container consults — `Equals` and `GetHashCode` — as one object, so injection relocates the container's identity **whole**: the two functions that must agree — the facets the container consults — travel together, and the type's `CompareTo` is never consulted. (K's own `Equals` remains observable elsewhere, e.g. `DictionaryEntry<K, V>` record equality — the claim is about the container's lookups, not every use of K.) An injected *ordering* comparer would do the opposite: the container would find by the instance's order while the element's own equality stayed the type's — and since a sorted container's identity *is* `CompareTo`-equality (stdlib §4.18), the split would be directly observable in `Contains`/`TryAdd`. The single-order rule's real content is *identity must not fork*; the equality-comparer constructors satisfy it, the ordering injection would not. Both postures stand, and stdlib §4.8/§4.17 now cite this record.
+
 ## 18. Things deferred
 
 Not in this version; the design is open to them in future revisions.

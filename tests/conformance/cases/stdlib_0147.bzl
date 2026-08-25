@@ -6,7 +6,7 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
 
   // Construction
   public static pure method From(value: char): string;
-  public static pure method From(buffer: Array<char>, start: int, count: int): string;
+  public static pure method From(buffer: Array<char>, start: int, length: int): string;
   public static method From(value: CString): string;                  // FFI-boundary, owned-instance source
   public static method From(value: WString): string;                  // FFI-boundary, owned-instance source
   public static method FromCStringPointer(p: IntPtr): string;         // FFI-boundary, raw-pointer source
@@ -69,7 +69,7 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
 
   public pure method Insert(startIndex: int, value: string): string;
   public pure method Remove(startIndex: int): string;
-  public pure method Remove(startIndex: int, count: int): string;
+  public pure method Remove(startIndex: int, length: int): string;
 
   // Splitting
   public method Split(separator: char): owned Array<string>;

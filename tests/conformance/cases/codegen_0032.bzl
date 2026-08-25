@@ -1,7 +1,7 @@
 public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>
   pure readonly property Length: int;   IsEmpty: bool;   IsAscii: bool;
   pure readonly property [i: int]: char;      pure readonly property [r: Range<int>]: string;
-  static pure From(value: char): string;   static pure From(buffer: Array<char>, start: int, count: int): string;
+  static pure From(value: char): string;   static pure From(buffer: Array<char>, start: int, length: int): string;
   static From(value: CString|WString): string;   static FromCStringPointer/FromWStringPointer(p: IntPtr): string;
   static pure Repeat(c: char, count: int): string;    static pure Repeat(unit: string, count: int): string;
   static Join(separator: string, items: IEnumerable<string>): string;
