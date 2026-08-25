@@ -761,7 +761,15 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     // or — §28.5/§24.4 (#879) — a Subscription handle (unsubscribed via
     // bz_subscription_dispose, which is null-safe).
     struct OwnedField {
-        const sema::FieldSymbol* fs;
+        // fix #2778 / §29.7 (v0.NNN): auto-property storage is a MemberSymbol,
+        // not a FieldSymbol — widening this from FieldSymbol* to Symbol* lets
+        // the same struct carry both cases through the slot-1 dispatch loop.
+        // The downstream consumers only need this for the `fieldIndex_` lookup
+        // (which is Symbol*-keyed) and the fieldIndex_/.dwo path; the typed
+        // FieldSymbol*-typed predicates in the population loop are restricted to
+        // FieldSymbol below (the MemberSymbol autoprop case is classified
+        // up-front and reuses the iterator-vtable disposal shape).
+        const sema::Symbol* fs;
         const sema::TypeRef* collTy;  // non-null → collection field
         // §28.13 (#620): true for Shared<T> owned field (bz_shared_release),
         // false for ordinary class/exception/collection field.
@@ -811,6 +819,45 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
     std::vector<OwnedField> owned;
     for (const sema::Symbol* m : ts->members) {
         auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+        // fix #2778 / §28.6 / §29.7 (v0.NNN): an `owned IEnumerable<T>` /
+        // `IOwningEnumerable<T>` auto-property's backing storage is a
+        // MemberSymbol (not a FieldSymbol) and was therefore skipped by the
+        // FieldSymbol-only check below — the wrapped enumerator's slot-1
+        // Dispose never fired, the wrap frame leaked (and the OWNING wrap's
+        // own slot-1 Dispose — bz_array_free + free(self) — never ran, so the
+        // backing array leaked too). The disposal walker now classifies the
+        // auto-property storage here, mirroring the FieldSymbol arm below:
+        // `iterField = true` lets the slot-1 dispatch loop free it through the
+        // iterator-vtable path (the same code path the `isOwnedIteratorInterface
+        // Field` arm uses). Gated on `isAutoPropertyStorageSymbol` so a
+        // computed-property accessor (no storage) cannot enter this branch.
+        if (!fs && sema::isAutoPropertyStorageSymbol(m, ctx_) &&
+            fieldIndex_.find(m) != fieldIndex_.end()) {
+            const sema::TypeRef* fieldTy = nullptr;
+            if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m)) {
+                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ms->decl)) {
+                    if (pd->type) fieldTy = ctx_.resolvedType(*pd->type);
+                }
+            }
+            if (!fieldTy) fieldTy = ctx_.importedMemberType(m);
+            if (fieldTy && isVtableBackedIEnumerableType(fieldTy)) {
+            // `hasOwnedModifier` keys on `modifiers`; MemberSymbol inherits
+            // that vector from Symbol. We mirror the FieldSymbol arm's
+            // `isOwnedIteratorInterfaceField` gate explicitly because the
+            // helper is FieldSymbol-typed and an autoprop-storage MemberSymbol
+            // would not pass its `fs->decl` checks.
+            bool hasOwned = false;
+            if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m)) {
+                for (auto mod : ms->modifiers)
+                    if (mod == "owned") { hasOwned = true; break; }
+            }
+            if (hasOwned) {
+                OwnedField of{m, nullptr};
+                of.iterField = true;
+                owned.push_back(of);
+            }
+            }
+        }
         if (!fs) continue;
         if (fieldIndex_.find(fs) == fieldIndex_.end()) continue;
         if (isOwnedReferenceField(fs)) {
@@ -1152,7 +1199,11 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                 llvm_, "owned.task.cont", currentFn_);
             builder_.CreateCondBr(isNull, taskContBB, taskDispBB);
             builder_.SetInsertPoint(taskDispBB);
-            emitOwnedTaskDisposal(it->fs, val);
+            // taskField is set only on the FieldSymbol arm below; the
+            // MemberSymbol autoprop-storage case (fix #2778) is classified
+            // up-front with iterField=true and never reaches this branch.
+            emitOwnedTaskDisposal(
+                static_cast<const sema::FieldSymbol*>(it->fs), val);
             // Null the slot AFTER the disposal so a re-entrant / second
             // pass is a no-op (the #396 slot-null precedent; mirrors
             // iterField / eventSourceField / sharedField / weakField

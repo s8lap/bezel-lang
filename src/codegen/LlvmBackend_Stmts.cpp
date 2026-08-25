@@ -956,6 +956,71 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 lowerOwningInlineArrayReassign(
                     *as->target, addr, elemTy,
                     /*skipDisposal=*/as->wholeValueLhsMovedFrom);
+                // fix #2778 / §28.6 / §29.7 (v0.NNN): a CLASS field or
+                // auto-property typed as the pure (declaration-less)
+                // `IEnumerable<T>` interface (built-in iterator format —
+                // §29.11 vtable dispatch) must store a vtable-backed
+                // enumerator, NOT the raw collection pointer. The local-decl
+                // path (lowerLocalDecl ~12860) wraps an `Array<T>`/`Stack<T>`/
+                // `Queue<T>`/`Set<T>`/`LinkedList<T>`/user-class source as a
+                // vtable-backed wrapper before the slot init, and the return-
+                // coercion path (wrapAsIEnumerableForTarget ~7555) wraps on
+                // the RETURN edge; the field-store path was missing the same
+                // primitive. Pre-fix the slot held a raw `bz_array_t*` /
+                // `bz_llist_t*` / etc. whose first word is the backing's count
+                // field, not a vtable pointer, and the §29.7 iterator-vtable
+                // slot-1 Dispose at owner disposal read the count bits as a
+                // function pointer → SIGSEGV. Mirror the local-decl /
+                // return-coercion wrap at the explicit-assignment site. Gated
+                // to a CLASS field/auto-property (NOT a local — that's
+                // lowerLocalDecl; NOT a ref-param — `ref`/`out` aliases are
+                // borrow-only, the wrap doesn't apply; NOT a static field —
+                // program-lifetime storage, no slot-1 Dispose; NOT a record
+                // field — records have no disposer, §9.7). A null RHS
+                // passes through unchanged (wrap-creator returns null for a
+                // null input); an already-`IEnumerable<T>` source passes
+                // through unchanged (wrap-creator keys on the headName
+                // mismatch). srcOwnedByCallee matches the return-coercion's
+                // alias-rejection predicate (`returnSourceIsCalleeOwned
+                // Collection`): a `new` / `move e` / producer-init local
+                // source is the sole owner of the backing so the OWNING
+                // wrap's slot-1 Dispose frees the backing at field disposal;
+                // a named local / parameter / field source keeps the
+                // BORROWING wrap, and the source's own binder still disposes
+                // the backing at its own scope end (no double-free).
+                if (rhs && as->value.get()) {
+                    const sema::TypeRef* tt = ctx_.exprType(*as->target);
+                    if (tt && isVtableBackedIEnumerableType(tt)) {
+                        llvm::Type* dummy = nullptr;
+                        if (!localSlot(*as->target) &&
+                            !staticFieldGlobal(*as->target) &&
+                            !refParamAddr(*as->target, dummy)) {
+                            sema::Symbol* lhSym = ctx_.exprSymbol(*as->target);
+                            bool isClassFieldOrProp = false;
+                            if (auto* fs = dynamic_cast<sema::FieldSymbol*>(lhSym)) {
+                                isClassFieldOrProp =
+                                    fs->parent &&
+                                    fs->parent->kind == ast::TypeDeclKind::Class;
+                            } else if (auto* ms =
+                                           dynamic_cast<sema::MemberSymbol*>(lhSym)) {
+                                isClassFieldOrProp =
+                                    sema::isAutoPropertyStorageSymbol(ms, ctx_) &&
+                                    ms->parent &&
+                                    ms->parent->kind ==
+                                        ast::TypeDeclKind::Class;
+                            }
+                            if (isClassFieldOrProp) {
+                                rhs = wrapAsIEnumerableForTarget(
+                                    rhs, tt, as->value.get(),
+                                    /*ownLazyPipeline=*/true,
+                                    /*outWrapMade=*/nullptr,
+                                    /*srcOwnedByCallee=*/
+                                    returnSourceIsCalleeOwnedCollection(
+                                        as->value.get()));
+                            }
+                        }
+                    }
+                }
                 // #429 / §4.6 / §28.9: a store into a CLASS string field /
                 // auto-property takes an independent +1 (retain-new or transfer-
                 // producer / release-old), released on the owner's disposal.
