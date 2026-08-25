@@ -7149,6 +7149,113 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                     }
                     return nullptr;
                 }
+                // #2457 (stdlib §4.9 v0.135, §28.2 / §28.3, v0.240): explicit
+                // `entry.Dispose()` where `entry: DrainedEntry<K, V>` (the loop
+                // variable from `for var entry in d.Drain() do ... end`). The
+                // entry is a STRUCT {K key; V* value}, not a pointer-to-heap-
+                // object, so the `recv->getType()->isPointerTy()` chain below
+                // (which gates every other built-in Dispose arm) would skip
+                // it — the call would emit nothing and the loop's auto-dispose
+                // at scope-end would still run, leaving the explicit Dispose
+                // a silent no-op (the §28.2 exactly-once rule wants the
+                // EXPLICIT discharge to do the work, not leave it for the auto
+                // path; a SECOND explicit Dispose in the same iteration is
+                // rejected by the runtime destructor run-once flag).
+                //
+                // Mirror the iteration-variable `it->drainedEntry` disposal arm
+                // (LlvmBackend_Disposal.cpp, ~5560): dispose V via
+                // emitDisposeAndReclaim (null-guard; null field[1] after so
+                // the scope-end auto-dispose's null-check skips — exactly-once
+                // across explicit+auto), and (when K is string) release the
+                // bz_string_t* at field[0] and null that field too (so the
+                // scope-end auto-dispose's second `bz_string_release` finds
+                // null and is a no-op; bz_string_release is null-safe).
+                {
+                    auto* recvTy = ctx_.exprType(*ma->target);
+                    bool isDE = recvTy &&
+                        recvTy->kind == sema::TypeRef::Kind::Named &&
+                        !recvTy->declaration &&
+                        recvTy->headName() == "DrainedEntry" &&
+                        recvTy->genericArgs.size() >= 2 &&
+                        recvTy->genericArgs[0] && recvTy->genericArgs[1];
+                    if (isDE) {
+                        llvm::AllocaInst* slot = localSlot(*ma->target);
+                        if (slot) {
+                            const sema::TypeRef* kTy = recvTy->genericArgs[0];
+                            const sema::TypeRef* vTy = recvTy->genericArgs[1];
+                            llvm::Type* kTyLlvm = lowerTypeRef(kTy);
+                            llvm::Type* vTyLlvm = lowerTypeRef(vTy);
+                            if (kTyLlvm && vTyLlvm) {
+                                llvm::StructType* entStTy =
+                                    llvm::StructType::get(
+                                        llvm_, {kTyLlvm, vTyLlvm});
+                                // Step 1: dispose V (field[1]) and null it.
+                                if (vTyLlvm->isPointerTy()) {
+                                    llvm::Value* valFldPtr =
+                                        builder_.CreateStructGEP(
+                                            entStTy, slot, 1, "de.val.ptr");
+                                    llvm::Value* valPtr =
+                                        builder_.CreateLoad(
+                                            ptrTy(), valFldPtr, "de.val");
+                                    llvm::Value* isNullVal =
+                                        builder_.CreateICmpEQ(
+                                            valPtr,
+                                            llvm::ConstantPointerNull::get(
+                                                ptrTy()));
+                                    auto* dispBB = llvm::BasicBlock::Create(
+                                        llvm_, "de.dispose", currentFn_);
+                                    auto* afterValBB =
+                                        llvm::BasicBlock::Create(
+                                            llvm_, "de.after_val",
+                                            currentFn_);
+                                    builder_.CreateCondBr(
+                                        isNullVal, afterValBB, dispBB);
+                                    builder_.SetInsertPoint(dispBB);
+                                    emitDisposeAndReclaim(valPtr);
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(
+                                            ptrTy()),
+                                        valFldPtr);
+                                    builder_.CreateBr(afterValBB);
+                                    builder_.SetInsertPoint(afterValBB);
+                                }
+                                // Step 2: release key (field[0]) if K is string.
+                                if (kTy->kind == sema::TypeRef::Kind::Primitive &&
+                                    kTy->primitive ==
+                                        sema::PrimitiveType::String) {
+                                    llvm::Value* keyFldPtr =
+                                        builder_.CreateStructGEP(
+                                            entStTy, slot, 0, "de.key.ptr");
+                                    llvm::Value* keyPtr =
+                                        builder_.CreateLoad(
+                                            ptrTy(), keyFldPtr, "de.key");
+                                    llvm::Value* isNullKey =
+                                        builder_.CreateICmpEQ(
+                                            keyPtr,
+                                            llvm::ConstantPointerNull::get(
+                                                ptrTy()));
+                                    auto* relBB = llvm::BasicBlock::Create(
+                                        llvm_, "de.keyrel", currentFn_);
+                                    auto* afterKeyBB =
+                                        llvm::BasicBlock::Create(
+                                            llvm_, "de.after_key",
+                                            currentFn_);
+                                    builder_.CreateCondBr(
+                                        isNullKey, afterKeyBB, relBB);
+                                    builder_.SetInsertPoint(relBB);
+                                    emitStringRelease(keyPtr);
+                                    builder_.CreateStore(
+                                        llvm::ConstantPointerNull::get(
+                                            ptrTy()),
+                                        keyFldPtr);
+                                    builder_.CreateBr(afterKeyBB);
+                                    builder_.SetInsertPoint(afterKeyBB);
+                                }
+                            }
+                        }
+                        return nullptr;
+                    }
+                }
                 llvm::Value* recv = lowerExpr(*ma->target);
                 if (recv && recv->getType()->isPointerTy()) {
                     // fix #2967 (spec §28.2 / §28.3, v0.240): every branch of
