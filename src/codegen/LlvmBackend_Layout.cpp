@@ -4060,8 +4060,12 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
         // Return type — substitute when the declared return is a bare
         // type-parameter reference (e.g. `IBox<T>.Get(): T` with T = string).
         llvm::Type* newRetTy = methTy->getReturnType();
-        if (const ast::MethodDecl* md =
-                dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        // SEAM-ACCESSOR: MethodSymbol has no resolved-return-type field
+        // (Symbol.hpp: genericParams/params/isOperator/operatorToken/
+        // extensionDecl — no returnType), so `ms->decl->returnType` is the
+        // ONLY source of the declared return; #2780's generalised thunk
+        // substitution MUST read the AST MethodDecl here.
+        if (const ast::MethodDecl* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
             if (md->returnType) {
                 const sema::TypeRef* retRt = ctx_.resolvedType(*md->returnType);
                 if (isBareTypeParamRef(retRt)) {
