@@ -86,13 +86,20 @@ using TypeParamResolver =
 // The body is a pure function of its argument — it reads no ExprTC state —
 // which is what makes the relocation behaviour-preserving.
 //
-// NOT covered (pre-existing gap, filed as #2666): a field of owning-inline-
-// array type `[N owned]T?` (§15.1.1), which the spec's definition also
-// excludes from trivial-dispose.  Callers that need that arm must guard
-// separately; see `classChainHasOwningInlineArrayField` at the §28.3 gate in
-// Ownership.cpp.  A FOURTH independent copy of this classification lives at
-// PureChecker.cpp's `isTrivialDisposeClass` (§22.15) — collapsing it into
-// this one is part of #2666.
+// fix #2666: the owning-inline-array arm of the spec's third disqualifier
+// (`[N owned]T?` / `[N owned]T`, §15.1.1) is tested here directly — read
+// from `fs->posParam->type` for primary-ctor parameters and from the body
+// `FieldDecl`'s type otherwise.  The IMPORTED-class short-circuit
+// (`importedNonTrivialDispose`) above carries the exporter's verdict on the
+// wire; the exporter runs this same predicate.  Callers that previously kept
+// their own inline-array walk (`MethodOwnership::classChainHasOwningInlineArrayField`
+// at the §28.3 gate in Ownership.cpp, #2654) consult this predicate only and
+// delete the local companion.  A FOURTH independent copy of this
+// classification lives at `PureChecker.cpp`'s `isTrivialDisposeClass`
+// (§22.15) and a fifth at `ExprTypecheck.cpp`'s §21.9 inline walk in
+// `visitStmt`'s ExpressionStmt arm — both were updated in lockstep with this
+// predicate's owning-inline-array extension so the four walks cannot drift on
+// the inline-array arm.
 //
 // Cycle-guarded (mirrors the #1624 precedent) so a malformed base-type graph
 // that survives error recovery cannot hang the compiler.

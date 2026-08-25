@@ -427,11 +427,12 @@ public:
     // is `ld` a plain `var` bound to `new T(...)` where T is a trivial-dispose
     // CLASS? Consulted ONLY to suppress the §28.3 auto-drop WARNING — the
     // `autoDropAtScopeEnd` flag and the emitted scope-end free are unaffected.
+    // fix #2666: the inline-array-field arm of the trivial-dispose predicate
+    // is now tested INSIDE `common::isNonTrivialDisposeClass` itself, so the
+    // `classChainHasOwningInlineArrayField` companion walk this method used
+    // to consult (#2654) is removed — see `localIsTrivialDisposeNewBinding`'s
+    // header comment for the rationale and the #2666 walk-through.
     bool localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld);
-    // §15.1.1 / §28.9 (#2654): does `decl`'s class chain declare a field of
-    // owning-inline-array type (`[N owned]T?`)? Such a field excludes the
-    // class from trivial-dispose, and the shared predicate does not test it.
-    bool classChainHasOwningInlineArrayField(sema::TypeSymbol* decl);
 
 private:
     sema::SemaContext& ctx_;

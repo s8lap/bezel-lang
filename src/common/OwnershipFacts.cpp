@@ -79,13 +79,43 @@ bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl) {
             }
             auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
             if (!fs) continue;
+            // fix #2666 (§28.9 v0.237 / §15.1.1): an owning-inline-array
+            // field — `[N owned]T?` or `[N owned]T`, an `ast::TypeKind::
+            // InlineArray` whose `arrayOwned` flag is set — disqualifies
+            // trivial-dispose per the spec's third arm. The ownedness lives
+            // in the TYPE, not in `fs->modifiers`, so the `owned`-modifier
+            // arm below does not see it. Read directly from the AST: a
+            // primary-ctor parameter's TYPE lives at `fs->posParam->type`,
+            // a body FieldDecl's TYPE at `fd->type`. The IMPORTED-class
+            // short-circuit above (`importedNonTrivialDispose`) already
+            // covers wire-side fidelity: the exporter runs this same
+            // predicate, and the carried verdict is replayed at import.
+            const ast::Type* fieldAstTy = nullptr;
+            if (fs->posParam) {
+                fieldAstTy = fs->posParam->type.get();
+            } else if (auto* fd =
+                           dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+                fieldAstTy = fd->type.get();
+            }
+            if (fieldAstTy &&
+                fieldAstTy->kind == ast::TypeKind::InlineArray &&
+                fieldAstTy->arrayOwned) {
+                reject = true;
+                break;
+            }
             if (fs->posParam) {
                 // fix #3205 (§22.10 v0.254): mirror the codegen
                 // isCapturedOwnedPrimaryParam predicate widening — gate on
                 // `!posParamInitRef` only, so a NEVER-referenced `owned`
                 // primary-ctor parameter is also counted as non-trivial-
                 // dispose storage here. See the codegen predicate's comment
-                // for the four-case truth table.
+                // for the four-case truth table. Walked AFTER the inline-
+                // array arm above so a primary-ctor parameter whose type
+                // is `[N owned]T?` is also caught (#2666); record positional
+                // fields skip the inline-array leg via `fieldAstTy == null`
+                // for the `record` parent (their type resolves to the
+                // param's type, but the inline-array arm above rejects first
+                // for owning records — rejected separately).
                 if (fs->parent &&
                     fs->parent->kind == ast::TypeDeclKind::Class &&
                     fs->posParam->modifier == "owned" &&

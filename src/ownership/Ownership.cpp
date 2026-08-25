@@ -5439,15 +5439,17 @@ bool MethodOwnership::rhsIsVacuousBorrowPin(const ast::Expr& e) const {
 //     from the table and must keep the warning. Reuses one shared authority
 //     rather than hand-rolling a parallel name list. // fix #2667
 //   * an owning-inline-array field (`[N owned]T?` / `[N owned]T`, §15.1.1)
-//     DISQUALIFIES. The spec's trivial-dispose definition excludes such a
-//     field, but the shared `common::isNonTrivialDisposeClass` walk does not
-//     test for it (pre-existing gap, filed as #2666) — testing it here keeps
-//     this suppression sound even while the shared predicate stays
-//     incomplete. Delete this guard when #2666 lands.
+//     DISQUALIFIES — handled INSIDE `common::isNonTrivialDisposeClass` since
+//     fix #2666: the predicate now walks inline-array fields and returns
+//     true (non-trivial) on `[N owned]T?` / `[N owned]T`, so the guard
+//     that used to live in `classChainHasOwningInlineArrayField` is
+//     subsumed. The previously-separate walk that this file kept as a
+//     workaround is removed; the suppression soundness is restored to
+//     the single shared predicate.
 // The `using var` / `owned`-location half of the spec's precondition is
 // structural: `ld.isUsing` is excluded below, and an `owned` LOCATION (field,
 // `owned` parameter) is not an `ast::LocalDecl` at all, so it cannot reach
-// this arm.  // per §28.9, §28.3, v0.268, #2654 + #2667
+// this arm.  // per §28.9, §28.3, v0.268, #2654 + #2666 + #2667
 bool MethodOwnership::localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld) {
     if (ld.isUsing) return false;                      // "…or `using var`"
     if (!ld.initializer) return false;
@@ -5485,66 +5487,7 @@ bool MethodOwnership::localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld) 
     sema::TypeSymbol* d = t->declaration;
     if (d->kind != ast::TypeDeclKind::Class) return false;
     if (common::isNonTrivialDisposeClass(d)) return false;
-    if (classChainHasOwningInlineArrayField(d)) return false;
     return true;
-}
-
-// §15.1.1 / §28.9 (v0.237): does `decl`'s class chain declare a field of
-// OWNING inline-array type? The spec's trivial-dispose definition excludes a
-// class with "no fields of owning-inline-array type (`[N owned]T?` or
-// `[N owned]T`, §15.1.1)", and such a field carries a real per-slot disposal
-// obligation. Walks the same base chain, with the same cycle guard (#1624),
-// as `common::isNonTrivialDisposeClass`. // per §28.9, §15.1.1, #2654
-bool MethodOwnership::classChainHasOwningInlineArrayField(
-    sema::TypeSymbol* decl) {
-    std::unordered_set<const sema::TypeSymbol*> seen;
-    for (sema::TypeSymbol* cur = decl; cur;) {
-        if (!seen.insert(cur).second) break;  // cycle guard (#1624)
-        for (sema::Symbol* m : cur->members) {
-            auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
-            if (!fs) continue;
-            const ast::Type* ty = nullptr;
-            if (fs->posParam) {
-                ty = fs->posParam->type.get();
-            } else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-                ty = fd->type.get();
-            }
-            // fix #3212 (§15.1.1 / §28.9 / §28.3, v0.254): an IMPORTED
-            // class's instance field carries no `FieldDecl` (ModuleLoader
-            // never reconstructs one for non-generic imports, per the
-            // #503/#2414 AST-attach convention) and a non-positional field
-            // also has no `posParam`; without a `Type` AST node to feed
-            // `resolvedType`, the walk falls through and the predicate
-            // returns false, suppressing the §28.3 auto-drop WARNING the
-            // single-module twin fires for the same `[N owned]T?` field.
-            // The wire side carries the field's type in
-            // `ModuleLoader::fieldTypes_` (MetaMember::type → TypeKind::
-            // InlineArray with `arrayOwned` preserved at
-            // ModuleLoader.cpp:225-231), published through
-            // `ctx.importedMemberType(fs)`, so we can resolve the predicate
-            // for the import the same way we do for local. Predicates that
-            // gate diagnostics and not correctness are safe to widen in
-            // this direction.
-            const sema::TypeRef* tr = nullptr;
-            if (ty) {
-                tr = ctx_.resolvedType(*ty);
-            } else if (!fs->decl && ctx_.isImported(fs)) {
-                tr = ctx_.importedMemberType(fs);
-            }
-            if (!tr) continue;
-            if (tr->kind == sema::TypeRef::Kind::InlineArray &&
-                tr->arrayOwned)
-                return true;
-        }
-        sema::TypeSymbol* nextBase = nullptr;
-        for (sema::TypeSymbol* b : cur->baseTypes)
-            if (b && b->kind == ast::TypeDeclKind::Class) {
-                nextBase = b;
-                break;
-            }
-        cur = nextBase;
-    }
-    return false;
 }
 
 bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {

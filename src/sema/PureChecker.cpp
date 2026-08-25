@@ -182,15 +182,40 @@ bool PureBodyWalker::isTrivialDisposeClass(TypeSymbol* decl) const {
         //
         // This is the FOURTH independent copy of §28.9's classification
         // (alongside `common::isNonTrivialDisposeClass`, `Ownership.cpp`'s
-        // §28.3 gate, and `ExprTypecheck.cpp`'s §21.9 walk). #3191 fixed
-        // three; PureChecker's walker was not in scope for that issue's
-        // verify-first and surfaced separately here. Collapsing all four is
-        // #2666's subject and is deliberately not attempted.
+        // §28.3 gate, and `ExprTypecheck.cpp`'s §21.9 walk). #2666 brings
+        // all four into line on the inline-array arm (§28.9 v0.237's third
+        // disqualifier); the duplicated walks remain here, kept in sync
+        // with the predicate's shape by construction.
         if (cur->importedNonTrivialDispose) return false;
         for (Symbol* m : cur->members) {
             if (dynamic_cast<DestructorSymbol*>(m)) return false;
             auto* fs = dynamic_cast<FieldSymbol*>(m);
             if (!fs) continue;
+            // fix #2666 (§28.9 v0.237 / §15.1.1): an owning-inline-array
+            // field — `[N owned]T?` / `[N owned]T`, `TypeKind::InlineArray`
+            // with `arrayOwned` set — disqualifies trivial-dispose per the
+            // spec's third arm. Read from the AST directly (a primary-ctor
+            // parameter's TYPE is `fs->posParam->type`; a body field's TYPE
+            // is `fs->decl` cast to FieldDecl). Walks BEFORE the posParam
+            // arm so a primary-ctor parameter whose type is `[N owned]T?`
+            // is caught; the `modifier == "owned"` arm below covers an
+            // `owned` primary-ctor parameter that is not also owning-inline-
+            // array. Mirrors `common::isNonTrivialDisposeClass` so the
+            // §22.15 throw-carve-out (this walker) and the §28.3 auto-drop
+            // (the shared predicate, #2654) cannot drift on the inline-array
+            // arm — the duplicated-predicate defect class.
+            const ast::Type* fieldAstTy = nullptr;
+            if (fs->posParam) {
+                fieldAstTy = fs->posParam->type.get();
+            } else if (auto* fd =
+                           dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+                fieldAstTy = fd->type.get();
+            }
+            if (fieldAstTy &&
+                fieldAstTy->kind == ast::TypeKind::InlineArray &&
+                fieldAstTy->arrayOwned) {
+                return false;
+            }
             if (fs->posParam) {
                 if (fs->parent &&
                     fs->parent->kind == ast::TypeDeclKind::Class &&

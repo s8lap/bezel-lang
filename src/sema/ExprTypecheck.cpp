@@ -12444,9 +12444,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         // shared copy alone did NOT make this diagnostic fire —
                         // verified by measurement, not assumed — which is the
                         // duplicated-predicate defect class in miniature.
-                        // Collapsing them is #2666's subject and is deliberately
-                        // NOT attempted here; a follow-up records that this
-                        // verdict must be added to any copy #2666 leaves behind.
+                        // #2666 brings all four into line on the owning-
+                        // inline-array arm (§28.9 v0.237's third
+                        // disqualifier); collapsing them onto the shared
+                        // predicate is filed separately and the walks
+                        // remain here, in sync with the predicate's shape
+                        // by construction.
                         //
                         // Per level, not once at the head, so a LOCAL class
                         // deriving from an imported base is decided when the walk
@@ -12517,6 +12520,36 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             // truth table and the spec enumeration gap.
                             auto* fs = dynamic_cast<FieldSymbol*>(m);
                             if (!fs) continue;
+                            // fix #2666 (§28.9 v0.237 / §15.1.1): an
+                            // owning-inline-array field — `[N owned]T?` /
+                            // `[N owned]T`, `TypeKind::InlineArray` with
+                            // `arrayOwned` set — disqualifies
+                            // trivial-dispose per the spec's third arm.
+                            // Walks BEFORE the posParam arm so a
+                            // primary-ctor parameter whose type is `[N
+                            // owned]T?` is caught too. Mirrors
+                            // `common::isNonTrivialDisposeClass` /
+                            // `PureChecker::isTrivialDisposeClass` so the
+                            // §21.9 reject here, the §28.3 auto-drop, and
+                            // the §22.15 throw carve-out cannot drift on
+                            // the inline-array arm. See those walkers'
+                            // comments for the rationale and the
+                            // #2666/#2654+#3191+#3205 sibling structure.
+                            const ast::Type* fieldAstTy = nullptr;
+                            if (fs->posParam) {
+                                fieldAstTy = fs->posParam->type.get();
+                            } else if (auto* fd =
+                                           dynamic_cast<const ast::FieldDecl*>(
+                                               fs->decl)) {
+                                fieldAstTy = fd->type.get();
+                            }
+                            if (fieldAstTy &&
+                                fieldAstTy->kind ==
+                                    ast::TypeKind::InlineArray &&
+                                fieldAstTy->arrayOwned) {
+                                reject = true;
+                                break;
+                            }
                             if (fs->posParam) {
                                 if (fs->parent &&
                                     fs->parent->kind ==
