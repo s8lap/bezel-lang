@@ -244,29 +244,36 @@ BEZEL_TEST(bare_new_trivial_stmt_reclaim_2655, constructor_side_effect_survives_
 // the flag's setter out of the ownership pass and into §21.9's walk.
 //
 // `move r;` in statement position is an owned production — the ownership pass
-// classifies it `producerState == Owned` — but it is NOT one of §21.9's
-// `ownedProduced` shapes (not a `NewExpr`, not a `CallExpr`), so §21.9's hard
-// error does not fire on it even though `Res` is NON-trivial-dispose. Under the
-// first draft's `producerState == Owned` gate this arm would therefore have
-// fired here and `dynamicDispose` would have run `Res`'s USER DESTRUCTOR at end
-// of statement — contradicting the §28.9 sentence the whole fix rests on
-// ("reclaimed by an implementation-defined mechanism … that runs no user code")
-// and proposal 0077 §2.2, which scopes silent reclaim to trivial-dispose alone.
+// classifies it `producerState == Owned` — and §21.9's walk has to RECOGNIZE
+// IT AS ONE TOO, otherwise `r` is moved-from but the produced value is
+// dropped on the floor with no reclaim registered. As of #2680 the walk does
+// recognize it, so a bare `move r;` over a non-trivial-dispose `Res` is the
+// §21.9 hard error (the program's reaction: "this expression produces an
+// owned value that requires disposal … bind it / call .Dispose() / transfer
+// it (move/return)"). The test inverts from the pre-#2680 form (which
+// asserted the destructor did NOT run because the value silently leaked) to
+// the post-#2680 form (which asserts the program is rejected at the
+// typecheck pass, before any destructor could even be scheduled to misfire).
 //
-// Here the exactly-once oracle IS writable, and it inverts: a non-trivial class
-// HAS a destructor, so a live-object counter can prove the free did NOT happen.
-// `Res.alive == 1` after the statement means the destructor never ran. (Under
-// the rejected wider gate this program returned 0.)
+// WHY THE INVERSION MATTERS. Under the wider `producerState == Owned` gate
+// the FIRST draft of #2655 used, this program would compile and `Res`'s
+// destructor would RUN at end of statement — directly contradicting the
+// §28.9 sentence #2655's whole fix rests on ("reclaimed by an
+// implementation-defined mechanism … that runs no user code"). The HARD
+// ERROR is the correct response: it forces the caller to rewrite as
+// `_ := move r;` / `using var _ := move r;` (which free exactly once at the
+// documented boundary), instead of letting the destructor misfire on the
+// bare form.
 //
-// runAot, not runAotChecked, and deliberately: `move r;` leaves `r` moved-from,
-// so nothing owns the value and it LEAKS 16 B — verified. That leak is the
-// correct, safe direction for a shape neither §21.9 nor this fix claims, and it
-// is exactly what the separately-filed §21.9 under-rejection covers. Asserting
-// it under LSan would fail on the expected leak and hide the actual point.
-// per §21.9, §28.9, §28.8.1 (issue #2655, reviewer-directed self-pass)
+// runAot, not runAotChecked, and deliberately: a hard error short-circuits
+// the run before the executable is invoked, so ASan instrumentation is
+// moot here. The diagnostic must carry the §21.9 citation AND the
+// non-trivial-dispose phrasing so a reader can verify the rule the program
+// is being measured against.
+// per §21.9, §28.3, §28.9, §28.8.1 (issue #2655 + #2680, reviewer-directed self-pass)
 BEZEL_TEST(bare_new_trivial_stmt_reclaim_2655,
-           non_trivial_producer_outside_spec_21_9_keeps_its_destructor_unrun) {
-    BEZEL_EXPECT_EQ(runValueOnly(
+           non_trivial_producer_outside_spec_21_9_now_hard_errors_after_2680) {
+    auto r = runAot(
         "module M; "
         "class Res "
         "  public static alive: int := 0; "
@@ -277,10 +284,20 @@ BEZEL_TEST(bare_new_trivial_stmt_reclaim_2655,
         "  public static method Main(): int "
         "    var r := new Res(); "
         "    move r; "
-        "    return Res.alive; "   // 1 == the destructor did NOT run
+        "    return Res.alive; "
         "  end Main; "
-        "end C;"),
-        1);
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);  // hard error → no executable run
+    bool sawSection219 = false;
+    bool sawNonTrivial = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("\xC2\xA7""21.9") != std::string::npos)
+            sawSection219 = true;
+        if (d.message.find("non-trivial-dispose") != std::string::npos)
+            sawNonTrivial = true;
+    }
+    BEZEL_EXPECT_TRUE(sawSection219);
+    BEZEL_EXPECT_TRUE(sawNonTrivial);
 }
 
 // ── SCOPE RE-HOMING PRE-EMPT (reviewer-directed). `new Widget(out owned var x);`

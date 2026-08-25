@@ -12388,9 +12388,187 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // structurally and reject directly.
             bool subDrop = isEventSubscribeDrop(es->expr.get());
             if (subDrop) ownedProduced = true;
+
+            // fix #2680 (§21.9, v0.278): `externOwnedBare` parallels
+            // `subDrop` below — when the widening's (c) arm fires (an
+            // extern call returning `owned T`), set this to force the §21.9
+            // hard error REGARDLESS of result type. See the long (c) note in
+            // the widening block below for the nullable-FFI-buffer reason
+            // the type-driven walk would otherwise miss it.
+            bool externOwnedBare = false;
+
+            // fix #2680 (§21.9, v0.278): widen the owned-producer predicate
+            // to FIVE shapes the existing walk under-rejected (silent leak —
+            // the produced owned value was dropped on the floor with no free
+            // emitted and no diagnostic, exactly the shape #2655's NEW arm was
+            // filed for and the family #3189 widened one arm of). The widening
+            // is gated on the EXISTING downstream non-trivial-dispose walk
+            // below: each new arm only triggers the §21.9 hard error when the
+            // produced value's type is a non-trivial-dispose class — borrowed /
+            // null / interface / value-builtin / nullable / trivial-dispose
+            // results remain ACCEPTED (and trivial-dispose still reclaims via
+            // `disposeOwnedValue`, the same path #2655 wired up). Every arm
+            // keys on the same authority the existing shapes do (a MethodSymbol
+            // returning owned, a Function-typed callee declaring owned return,
+            // an ExternDecl's `returnOwned` flag, the arm-meet predicate), so
+            // a future widening of those predicates widens §21.9 with it by
+            // construction.
+            //
+            //   (a) `move <binding>;`                — UnaryExpr op=="move"
+            //       §28.8.1 marks a fresh transfer of the operand's owned
+            //       binding (§28.3 producer; result type == operand type).
+            //       Excluded by an earlier sema pass when the operand is not
+            //       an owned binding, so the survivor here is always a
+            //       §28.8.1 transfer.
+            //   (c) `extern_method(args);`           — CallExpr with
+            //       ExternDeclSymbol callee; `externDecl->returnOwned` is
+            //       the marker (mirrors MethodSymbol::returnOwned).
+            //   (d) function-VALUE `f(args);`        — CallExpr with
+            //       LocalSymbol/ParameterSymbol/FieldSymbol callee whose
+            //       declType is a Function TypeRef carrying `funcReturnOwned`.
+            //       Callee resolves through §27.7's function-typed-call
+            //       path, not through the method/calleeReturnsOwned route.
+            //   (e) `a + b;` / `-x;`                 — BinaryExpr/UnaryExpr
+            //       whose `exprSymbol` is a MethodSymbol (an operator overload
+            //       MethodSymbol — see typeBinary/typeUnary in
+            //       ExprTypecheck_Exprs.cpp). The `methodReturnsOwned`
+            //       accessor consults BOTH OperatorDecl::returnOwned AND the
+            //       importedReturnOwned wire bit, so the imported-operator
+            //       twin fires here too.
+            //   (f) `if`/`case` arm-meet             — ConditionalExpr/
+            //       CaseExpr whose every value-producing arm is a fresh
+            //       owned producer (a `new`, an owned-returning call, a
+            //       nested owned-meet, a `move`, or a marked `owned x` arm).
+            //       The arm-meet predicate `conditionalCaseArmMeetIsOwned`
+            //       is already the single home for this question (used by
+            //       the ownership pass's `producerState`); §21.9 re-uses it
+            //       so the two cannot disagree.
+            if (!ownedProduced) {
+                if (auto* ue =
+                        dynamic_cast<const ast::UnaryExpr*>(es->expr.get())) {
+                    if (ue->op == "move") {
+                        // §28.8.1 transfer marker — the result is the
+                        // operand's type, owned by §28.3. Sema rejects a
+                        // `move` over a non-owned binding earlier (§28.6 +
+                        // §28.8.1 gates in ExprTypecheck_Exprs.cpp), so any
+                        // survivor here is a §28.3 producer.
+                        ownedProduced = true;
+                    } else if (ue->op == "+" || ue->op == "-" ||
+                               ue->op == "~" || ue->op == "not") {
+                        // §25 operator overload (exprSymbol set by
+                        // typeUnary, ExprTypecheck_Exprs.cpp). consult
+                        // methodReturnsOwned — its OperatorDecl arm covers
+                        // the local case and the importedReturnOwned arm
+                        // covers the imported twin.
+                        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                                ctx_.exprSymbol(*ue))) {
+                            if (sema::methodReturnsOwned(*ms, ctx_))
+                                ownedProduced = true;
+                        }
+                    }
+                } else if (auto* be =
+                               dynamic_cast<const ast::BinaryExpr*>(
+                                   es->expr.get())) {
+                    // §25 binary operator overload (exprSymbol set by
+                    // typeBinary). Same `methodReturnsOwned` route as the
+                    // unary arm above; `and`/`or`/`in` are NOT overloaded
+                    // (§25) and never set exprSymbol, so they cannot fire.
+                    if (be->op != "and" && be->op != "or" &&
+                        be->op != "in") {
+                        if (auto* ms = dynamic_cast<sema::MethodSymbol*>(
+                                ctx_.exprSymbol(*be))) {
+                            if (sema::methodReturnsOwned(*ms, ctx_))
+                                ownedProduced = true;
+                        }
+                    }
+                } else if (dynamic_cast<const ast::ConditionalExpr*>(
+                               es->expr.get()) ||
+                           dynamic_cast<const ast::CaseExpr*>(es->expr.get())) {
+                    // §28.3 arm-meet (#1661) — every value-producing arm is a
+                    // fresh owned producer. `null` and `throw` arms absorb
+                    // (their handling is INSIDE `armsMeetOwned`). The
+                    // callee through to `conditionalCaseArmMeetIsOwned` is the
+                    // SAME predicate the ownership pass's `producerState`
+                    // consults, so §21.9 stays in lockstep with the §28.3
+                    // auto-drop classification.
+                    if (common::conditionalCaseArmMeetIsOwned(
+                            *es->expr, ctx_, /*resolveParam=*/nullptr))
+                        ownedProduced = true;
+                } else if (auto* ce2 =
+                               dynamic_cast<const ast::CallExpr*>(
+                                   es->expr.get())) {
+                    // CallExpr arm 2: callee is an EXTERN (`owned T` return)
+                    // or a function-VALUE local/parameter/field whose
+                    // Function-typed declType declares an `owned` return.
+                    // The MethodSymbol path above (calleeReturnsOwned) does
+                    // not apply — those resolve to ExternDeclSymbol /
+                    // LocalSymbol / ParameterSymbol / FieldSymbol, and the
+                    // marker lives on `externDecl->returnOwned` or on the
+                    // Function TypeRef's `funcReturnOwned`. Mirror the
+                    // existing `extern` / `function-typed` typing path in
+                    // ExprTypecheck_Calls.cpp:~3469 / :3483.
+                    if (ce2->callee) {
+                        if (auto calleeSym =
+                                ctx_.exprSymbol(*ce2->callee)) {
+                            if (auto* xd = dynamic_cast<
+                                    sema::ExternDeclSymbol*>(calleeSym)) {
+                                if (xd->externDecl &&
+                                    xd->externDecl->returnOwned) {
+                                    ownedProduced = true;
+                                    // fix #2680 (§21.9, v0.278): the §32.5-
+                                    // admissible extern return type is a
+                                    // nullable FFI boundary name (CString?/
+                                    // WString?/RawBytes?), so the
+                                    // `!t->nullable` gate on the type-driven
+                                    // walk below would skip the rejection.
+                                    // Force it. See the long (c) note.
+                                    externOwnedBare = true;
+                                }
+                            } else if (auto* loc = dynamic_cast<
+                                           sema::LocalSymbol*>(calleeSym)) {
+                                if (loc->declType &&
+                                    loc->declType->kind ==
+                                        TypeRef::Kind::Function &&
+                                    loc->declType->funcReturnOwned)
+                                    ownedProduced = true;
+                            } else if (auto* par = dynamic_cast<
+                                           sema::ParameterSymbol*>(
+                                           calleeSym)) {
+                                TypeRef* prt =
+                                    par->declType
+                                        ? ctx_.resolvedType(*par->declType)
+                                        : nullptr;
+                                if (prt &&
+                                    prt->kind == TypeRef::Kind::Function &&
+                                    prt->funcReturnOwned)
+                                    ownedProduced = true;
+                            } else if (dynamic_cast<sema::FieldSymbol*>(
+                                           calleeSym)) {
+                                if (TypeRef* ft =
+                                        ctx_.exprType(*ce2->callee)) {
+                                    if (ft->kind == TypeRef::Kind::Function &&
+                                        ft->funcReturnOwned)
+                                        ownedProduced = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if (ownedProduced) {
                 const TypeRef* t = ctx_.exprType(*es->expr);
-                bool reject = subDrop;
+                // fix #2680 (§21.9, v0.278): the extern-returning-owned case
+                // sets `externOwnedBare` in addition to `ownedProduced`
+                // (see the long (c) note above). The result type for any
+                // extern-returning-owned call is, by §32.5, a nullable FFI
+                // boundary name — `CString?` / `WString?` / `RawBytes?` — so
+                // the `!t->nullable` gate below skips the non-trivial-dispose
+                // walk and `reject` would stay false; the produced buffer
+                // would leak silently. Mirror the `subDrop` precedent: force
+                // the §21.9 hard error REGARDLESS of result type. (A non-
+                // extern owned producer keeps the existing type-driven walk,
+                // which gates on `!nullable && Named Class`.)
+                bool reject = subDrop || externOwnedBare;
                 // fix #2655 / §28.3 / §28.9 (v0.237): set only when the walk
                 // below RUNS and finds the produced class TRIVIAL-dispose —
                 // see the stamp beside the `reject` diagnostic for why this
