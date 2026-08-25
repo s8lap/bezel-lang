@@ -14022,6 +14022,29 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
             }
         }
     }
+    // fix #2779 / §29.2 / §29.11 / §23.3 / §28.3 K3 / §28.9 (v0.240): the
+    // `var e := s.E;` BOUND spelling through an INTERFACE-typed receiver —
+    // the shape the issue's repro exercises. The plain-`var` isCall / isNew /
+    // wrappedHere trio above is the only ownership claim this function
+    // considered before #2779; the interface-dispatched property read has
+    // NONE of those shapes (it is a MemberAccessExpr whose initializer's
+    // type is an already-IEnumerable), so `ownsSource` was false and the
+    // local's scope-end registered no disposal — the freshly minted wrapper
+    // frame leaked one per read (the issue's "64 × 32 B" measurement).
+    //
+    // Widen `ownsSource` to true for the same interface-dispatched
+    // iterator-format property read the lowerIEnumerableBuiltinFor /
+    // lowerAwaitFor siblings widen at the for-in site: the wrap-creator
+    // fires UNCONDITIONALLY for any iterator-format-typed property read
+    // (BLOCK-bodied #2703, EXPRESSION-BODIED #2815 / #2777), so the
+    // local-decl's wrapper-frame claim is sound for that family. The
+    // #2174 borrow-pin for non-iterator-format interface properties is
+    // preserved (this predicate is iterator-format-specific, not a
+    // general flip of all interface-dispatched reads). // per #2779, #2703,
+    // #2815, #2174
+    if (!ownsSource &&
+        isInterfaceDispatchedIteratorRead(ld->initializer.get()))
+        ownsSource = true;
     // §28.10 / stdlib §4.5 v0.195 (#2146): a plain `var d := recv.Drain();`
     // over a NAMED owning collection does NOT own a fresh source — the drain
     // view IS the receiver at IOwningEnumerable static type ("no separate
@@ -14426,6 +14449,36 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             }
         }
     }
+    // fix #2779 / §29.2 / §29.11 / §23.3 / §28.3 K3 / §28.9 (v0.240): the
+    // `using var e := s.E;` BOUND-SPELLING twin of the
+    // registerIterableSourceDisposal widening above. The OWNERSHIP pass's
+    // §28.10 borrow-pin (signature-level §28.6 verdict for an interface-
+    // dispatched property read) sets `usingVarSourceIsBorrow = true`, and
+    // the early-return above skips the disposal registration. The wrap-
+    // creator fires UNCONDITIONALLY for the iterator-format-typed read, so
+    // the local OWNS the wrapper frame and the using-var must register the
+    // scope-end iterEnumDispose (the same `isSyncIterEnum` arm below). The
+    // override mirrors the block-bodied carve-out immediately above and is
+    // FURTHER gated on the iterator-format local-effective-type, the same
+    // §28.6 / #2137 family defence preserved by that carve-out. // per
+    // #2779, #2703, #2174
+    if (ld->usingVarSourceIsBorrow && ld->initializer) {
+        if (isInterfaceDispatchedIteratorRead(ld->initializer.get())) {
+            const sema::TypeRef* lt =
+                ld->type ? ctx_.resolvedType(*ld->type)
+                         : ctx_.exprType(*ld->initializer);
+            bool isIterFmt =
+                lt && lt->kind == sema::TypeRef::Kind::Named &&
+                !lt->declaration && lt->astNode && lt->astNode->name &&
+                !lt->astNode->name->parts.empty() &&
+                (lt->headName() == "IEnumerable" ||
+                 lt->headName() == "IOwningEnumerable" ||
+                 lt->headName() == "IAsyncEnumerable" ||
+                 lt->headName() == "IOwningAsyncEnumerable");
+            if (isIterFmt)
+                const_cast<ast::LocalDecl*>(ld)->usingVarSourceIsBorrow = false;
+        }
+    }
     if (ld->usingVarSourceIsBorrow) return;
 
     // fix #2975 (§29.7 / §29.3 / §28.3 / §28.2 / §8.1, v0.240): a slot declared
@@ -14539,6 +14592,27 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         ld->initializer.get())) {
                     if (blockGetterOf(ctx_.exprSymbol(*ma)))
+                        ownsSource = true;
+                    // fix #2779 / §29.2 / §29.11 / §23.3 / §28.3 K3 / §28.9
+                    // (v0.240): the `using var` BOUND-SPELLING twin of the
+                    // registerIterableSourceDisposal widening above. An
+                    // INTERFACE-dispatched iterator-format property read has
+                    // no `blockGetterOf` (the interface's PropertySymbol has
+                    // no accessor body — `bodyKind == Auto`), so the
+                    // narrower #2769 arm declines; the wrap-creator still
+                    // fires UNCONDITIONALLY for the iterator-format-typed
+                    // read, so the local OWNS the wrapper frame and must
+                    // register the scope-end iterEnumDispose. The same
+                    // `isInterfaceDispatchedIteratorRead` predicate the
+                    // lowerIEnumerableBuiltinFor / lowerAwaitFor siblings
+                    // widen at the for-in site; the `using var` path
+                    // reaches this arm after the
+                    // `usingVarSourceIsBorrow` override above lifts the
+                    // §28.10 borrow-pin. The #2174 borrow-pin for
+                    // non-iterator-format interface properties is preserved
+                    // (the predicate is iterator-format-specific).
+                    // // per #2779, #2703, #2174
+                    else if (isInterfaceDispatchedIteratorRead(ma))
                         ownsSource = true;
                 }
             }

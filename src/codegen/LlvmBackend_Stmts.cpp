@@ -7460,6 +7460,32 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             sourceIsNamedLocal = sema::isAutoPropertyStorageSymbol(ps, ctx_);
         }
     }
+    // fix #2779 / §29.2 / §29.11 / §23.3 / §28.3 K3 / §28.9 (v0.240): an
+    // INTERFACE-dispatched computed `IEnumerable<T>`-family property read —
+    // `for var x in s.E do ... end;` where `s: ISeq` and `ISeq.readonly
+    // property E: IEnumerable<T>;` is body-less — is statically misclassified
+    // as an auto-property storage by the `sema::isAutoPropertyStorageSymbol`
+    // arm above (the interface's `PropertyDecl` records `bodyKind == Auto`
+    // because the interface declaration has no accessor body), so the for-in
+    // refuses to register a loop-end dispose. The runtime is the opposite: the
+    // wrap-creator (`wrapAsIEnumerableForTarget` on the BLOCK-bodied getter's
+    // RETURN edge, or `wrapPropertyArrayAsIEnumerable` on the EXPRESSION-BODIED
+    // read site) fires UNCONDITIONALLY for any iterator-format-typed property
+    // read, regardless of the implementer (Array/Stack/Queue/Set/LinkedList/
+    // user-class IEnumerable<T>), and the wrapper frame is a fresh heap
+    // object the reader must reclaim. Widen the verdict to
+    // `!sourceIsNamedLocal` for the interface-dispatched iterator-format case
+    // so the loop-end slot-1 iterEnumDispose registers; the predicate is
+    // sound for that family (it is the only family the wrap-creator touches)
+    // and preserves the #2174 borrow-pin for non-iterator-format interface
+    // properties. The opposite-direction narrowing for the bound-spelling
+    // (`var e := s.E; for x in e do ...`) is the symmetric change in
+    // `registerIterableSourceDisposal` below — the local claims ownership
+    // there because the wrap happened at the read site, not the local-decl
+    // site. // per #2779, #2703, #2815, #2174
+    if (sourceIsNamedLocal &&
+        isInterfaceDispatchedIteratorRead(fs.iterable.get()))
+        sourceIsNamedLocal = false;
     if (!sourceIsNamedLocal) {
         Disposal ds{srcSlot, nullptr};
         ds.iterEnumDispose = true;
@@ -8392,6 +8418,23 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
             sourceIsNamedLocal = sema::isAutoPropertyStorageSymbol(ps, ctx_);
         }
     }
+    // fix #2779 / §29.2 / §30.5 / §23.3 / §28.3 K3 / §28.9 (v0.240): the
+    // async-enumerable twin of the lowerIEnumerableBuiltinFor widening above.
+    // An `await for` whose source is an INTERFACE-dispatched
+    // `IAsyncEnumerable<T>`-family property read is statically misclassified
+    // as an auto-property storage (the interface's `PropertyDecl` records
+    // `bodyKind == Auto`); the runtime is the opposite — the wrap-creator
+    // fires UNCONDITIONALLY for the iterator-format-typed read, and the
+    // wrapper frame is a fresh heap object the reader must reclaim. Widen
+    // the verdict to `!sourceIsNamedLocal` for that family so the async loop
+    // registers the loop-end source disposal via the async-state-machine
+    // wire (smIterEnumFrameSlot_) alongside the enumerator's own disposal.
+    // The predicate is the same `isInterfaceDispatchedIteratorRead` and
+    // matches its sibling exactly; the #2174 borrow-pin for non-iterator-
+    // format interface properties is preserved. // per #2779, #2703, #1525
+    if (sourceIsNamedLocal &&
+        isInterfaceDispatchedIteratorRead(fs.iterable.get()))
+        sourceIsNamedLocal = false;
     llvm::Value* enumIsSrc = builder_.CreateICmpEQ(enumPtr, srcPtr, "afor.selfen");
     auto* enumOwnSlot = entryAlloca(ptrTy());
     builder_.CreateStore(

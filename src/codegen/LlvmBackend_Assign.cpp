@@ -7710,6 +7710,79 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     return v;
 }
 
+// fix #2779 / §29.2 / §29.11 / §23.3 / §28.3 K3 / §28.9 (v0.240): a static
+// widening of the §23.3 / §29.11 property-read ownership classification for
+// the INTERFACE-dispatched shape — `s.E` where `s: ISeq` (an interface
+// declared with a body-less `readonly property E: IEnumerable<T>;`). At an
+// interface-typed receiver, `ctx_.exprSymbol` resolves to the INTERFACE's
+// PropertySymbol (whose `ast::PropertyDecl` records `bodyKind == Auto` —
+// the interface declaration has no accessor body), so the existing
+// `sema::isAutoPropertyStorageSymbol` classification is statically forced to
+// `true` and the for-in / using-var / plain-`var` paths correctly refuse to
+// claim the wrapper frame as theirs. The runtime behaviour is the OPPOSITE:
+// the wrap-creator (`wrapAsIEnumerableForTarget` on the BLOCK-bodied getter's
+// RETURN edge, #2703; or `wrapPropertyArrayAsIEnumerable` on the
+// EXPRESSION-BODIED read site, #2815 / #2777) fires UNCONDITIONALLY for every
+// iterator-format-typed property read, for every implementer (Array/Stack/
+// Queue/Set/LinkedList/user-class-IEnumerable<T>), and the wrapper frame is
+// a fresh heap object the reader must reclaim. The interface dispatch hides
+// the body-vs-storage distinction a concrete receiver would expose, so the
+// static widening here (always classify as fresh-mint) is sound for the
+// iterator-format declared type — and for that family alone.
+//
+// The opposite-direction pin #2174 keeps: a non-iterator-format interface
+// property read (e.g. `property Name: string;` over `s: IShape`) stays a
+// borrow, because the wrap-creator never fires for non-iterator-format
+// declared types. The widening is therefore ITERATOR-FORMAT-SPECIFIC, not a
+// general flip of all interface-dispatched reads — it preserves the #2174
+// heap-use-after-free defence for the family that defence was designed for.
+//
+// Per the issue's "needs a runtime discriminator" framing, this is the
+// narrower implementation that takes the "wrap unconditional at the
+// interface face" candidate the issue enumerated: the wrap-creator is
+// already unconditional (every implementer mints), so the call site can
+// claim ownership statically. The double-free direction the issue warns
+// about (an implementer whose `E` is an auto-property handing back stored
+// state) does not arise: the interface declaration `readonly property E:
+// IEnumerable<T>;` has no storage of its own, so no implementer can hand
+// back a "stored" IEnumerable through the interface slot — every read
+// dispatches through the implementer's accessor, and every implementer's
+// accessor that returns a non-IEnumerable body type goes through the
+// wrap-creator. (The interface declaration could DECLARE the property with
+// an expression body / block body, in which case the wrap would happen at
+// the interface's accessor, but the test in this lane uses the canonical
+// body-less form that the issue's repro shape relies on.)
+bool Emitter::isInterfaceDispatchedIteratorRead(
+        const ast::Expr* iterable) const {
+    if (!iterable) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(iterable);
+    if (!ma) return false;
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+    if (!ps || ps->isIndexer) return false;
+    if (!ps->parent || ps->parent->kind != ast::TypeDeclKind::Interface)
+        return false;
+    // The property's declared return type is the MemberAccessExpr's sema type
+    // (mirrors `wrapPropertyArrayAsIEnumerable`'s `ctx_.exprType(*ma)`
+    // argument). For an interface-dispatched read the resolved symbol is the
+    // interface's `PropertySymbol` (whose `ast::PropertyDecl` records
+    // `bodyKind == Auto` because the interface declaration has no accessor
+    // body), and the property's declared type is exactly the interface's
+    // declared type for the slot — the four iterator-format heads
+    // (#943/#1525/#1268/#2356) the wrap-creator keys on. A null check on
+    // the exprType defends against untyped arguments in error-recovery
+    // paths.
+    const sema::TypeRef* propTy = ctx_.exprType(*ma);
+    if (!propTy || propTy->kind != sema::TypeRef::Kind::Named ||
+        propTy->declaration)
+        return false;
+    if (!propTy->astNode || !propTy->astNode->name ||
+        propTy->astNode->name->parts.empty())
+        return false;
+    std::string_view n = propTy->headName();
+    return n == "IEnumerable" || n == "IOwningEnumerable" ||
+           n == "IAsyncEnumerable" || n == "IOwningAsyncEnumerable";
+}
+
 // fix #2815 / §23.2 / §29.2 (v0.240) and #2777 (§29.2 / §23.2, v0.240):
 // see the declaration in LlvmBackend_impl.hpp.
 //

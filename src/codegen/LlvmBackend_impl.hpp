@@ -7781,6 +7781,36 @@ private:
                                             bool* outWrapMade = nullptr,
                                             bool srcOwnedByCallee = false);
 
+    // fix #2779 / §29.2 / §29.11 / §23.3 / §28.3 K3 / §28.9 (v0.240): an
+    // INTERFACE-dispatched computed `IEnumerable<T>`-family property read —
+    // `s.E` where `s: ISeq` and `ISeq.readonly property E: IEnumerable<T>`
+    // declares a body-less `property E: IEnumerable<T>;` (auto-form) — returns
+    // true iff `iterable` is a MemberAccessExpr that resolves to a
+    // PropertySymbol whose parent is an INTERFACE and whose declared return
+    // type is one of the four iterator-format heads (IEnumerable /
+    // IOwningEnumerable / IAsyncEnumerable / IOwningAsyncEnumerable).
+    //
+    // The predicate is the STATIC half of the issue's "needs a runtime
+    // discriminator" framing: the wrap-creator (`wrapAsIEnumerableForTarget`
+    // on the BLOCK-bodied getter's RETURN edge #2703, or
+    // `wrapPropertyArrayAsIEnumerable` on the EXPRESSION-BODIED read site
+    // #2815) fires UNCONDITIONALLY for any iterator-format-typed property
+    // read, regardless of the implementer (Array/Stack/Queue/Set/LinkedList/
+    // user-class IEnumerable<T>), and the wrapper frame is a freshly
+    // allocated vtable object the caller must reclaim. The interface
+    // dispatch at the call site is precisely what hides the
+    // body-vs-storage distinction the concrete receiver would expose, so
+    // the safety of the static widening (a true "fresh-mint" answer for
+    // EVERY implementer, never a "borrowed storage" answer) hinges on
+    // that wrap-creator universality — confirmed by reading
+    // LlvmBackend_Assign.cpp:7500-7711 and the wrap helper's own positive
+    // list. The opposite-direction classification #2174 preserves is
+    // narrowed: that fix pins interface-dispatched reads as borrows for
+    // a NON-iterator-format declared type; this widening reclassifies
+    // the iterator-format subset (the only family the wrap-creator
+    // touches) as fresh-mint.
+    bool isInterfaceDispatchedIteratorRead(const ast::Expr* iterable) const;
+
     // fix #2815 / §23.2 / §29.2 (v0.240): a property whose declared type is
     // `IEnumerable<T>` (or `IOwningEnumerable<T>`) but whose COMPUTED getter
     // body yields an Array-backed collection — `public property Items:
