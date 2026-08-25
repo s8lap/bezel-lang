@@ -218,6 +218,15 @@ std::unordered_set<std::string_view> joinUnionLive(
     return result;
 }
 
+// §22.3 (fix #2595, #2631): does this parameter list declare a callee-side
+// `out` parameter (plain `out` or `out owned`)? The `out var` spelling is a
+// caller-side inline-declaration modifier, never a parameter mode — same
+// exclusion MethodDA::seedOutParams makes. Forward-declared so the lambda-body
+// walk in MethodDA::visitExpr's LambdaExpr arm (#2631) can gate on it without
+// having to inline the predicate; the canonical definition is below the
+// MethodDA class.
+bool hasOutParam(const std::vector<ast::Param>& params);
+
 // Per-method walker. The state is the set of locally-declared names
 // that have been definitely assigned at the current program point.
 // Names enter the set when:
@@ -1446,10 +1455,42 @@ private:
             return;
         }
         if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
-            // Lambda body is its own DA scope — we don't analyze it
-            // recursively here; that's an exercise for a later slice
-            // (capture model and closure-DA are non-trivial).
-            (void)lam;
+            // §22.3 (fix #2631): a lambda body is a CALLEE — it can declare
+            // an `out` parameter (`(out int) -> ()` is a legal function type,
+            // and `tests/codegen/ref_out_params_test.cpp:115-124` exercises the
+            // shape), and §22.3 imposes the same callee-side assignment
+            // obligation on it as on a method: every `out` parameter must be
+            // assigned on every normal-completion (return) path, throw
+            // exempt. Before this fix the walker skipped the node entirely
+            // with the comment "we don't analyze it recursively here; that's
+            // an exercise for a later slice (capture model and closure-DA are
+            // non-trivial)". That comment is still right about *full*
+            // closure-DA, but the `out`-parameter obligation is callee-local
+            // — an `out` parameter of a lambda is not a captured variable, so
+            // the check needs no capture analysis. Walking the lambda body
+            // with a fresh MethodDA discharges the §22.3 obligation; the
+            // wider closure-DA work is left as a follow-up.
+            //
+            // Narrow scope, matching #2595's narrow expression-body fix: a
+            // lambda with NO `out` parameter is untouched — entering the
+            // walk unconditionally would newly subject every lambda in the
+            // language to the walker's other (§29.11 lazy-consumption,
+            // local-DA read) bookkeeping for no §22.3 benefit.
+            //
+            // Both body forms matter: block (`isBlockBody` → `stmts`,
+            // `do … end`) and expression (`!isBlockBody` → `exprBody`,
+            // `=> E;`). A fresh MethodDA per lambda expression so each
+            // lambda's `out`-parameter set and body are analyzed
+            // independently — capturing semantics (the wider closure-DA
+            // problem) are deliberately out of scope here.
+            if (hasOutParam(lam->params)) {
+                MethodDA da(ctx_);
+                if (lam->isBlockBody) {
+                    da.run(lam->params, lam->stmts);
+                } else if (lam->exprBody) {
+                    da.runExpressionBody(lam->params, *lam->exprBody);
+                }
+            }
             return;
         }
         if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
