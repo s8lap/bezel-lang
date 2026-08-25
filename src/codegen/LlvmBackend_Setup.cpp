@@ -10828,6 +10828,56 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
             // re-insert is a no-op but makes it explicit.
             boxStorageFields_.insert(static_cast<const void*>(m));
         }
+        // fix #2778 / §28.6 / §29.7 (v0.NNN): a CLASS field or auto-property
+        // typed as the pure (declaration-less) `IEnumerable<T>` interface
+        // (built-in iterator format — §29.11 vtable dispatch) must store a
+        // vtable-backed enumerator, NOT the raw collection pointer. The
+        // local-decl path (lowerLocalDecl ~12860) wraps an `Array<T>`/
+        // `Stack<T>`/`Queue<T>`/`Set<T>`/`LinkedList<T>`/user-class source as a
+        // vtable-backed wrapper before the slot init, and the return-coercion
+        // path (wrapAsIEnumerableForTarget ~7555) wraps on the RETURN edge;
+        // the field-init path was missing the same primitive. Pre-fix the
+        // slot held a raw `bz_array_t*` / `bz_llist_t*` / etc. whose first
+        // word is the backing's count field, not a vtable pointer, and the
+        // §29.7 iterator-vtable slot-1 Dispose at owner disposal read the
+        // count bits as a function pointer → SIGSEGV. Mirror the local-decl /
+        // return-coercion wrap at the field-init site: declared target type
+        // is the wrap-creator's gate (headName=="IEnumerable"), source type
+        // is the initializer's exprType. A null initializer source passes
+        // through unchanged (the wrap-creator returns null for a null input);
+        // an already-`IEnumerable<T>` source passes through unchanged
+        // (wrap-creator keys on the headName mismatch). Gated on the field's
+        // enclosing TypeDecl being a Class — a record's reference fields are
+        // borrows with no disposer (§9/§9.7), and a static field's slot is
+        // program-lifetime storage (no slot-1 Dispose), so neither can reach
+        // the §29.7 broken shape.
+        if (v && t->kind == ast::TypeDeclKind::Class) {
+            // Static fields are program-lifetime storage with no slot-1
+            // Dispose (§22.13), so they never reach the §29.7 broken shape;
+            // exclude them from the wrap so a static `IEnumerable<T>` field
+            // initializer still stores the raw value (the canonical pattern).
+            bool isStatic = false;
+            if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m))
+                isStatic = isStaticField(fs);
+            if (!isStatic) {
+                const sema::TypeRef* fieldTy = nullptr;
+                if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+                    if (fd->type) fieldTy = ctx_.resolvedType(*fd->type);
+                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+                    if (pd->type) fieldTy = ctx_.resolvedType(*pd->type);
+                if (!fieldTy && m->decl == nullptr) {
+                    if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m))
+                        fieldTy = ctx_.importedMemberType(ms);
+                }
+                if (fieldTy && isVtableBackedIEnumerableType(fieldTy))
+                    v = wrapAsIEnumerableForTarget(
+                        v, fieldTy, init,
+                        /*ownLazyPipeline=*/true,
+                        /*outWrapMade=*/nullptr,
+                        /*srcOwnedByCallee=*/
+                        returnSourceIsCalleeOwnedCollection(init));
+            }
+        }
         builder_.CreateStore(
             v, builder_.CreateStructGEP(st, obj, idxIt->second));
     }
