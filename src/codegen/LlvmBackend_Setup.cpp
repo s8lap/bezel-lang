@@ -4290,6 +4290,53 @@ void Emitter::declareVtables() {
                 allVtables_.push_back(gv);  // §8.6 #417: string discriminator
         }
     }
+    // fix #3358 (§2.8.3 rule 4, §8.6, v0.240): the SPAN analogue of the
+    // #2797 consumer-side block above. A dependency that boxes a Span value
+    // emits `bvt$spanbox$<module>.<head>` with ExternalLinkage (the
+    // exporter-side change in `ensureSpanBoxVtable`); the consumer DECLARES
+    // that symbol here, ExternalLinkage with no initializer (the address is
+    // the only thing `bz_obj_is_string` reads), and pushes it into
+    // `allVtables_` so the discriminator's whitelist contains the
+    // dependency's span-box vtable address. Without this declaration the
+    // table has no entry for the dependency's `bvt$spanbox$<Lib>.Span`
+    // (because the dependency's mint is the only DEFINITION, in the
+    // dependency's .o — this is the residual #2797 left for SPAN), and the
+    // "not in table ⇒ string" premise mis-fires for every Span value
+    // arriving across a module boundary.
+    //
+    // Gate: every imported MODULE NAME (via `importedByModule` — keyed on
+    // `md.moduleName` for every loaded dependency). The discriminator
+    // runtime needs every dependency's `bvt$spanbox$<dep>.<head>` in its
+    // own `bz$vtable$table` because a Span value the dependency boxed
+    // carries the dependency's box-vtable address in its word 0, and
+    // `bz_obj_is_string`'s "not in table ⇒ string" premise mis-fires
+    // without it. Iterating per-module (not per-symbol, because a
+    // consumer reaching the dependency through `Object`/`IReadOnlySpan`
+    // has no Span TypeSymbol in `importedSymbols`) declares the four
+    // heads for every dependency name. The exporter's unconditional
+    // pre-mint loop below ensures each dependency emits all four heads,
+    // so every consumer-side declaration here resolves at link time.
+    if (ctx_.hasImports()) {
+        for (const auto& [modName, _types] : ctx_.importedByModule()) {
+            for (const char* head : {"Span", "ReadOnlySpan",
+                                     "ArraySpan", "ReadOnlyArraySpan"}) {
+                std::string boxVtName =
+                    std::string("bvt$spanbox$") + modName + "." + head;
+                llvm::GlobalVariable* gv =
+                    module_->getNamedGlobal(boxVtName);
+                if (!gv) {
+                    gv = new llvm::GlobalVariable(
+                        *module_, llvm::ArrayType::get(ptrTy(), 0),
+                        /*isConstant=*/true,
+                        llvm::GlobalValue::ExternalLinkage,
+                        /*init=*/nullptr, boxVtName);
+                }
+                if (std::find(allVtables_.begin(), allVtables_.end(),
+                              gv) == allVtables_.end())
+                    allVtables_.push_back(gv);
+            }
+        }
+    }
     // fix #2387 (§2.8.2/§2.8.3 rule 4; v0.235): declareImportedPropertyGetters
     // populates importedPropGetterFns_, which ensurePropertyAccessorFn's
     // imported-property fallback (LlvmBackend_Assign.cpp) now consults from
@@ -4881,6 +4928,113 @@ void Emitter::declareVtables() {
                      : llvm::GlobalValue::InternalLinkage,
             init, "vt$" + mangledTypeName(ts));
         allVtables_.push_back(vtables_[ts]);  // §8.6 #417: string discriminator
+    }
+    // fix #3358 (§2.8.3 rule 4, §8.6, v0.240): the SPAN analogue of the
+    // #2797 "module-owns-its-emit" rule, on the EXPORTER side. The consumer-
+    // side block above (gated on `importedSymbols`) declares only the heads
+    // whose span-like TypeSymbol appears in the imported-symbols list, and
+    // a consumer that imports a dependency whose public surface has no
+    // `Span`/`ReadOnlySpan`/`ArraySpan`/`ReadOnlyArraySpan` TypeSymbol (only
+    // a method whose return type is `Object` reaching through `IReadOnlySpan`)
+    // has no imported symbol to gate on — and the consumer's `bz$vtable$table`
+    // then lacks the dependency's `bvt$spanbox$<dep>.<head>` address, so the
+    // discriminator mis-fires ("not in table ⇒ string") for every Span value
+    // the dependency boxes. The same defect that #2797 fixed for records/
+    // enums (a class-typed value the dependency boxed is recognized by the
+    // consumer's table) recurs for Span because the dependency emits ONLY the
+    // heads its source types need (e.g. `bvt$spanbox$<Lib>.Span` for
+    // `Span<int>` source, no ReadOnlySpan/ArraySpan/ReadOnlyArraySpan mints
+    // — those would be dead code in the dependency's .o, but they're the
+    // symbols a CONSUMER's over-eager declaration tries to resolve).
+    //
+    // The fix: unconditionally pre-mint all four heads at module-finalize
+    // time (now, end of `declareVtables`). Each head gets a canonical
+    // ExternalLinkage def under `<own-module>.<head>`; the body is the same
+    // span-box vtable `ensureSpanBoxVtable` mints per-`(elemTy, head)`, with
+    // `i32` as the sentinel element type (the vtable is keyed by name — not
+    // elemTy — across the four heads, so a single elemTy per head is the
+    // canonical choice). The dependency's `bz$vtable$table` then contains
+    // all four head addresses regardless of which head its source types
+    // actually use, so any consumer's per-imported-module declaration of all
+    // four heads resolves at link time to the dependency's defs.
+    //
+    // Body correctness for unused heads: `o is Span` walks the descriptor
+    // chain (`btd$spanbox`, shared LinkOnceODR — #2301's `ptd$<nm>`
+    // precedent), so the discriminator's answer is correct even when the
+    // vtable's own function pointers target `i32` payloads. Runtime vtable
+    // functions (IndexOf / Contains / ToString / etc.) carry the `i32`
+    // sentinel's signatures and would mis-handle a non-int box in a future
+    // `bvt$spanbox$<own>.Span` emit — but that's a pre-existing per-`(elemTy,
+    // head)` cache collision unrelated to the cross-module table fix this
+    // commit addresses. The discriminator's "not in table ⇒ string" gate is
+    // the load-bearing surface for the bug; the body correctness is a
+    // separate (and separable) per-elemTy concern.
+    //
+    // Done here, at end of `declareVtables`.  ensureSpanBoxVtable's normal
+    // path returns null when the IReadOnlySpan descriptor isn't in
+    // `descArray_` (a module that doesn't touch the IReadOnlySpan symbol
+    // has no descriptor registered), which would silently leave the four
+    // heads undefined and the consumer-side declarations above unresolved
+    // at link time.  The fallback below mints each head as a stub
+    // ExternalLinkage def with the canonical `kVirtualMethodsBase`-element
+    // shape (slot [0] = `btd$spanbox`, slots [1..5] = null), no itmap or
+    // itable — the discriminator's "not in table ⇒ string" gate only needs
+    // the symbol's address, and the stub's null vtable slots are never
+    // reached at runtime when the head is genuinely unused.
+    for (const char* head : {"Span", "ReadOnlySpan",
+                             "ArraySpan", "ReadOnlyArraySpan"}) {
+        if (!ensureSpanBoxVtable(i32(), head)) {
+            // IReadOnlySpan descriptor unavailable — emit a stub so the
+            // consumer-side declarations above resolve at link time.
+            // The stub body's slot [0] references the LinkOnceODR
+            // `btd$spanbox` (created here if absent, otherwise reused);
+            // slots [1..5] are null (the runtime's discriminator doesn't
+            // call them, and the itmap slot [1] being null makes
+            // interface dispatch bail — §8.6 + #970 — for this never-
+            // used head).
+            llvm::GlobalVariable* stubDesc =
+                module_->getNamedGlobal("btd$spanbox");
+            if (!stubDesc) {
+                auto* descArrTy = llvm::ArrayType::get(ptrTy(), 2);
+                stubDesc = new llvm::GlobalVariable(
+                    *module_, descArrTy, /*isConstant=*/true,
+                    llvm::GlobalValue::LinkOnceODRLinkage, nullptr,
+                    "btd$spanbox");
+                stubDesc->setInitializer(llvm::ConstantArray::get(
+                    descArrTy, {stubDesc,
+                                llvm::ConstantPointerNull::get(ptrTy())}));
+            }
+            std::string ownModName2;
+            if (auto* mdecl = dynamic_cast<const ast::ModuleDecl*>(
+                    ctx_.module()->decl)) {
+                if (mdecl->name && !mdecl->name->parts.empty()) {
+                    for (std::size_t i = 0; i < mdecl->name->parts.size();
+                         ++i) {
+                        if (i) ownModName2 += '.';
+                        ownModName2 +=
+                            std::string(mdecl->name->parts[i]);
+                    }
+                }
+            }
+            if (ownModName2.empty())
+                ownModName2 = std::string(ctx_.module()->name);
+            std::string stubVtName =
+                "bvt$spanbox$" + ownModName2 + "." + head;
+            if (!module_->getNamedGlobal(stubVtName)) {
+                auto* stubArrTy = llvm::ArrayType::get(
+                    ptrTy(), kVirtualMethodsBase);
+                std::vector<llvm::Constant*> stubElems(
+                    kVirtualMethodsBase,
+                    llvm::ConstantPointerNull::get(ptrTy()));
+                stubElems[0] = stubDesc;
+                auto* stubGV = new llvm::GlobalVariable(
+                    *module_, stubArrTy, /*isConstant=*/true,
+                    llvm::GlobalValue::ExternalLinkage,
+                    llvm::ConstantArray::get(stubArrTy, stubElems),
+                    stubVtName);
+                (void)stubGV;
+            }
+        }
     }
 }
 
@@ -31384,10 +31538,20 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy,
         "itmap$spanbox");
 
     // --- Build a minimal span-box descriptor: [self, null] ---
+    // fix #3358 (§2.8.3 rule 4, §8.6, v0.240): `btd$spanbox` is the head of
+    // every Span-typed box's descriptor chain. Without LinkOnceODR each
+    // module's `btd$spanbox` is at a distinct InternalLinkage address; a
+    // value a DEPENDENCY boxed carries the dependency's `btd$spanbox` in its
+    // vtable[0], but the consumer compares against its OWN `btd$spanbox`
+    // (different address) and the descriptor-chain walk in `emitIsA` silently
+    // fails even when the discriminator's vtable-table entry is correct (the
+    // 'string' mis-fire is the FIRST failure, but without LinkOnceODR the
+    // second-stage `emitIsA` walk is also broken). LinkOnceODR unifies the
+    // address across modules — the #2301 `ptd$<nm>` precedent.
     auto* descArrTy = llvm::ArrayType::get(ptrTy(), 2);
     auto* boxDesc = new llvm::GlobalVariable(
         *module_, descArrTy, /*isConstant=*/true,
-        llvm::GlobalValue::InternalLinkage, nullptr, "btd$spanbox");
+        llvm::GlobalValue::LinkOnceODRLinkage, nullptr, "btd$spanbox");
     boxDesc->setInitializer(llvm::ConstantArray::get(
         descArrTy, {boxDesc, llvm::ConstantPointerNull::get(ptrTy())}));
 
@@ -31401,11 +31565,41 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy,
     vtElems[kEqualsSlot]      = boxDefaultEqualsThunk();
     vtElems[kGetHashCodeSlot] = boxDefaultHashCodeThunk();
     auto* vtArrTy = llvm::ArrayType::get(ptrTy(), vtElems.size());
+    // fix #3358 (§2.8.3 rule 4, §8.6, v0.240): the SPAN analogue of #2797's
+    // `bvt$box$<R>` fix. The span-box vtable `bvt$spanbox$<head>` was
+    // InternalLinkage — each module's mint sat at a private address that no
+    // other artifact could reference, so the consumer's `bz$vtable$table`
+    // contained no entry for the dependency's span-box vtable and the
+    // discriminator's "not in table ⇒ string" premise mis-fired for every
+    // Span value arriving across a module boundary.
+    //
+    // The fix: ExternalLinkage + module-QUALIFIED name (mirroring #1488's
+    // class-vtable mangling + #2797's `bvt$box$<M>.<R>`). The qualified name
+    // carries the exporter identity and lets the consumer declare the
+    // exporter's vtable in its own `bz$vtable$table` without colliding with
+    // two modules' same-named Span records (§2.8.3 rule 3).
+    //
+    // The exporter's own name comes from `ctx_.module()` (a ModuleSymbol
+    // populated by SymbolCollection from the SourceFile's ModuleDecl); the
+    // ModuleSymbol's `name` is the dotted full name (`System.Collections.Generic`),
+    // matching the `ts->moduleName` field used by `mangledTypeName`.
+    std::string ownModName;
+    if (auto* mdecl = dynamic_cast<const ast::ModuleDecl*>(ctx_.module()->decl)) {
+        if (mdecl->name && !mdecl->name->parts.empty()) {
+            for (std::size_t i = 0; i < mdecl->name->parts.size(); ++i) {
+                if (i) ownModName += '.';
+                ownModName += std::string(mdecl->name->parts[i]);
+            }
+        }
+    }
+    if (ownModName.empty()) ownModName = std::string(ctx_.module()->name);
+    std::string spanBoxVtName =
+        "bvt$spanbox$" + ownModName + "." + std::string(head);
     auto* vtGV = new llvm::GlobalVariable(
         *module_, vtArrTy, /*isConstant=*/true,
-        llvm::GlobalValue::InternalLinkage,
+        llvm::GlobalValue::ExternalLinkage,
         llvm::ConstantArray::get(vtArrTy, vtElems),
-        "bvt$spanbox$" + std::string(head));
+        spanBoxVtName);
     allVtables_.push_back(vtGV);
 
     spanBoxVtables_[key] = vtGV;

@@ -460,6 +460,18 @@ public:
     // (non-import) path stay byte-for-byte unchanged when there are no imports.
     bool hasImports() const { return !importedByModule_.empty(); }
 
+    // fix #3358 (§2.8.3 rule 4, §8.6, v0.240): the per-module registry of
+    // imported TypeSymbols, exposed to codegen so the consumer-side block in
+    // `declareVtables` can iterate module names (the cross-module span box
+    // vtable fix needs the dependency's `bvt$spanbox$<module>.<head>`
+    // declared in its own `bz$vtable$table` regardless of whether the
+    // consumer's source mentions Span — which `importedSymbols()` does NOT
+    // surface when the consumer only sees the dependency as a typed result
+    // reaching through `Object`/`IReadOnlySpan`). Read-only view; the map
+    // itself stays private (writes go through `registerImportedType`).
+    const std::unordered_map<std::string, std::vector<TypeSymbol*>>&
+    importedByModule() const { return importedByModule_; }
+
     // §26.5 step 2 (#2573): true once at least one imported `public extension`
     // block has been registered. An extension-only dependency (one whose public
     // surface carries extension blocks but no exported types) never populates
