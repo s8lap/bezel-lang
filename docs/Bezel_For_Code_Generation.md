@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.278. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.280. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -64,7 +64,7 @@ type Handler<T> := (T, string?) -> bool;  // type alias: `:=`, never a visibilit
 
 After the module line and imports come top-level declarations: `class`, `interface`, `record`, `enum`, `choice`, `extension`, `type`, `extern` (§2.1, §2.2, §27.8, A.2). Source files are UTF-8 with extension `.bzl`. Comments: `// line`, `/* block, does not nest */`, `/// doc` (§1.1, §1.5).
 
-Auto-imported, no `import` needed (§2.3): `System`, `System.Text`, the primitives, `Array<T>`, `OwningArray<T>`, the `Task` family, the eight iteration interfaces, `CancellationToken`/`CancellationTokenSource` and the event types. **Everything else needs an import** — section 5.0 has the table.
+Auto-imported, no `import` needed (§2.3): `System`, `System.Text`, the primitives, `Array<T>`, `OwningArray<T>`, the `Task` family, the eight iteration interfaces, `CancellationToken`, `Subscription`, and the six event types. `CancellationTokenSource` is NOT auto — it needs `import System.Threading;`. **Everything else needs an import** — section 5.0 has the table.
 
 ### 3.2 Keywords
 
@@ -610,7 +610,7 @@ Everything below is transcribed from `Bezel_Standard_Library.md` v0.278 with its
 | `System.Text` | auto | `StringBuilder`, `Encoding`, `ReadOnlyStringSpan` |
 | `System.Collections.Generic` | **explicit** | the collections — *except* the iteration interfaces (`IEnumerable`/`IEnumerator`/`IAsyncEnumerable`/`IAsyncEnumerator`/`IOwning*`), which are auto |
 | `System.Collections.Linq` | **auto** (v0.278) | the query operators. No `import` needed — §2.3's invariant: a stdlib extension over an always-available type is auto-imported |
-| `System.Threading` | **explicit** | *except* `CancellationToken`/`CancellationTokenSource` and the six event types, which are auto |
+| `System.Threading` | **explicit** | *except* `CancellationToken`, `Subscription`, and the six event types, which are auto — `CancellationTokenSource` itself needs the import |
 | `System.IO` | **explicit** | `Stream`, `FileStream`, `File`, `TextReader`/`TextWriter`, `Directory`, `Path` |
 | `System.Diagnostics` | **explicit** | `Stopwatch`, `Debug` |
 | `System.Serialization` | **explicit** | `JsonSerializer`/`JsonDeserializer`/`BinarySerializer`/`BinaryDeserializer`/`JsonOptions`/`SerializationException`/`Json`/`Binary` |
