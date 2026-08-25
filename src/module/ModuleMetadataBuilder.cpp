@@ -2160,6 +2160,53 @@ static bool convertExtension(const sema::ExtensionSymbol& ext,
     out.target = convertType(target);
     out.visibility = toMetaVisibility(decl->visibility, /*inInterface=*/false);
     for (sema::Symbol* m : ext.members) {
+        // fix #2583 (§26.3, §26.5 step 2, v0.236): the prior declaration
+        // accepted only methods and silently dropped property members on the
+        // (incorrect) rationale that "A property has no exported accessor
+        // symbol (it is inlined at the use site), so only methods cross". The
+        // inlining-at-use-site story is true for a LOCAL extension property
+        // (codegen calls computedGetterOf, which lowers the body in the local
+        // sema context). For a CROSS-MODULE extension property the importer
+        // has no local sema body to call, so the property must ride the wire
+        // and the importer must re-parse + attach the body — exactly mirroring
+        // how a generic-class property rides in `propertyBodyText` (#2893).
+        // The method branch below is unchanged.
+        if (auto* prop = dynamic_cast<const sema::PropertySymbol*>(m)) {
+            // §26.3: an extension property is expression-bodied only
+            // (`property Name: Type => expr;`); the block-accessor and auto
+            // forms are not admitted by parser/sema. Restate the gate here
+            // as a belt-and-braces — a stale or buggy AST shape that reaches
+            // this site gets the same decline.
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(prop->decl);
+            if (pd == nullptr) continue;
+            if (pd->bodyKind != ast::PropertyBodyKind::Expression) continue;
+            if (pd->isIndexer) continue;
+            if (!isExportedMember(prop->visibility, /*inInterface=*/false))
+                continue;
+            // (Generic extension properties are impossible by construction:
+            // PropertySymbol carries no genericParams — only FunctionSymbol /
+            // MethodSymbol / TypeSymbol / ExtensionSymbol do, and the parser /
+            // sema never admit a generic property. Importer-side
+            // monomorphization is required only for generic methods, handled
+            // below.)
+            MetaMember mm;
+            // Reuse the regular Property-branch of convertMember: it sets
+            // kind=Property, type, hasGetter/hasSetter (true/false — §26.3
+            // computed read-only), isAutoProperty=false (extensions are
+            // never auto), setterVisibility=Public, and — when source
+            // carries the full PropertyDecl span — propertyBodyText so the
+            // importer can re-parse it. visibility/modifiers ride alongside.
+            if (convertMember(*prop, /*inInterface=*/false, ctx, mm,
+                              /*isGenericType=*/false, source)) {
+                // §26.3: extension properties have no setter — the spec read
+                // "computed read-only properties" is the only form. Force the
+                // wire shape to match even if the exporter-derived conversion
+                // accidentally disagreed (a defensive belt).
+                mm.hasSetter = false;
+                out.members.push_back(std::move(mm));
+            }
+            continue;
+        }
         auto* meth = dynamic_cast<const sema::MethodSymbol*>(m);
         // §26.3: extensions declare methods and computed read-only properties.
         // A property has no exported accessor symbol (it is inlined at the use
