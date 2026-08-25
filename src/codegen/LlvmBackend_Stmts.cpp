@@ -2897,6 +2897,51 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // — the same resolver `x?.Dispose()` / `x.Dispose()` uses, so it
                     // is already general across LocalSymbol (any decl kind) and
                     // `owned` ParameterSymbol receivers.
+                    //
+                    // fix #2675 / §17.13 / §28.3 / §28.9 (v0.278): the
+                    // announced-consume path's class-vtable dispatch (the
+                    // `emitDisposeAndReclaim` below) reads the slot's word 0 as a
+                    // Bezel vtable and indirect-calls slot 2 — a wild call for a
+                    // vtable-less built-in class (StringBuilder, Random,
+                    // EventSource<T>, AsyncEventSource<T>, TaskCompletionSource<T>,
+                    // OwningTaskCompletionSource<T>, Channel<T>, Atomic<T>,
+                    // AtomicInteger<T>, Stopwatch, Mutex, Semaphore, FileStream,
+                    // CancellationTokenSource, the Buffer family). A
+                    // `using var sb := new StringBuilder(); _ := sb;` therefore
+                    // SIGSEGV'd with pc=0 (measured on 39c03b1: `DEADLYSIGNAL`,
+                    // `ERROR: AddressSanitizer: SEGV on unknown address
+                    // 0x000000000000` — the same signature #3157/#2973 recorded
+                    // for `Random` and Channel<T>). #2655 fixed the FRESH-producer
+                    // arm (`_ := new StringBuilder();`) but left the named-binding
+                    // arm on the class dispatch.
+                    //
+                    // Detect the named-owned-binding vtable-less shape HERE — same
+                    // place the explicit-Dispose chain detects it (#2967/#2921)
+                    // — and route through `emitVtablelessBuiltinRelease`, the same
+                    // call the `using var` scope-exit auto-drop chain routes
+                    // through (#1185 / #2973). Both paths now agree on what
+                    // releases a given built-in (the no-drift property the
+                    // original arms were introduced to enforce), and the slot is
+                    // still nulled afterwards so a following scope-end / unwind
+                    // auto-drop reloads null and skips — exactly-once.
+                    //
+                    // The named-binding `discardOutOwnedVar` flag is set by the
+                    // ownership pass only when the binding's state is Owned and
+                    // not a `using var` borrow-pin alias (§3253) — so this
+                    // emission runs only for the Genuine-Owner shape and cannot
+                    // double-dispose a borrow-pin (whose real owner keeps the
+                    // obligation). A borrow-state operand is also already
+                    // excluded by `lookupState(...) == Owned`. The free path
+                    // goes through `builtinTypeName` + the same
+                    // `common::isVtableLessBuiltinClassName` registry gate the
+                    // `using var` chain and the explicit-Dispose chain use, so
+                    // adding a new built-in here is a line in
+                    // `usingAutoDropVtablelessBuiltin` / `emitVtablelessBuiltin-
+                    // Release`, not a third copy of the detection code in this
+                    // function. When no release is known for the named built-in,
+                    // `emitVtablelessBuiltinRelease` returns false and we fall
+                    // through to the class dispatch — the same "leak before wild
+                    // jump" trade #2874 / #2973 record.
                     llvm::Type* slotTy = nullptr;
                     llvm::Value* slotAddr =
                         explicitDisposeOwnedReceiverSlot(*ds->value, slotTy);
@@ -2911,14 +2956,38 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             llvm_, "disc.cont", currentFn_);
                         builder_.CreateCondBr(isNull, contBB, dispBB);
                         builder_.SetInsertPoint(dispBB);
-                        emitDisposeAndReclaim(obj);
-                        builder_.CreateStore(nullVal, slotAddr);
-                        // #2310 / §29.8 / §30.1 (#973a residual): also null the
-                        // FRAME capture slot of an `owned` state-machine parameter
-                        // this `_ := p` discard just consumed (no-op outside a
-                        // state-machine body, for non-parameter sources, for
-                        // non-owned parameters). per §29.8 / §30.1
-                        nullStateMachineOwnedParamCapture(ds->value.get());
+                        std::string_view bn;
+                        if (const sema::TypeRef* rt =
+                                ctx_.exprType(*ds->value)) {
+                            bn = builtinTypeName(rt);
+                        }
+                        if (!bn.empty() &&
+                            common::isVtableLessBuiltinClassName(bn) &&
+                            emitVtablelessBuiltinRelease(bn, obj)) {
+                            // vtable-less path: builtin released; null the
+                            // slot so a following scope-exit / unwind
+                            // registration reloads null and skips.
+                            builder_.CreateStore(nullVal, slotAddr);
+                            // #2310 / §29.8 / §30.1 (#973a residual): also null
+                            // the FRAME capture slot of an `owned`
+                            // state-machine parameter this `_ := p` discard just
+                            // consumed (no-op outside a state-machine body, for
+                            // non-parameter sources, for non-owned parameters).
+                            // per §29.8 / §30.1
+                            nullStateMachineOwnedParamCapture(
+                                ds->value.get());
+                        } else {
+                            // class/interface (or a vtable-less builtin no
+                            // arm names yet — leak-before-wild-jump, #2973).
+                            emitDisposeAndReclaim(obj);
+                            builder_.CreateStore(nullVal, slotAddr);
+                            // #2310 / §29.8 / §30.1 (#973a residual): also null the
+                            // FRAME capture slot of an `owned` state-machine parameter
+                            // this `_ := p` discard just consumed (no-op outside a
+                            // state-machine body, for non-parameter sources, for
+                            // non-owned parameters). per §29.8 / §30.1
+                            nullStateMachineOwnedParamCapture(ds->value.get());
+                        }
                         builder_.CreateBr(contBB);
                         builder_.SetInsertPoint(contBB);
                     }
