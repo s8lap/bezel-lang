@@ -290,13 +290,24 @@ BEZEL_TEST(vacuous_pin_lint_2073,
 // and the #1595 `using var t := F.Work(p)` Task-family pattern). FAILS WITHOUT
 // THE REWORK. // per §28.10 #2073 (rework 2)
 
-// `using var` over StringBuilder must not emit the inert-RHS warning: although
-// compiler-intrinsic, StringBuilder owns its parts array and retained strings,
-// and the runtime performs real scope-end cleanup (stdlib §3.1; spec §28.9,
-// v0.226). The plain-`var` control pins the matching §28.3 owned auto-drop hint,
-// so the two binding forms cannot oscillate between incompatible classifications.
-BEZEL_TEST(stringbuilder_ownership_hint_2190,
-           stringbuilder_classified_owned_spec_28_3_28_9_v0226) {
+// §28.9 (v0.240), fix #2269: StringBuilder is TRIVIAL-DISPOSE — the spec
+// (L7363) names it explicitly ("declares no destructor and no `owned`
+// fields, and its intrinsic backing storage is released by the instance's
+// own free, exactly as a borrowing collection's is"), and §28.9 L7357
+// forbids the ownership-discharge warning on a `new` expression of a
+// trivial-dispose class type whose result is not stored in `owned` or
+// `using var`. The scope-end reclaim still runs (the codegen auto-drop
+// chain reclaims the builder via the borrowing-`Array<string>` free path,
+// #1185 / LlvmBackend_Setup.cpp:15725) but it is the §28.9
+// trivial-dispose reclaim, not the must-use discharge; the warning the
+// `#2190` test pinned was based on a stale v0.226 reading and is wrong
+// at v0.240. The `using var` half of the regression (no inert-RHS / no
+// vacuous-pin warning) is unchanged from #2190: it was vacuous the whole
+// time — StringBuilder was never in `kDisposableBuiltinHeadNames`'s
+// neighbour table `kChainClaimedBuiltinHeadNames` either, so the lint
+// also correctly skipped. // per §28.9 (v0.240), fix #2269
+BEZEL_TEST(stringbuilder_ownership_hint_2269,
+           stringbuilder_trivial_dispose_no_ceremony_warning_v0240) {
     auto usingResult = parseAndCheckOwnership(
         "module M; "
         "class C "
@@ -319,8 +330,14 @@ BEZEL_TEST(stringbuilder_ownership_hint_2190,
         "  end Plain; "
         "  public static method Main(): int return 0; end Main; "
         "end C;");
+    // §28.9 L7357: a `new` of a trivial-dispose class type whose result is
+    // not stored in `owned` or `using var` does NOT produce the standard
+    // ownership-discharge warning. The scope-end reclaim still runs (the
+    // codegen chain reclaims the builder's backing array via the
+    // borrowing-`Array<string>` free path) but it is the trivial-dispose
+    // reclaim, not a must-use discharge.
     BEZEL_EXPECT_FALSE(plainResult.diagnostics.hasErrors());
-    BEZEL_EXPECT_TRUE(bezel::test::hasAutoDropWarning(plainResult, "sb"));
+    BEZEL_EXPECT_FALSE(bezel::test::hasAutoDropWarning(plainResult, "sb"));
 }
 
 // `using var` over a fresh Channel<T> — the §6.9 / #600 canonical pattern.

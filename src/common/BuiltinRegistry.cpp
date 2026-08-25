@@ -478,9 +478,22 @@ bool isBuiltinInterfaceHead(std::string_view n) {
 // invariant). That decision is filed separately; the table here matches the
 // lint's current table so the lift is behaviour-preserving.
 // per §28.3 / §28.9 / §28.10, fix #2992
-constexpr std::array<std::string_view, 41> kDisposableBuiltinHeadNames = {
-    // stdlib §3.1 / spec §28.9 (#2190): StringBuilder owns its heap parts array.
-    "StringBuilder",
+constexpr std::array<std::string_view, 40> kDisposableBuiltinHeadNames = {
+    // fix #2269 (§28.9, v0.240): StringBuilder is REMOVED from the disposable
+    // set. The spec (§28.9 L7363) classifies StringBuilder as TRIVIAL-DISPOSE
+    // ("declares no destructor and no `owned` fields, and its intrinsic
+    // backing storage is released by the instance's own free, exactly as a
+    // borrowing collection's is") and §28.9 L7357 forbids the ownership-
+    // discharge warning on a `new` expression of a trivial-dispose type that
+    // isn't stored. #2190 added it to this table on a stale v0.226 reading;
+    // the §28.3 ceremony now over-fires on `var sb := new StringBuilder();`
+    // and `using var sb := new StringBuilder();` draws the vacuous-pin lint
+    // the spec says it must not. Removing it restores the spec-trivial-dispose
+    // classification: StringBuilder carries the intrinsic backing-storage free
+    // (the only disposal work) and nothing else, so the lint and the §28.3
+    // ceremony both correctly classify it as ordinary reclaim (no user code).
+    // // per §28.9 (v0.240), fix #2269
+    //
     // §2.15 concrete serializers/deserializers (#2073 rework 3b).
     "BinarySerializer", "BinaryDeserializer",
     "JsonSerializer", "JsonDeserializer",
@@ -552,10 +565,27 @@ bool isDisposableBuiltinHeadName(std::string_view head) {
 // and `isChainClaimedBuiltinHeadName`) are EXPLICITLY disjoint — the former
 // is the lint's narrow table, the latter is the factory-call-form closure
 // for the gap #2695 created.  // per §28.3 / §28.9 / §28.10, fix #3017
-constexpr std::array<std::string_view, 13> kChainClaimedBuiltinHeadNames = {
+//
+// fix #2269 (§28.9, v0.240): `StringBuilder` joins the chain-claimed set —
+// it is chain-claimed by the codegen auto-drop chain (registerUsingDisposal
+// routes it through the borrowing-`Array<string>` free with the string-
+// element release thunk, per #1185 / LlvmBackend_Setup.cpp:15725). The spec
+// classifies StringBuilder as trivial-dispose (§28.9 L7363 — "declares no
+// destructor and no `owned` fields, and its intrinsic backing storage is
+// released by the instance's own free, exactly as a borrowing collection's
+// is"), so `localIsTrivialDisposeNewBinding` (Ownership.cpp, the §28.3
+// auto-drop warning suppressor) must admit it — which this set is the
+// authority for. Removing it from `kDisposableBuiltinHeadNames` (the lint
+// table) closed the vacuous-pin over-fire; this addition closes the
+// §28.3 auto-drop over-fire. The two predicates remain disjoint: the
+// lint's table is the disposable-but-non-trivial-dispose surface, the
+// chain's table is the trivial-dispose surface the chain still reclaims.
+// // per §28.9 (v0.240), fix #2269
+constexpr std::array<std::string_view, 14> kChainClaimedBuiltinHeadNames = {
     "Array", "Stack", "Queue", "Set", "SortedSet",
     "Dictionary", "SortedDictionary", "LinkedList",
     "Random", "Atomic", "AtomicInteger", "Stopwatch", "Buffer",
+    "StringBuilder",
 };
 
 bool isChainClaimedBuiltinHeadName(std::string_view head) {
