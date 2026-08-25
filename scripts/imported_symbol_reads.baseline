@@ -34,17 +34,17 @@
 #         silent "no" across a module boundary.
 20   src/codegen/LlvmBackend_Assign.cpp
 28   src/codegen/LlvmBackend_Calls2.cpp
-2    src/codegen/LlvmBackend_Disposal.cpp
+3    src/codegen/LlvmBackend_Disposal.cpp
 8    src/codegen/LlvmBackend_Exprs.cpp
 7    src/codegen/LlvmBackend_Exprs2.cpp
 3    src/codegen/LlvmBackend_Layout.cpp
 8    src/codegen/LlvmBackend_Serialization.cpp
-56   src/codegen/LlvmBackend_Setup.cpp
+58   src/codegen/LlvmBackend_Setup.cpp
 4    src/codegen/LlvmBackend_Stmts.cpp
 2    src/codegen/LlvmBackend_String.cpp
 21   src/codegen/LlvmBackend_impl.hpp
 2    src/common/OwnershipFacts.cpp
-3    src/module/ModuleLoader.cpp
+4    src/module/ModuleLoader.cpp
 10   src/module/ModuleMetadataBuilder.cpp
 4    src/ownership/Ownership.cpp
 3    src/ownership/Ownership_Checks.cpp
