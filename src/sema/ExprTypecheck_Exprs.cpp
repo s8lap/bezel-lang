@@ -3440,18 +3440,34 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             "#992)");
                     }
                 }
-                // per §15.4 / §22.7 (#599): a collection literal `[..]`
+                // per §15.4 / §22.7 (#599, #2725): a collection literal `[..]`
                 // in a `new` argument position is a compile error when the
                 // constructor parameter is not a collection type.  The
                 // stdlib builtin collection types (Array<T>, Stack<T>, etc.)
                 // are represented as Named TypeRefs with a null declaration
-                // and expose only `constructor()` / `constructor(capacity:
-                // int)` — neither accepts a collection literal (§15.4
-                // requires a collection-typed target context for `[..]`).
-                // Codegen silently ignores all `new Array<T>(...)` arguments
-                // and always emits an empty-capacity allocation, so the
-                // misuse produces a silently empty collection (#599).
-                // Detect and reject here before codegen sees the node.
+                // and expose only constructors whose parameter shapes do NOT
+                // admit a collection literal — §15.4 requires a
+                // collection-typed target context for `[..]`, and a `new`
+                // argument position supplies no target.  Codegen silently
+                // ignores all `new Array<T>(...)` arguments and always emits
+                // an empty-capacity allocation, so the misuse produces a
+                // silently empty collection (#599).  Detect and reject here
+                // before codegen sees the node.
+                //
+                // fix #2725: the rationale was previously one string for the
+                // whole branch ("the constructor takes an optional `int`
+                // capacity"), which is false for every type in the branch
+                // except the capacity-bearing ones — Stack/OwningStack/Queue/
+                // OwningQueue/OwningLinkedList/Shared/Weak take no `int
+                // capacity` form at all; LinkedList takes `IEnumerable<T>`,
+                // not `int`; StringBuilder also takes `(initial: string)`,
+                // which the message hid.  A diagnostic that names a
+                // constructor the type does not have is worse than one that
+                // names none. The shape per type below mirrors the stdlib
+                // declarations (v0.282: §4.4 Array, §4.5 OwningArray, §4.10
+                // Set, §4.10 OwningSet, §4.8 Dictionary, §4.8 OwningDictionary,
+                // §4.6 LinkedList, §4.7 OwningLinkedList, §4.11 Stack/Queue,
+                // §3.1 StringBuilder, §2.16 Shared/Weak).
                 if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
                     rt->astNode && rt->astNode->name &&
                     !rt->astNode->name->parts.empty()) {
@@ -3468,6 +3484,55 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // take an owned value, not a collection literal.
                         colName == "Shared"    || colName == "Weak";
                     if (isBuiltinColl) {
+                        // Per-type constructor-shape rationale (#2725). One
+                        // string per stdlib type, paired with the matching
+                        // declaration in `docs/Bezel_Standard_Library.md`.
+                        // The WHY-REJECTED half (`§15.4 requires a
+                        // collection-typed target`) and the remedy (bind to a
+                        // named typed binding first) are the same for every
+                        // type — only the WHAT-IS-TAKEN half varies.
+                        std::string_view rationale;
+                        if (colName == "Array") {
+                            rationale = "takes an optional `int` capacity "
+                                        "(or a `(size: int, fill: T)` sized-fill pair)";
+                        } else if (colName == "OwningArray") {
+                            rationale = "takes an optional `int` capacity";
+                        } else if (colName == "Stack" || colName == "OwningStack" ||
+                                   colName == "Queue" || colName == "OwningQueue" ||
+                                   colName == "OwningLinkedList") {
+                            rationale = "takes no arguments";
+                        } else if (colName == "Set" || colName == "OwningSet" ||
+                                   colName == "Dictionary" ||
+                                   colName == "OwningDictionary") {
+                            rationale = "takes an optional `int` capacity "
+                                        "(and/or an `IEqualityComparer<K>`)";
+                        } else if (colName == "LinkedList") {
+                            // §15.4: a collection literal has no standalone
+                            // type, so it cannot be passed where the expected
+                            // type is `IEnumerable<T>` either — the literal
+                            // needs a target-typed position. Bind the literal
+                            // to a typed binding first, then transfer through
+                            // `Add`/`AddLast`/etc., or pass an Array/span.
+                            rationale = "takes an `IEnumerable<T>` source "
+                                        "(a collection literal has no standalone "
+                                        "type to coerce to `IEnumerable<T>` — "
+                                        "bind the literal to a typed binding "
+                                        "first and transfer through `AddLast`/"
+                                        "`AddFirst`/etc., or pass an Array/span)";
+                        } else if (colName == "StringBuilder") {
+                            rationale = "takes an `int` capacity or a `string` "
+                                        "initial value";
+                        } else if (colName == "Shared") {
+                            // stdlib §2.16: `constructor(owned value: T)`.
+                            rationale = "takes a single `owned` value of `T`";
+                        } else {  // "Weak"
+                            // stdlib §2.16 declares no constructors on Weak<T>;
+                            // `new Weak<T>(...)` is already rejected upstream
+                            // by constructor-lookup, but if the lookup ever
+                            // relaxes this branch is the safety net.
+                            rationale = "declares no constructors and cannot be "
+                                        "constructed with `new`";
+                        }
                         for (const auto& a : ne->args) {
                             if (a.value && dynamic_cast<const ast::CollectionLiteralExpr*>(
                                                a.value.get())) {
@@ -3477,11 +3542,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                     std::string("collection literal `[..]` cannot be "
                                         "passed as an argument to `new ") +
                                     std::string(colName) +
-                                    "<...>` — the constructor takes an optional "
-                                    "`int` capacity, not a collection literal; use a "
-                                    "typed-target declaration instead: "
-                                    "`var x: " + std::string(colName) +
-                                    "<T> := [...]` (\xC2\xA7""15.4, #599)");
+                                    "<...>` — the constructor " +
+                                    std::string(rationale) +
+                                    ", not a collection literal; bind the literal "
+                                    "to a named typed binding first (`var xs: " +
+                                    std::string(colName) +
+                                    "<T> := [...]`) and transfer its elements "
+                                    "through `Add`/`AddLast`/etc. "
+                                    "(\xC2\xA7""15.4, #2725)");
                             }
                         }
                     }
