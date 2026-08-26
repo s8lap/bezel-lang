@@ -702,15 +702,15 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             handleDischarge(*te->operand);
             // §31.1 / §28.3 v0.182 (double-free fix, mirrors the ThrowStmt
             // handling in Ownership.cpp visitStmt): a bare `x ?? throw e` /
-            // `=> throw e` of a named owned LOCAL is an announced consume — the
-            // throw keyword is the announcement, no `move` marker needed — and
-            // must be discharged here or its established scope-end / exception-
-            // path disposal double-frees the object the exception machinery is
-            // simultaneously propagating. checkThrowOperandNotBorrowed above
-            // already rejected a borrowed operand (e.g. a catch-arm binding
-            // re-thrown), so a bare identifier that survives it and is
-            // currently Owned is exactly the case to discharge. // per §28.3,
-            // §31.1
+            // `=> throw e` of a named owned LOCAL is a marker-free-position
+            // consume — the throw keyword is the announcement, no `move`
+            // marker needed — and must be discharged here or its established
+            // scope-end / exception-path disposal double-frees the object the
+            // exception machinery is simultaneously propagating.
+            // checkThrowOperandNotBorrowed above already rejected a borrowed
+            // operand (e.g. a catch-arm binding re-thrown), so a bare identifier
+            // that survives it and is currently Owned is exactly the case to
+            // discharge. // per §28.3, §31.1
             if (const auto* id =
                     dynamic_cast<const ast::IdentifierExpr*>(te->operand.get())) {
                 if (id->name != "this" && id->name != "base") {
@@ -3746,7 +3746,7 @@ sema::Symbol* MethodOwnership::borrowSourceForExpr(const ast::Expr& rhs) {
         }
     }
     // Shape 1 — a re-borrow rooted at an Owned local. Per §28.3 producers:
-    // a local read `r` of an owned local in a borrow-consuming position is a
+    // a local read `r` of an owned local in a borrowing position is a
     // borrow (source: `r`); a field/indexer access `r.f` / `r[i]` is a
     // borrow (source: `r`, the access target's root). identifierRoot peels
     // member/index chains down to the root identifier. If that root resolves

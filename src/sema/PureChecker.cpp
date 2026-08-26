@@ -846,10 +846,10 @@ void PureBodyWalker::checkOneStmt(const ast::Stmt* s) {
     }
     if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
         // §22.15 contrapositive: the consuming discard is rejected
-        // (disposal-running / announced consume).
+        // (disposal-running / marker-free-position consume).
         reportPureViolation(
             ds->span.begin, "the consuming discard",
-            "`_ := expr` is the announced consume");
+            "`_ := expr` is a marker-free consume (§28.3)");
         if (ds->value) checkExpr(ds->value.get());
         return;
     }
