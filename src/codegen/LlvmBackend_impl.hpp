@@ -12741,6 +12741,33 @@ private:
     // the same set, which is what makes the producer/consumer balance sound.
     bool isPrimIntrinsicMethodRef(const ast::Expr* e) const;
 
+    // fix #2781 (§8.1 / §14.2): a method-group reference to Object's universal
+    // instance member on an Object-typed receiver — `o.ToString`, `o.Equals`,
+    // `o.GetHashCode` — has no MethodSymbol (Object is a primitive, its
+    // virtuals are runtime intrinsics, the receiver's static interface admits
+    // anything). Mint a thunk closure that mirrors lowerObjectToString /
+    // lowerObjectEquals / lowerObjectGetHashCode: null → §8.3/§8.4/§8.5
+    // default; bz_string* → content intrinsic (+ retain for ToString per
+    // #2846); class/box → vtable[fixed slot] dispatch to the override or
+    // the per-class default thunk. `ma` is the MemberAccessExpr node;
+    // `memberName` selects the dispatch shape (must be one of the three
+    // names, plus arity 0 / 1). Returns a fresh +1 closure cell (the cell
+    // owns its env, never the receiver — §28.3 borrow semantics).
+    llvm::Value* makeObjectMemberThunk(const ast::MemberAccessExpr& ma,
+                                      std::string_view memberName);
+
+    // fix #2781 (§27.6 / §8.1): recognize the bare-reference VALUE shape that
+    // `makeObjectMemberThunk` backs with a fresh +1 closure cell — kept in one
+    // place so the CG60 producer (LlvmBackend_Exprs.cpp) and every disposal
+    // site agree on the recognized set. The producer guards are: a
+    // MemberAccessExpr whose target's exprType is the `Object` primitive, whose
+    // member name is one of ToString / Equals / GetHashCode, whose `exprSymbol`
+    // is null (universal Object members have no MethodSymbol — they live in
+    // the fixed vtable slots 3/4/5), and whose `exprType` is Function (the
+    // CG60 patch sets it from the absent MethodSymbol, so the same predicate
+    // also catches sites that bypassed CG60 by accident).
+    bool isObjectMemberMethodRef(const ast::Expr* e) const;
+
     // #1170: build a fresh closure cell { thunk, env, rc, envdtor, kind }
     // wrapping a (possibly cached) method thunk and the current receiver. Shared
     // by the cache-hit and cache-miss paths of makeMethodThunk. `kind` tags the

@@ -21695,6 +21695,16 @@ bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     // local releases its single reference at scope end. A call is a CallExpr
     // node, never this shape, so this cannot misfire.
     if (isPrimIntrinsicMethodRef(init)) return true;
+    // fix #2781 (§8.1 / §27.6, v0.282): a bare reference to a UNIVERSAL Object
+    // member (`var f := o.GetHashCode;` where `o: Object`) lowers to a fresh
+    // +1 closure cell via the new `makeObjectMemberThunk` (CG60 path,
+    // LlvmBackend_Exprs.cpp ~6283). It has no MethodSymbol (universal Object
+    // members are dispatched structurally through fixed vtable slots 3/4/5,
+    // §8.1), so the MethodSymbol branch above misses it and the 40-byte cell
+    // leaked. Match the CG60 gate that produced the cell — sema-typed as a
+    // Function with no MethodSymbol and an Object-typed receiver — so the
+    // local's scope-end release picks it up.
+    if (isObjectMemberMethodRef(init)) return true;
     return false;
 }
 

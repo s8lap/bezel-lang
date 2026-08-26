@@ -4528,6 +4528,303 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     return buildMethodClosureCell(thunk, instMethod, receiverVal, kind);
 }
 
+
+// fix #2781 / §8.1 / §14.2: a method-group reference on an Object-typed
+// receiver to one of Object's three universal instance members —
+// `o.ToString`, `o.Equals`, `o.GetHashCode` — has no MethodSymbol bound
+// (Object is a primitive; its virtuals are runtime intrinsics, the receiver's
+// static interface admits anything, and sema deliberately leaves the
+// MemberAccessExpr symbol null rather than synthesising one). The prior
+// CG60 path returned nullptr for this shape, so the method-group reference
+// degraded to the §27.5 #2434 zero-init: `var f := o.GetHashCode;` made
+// `f` a null closure whose `f()` returned 0, and `var f := o.ToString;`
+// inside an interpolation ICEd on a mistyped ICmp. Fix: mint a thunk
+// closure here that mirrors lowerObjectToString / lowerObjectEquals /
+// lowerObjectGetHashCode's diamond — null receiver → §8.3/§8.4/§8.5
+// default; a bz_string* receiver (no vtable at word 0, §4.6) → the string
+// intrinsic (+ retain for ToString per #2846, since lowerObjectToString's
+// contract is +1); a class/box receiver → vtable[fixed slot] dispatch to
+// the user override (if any) or the per-class default thunk minted by
+// classToStringThunk / classEqualsThunk / classHashCodeThunk. The thunk's
+// signature is `T(ptr env [, ptr other])` matching the §27.6 closure ABI;
+// the env stores the BORROW of the receiver (cell does not own it, §28.3).
+// `ma` is the MemberAccessExpr; the function does its own lowerExpr on
+// `ma->target` to obtain the receiver value at the use site, then stores
+// it in a fresh env block.
+llvm::Value* Emitter::makeObjectMemberThunk(const ast::MemberAccessExpr& ma,
+                                             std::string_view memberName) {
+    if (!ma.target) return nullptr;
+    // Identify the slot from the member name. The arity check is implicit
+    // in the name (ToString/GetHashCode are nullary, Equals takes one arg)
+    // and the only call site that lands here is the Object-receiver arm
+    // of the CG60 path in LlvmBackend_Exprs.cpp — already gated on
+    // memberName being one of the three and arity matching.
+    unsigned fixedSlot = 0;
+    llvm::Type* retTy = nullptr;
+    bool takesOther = false;
+    if (memberName == "ToString") {
+        fixedSlot = kToStringSlot;
+        retTy = ptrTy();     // §4.6 string pointer
+    } else if (memberName == "Equals") {
+        fixedSlot = kEqualsSlot;
+        retTy = builder_.getInt1Ty();
+        takesOther = true;
+    } else if (memberName == "GetHashCode") {
+        fixedSlot = kGetHashCodeSlot;
+        retTy = i32();
+    } else {
+        return nullptr;
+    }
+    // Lower the receiver value at the use site (a fresh lowerExpr, just
+    // like makeMethodThunk's caller does). The thunk captures the result
+    // in its env so the call site does NOT need to pass it.
+    llvm::Value* recvVal = lowerExpr(*ma.target);
+    if (!recvVal || !recvVal->getType()->isPointerTy()) return nullptr;
+    // Build the thunk's signature: retTy (ptr env [, ptr other]).
+    std::vector<llvm::Type*> paramTys;
+    paramTys.push_back(ptrTy());  // env
+    if (takesOther) paramTys.push_back(ptrTy());  // other
+    auto* thunkFnTy = llvm::FunctionType::get(retTy, paramTys, false);
+    static std::atomic<unsigned> objThunkCtr{0};
+    std::string thunkName = "objthunk$" +
+        std::string(memberName) + "$" +
+        std::to_string(objThunkCtr.fetch_add(1));
+    auto* thunk = llvm::Function::Create(
+        thunkFnTy, llvm::Function::InternalLinkage, thunkName, module_.get());
+    // Save emitter state (mirrors makeMethodThunk's preamble).
+    llvm::Function* savedFn = currentFn_;
+    llvm::Value* savedThis = currentThis_;
+    llvm::BasicBlock* savedBB = builder_.GetInsertBlock();
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    auto savedRefParams = refParams_;
+    auto savedDisposeStack = disposeStack_;
+    auto savedLoopStack = loopStack_;
+    auto savedFinallyStack = finallyStack_;
+    auto savedFinallyBodies = finallyBodyStack_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::BasicBlock* savedProp = propagateBB_;
+    llvm::Value* savedCaught = currentCaughtExc_;
+    std::size_t savedUnwindDepth = unwindScopeDepth_;
+    bool savedDiverged = diverged_;
+    currentFn_ = thunk;
+    currentThis_ = nullptr;
+    locals_.clear(); paramSlots_.clear(); refParams_.clear();
+    disposeStack_.clear(); loopStack_.clear();
+    finallyStack_.clear(); finallyBodyStack_.clear();
+    unwindTarget_ = nullptr; propagateBB_ = nullptr;
+    currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
+    builder_.SetInsertPoint(
+        llvm::BasicBlock::Create(llvm_, "entry", thunk));
+    // Arg 0 is env — points to a heap block holding the receiver
+    // (captured via buildMethodClosureCell below). Load it inside the
+    // thunk since SSA values from the outer function are not in scope
+    // here.
+    auto argIt = thunk->args().begin();
+    llvm::Value* envPtr = &*argIt++;
+    llvm::Value* recvInThunk = builder_.CreateLoad(ptrTy(), envPtr,
+                                                  "objthunk.recv");
+    llvm::Value* otherArg = takesOther ? &*argIt++ : nullptr;
+    // Build the diamond. Each arm produces a value of retTy. The three
+    // arms must produce the same type for the PHI to be well-formed.
+    auto* nullBB = llvm::BasicBlock::Create(
+        llvm_, "objthunk.null", thunk);
+    auto* liveBB = llvm::BasicBlock::Create(
+        llvm_, "objthunk.live", thunk);
+    auto* endBB = llvm::BasicBlock::Create(
+        llvm_, "objthunk.end", thunk);
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        recvInThunk, llvm::ConstantPointerNull::get(ptrTy()),
+        "objthunk.isnull");
+    builder_.CreateCondBr(isNull, nullBB, liveBB);
+    // null receiver → §8.3/§8.4/§8.5 default.
+    builder_.SetInsertPoint(nullBB);
+    llvm::Value* nullRes = nullptr;
+    if (fixedSlot == kToStringSlot) {
+        nullRes = lowerStringLiteral("\"null\"", false);
+    } else if (fixedSlot == kEqualsSlot) {
+        nullRes = builder_.CreateICmpEQ(
+            recvInThunk, otherArg ? otherArg : recvInThunk,
+            "objthunk.nulleq");
+    } else {
+        nullRes = builder_.getInt32(0);
+    }
+    llvm::BasicBlock* nullEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+    // live: discriminate string vs vtable-bearing.
+    builder_.SetInsertPoint(liveBB);
+    auto* isStrFn = declareC("bz_obj_is_string",
+                             i32(), {ptrTy(), ptrTy()});
+    llvm::Value* isStr = builder_.CreateCall(
+        isStrFn, {recvInThunk, vtableTablePtr()}, "objthunk.isstr");
+    auto* strBB = llvm::BasicBlock::Create(
+        llvm_, "objthunk.str", thunk);
+    auto* vtBB = llvm::BasicBlock::Create(
+        llvm_, "objthunk.vt", thunk);
+    builder_.CreateCondBr(
+        builder_.CreateICmpNE(isStr, builder_.getInt32(0)),
+        strBB, vtBB);
+    // string receiver → content semantics (+ retain for ToString).
+    builder_.SetInsertPoint(strBB);
+    llvm::Value* strRes = nullptr;
+    llvm::BasicBlock* strEnd = nullptr;
+    if (fixedSlot == kToStringSlot) {
+        strRes = recvInThunk;
+        emitStringRetain(strRes);
+        builder_.CreateBr(endBB);
+        strEnd = builder_.GetInsertBlock();
+    } else if (fixedSlot == kEqualsSlot) {
+        // §9.6: a string receiver equals another iff other is also a string
+        // of equal content (the #9.6 `string.Equals(Object?)` overload).
+        // The string arm splits into TWO sub-arms so the outer PHI receives
+        // a distinct predecessor for each — content-equality vs always-false.
+        // Both sub-arms unconditionally branch to endBB, and the outer PHI
+        // (built below) receives four incoming entries (null, strEq, strNe,
+        // vt) instead of the three the ToString / GetHashCode arms use.
+        auto* strEqBB = llvm::BasicBlock::Create(
+            llvm_, "objthunk.streq", thunk);
+        auto* strNeBB = llvm::BasicBlock::Create(
+            llvm_, "objthunk.strne", thunk);
+        llvm::Value* otherIsStr = builder_.CreateCall(
+            isStrFn, {otherArg, vtableTablePtr()}, "objthunk.oisstr");
+        builder_.CreateCondBr(
+            builder_.CreateICmpNE(otherIsStr, builder_.getInt32(0)),
+            strEqBB, strNeBB);
+        builder_.SetInsertPoint(strEqBB);
+        llvm::Value* strEqRes = emitStringEq(recvInThunk, otherArg);
+        // emitStringEq may emit its own basic blocks; capture the block the
+        // intrinsic left the builder in as the predecessor of endBB.
+        llvm::BasicBlock* strEqEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(strNeBB);
+        llvm::Value* strNeRes = builder_.getFalse();
+        builder_.CreateBr(endBB);
+        // Park the two string-arm PHI predecessors in a side vector; the
+        // outer PHI below (built unconditionally for all three methods)
+        // splices them in instead of the ToString/GetHashCode's single
+        // strEnd when fixedSlot == kEqualsSlot.
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(retTy, 4, "objthunk.res");
+        phi->addIncoming(nullRes, nullEnd);
+        phi->addIncoming(strEqRes, strEqEnd);
+        phi->addIncoming(strNeRes, strNeBB);
+        // vtEnd is filled in below by the vtable arm.
+        llvm::PHINode* eqPhi = phi;
+        // class/box receiver → dispatch vtable[fixed slot].
+        builder_.SetInsertPoint(vtBB);
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recvInThunk);
+        llvm::Value* vtFn = builder_.CreateLoad(
+            ptrTy(),
+            builder_.CreateGEP(ptrTy(), vptr,
+                               {builder_.getInt32(fixedSlot)}),
+            "objthunk.vfn");
+        std::vector<llvm::Type*> vtParamTys{ptrTy()};
+        if (takesOther) vtParamTys.push_back(ptrTy());
+        auto* vtFnTy = llvm::FunctionType::get(retTy, vtParamTys, false);
+        std::vector<llvm::Value*> vtCallArgs{recvInThunk};
+        if (takesOther) vtCallArgs.push_back(otherArg);
+        llvm::Value* vtRes = builder_.CreateCall(
+            vtFnTy, vtFn, vtCallArgs, "objthunk.r");
+        if (vtRes->getType() != retTy) {
+            if (vtRes->getType()->isIntegerTy() && retTy->isIntegerTy())
+                vtRes = builder_.CreateZExtOrTrunc(vtRes, retTy, "objthunk.z");
+        }
+        llvm::BasicBlock* vtEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        // Now the vtable arm has its terminator; the endBB block was created
+        // earlier as a forward declaration but has no terminator yet — we are
+        // currently in vtBB after the CreateBr above, and need to install a
+        // terminator for endBB. The unified PHI was already built above; its
+        // predecessor list is correct. Create a Ret directly from endBB to
+        // close the function body.
+        builder_.SetInsertPoint(endBB);
+        eqPhi->addIncoming(vtRes, vtEnd);
+        if (retTy->isVoidTy()) builder_.CreateRetVoid();
+        else builder_.CreateRet(eqPhi);
+        // Restore emitter state and return (the ToString/GetHashCode arms
+        // fall through below with their own PHI + return).
+        currentFn_ = savedFn;
+        currentThis_ = savedThis;
+        locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
+        refParams_ = std::move(savedRefParams);
+        disposeStack_ = std::move(savedDisposeStack);
+        loopStack_ = std::move(savedLoopStack);
+        finallyStack_ = std::move(savedFinallyStack);
+        finallyBodyStack_ = std::move(savedFinallyBodies);
+        unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
+        currentCaughtExc_ = savedCaught;
+        unwindScopeDepth_ = savedUnwindDepth;
+        diverged_ = savedDiverged;
+        if (savedBB) builder_.SetInsertPoint(savedBB);
+        return buildMethodClosureCell(thunk, /*instMethod=*/true,
+                                      /*receiverVal=*/recvVal, FVK_FN_PLUS_RECV);
+    } else {
+        sema::TypeRef strTy;
+        strTy.kind = sema::TypeRef::Kind::Primitive;
+        strTy.primitive = sema::PrimitiveType::String;
+        strRes = emitValueHashCode(recvInThunk, &strTy);
+        if (strRes->getType()->isIntegerTy() &&
+            !strRes->getType()->isIntegerTy(32))
+            strRes = builder_.CreateZExtOrTrunc(
+                strRes, i32(), "objthunk.hash");
+        builder_.CreateBr(endBB);
+        strEnd = builder_.GetInsertBlock();
+    }
+    // class/box receiver → dispatch vtable[fixed slot].
+    builder_.SetInsertPoint(vtBB);
+    llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recvInThunk);
+    llvm::Value* vtFn = builder_.CreateLoad(
+        ptrTy(),
+        builder_.CreateGEP(ptrTy(), vptr,
+                           {builder_.getInt32(fixedSlot)}),
+        "objthunk.vfn");
+    // Build the vtable call type. The slot's callee signature is
+    // `T(ptr this [, ptr other])` for classHashCodeThunk /
+    // classEqualsThunk / classToStringThunk.
+    std::vector<llvm::Type*> vtParamTys{ptrTy()};
+    if (takesOther) vtParamTys.push_back(ptrTy());
+    auto* vtFnTy = llvm::FunctionType::get(retTy, vtParamTys, false);
+    std::vector<llvm::Value*> vtCallArgs{recvInThunk};
+    if (takesOther) vtCallArgs.push_back(otherArg);
+    llvm::Value* vtRes = builder_.CreateCall(
+        vtFnTy, vtFn, vtCallArgs, "objthunk.r");
+    if (vtRes->getType() != retTy) {
+        if (vtRes->getType()->isIntegerTy() && retTy->isIntegerTy())
+            vtRes = builder_.CreateZExtOrTrunc(vtRes, retTy, "objthunk.z");
+    }
+    llvm::BasicBlock* vtEnd = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+    // Merge the three arms with a retTy-keyed PHI.
+    builder_.SetInsertPoint(endBB);
+    auto* phi = builder_.CreatePHI(retTy, 3, "objthunk.res");
+    phi->addIncoming(nullRes, nullEnd);
+    phi->addIncoming(strRes, strEnd);
+    phi->addIncoming(vtRes, vtEnd);
+    if (retTy->isVoidTy()) builder_.CreateRetVoid();
+    else builder_.CreateRet(phi);
+    // Restore emitter state (mirrors makeMethodThunk's tail).
+    currentFn_ = savedFn;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals); paramSlots_ = std::move(savedParams);
+    refParams_ = std::move(savedRefParams);
+    disposeStack_ = std::move(savedDisposeStack);
+    loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);
+    finallyBodyStack_ = std::move(savedFinallyBodies);
+    unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
+    currentCaughtExc_ = savedCaught;
+    unwindScopeDepth_ = savedUnwindDepth;
+    diverged_ = savedDiverged;
+    if (savedBB) builder_.SetInsertPoint(savedBB);
+    // Build the closure cell: { thunk, env, rc, envdtor, kind }. The env
+    // holds the captured receiver (§28.3 borrow). instMethod=true so the
+    // cell gets an env block; receiverVal is the SSA value of the
+    // receiver at the use site, which buildMethodClosureCell copies into
+    // the heap env block.
+    return buildMethodClosureCell(thunk, /*instMethod=*/true,
+                                  /*receiverVal=*/recvVal, FVK_FN_PLUS_RECV);
+}
+
 // §27.6 (v0.184, #1758): back a bare reference to a primitive-intrinsic static
 // method (`int.Parse`, `char.IsDigit`, `double.IsNaN`, …) with a thunk closure.
 // See the header declaration for the full contract. A primitive intrinsic has no
@@ -4669,6 +4966,30 @@ bool Emitter::isPrimIntrinsicMethodRef(const ast::Expr* e) const {
     if (!t || t->kind != sema::TypeRef::Kind::Function) return false;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
     return id && sema::primitiveFromName(id->name) != sema::PrimitiveType::None;
+}
+
+// fix #2781 (§8.1 / §14.2 / §27.6): mirror of isPrimIntrinsicMethodRef for
+// the Object-receiver path. Recognizes `var f := o.ToString;` /
+// `o.Equals` / `o.GetHashCode;` (o: Object). The CG60 gate that produced
+// the closure cell sets exprType to Function and exprSymbol to null (no
+// MethodSymbol exists for the universal Object members — they live in the
+// fixed vtable slots 3/4/5 and are dispatched structurally by codegen), so
+// both conditions are necessary, but they are not jointly sufficient — the
+// same shape with a different member name (e.g. `o.EqualsOrWhatever`)
+// should NOT be eligible, because the CG60 producer skipped it.
+bool Emitter::isObjectMemberMethodRef(const ast::Expr* e) const {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e);
+    if (!ma || !ma->target) return false;
+    if (ctx_.exprSymbol(*e)) return false;          // a real MethodSymbol ref
+    const sema::TypeRef* t = ctx_.exprType(*e);      // sema/CG60 typed it
+    if (!t || t->kind != sema::TypeRef::Kind::Function) return false;
+    // CG60 patches the receiver's type checks (Object primitive); we do the
+    // same check on the side that asks whether the producer ran.
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Primitive ||
+        recvTy->primitive != sema::PrimitiveType::Object) return false;
+    auto m = ma->member;
+    return m == "ToString" || m == "Equals" || m == "GetHashCode";
 }
 
 // §27.7.1 (#1544): classify the equality kind of a method-reference function

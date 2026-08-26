@@ -6245,6 +6245,83 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     // CG60: `Class.StaticMethod` or `obj.InstanceMethod` used as a
     // value (not called). Produce a closure struct for it.
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        // fix #2781 / §8.1 / §14.2: a method-group reference to Object's
+        // three universal instance members on an Object-typed receiver —
+        // `o.ToString`, `o.Equals`, `o.GetHashCode` — has no MethodSymbol
+        // bound (Object is a primitive; its virtuals are runtime intrinsics).
+        // The CG60 fallthrough used to return nullptr, silently zero-initing
+        // the closure cell (so `var f := o.GetHashCode;` made `f()` return
+        // 0; `var f := o.ToString` ICEd inside an interpolation on mistyped
+        // ICmp). Mint a thunk closure here that mirrors lowerObjectToString /
+        // lowerObjectEquals / lowerObjectGetHashCode — null → §8.3/§8.4/§8.5
+        // default; bz_string* → string intrinsic (+ retain for ToString);
+        // class/box → vtable[fixed slot] dispatch to the override or the
+        // per-class default thunk. GetType (§8.2) is non-virtual — left
+        // alone here; ReferenceEquals (§8.4) is a static method — likewise.
+        if (ma->target) {
+            const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+            if (recvTy && recvTy->kind == sema::TypeRef::Kind::Primitive &&
+                recvTy->primitive == sema::PrimitiveType::Object) {
+                std::string_view m = ma->member;
+                if (m == "ToString" || m == "Equals" || m == "GetHashCode") {
+                    // fix #2781 / §8.1 / §27.6: build the Function TypeRef for
+                    // the §8.1 universal signature and bind the MA's exprType
+                    // AND — when this MA is the direct initializer of a local
+                    // (`var f := o.GetHashCode;`) — the local's declType to it.
+                    // Without the declType patch, `f()`'s lowerCall arm (line
+                    // ~4770 of LlvmBackend_Calls2.cpp) sees a null declType on
+                    // the LocalSymbol and silently degrades to the #2434
+                    // zero-init — the closure cell is BUILT but never called.
+                    sema::TypeRef* fnTy = ctx_.makeTypeRef();
+                    fnTy->kind = sema::TypeRef::Kind::Function;
+                    sema::TypeRef* objTy = ctx_.makeTypeRef();
+                    objTy->kind = sema::TypeRef::Kind::Primitive;
+                    objTy->primitive = sema::PrimitiveType::Object;
+                    objTy->nullable = true;
+                    sema::TypeRef* retTy = ctx_.makeTypeRef();
+                    if (m == "ToString") {
+                        retTy->kind = sema::TypeRef::Kind::Primitive;
+                        retTy->primitive = sema::PrimitiveType::String;
+                        fnTy->funcReturn = retTy;
+                    } else if (m == "Equals") {
+                        retTy->kind = sema::TypeRef::Kind::Primitive;
+                        retTy->primitive = sema::PrimitiveType::Bool;
+                        fnTy->funcReturn = retTy;
+                        sema::TypeRef::FuncParam fp;
+                        fp.type = objTy;
+                        fnTy->funcParams.push_back(std::move(fp));
+                    } else {  // GetHashCode
+                        retTy->kind = sema::TypeRef::Kind::Primitive;
+                        retTy->primitive = sema::PrimitiveType::Int;
+                        fnTy->funcReturn = retTy;
+                    }
+                    ctx_.setExprType(&e, fnTy);
+                    // Sema left the binding local's declType null because the
+                    // MemberAccessExpr's resolved symbol was null. Restore it
+                    // here from the exprType we just set so `f()` dispatches
+                    // through emitClosureCall. Walk ctx_.symbols() and patch
+                    // any LocalSymbol whose LocalDecl's initializer IS this
+                    // exact MA — a small linear scan, O(symbols) per Object-
+                    // member method-group reference, and a one-time cost at
+                    // first use (subsequent call sites of the same MethodGroup
+                    // hit the #3153 reject less because the existing reject
+                    // already gates `loc->declType->kind != Function`). The
+                    // LocalSymbol::declType field is mutable (Symbol.hpp); a
+                    // post-sema codegen-only patch is safe — sema never reads
+                    // it again after the LocalDecl initializer is typechecked.
+                    for (const auto& sym : ctx_.symbols()) {
+                        auto* ls = dynamic_cast<sema::LocalSymbol*>(sym.get());
+                        if (!ls || !ls->decl) continue;
+                        auto* ld = dynamic_cast<const ast::LocalDecl*>(ls->decl);
+                        if (!ld || ld->initializer.get() != &e) continue;
+                        ls->declType = fnTy;
+                        break;
+                    }
+                    if (llvm::Value* oc = makeObjectMemberThunk(*ma, m))
+                        return oc;
+                }
+            }
+        }
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e))) {
             llvm::Value* recv = nullptr;
             // §27.6 (#1306 rework): an extension-method reference is EITHER

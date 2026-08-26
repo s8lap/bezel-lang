@@ -16125,9 +16125,34 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 } else if (ma.member == "ToString") {
                     // CG27c: ToString() is an intrinsic on all primitive
                     // types (§5) — returns the string representation.
-                    ctx_.setExprType(
-                        &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
-                    return;
+                    //
+                    // fix #2781 (§8.5 / §27.6, v0.282): a BARE reference
+                    // `var f := o.ToString;` on an Object-typed receiver is a
+                    // §27.6 method-group reference — it must type as a
+                    // function value `() -> string`, not as the scalar
+                    // `string` result, so the enclosing LocalDecl infers
+                    // `f`'s declType as Function and `f()` dispatches
+                    // through emitClosureCall. The CG27c arm is the §5
+                    // primitive-intrinsic intent and is correct for
+                    // NUMERIC receivers (`n.ToString`); for Object receivers
+                    // it silently flattened the reference into a string-typed
+                    // local, so `f()` reached visitCallExpr's §27.7 "cannot
+                    // call a value of type `string`" reject (no MethodSymbol
+                    // existed either, so the bare-reference path had no
+                    // fallback). For the CALL form `o.ToString()`, the
+                    // direct-callee path below (calleeOfCallCtx_ == &ma)
+                    // still types and lowers the call correctly. Skipped
+                    // here so the reference stays Function-typed and
+                    // codegen's `makeObjectMemberThunk` (CG60) can back it
+                    // with a vtable-dispatching thunk (issue #2781 reports
+                    // this exact asymmetry).
+                    if (tt->primitive != PrimitiveType::Object ||
+                        &ma == calleeOfCallCtx_) {
+                        ctx_.setExprType(
+                            &ma,
+                            ctx_.primitiveTypeRef(PrimitiveType::String));
+                        return;
+                    }
                 } else if (ma.member == "IsNaN" || ma.member == "IsInfinity" ||
                            ma.member == "IsFinite" ||
                            ma.member == "IsPositiveInfinity" ||
