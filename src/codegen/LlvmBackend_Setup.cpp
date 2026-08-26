@@ -17995,11 +17995,12 @@ struct UnwindIneligibleWalker {
         }
         if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
             // fix #1893 / §28.3 (v0.184/v0.194): a `_ := x;` DISCARD of a bare-
-            // identifier named owned binding (the "announced consume") must NOT
-            // taint `x` as unwind-ineligible — the exact same reasoning as an
-            // explicit `x.Dispose()` (walked as a borrow above). On the normal
-            // path the discard's announced-consume codegen (discardOutOwnedVar /
-            // the owning-collection discard path) disposes `x` AND nulls its slot,
+            // identifier named owned binding (a marker-free-position consume)
+            // must NOT taint `x` as unwind-ineligible — the exact same reasoning
+            // as an explicit `x.Dispose()` (walked as a borrow above). On the
+            // normal path the discard's marker-free-position consume codegen
+            // (discardOutOwnedVar / the owning-collection discard path) disposes
+            // `x` AND nulls its slot,
             // and every scope-end / exception-path disposal reloads that slot
             // null-guarded (or via the null-safe collection free) — so a discard
             // that is UNREACHABLE or PRECEDED BY A THROW keeps a live slot and

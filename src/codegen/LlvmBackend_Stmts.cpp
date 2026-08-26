@@ -234,7 +234,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // full using-disposal dispatcher.
         else if (ld->autoDropAtScopeEnd) registerUsingDisposal(ld);
         // fix #1892 / §17.13 / §28.5: a plain `var` owning-COLLECTION local
-        // discharged via a `_ := x;` DISCARD (announced consume). The ownership
+        // discharged via a `_ := x;` DISCARD (marker-free-position consume).
+        // The ownership
         // pass markDisposedByName's it (so autoDropAtScopeEnd is false) and set
         // dischargedByDiscard on the decl. registerUnwindOwnedLocal (the class-
         // only unwind path below) does NOT cover collections, so the container

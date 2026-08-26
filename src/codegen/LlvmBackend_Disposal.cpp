@@ -138,7 +138,7 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         // body aliases a field the disposer is about to release; the borrow
         // model retains at bind and releases at scope end, so the OVERALL
         // release of the field's reference is unaffected — the local's release
-        // drops the borrow, then the field cascade drops the original. The
+        // releases the borrow, then the field cascade drops the original. The
         // `armValueLikeChoiceStrRelease` `if (emittingDisposerBody_) return;`
         // guard (LlvmBackend_Setup.cpp) covers the §11 choice-value path, not
         // the `var` string-local path; the analysis here is the correct one

@@ -975,7 +975,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             // codegen's null-guarded dynamicDispose (the marker lowering
             // nulls the slot on the selected path), so neither the
             // discharge error nor the must-use warning applies (the marked
-            // arm is an announced consume; per-path disposal is the
+            // arm is a marker-free-position consume; per-path disposal is the
             // language's job).
             if (auto* lsAt = dynamic_cast<sema::LocalSymbol*>(sym)) {
                 if (auto* ldAt =

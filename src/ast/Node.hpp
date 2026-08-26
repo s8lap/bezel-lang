@@ -189,7 +189,8 @@ struct LocalDecl : Stmt {
     // fix #1892 / §17.13 / §28.3 / §28.5 (v0.194): set by the ownership pass on a
     // plain (non-`using`) owning-COLLECTION local (OwningArray/OwningDictionary/
     // OwningSet/OwningStack/OwningQueue/OwningLinkedList) that is discharged via a
-    // `_ := x;` DISCARD (the "announced consume", spec §17.13). Such a local is
+    // `_ := x;` DISCARD (a marker-free-position consume, spec §17.13/§28.3
+    // glossary, v0.281). Such a local is
     // markDisposedByName in the ownership pass, so it is NOT flagged
     // autoDropAtScopeEnd and would otherwise fall to registerUnwindOwnedLocal —
     // which covers only class/interface instances (unwindOwnedLocalClass excludes
@@ -224,8 +225,9 @@ struct LocalDecl : Stmt {
     // declaration's scope (both edges): the consumed path reloads null and
     // skips; the not-selected path disposes exactly once. The §28.3
     // end-of-method discharge error and the affine auto-drop are both
-    // suppressed for a local carrying this flag (the marked arm is an
-    // announced consume; the per-path disposal is the language's job).
+    // suppressed for a local carrying this flag (the marked arm is a
+    // marker-free-position consume; the per-path disposal is the language's
+    // job).
     // Monotone (set-only), fixpoint-safe.
     bool dischargedByArmTransfer = false;
     // §17.15 (v0.216, #2098): this LocalDecl is a CLAUSE of a binding atom
@@ -437,7 +439,8 @@ struct DiscardStmt : Stmt {
     // BINDING — a plain owned local (any decl form: `var`/`using var`
     // LocalDecl, the `out owned var` inline form, or an owning-enumerable
     // for-loop variable) or an `owned` parameter — that is currently Owned.
-    // This is the "announced consume" of a named owned binding (v0.184):
+    // This is the marker-free-position consume of a named owned binding
+    // (v0.184):
     // codegen emits null-guarded dispose+reclaim of the local's slot at this
     // statement and nulls the slot (so the exception-path unwindOnly disposal
     // is a no-op). Distinct from disposeOwnedValue (fresh-producer path) which
