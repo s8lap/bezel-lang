@@ -21468,6 +21468,77 @@ struct StringEscapeWalker {
                     expr(as->value.get(), /*safeRead=*/true);
                     return;
                 }
+                // fix #2806 / §4.6 / §28.3 K1.6 / §28.9 (v0.282): the
+                // LOCAL-TO-LOCAL string ASSIGNMENT twin of #2764's
+                // declaration form — `alias := built;` where `alias` is an
+                // already-declared, non-using, non-nullable string local —
+                // is a BORROW of `built`, not an ESCAPE. The #2764
+                // declaration relaxation (LlvmBackend_Setup.cpp, the
+                // LocalDecl arm above) closed `var other := built;`; this
+                // AssignmentStmt arm goes through a separate branch of the
+                // walker and was UNTOUCHED by #2764.
+                //
+                // WHY IT WAS BROKEN. A bare-identifier RHS naming the
+                // tracked local was an ESCAPE — it suppressed `built`'s
+                // scope-end release, so the producer's +1 leaked (one heap
+                // string per assignment; loop-amplified, 751 B / 40
+                // allocations under LSan on the issue's own repro after
+                // #2764 was applied).
+                //
+                // WHY IT IS SOUND. `lowerStringLocalReassign` retains a
+                // borrow RHS into the target's slot ONLY for a genuine
+                // non-nullable `string` LOCAL slot (#2717 declines a
+                // `string?` slot, a `using var` slot, and any non-string
+                // target, leaving a plain CreateStore that takes no
+                // reference). Exactly the same gate `armStringLocalRefcount`
+                // tests before emitting `bz_string_retain` at the
+                // declaration site — the set `Emitter::stringBorrowAll_`,
+                // exposed to this walker via the `borrowRetainedAliases`
+                // field #2764 added. So:
+                //
+                //   * target's LocalDecl ∈ stringBorrowAll_ ⇒ target is a
+                //     non-using, non-nullable, borrow-initialized string
+                //     local ⇒ `lowerStringLocalReassign` retains the RHS
+                //     into target's slot ⇒ target owns its OWN independent
+                //     +1 ⇒ the source's +1 can be released at its own
+                //     scope end.
+                //
+                // Relaxing for any other target shape would free `built`
+                // while an un-retained alias still named it — a
+                // use-after-free, strictly worse than the bounded leak.
+                //
+                // Gated on `stringReleaseMode`, matching every other
+                // relaxation on this walker (sound only for the
+                // string-release walks; the dict-materializer, grouping,
+                // and borrowing-Array walks reuse this walker but emit no
+                // assignment-side retain, so for them the copy genuinely
+                // aliases a single reference and must keep tainting the
+                // source). NOT applied inside `inLambda` — a captured-from
+                // outer-local read always escapes (the env outlives the
+                // scope), the same `inLambda` clause the #1997 reassign
+                // and the #2764 declaration relaxations use.
+                //
+                // Mirrors #2764's `var other := built;` declaration form
+                // exactly, with the predicate flipped from "target is the
+                // declaration being walked" to "value is the tracked
+                // local AND target's LocalDecl is in stringBorrowAll_".
+                if (borrowRetainedAliases &&
+                    !inLambda &&
+                    isTargetIdent(as->value.get())) {
+                    auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        as->target.get());
+                    if (tid) {
+                        auto* tls = dynamic_cast<sema::LocalSymbol*>(
+                            ctx.exprSymbol(*tid));
+                        if (tls && tls->decl &&
+                            borrowRetainedAliases->count(
+                                static_cast<const void*>(tls->decl))) {
+                            expr(as->target.get(), /*safeRead=*/false);
+                            expr(as->value.get(), /*safeRead=*/true);
+                            return;
+                        }
+                    }
+                }
             }
             expr(as->target.get(), /*safeRead=*/false);
             expr(as->value.get(), /*safeRead=*/false);
