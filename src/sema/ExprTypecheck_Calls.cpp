@@ -13421,13 +13421,69 @@ void ExprTC::declineUnsupportedImportedPropertyAccess(PropertySymbol* ips,
             }
             if (gpIndex.empty()) return false;  // sanity
             TypeRef* pty = nullptr;
+            // fix #3365 (§14.1 / §23.3 / §2.5 / §2.8.3 rule 4, v0.282):
+            // when the importer has attached a re-parsed ast::PropertyDecl
+            // (via `parseAndAttachPropertyBody` at ModuleLoader.cpp, the
+            // propertyBodyText carriage), the property is read-only on a
+            // generic class CAN be monomorphized per instantiation by the
+            // existing codegen inline-body path: the body is lowered with
+            // the active `genericSubst_` substituting T → concrete type, so
+            // the substitution walks through the body's field reads
+            // (`_t: T` → `_t: Pt` for `T = Pt`) and the property's return
+            // type is the same concrete type. The same path the LOCAL
+            // generic-class property twin uses (pinned by #2884's own T8
+            // control test) — and where #2884's own comment on the
+            // PropertyDecl-attached case observes "codegen's re-parsed
+            // PropertyDecl monomorphizes the accessor per instantiation".
+            //
+            // NARROW PREDICATE — the WRITE side (`g.P := v` on a `property
+            // P: T`) still SEGVs for a reference-typed T (measured at HEAD
+            // on the local twin `class GLocalT5<T> { _t: T; property P: T
+            // get=>_t; set=>do _t := value; end; }` + `g.P := "hi"` at
+            // `T = string`: exit 139 — the read of `_t` for the
+            // property's return type substitution works, but the WRITE for
+            // a reference-typed T does not, per the §14.1 / #2893
+            // follow-up comment recorded in 2945 T5). So admit arm 3
+            // ONLY when the property has no setter:
+            //   * Expression body: read-only by §23.2 (no setter arm is
+            //     admitted by the grammar).
+            //   * Block body with no `set` accessor: read-only block.
+            //   * Auto body, with or without a setter: storage-only, the
+            //     codegen re-lowers the field-access path correctly but
+            //     the spec's "auto property's storage layout" view doesn't
+            //     change with T, so the existing #2478 storage layout
+            //     already covers it; we keep arm 3 declining here to
+            //     match #2945's T5 maintenance comment, which describes
+            //     the same conservative refusal.
+            //
+            // The decline still fires for the three shapes that have no
+            // honest lowering today: virtual/abstract/static, a property
+            // with a setter, and an auto-body property (the
+            // pre-#3365 conservative refusal for all three is kept
+            // because the codegen write path for reference-typed T
+            // still has the SEGV).
+            bool readOnlyWithReParsedBody = false;
             if (auto* pd =
                     dynamic_cast<const ast::PropertyDecl*>(ips->decl)) {
                 if (pd->type) pty = ctx_.resolvedType(*pd->type);
+                if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+                    // Expression-bodied: read-only by §23.2.
+                    readOnlyWithReParsedBody = true;
+                } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+                    // Block-bodied with a `set` arm is settable — decline.
+                    // Block-bodied with only `get` (no `set`) is read-only.
+                    bool hasSet = false;
+                    for (const auto& a : pd->accessors)
+                        if (a.isSet) { hasSet = true; break; }
+                    if (!hasSet) readOnlyWithReParsedBody = true;
+                }
+                // Auto body: not readOnlyWithReParsedBody (keeps decline).
             } else if (!ips->decl) {
                 pty = ctx_.importedMemberType(ips);
             }
-            if (typeRefReferencesAnyNameIn(pty, gpIndex)) return false;
+            if (typeRefReferencesAnyNameIn(pty, gpIndex) &&
+                !readOnlyWithReParsedBody)
+                return false;
             return true;
         }()) {
         ctx_.diagnostics().report(
