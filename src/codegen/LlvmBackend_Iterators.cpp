@@ -924,6 +924,35 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         if (retName != "IOwningEnumerable" && retName != "IOwningEnumerator")
             elemIsOwnedClass = true;
     }
+    // fix #2738 / §28.3 / §29.2 (v0.282): non-nullable `string` element kind. The
+    // enumerator owns the +1 reference minted by `yield return <+1 producer>`
+    // (interpolation, `+`, `??`, case, conditional, range slice, ToString) per
+    // §29.2 row 3 ("shared reference ... the enumerator does not dispose
+    // anything"). Spec says no ownership transfer, but for a borrowing head
+    // (IEnumerable<string>, IEnumerator<string>, IList<string>, etc.) the
+    // caller-side §28.3 full-expression boundary discharge only fires for a
+    // NAMED bind — a `yield return $"g-{i}"` is a full-expression whose result
+    // is "consumed" by the yield store, so the §28.3 row "the producer's
+    // +1 ... the binding that consumes it ... releases it" was misapplying:
+    // the yield store does not bind it (no name), and the slot is reused on
+    // the next yield (which would silently drop the mint's +1). The fix
+    // threads the ownership through the iterator's own frame using the same
+    // current_val_owned flag mechanism as the class-element discipline
+    // (§29 #1120), so the next MoveNext advance releases the displaced +1
+    // and the iterator's Dispose releases the outstanding one. Narrowly gated
+    // on the non-nullable string primitive kind — value-type and nullable-
+    // value element iterators keep their existing handling (no +1 reference
+    // is ever produced, so no leak can occur). Mutually exclusive with
+    // elemIsOwnedClass (class/interface kind) and isOwningIter (owning head)
+    // by construction.
+    bool elemIsRuntimeManagedPrimitive = false;
+    if (!elemIsOwnedClass && !isOwningIter &&
+        elemSemaTy &&
+        elemSemaTy->kind == sema::TypeRef::Kind::Primitive &&
+        elemSemaTy->primitive == sema::PrimitiveType::String &&
+        !elemSemaTy->nullable) {
+        elemIsRuntimeManagedPrimitive = true;
+    }
 
     // Build the kind-agnostic frame; the yield driver's extra trailing fields are
     // the `current_val` of element type T, then (#747) a spill-area pointer for a
@@ -1439,6 +1468,14 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // non-null current_val (the §29.1 contract), so the displaced value
         // must be disposed BEFORE the next yield store overwrites the slot.
         iterIsOwningIter_ = isOwningIter;
+        // fix #2738 / §28.3 / §29.2 (v0.282): thread ownership of the +1 reference
+        // minted by `yield return <+1 string producer>` through the iterator frame.
+        // YieldStmt gates its new prev-dispose on this flag; the iterator's Dispose
+        // extends disposeYieldedVal below to also release the outstanding +1 when
+        // this flag is set. Mutually exclusive with iterElemIsOwnedClass_ (class
+        // kind) and iterIsOwningIter_ (owning head) by construction (see
+        // elemIsRuntimeManagedPrimitive computation above).
+        iterElemIsRuntimeManagedPrimitive_ = elemIsRuntimeManagedPrimitive;
         // #747: enable for-loop frame-spill for THIS MoveNext, reusing the async
         // spill-area mechanism. registerForLoopSpillSlots records a suspending
         // for-loop's implicit allocas (index / array-ptr / enumerator) into
@@ -1888,7 +1925,8 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // needed); if it is non-null when Dispose is called the consumer never
         // called TakeCurrent (manual-protocol abandonment) and we must dispose.
         auto disposeYieldedVal = [&]() {
-            if (!elemIsOwnedClass && !isOwningIter) return;
+            if (!elemIsOwnedClass && !isOwningIter &&
+                !elemIsRuntimeManagedPrimitive) return;
             // #1837 / §4.13 / §29.1 (v0.196): the cleanup below loads current_val
             // and compares it against a null POINTER, so it requires elemTy to be
             // a pointer. An IOwningEnumerable<T> iterator emitted as its
@@ -1924,7 +1962,19 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                     llvm::ConstantPointerNull::get(ptrTy()), cvField);
                 builder_.CreateBr(contBB);
             } else {
-                // §29 (#1120): IEnumerable<owned T> — check owned flag.
+                // §29 (#1120) / #2738 (v0.282): gating the dispose on the
+                // current_val_owned flag distinguishes two cases — for
+                // IEnumerable<owned T> (class element, #1120) the enumerator
+                // owns the +1 only when the yield is a `new`; for
+                // IEnumerable<string> / IList<string> / etc. (runtime-
+                // managed primitive, #2738) the enumerator owns the +1 only
+                // when the yield is a +1 string producer (interpolation, +,
+                // ??, case, conditional, range slice, ToString — see
+                // isPlusOneStringProducer). In both cases the predicate is
+                // "the enumerator owns the reference"; the predicate differs
+                // because the minting shape differs. The flag byte is shared
+                // (CURRENT_VAL_OWNED_FIELD) and was already wired by both
+                // yield-store sites.
                 llvm::Value* ownedFld = builder_.CreateStructGEP(
                     stateStructTy, self, CURRENT_VAL_OWNED_FIELD);
                 llvm::Value* ownedByte =
@@ -1939,7 +1989,20 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                     llvm_, "ity.yv.after", targetFn);
                 builder_.CreateCondBr(isOwned, dispBB, skipBB);
                 builder_.SetInsertPoint(dispBB);
-                emitDisposeAndReclaim(yv);
+                if (elemIsRuntimeManagedPrimitive) {
+                    // fix #2738: release the +1 reference via the refcounted
+                    // string release path — bz_string_release is the
+                    // canonical releaser for a non-nullable string primitive
+                    // (matching how the §28.3 / §28.9 borrow site releases
+                    // a borrowed +1 on scope exit). emitDisposeAndReclaim
+                    // would dispatch through the class dispatch table and
+                    // is wrong for a non-class element type.
+                    emitStringRelease(yv);
+                } else {
+                    // §29 (#1120): class element — emitDisposeAndReclaim
+                    // walks the vtable dispatch chain.
+                    emitDisposeAndReclaim(yv);
+                }
                 builder_.CreateBr(afterBB);
                 builder_.SetInsertPoint(skipBB);
                 builder_.CreateBr(afterBB);

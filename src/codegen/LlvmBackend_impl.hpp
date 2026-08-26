@@ -10365,6 +10365,17 @@ private:
     // IOwningEnumerable<T> / IOwningEnumerator<T>. Mutually exclusive with
     // iterElemIsOwnedClass_ by construction. Cleared to false after MoveNext.
     bool iterIsOwningIter_ = false;
+    // fix #2738 / §28.3 / §29.2 (v0.282): true when the element type is a
+    // non-nullable `string` primitive (the runtime-managed +1 reference kind).
+    // The iterator then owns the +1 reference the YieldStmt mints on each
+    // `yield return <+1 producer>` (interpolation, `+`, `??`, case, conditional,
+    // range slice, ToString) and must release it on next MoveNext advance AND
+    // on iterator Dispose. Mirrors the class-element discipline above (§29
+    // #1120); gated on pointer iterElemTy_ so unspecialized generic templates
+    // (T unresolved → i32 placeholder) elide cleanly. Mutually exclusive with
+    // both iterElemIsOwnedClass_ (class/interface kind) and iterIsOwningIter_
+    // (owning head) by construction — the three are exhaustive and disjoint.
+    bool iterElemIsRuntimeManagedPrimitive_ = false;
 
     // ---- Async-specific live state (used only when smKind_ == Await) ----
     // Frame field indices for the two trailing async slots (see emitAsyncMethod):

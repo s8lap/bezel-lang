@@ -1105,6 +1105,37 @@ llvm::Value* Emitter::materializeVtableIEnumerableToArray(
     llvm::Value* curSlot = builder_.CreateGEP(ptrTy(), vt2, {builder_.getInt32(3)});
     llvm::Value* curFn = builder_.CreateLoad(ptrTy(), curSlot);
     llvm::Value* curVal = builder_.CreateCall(currentTy, curFn, {en}, "mat.cur");
+    // fix #2738 / §28.3 / §29.2 (v0.282): for a non-nullable string element,
+    // the iterator's `yield return <+1 producer>` mints a fresh +1 reference
+    // that the §29.2 row 3 enumerator-doesn't-dispose assumption relied on the
+    // consumer to release. The for-in case takes the iterator as the sole
+    // borrower — the iterator's current_val slot retains the +1 across the
+    // iteration and the yield-store prev-dispose (#2738's primary fix) + the
+    // iterator's Dispose release the +1 at the right times. The
+    // vtable-materialize drain copies curVal's pointer into arr via
+    // bz_array_add (which is a byte-copy, no retain), so the iterator's +1 is
+    // the ONLY holder until the iterator disposes — but the iterator's yield-
+    // store prev-dispose FREES the previous +1 before the next yield's store
+    // overwrites the slot, and the iterator's Dispose FREES the last +1.
+    // Without a balancing retain HERE, the previous N-1 curVal pointers in arr
+    // (and the last one, after Dispose) are dangling when arr is later wrapped
+    // as a lazy source and drained into the outer ToArray's result array. The
+    // bz_array_retain_strings at the outer ToArray intercept (Calls3.cpp line
+    // ~1709) retains each string by 1 — but for THIS materialize path, the
+    // outer retain is also the over-count (#2738's second orphan: mat_arr is
+    // freed at bz_lazy_dispose before the result array's lifetime ends, so
+    // mat_arr's retains here are orphaned unless the outer retain is skipped
+    // for this path). The conditional outer-retain skip below (line ~1718)
+    // matches this conditional retain so the two stay in lockstep. Gated on
+    // the same non-nullable string primitive predicate as the iterElemSemaTy
+    // checks elsewhere so nullable strings / class elements / value primitives
+    // are unaffected (they don't mint a +1 refcount on yield).
+    if (elemRef &&
+        elemRef->kind == sema::TypeRef::Kind::Primitive &&
+        elemRef->primitive == sema::PrimitiveType::String &&
+        !elemRef->nullable && elemTy->isPointerTy()) {
+        emitStringRetain(curVal);
+    }
     // Spill the by-value element to a stack slot and append its bytes.
     auto* elemSlot = entryAlloca(elemTy);
     builder_.CreateStore(curVal, elemSlot);
@@ -1698,10 +1729,41 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // the produced element type being in the RuntimeManaged row AND specifically
         // a non-nullable string primitive (same logic as emitArrayRetainStringsIfStringArray;
         // #602 batch 4: isStringElementArray was deleted, RuntimeManaged check is direct).
+        //
+        // fix #2738 / §28.3 / §29.2 (v0.282) — NARROW VTABLE-BACKED EXCLUSION:
+        // when the receiver is a vtable-backed IEnumerable<string> (the
+        // materializeVtableIEnumerableToArray path drains the enumerator's
+        // curVal pointers into a fresh bz_array_t, then the lowerToLazyEnumerator
+        // call above wraps that array as a lazy ARRAY source for this bz_lazy_to_array
+        // drain), the drain loop's per-element emitStringRetain (Calls3.cpp ~line
+        // 1107 — the materialize's balancing retain for the iterator's
+        // yield-store prev-dispose + Dispose release) is ALREADY the sole
+        // ownership transfer. Adding the outer bz_array_retain_strings here
+        // would over-count by 1 per element: mat_arr is freed at bz_lazy_dispose
+        // before the result array's lifetime ends (the materialize's own
+        // retains are then orphaned, leaving rc=1 at result.Dispose → leak of
+        // every yielded string). For the non-vtable-backed source paths (Array<T>,
+        // chain ending in Array<T> / Lazy<T>) the source array HOLDS the +1
+        // refs for its strings across this drain — its `using var`/local
+        // binding releases them symmetrically with the result's retain — so
+        // the outer retain is correct and necessary there. Skip iff the recv is
+        // vtable-backed AND elemRef is a non-nullable string primitive. The two
+        // gates match the materialize drain's retain above exactly.
         {
+            bool skipOuterRetain = false;
+            if (elemRef &&
+                elemRef->kind == sema::TypeRef::Kind::Primitive &&
+                elemRef->primitive == sema::PrimitiveType::String &&
+                !elemRef->nullable) {
+                if (auto* recvTy = ctx_.exprType(*ma->target)) {
+                    if (isVtableBackedIEnumerableType(recvTy))
+                        skipOuterRetain = true;
+                }
+            }
             const ElementPolicy toArrPol =
                 elementPolicyFor(elemRef, /*owningFamily=*/false);
-            if (toArrPol.cat == ElementPolicy::Category::RuntimeManaged &&
+            if (!skipOuterRetain &&
+                toArrPol.cat == ElementPolicy::Category::RuntimeManaged &&
                 elemRef &&
                 elemRef->kind == sema::TypeRef::Kind::Primitive &&
                 elemRef->primitive == sema::PrimitiveType::String &&

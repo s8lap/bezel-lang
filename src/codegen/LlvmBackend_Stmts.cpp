@@ -3427,6 +3427,99 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             builder_.CreateStore(
                                 builder_.getInt8(yieldIsNew ? 1 : 0), ownedFld);
                         }
+                        // fix #2738 / §28.3 / §29.2 (v0.282): mirror the class-element gate above for
+                        // the runtime-managed primitive element kind (non-nullable
+                        // `string`). The YieldStmt's full-expression boundary
+                        // discharge (§28.3 row "the producer's +1 ... the binding
+                        // that consumes it ... releases it") assumes the result is
+                        // BOUND to a name — but a `yield return` is NOT a binding
+                        // (no `var s :=` shape), and the slot is overwritten by the
+                        // next yield's store. Without this gate, every
+                        // `yield return <+1 producer>` (interpolation, `+`, `??`,
+                        // case, conditional, range slice, ToString) leaks one
+                        // fresh +1 reference. The thread is: yield mints a +1
+                        // (the producer's malloc'd header, rc=1), the yield-store
+                        // holds it in the iterator's `current_val` slot as the
+                        // enumerator's +1 (same discipline as §29 #1120's class-
+                        // element form: the next MoveNext releases the displaced
+                        // +1 before storing the next), and the iterator's Dispose
+                        // releases the outstanding +1. The current_val_owned flag
+                        // distinguishes "this +1 is owned by the enumerator" (1,
+                        // was minted by a `+1 producer` yield) from "this +1 is
+                        // borrowed from another binding" (0, was `yield return
+                        // <borrow>` — no release needed here). Disjoint from the
+                        // class-element gate (this fires for primitives, that
+                        // fires for classes/interfaces) and from the owning-iter
+                        // gate (this is for the borrowing head) — the three are
+                        // exhaustive and disjoint by construction in
+                        // emitIteratorMethod (LlvmBackend_Iterators.cpp lines
+                        // 918-942 + elemIsRuntimeManagedPrimitive computation).
+                        if (smKind_ == SuspendKind::Yield &&
+                            iterElemIsRuntimeManagedPrimitive_ &&
+                            iterElemTy_->isPointerTy()) {
+                            llvm::Value* ownedFld = builder_.CreateStructGEP(
+                                smStateStruct_, smSelf_,
+                                iterCurrentValOwnedField_);
+                            // --- dispose previous if owned ---
+                            llvm::Value* prevVal = builder_.CreateLoad(
+                                iterElemTy_, cvField, "ity.sprev");
+                            llvm::Value* prevIsNull = builder_.CreateICmpEQ(
+                                prevVal,
+                                llvm::ConstantPointerNull::get(ptrTy()),
+                                "ity.sprevnull");
+                            auto* prevNonNullBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.sprev.nonnull", currentFn_);
+                            auto* prevContBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.sprev.cont", currentFn_);
+                            builder_.CreateCondBr(
+                                prevIsNull, prevContBB, prevNonNullBB);
+                            builder_.SetInsertPoint(prevNonNullBB);
+                            llvm::Value* prevOwned = builder_.CreateLoad(
+                                i8(), ownedFld, "ity.sprevowned");
+                            llvm::Value* prevIsOwned = builder_.CreateICmpNE(
+                                prevOwned, builder_.getInt8(0), "ity.spreviso");
+                            auto* dispBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.sprev.disp", currentFn_);
+                            auto* skipBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.sprev.skip", currentFn_);
+                            auto* afterDispBB = llvm::BasicBlock::Create(
+                                llvm_, "ity.sprev.after", currentFn_);
+                            builder_.CreateCondBr(prevIsOwned, dispBB, skipBB);
+                            builder_.SetInsertPoint(dispBB);
+                            // #2738: release the displaced +1 reference via
+                            // the refcounted string release path — bz_string_release
+                            // is the canonical releaser for a non-nullable string
+                            // primitive (matching how §28.9 / §28.3 releases a
+                            // borrowed +1 on scope exit). emitStringRelease is
+                            // null- and sentinel-safe, so the owned-flag gate is
+                            // sufficient (no separate null guard needed beyond
+                            // the prev non-null check above).
+                            emitStringRelease(prevVal);
+                            builder_.CreateBr(afterDispBB);
+                            builder_.SetInsertPoint(skipBB);
+                            builder_.CreateBr(afterDispBB);
+                            builder_.SetInsertPoint(afterDispBB);
+                            builder_.CreateBr(prevContBB);
+                            builder_.SetInsertPoint(prevContBB);
+                            // --- set owned flag for new value ---
+                            // Enumerator owns it only when the expression is a
+                            // +1 string producer (interpolation, `+`, `??`,
+                            // case, conditional, range slice, ToString — see
+                            // isPlusOneStringProducer). A literal (`yield return
+                            // "x"`) is a static immortal sentinel with rc=∞ —
+                            // not a +1 producer, do not release. A borrowed
+                            // local/param (`yield return s`) is a re-borrow —
+                            // the existing binding owns the +1 and the
+                            // iterator never had it; do not release. Same
+                            // discipline as the class-element gate above, with
+                            // the isPlusOneStringProducer predicate standing in
+                            // for `new X()`.
+                            bool yieldIsProducer =
+                                isPlusOneStringProducer(ys->value.get());
+                            builder_.CreateStore(
+                                builder_.getInt8(yieldIsProducer ? 1 : 0),
+                                ownedFld);
+                        }
                         // fix #2621 / §29.1 (v0.236): sync IOwningEnumerable<T> /
                         // IOwningEnumerator<T> — the enumerator ALWAYS owns a
                         // non-null current_val (the §29.1 contract: ownership
