@@ -5435,6 +5435,82 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
             "collection and transfer ownership with `Add(owned item)` "
             "instead)");
     }
+
+    // §15.4 (v0.243, rationale §5.28): "the compiler must warn when a
+    // store-position argument on a borrowing-family collection —
+    // `Add`/`Insert` and the indexer-set, key and value positions alike —
+    // is a fresh unbound owned temporary of class type (§28.3): a `new`
+    // expression, a collection literal, an `owned`-returning call result,
+    // a `move` result, or a `Task`-family call result". The program stays
+    // ADMITTED (deliberate literal-only asymmetry: an opaque callee's
+    // signature type-announces no retention — §15.4's own resolution 5),
+    // and the hazard is backstopped by checked disposal mode (§28.2). The
+    // lint is the §28.11 store-rule counterpart on the FRESH-TEMPORARY
+    // half — the named-local half above is the borrow-store rejection,
+    // this is the fresh-producer warning. Restricted to the ELEMENT-STORE
+    // positions (storing), excluding the bulk `AddRange` (whose argument
+    // is a COLLECTION, not an element — the fresh-aggregate rule applies
+    // at the literal site, not here) and excluding an owned-RETURNING
+    // call into the OWNING family (which takes ownership; the borrow-store
+    // rule above excludes those receivers). // per §15.4, §28.3, §28.11
+    if (!storing) return;
+    for (const ast::CallArgument& a : call.args) {
+        if (!a.value) continue;
+        const sema::TypeRef* argType = ctx_.exprType(*a.value);
+        if (!argType || argType->kind != sema::TypeRef::Kind::Named ||
+            !argType->declaration ||
+            argType->declaration->kind != ast::TypeDeclKind::Class ||
+            argType->declaration->isValueBuiltin) {
+            continue;  // not a class type — out of scope for §15.4's lint
+        }
+        bool freshTemp = false;
+        if (dynamic_cast<const ast::NewExpr*>(a.value.get())) {
+            freshTemp = true;  // `new T(...)`
+        } else if (auto* ce =
+                       dynamic_cast<const ast::CallExpr*>(a.value.get())) {
+            // `owned`-returning call is a fresh-producer shape per §15.4 —
+            // the call mints a fresh owned value each invocation. The
+            // `Task`-family mint-announcing return (§28.3 / K6.3) is the
+            // sibling: a Task-shaped fresh frame, freed at the Task's
+            // teardown (and the borrowed slot dangles besides, §15.4's
+            // hazard split). Both families are admitted with the same
+            // warning — the borrow-store hazard is symmetric. #3383's
+            // immediate bug is the `new T(...)` case; the call shapes
+            // are listed by §15.4 as the same family and admitted with
+            // the same lint.
+            if (common::calleeReturnsOwned(*ce, ctx_)) {
+                freshTemp = true;
+            }
+        }
+        // (Collection literals: at a borrowing-family `Add`, the literal
+        // argument is the aggregate per §15.4 resolution 1, owned by its
+        // K8 temporary and freed at statement end — the warning still
+        // applies, but the literal's STATIC TYPE is the collection head,
+        // not a class type, so the class-type gate above already filters
+        // it out. The borrow-store rejection above handles the literal
+        // cases §15.4 admits at the `Add` site via the named-local
+        // predicate when a literal's elements are themselves bound to
+        // named locals — the literal-itself-as-argument is a K8 aggregate
+        // and is the §15.4 literal-tree rule's territory, deliberately
+        // not warned here to avoid double-firing on the literal site.)
+        if (!freshTemp) continue;
+        const std::string recvName =
+            recvRoot ? std::string(recvRoot->name) : std::string("it");
+        report(
+            Severity::Warning, a.value->span.begin,
+            std::string("fresh unbound owned temporary of class type passed "
+                        "to `.") +
+            std::string(m) + "(...)` on `" + recvName +
+            "` — the temporary dies at its K8 full-expression boundary and "
+            "the borrowing collection retains a reference to the freed "
+            "instance (checked disposal mode raises "
+            "`DisposedAccessException` on later use, §28.2); bind the source "
+            "to a named holder first (`var tmp := new " +
+            std::string(argType->declaration->name) +
+            "(...); " + recvName + "." + std::string(m) + "(tmp);`), or use "
+            "the owning family whose store position takes ownership (§15.4, "
+            "§28.11)");
+    }
 }
 
 // §28.11 "Storing a borrow" (v0.180; hole closed #1884). §28.11 lists the store
