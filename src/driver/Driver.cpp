@@ -197,9 +197,18 @@ std::vector<SourceLocation> collectScopedAwaitBindSites(
             if (!dep.metadataPath.empty())
                 depMetaPaths.push_back(dep.metadataPath);
         std::string depErr, failedPath;
+        // Use the FULL dotted name — ctx.module()->name is the leaf.
+        std::string rootDottedName;
+        if (unit->module && unit->module->name) {
+            for (std::size_t i = 0; i < unit->module->name->parts.size(); ++i) {
+                if (i != 0) rootDottedName += '.';
+                rootDottedName += std::string(unit->module->name->parts[i]);
+            }
+        }
+        std::string_view rootName = rootDottedName;
         if (!depMetaPaths.empty() &&
             !bezel::module::loadDependencies(depMetaPaths, ctx, &depErr,
-                                             &failedPath))
+                                             &failedPath, rootName))
             return sites;   // the real run reports it; stay silent here
     }
     sema::resolveTypes(*unit, ctx);
@@ -369,9 +378,49 @@ CompileResult Driver::compileFile(const std::string& path,
         return compileExecutableObject(path, /*objectPath=*/"", deps, opts);
 
     const std::string objectPath = outputPath + ".o";
-    CompileResult cc = compileExecutableObject(path, objectPath, deps, opts);
+    // §2.8.1 rule 3 (#1729, v0.188): the loader's metadata-side dedup
+    // collapses bit-identical duplicates of one moduleName (the diamond-
+    // assembly shape). The link step still sees every dependency object
+    // unless we filter the `deps` to the dedup'd set — otherwise the
+    // dedupped second copy is double-linked and fails with "multiple
+    // definition of …". Compile-time only; the surviving paths are
+    // thrown away after the link.
+    std::vector<std::string> survivingDepPaths;
+    CompileResult cc = compileExecutableObject(path, objectPath, deps, opts,
+                                               &survivingDepPaths);
     if (!cc.success) return cc;
-    if (!linkExecutableObject(objectPath, outputPath, deps, opts)) {
+    // Build the filtered-deps list: keep only deps whose metadataPath
+    // survived the loader's dedup, AND dedup by metadataPath so two deps
+    // pointing at the same metadata (which is also the typical diamond
+    // shape — App.bzl imports Base twice, once via LibA and once via LibB)
+    // link only the canonical copy. An empty `survivingDepPaths` means
+    // the caller did not opt in to the dedup reporting (older test
+    // harnesses, the front-end-only path); fall back to the original
+    // deps — the dedup simply cannot reach the link in that case, which
+    // matches the pre-#1729 behavior.
+    std::vector<Dependency> linkDeps;
+    if (!survivingDepPaths.empty()) {
+        std::unordered_set<std::string> survivors(survivingDepPaths.begin(),
+                                                  survivingDepPaths.end());
+        std::unordered_set<std::string> seenMeta;
+        linkDeps.reserve(deps.size());
+        for (const Dependency& dep : deps) {
+            // Empty metadataPath = no loader work; pass the dep through.
+            // (Such deps have no module to dedup; they typically carry an
+            // object-only entry to link against.)
+            if (dep.metadataPath.empty()) {
+                linkDeps.push_back(dep);
+                continue;
+            }
+            if (!survivors.count(dep.metadataPath)) continue;
+            // Among the surviving deps, dedup by metadataPath so a diamond
+            // that names the same metadata file twice links only once.
+            if (!seenMeta.insert(dep.metadataPath).second) continue;
+            linkDeps.push_back(dep);
+        }
+    }
+    if (!linkExecutableObject(objectPath, outputPath,
+                              linkDeps.empty() ? deps : linkDeps, opts)) {
         std::remove(objectPath.c_str());
         return CompileResult{false, cc.errorCount + 1};
     }
@@ -393,7 +442,8 @@ CompileResult Driver::compileFile(const std::string& path,
 // came out unchanged.
 CompileResult Driver::compileExecutableObject(
     const std::string& path, const std::string& objectPath,
-    const std::vector<Dependency>& deps, const codegen::CodegenOptions& opts) {
+    const std::vector<Dependency>& deps, const codegen::CodegenOptions& opts,
+    std::vector<std::string>* survivingDepPaths) {
     std::string source;
     if (!readFile(path, source)) {
         std::cerr << "bezelc: error: cannot open '" << path << "'\n";
@@ -437,6 +487,35 @@ CompileResult Driver::compileExecutableObject(
         // the AST via side-tables on SemaContext.
         sema::SemaContext semaCtx(diagnostics);
         sema::collectSymbols(*unit, semaCtx);
+        // §2.8.1 rule 5 (#1729, v0.188): the root compilation's module name
+        // must not collide with an implementation-provided stdlib module.
+        // Detected here (after symbol collection, where the ModuleDecl's
+        // name is attached to the SemaContext) and BEFORE the loader runs so
+        // the diagnostic names the user's own source. §2.8.1 rules 3+5:
+        // stdlib modules cannot be re-declared by user code.
+        //
+        // The SemaContext's ModuleSymbol carries the LEAF name only (the
+        // short identifier, not the dotted form — moduleSymbolName in
+        // SymbolCollection.cpp takes parts.back()); the impl-provided set
+        // uses the full dotted form, so we must reconstruct the full name
+        // from the AST's QualifiedName. Mirrors the §2.8.1 rule 4 self-
+        // import reconstruction in TypeResolution.cpp's sourceImports loop.
+        std::string rootDottedName;
+        if (unit->module && unit->module->name) {
+            for (std::size_t i = 0; i < unit->module->name->parts.size(); ++i) {
+                if (i != 0) rootDottedName += '.';
+                rootDottedName += std::string(unit->module->name->parts[i]);
+            }
+        }
+        if (!rootDottedName.empty() &&
+            bezel::module::isImplProvidedModuleName(rootDottedName)) {
+            std::cerr << "bezelc: error: source file '" << path
+                      << "' declares module '" << rootDottedName
+                      << "', which is an implementation-provided module name "
+                         "(§2.8.1 rules 3+5); stdlib modules cannot be "
+                         "re-declared by user code\n";
+            return CompileResult{false, 1};
+        }
         // §2.5 / §2.6 step 2 (issue #328 inc 3): load each dependency's
         // public-interface metadata into the cross-module symbol table BEFORE
         // type resolution, so the importer's `import`s and cross-module
@@ -451,6 +530,13 @@ CompileResult Driver::compileExecutableObject(
         // regardless of the order the `--import`s are listed. The old per-dep loop
         // resolved artifact N's references before artifact N+1 loaded, silently
         // degrading a forward reference to a garbage-valued TypeRef.
+        //
+        // §2.8.1 rules 3+5 (#1729, v0.188): the loader receives the root's
+        // module name so it can reject a dep that re-declares it (rule 3's
+        // "dep declaring a name the root also declares") or one of the
+        // stdlib's impl-provided names (rule 5). `survivingDepPaths` collects
+        // the dedup'd set so compileFile can pass exactly those to the link
+        // step (otherwise a diamond-assembly duplicate fails the link).
         {
             std::vector<std::string> depMetaPaths;
             depMetaPaths.reserve(deps.size());
@@ -461,9 +547,17 @@ CompileResult Driver::compileExecutableObject(
             // rejects an executable artifact presented as a dependency; print that
             // (it names the artifact + its kind) instead of the generic message.
             std::string depErr, failedPath;
+            std::vector<std::string> depSurvivors;
+            // Use the full dotted root name (not the leaf on semaCtx.module()
+            // — see the impl-provided check above for why) so the loader
+            // rejects a dep whose moduleName equals the root's FULL name
+            // and so the impl-provided-name comparison in loadDependencies
+            // sees the dotted form.
+            std::string_view rootName = rootDottedName;
             if (!depMetaPaths.empty() &&
-                !bezel::module::loadDependencies(depMetaPaths, semaCtx, &depErr,
-                                                 &failedPath)) {
+                !bezel::module::loadDependencies(
+                    depMetaPaths, semaCtx, &depErr, &failedPath, rootName,
+                    survivingDepPaths ? survivingDepPaths : &depSurvivors)) {
                 if (!depErr.empty())
                     std::cerr << "bezelc: error: " << depErr << "\n";
                 else
@@ -587,9 +681,31 @@ CompileResult Driver::compileObject(const std::string& path,
         injectStdlibPrelude(*unit);
         sema::SemaContext semaCtx(diagnostics);
         sema::collectSymbols(*unit, semaCtx);
+        // §2.8.1 rule 5 (#1729, v0.188): impl-provided-name check (mirrors
+        // compileExecutableObject). The SemaContext's ModuleSymbol carries
+        // the leaf only — reconstruct the full dotted name from the AST.
+        std::string rootDottedName;
+        if (unit->module && unit->module->name) {
+            for (std::size_t i = 0; i < unit->module->name->parts.size(); ++i) {
+                if (i != 0) rootDottedName += '.';
+                rootDottedName += std::string(unit->module->name->parts[i]);
+            }
+        }
+        if (!rootDottedName.empty() &&
+            bezel::module::isImplProvidedModuleName(rootDottedName)) {
+            std::cerr << "bezelc: error: source file '" << path
+                      << "' declares module '" << rootDottedName
+                      << "', which is an implementation-provided module name "
+                         "(§2.8.1 rules 3+5); stdlib modules cannot be "
+                         "re-declared by user code\n";
+            return CompileResult{false, 1};
+        }
         // §2.5: a library may itself import dependencies (acyclic). #1487: load
         // them in two global passes (see the compileFile path) so cross-artifact
         // Named references resolve independently of the `--import` order.
+        // §2.8.1 rules 3+5 (#1729, v0.188): pass the root name so the loader
+        // can reject a dep that re-declares it or declares an impl-provided
+        // name. compileObject does no linking, so no survivingPaths needed.
         {
             std::vector<std::string> depMetaPaths;
             depMetaPaths.reserve(deps.size());
@@ -599,9 +715,10 @@ CompileResult Driver::compileObject(const std::string& path,
             // §2.8.4 rule 4 (#1733): reject an executable artifact presented as
             // a dependency — see the compileFile path above for the rationale.
             std::string depErr, failedPath;
+            std::string_view rootName = rootDottedName;
             if (!depMetaPaths.empty() &&
                 !bezel::module::loadDependencies(depMetaPaths, semaCtx, &depErr,
-                                                 &failedPath)) {
+                                                 &failedPath, rootName)) {
                 if (!depErr.empty())
                     std::cerr << "bezelc: error: " << depErr << "\n";
                 else

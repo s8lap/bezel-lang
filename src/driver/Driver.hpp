@@ -71,10 +71,17 @@ public:
     // the §33.5 entry-point check) and emit the native object at `objectPath`,
     // performing NO link. An empty `objectPath` runs the front-end only, with no
     // codegen and no entry-point check — the `compileFile(path, "")` shape.
+    //
+    // §2.8.1 rules 3+5 (#1729, v0.188): when `survivingDepPaths` is non-null,
+    // it receives the subset of `deps` whose artifacts the loader actually
+    // kept (one per moduleName, after the rule-3 dedup). `compileFile` uses
+    // it to filter the dependency list passed to the link step so a
+    // diamond-assembly duplicate is not double-linked.
     CompileResult compileExecutableObject(const std::string& path,
                                           const std::string& objectPath,
                                           const std::vector<Dependency>& deps,
-                                          const codegen::CodegenOptions& opts);
+                                          const codegen::CodegenOptions& opts,
+                                          std::vector<std::string>* survivingDepPaths = nullptr);
 
     // The LINK half: link `objectPath` (plus each dependency's object) into the
     // executable `exePath` with the project's clang recipe. Prints

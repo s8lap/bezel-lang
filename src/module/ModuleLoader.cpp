@@ -4279,9 +4279,38 @@ std::optional<ModuleMetadata> loadDependency(const std::string& artifactPath,
     return md;
 }
 
+// §2.8.1 rule 5 (#1729, v0.188): the implementation-provided module set —
+// the §2.3 always-available set (System, System.Text, System.Collections.Linq)
+// plus the explicitly-imported modules the standard-library document defines
+// (System.Collections.Generic, System.Threading, System.IO, System.Diagnostics,
+// System.Serialization, System.Reflection, System.Interop). Adding a name here
+// without also editing the spec/stdlib amendment is a spec defect — see the
+// proposal 0034 ruling and the file header in docs/proposals/0034-module-
+// identity.md §1 rule 5.
+static constexpr const char* kImplProvidedModuleNames[] = {
+    "System",                       // stdlib §2
+    "System.Collections.Generic",   // stdlib §4
+    "System.Collections.Linq",      // stdlib §5 (auto-imported, v0.278)
+    "System.Diagnostics",           // stdlib §8
+    "System.Interop",               // stdlib §10.5/§10.6
+    "System.IO",                    // stdlib §7
+    "System.Reflection",            // stdlib §11 (deferred, but reserved)
+    "System.Serialization",         // stdlib §2.15
+    "System.Text",                  // stdlib §3
+    "System.Threading",             // stdlib §6
+};
+
+bool isImplProvidedModuleName(std::string_view name) {
+    for (const char* implName : kImplProvidedModuleNames)
+        if (name == implName) return true;
+    return false;
+}
+
 bool loadDependencies(const std::vector<std::string>& artifactPaths,
                       sema::SemaContext& ctx, std::string* diag,
-                      std::string* failedPath) {
+                      std::string* failedPath,
+                      std::string_view rootModuleName,
+                      std::vector<std::string>* survivingPaths) {
     // §2.5 / #1487: load a set of dependency artifacts so that a Named type
     // reference is resolved INDEPENDENTLY of the order they appear on the command
     // line. The old per-artifact loop (loadDependency once each, in sequence) did
@@ -4345,6 +4374,40 @@ bool loadDependencies(const std::vector<std::string>& artifactPaths,
             if (failedPath) *failedPath = path;
             return false;
         }
+        // §2.8.1 rule 5 / rule 3 (#1729, v0.188): the implementation-provided
+        // modules participate in duplicate-name detection. A dependency
+        // artifact declaring an impl-provided name is a build error — the
+        // implementation's stdlib §X IS the only artifact that supplies that
+        // name, and presenting a competing user artifact would let a file
+        // silently override the stdlib's surface.
+        if (isImplProvidedModuleName(md->moduleName)) {
+            if (diag)
+                *diag = "dependency artifact '" + path +
+                        "' declares module '" + md->moduleName +
+                        "', which is an implementation-provided module name "
+                        "(§2.8.1 rules 3+5); stdlib modules cannot be "
+                        "re-declared by user artifacts";
+            if (failedPath) *failedPath = path;
+            return false;
+        }
+        // §2.8.1 rule 3 (#1729, v0.188): "a dependency artifact declaring a
+        // module name that the root compilation also declares" is a build
+        // error. The root compilation owns its own module name; presenting a
+        // dependency under the same name would silently widen visibility for
+        // the root's `internal` access (§2.8.1 rule 2's closure-by-compilation
+        // invariant). Distinct from the "two-deps-same-name" rule below
+        // (root vs dep is the head of the build, dep vs dep is in closure).
+        if (!rootModuleName.empty() &&
+            md->moduleName == std::string(rootModuleName)) {
+            if (diag)
+                *diag = "dependency artifact '" + path +
+                        "' declares module '" + md->moduleName +
+                        "', which is also the name of the root compilation; "
+                        "a build's dependency closure cannot redeclare a "
+                        "module the root already supplies (§2.8.1 rule 3)";
+            if (failedPath) *failedPath = path;
+            return false;
+        }
         // §2.8.3 rule 3 / §2.8.1 rule 3: repeated artifacts for one module
         // are idempotent only when their descriptions agree. This is the
         // metadata-time staleness backstop for carried contract records.
@@ -4355,15 +4418,21 @@ bool loadDependencies(const std::vector<std::string>& artifactPaths,
         if (prior != states.end()) {
             if (!metadataDescriptionsAgree(prior->md, *md)) {
                 if (diag)
-                    *diag = "stale or disagreeing descriptions for module '" +
-                            md->moduleName + "' in dependency artifacts '" +
-                            prior->path + "' and '" + path +
-                            "' (§2.8.3 rule 3; recompile dependents)";
+                    *diag = "two distinct dependency artifacts declare the "
+                            "same module name '" + md->moduleName +
+                            "' ('" + prior->path + "' and '" + path +
+                            "') but describe it differently; a build whose "
+                            "artifact set contains two distinct artifacts "
+                            "declaring one module name is ill-formed "
+                            "(§2.8.1 rule 3)";
                 if (failedPath) *failedPath = path;
                 return false;
             }
             // Prefer a record-carrying rebuild over an opaque legacy copy; an
             // equal carried duplicate otherwise needs no second symbol shell.
+            // (`prior->path` is updated so the survivingPaths list reports
+            // the canonical copy — the one a downstream native link will
+            // need, since the metadata-deduped copy never reaches the link.)
             if (!prior->md.contractRecordsCarried &&
                 md->contractRecordsCarried) {
                 prior->md = std::move(*md);
@@ -4385,6 +4454,21 @@ bool loadDependencies(const std::vector<std::string>& artifactPaths,
     // registered — a Named ref binds by name whatever the load order.
     for (DepState& st : states)
         loadMetadataPass2(st.md, ctx, st.localTypes, st.created);
+    // §2.8.1 rule 3's idempotence carve-out (#1729, v0.188): bit-identical
+    // duplicates are deduplicated, not diagnosed. The metadata side above
+    // already collapses them (the `continue` above skips adding the second
+    // copy to `states`); but the artifact PATH is still handed to the native
+    // link step unless we tell the caller which paths survived. Without this
+    // list, a diamond assembly (LibA + LibB both depend on Base, both ship
+    // base.o on the command line) links two copies of every Base symbol and
+    // fails with "multiple definition of …" — the link-time surface of the
+    // very dedup the metadata side already performed.
+    if (survivingPaths) {
+        survivingPaths->clear();
+        survivingPaths->reserve(states.size());
+        for (const DepState& st : states)
+            survivingPaths->push_back(st.path);
+    }
     return true;
 }
 

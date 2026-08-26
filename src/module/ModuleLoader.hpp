@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "module/ModuleMetadata.hpp"
@@ -81,13 +82,43 @@ std::optional<ModuleMetadata> loadDependency(const std::string& artifactPath,
 // on failure returns false and, for an executable-artifact rejection (§2.8.4
 // rule 4), sets `*diag`; `*failedPath` (when non-null) names the offending
 // artifact for a generic "cannot load metadata" message.
+//
+// §2.8.1 rules 1/3/5 (#1729, v0.188):
+//   - When `rootModuleName` is non-empty, any dependency whose moduleName
+//     equals it is rejected as the §2.8.1 rule-3 build error (a dependency
+//     artifact declaring a module name the root compilation also declares).
+//   - Any dependency whose moduleName is impl-provided (see
+//     isImplProvidedModuleName) is rejected as the rule-5 build error
+//     (rule 3 applied through rule 5).
+//   - Two distinct dependencies declaring the same moduleName with
+//     disagreeing descriptions are rejected as the rule-3 build error
+//     (stale/disagreeing).
+//   - Two distinct dependencies declaring the same moduleName with
+//     agreeing descriptions are deduplicated, not diagnosed (rule 3's
+//     idempotence carve-out, "the same artifact … bit-identical content").
+//
+// `survivingPaths` (when non-null) receives the subset of `artifactPaths` that
+// were kept (one per moduleName — the canonical survivor wins), so the caller
+// can pass exactly those to the native link step (otherwise a duplicate
+// metadata-deduped dependency still contributes its object file twice to the
+// link, producing §2.8.1 rule-3's "multiple definition of …" error at link
+// time, #1729's repro).
 bool loadDependencies(const std::vector<std::string>& artifactPaths,
                       sema::SemaContext& ctx, std::string* diag = nullptr,
-                      std::string* failedPath = nullptr);
+                      std::string* failedPath = nullptr,
+                      std::string_view rootModuleName = {},
+                      std::vector<std::string>* survivingPaths = nullptr);
 
 // Load an already-deserialized ModuleMetadata into `ctx` (the artifact bytes
 // were obtained elsewhere — e.g. a sema-level test). Reconstructs and registers
 // the exported types as above. Returns true on success.
 bool loadMetadata(const ModuleMetadata& md, sema::SemaContext& ctx);
+
+// §2.8.1 rule 5 (#1729, v0.188): the standard-library module names the
+// compiler provides without any presented artifact. A root compilation or
+// dependency artifact declaring one of these names is a build error (rule 3,
+// applied through rule 5). The list is the standard-library document's module
+// catalog at this revision.
+bool isImplProvidedModuleName(std::string_view name);
 
 }  // namespace bezel::module
