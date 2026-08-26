@@ -8734,6 +8734,36 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                             else
                                 ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        } else if (m == "ReceiveAll") {
+                            // §30.15 / stdlib §6.9 v0.186 (#1724): ReceiveAll():
+                            // the non-exceptional drain form. Returns an async
+                            // enumerable over the channel — class-T yields
+                            // IOwningAsyncEnumerable<T>; value/string T yields
+                            // IAsyncEnumerable<T> (no ownership transfer; the
+                            // iteration variable is `T`, not `owned T`).
+                            //
+                            // The call mints a fresh drain enumerable frame per
+                            // §28.3 v0.258 (calls mint); single-consumer discipline
+                            // is a channel invariant (runtime-enforced), not a
+                            // frame-identity fact.
+                            bool elemIsClass = (elemTy->kind == TypeRef::Kind::Named &&
+                                               elemTy->declaration &&
+                                               elemTy->declaration->kind ==
+                                                   ast::TypeDeclKind::Class);
+                            auto* aeTy = ctx_.makeTypeRef();
+                            aeTy->kind = TypeRef::Kind::Named;
+                            aeTy->nullable = false;
+                            auto* aeAnn = new ast::Type();
+                            aeAnn->kind = ast::TypeKind::Named;
+                            auto* aeNm = new ast::QualifiedName();
+                            aeNm->parts.push_back(elemIsClass
+                                ? "IOwningAsyncEnumerable"
+                                : "IAsyncEnumerable");
+                            aeAnn->name.reset(aeNm);
+                            aeTy->astNode = aeAnn;
+                            aeTy->genericArgs.push_back(
+                                const_cast<TypeRef*>(elemTy));
+                            ctx_.setExprType(&ce, aeTy);
                         } else if (m != "Dispose") {
                             // §6.9 / #640: Channel<T> does not expose `Send` or
                             // `TrySend` (those live on ChannelSender<T>); any other

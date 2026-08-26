@@ -2428,6 +2428,29 @@ struct bz_channel_t {
     // per fix #634: refcount — Channel object holds +1, each sender holds +1;
     // last release (core_refs == 1 → 0) deletes.
     std::atomic<int> core_refs{1};
+    // §30.15 / stdlib §6.9 v0.186 (#1724): single-consumer invariant for
+    // `Channel<T>.ReceiveAll()`. The drain enumerable holds ch->recv_all_active
+    // for its lifetime; while set, every other consumption form
+    // (a fresh ReceiveAll, a Receive that begins to park, a TryReceive) raises
+    // InvalidOperationException. bz_exc carries the IOE vtable at the failing
+    // call site, mirroring the ChannelClosedException protocol.
+    int32_t  recv_all_active;
+    // Set while a `Channel.Receive()` task is parked in ch->pending — the spec
+    // says beginning a ReceiveAll while a Receive task is pending also raises
+    // IOE (channel is single-consumer). Cleared when the parked task completes
+    // (item delivered or fault), or when the channel closes/disposes.
+    int32_t  pending_recv_task;
+    // If non-null, the parked drain-waiter task from a ReceiveAll MoveNextAsync
+    // that found the channel empty + open. At most one exists because of the
+    // single-consumer rule. bz_channel_send completes it with the item;
+    // channel_close_and_drain_pending completes it with the drained signal
+    // (NOT an exception — the spec text's "completes normally" requirement).
+    bz_task_t* recv_all_waiter_task;
+    // §30.15 / stdlib §6.9 v0.186 (#1724): pointer to the enumerator's
+    // `current_yielded` void* slot, set by MoveNextAsync when it parks. On
+    // Send arrival, bz_channel_send writes the item pointer through this slot
+    // before completing the parked task. Void** to allow direct write.
+    void** recv_all_waiter_item_slot;
 };
 
 // Forward declaration
@@ -2462,6 +2485,11 @@ void* bz_channel_new(void (*dispose_elem)(void*), int64_t capacity) {
     ch->sender_count   = 0;
     ch->closed         = false;
     ch->disposed       = false;
+    // §30.15 / stdlib §6.9 v0.186 (#1724): drain-singleton state.
+    ch->recv_all_active       = 0;
+    ch->pending_recv_task     = 0;
+    ch->recv_all_waiter_task  = nullptr;
+    ch->recv_all_waiter_item_slot = nullptr;
     // core_refs starts at 1 (the Channel object's ref); per fix #634.
     return ch;
 }
@@ -2494,6 +2522,10 @@ extern "C"
 void bz_channel_send(void* chp, void* item, void* cce_vtable, void* cfe_vtable) {
     auto* ch = (bz_channel_t*)chp;
     bz_pending_receiver_t recv{nullptr, nullptr};
+    // §30.15 / stdlib §6.9 v0.186 (#1724): a ReceiveAll drain waiter parked in
+    // MoveNextAsync. If set, the new item is delivered straight to it
+    // (single-consumer invariant; this branch has priority over `pending`).
+    bz_task_t* drain_waiter = nullptr;
     {   std::lock_guard<std::mutex> lk(ch->mtx);
         if (ch->closed || ch->disposed) {
             // §30.15 / fix #634: send after close raises ChannelClosedException.
@@ -2515,9 +2547,19 @@ void bz_channel_send(void* chp, void* item, void* cce_vtable, void* cfe_vtable) 
             }
             return;
         }
-        if (!ch->pending.empty()) {
+        if (ch->recv_all_waiter_task) {
+            drain_waiter = ch->recv_all_waiter_task;
+            ch->recv_all_waiter_task = nullptr;
+            // Don't push to items; deliver directly to the drain waiter below.
+        } else if (!ch->pending.empty()) {
             recv = ch->pending.front();
             ch->pending.pop_front();
+            // §30.15 / stdlib §6.9 v0.186 (#1724): the parked-receiver count
+            // (the channel-side of the single-consumer rule) drops whenever a
+            // parked Receive task is delivered to. The recv_all_active gate on
+            // this channel is independent — both gates release independently
+            // on their respective endings.
+            ch->pending_recv_task = 0;
             // Don't push item to items -- deliver directly via the task below.
         } else if (ch->capacity > 0 &&
                    (int64_t)ch->items.size() >= ch->capacity) {
@@ -2544,6 +2586,18 @@ void bz_channel_send(void* chp, void* item, void* cce_vtable, void* cfe_vtable) 
         // Route through the receiver's domain so the continuation is serialized.
         // bz_task_complete stores result_size bytes; for a void* item we store 8.
         bz_task_complete(recv.task, &item, sizeof(void*));
+    }
+    // §30.15 / stdlib §6.9 v0.186 (#1724): deliver the new item to the drain
+    // waiter. The enumerator set ch->recv_all_waiter_item_slot before parking
+    // to point at its own `current_yielded` void* slot; we write `item` there
+    // and complete the parked task with the 1-byte status 1 ("got an item").
+    if (drain_waiter) {
+        if (ch->recv_all_waiter_item_slot) {
+            *(void**)ch->recv_all_waiter_item_slot = item;
+            ch->recv_all_waiter_item_slot = nullptr;
+        }
+        uint8_t one = 1;
+        bz_task_complete(drain_waiter, &one, sizeof(one));
     }
 }
 
@@ -2594,6 +2648,9 @@ void* bz_channel_send_async(void* chp, void* item, void* cce_vtable) {
             // A receiver is already waiting: hand the item straight across.
             recv = ch->pending.front();
             ch->pending.pop_front();
+            // §30.15 / stdlib §6.9 v0.186 (#1724): parked-receiver count
+            // drops when this Receive task is delivered to.
+            ch->pending_recv_task = 0;
             complete_now = true;
         } else if (ch->capacity == 0 ||
                    (int64_t)ch->items.size() < ch->capacity) {
@@ -2687,6 +2744,9 @@ void* bz_channel_receive(void* chp, void* cce_vtable) {
         } else {
             // Park in pending-receiver FIFO.
             ch->pending.push_back({task, task->domain});
+            // §30.15 / stdlib §6.9 v0.186 (#1724): mark a Receive task as
+            // pending so a subsequent ReceiveAll raises IOE (single-consumer).
+            ch->pending_recv_task = 1;
         }
     }
 
@@ -2895,10 +2955,23 @@ static void channel_close_and_drain_pending(bz_channel_t* ch,
                                             void* cce_vtable) {
     std::deque<bz_pending_receiver_t> pending;
     std::deque<bz_pending_sender_t>   senders;  // v0.174 (#809)
+    // §30.15 / stdlib §6.9 v0.186 (#1724): a ReceiveAll drain waiter parked in
+    // MoveNextAsync when the channel was empty + open. On close, complete it
+    // NORMALLY with the "drained" sentinel (NOT ChannelClosedException — the
+    // spec text's "completes normally" requirement overrides the Receive
+    // faulting convention for this single waiter slot).
+    bz_task_t* recv_all_waiter = nullptr;
     {   std::lock_guard<std::mutex> lk(ch->mtx);
         ch->closed = true;
         pending.swap(ch->pending);
         senders.swap(ch->pending_senders);
+        recv_all_waiter = ch->recv_all_waiter_task;
+        ch->recv_all_waiter_task = nullptr;
+        ch->recv_all_waiter_item_slot = nullptr;  // close = no item handoff
+        // §30.15 / stdlib §6.9 v0.186 (#1724): the parked-receiver count
+        // drops — every pending Receive task is being faulted with
+        // ChannelClosedException below.
+        ch->pending_recv_task = 0;
     }
     for (auto& r : pending) {
         void* excObj = nullptr;
@@ -2907,6 +2980,14 @@ static void channel_close_and_drain_pending(bz_channel_t* ch,
             memcpy(excObj, &cce_vtable, sizeof(void*));
         }
         bz_task_complete_error_obj(r.task, excObj);
+    }
+    // §30.15 / stdlib §6.9 v0.186 (#1724): drain-waiter normal completion
+    // (1-byte result = 0 = "exhausted, no item"). The task is freed when the
+    // caller drops it; we don't add a result_disposer because the result is a
+    // one-byte sentinel, not an owned class value.
+    if (recv_all_waiter) {
+        uint8_t zero = 0;
+        bz_task_complete(recv_all_waiter, &zero, sizeof(zero));
     }
     // v0.174 (#809): a SendAsync still awaiting capacity when the channel closes.
     // Dispose its pending item (the buffered-undelivered-items rule — class-T
@@ -2979,6 +3060,324 @@ void bz_channel_dispose(void* chp, void* cce_vtable) {
     // alive this is the last ref and the core is freed here.  If senders are
     // still alive their refs keep the core alive until they release.
     channel_core_release(ch);
+}
+
+// ---------------------------------------------------------------------------
+// §30.15 / stdlib §6.9 v0.186 (#1724): Channel<T>.ReceiveAll()
+//
+// Implements the non-exceptional drain form: an async enumerable
+// (IOwningAsyncEnumerable<T> for class-T, IAsyncEnumerable<T> for value-T)
+// that yields each item with Receive's exact transfer semantics, suspends
+// while the channel is empty + open, and completes NORMALLY on
+// drained-and-closed. Single-consumer enforced via the channel-side flag
+// recv_all_active; pending Receive task check via pending_recv_task.
+//
+// The runtime shape mirrors WhenEach: a vtable-backed struct implementing
+// the IAsyncEnumerable<T> / IOwningAsyncEnumerable<T> protocol. The struct
+// itself lives at the address the vtable points back to (vtable[0] = self),
+// so the enumerable and the enumerator are the SAME object — a fresh drain
+// frame is minted per call (v0.258 §28.3 calls-mint), not the channel re-
+// exposed, per the spec's positive frame-identity statement.
+//
+// The bz_channel_t side stores three pieces of drain state:
+//   recv_all_active        : 1 while an enumerator is alive (counts receivers,
+//                            not waiters; cleared on dispose / finalization).
+//   recv_all_waiter_task   : the parked bz_task_t from MoveNextAsync when the
+//                            channel was empty + open. Sent items route here;
+//                            a normal-complete-with-0 on close goes here.
+//   recv_all_waiter_item_slot : pointer to the enumerator's current_yielded
+//                            void* slot — bz_channel_send writes the item
+//                            through this slot before completing the parked
+//                            task with status=1.
+//   pending_recv_task      : set while a Channel<T>.Receive() task is parked
+//                            in ch->pending. A subsequent ReceiveAll raises
+//                            IOE (single-consumer rule). Cleared on delivery
+//                            or close-fault.
+// ---------------------------------------------------------------------------
+
+struct bz_channel_recv_all_enumerator_t {
+    void*     vtable;            // slot 0 (self-reference for GetAsyncEnumerator)
+    // Owner ref count. The owner (the fresh caller-owned frame) holds 1; no
+    // other holders are registered today (the MoveNextAsync parked task is
+    // owned by bz_channel_t's recv_all_waiter_task and completes in
+    // bz_chrecvall_move_next's caller — it does not hold a ref here).
+    std::atomic<int64_t> refs{1};
+    // The channel (with a core_refs +1 acquired at init, released at dispose).
+    bz_channel_t* ch;
+    // Current item slot (set by MoveNextAsync fast path OR by bz_channel_send
+    // writing through ch->recv_all_waiter_item_slot). Valid when
+    // pending_advance is non-null or the synchronous fast-path completed with
+    // status=1. The owning variant's TakeCurrent nulls it; the borrowing
+    // variant's Current reads it as-is.
+    void*     current_yielded;
+    // The parked bz_task_t when MoveNextAsync found empty+open; null when no
+    // advance is pending. Used to disambiguate "1 advance outstanding" from
+    // "no advance outstanding" for the channel-side drain waiter hand-off
+    // and for the bz_channel_t's recv_all_waiter_item_slot pointer (only set
+    // when this is non-null).
+    bz_task_t* pending_advance;
+    // 1 if the enumerator was disposed (using-var scope-end / explicit
+    // Dispose); drives the post-dispose defensive checks.
+    int32_t   disposed;
+    // 1 once the channel is drained-and-closed (MoveNextAsync returned false
+    // in the synchronous path, or the parked task completed via close signal).
+    int32_t   exhausted;
+    // 1 = owning variant (TakeCurrent transfers ownership, sets null); 0 =
+    // borrowing variant (Current reads directly).
+    int32_t   is_owning;
+};
+
+// Forward declarations of the vtable-slot functions. Each takes a single
+// `void* self` (and slot 4 a second token arg, per §30.7 v0.228 #1525).
+static void  bz_chrecvall_dispose(void* self);
+static void* bz_chrecvall_move_next(void* self);
+static void* bz_chrecvall_current(void* self);
+static void* bz_chrecvall_take_current(void* self);
+static void* bz_chrecvall_self_enumerator(void* self, void* /*token*/);
+
+static void* g_chrecvall_vtable_borrowing[5] = {nullptr, nullptr, nullptr,
+                                               nullptr, nullptr};
+static void* g_chrecvall_vtable_owning[5]    = {nullptr, nullptr, nullptr,
+                                               nullptr, nullptr};
+static std::once_flag g_chrecvall_vtables_once;
+
+static void bz_chrecvall_vtables_init(void) {
+    std::call_once(g_chrecvall_vtables_once, []() {
+        g_chrecvall_vtable_borrowing[0] = g_chrecvall_vtable_borrowing;  // self
+        g_chrecvall_vtable_borrowing[1] = (void*)bz_chrecvall_dispose;
+        g_chrecvall_vtable_borrowing[2] = (void*)bz_chrecvall_move_next;
+        g_chrecvall_vtable_borrowing[3] = (void*)bz_chrecvall_current;
+        g_chrecvall_vtable_borrowing[4] = (void*)bz_chrecvall_self_enumerator;
+        g_chrecvall_vtable_owning[0]    = g_chrecvall_vtable_owning;     // self
+        g_chrecvall_vtable_owning[1]    = (void*)bz_chrecvall_dispose;
+        g_chrecvall_vtable_owning[2]    = (void*)bz_chrecvall_move_next;
+        g_chrecvall_vtable_owning[3]    = (void*)bz_chrecvall_take_current;
+        g_chrecvall_vtable_owning[4]    = (void*)bz_chrecvall_self_enumerator;
+    });
+}
+
+static void bz_chrecvall_release(bz_channel_recv_all_enumerator_t* e) {
+    if (e->refs.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        if (e->ch) channel_core_release(e->ch);
+        delete e;
+    }
+}
+
+// bz_chrecvall_dispose: explicit `e.Dispose()` or using-var scope-end
+// disposal. Idempotent (second call is a no-op). Clears the channel-side
+// recv_all_active flag so a fresh ReceiveAll can begin (single-consumer
+// obligation releases on any enumeration-ending edge — normal completion,
+// fault, or enumerator disposal, per the spec text). The parked advance, if
+// any, is freed without affecting the channel (the receiver has stopped
+// observing; the channel's "give back" protocol doesn't apply because no
+// item was ever transferred to this enumerator's current_yielded slot).
+static void bz_chrecvall_dispose(void* self) {
+    auto* e = (bz_channel_recv_all_enumerator_t*)self;
+    if (!e) return;
+    bool wasDisposed = false;
+    bz_task_t* parked = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(e->ch->mtx);
+        wasDisposed = (e->disposed != 0);
+        if (!wasDisposed) {
+            e->disposed = 1;
+            // Clear recv_all_active on the channel. If a waiter is parked,
+            // also clear the channel-side recv_all_waiter_task / item-slot
+            // pointer (the enumerator no longer observes them); COMPLETE the
+            // parked task with status=0 (exhausted) so the consumer's await
+            // wakes up — mirroring WhenEach's bz_we_dispose. The consumer's
+            // await reads status=0 and exits the loop; the parked task is
+            // freed by the consumer's `freeTaskAfter=true` after the await
+            // returns. We must NOT free the parked task here — the consumer
+            // still holds a reference to it (its state machine owns the
+            // advance variable).
+            if (e->pending_advance &&
+                e->pending_advance == e->ch->recv_all_waiter_task) {
+                parked = e->pending_advance;
+                e->ch->recv_all_waiter_task = nullptr;
+                e->ch->recv_all_waiter_item_slot = nullptr;
+            }
+            e->ch->recv_all_active = 0;
+        }
+    }
+    if (!wasDisposed) {
+        if (parked) {
+            uint8_t zero = 0;
+            bz_task_complete(parked, &zero, sizeof(zero));
+        }
+        // Dispose current_yielded if it was transferred in by Send but never
+        // consumed by TakeCurrent. BORROWING variant: value-typed scalars and
+        // string-references don't need deep disposal. OWNING variant: dispose
+        // any class-typed item we still hold.
+        if (e->current_yielded && e->is_owning && e->ch->dispose_elem) {
+            e->ch->dispose_elem(e->current_yielded);
+            e->current_yielded = nullptr;
+        }
+    }
+    bz_chrecvall_release(e);
+}
+
+// bz_chrecvall_move_next: returns a bz_task_t* whose 1-byte result is
+//   1 → got an item, e->current_yielded is valid
+//   0 → exhausted, no item
+// (mirrors WhenEach's 1-byte MoveNextAsync status; the borrowed current
+// value sits in e->current_yielded regardless of variant.)
+//
+// Three cases:
+//   (a) Fast path: channel has items → take one, store in current_yielded,
+//       return an already-completed task with status=1.
+//   (b) Empty + closed/disposed → return an already-completed task with
+//       status=0 (NORMAL completion; NO ChannelClosedException).
+//   (c) Empty + open → park a bz_task_t on the channel (recv_all_waiter_task),
+//       set recv_all_waiter_item_slot = &e->current_yielded so a future Send
+//       can hand the item through, store the parked task in
+//       e->pending_advance, and return it (still-pending). The Send or
+//       close path completes the parked task with status=1 (item written
+//       to *item_slot) or status=0 (close signal; *item_slot untouched).
+static void* bz_chrecvall_move_next(void* self) {
+    auto* e = (bz_channel_recv_all_enumerator_t*)self;
+    if (!e) return nullptr;
+    bz_channel_t* ch = e->ch;
+
+    // Already disposed or exhausted → return a freshly-completed task with 0.
+    if (e->disposed || e->exhausted) {
+        auto* t = new bz_task_t();
+        { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+          t->domain = d; domain_ref(d); }
+        uint8_t zero = 0;
+        bz_task_complete(t, &zero, sizeof(zero));
+        return t;
+    }
+
+    auto* task = new bz_task_t();
+    { bz_domain_t* d = g_current_domain ? g_current_domain : g_main_domain;
+      task->domain = d; domain_ref(d); }
+
+    bool fast_completed = false;
+    bool exhausted_now  = false;
+    // Wake admitted-sender task outside the channel lock (mirrors
+    // bz_channel_receive's pattern: lock + state mutation, release, then
+    // bz_task_complete which may re-enter via the domain queue).
+    bz_task_t* wokenSender = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(ch->mtx);
+        if (!ch->items.empty()) {
+            e->current_yielded = ch->items.front();
+            ch->items.pop_front();
+            fast_completed = true;
+            // v0.174 (#809): like Receive, admit the oldest parked sender.
+            if (!ch->pending_senders.empty()) {
+                auto woken = ch->pending_senders.front();
+                ch->pending_senders.pop_front();
+                ch->items.push_back(woken.item);
+                wokenSender = woken.task;
+            }
+        } else if (ch->closed || ch->disposed) {
+            exhausted_now = true;
+            e->exhausted = 1;
+        } else {
+            // Park the task as the channel's drain waiter.
+            ch->recv_all_waiter_task = task;
+            ch->recv_all_waiter_item_slot = &e->current_yielded;
+            e->pending_advance = task;
+        }
+    }
+
+    if (fast_completed) {
+        uint8_t one = 1;
+        bz_task_complete(task, &one, sizeof(one));
+    } else if (exhausted_now) {
+        uint8_t zero = 0;
+        bz_task_complete(task, &zero, sizeof(zero));
+    }
+    // Wake any admitted sender outside the lock.
+    if (wokenSender) bz_task_complete(wokenSender, nullptr, 0);
+    // else: parked; bz_channel_send or channel_close_and_drain_pending
+    // will complete the task.
+    return task;
+}
+
+// bz_chrecvall_current: borrow the current item (borrowing variant).
+static void* bz_chrecvall_current(void* self) {
+    auto* e = (bz_channel_recv_all_enumerator_t*)self;
+    if (!e) return nullptr;
+    return e->current_yielded;
+}
+
+// bz_chrecvall_take_current: transfer ownership of the current item
+// (owning variant). Nulls the slot so a subsequent TakeCurrent / Dispose
+// can't double-free.
+static void* bz_chrecvall_take_current(void* self) {
+    auto* e = (bz_channel_recv_all_enumerator_t*)self;
+    if (!e) return nullptr;
+    void* item = e->current_yielded;
+    e->current_yielded = nullptr;
+    return item;
+}
+
+// bz_chrecvall_self_enumerator: slot 4 — the enumerable and enumerator are
+// the same object, so GetAsyncEnumerator returns self. The §29.11 single-
+// consumption guard is enforced by the channel-side recv_all_active flag,
+// not by get_enum_called (an imported WhenEach-style flag, deferred per
+// #2112).
+static void* bz_chrecvall_self_enumerator(void* self, void* /*token*/) {
+    return self;
+}
+
+// bz_channel_recv_all_init: §30.15 / stdlib §6.9 v0.186 (#1724).
+// Allocate a fresh drain enumerable over the channel. Returns the
+// IAsyncEnumerable<T>* / IOwningAsyncEnumerable<T>* to the caller (same
+// pointer for both views — the difference is the vtable-slot 3 dispatch:
+// borrowing Current vs owning TakeCurrent).
+//
+// is_owning = 1 → TakeCurrent variant (class T); the caller receives
+// ownership of each yielded item via the iterator variable.
+// is_owning = 0 → Current variant (value/string T); the item is a borrowed
+// inttoptr-cast value or string ref.
+//
+// On the single-consumer violation (recv_all_active OR pending_recv_task),
+// returns nullptr AND stores an IOE exception object in bz_exc. The codegen
+// arm checks the return value AND calls emitPendingCheck() right after to
+// surface the IOE.
+extern "C"
+void* bz_channel_recv_all_init(void* chp, void* ioe_vtable, int32_t is_owning) {
+    auto* ch = (bz_channel_t*)chp;
+    if (!ch) return nullptr;
+    bz_main_domain_get();
+
+    // Single-consumer pre-check.
+    bool violation = false;
+    {   std::lock_guard<std::mutex> lk(ch->mtx);
+        if (ch->recv_all_active || ch->pending_recv_task)
+            violation = true;
+        else
+            ch->recv_all_active = 1;
+    }
+    if (violation) {
+        if (ioe_vtable) {
+            void* excObj = calloc(1, (size_t)BZ_EXC_OBJ_SIZE);
+            memcpy(excObj, &ioe_vtable, sizeof(void*));
+            extern thread_local void* bz_exc;
+            bz_exc = excObj;
+        }
+        return nullptr;
+    }
+
+    bz_chrecvall_vtables_init();
+    auto* e = new bz_channel_recv_all_enumerator_t();
+    e->vtable          = is_owning ? g_chrecvall_vtable_owning
+                                   : g_chrecvall_vtable_borrowing;
+    // Channel owns the enumerator's view; we hold a core ref so the channel
+    // core survives until the enumerator is disposed (mirrors WhenEach's
+    // refs pattern). Released in bz_chrecvall_release.
+    e->ch              = ch;
+    e->current_yielded = nullptr;
+    e->pending_advance = nullptr;
+    e->disposed        = 0;
+    e->exhausted       = 0;
+    e->is_owning       = is_owning;
+    channel_core_ref(ch);
+    return e;
 }
 
 // ---------------------------------------------------------------------------

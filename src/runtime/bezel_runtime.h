@@ -1765,6 +1765,20 @@ void bz_channel_sender_release(void* tx, void* cce_vtable);
 // undelivered items in REVERSE insertion order (§28.11), and free the struct.
 void bz_channel_dispose(void* ch, void* cce_vtable);
 
+// §30.15 / stdlib §6.9 v0.186 (#1724): Channel<T>.ReceiveAll() — build a
+// fresh drain-enumerable frame over the channel and return it as
+// IAsyncEnumerable<T>* (is_owning=0, value/string T) or
+// IOwningAsyncEnumerable<T>* (is_owning=1, class T). The returned pointer
+// is the enumerable's vtable-self-address; vtable slot 4 (GetAsyncEnumerator)
+// returns the same pointer (the enumerable and enumerator are one object).
+//
+// Returns nullptr + stores an InvalidOperationException in bz_exc when the
+// single-consumer rule is violated: another ReceiveAll is already active OR
+// a Receive() task is parked on the channel. ioe_vtable is the
+// InvalidOperationException vtable (best-effort — pass null to skip the
+// exception object construction).
+void* bz_channel_recv_all_init(void* ch, void* ioe_vtable, int32_t is_owning);
+
 // Domain.Spawn: spawn a fresh domain that runs entry_fn(arg_ptr).
 // Returns an OwningTask bz_task_t* that completes (with the result pointer)
 // when the spawned domain finishes, or faults with DomainFaultedException.

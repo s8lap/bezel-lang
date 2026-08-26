@@ -4297,6 +4297,50 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 }
                 return nullptr;
             }
+
+            // §30.15 / stdlib §6.9 v0.186 (#1724): ReceiveAll() — returns a
+            // fresh IAsyncEnumerable<T>* / IOwningAsyncEnumerable<T>*
+            // (vtable-backed enumerator). The drain enumerable mints a frame
+            // per call (v0.258 §28.3 calls-mint) and is a separate object from
+            // the channel — disposing it ends the enumeration without
+            // affecting the channel. The owning variant (class T) uses
+            // TakeCurrent at vtable slot 3; the borrowing variant (value/string T)
+            // uses Current. Both share vtable slots 1 (Dispose) and 2
+            // (MoveNextAsync). The IOE vtable is fetched at the call site
+            // (single-consumer rule: a second ReceiveAll or a ReceiveAll begun
+            // while a Receive task is parked raises IOE via bz_exc).
+            if (mname == "ReceiveAll" && call.args.empty()) {
+                llvm::Value* ioeVt = llvm::ConstantPointerNull::get(ptrTy());
+                {   auto vit = builtinVtable_.find(
+                        "InvalidOperationException");
+                    if (vit != builtinVtable_.end()) ioeVt = vit->second;
+                }
+                // The owning flag is 1 for class-T channels, 0 for value-T
+                // and string-T channels. Detect via the element type of the
+                // receiver's genericArgs[0]: a Named-with-declaration type is a
+                // class.
+                int32_t is_owning = 0;
+                if (recvTy && recvTy->kind == sema::TypeRef::Kind::Named &&
+                    !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                    auto* elemTy = recvTy->genericArgs[0];
+                    if (elemTy->kind == sema::TypeRef::Kind::Named &&
+                        elemTy->declaration &&
+                        elemTy->declaration->kind ==
+                            ast::TypeDeclKind::Class)
+                        is_owning = 1;
+                }
+                auto* fn = declareC("bz_channel_recv_all_init", ptrTy(),
+                                    {ptrTy(), ptrTy(), i32()});
+                llvm::Value* es = builder_.CreateCall(
+                    fn, {ch, ioeVt, builder_.getInt32(is_owning)},
+                    "ch.recvall");
+                // Single-consumer violation surfaces as IOE via bz_exc on
+                // the runtime side (see bz_channel_recv_all_init). Mirror the
+                // TryReceive / Send arm and check bz_exc here so the exception
+                // propagates into the caller's handler.
+                emitPendingCheck();
+                return es;
+            }
         }
     }
 
