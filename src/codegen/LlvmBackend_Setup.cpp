@@ -9191,10 +9191,28 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             // above what the caller expects), so the caller's release under-counts.
             // Mirror the ReturnStmt logic exactly: TRANSFER if `ci.exprBody` is
             // already a +1 producer or a returned-local-owns-plus-one; else RETAIN.
+            //
+            // fix #2262 (§28.3 / §22.3, v0.282): the arrow-body half of the
+            // nullable-string return-mint (#2196 un-gated the ReturnStmt half
+            // and the caller-side isUserMethodStringReturnCall recognition, but
+            // missed THIS site). A `=> fieldRef` / `=> param` body whose declared
+            // return type is `string?` returns a raw borrow — the caller now
+            // classifies the call as a +1 producer (the +1 side of #2196) and
+            // arms a scope-end release (collectStringReleaseEligible) that has
+            // NO matching retain to release, so the borrow's rc drops one below
+            // its true count: premature free of the field's string, then UAF on
+            // the next read, or a double-free at object disposal. `bz_string_retain`
+            // is null-safe (no-op on a sentinel/null), so emitting it for an
+            // arrow body that returns `null` or a string literal is harmless.
+            // The `isPlusOneStringProducer` / `returnedStringLocalOwnsPlusOne`
+            // TRANSFER predicates already short-circuit correctly for nullable
+            // returns (a `=> "a"+"b"` arrow body for a `string?` method still
+            // passes the producer through without an extra retain — the producer
+            // row was never gated `!nullable`).
             if (v && currentReturnTypeNode_ && v->getType()->isPointerTy()) {
                 const sema::TypeRef* declRet =
                     ctx_.resolvedType(*currentReturnTypeNode_);
-                if (declRet && !declRet->nullable &&
+                if (declRet &&
                     declRet->kind == sema::TypeRef::Kind::Primitive &&
                     declRet->primitive == sema::PrimitiveType::String &&
                     !isPlusOneStringProducer(ci.exprBody) &&
