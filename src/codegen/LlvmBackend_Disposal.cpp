@@ -3108,9 +3108,37 @@ bool Emitter::freshNewReceiverTempEligible(const ast::Expr* recvExpr,
         // itself an owned producer per §28.3's producer table, and the
         // receiver was ALREADY due for disposal at the end of the full
         // expression per §28.3's unbound-temporary rule.
+        //
+        // fix #2261 / §28.3 / §29.1 / §30.1: NARROW the #2205 admission to
+        // EXCLUDE the deferred-activation heads — `OwningTask` (the Task-
+        // family intersection of `isOwningTypeHead`) and the four
+        // `IOwning*` iterable-interface heads (the iterable-family
+        // intersection of `isOwningTypeHead`). These are exactly the heads
+        // §28.3's *Calls mint for the mint-announcing families* row 2
+        // calls out as "the produced frame still **carries** the call's
+        // receiver's and plain arguments' borrows until settlement"
+        // (§29.1 for iterator frames, settlement = completion or disposal;
+        // §30.1 for async tasks, settlement = `Task.Wait` completion). The
+        // same #2205 K1.5/K3.13 reasoning DOES apply to the
+        // element-owning collection heads and to the non-deferred owning
+        // wrappers (Shared, Weak, ChannelSender, CancellationTokenSource)
+        // — those heads do NOT carry the receiver's borrow into a frame
+        // that outlives the call, and stay admitted. The element-owning
+        // collections are also independently listed by
+        // `isOwningCollectionHead` so the precise-exclusion form
+        //   isOwningCollectionHead(h) || (isOwningTypeHead(h) &&
+        //                                !isTaskFamilyHead(h) &&
+        //                                !isIterableInterfaceHead(h))
+        // matches them either way. The intersection of the excluded sets
+        // with `isOwningTypeHead` is exactly `OwningTask` + the four
+        // `IOwning*` heads (plain `Task` is in `isTaskFamilyHead` but not
+        // in `isOwningTypeHead`; plain `IEnumerable<T>` etc. are in
+        // `isIterableInterfaceHead` but not in `isOwningTypeHead`).
         std::string_view head = resultTy->headName();
         if (common::isOwningCollectionHead(head) ||
-            common::isOwningTypeHead(head)) {
+            (common::isOwningTypeHead(head) &&
+             !common::isTaskFamilyHead(head) &&
+             !common::isIterableInterfaceHead(head))) {
             valueResult = true;
         }
     }
