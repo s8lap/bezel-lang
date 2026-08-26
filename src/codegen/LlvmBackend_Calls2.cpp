@@ -442,6 +442,30 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return ok;
     }
+    // stdlib §9.5 / §1 *OrNull tier (v0.231, #1792): char.ParseOrNull(s)
+    // → char? — the *OrNull convenience form of char.Parse, null exactly
+    // where Parse raises FormatException (any string whose code-point count
+    // is not 1, per §9.5). Mirrors char.TryParse's ok check and uses the
+    // generic nullable primitive companion struct {i8 hasVal, i32 value}.
+    // (The earlier char.Parse / char.TryParse handlers above carry the
+    // strict-fault and Try-shape variants; this one is the nullable-return
+    // form — distinct from char.TryParse's bool result.)
+    if (pt == P::Char && m == "ParseOrNull" && call.args.size() == 1 &&
+        call.args[0].value) {
+        llvm::Value* s = lowerExpr(*call.args[0].value);
+        if (!s) return nullptr;
+        llvm::Value* len = loadStringLen(s);
+        llvm::Value* ok = builder_.CreateICmpEQ(
+            len, builder_.getInt64(1), "chpon.ok");
+        llvm::Value* cp0 = loadCodePoint(s, builder_.getInt64(0));
+        llvm::StructType* st = nullablePrimStructTy(P::Char);
+        // null arm: {i8 0, i32 0} (the default value slot is irrelevant when
+        // hasValue is 0; per §17.11 / §9.5 the default(char) is '\0').
+        llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);
+        // present arm: wrap the parsed code point with hasValue=1.
+        llvm::Value* wrapV = wrapNullablePrim(P::Char, cp0);
+        return builder_.CreateSelect(ok, wrapV, nullV, "chpon.sel");
+    }
     // stdlib §9.3 / §2.19: decimal.TryParse(s, out result): bool — routes to
     // bz_decimal_try_parse (no exception on failure; out gets 0 per §9.3).
     if (pt == P::Decimal && m == "TryParse" && call.args.size() == 2 &&
@@ -1172,6 +1196,40 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // Neither "true" nor "false" → FormatException (strict-fault Parse).
         emitGuardThrow(builder_.CreateNot(ok, "bp.bad"), "FormatException");
         return cmpTrue;
+    }
+    // stdlib §9.4 / §1 *OrNull tier (v0.231, #1792): bool.ParseOrNull(s) →
+    // bool? — the *OrNull convenience form of bool.Parse, null exactly where
+    // Parse raises FormatException (any string other than the two canonical
+    // case-insensitive words "true"/"false", per §9.4). Mirrors bool.Parse's
+    // strcasecmp check and uses the nullable primitive companion struct
+    // {i8 hasVal, i1 value}.
+    if (pt == P::Bool && m == "ParseOrNull" && call.args.size() == 1 &&
+        call.args[0].value) {
+        llvm::Value* strVal = lowerExpr(*call.args[0].value);
+        if (!strVal) return nullptr;
+        llvm::Value* strData = loadStringData(strVal);
+        auto* strcasecmpFn = declareC("strcasecmp", i32(), {ptrTy(), ptrTy()});
+        llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
+        unsigned bid = stringLiteralIdx_++;
+        auto* trueGV = new llvm::GlobalVariable(*module_, trueStr->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, trueStr, ".bz.bpon.true." + std::to_string(bid));
+        llvm::Constant* falseStr = llvm::ConstantDataArray::getString(llvm_, "false", true);
+        auto* falseGV = new llvm::GlobalVariable(*module_, falseStr->getType(), true,
+            llvm::GlobalValue::PrivateLinkage, falseStr, ".bz.bpon.false." + std::to_string(bid));
+        llvm::Value* cmpTrue = builder_.CreateICmpEQ(
+            builder_.CreateCall(strcasecmpFn, {strData, trueGV}),
+            builder_.getInt32(0), "bpon.isTrue");
+        llvm::Value* cmpFalse = builder_.CreateICmpEQ(
+            builder_.CreateCall(strcasecmpFn, {strData, falseGV}),
+            builder_.getInt32(0), "bpon.isFalse");
+        llvm::Value* ok = builder_.CreateOr(cmpTrue, cmpFalse, "bpon.ok");
+        llvm::StructType* st = nullablePrimStructTy(P::Bool);
+        // null arm: {i8 0, i1 0} (the default value slot is irrelevant when
+        // hasValue is 0; per §17.11 the default(bool) is false).
+        llvm::Value* nullV = llvm::ConstantAggregateZero::get(st);
+        // present arm: wrap the parsed bool (cmpTrue: i1) with hasValue=1.
+        llvm::Value* wrapV = wrapNullablePrim(P::Bool, cmpTrue);
+        return builder_.CreateSelect(ok, wrapV, nullV, "bpon.sel");
     }
 
     // int.Parse(s, radix): base-N integer parse (stdlib §9.1 `Parse(s, radix)`).

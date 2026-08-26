@@ -14343,7 +14343,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         return;
                     }
                 }
-                // §9.4: bool/Boolean static methods — TryParse → bool, Parse → bool.
+                // §9.4: bool/Boolean static methods — TryParse → bool, Parse → bool,
+                // ParseOrNull (v0.231, §1 *OrNull tier) → bool? (#1792).
                 if (pt == PrimitiveType::Bool) {
                     if (mbr == "TryParse") {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
@@ -14351,6 +14352,37 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     }
                     if (mbr == "Parse") {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        return;
+                    }
+                    // stdlib §9.4 / §1 *OrNull tier (v0.231): bool.ParseOrNull(s)
+                    // → bool?, null exactly where Parse(s) raises FormatException.
+                    // fix #1792: the closed-set handler above was missing this
+                    // member; a direct `bool.ParseOrNull("true")` call fell through
+                    // to the §3.4 "no static method" diagnostic. (Codegen lowers
+                    // the call alongside bool.Parse / bool.TryParse.)
+                    if (mbr == "ParseOrNull") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(
+                            PrimitiveType::Bool, /*nullable=*/true));
+                        return;
+                    }
+                }
+                // §9.5 / #1792: char/Char static Parse family — TryParse → bool
+                // (out char slot writes '\0' on failure, the parsed code point on
+                // success per §9.5); ParseOrNull (v0.231) → char?, null exactly
+                // where Parse(s) raises FormatException. (Parse itself is handled
+                // by the generic `mbr == "Parse"` branch above — it returns the
+                // primitive `pt`, which for char is char; the codegen handler at
+                // LlvmBackend_Calls2.cpp L406 already lowers it.) Direct
+                // `char.TryParse(...)` and `char.ParseOrNull(...)` were rejected
+                // outright as "no static method or property" before #1792.
+                if (pt == PrimitiveType::Char) {
+                    if (mbr == "TryParse") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                        return;
+                    }
+                    if (mbr == "ParseOrNull") {
+                        ctx_.setExprType(&ma, ctx_.primitiveTypeRef(
+                            PrimitiveType::Char, /*nullable=*/true));
                         return;
                     }
                 }
