@@ -4766,6 +4766,57 @@ void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
         // (`Array`, `Dictionary`, a span) resolves no user
         // PropertySymbol, so `ps` stays null and those are
         // untouched by construction.
+        //
+        // fix #1723 (§4.19 / §30.14, v0.186): FrozenArray<T> is the
+        // one BUILTIN collection with a read-only indexer. §4.19
+        // declares `public property [i: int]: T { get }` — the `set`
+        // half is structurally absent — and §30.14's freezing
+        // semantics forbids post-construction mutation. The
+        // pre-fix codegen admitted `f[i] := v` for a FrozenArray<T>
+        // receiver because FrozenArray is in
+        // `kArrayBackedCollections` and so routes through
+        // `lowerCollectionIndexerSet` (the bz_array_set path), which
+        // silently mutated the storage. Per `tests/conformance/
+        // cases/codegen_0028.bzl` line 17 the conforming surface is
+        // getter-only — a programmatic mutation is a PROGRAM ERROR.
+        // Reject at sema, before codegen reaches the indexer-set
+        // lowering (an IncrementStmt / compound `+=` form lands
+        // here too via the `incOp` parameter; both carry the
+        // §17.6 / §30.14 obligation that read-only storage be neither
+        // assigned nor incremented).
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&target)) {
+            if (ix->target) {
+                const sema::TypeRef* rt = ctx_.exprType(*ix->target);
+                // §4.19 / §30.14: FrozenArray<T> reaches the assignment
+                // sema in two TypeRef shapes — (a) the bare-annotation
+                // `var f: FrozenArray<T>` (a Named+astNode+head name),
+                // and (b) the static-factory result
+                // `FrozenArray<T>.From(...)` (a Named+declaration, no
+                // astNode — ExprTypecheck_Calls.cpp synthesizes it at
+                // line ~7160; it is ALSO an astNode-backed shape when
+                // the receiver is an explicit ClassType Named type).
+                // The headName() helper returns "" for shape (b),
+                // because there is no syntactic identifier on the
+                // TypeRef — the declaration's SYMBOL name is the only
+                // signal, hence the second disjunct below.
+                bool isFrozenTy =
+                    rt && rt->kind == sema::TypeRef::Kind::Named &&
+                    !rt->nullable &&
+                    (rt->headName() == "FrozenArray" ||
+                     (rt->declaration &&
+                      rt->declaration->name == "FrozenArray"));
+                if (isFrozenTy) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        std::string("cannot ") +
+                            (incOp ? "increment through"
+                                   : "assign through") +
+                            " a `FrozenArray<T>` indexer — it is "
+                            "deeply immutable and declares no setter "
+                            "(§4.19 / §30.14)");
+                }
+            }
+        }
         ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(target));
         if (ps && !ps->isIndexer) ps = nullptr;
         // An indexer's PropertySymbol::name is the synthetic
