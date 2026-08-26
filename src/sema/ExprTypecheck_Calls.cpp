@@ -10096,6 +10096,28 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // slot) see the §7.5 result type. A unit/void result and an already-nullable
     // return are left unchanged.
     if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get())) {
+        // fix #2756 / §7.5 / §22.3 (v0.282): the `MemberAccessExpr`-typed
+        // dispatch at the outer `if (!calleeSym)` block (line ~9752) carries
+        // the callee's exprType to the call via the second `if (!calleeSym)`
+        // inside the MA block — but the MA block only fires for
+        // MemberAccessExpr callees. The sibling NullCondMemberExpr callee
+        // shape, whose access exprType was just set by resolveNullCondMember
+        // (the §21.1 materializer fix above), needs the same propagation
+        // here: without it the CALL stays untyped, codegen degrades the
+        // local to a zero-initialized slot (#2434), and the §21.1 predicate
+        // (isBuiltinOwnedMaterializerCall) has nothing to read at its
+        // result-head gate. Mirror the MA-block propagation exactly:
+        // Function-return-typed callees lift to funcReturn, every other
+        // TypeRef shape copies verbatim. The §7.5 nullable lift at the end
+        // of this block will then make the call result nullable.
+        if (!ctx_.exprType(ce)) {
+            if (auto* rt = ctx_.exprType(*ncm)) {
+                if (rt->kind == TypeRef::Kind::Function && rt->funcReturn)
+                    ctx_.setExprType(&ce, rt->funcReturn);
+                else if (rt->kind != TypeRef::Kind::Function)
+                    ctx_.setExprType(&ce, rt);
+            }
+        }
         // fix #2345 / §7.5 / §22.3 / §22.4: #2318 rejected EVERY `out`/
         // `out owned` argument on a null-conditional call `recv?.M(...)`
         // uniformly, because DefiniteAssignment.cpp had no per-path
@@ -19546,6 +19568,87 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             SourceLocation loc = nm.span.begin;
             if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
             checkEqualityMemberUseSite(gateType, nm.member, loc);
+        }
+        // fix #2756 / §7.5 / §22.3 (v0.282): the §21.1 materializer members
+        // reached through `?.` — `Split` on string; `Sorted`/`Reversed`/
+        // `Slice` on `Array`/`Set`; `ToArray`/`ToSet` on `Array`/`Set`;
+        // `ToDictionary` on `Dictionary` — have no Symbol AND no
+        // builtinValueMemberType escape hatch (their RESULT is a collection,
+        // not a primitive value member), so without this the access stays
+        // untyped, the call at typeCall's NCM block stays untyped, and
+        // codegen degrades to a zero-initialized local (#2434). The string-
+        // typed-receiver diagnostic below would otherwise reject every one
+        // of them with "string member `?.M` is not yet supported in codegen";
+        // pre-type the recognized ones here so the NCM-block propagation in
+        // typeCall can carry the call's type forward, and the §21.1 predicate
+        // (isBuiltinOwnedMaterializerCall, OwnershipFacts.cpp) reads a non-
+        // null call exprType and rejects `const b := t?.Split(",")` per §21.1
+        // — the rejection the tripwire in
+        // `tests/ownership/const_nullcond_materializer_2749_test.cpp`
+        // (banner-named `residual_nullcond_builtin_call_is_untyped_pending_2756`,
+        // now flipped to expect rejection per #2756's fix) is meant to
+        // witness. §7.5: `?.` always lifts to nullable.
+        if (recvTyForDiag) {
+            bool typedNcm = false;
+            // §9.6 Split(char|string|Array<char>) on string receiver.
+            if (recvTyForDiag->kind == TypeRef::Kind::Primitive &&
+                recvTyForDiag->primitive == PrimitiveType::String &&
+                nm.member == "Split") {
+                // Same shape as the resolveMemberAccess Split arm at L16024,
+                // but with `nullable=true` per §7.5 (`s.Split` is non-nullable,
+                // `s?.Split` lifts to nullable).
+                static const ast::Type* kArrayAstNode = []() -> ast::Type* {
+                    auto* qn = new ast::QualifiedName;
+                    qn->parts.push_back("Array");
+                    auto* t = new ast::Type;
+                    t->kind = ast::TypeKind::Named;
+                    t->name.reset(qn);
+                    return t;
+                }();
+                auto* tr = ctx_.makeTypeRef();
+                tr->kind = TypeRef::Kind::Named;
+                tr->declaration = nullptr;
+                tr->astNode = kArrayAstNode;
+                tr->genericArgs.push_back(
+                    ctx_.primitiveTypeRef(PrimitiveType::String));
+                tr->nullable = true;
+                ctx_.setExprType(&nm, tr);
+                typedNcm = true;
+            }
+            // §4.4 Sorted/Reversed/Slice, §5 ToArray/ToSet/ToDictionary on
+            // builtin collections (Array/Set/Dictionary Named, declaration-
+            // less, astNode-backed). The element/key type mirrors the
+            // receiver's first genericArg — matching the `.` form's
+            // resolveMemberAccess arms for these methods.
+            if (!typedNcm &&
+                recvTyForDiag->kind == TypeRef::Kind::Named &&
+                !recvTyForDiag->declaration && recvTyForDiag->astNode &&
+                recvTyForDiag->astNode->name &&
+                !recvTyForDiag->astNode->name->parts.empty() &&
+                !recvTyForDiag->genericArgs.empty() && recvTyForDiag->genericArgs[0]) {
+                std::string_view cn = recvTyForDiag->headName();
+                bool isMaterializer = false;
+                if ((cn == "Array" || cn == "Set") &&
+                    (nm.member == "Sorted" || nm.member == "Reversed" ||
+                     nm.member == "Slice" || nm.member == "ToArray" ||
+                     nm.member == "ToSet")) {
+                    isMaterializer = true;
+                } else if (cn == "Dictionary" &&
+                           (nm.member == "ToDictionary")) {
+                    isMaterializer = true;
+                }
+                if (isMaterializer) {
+                    auto* tr = ctx_.makeTypeRef();
+                    tr->kind = TypeRef::Kind::Named;
+                    tr->declaration = nullptr;
+                    tr->astNode = recvTyForDiag->astNode;
+                    tr->genericArgs.push_back(recvTyForDiag->genericArgs[0]);
+                    tr->nullable = true;
+                    ctx_.setExprType(&nm, tr);
+                    typedNcm = true;
+                }
+            }
+            if (typedNcm) return;
         }
         // fix #3155 (§7.5, v0.255): the `?.` form must MIRROR the `.` form's
         // member-not-found diagnostic, not silently fall through. Before this

@@ -87,30 +87,34 @@ bool hasAnyConstOwnedProductionError(const OwnershipResult& r) {
 }  // namespace
 
 // =====================================================================
-// TRIPWIRE — NOT an assertion that the current behaviour is correct.
+// fix #2756 / §21.1 / stdlib §9.6 (v0.282): `const b := t?.Split(",")` is now
+// rejected. Before this fix the call left the `NullCondMemberExpr` access
+// untyped (resolveNullCondMember had no `builtinValueMemberType` escape hatch
+// for built-in methods and no colName dispatch of its own) and the call's
+// exprType at typeCall was null too, so the §21.1 predicate's result-head
+// gate had nothing to read and the program silently degraded to a
+// zero-initialized local (#2434). This test pins the rejection: the
+// materializer predicate (isBuiltinOwnedMaterializerCall,
+// OwnershipFacts.cpp:450) now sees the typed call (Split, no symbol, head
+// `Array`), §21.1 fires ("must not take an owned production"), and the
+// `const` initializer is rejected.
 //
-// §21.1 REQUIRES this program to be rejected: `Split` is declared
-// `owned`-returning (stdlib §9.6) and §28.3's `null` row cannot demote the
-// non-null path. It is accepted today ONLY because #2756 leaves the call
-// untyped, so the predicate's result-head gate has nothing to read and fails
-// open. The value is also never allocated, so there is no leak to measure yet.
-//
-// ⚠ WHEN THIS TEST GOES RED, #2756 HAS BEEN FIXED AND THE RIGHT RESPONSE IS TO
-// FLIP IT: replace the FALSE below with TRUE, rename it to
-// `nullcond_materializer_const_rejected_spec_21_1_stdlib_9_6`, and delete this
-// banner. Do NOT weaken the predicate to keep this green — that would restore
-// #2709's accept-and-leak on the `?.` path, this time with a real allocation
-// behind it.
+// The matched tripwire was the file's `residual_nullcond_builtin_call_is_untyped_pending_2756`
+// test, which asserted the pre-fix untyped-and-accepted state and whose banner
+// asked for THIS exact replacement on #2756's fix. The user-method control
+// case (`accept_user_method_via_nullcond_spec_28_3_21_1`) stays green because
+// `resolveNullCondMember` attaches a MethodSymbol to the callee and the same
+// narrowness gate that excludes the `.` form excludes the `?.` form.
 // =====================================================================
 BEZEL_TEST(const_nullcond_materializer_2749,
-           residual_nullcond_builtin_call_is_untyped_pending_2756) {
+           nullcond_materializer_const_rejected_spec_21_1_stdlib_9_6) {
     auto r = parseAndCheckOwnership(
         "module M; class C public static method M(): int "
         "    var t: string? := \"a,b,c\"; "
         "    const b := t?.Split(\",\"); "
         "    return 0; end M; "
         "  public static method Main(): int return 0; end Main; end C;");
-    BEZEL_EXPECT_FALSE(hasAnyConstOwnedProductionError(r));
+    BEZEL_EXPECT_TRUE(hasAnyConstOwnedProductionError(r));
 }
 
 // =====================================================================
@@ -183,4 +187,37 @@ BEZEL_TEST(const_nullcond_materializer_2749,
         "    return 0; end M; "
         "  public static method Main(): int return 0; end Main; end C;");
     BEZEL_EXPECT_TRUE(hasAnyConstOwnedProductionError(r));
+}
+
+// =====================================================================
+// fix #2756 / §7.5 (v0.282): the `?.` builtin-call typing fix above is the
+// PRECONDITION for the `?.` builtin-call surface to type at all. Before
+// this fix `var parts := t?.Split(",");` (with `t: string?` and a non-const
+// initializer) was left untyped on the access AND on the call — codegen
+// degraded the local to a zero-initialized slot (#2434). After the fix the
+// access is typed `Array<string>?` (per §7.5) and the call's exprType is
+// propagated by the NCM-block shim in typeCall. This test pins the post-
+// fix sema/ownership behaviour on the NON-`const` shape (the `const` shape
+// is pinned by `nullcond_materializer_const_rejected_spec_21_1_stdlib_9_6`
+// above): ownership parses cleanly, the §21.1 predicate's narrowness gate
+// does not fire (this is a `var`, not a `const`), and the diagnostic stream
+// does NOT carry the §21.1 \"must not take an owned production\" message.
+// The codegen-level \"degraded to a zero/null return value\" #2434/#2491
+// diagnostic is what codegen emits when the call exprType is null; the
+// OWNERSHIP pass itself does not produce it, so we rely on the matching
+// non-`const` call as a positive witness that the type is now non-null.
+// =====================================================================
+BEZEL_TEST(const_nullcond_materializer_2749,
+           nullcond_split_owned_var_no_const_reject_spec_7_5) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C public static method M(): int "
+        "    var t: string? := \"a,b,c\"; "
+        "    var parts := t?.Split(\",\"); "
+        "    return 0; end M; "
+        "  public static method Main(): int return 0; end Main; end C;");
+    // Non-const binding of an owned production: §21.1 does NOT reject
+    // (it only rejects `const`). §28.10's auto-drop note MAY fire here
+    // (the value is owned and not `using`-bound), and that is expected;
+    // we only assert §21.1 is silent.
+    BEZEL_EXPECT_FALSE(hasAnyConstOwnedProductionError(r));
 }
