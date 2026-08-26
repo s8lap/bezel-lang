@@ -1499,10 +1499,38 @@ llvm::Type* Emitter::storageType(const sema::Symbol* m) {
         if (mem->decl == nullptr)
             if (sema::TypeRef* tr = ctx_.importedMemberType(mem))
                 return lowerTypeRef(tr);
-    if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
-        return lowerType(fd->type.get());
-    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
-        return lowerType(pd->type.get());
+    if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl)) {
+        // fix #2827 (§14.2 / §4.7, v0.282): a field whose declared type is
+        // the NON-nullable unit type (`()`) must substitute the §4.7 one-byte
+        // placeholder (`unitPlaceholderTy`) — `lowerType`'s `Kind::Unit` arm
+        // returns `void`, and `void` is unsized, so a struct field typed
+        // `void` produces a GEP into an unsized type and the IR verifier
+        // aborts. Concretely:
+        //   `public class Holder<T> { public v: T; }
+        //    using var h := new Holder<()>();`
+        // emitted `getelementptr … %"class.Holder$spec0", ptr %1, i32 0, i32
+        // 0` on a `void`-typed field 0 — MEASURED on d34c8b4. The substitution
+        // is the SAME `unitPlaceholderTy()` swap the §4.7 local-decl path
+        // (`lowerLocalDecl`, #1619) and the parameter-signature builders
+        // (#1619 / #3105 / #4493) already make — each unit field occupies
+        // one inert byte, and §4.7's "one value" property means no byte
+        // pattern distinguishes it from another, so the placeholder is
+        // faithful. A `()?` target never reaches here (`isNullableValueTy`
+        // claims `()?` first and returns the tagged `{i8, i8}` optional — a
+        // real first-class type, no substitution needed).
+        llvm::Type* fty = lowerType(fd->type.get());
+        if (fty && fty->isVoidTy()) fty = unitPlaceholderTy();
+        return fty;
+    }
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl)) {
+        // Same #2827 substitution as the field arm above — an auto-property
+        // with `()?`-shaped backing storage is reduced by `lowerType` to its
+        // declared type's LLVM type, which is `void` for `()`. Gated
+        // identically.
+        llvm::Type* pty = lowerType(pd->type.get());
+        if (pty && pty->isVoidTy()) pty = unitPlaceholderTy();
+        return pty;
+    }
     return i32();
 }
 
