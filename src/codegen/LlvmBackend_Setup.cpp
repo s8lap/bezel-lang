@@ -12802,6 +12802,26 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                             if (litAllBoxes)
                                 d.collectionElemDisposer = boxElementDisposerThunk();
                         }
+                        // fix #2774 / §28.9 / §15.4 (v0.282): for an `Array<string>`
+                        // literal, install stringElementReleaseThunk so the scope-
+                        // end bz_array_free call releases each co-owned +1 the
+                        // materializeHeapCollectionLiteral insert path retained
+                        // (`litIsStrArr` → `emitStringRetain`). Without it the array
+                        // backing reclaims only the bz_array_t + data buffer — the
+                        // strings inside the slots would leak (and the backing
+                        // itself was never reclaimed before this whole reclaim block
+                        // was widened to admit string elements). Mirrors the
+                        // materializer-path derivation at the end of lowerLocalDecl
+                        // (~13983-13990). Non-string RuntimeManaged elements
+                        // (closures) are still excluded by isBorrowingArrayLiteralLocal,
+                        // so this branch only fires for strings.
+                        if (!d.collectionElemDisposer) {
+                            const sema::TypeRef* elt =
+                                (!collTy->genericArgs.empty())
+                                    ? collTy->genericArgs[0] : nullptr;
+                            if (isStringTypeRefNonNull(elt))
+                                d.collectionElemDisposer = stringElementReleaseThunk();
+                        }
                         disposeStack_.back().push_back(d);
                     }
                     // fix #2142 / §28.9 / §28.11 (v0.220): reclaim the backing of
@@ -24027,12 +24047,17 @@ void Emitter::collectBorrowingArrayFreeEligible(
 // backing-only (a null per-element disposer: value types, and class/interface
 // BORROWS)? Those are exactly the literals codegen lowers to a fresh bz_array_t
 // the local owns and whose scope-end reclaim is a single bz_array_free(backing,
-// null) — no element +1 to release, so no double-free. `Array<string>` and other
-// runtime-managed-element literals (retain/release-per-element) are excluded here
-// (their +1/element semantics differ from the materializer path; left to a
-// separate rule). A `new Array<T>(...)` / alias / materializer initializer is not
-// a CollectionLiteralExpr, so it is not matched (those are handled elsewhere, or
-// carry their own disposal obligation).
+// null) — no element +1 to release, so no double-free. fix #2774 / §28.9 /
+// §15.4 (v0.282): `Array<string>` literals are NOW admitted — the literal arm
+// in `materializeHeapCollectionLiteral` retains a +1 per string element
+// (`litIsStrArr` / `emitStringRetain`), and the reclaim block in `lowerLocalDecl`
+// installs `stringElementReleaseThunk` as the per-element disposer, so the
+// backing AND the co-owned +1 are released symmetrically (no leak, no double-
+// free). Closure elements are still excluded — the materializer has no
+// matching per-element retain so a release would be an unpaired -1; widening to
+// closures is a separate fix. A `new Array<T>(...)` / alias / materializer
+// initializer is not a CollectionLiteralExpr, so it is not matched (those are
+// handled elsewhere, or carry their own disposal obligation).
 bool Emitter::isBorrowingArrayLiteralLocal(const LocalDeclInitView& view) {
     if (view.isUsing || !view.init) return false;
     const sema::TypeRef* rt = nullptr;
@@ -24045,12 +24070,15 @@ bool Emitter::isBorrowingArrayLiteralLocal(const LocalDeclInitView& view) {
         view.init);
     if (!lit || lit->isDict) return false;
     // Backing-only element policy gate (same disposer the reclaim block derives):
-    // a null per-element disposer AND not a runtime-managed (string/fn) element.
+    // a null per-element disposer AND not a runtime-managed NON-string element
+    // (closures have no per-element retain at insert, so a release would be an
+    // unpaired -1 — left to a separate fix).
     const sema::TypeRef* el =
         (!rt->genericArgs.empty()) ? rt->genericArgs[0] : nullptr;
     ElementPolicy ep = elementPolicyFor(el, /*owningFamily=*/false);
     if (ep.disposerThunk != nullptr) return false;
-    if (ep.cat == ElementPolicy::Category::RuntimeManaged) return false;
+    if (ep.cat == ElementPolicy::Category::RuntimeManaged &&
+        !isStringTypeRefNonNull(el)) return false;
     return true;
 }
 
