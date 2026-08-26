@@ -8,5 +8,4 @@
 
 module M; class C public static method M() new Set<int>([1, 2, 3]); end M; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: collection literal `[..]` cannot be passed as an argument to `new Set<...>` — the constructor takes an optional `int` capacity, not a collection literal; use a typed-target declaration instead: `var x: Set<T> := [...]`
-// CHECK-SAME: (§15.4, #599)
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: collection literal `[..]` cannot be passed as an argument to `new Set<...>` — the constructor takes an optional `int` capacity (and/or an `IEqualityComparer<K>`), not a collection literal; bind the literal to a named typed binding first (`var xs: Set<T> := [...]`) and transfer its elements through `Add`/`AddLast`/etc. (§15.4, #2725)
