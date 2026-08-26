@@ -1330,6 +1330,12 @@ struct CaseArm {
 struct CaseExpr : Expr {
     std::unique_ptr<Expr> scrutinee;   // null when bare `case CaseArm*`
     std::vector<CaseArm> arms;
+    // K8 full-expression boundary flag (#1795): the K8 boundary for an unbound
+    // owned temporary minted by the scrutinee is the WHOLE `case` construct
+    // (statement-position and expression-position alike). Set by the ownership
+    // pass when the scrutinee is a fresh owned producer; read by codegen's
+    // lowerCaseExpr / lowerCaseStmt to emit the disposal at endBB.
+    bool disposeOwnedScrutinee = false;
 };
 
 // A.7 `MarkedTransfer ::= "owned" Identifier` (v0.209, #2080): the K3.4
@@ -1384,6 +1390,10 @@ struct CaseStmt : Stmt {
     // by Emitter::lowerCaseStmt, so a single AST-mutable field is sufficient
     // (no need for a SemaContext side table).
     bool totalityGranted = false;
+    // K8 full-expression boundary flag (#1795): mirrors
+    // CaseExpr::disposeOwnedScrutinee for the statement-position form. Set
+    // by the ownership pass; read by Emitter::lowerCaseStmt.
+    bool disposeOwnedScrutinee = false;
 };
 
 // A.3 `ExtensionDecl ::= Visibility? "extension" Type GenericConstraints*

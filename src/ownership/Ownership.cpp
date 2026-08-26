@@ -2688,6 +2688,30 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
     // arm-local discharge tracking does not leak into the post-case state).
     if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
         if (cs->scrutinee) checkRead(*cs->scrutinee, /*selfTarget=*/false);
+        // K8 full-expression boundary (#1795): the K8 boundary for an
+        // unbound owned temporary minted by the scrutinee is the WHOLE `case`
+        // construct (statement-position and expression-position alike). Mark
+        // the case-statement node so codegen's lowerCaseStmt stores the
+        // scrutinee in an entry alloca and emits a null-guarded dispose at
+        // the construct's endBB. The gate mirrors DiscardStmt::disposeOwned-
+        // Value above: producerState == Owned plus a heap class/interface
+        // type (or an owning-collection head) — the same predicate the
+        // §17.13 / #1009 / #1909 paths consult.
+        if (!suppressDiag_ && cs->scrutinee &&
+            producerState(*cs->scrutinee) == OwnershipState::Owned) {
+            const sema::TypeRef* rt = ctx_.exprType(*cs->scrutinee);
+            bool isHeapClass = rt && rt->kind == sema::TypeRef::Kind::Named &&
+                rt->declaration &&
+                (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                 rt->declaration->kind == ast::TypeDeclKind::Interface) &&
+                !rt->declaration->isValueBuiltin &&
+                (rt->declaration->decl != nullptr ||
+                 !rt->declaration->moduleName.empty());
+            bool isOwningCollection = rt && rt->kind == sema::TypeRef::Kind::Named &&
+                isOwningCollectionNameHead(rt->headName());
+            if (isHeapClass || isOwningCollection)
+                const_cast<ast::CaseStmt*>(cs)->disposeOwnedScrutinee = true;
+        }
         BlockState saved = states_;
         for (const auto& arm : cs->arms) {
             states_ = saved;

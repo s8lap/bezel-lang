@@ -760,6 +760,29 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
     }
     if (auto* ce = dynamic_cast<const ast::CaseExpr*>(&e)) {
         if (ce->scrutinee) checkRead(*ce->scrutinee, /*selfTarget=*/false);
+        // K8 full-expression boundary (#1795): the case-EXPRESSION counterpart
+        // of the CaseStmt mark in Ownership.cpp's visitStmt arm. Same
+        // predicate: producerState == Owned on the scrutinee plus a heap
+        // class/interface type (or an owning-collection head) sets
+        // CaseExpr::disposeOwnedScrutinee, which lowerCaseExpr then reads to
+        // emit the entry-alloca + endBB-dispose pair. The shared `isHeapClass
+        // || isOwningCollection` gate keeps both forms of the §28.3 unbound-
+        // owned-temporary reclaim keyed on the same producer classifier.
+        if (!suppressDiag_ && ce->scrutinee &&
+            producerState(*ce->scrutinee) == OwnershipState::Owned) {
+            const sema::TypeRef* rt = ctx_.exprType(*ce->scrutinee);
+            bool isHeapClass = rt && rt->kind == sema::TypeRef::Kind::Named &&
+                rt->declaration &&
+                (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                 rt->declaration->kind == ast::TypeDeclKind::Interface) &&
+                !rt->declaration->isValueBuiltin &&
+                (rt->declaration->decl != nullptr ||
+                 !rt->declaration->moduleName.empty());
+            bool isOwningCollection = rt && rt->kind == sema::TypeRef::Kind::Named &&
+                isOwningCollectionNameHead(rt->headName());
+            if (isHeapClass || isOwningCollection)
+                const_cast<ast::CaseExpr*>(ce)->disposeOwnedScrutinee = true;
+        }
         BlockState saved = states_;
         for (const auto& arm : ce->arms) {
             states_ = saved;

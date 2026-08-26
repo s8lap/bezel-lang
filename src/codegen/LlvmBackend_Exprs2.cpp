@@ -8096,6 +8096,14 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
     bool isStr = false;
     const sema::TypeRef* scrutTy = nullptr;
     sema::TypeRef choiceScrutStorage;  // backs a recovered `this`-choice scrutTy
+    // K8 full-expression boundary (#1795): mirror the CaseStmt scratch
+    // variables for the expression-position form. The ownership pass set
+    // ce->disposeOwnedScrutinee when the scrutinee is a fresh owned producer;
+    // we capture scrut in an entry alloca, register the slot for unwind
+    // disposal, and emit a normal-path disposal at endBB top — the same
+    // dispose-exactly-once pair as the CaseStmt arm.
+    llvm::AllocaInst* scrutOwnedSlot = nullptr;
+    bool scrutOwnIsOwningCollection = false;
     if (ce.scrutinee) {
         scrut = lowerExpr(*ce.scrutinee);
         if (!scrut) return nullptr;
@@ -8125,6 +8133,22 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                     const_cast<sema::TypeSymbol*>(chTy);
                 scrutTy = &choiceScrutStorage;
             }
+        }
+        if (ce.disposeOwnedScrutinee && scrutTy &&
+            scrutTy->kind == sema::TypeRef::Kind::Named &&
+            scrut->getType()->isPointerTy()) {
+            scrutOwnedSlot = entryAllocaNullPtr();
+            builder_.CreateStore(scrut, scrutOwnedSlot);
+            scrutOwnIsOwningCollection = common::isOwningCollectionHead(
+                scrutTy->headName());
+            Disposal d{scrutOwnedSlot, nullptr};
+            d.unwindOnly = true;   // arm-body throw disposes the temp
+            if (!scrutOwnIsOwningCollection)
+                d.dynamicDispose = true;
+            else
+                d.collection = true;
+            if (!disposeStack_.empty())
+                disposeStack_.back().push_back(d);
         }
     }
     const sema::TypeRef* resultSemaTy = ctx_.exprType(ce);
@@ -8545,21 +8569,63 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
     }
 
     builder_.SetInsertPoint(endBB);
-    // CG40: if EVERY arm diverged, no arm reaches endBB — the whole case
-    // diverges (like a conditional whose both branches throw). Report it via
-    // diverged_ so the enclosing return/decl/expr context skips emitting code
-    // into the (predecessorless) endBB, exactly as lowerConditional does.
+    // K8 full-expression boundary (#1795): dispose the case-scrutinee owned
+    // temporary on the normal edge. The scrut slot holds a fresh non-null
+    // pointer (always populated by the store registered above) so the dispose
+    // is unconditional here — paired with the `unwindOnly` Disposal entry on
+    // the dispose stack that fires on an arm-body throw, the two paths are
+    // mutually exclusive. The function's original endBB content (PHI + return)
+    // lives in a fresh `scrutEndBB`, whose single predecessor is endBB, so
+    // the PHI predecessors stay correct and IR verification passes.
+    llvm::BasicBlock* scrutEndBB = nullptr;
+    llvm::AllocaInst* resultSlot = nullptr;
+    if (ce.scrutinee && scrutOwnedSlot) {
+        // Allocate a slot for the case's result value BEFORE endBB has any
+        // instructions, so the dispose call below can run without first having
+        // to thread the result through a PHI (the PHI in endBB would otherwise
+        // have its predecessors broken when we route through a fresh block).
+        resultSlot = entryAlloca(incomings[0].first->getType());
+    }
+
+    builder_.SetInsertPoint(endBB);
+    llvm::PHINode* phi = nullptr;
     if (incomings.empty()) {
-        // endBB has no predecessors and the caller (diverged_) emits nothing
-        // into it; an empty block is malformed IR (no terminator). Cap it with
-        // `unreachable` so the block is well-formed — it is provably dead.
+        // CG40: every arm diverged — endBB has no predecessors and the caller
+        // emits nothing into it; an empty block is malformed IR. Cap with
+        // `unreachable` and report divergence, exactly as lowerConditional does.
         builder_.CreateUnreachable();
         diverged_ = true;
         return llvm::PoisonValue::get(resultTy);
     }
-    auto* phi = builder_.CreatePHI(incomings[0].first->getType(),
-                                   incomings.size());
+    phi = builder_.CreatePHI(incomings[0].first->getType(),
+                             incomings.size());
     for (auto& [v, bb] : incomings) phi->addIncoming(v, bb);
+    if (ce.scrutinee && scrutOwnedSlot) {
+        // Store the case result so scrutEndBB (endBB's single successor) can
+        // re-load it after the dispose clobbers register state.
+        builder_.CreateStore(phi, resultSlot);
+        llvm::Value* scrutVal = builder_.CreateLoad(
+            ptrTy(), scrutOwnedSlot, "casescrut.load");
+        if (!scrutOwnIsOwningCollection)
+            emitDisposeAndReclaim(scrutVal);
+        else
+            freeUnboundOwnedOwningCollectionTemp(scrutVal, scrutTy);
+        if (!disposeStack_.empty()) {
+            auto& scope = disposeStack_.back();
+            for (auto it = scope.begin(); it != scope.end(); ++it) {
+                if (it->slot == scrutOwnedSlot) {
+                    scope.erase(it);
+                    break;
+                }
+            }
+        }
+        scrutEndBB = llvm::BasicBlock::Create(
+            llvm_, "casescrut.end", currentFn_);
+        builder_.CreateBr(scrutEndBB);
+        builder_.SetInsertPoint(scrutEndBB);
+        return builder_.CreateLoad(
+            incomings[0].first->getType(), resultSlot, "case.result");
+    }
     return phi;
 }
 

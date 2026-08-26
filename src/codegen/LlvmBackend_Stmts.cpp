@@ -9055,6 +9055,15 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
     bool isStr = false;
     const sema::TypeRef* scrutTy = nullptr;
     sema::TypeRef choiceScrutStorage;  // backs a recovered `this`-choice scrutTy
+    // K8 full-expression boundary (#1795): the case scrutinee may be a fresh
+    // owned temporary. The ownership pass flagged this on cs->disposeOwned-
+    // Scrutinee when scrut is `new T(...)` for a heap class, an owned-returning
+    // factory call, or an owning-collection materializer — every shape that
+    // would otherwise leak at end-of-case. We capture the scrut in an entry
+    // alloca, register the slot for unwind disposal (an arm-body throw
+    // disposes the temp), and emit a normal-path disposal at endBB top.
+    llvm::AllocaInst* scrutOwnedSlot = nullptr;
+    bool scrutOwnIsOwningCollection = false;
     if (cs.scrutinee) {
         scrut = lowerExpr(*cs.scrutinee);
         if (!scrut) return false;
@@ -9079,6 +9088,22 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
                     const_cast<sema::TypeSymbol*>(chTy);
                 scrutTy = &choiceScrutStorage;
             }
+        }
+        if (cs.disposeOwnedScrutinee && scrutTy &&
+            scrutTy->kind == sema::TypeRef::Kind::Named &&
+            scrut->getType()->isPointerTy()) {
+            scrutOwnedSlot = entryAllocaNullPtr();
+            builder_.CreateStore(scrut, scrutOwnedSlot);
+            scrutOwnIsOwningCollection = common::isOwningCollectionHead(
+                scrutTy->headName());
+            Disposal d{scrutOwnedSlot, nullptr};
+            d.unwindOnly = true;   // arm-body throw disposes the temp
+            if (!scrutOwnIsOwningCollection)
+                d.dynamicDispose = true;  // class instance via vtable Dispose
+            else
+                d.collection = true;      // owning-collection free path
+            if (!disposeStack_.empty())
+                disposeStack_.back().push_back(d);
         }
     }
     auto* endBB =
@@ -9166,6 +9191,41 @@ bool Emitter::lowerCaseStmt(const ast::CaseStmt& cs) {
         // with no action (the historical shape, kept for non-granted cases).
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
+    }
+    // K8 full-expression boundary (#1795): dispose the case-scrutinee owned
+    // temporary at the top of endBB and route to a fresh scrutEndBB. The
+    // scrut slot holds a fresh non-null pointer (always populated by the store
+    // registered above), so the dispose is unconditional on the normal edge —
+    // paired with the `unwindOnly` Disposal entry on the dispose stack that
+    // fires on an arm-body throw, the two paths are mutually exclusive. The
+    // old `endBB` becomes a thin dispatch into `scrutEndBB` so the function's
+    // remaining control flow (the case's enclosing statement) sees endBB as
+    // its convergence point with no PHI-pred mismatch.
+    if (cs.scrutinee && scrutOwnedSlot) {
+        llvm::Value* scrutVal = builder_.CreateLoad(
+            ptrTy(), scrutOwnedSlot, "casescrut.load");
+        if (!scrutOwnIsOwningCollection)
+            emitDisposeAndReclaim(scrutVal);
+        else
+            freeUnboundOwnedOwningCollectionTemp(scrutVal, scrutTy);
+        // Discharge the matching unwind entry so a later emitDisposals pass
+        // (return / throw out of the case construct's containing scope) sees
+        // an empty slot and skips — no double-free. The Disposal is held by
+        // pointer reference inside the on-stack entry, so erasing the entry
+        // from the back vector's range is sufficient.
+        if (!disposeStack_.empty()) {
+            auto& scope = disposeStack_.back();
+            for (auto it = scope.begin(); it != scope.end(); ++it) {
+                if (it->slot == scrutOwnedSlot) {
+                    scope.erase(it);
+                    break;
+                }
+            }
+        }
+        auto* scrutEndBB = llvm::BasicBlock::Create(
+            llvm_, "casescrut.end", currentFn_);
+        builder_.CreateBr(scrutEndBB);
+        builder_.SetInsertPoint(scrutEndBB);
     }
     return false;
 }
