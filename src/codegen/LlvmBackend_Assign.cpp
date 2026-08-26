@@ -11231,6 +11231,82 @@ void Emitter::emitAccessorRefArgWriteBacks(std::vector<AccessorRefArg>& recs,
                     "internal: no setter for the `ref`/`out` accessor "
                     "write-back — #1302");
         }
+
+        // fix #2746 (§22.3 / §28.9 / §23.4, v0.282): release every `+1` string
+        // PRODUCER INDEX that `emitAccessorRefArgCopyIn` pinned for this
+        // bracket. The pin bracket owns the index's lifetime across BOTH the
+        // copy-in getter AND the write-back setter, so #2717's
+        // `exprValueOverride_.count(ie)` suppression in
+        // `releaseIndexArgStringProducers` is structurally correct for both
+        // accessor sites — but leaves a leak: the suppression skips the
+        // release for ALL pinned indices, including CLASS-receiver cases where
+        // a release at the bracket's end is safe (the class field is the
+        // VALUE, not the INDEX). #2746 closes that leak by relocating the
+        // release into the bracket itself, where it fires EXACTLY ONCE — after
+        // the call (write-back on the normal edge, no write-back on the
+        // exception edge; on both edges the callee is done with the index
+        // because it never received it — §23.5's "ref/out in indexer
+        // parameter lists" restriction means the index is a lookup key the
+        // callee never sees) and BEFORE the pins are erased.
+        //
+        // GATES. The same two gates `releaseIndexArgStringProducers` already
+        // applies, mirrored verbatim so the two halves of the index-argument
+        // release discipline share exactly one definition:
+        //   * receiver-kind gate — RECORD (§9/§9.7) and INTERFACE receivers
+        //     are deliberately excluded. A record's reference fields are
+        //     borrows with no independent +1 (§9.7); an interface's runtime
+        //     implementor may be record-backed. The accessor might store the
+        //     index into a record field, and a release here would dangle that
+        //     field. Same discriminant as `emitProducerRelease`'s
+        //     `recvDecl->kind == Class` gate. The bracket owns the lifetime
+        //     for the call, NOT for any callee-side aliasing — that hazard is
+        //     the same one `releaseIndexArgStringProducers` declines.
+        //   * `diverged_` — mirror #2717's own `!diverged_` guard; on a
+        //     diverged path the callee never ran, but releasing into a
+        //     terminated BB is malformed IR. (The exception edge that flips
+        //     `emit=false` does NOT set `diverged_` — the divergence flag is
+        //     for control flow like `throw`, the exception flag is for
+        //     setter-call-site unwind — and the bracket release has to fire
+        //     on the exception edge because the callee is done with the index
+        //     either way.)
+        // The element-type gate that `releaseIndexArgStringProducers` applies
+        // does NOT apply here: by the time the bracket release fires, the
+        // getter's result has been consumed (the callee wrote to the slot,
+        // and the write-back setter has either run with the new slot value or
+        // is no longer going to run). The "accessor hands the caller back the
+        // index" hazard (#2717's round-3 fix-closed) is exclusively a
+        // between-accessor concern; nothing in the bracket reads through the
+        // index value after the slot is consumed.
+        if (!diverged_ && r.target) {
+            if (auto* ix = dynamic_cast<const ast::IndexExpr*>(r.target)) {
+                const sema::TypeSymbol* recvDecl =
+                    indexAccessReceiverDecl(*ix);
+                if (recvDecl &&
+                    recvDecl->kind == ast::TypeDeclKind::Class) {
+                    // Build a set of pinned expressions so the
+                    // "is this index one we pinned" check is O(1) per index
+                    // rather than O(|pins|). `pins` is small (one receiver +
+                    // one entry per index), so the optimization is incidental;
+                    // the correctness benefit is the same: only pinned indices
+                    // are released, exactly once.
+                    std::unordered_set<const ast::Expr*> pinned;
+                    pinned.reserve(r.pins.size());
+                    for (const ast::Expr* e : r.pins) pinned.insert(e);
+                    for (std::size_t k = 0; k < ix->indices.size(); ++k) {
+                        const ast::Expr* ie = ix->indices[k].value.get();
+                        if (!ie || !pinned.count(ie)) continue;
+                        if (!isPlusOneStringProducer(ie)) continue;
+                        auto it = exprValueOverride_.find(ie);
+                        if (it == exprValueOverride_.end()) continue;
+                        llvm::Value* v = it->second;
+                        if (!v || !v->getType()->isPointerTy()) continue;
+                        emitStringRelease(v);   // null/sentinel-safe, NOT
+                                                 // idempotent — exactly one
+                                                 // fire is the discipline
+                    }
+                }
+            }
+        }
         for (const ast::Expr* e : r.pins) exprValueOverride_.erase(e);
     }
     recs.clear();

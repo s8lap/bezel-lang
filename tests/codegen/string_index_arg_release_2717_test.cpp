@@ -881,16 +881,34 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 
 // ---------------------------------------------------------------------
 // (L) / (M) §22.3 accessor `ref`/`out` argument whose LOCATION is an indexer
-// slot — the pinned index must be released by NEITHER the copy-in getter nor
-// the write-back setter.
+// slot — the pinned index must be released EXACTLY ONCE, by the §22.3
+// bracket itself (NOT by either accessor). #2717's first cut released at both
+// ends of the copy-in/copy-out bracket (a double free + use-after-free
+// observed as `SEGV` inside `__asan::Allocator::Deallocate`); suppressing at
+// both ends restored the leak. #2746 closes the leak by relocating the
+// release into the bracket so it fires once, after the call, on both the
+// normal-return and exception edges.
 // ---------------------------------------------------------------------
 BEZEL_TEST(codegen_string_index_arg_release_2717,
-           ref_arg_into_indexer_slot_is_not_double_freed_spec_22_3) {
+           ref_arg_into_indexer_slot_index_is_released_exactly_once_spec_22_3) {
     JitResult r = runAotChecked(kRefArgIntoIndexerSlotWithProducerIndex);
     if (wasSkipped(r)) return;
-    // Leaks by design (#2746). The POINT is WHICH report fires: unsuppressed,
-    // this is a SEGV inside ASan's Deallocate from the second release.
-    expectLeakButNoMemoryError(r);
+    // #2746 fix: the bracket owns the lifetime across copy-in + write-back,
+    // so the release fires once, here, instead of at EITHER accessor (which
+    // would double-free). Pre-fix this asserted LEAK; the assertion inverts
+    // here because the leak has been closed. Pre-fix: r.ran=false (LSan
+    // reports the leak), post-fix: r.ran=true and exitCode=171.
+    BEZEL_EXPECT_TRUE(r.ran);                  // #2746 closes the leak
+    BEZEL_EXPECT_EQ(r.exitCode, 171);         // §22.3 write-back value preserved
+    // Belt-and-suspenders: even after r.ran=true, re-grep the report for the
+    // specific sanitizer-failure signatures — a double-free / UAF would still
+    // set `r.ran=false`, but the gate fires FIRST so this confirms the FAIL
+    // direction (the leak that was the pre-fix contract has been removed,
+    // NOT replaced by a memory error).
+    const std::string t = sanitizerText(r);
+    BEZEL_EXPECT_TRUE(t.find("detected memory leaks") == std::string::npos);
+    BEZEL_EXPECT_TRUE(t.find("heap-use-after-free") == std::string::npos);
+    BEZEL_EXPECT_TRUE(t.find("double-free") == std::string::npos);
 }
 
 BEZEL_TEST(codegen_string_index_arg_release_2717,
@@ -904,10 +922,22 @@ BEZEL_TEST(codegen_string_index_arg_release_2717,
 }
 
 BEZEL_TEST(codegen_string_index_arg_release_2717,
-           out_arg_into_indexer_slot_is_not_double_freed_spec_22_3) {
+           out_arg_into_indexer_slot_index_is_released_exactly_once_spec_22_3) {
     JitResult r = runAotChecked(kOutArgIntoIndexerSlotWithProducerIndex);
     if (wasSkipped(r)) return;
-    expectLeakButNoMemoryError(r);
+    // Same as the `ref` case above. Pre-fix this asserted LEAK; #2746 closes
+    // it. `out` was ACCIDENTALLY clean before #2717 (no copy-in getter runs,
+    // so exactly one release fired and the helper happened to be correct);
+    // the uniform suppression at both ends made it leak in lockstep with
+    // `ref`. #2746's bracket release restores `out` to its pre-#2717 leak-
+    // free behavior, but for the right reason now: the §22.3 bracket itself
+    // owns the lifetime.
+    BEZEL_EXPECT_TRUE(r.ran);                  // #2746 closes the leak
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+    const std::string t = sanitizerText(r);
+    BEZEL_EXPECT_TRUE(t.find("detected memory leaks") == std::string::npos);
+    BEZEL_EXPECT_TRUE(t.find("heap-use-after-free") == std::string::npos);
+    BEZEL_EXPECT_TRUE(t.find("double-free") == std::string::npos);
 }
 
 BEZEL_TEST(codegen_string_index_arg_release_2717,
