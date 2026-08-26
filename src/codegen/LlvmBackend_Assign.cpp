@@ -1648,6 +1648,34 @@ bool Emitter::rejectImportedVirtualBaseIndexer(
     return false;
 }
 
+// fix #2837 (§12.3 / §23.4 / §2.8.2 / §26.5, v0.282): the closing pin for
+// the cross-module `base[i]` reject. #2832's `rejectImportedVirtualBaseIndexer`
+// above is the diagnostic side — it fires ONLY when the OWNER-direct entry
+// map is empty (the ABSTRACT virtual shape, which §12.5-correctly has no
+// OWNER body to call from `base[i]` either way). The remaining half is the
+// call-side route in `lowerIndexerGet` / `lowerIndexerSet` /
+// `lowerIndexerCompoundCore` (this file, lines ~1737 / ~2454 / ~3168
+// respectively) that dispatches `base[i]` through the OWNER's direct entry
+// — `importedIndexerGetterDirectFns_[ps]` and
+// `importedIndexerSetterDirectFns_[ps]` — when the OWNER body exists.
+//
+// The structural ABI addition lives in `LlvmBackend_Setup.cpp`:
+//   * `emitExportedIndexerGetters` / `-Setters` were widened (#3231) to
+//     emit ExternalLinkage `bz$<Class>$idxget$<arity>` / `$idxset$<arity>`
+//     wrappers for VIRTUAL, non-override, non-abstract indexers too — the
+//     OWNER-class body, the same direct-entry ABI the non-virtual case
+//     uses; and
+//   * `declareImportedIndexerGetters` / `-Setters` declare the matching
+//     external in four new direct-entry maps. `indexTargetIsBase(ix)` is
+//     the §12.3 predicate that picks this route OVER the vtable-dispatch
+//     wrapper (`importedIndexerGetterFns_[ps]`, #2545).
+//
+// The three call-site guards (lowerIndexerGet / -Set / -CompoundCore) are
+// the SAME shape: `indexTargetIsBase(ix) && isVirtualIndexer(ps) &&
+// <direct-entry-map>.count(ps)`. The reject below is the
+// last-resort fallback that fires when no OWNER-direct entry exists —
+// only ever the ABSTRACT virtual case.
+//
 // fix #3199 (§12.3 / §23 / §2.8.2, v0.254) — the named-property twin of
 // `rejectImportedVirtualBaseIndexer` (#2832) immediately above. See the header
 // for the contract and the ABI mechanism.
