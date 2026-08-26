@@ -8035,6 +8035,19 @@ void Emitter::registerFfiExprTemp(llvm::AllocaInst* slot, bool isRawBytes) {
         d.rawBytes = isRawBytes;
         disposeStack_.back().push_back(d);
     }
+    // fix #2754 (§28.3 / §30.13, v0.282) — promote the slot into the async
+    // state machine's frame when this FFI temp is produced INSIDE an async
+    // method body (`smStateStruct_` non-null). Without this promotion, the
+    // entry-block alloca is a plain stack slot; on a real cross-thread resume
+    // the worker thread reads an uninitialised stack offset, the K8 boundary
+    // free's null-guard sees `null` and skips the reclaim, and the
+    // bz_string_to_utf8z buffer leaks (the strictly-better-than-wild-free
+    // shape #2733 introduced). Mirror the analogous Pattern A task-temp
+    // promotion at LlvmBackend_Async.cpp:3702 (registerAwaitedTaskTemp) —
+    // `fixupSuspendDominance` heap-spills the slot through
+    // `asyncSpillPtrField_` so the post-resume load reads the persisted
+    // value the store-before-suspend wrote. // per §28.3, §30.13
+    if (smStateStruct_) asyncHandlerSpillSlots_.push_back(slot);
     ffiExprTemps_.push_back({slot, isRawBytes, currentFn_});
 }
 

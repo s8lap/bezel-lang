@@ -2723,11 +2723,26 @@ private:
     // slot whose disposal is registered on disposeStack_ must be null on such a
     // path or the pass frees an undef pointer. `entryAlloca`'s bare alloca is
     // only safe for a slot whose every reader is dominated by its store.
+    //
+    // fix #2754 (§28.3 / §30.13, v0.282) — the entry-block null-init here
+    // writes through the slot's alloca instruction, but a slot registered into
+    // `asyncHandlerSpillSlots_` is replaced post-lowering by a GEP into the
+    // async frame's heap-spill area (created in `contBB` by
+    // `promoteDemotedSlotsToFrame`). That GEP does NOT dominate the entry-
+    // block init's store, so a naïve promote leaves malformed IR (`Instruction
+    // does not dominate all uses`). The async path does NOT need the entry-
+    // block init either: `calloc` (in `allocBB`) zeroes the heap-spill struct,
+    // so the slot reads null on every reachable path — the same null-guarded
+    // free that motivates #2733 stays idempotent. Skip the entry-block init
+    // when the slot will be frame-spilled; the (sync) entry-block init stays
+    // for every other use.
     llvm::AllocaInst* entryAllocaNullPtr() {
         llvm::BasicBlock& entry = currentFn_->getEntryBlock();
         llvm::IRBuilder<> tmp(&entry, entry.begin());
         auto* a = tmp.CreateAlloca(ptrTy());
-        tmp.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), a);
+        if (!smStateStruct_) {
+            tmp.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), a);
+        }
         return a;
     }
 

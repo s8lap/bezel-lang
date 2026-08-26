@@ -11067,6 +11067,21 @@ void Emitter::emitInstanceInitFunction(const sema::TypeSymbol* ts) {
     llvm::Function* fn = it->second;
     if (!fn->empty()) return;  // already emitted
 
+    // fix #2754 (§28 "Resource Management", v0.282) — save/restore
+    // `disposeStack_` like every other emitter that lowers user code under a
+    // swapped `currentFn_` (lambda body, the six property/indexer accessor
+    // emitters, buildSpecializedMethodFn, the three Layout.cpp thunks,
+    // genericInstSfinitFn, the specialized disposers — see the audit at
+    // Setup.cpp:4013 and Disposal.cpp:1519 / :4119). Pre-fix, the clear at
+    // line 11082 dropped any Disposals the caller had pushed before
+    // emitInstanceInitFunction was invoked, leaving a temporary produced in
+    // a field initializer without a `disposeStack_` backstop and letting a
+    // later iteration over `initFns_` see stale entries from this class.
+    // Save the full vector and restore it after the body — the body's own
+    // scope is pushed and popped by lowerScopedBlock below, so the swap is
+    // clean on every iteration. // per §28.3
+    auto savedDisposeStack = disposeStack_;
+
     // Save/restore the per-function emitter state (mirrors emitDisposerBody).
     llvm::Function* savedFn = currentFn_;
     llvm::Value* savedThis = currentThis_;
@@ -11132,6 +11147,10 @@ void Emitter::emitInstanceInitFunction(const sema::TypeSymbol* ts) {
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
+    // fix #2754 (§28, v0.282) — restore the caller's `disposeStack_`; see the
+    // declaration comment at the head of this function for the audit.
+    // // per §28.3
+    disposeStack_ = std::move(savedDisposeStack);
     if (savedInsert) builder_.SetInsertPoint(savedInsert);
 }
 
