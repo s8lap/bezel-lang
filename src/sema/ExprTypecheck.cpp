@@ -3,6 +3,7 @@
 #include "sema/EnumValues.hpp"  // enumDeclaredValues — §10.2/§17.11 (#3044)
 #include "sema/GenericParams.hpp"  // fix #3143: the ONE both-sources generic-param walk (§14.1/§12.9/§2.5)
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <functional>
@@ -2863,6 +2864,237 @@ bool ExprTC::isTaskShapedRef(const TypeRef* t) const {
             t->headName() == "OwningTask");
 }
 
+// fix #1820 (§28.3, v0.223 ruling; carried in v0.282): is `t` a concrete
+// class-or-interface slot that triggers the Concrete-slot function bodies
+// callee-side rule? The ruling lists the slot's claimed exclusions verbatim
+// (not `owned`-marked, not `Task`-family, not one of the iterator interface
+// heads, not a bare type parameter) — every other class/interface Named
+// triggers the callee-side admission. Value types, primitives, and the
+// special forms (Function / InlineArray / Unit / Error) are also outside the
+// rule because the §28.3 producer row's "concrete class or interface"
+// phrasing names only the reference-typed class/interface slots.
+//
+// The caller is responsible for the `owned`-marker filter: the `owned`
+// modifier is on the OUTER function type's `funcReturnOwned` flag, not on
+// the inner Named slot this predicate sees. The caller checks the outer
+// function type's owned marker (or the parallel `pendingLambdaTarget…`
+// plumbing) and skips this predicate on the `owned`-marked branch — the
+// §28.8 transferring form governs such slots, not this borrowing-row
+// callee-side rule.
+bool ExprTC::isConcreteSlotReturnType(const TypeRef* t) const {
+    if (!t) return false;
+    // §28.3 (v0.223 ruling): the producer row's "concrete class / interface"
+    // phrasing admits every reference-typed slot a caller might store a
+    // borrowed frame into — Named class/interface declarations AND `Object`,
+    // which resolves as Primitive (PrimitiveType::Object) per §3.4's keyword
+    // taxonomy but is the canonical concrete class slot for the rule's
+    // purposes (an `Object` reference at function slot is exactly the
+    // `var g: () -> Object := …` shape cx4 pins). The other primitives
+    // (numeric, char, bool, string) are value-typed — the §28.3 row's
+    // "Function value … never owned" carve-out handles those implicitly
+    // because no borrowed frame fits a value slot. Function, InlineArray,
+    // Unit, Error: outside the row's claim by definition.
+    if (t->kind == TypeRef::Kind::Primitive &&
+        t->primitive == PrimitiveType::Object) return true;
+    if (t->kind != TypeRef::Kind::Named) return false;
+    // Task-family: the v0.190 rule claims these (calls mint).
+    if (isTaskShapedRef(t)) return false;
+    // The eight iterator/enumerator interface heads (§29.3/§30.7) are
+    // #1787's seam, deliberately unclassified by #1820.
+    if (!t->nullable && t->astNode && t->astNode->name &&
+        !t->astNode->name->parts.empty()) {
+        const std::string_view h = t->headName();
+        if (h == "IEnumerable" || h == "IEnumerator" ||
+            h == "IAsyncEnumerable" || h == "IAsyncEnumerator" ||
+            h == "IOwningEnumerable" || h == "IOwningEnumerator" ||
+            h == "IOwningAsyncEnumerable" || h == "IOwningAsyncEnumerator")
+            return false;
+    }
+    // Class/interface declaration — accept. Value builtins and primitives
+    // are filtered by the Named-only check above (except for Object above).
+    return t->declaration != nullptr &&
+           (t->declaration->kind == ast::TypeDeclKind::Class ||
+            t->declaration->kind == ast::TypeDeclKind::Interface);
+}
+
+// fix #1820 (§28.3, v0.223 ruling): is `e` a fresh owned-producing
+// expression — `new T()` over a class/interface, or a call whose callee
+// returns `owned` (per `common::calleeReturnsOwned`, which covers
+// methods, function values, extern calls, and operators)? A `move e;`
+// expression is encoded as a UnaryExpr with `op == "move"`, whose
+// semantic is "transfer the binding's ownership"; sema's other callee-
+// side paths reject a non-owned move upstream, so flagging every UnaryExpr
+// `move` at this gate is the conservative rule the ruling records.
+bool ExprTC::isFreshOwnedProducerExpr(const ast::Expr& e) const {
+    if (dynamic_cast<const ast::NewExpr*>(&e)) {
+        // `new T()` over a class/interface is owned. Records/primitives are
+        // value-typed and never form an owned production; their `new` does
+        // not need this check.
+        const TypeRef* t = ctx_.exprType(e);
+        return t && t->kind == TypeRef::Kind::Named && t->declaration &&
+               (t->declaration->kind == ast::TypeDeclKind::Class ||
+                t->declaration->kind == ast::TypeDeclKind::Interface);
+    }
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        // `move e;` is encoded as `UnaryExpr{op = "move", operand = e}` per
+        // A.7 / §28.6. Conservatively flag it at this gate; a non-owned
+        // move is rejected upstream (§28.6/§28.8.1).
+        if (ue->op == "move") return true;
+    }
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        // §28.3 (v0.190) + §30.1 / §30.5: a CALL mints an OWNED frame when
+        // the callee's DECLARED (pre-substitution) return is `Task`-family —
+        // the §28.3 producer row's "Calls mint for the mint-announcing
+        // families" claim. The explicit `owned` keyword is a separate path;
+        // both are rejected at the concrete-slot callee-side rule.
+        if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_)) {
+            if (md->returnType) {
+                if (const TypeRef* declRet =
+                        ctx_.resolvedType(*md->returnType)) {
+                    if (declRet->kind == TypeRef::Kind::Named &&
+                        common::isTaskFamilyHead(declRet->headName()))
+                        return true;
+                }
+            }
+            if (md->returnOwned) return true;  // explicit `owned` marker
+        }
+        // Function-valued callee path (a lambda or function-value with
+        // declared `owned` return); mirrors calleeReturnsOwned's
+        // Function-typed arm.
+        if (common::calleeReturnsOwned(*ce, ctx_)) return true;
+    }
+    return false;
+}
+
+// fix #1820 (§28.3): walk a lambda body and invoke `fn` on every value-
+// carrying return expression and the expression body. Mirrors
+// collectLambdaReturnTypeFromStmt's recursion exactly — same statement
+// wrappers, same case-block bodyKind gate, same exclusion of nested
+// lambdas — so the rejection sees the same return-path set the
+// inference sees.
+template <typename F>
+void ExprTC::forEachLambdaReturnValue(
+    const ast::LambdaExpr& lam, F&& fn) const {
+    if (lam.exprBody) fn(lam.exprBody.get());
+    std::vector<const ast::Stmt*> stack;
+    for (const auto& s : lam.stmts) stack.push_back(s.get());
+    while (!stack.empty()) {
+        const ast::Stmt* s = stack.back();
+        stack.pop_back();
+        if (!s) continue;
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            if (rs->value) fn(rs->value.get());
+            continue;
+        }
+        if (auto* bs = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (const auto& s2 : bs->body) stack.push_back(s2.get());
+            continue;
+        }
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (const auto& s2 : ifs->ifBranch.body)
+                stack.push_back(s2.get());
+            for (const auto& el : ifs->elifBranches)
+                for (const auto& s2 : el.body) stack.push_back(s2.get());
+            for (const auto& s2 : ifs->elseBody) stack.push_back(s2.get());
+            continue;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (const auto& s2 : ws->body) stack.push_back(s2.get());
+            continue;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (const auto& s2 : fs->body) stack.push_back(s2.get());
+            continue;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (const auto& s2 : ts->body) stack.push_back(s2.get());
+            for (const auto& arm : ts->catches)
+                stack.push_back(arm.body.get());
+            for (const auto& s2 : ts->finallyBody) stack.push_back(s2.get());
+            continue;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (const auto& arm : cs->arms)
+                if (arm.bodyKind == ast::CaseArmBodyKind::Block)
+                    for (const auto& s2 : arm.stmts)
+                        stack.push_back(s2.get());
+            continue;
+        }
+        // LocalDecl, AssignmentStmt, ExpressionStmt, BreakStmt,
+        // ContinueStmt, ThrowStmt, YieldStmt, DiscardStmt — carry
+        // expressions, not returns; nested lambdas inside those
+        // expressions have their own callable and are excluded.
+    }
+}
+
+// fix #1820 (§28.3, v0.223 ruling; carried in v0.282): the callee-side
+// check for the §28.3 "function-value invocation of a concrete class /
+// interface slot" producer row. The row classifies every such invocation
+// as a borrow carrying {the function value} ∪ {plain reference-typed
+// arguments}, so any caller-side treatment of the produced frame is a
+// BORROW — the caller does NOT own the frame. A lambda checked against
+// such a slot must therefore admit, on every body return path, only
+// sources the row's caller-side would re-establish: `null` (for a
+// nullable slot), a capture-sourced borrow, a plain-parameter-sourced
+// borrow, or static storage. A fresh owned production is rejected —
+// the row's borrower never disposes it.
+//
+// `targetSlot` is the function-type target's declared return slot —
+// the same `pendingLambdaTargetReturn_` value the lambda visit threaded
+// in. When it is a concrete class/interface (per isConcreteSlotReturnType)
+// the check fires; otherwise the call is a no-op so the wider
+// "every lambda has a target" case stays cheap.
+//
+// The check walks every body return path (expression body + each
+// `return e;` in the block body), consulting isFreshOwnedProducerExpr.
+// We do NOT exclude `null` (one of the row's admitted sources) — a
+// `null` literal against a nullable slot is the legitimate `null`
+// source. Likewise we do not exclude a captured-local/parameter read —
+// identifier reads are NOT fresh producers (they're borrows of the
+// captured binding), so the predicate returns false on them naturally.
+void ExprTC::checkConcreteSlotLambdaBody(
+    const ast::LambdaExpr& lam, const TypeRef* targetSlot,
+    bool targetOwnedMarker,
+    TypeRef* /*savedCurrentReturnType*/) {
+    if (!targetSlot) return;
+    // §28.8: a target slot marked `owned` transfers the lambda's minted
+    // frame to the caller, who then owns and disposes it — the §28.3
+    // producer-row borrow rule does NOT apply (it's specifically the
+    // non-owned, plain class/interface slot the row's caller-side claim
+    // targets). The callee-side check is suppressed entirely on the
+    // owned-marked branch.
+    if (targetOwnedMarker) return;
+    if (!isConcreteSlotReturnType(targetSlot)) return;
+    forEachLambdaReturnValue(lam, [&](const ast::Expr* retVal) {
+        if (!retVal) return;
+        // A `null` literal at a nullable slot is the §28.3 row's
+        // admitted `null` source — not a fresh producer.
+        if (targetSlot->nullable &&
+            dynamic_cast<const ast::NullLiteralExpr*>(retVal))
+            return;
+        if (isFreshOwnedProducerExpr(*retVal)) {
+            ctx_.diagnostics().report(
+                Severity::Error, retVal->span.begin,
+                std::string("a lambda body's return path produces a "
+                    "fresh owned value (`") +
+                    (ctx_.exprType(*retVal)
+                        ? std::string(ctx_.exprType(*retVal)->headName())
+                        : std::string("?")) +
+                    "`) at a target slot whose declared return type is `"
+                    + std::string(targetSlot->headName()) +
+                    "` — the §28.3 producer row classifies every function-"
+                    "value invocation of a concrete class/interface slot "
+                    "as a borrow, so no caller would dispose the minted "
+                    "frame (§28.3, §28.6; fix #1820, v0.223 ruling carried "
+                    "in v0.282); spell the slot's return `owned` to "
+                    "transfer (the stdlib §4.14 convention `fn: (int) -> "
+                    "owned T`), or restructure the body to return a "
+                    "borrowed source (a captured local/parameter read, "
+                    "static storage, or `null` for a nullable slot)");
+        }
+    });
+}
+
 // stdlib §5 (#755): a BARE lazy GroupBy result — `IEnumerable<IGrouping<TKey,T>>`
 // is modelled by sema's makeLazyEnumerable(IGrouping<…>): a Named TypeRef with NO
 // astNode whose sole generic argument is the synthetic "IGrouping" element. The
@@ -3724,6 +3956,27 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
     // is the getter-as-function value (≡ `() => b.P`) and codegen emits a
     // property thunk. (Methods are already unconditionally function-typed; a
     // property read needs this target-directed promotion.)
+    //
+    // §27.6 / fix #1820 (v0.223 ruling, carried in v0.282's mint-announcing
+    // family boundary): a property reference over a property whose declared
+    // type is a `Task`-family type is rejected at the formation site. The
+    // reference's function type would carry a mint-announcing return slot,
+    // whose invocation the §28.3 producer row classifies as an owned mint
+    // (`Calls mint for the mint-announcing families`), while the underlying
+    // getter lends its storage (§30.11's source-owns-task rule; the stored-
+    // view property face whose lend-only guarantee is axiom A4's) — formation
+    // would pair two owners over one stored task. The same mint/lend boundary
+    // governs return-slot bridging generally (§27.1.1's family rule).
+    // Remedy in the diagnostic: read the property directly and consume the
+    // task through §30.5's admitted borrow positions, or wrap a genuine task
+    // PRODUCER (a method reference over a Task-returning method remains the
+    // ordinary, admissible spelling).
+    auto isTaskFamilyPropertyReturn = [](const TypeRef* ty) {
+        if (!ty || ty->kind != TypeRef::Kind::Named) return false;
+        // §27.6: the ruling reads "declared type (nullability stripped)";
+        // a nullable Task-family property is the same family.
+        return ty->headName() == "Task" || ty->headName() == "OwningTask";
+    };
     if (to->kind == TypeRef::Kind::Function &&
         from->kind != TypeRef::Kind::Function && fromExpr &&
         to->funcParams.empty() && to->funcReturn) {
@@ -3737,9 +3990,28 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                     return a->declaration == b->declaration;
                 return false;
             };
-            if (!ps->isIndexer && sameRetTy(to->funcReturn, from)) {
-                ctx_.setExprType(const_cast<ast::Expr*>(fromExpr), to);
-                return;  // accepted as a property getter reference
+            if (!ps->isIndexer) {
+                if (isTaskFamilyPropertyReturn(from)) {
+                    // §27.6 (#1820): mint-announcing property reference.
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        std::string("cannot form a method reference over a "
+                            "property whose declared type is `") +
+                            std::string(from->headName()) +
+                            "` — the reference's function type would carry a "
+                            "`Task`-family return slot, whose invocation the "
+                            "§28.3 producer row classifies as an owned mint, "
+                            "while the getter lends its storage (§27.6, "
+                            "§28.3, §30.11); read the property directly and "
+                            "consume the task through §30.5's admitted borrow "
+                            "positions, or wrap a genuine task producer (a "
+                            "method reference over a `Task`-returning method)");
+                    return;
+                }
+                if (sameRetTy(to->funcReturn, from)) {
+                    ctx_.setExprType(const_cast<ast::Expr*>(fromExpr), to);
+                    return;  // accepted as a property getter reference
+                }
             }
         }
     }
@@ -3909,6 +4181,81 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                                          isSubtype)) {
                 reportNotConvertible();
                 return;
+            }
+        }
+        // §27.6 / fix #1820 (v0.223 ruling delta (5); carried in v0.282): a
+        // method reference over a STATIC callee whose declared return type
+        // (nullability stripped) is one of the eight §29.3/§30.7 iterable or
+        // enumerator interfaces, or a lazy query — the iterator convention's
+        // frame-minting factories (§28.3 producers "Iterator and iterable
+        // returns") — may be formed only against a target slot whose return
+        // (nullability stripped) is also such an interface, OR left at the
+        // callee's own type. Bridging the reference to any other return slot
+        // (`() -> Object`, a concrete class/interface type) is rejected at
+        // the formation site — the retyped face would erase the frame-mint
+        // announcement (type-announced, K6.2), and an invocation through it
+        // would classify under the producers row as a borrow: a leaked
+        // caller-owned frame. Instance iterable-returning callees are
+        // outside this fence (their calls lend under axiom A2's recorded
+        // keying — receiver-sourced — and are soundly borrow-classified
+        // through any slot).
+        //
+        // The check fires on the function-to-function compatibility block
+        // above, where the method-reference formation is the assignment's
+        // SOURCE: a bare MethodSymbol resolution with the static modifier
+        // and an iterable-family return. The same-source-typed-as-its-own-
+        // type control (`from` and `to` carry the same `funcReturn`) is the
+        // identity-type accept case; the same-family retyping (an
+        // IEnumerable<Dog>->IEnumerable<Animal> retyping, e.g.) is admitted
+        // by the covariance rule below as it always was. Every other
+        // retyping target is the reject this fence fires on.
+        if (freshReferenceFormation && fromExpr) {
+            if (auto* ms = dynamic_cast<MethodSymbol*>(
+                    ctx_.exprSymbol(*fromExpr))) {
+                const bool calleeIsStatic =
+                    std::find(ms->modifiers.begin(), ms->modifiers.end(),
+                              std::string_view("static")) !=
+                    ms->modifiers.end();
+                auto isIterableFamily = [](const TypeRef* t) {
+                    if (!t || t->kind != TypeRef::Kind::Named ||
+                        t->nullable || !t->astNode || !t->astNode->name ||
+                        t->astNode->name->parts.empty()) return false;
+                    const std::string_view h = t->headName();
+                    return h == "IEnumerable" || h == "IEnumerator" ||
+                           h == "IAsyncEnumerable" || h == "IAsyncEnumerator" ||
+                           h == "IOwningEnumerable" || h == "IOwningEnumerator" ||
+                           h == "IOwningAsyncEnumerable" ||
+                           h == "IOwningAsyncEnumerator" ||
+                           isBareLazyGroupingType(t);
+                };
+                if (calleeIsStatic && from->funcReturn && to->funcReturn &&
+                    isIterableFamily(from->funcReturn) &&
+                    !functionSlotConvertible(from->funcReturn, to->funcReturn,
+                                            isSubtype)) {
+                    // §27.6 (#1820): static iterable-factory bridge to a
+                    // non-iterable return slot. The retyped face would
+                    // erase the iterator convention's frame-mint
+                    // announcement.
+                    ctx_.diagnostics().report(
+                        Severity::Error, loc,
+                        std::string("a method reference over the static "
+                            "iterable-factory callee `") +
+                            std::string(ms->name) +
+                            "` whose return type is `" +
+                            std::string(from->funcReturn->headName()) +
+                            "` may not be bridged to a target slot whose "
+                            "return is `" +
+                            std::string(to->funcReturn->headName()) +
+                            "` — the retyped face would erase the iterator "
+                            "convention's frame-mint announcement and an "
+                            "invocation through it would classify under the "
+                            "§28.3 producer row as a borrow, leaking the "
+                            "caller-owned frame (§27.6, §28.3; fix #1820, "
+                            "v0.223 ruling delta (5)); keep the reference at "
+                            "the callee's iterable type, or materialize the "
+                            "sequence at the call site");
+                    return;
+                }
             }
         }
         return;
@@ -11779,6 +12126,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         TypeRef* savedLamRet = pendingLambdaReturnType_;
         std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
         TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
+        bool savedLamTargetRetOwned = pendingLambdaTargetReturnOwned_;
         if (ld->type && ld->initializer) {
             if (dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get())) {
                 if (auto* dt = ctx_.resolvedType(*ld->type)) {
@@ -11794,6 +12142,14 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     // each `return` (a future slice), never unified by inference.
                     if (dt->kind == TypeRef::Kind::Function)
                         pendingLambdaTargetReturn_ = dt->funcReturn;
+                    // fix #1820 (§28.3 / §28.8): the OUTER function type's
+                    // `funcReturnOwned` flag — the `(…) -> owned T` keyword —
+                    // travels separately from the inner slot because the slot
+                    // itself does not carry the marker. The callee-side rule
+                    // consults this to know when §28.8 transfers the slot and
+                    // the §28.3 borrow rule's check does not apply.
+                    if (dt->kind == TypeRef::Kind::Function)
+                        pendingLambdaTargetReturnOwned_ = dt->funcReturnOwned;
                     // fix #829: thread the target's positional parameter types so
                     // an untyped lambda param `(a, b) => …` is given its inferred
                     // type (the body's operator/member resolution then sees the
@@ -11811,6 +12167,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         pendingLambdaReturnType_ = savedLamRet;
         pendingLambdaParamTypes_ = savedLamParams;
         pendingLambdaTargetReturn_ = savedLamTargetRet;
+        pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
         currentLiteralWideningHint_ = savedHint;
         // stdlib §5 (#755): reject STORING a bare lazy GroupBy result in a local —
         // the lazy IGrouping<TKey,T> enumerator dangles after the store and
@@ -12237,13 +12594,21 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         // `() -> Dog` converts to the target under §27.1.1), never unified by
         // inference. Restored after the visit.
         TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
+        bool savedLamTargetRetOwned = pendingLambdaTargetReturnOwned_;
         if (rs->value && returnCtx_ == ReturnCtx::ValueMethod &&
             currentReturnType_ &&
             currentReturnType_->kind == TypeRef::Kind::Function &&
-            dynamic_cast<const ast::LambdaExpr*>(rs->value.get()))
+            dynamic_cast<const ast::LambdaExpr*>(rs->value.get())) {
             pendingLambdaTargetReturn_ = currentReturnType_->funcReturn;
+            // fix #1820 (§28.3 / §28.8): the enclosing method's `funcReturnOwned`
+            // marker is threaded alongside the inner slot. The call-arg path
+            // below threads the marker from the function-typed argument's
+            // OWN type — both paths must agree.
+            pendingLambdaTargetReturnOwned_ = currentReturnType_->funcReturnOwned;
+        }
         if (rs->value) visitExpr(*rs->value);
         pendingLambdaTargetReturn_ = savedLamTargetRet;
+        pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
         currentLiteralWideningHint_ = savedRetHint;
         // §22.4 (v0.183, #1585): a `return E;` that may produce a postcondition's
         // stated constant must leave the out parameter provably non-null.
@@ -13163,6 +13528,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         if (as->value) {
             TypeRef* savedPending = pendingLambdaParamType_;
             TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
+            bool savedLamTargetRetOwned = pendingLambdaTargetReturnOwned_;
             if (eventPayload &&
                 dynamic_cast<const ast::LambdaExpr*>(as->value.get()))
                 pendingLambdaParamType_ = eventPayload;
@@ -13178,8 +13544,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (as->target &&
                 dynamic_cast<const ast::LambdaExpr*>(as->value.get())) {
                 if (TypeRef* tgtTy = ctx_.exprType(*as->target)) {
-                    if (tgtTy->kind == TypeRef::Kind::Function)
+                    if (tgtTy->kind == TypeRef::Kind::Function) {
                         pendingLambdaTargetReturn_ = tgtTy->funcReturn;
+                        // fix #1820 (§28.3 / §28.8): the assignment target's
+                        // `funcReturnOwned` marker travels with the inner
+                        // slot. Same shape as the typed-local and call-arg
+                        // paths.
+                        pendingLambdaTargetReturnOwned_ =
+                            tgtTy->funcReturnOwned;
+                    }
                 }
             }
             // per §4.2 (v0.182): an assignment target whose declared type is
@@ -13227,6 +13600,7 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             currentLiteralWideningHint_ = savedAssignHint;
             pendingLambdaParamType_ = savedPending;
             pendingLambdaTargetReturn_ = savedLamTargetRet;
+            pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
         }
         // §6.6 (v0.184, #1689): a compound assignment `x op= e` desugars to
         // `x := x op e`. Let T be the target's type and R the type of

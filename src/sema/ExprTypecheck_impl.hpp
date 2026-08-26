@@ -593,9 +593,58 @@ private:
     // visitExpr(LambdaExpr) so a nested lambda never inherits it.
     TypeRef* pendingLambdaTargetReturn_ = nullptr;
 
+    // fix #1820 (§28.3 / §28.8): the `funcReturnOwned` flag of the OUTER
+    // function type (`(…) -> owned T`) whose return slot is in
+    // pendingLambdaTargetReturn_. The flag does not live on the inner slot
+    // itself, so the callee-side rule needs a separate thread-in. When true
+    // the §28.8 transferring rule governs the slot and the §28.3 borrow
+    // rule's check is suppressed. Cleared alongside pendingLambdaTargetReturn_.
+    bool pendingLambdaTargetReturnOwned_ = false;
+
     // issue #777 / §30.6: true when `t` is a Named `Task<…>` / `OwningTask<…>`
     // (the async task wrapper). Used to detect a forgotten `await`.
     bool isTaskShapedRef(const TypeRef* t) const;
+
+    // fix #1820 (§28.3, v0.223 ruling; carried in v0.282): is `t` a concrete
+    // class-or-interface slot that triggers the Concrete-slot function bodies
+    // callee-side rule? Returns false for: null/Error type, an `owned`-marked
+    // slot (transferred by §28.8), a `Task`-family slot (claimed by v0.190),
+    // one of the eight iterator/enumerator interface heads (#1787),
+    // a bare type parameter (claimed by v0.194), an inline-array/unit/primitive
+    // slot, or a record/enum/choice/builtin value type.
+    bool isConcreteSlotReturnType(const TypeRef* t) const;
+
+    // fix #1820 (§28.3, v0.223 ruling): is `e` a fresh owned-producing
+    // expression — `new T()` over a class/interface, or a call whose callee
+    // returns `owned` (per `common::calleeReturnsOwned`, which covers
+    // methods, function values, extern calls, and operators)? Used by the
+    // Concrete-slot function bodies callee-side rule to reject fresh mints
+    // at concrete class/interface return slots.
+    bool isFreshOwnedProducerExpr(const ast::Expr& e) const;
+
+    // fix #1820 (§28.3): walk a lambda body and call `fn` for every value-
+    // carrying return statement and the expression body (if present). The
+    // walker descends through do/end, if/elif/else, while, for,
+    // try/catch/finally, statement-position case block arms — matching
+    // collectLambdaReturnTypes exactly so the rejection sees the same set
+    // of return paths the inference sees.
+    template <typename F>
+    void forEachLambdaReturnValue(
+        const ast::LambdaExpr& lam, F&& fn) const;
+
+    // fix #1820 (§28.3): Concrete-slot function bodies callee-side check.
+    // When a lambda is being type-checked at a function-type target whose
+    // return slot is a concrete class/interface (per isConcreteSlotReturnType
+    // above), reject every fresh-owned body return path. The caller is the
+    // only parameter-thread-in point (`pendingLambdaTargetReturn_`).
+    // `targetOwnedMarker` is the OUTER function type's `funcReturnOwned` flag
+    // (the `(…) -> owned T` keyword) — when true, the §28.8 transferring
+    // rule governs the slot and the §28.3 producer-row borrow rule does NOT
+    // apply, so the callee-side check is suppressed entirely.
+    void checkConcreteSlotLambdaBody(
+        const ast::LambdaExpr& lam, const TypeRef* targetSlot,
+        bool targetOwnedMarker,
+        TypeRef* savedCurrentReturnType);
 
     // §27.3 (v0.226, #2107): recursively collect the resolved type of every
     // value-carrying `return e;` in a block-bodied lambda body, descending

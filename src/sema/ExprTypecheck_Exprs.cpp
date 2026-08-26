@@ -6762,6 +6762,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 TypeRef* savedLamRet = pendingLambdaReturnType_;
                 std::vector<TypeRef*> savedLamParams = pendingLambdaParamTypes_;
                 TypeRef* savedLamTargetRet = pendingLambdaTargetReturn_;
+                bool savedLamTargetRetOwned = pendingLambdaTargetReturnOwned_;
                 if (auto* lam =
                         dynamic_cast<const ast::LambdaExpr*>(a.value.get())) {
                     if (eventPayload)     pendingLambdaParamType_ = eventPayload;
@@ -6889,6 +6890,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 // unified by inference). Apply the same class-
                                 // level generic substitution as the params.
                                 pendingLambdaTargetReturn_ = pt->funcReturn;
+                                // fix #1820 (§28.3 / §28.8): the call-arg's
+                                // `funcReturnOwned` marker travels alongside
+                                // the inner slot, exactly like the typed-local
+                                // and assignment paths. The callee-side rule
+                                // reads this to suppress its check on the
+                                // §28.8 transferring branch.
+                                pendingLambdaTargetReturnOwned_ =
+                                    pt->funcReturnOwned;
                                 if (!classSubst.empty() &&
                                     pendingLambdaTargetReturn_)
                                     pendingLambdaTargetReturn_ =
@@ -6988,6 +6997,7 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 pendingLambdaReturnType_ = savedLamRet;
                 pendingLambdaParamTypes_ = savedLamParams;
                 pendingLambdaTargetReturn_ = savedLamTargetRet;
+                pendingLambdaTargetReturnOwned_ = savedLamTargetRetOwned;
             }
             // per §7.4 (#1188): a `ref`/`out` argument can be reassigned by the
             // callee — including being set to null — so a prior null-narrowing
@@ -7744,6 +7754,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // a nested lambda doesn't inherit it.
         TypeRef* lamTargetRet = pendingLambdaTargetReturn_;
         pendingLambdaTargetReturn_ = nullptr;
+        // fix #1820 (§28.3 / §28.8): the OUTER function type's `owned`
+        // marker, threaded alongside the inner slot because the slot itself
+        // does not carry the marker. Consumed once so a nested lambda doesn't
+        // inherit it.
+        bool lamTargetRetOwned = pendingLambdaTargetReturnOwned_;
+        pendingLambdaTargetReturnOwned_ = false;
         // §27.3 (v0.217, #2101): the optional return-type ascription. When
         // present it behaves exactly as a method's declared return type —
         // each `return e;` (and an expression body) is checked against it
@@ -8132,6 +8148,37 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             }
         }
         for (const auto& s : lam->stmts) if (s) visitStmt(*s);
+        // fix #1820 (§28.3, v0.223 ruling; carried in v0.282): Concrete-slot
+        // function bodies — the row's callee-side half, mandatory per the
+        // ruling (delta (4) was originally drafted as optional; the post-
+        // critique ruling made it normative). When this lambda is checked
+        // against a target whose return slot is a concrete class/interface
+        // (per isConcreteSlotReturnType), every body return path must not
+        // produce a fresh owned value (a `new T()`, a `move`, a Task-family
+        // call result, or any other `owned`-returning call). The §28.3
+        // producer row classifies every function-value invocation as a
+        // borrow, so no caller would ever dispose a minted value — a
+        // silent leak (cx3, cx4) or live two-owners pairing (p1820e family).
+        // Remedy in the diagnostic: spell the slot's return `owned` to
+        // transfer (the stdlib §4.14 convention `fn: (int) -> owned T`).
+        //
+        // The check runs only when lamTargetRet (the captured target
+        // return slot, threaded from pendingLambdaTargetReturn_) is a
+        // concrete class/interface slot, so an untyped-context lambda
+        // (`var f := lambda() => new Res();` with no annotation) is
+        // unaffected — the no-target inference still picks `Res` and the
+        // §21.9 / §28.6 paths handle the rest. The check also does NOT
+        // fire on an ASCRIBED lambda: an ascription is the programmer-
+        // declared return slot, and its `return` statements go through
+        // the ordinary `checkAssignable(currentReturnType_, …)` path
+        // (line 8090+) which already constrains the body's types.
+        // The two paths are distinct (typed-context vs. ascription) per
+        // #2107's threading distinction.
+        if (lamTargetRet && !hasAscription) {
+            checkConcreteSlotLambdaBody(*lam, lamTargetRet,
+                                        lamTargetRetOwned,
+                                        /*savedCurrentReturnType=*/nullptr);
+        }
         // issue #777 / §30.6: forgotten `await` in an expression-bodied async
         // lambda. The body must produce the element type T threaded in as
         // lamRetHint, not a `Task` value. A Task-shaped body where T is not

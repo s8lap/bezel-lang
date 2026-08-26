@@ -142,6 +142,16 @@ BEZEL_TEST(codegen_generic_value_method_516, apply_bool_lambda_return_14_1_27_3)
 // it did before (reference types already dispatched correctly via vtable).
 // v0.201 (#2048): the fresh-producing factory is spelled `owned Box` per the
 // declaration-site static-return rule.
+// v0.223 / fix #1820: the §28.3 producer row's callee-side rule requires a
+// lambda at a concrete class/interface slot to spell `owned` to transfer —
+// `fn: (int) -> U` (plain U) classifies the invocation as a borrow and the
+// lambda's `new Box(x)` is rejected as a fresh producer under that
+// classification. The remedy is the stdlib §4.14 generic-factory convention
+// `fn: (int) -> owned U` — §28.1's per-instantiation erasure keeps value
+// substitutions unchanged, so the migration is a one-line declaration
+// change with no caller-side fallout. The runtime return path stays the
+// same: `GetBox(): owned Box` reads the lambda's owned-mint straight into
+// its own transferring return slot.
 BEZEL_TEST(codegen_generic_value_method_516, apply_class_ref_type_U_still_works_14_1_27_3) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -151,7 +161,7 @@ BEZEL_TEST(codegen_generic_value_method_516, apply_class_ref_type_U_still_works_
         "  destructor end destructor; "
         "end Box; "
         "class Helper "
-        "  public static method Apply<U>(x: int, fn: (int) -> U): U where U: notnull "
+        "  public static method Apply<U>(x: int, fn: (int) -> owned U): owned U where U: notnull "
         "    => fn(x); "
         "end Helper; "
         "class C "
