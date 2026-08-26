@@ -786,6 +786,21 @@ llvm::Function* Emitter::patternAResultDisposerFor(
     // which case we fall through to the existing class-instance path.
     if (llvm::Function* collDisp = patternAResultCollectionDisposer(tElem))
         return collDisp;
+    // fix #1889 element-half / #776 + #777 regression guard: a nested Task-
+    // family result (`Task<Task<U>>`, `Task<OwningTask<U>>`) is BORROWED, not
+    // OWNED — `Task<U>` does not own its U, so the outer `Task<Task<U>>`'s
+    // fire-and-forget cascade MUST NOT dispose the inner task (it must
+    // transfer the inner task pointer to the awaiter; disposing here is a
+    // double-free / UAF when the awaiter subsequently awaits the inner task).
+    // Before #1889 elementPolicyFor returned the Value row for a Task-family
+    // tElem (no class declaration ⇒ falls through), so the disposer was null
+    // and transfer worked. With #1889 the Task-family branch now classifies
+    // the inner task ClassOwned and returns taskElementDisposerThunk — which
+    // is correct for an OWNING COLLECTION element (#1889's main case) but
+    // wrong here, where the outer Task's fire-and-forget is the call site.
+    // Exclude nested Task-family results explicitly so the two policies stay
+    // disjoint. // per §30.5 (Task<T> doesn't own its T)
+    if (isTaskTypeName(tElem)) return nullptr;
     ElementPolicy pol = elementPolicyFor(tElem, /*owningFamily=*/true);
     return pol.cat == ElementPolicy::Category::ClassOwned ? pol.disposerThunk
                                                            : nullptr;

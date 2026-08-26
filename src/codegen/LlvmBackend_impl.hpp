@@ -1615,6 +1615,17 @@ private:
     // collections (e.g. OwningArray<OwningArray<R>>). Keyed by the TypeRef* of
     // the inner collection element type (unique per sema type).
     std::map<const sema::TypeRef*, llvm::Function*> nestedCollectionDisposerThunks_;
+    // fix #1889 / §28.6 / §30.5: per-Task-family-type element thunks for owning
+    // collections of Task / Task<T> / OwningTask<T>. Each thunk runs the complete
+    // non-blocking task drop protocol (fault_obj prelude, per-T result_disposer
+    // attach via elementPolicyFor, bz_task_fire_and_forget[_checked]) — the
+    // per-element analogue of emitOwnedTaskDisposal / emitTaskDisposal that the
+    // `using var` and owned-field paths already share. Keyed by the Task element
+    // TypeRef* (unique per sema type). Without this, an OwningArray<OwningTask<T>>
+    // dropped without draining leaks each task frame + its produced result
+    // (208 B per element under `bz$App$Make`'s bz_task_t, async frame, result
+    // slot — the #1889 element half, the #2224 deferred gap).
+    std::map<const sema::TypeRef*, llvm::Function*> taskElementDisposerThunks_;
     // #2279 (§30.5 Pattern A, v0.236): per-result-collection-type thunks for the
     // intrinsic-collection case `Task<intrinsic-coll>` — when a Pattern A task
     // produces an Array<T>/Set<T>/Dictionary<K,V>/LinkedList<T>/OwningBuffer<T>/
@@ -8557,6 +8568,16 @@ private:
     // OwningArray<OwningArray<R>>). Recursively resolves the inner element's
     // disposer via elementPolicyFor. Cached per element-collection TypeRef*.
     llvm::Function* nestedCollectionDisposerThunk(const sema::TypeRef* elemCollTy);
+    // fix #1889 / §28.6 / §30.5: void(void*) thunk for a Task / Task<T> /
+    // OwningTask<T> element of an owning collection (e.g. OwningArray<OwningTask<T>>).
+    // Runs the same complete non-blocking disposal protocol as a task local / an
+    // owned Task-family field — fault_obj prelude (deferred or now-disposed
+    // depending on the awaiter's in-flight state), per-T result_disposer attach
+    // via elementPolicyFor (only for OwningTask<T:class>), then
+    // bz_task_fire_and_forget[_checked]. Cached per Task element TypeRef* —
+    // each (Task/Task<T>/OwningTask<T>) TypeRef gets its own thunk so the
+    // per-T result_disposer matches the element's concrete type. // per §30.5
+    llvm::Function* taskElementDisposerThunk(const sema::TypeRef* taskTy);
 
     // #429 / §4.6 / §28.9: a module-level `void(void*)` thunk that calls
     // bz_string_release on the element (the slot holds a bz_string*). Used as the

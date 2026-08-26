@@ -172,6 +172,46 @@ Emitter::ElementPolicy Emitter::elementPolicyFor(const sema::TypeRef* elemTy,
         }
     }
 
+    // §30.5 / §28.11 (#1889): an owning collection of Task-family values
+    // (Task / Task<T> / OwningTask<T>) owns each task frame, and disposing the
+    // collection must also dispose the unconsumed class result and the fault
+    // object (§30.9) of every element. A task is a builtin class with no user
+    // TypeDecl (declaration == nullptr OR declaration->decl == nullptr), so it
+    // does not match the declaration-based class arm below, nor any of the
+    // other builtin-handle arms above — before this fix it fell through to the
+    // Value row (null disposer), and bz_array_free / bz_llist_free /
+    // bz_dict_free was called with a NULL disposer; every element's task
+    // frame, async frame, and result slot leaked (208 B per element under
+    // `bz$App$Make`, the #1889 element-half / #2224 deferred gap).
+    //
+    // The element thunk (taskElementDisposerThunk) runs the same complete
+    // non-blocking task disposal protocol the `using var` task scope-end path
+    // and the owned Task-family field path share via emitTaskDisposal —
+    // fault-object prelude, per-T result_disposer attach (for OwningTask<T:
+    // class>), and bz_task_fire_and_forget[_checked]. The borrowing family
+    // retains the existing borrow-only policy: a borrowed task frame is
+    // disposed elsewhere (the mint CALL's scope), so the outer collection must
+    // NOT fire-and-forget it again — a double fire-and-forget on one
+    // bz_task_t* corrupts async continuation state (#3096's symptom). The
+    // Task branch is deliberately BEFORE the Shared/Weak / user-class arm so
+    // a builtin task TypeRef never falls into the declaration-based test.
+    if (elemTy && isTaskTypeName(elemTy)) {
+        if (owningFamily) {
+            return ElementPolicy{
+                ElementPolicy::Category::ClassOwned,
+                ptrTy(),
+                taskElementDisposerThunk(elemTy),
+                /*retainRelease=*/false
+            };
+        }
+        return ElementPolicy{
+            ElementPolicy::Category::ClassBorrow,
+            ptrTy(),
+            /*disposerThunk=*/nullptr,
+            /*retainRelease=*/false
+        };
+    }
+
     bool isSharedWeakElem = isSharedOrWeak(elemTy);
     // Distinguish Shared vs Weak for per-element release thunk selection.
     auto isWeakElem = [](const sema::TypeRef* t) {

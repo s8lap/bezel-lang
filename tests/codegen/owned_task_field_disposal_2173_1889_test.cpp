@@ -225,6 +225,41 @@ BEZEL_TEST(codegen_owned_task_collection_1889,
 }
 
 // ---------------------------------------------------------------------------
+// #1889 — the COLLECTION ELEMENT half (the field half is pinned above as
+// `owned_task_field_disposed_at_scope_end_1889`). An `OwningArray<OwningTask
+// <Cell>>` dropped without draining must dispose each task frame AND its
+// produced Cell result (§30.5 "disposing an unconsumed OwningTask<T>"; §28.11
+// table: class/interface × owning → owned). The thunk that runs this lives
+// at taskElementDisposerThunk (Disposal.cpp); it is the per-element analogue
+// of emitOwnedTaskDisposal and routes through emitTaskDisposal so the same
+// fault-object prelude + per-T result_disposer + bz_task_fire_and_forget
+// [_checked] the `using var` and field paths use.
+// Pre-fix behaviour: 208 bytes leak per element under `bz$App$Make` — the
+// 184 B bz_task_t, its async frame, and its 8 B result slot — and Cell.n
+// stays at 1 (Cell never disposed). Cell.n must reach 0 AND the program
+// must exit 0; the existing `runAotCheckedLenient` cell above cannot pin
+// this because LSan is the only witness to the task-frame leak and LSan is
+// OFF under lenient. // per §28.6 / §28.11 / §30.5
+// ---------------------------------------------------------------------------
+BEZEL_TEST(codegen_owned_task_collection_1889,
+           owning_collection_owningtask_cell_element_disposed_1889) {
+    BEZEL_EXPECT_EQ(runChecked(
+        "module M; " + std::string(kCell) +
+        "class App "
+        "  public static async method Make(): OwningTask<Cell> "
+        "    return new Cell(); "
+        "  end Make; "
+        "  public static method Main(): int "
+        "    do "
+        "      using var tasks := new OwningArray<OwningTask<Cell>>(); "
+        "      tasks.Add(App.Make()); "
+        "    end; "
+        "    return Cell.n; "
+        "  end Main; "
+        "end App;"), 0);
+}
+
+// ---------------------------------------------------------------------------
 // #2173 — §30.10 backstop: a stale borrow of an owned Task<Data> field's
 // produced result, after the field is overwritten by `_t := t` (§28.7
 // drop-on-overwrite). The OLD task is disposed (fire-and-forget[_checked]),

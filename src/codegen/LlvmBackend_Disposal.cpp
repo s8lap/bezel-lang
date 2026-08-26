@@ -3546,6 +3546,64 @@ llvm::Function* Emitter::nestedCollectionDisposerThunk(const sema::TypeRef* elem
 }
 
 
+// fix #1889 / §28.6 / §30.5: dispose one Task / Task<T> / OwningTask<T>
+// element owned by an owning collection. Collection free callbacks have the
+// same `void(void*)` ABI as the class-element thunks above (passed to
+// bz_array_free / bz_llist_free / bz_dict_free as the per-element disposer),
+// but a task needs the full non-blocking protocol rather than a vtable Dispose
+// call: its unconsumed class result (OwningTask<T:class> via
+// bz_task_set_result_disposer, §30.5) and its fault object (§30.9 / #3030's
+// deferred-or-now-disposed prelude) are both part of the task's disposal
+// contract — a bare bz_task_free would reclaim only the task struct and leak
+// both. So this thunk calls emitTaskDisposal — the same helper the `using
+// var` task scope-end path (Disposal.cpp ~5127) and the owned-field path
+// (emitOwnedTaskDisposal, line 454) already share.
+//
+// The thunk is built in a private LLVM function while temporarily making it
+// the active emitter function (`currentFn_`) and insertion point, then
+// restoring the caller's. emitTaskDisposal reads/writes `builder_` /
+// `currentFn_` (CreateCondBr, CreateCall, declareC) so we must swap them
+// around the call — a LOCAL IRBuilder (the shape sharedReleaseThunk /
+// groupingFreeThunk / nestedCollectionDisposerThunk use) would not survive
+// emitTaskDisposal's first builder_ read. The save/restore is the same
+// pattern the existing field-path uses (emitTaskDisposal's own block
+// transitions); a null input is short-circuited inside emitTaskDisposal so
+// no extra guard is needed here. Cached per Task TypeRef* (each Task /
+// Task<T> / OwningTask<T> gets its own thunk so the per-T result_disposer
+// matches that element's concrete T — see emitTaskDisposal line 593 which
+// reads taskTy->genericArgs[0] via elementPolicyFor). // per §30.5 / §30.9
+llvm::Function* Emitter::taskElementDisposerThunk(const sema::TypeRef* taskTy) {
+    // Cache hit.
+    auto it = taskElementDisposerThunks_.find(taskTy);
+    if (it != taskElementDisposerThunks_.end()) return it->second;
+
+    // void(void*) thunk: void bz$taskElemDispose$N(bz_task_t* task)
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    // Per-TypeRef key on the symbol name (mirrors nestedCollectionDisposerThunk
+    // — guards against name clash if a module needs more than one Task thunk).
+    std::string name = "bz$taskElemDispose";
+    name += "$" + std::to_string(reinterpret_cast<std::uintptr_t>(taskTy));
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      name, module_.get());
+    taskElementDisposerThunks_[taskTy] = fn;
+    llvm::Argument* task = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+
+    // Swap builder_ / currentFn_ so emitTaskDisposal emits into `fn`. Restored
+    // before returning; the caller's insertion point is unchanged.
+    auto savedIP = builder_.saveIP();
+    llvm::Function* savedFn = currentFn_;
+    currentFn_ = fn;
+    builder_.SetInsertPoint(entry);
+    emitTaskDisposal(taskTy, task);
+    builder_.CreateRetVoid();
+    currentFn_ = savedFn;
+    builder_.restoreIP(savedIP);
+    return fn;
+}
+
+
 // #2279 (§30.5 Pattern A, v0.236): build the per-result-collection-type
 // `void(void*)` thunk that frees a Pattern A task's RESULT when that result
 // is itself an intrinsic collection (Array<T> / Set<T> / Dictionary<K,V> /
