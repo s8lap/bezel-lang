@@ -3219,6 +3219,35 @@ bool Emitter::isEventSourceTypeName(const sema::TypeRef* rt) {
     return n == "EventSource" || n == "AsyncEventSource";
 }
 
+// fix #1832 / stdlib §6.5 (v0.187): the cross-domain publication-point pair
+// (ISharedEvent<T> / SharedEventSource<T>). Same shape as the instance pair:
+// ISharedEvent<T> is the public subscribe-only face (its runtime value, like
+// IEvent<T>, is the same bz_event_source_t* the source-side field gives up),
+// and SharedEventSource<T> is the producer-side sealed class. Both have no
+// user TypeDecl and reach codegen as declaration-less Named refs whose head
+// name is the registered builtin. The interface face deliberately does NOT
+// extend IEvent<T> — spec §6.5 (v0.187) cuts that to keep the capture-free
+// admission from being laundered through IEvent<T>.Subscribe's scoped
+// signature — so the two predicates below stay disjoint from isIEventTypeName
+// / isEventSourceTypeName even though the runtime representation is shared
+// (a bz_event_source_t*; real synchronization discipline around the
+// subscriber list is a follow-up slice).
+bool Emitter::isISharedEventTypeName(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    return rt->headName() == "ISharedEvent";
+}
+
+bool Emitter::isSharedEventSourceTypeName(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    return rt->headName() == "SharedEventSource";
+}
+
 llvm::Value* Emitter::lowerEventHandlerClosure(const ast::Expr* handlerExpr,
                                                const sema::TypeRef* payload) {
     if (!handlerExpr) return nullptr;

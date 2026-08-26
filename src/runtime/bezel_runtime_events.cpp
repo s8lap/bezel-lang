@@ -297,6 +297,36 @@ extern "C" void bz_event_source_free(void* srcp) {
     free(s);
 }
 
+// fix #1832 / stdlib §6.5 (v0.187): the cross-domain publication-point pair
+// SharedEventSource<T> / ISharedEvent<T>. The runtime representation is the
+// same bz_event_source_t* the instance pair uses — the synchronized
+// quiescence / lock discipline around the subscriber list (the contract that
+// subscribe/raise/Subscription.Dispose are safe to reach from every domain) is
+// recorded for a follow-up slice; this first pair of entry points admits the
+// type names by mirroring the instance surface, leaving room for a future
+// mutex slot in the struct without changing the codegen contract.
+//
+// `bz_shared_event_source_new` deliberately routes through the same allocation
+// path bz_event_source_new uses (calloc + token=1), so the cross-domain path
+// cannot drift in handler-list initialization; the lock discipline will plug
+// in by mutating the returned struct's lock slot, not by changing how the
+// struct is allocated. Likewise `bz_shared_event_source_free` mirrors
+// bz_event_source_free: null-safe, severs the subscriber list, frees the
+// struct — the lock acquired at free time is a release-acquire detail that
+// does not change the shape.
+extern "C" void* bz_shared_event_source_new(void) {
+    // §6.5 (v0.187) / fix #1832: same allocation as bz_event_source_new —
+    // future synchronization will live in a struct slot, not in the
+    // allocation path.
+    return bz_event_source_new();
+}
+
+extern "C" void bz_shared_event_source_free(void* srcp) {
+    // §6.5 (v0.187) / fix #1832: null-safe, same reclaim shape as
+    // bz_event_source_free. Future synchronized quiescence plugs in here.
+    bz_event_source_free(srcp);
+}
+
 // per §24.5 / §30.13 / #1377: async-event RaiseAsync via continuation chaining.
 //
 // Problem with the prior implementation (bz_task_await_sync loop inside the

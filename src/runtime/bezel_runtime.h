@@ -1163,6 +1163,28 @@ void bz_subscription_dispose(void* sub);
 void bz_event_source_free(void* src);
 
 // ---------------------------------------------------------------------------
+// Shared event sources (stdlib §6.5, v0.187, fix #1832): the cross-domain
+// publication-point pair SharedEventSource<T> / ISharedEvent<T>. The runtime
+// representation is the same bz_event_source_t* the instance pair uses — the
+// cross-domain contract (synchronized quiescence / lock discipline around the
+// subscriber list for cross-domain subscribe/raise/Subscription.Dispose) is
+// recorded as a follow-up slice; this first pair of entry points admits the
+// type names by mirroring the instance surface. Reclaiming the source still
+// severs the subscriber list before freeing the struct, so a publisher's
+// disposal remains a deterministic unsubscribe-all (spec §28.14 quiescence).
+// ---------------------------------------------------------------------------
+
+// Allocate an empty SharedEventSource. Returns an opaque bz_event_source_t*.
+// This is the shared path's construction entry — distinct from
+// bz_event_source_new so a future mutex acquisition at construction time lands
+// on the shared path without disturbing the instance path's drain.
+void* bz_shared_event_source_new(void);
+
+// Free a SharedEventSource and its handler list. Null-safe (mirroring
+// bz_event_source_free: `if (!s) return;`).
+void bz_shared_event_source_free(void* src);
+
+// ---------------------------------------------------------------------------
 // String reference counting (§4.6 / §28.9, issue #422 strings increment).
 // `string` is runtime-managed (§4.6): its memory is reclaimed automatically.
 // Strings are immutable, reference-shared LEAVES (§28.8), so acyclic reference

@@ -184,6 +184,15 @@ int Resolver::builtinTypeArity(std::string_view n) {
         n == "ICollection" || n == "IList" ||
         n == "IOwningCollection" || n == "IOwningList" ||
         n == "IEvent" || n == "IAsyncEvent" ||
+        // fix #1832 / stdlib §6.5 (v0.187): the cross-domain publication-
+        // point pair (sibling of IEvent/IAsyncEvent + EventSource/AsyncEventSource
+        // above). ISharedEvent<out T> is the public subscribe-only face,
+        // SharedEventSource<T> is the producer-side sealed class. Both are
+        // declaration-less Named refs at arity 1, same shape as the instance
+        // pair — the runtime synchronization is a follow-up slice; this just
+        // admits the names so sema no longer rejects `SharedEventSource<int>`
+        // / `ISharedEvent<int>` as "unresolved type name".
+        n == "ISharedEvent" || n == "SharedEventSource" ||
         // stdlib §6.5 / spec §2.3 (fix #1536): EventSource<T> / AsyncEventSource<T>
         // — the producer-side (in-declaring-class) face of an event member
         // (§24.3). Per §2.3, `IEvent<T>`/`IAsyncEvent<T>` are auto-imported (they

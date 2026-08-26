@@ -9393,7 +9393,17 @@ static bool isInSynchronizedSet(const TypeRef* rt) {
     if (n.empty()) return false;
     return n == "Mutex" || n == "Semaphore" ||
            n == "Atomic" || n == "AtomicInteger" ||
-           n == "ChannelSender";
+           n == "ChannelSender" ||
+           // fix #1832 / §22.12 rule 5 / stdlib §6.5 (v0.187): the §6.5
+           // cross-domain publication-point pair (SharedEventSource<T>) is
+           // the documented form-(i) example — the entire point of the pair
+           // is that static reachability replaces transfer as the
+           // distribution mechanism, and the synchronized fact is what makes
+           // that safe. Adding it here lets the rule-4 warning be silenced
+           // on the recommended `static readonly SharedEventSource<T>` shape
+           // and lets §22.12 rule 2's form-(i) overwrite-never-disposes
+           // store apply uniformly with the rest of the synchronized set.
+           n == "SharedEventSource";
 }
 
 // §22.12 rule 2 form (ii) (v0.181, #1556): the lazy task cache. A mutable static

@@ -3561,6 +3561,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             auto* newFn = declareC("bz_event_source_new", ptrTy(), {});
             return builder_.CreateCall(newFn, {}, "event.source");
         }
+        // fix #1832 / stdlib §6.5 (v0.187): user construction of a
+        // cross-domain publication point — `new SharedEventSource<T>()`. Same
+        // shape as the instance source above (declaration-less Named ref,
+        // bz_event_source_t* runtime rep), with a distinct allocation entry
+        // point bz_shared_event_source_new that mirrors the cross-domain
+        // contract (synchronized quiescence on dispose; record-side the
+        // runtime reserves a slot for a future mutex). The disposal arm in
+        // emitOwnedFieldDisposals matches via isOwnedSharedEventSourceField.
+        if (isSharedEventSourceTypeName(rt)) {
+            auto* newFn = declareC("bz_shared_event_source_new", ptrTy(), {});
+            return builder_.CreateCall(newFn, {}, "shared.event.source");
+        }
         // CG22: built-in exception types (Exception, ArgumentException, …)
         // have no user TypeSymbol (rt->declaration == null) but do have a
         // built-in vtable from setupBuiltinExceptions. Construct a 16-byte

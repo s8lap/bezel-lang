@@ -1353,6 +1353,15 @@ private:
         // "AsyncEventSource" in the declared type, the NewExpr type name, or the
         // inferred initializer exprType (the #2017 generic-factory shape).
         bool eventSource = false;
+        // fix #1832 / stdlib §6.5 (v0.187): a `using var` (or §28.3
+        // auto-drop) bound to a SharedEventSource<T>. Same shape as
+        // `eventSource` above (declaration-less Named ref, bz_event_source_t*
+        // rep) but routed through bz_shared_event_source_free so the
+        // cross-domain synchronized quiescence lives at the right entry
+        // point. Recognised by the builtin type name "SharedEventSource" in
+        // the declared type / NewExpr type / inferred initializer exprType
+        // — same recognition shapes as the instance pair.
+        bool sharedEventSource = false;
         // fix #2921 (spec §28.9 / §28.3, stdlib §3, v0.240): a `using var` (or
         // §28.3 auto-drop) bound to a VTABLE-LESS BUILT-IN CLASS that no arm
         // above claims. `vtablelessBuiltin` is that built-in's name; scope exit
@@ -9164,6 +9173,40 @@ private:
         return false;
     }
 
+    // fix #1832 / stdlib §6.5 (v0.187): true when `fs` is an `owned` field of
+    // type SharedEventSource<T> — the cross-domain publication-point sealed
+    // class. Same shape as isOwnedEventSourceField: declaration-less Named
+    // ref, bz_event_source_t*-shaped runtime rep (the synchronized quiescence
+    // / lock discipline lives in the runtime's bz_shared_event_source_free;
+    // from codegen's view the disposal looks the same as the instance pair,
+    // except it calls bz_shared_event_source_free not bz_event_source_free so
+    // a future mutex can be acquired at free time without disturbing the
+    // instance path).
+    bool isOwnedSharedEventSourceField(const sema::FieldSymbol* fs) const {
+        if (fs->posParam) {
+            const sema::TypeRef* pt = capturedOwnedPrimaryParamType(fs);
+            return isSharedEventSourceTypeName(pt);
+        }
+        if (!hasOwnedModifier(fs)) return false;
+        const sema::TypeRef* rt = nullptr;
+        if (!fs->decl) {
+            rt = ctx_.importedMemberType(fs);
+        } else {
+            auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->type) return false;
+            rt = ctx_.resolvedType(*fd->type);
+        }
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+            return false;
+        if (isSharedEventSourceTypeName(rt)) return true;
+        // #662 foundation B twin: an IMPORTED field has no astNode; the type
+        // name rides importedName.
+        if (!fs->decl) {
+            return rt->importedName == "SharedEventSource";
+        }
+        return false;
+    }
+
     // #362 / stdlib §4.5: if `fs` is an `owned` field whose type is a heap
     // collection (Array<T>/OwningArray<T>/…, builtins with no TypeSymbol so
     // isOwnedReferenceField does not match them), return its resolved TypeRef;
@@ -14391,6 +14434,14 @@ private:
     static bool isIEventTypeName(const sema::TypeRef* rt);
     // §6.5 / §24.3 (#1610): producer-side "EventSource"/"AsyncEventSource".
     static bool isEventSourceTypeName(const sema::TypeRef* rt);
+    // fix #1832 / stdlib §6.5 (v0.187): cross-domain publication-point pair.
+    // ISharedEvent<T> is the public subscribe-only face; SharedEventSource<T>
+    // is the producer-side sealed class. Mirrors isIEventTypeName /
+    // isEventSourceTypeName — declaration-less Named refs with the registered
+    // builtin head — and is INTENTIONALLY disjoint from them (SharedEventSource
+    // does NOT implement IEvent, per spec §6.5 v0.187).
+    static bool isISharedEventTypeName(const sema::TypeRef* rt);
+    static bool isSharedEventSourceTypeName(const sema::TypeRef* rt);
 
     // per §24.4: `<event> += h` / `<event> -= h` inside the declaring class —
     // a fixed desugaring to Add/Remove. Returns true when handled.

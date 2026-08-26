@@ -15924,6 +15924,38 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // fix #1832 / stdlib §6.5 (v0.187): a `using var` bound to a
+    // SharedEventSource<T>. Same shape as the `eventSource` arm above
+    // (declaration-less Named ref, bz_event_source_t* rep), with the
+    // cross-domain entry point bz_shared_event_source_free so the
+    // synchronized quiescence lands on the right runtime call. Without
+    // this arm the source leaks its subscriber list + struct at scope end
+    // — the codegen-owned-field path already routes owned SharedEventSource
+    // fields through isOwnedSharedEventSourceField above, but the LOCAL
+    // path is wired here.
+    {
+        auto isSharedEvSrcName = [](const sema::TypeRef* rt) {
+            return rt && rt->kind == sema::TypeRef::Kind::Named &&
+                   !rt->declaration && rt->astNode && rt->astNode->name &&
+                   !rt->astNode->name->parts.empty() &&
+                   rt->headName() == "SharedEventSource";
+        };
+        bool isSES = false;
+        if (ld->type) isSES = isSharedEvSrcName(ctx_.resolvedType(*ld->type));
+        if (!isSES && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isSES = newExprBuiltinHead(ne) == "SharedEventSource";
+        }
+        if (!isSES && ld->initializer)
+            isSES = isSharedEvSrcName(ctx_.exprType(*ld->initializer));
+        if (isSES) {
+            Disposal d{it->second, nullptr};
+            d.sharedEventSource = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
     // stdlib §6.7 / §30.5: a `using var` bound to a Task / Task<T> / OwningTask<T>.
     // Tasks have no user TypeSymbol; at scope end the task is freed via bz_task_free.
     // Double-free safety: lowerAwait only frees tasks whose operand is an anonymous

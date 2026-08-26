@@ -186,7 +186,7 @@ BEZEL_TEST(builtin_registry_snapshot, iterable_interface_head_set) {
 // (imported-only) are deliberately NOT in the shared set — they are the small
 // site-local deltas the two call sites still test explicitly.
 BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
-    static constexpr std::array<std::string_view, 67> kSnapshot = {
+    static constexpr std::array<std::string_view, 69> kSnapshot = {
         "Array", "OwningArray", "Dictionary", "OwningDictionary",
         // INTENTIONAL addition (stdlib §4.18, #1426): SortedSet — bz_dict_t*
         // rep on both the astNode and imported paths.
@@ -227,6 +227,13 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         // AsyncEventSource<T> — the producer-side event face (§24.3), same
         // ptr rep as IEvent<T>/IAsyncEvent<T>.
         "IEvent", "IAsyncEvent", "EventSource", "AsyncEventSource",
+        // INTENTIONAL addition (stdlib §6.5, fix #1832, v0.187):
+        // ISharedEvent<T> / SharedEventSource<T> — the cross-domain
+        // publication-point pair, same ptr rep as the instance pair. The
+        // cross-domain synchronization discipline lives at the runtime
+        // entry point (bz_shared_event_source_*); type-name registration
+        // here just admits the names.
+        "ISharedEvent", "SharedEventSource",
         "Mutex", "Lock", "Semaphore", "SemaphoreToken",
         "TaskCompletionSource", "OwningTaskCompletionSource",
         "Atomic", "AtomicInteger", "Buffer",
@@ -294,8 +301,10 @@ BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
     // from the deleted duplicate WAS the defect, plus the long-standing ones.
     for (std::string_view n : {"Stopwatch", "FileStream", "TaskScope",
                                "SortedDictionary", "SortedSet",
-                               "IEvent", "IAsyncEvent", "EventSource",
-                               "AsyncEventSource", "ISerializer",
+                               "IEvent", "IAsyncEvent", "ISharedEvent",
+                               "EventSource", "AsyncEventSource",
+                               "SharedEventSource",
+                               "ISerializer",
                                "IDeserializer", "ISerializable",
                                "IDeserializable", "BinarySerializer",
                                "BinaryDeserializer", "JsonSerializer",
@@ -362,6 +371,12 @@ BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
                                "CancellationTokenSource", "TaskScope",
                                "Shared", "Weak", "Channel", "ChannelSender",
                                "EventSource", "AsyncEventSource",
+                               // fix #1832 (stdlib §6.5, v0.187):
+                               // SharedEventSource<T> — concrete class head,
+                               // not an interface; same vtable-less treatment
+                               // as the instance pair (heap-allocated, no
+                               // vtable, freed via bz_shared_event_source_free).
+                               "SharedEventSource",
                                "Mutex", "Lock", "Semaphore", "SemaphoreToken",
                                "TaskCompletionSource",
                                "OwningTaskCompletionSource",
@@ -374,12 +389,12 @@ BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
     // (b) OUT: every reserved INTERFACE head — the receivers that may hold a
     // user class and must keep dispatching through its vtable. This is the
     // whole content of the subtraction, so it is pinned name-for-name.
-    static constexpr std::array<std::string_view, 21> kInterfaceHeads = {
+    static constexpr std::array<std::string_view, 22> kInterfaceHeads = {
         "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
         "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
         "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
         "ICollection", "IList", "IOwningCollection", "IOwningList",
-        "IEvent", "IAsyncEvent", "IGrouping",
+        "IEvent", "IAsyncEvent", "ISharedEvent", "IGrouping",
         "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
     };
     for (auto n : kInterfaceHeads) {
@@ -412,12 +427,12 @@ BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
 // reads, so any drift between this snapshot and the `kBuiltinInterfaceHeads`
 // array it mirrors is the regression shape.
 BEZEL_TEST(builtin_registry_snapshot, builtin_interface_head_set_8_1) {
-    static constexpr std::array<std::string_view, 21> kInterfaceHeads = {
+    static constexpr std::array<std::string_view, 22> kInterfaceHeads = {
         "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
         "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
         "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
         "ICollection", "IList", "IOwningCollection", "IOwningList",
-        "IEvent", "IAsyncEvent", "IGrouping",
+        "IEvent", "IAsyncEvent", "ISharedEvent", "IGrouping",
         "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
     };
     for (auto n : kInterfaceHeads) {
@@ -456,6 +471,11 @@ BEZEL_TEST(builtin_registry_snapshot, builtin_interface_head_set_8_1) {
                                "CancellationTokenSource", "TaskScope",
                                "Shared", "Weak", "Channel", "ChannelSender",
                                "EventSource", "AsyncEventSource",
+                               // fix #1832 (stdlib §6.5, v0.187):
+                               // SharedEventSource<T> — class head, NOT an
+                               // interface head (the interface in this pair
+                               // is ISharedEvent<T>).
+                               "SharedEventSource",
                                "Mutex", "Lock", "Semaphore", "SemaphoreToken",
                                "TaskCompletionSource",
                                "OwningTaskCompletionSource",
@@ -512,6 +532,9 @@ BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3
         "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
         "Channel", "ChannelSender",
         "EventSource", "AsyncEventSource",
+        // fix #1832 (stdlib §6.5, v0.187): SharedEventSource<T> — same
+        // §28.9 vtable-less reclaim discipline as the instance sources.
+        "SharedEventSource",
         "Subscription",
         "TaskScope", "CancellationTokenSource",
         "Mutex", "Lock", "Semaphore", "SemaphoreToken",
@@ -554,7 +577,7 @@ BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3
 // deliberately does not name them) stay OUT — they render lowercase or
 // not at all, respectively.
 BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
-    static constexpr std::array<std::string_view, 78> kSnapshot = {
+    static constexpr std::array<std::string_view, 79> kSnapshot = {
         // §2 System — §2.5/§2.6 value-builtins whose box thunk renders the
         // type-name literal (fix #3119 (a)).
         "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid",
@@ -599,6 +622,9 @@ BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
         "JsonDeserializer",
         // §24.3 — event sources.
         "EventSource", "AsyncEventSource",
+        // fix #1832 (stdlib §6.5, v0.187): SharedEventSource<T> —
+        // cross-domain publication point. Same module as the instance pair.
+        "SharedEventSource",
         // §2.11 — Subscription.
         "Subscription",
     };
@@ -611,6 +637,8 @@ BEZEL_TEST(builtin_registry_snapshot, builtin_class_module_path_set) {
         "ulong", "float", "double", "decimal", "char", "string",
         "IEnumerable", "IEnumerator", "ICollection", "IList",
         "ISerializer", "IDeserializer", "IEvent", "IAsyncEvent",
+        // fix #1832: ISharedEvent<T> is an interface head (§2.13 rule 1).
+        "ISharedEvent",
     })
         BEZEL_EXPECT_TRUE(builtinClassModulePathOf(n).empty());
 }

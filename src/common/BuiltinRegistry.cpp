@@ -130,7 +130,7 @@ constexpr std::array<std::string_view, 3> kFfiBufferBuiltins = {
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
 // (imported-only) are NOT here — they stay as explicit deltas at the sites.
-constexpr std::array<std::string_view, 67> kHeapPointerReferenceBuiltins = {
+constexpr std::array<std::string_view, 69> kHeapPointerReferenceBuiltins = {
     // §4 collections (SortedSet: stdlib §4.18/#1426 — bz_dict_t* rep, both paths)
     "Array", "OwningArray", "Dictionary", "OwningDictionary",
     "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
@@ -176,7 +176,16 @@ constexpr std::array<std::string_view, 67> kHeapPointerReferenceBuiltins = {
     // §24.3 event sources; §6.5 / fix #1536: EventSource<T>/AsyncEventSource<T>
     // (the producer-side face, §24.3) are heap-allocated like the IEvent<T>/
     // IAsyncEvent<T> interfaces above — same ptr rep, no user TypeDecl.
-    "IEvent", "IAsyncEvent", "EventSource", "AsyncEventSource",
+    //
+    // fix #1832 / §6.5 (v0.187): the cross-domain publication-point pair
+    // ISharedEvent<T> / SharedEventSource<T> share the §24.3 same ptr rep (a
+    // bz_event_source_t*; a real synchronization discipline around the
+    // subscriber list is recorded for a later slice and is the runtime-side
+    // contract — the type-name registration here just admits them). Both names
+    // are heap-pointer references with no user TypeDecl, exactly like the
+    // instance pair above.
+    "IEvent", "IAsyncEvent", "ISharedEvent",
+    "EventSource", "AsyncEventSource", "SharedEventSource",
     // §6.2/§6.3 sync primitives
     "Mutex", "Lock", "Semaphore", "SemaphoreToken",
     // §6.6 task-completion sources; §6.4 atomics; #545 Buffer
@@ -290,14 +299,14 @@ kPositionalCtorOnlyBuiltinRecordArities = {{
 // every OTHER reserved name denotes a concrete built-in whose runtime value is
 // a header-less C struct. See the header for why the derivation runs in this
 // direction (a forgotten entry here costs a leak, never a wild jump).
-constexpr std::array<std::string_view, 21> kBuiltinInterfaceHeads = {
+constexpr std::array<std::string_view, 22> kBuiltinInterfaceHeads = {
     // §29 iteration / collection interfaces
     "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
     "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
     "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
     "ICollection", "IList", "IOwningCollection", "IOwningList",
     // §24.3 / §6.5 event faces; §5 groupings
-    "IEvent", "IAsyncEvent", "IGrouping",
+    "IEvent", "IAsyncEvent", "ISharedEvent", "IGrouping",
     // §2.14–§2.15 serialization vocabulary
     "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
 };
@@ -478,7 +487,7 @@ bool isBuiltinInterfaceHead(std::string_view n) {
 // invariant). That decision is filed separately; the table here matches the
 // lint's current table so the lift is behaviour-preserving.
 // per §28.3 / §28.9 / §28.10, fix #2992
-constexpr std::array<std::string_view, 40> kDisposableBuiltinHeadNames = {
+constexpr std::array<std::string_view, 41> kDisposableBuiltinHeadNames = {
     // fix #2269 (§28.9, v0.240): StringBuilder is REMOVED from the disposable
     // set. The spec (§28.9 L7363) classifies StringBuilder as TRIVIAL-DISPOSE
     // ("declares no destructor and no `owned` fields, and its intrinsic
@@ -509,6 +518,12 @@ constexpr std::array<std::string_view, 40> kDisposableBuiltinHeadNames = {
     // §30.15 channels; §24.3 events; §2.11 subscription.
     "Channel", "ChannelSender",
     "EventSource", "AsyncEventSource",
+    // fix #1832 / §6.5 (v0.187): SharedEventSource<T> — same §28.9
+    // vtable-less reclaim discipline as the instance sources (the
+    // synchronized quiescence / lock discipline is a runtime concern; the
+    // shape that matters here is that an owned field of this head is
+    // bz_event_source_t*-shaped and freed through the chain).
+    "SharedEventSource",
     "Subscription",
     // §6.10 nursery; §6.1 cancellation.
     "TaskScope", "CancellationTokenSource",
@@ -649,7 +664,7 @@ struct BuiltinClassModulePath {
     std::string_view name;
     std::string_view modulePath;
 };
-constexpr std::array<BuiltinClassModulePath, 78> kBuiltinClassModulePaths = {{
+constexpr std::array<BuiltinClassModulePath, 79> kBuiltinClassModulePaths = {{
     // stdlib §2 (System) — the §2.5/§2.6 temporal/identity value types are
     // value-shaped (§3.1) but their BOX thunk (`valueBuiltinBoxToStringThunk`)
     // is in the §8.5 default path, so they belong here too.
@@ -759,6 +774,11 @@ constexpr std::array<BuiltinClassModulePath, 78> kBuiltinClassModulePaths = {{
     // the class heads go under `System`, the interface heads are out.
     {"EventSource", "System"},
     {"AsyncEventSource", "System"},
+    // fix #1832 / §6.5 (v0.187): the shared cross-domain publication
+    // point. Same module as the instance pair (System.Threading, exposed as
+    // `System` per §2.3's auto-import rule); the interface head ISharedEvent
+    // is intentionally absent per the §2.13 rule 1 contract.
+    {"SharedEventSource", "System"},
     // §2.11 (#2190): Subscription — a class head under `System`.
     {"Subscription", "System"},
 }};

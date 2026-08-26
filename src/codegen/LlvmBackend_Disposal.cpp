@@ -788,6 +788,14 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // field — a bz_event_source_t* freed via bz_event_source_free (null-safe),
         // which reclaims the subscriber list and the struct. No vtable.
         bool eventSourceField = false;
+        // fix #1832 / stdlib §6.5 (v0.187): true for an owned
+        // SharedEventSource<T> field — the cross-domain publication-point
+        // sealed class. Same runtime rep (a bz_event_source_t*) as the
+        // instance pair, but the disposal call is bz_shared_event_source_free
+        // so the synchronized quiescence / lock discipline lands on the right
+        // runtime entry point (a future mutex acquired at free time must not
+        // disturb the instance path's drain).
+        bool sharedEventSourceField = false;
         // §28.6 / §30.5 (#1889): true for an owned Task / Task<T> / OwningTask<T>
         // field — their Dispose() runs the full using-var task protocol via
         // emitOwnedTaskDisposal (error_obj prelude + per-T result_disposer +
@@ -895,6 +903,14 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // (null-safe), which reclaims the subscriber list + struct.
             OwnedField of{fs, nullptr};
             of.eventSourceField = true;
+            owned.push_back(of);
+        } else if (isOwnedSharedEventSourceField(fs)) {
+            // fix #1832 / stdlib §6.5 (v0.187): an `owned`
+            // SharedEventSource<T> field. Same rep as the instance pair but
+            // freed via bz_shared_event_source_free so the cross-domain
+            // synchronized quiescence lands on the right entry point.
+            OwnedField of{fs, nullptr};
+            of.sharedEventSourceField = true;
             owned.push_back(of);
         } else if (taskFamilyTypeFromField(fs)) {
             // §28.6 / §30.5 (#1889): an `owned` Task / Task<T> / OwningTask<T>
@@ -1094,6 +1110,20 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
         // no-op.
         if (it->eventSourceField) {
             auto* freeFn = declareC("bz_event_source_free",
+                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(freeFn, {val});
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            continue;
+        }
+        // fix #1832 / stdlib §6.5 (v0.187): owned SharedEventSource<T> field —
+        // free via bz_shared_event_source_free (null-safe, reclaims the
+        // subscriber list + struct). The shared path is structurally a sibling
+        // of the instance pair above, with the synchronized quiescence /
+        // lock discipline on the runtime side; the codegen contract is
+        // identical (null-safe free, null-after to make re-entrant passes
+        // no-ops).
+        if (it->sharedEventSourceField) {
+            auto* freeFn = declareC("bz_shared_event_source_free",
                                     llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(freeFn, {val});
             builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
@@ -5477,6 +5507,37 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             builder_.CreateCondBr(isNull, contBB, frBB);
             builder_.SetInsertPoint(frBB);
             auto* fn = declareC("bz_event_source_free",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {src});
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // fix #1832 / stdlib §6.5 (v0.187): a `using var` SharedEventSource<T>
+        // — a bz_event_source_t* with no vtable, freed via
+        // bz_shared_event_source_free (null-safe). Same null-guard /
+        // null-after discipline as `it->eventSource` above so a ctor that
+        // threw before the local was assigned (or a moved-out slot) is safe,
+        // and a re-entrant / unwind pass is a no-op. The runtime entry point
+        // is the only difference from `eventSource` — the synchronized
+        // quiescence discipline lives there, so a future mutex acquired at
+        // free time won't disturb the instance path.
+        if (it->sharedEventSource) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* src = builder_.CreateLoad(ptrTy(), addr,
+                                                   "sesrc.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                src, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "sesrc.free",
+                                                    currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "sesrc.cont",
+                                                    currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* fn = declareC("bz_shared_event_source_free",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {src});
             builder_.CreateStore(
