@@ -172,3 +172,66 @@ BEZEL_TEST(property_face_wrapper_claim_3419,
     // about the CLAIM, not the order (which #3405's test pins).
     BEZEL_EXPECT_EQ(r.exitCode, 207);
 }
+
+// ---------------------------------------------------------------------------
+// (C) THE TOO-WIDE HALF -- the direction that is a WILD JUMP, not a leak.
+//
+//     The stale claim list also gated on `getterTy->declaration != nullptr`,
+//     which claimed a wrapper frame on every one of
+//     `wrapUserClassAsIEnumerable`'s DECLINE paths. This program takes one of
+//     them: `Src`'s `GetEnumerator` returns an iterator-METHOD result, so no
+//     `TypeSymbol` is structurally an enumerator, `enumTs` stays null, and the
+//     wrap declines -- while the old predicate claimed a frame anyway and the
+//     scope-end disposal then called the interface-map GLOBAL as a function.
+//
+//     Measured on 0c5ecd1 (`bezelc` built from that tree, generated-code ASan):
+//
+//       AddressSanitizer: SEGV on unknown address 0x000000556820
+//       Hint: PC is at a non-executable region. Maybe a wild jump?
+//         #0 ... in itmap$Src
+//       -> exit 1
+//
+//     and clean at exit 7 with the fix. `itmap$Src` is #2975's shape exactly.
+//
+//     ⚠ This row exists because the too-wide half is the DANGEROUS half and
+//     rows (A) and (B) pin only the too-narrow one. Without it a future change
+//     could re-widen the claim -- reintroducing a wild jump -- with the whole
+//     suite green. A leak regression is recoverable; this one is not.
+//     per §28.6, §29.2, §2975
+// ---------------------------------------------------------------------------
+BEZEL_TEST(property_face_wrapper_claim_3419,
+           declined_user_class_wrap_claims_no_frame_28_6) {
+    JitResult r = runAotChecked(
+        "module M; "
+        "class Src: IEnumerable<int> "
+        "  public method GetEnumerator(): owned IEnumerator<int> "
+        "    return Gen(); "
+        "  end GetEnumerator; "
+        "  private method Gen(): owned IEnumerator<int> "
+        "    yield return 1; "
+        "    yield return 2; "
+        "  end Gen; "
+        "end Src; "
+        "class C "
+        "  private owned _s: Src; "
+        "  public constructor() _s := new Src(); end constructor; "
+        "  public property Items: IEnumerable<int> => _s; "
+        "end C; "
+        "class Main "
+        "  public static method Main(): int "
+        "    using var c := new C(); "
+        "    var i := 0; "
+        "    while i < 5 do "
+        "      var e := c.Items; "
+        "      i := i + 1; "
+        "    end while; "
+        "    return 7; "
+        "  end Main; "
+        "end Main;");
+    if (wasSkipped(r)) return;
+    // `r.ran` is the load-bearing assertion: pre-fix the process died on a wild
+    // jump, so it is false there. The exit code then pins that the five reads
+    // completed rather than the program merely surviving.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
