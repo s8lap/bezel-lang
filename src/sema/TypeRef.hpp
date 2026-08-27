@@ -197,4 +197,32 @@ inline bool primitiveNeverConformsToBuiltinIface(std::string_view head) {
     return head == "IDisposable" || head == "IAsyncDisposable";
 }
 
+// fix #3434 (spec §4.7 *The unit type* / §21.7 *The `return` statement*,
+// v0.283): does a callable whose return-type ascription RESOLVES to `r`
+// produce a value?
+//
+// §4.7 makes `()` "the type with exactly one value" and "the return type of
+// methods declared without an explicit return type", so a written `: ()` and a
+// missing ascription name ONE type and one contract — a callable that yields
+// nothing. `()?` is a different type ("an optional with two values, `null` and
+// `()`"), so a callable ascribed `()?` DOES return a value; that `!nullable`
+// conjunct is load-bearing and is #3095's.
+//
+// The caller supplies the resolved TypeRef for an ascription that EXISTS. A
+// missing ascription is the caller's own "no value" case (there is no TypeRef
+// to pass), and a null `r` here means an ascription that failed to resolve —
+// which must NOT be read as unit, because that would suppress a real diagnostic
+// on a broken program.
+//
+// This exists because the decision had been made TWICE and the two answers had
+// drifted: sema's `ExprTC::returnsValue` (which drives §21.7's ReturnCtx, so
+// `method Give(): () return C.Nothing(); end Give;` is rejected with "this
+// callable has no return type") said yes to the equivalence, while codegen's
+// `Emitter::arrowBodyLoweredAsUnit` tested the SPELLING — `!declRet`, whether a
+// return type was WRITTEN — and so drew a spurious `#2491` internal-degrade
+// note on `method M(): () => UnitCall();`. Both now ask here.
+inline bool ascribedReturnTypeProducesValue(const TypeRef* r) {
+    return !(r && r->kind == TypeRef::Kind::Unit && !r->nullable);
+}
+
 } // namespace bezel::sema

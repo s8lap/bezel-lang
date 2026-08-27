@@ -2829,18 +2829,21 @@ TypeRef* ExprTC::substituteGenericCaseFieldType(
 // resolves to the unit type → no. Anything else → yes.
 bool ExprTC::returnsValue(const ast::Type* rt) {
     if (!rt) return false;
-    TypeRef* r = ctx_.resolvedType(*rt);
-    // fix #3095 / §4.7 (v0.252): `!r->nullable` is load-bearing. `()` IS the
-    // implicit return type of a callable declared without one, so a `: ()`
-    // ascription is a void-method context — but `()?` is a DIFFERENT type,
-    // "an optional with two values, `null` and `()`" (§4.7), and a method
-    // ascribed `()?` therefore DOES return a value. Without the conjunct this
-    // folded `()?` into the no-return-type case and §21.7's value-carrying-
-    // `return` rejection fired on `return null;` — "this callable has no return
-    // type — `return` may not carry a value" reported for a callable that has
-    // one. // per §4.7, §21.7
-    if (r && r->kind == TypeRef::Kind::Unit && !r->nullable) return false;
-    return true;
+    // fix #3095 / §4.7 (v0.252): the `!r->nullable` conjunct inside the shared
+    // predicate is load-bearing. `()` IS the implicit return type of a callable
+    // declared without one, so a `: ()` ascription is a void-method context —
+    // but `()?` is a DIFFERENT type, "an optional with two values, `null` and
+    // `()`" (§4.7), and a method ascribed `()?` therefore DOES return a value.
+    // Without the conjunct this folded `()?` into the no-return-type case and
+    // §21.7's value-carrying-`return` rejection fired on `return null;` — "this
+    // callable has no return type — `return` may not carry a value" reported
+    // for a callable that has one. // per §4.7, §21.7
+    //
+    // fix #3434 (v0.283): the test itself now lives in
+    // `sema::ascribedReturnTypeProducesValue` (sema/TypeRef.hpp), because
+    // codegen needs the SAME answer and had been deciding it from the spelling
+    // instead. See that predicate's comment.
+    return sema::ascribedReturnTypeProducesValue(ctx_.resolvedType(*rt));
 }
 
 // async-readiness 3b (§30.1): map an `async` method's declared return type to

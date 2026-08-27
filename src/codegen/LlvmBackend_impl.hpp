@@ -14851,10 +14851,39 @@ private:
     // ONE predicate, called from both arrow-body faces of the #2491 diagnostic
     // — #2924's four-way-mirror finding is that this message is already
     // hand-copied four times, and this must not make it five.
+    //
+    // fix #3434 (§4.7 / §21.7, v0.283): the first conjunct used to be the bare
+    // `!declRet` — a test on whether a return type was WRITTEN, not on what the
+    // callable returns. §4.7 makes the two spellings one type ("`()` is the
+    // type with exactly one value … It is the return type of methods declared
+    // without an explicit return type"), and the front end already agreed:
+    // §21.7 rejects `method Give(): () return C.Nothing(); end Give;` with
+    // "this callable has no return type — `return` may not carry a value",
+    // because sema's `returnsValue` treats a declared `: ()` as having none.
+    // §32.5 states the equivalence outright for the declarations it governs:
+    // "An FFI declaration with no `:` clause produces a unit-returning method;
+    // an explicit `: ()` is also accepted and means the same thing."
+    //
+    // So `method Push(s: ChannelSender<int>): () => s.Send(42);` drew the
+    // spurious `#2491` degrade note that #2963 exists to suppress, while the
+    // identical program with the ascription deleted did not. The gate is now
+    // the SEMANTIC one, asked of the shared authority sema's `returnsValue`
+    // asks (`sema::ascribedReturnTypeProducesValue`) rather than a second
+    // spelling of it — the #3419 shape. `resolveTypeParamRef` is applied first
+    // so a generic return type monomorphized to `()` (§7.10's `where T: value`
+    // admits the unit type) answers as the concrete type it is; it is a no-op
+    // for every other ref.
+    //
+    // An ascription that FAILED to resolve answers "produces a value", so the
+    // note still fires on a broken program rather than being suppressed by the
+    // absence of a type.
     bool arrowBodyLoweredAsUnit(const ast::Expr* body,
                                 const ast::Type* declRet) const {
-        return !declRet && dynamic_cast<const ast::CallExpr*>(body) &&
-               lastCallHandledWithoutValue_;
+        if (!dynamic_cast<const ast::CallExpr*>(body)) return false;
+        if (!lastCallHandledWithoutValue_) return false;
+        if (!declRet) return true;
+        return !sema::ascribedReturnTypeProducesValue(
+            resolveTypeParamRef(ctx_.resolvedType(*declRet)));
     }
 
     // per §14.1/§14.2 + §26.5 (issue #391): bind a generic method's
