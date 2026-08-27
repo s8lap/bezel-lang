@@ -28,8 +28,16 @@
 #   -t TAG      prefix for this cycle's log names (default: the current HEAD sha)
 #   -n N        max attempts per mode before giving up (default 40)
 #
+# The tree it gates (#3413): the repo root is derived from THIS SCRIPT's own
+# location, so a gate follows the tree it was invoked from. The resolved path
+# and HEAD are printed in the banner and recorded in the verdict. Launching
+# another tree's copy of this script from your worktree is REFUSED (exit 66) —
+# say BEZEL_GATE_REPO=<path> if gating a different tree is deliberate.
+#
 # Exit codes: 0 = both modes trustworthy-green. Non-zero = the gate's own rc for
-# a real failure, or 99 if a mode never produced a trustworthy run.
+# a real failure, 66 if the tree to gate could not be resolved or disagreed with
+# the caller's (#3413), 67 if HEAD moved mid-cycle, or 99 if a mode never
+# produced a trustworthy run.
 #
 # Environment: BEZEL_NO_GC=1 is set for the gate runs — gate_and_push.sh's
 # post-push worktree reap is slow (~1 worktree / 14s) and has no business
@@ -37,8 +45,132 @@
 
 set -u
 
-REPO=/home/stepan/w/code/bezel-lang
-cd "$REPO" || exit 1
+# ── WHICH TREE DOES THIS GATE VALIDATE? (fix #3413) ─────────────────────────
+#
+# This was two lines: `REPO=/home/stepan/w/code/bezel-lang; cd "$REPO"`. A
+# literal. gate_and_push.sh cds to `git rev-parse --show-toplevel`, so launching
+# it from a lane or integration worktree LOOKS like it gates that worktree — and
+# then this script cd'd away to the shared checkout and gated whatever THAT tree
+# had checked out. The verdict named a tree the operator never selected.
+#
+# The failure is silent and biased toward FALSE GREEN: the shared checkout
+# normally sits on already-landed `main`, by construction the tree most likely
+# to be clean, so a gate that misses its target cannot fail on the new work.
+#
+# MEASURED (Run 4 cycle 4, 2026-08-27): the cycle reported "BOTH oracles PASS,
+# 19071/19071 gtests, 0 ASan" and pushed e9bd762, while its own
+# gate-verdict.json recorded head=d34c8b4 — the previous day's commit on branch
+# cycle-2-integration-v3. `git diff d34c8b4 e9bd762` is 56 files / +7775 lines.
+# Nine commits reached main ungated. Two defects escaped through that hole and
+# were found only by hand: #2837's regression test, whose assertions compare an
+# 8-bit exit status against 501 and so were arithmetically unreachable from the
+# day they were added, and a gap-pin whose rejection had been superseded two
+# days earlier.
+#
+# The root now comes from the script's OWN location, so the gate follows the
+# tree it was invoked from. BEZEL_GATE_REPO=<path> overrides it for the
+# deliberate case — and, because it makes the operator NAME the tree, it is also
+# the only way past the mismatch refusal below.
+#
+# FAIL CLOSED, ALWAYS: every failure to resolve a root exits, never falls back
+# to a literal. A gate that cannot name the tree it validates must not run.
+
+GATE_LAUNCH_DIR="$PWD"
+
+# _gfc_root DIR -> the git worktree root containing DIR, as a PHYSICAL path, on
+# stdout; empty output + rc 1 when DIR is not inside a worktree. `pwd -P`
+# normalizes the symlinked lane paths scripts/lane_setup.sh creates, so two
+# spellings of ONE tree can never read as a mismatch below (a false refusal on a
+# correct tree would block every push, which is the one outcome worse than the
+# bug being fixed).
+_gfc_root() {
+  local top
+  top="$(git -C "$1" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [ -n "$top" ] || return 1
+  (cd "$top" 2>/dev/null && pwd -P) || return 1
+}
+
+if [ -n "${BEZEL_GATE_REPO:-}" ]; then
+  REPO="$(_gfc_root "$BEZEL_GATE_REPO")" || REPO=""
+  REPO_SOURCE="BEZEL_GATE_REPO override"
+  if [ -z "$REPO" ]; then
+    echo "gate_full_cycle: REFUSING — BEZEL_GATE_REPO='$BEZEL_GATE_REPO' is not inside a git worktree." >&2
+    echo "  A gate that cannot name the tree it validates must not run (#3413)." >&2
+    exit 66
+  fi
+else
+  _gfc_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd -P)" || _gfc_self_dir=""
+  REPO=""
+  if [ -n "$_gfc_self_dir" ]; then
+    REPO="$(_gfc_root "$_gfc_self_dir")" || REPO=""
+  fi
+  REPO_SOURCE="this script's own location"
+  if [ -z "$REPO" ]; then
+    echo "gate_full_cycle: REFUSING — cannot derive a repo root from this script's" >&2
+    echo "  location ('${BASH_SOURCE[0]:-$0}'). A gate that cannot name the tree it" >&2
+    echo "  validates must not run (#3413). Set BEZEL_GATE_REPO=<path> to say which." >&2
+    exit 66
+  fi
+fi
+
+cd "$REPO" || { echo "gate_full_cycle: REFUSING — cannot cd to '$REPO' (#3413)." >&2; exit 66; }
+
+# The identity of the tree under gate, captured ONCE, here. Everything that
+# reports on this cycle — the banner, the cycle log, the verdict — reads these
+# variables, so a report can never describe a tree other than the one entered.
+GATE_REPO_HEAD="$(git rev-parse HEAD 2>/dev/null || echo '')"
+GATE_REPO_HEAD_SHORT="$(git rev-parse --short HEAD 2>/dev/null || echo '?')"
+GATE_REPO_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+
+# ── REFUSE A TREE THE CALLER IS NOT STANDING IN ─────────────────────────────
+# Deriving the root from BASH_SOURCE fixes the common path, but not the one the
+# coordinator hit twice in Run 6: invoking ANOTHER tree's copy of this script
+# (`cd /my/worktree && /shared/checkout/scripts/gate_full_cycle.sh`). The script
+# then correctly gates ITS OWN tree — which is still not the tree the operator
+# meant, and the launcher still prints the worktree's HEAD.
+#
+# The rule is the tree, not just the sha: the tree is what gets configured,
+# built, and tested, and two trees at one commit still differ in working-tree
+# state and build state. Both HEADs are reported so an operator can see at a
+# glance whether it was a mere path confusion or a genuinely different batch.
+#
+# A launch directory OUTSIDE any git worktree does NOT refuse: that is the
+# documented detached-launch shape (`setsid nohup … &` from a scratch dir), and
+# there is no second tree for the verdict to be confused with.
+GATE_LAUNCH_ROOT="$(_gfc_root "$GATE_LAUNCH_DIR")" || GATE_LAUNCH_ROOT=""
+if [ -n "$GATE_LAUNCH_ROOT" ] && [ "$GATE_LAUNCH_ROOT" != "$REPO" ] \
+   && [ -z "${BEZEL_GATE_REPO:-}" ]; then
+  _gfc_launch_head="$(git -C "$GATE_LAUNCH_ROOT" rev-parse --short HEAD 2>/dev/null || echo '?')"
+  {
+    echo "== gate_full_cycle: REFUSING — this would gate a DIFFERENT tree than the caller's =="
+    echo "==   tree it would gate : $REPO @ $GATE_REPO_HEAD_SHORT ($GATE_REPO_BRANCH)"
+    echo "==     (root from $REPO_SOURCE)"
+    echo "==   tree you launched from: $GATE_LAUNCH_ROOT @ $_gfc_launch_head"
+    echo "==   A verdict that names one tree while the operator meant another is the"
+    echo "==   #3413 false-green: Run 4 cycle 4 reported both oracles green over the"
+    echo "==   previous day's commit and let nine ungated commits reach main."
+    echo "==   Fix: cd into the tree you mean and run ITS scripts/gate_and_push.sh,"
+    echo "==   or name the tree explicitly with BEZEL_GATE_REPO=<path> if deliberate."
+  } >&2
+  exit 66
+fi
+
+# The identity banner. Printed on stdout BEFORE any work, so a human or an agent
+# reading a gate log from the top sees which tree the verdict below describes —
+# the thing that was missing when Run 4's launcher printed the integration HEAD
+# over a gate of the shared checkout.
+#
+# ⚠ This banner belongs HERE (the cycle's own stdout), never inside gate.sh.
+# gate.sh's stdout is captured to $LOGDIR/${TAG}_{plain,full}.log, and the
+# ASan-ran evidence check is `grep -qi 'asan\|sanitize'` over the --full log
+# (see the assert-asan-ran block below). A repo path containing "asan" — an
+# every-run occurrence under /var/tmp/bezel-scratch/build-asan-* — would satisfy
+# that grep from the PATH alone, turning the silent-degradation detector into a
+# tautology. An observability change is a change.
+echo "== gate_full_cycle: TREE UNDER GATE =="
+echo "==   repo: $REPO"
+echo "==   HEAD: $GATE_REPO_HEAD_SHORT ($GATE_REPO_BRANCH)  — root from $REPO_SOURCE"
+echo "==   launched from: $GATE_LAUNCH_DIR"
 
 # Scratch dir + cycle-verdict path (matches gate.sh:76-77). The cycle writes its
 # OWN verdict here (Phase 3c, per the exit-code-trap) so downstream consumers
@@ -57,12 +189,21 @@ while [ $# -gt 0 ]; do
     -d) LOGDIR="$2"; shift 2 ;;
     -t) TAG="$2"; shift 2 ;;
     -n) MAX_ATTEMPTS="$2"; shift 2 ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    # Print the contiguous comment block after the shebang. A literal line
+    # range (this was `sed -n '2,40p'`) silently slides out of date every time
+    # the header grows, and had already drifted past `set -u` into code.
+    -h|--help) awk 'NR>1 && /^#/ {print; next} NR>1 {exit}' "$0"; exit 0 ;;
     *) echo "gate_full_cycle: unknown argument '$1'" >&2; exit 64 ;;
   esac
 done
 
-[ -n "$TAG" ] || TAG="$(git rev-parse --short HEAD 2>/dev/null || echo notag)"
+# The default tag is the sha captured on entry — the tree under gate, never a
+# fresh read. `?` is what a repo with no commits yields; keep the original
+# `notag` spelling rather than putting a `?` in every log filename.
+if [ -z "$TAG" ]; then
+  TAG="${GATE_REPO_HEAD_SHORT:-notag}"
+  [ "$TAG" = "?" ] && TAG="notag"
+fi
 mkdir -p "$LOGDIR" || exit 1
 CYCLE_LOG="$LOGDIR/${TAG}_cycle.log"
 
@@ -97,9 +238,15 @@ _legacy_rc_decision() { # rc log -> echoes accept|retry|bail
 # (`|| true`): a verdict-write hiccup must never change the exit code.
 write_cycle_verdict() { # rc
   local rc="$1"
-  local head; head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+  # fix #3413: --repo names the tree this verdict describes, and --head is the
+  # sha captured when the cycle ENTERED that tree (not a fresh read at exit, so
+  # a HEAD that moved under a running gate cannot silently relabel the verdict
+  # as being about the new commit). Together they make the verdict self-
+  # describing: Run 4 cycle 4's forensic needed exactly these two fields and
+  # only had one of them.
   PYTHONPATH=scripts python3 -m gate.verdict write --path "$CYCLE_VERDICT_FILE" \
-    --rc "$rc" --head="$head" --mode=cycle --oracle=dual 2>/dev/null || true
+    --rc "$rc" --head="${GATE_REPO_HEAD:-}" --repo="${REPO:-}" \
+    --mode=cycle --oracle=dual 2>/dev/null || true
 }
 trap 'rc=$?; write_cycle_verdict "$rc" || true; exit $rc' EXIT
 
@@ -223,7 +370,7 @@ run_until_trustworthy() {
   return 99
 }
 
-say "cycle start at $(git rev-parse --short HEAD) — logs in $LOGDIR"
+say "cycle start: repo=$REPO head=$GATE_REPO_HEAD_SHORT ($GATE_REPO_BRANCH) root-from='$REPO_SOURCE' launched-from=$GATE_LAUNCH_DIR — logs in $LOGDIR"
 
 # STALENESS PREFLIGHT. A gate that validates a STALE compiler is the worst
 # possible outcome: it reports green for code that was never built. This is not
@@ -498,5 +645,22 @@ grep -E '^(PASS|FAIL|SKIP):' "$LOGDIR/${TAG}_conformance.log" \
   | sed 's/^/  conformance /' | tee -a "$CYCLE_LOG" >/dev/null
 say "conformance phase: GREEN"
 
-say "cycle COMPLETE: both oracles trustworthy-green + conformance green"
+# fix #3413 (the other half): THE TREE MUST STILL BE THE ONE THAT WAS GATED.
+# CLAUDE.md freezes the tree for the duration of a cycle, but nothing enforced
+# it, and the consequence is the same class as the hardcoded root — a green
+# verdict about a commit that is no longer what a push would ship. It is also
+# actively DANGEROUS downstream: gate_and_push.sh reads the verdict with
+# --expect-head, a mismatch there returns "stale" (exit 2), and its stale branch
+# falls back to $? and PUSHES with only a note. Catch it here, where the answer
+# is still knowable, and fail closed.
+_now_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+if [ "$_now_head" != "$GATE_REPO_HEAD" ]; then
+  say "CYCLE FAILURE: HEAD MOVED DURING THE CYCLE — gated ${GATE_REPO_HEAD:-?}, tree is now ${_now_head:-?}"
+  say "  Everything above describes the commit that was gated, not the one now"
+  say "  checked out. Refusing to report green for a tree that changed under it"
+  say "  (#3413); the tree is frozen for the duration of a gate."
+  exit 67
+fi
+
+say "cycle COMPLETE ($REPO @ $GATE_REPO_HEAD_SHORT): both oracles trustworthy-green + conformance green"
 exit 0

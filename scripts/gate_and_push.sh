@@ -102,6 +102,23 @@ trap _bezel_gate_signal_done EXIT
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate_and_push: not in a git repo" >&2; exit 2; }
 
+# fix #3413: SAY WHICH TREE. This script cds to the launching directory's
+# worktree root and then runs THAT tree's scripts/gate_full_cycle.sh, so what
+# follows is about this path and this commit — but until now nothing said so,
+# and gate_full_cycle.sh then cd'd away to a hardcoded checkout while this
+# banner-less script's caller assumed the worktree. Print the identity before
+# any work, and reuse it at the push boundary below.
+#
+# `pwd -P` is the canonical spelling the cycle records in its verdict and the
+# comparison below uses; a symlinked lane path must not read as another tree.
+# The wording deliberately avoids "GATE PASSED", "GATE FAILED …->",
+# "PUSHED origin/main now" and "NOT pushing": gate_wait.sh treats those as
+# TERMINAL log markers, and a waiter that matched this opening banner would
+# report a verdict before the gate had run.
+GATE_REPO_ROOT="$(pwd -P)"
+echo "== gate_and_push: tree = $GATE_REPO_ROOT =="
+echo "== gate_and_push: head = $(git rev-parse --short HEAD 2>/dev/null || echo '?') ($(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')) =="
+
 # ── THE TREE MUST BE CLEAN ─────────────────────────────────────────────────
 # A gate VALIDATES THE WORKING TREE but PUSHES HEAD. When they differ, the
 # verdict does not describe what gets pushed — and the difference can be exactly
@@ -267,6 +284,57 @@ if "${GATE_CMD[@]}"; then
   # branch below is the dual-consume CROSS-CHECK (asserted to agree with
   # cross_check); keep it for 1 landing gate, then retire.
   _head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+
+  # ── fix #3413: A PRESENT VERDICT THAT NAMES ANOTHER TREE OR COMMIT IS A
+  # ── REFUSAL, NOT A NOTE. This check must come BEFORE the --expect-head read.
+  #
+  # `verdict read --expect-head` collapses THREE different situations into
+  # exit 2 — missing, unparseable, and stale — and the handler for exit 2 below
+  # is "no usable cycle verdict (writer best-effort) — relying on $?", which
+  # PUSHES. So a verdict that loudly disagreed about which commit was gated was
+  # downgraded to a note and the push went ahead. That is not hypothetical: it
+  # is the path Run 4 cycle 4 (2026-08-27) took. It pushed e9bd762 while
+  # gate-verdict.json recorded head=d34c8b4 — the previous day's commit on
+  # cycle-2-integration-v3, 56 files / +7775 lines away — and the only trace was
+  # that note. Nine commits landed ungated.
+  #
+  # Reading the fields DIRECTLY separates the three cases: exit 2 here means the
+  # verdict (or the field) is genuinely absent, which keeps the documented
+  # best-effort fallback intact for old verdicts; a value that disagrees is
+  # positive evidence that the gate validated something else, and the only safe
+  # response to that is to refuse.
+  _v_head="$(PYTHONPATH=scripts python3 -m gate.verdict read --path "$GATE_VERDICT" \
+       --field head 2>/dev/null)"; _vhrc=$?
+  if [ "$_vhrc" -ne 2 ] && [ -n "$_v_head" ] && [ "$_v_head" != "$_head" ]; then
+    echo "== gate_and_push: REFUSING TO PUSH — the verdict describes a DIFFERENT COMMIT ==" >&2
+    echo "   about to push : $_head" >&2
+    echo "   verdict gated : $_v_head   ($GATE_VERDICT)" >&2
+    echo "   A green verdict for another commit is not evidence about this one (#3413)." >&2
+    echo "   This is the exact shape that let nine ungated commits reach main on 2026-08-27." >&2
+    echo "   If the cycle's (best-effort) verdict write failed and this is a STALE file from" >&2
+    echo "   an earlier gate, delete it and re-gate — do not push over an unexplained one." >&2
+    exit 1
+  fi
+  # The `-n` guards above and below cover the read reporting the field PRESENT
+  # but BLANK. That is unreachable for a cycle that exited 0 (both writers set
+  # head/repo before the EXIT trap is even registered), and treating an
+  # unforeseen blank as a refusal would be a false-closed on a green gate — so
+  # blank falls back, a DISAGREEING VALUE refuses. Absent (exit 2) and blank are
+  # the fallback; only positive evidence of another subject blocks the push.
+  #
+  # The same question, asked of the TREE. A verdict written before #3413 has no
+  # repo field: exit 2 / empty, and this check stands down (back-compat) rather
+  # than assuming agreement — an absent field is never evidence of a match.
+  _v_repo="$(PYTHONPATH=scripts python3 -m gate.verdict read --path "$GATE_VERDICT" \
+       --field repo 2>/dev/null)"; _vrrc=$?
+  if [ "$_vrrc" -ne 2 ] && [ -n "$_v_repo" ] && [ "$_v_repo" != "$GATE_REPO_ROOT" ]; then
+    echo "== gate_and_push: REFUSING TO PUSH — the verdict describes a DIFFERENT WORKING TREE ==" >&2
+    echo "   about to push from : $GATE_REPO_ROOT" >&2
+    echo "   verdict gated tree : $_v_repo   ($GATE_VERDICT)" >&2
+    echo "   The gate validated another checkout; its result says nothing about this one (#3413)." >&2
+    exit 1
+  fi
+
   _v_out="$(PYTHONPATH=scripts python3 -m gate.verdict read --path "$GATE_VERDICT" \
        --expect-head "$_head" 2>/dev/null)"; _vrc=$?
   case "$_vrc" in

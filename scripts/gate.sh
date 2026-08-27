@@ -69,6 +69,21 @@
 #                            (default 50 — the full pass then does the work anyway)
 set -u
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate: not in a git repo" >&2; exit 2; }
+# fix #3413: the tree this gate validates, recorded so its verdict names its own
+# subject. gate.sh already follows the caller's tree (the cd above) — it was
+# gate_full_cycle.sh that cd'd to a hardcoded path — so this is identity, not a
+# behaviour change. `pwd -P` matches the spelling gate_full_cycle.sh and
+# gate_and_push.sh compare against, so a symlinked lane path cannot read as a
+# different tree.
+#
+# ⚠ DELIBERATELY NOT ECHOED. gate.sh's stdout is captured to the per-oracle log,
+# and the ASan-ran evidence check is `grep -qi 'asan\|sanitize'` over the --full
+# log (gate_full_cycle.sh, assert-asan-ran). A repo path containing "asan" —
+# routine under /var/tmp/bezel-scratch/build-asan-* — would satisfy that grep
+# from the PATH alone and turn the silent-degradation detector into a tautology.
+# The identity banner therefore lives in gate_full_cycle.sh, whose stdout that
+# grep never reads. The verdict JSON below is not grepped, so it is safe there.
+GATE_REPO="$(pwd -P)"
 
 # Make scripts/ importable as the `gate` package so `python3 -m gate.serialize`
 # resolves from any cwd. Honor an operator's pre-set PYTHONPATH by appending
@@ -119,7 +134,7 @@ gate_write_verdict() { # rc [total_s] — write gate-verdict.json; best-effort, 
   PYTHONPATH=scripts python3 -m gate.verdict write_from_state \
     --path "$GATE_VERDICT_FILE" --rc "$rc" \
     --shard-log "$S/gate_shard.log" \
-    --head "${GATE_HEAD:-}" --mode="${MODE:-}" --oracle "$oracle" \
+    --head "${GATE_HEAD:-}" --repo "${GATE_REPO:-}" --mode="${MODE:-}" --oracle "$oracle" \
     --started-epoch "${GATE_EPOCH:-0}" --total-s "$total" \
     --failed-phase "${FAILED_PHASE:-}" \
     --shard-count "${SHARD_COUNT:-0}" --shard-reported-s "${SHARD_REPORTED_S:-0}" \

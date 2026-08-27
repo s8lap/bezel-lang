@@ -18,7 +18,16 @@
 #          | PROC (live build/test procs rooted in the tree) | last commit subject
 set -u
 
-ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel 2>/dev/null || echo /home/stepan/w/code/bezel-lang)"
+# fix #3413: derive the root, never fall back to a literal. The fallback here
+# was `|| echo /home/stepan/w/code/bezel-lang` — the same shape that made
+# gate_full_cycle.sh report on a tree the operator never selected, and the same
+# reason it is wrong: a script that cannot find its repo must say so, not
+# silently report on somebody else's checkout.
+ROOT="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel 2>/dev/null)" || ROOT=""
+if [ -z "$ROOT" ]; then
+  echo "lane_status: cannot derive a repo root from $(dirname "$0")/.. — refusing to guess (#3413)." >&2
+  exit 2
+fi
 WINDOW_MIN="${BEZEL_LANE_WINDOW_MIN:-240}"
 now=$(date +%s)
 

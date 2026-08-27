@@ -148,7 +148,8 @@ def build_verdict_obj(rc, truncated=False, head="", mode="", oracle="",
                       shard_count=0, shard_reported_s=0,
                       coverage_gtests=None, coverage_littests=None,
                       expected_gtests=None,
-                      asan_errors=None, arbitration_suspects=None):
+                      asan_errors=None, arbitration_suspects=None,
+                      repo=""):
     """Build the full verdict schema dict from gate context.
 
     This is the pure construction helper: it takes the raw fields gate.sh
@@ -164,6 +165,16 @@ def build_verdict_obj(rc, truncated=False, head="", mode="", oracle="",
     Coverage fields default to None (not 0) when not measured — per #3010's
     lesson, an unmeasured number must emit null, never 0, so a genuine zero is
     distinguishable from a harvest failure.
+
+    `repo` (fix #3413) is the absolute path of the WORKING TREE the gate
+    validated. A verdict carried `head` but never said WHICH tree that head was
+    read from, so a gate that silently validated another checkout produced a
+    verdict indistinguishable from a correct one. Run 4 cycle 4 (2026-08-27)
+    reported both oracles green and pushed e9bd762 while this file recorded
+    head=d34c8b4 — the previous day's commit on another branch, 56 files /
+    +7775 lines apart — because gate_full_cycle.sh cd'd to a hardcoded path.
+    With `repo` present the verdict names its own subject, and the push
+    boundary can compare it against the tree it is about to push.
     """
     v = verdict_from_rc(rc, truncated)
     trustworthy = is_trustworthy(v, truncated)
@@ -172,6 +183,7 @@ def build_verdict_obj(rc, truncated=False, head="", mode="", oracle="",
         "verdict": v.value,
         "trustworthy": trustworthy,
         "head": head,
+        "repo": repo,
         "mode": mode,
         "oracle": oracle,
         "started_epoch": started_epoch,
@@ -295,6 +307,9 @@ def _main_write(argv):
     p.add_argument("--undercount-banner", action="store_true", default=False,
                    help="the 'shard crash / undercount' marker was in the shard log")
     p.add_argument("--head", default="", help="git HEAD sha")
+    p.add_argument("--repo", default="",
+                   help="absolute path of the working tree that was gated "
+                        "(fix #3413 — a verdict must name its own subject)")
     p.add_argument("--mode", default="", help="gate mode (default/--full/--quick/--no-asan)")
     p.add_argument("--oracle", default="", help="oracle (plain/asan)")
     p.add_argument("--started-epoch", type=int, default=0, help="gate start epoch seconds")
@@ -313,6 +328,7 @@ def _main_write(argv):
         rc=args.rc,
         truncated=args.truncated,
         head=args.head,
+        repo=args.repo,
         mode=args.mode,
         oracle=args.oracle,
         started_epoch=args.started_epoch,
@@ -384,6 +400,9 @@ def _main_write_from_state(argv):
                    help="shard log path; read for the undercount banner "
                         "(missing/unreadable => no banner seen)")
     p.add_argument("--head", default="", help="git HEAD sha")
+    p.add_argument("--repo", default="",
+                   help="absolute path of the working tree that was gated "
+                        "(fix #3413 — a verdict must name its own subject)")
     p.add_argument("--mode", default="",
                    help="gate mode (default/--full/--quick/--no-asan). "
                         "Caller uses the --mode=VALUE form so a '--full' value "
@@ -414,6 +433,7 @@ def _main_write_from_state(argv):
         rc=args.rc,
         truncated=truncated,
         head=args.head,
+        repo=args.repo,
         mode=args.mode,
         oracle=args.oracle,
         started_epoch=args.started_epoch,
@@ -463,6 +483,17 @@ def _main_read(argv):
     the disambiguation a poller uses to reject a STALE or CONCURRENT gate's
     verdict on the shared default path (#3000 shape: a reader that proceeds on
     a document not its own is the defect).
+
+    `--expect-repo PATH` is the same disambiguation for the TREE (fix #3413).
+    ⚠ Both are deliberately EXIT 2 ("not my document"), not exit 1 ("not a
+    pass"), because a poller that owns neither must fall back rather than read
+    a stranger's outcome. A consumer that can DISTINGUISH the two — the push
+    boundary — must NOT use this flag for the decision: exit 2 also means
+    "missing", and gate_and_push.sh's missing-verdict fallback is to trust $?
+    and push. That collapse is how Run 4 cycle 4 pushed e9bd762 over a verdict
+    naming d34c8b4: the stale verdict was reported as "absent" and the push
+    proceeded on a note. Read `--field head` / `--field repo` directly (exit 2
+    then means genuinely absent) and refuse on a value that disagrees.
     """
     p = argparse.ArgumentParser(
         prog="verdict.py read",
@@ -477,6 +508,10 @@ def _main_read(argv):
     p.add_argument("--expect-head", default=None,
                    help="refuse (exit 2) if the verdict head != this sha "
                         "(disambiguates a stale/concurrent gate's verdict)")
+    p.add_argument("--expect-repo", default=None,
+                   help="refuse (exit 2) if the verdict repo != this path "
+                        "(fix #3413 — disambiguates a verdict written by a "
+                        "gate that validated another working tree)")
     args = p.parse_args(argv)
 
     obj = read_verdict(args.path)
@@ -510,6 +545,20 @@ def _main_read(argv):
                 "verdict read: head mismatch (got {!r}, expected {!r}) — refusing "
                 "a stale/concurrent verdict at {}\n".format(
                     head[:12], args.expect_head[:12], args.path))
+            return 2
+
+    if args.expect_repo is not None:
+        # fix #3413: the same staleness question as --expect-head, asked of the
+        # TREE. A verdict written before this field existed has no "repo" key;
+        # treat that as unanswerable and refuse (exit 2 -> the consumer falls
+        # back) rather than assuming it matches — an absent field is not
+        # evidence of agreement (the "not X => assume Z" category defect).
+        repo = obj.get("repo")
+        if repo != args.expect_repo:
+            sys.stderr.write(
+                "verdict read: repo mismatch (got {!r}, expected {!r}) — refusing "
+                "a verdict that describes another working tree at {}\n".format(
+                    repo, args.expect_repo, args.path))
             return 2
 
     if args.field is not None:
