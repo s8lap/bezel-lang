@@ -453,13 +453,20 @@ BEZEL_TEST(capture_cell_reclaim_3435_3426,
         "a=8\nb=9\n");
 }
 
-// ── OVER-RELEASE GUARD: the escaping capture site is INSIDE A LOOP. One
-// syntactic lambda node there makes one closure PER ITERATION over a single
-// shared cell, and `singleCaptureLocals_` cannot see that (it counts lambda
-// NODES). `loopStack_.empty()` is the proof that declines it. Without that
-// conjunct iteration 0's closure — released at the loop body's own scope end —
-// frees the cell that iteration 1 then reads and frees again; measured on a
-// scratch build with the conjunct removed, this row aborts.
+// ── PARITY ROW (leak-count/value), not a proven guard. The escaping capture
+// site is INSIDE A LOOP: one syntactic lambda node there makes one closure PER
+// ITERATION over a single shared cell, and `singleCaptureLocals_` cannot see
+// that (it counts lambda NODES). `loopStack_.empty()` declines it.
+//
+// ⚠ This row does NOT prove that conjunct necessary. MEASURED on a scratch
+// build with `loopStack_.empty()` deleted from both #3426 arms: values stay
+// right (g=7 / h=8) and it does not abort — 68 B/5 becomes 64 B/4. It is safe
+// by accident, because a returned-escaping lambda gets no scope-end release,
+// so at most one envdtor ever runs. The row that DOES prove the conjunct is
+// `field_store_escape_inside_loop`, where deleting it yields a real
+// `AddressSanitizer: attempting double-free`.
+//
+// Kept as a parity row: the leak count and the values must not move.
 // per §27.5, §28.9 (issue #3426)
 BEZEL_TEST(capture_cell_reclaim_3435_3426,
            escaping_capture_inside_loop_cell_not_freed_spec_27_5_28_9) {
