@@ -7834,6 +7834,18 @@ private:
     llvm::Value* wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
                                              const sema::TypeRef* iEnumTy);
 
+    // fix #3450 (§28.11; stdlib §4.11, v0.283): the element disposer an OWNING
+    // enumerator wrap installs in its slot-1 `bz_array_free`, and the cache-key
+    // segment that keeps two `ptr`-lowered element types from sharing one
+    // Dispose. #2710 wrote the predicate into `wrapOwnedArrayAsIEnumerable`
+    // while the stack twin `wrapOwnedStackAsIEnumerator` hardcoded null; both
+    // now ask this one function (#3419 point 1). Returns null when the element
+    // carries no disposal obligation at a borrowing head — which is the common
+    // case, and which `ownedWrapDisposerKey` maps to an EMPTY key segment so
+    // existing symbol names are unchanged.
+    llvm::Function* ownedWrapElementDisposer(const sema::TypeRef* iEnumTy);
+    static std::string ownedWrapDisposerKey(llvm::Function* elDisp);
+
     // §29.2 (#437 / #1850): the cached machinery (struct type, vtable global,
     // element stride) for the array enumerator over a given lowered element type.
     // Extracted from wrapArrayAsIEnumerable so both the top-level wrap and the

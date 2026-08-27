@@ -7803,20 +7803,29 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // fix #2299 / §28.9: at the RETURN coercion, a callee-owned Array/
         // Queue source is wrapped in an OWNING enumerator (slot-1 Dispose
         // frees the wrapper frame AND the backing array — the caller
-        // disposes the enumerator exactly once). A Stack/OwningStack source
-        // has no OWNING-wrap variant in this fix; the borrowing wrap is
-        // kept and the source is freed immediately after the wrap is built
-        // (the wrap's slot-1 Dispose is still `free(self)` on the caller's
-        // side, freeing only the wrapper frame — the backing was already
-        // reclaimed). A borrowed source keeps the plain wrap (the source's
-        // owner retains the disposal obligation).
+        // disposes the enumerator exactly once). A borrowed source keeps the
+        // plain wrap (the source's owner retains the disposal obligation).
+        //
+        // fix #3450 (§28.2 / §28.9 / §28.11; stdlib §4.11, v0.283): the
+        // Stack/OwningStack arm USED to read "has no OWNING-wrap variant in
+        // this fix", build the BORROWING wrap and then call
+        // `freeCollectionSourceNow` on the backing right here — handing the
+        // caller an enumerator over memory this function had just freed.
+        // Every subsequent MoveNext/Current read freed memory: measured on
+        // 0c5ecd1, `order=0` (a SILENT zero-iteration loop) on the plain
+        // build and an ASan SEGV in `bz$stackenum$i32$Current` on the
+        // sanitized one — #2633's oracle split in one program. That claim
+        // stopped being true at #2987, which built `wrapOwnedStackAsIEnumerator`
+        // for exactly this shape (the local-decl site at
+        // `LlvmBackend_Setup.cpp` has used it since v0.240). This is the
+        // LinkedList twin's fix (#3354) applied to the stack: use the OWNING
+        // sibling and drop the immediate free, so the backing is reclaimed by
+        // the wrap's slot-1 Dispose at the CALLER's scope end — after
+        // iteration, not before it.
         if (outWrapMade) *outWrapMade = true;
         if (srcOwnedByCallee) {
-            if (an == "Stack" || an == "OwningStack") {
-                llvm::Value* wrap = wrapStackAsIEnumerator(v, targetTy);
-                freeCollectionSourceNow(v, actualTy);
-                return wrap;
-            }
+            if (an == "Stack" || an == "OwningStack")
+                return wrapOwnedStackAsIEnumerator(v, targetTy);
             return wrapOwnedArrayAsIEnumerable(v, targetTy);
         }
         if (an == "Stack" || an == "OwningStack")
@@ -8464,6 +8473,47 @@ llvm::Value* Emitter::owningDrainWrapForHead(llvm::Value* src,
 //     (registerIterableSourceDisposal / registerUsingDisposal → slot-1 Dispose).
 // This is the lazy-pipeline analogue of the borrow/own split the plain wrapper
 // relies on when the Array<T> has a separate owning local.
+// fix #3450 (§28.11; stdlib §4.11, v0.283): the element disposer an
+// OWNING enumerator wrap installs in its slot-1 `bz_array_free`, and the cache
+// key that keeps two element types from sharing one Dispose.
+//
+// THE PREDICATE. #2710 wrote it into `wrapOwnedArrayAsIEnumerable`: the
+// disposer comes from the ENUMERATOR's element type (the `T` in
+// `IEnumerable<T>`), not from the source collection — the wrap hands out
+// borrows, so a class element is NOT disposed here (the ClassBorrow row's
+// thunk is null) while a RuntimeManaged non-nullable `string` element IS
+// released, because its insertion retained the array's +1. The `!nullable`
+// guard is #2710's: a nullable string element is never retained at
+// construction, so releasing it would be a double-free direction. The stack
+// twin `wrapOwnedStackAsIEnumerator` hardcoded null instead — #3419's pattern,
+// and the arm this fix makes a second caller of.
+//
+// THE CACHE KEY. Both wraps name their per-element-type functions from the
+// LOWERED llvm type ("ptr", "i32", …), and `string`, a class, and `IGrouping`
+// all lower to `ptr`. Without a key segment for the disposer, the FIRST
+// element type minted at this face wins the shared `…$Dispose` and every other
+// one inherits it: a module holding both a `Stack<string>` and a
+// `Stack<SomeClass>` at this face would run the string RELEASE over class
+// pointers, or skip the release entirely. That is the over-release direction,
+// so the disposer's identity is part of the key. The segment is EMPTY when the
+// disposer is null, so the overwhelmingly common shape keeps its existing
+// symbol names.
+llvm::Function* Emitter::ownedWrapElementDisposer(const sema::TypeRef* iEnumTy) {
+    const sema::TypeRef* elTy = (iEnumTy && !iEnumTy->genericArgs.empty())
+                                    ? iEnumTy->genericArgs[0] : nullptr;
+    ElementPolicy pol = elementPolicyFor(elTy, /*owning=*/false);
+    if (pol.disposerThunk) return pol.disposerThunk;
+    bool isStringElem =
+        pol.cat == ElementPolicy::Category::RuntimeManaged &&
+        elTy && elTy->kind == sema::TypeRef::Kind::Primitive &&
+        elTy->primitive == sema::PrimitiveType::String && !elTy->nullable;
+    return isStringElem ? stringElementReleaseThunk() : nullptr;
+}
+
+std::string Emitter::ownedWrapDisposerKey(llvm::Function* elDisp) {
+    return elDisp ? ("$" + elDisp->getName().str()) : std::string();
+}
+
 llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
                                                   const sema::TypeRef* iEnumTy) {
     llvm::Type* elemTy = i32();
@@ -8479,9 +8529,14 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
         ("i" + std::to_string(elemTy->getIntegerBitWidth())) :
         (elemTy->isPointerTy() ? "ptr" : "f");
     std::string plainPrefix = "bz$arrenum$" + elemName + "$";
-    std::string prefix = "bz$arrenumown$" + elemName + "$";
+    // fix #3450 (v0.283): the disposer is part of the cache key — see
+    // `ownedWrapElementDisposer` for why sharing one Dispose across two
+    // element types that both lower to `ptr` is an over-release hazard.
+    llvm::Function* elDisp = ownedWrapElementDisposer(iEnumTy);
+    std::string prefix =
+        "bz$arrenumown$" + elemName + ownedWrapDisposerKey(elDisp) + "$";
 
-    // Owning Dispose: bz_array_free(self->arr, ?); free(self).
+    // Owning Dispose: bz_array_free(self->arr, <element disposer>); free(self).
     // fix #2710 (§28.2 / §28.9 / §28.11, v0.240): the element disposer is
     // derived from the ENUMERATOR's element type (the T in IEnumerable<T>),
     // not hardcoded to null. The borrowing-family `string` element is the
@@ -8505,21 +8560,10 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
         llvm::Value* self = dispFn->arg_begin();
         llvm::Value* arrPtr =
             b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
-        // Element-type-derived disposer (the same shape #2710 Site 2's
-        // `freeCollectionSourceNow` carries): RuntimeManaged +
+        // Element-type-derived disposer, hoisted to the cache key above
+        // (fix #3450): the same shape #2710 Site 2's
+        // `freeCollectionSourceNow` carries — RuntimeManaged +
         // non-nullable string primitive → stringElementReleaseThunk.
-        const sema::TypeRef* iEnumElTy =
-            (iEnumTy && !iEnumTy->genericArgs.empty())
-                ? iEnumTy->genericArgs[0] : nullptr;
-        ElementPolicy iEnumElPol =
-            elementPolicyFor(iEnumElTy, /*owning=*/false);
-        bool iEnumElIsString =
-            iEnumElPol.cat == ElementPolicy::Category::RuntimeManaged &&
-            iEnumElTy && iEnumElTy->kind == sema::TypeRef::Kind::Primitive &&
-            iEnumElTy->primitive == sema::PrimitiveType::String &&
-            !iEnumElTy->nullable;
-        llvm::Function* elDisp = iEnumElPol.disposerThunk;
-        if (!elDisp && iEnumElIsString) elDisp = stringElementReleaseThunk();
         llvm::Value* elDispVal = elDisp
             ? llvm::cast<llvm::Value>(elDisp)
             : llvm::ConstantPointerNull::get(ptrTy());
@@ -9569,11 +9613,22 @@ llvm::Value* Emitter::wrapStackAsIEnumerator(llvm::Value* arr,
 // responsibility. Slot 4 stamps fresh NON-owning clones (GetEnumerator) so a
 // per-loop enumerator disposes only its own struct while the wrapper owns the
 // array exactly once at the local's scope end (§28.3 — leak-free, no
-// double-free). Element-disposer-less bz_array_free is correct at the
-// local-decl site because the source is an unbound `new` by construction, so
-// it is EMPTY (a collection constructor argument is a capacity, not contents,
-// per stdlib §4.4), which is the same predicate #2975 manifestation 3 used to
-// gate the Array local-decl fix.
+// double-free).
+//
+// fix #3450 (§28.2 / §28.9 / §28.11, v0.283): the slot-1 `bz_array_free`'s
+// element disposer is DERIVED from the enumerator's element type, exactly as
+// its array twin `wrapOwnedArrayAsIEnumerable` has derived it since #2710 —
+// it is no longer hardcoded null. #2987's argument for the null ("the source
+// is an unbound `new` by construction, so it is EMPTY") held only at the
+// local-decl site it was written for; #3450 makes the RETURN coercion a
+// second caller, where the source is a callee-owned local that has been
+// PUSHED to before the return, so emptiness is false there. The two wraps
+// answering the same question differently is #3419's pattern, and the answer
+// that differs is a leak (a `Stack<string>` source retains one +1 per element
+// at insertion — the `.Push` arms in `LlvmBackend_Calls.cpp` — which a null
+// disposer never releases). The predicate is `wrapOwnedArrayAsIEnumerable`'s
+// verbatim, so the two families now agree by construction rather than by
+// coincidence.
 llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
                                                   const sema::TypeRef* iEnumTy) {
     llvm::Type* elemTy = i32();
@@ -9593,9 +9648,16 @@ llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
         ("i" + std::to_string(elemTy->getIntegerBitWidth())) :
         (elemTy->isPointerTy() ? "ptr" : "f");
     std::string plainPrefix = "bz$stackenum$" + elemName + "$";
-    std::string prefix = "bz$stackenumown$" + elemName + "$";
+    // fix #3450 (v0.283): the element-type-derived disposer this wrap's
+    // slot-1 `bz_array_free` installs — the array twin's #2710 predicate,
+    // asked through the one shared helper rather than re-spelled — and the
+    // cache-key segment that keeps two `ptr`-lowered element types from
+    // sharing one Dispose.
+    llvm::Function* elDisp = ownedWrapElementDisposer(iEnumTy);
+    std::string prefix =
+        "bz$stackenumown$" + elemName + ownedWrapDisposerKey(elDisp) + "$";
 
-    // Owning Dispose: bz_array_free(self->arr, null); free(self).
+    // Owning Dispose: bz_array_free(self->arr, <element disposer>); free(self).
     auto* dispFn = module_->getFunction(prefix + "Dispose");
     if (!dispFn) {
         dispFn = llvm::Function::Create(
@@ -9606,6 +9668,13 @@ llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
         llvm::Value* self = dispFn->arg_begin();
         llvm::Value* arrPtr = b.CreateLoad(ptrTy(),
             b.CreateStructGEP(stTy, self, 1));
+        // fix #3450 (§28.11, v0.283): the element-type-derived disposer
+        // (computed with the cache key above) — null for the ClassBorrow row
+        // an `IEnumerable<T>` head produces, so a class element is NOT
+        // disposed here; the loop's borrow does not own it.
+        llvm::Value* elDispVal = elDisp
+            ? llvm::cast<llvm::Value>(elDisp)
+            : llvm::ConstantPointerNull::get(ptrTy());
         auto* freeArrFn = module_->getOrInsertFunction(
             "bz_array_free", llvm::FunctionType::get(
                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false))
@@ -9613,7 +9682,7 @@ llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
         b.CreateCall(
             llvm::FunctionType::get(
                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false),
-            freeArrFn, {arrPtr, llvm::ConstantPointerNull::get(ptrTy())});
+            freeArrFn, {arrPtr, elDispVal});
         auto* freeFn = module_->getOrInsertFunction(
             "free", llvm::FunctionType::get(
                 llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
