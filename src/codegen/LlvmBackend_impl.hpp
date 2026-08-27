@@ -11643,17 +11643,23 @@ private:
     // releasing them at scope end is balanced. Returns null otherwise (a borrow
     // payload arg, a non-construction initializer, an owning/borrow-bearing
     // choice, or a non-choice type → no release; the conservative, safe default).
+    // fix #3416 (§21.1, v0.283): takes an `ast::Node*` and decodes it through
+    // `localDeclInitView`, so a §21.1 runtime `const` (ast::LocalConstDecl) is
+    // classified exactly as its `var` (ast::LocalDecl) twin is. Any other node
+    // yields an all-null view and answers null.
     const sema::TypeRef* valueLikeChoiceLocalMintsStringPayload(
-        const ast::LocalDecl* ld) const;
+        const ast::Node* ldNode) const;
     // fix #2115: register (if eligible) the scope-end managed-payload release of
     // a value-like choice local. Called from lowerLocalDecl after the slot store;
     // gated on valueLikeChoiceStrReleaseEligible_ (the escape walk's verdict) so
     // it never fires on a local whose value is copied/returned/captured/case-
     // matched (a second release through an alias would double-free). Mirrors
     // armStringLocalRefcount's contract for the string-local release.
+    // fix #3416: `ld` is an `ast::Node*` (LocalDecl or §21.1 LocalConstDecl) —
+    // see valueLikeChoiceLocalMintsStringPayload above.
     void armValueLikeChoiceStrRelease(const void* declNode,
                                       llvm::AllocaInst* slot,
-                                      const ast::LocalDecl* ld);
+                                      const ast::Node* ld);
     // fix #2115: emit a tag-switched bz_string_release walk over the ACTIVE
     // case's string-typed payload fields of a value-like choice struct. Mirrors
     // emitOwningChoiceActiveCaseDisposal's switch/join shape but calls

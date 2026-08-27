@@ -60,16 +60,26 @@
 // oracle that moves and the plain assertions pin that the fix froze nothing
 // early.
 //
-// ⚠ DELIBERATE EXCLUSIONS — cases (J)-(M). The relaxation fires only for a copy
-// target that armStringLocalRefcount actually RETAINS (membership in
-// `stringBorrowAll_`). A `const` target is a LocalConstDecl and is never
-// retained; a `string?`-declared target and a `using var` target are excluded
-// from the borrow-candidate set by construction; and an alias STORED into a
-// class field escapes on its own account. Each keeps the pre-existing bounded
-// leak, which is the safe direction — relaxing for them would free the source
-// while an un-retained alias still named it, a use-after-free. Each is pinned
-// below as a characterization guard that asserts the PAIR: a leak IS reported
-// and specifically NOT a use-after-free / double-free / SEGV.
+// ⚠ DELIBERATE EXCLUSIONS — cases (J), (L), (M). The relaxation fires only for
+// a copy target that armStringLocalRefcount actually RETAINS (membership in
+// `stringBorrowAll_`). A `string?`-declared target and a `using var` target are
+// excluded from the borrow-candidate set by construction, and an alias STORED
+// into a class field escapes on its own account. Each keeps the pre-existing
+// bounded leak, which is the safe direction — relaxing for them would free the
+// source while an un-retained alias still named it, a use-after-free. Each is
+// pinned below as a characterization guard that asserts the PAIR: a leak IS
+// reported and specifically NOT a use-after-free / double-free / SEGV.
+//
+// fix #3416 (§21.1 / §28.9, v0.283): case (K), the `const` copy target, LEFT
+// this list and is now a RELAXED case, asserted clean. It was excluded here on
+// a true premise — "a LocalConstDecl is never retained" — that #3416 changed:
+// §21.1's runtime `const` is now admitted to `stringBorrowAll_` by
+// `collectStringReleaseEligible`, so armStringLocalRefcount retains it at bind
+// exactly as it retains a `var`, and StringEscapeWalker's `LocalConstDecl` arm
+// carries the same relaxation its `LocalDecl` sibling does. The condition the
+// relaxation rests on therefore holds for a `const`, and it holds MORE strongly:
+// §21.1 makes a `const` "not an assignable location", so the alias's own
+// reference cannot be displaced before its scope-end release.
 
 #include <string>
 
@@ -395,7 +405,7 @@ const char* kAliasChainWithEscapingMiddle =
     "end C;";
 
 // =====================================================================
-// (J)-(M) THE DELIBERATE EXCLUSIONS. Each still leaks; none may have freed
+// (J), (L), (M) THE DELIBERATE EXCLUSIONS. Each still leaks; none may have freed
 // anything early.
 // =====================================================================
 
@@ -424,9 +434,11 @@ const char* kAliasStoredIntoClassField =
     "  end Main; "
     "end C;";
 
-// (K) a `const` copy target. A LocalConstDecl is not a `var` string local:
-// collectStringReleaseEligible never collects it and armStringLocalRefcount
-// never retains it, so the source must keep tainting.
+// (K) a `const` copy target. Was a deliberate exclusion (a LocalConstDecl was
+// not collected and never retained, so the source kept tainting and leaked);
+// fix #3416 admits §21.1's runtime `const` to `stringBorrowAll_` and gives the
+// walker's LocalConstDecl arm the same borrow relaxation, so this is now a
+// RELAXED case and the program is clean. 20 iterations leaked pre-#3416.
 const char* kConstCopyTarget =
     "module M; class C "
     "  public static method Main(): int "
@@ -667,7 +679,9 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
 }
 
 // ---------------------------------------------------------------------
-// (J)-(M) the deliberate exclusions, pinned as characterization guards. Each
+// (J), (L), (M) the deliberate exclusions, pinned as characterization guards.
+// (K), the `const` copy target, LEFT this group in #3416 — see its own note
+// below and the header. Each remaining one
 // still LEAKS (the safe direction) and must not report a memory error: relaxing
 // for any of them would free the source while an un-retained alias named it.
 // ---------------------------------------------------------------------
@@ -685,11 +699,17 @@ BEZEL_TEST(codegen_string_local_copy_release_2764,
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
 
+// fix #3416 (§21.1 / §28.9, v0.283): case (K) moved from the exclusion list to
+// the relaxed set — see the note in this file's header. §21.1's runtime `const`
+// copy target is now retained at bind and released at scope end like its `var`
+// twin, so the SOURCE's producer +1 is released too and the program is clean.
+// The assertion is inverted deliberately, in the same change that made it true.
 BEZEL_TEST(codegen_string_local_copy_release_2764,
-           const_copy_target_is_deliberately_excluded_spec_21_1) {
+           const_copy_target_is_relaxed_like_var_spec_21_1) {
     JitResult r = runAotChecked(kConstCopyTarget);
     if (wasSkipped(r)) return;
-    expectLeakButNoMemoryError(r);
+    BEZEL_EXPECT_TRUE(r.ran);              // leaked 20 producers pre-#3416
+    BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
 
 BEZEL_TEST(codegen_string_local_copy_release_2764,

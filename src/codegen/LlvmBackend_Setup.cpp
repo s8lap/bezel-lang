@@ -13939,9 +13939,16 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // second release through an alias would double-free). Mirrors the string-
     // local release arming just above; only acts on the value-like choice
     // locals collectStringReleaseEligible classified for THIS function.
+    // fix #3416 (§21.1 / §28.9 / §35.4, v0.283): pass `declNode` STRAIGHT
+    // THROUGH. It was `dynamic_cast<const ast::LocalDecl*>(declNode)`, which is
+    // null for a §21.1 runtime `const` (ast::LocalConstDecl) — so the arming
+    // bailed on its `!ld` guard even once the collector admitted the node, and
+    // `const a := Msg.Note(p + "llo");` leaked its 38-byte payload string where
+    // the `var` twin was clean. The callee now decodes both node kinds through
+    // the shared `localDeclInitView`.
     if (slot && v)
         armValueLikeChoiceStrRelease(static_cast<const void*>(declNode), slot,
-            dynamic_cast<const ast::LocalDecl*>(declNode));
+                                     declNode);
     // #422 / #429 / §27.5 / §28.9: if this `var` closure (function-typed) local
     // was proven non-escaping and initialized by a +1 closure producer (a lambda
     // expression, a method reference, or a call to a user-defined closure-
@@ -17058,7 +17065,7 @@ bool Emitter::registerOwningChoiceDisposal(const ast::LocalDecl* ld) {
 
 
 const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
-        const ast::LocalDecl* ld) const {
+        const ast::Node* ldNode) const {
     // fix #2115 / §28.9 / §35.4: classify a `var` choice local for scope-end
     // managed-payload release. The value-like choice struct is a value-typed
     // stack slot; a +1 producer string stored into a case payload
@@ -17076,14 +17083,19 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     // may alias into a longer-lived owner; a scope-end release would dangle or
     // double-free). Returns the instantiated choice TypeRef when eligible, null
     // otherwise. // per §28.9 (string refcount discipline), §35.4 v0.226.
-    if (!ld || ld->isUsing || !ld->initializer) return nullptr;
+    // fix #3416 (§21.1 / §28.9 / §35.4, v0.283): read the declaration through
+    // the shared `localDeclInitView`, so a §21.1 runtime `const` binding
+    // (ast::LocalConstDecl) is classified exactly as its `var` twin is. An
+    // all-null view (any other node kind) answers "not a candidate" through the
+    // `!v.init` test — the same answer the old `!ld` test gave.
+    LocalDeclInitView v = localDeclInitView(ldNode);
+    if (!v.init || v.isUsing) return nullptr;
     // Resolve the choice type (the declared annotation wins; else the
     // initializer's inferred type), through the active substitution so a
     // generic choice at a concrete instantiation resolves to its specialized
     // cases — the same path registerOwningChoiceDisposal walks.
     const sema::TypeRef* rt =
-        ld->type ? ctx_.resolvedType(*ld->type)
-                 : ctx_.exprType(*ld->initializer);
+        v.type ? ctx_.resolvedType(*v.type) : ctx_.exprType(*v.init);
     rt = resolveTypeParamRef(rt);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration) {
         return nullptr;
@@ -17121,7 +17133,7 @@ const sema::TypeRef* Emitter::valueLikeChoiceLocalMintsStringPayload(
     // any other source (a call returning a choice, a field/param read) is
     // conservatively rejected: the payload's ownership cannot be proved at this
     // analysis level, so release is unsafe (the value may be a borrow).
-    auto* call = dynamic_cast<const ast::CallExpr*>(ld->initializer.get());
+    auto* call = dynamic_cast<const ast::CallExpr*>(v.init);
     if (!call || !call->callee) return nullptr;
     auto* cc = dynamic_cast<sema::ChoiceCaseSymbol*>(
         ctx_.exprSymbol(*call->callee));
@@ -20004,7 +20016,7 @@ void Emitter::retainAssignedStringParams(
 
 void Emitter::armValueLikeChoiceStrRelease(const void* declNode,
                                            llvm::AllocaInst* slot,
-                                           const ast::LocalDecl* ld) {
+                                           const ast::Node* ld) {
     // fix #2115 / §28.9 / §35.4: register the scope-end managed-payload release
     // of a value-like choice local. The slot store itself is performed by the
     // caller (lowerLocalDecl). Eligibility has TWO gates, both pre-computed by
@@ -21363,8 +21375,10 @@ struct StringEscapeWalker {
             // source: relaxing for them would free `built` while an
             // un-retained alias still named it (a use-after-free — strictly
             // worse than the bounded leak). `const other := built;` is a
-            // LocalConstDecl, a different node handled by its own arm below,
-            // and is likewise never retained. Reassignment of either binding
+            // LocalConstDecl, a different node handled by its own arm below
+            // — which since #3416 carries this same relaxation, because #3416
+            // admits a §21.1 `const` to stringBorrowAll_ and so retains it at
+            // bind exactly as a `var` is retained. Reassignment of either binding
             // stays safe: both `built := …` and `other := …` route through
             // lowerStringLocalReassign, which releases the displaced value and
             // keeps its slot at exactly +1 on the new one.
@@ -21407,6 +21421,45 @@ struct StringEscapeWalker {
             return;
         }
         if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            // fix #3416 (§21.1 / §28.9, v0.283): #2764's BORROW-ALIAS
+            // relaxation, for §21.1's `const` spelling of the same binding.
+            // `const other := built;` is a plain local-to-local string COPY and
+            // is a BORROW of `built`, not an escape of it, under exactly the
+            // condition the `var` arm above requires: the new binding is one
+            // armStringLocalRefcount RETAINS at bind, i.e. a member of
+            // `stringBorrowAll_` (= `borrowRetainedAliases`, the same set that
+            // function tests before emitting `bz_string_retain`). Since #3416
+            // admitted a §21.1 `const` to that set, the premise the relaxation
+            // rests on now holds for it byte-for-byte: after the bind the heap
+            // string carries `built`'s producer +1 and the const binding's own
+            // fresh retain, with one owner each, so releasing `built`'s at ITS
+            // scope end can neither dangle the alias (which holds its own
+            // reference) nor double-free (each slot releases only what it
+            // minted). §21.1 makes it STRONGER than for a `var`: a `const` is
+            // "not an assignable location", so the alias's reference cannot be
+            // displaced before its own scope-end release.
+            //
+            // Without this the `const` alias kept tainting its source, so the
+            // SOURCE's producer +1 was never released. MEASURED at 500
+            // iterations of `var p := "ab" + z; const s := p;`: 18500 bytes in
+            // 1000 allocations, where the `var` twin was clean. A SINGLE
+            // execution of that shape reports CLEAN under LSan — the last
+            // iteration's string is still reachable from the live stack — so
+            // the loop is the honest oracle here, and a one-shot test of this
+            // shape passes vacuously.
+            //
+            // The set-membership test, not the syntax, is what makes it sound,
+            // exactly as in the `var` arm: a `const` binding NOT in the set (a
+            // `string?`-declared one, or one declared in a lambda body, whose
+            // declarations collectStringReleaseEligible does not scan) gets no
+            // retain and must keep tainting the source — otherwise the source's
+            // release would free a string an un-retained alias still names.
+            if (stringReleaseMode && !inLambda && borrowRetainedAliases &&
+                borrowRetainedAliases->count(static_cast<const void*>(lc)) &&
+                isTargetIdent(lc->value.get())) {
+                expr(lc->value.get(), /*safeRead=*/true);
+                return;
+            }
             expr(lc->value.get(), /*safeRead=*/false); return;
         }
         if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
@@ -23008,29 +23061,64 @@ void Emitter::collectStringReleaseEligible(
     // that the walk proves non-escaping is eligible for a scope-end release —
     // producers TRANSFER (no retain), borrows RETAIN at bind (#429). The two
     // eligibility sets are disjoint by construction (producer vs borrow).
-    std::vector<const ast::LocalDecl*> producerCandidates;
-    std::vector<const ast::LocalDecl*> borrowCandidates;
+    //
+    // fix #3416 (§21.1 / §28.9, v0.283): the scan covers a §21.1 runtime `const`
+    // local (ast::LocalConstDecl) as well as a plain `var` (ast::LocalDecl).
+    // §21.1 gives a runtime `const` its OWN AST node, a sibling of LocalDecl
+    // with differently-named fields, so the `dynamic_cast<const
+    // ast::LocalDecl*>(s)` this scan used matched only the `var` spelling and
+    // every `const` was silently skipped — it never became a candidate, the
+    // escape walk never ran for it, and armStringLocalRefcount therefore never
+    // armed its scope-end release. Measured on the pre-fix build:
+    // `const s := p + "cd"` leaked 37 B / 2 allocs and `const s := n.ToString()`
+    // 35 B / 2 allocs, where both `var` twins were ASan+LSan clean.
+    //
+    // This is the FIFTH instance of that LocalDecl-only pattern (#2802, #3375,
+    // #3402, #3417 are the others), so the decode is NOT re-spelled here: the
+    // candidate vectors are widened to `const ast::Node*` and the initializer /
+    // type / isUsing triple is read through `Emitter::localDeclInitView`, the
+    // single authority #3402 hoisted into LlvmBackend_impl.hpp. No consumer
+    // changes: `lowerStmt`'s LocalConstDecl arm already routes through the same
+    // `lowerLocalDecl`, and `armStringLocalRefcount` / the two
+    // `isTrackedStringLocalForRelease` readers key the eligibility sets by NODE
+    // POINTER (`const void*`), never by node kind.
+    //
+    // Soundness (§21.1 *Ownership* / §28.9). A `const` binding takes no disposal
+    // obligation and this adds none: §28.9 makes `string` a runtime-managed type
+    // and §21.1's Ownership paragraph admits exactly those as a runtime const's
+    // initializer, while forbidding an owned production. What is released is the
+    // same single reference the `var` path has always released — the producer's
+    // transferred +1, or the borrow's own bind-time retain — at the same point,
+    // under the same conservative escape walk. Exactly-once is EASIER to
+    // establish than for a `var`: §21.1 makes a `const` "not an assignable
+    // location", so the drop-on-overwrite / reassignment edge cannot be spelled
+    // (`objectStringReassignedLocals_` and the `stringReleaseMode` relaxation
+    // are vacuous for it).
+    std::vector<const ast::Node*> producerCandidates;
+    std::vector<const ast::Node*> borrowCandidates;
     // fix #2115 / §28.9 / §35.4: value-like choice locals whose initializer is
     // a choice construction every string payload arg of which is a +1 producer
     // or a literal — the slot owns +1 on the active case's strings. The escape
     // walk (run below, conservative mode) gates scope-end release on the value
     // never being copied / returned / captured / case-matched / arg-passed.
-    std::vector<const ast::LocalDecl*> valueLikeChoiceCandidates;
+    std::vector<const ast::Node*> valueLikeChoiceCandidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (!ld->isUsing && ld->initializer) {
-                if (isPlusOneStringProducer(ld->initializer.get())) {
-                    producerCandidates.push_back(ld);
+        {
+            // fix #3416: LocalDecl OR §21.1 LocalConstDecl, decoded once.
+            LocalDeclInitView v = localDeclInitView(s);
+            if (v.init && !v.isUsing) {
+                if (isPlusOneStringProducer(v.init)) {
+                    producerCandidates.push_back(s);
                     // fix #2817: this decl belongs to the body being analyzed.
-                    stringLocalCandidates_.insert(static_cast<const void*>(ld));
-                } else if (valueLikeChoiceLocalMintsStringPayload(ld)) {
+                    stringLocalCandidates_.insert(static_cast<const void*>(s));
+                } else if (valueLikeChoiceLocalMintsStringPayload(s)) {
                     // fix #2115: a value-like choice local whose construction
                     // mints +1 string payload(s) — released at scope end iff
                     // non-escaping (the walk below).
-                    valueLikeChoiceCandidates.push_back(ld);
+                    valueLikeChoiceCandidates.push_back(s);
                     // fix #2817: see the producer branch above.
-                    stringLocalCandidates_.insert(static_cast<const void*>(ld));
+                    stringLocalCandidates_.insert(static_cast<const void*>(s));
                 } else {
                     // #429: a BORROW-initialized string local. Recognized by the
                     // local's resolved type being `string` (non-nullable; a
@@ -23040,17 +23128,16 @@ void Emitter::collectStringReleaseEligible(
                     // borrows for this increment). The symbol type comes from the
                     // initializer's exprType (inference) or the declared type.
                     const sema::TypeRef* lt = nullptr;
-                    if (ld->type) lt = ctx_.resolvedType(*ld->type);
-                    if (!lt && ld->initializer)
-                        lt = ctx_.exprType(*ld->initializer);
+                    if (v.type) lt = ctx_.resolvedType(*v.type);
+                    if (!lt) lt = ctx_.exprType(*v.init);
                     if (lt && !lt->nullable &&
                         lt->kind == sema::TypeRef::Kind::Primitive &&
                         lt->primitive == sema::PrimitiveType::String) {
-                        borrowCandidates.push_back(ld);
-                        stringBorrowAll_.insert(static_cast<const void*>(ld));
+                        borrowCandidates.push_back(s);
+                        stringBorrowAll_.insert(static_cast<const void*>(s));
                         // fix #2817: see the producer branch above.
                         stringLocalCandidates_.insert(
-                            static_cast<const void*>(ld));
+                            static_cast<const void*>(s));
                     }
                 }
             }
