@@ -857,7 +857,17 @@ llvm::Value* Emitter::emitWithFormatSpec(llvm::Value* val,
         // with an inner `:FORMAT` are handled above; a bare-alignment DateTime
         // (i64) flows through emitValueToString to the same numeric fallback it
         // used before, so this does not change those paths.
-        if (!strVal && rt && rt->kind == sema::TypeRef::Kind::Named) {
+        // fix #3442 (§8.5 / §18.5, v0.283): a UNIT operand joins the Named
+        // operands in routing through the general converter, for the identical
+        // reason — otherwise it falls to the default chain below, where the
+        // unit slot's inert placeholder byte matches `isIntegerTy()` and
+        // `$"[{u,5}]"` renders `[    0]` instead of `[   ()]`. §18.5's
+        // alignment applies to the RENDERED text whatever the type, so the only
+        // question is which renderer produces it, and for unit that is §8.5's
+        // `"()"` — the same answer the unaligned hole now gets.
+        if (!strVal && rt &&
+            (rt->kind == sema::TypeRef::Kind::Named ||
+             (rt->kind == sema::TypeRef::Kind::Unit && !rt->nullable))) {
             strVal = emitValueToString(val, rt);
         }
         if (!strVal) {
@@ -2947,6 +2957,33 @@ llvm::Value* Emitter::tryOpaqueSlotBuiltinRender(llvm::Value* val,
 llvm::Value* Emitter::emitValueToString(llvm::Value* val,
                                         const sema::TypeRef* fieldTy) {
     using K = sema::TypeRef::Kind;
+    // fix #3442 (§8.5 *`ToString`* / §4.7 / §18.5, v0.283): the UNIT row of
+    // §8.5 — "and for the unit type: the type's name — … `"()"` for unit". This
+    // function is the shared value-rendering authority every non-primitive
+    // §18.5 hole and every record component bottoms out in (the InlineArray arm
+    // below delegates here for exactly that reason, #2913), and it had NO unit
+    // arm at all: a unit-typed operand fell past every arm to the trailing
+    // LLVM-shape fallback, where the unit slot's one INERT placeholder byte
+    // (`unitPlaceholderTy`) matched `isIntegerTy()` and rendered as `"0"` —
+    // MEASURED: `$"[{u}]"` on `var u: () := ()` printed `[0]`, and `$"[{p}]"`
+    // on a PRESENT `()?` printed `[0]` too, while `$"[{u.ToString()}]"` on the
+    // very same value printed `[()]`. Two spellings of one §8.5 rule
+    // disagreeing inside one program, and `0` is a rendering the document
+    // permits for no unit-typed expression. The byte is the one whose "CONTENTS
+    // are never meaningfully read" (#2915 / #3421 / isNullableUnitTy) — reading
+    // it was the bug.
+    //
+    // Placed FIRST, ahead of every `val->getType()` dereference, because `val`
+    // is legitimately NULL here: `()` lowers to LLVM `void`, so `lowerExpr`
+    // returns nullptr for every unit-typed expression by construction. §4.7
+    // gives the unit type exactly one value, so §8.5's answer does not depend
+    // on `val` at all and nothing is lost by not having one. The `()?` sibling
+    // needs no arm of its own — the nullable-VALUE arm just below already
+    // branches on the tag and recurses with the non-nullable inner type, which
+    // lands exactly here, so a present `()?` renders `"()"` and a null one
+    // keeps §18.5's `"null"`.
+    if (fieldTy && fieldTy->kind == K::Unit && !fieldTy->nullable)
+        return lowerStringLiteral(kUnitToStringSource, false);
     // per §8.3/§9.1: a NULLABLE REFERENCE field (string?, Object?, nullable
     // class/interface) is a plain `ptr` with a real null. A null field renders
     // as the literal "null" — the same rendering null interpolation uses

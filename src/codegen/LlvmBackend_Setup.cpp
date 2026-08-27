@@ -32938,7 +32938,11 @@ llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
                                          "bz$unittostr", module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", toStrFn);
         ThunkScope scope(currentFn_, builder_, toStrFn, entry);
-        builder_.CreateRet(lowerStringLiteral("\"()\"", false));
+        // fix #3442: §8.5's unit rendering, from its one spelling
+        // (`kUnitToStringSource`), so this thunk and the three unboxed
+        // positions cannot disagree — the ToString twin of what #3422 did for
+        // `bz$uniteq` / `kUnitHashCode`.
+        builder_.CreateRet(lowerStringLiteral(kUnitToStringSource, false));
     }
 
     // The vtable global is created HERE, before the thunks, and its initializer

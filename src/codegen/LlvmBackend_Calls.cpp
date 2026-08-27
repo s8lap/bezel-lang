@@ -237,7 +237,8 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         const sema::TypeRef* preTy = ctx_.exprType(*call.args[0].value);
         if (preTy && preTy->kind == sema::TypeRef::Kind::Unit) {
             arg = builder_.CreateBitCast(
-                lowerStringLiteral("\"()\"", false), ptrTy(),
+                // fix #3442: §8.5's unit rendering, from its one spelling.
+                lowerStringLiteral(kUnitToStringSource, false), ptrTy(),
                 "console.arg.unit");
         }
     }

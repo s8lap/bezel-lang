@@ -369,6 +369,31 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 ev = lowerExpr(*part.expr);
                 inlineBoxMint = lastBoxMint_;
                 lastBoxMint_ = savedBoxMint;
+                // fix #3442 (§4.7 / §8.5 / §18.5, v0.283): a UNIT-typed hole is
+                // the one expression kind that legitimately lowers to NO value
+                // — `()` is LLVM `void`, so `lowerExpr` returns nullptr for it
+                // by construction (#3421 normalizes the producer). The #1386
+                // arm below exists for expression kinds codegen does not handle
+                // and cannot tell the two apart, so `$"[{()}]"` and
+                // `$"[{C.Nothing()}]"` were HARD COMPILE ERRORS on programs §4.7
+                // makes legal (measured: `internal: lowerExpr returned null for
+                // interpolated-string expression part — #1386`, exit 1). Give
+                // the hole the inert placeholder byte the unit LOCAL slot
+                // already stores (`unitPlaceholderTy`, the ONE definition of
+                // that substitution) so nothing downstream sees a null; the
+                // §8.5 arm further down answers `"()"` without reading it, and
+                // the receiver/producer expression has already been lowered
+                // above for its effects (§22.5's "observable … and is
+                // normative"). `appendPart`'s `srcEv` bookkeeping is unaffected:
+                // a non-pointer constant is neither a +1 string producer nor a
+                // box mint, so every one of its arms declines exactly as it did
+                // when this hole did not compile at all.
+                if (!ev) {
+                    const sema::TypeRef* uTy = ctx_.exprType(*part.expr);
+                    if (uTy && uTy->kind == sema::TypeRef::Kind::Unit &&
+                        !uTy->nullable)
+                        ev = llvm::ConstantInt::get(unitPlaceholderTy(), 0);
+                }
                 if (!ev) {
                     // #1386: ICE — lowerExpr returned null for a non-null
                     // interpolated-string expression part; the expression kind
@@ -617,6 +642,23 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     // place the §8.5 answer lives.
                     if (!pv && rt &&
                         rt->kind == sema::TypeRef::Kind::InlineArray)
+                        pv = emitValueToString(ev, rt);
+                    // fix #3442 (§8.5 unit row / §4.7 / §18.5, v0.283): the
+                    // UNIT hole, exactly the #2913 shape one type over. §8.5
+                    // puts unit in the SAME sentence as the inline arrays
+                    // directly above — "and for the unit type: the type's name
+                    // … `"()"` for unit" — and its first sentence puts
+                    // interpolation squarely in scope ("`ToString` is invoked
+                    // implicitly inside string interpolation ([§18.5]) via
+                    // virtual dispatch"). Without an arm the hole reached the
+                    // LLVM-shape fallback below, where the placeholder byte
+                    // matched `isIntegerTy(8)` and rendered `"0"`. Delegated to
+                    // `emitValueToString` rather than rendered here, for
+                    // #2913's recorded reason: this chain is already a second
+                    // dispatch mirroring that function's, and a rendering here
+                    // would make it a third place the §8.5 answer lives.
+                    if (!pv && rt && rt->kind == sema::TypeRef::Kind::Unit &&
+                        !rt->nullable)
                         pv = emitValueToString(ev, rt);
                     // fix #2661 (spec §8.5 / §18.5, v0.252): a SPAN or a
                     // `Range<T>` hole. Exactly the #2913 shape one type over:

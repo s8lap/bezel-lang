@@ -4147,7 +4147,8 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 if (isToStr || isHash || isEq) {
                     (void)lowerExpr(*ma->target);  // per §22.3 / §7.5
                     if (isToStr)
-                        return lowerStringLiteral("\"()\"", /*verbatim=*/false);
+                        return lowerStringLiteral(kUnitToStringSource,
+                                                  /*verbatim=*/false);
                     if (isHash) return builder_.getInt32(kUnitHashCode);
                     const ast::Expr* arg = call.args[0].value.get();
                     const sema::TypeRef* at = ctx_.exprType(*arg);

@@ -2665,6 +2665,22 @@ private:
     // for a one-valued type; 'u','n','i','t' is recognizable in a report.
     static constexpr uint32_t kUnitHashCode = 0x756E6974u;
 
+    // fix #3442 (§8.5 *`ToString`*, §4.7 *The unit type*, v0.283): the ONE
+    // rendering the unit type answers with, as Bezel string-literal SOURCE TEXT
+    // (the form `lowerStringLiteral` takes, quotes included). §8.5, verbatim:
+    // "For inline arrays (all forms …) and for the unit type: the type's name —
+    // `"[3]int"`-style for an inline array, `"()"` for unit".
+    //
+    // FOUR positions must agree on it and each spelled it out separately before
+    // this constant: the box thunk `bz$unittostr` (the unit box vtable's
+    // kToStringSlot), the unboxed `u.ToString()` arm in `lowerCallDispatch`,
+    // the §21.9 `Console.WriteLine(())` argument rescue, and — added by #3442 —
+    // `emitValueToString`'s unit arm, which every §18.5 interpolation hole
+    // reaches. Same discipline as `kUnitHashCode` directly above, and the same
+    // reason the inline-array row bottoms out in one `inlineArrayTypeSpelling`
+    // (#2959): one §8.5 answer must have one spelling, or the spellings drift.
+    static constexpr const char* kUnitToStringSource = "\"()\"";
+
     // fix #3422 (§8.3 / §8.6 "Boxing of the unit value", v0.283): "is `other`
     // — an `Object?` reference — a boxed `()`?", as an i1. The ONE place that
     // decides it: `bz$uniteq` (the box vtable's kEqualsSlot) is emitted FROM
