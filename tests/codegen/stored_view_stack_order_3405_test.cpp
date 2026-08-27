@@ -72,8 +72,24 @@
 //       element takes the TOP and leaves the remainder in the field, disposed
 //       exactly once there. Under ASan/LSan.
 //   (G) `OwningQueue` at the owning head still drains front-to-back — the
-//       verified negative for the new `lifo` cache key (the two variants must
-//       never share a vtable).
+//       verified negative for the ROUTING decision: which leaf passes which
+//       `lifo` value. MEASURED: rebuilding with the forward leaf's call
+//       changed to `owningDrainWrapForHead(arr, iEnumTy, true)` makes this
+//       row print `order=201005` and go red.
+//   (H) The `lifo` CACHE-KEY guard, which (G) does NOT provide. The two
+//       variants share a struct layout and differ only by the `lifo$` segment
+//       of the per-element-type name prefix, so a key-less build silently
+//       gives one family the other's vtable. Only a program holding BOTH an
+//       `OwningStack<Item>` and an `OwningArray<Item>` at `IOwningEnumerable`
+//       heads can see it — a single-family program instantiates one variant
+//       and is blind. MEASURED on a scratch compiler with the `lifo$` segment
+//       removed: this row prints `stack=201005 array=201005` and goes red,
+//       while (G), the whole of this file's other six rows, and the
+//       `iowningenumerable` / `drain` / `owning_queue` filters all stay green.
+//   (I) The EXPRESSION-BODIED INDEXER getter (§23.2), the third read site
+//       `wrapPropertyArrayAsIEnumerable` serves besides the qualified and
+//       bare-`this` property reads (`LlvmBackend_Assign.cpp:2301`). Same
+//       routing, same defect: 51020 on 1e3861a, 201005 with the fix.
 
 #include <string>
 
@@ -243,8 +259,15 @@ BEZEL_TEST(stored_view_stack_order_3405,
 // ---------------------------------------------------------------------------
 // (D) Verified negatives at the same site — the siblings the routing change
 //     must NOT disturb.
-//   per stdlib §4.11 ("a queue front-to-back (dequeue order)") and §4.6
-//   (LinkedList head-to-tail)
+//   per stdlib §4.11 ("a queue front-to-back (dequeue order)") for the queue
+//   half. The LinkedList half is a MEASURED invariance claim, not a cited
+//   one: stdlib §4.6 `LinkedList<T>` states head-to-tail order only for
+//   SEQUENCE-LITERAL construction ("textual order is head-to-tail:
+//   `using var l: LinkedList<int> := [10, 20, 30];` produces a list whose
+//   `First` is `10` and `Last` is `30`"), and carries no iteration-order
+//   sentence of its own. What this row pins is that the value is IDENTICAL
+//   on 1e3861a and with the fix — the LinkedList family never went through
+//   the deleted arm, so the routing change must not perturb it.
 // ---------------------------------------------------------------------------
 BEZEL_TEST(stored_view_stack_order_3405,
            queue_and_linkedlist_stored_views_keep_forward_order_4_11) {
@@ -378,10 +401,17 @@ BEZEL_TEST(stored_view_stack_order_3405,
 }
 
 // ---------------------------------------------------------------------------
-// (G) The `lifo` cache key's verified negative: `OwningQueue` at the owning
-//     head still drains front-to-back. The LIFO and forward variants share a
-//     struct layout, so a cache-key mistake would silently give one the
-//     other's vtable.
+// (G) The ROUTING negative: `OwningQueue` at the owning head still drains
+//     front-to-back, i.e. the forward leaf still passes `lifo=false`.
+//
+// ⚠ This row is NOT the guard for the `lifo` CACHE KEY, which an earlier
+// revision of this header claimed it was. Measured: a scratch compiler with
+// the `lifo$` segment removed from the name prefix leaves this row GREEN —
+// the program instantiates only the queue's variant, so there is nothing for
+// it to collide with. Row (H) is the cache-key guard. What this row DOES
+// prove, also measured: rebuilding with the forward leaf's call changed to
+// `owningDrainWrapForHead(arr, iEnumTy, /*lifo=*/true)` makes it print
+// `order=201005` and fail.
 //   per stdlib §4.11 ("a queue front-to-back (dequeue order)"), §4.13
 // ---------------------------------------------------------------------------
 BEZEL_TEST(stored_view_stack_order_3405,
@@ -423,5 +453,140 @@ BEZEL_TEST(stored_view_stack_order_3405,
     BEZEL_EXPECT_TRUE(r.ran);
     // Unchanged by this fix — measured identical on 1e3861a and after.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "order=51020"));
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ---------------------------------------------------------------------------
+// (H) The `lifo` CACHE-KEY guard — the one shape that can observe it.
+//
+// `wrapArrayAsIOwningEnumerator` caches its Dispose/MoveNext/TakeCurrent/
+// GetOwningEnumerator functions and its vtable under a per-element-type name
+// prefix. The LIFO and front-to-back variants have the SAME struct layout and
+// the SAME element type, so without the `lifo$` segment in that prefix the
+// SECOND family to be lowered silently reuses the FIRST family's vtable —
+// including its drain primitive.
+//
+// A single-family program cannot see this: it instantiates one variant and
+// there is nothing to collide with. Row (G) is exactly such a program, which
+// is why it stays green on a key-less build. This row holds an
+// `OwningStack<Item>` AND an `OwningArray<Item>` at `IOwningEnumerable<Item>`
+// heads in one compilation unit, so both variants are minted for element type
+// `ptr` and a shared key makes them the same object.
+//
+// MEASURED on a scratch compiler built with the `lifo$` segment removed:
+//   stack=201005 array=201005   <- the array inherited the stack's LIFO vtable
+// and with the key in place:
+//   stack=201005 array=51020
+// Both builds drain both collections (srem=0 arem=0), so the failure mode is
+// a SILENT wrong order, never a crash or a leak — nothing but an
+// order assertion over two families in one program can catch it.
+//   per stdlib §4.11 "Iteration order" (both halves of the sentence at once),
+//   §4.5 / §4.13
+// ---------------------------------------------------------------------------
+BEZEL_TEST(stored_view_stack_order_3405,
+           lifo_and_forward_owning_drains_do_not_share_a_vtable_4_11) {
+    const std::string src =
+        "module M; "
+        "class Item "
+        "  public V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "end Item; "
+        "class C "
+        "  private owned _s: OwningStack<Item>; "
+        "  private owned _a: OwningArray<Item>; "
+        "  public constructor() "
+        "    _s := new OwningStack<Item>(); "
+        "    _s.Push(new Item(5)); "
+        "    _s.Push(new Item(10)); "
+        "    _s.Push(new Item(20)); "
+        "    _a := new OwningArray<Item>(); "
+        "    _a.Add(new Item(5)); "
+        "    _a.Add(new Item(10)); "
+        "    _a.Add(new Item(20)); "
+        "  end constructor; "
+        "  public property S: IOwningEnumerable<Item> => _s; "
+        "  public property A: IOwningEnumerable<Item> => _a; "
+        "  public property SRem: int => _s.Count; "
+        "  public property ARem: int => _a.Count; "
+        "end C; "
+        "class Main "
+        "  public static method Run(): int "
+        "    using var c := new C(); "
+        "    var s := 0; "
+        "    for var x in c.S do "
+        "      using var y := owned x; "
+        "      s := s * 100 + y.V; "
+        "    end for; "
+        "    var a := 0; "
+        "    for var p in c.A do "
+        "      using var q := owned p; "
+        "      a := a * 100 + q.V; "
+        "    end for; "
+        "    Console.WriteLine("
+        "      $\"stack={s} array={a} srem={c.SRem} arem={c.ARem}\"); "
+        "    return 0; "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    return Run(); "
+        "  end Main; "
+        "end Main;";
+    JitResult r = runAotChecked(src);
+    if (wasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    // The two families must disagree — §4.11 gives the stack pop order and the
+    // array (an `OwningArray`, no §4.11 reversal) front-to-back. A key-less
+    // build prints "array=201005" here.
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "stack=201005 array=51020"));
+    BEZEL_EXPECT_FALSE(has(r.stdoutText, "array=201005"));
+    // Both still drain — the key affects the ORDER, never the destructiveness.
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "srem=0 arem=0"));
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ---------------------------------------------------------------------------
+// (I) The expression-bodied INDEXER getter — the third read site
+//     `wrapPropertyArrayAsIEnumerable` serves.
+//
+// The helper is applied at the qualified property read and the bare-`this`
+// read (`LlvmBackend_Exprs.cpp`) and at the expression-bodied indexer getter
+// (`LlvmBackend_Assign.cpp:2301`). Rows (A)-(C) cover the property spelling;
+// the indexer took the identical deleted arm and had the identical defect.
+// MEASURED: 51020 on 1e3861a, 201005 with the fix.
+//   per stdlib §4.11 "Iteration order", spec §23.2 (expression-bodied
+//   accessors), §29.2
+// ---------------------------------------------------------------------------
+BEZEL_TEST(stored_view_stack_order_3405,
+           expression_bodied_indexer_getter_also_pops_in_order_4_11) {
+    const std::string src =
+        std::string(kPrelude) +
+        "class D "
+        "  private owned _s: OwningStack<Item>; "
+        "  public constructor() "
+        "    _s := new OwningStack<Item>(); "
+        "    _s.Push(new Item(5)); "
+        "    _s.Push(new Item(10)); "
+        "    _s.Push(new Item(20)); "
+        "  end constructor; "
+        "  public property [i: int]: IEnumerable<Item> => _s; "
+        "end D; "
+        "class Main "
+        "  public static method Run(): int "
+        "    using var d := new D(); "
+        "    var order := 0; "
+        "    for var x in d[0] do "
+        "      order := order * 100 + x.V; "
+        "    end for; "
+        "    Console.WriteLine($\"indexer={order}\"); "
+        "    return 0; "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    return Run(); "
+        "  end Main; "
+        "end Main;";
+    JitResult r = runAot(src);
+    BEZEL_EXPECT_TRUE(r.ran);
+    // Pre-fix on 1e3861a: "indexer=51020".
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "indexer=201005"));
+    BEZEL_EXPECT_FALSE(has(r.stdoutText, "indexer=51020"));
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
