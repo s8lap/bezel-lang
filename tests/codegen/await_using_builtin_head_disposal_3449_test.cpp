@@ -110,6 +110,17 @@
 // decision is exactly the duplicated-predicate shape that produced #2921 and
 // #2973 in this very chain, and that #2992 was filed about.
 //
+// ⚠ THE SCOPE IS HEAD-RESOLVABLE DECLARATIONS, not all of them. Sharing one
+// resolution is what makes the fall-through set and the guard's set identical;
+// it does not make either set complete. A monomorphized GENERIC head has no
+// name `usingVarBuiltinHeadName` can produce, so it is invisible to both:
+// `await using var s := new T();` at `T = Stopwatch` still takes the word-0
+// read. Measured on 0c5ecd1 and on this fix, IDENTICALLY — `await using` SEGV
+// @0x10 both sides, plain `using var` 6400 B / 200 allocs leaked both sides
+// (the sync chain does not claim it either). Not a regression and not widened
+// by this fix; filed as its own shape by the #3449 review. It is the one place
+// the twins still disagree, so no row below asserts otherwise.
+//
 // Every test runs under runAotChecked (generated-code ASan with LSan), so
 // `r.ran` is itself the memory-safety assertion, and each program returns a
 // distinctive value through `Main` so a silent mis-execution cannot pass.
@@ -365,7 +376,7 @@ BEZEL_TEST(await_using_builtin_head_disposal_3449,
 // fallback: §28.12 requires the awaited `DisposeAsync()` to run and the
 // destructor body NOT to ("For `await using`, the awaited `DisposeAsync()`
 // performs whatever asynchronous cleanup the class defines; the destructor body
-// (if any) is not also run, because `DisposeAsync` supersedes it" — §28.12
+// (if any) is **not** also run, because `DisposeAsync` supersedes it" — §28.12
 // verbatim, v0.283). The observable is stdout, not an exit code: an exit code
 // cannot distinguish "DisposeAsync ran" from "the destructor ran".
 // per §28.12 (issue #3449)
@@ -399,7 +410,7 @@ BEZEL_TEST(await_using_builtin_head_disposal_3449,
 // ── The plain-keyword twin of the user-class control: §28.12's other half —
 // "For plain `using` (or a synchronous `Dispose()` call) on a class that
 // implements both, the destructor body runs synchronously and `DisposeAsync` is
-// not invoked" (§28.12 verbatim, v0.283). Together the two rows pin that the
+// **not** invoked" (§28.12 verbatim, v0.283). Together the two rows pin that the
 // keyword still selects the logical-disposal path for a USER class, which is
 // exactly the decision the fix leaves alone. // per §28.12 (issue #3449)
 BEZEL_TEST(await_using_builtin_head_disposal_3449,

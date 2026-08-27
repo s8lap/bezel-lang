@@ -15734,17 +15734,35 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         // synchronous collection disposal"), which #3437 then applied to the
         // iterator-format family and this applies to the residual built-ins.
         // Falling through hands them the SAME arms the plain spelling reaches,
-        // which is what makes the two twins agree.
+        // which is what makes the two twins agree — for every head the
+        // resolution below can NAME. Where it cannot (a monomorphized generic
+        // head), neither spelling is claimed and the twins still disagree; see
+        // the ⚠ on the fall-through test itself.
         // // per §28.12, §28.9, §28.3, #3449, #2739, #3437, #2992, #3157, #2975
         {
             std::string_view builtinHead = usingVarBuiltinHeadName(ld);
             if (!builtinHead.empty() &&
                 common::isVtableLessBuiltinClassName(builtinHead)) {
                 // Fall through to the representation chain below — and, if no
-                // arm there claims it, to #2992's end-of-chain guard, which is
-                // now reachable from this spelling for its ENTIRE population
-                // (the guard fires only for `isVtableLessBuiltinClassName`
-                // heads, which is exactly the set that falls through here).
+                // arm there claims it, to #2992's end-of-chain guard, which
+                // this spelling can now reach for every declaration whose head
+                // `usingVarBuiltinHeadName` CAN NAME: that resolution is the
+                // one the guard itself uses, so the set that falls through here
+                // and the set the guard judges are the same set.
+                //
+                // ⚠ NOT every declaration — the scope is head-RESOLVABLE ones.
+                // A monomorphized generic head has no name either call can
+                // produce: `await using var s := new T();` at `T = Stopwatch`
+                // is invisible to both the resolution and the guard, so it
+                // still reaches the word-0 read. MEASURED on 0c5ecd1 and on
+                // this fix, identically — SEGV @0x10 for `await using`, and
+                // 6400 B / 200 allocs leaked for the plain `using var` twin,
+                // which the sync chain does not claim either. Unchanged by this
+                // fix in both directions (not a regression, not widened), and
+                // the twins therefore still DISAGREE at that head: a leak on
+                // one side, a wild jump on the other. Filed separately by the
+                // #3449 review as its own shape; do not read the sentence above
+                // as covering it.
             } else {
                 Disposal d{it->second, nullptr};
                 d.asyncDispose = true;
