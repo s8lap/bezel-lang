@@ -120,7 +120,19 @@ llvm::Value* Emitter::rescueUnitAssignRhs(llvm::Value* rhs,
 
 bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
-        lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
+        // fix #3377 / §28.3: a `using var` is a SCOPE-BOUND consumer — §28.3
+        // makes it non-movable ("cannot move out of `using var`; `using var`
+        // is scope-bound"), so a deferred-activation frame bound to one
+        // provably dies at this scope's end and its fresh receiver can be
+        // reclaimed there too. A plain `var` is NOT published: it can be
+        // moved/returned, so its receiver keeps the (sound) pre-fix leak.
+        {
+            auto* savedScopeBoundInit = deferredRecvScopeBoundInit_;
+            deferredRecvScopeBoundInit_ =
+                ld->isUsing ? ld->initializer.get() : nullptr;
+            lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
+            deferredRecvScopeBoundInit_ = savedScopeBoundInit;
+        }
         // #823 / §27.5: a local declared INSIDE a loop body is re-initialised
         // every iteration, so a closure capturing it needs a fresh cell per
         // iteration. Record its slot so boxLocalSlot chooses fresh-each-iteration
@@ -3162,6 +3174,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return lowerWhile(*ws);
     }
     if (auto* fors = dynamic_cast<const ast::ForStmt*>(&s)) {
+        // fix #3377 / §29.2 / §28.3: a for-in's iterable is a SCOPE-BOUND
+        // consumer — the §29.2 desugaring binds it to `using var __source`,
+        // disposed at the loop's own scope end. Publishing it here lets
+        // `disposeFreshNewReceiverTempDeferred` reclaim the fresh receiver of
+        // a deferred-activation source (`for var x in new Src().Items()`)
+        // at that same scope end instead of leaking it. The gate matches on
+        // the RECEIVER CHAIN of this expression, so a call in the loop BODY
+        // never matches even though the flag stays set across the body.
+        auto* savedScopeBoundInit = deferredRecvScopeBoundInit_;
+        deferredRecvScopeBoundInit_ = fors->iterable.get();
+        struct RestoreForInit {
+            const ast::Expr** slot;
+            const ast::Expr* saved;
+            ~RestoreForInit() { *slot = saved; }
+        } restoreForInit{&deferredRecvScopeBoundInit_, savedScopeBoundInit};
         // §30.7: `await for var x in asyncSeq do ... end` — async iteration.
         // Must run before the synchronous for-handlers, which would misread the
         // async-enumerator source.

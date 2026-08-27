@@ -13086,6 +13086,68 @@ private:
     // body, so an erasure at the reclaim would lose it.
     void dischargeFreshNewReceiverTempUnwind(llvm::AllocaInst* slot);
 
+    // fix #3377 / §28.3 / §29.1 / §30.1 (v0.282): the fresh receiver of a
+    // deferred-activation call (an iterator / async-task frame whose
+    // settlement may still read `this`) is correctly kept alive past the call
+    // by #2261's predicate narrowing — but the narrowing leaves the receiver's
+    // OWNERSHIP lost. The frame's Dispose disposes owned parameters, owned
+    // locals, closure captures and the yielded value but not its `this`
+    // capture, so the receiver leaks. Thread the ownership to the frame's
+    // settlement by pushing the receiver onto the CURRENT `disposeStack_`
+    // scope. Reverse-order disposal fires the frame's `Dispose()` first (which
+    // may still read `this`), then the receiver. Fires on BOTH normal exit AND
+    // unwind (registered before the call, `unwindOnly=false`).
+    //
+    // ⚠ SCOPE-BOUND GATE — the load-bearing soundness condition. Pushing the
+    // receiver onto a LEXICAL scope is only correct when the produced frame
+    // provably dies in that same scope. It does NOT in general: for
+    //     `return new Src().Items();`
+    // the frame is returned, the receiver's scope-end dispose fires inside the
+    // callee, and the caller's first `MoveNext` reads a freed `this` — a
+    // heap-use-after-free, i.e. exactly the §28.3 defect #2261 removed, traded
+    // back in for the leak. (MEASURED: pre-gate this file's own fix turned the
+    // 16-byte leak into `heap-use-after-free ... freed by ... bz$M.P$Make`.)
+    //
+    // So the helper fires ONLY when the call's result is bound, in the current
+    // statement, to a SCOPE-BOUND consumer: a `using var` initializer or a
+    // for-in iterable. `deferredRecvScopeBoundInit_` carries that expression;
+    // `exprReceiverChainContains` checks the call is on its receiver chain
+    // (so `new Src().Items()` matches directly and
+    // `new Src().Items().GetOwningEnumerator()` matches through the outer
+    // call). Both consumers are scope-bound by the LANGUAGE, not by
+    // convention: §28.3 makes `using var` non-movable — sema rejects
+    // `return move en;` with "cannot move out of `using var` `en`; `using var`
+    // is scope-bound (§28.3)" — and the §29.2 for-in desugaring binds its
+    // source to the same kind of scope-bound `using var __source`. A frame
+    // reached this way therefore cannot outlive the scope the receiver is
+    // pushed onto, and borrows of it cannot either (§28.3 borrow rules), so
+    // the receiver is disposed exactly once, after the frame.
+    //
+    // Every other shape (a returned frame, a frame stored into a field, a
+    // plain non-`using` `var`) is left alone and keeps the pre-fix LEAK. That
+    // is deliberate: a bounded leak is the SOUND direction, and #2261 chose it
+    // over the use-after-free for the same reason. #3390 tracks threading
+    // ownership into the frame itself, which is what the escaping shapes need.
+    void disposeFreshNewReceiverTempDeferred(const ast::Expr* recvExpr,
+                                             llvm::Value* recvPtr,
+                                             const sema::TypeRef* resultTy,
+                                             const ast::Expr* callExpr);
+
+    // fix #3377: true when `target` is `root` or is reachable from it by
+    // descending the RECEIVER chain only — `CallExpr::callee` and
+    // `MemberAccessExpr::target`. Deliberately does NOT descend into call
+    // ARGUMENTS: an argument's value is not the expression the consumer binds,
+    // so a fresh receiver buried in one is not made scope-bound by the binding.
+    bool exprReceiverChainContains(const ast::Expr* root,
+                                   const ast::Expr* target) const;
+
+    // fix #3377: the initializer expression of the scope-bound consumer whose
+    // lowering is in progress — a `using var`'s initializer or a for-in's
+    // iterable — or null when the expression being lowered is not bound to
+    // one. Saved/restored around the two lowering sites (LlvmBackend_Stmts.cpp
+    // `lowerStmt`), so it is naturally correct under nesting.
+    const ast::Expr* deferredRecvScopeBoundInit_ = nullptr;
+
     // #913 / #1054 / §28.7: dispose the displaced old value of an owned class
     // local before a reassignment store overwrites it. Fires only when `target`
     // is a plain LOCAL variable (IdentifierExpr → LocalSymbol → LocalDecl) that

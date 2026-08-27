@@ -3261,6 +3261,146 @@ void Emitter::dischargeFreshNewReceiverTempUnwind(llvm::AllocaInst* slot) {
 }
 
 
+// fix #3377 / §28.3 / §29.1 / §30.1 (v0.282): the NORMAL-exit counterpart of
+// #2261's narrowing. The narrowing correctly keeps `disposeFreshNewReceiverTemp`'s
+// inline reclaim OFF for the deferred-activation result heads (OwningTask +
+// the four `IOwning*` iterable-interface heads) — the iterator/task frame's
+// settlement may still read `this`, so a same-expression inline dispose is a
+// use-after-free. But the narrowing leaves the fresh receiver's ownership LOST
+// — the iterator/task frame's Dispose disposes owned params / owned locals /
+// closure captures / yielded value but does NOT dispose its `this` capture, so
+// the receiver leaks. Thread the ownership to the frame's settlement by pushing
+// the receiver onto the current `disposeStack_` scope (the same scope the result
+// is bound to via the using-var / for-in source). Reverse-order disposal fires
+// `source.Dispose()` first (which reads `this` during finally-chain restoration
+// via emitFrameCaptureRestores), then the receiver.
+//
+// ⚠ THE SCOPE-BOUND GATE is the load-bearing soundness condition — see the
+// declaration comment in LlvmBackend_impl.hpp. Pushing onto a LEXICAL scope is
+// correct only for a frame that provably dies in that scope, which is why this
+// fires only for a result bound to a `using var` initializer or a for-in
+// iterable. Without it, `return new Src().Items();` frees the receiver inside
+// the callee and the caller's first MoveNext reads freed memory (MEASURED —
+// pinned by the c3 control in the #3377 test file). #3390 tracks the escaping
+// shapes, which keep the (sound) leak until ownership lives in the frame.
+//
+// PAIRING. Called from `lowerCallDispatch` at the receiver-registration point,
+// immediately after `registerFreshNewReceiverTempUnwind` — so BEFORE the
+// arguments are evaluated and before the call runs. The inline reclaim
+// (`disposeFreshNewReceiverTemp`) runs LATER, at the end of that function.
+// The two cannot both fire: this helper requires the result to be a
+// deferred-activation head, which is exactly the set #2261's narrowing makes
+// `freshNewReceiverTempEligible` reject, and the inline reclaim requires that
+// predicate to ACCEPT. So there is no double-dispose. Neither fires when the
+// receiver is a borrow (isFreshOwnedClassProducer returns false), so the
+// bound-receiver `using var s := new Src(); s.Items()` shape (#2440 / §29.1)
+// is untouched.
+//
+// UAF AVOIDANCE. The entry is registered BEFORE the call (the call site pushes
+// it as the last step of the receiver-side emission, before buildOrderedArgs
+// runs). On a throw out of an argument evaluation or the call itself, the
+// receiver is on the heap with no owner; the unwind pass fires this entry
+// exactly once (null-guarded, the slot stays live), disposing the receiver.
+//
+// SCOPE ORDERING. The receiver is pushed first (at the call site); the
+// using-var / for-in source's disposal is registered LATER (after the call
+// returns and the binding completes). Reverse-order scope-end iteration fires
+// the source's `Dispose` first (which reads `this`), then the receiver — so
+// `this` is alive for the source's cleanup. No double-dispose: the source's
+// Dispose does not touch `capture[0]` post-restoration (only finally chains
+// do), and this helper's entry is the sole owner of the receiver slot.
+//
+// UNWIND-ONLY PATH. `registerFreshNewReceiverTempUnwind` returns null for the
+// deferred-activation case (its predicate is the same
+// `freshNewReceiverTempEligible`, narrowed by #2261), so there is no parallel
+// `unwindOnly` entry to discharge. The single `unwindOnly=false` entry this
+// helper pushes fires on either path (normal exit or unwind) — the standard
+// scope-end disposal, with no double-dispose risk because nothing else holds
+// the receiver pointer.
+bool Emitter::exprReceiverChainContains(const ast::Expr* root,
+                                        const ast::Expr* target) const {
+    if (!root || !target) return false;
+    for (const ast::Expr* e = root; e;) {
+        if (e == target) return true;
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
+            e = ce->callee.get();
+            continue;
+        }
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            e = ma->target.get();
+            continue;
+        }
+        break;
+    }
+    return false;
+}
+
+
+void Emitter::disposeFreshNewReceiverTempDeferred(
+        const ast::Expr* recvExpr, llvm::Value* recvPtr,
+        const sema::TypeRef* resultTy, const ast::Expr* callExpr) {
+    if (!recvExpr || !recvPtr || !resultTy) return;
+    if (!isFreshOwnedClassProducer(recvExpr)) return;
+    // ⚠ THE SOUNDNESS GATE (see the declaration comment). Only a frame bound
+    // to a SCOPE-BOUND consumer in this statement — a `using var` initializer
+    // or a for-in iterable — provably dies in the scope we are about to push
+    // the receiver onto. `return new Src().Items();` does not, and pushing
+    // there frees the receiver inside the callee while the returned frame
+    // still holds it (heap-use-after-free — MEASURED). Everything that does
+    // not match keeps the pre-fix leak, which is the sound direction.
+    if (!exprReceiverChainContains(deferredRecvScopeBoundInit_, callExpr))
+        return;
+    // The result must be a deferred-activation head (the predicate's excluded
+    // set — see freshNewReceiverTempEligible's #2261 narrowing comment). If
+    // the predicate admits the result (owned class/interface, owning collection,
+    // owning wrapper, value-result) the inline reclaim path handles disposal
+    // and this helper must NOT push a parallel entry.
+    if (resultTy->kind != sema::TypeRef::Kind::Named) return;
+    std::string_view head = resultTy->headName();
+    bool isDeferredActivation =
+        common::isOwningTypeHead(head) &&
+        (common::isTaskFamilyHead(head) ||
+         common::isIterableInterfaceHead(head));
+    if (!isDeferredActivation) return;
+    // No enclosing scope to dispose through (a disposer body, or a function
+    // whose scopes are not yet established).
+    if (disposeStack_.empty()) return;
+    if (emittingDisposerBody_) return;
+    // Belt-and-braces: a non-pointer or literal-null receiver is never a
+    // disposable heap instance. The eligibility gate above already restricts
+    // to a heap CLASS producer, so this is defensive.
+    if (!recvPtr->getType()->isPointerTy()) return;
+    if (llvm::isa<llvm::ConstantPointerNull>(recvPtr)) return;
+    // Per the #2733 commentary in registerFreshNewReceiverTempUnwind: a
+    // null-init slot is required because a disposal pass can be reached on a
+    // path that never executed the production store. We register before the
+    // call here (not after), but the same null-init discipline applies — the
+    // unwind path through an operand evaluated before the production store
+    // would otherwise hand the disposal pass an undef pointer to free.
+    llvm::AllocaInst* slot = entryAllocaNullPtr();
+    builder_.CreateStore(recvPtr, slot);
+    Disposal d{slot, nullptr};
+    // Fires on both normal exit and unwind: the receiver's lifetime must
+    // match the deferred-activation frame's settlement whether the consumer
+    // finishes the loop normally, abandons mid-loop (a `break`/throw out of
+    // the body, or an iterator whose MoveNext throws), or throws out of an
+    // argument evaluation BEFORE the call returns (in which case the frame
+    // was never constructed and the receiver is the sole owner of itself).
+    d.unwindOnly = false;
+    // dynamicDispose dispatches through the vtable at runtime (the receiver's
+    // concrete class is not always statically known here — #3152's family
+    // showed classOfLocal returning null for an imported generic). The
+    // alternative `cls`-based path (line 6102) gates on `disposerFns_` having
+    // an entry for `it->cls`; leaving `cls` null silently SKIPS the entry on
+    // every scope end, which is the bug this attribute avoids. dynamicDispose
+    // also nulls the slot after reclaim so a doubled scope traversal
+    // (mid-expression binding-atom dispose scope, the same shape the
+    // `ffiBuffer` arm documents) is exactly-once. // per #383 / §28.
+    d.dynamicDispose = true;
+    disposeStack_.back().push_back(d);
+}
+
+
 void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
                                           llvm::Value* recvPtr,
                                           const sema::TypeRef* resultTy,

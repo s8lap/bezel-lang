@@ -8666,6 +8666,35 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 sema::methodReturnsOwned(*ms, ctx_);
             recvUnwindSlot = registerFreshNewReceiverTempUnwind(
                 recvTempExpr, recv, ctx_.exprType(call), recvCalleeReturnsOwned);
+            // fix #3377 / §28.3 / §29.1 / §30.1 (v0.282): #2261's predicate
+            // narrowing correctly keeps the inline reclaim OFF for the
+            // deferred-activation result heads (OwningTask + the four
+            // IOwning* iterable-interface heads) — the iterator/task frame's
+            // settlement may still read `this`, so a same-expression inline
+            // dispose would be a use-after-free. But the narrowing leaves the
+            // fresh receiver's ownership LOST: the frame's Dispose disposes
+            // owned params / owned locals / closure captures / yielded value
+            // but NOT its `this` capture. Thread the ownership to the frame's
+            // settlement by pushing the receiver onto the current
+            // `disposeStack_` scope (the same scope the using-var / for-in
+            // source is bound to); reverse-order scope-end disposal fires
+            // `source.Dispose()` first (which reads `this` during finally-
+            // chain restoration), then the receiver. Fires on BOTH normal
+            // exit and unwind. `recvUnwindSlot == null` is the post-narrowing
+            // signal that we are in the deferred-activation shape; the helper
+            // itself re-checks the predicate, so the call is harmless when
+            // the slot is null for an unrelated reason.
+            //
+            // The helper additionally gates on the call's result being bound
+            // to a SCOPE-BOUND consumer (`using var` initializer / for-in
+            // iterable) in this statement — without that gate a RETURNED
+            // frame's receiver is freed inside the callee and the caller's
+            // first `MoveNext` reads freed memory. `&call` is what the gate
+            // matches against the consumer's receiver chain.
+            if (!recvUnwindSlot) {
+                disposeFreshNewReceiverTempDeferred(
+                    recvTempExpr, recv, ctx_.exprType(call), &call);
+            }
         }
     }
     // per §14.1/§14.2 (issue #505): a generic *method* with a closure-typed
