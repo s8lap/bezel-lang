@@ -98,6 +98,17 @@ void writeSource2837(const std::string& path, const std::string& src) {
 // separate process, return its exit code. -1 on compile/link/run failure,
 // -2 if the dependency itself could not be produced (toolchain
 // unavailable).
+//
+// !! THE OBSERVABLE IS AN 8-BIT CHANNEL. Both runners report the program's
+// value as a PROCESS EXIT STATUS, and `WEXITSTATUS` yields only the low 8
+// bits, so a `Main` returning N is observed as `N & 0xff`. EVERY expected
+// value in this file must therefore be in 0..255. That is why the derived
+// override's getter is `200 + i + _w` (max observed 201) rather than a
+// larger, more visually distinctive constant: an earlier form used
+// `500 + i + _w` and asserted 501, which no exit status can ever equal --
+// the program computed 501 correctly and the runner reported 245. If a
+// future edit needs an observable above 255, it must move to captured
+// stdout text, NOT to the exit status.
 int compileImportAndRun2837(const std::string& libSrc,
                             const std::string& appSrc) {
     namespace fs = std::filesystem;
@@ -150,11 +161,11 @@ int compileLocalAndRun2837(const std::string& src) {
 // and `base[0] := v` writes `_v := v - 0 = v` (OWNER's setter).
 //
 // The derived class overrides both accessors with the FORMULA
-// `500 + i + _w` (getter) / `_w := value` (setter) so that
+// `200 + i + _w` (getter) / `_w := value` (setter) so that
 // pre-#3231 (which routed through the vtable-slot wrapper that loads the
 // derived slot at call time), `d.ViaBase(1)` would return
-// `500 + 1 + 0 = 501` instead of the OWNER's `3 + 100 + 1 = 104`.
-// Post-#3231 the OWNER-direct route returns 104, NOT 501.
+// `200 + 1 + 0 = 201` instead of the OWNER's `3 + 100 + 1 = 104`.
+// Post-#3231 the OWNER-direct route returns 104, NOT 201.
 const char* kLib2837 =
     "public class B2837 "
     "  protected _v: int := 3; "
@@ -170,9 +181,9 @@ const char* kLib2837 =
 // T1 — the issue's HEADLINE repro. A LOCAL class `D2837` inherits from the
 // IMPORTED base `B2837`, OVERRIDES the virtual indexer, and exposes
 // `ViaBase(i)` that returns `base[i]`. §12.3 requires the OWNER's body:
-// 104 (3 + 100 + 1), not 501 (500 + 1 + 0 — the override).
+// 104 (3 + 100 + 1), not 201 (200 + 1 + 0 — the override).
 //
-// Pre-#3231: 501 (the override, dispatched through the vtable-slot wrapper).
+// Pre-#3231: 201 (the override, dispatched through the vtable-slot wrapper).
 // Post-#3231: 104 (the OWNER's body, via the direct-entry map).
 // ===========================================================================
 BEZEL_TEST(xmod_imported_virtual_base_indexer_2837,
@@ -181,7 +192,7 @@ BEZEL_TEST(xmod_imported_virtual_base_indexer_2837,
         "public class D2837: B2837 "
         "  private _w: int := 0; "
         "  public override property [i: int]: int "
-        "    get => 500 + i + _w; "
+        "    get => 200 + i + _w; "
         "    set => _w := value; "
         "  end; "
         "  public method ViaBase(i: int): int => base[i]; "
@@ -202,7 +213,7 @@ BEZEL_TEST(xmod_imported_virtual_base_indexer_2837,
     BEZEL_EXPECT_TRUE(imported >= 0);
     BEZEL_EXPECT_FALSE(imported == 139);
     // §12.3: base[i] must return the OWNER's body (104), NOT the override
-    // (501), and the cross-module build must agree with the single-module
+    // (201), and the cross-module build must agree with the single-module
     // twin.
     BEZEL_EXPECT_EQ(imported, 104);
     BEZEL_EXPECT_EQ(imported, localTwin);
@@ -223,7 +234,7 @@ BEZEL_TEST(xmod_imported_virtual_base_indexer_2837,
         "public class D2837: B2837 "
         "  private _w: int := 0; "
         "  public override property [i: int]: int "
-        "    get => 500 + i + _w; "
+        "    get => 200 + i + _w; "
         "    set => _w := value; "
         "  end; "
         "  public method WriteAndRead(): int "
@@ -254,8 +265,8 @@ BEZEL_TEST(xmod_imported_virtual_base_indexer_2837,
 // the fix path). `base[0] += 5` reads through OWNER's getter (3 + 100 + 0
 // = 103), adds 5 (108), writes through OWNER's setter (`_v := 108 - 0 =
 // 108`). Pre-#3231 this read+write through the vtable-slot wrapper both
-// dispatched to the override, so `_w := 500 + 0 + 0 + 5 = 505` and the
-// read-back of `_w` printed `500 + 0 + 505 = 1005`. Post-#3231 the OWNER's
+// dispatched to the override, so `_w := 200 + 0 + 0 + 5 = 205` and the
+// read-back of `_w` printed `200 + 0 + 205 = 405`. Post-#3231 the OWNER's
 // slot is the source AND target of the compound; the read-back of `_v`
 // after `base[0] += 5` returns 108.
 // ===========================================================================
@@ -272,7 +283,7 @@ BEZEL_TEST(xmod_imported_virtual_base_indexer_2837,
         "public class D2837: B2837 "
         "  private _w: int := 0; "
         "  public override property [i: int]: int "
-        "    get => 500 + i + _w; "
+        "    get => 200 + i + _w; "
         "    set => _w := value; "
         "  end; "
         "  public method Bump(): int "
@@ -303,7 +314,7 @@ BEZEL_TEST(xmod_imported_virtual_base_indexer_2837,
 // ===========================================================================
 // T4 — ACCEPT CONTROL / §12.1 — `this[i]` on a derived receiver MUST
 // dispatch VIRTUALLY (the override wins). Pre-#3231 it already did; post-
-// #3231 the fix must not regress it. `this[1]` returns `500 + 1 + 0 = 501`
+// #3231 the fix must not regress it. `this[1]` returns `200 + 1 + 0 = 201`
 // on a fresh `D2837`, the override's body. Pinned so the widening cannot
 // silently re-route a non-`base` indexer access through the OWNER-direct
 // map.
@@ -314,7 +325,7 @@ BEZEL_TEST(xmod_imported_virtual_base_indexer_2837,
         "public class D2837: B2837 "
         "  private _w: int := 0; "
         "  public override property [i: int]: int "
-        "    get => 500 + i + _w; "
+        "    get => 200 + i + _w; "
         "    set => _w := value; "
         "  end; "
         "  public method ViaThis(i: int): int => this[i]; "
@@ -327,12 +338,12 @@ BEZEL_TEST(xmod_imported_virtual_base_indexer_2837,
         "end C; ";
     int localTwin = compileLocalAndRun2837(
         std::string("module Twin2837T4; ") + kLib2837 + appBody);
-    BEZEL_EXPECT_EQ(localTwin, 501);
+    BEZEL_EXPECT_EQ(localTwin, 201);
     int imported = compileImportAndRun2837(
         std::string("module Lib2837T4; ") + kLib2837,
         std::string("module App2837T4; import Lib2837T4; ") + appBody);
     if (imported == -2) return;
-    BEZEL_EXPECT_EQ(imported, 501);
+    BEZEL_EXPECT_EQ(imported, 201);
     BEZEL_EXPECT_EQ(imported, localTwin);
 }
 
@@ -350,7 +361,7 @@ BEZEL_TEST(xmod_imported_virtual_base_indexer_2837,
         "public class D2837: B2837 "
         "  private _w: int := 0; "
         "  public override property [i: int]: int "
-        "    get => 500 + i + _w; "
+        "    get => 200 + i + _w; "
         "    set => _w := value; "
         "  end; "
         "end D2837; "
@@ -363,12 +374,12 @@ BEZEL_TEST(xmod_imported_virtual_base_indexer_2837,
         "end C; ";
     int localTwin = compileLocalAndRun2837(
         std::string("module Twin2837T5; ") + kLib2837 + appBody);
-    BEZEL_EXPECT_EQ(localTwin, 501);  // override wins via vtable dispatch
+    BEZEL_EXPECT_EQ(localTwin, 201);  // override wins via vtable dispatch
     int imported = compileImportAndRun2837(
         std::string("module Lib2837T5; ") + kLib2837,
         std::string("module App2837T5; import Lib2837T5; ") + appBody);
     if (imported == -2) return;
-    BEZEL_EXPECT_EQ(imported, 501);
+    BEZEL_EXPECT_EQ(imported, 201);
     BEZEL_EXPECT_EQ(imported, localTwin);
 }
 
