@@ -93,6 +93,82 @@ const char* classificationName(common::ChoiceClassification c) {
     return "unknown";
 }
 
+// fix #3391 (spec §4.7 *The unit type*, §8.1 *Definition*, §26.5 *Resolution*,
+// §30.3 *The `Task`, `Task<T>`, and `OwningTask<T>` types*, stdlib §9
+// *Primitive type members*, v0.283) — ONE closed-surface member predicate for
+// the value receivers that carry no user `TypeSymbol`, so the `.` form
+// (`resolveMemberAccess`) and the `?.` form (the #3155 mirror) ask the same
+// question in the same place instead of each carrying its own copy.
+//
+// WHY THIS EXISTS. Both member-access resolvers end in a chain of
+// known-complete gates: a `string` receiver draws its own "not yet supported in
+// codegen" message, a known-complete user type draws "no member `M` on type `T`
+// (§11.3, §12.1)", and a non-string/non-`Object` PRIMITIVE receiver draws the
+// stdlib §9 / §8.1 message below — the primitive arm exists precisely because a
+// primitive has no user `TypeSymbol` and therefore slips past the
+// known-complete gate (#2126). `Kind::Unit` has exactly the same shape and was
+// simply never added: `()` has no `TypeSymbol` either, so `u.Id`, `u.Anything`
+// and `u.Anything()` were left UNTYPED and UNREPORTED by both resolvers.
+//
+// That gap is #3391. §30.3 declares `public method Wait();` with no return
+// type, which §4.7 makes unit ("It is the return type of methods declared
+// without an explicit return type"), and #2819 already teaches sema to stamp
+// `Kind::Unit` on `t.Wait()`. So `var r := t.Wait(); … r.Id` gave `r` the type
+// `()` correctly — and then every member access on it fell through both
+// resolvers in silence, leaving codegen's `lowerExpr` with nothing to lower.
+// The enclosing statement then took its own degradation path: an assignment
+// dropped the store (#2961's "assignment RHS expression failed to lower"), a
+// local declaration zero-initialized the slot (#2434), an `if` condition
+// evaluated as false. All three exit 0 with a WRONG VALUE — the repro printed
+// `sum=0` where the answer is 52 — and all three are ASan-clean, so nothing in
+// the gate could see them. A loud rejection is the correct disposition, and the
+// only one available: there is no `Id` on `()` to lower.
+//
+// CATEGORY-BLIND, as #2819's sibling gate is: the question is "this receiver's
+// resolved type is `Kind::Unit`", not an enumeration of the expressions that
+// produce unit (`Task.Wait()`, a method declared without a return type, the
+// `()` literal, a `()`-typed local/param/field). Nullability is likewise
+// ignored — §26.5 draws extension candidates from the receiver type and nothing
+// can be extended onto `()` (§26.2), so `()?` has no more members than `()`.
+//
+// Returns the diagnostic text when `mbr` is outside `recvTy`'s closed surface,
+// or an empty string when this predicate has nothing to say — the receiver is
+// not one of the closed-surface value kinds (`string`, `Object` and a
+// `Kind::None` primitive are deliberately excluded; see the call sites), or
+// `mbr` is one of §8.1's universal members, which exist on every type and reach
+// primitives and `()` alike through §8.6 boxing.
+std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
+                                           std::string_view mbr) {
+    if (!recvTy) return {};
+    if (mbr == "ToString" || mbr == "Equals" || mbr == "GetHashCode" ||
+        mbr == "GetType")
+        return {};
+    const std::string m(mbr);
+    if (recvTy->kind == TypeRef::Kind::Unit) {
+        return "no member `" + m +
+               "` on the unit type `()`: `()` has exactly one value "
+               "(\xC2\xA7""4.7) and exposes only the universal `ToString`/"
+               "`Equals`/`GetHashCode`/`GetType` (\xC2\xA7""8.1); no user "
+               "member or \xC2\xA7""26.5 extension provides `" + m +
+               "`. A unit-valued expression \xE2\x80\x94 a method declared "
+               "without a return type, or `Task.Wait()` (\xC2\xA7""30.3), "
+               "whose result is read from `Result`, not from `Wait()` "
+               "\xE2\x80\x94 is a statement, not a value.";
+    }
+    if (recvTy->kind == TypeRef::Kind::Primitive &&
+        recvTy->primitive != PrimitiveType::String &&
+        recvTy->primitive != PrimitiveType::Object &&
+        recvTy->primitive != PrimitiveType::None) {
+        return "no member `" + m + "` on primitive type `" +
+               primitiveSpellingForDiag(recvTy->primitive) +
+               "`: primitive value types expose only their documented members "
+               "(stdlib \xC2\xA7""9) and the universal `ToString`/`Equals`/"
+               "`GetHashCode`/`GetType` (\xC2\xA7""8.1); no user member or "
+               "\xC2\xA7""26.5 extension provides `" + m + "`";
+    }
+    return {};
+}
+
 }  // namespace
 
 // This translation unit holds the call-resolution and member-access
@@ -18156,41 +18232,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         //     `Equals`/`GetHashCode` are typed by the enclosing CallExpr;
         //     `GetType` is rejected by the reflection-not-implemented gate
         //     (§8.2). None must be shadowed by this reject.
+        //
+        // fix #3391 (§4.7 / §8.1, v0.283): the SAME rule applies to a `()`
+        // receiver, and for the same reason — the unit type has no user
+        // `TypeSymbol` either, so it slipped past the known-complete gate
+        // below exactly as a primitive does. Both arms are now asked through
+        // the one `closedValueSurfaceMemberReason` predicate (top of this
+        // file) that the `?.` mirror also asks, rather than each site
+        // carrying its own copy of the surface and the §8.1 exemption list.
         if (ma.target) {
             if (const TypeRef* recvTy = ctx_.exprType(*ma.target)) {
-                if (recvTy->kind == TypeRef::Kind::Primitive &&
-                    recvTy->primitive != PrimitiveType::String &&
-                    recvTy->primitive != PrimitiveType::Object &&
-                    recvTy->primitive != PrimitiveType::None &&
-                    !ctx_.exprType(ma)) {
-                    const auto& mbr = ma.member;
-                    bool universalObjMember =
-                        mbr == "ToString"    || mbr == "Equals" ||
-                        mbr == "GetHashCode" || mbr == "GetType";
-                    if (!universalObjMember) {
-                        // Local spelling of the primitive keyword for the
-                        // diagnostic (typeDisplayName is file-local to
-                        // Sendability.cpp).
-                        auto primName = [](PrimitiveType p) -> const char* {
-                            using P = PrimitiveType;
-                            switch (p) {
-                                case P::Bool:    return "bool";
-                                case P::Char:    return "char";
-                                case P::Int:     return "int";
-                                case P::Object:  return "Object";
-                                case P::Byte:    return "byte";
-                                case P::SByte:   return "sbyte";
-                                case P::Short:   return "short";
-                                case P::UShort:  return "ushort";
-                                case P::UInt:    return "uint";
-                                case P::Long:    return "long";
-                                case P::ULong:   return "ulong";
-                                case P::Float:   return "float";
-                                case P::Double:  return "double";
-                                case P::Decimal: return "decimal";
-                                default:         return "primitive";
-                            }
-                        };
+                if (!ctx_.exprType(ma)) {
+                    const std::string reason =
+                        closedValueSurfaceMemberReason(recvTy, ma.member);
+                    if (!reason.empty()) {
                         // The MemberAccessExpr span is degenerate (line 0)
                         // when the access is a call callee (`x.M()`) — the
                         // parser sets it only on the property form; fall back
@@ -18199,17 +18254,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         auto loc = ma.span.begin;
                         if (loc.line == 0 && ma.target)
                             loc = ma.target->span.begin;
-                        ctx_.diagnostics().report(
-                            Severity::Error, loc,
-                            std::string("no member `") + std::string(mbr) +
-                            "` on primitive type `" +
-                            primName(recvTy->primitive) +
-                            "`: primitive value types expose only their "
-                            "documented members (stdlib \xC2\xA7""9) and the "
-                            "universal `ToString`/`Equals`/`GetHashCode`/"
-                            "`GetType` (\xC2\xA7""8.1); no user member or "
-                            "\xC2\xA7""26.5 extension provides `" +
-                            std::string(mbr) + "`");
+                        ctx_.diagnostics().report(Severity::Error, loc, reason);
                         return;
                     }
                 }
@@ -20011,50 +20056,18 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                     return;
                 }
             }
-            // Primitive-typed receiver gate (mirrors the resolveMemberAccess
-            // block at ~line 16850; comments there explain the string/Object/
-            // universal-member exemptions).
-            if (recvTyForDiag &&
-                recvTyForDiag->kind == TypeRef::Kind::Primitive &&
-                recvTyForDiag->primitive != PrimitiveType::String &&
-                recvTyForDiag->primitive != PrimitiveType::Object &&
-                recvTyForDiag->primitive != PrimitiveType::None) {
-                bool universalObjMember =
-                    mbr == "ToString"    || mbr == "Equals" ||
-                    mbr == "GetHashCode" || mbr == "GetType";
-                if (!universalObjMember) {
-                    auto primName =
-                        [](PrimitiveType p) -> const char* {
-                        using P = PrimitiveType;
-                        switch (p) {
-                            case P::Bool:    return "bool";
-                            case P::Char:    return "char";
-                            case P::Int:     return "int";
-                            case P::Object:  return "Object";
-                            case P::Byte:    return "byte";
-                            case P::SByte:   return "sbyte";
-                            case P::Short:   return "short";
-                            case P::UShort:  return "ushort";
-                            case P::UInt:    return "uint";
-                            case P::Long:    return "long";
-                            case P::ULong:   return "ulong";
-                            case P::Float:   return "float";
-                            case P::Double:  return "double";
-                            case P::Decimal: return "decimal";
-                            default:         return "primitive";
-                        }
-                    };
-                    ctx_.diagnostics().report(
-                        Severity::Error, nmLoc,
-                        std::string("no member `") + std::string(mbr) +
-                        "` on primitive type `" +
-                        primName(recvTyForDiag->primitive) +
-                        "`: primitive value types expose only their "
-                        "documented members (stdlib \xC2\xA7""9) and the "
-                        "universal `ToString`/`Equals`/`GetHashCode`/"
-                        "`GetType` (\xC2\xA7""8.1); no user member or "
-                        "\xC2\xA7""26.5 extension provides `" +
-                        std::string(mbr) + "`");
+            // Closed-surface value-receiver gate — the primitive arm mirrors
+            // the resolveMemberAccess block above (whose comments explain the
+            // string/Object/universal-member exemptions), and fix #3391
+            // (§4.7 / §8.1, v0.283) adds the `()` arm there for the same
+            // reason. Both are asked through the one
+            // `closedValueSurfaceMemberReason` predicate at the top of this
+            // file, so the `.` and `?.` spellings cannot drift apart.
+            {
+                const std::string reason =
+                    closedValueSurfaceMemberReason(recvTyForDiag, mbr);
+                if (!reason.empty()) {
+                    ctx_.diagnostics().report(Severity::Error, nmLoc, reason);
                     return;
                 }
             }

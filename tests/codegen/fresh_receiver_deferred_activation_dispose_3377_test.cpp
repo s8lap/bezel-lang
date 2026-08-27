@@ -280,12 +280,18 @@ BEZEL_TEST(fresh_receiver_deferred_activation_dispose_3377,
 // `Fetch(): owned OwningTask<Res>` is an `async` method whose state machine
 // carries the receiver's borrow across `await Task.Delay(1)`, so the receiver
 // must survive to settlement (`t.Wait()`) and be reclaimed at the using-var's
-// scope end. `sum` counts non-null results, = 4.
+// scope end. `sum` counts completed iterations, = 4.
 //
-// The body deliberately does NOT read `r.Id`: reading a field off the
-// `t.Wait()` result inside a loop currently trips the #2961 "assignment RHS
-// expression failed to lower" internal error, which is an unrelated
-// pre-existing defect (filed separately) and would mask this test's signal.
+// The body deliberately does NOT read the result. #3391 settled why the
+// original spelling `var r := t.Wait(); if r <> null then ...` was not the
+// check it looked like: §30.3 declares `Wait()` with no return type, which
+// §4.7 makes unit, so `r` was a `()` and every member access on it lowered
+// to nothing (that is the #2961 "assignment RHS failed to lower" store-drop
+// the old comment here pointed at). The binding is gone; `sum` counts
+// iterations, and `live`/`made` carry this test's real signal. Reading the
+// value would be `t.Result` (§30.3's escape hatch) — but a `.Result` read
+// inside a loop leaks the result today (#3420), so this test
+// stays on the iteration count.
 // ============================================================================
 BEZEL_TEST(fresh_receiver_deferred_activation_dispose_3377,
            owning_task_fresh_receiver_disposed_at_settlement_30_1) {
@@ -313,8 +319,8 @@ BEZEL_TEST(fresh_receiver_deferred_activation_dispose_3377,
         "    var i := 0; "
         "    while i < 4 do "
         "      using var t := new Client().Fetch(); "
-        "      var r := t.Wait(); "
-        "      if r <> null then sum := sum + 1; end; "
+        "      t.Wait(); "
+        "      sum := sum + 1; "
         "      i := i + 1; "
         "    end while; "
         "    Console.WriteLine(\"live=\" + Client.live.ToString() + "

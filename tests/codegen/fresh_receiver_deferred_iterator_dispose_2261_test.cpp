@@ -210,6 +210,16 @@ BEZEL_TEST(fresh_receiver_deferred_iterator_dispose_2261,
 // disposes it at Task-settlement via `using var t := …; t.Wait()`. This
 // pins the fix's exclusion of the `OwningTask` head (in the Task-family
 // intersection of `isOwningTypeHead`).
+//
+// fix #3391 (§4.7 / §30.3, v0.283): the result is read from
+// `t.Result`, not from `var r := t.Wait()`. §30.3 declares `Wait()` with
+// NO return type, which §4.7 makes unit — so the old spelling
+// bound `r` to `()` and `r.Id` resolved to nothing at all. Both `if` guards
+// therefore lowered to a dropped condition and this test passed VACUOUSLY:
+// neither `r = null` nor `r.Id <> 13` was ever evaluated, so the 88/99 arms
+// could not fire whatever the receiver did. Reading `Result` (the escape hatch
+// §30.3 names for the value) makes both guards real; #3391 now rejects
+// the old spelling outright.
 // ============================================================================
 BEZEL_TEST(fresh_receiver_deferred_iterator_dispose_2261,
            owning_task_receiver_not_freed_before_settlement_30_1) {
@@ -230,7 +240,8 @@ BEZEL_TEST(fresh_receiver_deferred_iterator_dispose_2261,
         "  public static method Main(): int "
         "    do "
         "      using var t := new Client().Fetch(); "
-        "      var r := t.Wait(); "
+        "      t.Wait(); "
+        "      var r := t.Result; "
         "      if r = null then return 88; end; "
         "      if r.Id <> 13 then return 99; end; "
         "    end; "
