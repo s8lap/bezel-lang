@@ -5849,8 +5849,8 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
         // A receiver is an evaluated operand, and none of the rules that say so
         // carves out a receiver whose §8.5 answer is static:
         //   * §7.5 "Evaluation": "`?.` short-circuits. The receiver is evaluated
-        //     first; if it is null the access does not occur and nothing to its
-        //     right in the chain is evaluated" — a rule that a NULL receiver
+        //     first; if it is null the access does not occur and **nothing to
+        //     its right in the chain is evaluated**" — a rule that a NULL receiver
         //     SUPPRESSES the rest presupposes a non-null one's expression RUNS,
         //     and `.` has no short-circuit at all.
         //   * §22.3, the `ref`/`out` argument-locations passage: "the receiver
