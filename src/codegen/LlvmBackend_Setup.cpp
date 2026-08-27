@@ -14602,8 +14602,42 @@ void Emitter::consumeLastLambdaCapturedCells() {
         // would corrupt that later read. Skip boxedCellFree when the captured
         // local's declaration depth is shallower than the current scope (the
         // cell then leaks until the local's own scope exits — the sound
-        // trade-off). Only LOCALS are in declScopeDepth_; params are left to
-        // the disposal guard above (a noted follow-up).
+        // trade-off).
+        //
+        // fix #3403 (§27.5 / §28.9, v0.283): the same rule, for a captured
+        // PARAMETER. Only LOCALS are in declScopeDepth_, and the follow-up this
+        // comment used to note as open was a live SIGSEGV: the "disposal guard
+        // above" catches only a reads-THROUGH-cell disposal, which a plain
+        // `int` parameter does not have, so nothing at all protected the shape
+        //
+        //     method Run(v: int): int
+        //       do var g := lambda(): int => v; ... end;
+        //       return v;                       /* reads the freed cell */
+        //
+        // A parameter is bound in the body's OUTERMOST scope, and "depth 1 IS
+        // the function-body root scope" is not an invariant invented here:
+        // lowerScopedBlock tests exactly `disposeStack_.size() == 1` to decide
+        // whether it is opening "the function-body ROOT scope (the first one
+        // pushed)" and register the method's `owned` parameters' unwind
+        // disposal there. So "declared shallower than the capture site" is
+        // exactly `disposeStack_.size() > 1`, read off a fact the emitter
+        // already computes — no depth needs recording at paramSlots_'s many
+        // population sites.
+        //
+        // `do … end` emits no basic block of its own, so the parameter took
+        // boxLocalSlot's FRESH path in the shape above and this was reachable on
+        // the pre-fix compiler, before the widening above ever ran: measured as
+        // "AddressSanitizer: SEGV on unknown address 0x000000000000".
+        //
+        // COST, STATED. #969's rule is conservative by construction: it also
+        // declines the shape where the parameter is NOT read after the inner
+        // block and the free WOULD have been correct. Such a shape took the
+        // fresh path and was freed before this commit; it now leaks instead —
+        // measured at 80 B / 20 allocations over 20 calls (one cell per call),
+        // clean on a build with this conjunct deleted. That is the deliberate
+        // trade, the same one #969 made for locals, and the correct direction of
+        // danger: the alternative reading is the SIGSEGV above.
+        if (ce.isParam && disposeStack_.size() > 1) continue;
         auto dd = declScopeDepth_.find(ce.key);
         if (dd != declScopeDepth_.end() && dd->second < disposeStack_.size()) {
             // A pattern binding is established by the case matcher in the

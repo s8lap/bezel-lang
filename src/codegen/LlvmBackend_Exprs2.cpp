@@ -1242,7 +1242,27 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // Skip guarded-boxing cells — a param declared outside a loop whose
         // lambda capture is inside the loop body must not have its cell freed
         // at inner-scope exit (the cell is reused across iterations).
-        if (!alreadyBoxed && !wasGuardedParam &&
+        //
+        // fix #3403 (§27.5 / §28.9, v0.283): `loopStack_.empty()` is admitted
+        // alongside `!wasGuardedParam`, which is #3435's captured-LOCAL proof
+        // applied to the branch it was not applied to. The proof is about a
+        // BACKWARD EDGE, not about the storage class: with no enclosing loop
+        // above the capture site, boxLocalSlot's null-guarded allocation runs at
+        // most once per invocation and exactly one closure holds the cell, so
+        // the scope-end free is that cell's one and only free.
+        //
+        // For a PARAMETER the guarded path is not an exotic case, which is why
+        // the old flat exclusion mattered so much more here than it did for a
+        // local. boxLocalSlot picks fresh-vs-guarded by asking whether a
+        // StoreInst to the slot sits in the CURRENT basic block; a parameter's
+        // store is the prologue's, so the fresh path is taken only while the
+        // capture site is still in the entry block. Any block-splitting
+        // construct above it — an `if`, a `while`, a `case` — takes the guarded
+        // path, and an ASYNC body takes it ALWAYS (the resume function opens
+        // with the state-dispatch `switch`, so no body statement is ever in the
+        // entry block). That is the whole of the issue's "leaks only after an
+        // `await`" discriminator: it is the block boundary, not the await.
+        if (!alreadyBoxed && (!wasGuardedParam || loopStack_.empty()) &&
             currentFn_ == cellFreeEligibleFn_ &&
             cellFreeEligible_.count(static_cast<const void*>(sym))) {
             LastCellEntry lce{newSlot, static_cast<const void*>(sym)};
@@ -1252,6 +1272,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             lce.unwindUnsafe =
                 unwindUnsafeCellFree_.count(static_cast<const void*>(sym)) !=
                 0;
+            // fix #3403: mark this a PARAMETER entry so the #969 nested-scope
+            // guard in consumeLastLambdaCapturedCells applies to it. That guard
+            // reads declScopeDepth_, which holds LOCALS only — so before this
+            // flag existed a parameter captured inside a `do … end` had its cell
+            // freed at the INNER scope's end and every later read of the
+            // parameter (which goes through the cell after boxing) dereferenced
+            // a nulled holder: a SIGSEGV, measured on the pre-fix compiler.
+            lce.isParam = true;
             lastLambdaCapturedCells_.push_back(lce);
         }
         // #429/#672: resolve sema type for retain/release classification.

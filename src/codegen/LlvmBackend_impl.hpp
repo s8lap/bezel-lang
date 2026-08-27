@@ -781,6 +781,17 @@ private:
         // registers, so the cell-free is skipped on the unwind edge (see that
         // flag's declaration for the full soundness argument).
         bool unwindUnsafe = false;
+        // fix #3403 (§27.5 / §28.9, v0.283): true when `key` is a captured
+        // PARAMETER (a sema::Symbol*) rather than a captured local's LocalDecl.
+        // A parameter is bound in the function's OUTERMOST body scope
+        // (disposeStack_[0]) and is never in declScopeDepth_ — which is the
+        // #969 depth guard's input — so without this flag that guard silently
+        // does not apply to parameters and a capture site inside a nested
+        // `do … end` frees the cell at the INNER scope's end while the
+        // parameter's own later reads still go through it (paramSlots_ was
+        // rebound to the cell holder). Measured on the pre-fix compiler as a
+        // SIGSEGV at address 0, not a leak. See consumeLastLambdaCapturedCells.
+        bool isParam = false;
     };
     std::vector<LastCellEntry> lastLambdaCapturedCells_;
     // §27.5 / §28.9 (#969): block-nesting depth (== disposeStack_.size()) of each
@@ -788,8 +799,10 @@ private:
     // boxedCellFree registration to skip freeing a capture cell at an inner
     // lambda's scope when the captured local was declared in an ENCLOSING scope
     // (the cell must outlive the inner block — it is read through, after the
-    // inner block exits, by the outer local). Params are absent (handled by the
-    // existing reads-through-cell disposal guard, or left as a noted follow-up).
+    // inner block exits, by the outer local). Params are absent from this map on
+    // purpose: they are bound in the body's outermost scope by construction, so
+    // LastCellEntry::isParam (fix #3403) carries the same fact without needing a
+    // registration at every one of paramSlots_'s ~20 population sites.
     std::unordered_map<const void*, std::size_t> declScopeDepth_;
     // CG6: emitted LLVM function for each static method symbol.
     std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_;
