@@ -6743,6 +6743,87 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             auto* fn = declareC("bz_dict_contains_str", i1(), {ptrTy(), ptrTy(), i64()});
             return builder_.CreateCall(fn, {recv, kd, kl}, "dict.contains");
         }
+        // fix #3372 / stdlib §4.8 + §4.9 (v0.282, §1 Try shape (d)):
+        //   Dictionary<K, V>.TryAdd(key: K, value: V): bool
+        //   OwningDictionary<K, V>.TryAdd(key: K, owned value: V): bool
+        // The no-throw sibling of `.Add(k, v)` directly below: probe the key;
+        // absent -> insert and return true, present -> leave the table untouched
+        // and return false. For the OWNING form the passed value was consumed at
+        // the call site, so the false path DISPOSES it — the `OwningSet<T>.TryAdd`
+        // contract stdlib §4.9 cites verbatim (§4.10; §28.3 discharge rule, the
+        // same reasoning `Add`'s duplicate-key throw path below applies).
+        if (m == "TryAdd" && call.args.size() == 2 &&
+            call.args[0].value && call.args[1].value) {
+            llvm::Value* k = lowerExpr(*call.args[0].value);
+            llvm::Value* v = lowerExpr(*call.args[1].value);
+            if (!k || !v) return nullptr;
+            llvm::Value* isDup;
+            if (keyTy) {
+                auto* cf = declareC("bz_dict_contains_gen", i1(),
+                                    {ptrTy(), ptrTy()});
+                isDup = builder_.CreateCall(cf, {recv, genKeyPtr(k)}, "tryadd.dup");
+            } else {
+                auto [kd0, kl0] = strDataLen(k);
+                auto* cf = declareC("bz_dict_contains_str", i1(),
+                                    {ptrTy(), ptrTy(), i64()});
+                isDup = builder_.CreateCall(cf, {recv, kd0, kl0}, "tryadd.dup");
+            }
+            auto* dupBB = llvm::BasicBlock::Create(llvm_, "tryadd.dup.disp",
+                                                   currentFn_);
+            auto* insBB = llvm::BasicBlock::Create(llvm_, "tryadd.ins",
+                                                   currentFn_);
+            auto* endBB = llvm::BasicBlock::Create(llvm_, "tryadd.end",
+                                                   currentFn_);
+            builder_.CreateCondBr(isDup, dupBB, insBB);
+            // dupBB: the key is present. §4.9 (v0.282) — the owning form's value
+            // parameter is `owned`, so ownership arrived here and must be
+            // discharged (§28.3) rather than leaked; the borrowing §4.8 form
+            // leaves the argument alone.
+            builder_.SetInsertPoint(dupBB);
+            if (dictValIsOwning && dictValClassDisposer)
+                builder_.CreateCall(dictValClassDisposer, {v});
+            llvm::BasicBlock* dupEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            // insBB: absent — the insert path is `Add`'s, verbatim (#429 / §28.9
+            // string-value +1 retain, then the key-shaped store).
+            builder_.SetInsertPoint(insBB);
+            if (dictIsStringValue &&
+                !isPlusOneStringProducer(call.args[1].value.get()))
+                emitStringRetain(v);
+            llvm::Value* vPtr = encodeValue(v);
+            if (keyTy) {
+                auto* fn = declareC("bz_dict_set_gen",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                builder_.CreateCall(fn, {recv, genKeyPtr(k), vPtr});
+            } else {
+                auto [kd, kl] = strDataLen(k);
+                auto* fn = declareC("bz_dict_set_str",
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                builder_.CreateCall(fn, {recv, kd, kl, vPtr});
+            }
+            llvm::BasicBlock* insEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            builder_.SetInsertPoint(endBB);
+            // The PHI is created BEFORE any other instruction in endBB — a PHI
+            // must be the first thing in its block — and the incoming blocks are
+            // the ACTUAL predecessors (`GetInsertBlock` after each arm), not the
+            // blocks the arms started in, so the wiring survives a helper that
+            // splits its arm.
+            auto* phi = builder_.CreatePHI(i1(), 2, "tryadd.r");
+            phi->addIncoming(builder_.getFalse(), dupEnd);
+            phi->addIncoming(builder_.getTrue(), insEnd);
+            // fix #1970 / §28.4 / §28.6 (the `Add` handler below carries the full
+            // reasoning): the owning form consumed the value on BOTH edges — the
+            // insert transferred it into the table, the duplicate edge disposed it
+            // — so the caller's bare owned local/param slot is nulled once here,
+            // after the join, keeping the caller's null-guarded unwindOnly
+            // disposal exactly-once.
+            if (dictValIsOwning)
+                nullTransferredOwnedLocalSlot(call.args[1].value.get());
+            return phi;
+        }
         // .Add(k, v) / .Set(k, v)
         // #429 / §28.9: for a borrowing Dictionary<K, string> co-owns a +1 per
         // stored value. Take an INDEPENDENT +1 at insert/overwrite by retaining

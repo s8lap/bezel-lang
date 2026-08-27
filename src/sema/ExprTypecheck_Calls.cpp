@@ -6587,7 +6587,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (colName == "Dictionary" || colName == "OwningDictionary") {
                         if (m == "Count")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        // stdlib §4.8 / §4.9 (v0.282, §1 Try shape (d), #3372):
+                        // `TryAdd(key, value): bool` joins the bool-returning
+                        // members. Without this arm the call is left untyped, so
+                        // `var b: int := d.TryAdd(k, v)` sails past §5.1.
                         else if (m == "ContainsKey" || m == "Remove" || m == "TryGetValue" ||
+                                 m == "TryAdd" ||
                                  m == "TryPopValue")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         // fix #643 / stdlib §4.9: PopValue(key): owned V — removes
@@ -6687,7 +6692,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (colName == "SortedDictionary") {
                         if (m == "Count")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        // stdlib §4.17 (v0.282, §1 Try shape (d), #3372):
+                        // `TryAdd(key, value): bool`. It MUST be listed here —
+                        // the catch-all V-return arm at the end of this block
+                        // would otherwise type the call as the VALUE type
+                        // (`if sd.TryAdd(k, v)` rejected as non-bool; a
+                        // string-valued map producing malformed IR).
                         else if (m == "ContainsKey" || m == "Remove" ||
+                                 m == "TryAdd" ||
                                  m == "TryGetValue")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         // FirstKey / LastKey — return the key type K.
@@ -10921,7 +10933,13 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
                                colName == "LinkedList" ||
                                colName == "Dictionary" ||
                                colName == "OwningDictionary")) ||
-            (m == "TryAdd" && (colName == "Set" || colName == "SortedSet")) ||
+            // stdlib §4.8/§4.9/§4.17 (v0.282, #3372): the dictionary family's
+            // `TryAdd(key: K, ...)` declares the same NON-nullable key at pos 0
+            // that its `Add` twin above does.
+            (m == "TryAdd" && (colName == "Set" || colName == "SortedSet" ||
+                               colName == "Dictionary" ||
+                               colName == "OwningDictionary" ||
+                               colName == "SortedDictionary")) ||
             (m == "Push"      && colName == "Stack") ||
             (m == "Enqueue"   && colName == "Queue") ||
             (m == "AddFirst"  && colName == "LinkedList") ||
@@ -11019,7 +11037,14 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     // target type is non-nullable (§7)"), verified by probe. `Add` was the
     // only unguarded value slot.
     auto isDictValuePosition = [&](std::size_t pos) -> bool {
-        return pos == 1 && valueTy && m == "Add" && colName == "Dictionary";
+        // stdlib §4.8/§4.17 (v0.282, #3372): the borrowing `TryAdd(key: K,
+        // value: V)` declares the same non-nullable value slot `Add` does.
+        // OwningDictionary is still excluded — its value param is `owned`, so
+        // §22.3 governs it (see the comment block above).
+        return pos == 1 && valueTy &&
+               ((m == "Add" && colName == "Dictionary") ||
+                (m == "TryAdd" && (colName == "Dictionary" ||
+                                   colName == "SortedDictionary")));
     };
 
     for (std::size_t i = 0; i < ce.args.size(); ++i) {
