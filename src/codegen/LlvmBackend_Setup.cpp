@@ -14884,7 +14884,11 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // `lowerStmt` populates IMMEDIATELY before this registration runs).
     //
     // The pin is about the SOURCE object: §28.10 says a borrow-pinned
-    // `using var` registers no disposal because "its real owner disposes it".
+    // `using var` registers no disposal — "at scope end, no `Dispose()` is
+    // called, because the value is not owned by this scope" (the phrase "its
+    // real owner disposes it", which an earlier revision of this comment
+    // attributed to §28.10, appears nowhere in the spec; it came from the code
+    // comment above).
     // That is true of the source and FALSE of the wrapper frame — a fresh
     // `calloc` this declaration alone holds, which nothing else ever frees (the
     // source collection's own binder disposes the BACKING, not the wrap). So
@@ -14904,9 +14908,23 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // returns. No class/collection/dynamic arm is reachable for a lifted decl,
     // which is what the #2769 / #2779 carve-outs had to add an explicit
     // iterator-format head test to guarantee.
-    if (ld->usingVarSourceIsBorrow && iterFormatWrappedDecls_.count(ld))
-        const_cast<ast::LocalDecl*>(ld)->usingVarSourceIsBorrow = false;
-    if (ld->usingVarSourceIsBorrow) return;
+    // narrow #3418: the lift is PER-LOWERING, so it must NOT be written back
+    // into the AST. `iterFormatWrappedDecls_` is deliberately per-lowering —
+    // that is the whole point of #3384's `else erase` above, whose comment
+    // records that a verdict retained across generic instantiations is "a claim
+    // over a frame that was never minted … a double-free, strictly worse than
+    // the leak". A `const_cast` write-back latched `usingVarSourceIsBorrow` OFF
+    // permanently, which reintroduces exactly that hazard by another route: a
+    // generic body lowered twice, where the coercion MINTS in lowering 1 and
+    // takes one of `wrapUserClassAsIEnumerable`'s five decline paths in
+    // lowering 2, would enter lowering 2 with the pin already gone AND no
+    // report entry — falling through to `rawUserClassInBuiltinInterfaceSlot`'s
+    // dynamicDispose arm, or for a CallExpr init back to `ownsSource = isCall`,
+    // and DISPOSING A BORROW. #2769 / #2779 are immune because their gates are
+    // syntactic and lowering-invariant; this one is not. Keep it local.
+    bool pinned = ld->usingVarSourceIsBorrow;
+    if (pinned && iterFormatWrappedDecls_.count(ld)) pinned = false;
+    if (pinned) return;
 
     // fix #2975 (§29.7 / §29.3 / §28.3 / §28.2 / §8.1, v0.240): a slot declared
     // at a BUILT-IN INTERFACE HEAD that actually holds a RAW USER-CLASS
@@ -15021,7 +15039,12 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             // unminted frame is a double-free, strictly worse than the leak):
             // the set has exactly ONE writer, under the coercion's own
             // observation, and is never widened by a second predicate here. The
-            // rewrite is also a strict SUPERSET of the old positive list, so no
+            // rewrite differs from the old positive list only in the SAFE
+            // direction (it is NOT a strict superset, as an earlier revision of
+            // this comment claimed: the old predicate said true for any
+            // `initTR->declaration != nullptr`, where the new one says false
+            // when `wrapUserClassAsIEnumerable` declines — and that old TRUE was
+            // #2975's wild-jump, intercepted first at the count() guard), so no
             // existing claim is lost. Every helper the coercion can call frees
             // only the frame it minted — the borrowing wraps free `self`, and
             // `wrapArrayAsIOwningEnumerator` frees `self` plus an
