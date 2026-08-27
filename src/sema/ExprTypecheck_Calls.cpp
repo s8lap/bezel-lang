@@ -11365,14 +11365,27 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         // the diagnostic precise if the caller forgets the marker.
         // `Dictionary<K,V>.Add(key: K, value: V)` and `OwningDictionary<K,V>.
         // Add(key: K, owned value: V)` declare a NON-nullable key at pos 0
-        // (the value at pos 1 is a separate type V — filed separately). The
+        // (the value at pos 1 is handled by isDictValuePosition below). The
         // owning form's value arg carries the §22.3 `owned` modifier and is
         // skipped by the modifier guard below.
+        // fix #3399 / stdlib §4.17 (v0.283): `SortedDictionary<K, V>` joins
+        // them. It declares `public method Add(key: K, value: V);`
+        // (Bezel_Standard_Library.md:3322) — added at v0.282 by proposal 0119,
+        // which restored the duplicate-is-a-bug tier to the sorted map. #2582
+        // left the name out because §4.17 genuinely had no `Add` at the time
+        // (its write surface was the indexer only), and #3372 added the sibling
+        // `TryAdd` without revisiting `Add`; the gate never caught up with the
+        // stdlib revision. Unguarded, BOTH slots are memory-unsafe, not merely
+        // permissive: measured on 0c5ecd1, `sd.Add(k, 1)` with `k: string? :=
+        // null` and `sd2.Add(1, v)` with `v: string? := null` each compile and
+        // then SEGV at run time (ASan: READ of address 0x0) — the same failure
+        // mode #2582 records for the slots it closed.
         if (pos == 0 && (
             (m == "Add"    && (colName == "Set" || colName == "SortedSet" ||
                                colName == "LinkedList" ||
                                colName == "Dictionary" ||
-                               colName == "OwningDictionary")) ||
+                               colName == "OwningDictionary" ||
+                               colName == "SortedDictionary")) ||
             // stdlib §4.8/§4.9/§4.17 (v0.282, #3372): the dictionary family's
             // `TryAdd(key: K, ...)` declares the same NON-nullable key at pos 0
             // that its `Add` twin above does.
@@ -11455,13 +11468,21 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         return false;
     };
 
-    // §7 / stdlib §4.8 (#2592): the ONE parameter in this helper's surface
-    // whose declared type is `V` rather than the `genericArgs[0]` element/key
+    // §7 / stdlib §4.8 (#2592): the parameters in this helper's surface whose
+    // declared type is `V` rather than the `genericArgs[0]` element/key
     // type — `Dictionary<K, V>.Add(key: K, value: V)` at pos 1 (stdlib §4.8
-    // line 1850). Gated to `Dictionary` deliberately:
-    //   * `SortedDictionary<K, V>` (§4.17 line 2999-3017) declares NO
-    //     `Add(key, value)` at all — its write surface is the indexer-set —
-    //     which is also why #2582 left it out of the pos-0 `Add` name gate;
+    // line 1850). Gated to the two BORROWING maps deliberately:
+    //   * fix #3399 / stdlib §4.17 (v0.283): `SortedDictionary<K, V>` DOES
+    //     declare `Add(key: K, value: V)` (Bezel_Standard_Library.md:3322),
+    //     with the same two non-nullable slots, and is listed here now. The
+    //     previous text of this bullet — "`SortedDictionary<K, V>` (§4.17 line
+    //     2999-3017) declares NO `Add(key, value)` at all — its write surface
+    //     is the indexer-set — which is also why #2582 left it out of the
+    //     pos-0 `Add` name gate" — was TRUE when #2582 wrote it and became
+    //     false at v0.282, when proposal 0119 restored the throwing `Add` to
+    //     the sorted map. That stale claim is what kept BOTH slots unguarded
+    //     through #3372, which added the sibling `TryAdd` to these two lambdas
+    //     without re-reading it;
     //   * `OwningDictionary<K, V>.Add(key: K, owned value: V)` (§4.9 line
     //     1930) marks the value `owned`, so §22.3 governs that transfer, not
     //     §7 — the modifier guard in the loop below skips it, and naming it
@@ -11474,15 +11495,25 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     // separate Expr kind (not a CallExpr) and out of this helper's reach — but
     // it needs nothing: it already rejects an un-narrowed `V?` through the
     // ordinary assignment check ("the assigned value is nullable but the
-    // target type is non-nullable (§7)"), verified by probe. `Add` was the
-    // only unguarded value slot.
+    // target type is non-nullable (§7)"), verified by probe — and the same
+    // holds for `SortedDictionary`, whose indexer-set rejects a nullable VALUE
+    // with that message and a nullable KEY with "the index argument to
+    // `SortedDictionary[key]` is nullable …" (probed on 0c5ecd1). That
+    // asymmetry is what #3399 reports: the sorted map's own indexer write path
+    // was guarded while its `Add` was not. #2592's closing claim here — "`Add`
+    // was the only unguarded value slot" — has been superseded twice, by
+    // #3372's `TryAdd` and by this fix's `SortedDictionary.Add`, so it is
+    // withdrawn rather than restated: the accurate statement is that the two
+    // lambdas above enumerate the guarded slots, and nothing outside them is
+    // claimed.
     auto isDictValuePosition = [&](std::size_t pos) -> bool {
         // stdlib §4.8/§4.17 (v0.282, #3372): the borrowing `TryAdd(key: K,
         // value: V)` declares the same non-nullable value slot `Add` does.
         // OwningDictionary is still excluded — its value param is `owned`, so
         // §22.3 governs it (see the comment block above).
         return pos == 1 && valueTy &&
-               ((m == "Add" && colName == "Dictionary") ||
+               ((m == "Add" && (colName == "Dictionary" ||
+                                colName == "SortedDictionary")) ||
                 (m == "TryAdd" && (colName == "Dictionary" ||
                                    colName == "SortedDictionary")));
     };
