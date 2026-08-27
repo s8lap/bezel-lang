@@ -273,30 +273,41 @@ BEZEL_TEST(xmod_3277_forin_userclass_using_var_dispose,
 }
 
 // ===========================================================================
-// T3 — Named local source (control). The BoxEnum3267 is bound to a Named
-// local `r` first; the wrapper around `r` does NOT own the source (the
-// local keeps the ownership — `srcIsNamedOwner` is true, so
-// `ownsSrc = !srcIsNamedOwner = false`, just as the pre-fix default).
-// This is the mirror of T1 (the only difference is `r` is a named local
-// instead of an unnamed producer), and is what the fix is preserving.
+// T3 — Named local source. The BoxEnum3267 is bound to a Named local `r`
+// first; the wrapper around `r` does NOT own the source (the local keeps the
+// ownership — `srcIsNamedOwner` is true, so `ownsSrc = !srcIsNamedOwner =
+// false`, just as the pre-#3277 default). This is the mirror of T1 (the only
+// difference is `r` is a named local instead of an unnamed producer), and the
+// source-ownership half of it is what #3277 preserved. What the wrapper FRAME
+// itself costs is a separate obligation, and #3418 is where it is discharged —
+// see the note on the test below.
 //
-// KNOWN: this case has a separate leak (the wrapper-around-named-local
-// disposal shape) that the fix does not address — T3's pre-fix rc=1 and
-// post-fix rc=1 are both the same leak class. T3 is included as a
-// regression sentinel: the post-fix result MUST equal the pre-fix result
-// (both rc=1, both leaking the same 56 B), demonstrating that the fix
-// did NOT regress the named-local path. A separate future fix (filed as
-// follow-up) will address the wrapper-around-named-local disposal.
+// #3277 left this case leaking (the wrapper-around-named-local disposal
+// shape), pinned here as a sentinel at rc=1 with the note that improving it
+// to rc=15 "would mean a separate fix landed — also fine, but not this fix".
+//
+// fix #3418 (§28.6 / §29.2 / §28.3 / §28.10, v0.283) IS that separate fix, and
+// this expectation is updated in the same commit. `using var e:
+// IEnumerable<int> := r;` over a NAMED local is exactly #3418's shape: the
+// §29.2 decl-site coercion mints a wrapper frame that this declaration alone
+// holds, and `registerUsingDisposal` claimed it neither through its stale
+// re-spelling of the wrap-creator's grid nor at all, because §28.10's
+// borrow-pin early-returned first. #3418 points the claim at the coercion's own
+// `iterFormatWrappedDecls_` self-report and lifts the pin on that same
+// predicate, so the frame is now claimed and freed.
+//
+// The improvement direction is the SAFE one and is asserted as such: rc=15 is
+// the correct sum (4+5+6) with a clean LeakSanitizer report, which means the
+// source was disposed EXACTLY once — an over-claim would abort under ASan as a
+// double free (and would not return 15), not merely change the exit code.
 // ===========================================================================
 BEZEL_TEST(xmod_3277_forin_userclass_using_var_dispose,
-           named_local_source_unchanged_28_2) {
+           named_local_source_wrapper_frame_reclaimed_28_2) {
     int rc = buildLocalAndRunChecked3277(twinNamedLocalControl3277());
     BEZEL_EXPECT_TRUE(rc >= 0);
-    // Pre-fix and post-fix both: rc=1 (LSan leak). The fix does not change
-    // this — it must NOT regress to rc=0 (which would be a double-free),
-    // and must NOT improve to rc=15 (which would mean a separate fix
-    // landed — also fine, but not this fix).
-    BEZEL_EXPECT_EQ(1, rc);
+    // #3277-era: rc=1 (LSan leak of the unclaimed wrapper frame).
+    // Since #3418: rc=15 — the correct sum AND no LeakSanitizer report.
+    BEZEL_EXPECT_EQ(15, rc);
 }
 
 }  // namespace bezel::module

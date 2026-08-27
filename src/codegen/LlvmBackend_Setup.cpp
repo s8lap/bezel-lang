@@ -14874,6 +14874,38 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 const_cast<ast::LocalDecl*>(ld)->usingVarSourceIsBorrow = false;
         }
     }
+    // fix #3418 (§28.6 / §29.2 / §28.3 / §28.10, v0.283): the THIRD carve-out
+    // of the §28.10 borrow-pin, and the first one that does not need its own
+    // predicate. #2769 and #2779 each lifted the pin for one syntactic shape of
+    // an iterator-format initializer; the fact both were reaching for is
+    // simply *did the §29.2 decl-site coercion mint a wrapper frame for this
+    // declaration* — and `lowerLocalDecl` answers that itself, in
+    // `iterFormatWrappedDecls_` (#2975's `v != preIterWrap` self-report, which
+    // `lowerStmt` populates IMMEDIATELY before this registration runs).
+    //
+    // The pin is about the SOURCE object: §28.10 says a borrow-pinned
+    // `using var` registers no disposal because "its real owner disposes it".
+    // That is true of the source and FALSE of the wrapper frame — a fresh
+    // `calloc` this declaration alone holds, which nothing else ever frees (the
+    // source collection's own binder disposes the BACKING, not the wrap). So
+    // when the coercion minted a frame the pin must not suppress the frame's
+    // scope-end slot-1 Dispose. MEASURED on 3443cf5 (i.e. WITH #3384), 50
+    // executions: `using var e: IEnumerable<Item> := a;` over a named
+    // `OwningArray<Item>` leaked 1600 B / 50 allocs, the `IOwningEnumerable`
+    // twin 1200 B / 50, and a `Stack<int>` source at the `IEnumerable<int>`
+    // head 1600 B / 50 — byte-identical to the plain-`var` leak #3384 closed,
+    // with only the `using var` keyword differing.
+    //
+    // The lift cannot reach any OTHER disposal arm. The coercion's own gate
+    // requires an explicit declared type whose head is `IEnumerable` or
+    // `IOwningEnumerable` (declaration-less Named), so membership in the report
+    // IMPLIES `isSyncIterEnum` below is true and `wrappedHere` is true there,
+    // hence `ownsSource` is true and that arm registers the iterEnumDispose and
+    // returns. No class/collection/dynamic arm is reachable for a lifted decl,
+    // which is what the #2769 / #2779 carve-outs had to add an explicit
+    // iterator-format head test to guarantee.
+    if (ld->usingVarSourceIsBorrow && iterFormatWrappedDecls_.count(ld))
+        const_cast<ast::LocalDecl*>(ld)->usingVarSourceIsBorrow = false;
     if (ld->usingVarSourceIsBorrow) return;
 
     // fix #2975 (§29.7 / §29.3 / §28.3 / §28.2 / §8.1, v0.240): a slot declared
@@ -14964,12 +14996,38 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
              lt->headName() == "IAsyncEnumerable" ||       // fix #1525
              lt->headName() == "IOwningAsyncEnumerable");  // fix #1525
         if (isSyncIterEnum) {
-            const sema::TypeRef* initTR = ctx_.exprType(*ld->initializer);
-            bool wrappedHere = initTR && initTR->kind == sema::TypeRef::Kind::Named &&
-                ((initTR->astNode && initTR->astNode->name &&
-                  !initTR->astNode->name->parts.empty() &&
-                  initTR->headName() == "Array") ||
-                 initTR->declaration != nullptr);
+            // fix #3418 (§28.6 / §29.2 / §28.3, v0.283): the `using var` twin
+            // of #3384. What stood here was a THIRD, independent spelling of
+            // the wrap creator's admissible (declared head x initializer
+            // family) grid — narrower even than the one #3384 replaced on the
+            // plain-`var` side: it admitted only a head-`Array` initializer or
+            // a declaration-carrying one, not even the `Set`/`OwningSet` arm.
+            // Every frame the coercion minted outside that re-spelling was
+            // therefore minted and never claimed, and nothing else frees a
+            // wrapper frame.
+            //
+            // Same repair as #3384, for the same reason: ask the WRAP CREATOR
+            // what it did rather than re-deriving it. `lowerLocalDecl`'s §29.2
+            // coercion reports every frame it minted for this decl in
+            // `iterFormatWrappedDecls_` (#2975's `v != preIterWrap`
+            // self-report), `lowerStmt` runs that coercion immediately before
+            // this registration, and the report is CLEARED when the coercion
+            // declines — so the claim is EQUAL to the mint by construction, not
+            // merely a subset of it, and cannot drift again. This is the fifth
+            // duplicated-classification-predicate defect in this area (#3355,
+            // #3392, #3384, #3376), tracked structurally as #3419.
+            //
+            // CLAIM SUBSET-OF MINT (the dangerous direction — claiming an
+            // unminted frame is a double-free, strictly worse than the leak):
+            // the set has exactly ONE writer, under the coercion's own
+            // observation, and is never widened by a second predicate here. The
+            // rewrite is also a strict SUPERSET of the old positive list, so no
+            // existing claim is lost. Every helper the coercion can call frees
+            // only the frame it minted — the borrowing wraps free `self`, and
+            // `wrapArrayAsIOwningEnumerator` frees `self` plus an
+            // advanced-but-untaken pending it owns per §29.1 — never the source
+            // backing, so no source binder is double-freed.
+            bool wrappedHere = iterFormatWrappedDecls_.count(ld) != 0;
             bool ownsSource =
                 dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) ||
                 dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) ||
