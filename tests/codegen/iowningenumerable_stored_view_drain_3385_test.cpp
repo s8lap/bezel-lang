@@ -125,8 +125,9 @@ bool wasSkipped(const JitResult& r) {
 
 // The shared prelude: an owning collection field, the §28.6 stored-view face
 // at `IOwningEnumerable<Item>`, and a window onto the field's residual count.
-// (Bezel block comments are `(* ... *)`; C++ `//` inside these literals would
-// be lexed as Bezel source.)
+// (Never put a C++ `//` comment inside these literals: it is lexed as Bezel
+// source and comments out the rest of the program. Bezel's own comment forms
+// are `//`, `/* ... */` and `///` -- spec §1.5, which is exhaustive.)
 const char* const kPrelude =
     "module M; "
     "class Item "

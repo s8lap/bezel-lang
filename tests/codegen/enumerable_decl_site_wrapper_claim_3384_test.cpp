@@ -83,8 +83,10 @@
 // and LeakSanitizer enabled, so `r.ran` is simultaneously a no-leak and a
 // no-double-free assertion; the exit code carries the ownership observable.
 //
-// (Bezel block comments are `(* ... *)`; a C++ `//` inside these string
-// literals would be lexed as Bezel source.)
+// (Never put a C++ `//` comment inside these string literals: it is lexed as
+// Bezel source and comments out the rest of the program, so the test would
+// pass for the wrong reason. Bezel's own comment forms are `//`, `/* ... */`
+// and `///` -- spec §1.5, which is exhaustive.)
 
 #include <string>
 
