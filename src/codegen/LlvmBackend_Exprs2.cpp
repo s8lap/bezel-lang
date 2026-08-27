@@ -4021,6 +4021,95 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     return builder_.CreateCall(allocFn,
                         {builder_.getInt64((int64_t)ksz), hashT, eqT});
                 }
+                // fix #3428 / stdlib §4.18 (v0.283): a REFERENCE element
+                // (class, interface, `Object`) has no generic-key backing —
+                // `genericBackingType`'s `isSet` arm deliberately excludes it
+                // ("a class/interface SET element keeps its ARRAY-backed
+                // linear-scan machinery (emitArrayBackedSetInsert, #1070), a
+                // separate and working design"), and
+                // `SortedSet` is NOT in the Array arm's name list below. So the
+                // construction fell out of every branch, `lowerNew` returned
+                // nullptr, and the user saw lowerLocalDecl's #2974 degrade:
+                // "`new SortedSet(…)` produced no value … either `SortedSet`
+                // may not be instantiated at all … or this argument list
+                // matches no documented constructor". Both readings are FALSE
+                // here — §4.18 declares `public constructor();` and its sole
+                // constraint `where T: IComparable<T>` is satisfied by a class
+                // that implements it — so the message blamed the program for a
+                // compiler gap. `Set`/`OwningSet` are untouched: they DO fall
+                // through to the Array arm, and that path works.
+                //
+                // WHY A REJECTION AND NOT AN IMPLEMENTATION. Wiring this arm to
+                // the generic-key table (what `SortedDictionary` does for a
+                // class KEY, the #2773 `hasObjectHeaderEquality` row) would
+                // compile — and be wrong twice over, silently:
+                //   * §4.18 heads the type "membership by `CompareTo`-equality"
+                //     and says "adding an equal element leaves the set
+                //     unmodified"; the hash table keys on
+                //     `Equals`/`GetHashCode`, which for a class is §8.3
+                //     reference identity, so two `CompareTo`-equal instances
+                //     would both be stored.
+                //   * §4.18 promises "iteration in ascending order", and the
+                //     sorted-snapshot path needs `buildSortedKeyComparator`,
+                //     which returns null for anything that is not an integer or
+                //     float LLVM type — there is no `CompareTo`-through-the-
+                //     vtable comparator in this compiler at all.
+                // MEASURED on 0c5ecd1, the very construction the issue calls a
+                // working control: `SortedDictionary<Ord, int>` with a class key
+                // compiles, then iterates in INSERTION order (3, 1, 2 for keys
+                // added 3, 1, 2) and SEGVs on `FirstKey` under ASan. That is the
+                // outcome this arm would reproduce for `SortedSet`, so per the
+                // #511 `GetType` / #2722 comparer-constructor precedent the
+                // deferral is made LOUD instead. Filed as its own issue rather
+                // than fixed here; a correct reference-element ordered
+                // collection needs a comparator-keyed backing, not this one.
+                //
+                // The predicate is `hasObjectHeaderEquality` — the same named
+                // authority `genericBackingType`'s dictionary row uses to
+                // decide "carries the §8.3 object header: a class, an
+                // interface, or `Object`" — rather than a second spelling of
+                // the same classification.
+                if (colName == "SortedSet" && rt->genericArgs.size() == 1) {
+                    const sema::TypeRef* elemTy =
+                        resolveTypeParamRef(rt->genericArgs[0]);
+                    if (hasObjectHeaderEquality(elemTy)) {
+                        const bool isObj =
+                            elemTy->kind == sema::TypeRef::Kind::Primitive;
+                        std::string elemName =
+                            isObj ? "Object" : std::string(elemTy->headName());
+                        const char* kindWord =
+                            isObj ? "the `Object` type"
+                                  : (elemTy->declaration->kind ==
+                                     ast::TypeDeclKind::Interface
+                                         ? "an interface type"
+                                         : "a class type");
+                        // The element is named by its HEAD (`headName()`,
+                        // the alias-transparent authority) rather than a
+                        // reconstructed full spelling: there is no shared
+                        // ast::Type printer in this TU, and the three that
+                        // exist are file-local statics in other TUs. So the
+                        // message describes the head instead of presenting
+                        // `SortedSet<IComparable>` as if that were what the
+                        // program wrote for `SortedSet<IComparable<Ord>>`.
+                        ctx_.diagnostics().report(
+                            Severity::Error, ne.span.begin,
+                            "stdlib §4.18: `SortedSet<T>` is not yet "
+                            "implemented for a reference element type — the "
+                            "element type here (`" + elemName + "`) is " +
+                            kindWord + ", and this compiler has no "
+                            "`CompareTo`-based ordered backing for reference "
+                            "elements. Constructing one would silently break "
+                            "both halves of §4.18's contract (\"membership by "
+                            "`CompareTo`-equality, iteration in ascending "
+                            "order\"): membership would fall back to §8.3 "
+                            "reference identity, so two `CompareTo`-equal "
+                            "instances would both be stored, and iteration "
+                            "would come out in hash order. Use `Set<T>` "
+                            "(stdlib §4.10) where ordering is not required "
+                            "(#3428).");
+                        return llvm::ConstantPointerNull::get(ptrTy());
+                    }
+                }
             }
             // per §4.6/§4.7: LinkedList/OwningLinkedList use the real doubly-linked-
             // list runtime (bz_llist_alloc), not the bz_array_t backing. The
