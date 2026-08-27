@@ -523,6 +523,21 @@ private:
     // growing argument and lands at the declaration holding the edge.
     void checkExpandingInstantiationEdges();
 
+    // §14.6 (v0.262, #3271), generic-MEMBER half: the same per-edge condition
+    // applied to a generic member's SELF-edge — a call inside `M<T>`'s body
+    // spelling `M<Pair<T, T>>(…)`. `instantiations_` models generic TYPE nodes
+    // only, so this edge class is invisible to
+    // checkExpandingInstantiationEdges above; it is recorded separately in
+    // genericMemberEdges_ and verdicted here against the SAME
+    // substitutionIsAdmitted predicate, so the two halves cannot drift apart.
+    void checkExpandingGenericMemberEdges();
+
+    // §14.6 (v0.262, #3271): record `call` into genericMemberEdges_ when its
+    // callee spells the enclosing generic method's own name with explicit type
+    // arguments (`M<…>(…)`, `this.M<…>(…)`, `C.M<…>(…)`). No-op outside a
+    // generic method body and for every other callee shape.
+    void recordGenericMemberSelfEdge(const ast::CallExpr& call);
+
     void checkStaticClassMember(TypeSymbol* t, Symbol* m);
 
     // Slice S14: within one type, two members that aren't both
@@ -1004,6 +1019,16 @@ private:
     // parameters, so the OperatorDecl branch nulls it as well.
     const std::vector<ast::GenericParam>* currentMethodGenericParams_ = nullptr;
 
+    // §14.6 (v0.262, #3271): the METHOD declaration whose signature and body
+    // are being resolved, so a self-naming generic call inside that body can be
+    // attributed to the generic MEMBER's own node (§14.6: "each generic type is
+    // a node, and each generic member is its own node"). Saved/restored on
+    // exactly the lifetime of currentMethodGenericParams_ beside it, and nulled
+    // by the operator and constructor branches for the same reason those null
+    // the parameter list — a leaked pointer would attribute a later member's
+    // call to the wrong node.
+    const ast::MethodDecl* currentMethodDecl_ = nullptr;
+
     struct DeferredNestedObligation {
         TypeSymbol* outerType = nullptr;        // e.g. Box (owns outerParam)
         std::string_view outerParamName;        // e.g. "W"
@@ -1029,6 +1054,30 @@ private:
         const std::vector<ast::GenericParam>* methodGenericParams = nullptr;
     };
     std::vector<GenericInstantiation> instantiations_;
+
+    // §14.6 (v0.262, #3271): one SELF-NAMING generic-member instantiation
+    // request — a call inside generic member `M`'s own body that spells `M`
+    // again with explicit type arguments (`M<...>(…)`, `this.M<...>(…)`,
+    // `C.M<...>(…)`). This is the generic-MEMBER half of the §14.6
+    // instantiation-request graph, which `instantiations_` cannot carry:
+    // that record's node is always a generic TYPE, so a member's self-edge
+    // has no representation there at all.
+    //
+    // Only the DIRECT self-loop is recorded, and only when the enclosing type
+    // declares exactly one member of that name (checked at verdict time). Both
+    // restrictions exist to make target attribution exact without a resolved
+    // call graph: a self-loop is unconditionally inside its own SCC, so no SCC
+    // walk is needed, and a unique name means the spelled callee can only be
+    // the enclosing member. Mutual generic-member cycles and inference-supplied
+    // type arguments are the recorded residual (see checkExpandingGenericMemberEdges).
+    struct GenericMemberEdge {
+        TypeSymbol* enclosingType = nullptr;         // declaring type of source
+        const ast::MethodDecl* source = nullptr;     // the generic member
+        std::vector<TypeRef*> argRefs;               // spelled type arguments
+        std::vector<const ast::Type*> argAsts;       // their AST nodes
+        SourceLocation loc;                          // the call site
+    };
+    std::vector<GenericMemberEdge> genericMemberEdges_;
 
     // §3.6 / §8.3 (v0.158, #1338): one hash-container instantiation site whose
     // key/element must be hashable. Recorded while resolving a

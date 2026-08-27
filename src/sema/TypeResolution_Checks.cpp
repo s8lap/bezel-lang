@@ -10955,6 +10955,18 @@ std::string substitutionSpelling(const TypeRef* sub, const ast::Type* subAst) {
     return out;
 }
 
+// §14.6 places the rejection "at the declaration holding the edge". Give it a
+// real anchor: `Symbol::declLoc` when SymbolCollection stamped one, otherwise
+// the declaration node's own span. Returns the degenerate location only when
+// neither exists (an imported symbol, which carries no AST at all).
+SourceLocation declarationAnchor(const Symbol* sym) {
+    if (!sym) return SourceLocation{};
+    if (sym->declLoc.line != 0) return sym->declLoc;
+    if (sym->decl && sym->decl->span.begin.line != 0)
+        return sym->decl->span.begin;
+    return SourceLocation{};
+}
+
 }  // namespace
 
 // §14.6 / #3271 (v0.262): expanding in-SCC instantiation edges are a
@@ -11193,10 +11205,19 @@ void Resolver::checkExpandingInstantiationEdges() {
             else if (e.paramIdx < tgt->genericParams.size() &&
                      tgt->genericParams[e.paramIdx])
                 paramName = std::string(tgt->genericParams[e.paramIdx]->name);
-            // Span of the recording site (the AST node carrying the
-            // instantiation).
-            SourceLocation loc = inst.site ? inst.site->span.begin
-                                           : SourceLocation{};
+            // §14.6 places the error "at the declaration holding the edge".
+            // `inst.site` is the `Node<Pair<T, T>>` AST node, which is the
+            // most precise anchor available — but `Parser::parseType` stamps
+            // no span (the #1307/#2496 degenerate-span class, called out in
+            // Parser_Stmts.cpp's catch-arm stamping comment), so every site
+            // here reports the degenerate 0:0. Fall back to the SOURCE
+            // declaration, which is the anchor the spec names anyway; the
+            // site's span is still preferred so this needs no revisiting if
+            // parseType is ever taught to stamp.
+            SourceLocation loc =
+                (inst.site && inst.site->span.begin.line != 0)
+                    ? inst.site->span.begin
+                    : declarationAnchor(src);
             std::string message =
                 "the type parameter `" + paramName +
                 "` of generic type `" + targetName +
@@ -11212,6 +11233,107 @@ void Resolver::checkExpandingInstantiationEdges() {
             if (sub && sub->nullable)
                 message += " \xE2\x80\x94 the nullable form `T?` is "
                            "explicitly excluded by the rule";
+            ctx_.diagnostics().report(Severity::Error, loc, message);
+        }
+    }
+}
+
+// §14.6 / #3271 (v0.262), generic-MEMBER half. §14.6's graph makes "each
+// generic type … a node, and each generic member … its own node", and the
+// consequences paragraph names the call route explicitly: "a call
+// `F<Pair<T, T>>` inside `F<T>`'s body". checkExpandingInstantiationEdges
+// above answers that for generic TYPES, because `instantiations_` records a
+// resolved `Named<…>` annotation and its node is always a TypeSymbol. A
+// generic METHOD's self-request has no representation there at all — a
+// `Depth<Pair<T, T>>(…)` call inside `Depth<T>` records only the *argument*
+// `Pair<T, T>` (target `Pair`, an edge that closes no cycle), never the
+// `Depth` → `Depth` edge — so the shape compiled silently.
+//
+// This function verdicts the self-edges recorded by
+// `Resolver::recordGenericMemberSelfEdge`, against the SAME
+// `substitutionIsAdmitted` predicate the type half uses: exactly one
+// authority for "bare in-scope parameter or closed type", so the two halves
+// cannot answer differently for the same substitution.
+//
+// SCOPE, and why it stops where it does. Only the DIRECT self-loop is
+// decided here. §14.6's condition is per-edge *inside a strongly-connected
+// component*, and deciding component membership for a member edge needs a
+// resolved call graph — which does not exist at type-resolution time and
+// which the typechecker builds only later. A self-loop is the one member
+// edge class that needs no such graph: an edge from a node to itself is
+// unconditionally inside its own component. Two residuals follow and are
+// recorded as follow-up rather than guessed at:
+//
+//   * MUTUAL member cycles (`M<T>` calls `N<Pair<T, T>>`, `N<U>` calls
+//     `M<U>`) — in-SCC per §14.6, not decidable without the call graph.
+//   * INFERENCE-supplied type arguments (`Depth(p, n - 1)` where `p` has
+//     type `Pair<T, T>`) — the same edge with no spelled substitution to
+//     read; the substitution exists only after ExprTypecheck's inference.
+//
+// Both under-approximate — they miss expanding edges, they never reject an
+// admitted one — which is the safe direction for a rule whose failure mode
+// on the other side is rejecting legitimate generic code.
+void Resolver::checkExpandingGenericMemberEdges() {
+    if (genericMemberEdges_.empty()) return;
+
+    // One diagnostic per (source member, target parameter position): a member
+    // that spells the same expanding self-call at three sites is one defect.
+    std::set<std::tuple<const ast::MethodDecl*, std::size_t>> reported;
+
+    for (const GenericMemberEdge& edge : genericMemberEdges_) {
+        const ast::MethodDecl* src = edge.source;
+        if (!src || !edge.enclosingType) continue;
+
+        // OVERLOAD GUARD — the whole reason this check can attribute an edge
+        // without a resolved call graph. The recorder matched the callee by
+        // NAME; if the declaring type has more than one member of that name,
+        // the call may bind to a different overload, which §14.6 makes a
+        // DIFFERENT node, and whose edge is in an SCC only if that overload
+        // reaches back. Rejecting on a name match alone would be exactly the
+        // over-rejection this rule must not commit, so an overloaded name is
+        // left to the follow-up that models member nodes properly.
+        std::size_t sameName = 0;
+        for (const Symbol* mem : edge.enclosingType->members) {
+            if (mem && mem->name == src->name) ++sameName;
+        }
+        if (sameName != 1) continue;
+
+        // The source declaration's in-scope parameter names: the member's own
+        // plus the enclosing type's, per §14.6 ("the source's own, or an
+        // enclosing declaration's"). Same helper the type half uses.
+        const std::set<std::string_view> inScope =
+            inScopeParamNamesFor(edge.enclosingType, &src->genericParams);
+
+        for (std::size_t i = 0; i < edge.argRefs.size(); ++i) {
+            const TypeRef* sub = edge.argRefs[i];
+            const ast::Type* subAst =
+                i < edge.argAsts.size() ? edge.argAsts[i] : nullptr;
+            if (substitutionIsAdmitted(sub, subAst, inScope)) continue;
+            if (!reported.insert({src, i}).second) continue;
+
+            const std::string memberName = std::string(src->name);
+            const std::string paramName =
+                i < src->genericParams.size()
+                    ? std::string(src->genericParams[i].name)
+                    : std::string("?");
+            std::string message =
+                "the type parameter `" + paramName +
+                "` of generic method `" + memberName +
+                "` is substituted with a constructed type containing a "
+                "type parameter of the enclosing declaration in a "
+                "recursive generic instantiation: `" +
+                memberName + "<" + substitutionSpelling(sub, subAst) +
+                ">` (this declaration) requires `" + memberName +
+                "` instantiated at a growing argument, whose instantiation "
+                "closure has no bound (\xC2\xA7""14.6, #3271); a "
+                "recursive generic may not nest a type parameter inside a "
+                "constructed type argument";
+            if (sub && sub->nullable)
+                message += " \xE2\x80\x94 the nullable form `T?` is "
+                           "explicitly excluded by the rule";
+            SourceLocation loc = edge.loc.line != 0
+                                     ? edge.loc
+                                     : declarationAnchor(edge.enclosingType);
             ctx_.diagnostics().report(Severity::Error, loc, message);
         }
     }

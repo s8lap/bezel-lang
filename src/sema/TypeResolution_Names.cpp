@@ -859,6 +859,11 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         const std::vector<ast::GenericParam>* savedMethodParams =
             currentMethodGenericParams_;
         currentMethodGenericParams_ = &md->genericParams;
+        // §14.6 (v0.262, #3271): expose this method's DECLARATION on the same
+        // lifetime, so a self-naming generic call in the body below can be
+        // attributed to this generic member's own node.
+        const ast::MethodDecl* savedMethodDecl = currentMethodDecl_;
+        currentMethodDecl_ = md;
         Scope methodScope;
         methodScope.parent = parent;
         for (const auto& g : md->genericParams) {
@@ -944,6 +949,7 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         }
         currentMethodConstraints_ = savedConstraints;  // §28.1 (v0.196, #1817)
         currentMethodGenericParams_ = savedMethodParams;  // #2713
+        currentMethodDecl_ = savedMethodDecl;  // §14.6 (v0.262, #3271)
     } else if (auto* od =
                    dynamic_cast<const ast::OperatorDecl*>(&m)) {
         // §28.1 (v0.196, #1817): an operator carries no own generic constraints
@@ -961,6 +967,11 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         const std::vector<ast::GenericParam>* savedMethodParams =
             currentMethodGenericParams_;
         currentMethodGenericParams_ = nullptr;
+        // §14.6 (v0.262, #3271): an operator is not a generic member, so no
+        // self-edge can be attributed here; null the method decl for exactly
+        // the reason the parameter list above is nulled.
+        const ast::MethodDecl* savedMethodDecl = currentMethodDecl_;
+        currentMethodDecl_ = nullptr;
         Scope methodScope;
         methodScope.parent = parent;
         for (const auto& p : od->params) {
@@ -991,6 +1002,7 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         }
         currentMethodConstraints_ = savedConstraints;  // §28.1 (v0.196, #1817)
         currentMethodGenericParams_ = savedMethodParams;  // #2713
+        currentMethodDecl_ = savedMethodDecl;  // §14.6 (v0.262, #3271)
     } else if (auto* cd =
                    dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         Scope ctorScope;
@@ -2357,6 +2369,69 @@ void Resolver::recordAsTargetSite(const ast::Type& t, SourceLocation loc) {
     asTargetSites_.push_back({name, currentOuterType_, loc});
 }
 
+// §14.6 (v0.262, #3271): record `call` as a generic member's SELF-edge when
+// its callee spells the enclosing generic method's own name with explicit type
+// arguments. The three admitted spellings are the three ways a member can name
+// itself without going through another declaration:
+//
+//     M<...>(…)        — unqualified, the ordinary self-recursive call
+//     this.M<...>(…)   — instance-qualified
+//     C.M<...>(…)      — enclosing-type-qualified (the only spelling a static
+//                        member of `static class C` can use besides the bare one)
+//
+// Anything else — a call through a variable, an interface, a base projection,
+// or another declaration — is NOT recorded. §14.6's rule is per-edge over a
+// strongly-connected component, and a direct self-loop is the one edge class
+// whose SCC membership is decidable without a resolved call graph: a self-loop
+// is unconditionally inside its own component. Every other member edge needs
+// the call graph and is the recorded residual (see
+// checkExpandingGenericMemberEdges in TypeResolution_Checks.cpp).
+//
+// Recording is deliberately generous and the VERDICT is where the guards live
+// (the overload guard in particular) — recording is side-effect-free, so an
+// over-recorded edge costs a vector entry and nothing else.
+void Resolver::recordGenericMemberSelfEdge(const ast::CallExpr& call) {
+    if (!currentMethodDecl_ || !currentOuterType_) return;
+    // Only a GENERIC member has a self-edge to constrain: a non-generic
+    // member's edges attach to its declaring type's node (§14.6), and those
+    // are already carried by instantiations_.
+    const std::size_t arity = currentMethodDecl_->genericParams.size();
+    if (arity == 0) return;
+    if (!call.callee) return;
+
+    const std::vector<std::unique_ptr<ast::Type>>* typeArgs = nullptr;
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(call.callee.get())) {
+        if (id->name != currentMethodDecl_->name) return;
+        typeArgs = &id->typeArgs;
+    } else if (auto* ma =
+                   dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+        if (ma->member != currentMethodDecl_->name) return;
+        // The receiver must be `this` or the enclosing type's own name; any
+        // other receiver names a different declaration's member.
+        auto* recv = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!recv || !recv->typeArgs.empty()) return;
+        if (recv->name != "this" && recv->name != currentOuterType_->name)
+            return;
+        typeArgs = &ma->typeArgs;
+    } else {
+        return;
+    }
+    // The spelled type-argument count must match the member's declared arity,
+    // or the callee is some other member (or an error reported elsewhere).
+    if (!typeArgs || typeArgs->size() != arity) return;
+
+    GenericMemberEdge edge;
+    edge.enclosingType = currentOuterType_;
+    edge.source = currentMethodDecl_;
+    edge.loc = call.span.begin.line != 0 ? call.span.begin
+                                         : currentMethodDecl_->span.begin;
+    for (const auto& ta : *typeArgs) {
+        edge.argRefs.push_back(ta ? ctx_.resolvedType(*ta) : nullptr);
+        edge.argAsts.push_back(ta.get());
+    }
+    genericMemberEdges_.push_back(std::move(edge));
+}
+
 void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
     // First handle expressions that own a Type node directly.
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
@@ -2415,6 +2490,12 @@ void Resolver::resolveTypesInExpr(const ast::Expr& e, Scope* scope) {
         for (const auto& a : ce->args) {
             if (a.value) resolveTypesInExpr(*a.value, scope);
         }
+        // §14.6 (v0.262, #3271): record a generic member's SELF-edge. The
+        // callee is inspected AFTER the recursion above, so each spelled type
+        // argument already has a resolved TypeRef to record. §14.6 makes each
+        // generic member its own node; `instantiations_` carries generic TYPE
+        // nodes only, so this is the one place a member self-loop is visible.
+        recordGenericMemberSelfEdge(*ce);
         return;
     }
     if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {

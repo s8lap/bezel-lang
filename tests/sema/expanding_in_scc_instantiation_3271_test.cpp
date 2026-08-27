@@ -294,3 +294,315 @@ BEZEL_TEST(expanding_in_scc_instantiation_3271,
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasMsg(r, "§14.6"));
 }
+// =========================================================================
+// §14.6 / #3271: the generic-MEMBER route.
+//
+// §14.6's graph makes "each generic type … a node, and each generic member
+// … its own node", and the consequences paragraph names the call route in
+// exactly those terms: "a call `F<Pair<T, T>>` inside `F<T>`'s body". Every
+// test above exercises that shape where the node is a generic TYPE.
+//
+// A generic METHOD's self-request is a different node class, and the
+// type-node graph cannot see it: resolving `Depth<Pair<T, T>>(…)` inside
+// `Depth<T>` records only the ARGUMENT `Pair<T, T>` as an instantiation of
+// `Pair` — an edge from `Util` to `Pair` that closes no cycle. The
+// `Depth` → `Depth` edge, which is the self-loop §14.6 rejects, had no
+// representation at all.
+//
+// Pre-fix state, measured on real `bezelc` (not the sema harness): the two
+// spellings below compile, link, and RUN. The monomorphizer collapses the
+// unbounded specialization family `Depth<int>`, `Depth<Pair<int, int>>`,
+// `Depth<Pair<Pair<…>>>`, … onto three mangled keys
+// (`Util$Depth$spec`, `Util$Depth$spec.1`, `Util$Depth$spec$Pair`), so the
+// shape does not even announce itself as a hang — it silently reuses one
+// specialization for a family of distinct types.
+//
+// Scope of the rejection added here (the residual is recorded in the
+// implementation comment and as a follow-up, not guessed at): only the
+// DIRECT self-loop, spelled with EXPLICIT type arguments, is decided.
+// A self-loop is the one member-edge class whose SCC membership needs no
+// resolved call graph — an edge from a node to itself is unconditionally
+// inside its own component. Mutual member cycles and inference-supplied
+// type arguments both need the call graph and stay accepted; both
+// under-approximate, which is the safe direction for this rule.
+// =========================================================================
+
+// REJECTED — the generic-method call route, unqualified self-call.
+// `Depth<T>` requests `Depth<Pair<T, T>>`: the substitution at the
+// member's own parameter position is neither a bare in-scope parameter
+// (it is `Pair<T, T>`) nor a closed type (it contains T).
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_self_call_at_constructed_arg_rejected_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "static class Util "
+        "  public static method Depth<T>(x: T, n: int): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return Depth<Pair<T, T>>(p, n - 1); "
+        "  end Depth; "
+        "end Util;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "#3271"));
+    // The diagnostic names the cycle (the member) and the growing argument.
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Depth`"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "Pair<T, T>"));
+}
+
+// REJECTED — the same edge spelled `this.M<…>` on an instance method.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_this_qualified_self_call_rejected_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Runner "
+        "  public method Go<T>(x: T): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return this.Go<Pair<T, T>>(p); "
+        "  end Go; "
+        "end Runner;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
+}
+
+// REJECTED — the same edge spelled `C.M<…>` (enclosing-type-qualified).
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_type_qualified_self_call_rejected_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "static class Util "
+        "  public static method Go<T>(x: T): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return Util.Go<Pair<T, T>>(p); "
+        "  end Go; "
+        "end Util;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "generic method `Go`"));
+}
+
+// REJECTED — the nullable form on a member self-edge. Spec: "an argument
+// containing an in-scope type parameter other than as the bare argument
+// itself, the nullable form `T?` included".
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_self_call_nullable_form_rejected_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "static class Util "
+        "  public static method Go<T>(x: T): int "
+        "    return Go<T?>(null); "
+        "  end Go; "
+        "end Util;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "\xC2\xA7""14.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "nullable"));
+}
+
+// =========================================================================
+// §14.6 / #3271: OVER-REJECTION GUARDS for the generic-member route. The
+// failure mode this rule must not have is rejecting legitimate generic
+// recursion, so each admitted shape §14.6 names gets its own control.
+// =========================================================================
+
+// LEGAL — uniform recursion at the same type argument. The textbook shape:
+// `Depth<T>` calling `Depth<T>` substitutes the source's own bare parameter.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_self_call_bare_param_admitted_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "static class Util "
+        "  public static method Depth<T>(x: T, n: int): int "
+        "    if n <= 0 then "
+        "      return 0; "
+        "    end if; "
+        "    return 1 + Depth<T>(x, n - 1); "
+        "  end Depth; "
+        "end Util;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
+
+// LEGAL — a permutation cycle over bare parameters. Spec: "a cycle whose
+// edges permute or repeat bare parameters (`F<T, U>` calling `F<U, T>`) is
+// equally within the rule."
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_self_call_permutation_admitted_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "static class Util "
+        "  public static method Two<T, U>(a: T, b: U, n: int): int "
+        "    if n <= 0 then "
+        "      return 0; "
+        "    end if; "
+        "    return 1 + Two<U, T>(b, a, n - 1); "
+        "  end Two; "
+        "end Util;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
+
+// LEGAL — a closed type argument. `Depth<T>` calling `Depth<int>` bounds
+// the closure by construction; the rule's second admitted arm.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_self_call_closed_arg_admitted_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "static class Util "
+        "  public static method Depth<T>(x: T, n: int): int "
+        "    if n <= 0 then "
+        "      return 0; "
+        "    end if; "
+        "    return 1 + Depth<int>(7, n - 1); "
+        "  end Depth; "
+        "end Util;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
+
+// LEGAL — a bare parameter of the ENCLOSING declaration. Spec: the bare
+// parameter may be "the source's own, or an enclosing declaration's", so a
+// member self-call at the enclosing type's `X` is admitted.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_self_call_enclosing_type_param_admitted_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Holder<X> "
+        "  public value: X; "
+        "  public constructor(v: X) "
+        "    this.value := v; "
+        "  end constructor; "
+        "  public method Walk<T>(t: T, n: int): int "
+        "    if n <= 0 then "
+        "      return 0; "
+        "    end if; "
+        "    return 1 + this.Walk<X>(this.value, n - 1); "
+        "  end Walk; "
+        "end Holder;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
+
+// LEGAL — a growing argument on an edge to a DIFFERENT member. `Wrap<T>`
+// requesting `Consume<Pair<T, T>>` is not a self-loop, and `Consume` does
+// not request `Wrap` back, so the two members are in different components
+// and §14.6's per-edge condition does not apply to the edge at all. This is
+// the control that a name-blind rejection would fail.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_edge_to_other_member_admitted_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "static class Util "
+        "  public static method Wrap<T>(x: T): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return Consume<Pair<T, T>>(p); "
+        "  end Wrap; "
+        "  public static method Consume<U>(u: U): int "
+        "    return 1; "
+        "  end Consume; "
+        "end Util;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
+
+// LEGAL (conservatively) — an OVERLOADED member name. The recorder matches
+// the callee by name; with two members named `Go` the call may bind to the
+// other overload, which §14.6 makes a different node. Attributing the edge
+// on a name match alone would be exactly the over-rejection this rule must
+// not commit, so the overload guard declines to decide.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_overloaded_name_not_attributed_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "static class Util "
+        "  public static method Go<T>(x: T): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return Go<Pair<T, T>>(p, 1); "
+        "  end Go; "
+        "  public static method Go<U>(u: U, k: int): int "
+        "    return k; "
+        "  end Go; "
+        "end Util;");
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
+
+// LEGAL — a same-named member on a DIFFERENT receiver. `h.Go<Pair<T, T>>`
+// names `Helper.Go`, not the enclosing `Caller.Go`; the receiver guard
+// keeps the edge unattributed.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           generic_method_other_receiver_same_name_admitted_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class Pair<A, B> "
+        "  public v1: A; "
+        "  public v2: B; "
+        "  public constructor(a: A, b: B) "
+        "    this.v1 := a; this.v2 := b; "
+        "  end constructor; "
+        "end Pair; "
+        "class Helper "
+        "  public method Go<U>(u: U): int "
+        "    return 1; "
+        "  end Go; "
+        "end Helper; "
+        "class Caller "
+        "  public method Go<T>(x: T, h: Helper): int "
+        "    using var p := new Pair<T, T>(x, x); "
+        "    return h.Go<Pair<T, T>>(p); "
+        "  end Go; "
+        "end Caller;");
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}
+
+// LEGAL — a NON-generic method that calls itself. §14.6 attaches a
+// non-generic member's edges to its declaring type's node; the member has no
+// parameters to substitute, so there is nothing for this rule to decide.
+BEZEL_TEST(expanding_in_scc_instantiation_3271,
+           non_generic_method_self_call_admitted_spec_14_6_issue_3271) {
+    auto r = parseSemaAll(
+        "module M; "
+        "static class Util "
+        "  public static method Count(n: int): int "
+        "    if n <= 0 then "
+        "      return 0; "
+        "    end if; "
+        "    return 1 + Count(n - 1); "
+        "  end Count; "
+        "end Util;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasMsg(r, "\xC2\xA7""14.6"));
+}

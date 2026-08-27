@@ -431,6 +431,12 @@ void Resolver::run(const ast::SourceFile& src) {
     // the SCC walk sees the whole graph. Placed LAST so the diagnostic
     // lands after every other declaration-site check has fired.
     checkExpandingInstantiationEdges();
+    // §14.6 (v0.262, #3271), generic-MEMBER half: the same per-edge condition
+    // on a generic member's SELF-edge (`M<T>`'s body spelling
+    // `M<Pair<T, T>>(…)`), which the type-node graph above cannot see.
+    // Immediately after its sibling so the two §14.6 verdicts are adjacent in
+    // both the source and the diagnostic order.
+    checkExpandingGenericMemberEdges();
 }
 
 bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx) {
