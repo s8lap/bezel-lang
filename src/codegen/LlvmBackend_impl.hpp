@@ -750,6 +750,31 @@ private:
     // routed to the class disposal the explicit `.Dispose()` path already takes.
     // Keyed by the decl ast::Node* (module-lifetime — no clearing).
     std::unordered_set<const ast::Node*> iterFormatWrappedDecls_;
+    // fix #3419 (§29.2 / §23.2 / §23.4 / §28.6, v0.283): the PROPERTY/INDEXER
+    // READ face's half of the same self-report. `iterFormatWrappedDecls_` cannot
+    // cover it: `preIterWrap` is captured AFTER `lowerExpr(*init)` has run, so a
+    // frame minted INSIDE the read (`wrapPropertyArrayAsIEnumerable`) is
+    // invisible to the `v != preIterWrap` observation, and
+    // `registerIterableSourceDisposal` therefore re-derived the mint from a
+    // hand-written (declared head x getter family) list. That list had drifted:
+    // it omitted `OwningLinkedList` while carrying `LinkedList`, and it predates
+    // #3405's delete of the property face's own array-family arm, so it also
+    // could not see the lazy-pipeline drain the authority mints. MEASURED on
+    // 0c5ecd1: 500 executions of `var e := c.Items;` over a
+    // `public property Items: IEnumerable<Item> => _s;` backed by an
+    // `owned _s: OwningLinkedList<Item>` leaked 16000 bytes in 500 allocations
+    // under LSan (32 B per borrowing `{vtable, node, esz, …}` frame); the
+    // byte-identical program with `OwningStack` — a name the list DID carry —
+    // was clean.
+    //
+    // Keyed by the READ expression node, written at exactly one site (the wrap
+    // helper itself), under its own `result != v` observation, and CLEARED on
+    // decline. The clear is not a passenger: a read lowered more than once (a
+    // generic method emitted per instantiation) would otherwise inherit an
+    // earlier instantiation's WRAPPED verdict, and a claim over a frame that
+    // was never minted is a double-free — strictly worse than the leak this
+    // closes. CLAIM = MINT by construction, per #3384's shape.
+    std::unordered_set<const ast::Node*> propReadIterWrappedExprs_;
     // §27.5 / #673: for guarded-boxed (non-for-var) locals, maps each
     // cell-holder alloca (newSlot) to the ORIGINAL pre-boxing alloca
     // (the variable's original storage slot).  After boxing, the original
@@ -8049,9 +8074,14 @@ private:
     // non-case: sema rejects a getter body that produces a fresh owned value
     // (§28.6), measured on 1e3861a. See the definition's comment in
     // LlvmBackend_Assign.cpp for the measurements and #3419 for the pattern.
+    // `readExpr` is the property/indexer READ node this wrap is being made
+    // for; the helper records its own verdict against it in
+    // `propReadIterWrappedExprs_` so the ownership-claim site can read the mint
+    // instead of re-deriving it (#3419). Pass null only where no claim site can
+    // key on the read.
     llvm::Value* wrapPropertyArrayAsIEnumerable(
         llvm::Value* v, const sema::TypeRef* declTy,
-        const ast::Expr* getter);
+        const ast::Expr* getter, const ast::Expr* readExpr);
     // fix #2299 / §28.9 (RETURN-coercion source-ownership probe): is `src`
     // the OWNED producer of a heap-allocated collection whose RETURN transfer
     // moves ownership into the callee? Returns true for `new Array<int>()`,

@@ -7561,7 +7561,8 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
                 head = rt->headName();
             else if (!rt->importedName.empty())
                 head = rt->importedName;
-            return head == "IEnumerable" || head == "IOwningEnumerable";
+            // fix #3419 (§29.2, v0.283): read the shared head classifier.
+            return common::isSyncIterFormatEnumerableHead(head);
         };
         if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym)) {
             if (par->declType) {
@@ -7583,7 +7584,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             // and reads the iterator frame as an array (a 0-element silent
             // miscompile). Richer interfaces (IReadOnlyList, etc.) keep the
             // indexer-based array protocol, exactly as for a local/param.
-            if (n == "IEnumerable" || n == "IOwningEnumerable")
+            if (common::isSyncIterFormatEnumerableHead(n))
                 isArrayBacked = false;
         }
     } else if (dynamic_cast<const ast::MemberAccessExpr*>(fs.iterable.get())) {
@@ -7594,7 +7595,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable);
         if ((dynamic_cast<sema::FieldSymbol*>(sym) ||
              dynamic_cast<sema::PropertySymbol*>(sym)) &&
-            (n == "IEnumerable" || n == "IOwningEnumerable"))
+            common::isSyncIterFormatEnumerableHead(n))
             isArrayBacked = false;
     } else if (dynamic_cast<const ast::IndexExpr*>(fs.iterable.get())) {
         // fix #3356 / §29.2 / §23.4 (v0.278): an INDEXER read `obj[i]` whose
@@ -7627,7 +7628,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         // indexer return (the standard `property [i: int]: T` shape, the
         // `Object`-returning indexer, etc.) is intentionally NOT widened —
         // its array protocol is correct.
-        if (n == "IEnumerable" || n == "IOwningEnumerable")
+        if (common::isSyncIterFormatEnumerableHead(n))
             isArrayBacked = false;
     }
 

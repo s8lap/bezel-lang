@@ -9741,18 +9741,20 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // // per §28.14, §28.9, §27.5
     std::vector<llvm::Value*> callBoundedClosureArgs;
     if (auto* mdCb = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-        // The §28.14 deferred-activation frame heads — kept identical to
+        // The §28.14 deferred-activation frame heads: the return types that
+        // ANNOUNCE frame residence of a call-bounded callback (a callee
+        // declaring one may hold the callback past the call).
+        //
+        // fix #3419 (§28.14 / §29.2, v0.283): this WAS a hand-spelled copy of
+        // the ten names, annotated "kept identical to
         // MethodOwnership::returnTypeIsDeferredActivation /
-        // isDeferredActivationCallResult (Ownership_Checks.cpp). Those are the
-        // return types that ANNOUNCE frame residence of a call-bounded
-        // callback; a callee declaring one may hold the callback past the call.
+        // isDeferredActivationCallResult (Ownership_Checks.cpp)" — a comment
+        // that asks a reader to maintain an invariant nothing enforces, which
+        // is how every entry in #3419 began. The two registry predicates are
+        // the same ten names by construction; read them instead.
         auto headIsDeferredFrame = [](std::string_view h) {
-            return h == "IEnumerable" || h == "IEnumerator" ||
-                   h == "IAsyncEnumerable" || h == "IAsyncEnumerator" ||
-                   h == "IOwningEnumerable" || h == "IOwningEnumerator" ||
-                   h == "IOwningAsyncEnumerable" ||
-                   h == "IOwningAsyncEnumerator" || h == "Task" ||
-                   h == "OwningTask";
+            return common::isIterableInterfaceHead(h) ||
+                   common::isTaskFamilyHead(h);
         };
         const bool isSyncIterCallee =
             mdCb->bodyKind == ast::MethodBodyKind::Block &&
@@ -9858,16 +9860,13 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // §28.14, §28.9, §27.5
     std::vector<llvm::Value*> scopedClosureArgs;
     if (auto* mdSc = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-        // Re-derive the deferred-activation gates identically to the call-
-        // bounded arm above so the two arms never disagree on what counts as a
-        // frame.
+        // The same §28.14 gate as the call-bounded arm above. fix #3419: both
+        // arms now read the registry predicates rather than each carrying its
+        // own copy of the ten names — "re-derive identically so the two arms
+        // never disagree" is precisely the instruction that cannot be checked.
         auto headIsDeferredFrameSc = [](std::string_view h) {
-            return h == "IEnumerable" || h == "IEnumerator" ||
-                   h == "IAsyncEnumerable" || h == "IAsyncEnumerator" ||
-                   h == "IOwningEnumerable" || h == "IOwningEnumerator" ||
-                   h == "IOwningAsyncEnumerable" ||
-                   h == "IOwningAsyncEnumerator" || h == "Task" ||
-                   h == "OwningTask";
+            return common::isIterableInterfaceHead(h) ||
+                   common::isTaskFamilyHead(h);
         };
         const bool isSyncIterCalleeSc =
             mdSc->bodyKind == ast::MethodBodyKind::Block &&

@@ -1,0 +1,40 @@
+# enumerable_grid_spellings.baseline - the ratchet for umbrella #3419.
+# Regenerate with scripts/check_enumerable_grid_spellings.py --update after
+# a family lands on the shared classifier. The gate requires this file to
+# EQUAL the measured count, so BOTH a rise and stale headroom fail - a landed
+# family that forgot to --update is a violation exactly like a regression,
+# which is what stops a later family from quietly handing back what an
+# earlier one ratcheted away. Raising a count needs --force and an
+# explanation in the commit message.
+
+# classH: one comparison chain naming >=2 of the eight iterator/enumerator
+#         interface heads - the enumerable-wrap grid's DECLARED-HEAD axis.
+#         Authority: common::isIterFormatEnumerableHead /
+#         isSyncIterFormatEnumerableHead / isIterableInterfaceHead.
+1    src/codegen/LlvmBackend_Async.cpp
+8    src/codegen/LlvmBackend_Calls2.cpp
+1    src/codegen/LlvmBackend_Exprs.cpp
+3    src/codegen/LlvmBackend_Iterators.cpp
+2    src/codegen/LlvmBackend_Setup.cpp
+1    src/codegen/LlvmBackend_Stmts.cpp
+2    src/codegen/LlvmBackend_impl.hpp
+1    src/common/OwnershipFacts.cpp
+5    src/ownership/Ownership.cpp
+2    src/sema/ExprTypecheck.cpp
+5    src/sema/ExprTypecheck_Calls.cpp
+1    src/sema/TypeResolution_Checks.cpp
+1    src/sema/TypeResolution_Names.cpp
+
+# classF: one comparison chain naming OwningBuffer together with Array or
+#         OwningArray - the grid's SOURCE-FAMILY axis for the §29.2
+#         array-enumerator wrap. Authority:
+#         common::isArrayEnumeratorWrapSourceName.
+1    src/codegen/LlvmBackend_Assign.cpp
+1    src/codegen/LlvmBackend_Calls2.cpp
+1    src/codegen/LlvmBackend_Calls3.cpp
+1    src/codegen/LlvmBackend_Exprs.cpp
+1    src/codegen/LlvmBackend_Exprs2.cpp
+2    src/ownership/Ownership_Checks.cpp
+2    src/sema/ExprTypecheck_Calls.cpp
+1    src/sema/ExprTypecheck_Exprs.cpp
+1    src/sema/TypeResolution_Names.cpp

@@ -74,6 +74,58 @@ bool isIterableInterfaceHead(std::string_view head);
 // per §28.6, §28.3
 bool isOwningIterableInterfaceHead(std::string_view head);
 
+// #3419 / §29.2 / stdlib §4.12–§4.13: the four ITERATOR-FORMAT ENUMERABLE
+// heads — `IEnumerable<T>`, `IOwningEnumerable<T>`, `IAsyncEnumerable<T>`,
+// `IOwningAsyncEnumerable<T>`. These are the DECLARED-HEAD axis of the §29.2
+// enumerable-wrap grid: a value coerced to one of them must become a real
+// vtable-backed enumerator, because the iteration and disposal paths read the
+// value's first word as a vtable pointer (a raw `bz_array_t*` there is a
+// SIGSEGV). The four ENUMERATOR heads are deliberately absent — an enumerator
+// is what a wrap PRODUCES, not what it is created for; `isIterableInterfaceHead`
+// is the eight-name set for the separate §28.3 announced-set question.
+//
+// The grid's two axes drift independently and silently: the site that MINTS a
+// wrapper frame and the site that CLAIMS it each used to spell this head list
+// by hand, so widening one (#3355) left the other behind (#3392 — a frame
+// minted and never claimed, 6400 B / 200 allocs). A claim NARROWER than the
+// mint leaks; a claim WIDER double-frees. `scripts/check_enumerable_grid_
+// spellings.py` ratchets the remaining hand-spellings down.
+// per §29.2 / stdlib §4.12–§4.13, #3419
+bool isIterFormatEnumerableHead(std::string_view head);
+
+// The SYNCHRONOUS half of `isIterFormatEnumerableHead` — `IEnumerable<T>` and
+// `IOwningEnumerable<T>`. The §29.2 synchronous `for` desugaring and the
+// synchronous wrap creators (`wrapAsIEnumerableForTarget` and the local-decl /
+// property-read / indexer-read faces that route to it) admit exactly these two;
+// the async twins take the `await for` desugaring and its own enumerator
+// acquisition, so a site that admitted all four here would wrap an async source
+// with a synchronous enumerator. // per §29.2 / stdlib §4.12–§4.13, #3419
+bool isSyncIterFormatEnumerableHead(std::string_view head);
+
+// #3419 / §29.2 / stdlib §4.4–§4.5 / §4.11 / §4.14: the SOURCE-FAMILY axis of
+// the enumerable-wrap grid — the collection heads whose backing is the dense
+// `bz_array_t*` element array AND which therefore take the ARRAY-ENUMERATOR
+// wrap when widened to an iterator-format enumerable head: `Array`,
+// `OwningArray`, `OwningBuffer`, `Stack`, `OwningStack`, `Queue`, `OwningQueue`.
+//
+// ⚠ This is NOT `isArrayBackedCollectionName`, and the difference is load-
+// bearing rather than an oversight. That predicate answers "is this
+// `bz_array_t*`-backed" and so also contains `Set`, `OwningSet`, `SortedSet`
+// and `FrozenArray`. For the wrap question those four are wrong:
+//   * a `Set<T>`/`OwningSet<T>` over a VALUE/record/string element is a
+//     generic-key HASH table whose slots are not a dense element array, so it
+//     is SNAPSHOTTED (`bz_lazy_from_set` + drain) rather than wrapped — only
+//     the class-element set, whose backing IS the dense array, takes the
+//     array wrap, and that distinction is a `genericBackingType` query, not a
+//     name;
+//   * `SortedSet<T>` is deliberately excluded from the wrap entirely, because
+//     the snapshot is in hash order and yielding a sorted set's elements
+//     unordered would silently break stdlib §4.18's ordered-iteration contract.
+// Two different questions over overlapping name sets is exactly why both
+// predicates exist and are each named for their own question.
+// per §29.2 / stdlib §4.4–§4.5 / §4.11 / §4.14, #3419
+bool isArrayEnumeratorWrapSourceName(std::string_view n);
+
 // Array-backed collections (bz_array_t*): the receiver names whose indexer /
 // .Count lower through the bz_array_* runtime.  Backs isCollectionTypeName.
 // per §4.4–§4.7 / §4.14

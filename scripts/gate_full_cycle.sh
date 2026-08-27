@@ -534,9 +534,47 @@ if ! python3 scripts/check_imported_symbol_reads.py --strict \
 fi
 say "imported-symbol phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_seam.log"))"
 
+# ── ENUMERABLE-WRAP GRID PHASE (#3419) ─────────────────────────────────────
+# The third source check, and it guards the same structural failure as the
+# second: a classification answered independently at N sites, where the sites
+# drift and nothing makes them fail together. Here the question is the §29.2
+# (declared head × source family) wrap grid. The site that MINTS a wrapper
+# frame and the site that CLAIMS it must agree exactly — a claim narrower than
+# the mint LEAKS, a claim wider DOUBLE-FREES — and six such defects landed in
+# the 2026-08-27 run alone, four of them found by accident by a lane sweeping
+# for something else.
+#
+# Neither sharded oracle can see this class. Every spelling answers correctly
+# for the cells its own tests cover and wrongly only for the cells the OTHER
+# spelling covers, so a new spelling ships green. A source ratchet can see it.
+#
+# --self-test runs first and is not optional, for the reason recorded in
+# check_vacuous_tests and repeated in check_imported_symbol_reads: a green from
+# a matcher that matched nothing is worth nothing, and the multi-LINE spelling
+# of these chains is how most real sites are written.
+say "enumerable-grid phase: detector self-test + grid ratchet (#3419)"
+if ! python3 scripts/check_enumerable_grid_spellings.py --self-test \
+      > "$LOGDIR/${TAG}_grid.log" 2>&1; then
+  say "CYCLE FAILURE: check_enumerable_grid_spellings SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_grid.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_grid.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_enumerable_grid_spellings.py --strict \
+      >> "$LOGDIR/${TAG}_grid.log" 2>&1; then
+  say "CYCLE FAILURE: the enumerable-wrap grid GREW — a new hand-spelling of"
+  say "  the (declared head × source family) grid drifts from the wrap-creator"
+  say "  that mints the frame (#3419). See $LOGDIR/${TAG}_grid.log"
+  sed -n '/ENUMERABLE-WRAP GRID/,$p' "$LOGDIR/${TAG}_grid.log" 2>/dev/null | head -40 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "enumerable-grid phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_grid.log"))"
+
 # ── GATE SELF-TEST PHASE (#3415) ───────────────────────────────────────────
-# The third source-level check, and the one that guards the checker rather than
-# the tree. `scripts/gate/tests/` holds the self-tests for the gate's own
+# The fourth source-level check, and the one that guards the checkers rather
+# than the tree. `scripts/gate/tests/` holds the self-tests for the gate's own
 # Python — verdict reading, telemetry, canary, repo identity, serialization,
 # the gate_and_push EXIT-trap pin. Nothing in the repo executed them. Every
 # reference to that directory outside it was a comment, and CLAUDE.md asserted

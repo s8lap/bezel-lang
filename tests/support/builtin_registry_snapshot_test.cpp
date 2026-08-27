@@ -92,6 +92,78 @@ BEZEL_TEST(builtin_registry_snapshot, owning_prefix_predicate) {
         BEZEL_EXPECT_FALSE(isOwningPrefixedName(n));
 }
 
+// --- isIterFormatEnumerableHead / isSyncIterFormatEnumerableHead (#3419,
+//     §29.2, stdlib §4.12–§4.13): the enumerable-wrap grid's DECLARED-HEAD
+//     axis. NOT a migration snapshot — these tables are new with #3419, which
+//     consolidated 24 hand-written spellings of them. The pins are therefore
+//     about MEMBERSHIP, and the negatives carry the load: the four ENUMERATOR
+//     heads must stay OUT (an enumerator is what a wrap produces, not what one
+//     is created for), and the richer list/collection interfaces must stay out
+//     (they keep the array-backed protocol and take no wrap at all — wrapping
+//     one is #2815's SIGSEGV in reverse).
+BEZEL_TEST(builtin_registry_snapshot, iter_format_enumerable_head_set) {
+    static constexpr std::array<std::string_view, 4> kSnapshot = {
+        "IEnumerable", "IOwningEnumerable",
+        "IAsyncEnumerable", "IOwningAsyncEnumerable",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isIterFormatEnumerableHead(n));
+    for (std::string_view n : {"IEnumerator", "IOwningEnumerator",
+                               "IAsyncEnumerator", "IOwningAsyncEnumerator",
+                               "IReadOnlyCollection", "IReadOnlyList",
+                               "ICollection", "IList", "IOwningCollection",
+                               "IOwningList", "IGrouping", "Array", ""})
+        BEZEL_EXPECT_FALSE(isIterFormatEnumerableHead(n));
+    // It is exactly the ENUMERABLE half of the eight-name §28.3 announced set.
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isIterableInterfaceHead(n));
+}
+
+BEZEL_TEST(builtin_registry_snapshot, sync_iter_format_enumerable_head_set) {
+    static constexpr std::array<std::string_view, 2> kSnapshot = {
+        "IEnumerable", "IOwningEnumerable",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isSyncIterFormatEnumerableHead(n));
+    // The ASYNC twins must stay out: they take the `await for` desugaring and
+    // its own enumerator acquisition (§30.7), so a site that admitted all four
+    // would hand an async source a synchronous enumerator.
+    for (std::string_view n : {"IAsyncEnumerable", "IOwningAsyncEnumerable",
+                               "IEnumerator", "IOwningEnumerator",
+                               "IReadOnlyList", "IList", "Array", ""})
+        BEZEL_EXPECT_FALSE(isSyncIterFormatEnumerableHead(n));
+    // The sync pair is a subset of the four-name set.
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isIterFormatEnumerableHead(n));
+}
+
+// --- isArrayEnumeratorWrapSourceName (#3419, §29.2, stdlib §4.4–§4.5/§4.11/
+//     §4.14): the grid's SOURCE-FAMILY axis. The negatives are the whole point
+//     of the predicate existing separately from isArrayBackedCollectionName:
+//     `Set`/`OwningSet` over a value element are a generic-key HASH table that
+//     is SNAPSHOTTED rather than wrapped, `SortedSet` is excluded from the wrap
+//     outright (the snapshot is in hash order and would break stdlib §4.18's
+//     ordered-iteration contract), and `FrozenArray` has no `new` form to
+//     reach the coercion with. Both predicates answer truthfully about
+//     overlapping name sets; the DIFFERENCE is asserted here so a later lane
+//     cannot "simplify" one into the other.
+BEZEL_TEST(builtin_registry_snapshot, array_enumerator_wrap_source_set) {
+    static constexpr std::array<std::string_view, 7> kSnapshot = {
+        "Array", "OwningArray", "OwningBuffer",
+        "Stack", "OwningStack", "Queue", "OwningQueue",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isArrayEnumeratorWrapSourceName(n));
+    for (std::string_view n : {"Set", "OwningSet", "SortedSet", "FrozenArray",
+                               "LinkedList", "OwningLinkedList", "Dictionary",
+                               "OwningDictionary", "SortedDictionary",
+                               "IEnumerable", ""})
+        BEZEL_EXPECT_FALSE(isArrayEnumeratorWrapSourceName(n));
+    // Every wrap source IS array-backed, but not every array-backed collection
+    // is a wrap source — the containment is one-way, and that asymmetry is the
+    // reason both predicates exist.
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isArrayBackedCollectionName(n));
+    for (std::string_view n : {"Set", "OwningSet", "SortedSet", "FrozenArray"}) {
+        BEZEL_EXPECT_TRUE(isArrayBackedCollectionName(n));
+        BEZEL_EXPECT_FALSE(isArrayEnumeratorWrapSourceName(n));
+    }
+}
+
 // --- isArrayBackedCollectionName (§4.4–§4.7/§4.14) : isCollectionTypeName ---
 BEZEL_TEST(builtin_registry_snapshot, array_backed_collection_set) {
     static constexpr std::array<std::string_view, 11> kSnapshot = {

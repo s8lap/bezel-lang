@@ -6739,7 +6739,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // i32 default and `if b` emitted a malformed `br i32`. Codegen
                     // returns the receiver unchanged (the source iterator struct
                     // IS the enumerator; its vtable slot 2 = MoveNext).
-                    if ((colName == "IEnumerable" || colName == "IOwningEnumerable") &&
+                    if (common::isSyncIterFormatEnumerableHead(colName) &&
                         m == "GetEnumerator" && ce.args.empty() &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                         static const ast::Type* kIEnumeratorNode2 =

@@ -5671,7 +5671,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // IEnumerable-family interface or the getter's type is not in the
             // array-backed family, so it composes with the nullable / box
             // wraps above without re-doing their work.
-            v = wrapPropertyArrayAsIEnumerable(v, ctx_.exprType(*ma), getter);
+            v = wrapPropertyArrayAsIEnumerable(v, ctx_.exprType(*ma), getter, ma);
             currentEnumMethod_ = savedEnumMethod;
             currentThis_ = saved;
             genericSubst_ = std::move(savedSubst);
@@ -6164,7 +6164,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // not a pure IEnumerable-family interface or the getter's type is
             // not array-backed, so the bare read keeps its existing shape for
             // every other property).
-            return wrapPropertyArrayAsIEnumerable(bv, ctx_.exprType(e), getter);
+            return wrapPropertyArrayAsIEnumerable(bv, ctx_.exprType(e), getter, &e);
         }
         // CG33b: block-form getter (`get => do … end;`) accessed bare.
         if (const ast::PropertyAccessor* acc = blockGetterOf(ctx_.exprSymbol(e))) {

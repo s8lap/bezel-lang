@@ -90,6 +90,31 @@ constexpr std::array<std::string_view, 2> kTaskFamilyHeads = {
     "Task", "OwningTask",
 };
 
+// #3419 / §29.2 / stdlib §4.12–§4.13: the four ITERATOR-FORMAT ENUMERABLE heads
+// — the DECLARED-HEAD axis of the enumerable-wrap grid. A subset of
+// `kIterableInterfaceHeads` (the four ENUMERATOR heads are excluded: an
+// enumerator is what a wrap produces, not what one is created for). See the
+// header for why a hand-spelled copy of this list is a defect generator.
+constexpr std::array<std::string_view, 4> kIterFormatEnumerableHeads = {
+    "IEnumerable", "IOwningEnumerable",
+    "IAsyncEnumerable", "IOwningAsyncEnumerable",
+};
+
+// The SYNCHRONOUS half — the two heads the §29.2 `for` desugaring and the
+// synchronous wrap creators admit.
+constexpr std::array<std::string_view, 2> kSyncIterFormatEnumerableHeads = {
+    "IEnumerable", "IOwningEnumerable",
+};
+
+// #3419 / §29.2 / stdlib §4.4–§4.5 / §4.11 / §4.14: the SOURCE-FAMILY axis —
+// the collection heads that take the ARRAY-ENUMERATOR wrap. Deliberately NOT
+// `kArrayBackedCollections`: see the header for why `Set`/`OwningSet` (hash
+// backing → snapshot) and `SortedSet` (§4.18 ordered iteration) must stay out.
+constexpr std::array<std::string_view, 7> kArrayEnumeratorWrapSources = {
+    "Array", "OwningArray", "OwningBuffer",
+    "Stack", "OwningStack", "Queue", "OwningQueue",
+};
+
 // §4.4–§4.7 / §4.14 / §4.19: the bz_array_t*-backed collections
 // (isCollectionTypeName). LinkedList/OwningLinkedList are bz_llist_t-backed and
 // excluded here. FrozenArray<T> shares the bz_array_t* representation with
@@ -475,6 +500,24 @@ bool isIterableInterfaceHead(std::string_view head) {
 // to all four owning iterable heads). // per §28.6, §28.3
 bool isOwningIterableInterfaceHead(std::string_view head) {
     return contains(kOwningIterableInterfaceHeads, head);
+}
+
+// #3419 / §29.2 / stdlib §4.12–§4.13: the four iterator-format ENUMERABLE heads
+// — the enumerable-wrap grid's declared-head axis. // per §29.2, #3419
+bool isIterFormatEnumerableHead(std::string_view head) {
+    return contains(kIterFormatEnumerableHeads, head);
+}
+
+// The synchronous half of the above. // per §29.2, #3419
+bool isSyncIterFormatEnumerableHead(std::string_view head) {
+    return contains(kSyncIterFormatEnumerableHeads, head);
+}
+
+// #3419 / §29.2 / stdlib §4.4–§4.5 / §4.11 / §4.14: the array-enumerator wrap
+// SOURCE families. Not isArrayBackedCollectionName — see the header.
+// per §29.2, #3419
+bool isArrayEnumeratorWrapSourceName(std::string_view n) {
+    return contains(kArrayEnumeratorWrapSources, n);
 }
 
 bool isArrayBackedCollectionName(std::string_view n) {

@@ -67,7 +67,8 @@ bool Emitter::isVtableBackedIEnumerableType(const sema::TypeRef* rt) {
     // the iterator vtable (slot-1 Dispose, slot-4 GetEnumerator). These are
     // implemented uniformly by the yield-iterator / array-wrapper / user-class
     // -wrapper producers (§29.11), so the vtable read is always in-bounds.
-    return n == "IEnumerable" || n == "IOwningEnumerable";
+    // fix #3419 (§29.2, v0.283): read the shared head classifier.
+    return common::isSyncIterFormatEnumerableHead(n);
 }
 
 // stdlib §5 (#755): the ELEMENT TypeRef of an `IGrouping<TKey, T>` receiver —

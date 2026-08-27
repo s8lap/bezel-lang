@@ -9669,11 +9669,14 @@ bool MethodOwnership::isDeferredActivationCallResult(
         head = rt->declaration->name;
     }
     if (head.empty()) return false;
-    return head == "IEnumerable" || head == "IEnumerator" ||
-           head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
-           head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
-           head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator" ||
-           head == "Task" || head == "OwningTask";
+    // fix #3419 (§28.14 / §28.3, v0.283): the ten §28.14 deferred-activation
+    // heads were spelled by hand here, in `isDeferredActivationTypeNode` below,
+    // and twice more in `LlvmBackend_Calls2.cpp` — four copies of one list, two
+    // of them annotated as deliberate mirrors of the others, which is an
+    // invariant a reader is asked to maintain and nothing checks. The two
+    // registry tables are the same ten names by construction.
+    return common::isIterableInterfaceHead(head) ||
+           common::isTaskFamilyHead(head);
 }
 
 // §28.14 *Call-bounded × deferred activation* (v0.196): shared single-part-
@@ -9694,11 +9697,10 @@ static bool isDeferredActivationTypeNode(const ast::Type* t) {
         t->name->parts.size() != 1)
         return false;
     std::string_view head = t->name->parts.front();
-    return head == "IEnumerable" || head == "IEnumerator" ||
-           head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
-           head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
-           head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator" ||
-           head == "Task" || head == "OwningTask";
+    // fix #3419: the same ten heads as `isDeferredActivationCallResult` above,
+    // read off the registry rather than re-spelled. // per §28.14, §28.3
+    return common::isIterableInterfaceHead(head) ||
+           common::isTaskFamilyHead(head);
 }
 
 // §28.14 *Call-bounded × deferred activation* (v0.196): the declared-return-type

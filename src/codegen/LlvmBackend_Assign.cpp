@@ -2299,7 +2299,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // the position parity with the property inline path is what makes
     // a future spec change to that helper apply uniformly.
     result = wrapPropertyArrayAsIEnumerable(result, ctx_.exprType(ix),
-                                            getterExpr);
+                                            getterExpr, &ix);
     // fix #2717: release a `+1` string producer index temporary now the getter
     // body has read it. The helper's element-type gate is what makes this safe
     // on the GETTER side: an inlined `get => k;` lowers to a bare load of the
@@ -7700,11 +7700,15 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
 // has no value-element arm; the wrap helpers' slot-3 reuse of the
 // borrowing Current is the SAME defect for both class and (hypothetical)
 // value elements.
+    // fix #3419 (§29.2 / stdlib §4.12–§4.13, v0.283): this gate is the MINT
+    // side of the enumerable-wrap grid — it decides which declared heads take a
+    // §29.2 wrapper frame at all, and every ownership-CLAIM site downstream is
+    // only correct while it agrees. #3355 widened it by hand and #3392 was the
+    // claim predicate that did not follow. Both now read one classifier.
     if (!(targetTy->kind == sema::TypeRef::Kind::Named &&
           !targetTy->declaration && targetTy->astNode &&
           targetTy->astNode->name && !targetTy->astNode->name->parts.empty() &&
-          (targetTy->headName() == "IEnumerable" ||
-           targetTy->headName() == "IOwningEnumerable")))
+          common::isSyncIterFormatEnumerableHead(targetTy->headName())))
         return v;
     sema::TypeRef* actualTy = ctx_.exprType(*srcExpr);
     // #1916 / stdlib §5 / §29.11: a lazy LINQ pipeline (Select/Where/… → a
@@ -7731,10 +7735,13 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         actualTy->astNode && actualTy->astNode->name &&
         !actualTy->astNode->name->parts.empty())
         an = actualTy->headName();
-    bool actualIsArray =
-        (an == "Array" || an == "OwningArray" || an == "OwningBuffer" ||
-         an == "Stack" || an == "OwningStack" ||
-         an == "Queue" || an == "OwningQueue");
+    // fix #3419 (§29.2 / stdlib §4.4–§4.5 / §4.11 / §4.14, v0.283): the grid's
+    // SOURCE axis. This function is the wrap AUTHORITY, and its own list was
+    // still one of four verbatim copies of these seven names (the local-decl
+    // mint, `nestedIEnumViewNeeded`, and — until #3405 deleted it — the
+    // property face). One table now, in the registry, so adding a family
+    // member is one edit rather than a search.
+    bool actualIsArray = common::isArrayEnumeratorWrapSourceName(an);
     // fix #1069 / stdlib §4.10 / §29.2: a `Set<T>`/`OwningSet<T>` widened to a
     // pure `IEnumerable<T>` used to pass through UNWRAPPED — the callee's for-in
     // then read the raw backing pointer's first word as a vtable (SIGSEGV; the
@@ -7983,8 +7990,8 @@ bool Emitter::isInterfaceDispatchedIteratorRead(
         propTy->astNode->name->parts.empty())
         return false;
     std::string_view n = propTy->headName();
-    return n == "IEnumerable" || n == "IOwningEnumerable" ||
-           n == "IAsyncEnumerable" || n == "IOwningAsyncEnumerable";
+    // fix #3419 (§29.2, v0.283): read the shared head classifier.
+    return common::isIterFormatEnumerableHead(n);
 }
 
 // fix #2815 / §23.2 / §29.2 (v0.240) and #2777 (§29.2 / §23.2, v0.240):
@@ -8034,20 +8041,36 @@ bool Emitter::isInterfaceDispatchedIteratorRead(
 // value", §28.6 — measured on 1e3861a).
 llvm::Value* Emitter::wrapPropertyArrayAsIEnumerable(
         llvm::Value* v, const sema::TypeRef* declTy,
-        const ast::Expr* getter) {
-    if (!v || !declTy || !getter) return v;
+        const ast::Expr* getter, const ast::Expr* readExpr) {
+    // fix #3419 (§29.2 / §23.2 / §23.4, v0.283): every `return` below reports
+    // this read's verdict through `report`, so the ownership-claim site
+    // (`registerIterableSourceDisposal`) reads the mint rather than re-deriving
+    // it from a name list. Insert on wrap, ERASE on decline — see the member's
+    // comment in LlvmBackend_impl.hpp for why the erase is load-bearing.
+    auto report = [&](llvm::Value* result) -> llvm::Value* {
+        if (readExpr) {
+            if (result && result != v)
+                propReadIterWrappedExprs_.insert(readExpr);
+            else
+                propReadIterWrappedExprs_.erase(readExpr);
+        }
+        return result;
+    };
+    if (!v || !declTy || !getter) return report(v);
     if (declTy->kind != sema::TypeRef::Kind::Named || declTy->declaration)
-        return v;
+        return report(v);
     if (!declTy->astNode || !declTy->astNode->name ||
         declTy->astNode->name->parts.empty())
-        return v;
+        return report(v);
     std::string_view dn = declTy->headName();
-    if (dn != "IEnumerable" && dn != "IOwningEnumerable") return v;
+    // fix #3419 (§29.2, v0.283): read the shared head classifier.
+    if (!common::isSyncIterFormatEnumerableHead(dn)) return report(v);
     sema::TypeRef* getterTy = ctx_.exprType(*getter);
-    if (!getterTy || getterTy->kind != sema::TypeRef::Kind::Named) return v;
+    if (!getterTy || getterTy->kind != sema::TypeRef::Kind::Named)
+        return report(v);
     if (!getterTy->astNode || !getterTy->astNode->name ||
         getterTy->astNode->name->parts.empty())
-        return v;
+        return report(v);
     // fix #3405 (§29.2 / §23.2; stdlib §4.11, v0.283): the array-family arm
     // that used to sit here — a second spelling of `wrapAsIEnumerableForTarget`'s
     // `actualIsArray` grid, routing straight to `wrapArrayAsIEnumerable` — is
@@ -8097,15 +8120,19 @@ llvm::Value* Emitter::wrapPropertyArrayAsIEnumerable(
     // gate comment at line 7561-7594 for the scope and limitations; the
     // wrap helpers' slot-3 Current-vs-TakeCurrent gap is the
     // class-element follow-up #3364.
-    if (dn == "IEnumerable" || dn == "IOwningEnumerable") {
-        return wrapAsIEnumerableForTarget(
-            v, declTy, getter,
-            /*ownLazyPipeline=*/true,
-            /*outWrapMade=*/nullptr,
-            /*srcOwnedByCallee=*/
-            returnSourceIsCalleeOwnedCollection(getter));
-    }
-    return v;
+    // fix #3419 (§29.2, v0.283): the head re-test that stood here was a THIRD
+    // spelling of the gate in this same function — and a vacuous one: the early
+    // return above already declined every other head and `dn` is not reassigned
+    // between the two, so the condition was invariantly true and the trailing
+    // `return v;` unreachable. A dead copy of a classification still drifts on
+    // the next family member, and a reader cannot tell a dead one from a live
+    // one; delete rather than align (#3419 point 2).
+    return report(wrapAsIEnumerableForTarget(
+        v, declTy, getter,
+        /*ownLazyPipeline=*/true,
+        /*outWrapMade=*/nullptr,
+        /*srcOwnedByCallee=*/
+        returnSourceIsCalleeOwnedCollection(getter)));
 }
 
 // fix #2299 / §28.9: emit an immediate bz_array_free(v, ?) for the
@@ -9796,16 +9823,16 @@ bool Emitter::nestedIEnumViewNeeded(const sema::TypeRef* storedTy,
                                     const sema::TypeRef* viewTy) const {
     auto isArrayBacked = [](const sema::TypeRef* t) -> bool {
         if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
-        std::string_view h = t->headName();
-        return h == "Array" || h == "OwningArray" || h == "OwningBuffer" ||
-               h == "Stack" || h == "OwningStack" ||
-               h == "Queue" || h == "OwningQueue";
+        // fix #3419 (§29.2, v0.283): the SOURCE axis of the same grid
+        // `wrapAsIEnumerableForTarget`'s `actualIsArray` decides — this was a
+        // verbatim second copy of those seven names, 70 lines from the first.
+        return common::isArrayEnumeratorWrapSourceName(t->headName());
     };
     auto isPureIEnumView = [](const sema::TypeRef* t) -> bool {
         if (!t || t->kind != sema::TypeRef::Kind::Named || t->declaration)
             return false;
-        std::string_view h = t->headName();
-        return h == "IEnumerable" || h == "IOwningEnumerable";
+        // fix #3419 (§29.2, v0.283): read the shared head classifier.
+        return common::isSyncIterFormatEnumerableHead(t->headName());
     };
     const sema::TypeRef* storedElem =
         (storedTy && !storedTy->genericArgs.empty()) ? storedTy->genericArgs[0]

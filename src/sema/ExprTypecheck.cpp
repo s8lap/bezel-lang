@@ -2903,11 +2903,11 @@ bool ExprTC::isConcreteSlotReturnType(const TypeRef* t) const {
     // #1787's seam, deliberately unclassified by #1820.
     if (!t->nullable && t->astNode && t->astNode->name &&
         !t->astNode->name->parts.empty()) {
-        const std::string_view h = t->headName();
-        if (h == "IEnumerable" || h == "IEnumerator" ||
-            h == "IAsyncEnumerable" || h == "IAsyncEnumerator" ||
-            h == "IOwningEnumerable" || h == "IOwningEnumerator" ||
-            h == "IOwningAsyncEnumerable" || h == "IOwningAsyncEnumerator")
+        // fix #3419 (§28.3 / §29.3 / §30.7, v0.283): the eight §28.3 announced
+        // iterable/enumerator heads — `common::isIterableInterfaceHead` is the
+        // table, and a hand-spelled copy of it here is how the set silently
+        // acquires a ninth member at one site and not the other.
+        if (common::isIterableInterfaceHead(t->headName()))
             return false;
     }
     // Class/interface declaration — accept. Value builtins and primitives
@@ -4303,12 +4303,8 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                     if (!t || t->kind != TypeRef::Kind::Named ||
                         t->nullable || !t->astNode || !t->astNode->name ||
                         t->astNode->name->parts.empty()) return false;
-                    const std::string_view h = t->headName();
-                    return h == "IEnumerable" || h == "IEnumerator" ||
-                           h == "IAsyncEnumerable" || h == "IAsyncEnumerator" ||
-                           h == "IOwningEnumerable" || h == "IOwningEnumerator" ||
-                           h == "IOwningAsyncEnumerable" ||
-                           h == "IOwningAsyncEnumerator" ||
+                    // fix #3419 (§29.2, v0.283): read the shared head classifier.
+                    return common::isIterableInterfaceHead(t->headName()) ||
                            isBareLazyGroupingType(t);
                 };
                 if (calleeIsStatic && from->funcReturn && to->funcReturn &&
@@ -11237,9 +11233,12 @@ void ExprTC::checkBorrowingFamilyLiteralElements(
 // `IOwningEnumerable<T>`, `IOwningEnumerator<T>`, and the async pair each
 // constrain `where T: class` — ownership transfer through iteration is
 // meaningful only for class-typed elements (they own a disposable value).
+// fix #3419 (stdlib §4.13, v0.283): these are exactly
+// `common::kOwningIterableInterfaceHeads`; the hand-spelled copy is deleted
+// rather than aligned, so a fifth owning iterable head cannot be added to the
+// registry and missed here.
 static bool isOwningEnumerableHead(std::string_view n) {
-    return n == "IOwningEnumerable" || n == "IOwningEnumerator" ||
-           n == "IOwningAsyncEnumerable" || n == "IOwningAsyncEnumerator";
+    return common::isOwningIterableInterfaceHead(n);
 }
 
 // Is `ta` a class-like element type — a proper user class, or a compiler-known

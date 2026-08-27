@@ -13089,12 +13089,15 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     llvm::Value* preIterWrap = v;
     if (v && declType && init) {
         const sema::TypeRef* declTR = ctx_.resolvedType(*declType);
+        // fix #3419 (§29.2 / stdlib §4.12–§4.13, v0.283): the local-decl MINT
+        // gate. It and `wrapAsIEnumerableForTarget`'s gate are the same
+        // decision at two faces and must widen together — they did not when
+        // #3355 widened one of them, which is #3392.
         if (declTR && declTR->kind == sema::TypeRef::Kind::Named &&
             !declTR->declaration &&
             declTR->astNode && declTR->astNode->name &&
             !declTR->astNode->name->parts.empty() &&
-            (declTR->headName() == "IEnumerable" ||
-             declTR->headName() == "IOwningEnumerable")) {
+            common::isSyncIterFormatEnumerableHead(declTR->headName())) {
             const sema::TypeRef* initTR = ctx_.exprType(*init);
             // fix #747 R43 / §29.2: an Array<T> initializer assigned to an
             // IEnumerable<T> local must ALSO be wrapped in a vtable-backed
@@ -13119,17 +13122,15 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             // lowerIEnumerableBuiltinFor because by the time for-in lowering
             // runs the slot already holds the unwrapped value; wrapping here
             // keeps every IEnumerable<T> local holding a proper vtable object.
+            // fix #3419 (§29.2, v0.283): the SOURCE axis, shared with
+            // `wrapAsIEnumerableForTarget`'s `actualIsArray` and
+            // `nestedIEnumViewNeeded`'s `isArrayBacked` — three verbatim copies
+            // of the same seven names before this commit.
             bool initIsArray = initTR &&
                 initTR->kind == sema::TypeRef::Kind::Named &&
                 initTR->astNode && initTR->astNode->name &&
                 !initTR->astNode->name->parts.empty() &&
-                (initTR->headName() == "Array" ||
-                 initTR->headName() == "OwningArray" ||
-                 initTR->headName() == "OwningBuffer" ||
-                 initTR->headName() == "Stack" ||
-                 initTR->headName() == "OwningStack" ||
-                 initTR->headName() == "Queue" ||
-                 initTR->headName() == "OwningQueue");
+                common::isArrayEnumeratorWrapSourceName(initTR->headName());
             // fix #1069 / stdlib §4.10 / §29.2: a `Set<T>`/`OwningSet<T>` bound to
             // an explicit `IEnumerable<T>` local, mirroring the buildOrderedArgs
             // and RETURN splits (wrapAsIEnumerableForTarget). A CLASS-element set
@@ -14238,8 +14239,8 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     // disposal is this scope-end one. When the source hands back ITSELF
     // (`Task.WhenEach`, whose enumerable and enumerator are one object) the loop
     // likewise leaves it alone, so this remains the only disposal there too.
-    if (name != "IEnumerable" && name != "IOwningEnumerable" &&
-        name != "IAsyncEnumerable" && name != "IOwningAsyncEnumerable")
+    // fix #3419 (§29.2, v0.283): read the shared head classifier.
+    if (!common::isIterFormatEnumerableHead(name))
         return false;
 
     // Only the local that OWNS the freshly produced source object is disposed
@@ -14338,83 +14339,78 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
             // conjunction matches #2703's RETURN-side wrap target exactly,
             // so the ownsSource verdict agrees by construction.
             else if (const ast::Expr* cg = computedGetterOf(ctx_.exprSymbol(*ma))) {
-                // Local declared (explicitly OR via inference) as pure
-                // IEnumerable<T> and the getter body yields an Array-backed
-                // collection — same wrap-creator case #2703 handles on the
-                // RETURN side. Re-derive the local's effective-type test
-                // (declIsPureIEnum is in the inner block above and only fires
-                // when `ld->type` is set; an inferred `var it := s.Items;`
-                // has a null `ld->type` but the same ownership claim). Use
-                // `tr` — the explicit annotation OR the initializer's
-                // inferred type, already computed near the top of this
-                // function — so an un-annotated local participates in the
-                // claim. The conjunction matches the property-read wrap's
-                // positive list verbatim.
+                (void)cg;  // the guard is "there IS an expression-bodied getter"
+                // The local is declared — explicitly OR by inference — as a
+                // pure IEnumerable head, and the read minted a frame. `tr` is
+                // the explicit annotation OR the initializer's inferred type,
+                // computed near the top of this function, so an un-annotated
+                // `var it := s.Items;` participates in the claim too.
                 //
-                // fix #2777 (§29.2 / §23.2, v0.240): extended the positive
-                // list to Set/OwningSet/LinkedList — the same families
-                // #2703's BLOCK-BODIED RETURN wrap covers and that
-                // #2777's extended EXPRESSION-BODIED property-read wrap now
-                // also covers (wrapPropertyArrayAsIEnumerable dispatched to
-                // wrapAsIEnumerableForTarget for the non-Array case). A user
-                // class implementing IEnumerable<T> (declaration-carrying) is
-                // included via `getterTy->declaration != nullptr` — its
-                // enumerator struct is also freshly minted at the wrap site.
-                // fix #3392 / #3363 item 2 (§28.6 / §23.2 / §28.3 / §29.2, v0.282): the head
-                // list here must match the WRAP-CREATOR's. #3355 (5f184fd)
-                // widened `wrapAsIEnumerableForTarget` and
-                // `wrapPropertyArrayAsIEnumerable`
-                // (LlvmBackend_Assign.cpp) from `headName() == "IEnumerable"`
-                // to that head OR `IOwningEnumerable`, so a property read
-                // bound at an `IOwningEnumerable<T>` head now mints a
-                // vtable-backed wrapper frame instead of handing back the raw
-                // backing pointer. This OWNERSHIP-CLAIM predicate kept the
-                // pre-#3355 single-head spelling, so the local bound to the
-                // read never claimed the freshly minted frame and nothing
-                // else freed it — the field's own holder disposes the
-                // BACKING, not the wrap. One frame leaked per read. MEASURED
-                // on e9bd762: 200 reads of `property Items:
-                // IOwningEnumerable<Item> get => _items;` through `var e :=
-                // c.Items;` leaked 6400 bytes in 200 allocations under LSan
-                // (32 B/frame); the byte-identical program at an
-                // `IEnumerable<Item>` head was clean.
-                //
-                // This is the "duplicated classification predicate drifts
-                // from the predicate it mirrors" defect class: the wrap site
-                // and the ownership-claim site each spell the admissible head
-                // list independently, so widening one silently leaves the
-                // other behind.
+                // HISTORY (all superseded by the #3419 rewrite below; kept
+                // because the MEASUREMENTS are the record of what this arm is
+                // for, not because the mechanism survives).
+                //   #2815 / #2777 (§29.2 / §23.2, v0.240) built this arm as a
+                //   positive list of getter-body families — Array-backed, then
+                //   extended to Set/OwningSet/LinkedList — plus
+                //   `getterTy->declaration != nullptr` for a user class.
+                //   #3392 / #3363 item 2 (§28.6 / §23.2 / §28.3 / §29.2,
+                //   v0.282) then had to widen the HEAD half of that list to
+                //   match the wrap-creator, because #3355 (5f184fd) had widened
+                //   `wrapAsIEnumerableForTarget` and
+                //   `wrapPropertyArrayAsIEnumerable` from `headName() ==
+                //   "IEnumerable"` to that head OR `IOwningEnumerable` and left
+                //   this claim behind. MEASURED on e9bd762: 200 reads of
+                //   `property Items: IOwningEnumerable<Item> get => _items;`
+                //   through `var e := c.Items;` leaked 6400 bytes in 200
+                //   allocations under LSan (32 B/frame); the byte-identical
+                //   program at an `IEnumerable<Item>` head was clean.
+                //   That was a point repair on the HEAD half of a two-axis
+                //   grid; the FAMILY half then drifted the same way (#3467),
+                //   which is the whole argument of #3419 and why the list is
+                //   deleted rather than widened a third time.
                 bool declIsPureIEnum = tr && tr->kind ==
                     sema::TypeRef::Kind::Named && !tr->declaration &&
                     tr->astNode && tr->astNode->name &&
                     !tr->astNode->name->parts.empty() &&
-                    (tr->headName() == "IEnumerable" ||
-                     tr->headName() == "IOwningEnumerable");
-                if (declIsPureIEnum) {
-                    const sema::TypeRef* getterTy =
-                        ctx_.exprType(*cg);
-                    if (getterTy && getterTy->kind ==
-                            sema::TypeRef::Kind::Named) {
-                        if (getterTy->astNode && getterTy->astNode->name &&
-                            !getterTy->astNode->name->parts.empty()) {
-                            std::string_view gn = getterTy->headName();
-                            if (gn == "Array" || gn == "OwningArray" ||
-                                gn == "OwningBuffer" ||
-                                gn == "Stack" || gn == "OwningStack" ||
-                                gn == "Queue" || gn == "OwningQueue" ||
-                                gn == "Set" || gn == "OwningSet" ||
-                                gn == "LinkedList")
-                                ownsSource = true;
-                        }
-                        // A declaration-carrying user class implementing
-                        // IEnumerable<T>: wrapAsIEnumerableForTarget mints a
-                        // fresh wrapper frame (wrapUserClassAsIEnumerable),
-                        // so the local owns it and must register slot-1
-                        // iterEnumDispose at scope end.
-                        if (!ownsSource && getterTy->declaration != nullptr)
-                            ownsSource = true;
-                    }
-                }
+                    common::isSyncIterFormatEnumerableHead(tr->headName());
+                // fix #3419 (§29.2 / §23.2 / §28.6 / §28.3, v0.283): ask the
+                // property-read WRAP-CREATOR what it did, exactly as #3384
+                // taught this function to do for the decl-site coercion. The
+                // (declared head x getter family) list that stood here was the
+                // last name-list re-derivation of the grid at a CLAIM site, and
+                // it was wrong in two directions at once:
+                //
+                //   * TOO NARROW. It carried `LinkedList` but not
+                //     `OwningLinkedList`, so an `owned _s: OwningLinkedList<T>`
+                //     read through a §28.6 stored-view property minted a frame
+                //     nothing claimed. MEASURED on 0c5ecd1: 500 executions of
+                //     `var e := c.Items;` leaked 16000 bytes in 500 allocations
+                //     under LSan (32 B/frame); the byte-identical program with
+                //     `OwningStack` — a name the list DID carry — was clean.
+                //     It also could not see the lazy-pipeline drain
+                //     (`ownLazyPipeline=true`) the authority mints for a getter
+                //     body such as `=> _a.Select(f)`, which owns its drained
+                //     array outright.
+                //   * TOO WIDE. `wrapUserClassAsIEnumerable` has five decline
+                //     paths on which the raw class instance stays in the slot;
+                //     `getterTy->declaration != nullptr` claimed a frame on all
+                //     of them, and a slot-1 dispatch on a raw class instance
+                //     calls the interface-map GLOBAL as a function (#2975's
+                //     measured wild jump). The report cannot make that mistake:
+                //     a decline ERASES the verdict.
+                //
+                // The list was already stale before this commit for a third
+                // reason: #3405 DELETED the property face's own array-family
+                // arm and routed every family through
+                // `wrapAsIEnumerableForTarget`, so the comment above claiming
+                // the conjunction "matches the property-read wrap's positive
+                // list verbatim" described a list that no longer existed.
+                //
+                // `declIsPureIEnum` stays: the report says a frame was minted
+                // for the READ, and this test says the LOCAL's slot holds that
+                // frame rather than a box or a narrower interface view.
+                if (declIsPureIEnum && propReadIterWrappedExprs_.count(ma))
+                    ownsSource = true;
             }
         }
     }
@@ -14887,14 +14883,12 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 const sema::TypeRef* lt =
                     ld->type ? ctx_.resolvedType(*ld->type)
                              : ctx_.exprType(*ld->initializer);
+                // fix #3419 (§29.2, v0.283): read the shared head classifier.
                 bool isIterFmt =
                     lt && lt->kind == sema::TypeRef::Kind::Named &&
                     !lt->declaration && lt->astNode && lt->astNode->name &&
                     !lt->astNode->name->parts.empty() &&
-                    (lt->headName() == "IEnumerable" ||
-                     lt->headName() == "IOwningEnumerable" ||
-                     lt->headName() == "IAsyncEnumerable" ||
-                     lt->headName() == "IOwningAsyncEnumerable");
+                    common::isIterFormatEnumerableHead(lt->headName());
                 if (isIterFmt) {
                     // Re-set so the downstream arms see the correct value.
                     // Don't write back to the AST — the OWNERSHIP pass's
@@ -14924,14 +14918,12 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             const sema::TypeRef* lt =
                 ld->type ? ctx_.resolvedType(*ld->type)
                          : ctx_.exprType(*ld->initializer);
+            // fix #3419 (§29.2, v0.283): read the shared head classifier.
             bool isIterFmt =
                 lt && lt->kind == sema::TypeRef::Kind::Named &&
                 !lt->declaration && lt->astNode && lt->astNode->name &&
                 !lt->astNode->name->parts.empty() &&
-                (lt->headName() == "IEnumerable" ||
-                 lt->headName() == "IOwningEnumerable" ||
-                 lt->headName() == "IAsyncEnumerable" ||
-                 lt->headName() == "IOwningAsyncEnumerable");
+                common::isIterFormatEnumerableHead(lt->headName());
             if (isIterFmt)
                 const_cast<ast::LocalDecl*>(ld)->usingVarSourceIsBorrow = false;
         }
@@ -25396,11 +25388,12 @@ void Emitter::collectSafeViewAliases(
                         static_cast<const void*>(loc->decl) ==
                             static_cast<const void*>(arrLd)) {
                         const sema::TypeRef* dt = ctx_.resolvedType(*ld->type);
+                        // fix #3419 (§29.2, v0.283): read the shared head classifier.
                         if (dt && dt->kind == sema::TypeRef::Kind::Named &&
                             !dt->declaration && dt->astNode && dt->astNode->name &&
                             !dt->astNode->name->parts.empty() &&
-                            (dt->headName() == "IEnumerable" ||
-                             dt->headName() == "IOwningEnumerable"))
+                            common::isSyncIterFormatEnumerableHead(
+                                dt->headName()))
                             views.push_back(ld);
                     }
                 }
