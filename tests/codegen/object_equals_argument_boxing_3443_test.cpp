@@ -199,8 +199,8 @@ BEZEL_TEST(codegen_object_equals_argument_boxing_3443,
 
 // ── T5 — the `?.` MIRROR, which is a separate lowering site and was broken
 // identically. §7.5: "`?.` short-circuits. The receiver is evaluated first; if
-// it is null the access does not occur and nothing to its right in the chain is
-// evaluated" — so the null-receiver row must NOT print `Mark`'s marker, which is
+// it is null the access does not occur and **nothing to its right in the chain
+// is evaluated**" — so the null-receiver row must NOT print `Mark`'s marker, which is
 // exactly what pins that the new boxing sits INSIDE the non-null arm and does
 // not hoist the argument out of the short circuit.
 // (`.ToString()` is not called on the `bool?` result: that spelling emits

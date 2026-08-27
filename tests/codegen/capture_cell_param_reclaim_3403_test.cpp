@@ -374,8 +374,13 @@ BEZEL_TEST(capture_cell_param_reclaim_3403,
 // next iteration's null-guarded boxing therefore allocates a fresh cell rather
 // than resharing the freed one. The shape is safe by accident; the exclusion
 // stays, because the accident is not a proof and an escaping per-iteration
-// closure would not enjoy it. What this row asserts is the leak-count and value
-// parity across the fix. Printed total: sum over j of (3j + 3) = 630.
+// closure would not enjoy it.
+//
+// ⚠ What this row actually asserts is VALUE parity across the fix, not leak
+// parity: it runs through `plainOut` (`runAot`), whose oracle is the value and
+// completion only — it never observes a leak count. The leak-count equality was
+// measured out of band and is recorded in the commit body; do not read this row
+// as pinning it. Printed total: sum over j of (3j + 3) = 630.
 // per §27.5, §28.9 (issue #3403)
 BEZEL_TEST(capture_cell_param_reclaim_3403,
            guard_param_captured_inside_a_loop_is_not_freed_spec_27_5_28_9) {

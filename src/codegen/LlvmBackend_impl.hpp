@@ -4172,7 +4172,7 @@ private:
     bool isNullableValueStructBuiltinTy(const sema::TypeRef* rt);
     // fix #3095 / §4.7 (v0.252): is `rt` the NULLABLE UNIT type `()?`? §4.7,
     // verbatim: "Wrapping the unit type with `?` (yielding `()?`) is permitted
-    // by the grammar and produces an optional with **two values**, `null` and
+    // by the grammar and produces an optional with two values, `null` and
     // `()`." Two values is one BIT of state, so the tag alone carries the whole
     // type — but the type still needs a REPRESENTATION, and before this fix it
     // had none: `lowerTypeRef`'s `Kind::Unit` case returned LLVM `void`

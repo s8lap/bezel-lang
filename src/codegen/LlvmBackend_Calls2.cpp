@@ -4134,7 +4134,7 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     //     every one of them (see its ⚠ note);
     //   * anything else is a non-unit VALUE kind, which cannot be a unit box
     //     under any boxing ⇒ constant false, with the argument still lowered
-    //     for its effects (§22.5's "observable … and is normative").
+    //     for its effects (§22.5's "observable … and is normative…").
     // Note this deliberately does NOT route the argument through
     // `boxForTarget`: an `Object`-formal box is a fresh `calloc` per call site
     // (`boxUnitValue`), and nothing here needs the box — only the answer.

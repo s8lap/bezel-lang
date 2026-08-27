@@ -43,8 +43,8 @@
 // them carves out a receiver whose §8.5 answer happens to be static:
 //
 //   * §7.5 *Evaluation*: "`?.` short-circuits. The receiver is evaluated
-//     first; if it is null the access does not occur and nothing to its right
-//     in the chain is evaluated". A rule that a NULL receiver SUPPRESSES the
+//     first; if it is null the access does not occur and **nothing to its
+//     right in the chain is evaluated**". A rule that a NULL receiver SUPPRESSES the
 //     rest presupposes that a non-null receiver's expression RUNS — and `.` has
 //     no short-circuit at all.
 //   * §22.3, the `ref`/`out` argument-locations passage, states it outright for

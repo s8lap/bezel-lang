@@ -43,7 +43,8 @@
 //     which reads as the document stressing them. It does not.)
 //   * §22.5 *Evaluation order*: "The order is observable through side-effecting
 //     arguments and non-constant defaults (`DateTime.Now`, factory calls) and
-//     is normative."
+//     is normative…" (the spec sentence continues "; it matches C#'s
+//     treatment of supplied arguments" — truncated here, not ended)
 //   * §8.2 is the closest thing in the document to a licence for answering a
 //     universal from the static type, and it is explicit about what that
 //     removes: "the call is answered from the static type with no observable
