@@ -490,6 +490,21 @@ public:
                 emitDisposerBody(ts, fn);
             }
         }
+        // fix #3470 / §28.12 step 2: emit the physical-reclamation-only disposer
+        // for each class that got one (declareFunctions gates the population).
+        // Emitted HERE, in the same post-lowering pass as the ordinary
+        // disposers, so no caller's `genericSubst_` is active — the field
+        // classification and base-chain resolution inside see exactly what
+        // emitDisposerBody sees. Same deterministic name sort as above (#3020).
+        {
+            std::vector<std::pair<const sema::TypeSymbol*, llvm::Function*>>
+                sorted(disposerReclaimFns_.begin(), disposerReclaimFns_.end());
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& a, const auto& b) {
+                          return a.second->getName() < b.second->getName();
+                      });
+            for (auto& [ts, fn] : sorted) emitDisposerReclaimBody(ts, fn);
+        }
         // §2.5 / §22.8 (issue #328 item 2+3): emit the exported
         // `bz$<Type>$init` body for every public non-generic class declared in
         // THIS module. (An IMPORTED type's entry in initFns_ is an external
@@ -1320,6 +1335,14 @@ private:
         // fallback" (class not statically known, or DisposeAsync not found).
         bool asyncDispose = false;
         llvm::Function* disposeAsyncFn = nullptr;
+        // fix #3470 / §28.12 step 2: the class `disposeAsyncFn` was resolved
+        // FROM (registerUsingDisposal's `cls`) — the same single resolution, so
+        // the reclaim function and the DisposeAsync call can never key on two
+        // different answers to "which class is in this slot". Null exactly when
+        // `disposeAsyncFn` is null; used at emit time to look up
+        // disposerReclaimFns_ for §28.12 step 2's owned-field cascade + base
+        // chain, which the async arm previously replaced with a bare `free`.
+        const sema::TypeSymbol* asyncDisposeCls = nullptr;
         // stdlib §6.10 / §28.14 (v0.175, #808): an `await using var` bound to
         // a TaskScope. NORMAL exit: bz_task_scope_dispose_async (cancel the
         // scope's token, drain remaining children, swallow their faults;
@@ -8338,6 +8361,26 @@ private:
     // run-once flag and no free; the public Dispose guards it.
     void emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn);
 
+    // §28.12 step 2 ("owned fields are disposed in reverse declaration order,
+    // the base class's reclamation chains"): the physical-reclamation tail
+    // shared by emitDisposerCore (after the destructor body) and
+    // emitDisposerReclaimBody (instead of it). ONE spelling of the sequence, so
+    // the two logical-disposal paths cannot drift — §28.12's "this phase is the
+    // same regardless of which logical-disposal path ran" is structural here,
+    // not a coincidence of two similar code paths. Emits no terminator; the
+    // caller adds the `ret`.
+    void emitPhysicalReclamationSteps(const sema::TypeSymbol* ts);
+
+    // fix #3470 / §28.12 step 2: emit the body of disposerReclaimFns_[ts] — the
+    // run-once-flag guard of emitDisposerBody around emitPhysicalReclamationSteps
+    // ALONE. The class's own destructor body is deliberately absent:
+    // `DisposeAsync` superseded it (§28.12 step 1). The guard is a §28.2 PARITY
+    // row, not a measured-fallible one — see the definition's comment for the
+    // over-admitting-compiler measurement that establishes that, and for why
+    // removing it would still be wrong.
+    void emitDisposerReclaimBody(const sema::TypeSymbol* ts,
+                                 llvm::Function* fn);
+
     // §28.5: does `ts` declare at least one `owned` field whose type is one of
     // its own generic type parameters? Such a field is classified (and so auto-
     // disposed) at INSTANTIATION, not in the shared type-erased disposer; a
@@ -8628,6 +8671,17 @@ private:
     // explicit `obj.Dispose()` whose receiver is a slot/field this scope owns and
     // can null to block a second reclaim. free(null) is a no-op.
     void emitDisposeAndReclaim(llvm::Value* obj);
+
+    // fix #3470 / §28.12 step 2 ("...and the heap block is released"): the
+    // BLOCK-RELEASE tail of emitDisposeAndReclaim — identity-hash side-table
+    // reap, §31.4 CauseChain reclaim, and the free itself (suppressed under
+    // §28.2 checked-disposal quarantine). Split out so the `await using` path,
+    // whose logical disposal was the awaited DisposeAsync rather than the
+    // vtable Dispose, releases the block through the SAME three steps instead
+    // of a bare `free(obj)` that skipped the first two and the quarantine.
+    // `obj` must be non-null (free(null) would be a no-op, but the side-table
+    // and CauseChain helpers are called unconditionally).
+    void emitReclaimBlock(llvm::Value* obj);
 
     // §6.6 / §30.11 (#974): release a NON-NULL `bz_tcs_t*` — fault a pending
     // inner task, clean up its error object, fire-and-forget the task, free the
@@ -8952,6 +9006,20 @@ private:
     // set once at the most-derived public entry, never short-circuits a base
     // level's destructor.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> disposerCoreFns_;
+
+    // fix #3470 / §28.12 step 2: the PHYSICAL-RECLAMATION-ONLY disposer for a
+    // class that implements `IAsyncDisposable` — the run-once-flag-guarded
+    // {owned-field cascade + base chain} with the class's own destructor body
+    // OMITTED. §28.12 step 1 says the destructor body is not run when the
+    // awaited `DisposeAsync` performed logical disposal, and step 2 says
+    // physical reclamation still runs and "is the same regardless of which
+    // logical-disposal path ran"; this function is exactly step 2 for the
+    // `await using` path. Populated only for classes declared in THIS module
+    // that carry a `DisposeAsync` and are non-generic (see declareFunctions);
+    // absent means the async disposal site degrades to the full synchronous
+    // `emitDisposeAndReclaim` rather than leaking the owned subtree.
+    std::unordered_map<const sema::TypeSymbol*, llvm::Function*>
+        disposerReclaimFns_;
 
     static bool hasOwnedModifier(const sema::FieldSymbol* fs) {
         for (auto mod : fs->modifiers) {
@@ -10392,7 +10460,8 @@ private:
     // fallback: class not statically known, or not in async SM context), falls back
     // to emitDisposeAndReclaim (synchronous Dispose + free).
     void emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
-                                      llvm::Function* disposeAsyncFn);
+                                      llvm::Function* disposeAsyncFn,
+                                      const sema::TypeSymbol* cls = nullptr);
 
     // §30.7: emit an ASYNC ITERATOR method (declared `async`, contains `yield`,
     // returns IAsyncEnumerable<T> / IAsyncEnumerator<T>). Combines the iterator

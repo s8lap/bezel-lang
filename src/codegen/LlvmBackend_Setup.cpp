@@ -2244,6 +2244,33 @@ void Emitter::declareFunctions() {
             "bz$" + mangledTypeName(ts) + "$DisposeCore", module_.get());
         disposerCoreFns_[ts] = coreFn;
 
+        // fix #3470 / §28.12 step 2 (v0.283): a class that implements
+        // `IAsyncDisposable` also gets `bz$<C>$DisposeReclaim` — the run-once-
+        // guarded {owned-field cascade + base chain} with the class's own
+        // destructor body omitted. It is what `await using` calls after the
+        // awaited `DisposeAsync` returns ("the runtime invokes physical
+        // reclamation as the second step of the implicit `Dispose()` it issues
+        // after `DisposeAsync` returns; the destructor body that would normally
+        // run in the synchronous path is skipped"). Before this, that site
+        // emitted a bare `free(obj)` and stranded the whole owned subtree.
+        //
+        // POPULATION, deliberately narrow and keyed on the SAME fact the
+        // disposal site keys on: `findMethodByName(ts, "DisposeAsync")` is
+        // exactly the lookup `registerUsingDisposal` performs to resolve
+        // `d.disposeAsyncFn`, so a class gets a reclaim function iff an `await
+        // using` on it can reach the async arm. A generic class is excluded —
+        // its owned-field classification is per-instantiation (the #816/#2019
+        // specialized-disposer machinery), so the shared template body would be
+        // wrong; such a head degrades to the full synchronous reclamation at
+        // the disposal site. INTERNAL linkage: this is not part of the §2.5
+        // cross-module surface (an imported head degrades the same way).
+        if (ts->genericParams.empty() && findMethodByName(ts, "DisposeAsync")) {
+            auto* reclaimFn = llvm::Function::Create(
+                fnType, llvm::Function::InternalLinkage,
+                "bz$" + mangledTypeName(ts) + "$DisposeReclaim", module_.get());
+            disposerReclaimFns_[ts] = reclaimFn;
+        }
+
         // §2.5 / §2.6 / §22.8 (issue #328 item 2+3): a PUBLIC, non-generic class
         // gets an EXPORTED `bz$<Type>$init(ptr this)` — the §22.8 step-1+2
         // initializer (vtable install + field initializers) an importer calls
@@ -15806,8 +15833,25 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                         findMethodByName(cls, "DisposeAsync");
                     if (dams) {
                         auto fnIt = methodFns_.find(dams);
-                        if (fnIt != methodFns_.end())
+                        if (fnIt != methodFns_.end()) {
                             d.disposeAsyncFn = fnIt->second;
+                            // fix #3470 / §28.12 step 2: carry the class this
+                            // single resolution answered, so the emit site's
+                            // physical reclamation (disposerReclaimFns_) is
+                            // keyed on the SAME answer as the DisposeAsync
+                            // call and cannot drift from it.
+                            //
+                            // ⚠ This assignment was relocated during the
+                            // #3449/#3470 integration: fix #3449 moved this
+                            // resolution into the `else` arm, so #3470's copy
+                            // landed at a site that no longer exists. Taking
+                            // either side of that conflict verbatim would have
+                            // been wrong — HEAD alone leaves asyncDisposeCls
+                            // unset and silently disables #3470's reclamation;
+                            // the incoming side alone reinstates a duplicate
+                            // resolution at the retired location.
+                            d.asyncDisposeCls = cls;
+                        }
                     }
                 }
                 // disposeAsyncFn == null → sync fallback (emitDisposals

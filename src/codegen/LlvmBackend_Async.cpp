@@ -4185,7 +4185,13 @@ void Emitter::emitFreeSpillArea(llvm::Value* self) {
 // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
 // via `disposeAsyncFn` (the direct LLVM function pointer resolved at
 // registration time), await the returned Task (a proper suspend point), then
-// free the block (physical reclamation — §28.12 step 2).
+// run §28.12 step 2's PHYSICAL RECLAMATION on it — the class's
+// `bz$<C>$DisposeReclaim` (owned-field cascade + base chain, run-once guarded,
+// destructor body skipped per step 1) followed by emitReclaimBlock's block
+// release. `cls` is the class `disposeAsyncFn` was resolved from; it selects
+// that reclaim function, and a head with none degrades to the full synchronous
+// emitDisposeAndReclaim (see the tail). Before fix #3470 this was a bare
+// `free(obj)` and the owned subtree was stranded.
 //
 // When `disposeAsyncFn` is null (concrete class not statically known at
 // registration time — interface-typed local or class not yet emitted) OR the
@@ -4199,7 +4205,8 @@ void Emitter::emitFreeSpillArea(llvm::Value* self) {
 // `obj` is assumed NON-NULL here (the caller null-guards before branching).
 // DisposeAsync's function type is: ptr(ptr) — takes `this`, returns Task*.
 void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
-                                           llvm::Function* disposeAsyncFn) {
+                                           llvm::Function* disposeAsyncFn,
+                                           const sema::TypeSymbol* cls) {
     bool inAsyncSM = (smKind_ == SuspendKind::Await ||
                       smKind_ == SuspendKind::AsyncYield) &&
                      smStateStruct_ && smSelf_ && asyncResumeFn_;
@@ -4239,11 +4246,52 @@ void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
     // Result type is null (DisposeAsync returns Task, not Task<T>).
     emitAwaitSuspend(task, /*resultTy=*/nullptr, /*freeTaskAfter=*/true);
 
-    // Physical reclamation: free the object block (§28.12 step 2). The
-    // logical disposal (DisposeAsync) has already completed above; the
-    // destructor body is NOT re-run (DisposeAsync supersedes it per §28.12).
-    auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
-    builder_.CreateCall(freeFn, {obj});
+    // fix #3470 (§28.12 step 2, v0.283): PHYSICAL RECLAMATION. Step 2 reads,
+    // verbatim: "owned fields are disposed in reverse declaration order, the
+    // base class's reclamation chains, and the heap block is released. This
+    // phase is the same regardless of which logical-disposal path ran. For
+    // `await using`, the runtime invokes physical reclamation as the second
+    // step of the implicit `Dispose()` it issues after `DisposeAsync` returns;
+    // the destructor body that would normally run in the synchronous path is
+    // skipped."
+    //
+    // This was a bare `free(obj)`. Its comment named the confusion exactly —
+    // §28.12 says `DisposeAsync` supersedes the DESTRUCTOR BODY, and the code
+    // read that as "skip the generated `Dispose()` entirely", dropping the
+    // other two thirds of step 2 (the owned-field cascade and the base chain)
+    // along with it, plus the three block-release steps emitReclaimBlock owns.
+    // Measured on the issue's repro: 14400 B leaked in 400 allocations over 200
+    // executions, against a byte-identical program whose only difference is the
+    // `await` keyword and which is LeakSanitizer-clean.
+    //
+    // `disposerReclaimFns_[cls]` is emitDisposerBody minus the destructor body:
+    // the same run-once flag guard around the same emitPhysicalReclamationSteps
+    // the synchronous core runs, so the two paths cannot drift. `cls` is the
+    // SAME resolution `disposeAsyncFn` came from (registerUsingDisposal's
+    // `cls`), never a second classification of what is in the slot.
+    llvm::Function* reclaimFn = nullptr;
+    if (cls) {
+        auto rit = disposerReclaimFns_.find(cls);
+        if (rit != disposerReclaimFns_.end()) reclaimFn = rit->second;
+    }
+    if (reclaimFn) {
+        builder_.CreateCall(reclaimFn, {obj});
+        emitReclaimBlock(obj);
+    } else {
+        // DEGRADE, in the recoverable direction. No reclaim function exists for
+        // this head: the class is IMPORTED (its `bz$<C>$DisposeReclaim` belongs
+        // to the defining module and is not part of the exported ABI) or
+        // GENERIC (its physical reclamation is per-instantiation). Fall back to
+        // the FULL synchronous reclamation, which is the same arm the
+        // `!disposeAsyncFn` sync fallback above already takes: the object's
+        // owned subtree and base chain are reclaimed correctly through the
+        // vtable's most-derived `Dispose`, at the cost of also running the
+        // destructor body §28.12 step 1 would have skipped. That is a defined
+        // synchronous-fallback shape the section already sanctions elsewhere,
+        // and it is strictly better than the alternative this replaces — which
+        // ran no cleanup at all and stranded the whole subtree.
+        emitDisposeAndReclaim(obj);
+    }
 }
 
 

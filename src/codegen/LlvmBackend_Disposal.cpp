@@ -338,75 +338,180 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
                 builder_.CreateSelect(isNew, excNow, parkedDtorExc);
             builder_.CreateStore(restored, emitExcSlot());
         }
-        emitOwnedFieldDisposals(ts);
-        emitBaseDisposeChain(ts);
-        // fix #2951 (§28.4 step 3 / §28.2 / §28.9 / §31.4, v0.240): release the
-        // INHERITED §31.4 header. §28.4's generated `Dispose()` step 3 states,
-        // verbatim: "Chains to the base class's `Dispose()`." `emitBaseDisposeChain`
-        // above iterates `ts->baseTypes`, which holds only ancestors that HAVE a
-        // TypeSymbol — and a built-in exception has none — so for a class whose
-        // base is `Exception` (or any built-in exception) step 3 chained to
-        // NOTHING. `vt$<C>` slot 2 is the class's own `bz$<C>$Dispose`, whose
-        // core never touched the header, so the shared `bz$exDisposeMsg` that a
-        // directly-constructed `new Exception(msg)` disposes through was never
-        // reached from a subclass and NOTHING released its Message (or
-        // ArgumentException's ParamName). Measured on the 20-iteration repro:
-        // `711 byte(s) leaked in 40 allocation(s)`, against an identical loop on
-        // the built-in `Exception` that is clean.
-        //
-        // §28.9 makes the slot's obligation explicit for a runtime-managed
-        // string field, and §28.2's exactly-once is the whole contract here, so
-        // both directions were measured, not just the leak:
-        //
-        //   * UNDER-release — LSan on the amplified loops; clean now.
-        //   * OVER-release — LSan is blind to it, so it is measured by keeping
-        //     an independent reference alive ACROSS the disposal and reading it
-        //     after, with churn in between: one `+1` string aliased into TWO
-        //     subclass instances, both disposed, then the original read. An
-        //     over-release faults there under ASan; it does not.
-        //
-        // Exactly-once holds structurally, not just on the probes, for the two
-        // shapes that would otherwise release twice:
-        //   * A MULTI-LEVEL hierarchy (`ExB: ExA: Exception`). The gate is the
-        //     TRANSITIVE `hasBuiltinExceptionBase`, so both levels' cores carry
-        //     this call and `emitBaseDisposeChain` runs ExA's core from ExB's.
-        //     `bz$exDisposeMsg` NULLS each slot after releasing it (see
-        //     setupBuiltinExceptions) and `bz_string_release` is null-safe, so
-        //     the second call is a no-op. The transitive gate is deliberate: it
-        //     also covers a LOCAL class over an IMPORTED exception base, where
-        //     the chain's reach into the dependency's compiled core is not this
-        //     module's to guarantee.
-        //   * §28.6 REPEAT DISPATCH (explicit `Dispose()` then scope-end). The
-        //     public wrapper's run-once flag already stops the second entry, and
-        //     the slot-nulling makes it idempotent even if it did not.
-        //
-        // BLOCKED UNTIL NOW, and both blockers are real: #2902 (the `base(msg)`
-        // chain stored the message UN-RETAINED, so releasing it here freed a
-        // reference the caller still owned — measured `heap-use-after-free ...
-        // #2 bz$exDisposeMsg`) and #2950 (an imported subclass was laid out
-        // WITHOUT the header, so the exporter-compiled disposer handed the
-        // importer's FIELD VALUE to `bz_string_release` — `SEGV on unknown
-        // address 0x2b`, rdi = the field's value). Both are in this batch; this
-        // call is only sound with them.
-        //
-        // CauseChain@24 is deliberately NOT released here — see the #811/#1389
-        // reasoning on `bz$exDisposeMsg`: it is reclaimed at the terminal
-        // `emitDisposeAndReclaim` site, which runs exactly once per object,
-        // rather than in a disposer that can be re-dispatched. (That reclaim
-        // now ALSO covers a user subclass: #2989 widened
-        // `bz_exc_reclaim_causechain`'s gate to walk the type-descriptor chain,
-        // so a user subclass's vt$<C> is recognized via its btd$Exception
-        // ancestor — the same authority `o is Exception` uses — not just the
-        // built-in vtable-identity table.)
-        //
-        // Inherits the pre-existing corner noted above: a destructor that
-        // returns early leaves `terminated` set and skips this block entirely,
-        // exactly as it already skips the owned-field cascade and the base chain.
-        if (hasBuiltinExceptionBase(ts) && builtinExceptionDisposeFn_ &&
-            currentThis_)
-            builder_.CreateCall(builtinExceptionDisposeFn_, {currentThis_});
+        emitPhysicalReclamationSteps(ts);
         builder_.CreateRetVoid();
     }
+}
+
+
+// §28.12 step 2, verbatim: "owned fields are disposed in reverse declaration
+// order, the base class's reclamation chains, and the heap block is released.
+// This phase is the same regardless of which logical-disposal path ran."  The
+// first two of those three steps live here (the block release is
+// emitReclaimBlock, at the owning disposal SITE, because a re-dispatchable
+// Dispose must never free); this is the ONE spelling of them, called from
+// emitDisposerCore after the destructor body and from emitDisposerReclaimBody
+// INSTEAD of it (fix #3470: the `await using` path had no spelling at all — it
+// called a bare `free(obj)`, so every owned field and every base level of an
+// awaited-DisposeAsync object was stranded).  Emits no terminator.
+void Emitter::emitPhysicalReclamationSteps(const sema::TypeSymbol* ts) {
+    emitOwnedFieldDisposals(ts);
+    emitBaseDisposeChain(ts);
+    // fix #2951 (§28.4 step 3 / §28.2 / §28.9 / §31.4, v0.240): release the
+    // INHERITED §31.4 header. §28.4's generated `Dispose()` step 3 states,
+    // verbatim: "Chains to the base class's `Dispose()`." `emitBaseDisposeChain`
+    // above iterates `ts->baseTypes`, which holds only ancestors that HAVE a
+    // TypeSymbol — and a built-in exception has none — so for a class whose
+    // base is `Exception` (or any built-in exception) step 3 chained to
+    // NOTHING. `vt$<C>` slot 2 is the class's own `bz$<C>$Dispose`, whose
+    // core never touched the header, so the shared `bz$exDisposeMsg` that a
+    // directly-constructed `new Exception(msg)` disposes through was never
+    // reached from a subclass and NOTHING released its Message (or
+    // ArgumentException's ParamName). Measured on the 20-iteration repro:
+    // `711 byte(s) leaked in 40 allocation(s)`, against an identical loop on
+    // the built-in `Exception` that is clean.
+    //
+    // §28.9 makes the slot's obligation explicit for a runtime-managed
+    // string field, and §28.2's exactly-once is the whole contract here, so
+    // both directions were measured, not just the leak:
+    //
+    //   * UNDER-release — LSan on the amplified loops; clean now.
+    //   * OVER-release — LSan is blind to it, so it is measured by keeping
+    //     an independent reference alive ACROSS the disposal and reading it
+    //     after, with churn in between: one `+1` string aliased into TWO
+    //     subclass instances, both disposed, then the original read. An
+    //     over-release faults there under ASan; it does not.
+    //
+    // Exactly-once holds structurally, not just on the probes, for the two
+    // shapes that would otherwise release twice:
+    //   * A MULTI-LEVEL hierarchy (`ExB: ExA: Exception`). The gate is the
+    //     TRANSITIVE `hasBuiltinExceptionBase`, so both levels' cores carry
+    //     this call and `emitBaseDisposeChain` runs ExA's core from ExB's.
+    //     `bz$exDisposeMsg` NULLS each slot after releasing it (see
+    //     setupBuiltinExceptions) and `bz_string_release` is null-safe, so
+    //     the second call is a no-op. The transitive gate is deliberate: it
+    //     also covers a LOCAL class over an IMPORTED exception base, where
+    //     the chain's reach into the dependency's compiled core is not this
+    //     module's to guarantee.
+    //   * §28.6 REPEAT DISPATCH (explicit `Dispose()` then scope-end). The
+    //     public wrapper's run-once flag already stops the second entry, and
+    //     the slot-nulling makes it idempotent even if it did not.
+    //
+    // BLOCKED UNTIL NOW, and both blockers are real: #2902 (the `base(msg)`
+    // chain stored the message UN-RETAINED, so releasing it here freed a
+    // reference the caller still owned — measured `heap-use-after-free ...
+    // #2 bz$exDisposeMsg`) and #2950 (an imported subclass was laid out
+    // WITHOUT the header, so the exporter-compiled disposer handed the
+    // importer's FIELD VALUE to `bz_string_release` — `SEGV on unknown
+    // address 0x2b`, rdi = the field's value). Both are in this batch; this
+    // call is only sound with them.
+    //
+    // CauseChain@24 is deliberately NOT released here — see the #811/#1389
+    // reasoning on `bz$exDisposeMsg`: it is reclaimed at the terminal
+    // `emitDisposeAndReclaim` site, which runs exactly once per object,
+    // rather than in a disposer that can be re-dispatched. (That reclaim
+    // now ALSO covers a user subclass: #2989 widened
+    // `bz_exc_reclaim_causechain`'s gate to walk the type-descriptor chain,
+    // so a user subclass's vt$<C> is recognized via its btd$Exception
+    // ancestor — the same authority `o is Exception` uses — not just the
+    // built-in vtable-identity table.)
+    //
+    // Inherits the pre-existing corner noted above: a destructor that
+    // returns early leaves `terminated` set and skips this block entirely,
+    // exactly as it already skips the owned-field cascade and the base chain.
+    if (hasBuiltinExceptionBase(ts) && builtinExceptionDisposeFn_ &&
+        currentThis_)
+        builder_.CreateCall(builtinExceptionDisposeFn_, {currentThis_});
+}
+
+
+// fix #3470 / §28.12 step 2 (v0.283): emit `bz$<C>$DisposeReclaim` — the
+// PHYSICAL RECLAMATION the `await using` path issues after the awaited
+// `DisposeAsync` has returned.  §28.12 step 2, verbatim:
+//
+//   "Physical reclamation runs once, after logical disposal has completed:
+//    owned fields are disposed in reverse declaration order, the base class's
+//    reclamation chains, and the heap block is released. This phase is the
+//    same regardless of which logical-disposal path ran. For `await using`, the
+//    runtime invokes physical reclamation as the second step of the implicit
+//    `Dispose()` it issues after `DisposeAsync` returns; the destructor body
+//    that would normally run in the synchronous path is skipped."
+//
+// So this is EXACTLY emitDisposerBody minus the destructor body: the same
+// run-once flag guard around the same emitPhysicalReclamationSteps.  The heap
+// block is released by the disposal SITE (emitReclaimBlock), as for every other
+// disposer, so a repeat dispatch can never read a freed object.
+//
+// THE FLAG GUARD IS A PARITY ROW, NOT A MEASURED-FALLIBLE GUARD — stated that
+// way because it was measured and the measurement refuted the obvious claim.
+// It is here because this function is the same KIND of entry point as
+// emitDisposerBody (a once-per-object cascade over the same fields) and must
+// carry the same §28.2 idempotence, and because a second cascade WOULD be
+// unsound if anything reached it: emitOwnedFieldDisposals nulls the slot after
+// disposing an owned CLASS/task/iterator/event/Shared field, but the owned
+// COLLECTION arm (`it->collTy` — `bz_array_free` / `bz_llist_free` /
+// `bz_dict_free`) does NOT — it frees the backing and leaves the field pointing
+// at it, so a repeat pass double-frees every owned collection field.
+//
+// What was measured: a deliberately OVER-ADMITTING compiler, with both the flag
+// CHECK and the flag SET deleted from this function, was built and run against
+// the whole grid — the 7 rows of await_using_physical_reclamation_3470, the
+// `await_using` (57), `disposer` (50) and `taskscope` (36) filters, the 2188-test
+// lit corpus, and all seven ASan probes. Every one was green, and each probe's
+// exit code and LeakSanitizer summary was identical to the guarded build. So no
+// program reachable on today's compiler enters this function twice: sema
+// forbids `this.Dispose()` (§28.6) and `Dispose()` through a borrow, an explicit
+// `Dispose()` on the owning local DISCHARGES the obligation so no scope-end
+// disposal is registered at all, and emitDisposals nulls the slot immediately
+// after this call. The guard costs a compare and is the difference between
+// "unreachable today" and "unsound the day some path reaches it"; do not remove
+// it on the grounds that nothing exercises it.
+void Emitter::emitDisposerReclaimBody(const sema::TypeSymbol* ts,
+                                      llvm::Function* fn) {
+    currentFn_ = fn;
+    currentThis_ = &*fn->args().begin();
+    locals_.clear();
+    paramSlots_.clear();
+    refParams_.clear();
+    disposeStack_.clear();
+    loopStack_.clear(); finallyStack_.clear();
+    propagateBB_ = nullptr;
+    unwindTarget_ = nullptr;
+    currentCaughtExc_ = nullptr;
+    currentCaughtName_ = {};
+    unwindScopeDepth_ = 0;
+    builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+    // §28.2 idempotence, exactly as emitDisposerBody spells it: load the
+    // run-once flag; if already set this reclamation has run (or the full
+    // synchronous Dispose has), so it is a no-op.  Set it BEFORE the cascade so
+    // a re-entrant disposal during the cascade still short-circuits.
+    llvm::StructType* st = classStruct(ts);
+    unsigned fi = disposedFlagIndex(ts);
+    llvm::Value* flagAddr =
+        builder_.CreateStructGEP(st, currentThis_, fi, "disposed.flag");
+    llvm::Value* already = builder_.CreateICmpNE(
+        builder_.CreateLoad(disposedFlagTy(), flagAddr),
+        llvm::ConstantInt::get(disposedFlagTy(), 0), "already.disposed");
+    auto* doBB = llvm::BasicBlock::Create(llvm_, "reclaim.do", fn);
+    auto* retBB = llvm::BasicBlock::Create(llvm_, "reclaim.ret", fn);
+    builder_.CreateCondBr(already, retBB, doBB);
+    builder_.SetInsertPoint(doBB);
+    builder_.CreateStore(llvm::ConstantInt::get(disposedFlagTy(), 1), flagAddr);
+    // The class's own destructor body is deliberately NOT run here (§28.12 step
+    // 1: "the destructor body (if any) is not also run, because `DisposeAsync`
+    // supersedes it").  emitBaseDisposeChain, inside the shared steps, still
+    // chains to each BASE's core — which does run that base's destructor body.
+    // That is the conservative reading of step 2's "the base class's
+    // reclamation chains": only the class whose `DisposeAsync` ran has its
+    // synchronous cleanup superseded, so a base level's cleanup is preserved
+    // rather than silently dropped, and the emitted sequence differs from the
+    // synchronous path by exactly the one body §28.12 names.  The alternative
+    // reading (physical reclamation is destructor-free at every level) is
+    // filed as a spec-clarification issue rather than chosen silently here.
+    emitPhysicalReclamationSteps(ts);
+    builder_.CreateBr(retBB);
+    builder_.SetInsertPoint(retBB);
+    builder_.CreateRetVoid();
 }
 
 
@@ -2014,6 +2119,21 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
     // The caller is responsible for null-ing its slot afterward where a second
     // dispatch through the same slot is reachable. free(null) is a no-op.
     emitDynamicDispose(obj);
+    emitReclaimBlock(obj);
+}
+
+
+// fix #3470 / §28.12 step 2 ("...and the heap block is released"): the
+// block-release tail of emitDisposeAndReclaim, split out so the `await using`
+// path can reuse it verbatim. That path's logical disposal is the awaited
+// `DisposeAsync`, not the vtable Dispose, so it cannot call
+// emitDisposeAndReclaim as a whole — but §28.12 says the RECLAMATION "is the
+// same regardless of which logical-disposal path ran", and it was not: the
+// async arm emitted a bare `free(obj)`, skipping the identity-hash side-table
+// reap, the §31.4 CauseChain reclaim, and §28.2 checked-disposal's quarantine
+// (it freed a block whose disposed flag a surviving borrow's member-entry
+// guard is entitled to read).
+void Emitter::emitReclaimBlock(llvm::Value* obj) {
     // §8.3 / #2058: reap the side-table entry BEFORE the heap free (the object
     // is still live here, so the erase cannot read freed memory). Bounds the
     // identity-hash side-table for long-running services; the per-domain
@@ -6035,7 +6155,8 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // Pass the direct function pointer; null means sync fallback.
             // On the unwind path, always use sync fallback (pass null).
             emitAsyncDisposeAwaitAndFree(
-                obj, isUnwind ? nullptr : it->disposeAsyncFn);
+                obj, isUnwind ? nullptr : it->disposeAsyncFn,
+                isUnwind ? nullptr : it->asyncDisposeCls);
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);
