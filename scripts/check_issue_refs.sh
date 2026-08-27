@@ -64,7 +64,20 @@ rows="$(
     # how a just-filed issue gets closed by mistake.
     git log -1 --format=%B "$sha" | grep -oE '#[0-9]{4,}' | tr -d '#' | sort -u |
       while read -r n; do
-        case "$subj" in *"#$n"*) kind=FIX ;; *) kind=mention ;; esac
+        # fix #3458: the VERB decides, not mere presence in the subject.
+        # `narrow`/`sharpen` exist precisely so a PARTIAL fix does not close its
+        # issue; treating them as FIX told the operator to close issues whose
+        # remaining half is still open (measured: #3439, whose only commit in a
+        # range was `narrow`, while its mechanical-enforcement half was untouched).
+        # Anchor at the start: a substring test for `fix` also matches `part-fix`,
+        # `postfix` and `prefix` -- the same trap that motivated the two verbs.
+        case "$subj" in
+          "fix #$n:"*|"fix #$n "*)                 kind=FIX ;;
+          "narrow #$n:"*|"narrow #$n "*)           kind=PARTIAL ;;
+          "sharpen #$n:"*|"sharpen #$n "*)         kind=PARTIAL ;;
+          *"#$n"*)                                 kind=FIX ;;
+          *)                                       kind=mention ;;
+        esac
         printf '%s\t%s\t%s\t%s\n' "$n" "$sha" "$kind" "$subj"
       done
   done | sort -u | sort -k1,1n -s
@@ -72,7 +85,7 @@ rows="$(
 
 [ -n "$rows" ] || { echo "check_issue_refs: no issue references in $RANGE"; exit 0; }
 
-dangling=0; open_n=0; closed_n=0; to_close=""; seen_open=""; seen_closed=""; seen_dangling=""
+dangling=0; open_n=0; closed_n=0; to_close=""; to_partial=""; seen_open=""; seen_closed=""; seen_dangling=""
 printf '%-8s %-8s %-8s %-10s %s\n' "ISSUE" "STATE" "ROLE" "COMMIT" "SUBJECT"
 printf '%-8s %-8s %-8s %-10s %s\n' "-----" "-----" "----" "------" "-------"
 while IFS=$'\t' read -r num sha kind subj; do
@@ -89,6 +102,11 @@ while IFS=$'\t' read -r num sha kind subj; do
   if [ "$kind" = FIX ] && [ "$state" = OPEN ]; then
     case " $to_close " in *" $num "*) ;; *) to_close="$to_close $num" ;; esac
   fi
+  # fix #3458: a PARTIAL is reported so it is not silently absent from the
+  # checklist -- it needs a scope COMMENT, and explicitly not a close.
+  if [ "$kind" = PARTIAL ] && [ "$state" = OPEN ]; then
+    case " $to_partial " in *" $num "*) ;; *) to_partial="$to_partial $num" ;; esac
+  fi
   printf '#%-7s %-8s %-8s %-10s %.52s\n' "$num" "$state" "$kind" "$sha" "$subj"
 done <<< "$rows"
 
@@ -104,6 +122,11 @@ fi
 if [ -n "$to_close" ]; then
   echo "check_issue_refs: CLOSE AFTER PUSH (subject claims a fix, still open):$to_close"
   echo "  State any PARTIAL scope in the comment — roughly a third of fixes ship partial."
+fi
+if [ -n "$to_partial" ]; then
+  echo "check_issue_refs: COMMENT BUT DO NOT CLOSE (subject verb is narrow/sharpen):$to_partial"
+  echo "  These shipped a PARTIAL fix on purpose. Comment what landed and what remains;"
+  echo "  closing one loses the surviving half silently (fix #3458)."
 fi
 echo "check_issue_refs: OPEN issues with role 'mention' are follow-ups a lane filed — leave them open."
 exit 0
