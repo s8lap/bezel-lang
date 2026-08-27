@@ -10086,6 +10086,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // `string?` argument is rejected instead of silently accepted.
     checkBuiltinStringCallArgs(ce);
 
+    // §22.5 (v0.283, #3398): the BINDING twin of the three per-argument
+    // builtin checks around it. Those answer "is this argument's TYPE
+    // admissible"; none of them asks which PARAMETER an argument binds to,
+    // and a built-in member has no MethodSymbol for `checkCallArity` to bind
+    // against — so a named argument on a built-in was discarded and bound
+    // positionally, which made a reordered named call a silent wrong answer.
+    // Runs the same `bindArgsToParams` the user path runs, over the parameter
+    // names `common::builtinParamNames` now carries. See the header.
+    checkBuiltinNamedArgs(ce, calleeSym);
+
     // §7 / stdlib §4.x (#2582): the collection twin of #2315 — a builtin
     // collection instance method has no MethodSymbol either, so the same
     // per-argument assignability hole let an un-narrowed `int?` (or `T?`)
@@ -10633,6 +10643,163 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
             argTy, paramTy, a.value->span.begin,
             std::string("argument to `string.") + std::string(m) + "`",
             a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
+    }
+}
+
+// fix #3398 (spec §22.5 "Optional parameters and named arguments", v0.283;
+// stdlib §1 Conventions — *Window parameters*; §9.6; §3.2): §22.5 binding
+// for a call to a BUILT-IN member. See the header for the contract, the hole
+// it closes, and the two limitation-rejections it adds.
+//
+// WHICH CALLS THIS CLAIMS, and why the gate is a POSITIVE test. The check
+// fires only on a call that actually writes a named argument, and only where
+// the receiver is confidently a built-in:
+//
+//   * a primitive `string` receiver (head `string`) — the #2315 shape;
+//   * a Named receiver with no user `TypeSymbol` whose head is a reserved
+//     built-in name, a built-in exception name, or a head this registry
+//     table answers for — the #2582 shape, narrowed by a POSITIVE name test.
+//     The narrowing matters: a declaration-less single-part Named TypeRef is
+//     "a reserved builtin, or a type parameter" (BuiltinRegistry.hpp), and a
+//     bare type-parameter receiver `t.M(x := 1)` must not draw a built-in
+//     diagnostic. A member call through a type parameter's CONSTRAINT
+//     resolves to the interface's `MethodSymbol` and is excluded by the
+//     `calleeSym` gate anyway; the name test is the second line of defence.
+//   * the STATIC spelling `String.From(...)`, whose target is a bare
+//     identifier carrying no value type. Nothing at that shape distinguishes
+//     a built-in static class from a user one, so only the heads
+//     `isBuiltinNamedArgTableHead` names are claimed — a user static call is
+//     bound by `checkCallArity` and never reaches here.
+//
+// Every other shape returns without a claim, which leaves exactly today's
+// behaviour. A missed built-in therefore costs a rejection that did not fire,
+// never a false rejection — the same fail-safe direction the registry's other
+// positive tables take.
+void ExprTC::checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym) {
+    // Positional-only calls are entirely unchanged — this check exists for
+    // the named form and claims nothing else.
+    bool anyNamed = false;
+    for (const auto& a : ce.args)
+        if (!a.name.empty()) { anyNamed = true; break; }
+    if (!anyNamed) return;
+    // A resolved callee symbol means a user / imported / extension callee,
+    // whose binding `checkCallArity` (or `checkImportedCallArity`) already
+    // performs with this same binder. A built-in member resolves to none.
+    if (calleeSym) return;
+
+    // #2581 / #2594: a built-in instance callee is EITHER a MemberAccessExpr
+    // (`recv.M(..)`) OR a NullCondMemberExpr (`recv?.M(..)`); reuse the shared
+    // extractor so the null-conditional form is not a second, unchecked path.
+    auto [tgt, member] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt) return;
+
+    std::string_view head;
+    if (TypeRef* recvTy = ctx_.exprType(*tgt)) {
+        if (recvTy->kind == TypeRef::Kind::Primitive) {
+            // Only `string` has a documented parameter-name surface here
+            // (stdlib §9.6); the other primitives are left unclaimed.
+            if (recvTy->primitive != PrimitiveType::String) return;
+            head = "string";
+        } else if (recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration) {
+            // `headName()` is the alias-transparent read (#1462) and already
+            // falls back to the metadata `importedName` for a cross-module
+            // TypeRef with no astNode.
+            head = recvTy->headName();
+            if (head.empty()) return;  // the §5 lazy sentinel, and kin
+            if (!common::isReservedBuiltinTypeName(head) &&
+                !common::isBuiltinExceptionName(head) &&
+                !common::isBuiltinNamedArgTableHead(head))
+                return;
+        } else if (recvTy->kind == TypeRef::Kind::Named &&
+                   !recvTy->declaration->decl &&
+                   common::isBuiltinNamedArgTableHead(
+                       recvTy->declaration->name)) {
+            // Some built-in receivers DO carry a declaration: a
+            // `SemaContext::builtinClassSym` — a compiler-intrinsic
+            // `TypeSymbol` with `decl == nullptr`. `Encoding.UTF8` is one
+            // (ExprTypecheck_Calls.cpp stamps `builtinClassSym("Encoding")`
+            // on the singleton's TypeRef), so the declaration-less branch
+            // above never sees it and the whole §3.2 surface would be
+            // unclaimed.
+            //
+            // `decl == nullptr` alone does NOT mean "built-in" — an IMPORTED
+            // user `TypeSymbol` has no AST either — so the test is ANDed with
+            // the registry's own head set. A user class that happened to be
+            // named `Encoding` would resolve its member to a real
+            // `MethodSymbol` and be excluded by the `calleeSym` gate above.
+            // Other `builtinClassSym` heads (DateTime, TimeSpan, Guid, Range,
+            // …) stay unclaimed: the registry carries no rows for them, and an
+            // unclaimed built-in costs a rejection that does not fire, never a
+            // false one.
+            head = recvTy->declaration->name;
+        } else {
+            return;  // a user type: checkCallArity bound the call already
+        }
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(tgt)) {
+        if (!common::isBuiltinNamedArgTableHead(id->name)) return;
+        head = id->name;
+    } else {
+        return;
+    }
+
+    const std::string desc = std::string("call to built-in `") +
+                             std::string(head) + "." + std::string(member) +
+                             "`";
+    std::vector<std::string_view> names =
+        common::builtinParamNames(head, member, ce.args.size());
+    if (names.empty()) {
+        // Limitation 1 (see the header): no complete parameter-name list, so
+        // the name cannot be validated and the binding cannot be trusted.
+        // Reject loudly rather than bind positionally behind the caller's
+        // back — a loud rejection beats a wrong value.
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            desc + ": named arguments are not supported on this built-in "
+                   "member — the compiler carries no parameter names for it "
+                   "at " + std::to_string(ce.args.size()) +
+                " argument(s), so a name can be neither matched nor rejected "
+                "(§22.5, #3398). Pass the arguments positionally.");
+        return;
+    }
+
+    // The §22.5 binder, unchanged: `FormalsView::of` over an `ast::Param` list
+    // carrying just the names. A registry row is keyed by the EXACT argument
+    // count, so every formal in the view is supplied and none carries a
+    // default — the four §22.5 violations the binder reports (unknown name,
+    // bound twice, positional-after-named, required-not-supplied) are exactly
+    // the ones reachable here, with exactly the user path's wording.
+    std::vector<ast::Param> formals(names.size());
+    for (std::size_t i = 0; i < names.size(); ++i) formals[i].name = names[i];
+    BindResult b = bindArgsToParams(formals, ce.args, ce.span.begin, desc,
+                                    /*emit=*/true);
+    if (!b.ok) return;  // the binder reported; no cascade
+
+    // Limitation 2 (see the header): codegen lowers a built-in call by
+    // argument POSITION (`call.args[i]`), so a binding that is not the
+    // identity permutation would be honoured by sema and ignored by codegen —
+    // the wrong answer this fix exists to remove. §22.5's *Evaluation order*
+    // rules out buying the reorder by permuting the argument list here
+    // ("supplied argument expressions are evaluated in call-site textual
+    // order"), so the call is rejected until codegen can consume the binding
+    // (#3423).
+    for (std::size_t j = 0; j < names.size(); ++j) {
+        if (b.paramToArg[j] == static_cast<int>(j)) continue;
+        // Unreachable while `ok`: a registry row is keyed by exact arity and
+        // carries no defaults, so the binder's required-parameter clause has
+        // already rejected any unbound formal. Guarded so a future row shape
+        // cannot turn a -1 into a nonsense position in the message.
+        if (b.paramToArg[j] < 0) return;
+        const std::size_t ai = static_cast<std::size_t>(b.paramToArg[j]);
+        ctx_.diagnostics().report(
+            Severity::Error, ce.span.begin,
+            desc + ": a named argument that binds to a parameter other than "
+                   "its own position is not supported on a built-in member — "
+                   "`" + std::string(names[j]) + "` is parameter " +
+                std::to_string(j + 1) + " but is written as argument " +
+                std::to_string(ai + 1) +
+                " (§22.5, #3398). Pass the arguments in declaration order, or "
+                "positionally.");
+        return;
     }
 }
 

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 
 // #1414 Stage 3 — the data-only builtin registry (see BuiltinRegistry.hpp).
 //
@@ -355,6 +356,89 @@ constexpr std::array<BuiltinExceptionEdge, 29> kBuiltinExceptionHierarchy = {{
     // Exception per §22.16 "Failure semantics and the enforcement modes".
     {"ContractViolationException", "Exception"},
 }};
+
+// fix #3398 (spec §22.5, v0.283; stdlib §1 Conventions — *Window
+// parameters*; §9.6; §3.2): the built-in member parameter-name table. See the
+// header for the contract, and for why a MISS is a rejection rather than
+// permission.
+//
+// Every row is transcribed from the standard-library document's own
+// declaration; nothing here is inferred. `names` holds `arity` entries in
+// declaration order (the trailing slots of a shorter row are unused).
+struct BuiltinParamNameRow {
+    std::string_view head;
+    std::string_view member;
+    std::size_t arity;
+    std::array<std::string_view, 3> names;
+};
+
+// stdlib §9.6 `String` (v0.283). The STATIC members are keyed under the same
+// `"string"` head as the instance ones — no §9.6 member name is both, so one
+// table answers both spellings and the lookup normalizes `"String"` to
+// `"string"`.
+//
+// OMITTED, per the header's same-arity-disagreement rule: `Replace/2`
+// (`oldChar, newChar` | `oldValue, newValue`), `Repeat/2` (`c, count` |
+// `unit, count`), `Split/1` (`separator` | `separators`), `AsSpan/1`
+// (`start` | `r`). `Trim/0`, `ToUpper/0` and the other nullary members carry
+// no parameters and so cannot take a named argument at all.
+constexpr std::array<BuiltinParamNameRow, 31> kStringParamNames = {{
+    // Construction (static)
+    {"string", "From", 1, {"value", "", ""}},
+    {"string", "From", 3, {"buffer", "start", "length"}},  // renamed v0.282 (§1)
+    {"string", "FromCStringPointer", 1, {"p", "", ""}},
+    {"string", "FromWStringPointer", 1, {"p", "", ""}},
+    {"string", "Join", 2, {"separator", "items", ""}},
+    // Inspection (static)
+    {"string", "IsNullOrEmpty", 1, {"value", "", ""}},
+    {"string", "IsNullOrWhiteSpace", 1, {"value", "", ""}},
+    // Inspection (instance)
+    {"string", "Contains", 1, {"value", "", ""}},
+    {"string", "StartsWith", 1, {"value", "", ""}},
+    {"string", "EndsWith", 1, {"value", "", ""}},
+    {"string", "IndexOf", 1, {"value", "", ""}},
+    {"string", "IndexOf", 2, {"value", "startIndex", ""}},
+    {"string", "LastIndexOf", 1, {"value", "", ""}},
+    // Substring / span views
+    {"string", "Substring", 1, {"startIndex", "", ""}},
+    {"string", "Substring", 2, {"startIndex", "length", ""}},
+    {"string", "AsSpan", 2, {"start", "length", ""}},
+    // Modification
+    {"string", "Trim", 1, {"chars", "", ""}},
+    {"string", "PadLeft", 1, {"totalWidth", "", ""}},
+    {"string", "PadLeft", 2, {"totalWidth", "paddingChar", ""}},
+    {"string", "PadRight", 1, {"totalWidth", "", ""}},
+    {"string", "PadRight", 2, {"totalWidth", "paddingChar", ""}},
+    {"string", "PadCenter", 1, {"totalWidth", "", ""}},
+    {"string", "PadCenter", 2, {"totalWidth", "paddingChar", ""}},
+    {"string", "Insert", 2, {"startIndex", "value", ""}},
+    {"string", "Remove", 1, {"startIndex", "", ""}},
+    {"string", "Remove", 2, {"startIndex", "length", ""}},  // renamed v0.282 (§1)
+    // Comparison and equality
+    {"string", "CompareTo", 1, {"other", "", ""}},
+    {"string", "Compare", 2, {"a", "b", ""}},
+    {"string", "Compare", 3, {"a", "b", "ignoreCase"}},
+    // §9.6 declares BOTH `Equals(other: string?)` and the `Object?` override
+    // at arity 1, and they AGREE on the name, so the single row answers both.
+    {"string", "Equals", 1, {"other", "", ""}},
+    {"string", "Equals", 2, {"other", "ignoreCase", ""}},
+}};
+
+// stdlib §3.2 `Encoding` (v0.283). No overload at a shared arity disagrees on
+// names here, so the whole declared surface is covered.
+constexpr std::array<BuiltinParamNameRow, 5> kEncodingParamNames = {{
+    {"Encoding", "GetBytes", 1, {"s", "", ""}},
+    {"Encoding", "GetBytes", 2, {"s", "destination", ""}},
+    {"Encoding", "GetString", 1, {"bytes", "", ""}},
+    {"Encoding", "GetString", 3, {"bytes", "start", "length"}},  // renamed v0.282 (§1)
+    {"Encoding", "GetByteCount", 1, {"s", "", ""}},
+}};
+
+// The heads `kStringParamNames` / `kEncodingParamNames` answer for. See the
+// header for the two roles this predicate plays at the call site.
+constexpr std::array<std::string_view, 3> kBuiltinNamedArgTableHeads = {
+    "string", "String", "Encoding",
+};
 
 }  // namespace
 
@@ -845,5 +929,29 @@ std::string_view primitiveBuiltinSpelling(int primitive) {
     }
     return "<unknown>";
 }  // per stdlib §2.13 rule 2 / §3.4, fix #3119
+
+// fix #3398 (§22.5, v0.283; stdlib §1 / §9.6 / §3.2): see the header.
+std::vector<std::string_view> builtinParamNames(std::string_view typeHead,
+                                                std::string_view member,
+                                                std::size_t arity) {
+    // The static call spelling is `String.From(...)`; the instance receiver's
+    // head is the `string` keyword. One table answers both.
+    if (typeHead == "String") typeHead = "string";
+    auto scan = [&](const auto& tbl) -> std::vector<std::string_view> {
+        for (const auto& r : tbl)
+            if (r.head == typeHead && r.member == member && r.arity == arity)
+                return std::vector<std::string_view>(
+                    r.names.begin(),
+                    r.names.begin() + static_cast<std::ptrdiff_t>(arity));
+        return {};
+    };
+    if (typeHead == "string") return scan(kStringParamNames);
+    if (typeHead == "Encoding") return scan(kEncodingParamNames);
+    return {};
+}  // per §22.5 / stdlib §1 / §9.6 / §3.2
+
+bool isBuiltinNamedArgTableHead(std::string_view head) {
+    return contains(kBuiltinNamedArgTableHeads, head);
+}  // per §22.5, fix #3398
 
 }  // namespace bezel::common

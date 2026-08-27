@@ -21,6 +21,7 @@
 // table against the pre-refactor snapshot.
 
 #include <string_view>
+#include <vector>
 
 namespace bezel::common {
 
@@ -369,5 +370,71 @@ bool isKeywordAliasBuiltinName(std::string_view n);
 // argument never appears in a `Dictionary<…, Object>` per the spec, but the
 // rendering is still well-defined).
 std::string_view primitiveBuiltinSpelling(int primitive);
+
+
+// fix #3398 (spec §22.5 "Optional parameters and named arguments", v0.283;
+// stdlib §1 Conventions — *Window parameters*; §9.6 `String`; §3.2
+// `Encoding`): the ordered PARAMETER NAMES of a built-in member overload,
+// keyed by (type head, member name, argument count).
+//
+// Why this table exists at all: the compiler carries no parameter names for
+// any built-in (stdlib, non-user-declared) member, so §22.5's binder had
+// nothing to match a named argument against at a built-in call site. Every
+// name was therefore DISCARDED and every argument bound POSITIONALLY —
+// `"hello world".Remove(length := 6, startIndex := 5)` compiled clean and
+// evaluated `Remove(6, 5)`, a silent wrong answer (#3398). The names in this
+// table are the ones the standard-library document declares, and stdlib §1
+// makes them API surface ("parameter names are API surface (named arguments,
+// spec §22.5)").
+//
+// KEYED BY ARITY, deliberately: a built-in has no `MethodSymbol` and therefore
+// no overload set to resolve against, and the stdlib's built-in overloads are
+// distinguished at a call site chiefly by argument count
+// (`Remove(startIndex)` / `Remove(startIndex, length)`,
+// `GetString(bytes)` / `GetString(bytes, start, length)`).
+//
+// DELIBERATELY PARTIAL, and the partiality is safe because the CALLER treats
+// a miss as a REJECTION, never as permission: `ExprTC::checkBuiltinNamedArgs`
+// reports a named argument on a built-in member this table does not cover
+// rather than binding it positionally. So a missing row costs a loud
+// not-supported diagnostic, never a wrong value. Two consequences worth
+// stating:
+//
+//   * Overloads that share an arity but DISAGREE on parameter names are
+//     omitted entirely — the (head, member, arity) key cannot decide between
+//     them without overload resolution the built-in path does not have.
+//     In §9.6 that is exactly four: `Replace/2` (`oldChar, newChar` vs
+//     `oldValue, newValue`), `Repeat/2` (`c, count` vs `unit, count`),
+//     `Split/1` (`separator` vs `separators`) and `AsSpan/1` (`start` vs
+//     `r`). Named arguments on those four are rejected, not guessed.
+//   * The covered surface is the two type heads whose window parameters
+//     stdlib §1 renamed at v0.282 — `string` (§9.6) and `Encoding` (§3.2).
+//     Widening it is additive: a new row here needs no call-site change
+//     (except adding the head to `isBuiltinNamedArgTableHead` when the
+//     receiver arrives in the static or intrinsic-TypeSymbol shape). Both
+//     the widening and the overload-aware lookup are #3424.
+//
+// Returns the parameter names in declaration order, or an EMPTY vector when
+// the registry carries no names for that (head, member, arity). The head
+// `"String"` (the static call spelling) normalizes to `"string"`.
+// per §22.5 / stdlib §1 / §9.6 / §3.2, fix #3398
+std::vector<std::string_view> builtinParamNames(std::string_view typeHead,
+                                                std::string_view member,
+                                                std::size_t arity);
+
+// fix #3398: is `head` one of the built-in type heads `builtinParamNames`
+// carries rows for?
+//
+// Two call-site roles, both in `ExprTC::checkBuiltinNamedArgs`:
+//   * it admits the STATIC call spelling (`String.From(...)`), whose target is
+//     a bare identifier with no value type — there is nothing else at that
+//     shape to tell a built-in static class apart from a user one, and a user
+//     static call is already bound by `checkCallArity`, so the check claims
+//     only the heads named here;
+//   * it admits an INSTANCE receiver whose head is not in
+//     `isReservedBuiltinTypeName` (`Encoding` is not a `lowerTypeRef` Named
+//     case and so is absent from that set).
+// per §22.5, fix #3398
+bool isBuiltinNamedArgTableHead(std::string_view head);
 
 }  // namespace bezel::common

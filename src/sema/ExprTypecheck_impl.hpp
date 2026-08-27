@@ -2159,6 +2159,57 @@ private:
     // reached here (this covers the INSTANCE-receiver path only).
     void checkBuiltinStringCallArgs(const ast::CallExpr& ce);
 
+    // fix #3398 (spec §22.5 "Optional parameters and named arguments",
+    // v0.283; stdlib §1 Conventions — *Window parameters*; §9.6; §3.2):
+    // §22.5 BINDING for a call to a BUILT-IN member.
+    //
+    // The hole this closes. §22.5's binder ran for a user-declared callee
+    // (`checkCallArity` → `bindArgsToParams`) and, since #3178, for an
+    // imported one (`checkImportedCallArity` over the same binder). A
+    // built-in member has NO `MethodSymbol` at all, so neither ran and the
+    // argument NAME was discarded outright: every argument bound
+    // POSITIONALLY, any name was accepted, and a reordered named call
+    // silently computed a different value than the identical call on a
+    // user-declared method — `"hello world".Remove(length := 6,
+    // startIndex := 5)` compiled clean and evaluated `Remove(6, 5)`,
+    // printing `"hello "` where §22.5 requires `"hello"` (#3398). That is a
+    // wrong-answer bug, not only a missing-rejection bug.
+    //
+    // The rule applied here is `bindArgsToParams`'s — the SAME binder, over a
+    // `FormalsView` of the parameter names `common::builtinParamNames`
+    // carries — so the four §22.5 violations (unknown parameter name, a
+    // parameter bound twice, a positional argument after a named one, a
+    // required parameter left unsupplied) draw the same diagnostic strings a
+    // user-declared callee draws. No second copy of the rule; the built-in
+    // path only supplies the formals the registry now holds.
+    //
+    // TWO REJECTIONS this adds that a user-declared callee does not take, both
+    // stated as implementation limitations rather than language rules:
+    //
+    //   1. A named argument on a built-in member the registry carries no
+    //      names for is REJECTED. Rejecting an unknown name needs a COMPLETE
+    //      name list for that member, so a partial table must either fall
+    //      back to today's permissive positional binding or reject — and a
+    //      loud rejection beats a wrong value.
+    //   2. A named argument that binds to a parameter OTHER than its own
+    //      position is REJECTED even where the names are known. §22.5 admits
+    //      the reorder, but honouring it needs codegen to lower a built-in
+    //      call through the binding rather than through `ce.args[i]`, while
+    //      §22.5's *Evaluation order* forbids buying that by permuting the
+    //      argument list (supplied arguments evaluate in call-site textual
+    //      order). Reordering support is #3423; until it lands the call is
+    //      rejected, never mis-evaluated. Widening the table past `string` /
+    //      `Encoding` — and making its lookup overload-aware — is #3424; the
+    //      `new T(...)` twin, still unfixed, is #3425.
+    //
+    // `calleeSym` is the call's resolved callee symbol. A non-null one means
+    // the call is NOT a built-in member access — a user or imported method
+    // (including an EXTENSION method on a built-in receiver, §26.5, which
+    // resolves to a real `MethodSymbol` and whose named arguments
+    // `checkCallArity` already binds) — and this check does not claim it.
+    // per §22.5 / stdlib §1 / §9.6 / §3.2, fix #3398
+    void checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym);
+
     // §7 / stdlib §4.x (#2582): the COLLECTION twin of #2315. A builtin
     // collection instance method that declares a NON-nullable `item: T` /
     // `query: T` / `key: K` parameter (Array<T>.IndexOf/Contains/Remove/
