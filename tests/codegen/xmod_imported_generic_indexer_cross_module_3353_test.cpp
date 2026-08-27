@@ -52,9 +52,12 @@
 // ── SCOPE / NOT-COVERED ───────────────────────────────────────────────────
 //
 // This file exercises the cross-module form of the inherited-base indexer
-// case (the #3353 family). The cross-module property direction (#3348) is
-// still rejected at sema with a `#2884` diagnostic — see the existing
-// `xmod_imported_generic_indexer_property_3346_3348_test.cpp` SCOPE note.
+// case (the #3353 family). The cross-module property direction (#3348) was
+// still rejected at sema with a `#2884` diagnostic when this file was
+// written; `3ea8dee` (`fix #3365`) has since closed it, and T2 below pins
+// the resulting VALUE rather than the former rejection (#3414) — see the
+// existing `xmod_imported_generic_indexer_property_3346_3348_test.cpp`
+// SCOPE note.
 // Method direction cross-module is closed by `methodBodyText` + per-
 // instantiation `buildSpecializedMethodFn` (§14.1 / #783).
 //
@@ -244,14 +247,20 @@ BEZEL_TEST(xmod_imported_generic_indexer_cross_module_3353,
 }
 
 // ===========================================================================
-// T2 — property getter twin. The cross-module property direction is
-// rejected at sema with #2884 (a generic type's accessors are not
-// exported per instantiation; the importer-side property monomorphization
-// is not implemented). This cell pins the gap: the test compiles and runs,
-// the sema reject is expected, no value assertion.
+// T2 — property getter twin of T1. The cross-module PROPERTY direction
+// was originally a gap: it was rejected at sema with #2884 (a generic
+// type's accessors were not exported per instantiation, and the
+// importer-side property monomorphization did not exist), and this cell
+// pinned that rejection. `3ea8dee` (`fix #3365`, the #3348 follow-up —
+// cross-module PROPERTY body re-parse + attachment, §2.8.2/§2.8.3 r4/
+// §23.2/§23.3, v0.282) CLOSED the gap, so the cell is now a value-pin like
+// its T1 indexer twin: the app builds and `g.P` reads the full substituted
+// `Pt` slot, giving 7 + 8 = 15. Pinning the value, not merely the build,
+// is what keeps the erased-i32-placeholder read (which would give 14)
+// from passing here. See #3414.
 // ===========================================================================
 BEZEL_TEST(xmod_imported_generic_indexer_cross_module_3353,
-           t2_xmod_inherited_property_getter_record_arg_sema_reject_2884) {
+           t2_xmod_inherited_property_getter_record_arg_23_2) {
     auto dir = wtDir3353();
     const std::string lib =
         "module Lib3353t2; "
@@ -281,9 +290,13 @@ BEZEL_TEST(xmod_imported_generic_indexer_cross_module_3353,
     BEZEL_EXPECT_TRUE(libH.ok);
     if (!libH.ok) return;
     InProcessApp3353 r = buildApp3353(dir, libH.objPath, app);
-    // The importer's sema gate (SemaContext-imported-symbol-side) rejects
-    // cross-module generic-base property access with #2884 wording.
-    BEZEL_EXPECT_FALSE(r.ok);
+    BEZEL_EXPECT_TRUE(r.ok);
+    if (!r.ok) return;
+    auto [code, out] = runCapture3353(r.exePath);
+    // 7 + 8 = 15, read under the importer's own T -> Pt substitution.
+    // A read through the erased i32 placeholder gives 14 (X=7 plus the
+    // lower 4 bytes of the ctor argument spill), the T1 failure mode.
+    BEZEL_EXPECT_EQ(code, 15);
 }
 
 // ===========================================================================
