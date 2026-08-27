@@ -180,7 +180,12 @@ const Entry kWarningDegrades[] = {
      "through with the local's real value intact (registerUsingDisposal returns "
      "with no store altered). The harm it flags is a missing disposal arm, a "
      "bounded recoverable LEAK, never a zero/null read into a pointer slot; it "
-     "is a compiler-bug alarm, not a value-substituting degrade"},
+     "is a compiler-bug alarm, not a value-substituting degrade. #3449 "
+     "(v0.283) did not change what it substitutes; it changed WHO REACHES IT — "
+     "the `isAwaitUsing` branch above used to return unconditionally, so for "
+     "`await using var` this guard was dead code and the population it judges "
+     "(vtable-less built-in heads) got a word-0-as-vtable read instead. Both "
+     "spellings now reach it, and the note names the one it saw"},
 
     {"src/codegen/LlvmBackend_Setup.cpp", "#3437",
      Disposition::WrongValue,

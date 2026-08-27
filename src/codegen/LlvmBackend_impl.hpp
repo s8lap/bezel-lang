@@ -13694,6 +13694,27 @@ private:
     // is not.
     std::string_view newExprBuiltinHead(const ast::NewExpr* ne);
 
+    // fix #3449 (§28.3 / §28.9 / §28.12, v0.283): the BUILT-IN head name a
+    // `using var` / `await using var` declaration binds, resolved the one way
+    // `registerUsingDisposal`'s per-built-in chain resolves it — declared type
+    // first, then the `new` spelling, then the initializer's expression type.
+    //
+    // This is not a new classification predicate: it is the head
+    // resolution that #2992's end-of-chain guard already performed inline,
+    // lifted so that the guard and the `await using` fall-through test that now
+    // decides whether to REACH it cannot drift apart. Two spellings of "what
+    // built-in is this" — one deciding to fall through the chain and one
+    // deciding whether an unclaimed fallthrough is a bug — would be exactly the
+    // duplicated-predicate shape that produced #2921 / #2973 in this same
+    // function.
+    //
+    // `headTyOut`, when non-null, receives the resolved TypeRef the name came
+    // from (null when the name came from the `new` spelling and the declaration
+    // carried no type annotation) — #2992's guard needs it for the
+    // `isValueBuiltin` path. Returns `{}` when the head is not a built-in.
+    std::string_view usingVarBuiltinHeadName(
+        const ast::LocalDecl* ld, const sema::TypeRef** headTyOut = nullptr);
+
     // fix #2809 / spec §32.5 / stdlib §10.1–§10.3 (v0.240): is `rt` one of the
     // three FFI-boundary BUFFER classes (`CString` / `WString` / `RawBytes`)?
     //

@@ -14778,6 +14778,33 @@ std::string_view Emitter::newExprBuiltinHead(const ast::NewExpr* ne) {
     return ne->type->name->parts[0];
 }
 
+// fix #3449 (§28.3 / §28.9 / §28.12, v0.283): see the header for the contract.
+// The head resolution #2992's end-of-chain guard performed inline, lifted so
+// that the guard and the `await using` fall-through that must reach it read the
+// SAME answer. Order matters and is #2992's: the declared type wins, then the
+// `new` spelling (via `newExprBuiltinHead`, which is what keeps a user `class
+// EventSource` out of the built-in arms, #2991), then the initializer's type.
+// per §28.3 / §28.9, fix #2992, fix #3449
+std::string_view Emitter::usingVarBuiltinHeadName(
+    const ast::LocalDecl* ld, const sema::TypeRef** headTyOut) {
+    std::string_view headName;
+    const sema::TypeRef* headTy = nullptr;
+    if (ld->type) {
+        headTy = ctx_.resolvedType(*ld->type);
+        headName = builtinTypeName(headTy);
+    }
+    if (headName.empty() && ld->initializer) {
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+            headName = newExprBuiltinHead(ne);
+        if (headName.empty()) {
+            headTy = ctx_.exprType(*ld->initializer);
+            headName = builtinTypeName(headTy);
+        }
+    }
+    if (headTyOut) *headTyOut = headTy;
+    return headName;
+}
+
 void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (disposeStack_.empty()) return;
     auto it = locals_.find(ld);
@@ -15648,28 +15675,103 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 "— this is a compiler bug — #3437");
             return;
         }
-        Disposal d{it->second, nullptr};
-        d.asyncDispose = true;
-        // Attempt to resolve the direct DisposeAsync function pointer.
-        const sema::TypeSymbol* cls = classOfLocal(ld);
-        if (!cls && ld->initializer) {
-            // inferred: try the initializer's resolved type.
-            if (auto* rt = ctx_.exprType(*ld->initializer)) {
-                if (rt->kind == sema::TypeRef::Kind::Named)
-                    cls = rt->declaration;
+        // fix #3449 (§28.12 / §28.9 / §28.3, v0.283): FALL THROUGH at a
+        // vtable-less BUILT-IN head instead of returning into the generic
+        // fallback below.
+        //
+        // Structurally this is the same defect #3437 closed one family over,
+        // and the third time the same point fix has been paid (#2739, #3437,
+        // this): the SPELLING was deciding the disposal while the
+        // REPRESENTATION did not. This branch always RETURNED, through its
+        // collection arms, its `IAsyncEnumerator` arm, or the fallback below —
+        // so for `await using var` every residual built-in arm after it
+        // (`Subscription`, the serializers, `Stopwatch`, `FileStream`,
+        // `CancellationTokenSource`, `Mutex`, `Lock`, `Semaphore`, `Channel`,
+        // `Shared`/`Weak`, `Buffer`, `TaskCompletionSource`, the event sources,
+        // `Task`, `StringBuilder`, the #2921/#2973 vtable-less arm, …) was
+        // unreachable, AND SO WAS #2992's END-OF-CHAIN GUARD. That is what made
+        // this class silent rather than loud: the guard exists precisely to
+        // shout when a built-in head reaches the end of the chain unclaimed,
+        // and for this spelling it could not fire, so the next forgotten head
+        // would have been silent too.
+        //
+        // What the return cost, MEASURED on 0c5ecd1 (`--probe --asan`, each
+        // against its plain-`using var` twin, which differs by the keyword
+        // alone and returns 247 cleanly):
+        //   * `await using var s := new Stopwatch();`
+        //     ASan "SEGV on unknown address 0x0000000d4c8c ... in
+        //     bz$async$Run$Resume" — word 0 of a `bz_stopwatch_t` read as a
+        //     class vtable and slot 2 called.
+        //   * `await using var cts := new CancellationTokenSource();`
+        //     ASan "SEGV on unknown address 0x0" at `pc 0x0` — the same read,
+        //     landing on a null function pointer.
+        // Both are #2975's wild-jump shape.
+        //
+        // The gate is `common::isVtableLessBuiltinClassName`, the DERIVED
+        // predicate (`isReservedBuiltinTypeName` minus the interface heads)
+        // #3157 already used to split `emitOwnedParamCaptureDispose` for the
+        // identical reason. It answers exactly the fallback's own premise:
+        // `emitDisposals` → `emitAsyncDisposeAwaitAndFree` on a null
+        // `disposeAsyncFn` degrades to `emitDisposeAndReclaim` →
+        // `emitDynamicDispose`, i.e. *load word 0, call slot 2*, and a
+        // vtable-less built-in is by definition a plain C struct whose word 0
+        // is not a vtable. `classOfLocal` is deliberately NOT the discriminator
+        // — `await using var d: IAsyncDisposable := Make();` has none either
+        // and its slot really does hold a class object, which is why the
+        // built-in INTERFACE heads are subtracted from the predicate and keep
+        // the fallback. The subtraction fails SAFE in this direction too: a new
+        // built-in CLASS joins the set automatically and gets the
+        // representation chain, never the word-0 read.
+        //
+        // No spec amendment is implied and none is possible from codegen:
+        // §28.12 (v0.283) states `await using` "is the async counterpart of
+        // `using var`" and gives it exactly ONE restriction — "`await using` is
+        // valid only inside an async method or async lambda". A built-in head
+        // has no user `DisposeAsync` to await, so the `await` is a no-op and the
+        // synchronous representation-specific release is the whole obligation:
+        // #2739's recorded ruling ("an `await using var` over a builtin
+        // collection has no user-async-disposable shape … apply the same
+        // synchronous collection disposal"), which #3437 then applied to the
+        // iterator-format family and this applies to the residual built-ins.
+        // Falling through hands them the SAME arms the plain spelling reaches,
+        // which is what makes the two twins agree.
+        // // per §28.12, §28.9, §28.3, #3449, #2739, #3437, #2992, #3157, #2975
+        {
+            std::string_view builtinHead = usingVarBuiltinHeadName(ld);
+            if (!builtinHead.empty() &&
+                common::isVtableLessBuiltinClassName(builtinHead)) {
+                // Fall through to the representation chain below — and, if no
+                // arm there claims it, to #2992's end-of-chain guard, which is
+                // now reachable from this spelling for its ENTIRE population
+                // (the guard fires only for `isVtableLessBuiltinClassName`
+                // heads, which is exactly the set that falls through here).
+            } else {
+                Disposal d{it->second, nullptr};
+                d.asyncDispose = true;
+                // Attempt to resolve the direct DisposeAsync function pointer.
+                const sema::TypeSymbol* cls = classOfLocal(ld);
+                if (!cls && ld->initializer) {
+                    // inferred: try the initializer's resolved type.
+                    if (auto* rt = ctx_.exprType(*ld->initializer)) {
+                        if (rt->kind == sema::TypeRef::Kind::Named)
+                            cls = rt->declaration;
+                    }
+                }
+                if (cls && cls->kind == ast::TypeDeclKind::Class) {
+                    sema::MethodSymbol* dams =
+                        findMethodByName(cls, "DisposeAsync");
+                    if (dams) {
+                        auto fnIt = methodFns_.find(dams);
+                        if (fnIt != methodFns_.end())
+                            d.disposeAsyncFn = fnIt->second;
+                    }
+                }
+                // disposeAsyncFn == null → sync fallback (emitDisposals
+                // handles it).
+                disposeStack_.back().push_back(d);
+                return;
             }
         }
-        if (cls && cls->kind == ast::TypeDeclKind::Class) {
-            sema::MethodSymbol* dams = findMethodByName(cls, "DisposeAsync");
-            if (dams) {
-                auto fnIt = methodFns_.find(dams);
-                if (fnIt != methodFns_.end())
-                    d.disposeAsyncFn = fnIt->second;
-            }
-        }
-        // disposeAsyncFn == null → sync fallback (emitDisposals handles it).
-        disposeStack_.back().push_back(d);
-        return;
     }
 
     // per §2.11: a `using var` of type `Subscription` auto-disposes at scope
@@ -16755,22 +16857,17 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // forgotten here triggers a false `internal:` note (a bounded alarm), never
     // a silent leak — the same trade isVtableLessBuiltinClassName itself makes.
     // per §28.3 / §28.9, fix #2992
+    //
+    // fix #3449 (v0.283): REACHABLE FROM `await using` TOO. Until #3449 the
+    // `ld->isAwaitUsing` branch above always returned, so for that spelling
+    // this guard — and every residual built-in arm between it and the branch —
+    // was dead code, and the guard could not do the one job it exists for. The
+    // head resolution below is now `usingVarBuiltinHeadName`, the SAME call the
+    // branch's fall-through test makes, so the two cannot disagree about which
+    // declarations reach here.
     {
-        std::string_view headName;
         const sema::TypeRef* headTy = nullptr;
-        if (ld->type) {
-            headTy = ctx_.resolvedType(*ld->type);
-            headName = builtinTypeName(headTy);
-        }
-        if (headName.empty() && ld->initializer) {
-            if (auto* ne =
-                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                headName = newExprBuiltinHead(ne);
-            if (headName.empty()) {
-                headTy = ctx_.exprType(*ld->initializer);
-                headName = builtinTypeName(headTy);
-            }
-        }
+        std::string_view headName = usingVarBuiltinHeadName(ld, &headTy);
         if (!headName.empty() &&
             common::isVtableLessBuiltinClassName(headName)) {
             // Exclude value types — they carry no disposal obligation (§28.9).
@@ -16795,8 +16892,9 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 return;
             ctx_.diagnostics().report(
                 Severity::Warning, ld->span.begin,
-                std::string("internal: `using var` of disposable built-in `") +
-                    std::string(headName) +
+                std::string("internal: `") +
+                    (ld->isAwaitUsing ? "await using var" : "using var") +
+                    "` of disposable built-in `" + std::string(headName) +
                     "` has no disposal arm — the value leaks at scope end "
                     "(§28.3 / §28.9); this is a compiler bug — #2992");
         }
