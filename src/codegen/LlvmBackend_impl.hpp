@@ -11357,6 +11357,20 @@ private:
         const ast::Type* type = nullptr;   // LocalDecl::type      / LocalConstDecl::type
         bool isUsing = false;              // LocalDecl::isUsing   / always false for `const`
     };
+    // fix #3402 (§21.1 / §27.5 / §28.9, v0.283): the SINGLE authority that
+    // builds a LocalDeclInitView from either local-declaration node kind. It
+    // takes an `ast::Node*` (not an `ast::Stmt*`) so the symbol-side callers —
+    // which reach the declaration through `sema::LocalSymbol::decl`, an
+    // `ast::Node*` that is not always a Stmt — share it with the body-scan
+    // callers instead of each re-deriving the split. Returns an all-null view
+    // for any other node, so `view.init == nullptr` is the "not a local
+    // declaration" answer at every call site. #2802 introduced this split as a
+    // lambda local to collectBorrowingArrayFreeEligible; #3402 needed the same
+    // split in three more closure-reclaim walkers, and a fourth private copy of
+    // a classification predicate is exactly the shape that generated this
+    // defect family three times over — so it is hoisted here and the #2802
+    // lambda now delegates to it.
+    static LocalDeclInitView localDeclInitView(const ast::Node* n);
     // #1930 / stdlib §5 / §28.9: true if the local described by `view` is a plain
     // `var g := <expr>` whose initializer is a bare-GroupBy element-RETURNING
     // terminal (result type IGrouping<…>): `<src>.GroupBy(sel).First()/.Single()/

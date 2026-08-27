@@ -21778,6 +21778,22 @@ struct StringEscapeWalker {
 // so caller-side release of a call result could free a value the callee still
 // references (UAF). Restricting to lambda/method-reference producers keeps the
 // producer/consumer balance entirely inside codegen.
+// fix #3402 (§21.1 / §27.5 / §28.9, v0.283): see the declaration in
+// LlvmBackend_impl.hpp. The one place the LocalDecl / LocalConstDecl split is
+// decoded. §21.1 gives a runtime `const` its own AST node (LocalConstDecl) with
+// differently-named fields (`value` where a `var` has `initializer`), and no
+// `isUsing` at all — a `const` is never a `using var`, by grammar (A.6) and by
+// §21.1's ownership rule, so the view reports isUsing=false for it. Any other
+// node yields an all-null view.
+Emitter::LocalDeclInitView Emitter::localDeclInitView(const ast::Node* n) {
+    if (auto* ld = dynamic_cast<const ast::LocalDecl*>(n))
+        return {ld->initializer.get(), ld->type.get(), ld->isUsing};
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(n))
+        return {lc->value.get(), lc->type.get(), false};
+    return {};
+}
+
+
 bool Emitter::isPlusOneClosureProducer(const ast::Expr* init) const {
     if (!init) return false;
     if (dynamic_cast<const ast::LambdaExpr*>(init)) return true;
@@ -21883,12 +21899,23 @@ bool Emitter::returnedClosureLocalOwnsPlusOne(const ast::Expr* e) const {
     // A producer-initialized closure local: the lambda / method-ref +1 was
     // transferred into the slot (closureReleaseEligible_ or not — the slot
     // always holds the producer's +1).
-    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
-    if (ld && !ld->isUsing && ld->initializer &&
-        isPlusOneClosureProducer(ld->initializer.get())) {
+    // fix #3402 (§21.1 / §27.5 / §28.9, v0.283): read the declaration through
+    // the shared `localDeclInitView`, so a §21.1 runtime `const` binding
+    // (LocalConstDecl) answers the same way its `var` twin does. `lowerStmt`
+    // routes BOTH spellings through the same `lowerLocalDecl`, so the slot
+    // holds the producer's single +1 in both — and the premise this branch
+    // rests on ("the slot still holds the producer's +1 at the return") is
+    // STRONGER for a `const`: §21.1 makes it "not an assignable location", so
+    // the reassignment that could displace a `var`'s producer reference before
+    // the return cannot be spelled at all. Before this, `const f := lambda…;
+    // return f;` fell through to the retain path and minted a SECOND
+    // reference, so the cell's count never reached 0 (52 bytes / 3 allocations
+    // measured, where the `var` twin was clean).
+    LocalDeclInitView dv = localDeclInitView(loc->decl);
+    if (dv.init && !dv.isUsing && isPlusOneClosureProducer(dv.init)) {
         const sema::TypeRef* lt = nullptr;
-        if (ld->type) lt = ctx_.resolvedType(*ld->type);
-        if (!lt) lt = ctx_.exprType(*ld->initializer);
+        if (dv.type) lt = ctx_.resolvedType(*dv.type);
+        if (!lt) lt = ctx_.exprType(*dv.init);
         return lt && lt->kind == sema::TypeRef::Kind::Function;
     }
     // A non-escaping closure local also in closureReleaseEligible_ was
@@ -22841,14 +22868,46 @@ void Emitter::collectClosureReleaseEligible(
     // The escape walk decides which candidates are non-escaping. (Function-typed
     // locals never appear in `using var` — §28.9 — but the isUsing guard
     // mirrors the string path defensively.)
-    std::vector<const ast::LocalDecl*> candidates;
+    //
+    // fix #3402 (§21.1 / §27.5 / §28.9, v0.283): the scan covers a §21.1
+    // runtime `const` local (ast::LocalConstDecl) as well as a plain `var`
+    // (ast::LocalDecl). Both spellings bind the SAME codegen-internal +1
+    // closure cell — `lowerStmt`'s LocalConstDecl arm calls the very same
+    // `lowerLocalDecl(node, value, type)` the `var` arm calls, and that
+    // function's scope-end arming reads `closureReleaseEligible_` by NODE
+    // POINTER (`const void*`), never by node kind — so admitting the const
+    // node here is the whole fix; no consumer changes. Before this, a
+    // `const f := lambda(x: int) => x + 7;` leaked its 40-byte cell on every
+    // execution while the `var` twin was clean.
+    //
+    // Soundness (§21.1 *Ownership* / §28.9): a `const` binding takes NO
+    // disposal obligation, and this release adds none — a function-typed value
+    // is RUNTIME-MANAGED (§28.9: "Function-typed values … carry no disposal
+    // obligation"), and §21.1 admits exactly such values as a runtime const's
+    // initializer ("`string` and other runtime-managed values"). What is
+    // released here is codegen's OWN +1 on the cell, minted by lowerLambda /
+    // makeMethodThunk and transferred into the slot — the same reference the
+    // `var` path already releases. Exactly-once holds for the same reason it
+    // does for `var`, and more easily: the slot holds that single reference
+    // (the escape walk proved no other reference exists) and a `const` can
+    // never be reassigned (§21.1: "not an assignable location"), so the
+    // drop-on-overwrite edge that a `var` must reason about does not exist.
+    //
+    // This is the THIRD `LocalDecl`-only codegen walker of this family —
+    // after #2802 (collection-literal reclaim) and #3375 (collectSuspendLocals'
+    // state-machine frame fields) — so the candidate vector is widened to
+    // `const ast::Node*` and the initializer read goes through the shared
+    // `LocalDeclInitView` #2802 introduced for exactly this purpose, rather
+    // than growing a second parallel predicate.
+    std::vector<const ast::Node*> candidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (!ld->isUsing &&
-                (isPlusOneClosureProducer(ld->initializer.get()) ||
-                 isUserMethodClosureReturnCall(ld->initializer.get())))
-                candidates.push_back(ld);
+        {
+            LocalDeclInitView v = localDeclInitView(s);
+            if (v.init && !v.isUsing &&
+                (isPlusOneClosureProducer(v.init) ||
+                 isUserMethodClosureReturnCall(v.init)))
+                candidates.push_back(s);
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
             for (auto& b : is->ifBranch.body) scan(b.get());
@@ -23978,12 +24037,12 @@ void Emitter::collectBorrowingArrayFreeEligible(
     // isUsing from its own fields; a §21.1 `const` (LocalConstDecl) supplies
     // value/type from its own fields and isUsing=false (a `const` is never
     // a `using var`, by grammar). Null on neither — anything else is ignored.
+    // fix #3402: that split is now the shared `Emitter::localDeclInitView`
+    // (declared in LlvmBackend_impl.hpp beside LocalDeclInitView) so the
+    // closure-reclaim walkers this file also hosts read it from one authority
+    // rather than each keeping a private copy; the behavior is unchanged.
     auto viewFor = [](const ast::Stmt* s) -> LocalDeclInitView {
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s))
-            return {ld->initializer.get(), ld->type.get(), ld->isUsing};
-        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s))
-            return {lc->value.get(), lc->type.get(), false};
-        return {};
+        return localDeclInitView(s);
     };
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
@@ -25885,7 +25944,16 @@ void Emitter::collectDefinitelyEscapingLambdas(
     // its init lambda, so freeing the init lambda's cell (dropped at the
     // reassignment) could UAF a later read of the captured local.
     std::unordered_set<const void*> reassigned;
-    std::vector<const ast::LocalDecl*> returnedVars;
+    // fix #3402 (§21.1 / §27.5 / §28.9, v0.283): `const ast::Node*`, so a
+    // returned §21.1 runtime `const` binding (LocalConstDecl) is a candidate
+    // alongside a returned `var` (LocalDecl) — its initializer lambda escapes
+    // by exactly the same syntactic evidence. The `reassigned` guard below is
+    // what makes the extension safe, and for a `const` it is satisfied by
+    // construction: §21.1 makes a `const` "not an assignable location", so its
+    // value at the return IS its initializer lambda, always. Before this, the
+    // returned `const`-bound lambda was never marked definitely-escaping, so
+    // its envdtor did not free the capture cell it solely holds.
+    std::vector<const ast::Node*> returnedVars;
     // #694 field-store: `this.f := () => …` stores the closure on the receiver,
     // which outlives the method → a definite escape. Counted per field so a field
     // assigned more than once (its earlier lambda dropped mid-method) is excluded
@@ -25928,9 +25996,9 @@ void Emitter::collectDefinitelyEscapingLambdas(
                          dynamic_cast<const ast::IdentifierExpr*>(r->value.get()))
                 if (auto* loc =
                         dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id)))
-                    if (auto* ld =
-                            dynamic_cast<const ast::LocalDecl*>(loc->decl))
-                        returnedVars.push_back(ld);
+                    // fix #3402: LocalDecl OR LocalConstDecl (see returnedVars).
+                    if (localDeclInitView(loc->decl).init)
+                        returnedVars.push_back(loc->decl);
             return;
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -25954,10 +26022,10 @@ void Emitter::collectDefinitelyEscapingLambdas(
         }
     };
     for (auto& s : body) scan(s.get());
-    for (const ast::LocalDecl* ld : returnedVars) {
+    for (const ast::Node* ld : returnedVars) {
         if (reassigned.count(static_cast<const void*>(ld))) continue;
-        if (auto* lam =
-                dynamic_cast<const ast::LambdaExpr*>(ld->initializer.get()))
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(
+                localDeclInitView(ld).init))
             definitelyEscapingLambdas_.insert(static_cast<const void*>(lam));
     }
     // #694 field-store: a `this.f := () => …` whose field is assigned EXACTLY ONCE
@@ -26648,6 +26716,33 @@ void Emitter::collectCellFreeEligible(
                     usingInitOf[ld->initializer.get()] = ld;
                 if (ld->initializer)
                     expr(ld->initializer.get(), nonEsc);
+                return;
+            }
+            // fix #3402 (§21.1 / §27.5 / §28.9, v0.283): the SAME arm for a
+            // §21.1 runtime `const` (ast::LocalConstDecl). Without it this
+            // walker did not merely miss a reclaim — it never descended into a
+            // `const`'s initializer AT ALL, so a lambda written there was
+            // invisible to BOTH classifications: its captures never reached
+            // `capturedByEscaping`, and a sibling non-escaping `var` lambda
+            // over the same local still armed the scope-end cell free. The
+            // measured consequence was a heap-use-after-free, not a leak:
+            //
+            //     var k: int := 7;
+            //     var g := lambda() => k;     (* non-escaping → arms cell free *)
+            //     const f := lambda() => k;   (* invisible → escape unrecorded *)
+            //     return f;                   (* reads k through the freed cell *)
+            //
+            // `closureNonEscaping` is `closureReleaseEligible_`, which now
+            // admits const nodes (collectClosureReleaseEligible, above; this
+            // walk runs after it), so a `const`-bound lambda is classified by
+            // exactly the criterion its `var` twin is: non-escaping only when
+            // the escape walk proved it so, escaping otherwise. `isUsing` is
+            // structurally false for a `const` (§21.1 — a `const` is never a
+            // `using var`, by grammar), so no `usingInitOf` anchoring applies.
+            if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+                bool nonEsc =
+                    closureNonEscaping.count(static_cast<const void*>(lc));
+                if (lc->value) expr(lc->value.get(), nonEsc);
                 return;
             }
             if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
