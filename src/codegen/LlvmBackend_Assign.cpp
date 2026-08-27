@@ -8290,6 +8290,52 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
     llvm::Type* elemTy = i32();
     if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
         elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
+    // fix #3385 (§29.1 / §29.2 / §29.11; stdlib §4.5 / §4.13, v0.282): at an
+    // `IOwningEnumerable<T>` target the wrap must hand out the DRAINING
+    // enumerator, not this borrowing one.
+    //
+    // §29.1's "`Current` semantics on borrowing and owning enumerators" makes
+    // slot 3 a different operation for the two heads: `IEnumerator<T>.Current`
+    // is non-destructive and lends, while `IOwningEnumerator<T>.TakeCurrent()`
+    // "transfers ownership of the most-recently-yielded value to the caller,
+    // leaving the enumerator's internal slot empty" — and §29.2 desugars a
+    // source of static type `IOwningEnumerable<T>` through `TakeCurrent()`, so
+    // the loop variable OWNS each element and discharges it. Installing the
+    // borrowing `Current` under that head (#3355's interim SIGSEGV fix, which
+    // widened this gate but reused the borrowing helpers) left the SOURCE
+    // collection still holding every element it had already handed out: on a
+    // field-owned source — §28.6's stored-view face, `public property Items:
+    // IOwningEnumerable<Item> => _items;` over `owned _items: OwningArray<Item>`
+    // — the loop discharged each element and the field's own `bz_array_free`
+    // element-disposer pass then disposed the very same elements again
+    // (heap-use-after-free, #3385). §28.6's own worked example states the
+    // permission this relies on: a receiver-sourced borrow of an owning
+    // collection field is one "the caller may read/iterate/mutate/DRAIN".
+    //
+    // The transfer is therefore: element ownership leaves the collection at
+    // each yield (stdlib §4.5 "elements leave the collection as they are
+    // yielded"; §4.13's drain-view contract) and lands on the loop variable,
+    // which §28.3/§29.2 already require to be discharged. The CONTAINER is
+    // untouched — this wrap borrows the array exactly as the borrowing one
+    // does, and the field's holder still frees the (now empty) array.
+    //
+    // No second classification predicate is minted: `wrapArrayAsIOwningEnumerator`
+    // (#2218) is the existing draining authority — MoveNext pops through the
+    // same `bz_array_drain_next` the `for var x in coll.Drain()` loop uses,
+    // TakeCurrent moves the pending element out and nulls the slot per §29.1,
+    // and Dispose disposes an advanced-but-untaken pending. Only its slot 4 is
+    // extended (above) to mint a fresh enumerator, which the §29.2 desugaring
+    // needs and stdlib §4.13's view contract independently requires.
+    //
+    // Reachability: `IOwningEnumerable<T>` constrains `where T: class` (stdlib
+    // §4.13), so the element is always a class pointer — the pointer-sized
+    // element `bz_array_drain_next` requires — and only the owning collection
+    // families implement the interface, so a BORROWING `Array<T>` source can
+    // never arrive here (sema rejects the conversion, §5.1). The pointer guard
+    // keeps the arm off the non-class element types this helper also serves.
+    if (elemTy->isPointerTy() &&
+        builtinTypeName(iEnumTy) == "IOwningEnumerable")
+        return wrapArrayAsIOwningEnumerator(arr, iEnumTy);
     ArrEnumMachinery m = ensureArrayEnumMachinery(elemTy);
     llvm::StructType* stTy = m.stTy;
     // Allocate and fill the enumerator struct { vtable, arr, idx=-1, esz }.
@@ -8724,7 +8770,8 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         b.CreateRet(pend);
     }
 
-    // --- Slot 4 (GetOwningEnumerator): return self (no-op safe default). ---
+    // --- Slot 4 (GetOwningEnumerator): a FRESH enumerator over the same
+    // borrowed array, positioned before the collection's current remainder. ---
     auto* geFn = module_->getFunction(prefix + "GetOwningEnumerator");
     if (!geFn) {
         geFn = llvm::Function::Create(
@@ -8733,11 +8780,44 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
             module_.get());
         auto* bb = llvm::BasicBlock::Create(llvm_, "entry", geFn);
         llvm::IRBuilder<> b(bb);
-        b.CreateRet(&*geFn->arg_begin());
+        // fix #3385 (§29.1 / §29.11; stdlib §4.13, v0.282): the previous body
+        // was `return self;`, documented as a "safe no-op default" for a slot
+        // an IOwningEnumerator<T> receiver never dispatches. The same
+        // machinery now also backs the IOwningEnumerable<T> VIEW (the owning
+        // arm of wrapArrayAsIEnumerable below), where §29.2's desugaring DOES
+        // call slot 4 for the loop enumerator and then disposes BOTH the
+        // source view and that enumerator — returning `self` would free one
+        // struct twice. A fresh clone is also exactly what stdlib §4.13
+        // requires of a drain view: "each GetOwningEnumerator() call on a live
+        // view yields a fresh enumerator over the collection's *current*
+        // remainder ... a re-enumeration continues draining what remains,
+        // never replaying what already left" — which falls out of sharing the
+        // borrowed `arr` and starting with an empty `pending`. The clone owns
+        // neither the array nor a pending element, so its Dispose is the same
+        // free-the-struct path as the source's.
+        llvm::Value* self = &*geFn->arg_begin();
+        uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+        auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+        auto* callocC =
+            module_->getOrInsertFunction("calloc", callocFT).getCallee();
+        llvm::Value* clone = b.CreateCall(
+            callocFT, callocC,
+            {llvm::ConstantInt::get(i64(), 1),
+             llvm::ConstantInt::get(i64(), (int64_t)cloneSz)},
+            "oaege.clone");
+        llvm::Value* vt =
+            b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 0));
+        b.CreateStore(vt, b.CreateStructGEP(stTy, clone, 0));
+        llvm::Value* arrCp =
+            b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
+        b.CreateStore(arrCp, b.CreateStructGEP(stTy, clone, 1));
+        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                      b.CreateStructGEP(stTy, clone, 2));
+        b.CreateRet(clone);
     }
 
     // Vtable: [0]=self, [1]=Dispose, [2]=MoveNext, [3]=TakeCurrent,
-    // [4]=GetOwningEnumerator (no-op).
+    // [4]=GetOwningEnumerator (fresh clone over the current remainder).
     std::string vtName = prefix + "vtable";
     auto* vtGV = module_->getGlobalVariable(vtName);
     if (!vtGV) {
