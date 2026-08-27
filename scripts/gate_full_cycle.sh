@@ -572,7 +572,7 @@ say "gate-selftest phase: scripts/gate/tests (#3415)"
 _gs_log="$LOGDIR/${TAG}_gate_selftest.log"
 _gs_floor=560
 _gs_skip_cap=4
-if ! python3 -m unittest discover -s scripts/gate/tests \
+if ! python3 -m unittest discover -s scripts/gate/tests -v \
       > "$_gs_log" 2>&1; then
   say "CYCLE FAILURE: the gate's OWN self-tests failed — the machinery that"
   say "  decides whether the suite was green is itself broken, so this cycle's"
