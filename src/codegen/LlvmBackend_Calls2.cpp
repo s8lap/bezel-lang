@@ -4059,15 +4059,47 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     }
     // §8.5 (v0.182, #1579): the unit type's default `ToString` is the
     // constant `"()"` — unit has exactly one value, so nothing about the
-    // receiver needs to be read. Handled here (rather than through the
+    // receiver's VALUE needs to be read. Handled here (rather than through the
     // general class/interface/Object vtable-slot-3 ToString dispatch)
     // because unit has no vtable to dispatch through.
+    //
+    // fix #3431 (§7.5 / §22.3 / §22.5 / §8.2, v0.283): "nothing about the
+    // receiver's value needs to be read" is NOT "the receiver expression needs
+    // no evaluating". The two are different claims and this arm conflated them:
+    // it answered from the static type and returned WITHOUT ever handing
+    // `ma->target` to `lowerExpr`, so `C.SomeUnitMethod().ToString()` deleted
+    // the call from the program — the `CreateCall` was never emitted, `"()"`
+    // was still correct, and the whole thing was silent (measured: the repro
+    // printed `A` then `B()`, never the receiver's own `Console.WriteLine`).
+    // A receiver is an evaluated operand:
+    //   * §7.5 "Evaluation": "`?.` short-circuits. The receiver is evaluated
+    //     first; if it is null the access does not occur and **nothing to its
+    //     right in the chain is evaluated**" — the rule that a NULL receiver
+    //     suppresses the rest presupposes that a non-null one's expression
+    //     runs, and `.` has no short-circuit at all.
+    //   * §22.3, `ref`/`out` argument locations: "the receiver and every index
+    //     expression are **evaluated exactly once**, in §22.5's call-site
+    //     textual order". Exactly once — not zero times.
+    //   * §22.5 "Evaluation order": "The order is observable through
+    //     side-effecting arguments and non-constant defaults … and is
+    //     normative."
+    //   * §8.2 is the closest thing to a licence for answering a universal
+    //     from the static type, and it is explicit about what that removes:
+    //     "the call is answered from the static type with **no observable
+    //     boxing**". It removes the BOX, not the receiver.
+    // So: lower the receiver for its effects, exactly once, and THEN answer
+    // §8.5's constant. `lowerExpr` returns nullptr for every unit-typed
+    // expression by construction (unit lowers to LLVM `void`; #3421 normalizes
+    // the producer), which is why the result is deliberately discarded rather
+    // than tested — a null here means "unit", not "failed".
     if (call.args.empty() && call.callee) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
             if (ma->member == "ToString" && ma->target) {
                 if (const sema::TypeRef* rt = ctx_.exprType(*ma->target)) {
-                    if (rt->kind == sema::TypeRef::Kind::Unit)
+                    if (rt->kind == sema::TypeRef::Kind::Unit) {
+                        (void)lowerExpr(*ma->target);  // per §22.3 / §7.5
                         return lowerStringLiteral("\"()\"", /*verbatim=*/false);
+                    }
                 }
             }
         }
