@@ -47,6 +47,65 @@ GATE_AND_PUSH = os.path.normpath(
     os.path.join(SCRIPTS_DIR, "gate_and_push.sh"))
 
 
+REPO_ROOT = os.path.normpath(os.path.join(SCRIPTS_DIR, ".."))
+
+# Import the helper so the live-gate probe below uses the SAME lock primitive
+# the gate itself uses, rather than a second spelling of it.
+sys.path.insert(0, os.path.normpath(SCRIPTS_DIR))
+from gate import serialize  # noqa: E402
+
+
+def _live_gate_precondition_unmet():
+    """Return a human reason why the two tests that drive the REAL
+    `gate_and_push.sh` against the REAL lockfile must not run here, or None
+    if the environment can support them.
+
+    These two tests have a precondition they never used to state (#3415):
+
+      1. **The working tree is clean.** They invoke the real entry point, and
+         `gate_and_push.sh:135-141` refuses with exit 65 when tracked files
+         differ from HEAD — by design, because a gate validates the working
+         tree but pushes HEAD. So the tests fail for a reason that has nothing
+         to do with the delegation they pin, and they fail precisely when the
+         check is most wanted: a developer editing gate infrastructure has a
+         dirty tree.
+
+      2. **No real gate is running.** `test_held_lockfile_produces_clean_abort_message`
+         does not merely read the production lockfile — it `os.unlink`s it and
+         then holds it for 15s. Unlinking a lockfile a live gate holds an flock
+         on is ACTIVELY DESTRUCTIVE: the next `gate_and_push.sh` opens the path,
+         gets a NEW inode, acquires a fresh flock, and two gates run
+         concurrently — the exact failure this lockfile exists to prevent.
+
+    Skipping with a printed reason is the honest resolution. Weakening the
+    tests to run anywhere would cost their whole point: they are valuable
+    *because* they drive the real script and the real lock path, which is what
+    `test_default_lock_path_matches_helper` cannot check by grepping.
+    """
+    dirty = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD"],
+        cwd=REPO_ROOT, capture_output=True, text=True).stdout.strip()
+    if dirty:
+        return ("working tree is dirty, and gate_and_push.sh refuses (exit 65) "
+                "on a dirty tree by design; tracked files differing from HEAD: "
+                + ", ".join(dirty.split("\n")[:5]))
+    # Running INSIDE a gate: the ancestor chain carries a gate driver's name.
+    # This is the wired-as-a-gate-phase case, where the gate holds the very
+    # lock these tests would unlink.
+    if serialize.is_gate_sibling(os.getpid()):
+        return ("a gate driver is an ancestor of this test runner, so a real "
+                "gate is running; these tests would unlink the lockfile it holds")
+    # A gate running elsewhere (another terminal, another lane) holds the lock
+    # without being our ancestor. Probe non-blockingly and release at once.
+    probe = serialize.acquire_gate_lock(serialize.gate_lock_path())
+    if probe is None:
+        return ("the production gate lockfile {} is currently held, so a gate "
+                "is running somewhere; these tests would unlink it".format(
+                    serialize.gate_lock_path()))
+    probe.close()
+    return None
+
+
 def _holder_holds_lock(lockfile_path, hold_s=20):
     """Spawn a subprocess that calls `acquire_gate_lock` via the helper and
     sleeps — the lock is held by this subprocess until it exits. Returns the
@@ -94,6 +153,10 @@ class TestBashDelegation(unittest.TestCase):
         the 2026-08-09 deadlock class — the gate cannot block, cannot
         crash, and cannot exit non-zero (which CI would mis-read as a
         real gate failure)."""
+        # #3415: state the precondition instead of failing on it.
+        _unmet = _live_gate_precondition_unmet()
+        if _unmet:
+            self.skipTest(_unmet)
         lockfile = "/var/tmp/bezel-scratch/gate.lock"
         # Ensure the lockfile dir exists (helper also does this, but we
         # need it for the holder).
@@ -205,6 +268,10 @@ class TestBashDelegation(unittest.TestCase):
         banner. Confirms the refactor did not break the trivial path —
         every push (held or not) goes through this code, so a regression
         here would block every push, not just overlapping ones."""
+        # #3415: state the precondition instead of failing on it.
+        _unmet = _live_gate_precondition_unmet()
+        if _unmet:
+            self.skipTest(_unmet)
         lockfile = "/var/tmp/bezel-scratch/gate.lock"
         # Ensure no lock is held by any leftover holder from a previous
         # test. We don't have a way to wait for the kernel to release

@@ -534,6 +534,72 @@ if ! python3 scripts/check_imported_symbol_reads.py --strict \
 fi
 say "imported-symbol phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_seam.log"))"
 
+# ── GATE SELF-TEST PHASE (#3415) ───────────────────────────────────────────
+# The third source-level check, and the one that guards the checker rather than
+# the tree. `scripts/gate/tests/` holds the self-tests for the gate's own
+# Python — verdict reading, telemetry, canary, repo identity, serialization,
+# the gate_and_push EXIT-trap pin. Nothing in the repo executed them. Every
+# reference to that directory outside it was a comment, and CLAUDE.md asserted
+# that one of them "now fails the build", which was never true.
+#
+# That is the worst place in the tree to have an unenforced guard. These tests
+# certify the machinery that decides whether ~19,000 gtests were really green;
+# an undetected regression in it does not fail a gate, it makes a gate report
+# green while validating nothing. Exactly that happened once: a gate was found
+# validating the WRONG TREE, and nine commits reached main ungated. Two of the
+# self-tests here (test_repo_identity, test_gate_and_push_trap) pin the fixes
+# for that class, and until now nothing ran them.
+#
+# 33s, build-free, fail-closed — the same shape as the two phases above, and it
+# belongs in the CYCLE for the same reason: it is a property of the tree, so
+# running it twice inside gate.sh would only duplicate it.
+#
+# ⚠ COUNT RATCHETS, NOT JUST THE EXIT STATUS. `unittest` exits 0 for "OK" and
+# also for "OK (skipped=590)", and a discovery failure that collects nothing
+# exits 0 with "Ran 0 tests". A bare `if ! python3 …` would therefore accept
+# precisely the outcome this phase exists to prevent — the directory unenforced
+# with a green tick on top. So the phase asserts a FLOOR on tests run and a CAP
+# on tests skipped, and both are checked even when the run reports OK.
+#
+# The skip cap is what keeps the two environment-gated tests honest. Two tests
+# in test_integration_bash_python drive the REAL gate_and_push.sh against the
+# REAL lockfile; they self-skip when a gate is running (they would unlink a
+# lockfile a live gate holds) or when the tree is dirty (the entry point refuses
+# with exit 65 by design). Inside a gate BOTH conditions hold, so 2 skips here
+# is the expected steady state — and the cap means a third muted test fails the
+# phase instead of quietly joining them.
+say "gate-selftest phase: scripts/gate/tests (#3415)"
+_gs_log="$LOGDIR/${TAG}_gate_selftest.log"
+_gs_floor=560
+_gs_skip_cap=4
+if ! python3 -m unittest discover -s scripts/gate/tests \
+      > "$_gs_log" 2>&1; then
+  say "CYCLE FAILURE: the gate's OWN self-tests failed — the machinery that"
+  say "  decides whether the suite was green is itself broken, so this cycle's"
+  say "  verdict would mean nothing (#3415). See $_gs_log"
+  sed -n '/^\(FAIL\|ERROR\):/,$p' "$_gs_log" 2>/dev/null | head -40 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+_gs_ran="$(sed -n 's/^Ran \([0-9]*\) tests\?.*/\1/p' "$_gs_log" | tail -1)"
+_gs_skipped="$(sed -n 's/^OK (.*skipped=\([0-9]*\).*/\1/p' "$_gs_log" | tail -1)"
+[ -n "$_gs_skipped" ] || _gs_skipped=0
+if [ -z "$_gs_ran" ] || [ "$_gs_ran" -lt "$_gs_floor" ]; then
+  say "CYCLE FAILURE: the gate self-tests reported OK but ran only"
+  say "  ${_gs_ran:-0} tests (floor $_gs_floor) — discovery collected almost"
+  say "  nothing, so the OK certifies nothing (#3415). See $_gs_log"
+  exit 1
+fi
+if [ "$_gs_skipped" -gt "$_gs_skip_cap" ]; then
+  say "CYCLE FAILURE: the gate self-tests skipped $_gs_skipped tests (cap"
+  say "  $_gs_skip_cap) — an unenforced guard with a green tick is worse than"
+  say "  an honest gap (#3415). See $_gs_log"
+  sed -n '/skipped/p' "$_gs_log" 2>/dev/null | head -20 \
+    | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "gate-selftest phase: GREEN ($_gs_ran tests, $_gs_skipped skipped)"
+
 run_until_trustworthy "$LOGDIR/${TAG}_plain.log" "plain" || exit $?
 
 # --full folds whole-suite generated-code AddressSanitizer into the same sharded

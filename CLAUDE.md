@@ -320,17 +320,30 @@ a donefile-only waiter then hangs forever over a finished gate. That is not
 hypothetical — the marker was **dead on arrival** from the day it was added
 until #3158, because a second `trap … EXIT` later in the same script silently
 replaced the handler (bash keeps exactly one). `scripts/gate/tests/test_gate_and_push_trap.py`
-pins that a second one has not reappeared — but ⚠ **it is a MANUAL check, not a
-build gate**: nothing in the repo invokes `scripts/gate/tests/` (every reference
-to that directory outside it is a comment), and the same is true of
+pins that a second one has not reappeared, and **since #3415 it is gate-enforced**:
+`gate_full_cycle.sh` runs `python3 -m unittest discover -s scripts/gate/tests`
+as the `gate-selftest` phase, beside the vacuous-assertion and imported-symbol
+ratchets — build-free, ~33s, fail-closed. The same now holds for
 `test_telemetry`, `test_canary`, `test_gate_serialization` and
-`test_repo_identity`. An earlier revision of this file claimed it "now fails the
-build"; that was never true, and two independent lanes flagged it on 2026-08-27.
-Run them by hand — `python3 -m unittest discover -s scripts/gate/tests` — when
-touching gate infrastructure. Wiring them into the gate is tracked as #3415,
-which also records two hazards a naive phase would hit: the suite is sensitive
-to a dirty tree, and the serialization tests unlink and re-acquire the
-PRODUCTION gate lockfile.
+`test_repo_identity`. ⚠ It is a **gate** phase, not a *build* gate: `cmake --build`
+still does not run it, so run it by hand while iterating on gate infrastructure.
+Two earlier revisions of this passage were wrong in opposite directions — one
+claimed it "now fails the build" when nothing invoked the directory at all, the
+other still said "MANUAL check" after it was wired; check `gate_full_cycle.sh`
+for the phase before trusting either.
+
+The phase ratchets **counts, not just the exit status**, because `unittest` exits
+0 for "Ran 0 tests" and for "OK (skipped=590)" alike: it asserts a floor on tests
+run and a cap on tests skipped, so a collection failure or a muted directory
+fails the cycle instead of passing with a green tick. Two tests in
+`test_integration_bash_python` drive the real `gate_and_push.sh` against the real
+lockfile and **self-skip with a printed reason** when a gate is running or the
+tree is dirty — they would otherwise `unlink` a lockfile a live gate holds
+(letting a second gate start on a fresh inode), and the entry point refuses on a
+dirty tree by design (exit 65). Inside a gate both hold, so **2 skips is the
+expected steady state**. (An earlier revision attributed the lockfile hazard to
+`test_gate_serialization`; that file isolates every lock into a
+`TemporaryDirectory` and never touches the production path.)
 
 **The tree is FROZEN while a gate runs.** Not just `src/` — a mid-cycle rebuild
 makes a mixed-HEAD gate — but `scripts/` too: bash reads a script lazily by byte

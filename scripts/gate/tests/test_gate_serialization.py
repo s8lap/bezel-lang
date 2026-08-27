@@ -31,6 +31,7 @@ import) and PASSES once Lane A's gate/serialize.py lands.
 """
 
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -98,10 +99,185 @@ def _spawn_named(name, hold_s=30):
     resulting process is just `sleep N`, no gate name). The `exec -a
     NAME sleep N` preserves argv[0] across the optimization.
     """
-    return subprocess.Popen(
-        [name, "-c", "exec -a {0} sleep {1}".format(name, hold_s)],
-        executable=_BASH_PATH,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # #3415: detached, so the fixture does not inherit this runner's ancestry.
+    # See _spawn_detached for why a plain Popen makes the negative assertions
+    # depend on whatever launched the suite.
+    return _spawn_detached(["sleep", str(hold_s)], argv0=name)
+
+
+class _DetachedProc(object):
+    """Popen-shaped handle for a process we deliberately do NOT parent.
+
+    Exposes the subset the fixtures use — `.pid`, `.wait()`, `.poll()` — but
+    reaps by polling `/proc/<pid>` rather than `waitpid()`, because a detached
+    process is not our child and `waitpid()` would raise ECHILD.
+
+    The other cleanup helpers in this module need no such adaptation:
+    `_kill_proc` is `os.kill` + a `/proc` poll, and `_children_of` /
+    `_kill_proc_tree` enumerate `/proc` by `PPid`. None of them calls
+    `waitpid`, so all three work unchanged on a non-child. (An earlier
+    analysis of #3415 suspected `_children_of` of reaping the detached
+    fixtures — it does not: it is asked for the children OF a fixture, never
+    for the children of the fixture's new parent, so a reparented `PPid` of 1
+    or `systemd --user` never widens its result. The real cause was the
+    spawn race documented in `_spawn_detached`.)
+    """
+
+    def __init__(self, pid):
+        self.pid = pid
+
+    def poll(self):
+        return None if os.path.isdir("/proc/{}".format(self.pid)) else 0
+
+    def wait(self, timeout=5):
+        deadline = time.time() + (timeout if timeout is not None else 5)
+        while time.time() < deadline:
+            if self.poll() is not None:
+                return 0
+            time.sleep(0.01)
+        return None
+
+
+def _spawn_detached(argv, argv0=None):
+    """Spawn `argv` REPARENTED AWAY from this test runner, and return a
+    `_DetachedProc`. Raises `RuntimeError` if the fixture cannot be
+    established — a broken fixture must report as a broken fixture, not as a
+    failure of the predicate under test.
+
+    WHY THIS EXISTS (#3415). `is_gate_sibling` walks a pid's ANCESTOR chain
+    substring-matching `GATE_COMM_NAMES` (`gate.sh`, `gate_and_push.sh`,
+    `gate_full_cycle.sh`, `run_parallel.sh`, `dev_heavy.sh`). Every negative
+    test below asserts `is_gate_sibling(fixture) is False`, which silently
+    presumes the fixture has no gate-named ancestor. A fixture spawned with a
+    plain `subprocess.Popen` is OUR child, so it inherits the test runner's
+    entire ancestry — and the assertion is then decided by whatever launched
+    the suite, not by the predicate.
+
+    That is not hypothetical, and it is why this suite could not simply be
+    wired into the gate: run it as a gate phase and the runner's ancestors are
+    literally `gate_and_push.sh` -> `gate_full_cycle.sh`, so all four negative
+    tests fail 100% of the time, by construction.
+
+    The fix is to give the fixture a genuinely clean ancestry rather than to
+    weaken the predicate. `is_gate_sibling` is correct in production, where its
+    only call site passes pids from `pgrep -x cmake|cc1plus|ld|mold|lld|ninja|
+    make|bezel_tests*` and so never sees a gate-named process. A detached
+    fixture is also the *faithful* model of what these tests describe — a
+    "foreign builder" that is not part of this gate — which a child of the
+    test runner can never be.
+
+    MECHANISM. Double fork: the intermediate child forks the real fixture and
+    exits immediately, so the kernel reparents the fixture to `init` or
+    `systemd --user` (neither carries a gate name). `setsid` /
+    `start_new_session=True` is NOT sufficient: it changes the session, not
+    `PPid`, and the predicate walks `PPid`.
+
+    SYNCHRONISATION — this is the part that has to be exact. The caller needs
+    the fixture to have FINISHED `exec`ing before it reads `/proc`, because
+    `_wait_for_cmdline` gives up on its FIRST unreadable poll
+    (`if last is None: return None`) and a process is momentarily empty-cmdline
+    mid-`exec`. Polling for "cmdline is non-empty" does NOT establish this: the
+    pre-`exec` process is a shell whose own cmdline is both non-empty AND
+    contains the requested name, so a poll-based barrier returns while the
+    fixture is still the launcher. That produced exactly two symptoms —
+    `_comm_of` reading 'bash' instead of 'sleep', and `_cmdline_of` reading
+    None inside the `exec` window — for a measured 10 failures in 12 runs of
+    `SiblingDetectionTest`.
+
+    So the barrier is an fd, not a poll: `ready_w` is close-on-exec (every fd
+    from `os.pipe()` is, in Python 3), so it survives `fork` and is closed by
+    the kernel at the instant `execvp` succeeds. The parent's blocking read
+    therefore returns EOF exactly when the fixture has become the target
+    program. On `exec` FAILURE the child writes one byte first, so the parent
+    can tell "exec'd" (EOF) from "could not exec" (a byte) with no ambiguity
+    and no timing assumption.
+
+    `argv` is passed to `execvp` as a real argument vector, NOT joined into a
+    shell string: joining loses the argument boundaries, so
+    `["/bin/bash", "-c", "sleep 30"]` would become `bash -c sleep 30`, i.e.
+    `bash -c "sleep"` with `$0="30"` — which exits instantly with
+    "sleep: missing operand" and made the baseline fixture fail every run.
+    """
+    real_argv = [argv0 if argv0 is not None else argv[0]] + list(argv[1:])
+    ready_r, ready_w = os.pipe()
+    pid_r, pid_w = os.pipe()
+
+    intermediate = os.fork()
+    if intermediate == 0:  # pragma: no cover — child process
+        try:
+            os.close(ready_r)
+            os.close(pid_r)
+            grandchild = os.fork()
+            if grandchild == 0:
+                os.close(pid_w)
+                try:
+                    devnull = os.open(os.devnull, os.O_RDWR)
+                    os.dup2(devnull, 0)
+                    os.dup2(devnull, 1)
+                    os.dup2(devnull, 2)
+                    if devnull > 2:
+                        os.close(devnull)
+                    os.execvp(argv[0], real_argv)
+                except BaseException:
+                    pass
+                # Only reached if execvp failed. Tell the parent so it can
+                # raise instead of handing back a pid that never became the
+                # program under test.
+                try:
+                    os.write(ready_w, b"E")
+                except BaseException:
+                    pass
+                os._exit(127)
+            os.write(pid_w, str(grandchild).encode())
+        except BaseException:
+            pass
+        os._exit(0)
+
+    # --- parent ---
+    os.close(ready_w)
+    os.close(pid_w)
+    try:
+        # Reaping the intermediate is what orphans the fixture: the kernel
+        # reparents it the moment the intermediate exits, which has already
+        # happened by the time waitpid() returns.
+        os.waitpid(intermediate, 0)
+        raw = b""
+        while True:
+            chunk = os.read(pid_r, 32)
+            if not chunk:
+                break
+            raw += chunk
+        if not raw.strip():
+            raise RuntimeError(
+                "_spawn_detached({!r}): intermediate never reported a pid".format(
+                    argv))
+        pid = int(raw.strip())
+        # Blocks until execvp succeeds (EOF) or fails (one byte). No timeout
+        # race: both outcomes close or write the fd. select() only bounds a
+        # pathological hang so a broken fixture cannot wedge the suite.
+        readable, _, _ = select.select([ready_r], [], [], 20.0)
+        if not readable:
+            raise RuntimeError(
+                "_spawn_detached({!r}): exec barrier never signalled".format(argv))
+        failed = os.read(ready_r, 1)
+    finally:
+        os.close(pid_r)
+        os.close(ready_r)
+    if failed:
+        raise RuntimeError(
+            "_spawn_detached({!r}): execvp failed in the child".format(argv))
+
+    # Establish the postcondition the callers actually depend on, so an
+    # environment that cannot provide it fails HERE (as a fixture error naming
+    # the cause) rather than as a confusing assertion about the predicate.
+    ppid = _ppid_of(pid)
+    if ppid is not None and ppid == os.getpid():
+        raise RuntimeError(
+            "_spawn_detached({!r}): fixture {} was not reparented (PPid is "
+            "still this test runner) — its ancestry would be inherited from "
+            "whatever launched the suite, which is exactly what #3415 is "
+            "about".format(argv, pid))
+    return _DetachedProc(pid)
 
 
 def _comm_of(pid):
@@ -609,7 +785,7 @@ class SiblingDetectionTest(unittest.TestCase):
     def test_random_unrelated_process_is_not_sibling(self):
         """Regression guard: a normal subprocess (comm='sleep') with no
         gate-named ancestors reports is_gate_sibling=False."""
-        unrelated = subprocess.Popen(["sleep", "10"])
+        unrelated = _spawn_detached(["sleep", "10"])  # #3415: detached
         try:
             self.assertEqual(_comm_of(unrelated.pid), "sleep")
             self.assertFalse(
@@ -1082,9 +1258,10 @@ class IntegrationTest(unittest.TestCase):
         over-match on every bash invocation. (Production: a developer
         who runs `bash -c 'make'` from a terminal does not have a
         running gate as a sibling.)"""
-        proc = subprocess.Popen(
-            [_BASH_PATH, "-c", "sleep 30"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # #3415: detached, so this baseline does not inherit the runner's
+        # ancestry. The cmdline must stay `bash -c sleep 30` (no gate-name
+        # substring) — that is what the test pins — so argv0 stays "bash".
+        proc = _spawn_detached([_BASH_PATH, "-c", "sleep 30"], argv0="bash")
         try:
             deadline = time.time() + 5.0
             cmdline = None
