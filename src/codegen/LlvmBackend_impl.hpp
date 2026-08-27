@@ -9192,6 +9192,12 @@ private:
         if (!fs->decl) {
             rt = ctx_.importedMemberType(fs);
         } else {
+            // SEAM-ACCESSOR: this IS the both-sources accessor for "what is
+            // this owned field's type?" — the IMPORTED arm is the branch
+            // directly above (`ctx_.importedMemberType(fs)`), and this arm is
+            // reached only when `fs->decl` is non-null, i.e. a locally
+            // declared field, which is exactly where the AST is the correct
+            // and only source. Consulting both sources is the point of it.
             auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
             if (!fd || !fd->type) return false;
             rt = ctx_.resolvedType(*fd->type);
