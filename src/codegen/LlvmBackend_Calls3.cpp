@@ -5858,7 +5858,8 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
         //     call-site textual order". Exactly once — not zero times.
         //   * §22.5 "Evaluation order": "The order is observable through
         //     side-effecting arguments and non-constant defaults … and is
-        //     normative."
+        //     normative …" (the sentence continues "; it matches C#'s
+        //     treatment of supplied arguments" — truncated, not ended).
         //   * §8.2 is the closest thing to a licence for answering a universal
         //     from the static type, and is explicit about what it removes: "the
         //     call is answered from the static type with no observable boxing".
