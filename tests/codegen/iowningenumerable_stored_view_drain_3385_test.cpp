@@ -67,18 +67,38 @@
 //       faulted), which is the single-consumption violation #3355's commit
 //       body named.
 //
-// SCOPE NOTE (not pinned here). The BOUND spelling of the same shape —
-// `var e := c.Items; for var x in e do ... end;` — is fixed for the
-// use-after-free by this commit too, but still LEAKS the wrapper FRAME:
-// `registerIterableSourceDisposal`'s computed-getter arm claims ownership of a
-// freshly minted wrapper only when the local's effective type heads at
-// `IEnumerable`, never at `IOwningEnumerable`. That frame-ownership gap is
-// orthogonal to element ownership and predates this fix — measured on the
-// pre-fix build the same program leaks 32 bytes (the borrowing `arrenum`
-// frame) and on the post-fix build 24 bytes (the smaller `ownarrenum` frame);
-// the UAF merely aborted the process before LSan could report it in the
-// shapes below. It is tracked as #3392 (= #3363's item 2). Using the
-// direct-read spelling keeps these cases on the element axis only.
+//   (D) The BOUND spelling — `var e := c.Items; for var x in e do ... end;`.
+//       This is the SEAM between this fix and #3392, and it is pinned here
+//       because it is the one shape where the two meet.
+//
+// ⚠ THE TWO FIXES ARE MUTUALLY NECESSARY — this is why (D) matters.
+// #3392 (three commits earlier on this branch) widened
+// `registerIterableSourceDisposal`'s computed-getter arm so a local bound to
+// the stored view CLAIMS the freshly minted wrapper frame. On its own that
+// widening would be a DOUBLE FREE on this path: before this commit,
+// `wrapArrayAsIOwningEnumerator`'s vtable slot 4 was `return self;`, so the
+// source view V and the loop's enumerator C were THE SAME POINTER — #3392's
+// decl-slot claim and the loop's own enumerator disposal would both have
+// slot-1'd it.
+// This commit's slot-4 change (mint a fresh child clone per §29.2's
+// desugaring and stdlib §4.13) is what makes V and C distinct, and therefore
+// what makes #3392's claim safe. The ownership split is:
+//   V — claimed by #3392 at the local's scope end; its MoveNext is never
+//       dispatched (`IOwningEnumerable<T>` declares only
+//       `GetOwningEnumerator()`), so its `pending` is null for its whole
+//       lifetime and its Dispose is `free(self)` alone.
+//   C — registered by the loop, disposed at loop end; `TakeCurrent` nulled
+//       its `pending` at each yield, so its Dispose is also `free(self)`.
+//   elements — transit C's `pending` for the span of one
+//       MoveNext→TakeCurrent pair and land on the loop variable, which
+//       §28.3/§29.2 require to discharge them.
+//   the array — never freed by either frame; the field's holder frees it,
+//       now empty.
+// An earlier revision of this note claimed the bound spelling "still LEAKS
+// the wrapper FRAME … tracked as #3392". That was measured against main
+// WITHOUT #3392 and is FALSE on this branch — #3392 closes it three commits
+// back. Corrected per [[fix-must-update-existing-tests]]: a shipped record a
+// sibling commit falsified is the same defect class as a stale pinned test.
 //
 // ORACLE. `runAotChecked` compiles the generated program with AddressSanitizer
 // and LeakSanitizer enabled, so `r.ran` is simultaneously a no-UAF and a
@@ -232,4 +252,54 @@ BEZEL_TEST(iowningenumerable_stored_view_drain_3385,
     BEZEL_EXPECT_TRUE(r.ran);
     // first == 35 (5+10+20), second == 0.
     BEZEL_EXPECT_EQ(r.exitCode, 140);
+}
+
+// ---------------------------------------------------------------------------
+// (D) BOUND-and-iterated — the #3385 × #3392 seam.
+//   per §29.1 (TakeCurrent), §29.2 (the desugaring's source handling for a
+//   named local), §28.6 (stored view), stdlib §4.5 / §4.13
+//
+// Distinct from (A) in exactly one respect: the stored view is bound to a
+// LOCAL first, then iterated. That routes disposal through a different owner
+// than the direct-read spelling — §29.2 pins a named-local source with a
+// borrow rather than assuming its disposal obligation, so the loop does NOT
+// dispose V; #3392's decl-slot claim does, at `e`'s scope end.
+//
+// Neither commit's own tests reach this: #3385's (A)-(C) deliberately use the
+// direct-read spelling to stay on the element axis, and #3392's cases read the
+// property without ever iterating. The case was previously DELETED from
+// `block_bodied_ienumerable_property_bound_disposal_2769_test.cpp:193`
+// because "the IOwningEnumerable wrap path SEGVs in BOTH the direct and bound
+// spellings" — this pins that it no longer does.
+//
+// Observable is identical to (A) — `Remaining * 100 + total` == 35 — because
+// binding the view changes WHO frees the frames, not where the elements go.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(iowningenumerable_stored_view_drain_3385,
+           bound_stored_view_drains_once_frames_freed_by_two_owners_29_2) {
+    const std::string src =
+        std::string(kPrelude) +
+        "class Main "
+        "  public static method Run(): int "
+        "    using var c := new C(); "
+        "    var total := 0; "
+        "    var e := c.Items; "
+        "    for var x in e do "
+        "      using var y := owned x; "
+        "      total := total + y.V; "
+        "    end for; "
+        "    return c.Remaining * 100 + total; "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    return Run(); "
+        "  end Main; "
+        "end Main;";
+    JitResult r = runAotChecked(src);
+    if (wasSkipped(r)) return;
+    // `ran` is simultaneously the no-UAF and the no-LEAK assertion (ASan+LSan).
+    // Without #3392 this leaks V's 24-byte frame; without THIS commit's slot-4
+    // clone, V and C are the same pointer and #3392's claim double-frees it.
+    BEZEL_EXPECT_TRUE(r.ran);
+    // Remaining == 0 (every element left the collection), total == 35.
+    BEZEL_EXPECT_EQ(r.exitCode, 35);
 }
