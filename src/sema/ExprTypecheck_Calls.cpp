@@ -19660,13 +19660,29 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 !recvTyForDiag->genericArgs.empty() && recvTyForDiag->genericArgs[0]) {
                 std::string_view cn = recvTyForDiag->headName();
                 bool isMaterializer = false;
-                if ((cn == "Array" || cn == "Set") &&
+                // narrow #3376: ONLY the arms where the result head genuinely
+                // equals the RECEIVER head may reuse `recvTyForDiag->astNode`.
+                // On `Array<T>` (stdlib §4.4/§5) all four of these return
+                // `owned Array<T>`, so mirroring the receiver is correct:
+                //   Sorted(): owned Array<T>   Reversed(): owned Array<T>
+                //   Slice(r): owned Array<T>   ToArray(): owned Array<T>
+                // `ToSet`/`ToDictionary` and the `Set` receiver are DELIBERATELY
+                // excluded: their result head differs from the receiver head
+                // (§5 `ToSet(): owned Set<T>`, `ToArray(): owned Array<T>`,
+                // `ToDictionary<TKey>(key): owned Dictionary<TKey, T>`), so the
+                // receiver-mirroring shape below would type them CONFIDENTLY
+                // WRONG — a worse failure than the #2434 degraded slot this
+                // block exists to prevent. The `.` form keys the head on the
+                // MEMBER via makeConcreteCollectionResult/makeDictResult and
+                // gates `ToSet` on linqHashableCheck (#3331); those are
+                // function-local lambdas in resolveMemberAccess and are not
+                // reachable from here, so the correct fix is to hoist them —
+                // tracked as a follow-up. Until then these members fall
+                // through to the #3155 member-not-found mirror, exactly as
+                // they did before #3376.
+                if (cn == "Array" &&
                     (nm.member == "Sorted" || nm.member == "Reversed" ||
-                     nm.member == "Slice" || nm.member == "ToArray" ||
-                     nm.member == "ToSet")) {
-                    isMaterializer = true;
-                } else if (cn == "Dictionary" &&
-                           (nm.member == "ToDictionary")) {
+                     nm.member == "Slice" || nm.member == "ToArray")) {
                     isMaterializer = true;
                 }
                 if (isMaterializer) {
