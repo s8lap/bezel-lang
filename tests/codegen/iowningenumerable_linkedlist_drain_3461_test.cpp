@@ -97,6 +97,14 @@
 //       (24 B, LSan-visible). That is a pre-existing, family-independent gap —
 //       measured identical for `OwningArray` on this same build — filed
 //       separately, not this fix's to close.
+//   (G) The LOCAL-DECL face (`LlvmBackend_Setup.cpp`'s coercion), added while
+//       addressing the review. A FOURTH face this fix repairs that the original
+//       commit did not claim: `using var e: IOwningEnumerable<Item> := l;` over
+//       an `OwningLinkedList<Item>` local. Measured 3/3 on `origin/main`
+//       (`0c5ecd1`): `order=12 left=2` then rc 139; 3/3 here: `order=12 left=0`
+//       rc 0, and ASan/LSan-clean. `left` is the assertion that matters —
+//       `left=2` is the source refusing to drain while the loop discharged both
+//       elements, which is the double dispose the SIGSEGV then delivers.
 //
 // ORACLE. `runAotChecked` compiles the generated program with AddressSanitizer
 // and LeakSanitizer, so `r.ran` is simultaneously a no-UAF and a no-leak
@@ -386,5 +394,50 @@ BEZEL_TEST(iowningenumerable_linkedlist_drain_3461,
     // Pre-fix on 0c5ecd1 this face read the same borrowing wrap: `rem=3` and
     // the same double dispose at the receiver's scope end.
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "o=51020 rem=0"));
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ---------------------------------------------------------------------------
+// (G) The LOCAL-DECL coercion face — the fourth face, added on review.
+//   per §29.2 (the owning desugaring), stdlib §4.5 / §4.13, §28.3
+//
+// This is `LlvmBackend_Setup.cpp`'s local-decl arm, which routes a borrowed
+// LinkedList source through the same `wrapLinkedListAsIEnumerable` leaf. It was
+// repaired by the same one-line divert and was not claimed by the original
+// commit — the issue named only the stored-view property face.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(iowningenumerable_linkedlist_drain_3461,
+           local_decl_face_over_a_linked_list_drains_too_29_2) {
+    const std::string src =
+        "module M; "
+        "class Item "
+        "  public V: int; "
+        "  public constructor(v: int) V := v; end constructor; "
+        "end Item; "
+        "class Main "
+        "  public static method Run(): int "
+        "    using var l := new OwningLinkedList<Item>(); "
+        "    l.AddLast(new Item(1)); "
+        "    l.AddLast(new Item(2)); "
+        "    var order := 0; "
+        "    using var e: IOwningEnumerable<Item> := l; "
+        "    for var x in e do "
+        "      using var y := owned x; "
+        "      order := order * 10 + y.V; "
+        "    end for; "
+        "    Console.WriteLine($\"order={order} left={l.Count}\"); "
+        "    return 0; "
+        "  end Run; "
+        "  public static method Main(): int "
+        "    return Run(); "
+        "  end Main; "
+        "end Main;";
+    JitResult r = runAotChecked(src);
+    if (wasSkipped(r)) return;
+    // Pre-fix on 0c5ecd1: `order=12 left=2` reaches stdout, then SIGSEGV in the
+    // local's own scope-end disposal pass over elements the loop discharged.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "order=12 left=0"));
+    BEZEL_EXPECT_FALSE(has(r.stdoutText, "left=2"));
     BEZEL_EXPECT_EQ(r.exitCode, 0);
 }

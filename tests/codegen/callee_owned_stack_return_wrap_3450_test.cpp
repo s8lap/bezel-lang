@@ -26,7 +26,12 @@
 // ⚠ A #2633 ORACLE SPLIT, IN ONE PROGRAM. Measured on 0c5ecd1, `Make():
 // IEnumerable<int>` returning a callee-owned `Stack<int>` of 1, 2, 3:
 //
-//   plain build      `order=0`  — a SILENT zero-iteration loop, exit 0
+//   plain build      NONDETERMINISTIC — `order=0` (a SILENT zero-iteration
+//                    loop, exit 0) or SIGSEGV, run to run, out of ONE binary.
+//                    Re-measured 5x on the same `origin/main` executable while
+//                    addressing the review: 3 crashes, 2 silent `order=0`. An
+//                    earlier revision of this note said "`order=0`" flatly;
+//                    that is one of the two outcomes, not the outcome.
 //   ASan build       SEGV on unknown address 0x11, READ, in
 //                    `bz$stackenum$i32$Current` <- `bz$M.Main$Run`
 //
@@ -55,6 +60,43 @@
 // forced back to null on a scratch compiler, that row leaks 15200 B in 800
 // allocations at 200 iterations; with the fix it is LSan-clean.
 //
+// ★ THE CACHE KEY, AND THE WILD FREE ALREADY ON MAIN. A disposer that varies
+// with the SEMA element type, installed in a function whose cache key varies
+// only with the LOWERED one, hands the second element type the first one's
+// Dispose — `string`, any class, `IGrouping` and every function type all lower
+// to `ptr`. The disposer's identity is therefore part of the key, in both
+// wraps. That is NOT merely defensive hardening for the arm this fix touches:
+// `wrapOwnedArrayAsIEnumerable` has derived its disposer since #2710 **with no
+// key segment at all**, so the collision is LIVE ON `origin/main` for the array
+// family, and this commit closes it.
+//
+// The element type that exposes it is a FUNCTION type. A class-typed partner
+// only degrades to a silent field decrement (`bz_string_release` touches a
+// refcount at an offset and the runtime is not ASan-instrumented); a
+// `(int) -> int` element points that same thunk at `.text`, and the release
+// becomes `free()` on a function pointer. It also carries a null disposer and
+// no disposal obligation of its own, which is what makes it a usable partner at
+// all — there is no confounding element leak to separate the collision from.
+// Measured on `origin/main`, row (H)'s program under ASan:
+//
+//     SEGV ... WRITE
+//       #1 free
+//       #2 bz_string_release  src/runtime/bezel_runtime_refcounting.cpp:137:5
+//       #3 bz$strElemRelease
+//       #4 bz_array_free      src/runtime/bezel_runtime_collections.cpp:295:27
+//       #5 bz$arrenumown$ptr$Dispose
+//       #6 bz$M.Main$Run
+//
+// The method names `AaaStr` / `ZzzFn` are load-bearing, not decoration: they
+// order the two mints so the STRING thunk wins the shared name and the function
+// elements inherit it. Reverse the order and the collision degrades to a leak.
+//
+// An earlier revision of this file declined to ship a row here, reasoning that
+// no oracle separated the collision from an unrelated pre-existing leak. That
+// was true of the LSan oracle ONLY, and this file had already reached for the
+// same escape twice (row (C) here, row (F) in the #3461 file): drop to `runAot`
+// and assert the PLAIN-build exit status. Rows (H)/(I) do exactly that.
+//
 // COVERAGE.
 //   (A) The #3450 pin, plain build — the value the silent failure produced.
 //   (B) The same program sanitized — the fault the plain build did not show.
@@ -75,6 +117,22 @@
 //       loop-amplified 200x under LSan. A one-shot row here is worthless: the
 //       leak is 76 B per iteration and a single allocation can still be
 //       reachable at exit.
+//   (H) The CACHE-KEY row, ARRAY family — a true regression row. It FAILS on
+//       `origin/main` (`total=22`, then rc 139, deterministically 5/5) and
+//       passes here. This is the pre-existing #2710 wild free above.
+//   (I) The same shape at the STACK family — a FORWARD RATCHET, labelled as
+//       such. It also fails on `origin/main`, but for #3450's own reason (that
+//       arm never reaches the disposer at all: 3/5 SIGSEGV, 2/5 silent
+//       `total=0`), so main does not isolate the collision for this family.
+//       What isolates it is a key-removed build of THIS tree, on which (H) and
+//       (I) both SEGV 5/5 while every other row in this file stays green.
+//
+// ⚠ Rows (H)/(I) are `runAot`, and must stay so. Under `runAotChecked` both
+// leak 80 B in 2 allocations WITH the fix — the function-typed elements are
+// never released, because the wrap's slot-1 disposer is derived from the
+// BORROWING head. Same root cause as row (C)'s note, a different element
+// category; recorded on the issue filed for that gap. The observable these rows
+// assert is the plain-build exit status, which is where the wild free lands.
 //
 // ORACLE. `runAotChecked` compiles with AddressSanitizer + LeakSanitizer, so
 // `r.ran` is simultaneously a no-fault and a no-leak assertion.
@@ -378,4 +436,108 @@ BEZEL_TEST(callee_owned_stack_return_wrap_3450,
     BEZEL_EXPECT_TRUE(r.ran);
     // 200 iterations x 2 elements x 5 chars ("item1"/"item2").
     BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=2000"));
+}
+
+// ---------------------------------------------------------------------------
+// The cache-key programs for rows (H) and (I).
+//
+// `AaaStr` mints first (the `string` element's release thunk wins the shared
+// `…$Dispose`), `ZzzFn` second — so the function-typed elements inherit a
+// disposer that calls `bz_string_release` on a pointer into `.text`. Both
+// methods return through the SAME callee-owned RETURN arm; only the collection
+// family differs between the two programs.
+//
+// A function type is the partner precisely because it has NO disposal
+// obligation: its own correct disposer is null, so nothing else in the program
+// leaks or double-frees and the exit status isolates the collision.
+// (Never put a C++ `//` comment inside these literals: it is lexed as Bezel
+// source and comments out the rest of the program. Bezel's own comment forms
+// are `//`, `/* ... */` and `///` -- spec §1.5, which is exhaustive.)
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string keyCollideProgram(const char* ctor, const char* add) {
+    return
+        std::string(
+            "module M; "
+            "class Main "
+            "  public static method Mk(n: int): string "
+            "    return $\"item{n}\"; "
+            "  end Mk; "
+            "  public static method Dbl(n: int): int "
+            "    return n * 2; "
+            "  end Dbl; "
+            "  public static method AaaStr(): IEnumerable<string> "
+            "    var a := new ") + ctor + "<string>(); " +
+            "    a." + add + "(Mk(1)); " +
+            "    a." + add + "(Mk(2)); " +
+            "    return a; "
+            "  end AaaStr; "
+            "  public static method ZzzFn(): IEnumerable<(int) -> int> "
+            "    var a := new " + ctor + "<(int) -> int>(); " +
+            "    a." + add + "(Dbl); " +
+            "    a." + add + "(Dbl); " +
+            "    return a; "
+            "  end ZzzFn; "
+            "  public static method Run(): int "
+            "    var total := 0; "
+            "    using var e1 := AaaStr(); "
+            "    for var x in e1 do "
+            "      total := total + x.Length; "
+            "    end for; "
+            "    using var e2 := ZzzFn(); "
+            "    for var f in e2 do "
+            "      total := total + f(3); "
+            "    end for; "
+            "    Console.WriteLine($\"total={total}\"); "
+            "    return 0; "
+            "  end Run; "
+            "  public static method Main(): int "
+            "    return Run(); "
+            "  end Main; "
+            "end Main;";
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// (H) The cache-key row, ARRAY family — a live wild free on `origin/main`.
+//   per §28.11 (the element slot policy), §28.2 (dispose exactly once)
+//
+// FAILS on `origin/main`: `total=22` reaches stdout, then the scope-end
+// `bz$arrenumown$ptr$Dispose` runs the string release over the function
+// elements and the process dies with SIGSEGV (rc 139, 5/5). `r.ran` is
+// `WIFEXITED`, so it is false there.
+//
+// ⚠ `runAot`, not `runAotChecked` — see the header's note on rows (H)/(I).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(callee_owned_stack_return_wrap_3450,
+           owning_array_wrap_disposer_is_keyed_by_element_type_28_11) {
+    JitResult r = runAot(keyCollideProgram("Array", "Add"));
+    // The crash assertion: WIFEXITED is false when the generated program is
+    // killed by SIGSEGV.
+    BEZEL_EXPECT_TRUE(r.ran);
+    // 5 + 5 (two "itemN") + 6 + 6 (Dbl(3) twice) == 22.
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=22"));
+    // Redundant with `r.ran` by construction, and deliberately so: it is the
+    // half of the claim that survives if the harness's crash reporting changes.
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+}
+
+// ---------------------------------------------------------------------------
+// (I) The same shape, STACK family — a FORWARD RATCHET.
+//   per §28.11, stdlib §4.11
+//
+// Unlike (H) this row does not isolate the collision against `origin/main`:
+// that arm never reaches the disposer there at all (#3450's own defect — 3/5
+// SIGSEGV, 2/5 silent `total=0`). It fails against a key-removed build of THIS
+// tree, on which it SEGVs 5/5. It is here so the stack wrap cannot silently
+// lose the key segment the array wrap is now pinned on by (H).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(callee_owned_stack_return_wrap_3450,
+           owning_stack_wrap_disposer_is_keyed_by_element_type_28_11) {
+    JitResult r = runAot(keyCollideProgram("Stack", "Push"));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(has(r.stdoutText, "total=22"));
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
