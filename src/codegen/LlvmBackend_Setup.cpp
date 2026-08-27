@@ -14043,9 +14043,12 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         llvm::AllocaInst* state = nullptr;
         if (reassigned) {
             state = entryAlloca(llvm::Type::getInt1Ty(llvm_));
-            bool startsBoxed = false;
-            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(declNode))
-                startsBoxed = isPlusOneBoxProducer(ld);
+            // fix #3417: `declNode` straight through — it was cast to
+            // `const ast::LocalDecl*` here, which is null for a §21.1
+            // LocalConstDecl. (A `const` can never be reassigned, so this
+            // branch is unreachable for one; the cast is removed because
+            // isPlusOneBoxProducer now decodes both node kinds itself.)
+            bool startsBoxed = isPlusOneBoxProducer(declNode);
             builder_.CreateStore(builder_.getInt1(startsBoxed), state);
         }
         Disposal d{slot, nullptr};
@@ -21460,6 +21463,33 @@ struct StringEscapeWalker {
                 expr(lc->value.get(), /*safeRead=*/true);
                 return;
             }
+            // fix #3417 (§21.1 / §28.9 / §8.6, v0.283): #2900's OBJECT-ALIAS
+            // relaxation, the second of the pair the sibling `LocalDecl` arm
+            // carries, now that this fix admits an Object/interface-headed
+            // §21.1 `const` to `objectStringBorrowAll_`. `const o: Object := s;`
+            // is then RETAINED at bind and (when non-escaping) released at scope
+            // end through the state-bit-gated objectStringRelease Disposal, so
+            // the source `s` keeps its own +1 and its own release — the same
+            // two-owners-one-reference-each argument as the `var` twin, and the
+            // same conditions: `stringReleaseMode`, not inside a lambda, the
+            // binding NOT already in `borrowRetainedAliases` (the string-typed
+            // arm above owns that case), membership in the object-alias set, and
+            // the bare-identifier `isTargetIdent` shape (so `const o: Object :=
+            // s + "x"` still falls through to the conservative escape).
+            // MEASURED at 500 iterations of `var p := "ab" + z; const o: Object
+            // := p;`: 18500 bytes in 1000 allocations before, clean after, `var`
+            // twin clean on both sides. The `borrowRetainedAliases` null check
+            // is explicit here (the `var` arm dereferences it under the
+            // `objectStringBorrowAliases` guard alone); both are set together by
+            // every caller, so this only removes a latent null dereference.
+            if (stringReleaseMode && !inLambda && objectStringBorrowAliases &&
+                borrowRetainedAliases &&
+                !borrowRetainedAliases->count(static_cast<const void*>(lc)) &&
+                objectStringBorrowAliases->count(static_cast<const void*>(lc)) &&
+                isTargetIdent(lc->value.get())) {
+                expr(lc->value.get(), /*safeRead=*/true);
+                return;
+            }
             expr(lc->value.get(), /*safeRead=*/false); return;
         }
         if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
@@ -25116,13 +25146,18 @@ int Emitter::isObjectStringSource(const ast::Expr* valueExpr) {
 // #2960 source classifier must say the initializer is fresh-box. A class
 // instance coerced to Object/interface is classified definitely-non-box; an
 // Object/interface-valued copy is unknown and remains conservatively unmanaged.
-bool Emitter::isPlusOneBoxProducer(const ast::LocalDecl* ld) {
-    if (!ld || !ld->initializer) return false;
-    const sema::TypeRef* targetTy = ld->type
-        ? ctx_.resolvedType(*ld->type)
-        : ctx_.exprType(*ld->initializer);
+bool Emitter::isPlusOneBoxProducer(const ast::Node* ldNode) {
+    // fix #3417 (§21.1 / §8.6 / §28.9, v0.283): read the declaration through
+    // the shared `localDeclInitView`, so a §21.1 runtime `const` binding
+    // (ast::LocalConstDecl) is classified exactly as its `var` (ast::LocalDecl)
+    // twin is. Any other node yields an all-null view, whose `!v.init` answers
+    // false — the same answer the old `!ld` guard gave.
+    LocalDeclInitView v = localDeclInitView(ldNode);
+    if (!v.init) return false;
+    const sema::TypeRef* targetTy =
+        v.type ? ctx_.resolvedType(*v.type) : ctx_.exprType(*v.init);
     if (!isObjectOrInterfaceTarget(targetTy)) return false;
-    return boxLocalAssignmentSourceKind(ld->initializer.get()) == 1;
+    return boxLocalAssignmentSourceKind(v.init) == 1;
 }
 
 namespace {
@@ -25691,15 +25726,49 @@ void Emitter::collectBoxReleaseEligible(
     // definitely-non-box and records whether at least one box assignment exists.
     // A candidate is armed only when it starts boxed OR receives a box, and all
     // uses stay non-escaping.
-    std::vector<const ast::LocalDecl*> candidates;
+    //
+    // fix #3417 (§21.1 / §8.6 / §28.9, v0.283): the scan covers a §21.1 runtime
+    // `const` local (ast::LocalConstDecl) as well as a plain `var`
+    // (ast::LocalDecl). §21.1 gives a runtime `const` its OWN AST node, so the
+    // `dynamic_cast<const ast::LocalDecl*>(s)` that stood here matched only the
+    // `var` spelling: a `const` never became a candidate, the escape walk never
+    // ran for it, and `lowerLocalDecl` never registered its scope-end
+    // `bz_box_release`. Measured on the pre-fix build, `const o: Object := n;`
+    // leaked 24 bytes / 1 allocation per execution where the `var` twin was
+    // ASan+LSan clean.
+    //
+    // The decode is NOT re-spelled: the candidate vector is widened to
+    // `const ast::Node*` and the declaration is read through
+    // `Emitter::localDeclInitView`, the single authority #3402 hoisted into
+    // LlvmBackend_impl.hpp (LocalDecl -> {initializer, type, isUsing};
+    // LocalConstDecl -> {value, type, false}). A node that is NEITHER yields an
+    // all-null view, and such a node can never become a candidate — `targetTy`
+    // is then null and `isObjectOrInterfaceTarget(nullptr)` is false, exactly
+    // what the old LocalDecl-only cast answered for it. No consumer changes:
+    // `lowerStmt`'s LocalConstDecl arm routes through the same
+    // `lowerLocalDecl`, whose box arming reads `boxReleaseEligible_` by NODE
+    // POINTER (`const void*`), never by node kind.
+    //
+    // Soundness (§21.1 *Ownership* / §28.9). §28.9's second entry is "Boxed
+    // value types", and §21.1's Ownership paragraph admits exactly such
+    // runtime-managed values as a runtime const's initializer while forbidding
+    // an owned production — so the binding takes no disposal obligation and
+    // this adds none. What is released is the same single fresh box the `var`
+    // path has always released, at the same point, under the same conservative
+    // BoxEscapeWalker. Exactly-once is EASIER than for a `var`: §21.1 makes a
+    // `const` "not an assignable location", so `w.sawManagedAssignment` /
+    // `w.sawBoxAssignment` are vacuous for it, `boxReassignedLocals_` can never
+    // hold it, and the state-bit reassignment machinery is never armed.
+    std::vector<const ast::Node*> candidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            const sema::TypeRef* targetTy = ld->type
-                ? ctx_.resolvedType(*ld->type)
-                : (ld->initializer ? ctx_.exprType(*ld->initializer) : nullptr);
-            if (!ld->isUsing && isObjectOrInterfaceTarget(targetTy))
-                candidates.push_back(ld);
+        {
+            LocalDeclInitView v = localDeclInitView(s);   // fix #3417
+            const sema::TypeRef* targetTy =
+                v.type ? ctx_.resolvedType(*v.type)
+                       : (v.init ? ctx_.exprType(*v.init) : nullptr);
+            if (!v.isUsing && isObjectOrInterfaceTarget(targetTy))
+                candidates.push_back(s);
         }
         // fix #2968 (§8.1 / §8.5 / §18.5 / §28.9, v0.240): record any local
         // REASSIGNED at statement level, so the §2968 `Object`-slot narrowing
@@ -25739,7 +25808,7 @@ void Emitter::collectBoxReleaseEligible(
     };
     for (auto& s : body) scan(s.get());
 
-    for (const ast::LocalDecl* ld : candidates) {
+    for (const ast::Node* ld : candidates) {   // fix #3417: LocalDecl or LocalConstDecl
         BoxEscapeWalker w{
             ctx_, static_cast<const void*>(ld),
             [this](const ast::Expr* value) {
@@ -25809,33 +25878,57 @@ void Emitter::collectObjectStringReleaseEligible(
     // the caller). The source local's declared type must be a NON-NULLABLE
     // `string` primitive — the nullable case has different null-handling and
     // a retain on a possibly-null slot is the wrong shape.
-    std::vector<const ast::LocalDecl*> candidates;
+    //
+    // fix #3417 (§21.1 / §28.9 / §8.6, v0.283): BOTH ends of the alias are read
+    // through the shared `Emitter::localDeclInitView`, so a §21.1 runtime
+    // `const` (ast::LocalConstDecl) is admitted wherever its `var`
+    // (ast::LocalDecl) twin is — as the Object-typed TARGET of the alias, and
+    // as the `string` SOURCE it aliases. Both ends were LocalDecl-only casts,
+    // and each cost a leak measured on the pre-fix build:
+    //   * TARGET: `const o: Object := p;` was never a candidate, so no
+    //     bind-time retain and no scope-end release were emitted — 37 bytes /
+    //     2 allocations, the `var` twin clean.
+    //   * SOURCE: with a `const p := q + "x";` source the cast failed, so the
+    //     `var o: Object := p;` alias never entered `objectStringBorrowAll_` —
+    //     and #2764/#2900's escape walk reads exactly that set to decide
+    //     whether an Object alias of a string local is a BORROW or an ESCAPE.
+    //     The alias therefore made the SOURCE escape and the source's own
+    //     producer +1 stopped being released.
+    // A node that is neither yields an all-null view, and `!v.init` then
+    // answers exactly what the old cast's null answered. The body is wrapped in
+    // an immediately-invoked lambda so its early `return`s keep meaning "this
+    // node is not a candidate" rather than "stop scanning" — under the old
+    // LocalDecl-only cast they could only be reached for a LocalDecl (for which
+    // the block recursion below is a no-op anyway), which is no longer true.
+    std::vector<const ast::Node*> candidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (ld->isUsing || !ld->initializer) return;
+        [&] {
+            LocalDeclInitView v = localDeclInitView(s);   // fix #3417
+            if (v.isUsing || !v.init) return;
             if (!isObjectOrInterfaceTarget(
-                    ld->type ? ctx_.resolvedType(*ld->type) : nullptr))
+                    v.type ? ctx_.resolvedType(*v.type) : nullptr))
                 return;
-            auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                ld->initializer.get());
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(v.init);
             if (!id) return;
             auto* loc = dynamic_cast<const sema::LocalSymbol*>(
                 ctx_.exprSymbol(*id));
             if (!loc || !loc->decl) return;  // not a local → parameter/field
-            auto* srcLd = dynamic_cast<const ast::LocalDecl*>(loc->decl);
-            if (!srcLd) return;  // not a LocalDecl → parameter or capture
-            const sema::TypeRef* srcTy = srcLd->type
-                ? ctx_.resolvedType(*srcLd->type)
-                : (srcLd->initializer
-                       ? ctx_.exprType(*srcLd->initializer)
-                       : nullptr);
+            // fix #3417: the SOURCE may be a `var` or a §21.1 `const`; a
+            // parameter or capture is still excluded (its `decl` is neither
+            // local-declaration node, so the view is all-null and both `init`
+            // and `type` are null).
+            LocalDeclInitView sv = localDeclInitView(loc->decl);
+            if (!sv.init && !sv.type) return;
+            const sema::TypeRef* srcTy =
+                sv.type ? ctx_.resolvedType(*sv.type)
+                        : (sv.init ? ctx_.exprType(*sv.init) : nullptr);
             if (!srcTy || srcTy->nullable) return;
             if (srcTy->kind != sema::TypeRef::Kind::Primitive ||
                 srcTy->primitive != sema::PrimitiveType::String) return;
-            candidates.push_back(ld);
-            objectStringBorrowAll_.insert(static_cast<const void*>(ld));
-        }
+            candidates.push_back(s);
+            objectStringBorrowAll_.insert(static_cast<const void*>(s));
+        }();
         // Reassigned-target scan: identical shape to the box collector's —
         // every plain `:=` (and compound `:=`) into one of the candidate
         // locals is recorded so the reassignment site can release the old

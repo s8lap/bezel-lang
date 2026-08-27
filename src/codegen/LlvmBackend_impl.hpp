@@ -11962,7 +11962,11 @@ private:
     // capable locals use the same source classifier above plus a runtime i1
     // state bit, so class and box values may safely occupy the slot on different
     // control-flow paths.
-    bool isPlusOneBoxProducer(const ast::LocalDecl* ld);
+    // fix #3417 (§21.1, v0.283): takes an `ast::Node*` and decodes it through
+    // `localDeclInitView`, so a §21.1 runtime `const` (ast::LocalConstDecl) is
+    // classified exactly as its `var` (ast::LocalDecl) twin is. Any other node
+    // yields an all-null view and answers false.
+    bool isPlusOneBoxProducer(const ast::Node* ldNode);
 
     // #429 (box RETURN category) / §8.6 / §28.9: true when `init` is a call
     // to a USER-DEFINED, LOCALLY-COMPILED Bezel method whose declared return
