@@ -190,10 +190,26 @@ BEZEL_TEST(method_group_iface_string_2766, boxed_primitive_receiver_still_dispat
 
 // The shared-thunk case, which is why the fix has to live INSIDE the thunk body
 // and not at its mint site. All three method groups below resolve to the same
-// IEquatable.Equals MethodSymbol; before this fix one cached `thunk$0` served
-// every one of them. Each receiver must get its own correct answer:
+// IEquatable<string>.Equals MethodSymbol; before this fix one cached `thunk$0`
+// served every one of them. Each receiver must get its own correct answer:
 // 1 = user class (its own Equals), 2 = string (§9.6 content equality),
 // 4 = a string reached through an Object slot. 1 + 2 + 4 = 7.
+//
+// #2765 (stdlib §2.8/§2.9, v0.282): the third arm used to spell that Object
+// slot as `var e3: IEquatable<Object> := o;`. That conversion is now REJECTED
+// — stdlib §2.8/§2.9 records that `string` conforms at `string` only and
+// `IEquatable<T>` is invariant (§12.9), so no `IEquatable<Object>` view of a
+// string exists. The arm is respelled `var e3: IEquatable<string> := o;`,
+// which is the SAME shape this test is about and is strictly closer to the
+// property named above: the receiver still arrives through an `Object` slot
+// (the §5.1 Object→reference conversion, untouched by #2765), and the method
+// group now resolves to the very same `IEquatable<string>.Equals` symbol AND
+// the same `string` type argument as `f1`/`f2` — so all three groups share one
+// thunk-cache key, which is exactly the collision the #2766 fix had to keep
+// correct. VERIFIED to still return 7 against a pre-#2765 compiler, so the
+// respelling changes nothing this test was pinning. (The differing-type-
+// argument axis the old `IEquatable<Object>` spelling also touched is covered
+// on its own by int_and_string_comparable_in_one_program below.)
 BEZEL_TEST(method_group_iface_string_2766, one_cached_thunk_three_receivers) {
     BEZEL_EXPECT_EQ(runPlain(
         "module M; "
@@ -208,12 +224,12 @@ BEZEL_TEST(method_group_iface_string_2766, one_cached_thunk_three_receivers) {
         "  var e2: IEquatable<string> := s; "
         "  var f2 := e2.Equals; "
         "  var o: Object := s; "
-        "  var e3: IEquatable<Object> := o; "
+        "  var e3: IEquatable<string> := o; "
         "  var f3 := e3.Equals; "
         "  var n := 0; "
         "  if f1(\"mg2766-u\") then n := n + 1; end; "
         "  if f2(\"mg2766-s\") then n := n + 2; end; "
-        "  if f3(o) then n := n + 4; end; "
+        "  if f3(\"mg2766-s\") then n := n + 4; end; "
         "  return n; "
         "end Main; end C;"), 7);
 }

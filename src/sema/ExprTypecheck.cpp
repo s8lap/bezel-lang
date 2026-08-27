@@ -3287,8 +3287,35 @@ bool ExprTC::primitiveBoxesIntoBuiltinIface(PrimitiveType fromPrim,
     if (!isCmp && !isEq) return false;
     // Boolean implements IEquatable<bool> but NOT IComparable<bool> (§9.4).
     if (isCmp && fromPrim == PrimitiveType::Bool) return false;
+    // fix #2765 (stdlib §2.8/§2.9, v0.282; ruling 2026-08-11): `Object` is a
+    // PrimitiveType enumerator only because §4's Object class is a primitive
+    // LOOKUP KEY (TypeRef.hpp) — it is not a value type this §8.6 boxing path
+    // covers, and no `IEquatable<Object>`/`IComparable<Object>` conformance is
+    // declared anywhere: stdlib §2.8/§2.9 records that the primitives and
+    // `string` conform "at their own type only", both interfaces are invariant
+    // (§12.9), so "no `IComparable<Object>`/`IEquatable<Object>` view of them
+    // exists". Without this line the `targ->primitive == fromPrim` test below
+    // is satisfied INCIDENTALLY for `fromPrim == Object`. This is load-bearing,
+    // not belt-and-braces: `ExprTypecheck_Calls.cpp:179` calls the predicate
+    // from `implicitlyConvertible` — the §22.6 overload-applicability judgment,
+    // which has no `checkAssignable` early-return ahead of it — so an `Object`
+    // ARGUMENT at an `IEquatable<Object>` parameter is ruled applicable here or
+    // nowhere.
+    if (fromPrim == PrimitiveType::Object) return false;
     const TypeRef* targ = to->genericArgs[0];
     if (targ->kind != TypeRef::Kind::Primitive) return false;
+    // fix #2765 (stdlib §2.8/§2.9, v0.282): the type argument must be the
+    // primitive's own type EXACTLY, nullability included. `Int32` conforms at
+    // `IComparable<int>` and `String` at `IComparable<string>` (stdlib §9.1,
+    // §9.6 — `CompareTo(other: string)`, never `CompareTo(other: string?)`);
+    // both interfaces are invariant (§12.9) and `T`/`T?` are distinct types
+    // (§7), so no `IComparable<string?>` view exists. Pre-fix the comparison
+    // was `targ->primitive == fromPrim` with `targ->nullable` unread, which
+    // admitted `string → IComparable<string?>` (and the `int → IEquatable<int?>`
+    // family) at both the storage site and the argument site. This does NOT
+    // touch a USER conformance such as `class C: IComparable<C?>`, which is a
+    // declared Named→Named conformance and never reaches this predicate.
+    if (targ->nullable) return false;
     return targ->primitive == fromPrim;
 }
 
@@ -3754,6 +3781,62 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
         // source expression as a function thunk and emit the
         // property-thunk codegen path. An early-return here would skip
         // that re-typing and produce a runtime SIGSEGV (#2761).
+        //
+        // fix #2765 (stdlib §2.8/§2.9, v0.282; ruling 2026-08-11):
+        // `IEquatable<Object>` and `IComparable<Object>` are NOT in this
+        // carve-out. Stdlib §2.8/§2.9: "the stdlib's primitives and
+        // `string` conform to `IComparable<T>`/`IEquatable<T>` at their
+        // own type only … both interfaces are invariant (§12.9), so no
+        // `IComparable<Object>`/`IEquatable<Object>` view of them exists
+        // — object-keyed equality is `Object.Equals` (§8.3)". The
+        // permissive early-return admitted the view anyway, and codegen
+        // then had to carry a deliberate trap arm for the `CompareTo`
+        // half (there is no ordinal ordering to return for a non-string
+        // operand, §4.6); rejecting the conversion removes that arm at
+        // its root.
+        //
+        // Scope, deliberately narrow — this intercepts EXACTLY the shapes
+        // the early-return was ACCEPTING (its own `(!from->nullable ||
+        // to->nullable)` guard is repeated here), and only for the
+        // builtin `IEquatable`/`IComparable` spelled with an `Object`
+        // type argument:
+        //   * `Object? → IEquatable<Object>` keeps the §7 nullable
+        //     diagnostic it already produced (it never reached the
+        //     early-return), so no diagnostic is re-routed.
+        //   * the `null` literal (typed `Object?`) into a nullable
+        //     interface slot stays accepted — §5.1's nullable conversion.
+        //   * every other `Object → reference` shape (`Object → string`,
+        //     `Object → IEquatable<MyClass>`, `Object → SomeClass`, the
+        //     §27.6 function-typed re-type) is untouched.
+        // A USER interface named `IEquatable`/`IComparable` is excluded by
+        // `moduleName.empty()`, the same discriminator #3022 adopted.
+        bool toIsObjectKeyedBuiltinIface =
+            to->kind == TypeRef::Kind::Named &&
+            to->declaration && to->declaration->moduleName.empty() &&
+            (to->declaration->name == "IEquatable" ||
+             to->declaration->name == "IComparable") &&
+            to->genericArgs.size() == 1 && to->genericArgs[0] &&
+            to->genericArgs[0]->kind == TypeRef::Kind::Primitive &&
+            to->genericArgs[0]->primitive == PrimitiveType::Object;
+        bool fromIsNullLiteral =
+            fromExpr && dynamic_cast<const ast::NullLiteralExpr*>(fromExpr);
+        if (toIsObjectKeyedBuiltinIface && !fromIsNullLiteral &&
+            (!from->nullable || to->nullable)) {
+            std::string iface(to->declaration->name);
+            std::string targ =
+                to->genericArgs[0]->nullable ? "Object?" : "Object";
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what + " has a type that is not "
+                "implicitly convertible to the target type (§5.1): the "
+                "stdlib's primitives and `string` conform to "
+                "`IComparable<T>`/`IEquatable<T>` at their own type only "
+                "and both interfaces are invariant (§12.9), so no `" +
+                iface + "<" + targ + ">` view of them exists (stdlib "
+                "§2.8/§2.9) — object-keyed equality is `Object.Equals` "
+                "(§8.3)");
+            return;
+        }
         if (to->kind != TypeRef::Kind::Function &&
             (!from->nullable || to->nullable)) return;
         // Function-typed target, OR Object? → non-nullable reference:

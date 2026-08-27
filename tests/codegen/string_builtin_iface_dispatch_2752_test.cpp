@@ -200,38 +200,60 @@ BEZEL_TEST(codegen_string_builtin_iface_2752, string_through_object_slot_unchang
 // ── Argument-side guard. emitStringEq / emitStringOrdCmp dereference BOTH
 // operands as `bz_string` (loadStringLen reads offset 8, loadStringData offset
 // 0), so the runtime discriminator must validate the ARGUMENT too, not only the
-// receiver. That is reachable only through the IEquatable<Object> acceptance
-// #2765 questions: there the argument is statically `Object` and need not be a
-// string, whereas for IEquatable<string> it is statically a string.
+// receiver. In the interface arm (LlvmBackend_Calls2.cpp `strRecvPossible`)
+// that mattered only where the argument is statically `Object` and need not be
+// a string — i.e. only through the `IEquatable<Object>` / `IComparable<Object>`
+// acceptance; for `IEquatable<string>` the argument is statically a string.
 //
-// The governing sentence is §9.6's own declaration on `String`:
+// ⚠ #2765 (stdlib §2.8/§2.9, v0.282) REMOVED THAT ACCEPTANCE. `Object` →
+// `IEquatable<Object>` / `IComparable<Object>` is now a §5.1 rejection (no such
+// view exists — the primitives and `string` conform at their own type only and
+// both interfaces are invariant, §12.9), so the interface arm's mixed-operand
+// blocks (`ifc.mixed` / `ifc.strne` / the `CompareTo` trap) are now STATICALLY
+// UNREACHABLE and no Bezel program can be written that enters them. They are
+// kept in codegen as defence, not as live behaviour. The three tests below
+// therefore CANNOT be witnesses for that guard any more: the shape they
+// witnessed is no longer expressible in the language.
+//
+// What they still pin, and why they are kept. §9.6's own declaration on
+// `String`,
 //     public pure override method Equals(other: Object?): bool;
 //       // content-based, not reference-based
-// so a string compared against a NON-string Object is `false` — this is the
-// stdlib's answer, not an invention of the lowering.
+// survives at the site that is still reachable — `Object.Equals(Object?)`
+// through `lowerObjectEquals` (LlvmBackend_String.cpp), which runs
+// `bz_obj_is_string` on the receiver AND on `other` and yields `false` on the
+// mixed pair. Each test below re-spells its former `IEquatable<Object>` slot as
+// the direct `v.Equals(o)` call on that path and keeps its ARGUMENT shape (a
+// field-bearing class, a fieldless class, a boxed primitive). All three are now
+// ASAN TRIPWIRES / §9.6 controls over three distinct heap shapes — NOT
+// fail-without-fix witnesses. Labelled honestly; do not re-promote them.
 //
-// The next test is the true fail-without-fix WITNESS for the argument guard,
-// and it is deterministic (address-independent, no ASan needed) — see its own
-// comment. The two after it are broader shapes that pass either way; they are
-// kept as ASAN TRIPWIRES rather than witnesses, and are labelled as such.
+// The §2.9/§9.6 conversion side of this — that the `IEquatable<Object>` slot is
+// rejected at all — is pinned by
+// tests/sema/primitive_boxes_into_builtin_iface_2765_test.cpp.
 
-// #2752 / stdlib §9.6: the argument-side WITNESS. With a receiver-only guard
-// this returns TRUE where §9.6 requires FALSE — a silent wrong answer with no
-// crash and no ASan report.
+// #2752 / stdlib §9.6 / #2765: a string receiver in an `Object` slot compared
+// against a NON-string `Object` must be FALSE (§9.6's "content-based, not
+// reference-based"), through `lowerObjectEquals`.
 //
-// Why it is deterministic. A class instance is laid out [0] vtable pointer,
+// HISTORY — why the `Key` layout below is written the way it is. In its
+// original `IEquatable<Object>` spelling this was #2752's deterministic
+// fail-without witness: with a receiver-only guard `emitStringEq` misread the
+// argument as a `bz_string`. A class instance is laid out [0] vtable pointer,
 // [8] the §28.2 disposed flag (one byte, calloc-zeroed), then 8-byte-aligned
-// storage fields at 16 (LlvmBackend_Layout.cpp). Misread as
+// storage fields at 16 (LlvmBackend_Layout.cpp); misread as
 // bz_string_struct { data@0, len@8 (i64), width@16 (i8) } a LIVE instance
-// yields len = 0 (the zero flag plus zeroed padding) and width = the low byte
-// of its first 8-aligned field. Give that field the value 1 and pair it with
-// the receiver "" (Length 0, width 1): the length check passes (0 == 0), the
-// width check passes (1 == 1), and the content compare degenerates to
-// memcmp(_, _, 0), which returns 0 — i.e. EQUAL.
+// yields len = 0 and width = the low byte of its first 8-aligned field, so with
+// the field set to 1 and the receiver "" (Length 0, width 1) both checks passed
+// and the content compare degenerated to memcmp(_, _, 0) — EQUAL, a silent
+// wrong answer with no crash and no ASan report.
 //
-// ⚠ The field must be 8-byte-aligned for `width` to land on it: `_k: long`
-// sits at offset 16, whereas a `bool` field would sit at 9 and the probe would
-// read padding instead. Do not "simplify" the field type.
+// ⚠ Keep the `_k: long` field and the empty-string receiver. They no longer
+// trip anything on the `lowerObjectEquals` path (it validates `other` and has
+// always done so), but they are the exact operand pair that made the misread
+// observable, so this stays the cheapest live probe if an argument-side read is
+// ever reintroduced at either site. A `bool` field would sit at offset 9 and
+// the probe would read padding instead.
 BEZEL_TEST(codegen_string_builtin_iface_2752, object_slot_equals_nonstring_is_not_true) {
     BEZEL_EXPECT_EQ(runChecked(
         "module M; "
@@ -243,20 +265,22 @@ BEZEL_TEST(codegen_string_builtin_iface_2752, object_slot_equals_nonstring_is_no
         "  using var k := new Key(); "
         "  var s := \"\"; "
         "  var v: Object := s; "
-        "  var e: IEquatable<Object> := v; "
         "  var o: Object := k; "
-        "  return (if e.Equals(o) then 0 else 80); "
+        "  return (if v.Equals(o) then 0 else 80); "
         "end Main; end C;"), 80);
 }
 
-// ⚠ HONEST LABEL: the next two are NOT fail-without-fix witnesses — with the
-// receiver-only guard they returned the SAME values, because for these operands
-// the misread's length check fails and short-circuits to the correct `false`.
-// They are kept as ASAN TRIPWIRES over two further heap shapes (a fieldless
-// class, a boxed primitive): they run under the checked harness, so if the
-// argument-side read is ever reintroduced and lands out of bounds they fail.
-// The witness above is what pins the defect.
+// ⚠ HONEST LABEL: the next two were never fail-without-fix witnesses even in
+// their original `IEquatable<Object>` spelling — with the receiver-only guard
+// they returned the SAME values, because for these operands the misread's
+// length check fails and short-circuits to the correct `false`. They are kept
+// as ASAN TRIPWIRES over two further heap shapes (a fieldless class, a boxed
+// primitive) on the `lowerObjectEquals` path: they run under the checked
+// harness, so if an argument-side read is ever reintroduced and lands out of
+// bounds they fail.
 BEZEL_TEST(codegen_string_builtin_iface_2752, object_slot_equals_class_argument_is_false) {
+    // #2765: re-spelled from `IEquatable<Object>` to the direct
+    // `Object.Equals(Object?)` call — see the section comment above.
     BEZEL_EXPECT_EQ(runChecked(
         "module M; "
         "class Thing public constructor() end constructor; end Thing; "
@@ -264,9 +288,8 @@ BEZEL_TEST(codegen_string_builtin_iface_2752, object_slot_equals_class_argument_
         "  using var t := new Thing(); "
         "  var s := \"payload-text\"; "
         "  var v: Object := s; "
-        "  var e: IEquatable<Object> := v; "
         "  var o: Object := t; "
-        "  return (if e.Equals(o) then 0 else 60); "
+        "  return (if v.Equals(o) then 0 else 60); "
         "end Main; end C;"), 60);
 }
 
@@ -276,14 +299,15 @@ BEZEL_TEST(codegen_string_builtin_iface_2752, object_slot_equals_class_argument_
 // Plain runAot: boxing an Object leaks 24 bytes in 1 allocation here, which is
 // unrelated to this issue (it is the box, not the dispatch).
 BEZEL_TEST(codegen_string_builtin_iface_2752, object_slot_equals_boxed_argument_is_false) {
+    // #2765: re-spelled from `IEquatable<Object>` to the direct
+    // `Object.Equals(Object?)` call — see the section comment above.
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "class C public static method Main(): int "
         "  var s := \"payload-text\"; "
         "  var v: Object := s; "
-        "  var e: IEquatable<Object> := v; "
         "  var b: Object := true; "
-        "  return (if e.Equals(b) then 0 else 61); "
+        "  return (if v.Equals(b) then 0 else 61); "
         "end Main; end C;"), 61);
 }
 
