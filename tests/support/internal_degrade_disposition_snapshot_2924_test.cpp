@@ -97,8 +97,11 @@ struct Entry {
 };
 
 // The WARNING-severity `internal:` degrades (sixteen as of v0.240; #3079 added
-// at v0.249), each with the
-// judgement #2924 asks for.  Ordered by file, then by the tag.
+// at v0.249; the two #3157 alarms and #3437's representation guard at v0.283),
+// each with the
+// judgement #2924 asks for.  Ordered by file, then by the tag.  The live count
+// is `kN`, derived from this array — the prose above is a changelog, not the
+// number the test asserts.
 const Entry kWarningDegrades[] = {
     {"src/codegen/LlvmBackend_Assign.cpp", "#2833",
      Disposition::UnsafePointer,
@@ -178,6 +181,23 @@ const Entry kWarningDegrades[] = {
      "with no store altered). The harm it flags is a missing disposal arm, a "
      "bounded recoverable LEAK, never a zero/null read into a pointer slot; it "
      "is a compiler-bug alarm, not a value-substituting degrade"},
+
+    {"src/codegen/LlvmBackend_Setup.cpp", "#3437",
+     Disposition::WrongValue,
+     "the `await using` representation guard in registerUsingDisposal: when "
+     "`iterFormatWrappedDecls_` says the slot holds a §29.2 iterator-format "
+     "wrapper frame, the generic async-disposal fallback's premise (word 0 is "
+     "a CLASS vtable) is known false, so the site reports and registers "
+     "NOTHING. Same leak-not-substitute shape as the #2992 twin above and the "
+     "two #3157 alarms: no zero/null is manufactured and the slot keeps the "
+     "frame it already held; the bounded harm is one un-reclaimed frame at "
+     "scope end. It is the deliberate replacement for what the fallback did "
+     "instead — read the frame's word 0 as a vtable and call slot 2, which in "
+     "the iterator format is MoveNext (#2975's wild-jump shape) — so this "
+     "Warning stands where a memory-safety fault used to ship silently. "
+     "Unreachable as of #3437's first hunk (the iterator-format arm now claims "
+     "every such decl before this point); it is a ratchet against the next "
+     "edit re-opening the hole, tracked structurally as #3419"},
 
     {"src/codegen/LlvmBackend_Stmts.cpp", "#2491",
      Disposition::UnsafePointer,

@@ -14908,6 +14908,13 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // returns. No class/collection/dynamic arm is reachable for a lifted decl,
     // which is what the #2769 / #2779 carve-outs had to add an explicit
     // iterator-format head test to guarantee.
+    // fix #3437: that implication was FALSE for the `await using` spelling when
+    // this was written — the `isSyncIterEnum` arm was gated `!ld->isAwaitUsing`,
+    // so a lifted `await using var e: IEnumerable<T> := …` skipped it and landed
+    // in the collection / generic-async arms over a wrapper frame (an ASan SEGV
+    // in `bz_array_free`, and a MoveNext-as-Dispose read, respectively). The
+    // gate is gone, so the sentence above now holds for both spellings, which is
+    // the property this lift depends on.
     // narrow #3418: the lift is PER-LOWERING, so it must NOT be written back
     // into the AST. `iterFormatWrappedDecls_` is deliberately per-lowering —
     // that is the whole point of #3384's `else erase` above, whose comment
@@ -14993,7 +15000,42 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // through every branch below to no disposal registration at all — a 64-byte
     // frame leak confirmed under LSan with a single `await for` loop, no
     // abandonment or re-iteration required to trigger it.
-    if (!ld->isAwaitUsing && ld->initializer) {
+    //
+    // fix #3437 (§28.12 / §29.1 / §29.7 / §29.11, v0.283): this arm no longer
+    // excludes `await using`. The `!ld->isAwaitUsing` gate that stood here made
+    // the SPELLING decide the disposal, but the six names below name a
+    // REPRESENTATION — the iterator-format frame, vtable [0]=td, [1]=Dispose,
+    // [2]=MoveNext, [3]=Current — and the representation is the same whichever
+    // keyword bound it. None of the six is `IAsyncDisposable`: §28.12 defines
+    // asynchronous cleanup as the awaited `DisposeAsync()`, and the paragraph
+    // above records that only the two ENUMERATOR names carry it (they are NOT
+    // in this list and still reach their own arm below). So there is nothing to
+    // await for these heads, exactly as #2739 found for the builtin collections
+    // — "an `await using var` over a builtin collection has no
+    // user-async-disposable shape (no DisposeAsync to await) so the `await` is
+    // a no-op — apply the same synchronous collection disposal". This is that
+    // same ruling for the iteration-protocol family.
+    //
+    // What the gate cost, MEASURED on 1e3861a (`bezelc --sanitize=address`):
+    //   * `await using var e: IEnumerable<int> := a;` over a named `Array<int>`
+    //     and the `:= new Array<int>(2, 7)` twin both reached the `isAwaitUsing`
+    //     branch's COLLECTION arm — `collectionTypeOfLocal` answers from the
+    //     INITIALIZER's type (`Array<int>`) while the slot holds the §29.2
+    //     wrapper frame the decl-site coercion minted — and ran `bz_array_free`
+    //     over that frame, freeing its word-1 field as `data`: ASan
+    //     "SEGV on unknown address 0x589a50 ... in bz_array_free". Both crash;
+    //     the `using var` twin returns 14 cleanly.
+    //   * `await using var en := Gen();` at an `IEnumerator<int>` yield-iterator,
+    //     abandoned after one `MoveNext`, reached the generic `asyncDispose`
+    //     fallback with a null `disposeAsyncFn` → `emitDisposeAndReclaim` →
+    //     `emitDynamicDispose` read the frame's word 0 as a CLASS vtable and
+    //     called slot 2, which in the iterator format is MoveNext, not Dispose:
+    //     the frame was RESUMED and then freed without its pending `using var`
+    //     disposals ever running — 540000 B / 1000 allocs over 500 executions.
+    //     The `using var` twin is clean and returns 249.
+    // Routing all six here gives every one of them the slot-1 Dispose the plain
+    // spelling already gets. // per §28.12, §29.1, §29.7, #3437, #2739
+    if (ld->initializer) {
         const sema::TypeRef* lt = ld->type ? ctx_.resolvedType(*ld->type)
                                            : ctx_.exprType(*ld->initializer);
         // issue #1002 / §29.11: also match a `using var e := arr.GetEnumerator()`
@@ -15506,6 +15548,57 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                     return;
                 }
             }
+        }
+        // fix #3437 (§28.12 / §29.1 / §28.9, v0.283): REPRESENTATION GUARD on
+        // the generic fallback below. That fallback's premise is that the slot
+        // holds an object carrying the standard CLASS vtable ([0]=td$,
+        // [1]=itmap$, [2]=Dispose, [3]=ToString) — `emitDisposals` calls
+        // `emitAsyncDisposeAwaitAndFree`, which on a null `disposeAsyncFn`
+        // (every interface-typed local, since `classOfLocal` cannot answer
+        // through a declaration-less head) degrades to `emitDisposeAndReclaim`
+        // → `emitDynamicDispose` → *load word 0, call slot 2*. For a §29.2
+        // wrapper frame word 0 IS a vtable, but the ITERATOR-format one, whose
+        // slot 2 is MoveNext — so the "disposal" RESUMES the frame and then
+        // frees it with its own Dispose (and every pending `using var` inside
+        // it) never run. That is #2975's wild-jump shape one step short of a
+        // garbage function pointer, and #759 records the same read for the
+        // async enumerator names.
+        //
+        // A null `classOfLocal` is NOT the discriminator and must not be used as
+        // one: `await using var d: IAsyncDisposable := Make();` also has none,
+        // and there the slot genuinely holds a class object for which
+        // `emitDisposeAndReclaim` is exactly right (the comment on the fallback
+        // says so). The fact the compiler actually has is POSITIVE and belongs
+        // to the wrap creator: `iterFormatWrappedDecls_` is `lowerLocalDecl`'s
+        // own report (#2975's `v != preIterWrap`) that the §29.2 coercion minted
+        // an iterator-format frame for THIS declaration, which is precisely
+        // "word 0 is not a class vtable". No new classification predicate — the
+        // same authority #3384 and #3418 already read.
+        //
+        // Unreachable as of the hunk above, and provably so: the coercion only
+        // records a decl whose DECLARED type head is `IEnumerable` or
+        // `IOwningEnumerable` (declaration-less Named — see the gate in
+        // `lowerLocalDecl`, and `lowerStmt` passes `ld->type` as that
+        // `declType`), and the `isSyncIterEnum` arm reads `ld->type` FIRST, so
+        // membership in the report implies that arm matched and returned. The
+        // guard exists so the next edit that re-opens the hole says so instead
+        // of miscompiling; this area has produced #2975, #3384, #3418 and this
+        // issue, tracked structurally as #3419.
+        //
+        // A LOUD `internal:` note, not a hard error, and no registration: the
+        // frame then leaks, which is the recoverable direction — the same trade
+        // #2992's end-of-chain guard and #3157's vtable-less arm record ("a
+        // bounded leak is recoverable; aborting the compile is not").
+        // // per §28.12, §29.1, §28.9, #3437, #2975, #2992, #3157
+        if (iterFormatWrappedDecls_.count(ld)) {
+            ctx_.diagnostics().report(
+                Severity::Warning, ld->span.begin,
+                "internal: `await using var` whose slot holds a §29.2 "
+                "iterator-format wrapper frame reached the generic async "
+                "disposal fallback, which would read the frame's word 0 as a "
+                "class vtable; the frame is left un-reclaimed (a bounded leak) "
+                "— this is a compiler bug — #3437");
+            return;
         }
         Disposal d{it->second, nullptr};
         d.asyncDispose = true;
