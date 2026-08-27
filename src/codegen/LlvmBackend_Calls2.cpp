@@ -3888,6 +3888,25 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
 llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     const IrFootprint before = irFootprint();
     llvm::Value* v = lowerCallDispatch(call);
+    // fix #3421 (§4.7, v0.283): a void-typed result IS "no value" — LLVM `void`
+    // has no size and no alignment, so nothing can be done with the `CallInst`
+    // except discard it. Normalising it HERE, before the classification below,
+    // is what keeps #2963's three-way answer exact: a call to a method declared
+    // without a return type (§4.7 makes it unit) is precisely the "an arm
+    // lowered it and the result is unit" case, and left unnormalised it
+    // answered `!v == false` — "a value came back, nothing degraded" — about a
+    // value that does not exist. Post-#3421 `lowerExpr` normalises the same
+    // shape at the outer boundary, so WITHOUT this line the arrow-body reader
+    // would see a null value and a `false` flag and report #2491's degrade note
+    // on a working program: exactly the false note #2963 exists to suppress
+    // (`public method Twice() => Bump();`, pinned by
+    // tests/lit/call_lowered_as_unit_no_degrade_note_2963.bzl).
+    //
+    // Not a second copy of `lowerExpr`'s rule but the same one applied at the
+    // producer that owns the classification: this site must SEE the normalised
+    // value to classify it, the outer one enforces the invariant for every
+    // other consumer.
+    if (v && v->getType()->isVoidTy()) v = nullptr;
     // A value came back ⇒ nothing was degraded. No value and nothing emitted
     // that DOES anything ⇒ nothing lowered this. No value but real work emitted
     // ⇒ an arm lowered it and the result is unit.
@@ -5065,38 +5084,34 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
-            // fix #3105 (§4.7 / §8.5 / §21.9, v0.255): mirror the
-            // `buildOrderedArgs` rescue for the IIFE shape — a unit-
-            // returning call lowers to a void-typed `CallInst` (non-null
-            // `Value*`, but type void), the `if (!v)` guard below does
-            // not fire, and the void value is pushed into `args` directly.
-            // The IIFE function type is built from the actual LLVM arg
-            // types (line ~4603), so a void-typed parameter makes the
-            // function type invalid and the IR verifier aborts. Detect
-            // the void-typed v BEFORE the guard and substitute the §4.7
-            // unit placeholder byte (i8 0) — the same byte the
-            // `buildOrderedArgs` non-nullable-unit rescue substitutes.
-            // The side effects of the original call (the emitted
-            // `CreateCall`) are preserved: `lowerExpr` already emitted
-            // them, the substitution only replaces the `Value*` the
-            // downstream code pushes into `args`. The IIFE callee is
-            // local, so the formal-parameter type is recovered from the
-            // lambda's own parameter list (iifeLam->params, parallel to
-            // `md->params` in `buildOrderedArgs`).
-            if (v && v->getType()->isVoidTy() && iifeLam &&
-                iifeArgPos < iifeLam->params.size()) {
+            // fix #3105 (§4.7 / §8.5 / §21.9, v0.255): the IIFE shape's
+            // copy of the `buildOrderedArgs` rescue. A unit-typed
+            // argument produces no lowered value, the `if (!v) return
+            // nullptr` guard below therefore fired, and the WHOLE IIFE
+            // call was dropped. The IIFE function type is built from the
+            // actual LLVM argument types, and the callee's signature has
+            // a slot for this parameter, so the caller owes it an
+            // operand. The IIFE callee is local, so the formal-parameter
+            // type is recovered from the lambda's own parameter list
+            // (iifeLam->params, parallel to `md->params` in
+            // `buildOrderedArgs`).
+            //
+            // fix #3421 (§4.7, v0.283): that operand now comes from
+            // `unitValueForTarget` — the one predicate that says what a
+            // unit source lowers to at a target, answering both the `()`
+            // placeholder byte and the `()?` present optional — instead
+            // of this site's own copy of both arms. The test is `!v`
+            // rather than "v is void-typed" because `lowerExpr` now
+            // normalises every unit-typed result to nullptr at the
+            // producer, so a `()` literal and a call to a method declared
+            // without a return type arrive here identically. Side effects
+            // are unaffected: `lowerExpr` already emitted them; only the
+            // result is being supplied.
+            if (!v && iifeLam && iifeArgPos < iifeLam->params.size()) {
                 const ast::Param* fp = &iifeLam->params[iifeArgPos];
-                if (fp->type) {
-                    if (auto* formal0 = ctx_.resolvedType(*fp->type)) {
-                        if (formal0->kind == sema::TypeRef::Kind::Unit &&
-                            !formal0->nullable) {
-                            v = llvm::ConstantInt::get(
-                                unitPlaceholderTy(), 0);
-                        } else if (isNullableUnitTy(formal0)) {
-                            v = nullableUnitPresent(formal0);
-                        }
-                    }
-                }
+                if (fp->type)
+                    v = unitValueForTarget(v, ctx_.resolvedType(*fp->type),
+                                           a.value.get());
             }
             if (!v) return nullptr;
             args.push_back(v);
@@ -13002,24 +13017,25 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             // the `buildOrderedArgs` rescue above. The imported-callee
             // path rewrites the ordered args by hand (no
             // `buildOrderedArgs` call) and runs the same `if (!v) return
-            // nullptr` guard, so a void-typed `lowerExpr` for a unit-
-            // returning argument slips through just like the local case
-            // does. Detect the void-typed v BEFORE the guard and
-            // substitute the §4.7 unit placeholder byte when the formal
-            // parameter (formalTy, resolved from the imported
-            // ParameterSymbol's `resolvedDeclType`) is unit-typed or
-            // nullable-unit. The void-shaped side effects are preserved
-            // — `lowerExpr` already emitted them; the substitution only
-            // replaces the `Value*` the downstream code stores in
-            // `ordered[pi]`.
-            if (v && v->getType()->isVoidTy() && formalTy) {
-                if (formalTy->kind == sema::TypeRef::Kind::Unit &&
-                    !formalTy->nullable) {
-                    v = llvm::ConstantInt::get(unitPlaceholderTy(), 0);
-                } else if (isNullableUnitTy(formalTy)) {
-                    v = nullableUnitPresent(formalTy);
-                }
-            }
+            // nullptr` guard, so a unit-typed argument's absent value
+            // reached that guard and the WHOLE CALL was dropped. The
+            // formal (formalTy, resolved from the imported
+            // ParameterSymbol's `resolvedDeclType`) still occupies a slot
+            // in the callee's signature, so the caller owes it an operand.
+            //
+            // fix #3421 (§4.7, v0.283): that operand is now asked for
+            // through `unitValueForTarget` — the one predicate that says
+            // what a unit source lowers to at a target, answering both the
+            // `()` placeholder byte and the `()?` present optional. This
+            // site carried its own copy of both arms, as did the two
+            // `buildOrderedArgs` siblings. The test is `!v` rather than
+            // "v is void-typed" because `lowerExpr` now normalises EVERY
+            // unit-typed result to nullptr at the producer, so a `()`
+            // literal and a call to a method declared without a return
+            // type arrive here identically. Side effects are unaffected:
+            // `lowerExpr` already emitted them; only the result is being
+            // supplied.
+            if (!v) v = unitValueForTarget(v, formalTy, a.value.get());
             if (!v) {
                 emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
                 return nullptr;

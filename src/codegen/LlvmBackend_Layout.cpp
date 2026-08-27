@@ -3383,14 +3383,32 @@ llvm::Value* Emitter::unboxNarrowedRead(const ast::Expr& e) {
 // construction. It is a no-op whenever a value WAS lowered, whenever the target
 // is not `()?`, and whenever the source is not the non-nullable unit value
 // (a `()?`-typed source already carries its own tag).
+// fix #3421 (§4.7, v0.283): this predicate now answers for the PLAIN `()`
+// target as well, making it the ONE place that says what a unit source lowers
+// to at a value-demanding location. Its call sites in argument position each
+// carried their own copy of that second arm — the duplicated-classification
+// shape #3419 tracks, and the reason #2915/#3095/#3105/#3421 were four
+// separately-filed bugs over one root cause.
+//
+// The placeholder byte is the same one `lowerParamType` and `lowerFieldType`
+// substitute for the `void` a unit parameter or field would otherwise lower to,
+// and the same one `lowerLocalDecl`'s #1619 slot swap uses: `void` is not a
+// valid parameter, field, or `alloca` type. Its CONTENTS are never meaningfully
+// read — §4.7 gives `()` "exactly one value", so no byte pattern is
+// distinguishable from another — it exists only to keep arity and types
+// matching at a location whose signature has a slot for it.
 llvm::Value* Emitter::unitValueForTarget(llvm::Value* v,
                                          const sema::TypeRef* declTy,
                                          const ast::Expr* init) {
     if (v || !declTy || !init) return v;
-    if (!isNullableUnitTy(declTy)) return v;
+    const bool nullableTarget = isNullableUnitTy(declTy);
+    const bool unitTarget =
+        declTy->kind == sema::TypeRef::Kind::Unit && !declTy->nullable;
+    if (!nullableTarget && !unitTarget) return v;
     const sema::TypeRef* srcTy = ctx_.exprType(*init);
     if (!srcTy || srcTy->kind != sema::TypeRef::Kind::Unit || srcTy->nullable)
         return v;
+    if (unitTarget) return llvm::ConstantInt::get(unitPlaceholderTy(), 0);
     return nullableUnitPresent(declTy);
 }
 

@@ -52,6 +52,42 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
     // at the await.
     if (!awaitedTaskTemps_.empty() && atBoundary)
         flushAwaitedTaskTemps();
+    // fix #3421 (spec §4.7 *The unit type*, §21.1 *Variable declarations*,
+    // v0.283): ONE representation for "this expression produced no lowered
+    // value". LLVM `void` is not a value — it has no size and no alignment, so
+    // it cannot be stored, alloca'd, boxed, or passed — and the backend is
+    // already written throughout against the invariant that a unit-typed
+    // expression lowers to `nullptr`: the `()` LITERAL has always returned null
+    // here, and every unit rescue downstream keys on `!v` (`boxForTarget`'s
+    // #2915 arm, its #3095 `()?` sibling, `unitValueForTarget`,
+    // `rescueUnitAssignRhs`, `lowerLocalDecl`'s #2434 zero-init fallback).
+    //
+    // A DIRECT call to a method declared without a return type broke that
+    // invariant. §4.7 makes such a call's type unit ("It is the return type of
+    // methods declared without an explicit return type"), but `CreateCall`
+    // hands back a real void-typed `CallInst` and it was returned verbatim, so
+    // every consumer's `if (v)` took the has-a-value branch on a value that does
+    // not exist. Three consumers reached LLVM with it and killed the compiler
+    // outright, with no diagnostic of any kind: `lowerLocalDecl`'s `CreateStore`
+    // (`var r := C.Nothing();`) and the assignment statement's `CreateStore`
+    // (`r := C.Nothing();`) both trap inside `DataLayout::getABITypeAlign` —
+    // SIGILL, because this libLLVM build compiles that `llvm_unreachable` to
+    // `ud2` — and `boxValue`'s `getTypeAllocSize` (`var o: Object :=
+    // C.Nothing();`) fails the `Ty->isSized()` assertion.
+    //
+    // That the fix belongs HERE, at the producer, is settled by the CLOSURE
+    // form: `var f := C.Nothing; var r := f();` already compiles and runs
+    // correctly today, because the closure-call path performs exactly this
+    // normalization at its own return (`retTy->isVoidTy() ? nullptr : r`,
+    // LlvmBackend_Calls2.cpp). The direct-call form differs from it in nothing
+    // the language recognises, so one normalization covering every producer is
+    // the rule — not a fourth per-consumer repair. #2915, #3095 and #3105 were
+    // each one such repair, filed and fixed separately, for this same root
+    // cause; #3419 tracks that duplication shape.
+    //
+    // THE CALL ITSELF IS UNAFFECTED: `lowerExprInner` has already emitted it, so
+    // its side effects stand. Only the (nonexistent) result is dropped.
+    if (v && v->getType()->isVoidTy()) return nullptr;
     return v;
 }
 

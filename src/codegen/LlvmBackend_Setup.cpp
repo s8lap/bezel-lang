@@ -13541,6 +13541,47 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             lastCallGenericSubst_.clear();
         }
     }
+    // fix #3421 (§4.7, v0.283) — DEFENCE IN DEPTH at the site that crashed.
+    // `v` is void-typed here only if some producer hands back an LLVM `void`
+    // value. `lowerExpr` now normalises every one of those to nullptr (§4.7: a
+    // unit-typed expression HAS no lowered value, and the `()` literal has
+    // always been lowered that way), so this is unreachable from a clean front
+    // end. It stays because the failure mode it guards is the worst one
+    // available: `CreateStore` with a `void` operand goes straight into
+    // `DataLayout::getABITypeAlign`, which has no case for an unsized type and
+    // reaches an `llvm_unreachable` that this libLLVM build compiles to `ud2` —
+    // `bezelc` died with SIGILL, no diagnostic, no source location, nothing
+    // telling the user what was rejected. A compiler that says it cannot beats
+    // one that emits invalid IR, and beats one that traps by a wider margin.
+    //
+    // Severity::Error, UNLIKE the #2434 degrade note below it, and the
+    // difference is not a matter of taste. #2434 is a Warning because its
+    // population is real: #2434's own empirical lit-corpus check found six
+    // currently-LEGAL programs reaching it (the §3/#605 permissive surface, the
+    // `where T: new()` template stub), so an Error there is a false reject.
+    // This guard's population is EMPTY by construction — no legal program can
+    // present a void-typed lowered value once the producer normalises — which
+    // is exactly the "ICE guard, fails the build, safe whatever it substitutes"
+    // shape #2924 records as the reason it does not pin Error sites by name.
+    // Nothing is silently shipped either way: `v` is cleared first, so the
+    // branches below emit a well-formed zero-init rather than invalid IR, and
+    // the Error stops the object from being written.
+    //
+    // `init` is necessarily non-null when this fires (a void value can only
+    // come from lowering an initializer), so the report is guarded rather than
+    // given a synthetic location; `v` is cleared either way, so no path reaches
+    // the store below holding it.
+    if (v && v->getType()->isVoidTy()) {
+        if (init)
+            ctx_.diagnostics().report(
+                Severity::Error, init->span.begin,
+                "internal: a local's initializer lowered to an LLVM `void` value, "
+                "which has no size and cannot be stored (\xC2\xA7""4.7 "
+                "\xE2\x80\x94 a unit-typed expression has no lowered "
+                "value; every producer must report it as one) "
+                "\xE2\x80\x94 #3421");
+        v = nullptr;
+    }
     if (v) {
         builder_.CreateStore(v, slot);
     } else if (slotTy->isPointerTy() && declType &&
