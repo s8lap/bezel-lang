@@ -32672,6 +32672,13 @@ llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
     // overflow. Comparing the loaded word against a known global instead is
     // exactly as discriminating (a unit box's word 0 IS this global) and needs
     // no second dereference. Same defect class as #2921/#2923, one member over.
+    //
+    // fix #3422 (§8.3, v0.283): the test itself moved to
+    // `emitIsBoxedUnitAgainst` so that this thunk and the UNBOXED
+    // `u.Equals(x)` arm (LlvmBackend_Calls2.cpp) ask ONE question in ONE
+    // place. `vtGV` is passed explicitly because `unitBoxVtable_` is not
+    // published until the end of this function, so the wrapper that looks it
+    // up cannot be used from inside here.
     llvm::Function* eqFn;
     {
         auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
@@ -32680,26 +32687,12 @@ llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
                                       "bz$uniteq", module_.get());
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqFn);
         ThunkScope scope(currentFn_, builder_, eqFn, entry);
-        llvm::Value* other = eqFn->getArg(1);
-        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
-        auto* notNullBB = llvm::BasicBlock::Create(llvm_, "uniteq.nonnull", eqFn);
-        auto* endBB     = llvm::BasicBlock::Create(llvm_, "uniteq.end",     eqFn);
-        builder_.CreateCondBr(
-            builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
-
-        builder_.SetInsertPoint(notNullBB);
-        // ONE load: `other`'s first word. No second dereference — see above.
-        llvm::Value* otherVtbl =
-            builder_.CreateLoad(ptrTy(), other, "uniteq.ovtbl");
-        llvm::Value* same = builder_.CreateICmpEQ(
-            otherVtbl, llvm::ConstantExpr::getPointerCast(vtGV, ptrTy()));
-        builder_.CreateBr(endBB);
-
-        builder_.SetInsertPoint(endBB);
-        auto* phi = builder_.CreatePHI(i1(), 2, "uniteq.res");
-        phi->addIncoming(builder_.getFalse(), entry);  // other was null
-        phi->addIncoming(same, notNullBB);
-        builder_.CreateRet(phi);
+        // The helper's guards cannot fire here (a `ptr` argument, a live
+        // `vtGV`, `currentFn_` == eqFn under ThunkScope), but a thunk that
+        // `CreateRet(nullptr)`s would be malformed IR rather than a decline, so
+        // the fallback is spelled out.
+        llvm::Value* eq = emitIsBoxedUnitAgainst(eqFn->getArg(1), vtGV);
+        builder_.CreateRet(eq ? eq : builder_.getFalse());
     }
 
     // --- GetHashCode: a constant (see the note above) ---------------------
@@ -32717,7 +32710,10 @@ llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
         // unit box's hash would pass vacuously against the pre-fix behaviour.
         // Any constant satisfies §8.3 for a one-valued type; this one is
         // recognizable in a failure report.
-        builder_.CreateRet(builder_.getInt32(0x756E6974));  // 'u','n','i','t'
+        // fix #3422: the literal moved to `kUnitHashCode` so the unboxed
+        // `u.GetHashCode()` arm answers with the SAME integer — §8.3's
+        // hash-equality invariant across the two spellings, not tidiness.
+        builder_.CreateRet(builder_.getInt32(kUnitHashCode));  // 'u','n','i','t'
     }
 
     if (!inlineArrayBoxItmap_) {
@@ -32753,6 +32749,71 @@ llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
 llvm::GlobalVariable* Emitter::unitBoxDescriptor() {
     ensureUnitBoxVtable();
     return unitBoxDesc_;
+}
+
+
+// fix #3422 (§8.3 *`Equals` and `GetHashCode`* / §8.6 "Boxing of the unit
+// value", v0.283): "is `other` — an `Object?` reference — a boxed `()`?".
+//
+// §8.3's table has NO unit row, so the answer below is a reading the document
+// does not state, and it is the SAME reading #2915 already committed to when it
+// minted the unit box: the unit type has exactly one value, so §8.3's
+// Primitive-row "Value comparison" can only mean "the other operand is also a
+// unit", and §8.3's invariant then holds by construction. Extracting it here is
+// what keeps that reading singular: `bz$uniteq` (the box vtable's Equals slot)
+// is emitted from this function, and `lowerCallDispatch`'s UNBOXED
+// `u.Equals(x)` arm calls it — one predicate, two spellings, no drift (#3419).
+//
+// ⚠ ONE LOAD, NO SECOND DEREFERENCE — the #2915 gate-2 ASan finding, preserved
+// verbatim in behaviour by this extraction. `Equals(other: Object?)` admits ANY
+// Object, and not every Object has a vtable at word 0: for a `%bz.string` (and
+// the vtable-less builtins #2921/#2923 are about) word 0 is DATA. Loading it is
+// safe — every heap object has a first word — but DEREFERENCING that datum
+// reads wherever it points, which for an interned literal is a small global:
+// a `global-buffer-overflow in bz$uniteq`, invisible to the plain oracle and
+// caught only because #2633's dual-oracle rule makes both run. Comparing the
+// loaded word against the known vtable global instead is exactly as
+// discriminating (a unit box's word 0 IS this global) and needs no second
+// dereference. `boxUnitValue` mints a FRESH box per site, so pointer identity
+// would be wrong; the test has to be on the vtable.
+//
+// The vtable is passed in rather than looked up because `ensureUnitBoxVtable`
+// publishes `unitBoxVtable_` only at its end and is itself one of the two
+// callers; `emitIsBoxedUnit` below is the lookup form for everyone else.
+llvm::Value* Emitter::emitIsBoxedUnitAgainst(llvm::Value* other,
+                                             llvm::GlobalVariable* unitVt) {
+    if (!other || !unitVt || !other->getType()->isPointerTy()) return nullptr;
+    auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+    llvm::BasicBlock* entryBB = builder_.GetInsertBlock();
+    if (!entryBB || !currentFn_) return nullptr;
+    auto* notNullBB =
+        llvm::BasicBlock::Create(llvm_, "uniteq.nonnull", currentFn_);
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "uniteq.end", currentFn_);
+    builder_.CreateCondBr(
+        builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
+
+    builder_.SetInsertPoint(notNullBB);
+    llvm::Value* otherVtbl =
+        builder_.CreateLoad(ptrTy(), other, "uniteq.ovtbl");
+    llvm::Value* same = builder_.CreateICmpEQ(
+        otherVtbl, llvm::ConstantExpr::getPointerCast(unitVt, ptrTy()));
+    // The comparison's own block, not `notNullBB` by name: a folded ICmp can
+    // leave the builder elsewhere, and a PHI's incoming block must be the
+    // predecessor that actually branches here.
+    llvm::BasicBlock* sameBB = builder_.GetInsertBlock();
+    builder_.CreateBr(endBB);
+
+    builder_.SetInsertPoint(endBB);
+    auto* phi = builder_.CreatePHI(i1(), 2, "uniteq.res");
+    phi->addIncoming(builder_.getFalse(), entryBB);  // other was null (§8.4)
+    phi->addIncoming(same, sameBB);
+    return phi;
+}
+
+
+// fix #3422 (§8.3 / §8.6): the lookup form of the test above.
+llvm::Value* Emitter::emitIsBoxedUnit(llvm::Value* other) {
+    return emitIsBoxedUnitAgainst(other, ensureUnitBoxVtable());
 }
 
 

@@ -2652,6 +2652,33 @@ private:
     // comparison unspecified either way).
     llvm::Value* boxUnitValue();
 
+    // fix #3422 (§8.3 *`Equals` and `GetHashCode`*, v0.283): the ONE hash the
+    // unit type answers with. The box thunk `bz$unithash` (installed at the
+    // unit box vtable's kGetHashCodeSlot) and the UNBOXED `u.GetHashCode()`
+    // arm in `lowerCallDispatch` must return the same integer, and §8.3
+    // REQUIRES it rather than it being tidiness: `u.Equals(o)` is true for a
+    // boxed-`()` `o`, so §8.3's "if `a.Equals(b)` then `a.GetHashCode() =
+    // b.GetHashCode()`" makes any disagreement between the two spellings a
+    // violated invariant. Deliberately NOT 0 — a degenerate 0 is what every
+    // dropped/zero-init path already produces (#2804 recorded that exact trap),
+    // so a test asserting it would pass vacuously. Any constant satisfies §8.3
+    // for a one-valued type; 'u','n','i','t' is recognizable in a report.
+    static constexpr uint32_t kUnitHashCode = 0x756E6974u;
+
+    // fix #3422 (§8.3 / §8.6 "Boxing of the unit value", v0.283): "is `other`
+    // — an `Object?` reference — a boxed `()`?", as an i1. The ONE place that
+    // decides it: `bz$uniteq` (the box vtable's kEqualsSlot) is emitted FROM
+    // this helper and the unboxed `u.Equals(x)` arm calls it directly, so the
+    // two spellings of §8.3's unit equality cannot drift apart (#3419's
+    // duplicated-classification shape is what this avoids).
+    llvm::Value* emitIsBoxedUnit(llvm::Value* other);
+    // The same test against an ALREADY-KNOWN unit box vtable, for the one
+    // caller that is part-way through minting it: `ensureUnitBoxVtable`
+    // publishes `unitBoxVtable_` only at its end, so it cannot re-enter the
+    // wrapper above.
+    llvm::Value* emitIsBoxedUnitAgainst(llvm::Value* other,
+                                        llvm::GlobalVariable* unitVt);
+
     // fix #3127 (§8.6 "Boxing of the compiler-intrinsic `Range<T>`", v0.252):
     // per-`Range<T>` box descriptor + box vtable, minted on demand. Like
     // `[N]T` (§15.1 makes the size part of the type), `Range<T>` has no stable

@@ -4092,14 +4092,73 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // expression by construction (unit lowers to LLVM `void`; #3421 normalizes
     // the producer), which is why the result is deliberately discarded rather
     // than tested — a null here means "unit", not "failed".
-    if (call.args.empty() && call.callee) {
+    //
+    // fix #3422 (§8.1 / §8.3 / §8.6, v0.283): the arm now answers `Equals` and
+    // `GetHashCode` on a `()` receiver too. §8.1 declares all four universals on
+    // `Object` and states that "records, enums, primitives, inline arrays, and
+    // the unit type derive via boxing ([§8.6])"; §8.5 states the universality
+    // outright — "The defaults above are generated for **every** type of the
+    // applicable kind, wherever declared". So an answer is mandatory, and three
+    // of the four worked while these two lowered to nothing at all: the
+    // enclosing statement was dropped whole with only #3079's `internal:` note,
+    // or the receiving local was zero-initialized (`False` / `0`) with #2434's.
+    //
+    // WHAT THE ANSWER IS. §8.3's table has no unit row, so this is a reading the
+    // document does not state — and deliberately the SAME reading #2915 already
+    // committed to for the BOXED form (`ensureUnitBoxVtable`): the unit type has
+    // exactly one value, so §8.3's Primitive-row "Value comparison" can only
+    // mean "the other operand is also a unit", and "Value-based" hashing of a
+    // one-valued type can only be a constant. The equality test is not
+    // re-derived here — `emitIsBoxedUnit` IS the box thunk's own body — and the
+    // hash is `kUnitHashCode`, the box thunk's own constant. §8.3's invariant
+    // ("if `a.Equals(b)` then `a.GetHashCode() = b.GetHashCode()`") makes that
+    // sharing REQUIRED, not merely tidy: `u.Equals(o)` is true for a boxed-`()`
+    // `o`, so the two spellings' hashes must agree.
+    //
+    // The ARGUMENT is classified statically wherever its type settles the
+    // answer, which keeps the common cases allocation-free:
+    //   * a `()`-typed argument boxes to a unit box (§8.6) ⇒ constant true;
+    //   * a present `()?` argument boxes to "a boxed `T` (the non-nullable
+    //     form). The nullable wrapper is stripped during boxing" (§8.6), and a
+    //     null one to "a null `Object` reference" ⇒ its own hasValue tag;
+    //   * a reference-shaped argument (Object / interface / class / string /
+    //     `null`) needs the runtime vtable test — `emitIsBoxedUnit` is safe on
+    //     every one of them (see its ⚠ note);
+    //   * anything else is a non-unit VALUE kind, which cannot be a unit box
+    //     under any boxing ⇒ constant false, with the argument still lowered
+    //     for its effects (§22.5's "observable … and is normative").
+    // Note this deliberately does NOT route the argument through
+    // `boxForTarget`: an `Object`-formal box is a fresh `calloc` per call site
+    // (`boxUnitValue`), and nothing here needs the box — only the answer.
+    if (call.callee) {
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
-            if (ma->member == "ToString" && ma->target) {
-                if (const sema::TypeRef* rt = ctx_.exprType(*ma->target)) {
-                    if (rt->kind == sema::TypeRef::Kind::Unit) {
-                        (void)lowerExpr(*ma->target);  // per §22.3 / §7.5
+            const sema::TypeRef* rt =
+                ma->target ? ctx_.exprType(*ma->target) : nullptr;
+            if (rt && rt->kind == sema::TypeRef::Kind::Unit) {
+                const bool isToStr = ma->member == "ToString" &&
+                                     call.args.empty();
+                const bool isHash  = ma->member == "GetHashCode" &&
+                                     call.args.empty();
+                const bool isEq    = ma->member == "Equals" &&
+                                     call.args.size() == 1 &&
+                                     call.args[0].value;
+                if (isToStr || isHash || isEq) {
+                    (void)lowerExpr(*ma->target);  // per §22.3 / §7.5
+                    if (isToStr)
                         return lowerStringLiteral("\"()\"", /*verbatim=*/false);
-                    }
+                    if (isHash) return builder_.getInt32(kUnitHashCode);
+                    const ast::Expr* arg = call.args[0].value.get();
+                    const sema::TypeRef* at = ctx_.exprType(*arg);
+                    llvm::Value* other = lowerExpr(*arg);  // per §22.5
+                    if (at && at->kind == sema::TypeRef::Kind::Unit &&
+                        !at->nullable)
+                        return builder_.getTrue();
+                    if (at && isNullableUnitTy(at) && other &&
+                        other->getType()->isStructTy())
+                        return nullablePrimHasValue(other);
+                    if (other && other->getType()->isPointerTy())
+                        if (llvm::Value* r = emitIsBoxedUnit(other)) return r;
+                    return builder_.getFalse();
                 }
             }
         }
