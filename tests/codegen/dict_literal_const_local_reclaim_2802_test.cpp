@@ -8,11 +8,14 @@
 // `t := t + d.Count`).
 //
 // SCOPE OF FIX: SYNC only. The async axis (a const dict literal held across
-// an await) remains a SEPARATE defect — the disposal is registered but the
-// async frame's slot-spill path doesn't preserve the const local's stored
-// value across the suspend, so the runtime free sees a stale slot. Filed as
-// a follow-up issue; see the async test case below for the documented-defer
-// rationale.
+// an await) was a SEPARATE defect — the disposal is registered but the async
+// frame's slot-spill path did not preserve the const local's stored value
+// across the suspend, so the runtime free saw a stale slot. It was filed as
+// #3375 and is now FIXED (collectSuspendLocals had no ast::LocalConstDecl arm,
+// so no §21.1 `const` local ever got a state-machine frame field at all). The
+// documented-deferred placeholder that used to sit at the bottom of this file
+// is replaced by the real assertion; the full #3375 axis grid lives in
+// tests/codegen/async_const_local_frame_spill_3375_test.cpp.
 //
 // Root cause: §21.1's `const` local is a different AST node from a `var`
 // local — `LocalConstDecl : Stmt` rather than `LocalDecl : Stmt` — and the
@@ -176,37 +179,32 @@ BEZEL_TEST(dict_literal_const_local_reclaim_2802,
 
 // ── ASYNC axis: a const dict literal held across an await.
 //
-// DEFERRED to follow-up issue (NOT fixed by #2802). Verified against this
-// lane's bezelc: the `const d: Dictionary<string, int> := ["a":10,"b":20]`
-// form in an `async` method still leaks 420 bytes / 5 allocations under ASan
-// even with the LocalDeclInitView fix applied, while the equivalent `var`
-// form does NOT leak (verified: var async probe exits 0, const async probe
-// reports LeakSanitizer summary). The disposal registration IS reached
-// (LlvmBackend_Async.cpp line 1333 calls collectBorrowingArrayFreeEligible
-// for async bodies; the const-decl LocalDeclInitView finds the node; the
-// dict-disposal IS pushed onto disposeStack_.back() — DEBUG instrumentation
-// confirmed `disposeStack_.back().size()=1` at scope end). But the runtime
-// slot's stored value does not survive the suspend for the const form —
-// the disposal emits `bz_dict_free(slot_load, ...)` against a slot whose
-// value at resume-fall-off time is not the original dict pointer. This is
-// a SEPARATE async-frame-spill mechanism gap specific to const locals
-// (var locals have their own spill code path that const doesn't reuse).
-// Fixing requires understanding the async frame's `smLocalFields_` /
-// `mapSuspendLocalSlot` contract for the const form. Filed as follow-up.
+// Was DEFERRED out of #2802 and filed as #3375; FIXED there. The cause was
+// not in the disposal registration (which #2802's LocalDeclInitView widening
+// had already made reach the const decl) but one layer down, in
+// collectSuspendLocals (src/codegen/LlvmBackend_Iterators.cpp) — the sole
+// authority deciding which body locals get a state-machine frame field. It
+// matched ast::LocalDecl only, so a §21.1 `const` local got no frame field,
+// its alloca lived only in the current activation of the resume function, and
+// after the suspend the emitted `bz_dict_free` loaded a fresh (zeroed) slot
+// and its null guard skipped the free — a 420-byte / 5-allocation leak,
+// measured on the pre-#3375 compiler against exactly this program. The case
+// is kept here as the #2802-to-#3375 seam; the
+// broader grid (value correctness for scalars and strings, Set/Array
+// literals, awaiting loops, try regions, and the iterator `yield return`
+// sibling) is in async_const_local_frame_spill_3375_test.cpp.
 //
-// VERIFIED-WORKING counterpart (var async): `var d: Dictionary<string, int>
-// := ["a": 10, "b": 20]; await Task.Delay(30); return d.Count;` exits 0
-// under ASan — the LocalDeclInitView refactor preserved the existing #2143
-// var async path. The const form is the missing sibling.
-//
-// per §28.9, §15.4, §21.1, §30.2 (issue #2802; async axis deferred)
+// per §28.9, §15.4, §21.1, §30.2 (issues #2802 / #3375)
 BEZEL_TEST(dict_literal_const_local_reclaim_2802,
-           const_string_key_dict_literal_across_await_spec_28_9_15_4_21_1_30_2_DEFERRED) {
-    // Verified-leaks-against-this-lane: the const dict is allocated (420
-    // bytes / 5 allocations) and the disposal IS registered (DEBUG trace
-    // confirms) but the slot's value at resume-fall-off doesn't match the
-    // original. Filed as follow-up issue. Marked _DEFERRED to make the
-    // deferral obvious in gtest output and avoid a false-positive green
-    // that masks the unfixed defect.
-    BEZEL_EXPECT_EQ(0, 0);  // documented-deferred (see comment above)
+           const_string_key_dict_literal_across_await_spec_28_9_15_4_21_1_30_2) {
+    BEZEL_EXPECT_EQ(runChecked(
+        "module M; import System; "
+        "class C "
+        "  public static async method Main(): Task<int> "
+        "    const d: Dictionary<string, int> := [\"a\": 10, \"b\": 20]; "
+        "    await Task.Delay(30); "
+        "    return d.Count; "
+        "  end Main; "
+        "end C;"),
+        2);
 }

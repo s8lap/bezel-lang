@@ -92,34 +92,66 @@ void Emitter::computeFrameCapturedLocals(
 void Emitter::collectSuspendLocals(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
     std::vector<std::pair<const ast::Node*, llvm::Type*>>& out) {
+    // #461 (§30 async frames): the frame SLOT type for a suspend-live local
+    // must be at least as wide as its alloca, or the per-suspend spill (which
+    // stores `alloca->getAllocatedType()` bytes into the slot — see
+    // emitAwaitSuspend) overflows into the adjacent frame field and corrupts it
+    // (→ SIGSEGV on resume). When neither an annotation nor an initializer
+    // exprType is available, default to a POINTER-WIDTH slot (not i32): ptr is
+    // large enough to hold any scalar alloca (i32/i64/bool/ptr) without
+    // overflow, so a local with an unresolved type can never clobber its
+    // neighbours. With a known type the exact lowered type is used (so an
+    // `int?`/record/value struct still gets its precise slot and round-trips
+    // correctly).
+    //
+    // §27.5 / §30 (#808 exposure): a lambda-captured local's slot is rebound
+    // to a shared CELL POINTER (boxLocalSlot); the frame field must be
+    // ptr-typed or the 8-byte cell-pointer spill overflows a narrower value
+    // field and corrupts its neighbour (SIGSEGV on resume).
+    // frameCapturedLocals_ is computed per frame body.
+    //
+    // fix #3375: hoisted out of the LocalDecl arm so the §21.1 `const` arm
+    // below derives its slot type by the SAME rule rather than a second copy —
+    // the two forms differ only in which field carries the annotation
+    // (`LocalDecl::type` / `LocalConstDecl::type`) and the initializer
+    // (`LocalDecl::initializer` / `LocalConstDecl::value`).
+    auto frameSlotTy = [&](const ast::Node* node, const ast::Type* declType,
+                           const ast::Expr* init) -> llvm::Type* {
+        llvm::Type* ty = ptrTy();
+        if (declType) {
+            if (auto* rt = ctx_.resolvedType(*declType)) ty = lowerTypeRef(rt);
+        } else if (init) {
+            if (auto* rt = ctx_.exprType(*init)) ty = lowerTypeRef(rt);
+        }
+        if (frameCapturedLocals_.count(static_cast<const void*>(node)))
+            ty = ptrTy();
+        return ty;
+    };
     for (const auto& s : body) {
         if (!s) continue;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get())) {
-            // #461 (§30 async frames): the frame SLOT type for a suspend-live
-            // local must be at least as wide as its alloca, or the per-suspend
-            // spill (which stores `alloca->getAllocatedType()` bytes into the
-            // slot — see emitAwaitSuspend) overflows into the adjacent frame
-            // field and corrupts it (→ SIGSEGV on resume). When neither an
-            // annotation nor an initializer exprType is available, default to a
-            // POINTER-WIDTH slot (not i32): ptr is large enough to hold any
-            // scalar alloca (i32/i64/bool/ptr) without overflow, so a local with
-            // an unresolved type can never clobber its neighbours. With a known
-            // type the exact lowered type is used (so an `int?`/record/value
-            // struct still gets its precise slot and round-trips correctly).
-            llvm::Type* ty = ptrTy();
-            if (ld->type) {
-                if (auto* rt = ctx_.resolvedType(*ld->type)) ty = lowerTypeRef(rt);
-            } else if (ld->initializer) {
-                if (auto* rt = ctx_.exprType(*ld->initializer)) ty = lowerTypeRef(rt);
-            }
-            // §27.5 / §30 (#808 exposure): a lambda-captured local's slot is
-            // rebound to a shared CELL POINTER (boxLocalSlot); the frame field
-            // must be ptr-typed or the 8-byte cell-pointer spill overflows a
-            // narrower value field and corrupts its neighbour (SIGSEGV on
-            // resume). frameCapturedLocals_ is computed per frame body.
-            if (frameCapturedLocals_.count(static_cast<const void*>(ld)))
-                ty = ptrTy();
-            out.push_back({ld, ty});
+            out.push_back(
+                {ld, frameSlotTy(ld, ld->type.get(), ld->initializer.get())});
+        } else if (auto* lc =
+                       dynamic_cast<const ast::LocalConstDecl*>(s.get())) {
+            // fix #3375 (§21.1 runtime const locals / §29.3 / §30.2): a `const`
+            // local is a SINGLE-ASSIGNMENT local binding — initialized once at
+            // its declaration by ordinary runtime evaluation and readable for
+            // the rest of its scope, exactly like a `var` in every respect
+            // except assignability. It therefore needs a state-machine frame
+            // field for the same reason a `var` does: without one its alloca
+            // lives only in the current invocation of the resume / MoveNext
+            // function, so after a suspend the reload sees a FRESH, zeroed (or
+            // garbage) stack slot. Before this arm existed, `const a: int := 41;
+            // await ...; return a;` returned stack garbage, a `const s: string`
+            // SEGV'd on first use after the await, and a `const d: Dictionary<..>
+            // := [...]` literal's §28.9 scope-end reclaim read null out of the
+            // slot and skipped the free (the #3375 leak). `lowerLocalDecl`
+            // already keys its frame-backing path on the generic `declNode`
+            // (LlvmBackend_Setup.cpp) and lowerStmt lowers a LocalConstDecl
+            // through it, so registering the node here is all that is needed.
+            out.push_back(
+                {lc, frameSlotTy(lc, lc->type.get(), lc->value.get())});
         } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
             // The loop variable is anchored on the ForStmt node.
             if (!fs->varName.empty()) {
@@ -207,6 +239,21 @@ void Emitter::collectSuspendLocals(
                             ty = lowerTypeRef(rt);
                     }
                     out.push_back({ald, ty});
+                }
+                // fix #3375 (§21.1): the `const` sibling of the one-liner arm
+                // above — `catch E => const a := await f();`. Same reason as the
+                // LocalConstDecl arm in the main loop: a §21.1 const local needs
+                // a frame field or it does not survive the suspend. (The slot
+                // type comes from frameSlotTy, whose unresolved-type default is
+                // #461's pointer-width slot; the `var` sibling directly above
+                // still defaults to i32 — that pre-existing divergence is left
+                // alone here and filed separately rather than widened by a lane
+                // that is not about it.)
+                else if (auto* alc =
+                             dynamic_cast<const ast::LocalConstDecl*>(ab)) {
+                    out.push_back(
+                        {alc, frameSlotTy(alc, alc->type.get(),
+                                          alc->value.get())});
                 }
             }
             if (ts->hasFinally) collectSuspendLocals(ts->finallyBody, out);
