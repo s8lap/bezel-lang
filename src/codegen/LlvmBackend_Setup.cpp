@@ -13347,8 +13347,27 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         }
     }
     // fix #2975: record the coercion's own verdict (see `preIterWrap` above).
-    if (declNode && v && v != preIterWrap)
-        iterFormatWrappedDecls_.insert(declNode);
+    //
+    // fix #3384 (§28.6 / §29.2 / §28.3, v0.283): the verdict is now the SOLE
+    // authority for the DECL-SITE ownership claim as well (see
+    // `registerIterableSourceDisposal`), so record it PER LOWERING rather than
+    // stickily. A decl body lowered more than once — a generic method emitted
+    // once per instantiation — would otherwise carry an earlier instantiation's
+    // WRAPPED verdict into a lowering in which the coercion DECLINED
+    // (`wrapUserClassAsIEnumerable` has five decline paths), and a claim over a
+    // frame that was never minted is a double-free, strictly worse than the leak
+    // this fix closes. Both readers of the set
+    // (`registerIterableSourceDisposal` and, through it,
+    // `rawUserClassInBuiltinInterfaceSlot`) ask immediately after this call
+    // returns — `lowerStmt`'s LocalDecl arm calls `lowerLocalDecl` and then the
+    // registrations — so clearing a stale verdict here cannot lose one that is
+    // still needed.
+    if (declNode) {
+        if (v && v != preIterWrap)
+            iterFormatWrappedDecls_.insert(declNode);
+        else
+            iterFormatWrappedDecls_.erase(declNode);
+    }
     llvm::Type* declaredTy = declType ? lowerType(declType) : nullptr;
     // #914: a narrowed value-nullable initializer (sema accepted the assignment
     // because null-flow proved it non-null) lowered to the {flag, value} struct,
@@ -14180,38 +14199,62 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     // owns). A bare identifier/member initializer whose value is ALREADY an
     // IEnumerable (`var b := a;`) is an ALIAS — the aliased local already owns and
     // disposes the object, so registering disposal here too would double-free.
-    bool wrappedHere = false;
-    if (ld->type && ld->initializer) {
-        const sema::TypeRef* declTR = ctx_.resolvedType(*ld->type);
-        const sema::TypeRef* initTR = ctx_.exprType(*ld->initializer);
-        bool declIsPureIEnum = declTR && declTR->kind == sema::TypeRef::Kind::Named &&
-            !declTR->declaration && declTR->astNode && declTR->astNode->name &&
-            !declTR->astNode->name->parts.empty() &&
-            declTR->headName() == "IEnumerable";
-        if (declIsPureIEnum && initTR &&
-            initTR->kind == sema::TypeRef::Kind::Named) {
-            bool initIsArray = initTR->astNode && initTR->astNode->name &&
-                !initTR->astNode->name->parts.empty() &&
-                initTR->headName() == "Array";
-            // fix #1069 / stdlib §4.10: a `Set<T>`/`OwningSet<T>` init is wrapped
-            // at this decl site too (lowerLocalDecl) — a class-element set into a
-            // borrowing array enumerator, a dict-backed one into an OWNING
-            // enumerator over a fresh key snapshot. Both are freshly allocated
-            // here and owned by this local, so both need the scope-end slot-1
-            // Dispose (the borrowing wrapper frees only its own frame; the owning
-            // one also frees the snapshot). The SOURCE set is never disposed by
-            // either — no double-free with the set's own binder.
-            bool initIsSet = initTR->astNode && initTR->astNode->name &&
-                !initTR->astNode->name->parts.empty() &&
-                (initTR->headName() == "Set" ||
-                 initTR->headName() == "OwningSet");
-            // A user-class (declaration-carrying) init is wrapped (line 5413), as
-            // is an Array init (line 5410). A declaration-less IEnumerable init is
-            // NOT wrapped — it is a pre-existing IEnumerable value (an alias).
-            wrappedHere = initIsArray || initIsSet ||
-                          initTR->declaration != nullptr;
-        }
-    }
+    //
+    // fix #3384 (§28.6 / §29.2 / §28.3, v0.283): ask the DECL-SITE wrap-creator
+    // what it actually did instead of re-deriving it. `lowerLocalDecl`'s §29.2
+    // coercion reports every frame it minted for this decl in
+    // `iterFormatWrappedDecls_` (#2975's `v != preIterWrap` self-report), and
+    // `lowerStmt` runs that coercion IMMEDIATELY before this registration, so
+    // the report is exact and current at this point.
+    //
+    // The predicate that stood here was a second, independent spelling of the
+    // coercion's admissible (declared head × initializer family) grid, and the
+    // two had DRIFTED — the same "duplicated classification predicate drifts
+    // from the predicate it mirrors" defect class as #3392 and #3355. The
+    // coercion admits declared head `IEnumerable` OR `IOwningEnumerable` over
+    // Array/OwningArray/OwningBuffer/Stack/OwningStack/Queue/OwningQueue
+    // (#1177), Set/OwningSet (#1069), (Owning)LinkedList (#1177), a lazy LINQ
+    // pipeline (#1911) and a user class (#552); this claim admitted only the
+    // `IEnumerable` head over `Array`, `Set`/`OwningSet` and a
+    // declaration-carrying init. Every mint outside that narrow re-spelling was
+    // therefore minted and never claimed, and nothing else frees a wrapper
+    // frame — the source collection's own binder disposes the BACKING, not the
+    // wrap. MEASURED on d05399c, 50 executions of `var e: IEnumerable<Item> :=
+    // a;` over a `using var a := new OwningArray<Item>()`: 1600 bytes leaked in
+    // 50 allocations under LSan (32 B per `{vtable, arr, idx, esz}` borrowing
+    // frame); the `IOwningEnumerable<Item>` twin leaked 1200 bytes in 50
+    // allocations (24 B per `{vtable, arr, pending}` draining frame, #3385's
+    // `wrapArrayAsIOwningEnumerator`); Stack, Queue and LinkedList sources at
+    // the `IEnumerable<int>` head each leaked 1600 bytes in 50 allocations. An
+    // `Array<int>` and a `Set<int>` source — the two families the old
+    // re-spelling did admit — were clean, which is what identified the drift.
+    //
+    // CLAIM ⊆ MINT, by construction: the set is written at exactly one site,
+    // under the coercion's own `v != preIterWrap` observation, and is cleared
+    // there whenever the coercion declines (so a decl lowered once per generic
+    // instantiation cannot inherit an earlier WRAPPED verdict). Every frame this
+    // claim now covers is a fresh `calloc` the coercion performed for THIS decl,
+    // and the slot-1 Dispose it registers is the frame's own: the borrowing
+    // wraps (`wrapArrayAsIEnumerable`, `wrapStackAsIEnumerator`,
+    // `wrapLinkedListAsIEnumerable`, `wrapNestedArrayAsIEnumerable`) free only
+    // `self`, and `wrapArrayAsIOwningEnumerator` frees `self` plus an
+    // advanced-but-untaken pending it owns per §29.1 — none of them frees the
+    // source backing, so no source binder is double-freed. The OWNING wraps do
+    // free a backing, but never a backing another name holds:
+    // `wrapOwnedArrayAsIEnumerable` / `wrapOwnedStackAsIEnumerator` /
+    // `wrapOwnedLinkedListAsIEnumerable` are minted only for a `new` initializer
+    // — bound to no other name by construction — and were already claimed here
+    // through `isNew`; `drainLazyPipelineToOwnedIEnumerable` frees the array
+    // `bz_lazy_to_array` freshly allocated for it, not the source (its Set arm
+    // was already claimed through the old `initIsSet`, and its lazy-pipeline arm
+    // through `isCall` whenever the pipeline is spelled inline). The one shape
+    // this widening newly hands an owning Dispose is a lazy pipeline reached
+    // through an IDENTIFIER (`var lz := xs.Select(f); var e: IEnumerable<int> :=
+    // lz;`), and there too the freed array is the drain's own fresh allocation:
+    // MEASURED clean under ASan+LSan, with the iterated values intact, for
+    // `var lz := a.Select(lambda(x) => x + 1); var e: IEnumerable<int> := lz;`
+    // over 20 iterations.
+    bool wrappedHere = iterFormatWrappedDecls_.count(ld) != 0;
     bool isCall = dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) != nullptr;
     bool isNew = dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) != nullptr;
     bool ownsSource = isCall || isNew || wrappedHere;
