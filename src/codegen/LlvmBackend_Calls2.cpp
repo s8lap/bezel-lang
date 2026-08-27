@@ -2752,14 +2752,45 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     // receiver exactly once even when it has side effects (#1075). The dispatch
     // core itself is factored into lowerValueSemMethodOn so the null-conditional
     // path can reuse it with the unwrapped nullable inner value.
-    bool primValueSem = recvTy->kind == sema::TypeRef::Kind::Primitive &&
-        recvTy->primitive != sema::PrimitiveType::String &&
-        recvTy->primitive != sema::PrimitiveType::Object &&
+    //
+    // fix #3481 (§7.4 / §12.7 / §8.5, v0.283): classify — and dispatch — on the
+    // receiver's NON-NULLABLE form when it is a nullable VALUE type. The three
+    // predicates below read `kind`, `primitive` and `declaration->kind`, none of
+    // which `?` changes, so each one already answered "yes" for `Pt?`, `Color?`
+    // and `Sh?` — and then handed `lowerValueSemMethodOn` the `{i8 hasValue; T}`
+    // tagged struct as if it were the bare payload. Measured on 0c5ecd1:
+    // `p.ToString()` on `Pt? := new Pt(7, 8)` printed `Pt(X: 1, Y: 7)` — the
+    // fields read one slot late, so the rendered `X` is literally the hasValue
+    // TAG — and `s.ToString()` on an auto-hashable `Sh?` SEGFAULTED the
+    // compiler (rc=139, no diagnostic). §7.4 makes every one of these calls
+    // legal: the receiver is flow-narrowed to non-null before the member access,
+    // so the payload is the value the member is being invoked on.
+    //
+    // The unwrap is `lowerNullCondValueSemCall`'s, verbatim in shape — that is
+    // the `?.` spelling of this same dispatch, and it has always taken
+    // `nullablePrimValue(recv)` with `innerTy.nullable = false` (which is why
+    // `v?.ToString()` and `v!.ToString()` were both correct on the tree that
+    // miscompiled `v.ToString()`). Classifying off the unwrapped type rather
+    // than adding a nullable arm to each of the three predicates is what keeps
+    // the choice DIAGNOSTIC intact: a non-auto-hashable `Own?` still reaches
+    // `lowerValueSemMethodOn`'s #2479 message rather than a rendering, exactly
+    // as `Own` does.
+    sema::TypeRef unwrappedRecvTy;
+    const sema::TypeRef* dispatchTy = recvTy;
+    const bool nullableValueRecv = isNullableValueTy(recvTy);
+    if (nullableValueRecv) {
+        unwrappedRecvTy = *recvTy;
+        unwrappedRecvTy.nullable = false;
+        dispatchTy = &unwrappedRecvTy;
+    }
+    bool primValueSem = dispatchTy->kind == sema::TypeRef::Kind::Primitive &&
+        dispatchTy->primitive != sema::PrimitiveType::String &&
+        dispatchTy->primitive != sema::PrimitiveType::Object &&
         (isEquals || isGetHashCode);
-    bool namedValueSem = recvTy->kind == sema::TypeRef::Kind::Named &&
-        recvTy->declaration &&
-        (recvTy->declaration->kind == ast::TypeDeclKind::Record ||
-         recvTy->declaration->kind == ast::TypeDeclKind::Enum);
+    bool namedValueSem = dispatchTy->kind == sema::TypeRef::Kind::Named &&
+        dispatchTy->declaration &&
+        (dispatchTy->declaration->kind == ast::TypeDeclKind::Record ||
+         dispatchTy->declaration->kind == ast::TypeDeclKind::Enum);
     // §35.7 (v0.210, #2083 rework finding 2): a CHOICE receiver's direct
     // `.Equals(other)` / `.GetHashCode()` — sema-legal for value-like choices
     // (the §35.7 use-site rule rejects the rest) — dispatches the synthesized
@@ -2767,14 +2798,26 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     // here now — like Record/Enum's `namedValueSem` just above, the member-
     // kind branching (including the isAutoEqualityBearingChoice gate
     // ToString itself needs) lives inside lowerValueSemMethodOn, not here.
-    bool choiceValueSem = recvTy->kind == sema::TypeRef::Kind::Named &&
-        recvTy->declaration &&
-        recvTy->declaration->kind == ast::TypeDeclKind::Choice;
+    bool choiceValueSem = dispatchTy->kind == sema::TypeRef::Kind::Named &&
+        dispatchTy->declaration &&
+        dispatchTy->declaration->kind == ast::TypeDeclKind::Choice;
     if (!primValueSem && !namedValueSem && !choiceValueSem) return nullptr;
 
     llvm::Value* recv = lowerExpr(*ma->target);
     if (!recv) return nullptr;
-    return lowerValueSemMethodOn(recvTy, recv, call, member);
+    // fix #3481: read the §7.4-narrowed payload out of the tagged struct.
+    // ⚠ The shape test is a GUARD ON THE UNWRAP ONLY, not a second
+    // classification: `dispatchTy` is already the non-nullable form by this
+    // point either way, so a receiver that somehow did not materialize as the
+    // tagged struct is dispatched on the unwrapped TYPE with its own value
+    // rather than restored to the pre-#3481 pairing. That combination is not
+    // reachable — `isNullableValueTy` IS the predicate that names the
+    // `{i8 hasValue; T}` lowering, so `lowerTypeRef` gives every value of such a
+    // type that shape — and the test exists so an unreachable case cannot become
+    // `extractvalue` applied to a non-aggregate if that ever stops holding.
+    if (nullableValueRecv && recv->getType()->isStructTy())
+        recv = nullablePrimValue(recv);
+    return lowerValueSemMethodOn(dispatchTy, recv, call, member);
 }
 
 llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,

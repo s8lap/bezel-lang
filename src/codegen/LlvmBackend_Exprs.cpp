@@ -1327,6 +1327,48 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                         if (call->args.empty() && ma->member == "ToString" &&
                             tt->primitive != sema::PrimitiveType::Object) {
                             llvm::Value* recv = lowerExpr(*ma->target);
+                            // fix #3481 (§8.5 / §7.4 / §12.7, v0.283): a
+                            // NULLABLE primitive receiver is not the bare
+                            // primitive. `tt->kind == Primitive` is true of
+                            // `int?` exactly as of `int`, and this arm never
+                            // asked `tt->nullable` — so `v.ToString()` on a
+                            // §7.4-narrowed `int?` handed the whole
+                            // `{i8 hasValue; T}` tagged struct to
+                            // `emitPrimitiveToString`. §7.4 makes the call
+                            // legal (the narrowing is established at sema,
+                            // §12.7's flow rule), so this is not a rejected
+                            // program: it MISCOMPILED. Measured on 0c5ecd1,
+                            // one statement per compile — `int? := 5` and
+                            // `int? := 12345` both printed `1` (snprintf `%d`
+                            // over the struct read the hasValue TAG, so the
+                            // payload was unobservable), `decimal? := 2.5m`
+                            // printed `109291918593`, and `bool?`/`double?`/
+                            // `float?`/`char?`/`byte?` were IR-verifier aborts
+                            // (`Trunc only operates on integer:
+                            //  %2 = trunc { i8, i1 } %1 to i1`) because
+                            // `emitPrimitiveToString`'s arms trunc/zext/pass
+                            // the value as its bare LLVM type.
+                            //
+                            // `emitValueToString` is handed the NULLABLE
+                            // TypeRef, not an unwrapped payload: it is #2913's
+                            // shared §8.5 authority and its FIRST arm is
+                            // exactly this shape — branch on the tag, recurse
+                            // on the non-nullable inner type for a present
+                            // value, and render §18.5's `null` otherwise. That
+                            // arm is already what `Console.WriteLine(v)`
+                            // (LlvmBackend_Calls.cpp's #581/#583 branch), a
+                            // §18.5 hole, a record COMPONENT, and
+                            // `v?.ToString()`
+                            // (`lowerNullCondValueSemCall`) all reach for this
+                            // very value — each of which rendered `12345`
+                            // correctly while this spelling did not. Rendering
+                            // the payload unconditionally here would answer a
+                            // present value correctly and a null one with the
+                            // zero-filled slot; delegating keeps ONE answer for
+                            // both, and keeps this site from becoming a second
+                            // spelling of a rule that already has one.
+                            if (recv && isNullableValueTy(tt))
+                                return emitValueToString(recv, tt);
                             if (recv)
                                 return emitPrimitiveToString(recv, tt->primitive);
                         }
