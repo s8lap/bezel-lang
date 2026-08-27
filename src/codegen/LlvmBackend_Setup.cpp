@@ -14265,11 +14265,36 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
                 // class implementing IEnumerable<T> (declaration-carrying) is
                 // included via `getterTy->declaration != nullptr` — its
                 // enumerator struct is also freshly minted at the wrap site.
+                // fix #3392 / #3363 item 2 (§28.6 / §23.2 / §28.3 / §29.2, v0.282): the head
+                // list here must match the WRAP-CREATOR's. #3355 (5f184fd)
+                // widened `wrapAsIEnumerableForTarget` and
+                // `wrapPropertyArrayAsIEnumerable`
+                // (LlvmBackend_Assign.cpp) from `headName() == "IEnumerable"`
+                // to that head OR `IOwningEnumerable`, so a property read
+                // bound at an `IOwningEnumerable<T>` head now mints a
+                // vtable-backed wrapper frame instead of handing back the raw
+                // backing pointer. This OWNERSHIP-CLAIM predicate kept the
+                // pre-#3355 single-head spelling, so the local bound to the
+                // read never claimed the freshly minted frame and nothing
+                // else freed it — the field's own holder disposes the
+                // BACKING, not the wrap. One frame leaked per read. MEASURED
+                // on e9bd762: 200 reads of `property Items:
+                // IOwningEnumerable<Item> get => _items;` through `var e :=
+                // c.Items;` leaked 6400 bytes in 200 allocations under LSan
+                // (32 B/frame); the byte-identical program at an
+                // `IEnumerable<Item>` head was clean.
+                //
+                // This is the "duplicated classification predicate drifts
+                // from the predicate it mirrors" defect class: the wrap site
+                // and the ownership-claim site each spell the admissible head
+                // list independently, so widening one silently leaves the
+                // other behind.
                 bool declIsPureIEnum = tr && tr->kind ==
                     sema::TypeRef::Kind::Named && !tr->declaration &&
                     tr->astNode && tr->astNode->name &&
                     !tr->astNode->name->parts.empty() &&
-                    tr->headName() == "IEnumerable";
+                    (tr->headName() == "IEnumerable" ||
+                     tr->headName() == "IOwningEnumerable");
                 if (declIsPureIEnum) {
                     const sema::TypeRef* getterTy =
                         ctx_.exprType(*cg);
