@@ -8015,6 +8015,14 @@ bool Emitter::isInterfaceDispatchedIteratorRead(
 // field) and is left as a follow-up. Returns `v` unchanged when the declared
 // type is not a pure `IEnumerable<T>` / `IOwningEnumerable<T>` or the
 // getter's type is not an array-backed collection.
+//
+// ⚠ fix #3405 (v0.283) CORRECTS the two sentences above. (a) The named
+// "BORROWING wrap (wrapArrayAsIEnumerable)" is no longer called from here —
+// the array arm was deleted and every family dispatches through
+// `wrapAsIEnumerableForTarget`; see the in-body comment for why. (b) The
+// fresh-`new` getter is not a deferred leak but a non-case: sema rejects it
+// ("a property or indexer getter may not return a freshly-produced owned
+// value", §28.6 — measured on 1e3861a).
 llvm::Value* Emitter::wrapPropertyArrayAsIEnumerable(
         llvm::Value* v, const sema::TypeRef* declTy,
         const ast::Expr* getter) {
@@ -8031,11 +8039,37 @@ llvm::Value* Emitter::wrapPropertyArrayAsIEnumerable(
     if (!getterTy->astNode || !getterTy->astNode->name ||
         getterTy->astNode->name->parts.empty())
         return v;
-    std::string_view gn = getterTy->headName();
-    if (gn == "Array" || gn == "OwningArray" || gn == "OwningBuffer" ||
-        gn == "Stack" || gn == "OwningStack" ||
-        gn == "Queue" || gn == "OwningQueue")
-        return wrapArrayAsIEnumerable(v, declTy);
+    // fix #3405 (§29.2 / §23.2; stdlib §4.11, v0.283): the array-family arm
+    // that used to sit here — a second spelling of `wrapAsIEnumerableForTarget`'s
+    // `actualIsArray` grid, routing straight to `wrapArrayAsIEnumerable` — is
+    // DELETED rather than aligned. It was a strict SUBSET of the dispatch below
+    // (the borrowed, non-nested, forward-order cell) and, being a copy, it did
+    // not carry the three decisions the authority makes:
+    //
+    //   * the §4.11 stack divert (#2486/#2471) — measured on 1e3861a, a
+    //     `public property Items: IEnumerable<Item> => _items;` over an
+    //     `owned _items: OwningStack<Item>` of 1,2,3 yielded 1,2,3, while the
+    //     argument coercion and the direct `for` over the same stack yielded
+    //     3,2,1. stdlib §4.11 "Iteration order" (v0.283) requires the latter:
+    //     "All four types iterate (via `IReadOnlyCollection<T>`) in take order
+    //     — a stack top-to-bottom (pop order), a queue front-to-back (dequeue
+    //     order); the owning forms iterate identically, yielding borrows."
+    //     At the `IOwningEnumerable<Item>` head the same read drained the
+    //     source front-to-back, which is #3405 as filed.
+    //   * the §12.9 nested covariant view (#1850/#2487) — the same property at
+    //     `IEnumerable<IEnumerable<int>>` over `Array<Array<int>>` SIGSEGV'd on
+    //     1e3861a, because the plain wrap hands the inner `bz_array_t*` to a
+    //     consumer that drives vtable dispatch on it.
+    //   * the #2299 callee-owned arm. Unreachable HERE and measured so: a
+    //     getter body that is a `new` is rejected by sema ("a property or
+    //     indexer getter may not return a freshly-produced owned value", §28.6),
+    //     the `move` and call-result shapes classify Borrowed, and an
+    //     expression body has no locals — so `returnSourceIsCalleeOwnedCollection`
+    //     is statically false at this face and the delete changes nothing there.
+    //
+    // This is the #3419 shape: the wrap-creator decides, and this site reads
+    // its verdict instead of re-deriving it.
+    //
     // fix #2777 (§29.2 / §23.2, v0.240): the EXPRESSION-BODIED sibling of
     // #2703's BLOCK-BODIED §29.2 wrap. The block form wraps on the RETURN
     // edge through `wrapAsIEnumerableForTarget` (handles Set, LinkedList,
@@ -8333,9 +8367,15 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
     // families implement the interface, so a BORROWING `Array<T>` source can
     // never arrive here (sema rejects the conversion, §5.1). The pointer guard
     // keeps the arm off the non-class element types this helper also serves.
-    if (elemTy->isPointerTy() &&
-        builtinTypeName(iEnumTy) == "IOwningEnumerable")
-        return wrapArrayAsIOwningEnumerator(arr, iEnumTy);
+    //
+    // fix #3405 (stdlib §4.11, v0.283): the test itself moved into
+    // `owningDrainWrapForHead` so the reverse-order sibling
+    // `wrapStackAsIEnumerator` asks the SAME question rather than re-spelling
+    // it (or, as it did, not asking it at all). Front-to-back drain here; the
+    // stack leaf passes lifo=true.
+    if (llvm::Value* drain =
+            owningDrainWrapForHead(arr, iEnumTy, /*lifo=*/false))
+        return drain;
     ArrEnumMachinery m = ensureArrayEnumMachinery(elemTy);
     llvm::StructType* stTy = m.stTy;
     // Allocate and fill the enumerator struct { vtable, arr, idx=-1, esz }.
@@ -8350,6 +8390,48 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
     builder_.CreateStore(builder_.getInt64(m.esz),
         builder_.CreateStructGEP(stTy, en, 3));
     return en;
+}
+
+// fix #3405 (§29.1 / §29.2; stdlib §4.11 / §4.13, v0.283): the ONE owning-head
+// test both bz_array_t*-backed leaf wraps consult. See the declaration in
+// LlvmBackend_impl.hpp for why it is a function rather than an inline `if`.
+//
+// #3385 established the rule — at an `IOwningEnumerable<T>` target the wrap
+// must be the DRAINING enumerator (§29.2 desugars an owning-typed source
+// through `TakeCurrent()`, so element ownership leaves the collection at each
+// yield; a borrowing `Current` under that head leaves the source still holding
+// elements the loop has already discharged, which is a double dispose on a
+// field-owned source). It wrote the rule into `wrapArrayAsIEnumerable` alone,
+// so the reverse-order sibling `wrapStackAsIEnumerator` — the leaf every
+// coercion position routes a `Stack`/`OwningStack` source through — never
+// asked the question and kept the borrowing wrap at the owning head.
+//
+// `lifo` is the ONLY thing the two leaves disagree about, and it is the same
+// distinction stdlib §4.11 "Iteration order" already draws: "All four types
+// iterate (via `IReadOnlyCollection<T>`) in take order — a stack top-to-bottom
+// (pop order), a queue front-to-back (dequeue order); the owning forms iterate
+// identically, yielding borrows." `bz_array_drain_next_lifo` is the existing
+// primitive for the stack side (the `for var x in stk.Drain()` loop already
+// uses it, LlvmBackend_Stmts.cpp).
+//
+// Returns null — not `arr` — when the head is not the owning one, so a caller
+// can distinguish "not my case" from "already an enumerator" and fall through
+// to its own borrowing machinery.
+//
+// Reachability guard (#3385's, unchanged): `IOwningEnumerable<T>` constrains
+// `where T: class` (stdlib §4.13), so the element is always a class pointer —
+// the pointer-sized element `bz_array_drain_next*` requires. The pointer test
+// keeps the arm off the non-class element types these helpers also serve.
+llvm::Value* Emitter::owningDrainWrapForHead(llvm::Value* arr,
+                                             const sema::TypeRef* iEnumTy,
+                                             bool lifo) {
+    if (!arr) return nullptr;
+    if (builtinTypeName(iEnumTy) != "IOwningEnumerable") return nullptr;
+    llvm::Type* elemTy = i32();
+    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
+        elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
+    if (!elemTy->isPointerTy()) return nullptr;
+    return wrapArrayAsIOwningEnumerator(arr, iEnumTy, lifo);
 }
 
 // #1911 / stdlib §5 / §29.11: wrap a FRESH temporary array (no other owner) as a
@@ -8573,7 +8655,7 @@ llvm::Value* Emitter::drainLazyPipelineToOwnedIEnumerable(
 // scheme, so all calls with the same element T share the same functions +
 // vtable global.
 llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
-        llvm::Value* arr, const sema::TypeRef* iOwnEnumTy) {
+        llvm::Value* arr, const sema::TypeRef* iOwnEnumTy, bool lifo) {
     // Element type is always a class pointer (IOwningEnumerable<T> constrains
     // T: class per stdlib §4.13). Resolve through the active per-instantiation
     // substitution in case the iOwnEnumTy is a generic template; the bare
@@ -8600,7 +8682,13 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
     std::string elemName = elemLlvm->isIntegerTy()
         ? ("i" + std::to_string(elemLlvm->getIntegerBitWidth()))
         : (elemLlvm->isPointerTy() ? "ptr" : "f");
-    std::string prefix = "bz$ownarrenum$" + elemName + "$";
+    // fix #3405 (stdlib §4.11, v0.283): `lifo` keys the cache as well as the
+    // drain primitive. The two variants share the struct LAYOUT but must never
+    // share a vtable — a front-to-back MoveNext installed on a stack view
+    // would silently yield §4.11's wrong order, which is the defect this fix
+    // closes.
+    std::string prefix =
+        std::string("bz$ownarrenum$") + (lifo ? "lifo$" : "") + elemName + "$";
 
     // Wrapper struct: { ptr vtable, ptr arr, ptr pending }. Three pointer
     // fields (vtable + arr + pending); the wrapper holds a borrow of the
@@ -8733,8 +8821,15 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
                        "oaem.out.init");
         auto* drainFT = llvm::FunctionType::get(
             i1(), {ptrTy(), ptrTy()}, false);
+        // fix #3405 (stdlib §4.11 "Iteration order", v0.283): a stack view
+        // pops the TOP first, which on the bz_array_t* backing is the LAST
+        // slot — `bz_array_drain_next_lifo`, the same primitive the
+        // `for var x in stk.Drain()` desugaring already selects
+        // (LlvmBackend_Stmts.cpp). Every other array-backed family keeps the
+        // front-to-back `bz_array_drain_next`.
         auto* drainFn = module_->getOrInsertFunction(
-            "bz_array_drain_next", drainFT).getCallee();
+            lifo ? "bz_array_drain_next_lifo" : "bz_array_drain_next",
+            drainFT).getCallee();
         llvm::Value* ok = builder_.CreateCall(drainFT, drainFn, {arrPtr, outSlot},
                                        "oaem.ok");
         // Store the popped pointer into pending. With the entry-block zero-init
@@ -9163,6 +9258,18 @@ Emitter::ArrEnumMachinery Emitter::ensureStackEnumMachinery(llvm::Type* elemTy) 
 // rather than a fixed `-1`.
 llvm::Value* Emitter::wrapStackAsIEnumerator(llvm::Value* arr,
                                              const sema::TypeRef* iEnumTy) {
+    // fix #3405 (§29.1 / §29.2; stdlib §4.11 / §4.13, v0.283): the owning-head
+    // divert #3385 gave the FORWARD leaf, asked here through the one shared
+    // authority. Reaching this leaf means the source is the stack family, so
+    // the drain is `bz_array_drain_next_lifo` — §4.11's pop order, the same
+    // order the borrowing machinery below produces. Without this the
+    // `IOwningEnumerable<T>` head got a borrowing `Current` over a stack
+    // source: the loop discharged each element per §29.2 while the source
+    // still held it, which is exactly the double dispose #3385 closed for the
+    // forward families.
+    if (llvm::Value* drain =
+            owningDrainWrapForHead(arr, iEnumTy, /*lifo=*/true))
+        return drain;
     llvm::Type* elemTy = i32();
     if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
         elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);

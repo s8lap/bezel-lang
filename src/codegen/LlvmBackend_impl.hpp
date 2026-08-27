@@ -7697,6 +7697,21 @@ private:
     llvm::Value* wrapArrayAsIEnumerable(llvm::Value* arr,
                                         const sema::TypeRef* iEnumTy);
 
+    // fix #3405 (§29.1 / §29.2; stdlib §4.11 / §4.13, v0.283): the SINGLE
+    // owning-head test the two array-family leaf wraps share. #3385 put this
+    // test inline in `wrapArrayAsIEnumerable` only, so the reverse-order
+    // sibling `wrapStackAsIEnumerator` kept handing out the BORROWING
+    // enumerator at an `IOwningEnumerable<T>` target — the very shape #3385
+    // identified as a double-dispose of a field-owned source. Both leaves now
+    // ask this one function; `lifo` says which drain order stdlib §4.11
+    // requires of the source family ("a stack top-to-bottom (pop order), a
+    // queue front-to-back (dequeue order)"). Returns null when the target is
+    // not the owning head (or the element is not a class pointer), which is
+    // the caller's signal to build its own borrowing enumerator.
+    llvm::Value* owningDrainWrapForHead(llvm::Value* arr,
+                                        const sema::TypeRef* iEnumTy,
+                                        bool lifo);
+
     // #1911 / stdlib §5 / §29.11: like wrapArrayAsIEnumerable, but the resulting
     // enumerator OWNS its backing `arr` — its slot-1 Dispose frees the array (a
     // fresh temporary with no other owner, e.g. a lazy LINQ pipeline drained via
@@ -7898,6 +7913,19 @@ private:
     // the Set / LinkedList / user-class-IEnumerable families the BLOCK-
     // BODIED §29.2 wrap already handles — IOwningEnumerable + non-Array
     // remains a no-op (no wrap variant exists for that shape today).
+    //
+    // fix #3405 (stdlib §4.11 / §12.9, v0.283) — SUPERSEDES the two
+    // paragraphs above wherever they describe an Array-family SPECIAL CASE
+    // at this site. There is no longer one: the local array arm was deleted
+    // and EVERY family now dispatches through `wrapAsIEnumerableForTarget`,
+    // the wrap-creator that already decides the (source family × declared
+    // head × ownership) grid. The copy had drifted from it in three cells —
+    // the §4.11 stack order, the §12.9 nested covariant view, and the #2299
+    // callee-owned arm (the last provably unreachable here). The "OUT-OF-
+    // SCOPE fresh-`new`-in-getter leak" sentence above is likewise a
+    // non-case: sema rejects a getter body that produces a fresh owned value
+    // (§28.6), measured on 1e3861a. See the definition's comment in
+    // LlvmBackend_Assign.cpp for the measurements and #3419 for the pattern.
     llvm::Value* wrapPropertyArrayAsIEnumerable(
         llvm::Value* v, const sema::TypeRef* declTy,
         const ast::Expr* getter);
@@ -7953,8 +7981,15 @@ private:
     // wrapper pointer (the caller / using-var machinery disposes it via slot 1).
     // Generic key matches the ensureArrayEnumMachinery naming so the same
     // per-element-type machinery is shared across an entire compilation unit.
+    // fix #3405 (stdlib §4.11 "Iteration order", v0.283): `lifo` selects the
+    // drain primitive and keys the per-element-type function/vtable cache, so
+    // the stack family drains `bz_array_drain_next_lifo` (top-to-bottom, the
+    // §4.11 pop order) and every other array-backed family keeps
+    // `bz_array_drain_next` (front-to-back). The two variants never share a
+    // vtable — the name prefix carries the key.
     llvm::Value* wrapArrayAsIOwningEnumerator(llvm::Value* arr,
-                                              const sema::TypeRef* iOwnEnumTy);
+                                              const sema::TypeRef* iOwnEnumTy,
+                                              bool lifo = false);
 
     // #2218 / stdlib §4.5/§4.13 / spec §29.1/§29.2: at the call site of
     // `recv.GetOwningEnumerator()`, detect whether `recv` is actually a
