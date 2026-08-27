@@ -7800,14 +7800,28 @@ private:
     // sibling `wrapStackAsIEnumerator` kept handing out the BORROWING
     // enumerator at an `IOwningEnumerable<T>` target — the very shape #3385
     // identified as a double-dispose of a field-owned source. Both leaves now
-    // ask this one function; `lifo` says which drain order stdlib §4.11
-    // requires of the source family ("a stack top-to-bottom (pop order), a
-    // queue front-to-back (dequeue order)"). Returns null when the target is
-    // not the owning head (or the element is not a class pointer), which is
-    // the caller's signal to build its own borrowing enumerator.
-    llvm::Value* owningDrainWrapForHead(llvm::Value* arr,
+    // ask this one function; `backing` says which drain primitive walks the
+    // source family — for the array pair, which order stdlib §4.11 requires
+    // ("a stack top-to-bottom (pop order), a queue front-to-back (dequeue
+    // order)"). Returns null when the target is not the owning head (or the
+    // element is not a class pointer), which is the caller's signal to build
+    // its own borrowing enumerator.
+    //
+    // fix #3461 (§29.1 / §29.2; stdlib §4.7 / §4.13, v0.283): `List` is the
+    // third leaf. `wrapLinkedListAsIEnumerable` walks a node-based
+    // `bz_llist_t*`, not a `bz_array_t*`, so it is a leaf of this same grid
+    // that #3385 and #3405 never reached and it kept the borrowing `Current`
+    // at an `IOwningEnumerable<T>` target — #3385's double dispose at the
+    // LinkedList family. It now asks THIS function rather than carrying a
+    // fourth spelling of the head test (#3419 point 1).
+    enum class DrainBacking {
+        ArrayForward,  // bz_array_drain_next       (Array/Queue families)
+        ArrayLifo,     // bz_array_drain_next_lifo  (Stack family, §4.11)
+        List,          // bz_llist_drain_next       (LinkedList family, §4.7)
+    };
+    llvm::Value* owningDrainWrapForHead(llvm::Value* src,
                                         const sema::TypeRef* iEnumTy,
-                                        bool lifo);
+                                        DrainBacking backing);
 
     // #1911 / stdlib §5 / §29.11: like wrapArrayAsIEnumerable, but the resulting
     // enumerator OWNS its backing `arr` — its slot-1 Dispose frees the array (a
@@ -8087,6 +8101,26 @@ private:
     llvm::Value* wrapArrayAsIOwningEnumerator(llvm::Value* arr,
                                               const sema::TypeRef* iOwnEnumTy,
                                               bool lifo = false);
+
+    // fix #3461 (§29.1 / §29.2 / §29.11; stdlib §4.7 / §4.13, v0.283): the
+    // LinkedList sibling of wrapArrayAsIOwningEnumerator — the DRAINING
+    // enumerator an `IOwningEnumerable<T>` head requires over a node-backed
+    // `bz_llist_t*`. Same 3-field frame `{ vtable, list, pending }` and the
+    // same §29.1 protocol (MoveNext pops into `pending`, TakeCurrent moves it
+    // out and nulls the slot, Dispose disposes an advanced-but-untaken
+    // pending); only the drain primitive differs — `bz_llist_drain_next`,
+    // stdlib §4.7's own `Drain()` pop, head-to-tail per §28.11. Borrows the
+    // list: the source's owner still frees the (drained) container.
+    llvm::Value* wrapLinkedListAsIOwningEnumerator(
+        llvm::Value* list, const sema::TypeRef* iOwnEnumTy);
+
+    // fix #3461 (v0.283): the element-type resolution both owning-drain wraps
+    // share (`IOwningEnumerable<T>` constrains `T: class` per stdlib §4.13;
+    // resolve through the active per-instantiation substitution, and lower a
+    // bare unresolved type parameter as a class pointer per §29.2 #990).
+    // Extracted rather than copied into the LinkedList sibling: a second
+    // spelling of it would drift exactly the way #3419 records.
+    llvm::Type* owningDrainElemType(const sema::TypeRef* iOwnEnumTy);
 
     // #2218 / stdlib §4.5/§4.13 / spec §29.1/§29.2: at the call site of
     // `recv.GetOwningEnumerator()`, detect whether `recv` is actually a

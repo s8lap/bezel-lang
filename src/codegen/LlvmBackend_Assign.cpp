@@ -8372,9 +8372,9 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
     // `owningDrainWrapForHead` so the reverse-order sibling
     // `wrapStackAsIEnumerator` asks the SAME question rather than re-spelling
     // it (or, as it did, not asking it at all). Front-to-back drain here; the
-    // stack leaf passes lifo=true.
+    // stack leaf passes `ArrayLifo` and (fix #3461) the LinkedList leaf `List`.
     if (llvm::Value* drain =
-            owningDrainWrapForHead(arr, iEnumTy, /*lifo=*/false))
+            owningDrainWrapForHead(arr, iEnumTy, DrainBacking::ArrayForward))
         return drain;
     ArrEnumMachinery m = ensureArrayEnumMachinery(elemTy);
     llvm::StructType* stTy = m.stTy;
@@ -8406,13 +8406,26 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
 // coercion position routes a `Stack`/`OwningStack` source through — never
 // asked the question and kept the borrowing wrap at the owning head.
 //
-// `lifo` is the ONLY thing the two leaves disagree about, and it is the same
-// distinction stdlib §4.11 "Iteration order" already draws: "All four types
-// iterate (via `IReadOnlyCollection<T>`) in take order — a stack top-to-bottom
-// (pop order), a queue front-to-back (dequeue order); the owning forms iterate
-// identically, yielding borrows." `bz_array_drain_next_lifo` is the existing
-// primitive for the stack side (the `for var x in stk.Drain()` loop already
-// uses it, LlvmBackend_Stmts.cpp).
+// `backing` is the ONLY thing the leaves disagree about: which drain primitive
+// walks the source. The array pair's distinction is the one stdlib §4.11
+// "Iteration order" already draws: "All four types iterate (via
+// `IReadOnlyCollection<T>`) in take order — a stack top-to-bottom (pop order),
+// a queue front-to-back (dequeue order); the owning forms iterate identically,
+// yielding borrows." `bz_array_drain_next_lifo` is the existing primitive for
+// the stack side (the `for var x in stk.Drain()` loop already uses it,
+// LlvmBackend_Stmts.cpp).
+//
+// fix #3461 (§29.1 / §29.2; stdlib §4.7 / §4.13, v0.283): `List` is the third
+// leaf — `LinkedList<T>` / `OwningLinkedList<T>` are node-backed
+// (`bz_llist_t*`), not `bz_array_t*`-backed, so `wrapLinkedListAsIEnumerable`
+// is a leaf of this same grid that #3385 and #3405 never reached. It kept the
+// borrowing `Current` at an `IOwningEnumerable<T>` target, which on a
+// field-owned source is #3385's double dispose byte for byte (measured:
+// `rem=3` after what should be an owning drain, then heap-use-after-free in
+// `bz$elemDispose` <- `bz_llist_free` <- `C$DisposeCore`). The head test is
+// NOT re-spelled for it; the leaf asks THIS function, exactly as the two array
+// leaves do, and `bz_llist_drain_next` is the existing head-to-tail primitive
+// `for var x in list.Drain()` already selects (LlvmBackend_Stmts.cpp).
 //
 // Returns null — not `arr` — when the head is not the owning one, so a caller
 // can distinguish "not my case" from "already an enumerator" and fall through
@@ -8420,18 +8433,22 @@ llvm::Value* Emitter::wrapArrayAsIEnumerable(llvm::Value* arr,
 //
 // Reachability guard (#3385's, unchanged): `IOwningEnumerable<T>` constrains
 // `where T: class` (stdlib §4.13), so the element is always a class pointer —
-// the pointer-sized element `bz_array_drain_next*` requires. The pointer test
-// keeps the arm off the non-class element types these helpers also serve.
-llvm::Value* Emitter::owningDrainWrapForHead(llvm::Value* arr,
+// the pointer-sized element `bz_array_drain_next*` / `bz_llist_drain_next`
+// requires. The pointer test keeps the arm off the non-class element types
+// these helpers also serve.
+llvm::Value* Emitter::owningDrainWrapForHead(llvm::Value* src,
                                              const sema::TypeRef* iEnumTy,
-                                             bool lifo) {
-    if (!arr) return nullptr;
+                                             DrainBacking backing) {
+    if (!src) return nullptr;
     if (builtinTypeName(iEnumTy) != "IOwningEnumerable") return nullptr;
     llvm::Type* elemTy = i32();
     if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
         elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
     if (!elemTy->isPointerTy()) return nullptr;
-    return wrapArrayAsIOwningEnumerator(arr, iEnumTy, lifo);
+    if (backing == DrainBacking::List)
+        return wrapLinkedListAsIOwningEnumerator(src, iEnumTy);
+    return wrapArrayAsIOwningEnumerator(
+        src, iEnumTy, /*lifo=*/backing == DrainBacking::ArrayLifo);
 }
 
 // #1911 / stdlib §5 / §29.11: wrap a FRESH temporary array (no other owner) as a
@@ -8654,26 +8671,35 @@ llvm::Value* Emitter::drainLazyPipelineToOwnedIEnumerable(
 // Element name key matches ensureArrayEnumMachinery's per-element-type
 // scheme, so all calls with the same element T share the same functions +
 // vtable global.
-llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
-        llvm::Value* arr, const sema::TypeRef* iOwnEnumTy, bool lifo) {
-    // Element type is always a class pointer (IOwningEnumerable<T> constrains
-    // T: class per stdlib §4.13). Resolve through the active per-instantiation
-    // substitution in case the iOwnEnumTy is a generic template; the bare
-    // type-parameter case lowers as a class pointer (§29.2 #990 mirror).
+// fix #3461 (v0.283): the element-type resolution the owning-drain wraps
+// share. Extracted from `wrapArrayAsIOwningEnumerator` when the LinkedList
+// sibling needed the identical rule — a second copy of it would be a fifth
+// spelling of the same grid decision (#3419 point 1), and the rule is subtle
+// enough to drift (the unresolved-type-parameter arm below is #990's, and a
+// copy that forgot it would key an `i32` machinery for a class element).
+//
+// `IOwningEnumerable<T>` constrains `T: class` (stdlib §4.13), so the element
+// is always a class pointer. Resolve through the active per-instantiation
+// substitution in case `iOwnEnumTy` is a generic template; the bare
+// type-parameter case lowers as a class pointer (§29.2 #990 mirror).
+llvm::Type* Emitter::owningDrainElemType(const sema::TypeRef* iOwnEnumTy) {
     const sema::TypeRef* elemTr = (iOwnEnumTy && !iOwnEnumTy->genericArgs.empty())
                                       ? iOwnEnumTy->genericArgs[0]
                                       : nullptr;
     const sema::TypeRef* resolvedElem = resolveTypeParamRef(elemTr);
-    llvm::Type* elemLlvm;
     if (resolvedElem && resolvedElem != elemTr)
-        elemLlvm = lowerTypeRef(resolvedElem);
-    else if (elemTr && elemTr->kind == sema::TypeRef::Kind::Named &&
-             elemTr->declaration == nullptr)
-        elemLlvm = ptrTy();   // unresolved type param — class per §4.13
-    else if (elemTr)
-        elemLlvm = lowerTypeRef(elemTr);
-    else
-        elemLlvm = ptrTy();
+        return lowerTypeRef(resolvedElem);
+    if (elemTr && elemTr->kind == sema::TypeRef::Kind::Named &&
+        elemTr->declaration == nullptr)
+        return ptrTy();   // unresolved type param — class per §4.13
+    if (elemTr)
+        return lowerTypeRef(elemTr);
+    return ptrTy();
+}
+
+llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
+        llvm::Value* arr, const sema::TypeRef* iOwnEnumTy, bool lifo) {
+    llvm::Type* elemLlvm = owningDrainElemType(iOwnEnumTy);
 
     // Element-name key (same scheme as ensureArrayEnumMachinery) so the
     // Dispose / MoveNext / TakeCurrent / vtable are created once per element
@@ -8935,6 +8961,245 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         {builder_.getInt64(1), builder_.getInt64(stSz)}, "ownarrenum");
     builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, en, 0));
     builder_.CreateStore(arr, builder_.CreateStructGEP(stTy, en, 1));
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+        builder_.CreateStructGEP(stTy, en, 2));
+    return en;
+}
+
+// fix #3461 (§29.1 / §29.2 / §29.11; stdlib §4.7 / §4.13, v0.283): the
+// LinkedList sibling of `wrapArrayAsIOwningEnumerator` — the DRAINING
+// enumerator an `IOwningEnumerable<T>` head requires over a node-backed
+// `bz_llist_t*` source.
+//
+// WHY IT HAD TO EXIST. #3385 established the rule (a source of static type
+// `IOwningEnumerable<T>` desugars through `TakeCurrent()` per §29.2, so
+// element ownership LEAVES the collection at each yield; a borrowing `Current`
+// under that head leaves the source still holding elements the loop has
+// already discharged) and #3405 taught the second array leaf to ask it. The
+// LinkedList family reaches its wrap by a third leaf,
+// `wrapLinkedListAsIEnumerable`, whose only enumerator is the node-walking
+// BORROWING one — there was no draining variant for it to divert to. Measured
+// on 0c5ecd1 with `owned _l: OwningLinkedList<Item>` read through a §28.6
+// stored view at an `IOwningEnumerable<Item>` head: `rem=3` after what should
+// be an owning drain, then `heap-use-after-free` in `bz$elemDispose` <-
+// `bz_llist_free` <- `C$DisposeCore` — #3385's failure byte for byte.
+//
+// STRUCTURE. Deliberately field-for-field the array wrap's: a 3-pointer frame
+// `{ ptr vtable, ptr list, ptr pending }` that BORROWS the list and owns only
+// the class pointer parked in `pending`. Only the drain primitive differs —
+// `bz_llist_drain_next` pops the head node and unlinks it WITHOUT disposing
+// (stdlib §4.7's `Drain()` primitive, head-to-tail per §28.11's iteration
+// order), where the array wrap pops a slot. The container is untouched: the
+// field's holder still frees the (now empty) list.
+//
+//   * MoveNext (slot 2) pops the next element into `pending`, disposing an
+//     advanced-but-untaken previous first (§29.1's disposition for an
+//     abandoned pending, the same rule the array wrap follows).
+//   * TakeCurrent (slot 3) moves `pending` out and NULLS the slot — §29.1:
+//     "transfers ownership of the most-recently-yielded value to the caller,
+//     leaving the enumerator's internal slot empty".
+//   * Dispose (slot 1) disposes a non-null `pending`, then frees the frame.
+//     The LIST is NOT freed here — the source's owner disposes it.
+//   * Slot 4 (GetOwningEnumerator) mints a FRESH frame over the same borrowed
+//     list with an empty `pending`, which §29.2's desugaring requires (it
+//     calls slot 4 and then disposes BOTH the view and the enumerator, so
+//     returning `self` would free one frame twice) and which stdlib §4.13's
+//     drain-view contract independently requires ("a re-enumeration continues
+//     draining what remains, never replaying what already left" — which falls
+//     out of sharing the list, since the drain has already unlinked the nodes
+//     that left).
+llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
+        llvm::Value* list, const sema::TypeRef* iOwnEnumTy) {
+    llvm::Type* elemLlvm = owningDrainElemType(iOwnEnumTy);
+
+    // Element-name key (the scheme ensureLinkedListEnumMachinery uses) so the
+    // Dispose / MoveNext / TakeCurrent / vtable are created once per element
+    // type. The struct name is distinct from the borrowing wrap's
+    // ("llenum.<elem>") because the LAYOUT differs — 3 fields with a `pending`
+    // slot, not 4 with a node cursor pair.
+    std::string elemName = elemLlvm->isIntegerTy()
+        ? ("i" + std::to_string(elemLlvm->getIntegerBitWidth()))
+        : (elemLlvm->isPointerTy() ? "ptr" : "f");
+    std::string prefix = "bz$ownllenum$" + elemName + "$";
+    std::string stName = "ownllenum." + elemName;
+    auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
+    if (!stTy)
+        stTy = llvm::StructType::create(llvm_,
+            {ptrTy(), ptrTy(), ptrTy()}, stName);
+    auto* voidTy = llvm::Type::getVoidTy(llvm_);
+
+    // --- Dispose(self) — dispose pending (if any), free the frame. ---
+    auto* dispFn = module_->getFunction(prefix + "Dispose");
+    if (!dispFn) {
+        dispFn = llvm::Function::Create(
+            llvm::FunctionType::get(voidTy, {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", dispFn);
+        // §28: emitDisposeAndReclaim inserts through the Emitter's `builder_` /
+        // `currentFn_`. Swap them in for the helper body and restore after, so
+        // the caller's own insert point is untouched (the save pattern
+        // wrapArrayAsIOwningEnumerator uses, and for the same #2218 reason —
+        // an unsaved builder emits the helper's instructions into the wrong
+        // function).
+        llvm::Function* savedCurrentFn = currentFn_;
+        auto* savedBB = builder_.GetInsertBlock();
+        llvm::BasicBlock::iterator savedIP{};
+        if (savedBB) savedIP = builder_.GetInsertPoint();
+        currentFn_ = dispFn;
+        builder_.SetInsertPoint(bb);
+        llvm::Value* self = dispFn->arg_begin();
+        llvm::Value* pendF = builder_.CreateStructGEP(stTy, self, 2);
+        llvm::Value* pend = builder_.CreateLoad(ptrTy(), pendF, "olld.pend");
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            pend, llvm::ConstantPointerNull::get(ptrTy()), "olld.pend.null");
+        auto* dispBB = llvm::BasicBlock::Create(llvm_, "olld.disp", dispFn);
+        auto* contBB = llvm::BasicBlock::Create(llvm_, "olld.cont", dispFn);
+        builder_.CreateCondBr(isNull, contBB, dispBB);
+        builder_.SetInsertPoint(dispBB);
+        // Null the slot BEFORE disposing so a re-entrant Dispose (the class's
+        // own slot-1 cascading back here) cannot re-dispose the same pointer.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
+        emitDisposeAndReclaim(pend);
+        builder_.CreateBr(contBB);
+        builder_.SetInsertPoint(contBB);
+        auto* freeFn = module_->getOrInsertFunction(
+            "free", llvm::FunctionType::get(voidTy, {ptrTy()}, false))
+            .getCallee();
+        builder_.CreateCall(
+            llvm::FunctionType::get(voidTy, {ptrTy()}, false), freeFn, {self});
+        builder_.CreateRetVoid();
+        currentFn_ = savedCurrentFn;
+        if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+    }
+
+    // --- MoveNext(self) -> i1 — pop the head node via bz_llist_drain_next. ---
+    auto* mnFn = module_->getFunction(prefix + "MoveNext");
+    if (!mnFn) {
+        mnFn = llvm::Function::Create(
+            llvm::FunctionType::get(i1(), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "MoveNext", module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", mnFn);
+        llvm::Function* savedCurrentFn = currentFn_;
+        auto* savedBB = builder_.GetInsertBlock();
+        llvm::BasicBlock::iterator savedIP{};
+        if (savedBB) savedIP = builder_.GetInsertPoint();
+        currentFn_ = mnFn;
+        builder_.SetInsertPoint(bb);
+        llvm::Value* self = mnFn->arg_begin();
+        // An advanced-but-untaken previous pending is disposed before the next
+        // advance — the frame holds ONE pending slot, and §29.1's standard
+        // disposition for an abandoned pending is "dispose".
+        llvm::Value* pendF = builder_.CreateStructGEP(stTy, self, 2);
+        llvm::Value* prev = builder_.CreateLoad(ptrTy(), pendF, "ollm.prev");
+        llvm::Value* prevNull = builder_.CreateICmpEQ(
+            prev, llvm::ConstantPointerNull::get(ptrTy()), "ollm.prev.null");
+        auto* dispPrevBB = llvm::BasicBlock::Create(llvm_, "ollm.dispprev", mnFn);
+        auto* afterDispBB = llvm::BasicBlock::Create(llvm_, "ollm.after", mnFn);
+        builder_.CreateCondBr(prevNull, afterDispBB, dispPrevBB);
+        builder_.SetInsertPoint(dispPrevBB);
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
+        emitDisposeAndReclaim(prev);
+        builder_.CreateBr(afterDispBB);
+        builder_.SetInsertPoint(afterDispBB);
+        llvm::Value* listF = builder_.CreateStructGEP(stTy, self, 1);
+        llvm::Value* listPtr = builder_.CreateLoad(ptrTy(), listF, "ollm.list");
+        // #2264 / §28.3, the array wrap's hazard verbatim: bz_llist_drain_next
+        // returns false WITHOUT writing *val_out on an empty list, so the
+        // out-slot must be zero-initialised on EVERY invocation — otherwise
+        // the final (false) MoveNext publishes the previous call's stale
+        // pointer into `pending` and the scope-end Dispose double-frees an
+        // already-discharged element. The alloca + store go in the entry
+        // block, which runs on every call.
+        auto* allocaBB = &mnFn->getEntryBlock();
+        llvm::IRBuilder<> ab(allocaBB, allocaBB->begin());
+        auto* outSlot = ab.CreateAlloca(ptrTy(), nullptr, "ollm.out");
+        ab.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), outSlot,
+                       "ollm.out.init");
+        auto* drainFT = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
+        auto* drainFn = module_->getOrInsertFunction(
+            "bz_llist_drain_next", drainFT).getCallee();
+        llvm::Value* ok = builder_.CreateCall(
+            drainFT, drainFn, {listPtr, outSlot}, "ollm.ok");
+        llvm::Value* popped =
+            builder_.CreateLoad(ptrTy(), outSlot, "ollm.popped");
+        builder_.CreateStore(popped, builder_.CreateStructGEP(stTy, self, 2));
+        builder_.CreateRet(ok);
+        currentFn_ = savedCurrentFn;
+        if (savedBB) builder_.SetInsertPoint(savedBB, savedIP);
+    }
+
+    // --- TakeCurrent(self) -> ptr — move pending out, null the slot. ---
+    auto* tcFn = module_->getFunction(prefix + "TakeCurrent");
+    if (!tcFn) {
+        tcFn = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "TakeCurrent",
+            module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", tcFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = tcFn->arg_begin();
+        llvm::Value* pendF = b.CreateStructGEP(stTy, self, 2);
+        llvm::Value* pend = b.CreateLoad(ptrTy(), pendF, "olltc.pend");
+        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), pendF);
+        b.CreateRet(pend);
+    }
+
+    // --- Slot 4 (GetOwningEnumerator): a FRESH frame over the same borrowed
+    // list, with an empty pending — never `self` (§29.2 disposes both the view
+    // and the loop enumerator; sharing one frame would free it twice). ---
+    auto* geFn = module_->getFunction(prefix + "GetOwningEnumerator");
+    if (!geFn) {
+        geFn = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "GetOwningEnumerator",
+            module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", geFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = &*geFn->arg_begin();
+        uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+        auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+        auto* callocC =
+            module_->getOrInsertFunction("calloc", callocFT).getCallee();
+        llvm::Value* clone = b.CreateCall(
+            callocFT, callocC,
+            {llvm::ConstantInt::get(i64(), 1),
+             llvm::ConstantInt::get(i64(), (int64_t)cloneSz)},
+            "ollge.clone");
+        llvm::Value* vt =
+            b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 0));
+        b.CreateStore(vt, b.CreateStructGEP(stTy, clone, 0));
+        llvm::Value* listCp =
+            b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
+        b.CreateStore(listCp, b.CreateStructGEP(stTy, clone, 1));
+        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                      b.CreateStructGEP(stTy, clone, 2));
+        b.CreateRet(clone);
+    }
+
+    // Vtable: [0]=self, [1]=Dispose, [2]=MoveNext, [3]=TakeCurrent,
+    // [4]=GetOwningEnumerator (the same 5-slot §29.11 shape).
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getGlobalVariable(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: self-ptr (below)
+            dispFn, mnFn, tcFn, geFn
+        };
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    // Allocate + fill the frame { vtable, list, pending=null }.
+    uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* en = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1), builder_.getInt64((int64_t)stSz)}, "ownllenum");
+    builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, en, 0));
+    builder_.CreateStore(list, builder_.CreateStructGEP(stTy, en, 1));
     builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
         builder_.CreateStructGEP(stTy, en, 2));
     return en;
@@ -9268,7 +9533,7 @@ llvm::Value* Emitter::wrapStackAsIEnumerator(llvm::Value* arr,
     // still held it, which is exactly the double dispose #3385 closed for the
     // forward families.
     if (llvm::Value* drain =
-            owningDrainWrapForHead(arr, iEnumTy, /*lifo=*/true))
+            owningDrainWrapForHead(arr, iEnumTy, DrainBacking::ArrayLifo))
         return drain;
     llvm::Type* elemTy = i32();
     if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
@@ -9972,6 +10237,20 @@ Emitter::LlEnumMachinery Emitter::ensureLinkedListEnumMachinery(llvm::Type* elem
 // its binder's scope end; Dispose just frees the enumerator struct.
 llvm::Value* Emitter::wrapLinkedListAsIEnumerable(llvm::Value* list,
                                                   const sema::TypeRef* iEnumTy) {
+    // fix #3461 (§29.1 / §29.2; stdlib §4.7 / §4.13, v0.283): the owning-head
+    // divert #3385 gave the forward array leaf and #3405 gave the reverse one,
+    // asked here through the SAME shared authority. This leaf is where every
+    // coercion position routes a `LinkedList`/`OwningLinkedList` source, so
+    // before this it handed out the node-walking BORROWING `Current` at an
+    // `IOwningEnumerable<T>` target: the loop discharged each element per
+    // §29.2 while the list still held it, and the source's holder then ran
+    // `bz_llist_free` with the owning list's element disposer over the very
+    // same nodes — heap-use-after-free, #3385's failure at the third family.
+    // Reaching this leaf means the source is node-backed, so the drain is
+    // `bz_llist_drain_next`.
+    if (llvm::Value* drain =
+            owningDrainWrapForHead(list, iEnumTy, DrainBacking::List))
+        return drain;
     llvm::Type* elemTy = i32();
     if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
         elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
