@@ -23426,11 +23426,27 @@ bool Emitter::outVarStringReleaseEligible(const ast::IdentifierExpr* id) {
 void Emitter::collectRecordCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     recordCallResultReleaseEligible_.clear();
-    std::vector<const ast::LocalDecl*> candidates;
+    // fix #3436 (§21.1 / §9.7 / §28.9, v0.283): `const ast::Node*`, and the
+    // declaration is read through the shared `Emitter::localDeclInitView` —
+    // the single authority #3402 hoisted for exactly this split. The scan was
+    // `dynamic_cast<const ast::LocalDecl*>(s)`, which is null for a §21.1
+    // runtime `const` (ast::LocalConstDecl, a sibling Stmt with `value` where
+    // a `var` has `initializer`), so `const p := Mk();` never became a
+    // candidate, never entered `recordCallResultReleaseEligible_`, and
+    // `lowerLocalDecl` never registered the scope-end recordStringFields
+    // Disposal — the callee-minted +1 on each `string` field leaked (7290
+    // bytes / 400 allocations over 200 iterations; the `var` twin is clean).
+    // §21.1's Ownership paragraph admits a value-typed expression — records
+    // included — as a runtime `const`'s initializer, so this shape is
+    // spellable and the binding takes no disposal obligation; the reclaim is
+    // codegen's own, the same single reference the `var` path already
+    // releases, at the same point, under the same StringEscapeWalker.
+    std::vector<const ast::Node*> candidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (!ld->isUsing && ld->initializer) {
+        {
+            LocalDeclInitView v = localDeclInitView(s);
+            if (v.init && !v.isUsing) {
                 // #429-style narrow: only a record-returning CALL initializer
                 // is in scope. A `new P(...)` initializer (NewExpr) does NOT
                 // receive callee-minted +1s (the constructor copies field
@@ -23439,14 +23455,13 @@ void Emitter::collectRecordCallResultReleaseEligible(
                 // (IdentifierExpr naming another record local) and a
                 // with-copy (WithExpr) likewise carry no callee-minted +1
                 // by themselves. Restrict to CallExpr only.
-                if (auto* call = dynamic_cast<const ast::CallExpr*>(
-                        ld->initializer.get())) {
+                if (auto* call = dynamic_cast<const ast::CallExpr*>(v.init)) {
                     // Recover the record-with-string-fields type from the
                     // declared annotation, or — for an inferred
                     // `var p := Mk()` — from the initializer's exprType.
                     const sema::TypeRef* tr = nullptr;
-                    if (ld->type) tr = ctx_.resolvedType(*ld->type);
-                    if (!tr) tr = ctx_.exprType(*ld->initializer);
+                    if (v.type) tr = ctx_.resolvedType(*v.type);
+                    if (!tr) tr = ctx_.exprType(*v.init);
                     // fix #2448 / §9.7 / §28.9: the gate below used to admit
                     // ANY CallExpr returning a record-with-string-fields
                     // type, regardless of the callee's own body — blind to
@@ -23482,7 +23497,7 @@ void Emitter::collectRecordCallResultReleaseEligible(
                         if ((ms &&
                              isProvablyFreshRecordFactoryMethod(ms, tr->declaration)) ||
                             isSynthesizedRecordDeserializeCall(call, tr->declaration))
-                            candidates.push_back(ld);
+                            candidates.push_back(s);
                     }
                 }
                 // fix #2866 / §9.7 / §28.3 / §28.9 (v0.240): a `new P(...)`
@@ -23500,14 +23515,13 @@ void Emitter::collectRecordCallResultReleaseEligible(
                 // whose constructor is opaque (explicit ctor, nested value
                 // type, non-producer string arg, etc.) still falls to the
                 // safe-direction leak, identical to the CallExpr arm above.
-                if (auto* ne = dynamic_cast<const ast::NewExpr*>(
-                        ld->initializer.get())) {
+                if (auto* ne = dynamic_cast<const ast::NewExpr*>(v.init)) {
                     const sema::TypeRef* tr = nullptr;
-                    if (ld->type) tr = ctx_.resolvedType(*ld->type);
-                    if (!tr) tr = ctx_.exprType(*ld->initializer);
+                    if (v.type) tr = ctx_.resolvedType(*v.type);
+                    if (!tr) tr = ctx_.exprType(*v.init);
                     if (tr && isRecordWithStringFieldsTypeRef(tr) && ne->type &&
                         isFreshRecordConstructionOfExactType(ne, tr->declaration)) {
-                        candidates.push_back(ld);
+                        candidates.push_back(s);
                     }
                 }
             }
@@ -26099,12 +26113,38 @@ void Emitter::collectBoxCaptureLocals(
     assignedCaptureVars_.clear();  // fix #2706
 
     // Candidate box-producer locals (same predicate as collectBoxReleaseEligible).
+    //
+    // fix #3436 (§21.1 / §27.5 / §28.9, v0.283): the declaration is read through
+    // the shared `Emitter::localDeclInitView` (and `isPlusOneBoxProducer`, which
+    // #3417 already made `ast::Node*`-taking and which decodes the split through
+    // that same authority), so a §21.1 runtime `const` (ast::LocalConstDecl) is a
+    // candidate wherever its `var` twin is. The scan was
+    // `dynamic_cast<const ast::LocalDecl*>(s)`, which is null for a `const`, so
+    // `const o: Object := i;` captured by a lambda entered NEITHER reclaim path:
+    // BoxEscapeWalker treats the capture as an escape for BOTH spellings (so
+    // `boxReleaseEligible_`, the set #3417 fixed, deliberately excludes it), and
+    // the §27.5 capture-cell machinery this collector feeds — `boxCaptureLocals_`
+    // (the envdtor's `bz_box_release`) and `singleCaptureLocals_` (the envdtor's
+    // cell free) — never saw the node. The producer's single +1 was therefore
+    // dropped on the floor: 4776 bytes / 199 allocations over 200 iterations,
+    // where the `var` twin is ASan+LSan clean. §28.9's second entry is "Boxed
+    // value types" and §21.1's Ownership paragraph admits exactly such
+    // runtime-managed values as a runtime `const`'s initializer while rejecting
+    // an owned production, so no disposal obligation is added — the envdtor
+    // releases the same single fresh box the `var` path has always released, at
+    // the same point, under the same rc-retain model (#802: the FIRST capture
+    // transfers the producer's +1, every ADDITIONAL capture retains, every
+    // envdtor releases one). Exactly-once is EASIER to establish than for a
+    // `var`: §21.1 makes a `const` "not an assignable location", so it can never
+    // reach `assignedCaptureVars_` and `mutatedSharedCaptureCell`'s
+    // write-after-capture desynchronisation cannot arise for it at all.
     std::unordered_set<const void*> candidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
-        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (!ld->isUsing && isPlusOneBoxProducer(ld))
-                candidates.insert(static_cast<const void*>(ld));
+        {
+            LocalDeclInitView v = localDeclInitView(s);
+            if (v.init && !v.isUsing && isPlusOneBoxProducer(s))
+                candidates.insert(static_cast<const void*>(s));
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
             for (auto& b : is->ifBranch.body) scan(b.get());
@@ -26141,7 +26181,10 @@ void Emitter::collectBoxCaptureLocals(
     // reference) per returned closure. Counting parameters under their Symbol* key
     // closes that: the key spaces cannot collide (distinct allocations), and
     // boxCaptureLocals_ is unaffected because it additionally requires
-    // candidates.count(d), and `candidates` holds only LocalDecl nodes.
+    // candidates.count(d), and `candidates` holds only local-declaration nodes
+    // (fix #3436: LocalDecl OR §21.1 LocalConstDecl — the key is the node
+    // pointer either way, and `sema::LocalSymbol::decl` already points at
+    // whichever node declared the local, so this tally needed no change).
     std::vector<const ast::LambdaExpr*> lambdas;
     collectAllLambdas(body, lambdas);
     std::unordered_map<const void*, int> captureCount;
