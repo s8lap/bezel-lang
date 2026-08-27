@@ -1668,7 +1668,12 @@ private:
     // targets) nor checkCollectionBorrowStoreEscape (storing-method calls).
     // Owning-collection / inline-array indexer sets TAKE owned (a §28.8 transfer)
     // and are excluded. Called from handleAssignment; returns true when it
-    // reported a diagnostic. // per §28.11
+    // reported a diagnostic.
+    //
+    // It is also the indexer half of §15.4's fresh-store warning, for BOTH of
+    // that section's store positions — "the indexer-set, key and value positions
+    // alike" (#3395): the value always, and the index when the head is a
+    // dictionary, whose `:=` upsert retains an absent key. // per §28.11, §15.4
     bool checkIndexerSetBorrowStoreEscape(const ast::AssignmentStmt& as);
 
     // §15.4 fresh-store warning (v0.243, the taken #1813 follow-on) — THE one

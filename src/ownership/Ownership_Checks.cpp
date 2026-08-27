@@ -5607,17 +5607,49 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
     if (!borrowingFamily) return false;
 
     // §15.4 fresh-store warning (v0.243) — the indexer-set half of the shared
-    // sink (§15.4 names "`Add`/`Insert` and the indexer-set" in one breath, so
-    // both sinks route through the one authority). Emitted before the
-    // scope-comparison rejection below, which it neither gates nor is gated by:
-    // the warning fires on the argument's FRESHNESS, the rejection on a named
-    // source's SCOPE, and no expression is both. // per §15.4, §28.11
+    // sink (§15.4 names "`Add`/`Insert` and the indexer-set, key and value
+    // positions alike" in one breath, so both sinks route through the one
+    // authority). Emitted before the scope-comparison rejection below, which it
+    // neither gates nor is gated by: the warning fires on the argument's
+    // FRESHNESS, the rejection on a named source's SCOPE, and no expression is
+    // both.
+    //
+    // KEY AND VALUE ALIKE (#3395). §15.4's store-position list is one clause —
+    // "`Add`/`Insert` and the indexer-set, **key and value positions alike**" —
+    // and the storing-CALL sink already answers for the key (the `dictHead &&
+    // i == 0` selector in checkCollectionBorrowStoreEscape). This sink passed
+    // `isDictionaryKeyPosition=false` unconditionally and looked only at
+    // `as.value`, so the two sinks disagreed about the same store: `d.Add(new
+    // Key(), v)` warned while `d[new Key()] := v` said nothing. Wiring, not new
+    // machinery — the freshness question is answered by the one
+    // `warnSec154FreshStore` authority (producerState, the §28.3 producers
+    // table) for both positions.
+    //
+    // The index is examined ONLY for a DICTIONARY head, because only there is it
+    // a store position: `d[k] := v` upserts, so an absent key is RETAINED by the
+    // collection (stdlib §4.8 / §4.17), which is exactly the retention §15.4
+    // calls "statically certain to outlive the value". The index of an
+    // `Array`/`Stack`/`Queue`/`LinkedList`/`Set` head selects a position and is
+    // not retained in any slot, so it is not a store position and draws nothing.
+    // `OwningDictionary` is outside this sink altogether (the owned-setter bail
+    // above) and stays so: §15.4 scopes the must-warn to "a store-position
+    // argument on a **borrowing-family** collection", and the storing-call sink
+    // excludes it identically — the two sinks stay symmetric. // per §15.4, §28.11
     {
         const ast::IdentifierExpr* warnRoot = identifierRoot(*ix->target);
-        warnSec154FreshStore(
-            *as.value, "`coll[i] := …` store",
-            warnRoot ? std::string(warnRoot->name) : std::string("it"), cn,
-            /*isDictionaryKeyPosition=*/false);
+        const std::string recvNameForWarn =
+            warnRoot ? std::string(warnRoot->name) : std::string("it");
+        // The key position first: it is left of `:=` in source order.
+        if (cn == "Dictionary" || cn == "SortedDictionary") {
+            for (const ast::CallArgument& idx : ix->indices) {
+                if (!idx.value) continue;
+                warnSec154FreshStore(*idx.value, "`coll[key] := …` key store",
+                                     recvNameForWarn, cn,
+                                     /*isDictionaryKeyPosition=*/true);
+            }
+        }
+        warnSec154FreshStore(*as.value, "`coll[i] := …` store", recvNameForWarn,
+                             cn, /*isDictionaryKeyPosition=*/false);
     }
 
     // Classify the collection root exactly as checkCollectionBorrowStoreEscape
