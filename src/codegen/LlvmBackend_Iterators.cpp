@@ -230,25 +230,55 @@ void Emitter::collectSuspendLocals(
                     collectSuspendLocals(adb->body, out);
                 else if (auto* ald = dynamic_cast<const ast::LocalDecl*>(ab)) {
                     // A one-liner `catch E => var a := await f();` arm body.
-                    llvm::Type* ty = i32();
-                    if (ald->type) {
-                        if (auto* rt = ctx_.resolvedType(*ald->type))
-                            ty = lowerTypeRef(rt);
-                    } else if (ald->initializer) {
-                        if (auto* rt = ctx_.exprType(*ald->initializer))
-                            ty = lowerTypeRef(rt);
-                    }
-                    out.push_back({ald, ty});
+                    //
+                    // fix #3404 (§30.9 / §30.1, v0.283): routed through
+                    // `frameSlotTy` instead of keeping a private copy of the
+                    // derivation. The copy computed the same lowered type on
+                    // every path where a type IS available, and differed on the
+                    // two where one is not — it defaulted to `i32()`, which
+                    // contradicts #461's rule stated 150 lines above it:
+                    //
+                    //   "When neither an annotation nor an initializer exprType
+                    //    is available, default to a POINTER-WIDTH slot (not
+                    //    i32): ptr is large enough to hold any scalar alloca
+                    //    (i32/i64/bool/ptr) without overflow, so a local with an
+                    //    unresolved type can never clobber its neighbours."
+                    //
+                    // and it skipped #808's `frameCapturedLocals_` ptr-widening.
+                    // What an undersized slot costs was measured rather than
+                    // assumed: on a scratch compiler with this branch forced to
+                    // `i32()`, the per-suspend spill emits a mistyped 8-byte
+                    // `store ptr` into the 4-byte field, and the neighbouring
+                    // frame field silently reads back 0 instead of its value —
+                    // a WRONG ANSWER with no diagnostic, not a crash. Whether it
+                    // is observable at all depends on the next field's alignment
+                    // padding: with an 8-aligned `ptr` neighbour the padding
+                    // absorbed the overflow and the same program ran clean. That
+                    // layout-dependence is exactly why the invariant is stated
+                    // once and consulted, rather than re-derived per branch.
+                    //
+                    // No shape that reaches the old default is reachable from
+                    // source on this tree — see the commit message and
+                    // tests/codegen/async_catch_arm_frame_slot_3404_test.cpp for
+                    // the shapes tried and what rejected each (every initializer
+                    // with a null exprType is refused by the front end; an
+                    // await-initialized one resolves; and #808's
+                    // frameCapturedLocals_ widening cannot apply here at all,
+                    // because a one-liner arm's body IS the declaration, so no
+                    // lambda in the frame body can reference the local). The
+                    // change is therefore a de-duplication that removes a
+                    // contradicted invariant, not an observable behaviour fix.
+                    out.push_back(
+                        {ald, frameSlotTy(ald, ald->type.get(),
+                                          ald->initializer.get())});
                 }
                 // fix #3375 (§21.1): the `const` sibling of the one-liner arm
                 // above — `catch E => const a := await f();`. Same reason as the
                 // LocalConstDecl arm in the main loop: a §21.1 const local needs
-                // a frame field or it does not survive the suspend. (The slot
-                // type comes from frameSlotTy, whose unresolved-type default is
-                // #461's pointer-width slot; the `var` sibling directly above
-                // still defaults to i32 — that pre-existing divergence is left
-                // alone here and filed separately rather than widened by a lane
-                // that is not about it.)
+                // a frame field or it does not survive the suspend. (Both
+                // siblings now derive their slot type from `frameSlotTy`; the
+                // `var` one's private copy, and its i32 default, were removed by
+                // #3404 — see the branch directly above.)
                 else if (auto* alc =
                              dynamic_cast<const ast::LocalConstDecl*>(ab)) {
                     out.push_back(
