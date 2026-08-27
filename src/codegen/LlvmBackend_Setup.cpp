@@ -15006,15 +15006,49 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // the SPELLING decide the disposal, but the six names below name a
     // REPRESENTATION — the iterator-format frame, vtable [0]=td, [1]=Dispose,
     // [2]=MoveNext, [3]=Current — and the representation is the same whichever
-    // keyword bound it. None of the six is `IAsyncDisposable`: §28.12 defines
-    // asynchronous cleanup as the awaited `DisposeAsync()`, and the paragraph
-    // above records that only the two ENUMERATOR names carry it (they are NOT
-    // in this list and still reach their own arm below). So there is nothing to
-    // await for these heads, exactly as #2739 found for the builtin collections
-    // — "an `await using var` over a builtin collection has no
-    // user-async-disposable shape (no DisposeAsync to await) so the `await` is
-    // a no-op — apply the same synchronous collection disposal". This is that
-    // same ruling for the iteration-protocol family.
+    // keyword bound it.
+    //
+    // WHY, stated correctly. An earlier revision of this comment justified the
+    // change with "none of the six is `IAsyncDisposable`". That is FALSE, and
+    // the false half is IN this list: stdlib §4.13 (v0.283) declares
+    // `public interface IOwningAsyncEnumerable<T>: IAsyncDisposable where T:
+    // class` (Bezel_Standard_Library.md:2441). THREE iteration interfaces carry
+    // `IAsyncDisposable` — `IAsyncEnumerator`, `IOwningAsyncEnumerator` and
+    // `IOwningAsyncEnumerable` — not two. The over-broad reading came from the
+    // #1525 paragraph above, which is correct about `IAsyncEnumerable`
+    // specifically and was wrongly generalised to all six names.
+    //
+    // The justification that holds is §28.12's own synchronous-fallback clause.
+    // Asynchronous cleanup "runs only where the program wrote `await using`
+    // (whose implicit `finally` awaits `DisposeAsync` on both the normal and
+    // exception edges of an async body, with §29.7's synchronous fallback on
+    // early iterator abandonment)" — §28.12 verbatim, v0.283. §29.7 is the
+    // matching half: "When a consumer stops iterating early — `break`,
+    // exception, or `using var` ending before exhaustion — the iterator is
+    // disposed", running the pending cleanups "including, via §28.12's
+    // synchronous-fallback path, `await using var` disposals" — §29.7 verbatim,
+    // v0.283. A synchronous disposal of an iterator frame is therefore the
+    // spec's DEFINED degraded behaviour, not a liberty taken here.
+    //
+    // And it is the path that runs either way. The value at any of these heads
+    // is an iterator-format frame, so no `DisposeAsync` function pointer is
+    // reachable through it: `classOfLocal` cannot answer for a declaration-less
+    // builtin interface head, `disposeAsyncFn` stays null, and
+    // `emitAsyncDisposeAwaitAndFree` degrades to the synchronous
+    // `emitDisposeAndReclaim` by its own documented contract. So this change
+    // does NOT trade an awaited `DisposeAsync` for a synchronous one — no await
+    // was ever emitted at these heads, before or after. It changes only WHICH
+    // synchronous disposal runs: the frame's own slot-1 Dispose, instead of
+    // reading word 0 as a class vtable and calling slot 2.
+    //
+    // That is the disposition #2739 recorded for the builtin collections — "an
+    // `await using var` over a builtin collection has no user-async-disposable
+    // shape (no DisposeAsync to await) so the `await` is a no-op — apply the
+    // same synchronous collection disposal" — reached here by §28.12/§29.7
+    // rather than by an `IAsyncDisposable` claim that does not hold. (Driving
+    // `DisposeAsync` through an iterator frame at all would need the async
+    // unwind driver §30.7 records as "deferred future work, not foreclosed";
+    // that is not what stood here before, and not what this is.)
     //
     // What the gate cost, MEASURED on 1e3861a (`bezelc --sanitize=address`):
     //   * `await using var e: IEnumerable<int> := a;` over a named `Array<int>`
@@ -15032,7 +15066,20 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     //     called slot 2, which in the iterator format is MoveNext, not Dispose:
     //     the frame was RESUMED and then freed without its pending `using var`
     //     disposals ever running — 540000 B / 1000 allocs over 500 executions.
-    //     The `using var` twin is clean and returns 249.
+    //     The `using var` twin is clean and returns 249. The RESUMPTION is the
+    //     headline, not the free: dispatching slot 2 DRIVES THE STATE MACHINE,
+    //     so the scope-end "disposal" silently executes user statements from the
+    //     iterator body that the program never asked to run. Measured with a
+    //     generator incrementing a borrowed counter cell between yields, driven
+    //     by exactly ONE explicit `MoveNext`: the cell reads 2 under
+    //     `await using` and 1 under the `using var` twin (probe returns 210 vs
+    //     110; both 110 with this fix).
+    //   * the two heads with no wrapper and no matching collection predicate
+    //     leaked outright: `IOwningEnumerator<Item>` 328800 B / 900 allocs over
+    //     300 abandoned executions, and `IOwningAsyncEnumerable<Item>`
+    //     384300 B / 1500 over 300 — the latter being exactly the
+    //     `IAsyncDisposable`-bearing head the retired justification above was
+    //     wrong about.
     // Routing all six here gives every one of them the slot-1 Dispose the plain
     // spelling already gets. // per §28.12, §29.1, §29.7, #3437, #2739
     if (ld->initializer) {
