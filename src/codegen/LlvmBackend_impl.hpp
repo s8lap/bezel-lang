@@ -7691,6 +7691,74 @@ private:
     llvm::Value* boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
                               const ast::Expr* init);
 
+    // fix #3443 (§8.1 / §8.6 / §5.1, v0.283): §8.1's universal
+    // `public virtual method Equals(other: Object?): bool` FORMAL, as a sema
+    // TypeRef. `boxForTarget` decides §8.6 boxing by asking whether the TARGET
+    // is an Object/interface location, so a caller needs a TypeRef for the
+    // formal — and the three sites that answer `Equals` directly on an
+    // `Object`/interface/class receiver have NO MethodSymbol (that is exactly
+    // why they are answered here), so there is no declared parameter to read it
+    // off. Minted once into the sema arena and cached, so the `.` form, the
+    // `?.` mirror and the generic-T redirect all box against ONE spelling of
+    // the formal rather than three drifting copies.
+    const sema::TypeRef* universalEqualsFormalTy() {
+        if (!universalEqualsFormalTy_) {
+            sema::TypeRef* t = ctx_.makeTypeRef();
+            t->kind = sema::TypeRef::Kind::Primitive;
+            t->primitive = sema::PrimitiveType::Object;
+            t->nullable = true;  // §8.1 declares `other: Object?`
+            universalEqualsFormalTy_ = t;
+        }
+        return universalEqualsFormalTy_;
+    }
+    const sema::TypeRef* universalEqualsFormalTy_ = nullptr;
+
+    // fix #3443: lower the single argument of an `Equals` call this backend
+    // answers itself, applying §8.6 to it — "When a value type is used where
+    // `Object` (or an interface implemented by the value type) is expected, the
+    // value is boxed". One helper for all three receiver arms so the `.` form,
+    // the `?.` mirror and the generic-T redirect cannot disagree about whether
+    // the argument is boxed.
+    //
+    // ⚠ THE FRESH BOX IS DELIBERATELY NOT RELEASED, and that is a MEASURED
+    // decision, not an oversight — do not "finish" this by adding a
+    // `bz_box_release` after the dispatch. #2952 discharges an argument-position
+    // box right after the call ONLY when `isCalleeParamNonEscaping` can prove
+    // the callee does not store the parameter; here the callee is a VTABLE
+    // DISPATCH (`lowerObjectEquals` → vtable[kEqualsSlot]) and so is not
+    // statically known at all. The release was implemented first and MEASURED
+    // to produce a heap-use-after-free under ASan on this program:
+    //
+    //     class K
+    //       public S: Object?;
+    //       public override method Equals(other: Object?): bool
+    //         S := other; return false;
+    //       end Equals; …
+    //     var o: Object := k;  var b := o.Equals(5);
+    //     Console.WriteLine(k.S!.ToString());     // READ of freed 24-byte box
+    //
+    // — because `S` is assigned from an `Object?` PARAMETER, which
+    // `collectBoxStorageFields` cannot classify as box-only, so the field store
+    // takes NO `bz_box_retain` and the caller's `+1` is the only reference.
+    // §30.12's read-guard clause records the general shape ("a borrowed parameter
+    // admits stores in the callee, which no caller-side rule can reject without
+    // rejecting the pass-and-read idiom wholesale"), so this is a program the
+    // compiler admits. Leaking is #2952's own stated conservative direction:
+    // "the compiler's escape analysis conservatively leaks rather than
+    // guessing." The residual leak (24 B per `Equals` call with a value-typed
+    // argument) is filed separately rather than traded for a UAF.
+    llvm::Value* lowerUniversalEqualsArg(const ast::Expr& argExpr) {
+        llvm::Value* savedBoxMint = lastBoxMint_;
+        lastBoxMint_ = nullptr;
+        llvm::Value* other = lowerExpr(argExpr);
+        // The save/clear/restore around `boxForTarget` is #2952's discipline:
+        // it keeps THIS argument's mint from leaking into a sibling
+        // `boxForTarget`, or a previous mint into this one.
+        other = boxForTarget(other, universalEqualsFormalTy(), &argExpr);
+        lastBoxMint_ = savedBoxMint;
+        return other;
+    }
+
     // fix #3095 (§4.7, v0.252): boxForTarget's `()?` sibling — a unit-typed
     // source expression lowers to no llvm::Value, and at a `()?` LOCATION the
     // PRESENT optional `{i8 1, i8 0}` must be synthesized for it (§4.7: `()?`

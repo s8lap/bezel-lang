@@ -2664,7 +2664,13 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
                         if (llvm::Value* r = lowerObjectGetHashCode(recv))
                             return r;
                     } else if (call.args[0].value) {
-                        if (llvm::Value* other = lowerExpr(*call.args[0].value))
+                        // fix #3443: the third spelling of the same dispatch —
+                        // a bare `T` receiver monomorphized to a reference type
+                        // — needs the same §8.6 argument boxing, or
+                        // `t.Equals(5)` inside a generic body drops exactly as
+                        // the concrete `Object` receiver's did.
+                        if (llvm::Value* other =
+                                lowerUniversalEqualsArg(*call.args[0].value))
                             if (llvm::Value* r = lowerObjectEquals(recv, other))
                                 return r;
                     }
@@ -6080,7 +6086,29 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                 if (isObjectRecv || isIfaceRecv || isNamedClassRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {
-                        llvm::Value* other = lowerExpr(*call.args[0].value);
+                        // fix #3443 (§8.6 / §5.1 / §8.1, v0.283): the argument
+                        // of §8.1's `Equals(other: Object?)` is an `Object`
+                        // LOCATION, so §5.1's "any type to `Object`: … value
+                        // types (primitives, records, enums, non-owning inline
+                        // arrays, the unit type) by boxing ([§8.6])" applies to
+                        // it. This site handed the BARE lowered value to
+                        // `lowerObjectEquals`, which takes two `ptr`s and
+                        // therefore DECLINED for every value-typed argument —
+                        // and a declining `Equals` makes the whole call lower to
+                        // nothing, so `Console.WriteLine(o.Equals(5).ToString())`
+                        // drew #3079's `internal:` note and printed NOTHING,
+                        // while binding it to a local drew #2434's and left the
+                        // local zero-initialized (`False` — a WRONG VALUE with
+                        // only an `internal:` note, the silent shape).
+                        // MEASURED on 2be0ed3: `o.Equals(q)` (an `Object` local)
+                        // and `o.Equals("x")` worked, `o.Equals(5)`,
+                        // `o.Equals(i)` and `o.Equals(())` were dropped — the
+                        // dispatch itself was fine, only the argument's boxing
+                        // was missing. This is fix #3422's sibling on the other
+                        // operand: that one is the `()` RECEIVER, this the
+                        // value-typed ARGUMENT.
+                        llvm::Value* other =
+                            lowerUniversalEqualsArg(*call.args[0].value);
                         if (recv && other)
                             if (llvm::Value* r = lowerObjectEquals(recv, other))
                                 return r;
@@ -12879,8 +12907,16 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                             // remainder after the receiver), so it is lowered
                             // HERE — inside callBB — and never evaluated when
                             // the receiver is null.
+                            // fix #3443: the `?.` mirror of the `.` form's
+                            // §8.6 argument boxing, through the same helper —
+                            // so the two spellings of §8.1's universal `Equals`
+                            // cannot disagree about whether the argument is
+                            // boxed. It stays INSIDE this block, the non-null-
+                            // receiver arm, so §7.5's "nothing to its right in
+                            // the chain is evaluated" still holds: a null
+                            // receiver evaluates no argument and mints no box.
                             llvm::Value* ncoOther =
-                                lowerExpr(*call.args[0].value);
+                                lowerUniversalEqualsArg(*call.args[0].value);
                             if (ncoOther)
                                 ncoRes = lowerObjectEquals(recv, ncoOther);
                         }
