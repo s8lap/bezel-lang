@@ -1671,6 +1671,46 @@ private:
     // reported a diagnostic. // per §28.11
     bool checkIndexerSetBorrowStoreEscape(const ast::AssignmentStmt& as);
 
+    // §15.4 fresh-store warning (v0.243, the taken #1813 follow-on) — THE one
+    // authority for it, and the reason it is a function rather than two inline
+    // arms: §15.4 states the rule once for "`Add`/`Insert` and the indexer-set,
+    // key and value positions alike", so the two store sinks the compiler has
+    // (`checkCollectionBorrowStoreEscape`'s storing-method CALLS and
+    // `checkIndexerSetBorrowStoreEscape`'s `coll[i] := value`) must answer it
+    // with ONE predicate and ONE message. #3364's whole cost was a second
+    // predicate derived for one arm of a classification that already had an
+    // authority.
+    //
+    // §15.4: "Because the retention is statically certain to outlive the value,
+    // the compiler **must warn** when a store-position argument on a
+    // borrowing-family collection … is a **fresh unbound owned temporary of
+    // class type** (§28.3): a `new` expression, a collection literal, an
+    // `owned`-returning call result, a `move` result, or a `Task`-family call
+    // result … The warning does not narrow the admission: the program remains
+    // accepted, no `using var` is demanded, and the recorded literal-only-
+    // rejection asymmetry above stands unchanged."
+    //
+    // FRESHNESS IS `producerState`, NOT A NEW SHAPE LIST. producerState is the
+    // §28.3 producers-table authority already used for exactly this question at
+    // checkDisposeReceiverOwnership ("a fresh owned producer … or a `move`
+    // result — producerState already classifies a class-typed `move` operand as
+    // Owned (§28.8.1), so this single check covers both the spec's 'unbound
+    // owned temporary' and 'a `move` result' admissions"), and it carries the
+    // `new`/owned-call/marked-transfer/arm-meet/Task-family arms too. The one
+    // §15.4 form it has no arm for is the collection literal, which is added
+    // here as an explicit shape (a literal has no producerState arm because it
+    // is not a general expression, §15.4).
+    //
+    // `isDictionaryKeyPosition` selects the Dictionary-KEY message variant,
+    // which omits the owning-family remedy: `OwningDictionary`'s key position is
+    // borrowing exactly like `Dictionary`'s, so naming it there would send the
+    // reader to a remedy that does not work (the asymmetry
+    // checkBorrowingFamilyLiteralElements already prints for a rejected literal
+    // key). // per §15.4, §28.11, §28.3
+    void warnSec154FreshStore(const ast::Expr& arg, std::string_view storeSpelling,
+                              std::string_view recvName, std::string_view collHead,
+                              bool isDictionaryKeyPosition);
+
     // §28.3 / §28.5 / §28.8 (issue #402): true when `target` resolves to an
     // `owned` field — an owned storage location. Reuses the owned-field
     // recognizer `exprIsOwnedFieldRead` (a real FieldSymbol carrying the

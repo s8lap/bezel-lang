@@ -5256,6 +5256,32 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         // `obj.pool.Add(x)` / `this._pool.Add(x)` — reachable from a field.
         kind = RecvKind::Escapes;
     }
+
+    // §15.4 fresh-store warning (v0.243) — the storing-method-CALL half of the
+    // shared sink; `checkIndexerSetBorrowStoreEscape` is the other. Emitted
+    // BEFORE the `RecvKind::Unknown` bail below on purpose: §15.4's must-warn is
+    // not conditioned on the receiver's scope ("Because the retention is
+    // statically certain to outlive the value…"), since a borrowing collection
+    // outlives the K8 boundary of the statement storing into it in EVERY
+    // receiver shape — including the roots the escape rule below declines to
+    // classify. The BULK `AddRange` is excluded: its argument is a COLLECTION
+    // whose elements are copied out, and §15.4 names the element store positions
+    // ("`Add`/`Insert` and the indexer-set"), so a fresh source collection's own
+    // death leaves no dangling element slot behind. // per §15.4, §28.11
+    if (storing) {
+        const std::string recvNameForWarn =
+            recvRoot ? std::string(recvRoot->name) : std::string("it");
+        const std::string storeSpelling =
+            std::string("`.") + std::string(m) + "(...)` store";
+        const bool dictHead = (cn == "Dictionary" || cn == "SortedDictionary");
+        for (std::size_t i = 0; i < call.args.size(); ++i) {
+            if (!call.args[i].value) continue;
+            warnSec154FreshStore(*call.args[i].value, storeSpelling,
+                                 recvNameForWarn, cn,
+                                 /*isDictionaryKeyPosition=*/dictHead && i == 0);
+        }
+    }
+
     if (kind == RecvKind::Unknown) return;
 
     auto depthOf = [&](const ast::Node* declNode) -> int {
@@ -5437,6 +5463,114 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
     }
 }
 
+// per §15.4 (v0.243) / §28.11 *The element slot policy*: is `t` the CLASS-typed
+// population §15.4's fresh-store warning names ("a fresh unbound owned temporary
+// of **class type**")? §28.11's element-category table puts the other categories
+// in columns whose store cannot dangle: a value type "copies the value in", and
+// a runtime-managed reference (`string`, function types — §28.9) "stores the
+// reference". Only the class / interface row "stores the borrow".
+//
+// A builtin head with no user TypeDecl is class-typed exactly when the
+// BuiltinRegistry says it is a heap-pointer reference (the §4 collections, the
+// Task family, …). That is deliberately the registry's own classification and
+// not a second hand-list here — the value-shaped reserved names (`Range`, the
+// span shapes, `DateTime`, …) fall out of it for free. // per §15.4, §28.11, §28.9
+static bool sec154StoreArgIsClassTyped(const sema::TypeRef* t) {
+    if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+    if (t->declaration)
+        return (t->declaration->kind == ast::TypeDeclKind::Class ||
+                t->declaration->kind == ast::TypeDeclKind::Interface) &&
+               !t->declaration->isValueBuiltin;
+    const std::string_view head = t->headName();
+    return !head.empty() && common::isHeapPointerReferenceBuiltin(head);
+}
+
+// per §15.4 (v0.243): the borrowing-family heads that HAVE an owning twin, so
+// the warning's second remedy ("use the owning family, whose store positions
+// take ownership") can be named concretely. `SortedDictionary` / `SortedSet`
+// have no owning form in the stdlib (§4), so the remedy is omitted for them
+// rather than inventing `OwningSortedDictionary` — a diagnostic that names a
+// remedy which does not exist is worse than one that names none (the same
+// reasoning checkBorrowingFamilyLiteralElements applies to a Dictionary KEY).
+static bool sec154HeadHasOwningTwin(std::string_view head) {
+    return head == "Array" || head == "Set" || head == "LinkedList" ||
+           head == "Stack" || head == "Queue" || head == "Dictionary";
+}
+
+void MethodOwnership::warnSec154FreshStore(const ast::Expr& arg,
+                                           std::string_view storeSpelling,
+                                           std::string_view recvName,
+                                           std::string_view collHead,
+                                           bool isDictionaryKeyPosition) {
+    const sema::TypeRef* at = ctx_.exprType(arg);
+    if (!sec154StoreArgIsClassTyped(at)) return;
+    // §15.4's fresh set. producerState is the §28.3 producers-table authority
+    // (see the declaration comment) and covers `new`, an `owned`-returning call,
+    // a `move` result, a marked transfer, an owned arm-meet, and a Task-family
+    // call. The collection literal is the one §15.4 form producerState has no arm
+    // for — a literal is not a general expression (§15.4), so it is matched by
+    // shape here; the class-typed gate above has already excluded an inline-array
+    // literal (whose TypeRef is `Kind::InlineArray`, not `Named`).
+    //
+    // ⚠ THE LITERAL ARM IS CURRENTLY UNREACHABLE, and is here for spec fidelity
+    // rather than because it is exercised: a literal in a borrowing-collection
+    // STORE position does not compile at all today, in either spelling —
+    // `groups["odds"] := [1, 3, 5];` degrades with "#3025 indexer-setter RHS
+    // expression failed to lower" and `outer.Add([1, 2, 3]);` / `s.Push([1, 2,
+    // 3]);` with the #2457-class "produced no value, and no dispatch arm emitted
+    // any code" (all three measured on this HEAD). Sema also leaves such a
+    // literal's `exprType` unset, so the class-typed gate above already declines
+    // it. The arm costs one `dynamic_cast` and starts working the moment that
+    // lowering lands; it is NOT claimed as covered by this fix's tests.
+    const bool fresh =
+        producerState(arg) == OwnershipState::Owned ||
+        dynamic_cast<const ast::CollectionLiteralExpr*>(&arg) != nullptr;
+    if (!fresh) return;
+
+    // §15.4: "The stated hazard splits by family." Three arms, in the spec's
+    // own order of specificity.
+    const std::string_view argHead = at->headName();
+    std::string hazard;
+    if (!argHead.empty() && common::isTaskFamilyHead(argHead)) {
+        hazard =
+            "an abandoned task — the operation runs to its terminal state "
+            "unsupervised and its result, if owned, is disposed on arrival "
+            "(§30.5) — and the slot dangles besides";
+    } else if ((at->declaration &&
+                common::isNonTrivialDisposeClass(at->declaration)) ||
+               (!at->declaration && !argHead.empty() &&
+                common::isOwningCollectionHead(argHead))) {
+        hazard =
+            "a disposed instance, leaving the slot dangling";
+    } else {
+        hazard =
+            "a freed instance (checked disposal mode reports a "
+            "`DisposedAccessException` on a later use, §28.2)";
+    }
+
+    const std::string owningRemedy =
+        (!isDictionaryKeyPosition && sec154HeadHasOwningTwin(collHead))
+            ? std::string(", or use the owning family (`Owning") +
+                  std::string(collHead) +
+                  "`), whose store positions take ownership"
+            : std::string();
+
+    report(
+        Severity::Warning, arg.span.begin,
+        std::string("this ") + std::string(storeSpelling) + " on `" +
+        std::string(recvName) +
+        "` stores a fresh unbound owned temporary into a borrowing-family "
+        "collection: the argument dies at its K8 full-expression boundary "
+        "(the end of this statement, §28.3), while a borrowing `" +
+        std::string(collHead) +
+        "` slot only stores a borrow and takes no ownership — so the "
+        "collection retains a reference to " + hazard +
+        "; bind the source to a named holder first — `using var t := …;`, "
+        "then store `t`, whose own lifetime the §28.11 store rule then "
+        "checks" + owningRemedy +
+        " (§15.4 fresh-store warning, v0.243; §28.11)");
+}
+
 // §28.11 "Storing a borrow" (v0.180; hole closed #1884). §28.11 lists the store
 // operations of a borrowing collection together — "store (`Add`, `Insert`,
 // indexer-set)" — so the indexer-set sink `coll[i] := value` is a borrow store
@@ -5471,6 +5605,20 @@ bool MethodOwnership::checkIndexerSetBorrowStoreEscape(
         cn == "Array" || cn == "Dictionary" || cn == "SortedDictionary" ||
         cn == "Set" || cn == "Stack" || cn == "Queue" || cn == "LinkedList";
     if (!borrowingFamily) return false;
+
+    // §15.4 fresh-store warning (v0.243) — the indexer-set half of the shared
+    // sink (§15.4 names "`Add`/`Insert` and the indexer-set" in one breath, so
+    // both sinks route through the one authority). Emitted before the
+    // scope-comparison rejection below, which it neither gates nor is gated by:
+    // the warning fires on the argument's FRESHNESS, the rejection on a named
+    // source's SCOPE, and no expression is both. // per §15.4, §28.11
+    {
+        const ast::IdentifierExpr* warnRoot = identifierRoot(*ix->target);
+        warnSec154FreshStore(
+            *as.value, "`coll[i] := …` store",
+            warnRoot ? std::string(warnRoot->name) : std::string("it"), cn,
+            /*isDictionaryKeyPosition=*/false);
+    }
 
     // Classify the collection root exactly as checkCollectionBorrowStoreEscape
     // classifies a storing-method receiver: `Escapes` = every root that provably
