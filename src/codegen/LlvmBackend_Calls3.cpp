@@ -5814,8 +5814,9 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
     // of the type — so an owning `[2 owned]R` is a DIFFERENT type from `[2]R`
     // and must render DIFFERENTLY: `[2 owned]R`, not `[2]R`. N and the element
     // type are both static, so the whole result is a compile-time string
-    // constant; the receiver's runtime value is never read. Handled here
-    // (rather than the general array-address path below) because it needs
+    // constant; the receiver's runtime VALUE is never read (its EXPRESSION is
+    // still evaluated — see fix #3445 in the arm itself). Handled here (rather
+    // than the general array-address path below) because the ANSWER needs
     // neither `arrAddr` nor `elemTy`/`esz`.
     //
     // #2959 (§8.5 v0.240): the direct-call arm used to build the name by hand
@@ -5825,6 +5826,56 @@ llvm::Value* Emitter::tryLowerInlineArrayCall(const ast::CallExpr& call) {
     // renderers, disagreed on one cell. Delegate here too — same spelling,
     // single authority.
     if (m == "ToString" && call.args.empty()) {
+        // fix #3445 (§7.5 / §22.3 / §22.5 / §8.2, v0.283): "the receiver's
+        // runtime VALUE is never read" is NOT "the receiver EXPRESSION needs no
+        // evaluating". The comment above conflated the two and this arm acted on
+        // the conflation: it answered §8.5 from the static type and returned
+        // WITHOUT ever handing `ma->target` to `lowerExpr`, so
+        // `C.MakeArray().ToString()` deleted the call from the program — the
+        // `CreateCall` was never emitted, `"[3]int"` was still exactly right, and
+        // the whole thing was silent (measured on 0c5ecd1: the issue's repro
+        // printed `A`, `[3]int`, `B` and never the receiver's own
+        // `Console.WriteLine("side-arr")`, exit 0, no diagnostic).
+        //
+        // This is #3431's defect one type over. Those two are the WHOLE blast
+        // radius: measured with a side-effecting producer, only the two §8.5
+        // arms whose answer is a compile-time constant (`()` and `[N]T`) skipped
+        // it; a record, an `int` and an `owned Array<int>` receiver all ran
+        // their producer, because every arm that has to READ the receiver lowers
+        // it as a side effect of needing it. Within THIS function `ToArray`,
+        // `Contains`, `Equals` and `GetHashCode` all fall through to the
+        // `arrAddr` computation below and so were never affected.
+        //
+        // A receiver is an evaluated operand, and none of the rules that say so
+        // carves out a receiver whose §8.5 answer is static:
+        //   * §7.5 "Evaluation": "`?.` short-circuits. The receiver is evaluated
+        //     first; if it is null the access does not occur and nothing to its
+        //     right in the chain is evaluated" — a rule that a NULL receiver
+        //     SUPPRESSES the rest presupposes a non-null one's expression RUNS,
+        //     and `.` has no short-circuit at all.
+        //   * §22.3, the `ref`/`out` argument-locations passage: "the receiver
+        //     and every index expression are evaluated exactly once, in §22.5's
+        //     call-site textual order". Exactly once — not zero times.
+        //   * §22.5 "Evaluation order": "The order is observable through
+        //     side-effecting arguments and non-constant defaults … and is
+        //     normative."
+        //   * §8.2 is the closest thing to a licence for answering a universal
+        //     from the static type, and is explicit about what it removes: "the
+        //     call is answered from the static type with no observable boxing".
+        //     It removes the BOX, not the receiver.
+        //
+        // So: lower the receiver for its effects, EXACTLY ONCE, and then answer
+        // §8.5's constant. `lowerExpr` (rather than the `lvalueAddr`-first
+        // sequence the `arrAddr` block below uses) is deliberate: that sequence
+        // can emit IR and THEN decline — the §12.7 arm and the `a[i]` arm both
+        // do, see lvalueAddr's own ⚠ note — so falling back from it would risk
+        // evaluating a side-effecting sub-expression TWICE, which for this arm
+        // would be a worse defect than the one being fixed. One `lowerExpr` is
+        // one evaluation. Its result is discarded rather than tested because a
+        // null here must not resurrect the drop: §8.5's answer does not depend
+        // on the value, so a receiver this backend cannot value-lower still gets
+        // its correct rendering.
+        (void)lowerExpr(*ma->target);  // per §22.3 / §7.5 / §22.5
         // lowerStringLiteral expects Bezel string-literal SOURCE TEXT
         // (including the surrounding quotes); a type name is always a plain
         // identifier sequence (plus "[", "]", "?"), none of which need
