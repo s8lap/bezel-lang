@@ -11551,6 +11551,19 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                     /*isOut=*/formalMod == "out", accessorRefArgs);
         } else {
             v = lowerExpr(*a.value);
+            // fix #3433 (§4.7 / §22.7, v0.283): a unit-typed argument has NO
+            // lowered value — `()` lowers to LLVM `void`, so `lowerExpr`
+            // returns null for it — and the chain target's signature still has
+            // a slot for it (`lowerParamType` substitutes the §4.7 placeholder
+            // byte for the `void` a unit parameter would otherwise lower to).
+            // Routed through the SAME predicate the ordinary call-argument
+            // position uses, so `base(C.Nothing())` and `new B(C.Nothing())`
+            // agree by construction instead of the chain spelling alone
+            // reporting the #1386 ICE below. Deliberately NOT applied on the
+            // §22.3 ref/out branch above: there a null `v` means no ADDRESS was
+            // obtained, and the callee's formal is a `ptr` — a placeholder byte
+            // would be malformed IR, not a rescue.
+            if (!v) v = unitValueForCtorParam(v, target, ai, a.value.get());
         }
         if (!v) {
             // #1386: ICE — the expression kind is not yet handled by codegen.
@@ -12053,6 +12066,15 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
                         const auto& a = td->primaryBaseCtorArgs[i];
                         if (!a.value) { ok = false; break; }
                         llvm::Value* v = lowerExpr(*a.value);
+                        // fix #3433 (§4.7 / §22.8 / §11.1, v0.283): the
+                        // inheritance-clause face of the same gap — see the
+                        // `base(...)` site in emitChainCall above. §11.1's
+                        // `class D(): B(args)` chains to B's constructor
+                        // through this loop, which owed the unit placeholder
+                        // byte for a `()`-typed formal just as the explicit
+                        // chain call does.
+                        if (!v)
+                            v = unitValueForCtorParam(v, bt, i, a.value.get());
                         if (!v) {
                             // #1386: ICE — lowerExpr returned null for a
                             // positional-base-ctor argument.

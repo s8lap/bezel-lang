@@ -3413,6 +3413,43 @@ llvm::Value* Emitter::unitValueForTarget(llvm::Value* v,
 }
 
 
+// fix #3433 (§4.7 / §22.7 "Constructor chaining" / §22.8, v0.283): the
+// constructor-chain face of `unitValueForTarget` — see the declaration comment.
+//
+// §4.7 makes a method declared without a return type a producer of the unit
+// value, and "The unit type is a value type"; §22.7 places no restriction on
+// the argument types a chain call may carry. `new B(C.Nothing())` already
+// compiled (that path runs `buildOrderedArgs`, which carries the #2915/#3095/
+// #3421 rescue); only the `base(...)`/`this(...)` and `: Base(...)` spellings
+// of the SAME argument at the SAME constructor rejected it.
+//
+// The formal comes from `paramTypeOf` — the existing #1592 authority for "the
+// resolved declared TypeRef of a formal", which prefers an imported symbol's
+// `resolvedDeclType` and falls back to resolving a local one's `ast::Type`, so
+// an imported chain target answers as well as a local one. A generic formal
+// monomorphized to `()`/`()?` (§14.2's `where T: value` admitted substitutions)
+// arrives as a bare `Named T`, so it is resolved through the ACTIVE
+// substitution first, exactly as `buildOrderedArgs` does at the ordinary
+// call-argument position. `concr` is kept alive across the `unitValueForTarget`
+// call deliberately: it is a caller-owned holder, not a cached TypeRef.
+llvm::Value* Emitter::unitValueForCtorParam(llvm::Value* v,
+                                            sema::ConstructorSymbol* target,
+                                            std::size_t idx,
+                                            const ast::Expr* arg) {
+    if (v || !target || !arg || idx >= target->params.size()) return v;
+    sema::TypeRef* formal = paramTypeOf(target->params[idx]);
+    if (!formal) return v;
+    if (formal->kind == sema::TypeRef::Kind::Named && !formal->declaration &&
+        formal->nullable) {
+        sema::TypeRef concr;
+        if (nullableTypeParamConcrete(formal, concr))
+            return unitValueForTarget(v, &concr, arg);
+        return unitValueForTarget(v, formal, arg);
+    }
+    return unitValueForTarget(v, resolveTypeParamRef(formal), arg);
+}
+
+
 llvm::Value* Emitter::refParamAddr(const ast::Expr& e, llvm::Type*& elemTy) {
     if (!dynamic_cast<const ast::IdentifierExpr*>(&e)) return nullptr;
     sema::Symbol* sym = ctx_.exprSymbol(e);
