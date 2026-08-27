@@ -48,10 +48,15 @@
 //   * §17.11 / §3.6's *defaultable* row: the unit type is defaultable, and
 //     §17.11's per-kind list gives its zero value — "The unit type: `()`" — so
 //     `default(())` is an expression whose value must go somewhere.
-//   * §14.2: "`where T: value` restricts T to non-nullable value types —
-//     records, enums, choices ([§35]), primitives, inline arrays (all forms,
-//     including `[N owned]…` owning forms), and the unit type", so a generic
-//     body's `var x: T := f();` must compile at T = `()`.
+//   * §7.10 "Generics and nullability": "`where T: value` restricts T to
+//     non-nullable value types — records, enums, choices ([§35]), primitives,
+//     inline arrays (all forms, including `[N owned]…` owning forms), and the
+//     unit type", so a generic body's `var x: T := f();` must compile at
+//     T = `()`. §14.2 "Constraints" carries the same substance in its
+//     constraint table ("Non-nullable value types — … the unit type"), but the
+//     sentence quoted above is §7.10's; an earlier revision of this comment,
+//     and this commit's message, attributed it to §14.2. Corrected — the claim
+//     holds under both sections, only the attribution was wrong.
 //
 // So it is LEGAL, this is a codegen gap and not a missing rejection, and the
 // answer is to lower it — which is also what #3391 (the parent commit) left
