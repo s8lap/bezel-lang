@@ -13092,8 +13092,8 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             !declTR->declaration &&
             declTR->astNode && declTR->astNode->name &&
             !declTR->astNode->name->parts.empty() &&
-            declTR->headName() == "IEnumerable" ||
-            declTR->headName() == "IOwningEnumerable") {
+            (declTR->headName() == "IEnumerable" ||
+             declTR->headName() == "IOwningEnumerable")) {
             const sema::TypeRef* initTR = ctx_.exprType(*init);
             // fix #747 R43 / §29.2: an Array<T> initializer assigned to an
             // IEnumerable<T> local must ALSO be wrapped in a vtable-backed
