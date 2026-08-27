@@ -84,6 +84,17 @@ bool hasAnyConstOwnedProductionError(const OwnershipResult& r) {
     return false;
 }
 
+// narrow #3376: the "codegen has no lowering for this `?.` member" rejection.
+bool hasNotYetSupportedInCodegen(const OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("is not yet supported in codegen") !=
+            std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 // =====================================================================
@@ -220,4 +231,63 @@ BEZEL_TEST(const_nullcond_materializer_2749,
     // (the value is owned and not `using`-bound), and that is expected;
     // we only assert §21.1 is silent.
     BEZEL_EXPECT_FALSE(hasAnyConstOwnedProductionError(r));
+}
+
+// =====================================================================
+// narrow #3376 / §7.5 (v0.282) — THE REGRESSION THIS FILE PREVIOUSLY MISSED.
+//
+// #3376 pre-typed `t?.Split(",")` in `resolveNullCondMember` so the §21.1
+// materializer predicate could read a non-null call exprType (the `const`
+// rejection pinned above). But it ALSO returned early from that block, which
+// skipped the string-receiver gate further down — the gate that reports
+// "string member `?.Split` is not yet supported in codegen".
+//
+// Codegen has no lowering for `?.Split`; only the diagnostic saying so went
+// away. Measured on `var parts := t?.Split(",")`:
+//
+//   main (no #3376) -> "string member `?.Split` is not yet supported in
+//                       codegen", rc=1, program REJECTED
+//   with #3376      -> "#2434 ... degraded to a zero-initialized value",
+//                       rc=0, program ACCEPTED carrying a wrong value
+//
+// A loud compile error had become a silent wrong value — strictly worse than
+// the #2434 degradation #3376 set out to fix. Neither shipped #3376 test could
+// see it: both assert only on the §21.1 message, one that it is present and
+// one that it is absent, and the codegen-unsupported error is a different
+// message entirely.
+//
+// `narrow #3376` keeps the type (so the §21.1 `const` rejection above still
+// fires) and lets the gate reject as well. These two tests pin BOTH halves of
+// that invariant so it cannot silently invert again.
+// =====================================================================
+BEZEL_TEST(const_nullcond_materializer_2749,
+           nullcond_split_var_still_rejected_by_codegen_gate_spec_7_5) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C public static method M(): int "
+        "    var t: string? := \"a,b,c\"; "
+        "    var parts := t?.Split(\",\"); "
+        "    return 0; end M; "
+        "  public static method Main(): int return 0; end Main; end C;");
+    // The whole point: a `var` binding of an unlowerable `?.` builtin call is
+    // REJECTED, not accepted-and-degraded. Without the narrowing this is false
+    // and the program compiles to a zero-initialized slot.
+    BEZEL_EXPECT_TRUE(hasNotYetSupportedInCodegen(r));
+    // ...and §21.1 is still correctly silent on a non-`const` binding, so the
+    // narrowing did not achieve the rejection by over-firing §21.1.
+    BEZEL_EXPECT_FALSE(hasAnyConstOwnedProductionError(r));
+}
+
+BEZEL_TEST(const_nullcond_materializer_2749,
+           nullcond_split_const_keeps_both_diagnostics_spec_21_1_7_5) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C public static method M(): int "
+        "    var t: string? := \"a,b,c\"; "
+        "    const parts := t?.Split(\",\"); "
+        "    return 0; end M; "
+        "  public static method Main(): int return 0; end Main; end C;");
+    // #3376's actual value-add — the §21.1 const rejection — is PRESERVED by
+    // the narrowing (it depends only on the exprType, which is still set)...
+    BEZEL_EXPECT_TRUE(hasAnyConstOwnedProductionError(r));
+    // ...and now sits alongside the codegen gate rather than replacing it.
+    BEZEL_EXPECT_TRUE(hasNotYetSupportedInCodegen(r));
 }

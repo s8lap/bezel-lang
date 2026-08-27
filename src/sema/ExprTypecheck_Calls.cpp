@@ -19622,6 +19622,12 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
         // witness. §7.5: `?.` always lifts to nullable.
         if (recvTyForDiag) {
             bool typedNcm = false;
+            // narrow #3376 (second): typing an NCM access must NOT, on its
+            // own, suppress the "not yet supported in codegen" rejection
+            // below. Only the arms whose result codegen can actually LOWER
+            // may return early. See the block comment at the `if (typedNcm
+            // && typedNcmMayReturn)` site for why.
+            bool typedNcmMayReturn = false;
             // §9.6 Split(char|string|Array<char>) on string receiver.
             if (recvTyForDiag->kind == TypeRef::Kind::Primitive &&
                 recvTyForDiag->primitive == PrimitiveType::String &&
@@ -19694,9 +19700,34 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                     tr->nullable = true;
                     ctx_.setExprType(&nm, tr);
                     typedNcm = true;
+                    // The collection receiver is Named, so neither the string
+                    // gate nor the primitive gate below can fire for it; the
+                    // early return changes nothing observable here and is kept
+                    // only to preserve #3376's original control flow.
+                    typedNcmMayReturn = true;
                 }
             }
-            if (typedNcm) return;
+            // ⚠ narrow #3376 (second): DO NOT return merely because the
+            // access got a type. #3376 pre-typed `t?.Split(",")` on a string
+            // receiver expressly so the §21.1 const-materializer predicate
+            // could read a non-null exprType — but it also returned here,
+            // which SKIPPED the "string member `?.Split` is not yet supported
+            // in codegen" rejection at the string gate below. Measured on
+            // `var parts := t?.Split(",")`:
+            //     main       -> that rejection, rc=1, program REJECTED
+            //     with #3376 -> "#2434 degraded to a zero-initialized value",
+            //                   rc=0, program ACCEPTED with a wrong value
+            // That trades a loud compile error for a silent wrong value —
+            // strictly worse than the #2434 degradation #3376 set out to fix,
+            // and unsound. Codegen still has no lowering for `?.Split`; only
+            // the diagnostic that said so went missing.
+            // So: keep the type (the §21.1 `const` rejection #3376 added
+            // depends on it and is preserved), and fall through so the gate
+            // can still reject. Both of #3376's shipped tests continue to
+            // pass — the const one asserts the §21.1 message is PRESENT, the
+            // var one asserts it is ABSENT, and neither is affected by the
+            // separate codegen-unsupported error.
+            if (typedNcm && typedNcmMayReturn) return;
         }
         // fix #3155 (§7.5, v0.255): the `?.` form must MIRROR the `.` form's
         // member-not-found diagnostic, not silently fall through. Before this
