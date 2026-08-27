@@ -8927,6 +8927,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // and may have their boxed cells freed at outer-scope exit.
     cellFreeEligible_.clear();
     unwindUnsafeCellFree_.clear();  // fix #2334
+    sharedCellEnvdtorFreeOwner_.clear();  // fix #3426
     cellFreeEligibleFn_ = fn;
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts) {
         collectUnwindIneligible(*ci.stmts);
@@ -26553,12 +26554,19 @@ void Emitter::collectCellFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     cellFreeEligible_.clear();
     unwindUnsafeCellFree_.clear();  // fix #2334
+    sharedCellEnvdtorFreeOwner_.clear();  // fix #3426
 
     // Sets to accumulate captured entities per classification.
     std::unordered_set<const void*> capturedByNonEscaping; // LocalDecl* / Symbol*
     std::unordered_set<const void*> capturedByEscaping;    // same keys
     // fix #2334: see LambdaFinder::capturedByNonEscapingUnwindUnsafe.
     std::unordered_set<const void*> capturedByNonEscapingUnwindUnsafe;
+    // fix #3426: which ESCAPING lambda NODES capture each key, and which keys
+    // reached capturedByEscaping through the #1135 nested-lambda widening (no
+    // identifiable owner node). See sharedCellEnvdtorFreeOwner_'s declaration.
+    std::unordered_map<const void*, std::unordered_set<const void*>>
+        escapingCapturersOf;
+    std::unordered_set<const void*> nestedWidenedKeys;
 
     // Walk ALL expressions in the function body looking for LambdaExpr nodes.
     // We use two walkers:
@@ -26581,6 +26589,10 @@ void Emitter::collectCellFreeEligible(
         // BOTH exit edges). See Disposal::skipCellFreeOnUnwind for why a
         // Spawn-sourced capture needs the unwind edge suppressed.
         std::unordered_set<const void*>& capturedByNonEscapingUnwindUnsafe;
+        // fix #3426: see the two locals of the same name in the caller.
+        std::unordered_map<const void*, std::unordered_set<const void*>>&
+            escapingCapturersOf;
+        std::unordered_set<const void*>& nestedWidenedKeys;
         // fix #2334: anchors for `using var` initializer CallExprs (form 2
         // of §28.14 — `using var sub := cs.Token.Register(lambda)`). Populated
         // by stmt() before the initializer is walked; consulted by expr() to
@@ -26750,14 +26762,20 @@ void Emitter::collectCellFreeEligible(
                 }
             } else {
                 for (const sema::Symbol* s : syms) {
+                    // fix #3426: record WHICH escaping lambda node this is, not
+                    // just that one exists — the new envdtor route needs the
+                    // sole escaping capturer's identity to arm on exactly it.
+                    const void* key = nullptr;
                     if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
                         if (loc->decl)
-                            capturedByEscaping.insert(
-                                static_cast<const void*>(loc->decl));
+                            key = static_cast<const void*>(loc->decl);
                     } else if (dynamic_cast<const sema::ParameterSymbol*>(s)) {
-                        capturedByEscaping.insert(
-                            static_cast<const void*>(s));
+                        key = static_cast<const void*>(s);
                     }
+                    if (!key) continue;
+                    capturedByEscaping.insert(key);
+                    escapingCapturersOf[key].insert(
+                        static_cast<const void*>(lam));
                 }
             }
             // §27.5 / #1135: any outer local referenced through a NESTED lambda
@@ -26884,15 +26902,22 @@ void Emitter::collectCellFreeEligible(
                 if (lam->exprBody) findLamsE(lam->exprBody.get());
                 for (auto& s : lam->stmts) findLamsS(s.get());
                 // Classify all symbols found in nested lambda bodies as escaping.
+                // fix #3426: and DISQUALIFY them from the sole-escaping-holder
+                // route. This widening records no owner node — the nested
+                // lambda may itself escape the outer one, and outer and inner
+                // share the grandparent's cell — so there is no single closure
+                // whose envdtor is provably the last to hold it.
                 for (const sema::Symbol* s : nestedBodySyms) {
+                    const void* key = nullptr;
                     if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
                         if (loc->decl)
-                            capturedByEscaping.insert(
-                                static_cast<const void*>(loc->decl));
+                            key = static_cast<const void*>(loc->decl);
                     } else if (dynamic_cast<const sema::ParameterSymbol*>(s)) {
-                        capturedByEscaping.insert(
-                            static_cast<const void*>(s));
+                        key = static_cast<const void*>(s);
                     }
+                    if (!key) continue;
+                    capturedByEscaping.insert(key);
+                    nestedWidenedKeys.insert(key);
                 }
             }
         }
@@ -27273,8 +27298,26 @@ void Emitter::collectCellFreeEligible(
 
     LambdaFinder finder{ctx_, *this, closureReleaseEligible_,
                         capturedByNonEscaping, capturedByEscaping,
-                        capturedByNonEscapingUnwindUnsafe};
+                        capturedByNonEscapingUnwindUnsafe,
+                        escapingCapturersOf, nestedWidenedKeys};
     for (auto& s : body) finder.stmt(s.get());
+
+    // fix #3426 (§27.5 / §28.9, v0.283): record the sole out-of-frame holder of
+    // each SHARED capture cell — the overlap neither the scope-end route (just
+    // below) nor #694's envdtor route can reclaim. The full soundness argument
+    // is at sharedCellEnvdtorFreeOwner_'s declaration; conditions (a)-(e) there
+    // map one-to-one onto the five tests here. This runs AFTER
+    // collectDefinitelyEscapingLambdas (the documented dependency order at every
+    // one of the four call sites), so definitelyEscapingLambdas_ is populated.
+    for (const auto& [key, lams] : escapingCapturersOf) {
+        if (lams.size() != 1) continue;                     // (a)
+        if (!capturedByNonEscaping.count(key)) continue;    // (c)
+        if (nestedWidenedKeys.count(key)) continue;         // (d)
+        if (capturedByNonEscapingUnwindUnsafe.count(key)) continue;  // (e)
+        const void* owner = *lams.begin();
+        if (!definitelyEscapingLambdas_.count(owner)) continue;      // (b)
+        sharedCellEnvdtorFreeOwner_[key] = owner;
+    }
 
     // A captured entity qualifies iff:
     //   - it appears in capturedByNonEscaping (at least one non-escaping lambda

@@ -1323,6 +1323,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();
         unwindUnsafeCellFree_.clear();  // fix #2334
+        sharedCellEnvdtorFreeOwner_.clear();  // fix #3426
         cellFreeEligibleFn_ = resumeFn;
         collectBoxCaptureLocals(*ci.stmts);
         collectDefinitelyEscapingLambdas(*ci.stmts);
@@ -1785,6 +1786,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();
         unwindUnsafeCellFree_.clear();  // fix #2334
+        sharedCellEnvdtorFreeOwner_.clear();  // fix #3426
         cellFreeEligibleFn_ = resumeFn;
         if (!lam.exprBody) {
             collectClosureReleaseEligible(lam.stmts);

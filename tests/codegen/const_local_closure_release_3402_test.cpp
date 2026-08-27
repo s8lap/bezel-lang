@@ -218,13 +218,19 @@ BEZEL_TEST(const_local_closure_release_3402,
 // TWO DELIBERATE DEVIATIONS from the rest of this file, both forced by that
 // shape and both making the test STRONGER, not weaker:
 //
-//   * It uses `runAot`, NOT `runAotChecked`. The "one escaping plus one
-//     non-escaping lambda over the same capture" shape leaks the 4-byte
-//     capture cell — an UNRELATED, PRE-EXISTING defect that the all-`var`
-//     spelling of this same program exhibits identically (measured: 4 bytes /
-//     1 allocation, before and after this fix, `var` and `const` alike). A
-//     LeakSanitizer assertion here would therefore fail for a reason that has
-//     nothing to do with #3402.
+//   * It uses `runAot`, NOT `runAotChecked`. When this test was written the
+//     "one escaping plus one non-escaping lambda over the same capture" shape
+//     leaked the 4-byte capture cell — an UNRELATED, PRE-EXISTING defect that
+//     the all-`var` spelling of this same program exhibited identically
+//     (measured: 4 bytes / 1 allocation, `var` and `const` alike), so a
+//     LeakSanitizer assertion here would have failed for a reason that had
+//     nothing to do with #3402. ⚠ THAT REASON HAS EXPIRED: fix #3426 closed
+//     the shared-cell leak, and this exact program is now ASan+LSan clean
+//     (verified on the #3426 build). `runAot` is kept for the SECOND deviation
+//     below — the wrong-value oracle needs a plain, unsanitized allocator —
+//     not for the leak. The `const` spelling of the #3426 shape is asserted
+//     under the strict oracle in
+//     tests/codegen/capture_cell_reclaim_3435_3426_test.cpp.
 //
 //   * The observable is a WRONG VALUE, not a sanitizer verdict — which is why
 //     dropping ASan costs nothing. `Main` allocates its own int capture cell

@@ -201,6 +201,7 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         boxCaptureLocalsFn_ = fn;
         cellFreeEligible_.clear();
         unwindUnsafeCellFree_.clear();
+        sharedCellEnvdtorFreeOwner_.clear();  // fix #3426
         cellFreeEligibleFn_ = fn;
         collectClosureReleaseEligible(dd->body);
         collectBoxReleaseEligible(dd->body);

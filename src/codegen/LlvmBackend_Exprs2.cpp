@@ -1351,6 +1351,24 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
             singleCaptureLocals_.count(static_cast<const void*>(sym)))
             ce.freeCellInEnvdtor = true;
+        // fix #3426 (§27.5 / §28.9, v0.283): the SHARED-cell twin of the branch
+        // above. `singleCaptureLocals_` requires this env to be the cell's only
+        // holder; when a non-escaping sibling lambda also captures the parameter
+        // that fails, the scope-end route is disarmed too (the parameter is in
+        // capturedByEscaping), and the cell was reclaimed by nobody.
+        // sharedCellEnvdtorFreeOwner_ names THIS lambda the sole holder that
+        // outlives the frame, which makes its envdtor the last reader — see the
+        // ordering argument at the field's declaration. `alreadyBoxed` is NOT
+        // required here: in the shared case the cell is typically created by the
+        // FIRST (non-escaping) capture, so the escaping owner reaches
+        // boxLocalSlot's already-boxed path. `loopStack_.empty()` replaces the
+        // guarded-boxing exclusion as the backward-edge proof (that path reports
+        // wasGuardedParam=false for an already-boxed slot, so it proves nothing
+        // here).
+        if (!ce.freeCellInEnvdtor && loopStack_.empty() &&
+            currentFn_ == cellFreeEligibleFn_ &&
+            isSharedCellEnvdtorFreeOwner(static_cast<const void*>(sym), &lam))
+            ce.freeCellInEnvdtor = true;
         captures.push_back(ce);
     }
     // #1207 / §27.5/§22.3: captured outer ref/out params.
@@ -1519,8 +1537,38 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // entry. Its guarded cell can therefore be reclaimed at that arm
             // scope; the disposal path nulls the holder before a later loop
             // iteration can re-enter the arm.
+            // fix #3435 (§27.5 / §28.9, v0.283): the `inlineN > 0` conjunct on
+            // the `loopStack_.empty()` proof is dropped — the proof itself has
+            // nothing to do with the capture being an inline owned array. What
+            // makes a guarded cell unsafe to free at this scope is a BACKWARD
+            // EDGE above the capture site: one cell reused by every iteration's
+            // closure, so a free at the lambda's own scope would corrupt the
+            // next pass. `loopStack_.empty()` IS that proof, for any capture:
+            // no enclosing loop ⇒ boxLocalSlot's null-guarded allocation runs at
+            // most once per invocation and exactly one closure holds the cell.
+            //
+            // Why the plain-`var` case reached here at all is the surprising
+            // half. boxLocalSlot picks the fresh (non-guarded) strategy when a
+            // StoreInst to the slot sits in the CURRENT basic block; for a local
+            // whose declaration and capture are adjacent statements that is the
+            // same block, which is why `var t := 0; var f := lambda() => t;` was
+            // always clean. Put ANY block-splitting construct between them — the
+            // issue's `for` loop, but equally an `if`, a `while`, or a `case` —
+            // and the store is in a different block, the guarded path is taken,
+            // and this exclusion silently dropped the cell on the floor. The
+            // discriminator in the issue (clean with the assignment moved OUT of
+            // the loop) is exactly that block boundary, not the assignment.
+            //
+            // The two hazards a widened admission could reintroduce are BOTH
+            // already answered downstream, in consumeLastLambdaCapturedCells:
+            // a disposal that READS THROUGH the cell defers the free into the
+            // owner's scope (#966 / #1017), and a captured local declared in a
+            // SHALLOWER scope than the capture site skips the free entirely
+            // (#969) — the `do var g := () => x; end; return x;` read-after-
+            // inner-scope case. So the free registered here fires at the
+            // captured local's OWN scope end or not at all.
             bool guardedOk = !wasGuardedLocal || isPatternBinding ||
-                             (inlineN > 0 && loopStack_.empty());
+                             loopStack_.empty();
             if (guardedOk) {
                 LastCellEntry lce{newSlot, static_cast<const void*>(decl),
                                   inlineN};
@@ -1608,6 +1656,30 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             currentFn_ == boxCaptureLocalsFn_ &&
             definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
             singleCaptureLocals_.count(static_cast<const void*>(decl)))
+            ce.freeCellInEnvdtor = true;
+        // fix #3426 (§27.5 / §28.9, v0.283): the SHARED-cell route — the issue's
+        // own repro (`var g := () => k;` used, then `var f := () => k; return f;`
+        // — 4 B for an `int` capture, 8 B for a `string`, order-independent).
+        // Neither existing mechanism could reclaim that cell: `k` is in
+        // capturedByEscaping so the scope-end boxedCellFree is (correctly)
+        // disarmed, and `k` is captured by two envs so singleCaptureLocals_
+        // (correctly) declines the branch above. sharedCellEnvdtorFreeOwner_
+        // adds the missing third: it names the ONE definitely-escaping capturer
+        // whose envdtor provably runs after every non-escaping sibling's — see
+        // the field's declaration for why that ordering is guaranteed and why
+        // the walker declines the shapes where it is not.
+        //
+        // `!isForVar` is kept (a for-var's cell is fresh per iteration, so no
+        // single envdtor reclaims the earlier passes' cells) and
+        // `loopStack_.empty()` is the backward-edge proof, but `!alreadyBoxed`
+        // and the guarded-boxing exclusion are deliberately NOT: the shared cell
+        // is usually created by the FIRST capture, so the escaping owner arrives
+        // through boxLocalSlot's already-boxed path — which reports
+        // wasGuardedLocal=false regardless of how the cell was allocated and so
+        // is not a proof of anything at this site.
+        if (!ce.freeCellInEnvdtor && !isForVar && loopStack_.empty() &&
+            currentFn_ == cellFreeEligibleFn_ &&
+            isSharedCellEnvdtorFreeOwner(static_cast<const void*>(decl), &lam))
             ce.freeCellInEnvdtor = true;
         captures.push_back(ce);
     }
@@ -1928,6 +2000,12 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         llvm::Function* savedClosureRelEligFn = closureReleaseEligibleFn_;
         auto savedCellFreeElig = cellFreeEligible_;
         llvm::Function* savedCellFreeEligFn = cellFreeEligibleFn_;
+        // fix #3426: the sole-escaping-holder map is recomputed for the
+        // lambda's own body by emitAsyncLambda and keyed to the lambda
+        // resume fn, exactly like cellFreeEligible_ above — so it needs
+        // the identical save/restore, or a LATER lambda in the enclosing
+        // body would be matched against the nested lambda's owners.
+        auto savedSharedCellOwner = sharedCellEnvdtorFreeOwner_;
         auto savedBoxCaptureLocals = boxCaptureLocals_;
         auto savedSingleCaptureLocals = singleCaptureLocals_;
         auto savedAssignedCaptureVars = assignedCaptureVars_;  // fix #2706
@@ -1970,6 +2048,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         closureReleaseEligibleFn_ = savedClosureRelEligFn;
         cellFreeEligible_ = std::move(savedCellFreeElig);
         cellFreeEligibleFn_ = savedCellFreeEligFn;
+        sharedCellEnvdtorFreeOwner_ = std::move(savedSharedCellOwner);  // #3426
         boxCaptureLocals_ = std::move(savedBoxCaptureLocals);
         singleCaptureLocals_ = std::move(savedSingleCaptureLocals);
         assignedCaptureVars_ = std::move(savedAssignedCaptureVars);  // fix #2706

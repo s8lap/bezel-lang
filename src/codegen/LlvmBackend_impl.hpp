@@ -11966,6 +11966,66 @@ private:
     // cellFreeEligible_ by the same pre-scan; consulted by lowerLambda when
     // populating lastLambdaCapturedCells_.
     std::unordered_set<const void*> unwindUnsafeCellFree_;
+    // fix #3426 (§27.5 / §28.9, v0.283): the THIRD reclaim route for a boxed
+    // capture cell, covering the OVERLAP the other two deliberately leave open.
+    //
+    //   * The SCOPE-END route (cellFreeEligible_) arms only when NO escaping
+    //     lambda captures the local — an escaping env holds a raw cell pointer
+    //     that outlives the frame, so freeing there is a UAF.
+    //   * The ENVDTOR route (#694: definitelyEscapingLambdas_ ∧
+    //     singleCaptureLocals_) arms only when the escaping closure is the
+    //     cell's ONLY holder — a second env pointing at the same cell has no
+    //     statically fixed release order relative to it.
+    //
+    // A local captured by ONE escaping and ONE OR MORE non-escaping lambdas
+    // satisfies neither, so its cell was never reclaimed by anyone (4 B for an
+    // `int`, 8 B for a `string`, per shared capture — unbounded when the shape
+    // sits in a loop). Both existing mechanisms are individually sound; what was
+    // missing is the observation that the two holder classes are ORDERED:
+    //
+    //   Every non-escaping co-capturer is in closureReleaseEligible_ (or the
+    //   IIFE / §28.14 scoped-callback special cases), so its env is released
+    //   at a scope end INSIDE this frame. The escaping capturer is, by
+    //   definition of definitelyEscapingLambdas_, NOT in closureReleaseEligible_
+    //   — a returned local's `return f` is an escape for the ClosureEscapeWalker
+    //   — so `lowerLocalDecl` registers no scope-end release for it and its
+    //   envdtor cannot run until the value the frame handed out is dropped by
+    //   someone else, i.e. STRICTLY AFTER the frame is gone. The sole escaping
+    //   holder is therefore the LAST holder on every exit edge, and freeing the
+    //   cell in its envdtor (after that envdtor's own content release) is the
+    //   cell's one and only free.
+    //
+    // This map records that owner: capture KEY (an ast::LocalDecl* /
+    // ast::LocalConstDecl* node for a local, a sema::ParameterSymbol* for a
+    // parameter — the same two key spaces cellFreeEligible_ uses) → the ONE
+    // ast::LambdaExpr* that is its sole out-of-frame holder. Populated by
+    // collectCellFreeEligible only when ALL of:
+    //   (a) exactly one ESCAPING lambda node captures the key,
+    //   (b) that node is in definitelyEscapingLambdas_ (a conservatively-
+    //       escaping lambda — one merely passed as an argument — proves
+    //       nothing about when its env dies, so it is declined),
+    //   (c) at least one NON-escaping lambda also captures it (this is the
+    //       overlap; a key with no non-escaping co-capturer is #694's business
+    //       and its guards are left untouched),
+    //   (d) the key was not reached through the §27.5/#1135 NESTED-lambda
+    //       widening, which adds captures to the escaping set with no
+    //       identifiable owner node, and
+    //   (e) the key carries no #2334 TaskScope.Spawn taint, whose "non-
+    //       escaping" proof lapses on the unwind edge (#1422's non-blocking
+    //       zombie drain) — a zombie could still read the cell after the frame
+    //       exits, which is precisely when this route frees it.
+    // lowerLambda additionally requires `loopStack_.empty()` at the escaping
+    // capture site, the same backward-edge proof the captured-PARAM branch
+    // already uses: without it one syntactic lambda node inside a loop makes N
+    // closures over one guarded cell and N envdtors would free it N times.
+    std::unordered_map<const void*, const void*> sharedCellEnvdtorFreeOwner_;
+    // fix #3426: is `lam` the recorded sole out-of-frame holder of `key`'s cell?
+    bool isSharedCellEnvdtorFreeOwner(const void* key,
+                                      const ast::LambdaExpr* lam) const {
+        auto it = sharedCellEnvdtorFreeOwner_.find(key);
+        return it != sharedCellEnvdtorFreeOwner_.end() &&
+               it->second == static_cast<const void*>(lam);
+    }
     // Compute cellFreeEligible_ for a block body (see the .cpp).
     void collectCellFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
