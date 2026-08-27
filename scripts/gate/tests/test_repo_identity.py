@@ -74,6 +74,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from gate import verdict as gv   # noqa: E402
 
+# #3463: the two tests below drive the REAL gate_and_push.sh in its real gating
+# shape (stub cycle, no arguments), so the script correctly publishes its pid and
+# exit status — to GLOBAL paths that, inside the #3415 gate-selftest phase, are
+# the live gate's own. Measured overwriting them with "1", a FAILED verdict for a
+# gate that went on to pass. Redirect them into a temp dir.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from marker_isolation import isolated_markers  # noqa: E402
+
 REPO = pathlib.Path(__file__).resolve().parents[3]
 SCRIPTS = REPO / "scripts"
 FULL_CYCLE = SCRIPTS / "gate_full_cycle.sh"
@@ -547,10 +555,11 @@ class HandoffTest(_TwoRepos):
         with tempfile.TemporaryDirectory() as d:
             repo = _make_repo(os.path.join(d, "handoff"), "handoff")
             self._stub_cycle(repo)
-            env = dict(GIT_ENV, GATE_SKIP_LOCK="1")
-            r = subprocess.run(
-                [str(repo / "scripts" / "gate_and_push.sh")],
-                cwd=str(repo), env=env, capture_output=True, text=True, timeout=120)
+            with isolated_markers(dict(GIT_ENV, GATE_SKIP_LOCK="1")) as env:
+                r = subprocess.run(
+                    [str(repo / "scripts" / "gate_and_push.sh")],
+                    cwd=str(repo), env=env, capture_output=True, text=True,
+                    timeout=120)
             out = r.stdout + r.stderr
             self.assertIn("STUBCYCLE", out,
                           "gate_and_push must invoke the cycle script; got %r"
@@ -575,10 +584,11 @@ class HandoffTest(_TwoRepos):
         """
         with tempfile.TemporaryDirectory() as d:
             repo = _make_repo(os.path.join(d, "agree"), "agree")
-            env = dict(GIT_ENV, GATE_SKIP_LOCK="1")
-            push_out = subprocess.run(
-                [str(repo / "scripts" / "gate_and_push.sh"), "--nonsense"],
-                cwd=str(repo), env=env, capture_output=True, text=True, timeout=120)
+            with isolated_markers(dict(GIT_ENV, GATE_SKIP_LOCK="1")) as env:
+                push_out = subprocess.run(
+                    [str(repo / "scripts" / "gate_and_push.sh"), "--nonsense"],
+                    cwd=str(repo), env=env, capture_output=True, text=True,
+                    timeout=120)
             cycle_out = _run_cycle(repo, repo)
             m = re.search(r"gate_and_push: tree = (\S+)", push_out.stdout)
             self.assertIsNotNone(m, "no tree banner: %r" % push_out.stdout[:800])

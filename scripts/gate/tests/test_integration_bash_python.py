@@ -54,6 +54,13 @@ REPO_ROOT = os.path.normpath(os.path.join(SCRIPTS_DIR, ".."))
 sys.path.insert(0, os.path.normpath(SCRIPTS_DIR))
 from gate import serialize  # noqa: E402
 
+# #3463: these tests spawn the REAL gate_and_push.sh, which publishes its pid and
+# its exit status to GLOBAL paths. Inside the #3415 gate-selftest phase that is a
+# live gate's own completion signal — measured here overwriting it with "0", a
+# PASS verdict for a gate still mid-cycle. Point the markers at a temp dir.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from marker_isolation import isolated_markers  # noqa: E402
+
 
 def _live_gate_precondition_unmet():
     """Return a human reason why the two tests that drive the REAL
@@ -182,10 +189,11 @@ class TestBashDelegation(unittest.TestCase):
 
             # Now run the bash script. MUST exit 0 with the message.
             t0 = time.time()
-            result = subprocess.run(
-                [GATE_AND_PUSH, "--help"],
-                capture_output=True, timeout=15, text=True,
-            )
+            with isolated_markers(os.environ) as _env:   # #3463
+                result = subprocess.run(
+                    [GATE_AND_PUSH, "--help"],
+                    capture_output=True, timeout=15, text=True, env=_env,
+                )
             elapsed = time.time() - t0
             self.assertEqual(
                 result.returncode, 0,
@@ -279,10 +287,11 @@ class TestBashDelegation(unittest.TestCase):
         # best-effort. If a holder is still around, this test surfaces
         # the symptom as a held-lock abort (and the assertion below
         # fails loudly, NOT silently). That's the right failure mode.
-        result = subprocess.run(
-            [GATE_AND_PUSH, "--help"],
-            capture_output=True, timeout=15, text=True,
-        )
+        with isolated_markers(os.environ) as _env:   # #3463
+            result = subprocess.run(
+                [GATE_AND_PUSH, "--help"],
+                capture_output=True, timeout=15, text=True, env=_env,
+            )
         self.assertEqual(
             result.returncode, 0,
             "gate_and_push.sh --help with no held lock must exit 0; "

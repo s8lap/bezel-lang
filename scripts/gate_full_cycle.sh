@@ -572,7 +572,22 @@ say "gate-selftest phase: scripts/gate/tests (#3415)"
 _gs_log="$LOGDIR/${TAG}_gate_selftest.log"
 _gs_floor=560
 _gs_skip_cap=4
-if ! python3 -m unittest discover -s scripts/gate/tests -v \
+# fix #3463: THE PHASE MUST NOT BE ABLE TO REACH THIS GATE'S OWN MARKERS.
+#
+# Four modules in that directory drive the real scripts/gate_and_push.sh, which
+# publishes the running gate's pid and exit status to $BEZEL_GATE_PIDFILE /
+# $BEZEL_GATE_DONEFILE. On Run 7 cycle 1 this phase deleted the live gate's
+# pidfile and wrote "1" — a FAILED verdict — into its donefile, 20 seconds into
+# a cycle that went on to pass both oracles; the coordinator's
+# `scripts/wait_pid.sh` exited 3 about fifty minutes early. Per-module
+# isolation (scripts/gate/tests/marker_isolation.py) fixes the four we know
+# about; redirecting here is what makes the FIFTH one safe before anyone
+# notices it exists. Per-command, so the rest of the cycle is untouched.
+_gs_markers="$LOGDIR/${TAG}_gate_selftest_markers"
+mkdir -p "$_gs_markers" 2>/dev/null || true
+if ! BEZEL_GATE_PIDFILE="$_gs_markers/gate.pid" \
+     BEZEL_GATE_DONEFILE="$_gs_markers/gate.done" \
+     python3 -m unittest discover -s scripts/gate/tests -v \
       > "$_gs_log" 2>&1; then
   say "CYCLE FAILURE: the gate's OWN self-tests failed — the machinery that"
   say "  decides whether the suite was green is itself broken, so this cycle's"

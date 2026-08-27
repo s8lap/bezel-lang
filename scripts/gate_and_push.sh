@@ -44,14 +44,54 @@ set -u
 # also appeared in the waiter's own command line (see scripts/wait_pid.sh). Once,
 # a PASSING gate sat unnoticed for an hour. Publish identity + a terminal marker
 # so no caller ever has to pattern-match a process list again:
-#   $BEZEL_GATE_PIDFILE  - this script's pid, written at start, removed at exit
+#   $BEZEL_GATE_PIDFILE  - this script's pid, removed at exit
 #   $BEZEL_GATE_DONEFILE - written ONCE on exit, containing the exit status
+# Both appear only once this run is COMMITTED TO GATING (#3463) — a --help, a
+# refusal, or the "another gate is running" abort publishes nothing, because
+# those files belong to whichever gate is actually running.
 # Wait with:  scripts/wait_pid.sh "$BEZEL_GATE_PIDFILE"
+#
+# fix #3463: THE MARKERS ARE PUBLISHED ONLY BY AN INVOCATION THAT WILL GATE.
+#
+# These six lines used to run unconditionally at the top of the file, before the
+# argument parse, the clean-tree refusal and the serialization lock. So EVERY
+# invocation — `--help`, `--quick`, an unknown flag, a dirty-tree refusal, and
+# the "another gate is running" abort — overwrote the pidfile and, via the EXIT
+# trap, wrote its own exit status into the donefile. Those are GLOBAL paths: a
+# probe run while a real gate is in flight silently destroyed the live gate's
+# identity and published a terminal verdict for it.
+#
+# Measured (Run 7 cycle 1, 2026-08-28), on the real gate, and again in this lane
+# per self-test module against a sentinel pair:
+#   test_repo_identity          -> pidfile DELETED, donefile "1"   (gate FAILED)
+#   test_integration_bash_python-> pidfile DELETED, donefile "0"   (gate PASSED)
+# Both are false, and both are the dangerous direction: the donefile does not go
+# missing, it asserts a verdict. The `0` is the worse of the two — it is written
+# by the held-lock abort path, i.e. exactly when another gate IS running, so it
+# claims success for a gate that has not finished. `scripts/wait_pid.sh` then
+# exits 3 ("cannot read pidfile") ~50 minutes early over a gate that goes on to
+# pass, which is the documented waiting protocol breaking.
+#
+# The publication therefore moved to _bezel_gate_publish_markers, called once
+# the argument parse and the lock have both been cleared and this process is
+# committed to running a gate. Ordering is the fix: every path that can decline
+# to gate returns BEFORE the call, so it cannot touch another gate's state.
+# scripts/gate/tests/test_gate_markers.py pins both halves — that the
+# non-gating shapes leave a sentinel pair byte-identical, and that a real
+# gating run still publishes and still writes its rc.
 BEZEL_GATE_PIDFILE="${BEZEL_GATE_PIDFILE:-/var/tmp/bezel-scratch/gate.pid}"
 BEZEL_GATE_DONEFILE="${BEZEL_GATE_DONEFILE:-/var/tmp/bezel-scratch/gate.done}"
-mkdir -p "$(dirname "$BEZEL_GATE_PIDFILE")" 2>/dev/null || true
-rm -f "$BEZEL_GATE_DONEFILE" 2>/dev/null || true
-echo $$ > "$BEZEL_GATE_PIDFILE"
+_bezel_gate_markers_published=0
+_bezel_gate_publish_markers() {
+  mkdir -p "$(dirname "$BEZEL_GATE_PIDFILE")" 2>/dev/null || true
+  mkdir -p "$(dirname "$BEZEL_GATE_DONEFILE")" 2>/dev/null || true
+  # Clear a previous gate's terminal marker BEFORE claiming the pid, so a waiter
+  # that sees this pidfile can never also see a stale donefile beside it.
+  rm -f "$BEZEL_GATE_DONEFILE" 2>/dev/null || true
+  echo $$ > "$BEZEL_GATE_PIDFILE"
+  _bezel_gate_markers_published=1
+  echo "== gate_and_push: markers pid=$BEZEL_GATE_PIDFILE done=$BEZEL_GATE_DONEFILE =="
+}
 # fix #3158: ONE EXIT trap, doing BOTH jobs.
 #
 # Bash supports exactly one EXIT trap; a second `trap … EXIT` silently REPLACES
@@ -88,8 +128,17 @@ _bezel_gate_signal_done() {
   fi
   # Publish the terminal marker LAST, so a waiter that sees the donefile knows
   # the lock is already released and may start its own gate immediately.
-  echo "$rc" > "$BEZEL_GATE_DONEFILE" 2>/dev/null || true
-  rm -f "$BEZEL_GATE_PIDFILE" 2>/dev/null || true
+  #
+  # fix #3463: ONLY if this invocation published the markers in the first place.
+  # The lock release above is unconditional (it is this process's own resource);
+  # the markers are shared global state, and a run that declined to gate has no
+  # standing to write a verdict into them — least of all the "another gate is
+  # running" abort, whose rc is 0 and which by definition fires while somebody
+  # else's gate owns those files.
+  if [ "$_bezel_gate_markers_published" = "1" ]; then
+    echo "$rc" > "$BEZEL_GATE_DONEFILE" 2>/dev/null || true
+    rm -f "$BEZEL_GATE_PIDFILE" 2>/dev/null || true
+  fi
   return $rc
 }
 _gate_serialize_pid=""
@@ -258,6 +307,20 @@ else
   GATE_CMD=(scripts/gate_full_cycle.sh "${CYCLE_ARGS[@]+"${CYCLE_ARGS[@]}"}")
 fi
 
+# fix #3463: THE PUBLICATION POINT. Everything above can still decline to gate —
+# the clean-tree refusal (65), the held-lock abort (0), --quick (64), an unknown
+# flag (64), --help (0) — and every one of those returns without having touched
+# the shared marker files. From here on a gate WILL run, so claiming the pid and
+# clearing the terminal marker is this process's own business.
+#
+# It has to stay AFTER the lock: the abort path fires precisely when another
+# gate holds the lock, which is the one moment when overwriting these files
+# destroys a live gate's state. It cannot move earlier for a cheaper waiter
+# handshake without reintroducing that. scripts/wait_pid.sh's --pidfile-grace
+# (default 30s) covers the ~50ms this costs a waiter launched in the same
+# breath as the gate.
+_bezel_gate_publish_markers
+
 if "${GATE_CMD[@]}"; then
   # Phase 3c (per the exit-code-trap): cross-check the gate's exit against the
   # AUTHORITATIVE verdict file. $? is reliable HERE (a foreground command — no
@@ -408,8 +471,92 @@ if "${GATE_CMD[@]}"; then
   fi
 
   echo "== gate_and_push: GATE PASS -> pushing =="
-  if git push; then
-    echo "== gate_and_push: PUSHED origin/main now $(git rev-parse --short origin/main) =="
+
+  # ── fix #3464: PUSH THE GATED COMMIT, BY EXPLICIT REFSPEC. ─────────────────
+  #
+  # This was `git push`. Two problems, one of them fatal to the documented
+  # workflow.
+  #
+  # 1. IT CANNOT PUSH FROM AN INTEGRATION WORKTREE. #3413 requires gating from
+  #    the tree you launched from, so a batch is gated from a worktree on a
+  #    branch like `r7-c1-integration` that TRACKS `origin/main`. Git's default
+  #    push.default=simple refuses a bare push whenever the local branch name
+  #    differs from its upstream branch name:
+  #      fatal: The upstream branch of your current branch does not match the
+  #             name of your current branch.
+  #    Measured at the end of a green Run 7 cycle (2026-08-28): both oracles
+  #    passed, the push failed, and the cycle needed a manual
+  #    `git push origin HEAD:main`. Two correct fixes that jointly break the
+  #    workflow — #3413 moved the gate into the worktree, and nothing moved the
+  #    push with it.
+  #
+  # 2. A BARE PUSH PUSHES "WHATEVER HEAD IS NOW", not what was gated. Every
+  #    check above — the verdict head/repo cross-checks, --expect-head, the
+  #    telemetry gate — reasons about `$_head`, read once, ~120 lines up. The
+  #    push then re-resolved HEAD implicitly. #3413's whole point is that the
+  #    verdict and the pushed commit must be the same tree; only the verdict end
+  #    of that was enforced.
+  #
+  # So: re-read HEAD and refuse if it moved, resolve the destination from the
+  # branch's OWN upstream config (never a guess), and push the gated SHA to that
+  # ref explicitly. `$_head:$_ref` is unambiguous — a sha on the left cannot be
+  # re-interpreted as some other local branch, and a full `refs/heads/...` on the
+  # right cannot be re-interpreted as a tag or a remote-tracking ref.
+  _push_head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+  if [ -z "$_push_head" ] || [ "$_push_head" != "$_head" ]; then
+    echo "== gate_and_push: REFUSING TO PUSH — HEAD moved after the gate's verdict was cross-checked ==" >&2
+    echo "   gated commit : $_head" >&2
+    echo "   HEAD is now  : ${_push_head:-<unreadable>}" >&2
+    echo "   The verdict describes the gated commit; pushing this one would publish" >&2
+    echo "   a tree nothing verified (#3413/#3464). Re-gate." >&2
+    exit 1
+  fi
+
+  # The destination comes from THIS branch's upstream, the same pair `git push`
+  # would have consulted — not from a hardcoded "origin main", which would push
+  # somewhere the operator never selected if the worktree tracks anything else.
+  _cur_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+  _push_remote=""
+  _push_ref=""
+  if [ -n "$_cur_branch" ] && [ "$_cur_branch" != "HEAD" ]; then
+    _push_remote="$(git config --get "branch.$_cur_branch.remote" 2>/dev/null || true)"
+    _push_ref="$(git config --get "branch.$_cur_branch.merge" 2>/dev/null || true)"
+  fi
+  if [ -z "$_push_remote" ] || [ -z "$_push_ref" ]; then
+    echo "== gate_and_push: REFUSING TO PUSH — no upstream configured for this branch ==" >&2
+    echo "   branch : ${_cur_branch:-<detached HEAD>}" >&2
+    echo "   The gate passed; it just has no destination it can name. Set one with" >&2
+    echo "     git branch --set-upstream-to=origin/main" >&2
+    echo "   or land it by hand:  git push origin $_head:refs/heads/main" >&2
+    exit 1
+  fi
+  # A gate lands batches on main. Anything else is a deliberate act and must be
+  # said out loud rather than inferred from whatever this worktree tracks —
+  # "must not silently push some other branch" is the whole risk of widening a
+  # bare `git push` into an explicit refspec.
+  if [ "$_push_ref" != "refs/heads/main" ] && [ "${BEZEL_GATE_PUSH_DEST_OK:-0}" != "1" ]; then
+    echo "== gate_and_push: REFUSING TO PUSH — upstream is not main ==" >&2
+    echo "   branch      : $_cur_branch" >&2
+    echo "   destination : $_push_remote $_push_ref" >&2
+    echo "   The gate lands batches on main; pushing elsewhere is deliberate." >&2
+    echo "   Set BEZEL_GATE_PUSH_DEST_OK=1 if that is what you meant." >&2
+    exit 1
+  fi
+  echo "== gate_and_push: destination $_push_remote $_push_ref (upstream of '$_cur_branch'), commit $(git rev-parse --short "$_head") =="
+  if git push "$_push_remote" "$_head:$_push_ref"; then
+    # ⚠ KEEP THIS LINE BYTE-IDENTICAL. scripts/gate_wait.sh matches
+    # 'PUSHED origin/main now' as a TERMINAL marker and as its only accept
+    # marker — nothing in the gate ever prints 'GATE PASSED' — so rewording it
+    # would leave every waiter spinning to its timeout on a landed batch.
+    if [ "$_push_remote" = "origin" ] && [ "$_push_ref" = "refs/heads/main" ]; then
+      echo "== gate_and_push: PUSHED origin/main now $(git rev-parse --short origin/main) =="
+    else
+      # A deliberate non-main push (BEZEL_GATE_PUSH_DEST_OK=1). Do NOT claim
+      # origin/main here: gate_wait.sh would accept on a marker that names a
+      # destination this run did not touch. Such a run is classified from the
+      # verdict file, which is the honest source for it.
+      echo "== gate_and_push: pushed $(git rev-parse --short "$_head") to $_push_remote $_push_ref =="
+    fi
     # Auto-GC on land: reap worktrees whose commits are now in origin/main
     # (branch refs kept; WIP/locked/current worktrees never touched), drop stale
     # ASan trees, and quarantine >48h root scratch. Best-effort — a GC hiccup

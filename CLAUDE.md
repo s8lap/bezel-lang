@@ -314,7 +314,15 @@ both learned expensively:
    it cannot match itself).
 
 `gate_and_push.sh` publishes `$BEZEL_GATE_PIDFILE` (removed at exit) and
-`$BEZEL_GATE_DONEFILE` (the exit status). ⚠ Prefer the PIDFILE: the donefile is
+`$BEZEL_GATE_DONEFILE` (the exit status) — but only once it is **committed to
+gating** (#3463): a `--help`, a refusal, or the "another gate is running" abort
+publishes nothing, because those files belong to whichever gate is actually
+running. Before that fix every invocation wrote them, so the #3415 self-test
+phase deleted the live gate's pidfile and wrote `1` into its donefile 20s into a
+cycle that went on to pass, and `wait_pid.sh` exited ~50 min early. Publication
+therefore lands ~50ms in rather than immediately, so `wait_pid.sh` now waits a
+bounded moment (`--pidfile-grace`, default 30s) for the pidfile to appear
+instead of failing the launch race. ⚠ Prefer the PIDFILE: the donefile is
 written from an EXIT trap, so an uncatchable kill produces no marker at all, and
 a donefile-only waiter then hangs forever over a finished gate. That is not
 hypothetical — the marker was **dead on arrival** from the day it was added
