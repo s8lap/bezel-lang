@@ -4078,15 +4078,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     //     suppresses the rest presupposes that a non-null one's expression
     //     runs, and `.` has no short-circuit at all.
     //   * §22.3, `ref`/`out` argument locations: "the receiver and every index
-    //     expression are **evaluated exactly once**, in §22.5's call-site
-    //     textual order". Exactly once — not zero times.
+    //     expression are evaluated exactly once, in §22.5's call-site textual
+    //     order". Exactly once — not zero times. (Quoted plain: the spec sets
+    //     no emphasis on that phrase, and an earlier draft of this comment
+    //     bolded it — §22.3 / §8.2 below are cited as written, not as read.)
     //   * §22.5 "Evaluation order": "The order is observable through
     //     side-effecting arguments and non-constant defaults … and is
     //     normative."
     //   * §8.2 is the closest thing to a licence for answering a universal
     //     from the static type, and it is explicit about what that removes:
-    //     "the call is answered from the static type with **no observable
-    //     boxing**". It removes the BOX, not the receiver.
+    //     "the call is answered from the static type with no observable
+    //     boxing". It removes the BOX, not the receiver.
     // So: lower the receiver for its effects, exactly once, and THEN answer
     // §8.5's constant. `lowerExpr` returns nullptr for every unit-typed
     // expression by construction (unit lowers to LLVM `void`; #3421 normalizes

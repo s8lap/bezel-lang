@@ -37,15 +37,17 @@
 //     no short-circuit at all.
 //   * §22.3, the `ref`/`out` argument-locations passage, states it outright for
 //     the compound/indexer path: "the receiver and every index expression are
-//     **evaluated exactly once**, in §22.5's call-site textual order." Exactly
-//     once — not zero times.
+//     evaluated exactly once, in §22.5's call-site textual order." Exactly
+//     once — not zero times. (Quoted plain. The spec emphasises neither this
+//     phrase nor §8.2's below; an earlier draft of this comment bolded both,
+//     which reads as the document stressing them. It does not.)
 //   * §22.5 *Evaluation order*: "The order is observable through side-effecting
 //     arguments and non-constant defaults (`DateTime.Now`, factory calls) and
 //     is normative."
 //   * §8.2 is the closest thing in the document to a licence for answering a
 //     universal from the static type, and it is explicit about what that
-//     removes: "the call is answered from the static type with **no observable
-//     boxing**". It removes the BOX, not the receiver.
+//     removes: "the call is answered from the static type with no observable
+//     boxing". It removes the BOX, not the receiver.
 //
 // So the fix is one line at the one site that had the licence backwards: lower
 // the receiver for its effects, exactly once, and THEN answer §8.5's constant.
