@@ -45,9 +45,27 @@
 // ── SPEC CITATION ─────────────────────────────────────────────────────────
 //
 // §14.1 "Generic declarations" / §22.7 "Constructors" / §23.3 "Block-form
-// properties" / §23.4 "Indexers" / §2.5 "Dependency resolution" /
-// §2.8.2 "Cross-module type substitution" / §2.8.3 rule 4
-// (per-instance monomorphization), v0.278.
+// properties" / §23.4 "Indexers" (T1/T3/T4/T5) / §23.2 "Expression-bodied
+// read-only properties" (T2 — a named `property P: T => _v;`, NOT an
+// indexer, and read-onlyness by shape is what #3365's predicate arm keys
+// on) / §2.5 "Dependency resolution" / §2.8.2 "The artifact interface is a
+// semantic requirement" / §2.8.3 rule 4 (per-instance monomorphization),
+// v0.283.
+//
+// §2.8.2 clause 2 is the rule that decides T2: an external instantiation
+// "behaves identically to a same-module instantiation of the same generic
+// at the same arguments", and an implementation that cannot carry a body
+// shape "must reject the export, or the import, with a diagnostic naming
+// the shape; it must NOT alter the instantiation's semantics." So once the
+// capability exists, answering 15 is required and the former #2884 decline
+// (the spec's permitted reject-with-a-diagnostic fallback) is no longer
+// available. The same-module twin returning 23 is
+// `xmod_imported_generic_indexer_property_3346_3348` T2.
+//
+// ⚠ An earlier revision of this header cited §2.8.2 as "Cross-module type
+// substitution". That is NOT a heading in the spec — the real §2.8.2 title
+// is above. Corrected per the project's spec-citation discipline: verify
+// the §-title against the actual document, not from memory.
 //
 // ── SCOPE / NOT-COVERED ───────────────────────────────────────────────────
 //
@@ -64,11 +82,52 @@
 // ── FAIL-WITHOUT / PASS-WITH (verified mechanically on commit 600c3ca) ───
 //
 //  T1 inherited-indexer-getter (record arg):           14 pre-fix, 15 post-fix.
-//  T2 inherited-property-getter (record arg):          rejected at sema
-//                                                      (the #2884 path), so
-//                                                      no post-fix behavior
-//                                                      change here; pinned to
-//                                                      document the gap.
+//  T2 inherited-property-getter (record arg):          14 pre-#3365,
+//                                                      15 post-#3365.
+//                                                      ⚠ SUPERSEDED LINE:
+//                                                      this cell formerly
+//                                                      read "rejected at
+//                                                      sema (the #2884
+//                                                      path) ... pinned to
+//                                                      document the gap".
+//                                                      `3ea8dee` (`fix
+//                                                      #3365`) closed that
+//                                                      gap and did not
+//                                                      update this file, so
+//                                                      the pin outlived the
+//                                                      rejection it named
+//                                                      and failed the gate
+//                                                      as a stale gap-pin
+//                                                      (#3414). Verified by
+//                                                      a real two-module
+//                                                      bezelc build: X=7
+//                                                      Y=8 (the 14-shape is
+//                                                      X=7 Y=7), a 3-field
+//                                                      widening A=3 B=5
+//                                                      C=9, and an ASan run
+//                                                      with zero reports.
+//                                                      NOTE T2 and T1 share
+//                                                      an OBSERVABLE, not a
+//                                                      code path: T1 goes
+//                                                      through the
+//                                                      synthesized
+//                                                      InternalLinkage
+//                                                      wrapper in
+//                                                      `lowerIndexerGet`;
+//                                                      T2 through the
+//                                                      INLINE getter body
+//                                                      with
+//                                                      `computeAncestorGenericSubst`,
+//                                                      because #2893's
+//                                                      `propertyBodyText`
+//                                                      carriage makes
+//                                                      `computedGetterOf`
+//                                                      non-null and
+//                                                      pre-empts the
+//                                                      `bz$...$propget`
+//                                                      stub path. Two
+//                                                      independent paths,
+//                                                      one observable.
 //  T3 inherited-indexer-setter (record arg):           "Call parameter
 //                                                      type does not match
 //                                                      function signature!"
