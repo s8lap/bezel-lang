@@ -175,6 +175,170 @@ std::string closedValueSurfaceMemberReason(const TypeRef* recvTy,
 // definitions of the ExprTC worker: CallExpr return-type / arity checking
 // (typeCall and friends) and the `.` / `?.` member-access resolvers.
 
+// narrow issue 3440 (stdlib §5 `OfType<U>()`, spec §8.1 *Definition*,
+// §12 *Inheritance and Dispatch*, §12.7 *Type tests*, v0.283): see the header
+// doc on the declaration for what this decides and why it under-approximates.
+// What follows is the case analysis, each arm measured on HEAD 1e3861a before
+// it was written.
+//
+// The `OfType<U>()` lowering (`LlvmBackend_Calls3.cpp`) builds a `bz_lazy_where`
+// whose predicate trampoline is a constant `ret i32 1` — it performs NO runtime
+// type test — while both sema arms below type the result `IEnumerable<U>` from
+// the explicit type argument. So every element is RELABELLED `U` untested. That
+// is correct only where the omitted test could not have failed and the
+// relabelling changes no representation.
+bool ExprTC::ofTypeIdentityRelabelIsSound(const TypeRef* srcElem,
+                                          const TypeRef* outElem) {
+    // Undecidable inputs. A null element type (an unresolved receiver) or an
+    // `Error` type means the program is already ill-formed or unanalysable
+    // here; returning TRUE leaves today's behaviour and lets the real
+    // diagnostic be the one the user sees.
+    if (!srcElem || !outElem) return true;
+    if (srcElem->kind == TypeRef::Kind::Error ||
+        outElem->kind == TypeRef::Kind::Error)
+        return true;
+
+    // (1) U is the source element type. The omitted test is `x is T` on an
+    // `IEnumerable<T>` — always true — and nothing is relabelled at all. This
+    // arm also covers the no-explicit-type-argument spelling, where the caller
+    // leaves `outElem` pointing at `srcElem` itself.
+    //
+    // `functionSlotTypeRefEqual` is the TU-external EXACT structural TypeRef
+    // equality already used for §27.1.1 invariant slots (ExprTypecheck.cpp) —
+    // reused rather than respelled: it compares kind, nullability, primitive,
+    // declaration identity, the alias-transparent head for the null-declaration
+    // builtins, and generic arguments recursively, which is exactly "the same
+    // type" here.
+    if (functionSlotTypeRefEqual(srcElem, outElem)) return true;
+
+    // A nullable source element can hold `null`, which is not an instance of
+    // any non-nullable `U`; a nullable `U` at a non-nullable source is a
+    // different type from the source and the arms below do not model it. Both
+    // sides must be non-nullable past this point. (Measured: an
+    // `Array<Dog?>{null}.OfType<Dog>()` relabels the null and SIGSEGVs on the
+    // first member read.)
+    if (srcElem->nullable || outElem->nullable) return false;
+
+    const auto isClassOrIfaceDecl = [](const TypeSymbol* d) {
+        return d && (d->kind == ast::TypeDeclKind::Class ||
+                     d->kind == ast::TypeDeclKind::Interface);
+    };
+
+    // (2) A reference upcast: T and U are both non-generic class/interface
+    // types and T derives from U — the base-class and implemented-interface
+    // chain of spec §12 *Inheritance and Dispatch*, walked transitively by
+    // `ExprTC::isSubtype`. §12.7's `is T` then "tests whether a value is an
+    // instance of `T`" and is statically TRUE for every element, and both sides
+    // are object references, so admitting the sequence unchanged is the right
+    // answer.
+    //
+    // `isSubtype` is the one existing walker of that chain and deliberately
+    // IGNORES generic arguments. Requiring BOTH sides non-generic keeps this
+    // arm inside what `isSubtype` actually decides. That costs one currently-
+    // correct shape — `OwningArray<Der<int>>.OfType<Base<int>>()` works and is
+    // now refused — and it is not tidiness: measured on 1e3861a, the
+    // same `isSubtype` verdict that admits `Base<int>` also admits
+    // `Base<string>`, and `OwningArray<Der<int>>.OfType<Base<string>>()`
+    // compiles clean and SIGSEGVs on `b.Tag.Length`. Separating the two needs an
+    // argument-substitution judgment no existing authority makes; adding one
+    // here would be a fourth spelling of a classification in this file, so the
+    // interim declines both and says "not yet implemented", which is true.
+    if (srcElem->kind == TypeRef::Kind::Named &&
+        outElem->kind == TypeRef::Kind::Named &&
+        isClassOrIfaceDecl(srcElem->declaration) &&
+        isClassOrIfaceDecl(outElem->declaration) &&
+        srcElem->genericArgs.empty() && outElem->genericArgs.empty() &&
+        isSubtype(srcElem->declaration, outElem->declaration))
+        return true;
+
+    // (3) U is `Object` and T reaches it WITHOUT boxing. Spec §8.1 *Definition*
+    // (v0.283) is the authority that splits the two: "`Object` is the universal
+    // root. Every type derives from it: classes (including heap-array classes
+    // `Array<T>` and `OwningArray<T>`) directly through the inheritance chain,
+    // with `string`, interfaces, and function types reaching `Object` similarly
+    // via their reference-type heap representation; records, enums, primitives,
+    // inline arrays, and the unit type derive via boxing (§8.6) when used in
+    // `Object`-typed positions …". A boxing derivation changes representation,
+    // so only the first group may be relabelled in place.
+    //
+    // Narrower than §8.1's own list on purpose, and each exclusion is measured,
+    // not assumed: a FUNCTION element SIGSEGVs through this path, and so does a
+    // record; a Named type with a NULL declaration is either a builtin
+    // collection wrapper or a bare generic parameter and the two are not
+    // distinguishable here, and the parameter case may be substituted with a
+    // value type. Every one of those is left to the "not yet implemented"
+    // diagnostic.
+    //
+    // ⚠ `kind == Class` DOES NOT MEAN "reference type". A COMPILER-INTRINSIC
+    // class symbol (`SemaContext::builtinClassSym`) is minted with
+    // `kind = ast::TypeDeclKind::Class` regardless of whether the type it
+    // stands for is a value type, so the `isClassOrIfaceDecl` test above says
+    // "reference" for several types §8.1 puts on the BOXING side. The codebase
+    // already documents this exact trap and carries a carve-out for it —
+    // `LlvmBackend_Setup.cpp`'s boxability predicate, fix #3127: "`Range<T>` is
+    // a body record (§9.8) and boxable per §8.6's general rule, but its
+    // declaration is a BUILTIN CLASS SYM (kind=Class, not Record/Enum) — the
+    // Named branch's Record/Enum check below would return false". Measured on
+    // this file's own first landing: `Array<Range<int>>.OfType<Object>()` was
+    // ACCEPTED and SIGSEGV'd, and `Array<Ptr<int>>.OfType<Object>()` was
+    // accepted too.
+    //
+    // The gate is `moduleName.empty()`, the front end's existing builtin-symbol
+    // discriminator (adopted after #2995/#2997; see the #3022 note in
+    // `primitiveBoxesIntoBuiltinIface`): a `builtinClassSym` leaves it EMPTY,
+    // while SymbolCollection (local) and ModuleLoader (imported) populate it on
+    // every real user TypeSymbol. Requiring it NON-empty admits exactly the
+    // user-declared and imported classes and interfaces — the ones §8.1 puts on
+    // the reference-representation side — and excludes every intrinsic.
+    //
+    // `isValueBuiltinByName` (SemaContext.hpp) is the consolidated authority for
+    // "this builtin is a value type", and was considered instead. It is NOT
+    // sufficient here: `Ptr<T>` is absent from its list yet is pinned to a
+    // builtin class sym by `TypeResolution_Names.cpp` and was measurably
+    // accepted by this arm. The structural gate closes `Ptr`, closes `Range`,
+    // and closes whatever intrinsic is added next, which a name list cannot.
+    if (outElem->kind == TypeRef::Kind::Primitive &&
+        outElem->primitive == PrimitiveType::Object) {
+        if (srcElem->kind == TypeRef::Kind::Named &&
+            isClassOrIfaceDecl(srcElem->declaration) &&
+            !srcElem->declaration->moduleName.empty())
+            return true;
+        if (srcElem->kind == TypeRef::Kind::Primitive &&
+            (srcElem->primitive == PrimitiveType::String ||
+             srcElem->primitive == PrimitiveType::Object))
+            return true;
+    }
+
+    return false;
+}
+
+// narrow issue 3440: the diagnostic both `OfType<U>()` typing arms raise when
+// `ofTypeIdentityRelabelIsSound` cannot prove the relabelling correct.
+//
+// It says NOT IMPLEMENTED, not "your program is wrong" — deliberately. No
+// normative document states any semantics for `OfType<U>()`: it appears in
+// `Bezel_Standard_Library.md` twice (its bare signature under a `// Filtering`
+// group comment, and its name in the callback-free-lazy-operator list) and
+// nowhere at all in `Bezel_Language_Spec.md` or `Bezel_Changelog.md`. So as far
+// as anything ever specified, a rejected program here is legal; what is missing
+// is the compiler's runtime type test, not the user's understanding.
+std::string ExprTC::ofTypeNotImplementedMessage(const TypeRef* srcElem,
+                                                const TypeRef* outElem) {
+    const std::string src = typeNameForDiag(srcElem);
+    const std::string out = typeNameForDiag(outElem);
+    return "`OfType<" + out + ">()` on a sequence of `" + src +
+           "` is not yet implemented (stdlib §5 / issue 3440). This operator "
+           "needs a per-element runtime type test and the compiler emits none, "
+           "so it would relabel every `" + src + "` as `" + out +
+           "` untested and read it through the wrong type. Only the cases whose "
+           "test is statically true are implemented: `U` the sequence's own "
+           "element type, `U` a NON-GENERIC base class or implemented interface "
+           "of it (spec §12; a generic one is refused too, issue 3457), or `U` = "
+           "`Object` at a user-declared class or interface element (spec §8.1 — "
+           "a type that reaches `Object` by boxing is not one). Filter "
+           "explicitly with `Where` and an `is` test (spec §12.7) instead.";
+}
+
 // §5.1: implicit-conversion predicate used by §22.6 overload resolution.
 // Identity is NOT a §5.1 conversion (it is the "exact" relation), so a
 // pair of equal types returns false here. Conservative on everything the
@@ -4661,6 +4825,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     outElem = u;
                             }
                         }
+                        // narrow issue 3440 (stdlib §5, spec §8.1 / §12,
+                        // v0.283): this is ONE of TWO arms that type `OfType`
+                        // — this one for a lazy/Range/IGrouping receiver, the
+                        // other (below) for a concrete collection receiver —
+                        // and the identity lowering miscompiles through BOTH
+                        // identically, so both gate on the same predicate.
+                        // Reported here rather than left to codegen: the
+                        // lowering emits an always-true predicate trampoline,
+                        // so an unsound pair is a silent heap-buffer-overflow
+                        // at run time, not a codegen failure.
+                        if (!ofTypeIdentityRelabelIsSound(srcElem, outElem))
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                ofTypeNotImplementedMessage(srcElem, outElem));
+                        // The result type is set even on the error path so a
+                        // downstream `.ToArray()`/`.Count` types normally and
+                        // the user sees the ONE diagnostic above, not a cascade.
                         ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
                         return true;
                     }
@@ -6105,12 +6286,23 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         }
                         // stdlib §5 (#651): OfType<U>() — lazy IEnumerable<U>.
                         // U comes from the explicit type arg on the callee
-                        // MemberAccessExpr. When U == T (same source element type),
-                        // codegen produces a Where-all identity; when U != T for
-                        // value types, produces an empty enumerator.
+                        // MemberAccessExpr.
+                        //
+                        // narrow issue 3440 (v0.283): the comment that stood
+                        // here said codegen "produces an empty enumerator" when
+                        // U != T for value types. It does not, and never did —
+                        // `LlvmBackend_Calls3.cpp`'s arm builds a `bz_lazy_where`
+                        // whose predicate trampoline is a constant `ret i32 1`,
+                        // for every U. (Its own comment asserts the check is
+                        // "statically enforced by sema", i.e. here. Each side
+                        // claimed the other made a classification neither made;
+                        // measured: `Array<int>{1,2,3}.OfType<string>()`
+                        // compiled clean and SIGSEGV'd.) The gate below is that
+                        // enforcement, for BOTH arms.
                         else if (m == "OfType" && ce.args.empty()) {
-                            TypeRef* outElem = recvTy->genericArgs.empty()
+                            TypeRef* srcElem = recvTy->genericArgs.empty()
                                 ? nullptr : recvTy->genericArgs[0];
+                            TypeRef* outElem = srcElem;
                             // Extract explicit type arg <U> from the callee MA.
                             if (auto* callMa = dynamic_cast<const ast::MemberAccessExpr*>(
                                     ce.callee.get())) {
@@ -6121,6 +6313,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         outElem = u;
                                 }
                             }
+                            if (!ofTypeIdentityRelabelIsSound(srcElem, outElem))
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    ofTypeNotImplementedMessage(srcElem, outElem));
+                            // Typed even on the error path — see the sibling arm.
                             ctx_.setExprType(&ce, makeLazyEnumerable(outElem));
                         }
                         // stdlib §5 (#651): GroupBy<TKey>(key: (T)->TKey) —
