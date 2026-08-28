@@ -3551,12 +3551,27 @@ llvm::Value* Emitter::boxedStorage(llvm::AllocaInst* slot, llvm::Type*& elemTy) 
             // round-trips the frame. A local's does once lowerLambda has given it
             // its own field; a parameter's does via the resume prologue's
             // unconditional restore, which is why parameters are admitted here
-            // whether or not they carry a field of their own. Anything else — an
-            // async LAMBDA's own body local (its frame is hand-rolled and
-            // reserves no such field, #3499's neighbourhood), a catch-arm binding
-            // promoted into the spill area — is NOT restored, and addressing it
-            // after a resume would turn a loud SIGSEGV into a quiet wrong value.
-            // Decline those: the read stays exactly as it was before #3484.
+            // whether or not they carry a field of their own.
+            //
+            // ⚠ This sentence used to name "an async LAMBDA's own body local
+            // (its frame is hand-rolled and reserves no such field)" as the
+            // leading example of what is declined. `fix #3499` reserves that
+            // field and publishes it into smAllocaToField_, so an async
+            // lambda's body local now ROUND-TRIPS and is admitted here — the
+            // predicate below did not change, the world underneath it did.
+            //
+            // What is still declined: anything the predicate cannot see a field
+            // for, including a catch-arm binding's holder, which `fix #3503`
+            // makes heap-persistent through the handler SPILL area rather than
+            // through a frame field — so it is declined by a predicate that
+            // asks about fields, not because it fails to survive. That decline
+            // is now conservative rather than load-bearing; narrowing it wants
+            // its own measurement, not an assumption from this comment.
+            //
+            // The reason to decline when in doubt is unchanged: addressing a
+            // slot that did NOT round-trip after a resume turns a loud SIGSEGV
+            // into a quiet wrong value, and the read then stays exactly as it
+            // was before #3484.
             if (smStateStruct_ && smSelf_) {
                 p.syncSurvivesSuspend =
                     smAllocaToField_.count(syncIt->second) != 0 ||

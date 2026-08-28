@@ -1939,9 +1939,17 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
                 // fix #3484 follow-up: an async lambda restores its own params
                 // unconditionally here, exactly as emitFrameCaptureRestores does
                 // for a method, so this alloca is valid fall-back storage after a
-                // resume. Its captured LOCALS are NOT covered — this frame is
-                // hand-rolled and reserves no pre-box field — so boxedStorage
-                // declines those and leaves the pre-#3484 read in place.
+                // resume.
+                //
+                // ⚠ This comment used to continue "Its captured LOCALS are NOT
+                // covered — this frame is hand-rolled and reserves no pre-box
+                // field — so boxedStorage declines those". `fix #3499` (200
+                // lines above, published 20 lines below) reserves exactly that
+                // field and wires it into smAllocaToField_, so captured locals
+                // ARE covered now and boxedStorage admits them. The old text
+                // survived the change that falsified it; it is corrected rather
+                // than deleted because the decline it describes is what the
+                // #3484 follow-up was reasoning about.
                 smRestoredParamSlots_.insert(slot);
             }
             if (fc.localDecl) locals_[fc.localDecl] = slot;
