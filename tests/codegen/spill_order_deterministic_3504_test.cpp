@@ -78,6 +78,16 @@ std::string bezelcPath() {
 // compiler prints to stderr (LlvmBackend.cpp). A SUBPROCESS, not in-process
 // Driver: LLVM's errs() is a raw_fd_ostream whose capture by redirecting this
 // process's own fd 2 was found unreliable in #1391.
+//
+// ⚠ CONSEQUENCE, shared with the other IR-dump tests (#1391, #3073): this row
+// is an oracle on the `bezelc` BINARY, not on the `libbezel_core.a` this test
+// links. If a build produces the test binary without relinking `bezelc` — which
+// `scripts/agent_check.sh` does, since it builds `bezel_tests` and only reaches
+// `bezelc` in its later lit phase — the row measures a STALE compiler and fails
+// for a reason that has nothing to do with the source under test. Seen once
+// while writing this test, and it happened to be a clean accidental
+// FAIL-WITHOUT: against the parent `bezelc` the run count assertion passed (the
+// groups were found) and `strictlyAscending` fired twice, once per group.
 std::string compileAndCaptureIR(const std::string& source) {
     static int counter = 0;
     std::string bezelc = bezelcPath();

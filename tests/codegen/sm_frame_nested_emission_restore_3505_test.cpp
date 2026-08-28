@@ -46,6 +46,11 @@
 // lambda — the venue that runs clearSmFrame — is the whole perturbation, and
 // that the sync-lambda branch (which retracts only a subset by hand, and
 // deliberately keeps doing so) was never the venue and still is not.
+//
+// The SECOND venue is pinned too, because the issue named it and it is not the
+// same route: `buildSpecializedMethodFn` builds a lazy monomorphization from
+// mid-body, so a plain generic call inside an owning iterator retracts the same
+// five members with no lambda in the program at all (21 + a leak -> 31, clean).
 
 #include <string>
 
@@ -154,6 +159,31 @@ BEZEL_TEST(sm_frame_nested_emission_restore_3505,
         "  public static method Gen(): IOwningEnumerable<R> "
         "    yield return new R(1); "
         "    var g: (int) -> int := lambda(x) => x + 1; "
+        "    yield return new R(2); "
+        "    yield return new R(3); "
+        "  end Gen; " + kDriveAndMain;
+    BEZEL_EXPECT_EQ(runChecked(program), 31);
+}
+
+// THE SECOND VENUE. `buildSpecializedMethodFn` builds a lazy monomorphization
+// from the MIDDLE of another body, and the emit*Method helpers it calls each
+// open a StateMachineFrameScope — so a generic call inside an owning iterator
+// retracts the SAME five members, by a different route and with no lambda
+// anywhere. Its hand-written save list covered 16 of the 28. Same observable:
+// the §29.1 displaced-value dispose stops being emitted for every later yield.
+//
+//   pre-fix : 21 + LeakSanitizer report      post-fix: 31, clean
+BEZEL_TEST(sm_frame_nested_emission_restore_3505,
+           owning_iter_generic_specialization_between_yields_keeps_dispose) {
+    std::string program = std::string("module M; import System; ") + kCountR +
+        "class C "
+        "  public static method Ident<T>(v: T): IEnumerable<T> "
+        "    yield return v; "
+        "  end Ident; "
+        "  public static method Gen(): IOwningEnumerable<R> "
+        "    yield return new R(1); "
+        "    var q := 0; "
+        "    for var z in C.Ident<int>(5) do q := q + z; end; "
         "    yield return new R(2); "
         "    yield return new R(3); "
         "  end Gen; " + kDriveAndMain;
