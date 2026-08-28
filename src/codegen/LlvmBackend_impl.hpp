@@ -5721,10 +5721,53 @@ private:
     // §2.8.3 rule 3's identity ("declaring module name, ... qualified type
     // name, and generic arity"). `ts` is never null at a genuine call site;
     // the guard only covers a defensive/degenerate caller.
+    //
+    // fix #3529 (§11.6 / §2.8.3 rule 3, v0.283): the CLASS component is the
+    // type's QUALIFIED name, not its simple one — rule 3's identity is "its
+    // declaring module name, its qualified type name (including any
+    // enclosing-type path, §11.6), and its generic arity", and #1488 supplied
+    // only the module half. Two nested types with the same simple name in one
+    // module ("Outer1.Ord" and "Outer2.Ord") both produced "M.Ord": ONE
+    // `bz$classcmp$M.Ord` thunk answered for both (the second type sorted by
+    // the first's `CompareTo`), and their remaining symbols were
+    // auto-uniquified into names no other TU can name.
+    // `TypeSymbol::enclosingTypePath` carries the missing half, populated
+    // identically for a local declaration (SymbolCollection) and an imported
+    // one (ModuleLoader) so the two sides agree. A top-level type has an empty
+    // enclosing path, so its mangled name is byte-identical to pre-#3529.
+    //
+    // ⚠ THE NESTING SEPARATOR IS '+', NOT '.', AND THAT IS LOAD-BEARING.
+    // Rule 3's identity is a TUPLE — (module name, qualified type name, arity)
+    // — and a mangled symbol is one flat string, so the separator has to make
+    // the tuple boundary recoverable. A dotted join does not: a module name is
+    // itself dotted, so `module M.Outer1;` + `class Ord` and `module M;` +
+    // `class Outer1` + nested `class Ord` would BOTH render "M.Outer1.Ord".
+    // That is not hypothetical — it was MEASURED while developing this fix, as
+    // six `multiple definition of bz$M.Outer1.Ord$ctor` / `…$Dispose` /
+    // `…$init` / `vt$…` / `td$…` link errors on a two-library build that links
+    // and runs cleanly with the dotted spelling absent. '+' cannot appear in a
+    // Bezel identifier or in a dotted module name (Appendix A.2/A.3), so it can
+    // only ever mean "the enclosing-type path starts here", and it never
+    // collides with the '$' this scheme already uses as its FIELD separator
+    // (reusing '$' would have made `bz$<cls>$<member>` unparseable for the
+    // tooling that splits on it). The §11.6 surface spelling stays dotted where
+    // it belongs — `TypeSymbol::qualifiedTypeName()` for diagnostics, and
+    // `spec85QualifiedTypeName` below for observable §8.5 output; this is the
+    // LINKER spelling and is deliberately not the same string, for the same
+    // reason that helper is deliberately a separate function.
     static std::string mangledTypeName(const sema::TypeSymbol* ts) {
         if (!ts) return "";
-        if (ts->moduleName.empty()) return std::string(ts->name);
-        return ts->moduleName + "." + std::string(ts->name);
+        std::string cls(ts->name);
+        if (!ts->enclosingTypePath.empty()) {
+            // `enclosingTypePath` is the dotted §11.6 surface path ("A.B");
+            // re-spell its separators for the linker.
+            std::string path = ts->enclosingTypePath;
+            for (char& c : path)
+                if (c == '.') c = '+';
+            cls = path + "+" + cls;
+        }
+        if (ts->moduleName.empty()) return cls;
+        return ts->moduleName + "." + cls;
     }
 
     // fix #3119 (spec §8.5, v0.252; stdlib §2.13 rule 1 + rule 2): the module

@@ -74,7 +74,8 @@ bool isReservedPrimitiveAliasName(std::string_view n) {
 Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
                        ScopeId parentScope);
 TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
-                            ScopeId parentScope);
+                            ScopeId parentScope,
+                            std::string_view enclosingTypePath = {});
 Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
                       SemaContext& ctx);
 
@@ -287,8 +288,18 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         wrapper->scope = parent.memberScope;
         if (nt->decl) {
             wrapper->visibility = nt->decl->visibility;
+            // fix #3529 (§11.6 / §2.8.3 rule 3, v0.283): thread the
+            // ENCLOSING-TYPE PATH down so the inner TypeSymbol carries the
+            // other half of rule 3's identity ("its qualified type name
+            // (including any enclosing-type path, §11.6)"). `parent`'s own
+            // path is already populated — collectTypeDecl assigns it before
+            // it walks the member list — so a three-deep `A.B.C` composes
+            // correctly rather than each level seeing only its immediate
+            // parent. See TypeSymbol::enclosingTypePath for what the missing
+            // half cost the emitted symbol namespace.
             wrapper->type =
-                collectTypeDecl(*nt->decl, ctx, parent.memberScope);
+                collectTypeDecl(*nt->decl, ctx, parent.memberScope,
+                                parent.qualifiedTypeName());
         }
         return wrapper;
     }
@@ -298,9 +309,16 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
 }
 
 TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
-                            ScopeId parentScope) {
+                            ScopeId parentScope,
+                            std::string_view enclosingTypePath) {
     auto* sym = ctx.makeSymbol<TypeSymbol>();
     sym->name = td.name;
+    // fix #3529 (§11.6 / §2.8.3 rule 3, v0.283): the enclosing-type path, set
+    // BEFORE the member walk below so a nested type nested inside THIS one
+    // reads a complete path (see the NestedTypeMember arm of collectMember).
+    // Empty for a top-level declaration, which keeps every non-nested type's
+    // mangled name byte-identical to the pre-#3529 spelling.
+    sym->enclosingTypePath = std::string(enclosingTypePath);
     // §3.4 (#1081): reject a user type whose name is a reserved PascalCase
     // primitive-alias (Single/Double/Int32/String/…). The symbol is still
     // registered so later passes have a well-formed type to resolve against; the

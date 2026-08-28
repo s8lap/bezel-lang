@@ -529,6 +529,17 @@ struct Loader {
         // parent's already-populated moduleName rather than needing its own
         // MetaModule lookup.
         t->moduleName = parent.moduleName;
+        // fix #3529 (§11.6 / §2.8.3 rule 3, v0.283): the OTHER half of rule 3's
+        // identity, populated from the same place and for the same reason. The
+        // enclosing type's qualified name IS this type's enclosing-type path,
+        // and because reconstructTypeSymbol recurses through convertMember with
+        // `*t` as the new parent, a deeper `A.B.C` composes here exactly as
+        // SymbolCollection composes it locally. Nothing new goes on the wire:
+        // the metadata already nests a MetaTypeDecl inside its enclosing
+        // MetaMember, so the path is structural and no schema bump is needed.
+        // The two sides must agree or a nested type's external declaration in
+        // the importer names a symbol the exporter never defined.
+        t->enclosingTypePath = parent.qualifiedTypeName();
         // §9.2 (issue #501): propagate positional-record flag.
         t->hasPositionalFields = td.hasPositionalFields;
         // fix #2950 (§12 / §31.4 / §2.8.3 rule 4, v0.240): restore the built-in

@@ -171,6 +171,50 @@ struct TypeSymbol : Symbol {
     // TypeSymbol with no real module (builtins materialized on demand,
     // ts->decl == nullptr); those are never part of the cross-module ABI.
     std::string moduleName;
+    // fix #3529 / §11.6 / §2.8.3 rule 3: the dotted path of this type's
+    // ENCLOSING types, outermost-first, EXCLUDING the type's own name
+    // ("Outer1" for `Outer1.Ord`; "A.B" for `A.B.C`). Empty for a top-level
+    // type — which is every type in the pre-#3529 world, so the mangling of a
+    // non-nested type is byte-identical to what it was.
+    //
+    // The other half of §2.8.3 rule 3's identity that `moduleName` above only
+    // half-carried: rule 3 identifies a type program-wide by "its declaring
+    // module name, its qualified type name (including any enclosing-type path,
+    // §11.6), and its generic arity". #1488 gave codegen the module half; this
+    // is the enclosing-type half. Without it `Outer1.Ord` and `Outer2.Ord` in
+    // one module both mangle to "M.Ord" and share ONE `bz$classcmp$M.Ord`
+    // comparator thunk — measured, the second type sorts by the first's
+    // `CompareTo` (#3529) — while their `$ctor`/`$Dispose`/`$init`/`td$`/`vt$`
+    // symbols are LLVM auto-uniquified with `.1`/`.2` suffixes, names that
+    // exist in no other translation unit (the failure #1488's own comment in
+    // LlvmBackend_impl.hpp describes).
+    //
+    // Populated at symbol-creation time on BOTH sides, like `moduleName`:
+    // SymbolCollection::collectTypeDecl threads it down the nesting chain for a
+    // LOCAL declaration, ModuleLoader::reconstructTypeSymbol takes it from the
+    // enclosing reconstructed symbol for an IMPORTED one — so the exporter's
+    // definition and every importer's external declaration agree.
+    //
+    // The separator here is the §11.6 SURFACE one ('.'), because this is the
+    // path as the language spells it. `Emitter::mangledTypeName` deliberately
+    // re-spells it with '+' for the LINKER symbol: a module name is itself
+    // dotted, so a dotted mangling cannot tell `module M.Outer1;` + `class Ord`
+    // apart from `module M;` + `class Outer1` + nested `class Ord` (measured:
+    // six `multiple definition` link errors). Read the surface form through
+    // `qualifiedTypeName()` below, never by hand.
+    std::string enclosingTypePath;
+
+    // §11.6 / §2.8.3 rule 3: this type's QUALIFIED type name — the
+    // enclosing-type path joined to the simple name ("Outer1.Ord"), or just the
+    // simple name for a top-level type. Module-independent: the declaring
+    // module is the separate `moduleName` component of rule 3's identity, and
+    // the two are joined only where a whole identity is wanted (codegen's
+    // `Emitter::mangledTypeName`).
+    std::string qualifiedTypeName() const {
+        if (enclosingTypePath.empty()) return std::string(name);
+        return enclosingTypePath + "." + std::string(name);
+    }
+
     // §12 / §31.4 (#2950): the name of the BUILT-IN exception type this class
     // names DIRECTLY as its base ("Exception", "IOException", …), or empty when
     // it names none. A built-in exception has no user TypeSymbol at all (its
