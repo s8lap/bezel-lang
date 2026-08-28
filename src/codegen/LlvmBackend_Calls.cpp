@@ -4520,14 +4520,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // Each thunk arg is ptr* — a pointer to the class-pointer slot in
                 // the array buffer.  per §14.2 / #1195.
                 //
-                // fix #3488: the body used to be built INLINE here, and was the
-                // only such builder in the compiler — which is why #3428 and
-                // #3488 both concluded there was no `CompareTo`-through-the-
-                // vtable comparator at all and deferred the sorted-collection
-                // work on that ground. It is now buildObjectCompareToThunk, so
-                // `Array<T>.Sort()` and `SortedDictionary<K, V>`'s ordered
-                // operations share ONE builder and one `bz$classcmp$<C>` per
-                // module instead of two spellings of the same dispatch.
+                // fix #3488: the body used to be built INLINE here — which is
+                // why #3428 and #3488 both concluded there was no
+                // `CompareTo`-through-the-vtable comparator at all and deferred
+                // the sorted-collection work on that ground. It is now
+                // buildObjectCompareToThunk, so `Array<T>.Sort()`,
+                // `Array<T>.Sorted()` and `SortedDictionary<K, V>`'s ordered
+                // operations share ONE builder and one `bz$classcmp$<M.C>` per
+                // module instead of three spellings of the same dispatch.
+                // ⚠ #3488's own commit body called this "the only such builder";
+                // that was wrong — `Sorted()` below carried a third, verbatim
+                // copy until `narrow #3488` deleted it.
                 cmpFn = buildObjectCompareToThunk(elemTR);
                 // Unreachable: `classCompareMs` came from the same
                 // findMethodByName probe the helper's class arm runs, so it
@@ -4786,45 +4789,30 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             if (ifaceCmpFn2) {
                 cmpFn2 = ifaceCmpFn2;
             } else if (classCompareMs2) {
-                // Class IComparable<T> comparator thunk (mirrors Sort() path).
-                // per §14.2 / #1195.
-                std::string thunkName2 = std::string("bz$classcmp$") +
-                                         std::string(elemTR2->declaration->name);
-                cmpFn2 = module_->getFunction(thunkName2);
-                if (!cmpFn2) {
-                    auto* thunkTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                    cmpFn2 = llvm::Function::Create(thunkTy,
-                                                    llvm::Function::InternalLinkage,
-                                                    thunkName2, module_.get());
-                    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn2);
-                    llvm::IRBuilder<> thunkB(bb);
-                    llvm::Value* aSlot = &*cmpFn2->arg_begin();
-                    llvm::Value* bSlot = &*std::next(cmpFn2->arg_begin());
-                    llvm::Value* aPtr = thunkB.CreateLoad(ptrTy(), aSlot);
-                    llvm::Value* bPtr = thunkB.CreateLoad(ptrTy(), bSlot);
-                    auto* cmpToTy = llvm::FunctionType::get(
-                        i32(), {ptrTy(), ptrTy()}, false);
-                    llvm::Value* result = nullptr;
-                    auto vsIt = vtableSlot_.find(classCompareMs2);
-                    if (vsIt != vtableSlot_.end()) {
-                        unsigned vtSlot = vsIt->second;
-                        llvm::Value* vtable = thunkB.CreateLoad(ptrTy(), aPtr);
-                        llvm::Value* slotPtr = thunkB.CreateGEP(
-                            ptrTy(), vtable, {thunkB.getInt32(vtSlot)});
-                        llvm::Value* fnPtr = thunkB.CreateLoad(ptrTy(), slotPtr);
-                        result = thunkB.CreateCall(cmpToTy, fnPtr, {aPtr, bPtr});
-                    } else {
-                        auto fnIt = methodFns_.find(classCompareMs2);
-                        if (fnIt != methodFns_.end()) {
-                            result = thunkB.CreateCall(
-                                fnIt->second->getFunctionType(),
-                                fnIt->second, {aPtr, bPtr});
-                        } else {
-                            result = llvm::ConstantInt::get(i32(), 0);
-                        }
-                    }
-                    thunkB.CreateRet(result);
-                }
+                // Class IComparable<T> comparator thunk. per §14.2 / #1195.
+                //
+                // narrow #3488 (v0.283): this was a VERBATIM INLINE COPY of the
+                // Sort() builder — the THIRD spelling of one decision, after
+                // #3488 had already lifted the other two into
+                // buildObjectCompareToThunk while its own commit body claimed
+                // Sort()'s was "the only such builder in the compiler". The two
+                // spellings already DIVERGED in their miss arm (the helper
+                // returns null; this copy emitted a constant-0 comparator, i.e.
+                // a silent no-op sort), and they were kept in step on ordering
+                // only by sharing a cache NAME — so #3512's requalification of
+                // that name would have left this copy colliding cross-module
+                // AND emitting a second, differently-named thunk per type.
+                // Deleted rather than aligned, per the standing rule that a
+                // second spelling of an existing decision is this codebase's
+                // dominant defect generator.
+                cmpFn2 = buildObjectCompareToThunk(elemTR2);
+                // Unreachable, exactly as at the Sort() site: `classCompareMs2`
+                // came from the same `findMethodByName` probe the helper's class
+                // arm runs, and that helper demands `methodFns_.count(ms)` — so
+                // the deleted copy's constant-0 fallback was dead code, not a
+                // behaviour this arm relied on. Guarded because a null here
+                // would reach bz_array_sort as the comparator and be called.
+                if (!cmpFn2) return nullptr;
             } else if (isStringElem2) {
                 auto* cmpName = "bz$strcmp";
                 cmpFn2 = module_->getFunction(cmpName);

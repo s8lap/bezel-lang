@@ -23,8 +23,8 @@
 // from whichever type the consumer's lowering reached first. Everything keyed on
 // it then answered with the WRONG module's ordering:
 //
-//   * `Array<T>.Sort()` printed the ascending answer for the DESCENDING type
-//     (stdlib §4.4);
+//   * `Array<T>.Sort()` and `Array<T>.Sorted()` printed the ascending answer for
+//     the DESCENDING type (stdlib §4.4);
 //   * `SortedDictionary<K, V>` iterated ascending and reported the ascending
 //     `FirstKey`/`LastKey` for it (stdlib §4.17, "Ordering is defined by `K`'s
 //     `IComparable<K>.CompareTo`");
@@ -232,6 +232,32 @@ BEZEL_TEST(xmod_class_comparator_collision_3512,
         "  Console.WriteLine($\"asc={pa[0].Value()}{pa[1].Value()}{pa[2].Value()}"
         " desc={qa[0].Value()}{qa[1].Value()}{qa[2].Value()}\"); "
         "  return 0; "), "sort");
+    BEZEL_EXPECT_EQ(r.out, std::string("asc=123 desc=321\n"));
+}
+
+// per stdlib §4.4 (`public method Sorted(): owned Array<T>;  // fresh sorted
+// copy`), v0.283,
+// #3512 / narrow #3488: the `Sorted()` arm carried its OWN verbatim inline copy
+// of this comparator builder — a THIRD spelling, which #3488's commit body said
+// did not exist. It is now routed through `buildObjectCompareToThunk` and the
+// copy deleted, so this row is the one that would catch a copy left behind: an
+// unrouted `Sorted()` would keep colliding here while `Sort()` above went green.
+BEZEL_TEST(xmod_class_comparator_collision_3512,
+           array_sorted_uses_each_modules_own_comparator) {
+    RunOut r = buildAndRunTwoLibs(kLibP_asc, kLibQ_desc, app(
+        "  using var p1 := new LibP.Ord(2); "
+        "  using var p2 := new LibP.Ord(3); "
+        "  using var p3 := new LibP.Ord(1); "
+        "  var pa: Array<LibP.Ord> := [p1, p2, p3]; "
+        "  var ps := pa.Sorted(); "
+        "  using var q1 := new Q.Ord(2); "
+        "  using var q2 := new Q.Ord(3); "
+        "  using var q3 := new Q.Ord(1); "
+        "  var qa: Array<Q.Ord> := [q1, q2, q3]; "
+        "  var qs := qa.Sorted(); "
+        "  Console.WriteLine($\"asc={ps[0].Value()}{ps[1].Value()}{ps[2].Value()}"
+        " desc={qs[0].Value()}{qs[1].Value()}{qs[2].Value()}\"); "
+        "  return 0; "), "sorted");
     BEZEL_EXPECT_EQ(r.out, std::string("asc=123 desc=321\n"));
 }
 

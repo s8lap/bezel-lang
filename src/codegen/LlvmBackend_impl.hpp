@@ -14594,11 +14594,11 @@ private:
     // than loading and ICmp'ing a scalar. This is the builder Array<T>.Sort()
     // already used inline for `bz$classcmp$<C>` (#1195) and, via
     // ensureIfaceCmpThunk, for `bz$ifacecmp$<I>` (#2768); it is factored out
-    // here so the sorted-collection family and Sort() share ONE thunk per type
-    // rather than two spellings of it. The cache key is MODULE-QUALIFIED
-    // (§2.8.3 rule 3) since #3512; the bare type name made two modules'
-    // same-named `IComparable` classes share one comparator. Null when the
-    // reference type has no
+    // here so the sorted-collection family, Sort() and Sorted() share ONE thunk
+    // per type rather than three spellings of it. The cache key is
+    // MODULE-QUALIFIED (§2.8.3 rule 3) since #3512; the bare type name made two
+    // modules' same-named `IComparable` classes share one comparator. Null when
+    // the reference type has no
     // dispatchable `CompareTo` (`Object`, or a class that declares none) — the
     // §4.17 `where K: IComparable<K>` shape that nothing checks today (#3490).
     llvm::Function* buildObjectCompareToThunk(const sema::TypeRef* ty);

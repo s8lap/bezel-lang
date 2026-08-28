@@ -389,7 +389,7 @@ BEZEL_TEST(sorted_dictionary_class_key_3488, key_without_compareto_unchanged) {
         "tryAdd=True count=2\n");
 }
 
-// per stdlib §4.17 (v0.283) + §2.1, #3488: an `Object` key is a reference key
+// per stdlib §4.17 (v0.283) + spec §8.1, #3488: an `Object` key is a reference key
 // (`hasObjectHeaderEquality` admits it) with no `CompareTo` to dispatch, so it
 // too is untouched — it must keep constructing and counting, not crash on a
 // comparator that was never built.
@@ -469,6 +469,50 @@ BEZEL_TEST(sorted_dictionary_class_key_3488, array_class_element_sort_unchanged)
         "  Console.WriteLine($\"{arr[0].V}{arr[1].V}{arr[2].V}\"); "
         "  return 0; ")),
         "123\n");
+}
+
+// per stdlib §4.4 (`public method Sorted(): owned Array<T>;  // fresh sorted
+// copy`) + spec
+// §14.2, v0.283, narrow #3488: `Sorted()` carried a THIRD, verbatim inline copy
+// of the class comparator builder — which #3488's own commit body denied existed
+// when it called Sort()'s "the only such builder in the compiler". That copy is
+// now deleted and the arm routed through `buildObjectCompareToThunk`. This row
+// is the same-module no-collateral guard for that deletion: it passes on both
+// trees, and would catch a routing that stopped calling `CompareTo` at all —
+// exactly the silent no-op the deleted copy's own dead constant-0 fallback would
+// have produced. The cross-module half (where the two spellings genuinely
+// diverged) is `xmod_class_comparator_collision_3512`.
+BEZEL_TEST(sorted_dictionary_class_key_3488, array_class_element_sorted_unchanged) {
+    BEZEL_EXPECT_EQ(out(prog(
+        "  using var s1 := new Ord(3); "
+        "  using var s2 := new Ord(1); "
+        "  using var s3 := new Ord(2); "
+        "  var arr := new Array<Ord>(); "
+        "  arr.Add(s1); arr.Add(s2); arr.Add(s3); "
+        "  var srt := arr.Sorted(); "
+        "  Console.WriteLine($\"{srt[0].V}{srt[1].V}{srt[2].V}"
+        " src={arr[0].V}{arr[1].V}{arr[2].V}\"); "
+        "  return 0; ")),
+        "123 src=312\n");
+}
+
+// per stdlib §4.4 + spec §12, v0.283, narrow #3488: the deleted `Sorted()` copy
+// also carried its own vtable-slot dispatch, so the routing must keep dispatching
+// a VIRTUAL `CompareTo` to the override rather than to the base declaration.
+// `Desc` overrides `Virt`'s ascending comparison with a descending one; a
+// non-virtual bind would print the ascending answer. Passes on both trees.
+BEZEL_TEST(sorted_dictionary_class_key_3488,
+           array_sorted_dispatches_the_virtual_override) {
+    BEZEL_EXPECT_EQ(out(prog(
+        "  using var d1 := new Desc(3); "
+        "  using var d2 := new Desc(1); "
+        "  using var d3 := new Desc(2); "
+        "  var arr := new Array<Virt>(); "
+        "  arr.Add(d1); arr.Add(d2); arr.Add(d3); "
+        "  var srt := arr.Sorted(); "
+        "  Console.WriteLine($\"{srt[0].V}{srt[1].V}{srt[2].V}\"); "
+        "  return 0; ")),
+        "321\n");
 }
 
 // per stdlib §4.18 (v0.283), #3488 / #3428: `SortedSet<T>` is a DIFFERENT arm

@@ -586,10 +586,12 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
 // (`bz$ifacecmp$<I>`, interface element, via ensureIfaceCmpThunk), with the
 // IDENTICAL `i32 (ptr, ptr)` slot-address ABI `buildSortedKeyComparator` needs.
 // What was missing was the wiring, not the comparator. This function is the
-// Sort() builder LIFTED OUT so that both callers share one thunk per type — per
-// the standing rule that a second spelling of an existing decision is the
-// dominant defect generator here, the Sort() arm now calls this rather than
-// carrying its own copy.
+// Sort() builder LIFTED OUT so that every caller shares one thunk per type —
+// per the standing rule that a second spelling of an existing decision is the
+// dominant defect generator here, the Sort() arm calls this rather than
+// carrying its own copy, and so (since `narrow #3488`) does `Array<T>.Sorted()`,
+// which had carried a THIRD, verbatim inline copy that #3488's own body
+// asserted did not exist.
 //
 // Null for a reference type with no dispatchable `CompareTo`: `Object` (no
 // declaration to search), and a class or interface that declares none. §4.17
@@ -599,7 +601,11 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
 llvm::Function* Emitter::buildObjectCompareToThunk(const sema::TypeRef* ty) {
     if (!ty || !hasObjectHeaderEquality(ty)) return nullptr;
     // `Object` is Kind::Primitive here — it has no declaration to search for a
-    // `CompareTo`, and stdlib §2.1 declares none on it.
+    // `CompareTo`, and spec §8.1's declaration of it lists none (v0.283:
+    // `GetType`/`Equals`/`GetHashCode`/`ToString`/`ReferenceEquals`, and
+    // nothing else). An earlier revision of this line cited "stdlib §2.1" for
+    // that fact; stdlib §2.1 is `Console`. The claim was right, the authority
+    // was not.
     if (ty->kind != sema::TypeRef::Kind::Named || !ty->declaration) return nullptr;
 
     if (ty->declaration->kind == ast::TypeDeclKind::Interface) {
@@ -623,10 +629,11 @@ llvm::Function* Emitter::buildObjectCompareToThunk(const sema::TypeRef* ty) {
     // comparator built for whichever type reached this function FIRST was then
     // handed the other type's instances. Measured on 06551dd: two modules each
     // declaring `public class Ord: IComparable<Ord>` with OPPOSITE `CompareTo`
-    // both sorted ascending (`Array.Sort` and `SortedDictionary`
-    // iteration/`FirstKey`/`LastKey` alike), and with DIFFERING FIELD LAYOUTS
-    // (a leading `string` against a leading `int`) the shared thunk read one
-    // type's field at the other's offset and the program SEGV'd (rc=139).
+    // both sorted ascending (`Array.Sort`, `Array.Sorted` and
+    // `SortedDictionary` iteration/`FirstKey`/`LastKey` alike), and with
+    // DIFFERING FIELD LAYOUTS (a leading `string` against a leading `int`) the
+    // shared thunk read one type's field at the other's offset and the program
+    // SEGV'd (rc=139).
     //
     // The `SortedDictionary` half is why this is not merely an ordering bug:
     // `buildSortedObjectKeyIdentity` names its identity function after this one
