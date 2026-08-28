@@ -269,6 +269,62 @@ BEZEL_TEST(catch_escape_closure, return_holder_closure_capturing_binding_diagnos
         r, "carries a borrow of the caught exception"));
 }
 
+// fix #3521 (§31.1 / §31.2.1, v0.283) — the SAME escape, with the `try`
+// nested inside a `case` ARM BODY. Before the collapse, ownership answered "is
+// this decl a catch-arm binding" with its own syntactic pre-pass
+// (`collectCatchBorrowsStmt`), which recursed only into if / while / for /
+// do-end / try. A catch arm reached through a `case` arm was therefore
+// INVISIBLE to it, `isCatchBorrow` returned false, and every §31.1 escape check
+// silently did not fire — this exact program compiled clean on b43196a. Reading
+// sema's `LocalSymbol::isCatchBinding` makes the answer independent of any
+// walker's statement-form coverage, which is the whole point of having one
+// spelling. Nesting is the only difference from
+// `return_closure_capturing_binding_diagnosed_31_1` above, and §31.1's rule —
+// the borrow "may not be ... captured by a closure that may outlive the arm" —
+// does not mention where the `try` sits.
+BEZEL_TEST(catch_escape_closure, return_closure_capturing_binding_under_case_arm_diagnosed_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(n: int): () -> int "
+        "  case n of "
+        "    0 => do "
+        "      try DoWork(); "
+        "      catch var ex: Exception => return lambda() => Use(ex); "
+        "      end; "
+        "    end, "
+        "    _ => do end "
+        "  end case; "
+        "  return lambda() => 0; "
+        "end Handle;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned closure captures the caught exception"));
+}
+
+// CONTROL for the row above (§31.1): the same `case`-nested arm whose closure
+// is INVOKED LOCALLY inside the arm escapes nothing and must stay accepted.
+// This is the over-rejection guard on the widened coverage — feeding the escape
+// machinery a source it could not previously see must not make a legal
+// non-escaping capture an error.
+BEZEL_TEST(catch_escape_closure, local_closure_under_case_arm_invoked_locally_clean_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(n: int): int "
+        "  var k: int := 0; "
+        "  case n of "
+        "    0 => do "
+        "      try DoWork(); "
+        "      catch var ex: Exception => do "
+        "        var f := lambda() => Use(ex); "
+        "        k := f(); "
+        "      end; "
+        "      end; "
+        "    end, "
+        "    _ => do end "
+        "  end case; "
+        "  return k; "
+        "end Handle;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
 // --- POSITIVE 3 negative controls (must NOT be rejected) ------------------
 
 // CONTROL (§31.1): a closure that captures `ex` but is INVOKED LOCALLY within

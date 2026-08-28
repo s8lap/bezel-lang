@@ -2091,8 +2091,8 @@ void MethodOwnership::collectIdentifiersInStmt(
     // invisible to every leg and the program compiled and dangled at runtime.
     // Recurse into each control-flow form's guard/condition/iterable/scrutinee
     // expressions AND its nested statements, in source order (mirrors
-    // collectLocalDepthsStmt's / collectCatchBorrowsStmt's coverage; determinism
-    // is preserved — no pointer-keyed iteration). Widening only ADDS captures to
+    // collectLocalDepthsStmt's coverage; determinism is preserved — no
+    // pointer-keyed iteration). Widening only ADDS captures to
     // the escape check, whose ESCAPE gate is unchanged, so a non-escaping or a
     // param-/field-sourced capture stays accepted. // per §9.7 (v0.220), §28.9
     auto walkBody =
@@ -3541,7 +3541,11 @@ bool MethodOwnership::isOwnedTrackedLocal(sema::Symbol* sym) const {
 }
 
 bool MethodOwnership::isCatchBorrow(sema::Symbol* sym) const {
-    return sym && catchBorrows_.count(sym) != 0;
+    // fix #3521 (§31.1 / §31.2.1, v0.283): read the ONE spelling of this
+    // classification — the flag sema sets where it already anchors the catch
+    // binding (`ExprTypecheck`'s catch-arm registration). See the header.
+    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym);
+    return ls && ls->isCatchBinding;
 }
 
 bool MethodOwnership::isEscapeBoundLocal(sema::Symbol* sym) const {
@@ -4207,63 +4211,6 @@ sema::Symbol* MethodOwnership::carriedEscapeBoundSourceLiveAt(
 }
 
 // ---------------------------------------------------------------------------
-// §31.1 (issue #392) — catch-bound exception variables are scope-bound borrows.
-// ---------------------------------------------------------------------------
-
-void MethodOwnership::collectCatchBorrowsStmt(const ast::Stmt& s) {
-    // Recurse into the control-flow forms that can lexically contain a try
-    // statement (mirrors collectLocalDeclsStmt's structure). The ownership
-    // CFG flattens these, but here we only need to find the catch arms and
-    // their binding symbols, so a syntactic walk is sufficient and simplest.
-    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
-        for (const auto& bs : ifs->ifBranch.body) if (bs) collectCatchBorrowsStmt(*bs);
-        for (const auto& el : ifs->elifBranches)
-            for (const auto& bs : el.body) if (bs) collectCatchBorrowsStmt(*bs);
-        for (const auto& bs : ifs->elseBody) if (bs) collectCatchBorrowsStmt(*bs);
-        return;
-    }
-    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
-        for (const auto& bs : ws->body) if (bs) collectCatchBorrowsStmt(*bs);
-        return;
-    }
-    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
-        for (const auto& bs : fs->body) if (bs) collectCatchBorrowsStmt(*bs);
-        return;
-    }
-    if (auto* dob = dynamic_cast<const ast::DoEndBlock*>(&s)) {
-        for (const auto& bs : dob->body) if (bs) collectCatchBorrowsStmt(*bs);
-        return;
-    }
-    if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
-        for (const auto& bs : ts->body) if (bs) collectCatchBorrowsStmt(*bs);
-        for (const auto& arm : ts->catches) {
-            // §31.2.1 binding pattern `var ex: T`. The catch binding's
-            // LocalSymbol was created by ExprTypecheck anchored on the arm's
-            // body node (`bnd->decl = arm.body.get()`). Find it by that anchor.
-            if (arm.hasBinding && !arm.varName.empty() && arm.body) {
-                for (const auto& sym : ctx_.symbols()) {
-                    auto* ls = dynamic_cast<sema::LocalSymbol*>(sym.get());
-                    if (ls && ls->decl == arm.body.get() &&
-                        ls->name == arm.varName) {
-                        catchBorrows_.insert(ls);
-                        break;
-                    }
-                }
-            }
-            // A catch arm body may itself contain a nested try.
-            if (arm.body) collectCatchBorrowsStmt(*arm.body);
-        }
-        for (const auto& bs : ts->finallyBody) if (bs) collectCatchBorrowsStmt(*bs);
-        return;
-    }
-}
-
-void MethodOwnership::collectCatchBorrows(
-    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
-    for (const auto& s : body) if (s) collectCatchBorrowsStmt(*s);
-}
-
-// ---------------------------------------------------------------------------
 // §35.5 / §9.7 (v0.220, #2180) — case-arm payload-binding borrow provenance.
 //
 // §35.5: matching a choice value non-destructively is the default, and §19.3's
@@ -4313,7 +4260,7 @@ void MethodOwnership::registerCaseArmBorrowSources(
                 anchor = bp;
             if (!anchor) continue;
             // Find the arm binding's LocalSymbol by its decl anchor (the same
-            // decl == node lookup findLocalSymbol / collectCatchBorrowsStmt use).
+            // decl == node lookup findLocalSymbol uses).
             sema::LocalSymbol* bindSym = nullptr;
             for (const auto& s : ctx_.symbols()) {
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(s.get())) {
@@ -4410,7 +4357,7 @@ void MethodOwnership::collectCaseArmBorrowSourcesStmt(const ast::Stmt& s) {
         }
         return;
     }
-    // Recurse into the control-flow forms (mirrors collectCatchBorrowsStmt's
+    // Recurse into the control-flow forms (mirrors collectLocalDepthsStmt's
     // coverage) so a case nested under an if / loop / do-end / try / arm body
     // is reached; also scan the statements' own expressions for embedded case
     // expressions.
@@ -4494,10 +4441,9 @@ void MethodOwnership::collectCaseArmBorrowSources(
 
 // §28.3 / §28.9 (#861): record each LocalDecl's block-nesting depth. The method
 // body is depth 0; each nested do-end / if-branch / loop / try-arm body adds one.
-// Mirrors collectCatchBorrowsStmt's statement coverage so no scope-introducing
-// form is missed. A consistent over-count (e.g. a catch arm whose body is itself
-// a do-end) is harmless: only the monotonic ordering along a single nesting path
-// matters, and that is preserved. We do NOT recurse into lambda expression
+// Covers every scope-introducing statement form. A consistent over-count
+// (e.g. a catch arm whose body is itself a do-end) is harmless: only the
+// monotonic ordering along a single nesting path matters, and that is preserved. We do NOT recurse into lambda expression
 // bodies — locals declared inside a closure are closure-scoped, not method-scope
 // locals, and are never the target/source of this method's escape check.
 void MethodOwnership::collectLocalDepthsStmt(const ast::Stmt& s, int depth) {
@@ -11466,7 +11412,7 @@ void MethodOwnership::collectStmtsInsideTryStmt(const ast::Stmt& s,
         if (enclosingTry) stmtsInsideTryByStmt_[&s] = enclosingTry;
     }
     // Recurse into the control-flow forms that can lexically contain a try
-    // statement (mirrors collectCatchBorrowsStmt's structure). `insideTry` stays
+    // statement (mirrors collectLocalDepthsStmt's structure). `insideTry` stays
     // sticky once set: a statement nested three ifs deep inside a try body is
     // still inside that try.
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {

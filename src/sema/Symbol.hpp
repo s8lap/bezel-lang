@@ -713,6 +713,18 @@ struct LocalSymbol : Symbol {
     // lambda inside the atom that captures the binding. Set by visitExpr's
     // BindExpr arm right after the clause's visitStmt registration.
     bool isBindAtomClause = false;
+    // §31.1 / §31.2.1 (fix #3521): this local is a CATCH-ARM BINDING — the
+    // `var ex: T` of a `catch` arm pattern. §31.1 "Exception ownership": "the
+    // bound exception variable ... is a **borrow** of the in-flight exception;
+    // its source is the runtime, and its lifetime is the arm body's."
+    //
+    // This is the SINGLE spelling of that classification. It replaces three
+    // independent ones (#3419's family): sema anchored the fact on `decl`
+    // (`bnd->decl = arm.body.get()`), ownership RE-DERIVED it with a syntactic
+    // AST walk (`collectCatchBorrowsStmt`), and codegen RECORDED its own copy
+    // during lowering (`catchArmBindingDecls_`). Set by ExprTypecheck's catch-arm
+    // binding registration, the one place that already knows.
+    bool isCatchBinding = false;
     // §28.3 / #1387: set by the ownership pass on an `out owned var` INLINE local
     // (ls->decl is IdentifierExpr, not LocalDecl) that is never discharged on ANY
     // path — a never-moved genuine owner. Codegen (ensureOutVarSlots) registers a

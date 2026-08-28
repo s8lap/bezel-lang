@@ -198,13 +198,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // §29.3 / §29.8 (#945): classify iterator methods up-front so the end-of-
     // method check can apply the state-machine auto-dispose rule to owned params.
     sawYield_ = bodyContainsYield(body);
-    // Issue #392 / §31.1: collect this method's catch-bound exception
-    // variables before the dataflow runs. Each is a borrow of the in-flight
-    // exception whose lifetime is its arm body; the escape machinery consults
-    // `catchBorrows_` to reject the binding (or a re-borrow of it) escaping
-    // the arm (store-to-owned-field, return-as-owned, escaping closure
-    // capture). Done first so the per-statement escape checks see it.
-    collectCatchBorrows(body);
+    // Issue #392 / §31.1: this method's catch-bound exception variables need no
+    // pre-pass. Each is a borrow of the in-flight exception whose lifetime is
+    // its arm body, and the escape machinery consults `isCatchBorrow` — which
+    // since fix #3521 reads sema's `LocalSymbol::isCatchBinding` directly — to
+    // reject the binding (or a re-borrow of it) escaping the arm
+    // (store-to-owned-field, return-as-owned, escaping closure capture).
     // §28.8.1 (#3241 R2): clear the per-method side state for the deferred
     // in-`try` throwable checks. Fresh method = empty queue.
     pendingThrowableInTryChecks_.clear();

@@ -15183,6 +15183,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 auto* bnd = ctx_.makeSymbol<LocalSymbol>();
                 bnd->name = arm.varName;
                 bnd->decl = arm.body.get();
+                // fix #3521 (§31.1 / §31.2.1, v0.283): STATE the classification
+                // on the symbol rather than leaving it implicit in the `decl`
+                // anchor. Ownership's §31.1 escape checks and codegen's
+                // re-bound-on-every-arm-entry capture refresh both need "is this
+                // a catch-arm binding"; both used to re-derive it (an AST walk /
+                // a lowering-time side set). This is the fact's one home.
+                bnd->isCatchBinding = true;
                 // per §31.2.1: for a multi-type arm the binding's static type
                 // is the nearest common base (NCB) of all listed types; for a
                 // single-type arm it is the type itself.

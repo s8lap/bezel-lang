@@ -1452,17 +1452,26 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // caller's storage, so the envdtor must not release or free anything.
         captures.push_back(ce);
     }
-    // Box and collect captured outer locals.
-    std::vector<const ast::Node*> capturedLocalDecls;
+    // Box and collect captured outer locals. fix #3521 (§31.1 / §31.2.1,
+    // v0.283): carry the resolved LocalSymbol beside the decl node — this loop
+    // already resolves it, and the capture body below needs the symbol's
+    // `isCatchBinding` classification (it used to consult a codegen-local
+    // `catchArmBindingDecls_` side set recorded by lowerTry, the third of
+    // #3419's three spellings of the same fact).
+    std::vector<std::pair<const ast::Node*, const sema::LocalSymbol*>>
+        capturedLocalDecls;
     for (auto& [decl, slot] : locals_) {
         (void)slot;
         for (const sema::Symbol* s : capturedSyms) {
             if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
-                if (loc->decl == decl) { capturedLocalDecls.push_back(decl); break; }
+                if (loc->decl == decl) {
+                    capturedLocalDecls.push_back({decl, loc});
+                    break;
+                }
             }
         }
     }
-    for (const ast::Node* decl : capturedLocalDecls) {
+    for (const auto& [decl, declSym] : capturedLocalDecls) {
         llvm::AllocaInst* slot = locals_[decl];
         bool alreadyBoxed = cellVars_.count(slot) != 0;
         CaptureEntry ce;
@@ -1518,8 +1527,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         //
         // fix #3503 (§31.2 / §27.5 / §28.9, v0.283): a CATCH-ARM binding is the
         // same shape and was NOT covered — `arm.body` is an ordinary Stmt, so
-        // the `BindingPattern` test above cannot see it, and lowerTry records
-        // the fact instead. Measured on `ef339fa`, a `try/catch` inside a
+        // the `BindingPattern` test above cannot see it. Since fix #3521 the
+        // fact is read off the binding's own symbol (`isCatchBinding`, set by
+        // sema where it anchors the binding) rather than a lowering-time set.
+        // Measured on `ef339fa`, a `try/catch` inside a
         // `while` whose arm captures the binding: heap-use-after-free in the
         // closure on iteration 2, because the guarded cell still held iteration
         // 1's exception object, which the arm's own disposal had already
@@ -1534,7 +1545,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // arms: that is a release-direction change and needs its own evidence.
         // The cost of leaving it is one leaked cell per method invocation, which
         // is the behaviour every guarded in-loop capture already has (#3403).
-        if ((isPatternBinding || catchArmBindingDecls_.count(decl)) &&
+        if ((isPatternBinding || (declSym && declSym->isCatchBinding)) &&
             wasGuardedLocal) {
             llvm::Value* current = builder_.CreateLoad(ce.valTy, slot,
                                                        "pattern.capture.value");

@@ -626,24 +626,6 @@ private:
     // explicit discharge there would over-reject the idiomatic empty/false
     // pattern (the #1466 REDO reason). Monotone (grows only), fixpoint-safe.
     std::unordered_set<sema::Symbol*> preDeclaredOutOwnedRecipients_;
-    // Issue #392 / §31.1: the set of catch-bound exception variables in this
-    // method (`var ex: T` arm bindings). Per §31.1 the binding is a BORROW of
-    // the in-flight exception whose lifetime is the arm body: it may be passed
-    // to other methods (a borrow for the call's duration) and read, but may
-    // NOT be assigned to an `owned` field, returned as `owned`, or captured by
-    // a closure that may outlive the arm — the exception instance cannot
-    // escape the arm that caught it (the bare re-throw `throw;` is the one
-    // allowed exception). The binding is never declared via a `LocalDecl`, so
-    // it lives in this set rather than in `states_`; it carries no discharge
-    // obligation (the runtime owns and disposes the exception), so seeding it
-    // into `states_` as Owned would mis-fire the end-of-method undischarged
-    // check. The escape machinery consults this set via `isCatchBorrow` /
-    // `isEscapeBoundLocal` to treat an escape of the binding (or of a local
-    // that re-borrows it) exactly as it treats an escape of an owned scope-
-    // bound local. Populated at the start of run() by scanning this method's
-    // catch arms; symbols are unique per arm, so the set is path-insensitive
-    // (a catch binding only appears within its own arm body). // per §31.1
-    std::unordered_set<sema::Symbol*> catchBorrows_;
     // §28.3 (v0.180) consume-site freeze: per-local READ-use source offsets,
     // precomputed once by collectBorrowUses before the dataflow. A borrow-holder
     // is *live* at a consume site (a `move`, an `owned`-argument transfer, or a
@@ -1047,7 +1029,7 @@ private:
     // At a whole-value reassignment `arr := newValue;` reachable while some
     // slot is not provably moved-from, emits the §15.3-mandated warning
     // naming the at-risk slots. Runs before the CFG dataflow, like the other
-    // syntactic pre-passes below (collectCatchBorrows etc.) — it does not
+    // syntactic pre-passes below (collectLocalDepths etc.) — it does not
     // participate in branch-join precision (a conditionally-executed
     // `move arr[i]` is treated as if it always executes, the same
     // conservative simplification codegen's walker already makes for
@@ -1914,9 +1896,30 @@ private:
     bool isOwnedTrackedLocal(sema::Symbol* sym) const;
 
     // Issue #392 / §31.1: true when `sym` is a catch-bound exception variable
-    // of this method. A catch binding is a borrow of the in-flight exception
-    // whose lifetime is the arm body; like an owned scope-bound local, the
-    // borrow may not escape the arm.
+    // (`var ex: T` in a catch arm pattern). Per §31.1 "Exception ownership" the
+    // binding is a BORROW of the in-flight exception whose lifetime is the arm
+    // body: it may be passed to other methods (a borrow for the call's duration)
+    // and read, but may NOT be assigned to an `owned` field, returned as
+    // `owned`, or "captured by a closure that may outlive the arm" — the
+    // exception instance cannot escape the arm that caught it (the bare re-raise
+    // `throw;` is the one allowed exception). The binding is never declared via
+    // a `LocalDecl`, so it is not in `states_`; it carries no discharge
+    // obligation (the runtime owns and disposes the exception), so seeding it
+    // into `states_` as Owned would mis-fire the end-of-method undischarged
+    // check. The escape machinery consults this predicate via `isCatchBorrow` /
+    // `isEscapeBoundLocal` to treat an escape of the binding (or of a local that
+    // re-borrows it) exactly as it treats an escape of an owned scope-bound
+    // local.
+    //
+    // fix #3521 (§31.1 / §31.2.1, v0.283): reads `LocalSymbol::isCatchBinding`,
+    // which sema sets where it already anchors the binding. This REPLACES a
+    // per-method `catchBorrows_` set populated by a syntactic AST pre-pass
+    // (`collectCatchBorrows`), the second of #3419's three spellings of this
+    // classification. The pre-pass recursed only into if/while/for/do-end/try,
+    // so a catch arm nested in a `case` arm body or inside a lambda body was
+    // INVISIBLE to it and every §31.1 escape check silently did not fire there
+    // (measured on b43196a). Reading sema's flag makes the answer independent of
+    // the walker's statement-form coverage.
     bool isCatchBorrow(sema::Symbol* sym) const;
 
     // True when `sym` is a scope-bound local whose borrow may NOT escape this
@@ -1928,17 +1931,9 @@ private:
     // capture). // per §28.3, §31.1
     bool isEscapeBoundLocal(sema::Symbol* sym) const;
 
-    // Populate `catchBorrows_` by scanning every catch arm in `body`
-    // (recursively, including nested try/if/while/for/do bodies) for a binding
-    // pattern (`var ex: T`), resolving the bound LocalSymbol via the arm body
-    // node it anchors on. Called once at the start of run(). // per §31.1
-    void collectCatchBorrows(
-        const std::vector<std::unique_ptr<ast::Stmt>>& body);
-    void collectCatchBorrowsStmt(const ast::Stmt& s);
-
     // §28.3 / §28.9 (#861): populate `localDepth_` with each LocalDecl's
-    // block-nesting depth. Mirrors collectCatchBorrowsStmt's statement-form
-    // coverage so no block form is missed. Called once at the start of run().
+    // block-nesting depth, and (fix #3520) each catch arm's BINDING depth.
+    // Called once at the start of run().
     void collectLocalDepths(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void collectLocalDepthsStmt(const ast::Stmt& s, int depth);
@@ -1948,7 +1943,7 @@ private:
     // whose body the runtime disposes it after — a use-after-free. Diagnoses
     // that direct form. Indirect returns through a holder local
     // (`var b := ex; return b;`) and returned closures capturing `ex` are
-    // handled by the existing escape machinery, which `collectCatchBorrows` /
+    // handled by the existing escape machinery, which `isCatchBorrow` /
     // `isEscapeBoundLocal` extend to recognize the catch binding as a source.
     void checkCatchBorrowEscapesOnReturn(const ast::Expr& e);
 
@@ -2825,7 +2820,7 @@ private:
                             const StmtExprSiteVisitor& visit);
 
     // §28.8.1 "Exception paths are not exempt" (#3080): fill `stmtsInsideTry_`. A
-    // purely syntactic pre-pass whose traversal mirrors collectCatchBorrowsStmt's
+    // purely syntactic pre-pass whose traversal mirrors collectLocalDepthsStmt's
     // — the ownership CFG flattens the control-flow forms, but here we only need
     // to know which statements a `try` lexically encloses. // per §28.8.1
     void collectStmtsInsideTry(
