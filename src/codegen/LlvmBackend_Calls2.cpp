@@ -2820,6 +2820,32 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     return lowerValueSemMethodOn(dispatchTy, recv, call, member);
 }
 
+// fix #3452 (§8.1 / §8.3 / §8.5 / §4.7, v0.283): see the declaration in
+// LlvmBackend_impl.hpp. Body moved verbatim out of `lowerCallDispatch`'s
+// unit-receiver arm (fix #3422), whose long derivation of WHY each answer is
+// what it is still stands at that call site; only the receiver evaluation
+// stayed behind, because the two callers own that step.
+llvm::Value* Emitter::emitUnitUniversalAnswer(std::string_view member,
+                                              const ast::CallExpr& call) {
+    if (member == "ToString" && call.args.empty())
+        return lowerStringLiteral(kUnitToStringSource, /*verbatim=*/false);
+    if (member == "GetHashCode" && call.args.empty())
+        return builder_.getInt32(kUnitHashCode);
+    if (member != "Equals" || call.args.size() != 1 || !call.args[0].value)
+        return nullptr;
+    const ast::Expr* arg = call.args[0].value.get();
+    const sema::TypeRef* at = ctx_.exprType(*arg);
+    llvm::Value* other = lowerExpr(*arg);  // per §22.5
+    if (at && at->kind == sema::TypeRef::Kind::Unit && !at->nullable)
+        return builder_.getTrue();
+    if (at && isNullableUnitTy(at) && other && other->getType()->isStructTy())
+        return nullablePrimHasValue(other);
+    if (other && other->getType()->isPointerTy())
+        if (llvm::Value* r = emitIsBoxedUnit(other)) return r;
+    return builder_.getFalse();
+}
+
+
 llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
                                             llvm::Value* recv,
                                             const ast::CallExpr& call,
@@ -2828,6 +2854,31 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
     bool isGetHashCode = member == "GetHashCode"  && call.args.empty();
     bool isEquals      = member == "Equals"       && call.args.size() == 1;
     if (!recvTy || !recv) return nullptr;
+    // fix #3452 (§8.1 / §8.3 / §4.7 / §7.5, v0.283): a UNIT receiver. Reached
+    // from `lowerNullCondValueSemCall` with the `()` narrowed out of a `()?`
+    // (§4.7: "Wrapping the unit type with `?` … produces an optional with two
+    // values, `null` and `()`"), which is the `?.` spelling of the receiver
+    // #3422 fixed for the `.` form. Without this arm the switch below fell
+    // through to `kind != Named` and returned null, and the caller — which had
+    // already opened its `ncvs.do` / `ncvs.end` blocks and branched to them —
+    // returned null too, leaving both blocks WITHOUT A TERMINATOR: `bezelc`
+    // exited 1 with "IR verification failed (malformed IR emitted)" and no
+    // diagnostic naming the construct (measured on ef339fa for both
+    // `u?.Equals(())` and `u?.GetHashCode()`; `u?.ToString()` worked, because
+    // the caller routes ToString to `emitValueToString` instead).
+    //
+    // The answer is `emitUnitUniversalAnswer`'s — the SAME one the `.` form
+    // gives — which is what §8.3's invariant requires and not merely tidy:
+    // §7.5 lifts this result to `bool?`/`int?` but does not change it, so
+    // `u.Equals(x)` and `u!.Equals(x)` and a non-null `u?.Equals(x)` must agree.
+    // `recv` (the one inert payload byte) is deliberately unused: §4.7 gives the
+    // unit type exactly one value, so the receiver carries no information.
+    // ToString is left OUT and continues to fall through, exactly as the
+    // primitive arm below leaves it out — `emitValueToString` is the dedicated
+    // path both this function's callers already use for it.
+    if (recvTy->kind == sema::TypeRef::Kind::Unit && !recvTy->nullable &&
+        (isGetHashCode || isEquals))
+        return emitUnitUniversalAnswer(member, call);
     // fix #747 R43 / stdlib §9.1–§9.5: a PRIMITIVE value type (int/long/bool/
     // char/double/…) implements IEquatable<T> with an auto-generated
     // `Equals(other): bool` and a `GetHashCode(): int`. Codegen had no handler,
@@ -4195,22 +4246,15 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                      call.args[0].value;
                 if (isToStr || isHash || isEq) {
                     (void)lowerExpr(*ma->target);  // per §22.3 / §7.5
-                    if (isToStr)
-                        return lowerStringLiteral(kUnitToStringSource,
-                                                  /*verbatim=*/false);
-                    if (isHash) return builder_.getInt32(kUnitHashCode);
-                    const ast::Expr* arg = call.args[0].value.get();
-                    const sema::TypeRef* at = ctx_.exprType(*arg);
-                    llvm::Value* other = lowerExpr(*arg);  // per §22.5
-                    if (at && at->kind == sema::TypeRef::Kind::Unit &&
-                        !at->nullable)
-                        return builder_.getTrue();
-                    if (at && isNullableUnitTy(at) && other &&
-                        other->getType()->isStructTy())
-                        return nullablePrimHasValue(other);
-                    if (other && other->getType()->isPointerTy())
-                        if (llvm::Value* r = emitIsBoxedUnit(other)) return r;
-                    return builder_.getFalse();
+                    // fix #3452 (§8.1 / §8.3, v0.283): the answer itself moved
+                    // to `emitUnitUniversalAnswer` — unchanged in every respect
+                    // — so the `?.` spelling of this same call can reach it.
+                    // It was previously inline here and reachable only from the
+                    // `.` form, which is why `u?.Equals(())` / `u?.GetHashCode()`
+                    // on a `()?` receiver lowered to nothing at all and left
+                    // `lowerNullCondValueSemCall`'s blocks unterminated
+                    // (`bezelc: IR verification failed`).
+                    return emitUnitUniversalAnswer(ma->member, call);
                 }
             }
         }
@@ -13407,7 +13451,29 @@ llvm::Value* Emitter::lowerNullCondValueSemCall(
     llvm::Value* res = isToString
         ? emitValueToString(innerVal, &innerTy)
         : lowerValueSemMethodOn(&innerTy, innerVal, call, nm.member);
-    if (!res) return nullptr;
+    if (!res) {
+        // fix #3452 (§7.5, v0.283): a declining inner lowering must still leave
+        // WELL-FORMED IR behind. `callBB` and `endBB` already exist and the
+        // entry block already branched to them, so a bare `return nullptr` here
+        // left two blocks with no terminator — `bezelc` exited 1 with
+        // "IR verification failed (malformed IR emitted)", an internal-
+        // consistency failure that names no construct in the user's program,
+        // rather than the located `#3079` note the caller emits for a dropped
+        // statement. Close `callBB` into `endBB` and leave the builder there, so
+        // whatever the caller emits next continues in a properly-reached block
+        // and the null result degrades to that ordinary diagnostic.
+        //
+        // The one venue MEASURED to reach this (a `()` receiver's
+        // `Equals`/`GetHashCode`) is answered by `lowerValueSemMethodOn`'s unit
+        // arm as of this commit, so this is now a backstop and not a live path;
+        // it is kept because the decline is `lowerValueSemMethodOn`'s to make —
+        // §9.2's ineligible body record is documented there as "fall through to
+        // ordinary dispatch" — and the next such decline must not be a verifier
+        // failure again.
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        return nullptr;
+    }
     bool refResult = res->getType()->isPointerTy();   // ToString → string ptr
     llvm::Type* wrapTy = refResult
         ? static_cast<llvm::Type*>(ptrTy())

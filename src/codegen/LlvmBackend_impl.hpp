@@ -2860,6 +2860,21 @@ private:
     llvm::Value* emitIsBoxedUnitAgainst(llvm::Value* other,
                                         llvm::GlobalVariable* unitVt);
 
+    // fix #3452 (§8.1 / §8.3 / §8.5 / §4.7, v0.283): the ONE §8.1-universals
+    // answer for a receiver of the unit type — `ToString` / `GetHashCode` /
+    // `Equals(x)` — factored out of `lowerCallDispatch`'s `.`-form arm (#3422)
+    // so the `?.` form can reach the SAME decision instead of growing a second
+    // spelling of it. It answers only; it does NOT lower the receiver, because
+    // the two callers reach it having already done so on their own terms: the
+    // `.` form evaluates the receiver for its effects (§22.3), and the `?.`
+    // form has already evaluated and null-tested it (§7.5). It DOES lower the
+    // `Equals` argument, exactly once, at the point of call — which for `?.`
+    // is inside the non-null arm, as §7.5 requires ("if it is null the access
+    // does not occur and nothing to its right in the chain is evaluated").
+    // Returns null when `member`/arity is not one of the three universals.
+    llvm::Value* emitUnitUniversalAnswer(std::string_view member,
+                                         const ast::CallExpr& call);
+
     // fix #3127 (§8.6 "Boxing of the compiler-intrinsic `Range<T>`", v0.252):
     // per-`Range<T>` box descriptor + box vtable, minted on demand. Like
     // `[N]T` (§15.1 makes the size part of the type), `Range<T>` has no stable
