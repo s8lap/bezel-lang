@@ -3413,7 +3413,8 @@ llvm::Value* Emitter::unitValueForTarget(llvm::Value* v,
 }
 
 
-// fix #3433 (§4.7 / §22.7 "Constructor chaining" / §22.8, v0.283): the
+// fix #3433 (§4.7 / §12.8 "Constructor chaining" / §22.7 "Constructors" /
+// §22.8, v0.283): the
 // constructor-chain face of `unitValueForTarget` — see the declaration comment.
 //
 // §4.7 makes a method declared without a return type a producer of the unit
@@ -3426,12 +3427,25 @@ llvm::Value* Emitter::unitValueForTarget(llvm::Value* v,
 // The formal comes from `paramTypeOf` — the existing #1592 authority for "the
 // resolved declared TypeRef of a formal", which prefers an imported symbol's
 // `resolvedDeclType` and falls back to resolving a local one's `ast::Type`, so
-// an imported chain target answers as well as a local one. A generic formal
-// monomorphized to `()`/`()?` (§14.2's `where T: value` admitted substitutions)
-// arrives as a bare `Named T`, so it is resolved through the ACTIVE
-// substitution first, exactly as `buildOrderedArgs` does at the ordinary
-// call-argument position. `concr` is kept alive across the `unitValueForTarget`
-// call deliberately: it is a caller-owned holder, not a cached TypeRef.
+// an imported chain target answers as well as a local one. `concr` is kept
+// alive across the `unitValueForTarget` call deliberately: it is a
+// caller-owned holder, not a cached TypeRef.
+//
+// ⚠ THE GENERIC ARM IS NOT REACHED — an earlier revision of this comment
+// claimed it was. A generic formal monomorphized to `()`/`()?` (§7.10's
+// `where T: value` admitted substitutions) arrives as a bare `Named T`, and
+// this code does try to resolve it through the ACTIVE substitution — but
+// `genericSubst_` is EMPTY here. The argument loop is `Setup.cpp:11497`,
+// while the base-class substitution (`T -> ()`, the #617 mechanism) is built
+// and activated at `:11560`-`:11593`, i.e. AFTER the loop has run. So
+// `resolveTypeParamRef` is a no-op and the formal stays a bare `Named T`.
+// MEASURED, identical on this tree and on 0c5ecd1:
+//     class D: B<()>   … base(C.Nothing());   -> #1386 at :7:10
+//     class D(): B<()>(C.Nothing())           -> #1386 at :7:18
+// No test covers that arm. Tracked as issue 3501, which also records that the
+// `new B<()>(C.Nothing())` spelling is broken too — a whole missing family
+// rather than a gap in this fix. Do not read the paragraph above as covering
+// it.
 llvm::Value* Emitter::unitValueForCtorParam(llvm::Value* v,
                                             sema::ConstructorSymbol* target,
                                             std::size_t idx,

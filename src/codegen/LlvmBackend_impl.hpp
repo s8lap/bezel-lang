@@ -7829,16 +7829,19 @@ private:
     llvm::Value* unitValueForTarget(llvm::Value* v, const sema::TypeRef* declTy,
                                     const ast::Expr* init);
 
-    // fix #3433 (§4.7 / §22.7 / §22.8, v0.283): the CONSTRUCTOR-CHAIN face of
-    // `unitValueForTarget`. A `base(...)`/`this(...)` chain call and a primary
-    // class's `: Base(args)` inheritance clause are value-demanding argument
-    // positions exactly like an ordinary call's, but neither reaches
+    // fix #3433 (§4.7 / §12.8 / §22.7 / §22.8, v0.283): the CONSTRUCTOR-CHAIN
+    // face of `unitValueForTarget`. A `base(...)`/`this(...)` chain call and a
+    // primary class's `: Base(args)` inheritance clause are value-demanding
+    // argument positions exactly like an ordinary call's, but neither reaches
     // `buildOrderedArgs` — each lowers its own arguments and each answered a
     // null `lowerExpr` with the `#1386` ICE. This resolves the CHAIN TARGET's
-    // formal through the existing `paramTypeOf` authority (which covers a local
-    // AND an imported ctor) plus the active monomorphization, then hands it to
-    // the one predicate that says what a unit source lowers to at a
-    // value-demanding location. Defined in LlvmBackend_Layout.cpp beside it.
+    // formal through the existing `paramTypeOf` authority, which covers a local
+    // AND an imported ctor, then hands it to the one predicate that says what a
+    // unit source lowers to at a value-demanding location. Defined in
+    // LlvmBackend_Layout.cpp beside it — see that comment for the measured
+    // limit: the GENERIC arm (a formal monomorphized to `()`) is NOT reached,
+    // because the base-class substitution is activated after the argument loop
+    // has already run. Issue 3501.
     llvm::Value* unitValueForCtorParam(llvm::Value* v,
                                        sema::ConstructorSymbol* target,
                                        std::size_t idx, const ast::Expr* arg);
