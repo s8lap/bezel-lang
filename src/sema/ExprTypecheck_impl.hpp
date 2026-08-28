@@ -15,6 +15,8 @@
 // a program-wide ODR violation. Member bodies refer to it unqualified, which
 // resolves to the nested type, so the bodies need no change.
 
+#include "common/BuiltinRegistry.hpp"  // common::BuiltinFormals (fix #3424 / #3425)
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -2052,6 +2054,71 @@ private:
         return bindArgsToParams(sema::FormalsView::of(params), args, loc,
                                 calleeDesc, emit);
     }
+
+    // fix #3424 / #3425 (§22.5, v0.283): the winning candidate of a built-in
+    // callee's overload-aware parameter-name lookup — the names the call bound
+    // against, and the binding itself.
+    struct BuiltinBind {
+        std::vector<std::string_view> names;   // the DECLARED parameter list
+        BindResult bind;
+    };
+    // Run the SHARED §22.5 binder over the registry's CANDIDATE parameter-name
+    // lists for a built-in callee (`common::builtinParamNameCandidates` /
+    // `common::builtinCtorParamNameCandidates`) and return the first candidate
+    // that binds. A built-in has no overload set sema can resolve against, so
+    // "the call is valid if it binds against ANY declared overload's names" is
+    // the strongest statement available — and it is sound for the identity
+    // bindings the built-in call sites admit, because a call whose written
+    // names match one overload's declaration order lowers positionally to
+    // exactly that overload.
+    //
+    // On failure a diagnostic is reported and `false` is returned: the SHARED
+    // binder's own wording when there is one candidate (so a built-in callee's
+    // unknown name, double bind, positional-after-named and missing-required
+    // read identically to a user-declared callee's), and a candidate-listing
+    // message when there are several, because the shared binder can only name
+    // one of them. Shared by the member (#3398) and constructor (#3425) paths
+    // so the candidate rule has exactly one spelling.
+    // per §22.5, fix #3424 / #3425
+    bool bindBuiltinCandidates(
+        const std::vector<common::BuiltinFormals>& cands,
+        const std::vector<ast::CallArgument>& args, SourceLocation loc,
+        const std::string& desc, BuiltinBind& out);
+
+    // fix #3425 (§22.5 / §17.7 "The `new` operator", v0.283): the `new T(...)`
+    // twin of #3398's `checkBuiltinNamedArgs`.
+    //
+    // The hole this closes. A built-in type's constructors are arms of
+    // codegen's `lowerNew`, not `ConstructorSymbol`s sema can see (the same
+    // observation `checkBuiltinClosedConstructorSurface` above is built on),
+    // so no binder ever ran over a built-in `new` and the argument NAME was
+    // discarded outright: every argument bound POSITIONALLY and any name was
+    // accepted. MEASURED on ef339fa: `new StringBuilder(zzznotaparam := "ab")`
+    // compiled and ran, and `new Array<int>(fill := 7, size := 3)` — whose two
+    // arguments are distinguishable — printed `Count`=7 and `[0]`=3, i.e. it
+    // constructed `Array<int>(7, 3)` where §22.5 requires `Array<int>(3, 7)`.
+    // That is a silent wrong VALUE (and a wrong allocation size), not only a
+    // missing rejection, so #3425's own "severity: lower than #3398's,
+    // because the common built-in constructors take one parameter" understates
+    // it: `Array<T>(size, fill)`, `Semaphore(initialCount, maxCount)`,
+    // `Dictionary<K,V>(capacity, comparer)`, `FileStream(path, mode, access)`
+    // and `DateTime(year, month, day)` all take two or more.
+    //
+    // The rule applied is `bindArgsToParams`'s — the SAME binder the member,
+    // user and imported paths run — over the registry's declared constructor
+    // names, so the four §22.5 violations draw the user path's wording. The
+    // two implementation-limitation rejections #3398 states for members hold
+    // here for the same reasons: a head the registry carries no constructor
+    // names for is rejected (rejecting an unknown name needs a COMPLETE list),
+    // and a binding that is not the identity permutation is rejected wherever
+    // codegen lowers the constructor by `ne.args[i]` POSITION
+    // (`common::isBuiltinCtorLoweredByName` names the two heads whose
+    // `lowerNew` arm does bind by name, #3098). Lifting the reorder is #3423's
+    // codegen work, of which this is the `new`-expression half.
+    //
+    // `head` is the resolved built-in type name, already established as NOT a
+    // user type by the caller. // per §22.5 / §17.7, fix #3425
+    void checkBuiltinCtorNamedArgs(const ast::NewExpr& ne, const std::string& head);
 
     // §5.1: is a value of static type `from` implicitly convertible to
     // `to`? Identity is NOT counted here (that is the "exact" relation,

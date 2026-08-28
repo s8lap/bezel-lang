@@ -10919,6 +10919,59 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
     }
 }
 
+// fix #3424 / #3425 (§22.5 "Optional parameters and named arguments",
+// v0.283): see the header. One spelling of "try the registry's candidate
+// parameter-name lists, and report when none binds", shared by the built-in
+// MEMBER path (#3398) and the built-in CONSTRUCTOR path (#3425).
+bool ExprTC::bindBuiltinCandidates(
+    const std::vector<common::BuiltinFormals>& cands,
+    const std::vector<ast::CallArgument>& args, SourceLocation loc,
+    const std::string& desc, BuiltinBind& out) {
+    for (const auto& f : cands) {
+        // Silent first: a candidate that does not bind is not an error while
+        // another candidate may still claim the call (`emit=false` is the same
+        // mode §22.6 overload resolution uses to test applicability).
+        BindResult b = bindArgsToParams(sema::FormalsView::ofNames(f.names,
+                                                                  f.required),
+                                        args, loc, desc, /*emit=*/false);
+        if (!b.ok) continue;
+        out.names = f.names;
+        out.bind = std::move(b);
+        return true;
+    }
+    if (cands.size() == 1) {
+        // One candidate: re-run it with reporting on, so the reader gets the
+        // SHARED binder's diagnostic — byte-identical to the one a
+        // user-declared callee draws for the same §22.5 violation.
+        bindArgsToParams(
+            sema::FormalsView::ofNames(cands[0].names, cands[0].required), args,
+            loc, desc, /*emit=*/true);
+        return false;
+    }
+    // Several candidates and none binds: the shared binder can only name one
+    // of them, and naming an arbitrary one would tell the reader that the
+    // OTHER overload's names are unknown when they are simply not the ones
+    // they wrote. List every declared spelling instead.
+    std::string lists;
+    for (std::size_t i = 0; i < cands.size(); ++i) {
+        if (i) lists += " | ";
+        lists += "(";
+        for (std::size_t j = 0; j < cands[i].names.size(); ++j) {
+            if (j) lists += ", ";
+            lists += std::string(cands[i].names[j]);
+        }
+        lists += ")";
+    }
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        desc + ": the named arguments match none of the declared overloads at "
+             + std::to_string(args.size()) +
+        " argument(s) — the standard library declares " + lists +
+        " (\xC2\xA7""22.5). Use one overload's parameter names, in declaration "
+        "order, or pass the arguments positionally.");
+    return false;
+}
+
 // fix #3398 (spec §22.5 "Optional parameters and named arguments", v0.283;
 // stdlib §1 Conventions — *Window parameters*; §9.6; §3.2): §22.5 binding
 // for a call to a BUILT-IN member. See the header for the contract, the hole
@@ -11018,9 +11071,9 @@ void ExprTC::checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym) {
     const std::string desc = std::string("call to built-in `") +
                              std::string(head) + "." + std::string(member) +
                              "`";
-    std::vector<std::string_view> names =
-        common::builtinParamNames(head, member, ce.args.size());
-    if (names.empty()) {
+    std::vector<common::BuiltinFormals> cands =
+        common::builtinParamNameCandidates(head, member, ce.args.size());
+    if (cands.empty()) {
         // Limitation 1 (see the header): no complete parameter-name list, so
         // the name cannot be validated and the binding cannot be trusted.
         // Reject loudly rather than bind positionally behind the caller's
@@ -11035,17 +11088,19 @@ void ExprTC::checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym) {
         return;
     }
 
-    // The §22.5 binder, unchanged: `FormalsView::of` over an `ast::Param` list
-    // carrying just the names. A registry row is keyed by the EXACT argument
-    // count, so every formal in the view is supplied and none carries a
-    // default — the four §22.5 violations the binder reports (unknown name,
-    // bound twice, positional-after-named, required-not-supplied) are exactly
-    // the ones reachable here, with exactly the user path's wording.
-    std::vector<ast::Param> formals(names.size());
-    for (std::size_t i = 0; i < names.size(); ++i) formals[i].name = names[i];
-    BindResult b = bindArgsToParams(formals, ce.args, ce.span.begin, desc,
-                                    /*emit=*/true);
-    if (!b.ok) return;  // the binder reported; no cascade
+    // The §22.5 binder, unchanged: `FormalsView::ofNames` over the registry's
+    // declared names. The four §22.5 violations the binder reports (unknown
+    // name, bound twice, positional-after-named, required-not-supplied) are
+    // exactly the ones reachable here, with exactly the user path's wording.
+    // The lookup returns CANDIDATE lists (one per declared overload at this
+    // argument count) and the call is admitted if it binds against any one of
+    // them; carrying the member side's four same-arity §9.6 pairs that way is
+    // #3424.
+    BuiltinBind bb;
+    if (!bindBuiltinCandidates(cands, ce.args, ce.span.begin, desc, bb))
+        return;  // the helper reported; no cascade
+    const std::vector<std::string_view>& names = bb.names;
+    const BindResult& b = bb.bind;
 
     // Limitation 2 (see the header): codegen lowers a built-in call by
     // argument POSITION (`call.args[i]`), so a binding that is not the
@@ -11057,11 +11112,26 @@ void ExprTC::checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym) {
     // (#3423).
     for (std::size_t j = 0; j < names.size(); ++j) {
         if (b.paramToArg[j] == static_cast<int>(j)) continue;
-        // Unreachable while `ok`: a registry row is keyed by exact arity and
-        // carries no defaults, so the binder's required-parameter clause has
-        // already rejected any unbound formal. Guarded so a future row shape
-        // cannot turn a -1 into a nonsense position in the message.
-        if (b.paramToArg[j] < 0) return;
+        // fix #3424: a registry row may now carry §22.5 OPTIONAL parameters,
+        // so a formal beyond the supplied count is legitimately unbound (-1) —
+        // and that is exactly what positional lowering already does with a
+        // trailing omitted argument. A -1 WITHIN the supplied range is a
+        // genuine permutation (`M(a, c := 3)` skipping `b`), which codegen's
+        // by-position lowering would get wrong, so it falls through to the
+        // rejection below with the parameter named.
+        if (b.paramToArg[j] < 0) {
+            if (j >= ce.args.size()) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                desc + ": a named argument that binds to a parameter other "
+                       "than its own position is not supported on a built-in "
+                       "member — `" + std::string(names[j]) + "` is parameter " +
+                    std::to_string(j + 1) +
+                    " but is left to its default while a later argument is "
+                    "supplied (\xC2\xA7""22.5, #3398). Pass the arguments in "
+                    "declaration order, or positionally.");
+            return;
+        }
         const std::size_t ai = static_cast<std::size_t>(b.paramToArg[j]);
         ctx_.diagnostics().report(
             Severity::Error, ce.span.begin,

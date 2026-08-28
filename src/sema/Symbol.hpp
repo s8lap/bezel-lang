@@ -1572,11 +1572,35 @@ public:
         return v;
     }
 
+    // fix #3425 / #3424 (§22.5 "Optional parameters and named arguments",
+    // v0.283): the NAME-ONLY view — the built-in registry's parameter-name
+    // rows (`common::BuiltinFormals`). A built-in member or constructor has
+    // no `MethodSymbol`, no `ConstructorSymbol` and no `ast::Param` list at
+    // all (its implementation is an arm of codegen's `lowerCallDispatch` /
+    // `lowerNew`, not a declaration sema can see), so none of the four views
+    // above can answer for it — yet the binder needs only its three facts,
+    // and the registry carries exactly those: the declared names in order and
+    // the count of LEADING parameters that declare no default. Without this
+    // view #3398's built-in path had to materialize a throw-away
+    // `std::vector<ast::Param>` per call site, which could not express a
+    // §22.5 optional parameter at all (an `ast::Param` reports `hasDefault`
+    // from a `defaultValue` expression node the registry has nothing to put
+    // there). Non-owning, like every other view: the caller holds the names
+    // for the duration of the `bindArgsToParams` call.
+    static FormalsView ofNames(const std::vector<std::string_view>& names,
+                               std::size_t required) {
+        FormalsView v;
+        v.names_ = &names;
+        v.required_ = required;
+        return v;
+    }
+
     std::size_t size() const {
         if (params_) return params_->size();
         if (ms_) return formalParamCount(*ms_);
         if (cs_) return formalParamCount(*cs_);
         if (fields_) return fields_->size();
+        if (names_) return names_->size();
         return 0;
     }
     std::string_view name(std::size_t i) const {
@@ -1587,6 +1611,8 @@ public:
         if (fields_)
             return i < fields_->size() ? (*fields_)[i]->name
                                        : std::string_view{};
+        if (names_)
+            return i < names_->size() ? (*names_)[i] : std::string_view{};
         return {};
     }
     bool hasDefault(std::size_t i) const {
@@ -1606,6 +1632,11 @@ public:
                         !fs->posParam->defaultText.empty());
             return false;
         }
+        // fix #3425: the registry's rows put every defaulted parameter LAST
+        // (the stdlib declares no other shape — §22.5 requires it: "Every
+        // parameter after the first defaulted parameter must itself have a
+        // default"), so one count answers for the whole row.
+        if (names_) return i >= required_;
         return false;
     }
 
@@ -1617,6 +1648,9 @@ private:
     // above. A view, not a copy, so `bindArgsToParams` does not materialize a
     // third spelling of the formal list.
     const std::vector<const Symbol*>* fields_ = nullptr;
+    // fix #3425 / #3424 (§22.5, v0.283): see `ofNames` above.
+    const std::vector<std::string_view>* names_ = nullptr;
+    std::size_t required_ = 0;
 };
 
 } // namespace bezel::sema

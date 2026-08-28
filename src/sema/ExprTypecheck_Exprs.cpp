@@ -982,7 +982,110 @@ void ExprTC::checkBuiltinClosedConstructorSurface(const ast::NewExpr& ne) {
                     "standard-library producer that yields it) (\xC2\xA7"
                     "17.7)");
             }
+            // fix #3425: the arity is already wrong, so binding names against
+            // a declared list would only cascade. One diagnostic per `new`.
+            return;
         }
+    }
+
+    // fix #3425 (§22.5 / §17.7, v0.283): §22.5 binding for a NAMED argument on
+    // this built-in constructor. Reached with `n` already established as a
+    // built-in head that is NOT a user type, NOT a generic type parameter, and
+    // whose §17.7 closed-surface arms above did not already reject the call.
+    checkBuiltinCtorNamedArgs(ne, n);
+}
+
+// fix #3425 (spec §22.5 "Optional parameters and named arguments" and §17.7
+// "The `new` operator", v0.283): see the header for the hole this closes, the
+// measured wrong values, and why the two #3398 limitation-rejections hold here
+// too.
+void ExprTC::checkBuiltinCtorNamedArgs(const ast::NewExpr& ne,
+                                       const std::string& head) {
+    // Positional-only constructions are entirely unchanged — this check exists
+    // for the named form and claims nothing else.
+    bool anyNamed = false;
+    for (const auto& a : ne.args)
+        if (!a.name.empty()) { anyNamed = true; break; }
+    if (!anyNamed) return;
+
+    // A POSITIVE name test, exactly as `checkBuiltinNamedArgs` uses: the
+    // caller's gate proves `n` is not a user type, but a declaration-less
+    // single-part Named TypeRef is "a reserved builtin, or a type parameter"
+    // (BuiltinRegistry.hpp), and an UNRESOLVED type name reaches here too.
+    // Claiming only names the registry recognizes keeps a missed built-in
+    // costing a rejection that does not fire, never a false one — the same
+    // fail-safe direction every other positive table here takes.
+    if (!common::isReservedBuiltinTypeName(head) &&
+        !common::isBuiltinExceptionName(head))
+        return;
+
+    const std::string desc = "constructor of built-in `" + head + "`";
+    std::vector<common::BuiltinFormals> cands =
+        common::builtinCtorParamNameCandidates(head, ne.args.size());
+    if (cands.empty()) {
+        // Limitation 1 (the #3398 discipline): no complete parameter-name list
+        // for this constructor, so the name can be neither matched nor
+        // rejected and the binding cannot be trusted. Reject loudly rather
+        // than bind positionally behind the caller's back.
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            desc + ": named arguments are not supported on this built-in "
+                   "constructor — the compiler carries no parameter names for "
+                   "it at " + std::to_string(ne.args.size()) +
+                " argument(s), so a name can be neither matched nor rejected "
+                "(\xC2\xA7""22.5, \xC2\xA7""17.7, #3425). Pass the arguments "
+                "positionally.");
+        return;
+    }
+
+    BuiltinBind bb;
+    if (!bindBuiltinCandidates(cands, ne.args, ne.span.begin, desc, bb))
+        return;  // the helper reported; no cascade
+
+    // Limitation 2 (the #3398 discipline): codegen's `lowerNew` lowers a
+    // built-in construction by argument POSITION (`ne.args[i]`), so a binding
+    // that is not the identity permutation would be honoured by sema and
+    // ignored by codegen — the silent field permutation this fix exists to
+    // remove. §22.5's *Evaluation order* rules out buying the reorder by
+    // permuting the argument list here ("A call's supplied argument
+    // expressions are evaluated in call-site textual order"), so the call is
+    // rejected until codegen can consume the binding (#3423).
+    //
+    // The exception is the two record-shaped heads whose `lowerNew` arm
+    // already resolves each argument to its field slot BY NAME (#3098): for
+    // those the reorder is honoured end to end and must stay admitted.
+    if (common::isBuiltinCtorLoweredByName(head)) return;
+    const std::vector<std::string_view>& names = bb.names;
+    for (std::size_t j = 0; j < names.size(); ++j) {
+        if (bb.bind.paramToArg[j] == static_cast<int>(j)) continue;
+        if (bb.bind.paramToArg[j] < 0) {
+            // A §22.5 optional parameter left to its default. Beyond the
+            // supplied count that is exactly what positional lowering does
+            // with a trailing omitted argument; WITHIN it, it is a genuine
+            // permutation codegen would get wrong.
+            if (j >= ne.args.size()) continue;
+            ctx_.diagnostics().report(
+                Severity::Error, ne.span.begin,
+                desc + ": a named argument that binds to a parameter other "
+                       "than its own position is not supported on a built-in "
+                       "constructor — `" + std::string(names[j]) +
+                    "` is parameter " + std::to_string(j + 1) +
+                    " but is left to its default while a later argument is "
+                    "supplied (\xC2\xA7""22.5, #3425). Pass the arguments in "
+                    "declaration order, or positionally.");
+            return;
+        }
+        const std::size_t ai = static_cast<std::size_t>(bb.bind.paramToArg[j]);
+        ctx_.diagnostics().report(
+            Severity::Error, ne.span.begin,
+            desc + ": a named argument that binds to a parameter other than "
+                   "its own position is not supported on a built-in "
+                   "constructor — `" + std::string(names[j]) +
+                "` is parameter " + std::to_string(j + 1) +
+                " but is written as argument " + std::to_string(ai + 1) +
+                " (\xC2\xA7""22.5, #3425). Pass the arguments in declaration "
+                "order, or positionally.");
+        return;
     }
 }
 

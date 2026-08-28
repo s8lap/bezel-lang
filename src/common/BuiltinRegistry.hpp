@@ -20,6 +20,7 @@
 // name-for-name; tests/support/builtin_registry_snapshot_test.cpp pins each
 // table against the pre-refactor snapshot.
 
+#include <cstddef>
 #include <string_view>
 #include <vector>
 
@@ -426,56 +427,96 @@ std::string_view primitiveBuiltinSpelling(int primitive);
 
 // fix #3398 (spec §22.5 "Optional parameters and named arguments", v0.283;
 // stdlib §1 Conventions — *Window parameters*; §9.6 `String`; §3.2
-// `Encoding`): the ordered PARAMETER NAMES of a built-in member overload,
-// keyed by (type head, member name, argument count).
+// `Encoding`), widened by fix #3424 and joined by the constructor twin
+// fix #3425 (§17.7 "The `new` operator"): the declared PARAMETER NAMES of a
+// built-in member overload, and of a built-in constructor overload.
 //
-// Why this table exists at all: the compiler carries no parameter names for
-// any built-in (stdlib, non-user-declared) member, so §22.5's binder had
-// nothing to match a named argument against at a built-in call site. Every
-// name was therefore DISCARDED and every argument bound POSITIONALLY —
-// `"hello world".Remove(length := 6, startIndex := 5)` compiled clean and
-// evaluated `Remove(6, 5)`, a silent wrong answer (#3398). The names in this
-// table are the ones the standard-library document declares, and stdlib §1
-// makes them API surface ("parameter names are API surface (named arguments,
-// spec §22.5)").
+// Why these tables exist at all: the compiler carries no parameter names for
+// any built-in (stdlib, non-user-declared) member or constructor, so §22.5's
+// binder had nothing to match a named argument against at a built-in call
+// site. Every name was therefore DISCARDED and every argument bound
+// POSITIONALLY — `"hello world".Remove(length := 6, startIndex := 5)`
+// compiled clean and evaluated `Remove(6, 5)` (#3398), and
+// `new Array<int>(fill := 7, size := 3)` compiled clean and allocated SEVEN
+// slots of `3` (#3425, measured on ef339fa: `Count`=7, `[0]`=3, where the
+// positional `new Array<int>(3, 7)` gives 3 and 7). Both are silent wrong
+// answers, not merely missing rejections. The names in these tables are the
+// ones the standard-library document declares, and stdlib §1 makes them API
+// surface ("parameter names are API surface (named arguments, spec §22.5)").
 //
-// KEYED BY ARITY, deliberately: a built-in has no `MethodSymbol` and therefore
-// no overload set to resolve against, and the stdlib's built-in overloads are
-// distinguished at a call site chiefly by argument count
-// (`Remove(startIndex)` / `Remove(startIndex, length)`,
-// `GetString(bytes)` / `GetString(bytes, start, length)`).
+// KEYED BY ARGUMENT COUNT, and OVERLOAD-AWARE (fix #3424). A built-in has no
+// `MethodSymbol` / `ConstructorSymbol` and therefore no overload set to
+// resolve against, and the stdlib's built-in overloads are distinguished at a
+// call site chiefly by argument count (`Remove(startIndex)` /
+// `Remove(startIndex, length)`). Where two overloads DO share an argument
+// count and disagree on names — `StringBuilder/1` (`capacity` vs `initial`),
+// `Dictionary/1` (`capacity` vs `comparer`) — the lookup returns BOTH
+// candidate lists and the caller accepts a call that binds against ANY ONE of
+// them, which is what admits a built-in constructor overload pair at all.
+// #3398 shipped a single-list lookup and had to OMIT such overloads entirely;
+// carrying the MEMBER side's four omitted §9.6 pairs the same way is #3424.
+// Keying off the overload the built-in TYPE dispatch picks is not available:
+// that dispatch lives in codegen's `lowerCallDispatch` / `lowerNew` arm chain,
+// which sema cannot consult.
+//
+// A row carries `required` — the count of LEADING parameters that declare no
+// default — so a §22.5 optional parameter (stdlib `TimeOnly(hour, minute,
+// second := 0, millisecond := 0)`) needs ONE row rather than one per
+// admissible arity, and `FormalsView::ofNames` reports `hasDefault` from it.
 //
 // DELIBERATELY PARTIAL, and the partiality is safe because the CALLER treats
 // a miss as a REJECTION, never as permission: `ExprTC::checkBuiltinNamedArgs`
-// reports a named argument on a built-in member this table does not cover
-// rather than binding it positionally. So a missing row costs a loud
-// not-supported diagnostic, never a wrong value. Two consequences worth
-// stating:
-//
-//   * Overloads that share an arity but DISAGREE on parameter names are
-//     omitted entirely — the (head, member, arity) key cannot decide between
-//     them without overload resolution the built-in path does not have.
-//     In §9.6 that is exactly four: `Replace/2` (`oldChar, newChar` vs
-//     `oldValue, newValue`), `Repeat/2` (`c, count` vs `unit, count`),
-//     `Split/1` (`separator` vs `separators`) and `AsSpan/1` (`start` vs
-//     `r`). Named arguments on those four are rejected, not guessed.
-//   * The covered surface is the two type heads whose window parameters
-//     stdlib §1 renamed at v0.282 — `string` (§9.6) and `Encoding` (§3.2).
-//     Widening it is additive: a new row here needs no call-site change
-//     (except adding the head to `isBuiltinNamedArgTableHead` when the
-//     receiver arrives in the static or intrinsic-TypeSymbol shape). Both
-//     the widening and the overload-aware lookup are #3424.
-//
-// Returns the parameter names in declaration order, or an EMPTY vector when
-// the registry carries no names for that (head, member, arity). The head
-// `"String"` (the static call spelling) normalizes to `"string"`.
-// per §22.5 / stdlib §1 / §9.6 / §3.2, fix #3398
-std::vector<std::string_view> builtinParamNames(std::string_view typeHead,
-                                                std::string_view member,
-                                                std::size_t arity);
+// and `ExprTC::checkBuiltinCtorNamedArgs` report a named argument on a
+// built-in the table does not cover rather than binding it positionally. So a
+// missing row costs a loud not-supported diagnostic, never a wrong value —
+// which is also why a widening is purely additive and needs no call-site
+// change (except adding a head to `isBuiltinNamedArgTableHead` when a MEMBER
+// receiver arrives in the static or intrinsic-TypeSymbol shape).
+struct BuiltinFormals {
+    // The declared parameter names, in declaration order. `size()` is the
+    // overload's full parameter count, not the call's argument count.
+    std::vector<std::string_view> names;
+    // The leading parameters that carry no default; `names.size()` when every
+    // parameter is required.
+    std::size_t required = 0;
+};
 
-// fix #3398: is `head` one of the built-in type heads `builtinParamNames`
-// carries rows for?
+// The MEMBER table (#3398, widened by #3424). Returns every candidate whose
+// declared shape admits `argCount` arguments (`required <= argCount <=
+// names.size()`), in declaration order, or an EMPTY vector when the registry
+// carries no names for that (head, member) at that argument count. The head
+// `"String"` (the static call spelling) normalizes to `"string"`.
+// per §22.5 / stdlib §1 / §9.6 / §3.2, fix #3398 (candidate lists: #3425)
+std::vector<BuiltinFormals> builtinParamNameCandidates(std::string_view typeHead,
+                                                       std::string_view member,
+                                                       std::size_t argCount);
+
+// The CONSTRUCTOR table (fix #3425 — §22.5 / §17.7). Same contract as the
+// member lookup, keyed by (type head, argument count); a built-in
+// constructor's declared surface is §17.7's closed one, so the rows are
+// transcribed from the same standard-library declarations
+// `isPositionalCtorOnlyBuiltinRecord` and friends already answer for.
+// per §22.5 / §17.7 / stdlib §2.5 / §3.1 / §4 / §6 / §7.2, fix #3425
+std::vector<BuiltinFormals> builtinCtorParamNameCandidates(
+    std::string_view typeHead, std::size_t argCount);
+
+// fix #3425: does codegen's `lowerNew` arm for `head` lower its arguments
+// through the §22.5 BINDING (by parameter name) rather than by written
+// position?
+//
+// True for exactly the two record-shaped reserved builtins whose `lowerNew`
+// arm #3098 gave a by-name pass (`ExceptionInfo`, §31.4;
+// `ReadOnlyStringSpan`, stdlib §3.3 — LlvmBackend_Exprs2.cpp): for those a
+// REORDERED named argument list is honoured and must stay admitted. Every
+// other built-in constructor is lowered by `ne.args[i]` position, so a
+// binding that is not the identity permutation would be honoured by sema and
+// ignored by codegen — the wrong answer this fix exists to remove — and is
+// REJECTED until codegen can consume the binding (#3423, the member twin's
+// same limitation). // per §22.5 / §17.7, fix #3425
+bool isBuiltinCtorLoweredByName(std::string_view head);
+
+// fix #3398: is `head` one of the built-in type heads
+// `builtinParamNameCandidates` carries MEMBER rows for?
 //
 // Two call-site roles, both in `ExprTC::checkBuiltinNamedArgs`:
 //   * it admits the STATIC call spelling (`String.From(...)`), whose target is

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 
 // #1414 Stage 3 — the data-only builtin registry (see BuiltinRegistry.hpp).
 //
@@ -383,18 +384,23 @@ constexpr std::array<BuiltinExceptionEdge, 29> kBuiltinExceptionHierarchy = {{
 }};
 
 // fix #3398 (spec §22.5, v0.283; stdlib §1 Conventions — *Window
-// parameters*; §9.6; §3.2): the built-in member parameter-name table. See the
-// header for the contract, and for why a MISS is a rejection rather than
-// permission.
+// parameters*), widened and made overload-aware by fix #3424, and joined by
+// the constructor twin fix #3425 (§17.7): the built-in parameter-name tables.
+// See the header for the contract, and for why a MISS is a rejection rather
+// than permission.
 //
 // Every row is transcribed from the standard-library document's own
-// declaration; nothing here is inferred. `names` holds `arity` entries in
-// declaration order (the trailing slots of a shorter row are unused).
+// declaration; nothing here is inferred. `names` holds `total` entries in
+// declaration order (the trailing slots of a shorter row are unused);
+// `required` counts the LEADING parameters that declare no default, so one
+// row answers for every admissible argument count of an overload with §22.5
+// optional parameters.
 struct BuiltinParamNameRow {
     std::string_view head;
-    std::string_view member;
-    std::size_t arity;
-    std::array<std::string_view, 3> names;
+    std::string_view member;   // empty for a CONSTRUCTOR row
+    std::uint8_t total;
+    std::uint8_t required;
+    std::array<std::string_view, 4> names;
 };
 
 // stdlib §9.6 `String` (v0.283). The STATIC members are keyed under the same
@@ -405,59 +411,148 @@ struct BuiltinParamNameRow {
 // OMITTED, per the header's same-arity-disagreement rule: `Replace/2`
 // (`oldChar, newChar` | `oldValue, newValue`), `Repeat/2` (`c, count` |
 // `unit, count`), `Split/1` (`separator` | `separators`), `AsSpan/1`
-// (`start` | `r`). `Trim/0`, `ToUpper/0` and the other nullary members carry
-// no parameters and so cannot take a named argument at all.
+// (`start` | `r`). Widening the lookup to carry both candidate lists — which
+// this row shape now supports — is #3424. `Trim/0`, `ToUpper/0` and the other
+// nullary members carry no parameters and so cannot take a named argument at
+// all.
 constexpr std::array<BuiltinParamNameRow, 31> kStringParamNames = {{
     // Construction (static)
-    {"string", "From", 1, {"value", "", ""}},
-    {"string", "From", 3, {"buffer", "start", "length"}},  // renamed v0.282 (§1)
-    {"string", "FromCStringPointer", 1, {"p", "", ""}},
-    {"string", "FromWStringPointer", 1, {"p", "", ""}},
-    {"string", "Join", 2, {"separator", "items", ""}},
+    {"string", "From", 1, 1, {"value", "", "", ""}},
+    {"string", "From", 3, 3, {"buffer", "start", "length", ""}},  // renamed v0.282 (§1)
+    {"string", "FromCStringPointer", 1, 1, {"p", "", "", ""}},
+    {"string", "FromWStringPointer", 1, 1, {"p", "", "", ""}},
+    {"string", "Join", 2, 2, {"separator", "items", "", ""}},
     // Inspection (static)
-    {"string", "IsNullOrEmpty", 1, {"value", "", ""}},
-    {"string", "IsNullOrWhiteSpace", 1, {"value", "", ""}},
+    {"string", "IsNullOrEmpty", 1, 1, {"value", "", "", ""}},
+    {"string", "IsNullOrWhiteSpace", 1, 1, {"value", "", "", ""}},
     // Inspection (instance)
-    {"string", "Contains", 1, {"value", "", ""}},
-    {"string", "StartsWith", 1, {"value", "", ""}},
-    {"string", "EndsWith", 1, {"value", "", ""}},
-    {"string", "IndexOf", 1, {"value", "", ""}},
-    {"string", "IndexOf", 2, {"value", "startIndex", ""}},
-    {"string", "LastIndexOf", 1, {"value", "", ""}},
+    {"string", "Contains", 1, 1, {"value", "", "", ""}},
+    {"string", "StartsWith", 1, 1, {"value", "", "", ""}},
+    {"string", "EndsWith", 1, 1, {"value", "", "", ""}},
+    {"string", "IndexOf", 1, 1, {"value", "", "", ""}},
+    {"string", "IndexOf", 2, 2, {"value", "startIndex", "", ""}},
+    {"string", "LastIndexOf", 1, 1, {"value", "", "", ""}},
     // Substring / span views
-    {"string", "Substring", 1, {"startIndex", "", ""}},
-    {"string", "Substring", 2, {"startIndex", "length", ""}},
-    {"string", "AsSpan", 2, {"start", "length", ""}},
+    {"string", "Substring", 1, 1, {"startIndex", "", "", ""}},
+    {"string", "Substring", 2, 2, {"startIndex", "length", "", ""}},
+    {"string", "AsSpan", 2, 2, {"start", "length", "", ""}},
     // Modification
-    {"string", "Trim", 1, {"chars", "", ""}},
-    {"string", "PadLeft", 1, {"totalWidth", "", ""}},
-    {"string", "PadLeft", 2, {"totalWidth", "paddingChar", ""}},
-    {"string", "PadRight", 1, {"totalWidth", "", ""}},
-    {"string", "PadRight", 2, {"totalWidth", "paddingChar", ""}},
-    {"string", "PadCenter", 1, {"totalWidth", "", ""}},
-    {"string", "PadCenter", 2, {"totalWidth", "paddingChar", ""}},
-    {"string", "Insert", 2, {"startIndex", "value", ""}},
-    {"string", "Remove", 1, {"startIndex", "", ""}},
-    {"string", "Remove", 2, {"startIndex", "length", ""}},  // renamed v0.282 (§1)
+    {"string", "Trim", 1, 1, {"chars", "", "", ""}},
+    {"string", "PadLeft", 1, 1, {"totalWidth", "", "", ""}},
+    {"string", "PadLeft", 2, 2, {"totalWidth", "paddingChar", "", ""}},
+    {"string", "PadRight", 1, 1, {"totalWidth", "", "", ""}},
+    {"string", "PadRight", 2, 2, {"totalWidth", "paddingChar", "", ""}},
+    {"string", "PadCenter", 1, 1, {"totalWidth", "", "", ""}},
+    {"string", "PadCenter", 2, 2, {"totalWidth", "paddingChar", "", ""}},
+    {"string", "Insert", 2, 2, {"startIndex", "value", "", ""}},
+    {"string", "Remove", 1, 1, {"startIndex", "", "", ""}},
+    {"string", "Remove", 2, 2, {"startIndex", "length", "", ""}},  // renamed v0.282 (§1)
     // Comparison and equality
-    {"string", "CompareTo", 1, {"other", "", ""}},
-    {"string", "Compare", 2, {"a", "b", ""}},
-    {"string", "Compare", 3, {"a", "b", "ignoreCase"}},
+    {"string", "CompareTo", 1, 1, {"other", "", "", ""}},
+    {"string", "Compare", 2, 2, {"a", "b", "", ""}},
+    {"string", "Compare", 3, 3, {"a", "b", "ignoreCase", ""}},
     // §9.6 declares BOTH `Equals(other: string?)` and the `Object?` override
     // at arity 1, and they AGREE on the name, so the single row answers both.
-    {"string", "Equals", 1, {"other", "", ""}},
-    {"string", "Equals", 2, {"other", "ignoreCase", ""}},
+    {"string", "Equals", 1, 1, {"other", "", "", ""}},
+    {"string", "Equals", 2, 2, {"other", "ignoreCase", "", ""}},
 }};
 
 // stdlib §3.2 `Encoding` (v0.283). No overload at a shared arity disagrees on
 // names here, so the whole declared surface is covered.
 constexpr std::array<BuiltinParamNameRow, 5> kEncodingParamNames = {{
-    {"Encoding", "GetBytes", 1, {"s", "", ""}},
-    {"Encoding", "GetBytes", 2, {"s", "destination", ""}},
-    {"Encoding", "GetString", 1, {"bytes", "", ""}},
-    {"Encoding", "GetString", 3, {"bytes", "start", "length"}},  // renamed v0.282 (§1)
-    {"Encoding", "GetByteCount", 1, {"s", "", ""}},
+    {"Encoding", "GetBytes", 1, 1, {"s", "", "", ""}},
+    {"Encoding", "GetBytes", 2, 2, {"s", "destination", "", ""}},
+    {"Encoding", "GetString", 1, 1, {"bytes", "", "", ""}},
+    {"Encoding", "GetString", 3, 3, {"bytes", "start", "length", ""}},  // renamed v0.282 (§1)
+    {"Encoding", "GetByteCount", 1, 1, {"s", "", "", ""}},
 }};
+
+// fix #3425 — the built-in CONSTRUCTOR rows (§17.7's closed constructor
+// surface; the argument-taking constructors the standard library declares).
+// A head absent here rejects a named `new` argument loudly rather than
+// binding it positionally, so the coverage below is a floor, not a contract
+// (the remaining argument-taking heads are issue 3534).
+//
+// The stdlib heads whose only declared constructor is parameterless
+// (`SortedDictionary`, `SortedSet`, `Stack`, `Queue`, `Mutex`, `Stopwatch`,
+// `CancellationTokenSource`, `TaskScope`, the event sources, the
+// task-completion sources, …) carry no row for the same reason `Trim/0`
+// carries none: a nullary constructor cannot take a named argument.
+//
+// `DateTime`'s eight-parameter overload (§2.5) is deliberately ABSENT: it
+// declares two trailing defaults AND exceeds this row's four-name capacity,
+// so it would need a wider row shape; a named argument on it is rejected
+// rather than mis-bound (issue 3533).
+constexpr std::array<BuiltinParamNameRow, 34> kBuiltinCtorParamNames = {{
+    // stdlib §2.5 — the temporal value records.
+    {"DateTime", "", 3, 3, {"year", "month", "day", ""}},
+    {"DateOnly", "", 3, 3, {"year", "month", "day", ""}},
+    {"TimeOnly", "", 4, 2, {"hour", "minute", "second", "millisecond"}},
+    // stdlib §3.1 — `StringBuilder(capacity)` and `StringBuilder(initial)`
+    // share an argument count and disagree on names: two candidates (#3424's
+    // overload-aware lookup is what admits them).
+    {"StringBuilder", "", 1, 1, {"capacity", "", "", ""}},
+    {"StringBuilder", "", 1, 1, {"initial", "", "", ""}},
+    // stdlib §3.3 / §31.4 — the two record-shaped reserved builtins whose
+    // `lowerNew` arm honours the binding BY NAME (#3098); see
+    // `isBuiltinCtorLoweredByName`.
+    {"ReadOnlyStringSpan", "", 3, 3, {"Source", "Start", "Length", ""}},
+    {"ExceptionInfo", "", 3, 3, {"TypeName", "Message", "StackTrace", ""}},
+    // stdlib §4.14 / §4.15 — the span records' direct constructors. Lowered
+    // by POSITION (LlvmBackend_Exprs2.cpp), so a reorder stays rejected.
+    {"Span", "", 3, 3, {"Buffer", "Start", "Length", ""}},
+    {"ReadOnlySpan", "", 3, 3, {"Buffer", "Start", "Length", ""}},
+    {"ArraySpan", "", 3, 3, {"Source", "Start", "Length", ""}},
+    {"ReadOnlyArraySpan", "", 3, 3, {"Source", "Start", "Length", ""}},
+    // stdlib §4.2 / §4.5 / §4.6 / §4.8 / §4.14 — the collections.
+    {"Array", "", 1, 1, {"capacity", "", "", ""}},
+    {"Array", "", 2, 2, {"size", "fill", "", ""}},
+    {"OwningArray", "", 1, 1, {"capacity", "", "", ""}},
+    {"OwningBuffer", "", 1, 1, {"length", "", "", ""}},
+    {"OwningBuffer", "", 2, 2, {"length", "init", "", ""}},
+    {"LinkedList", "", 1, 1, {"source", "", "", ""}},
+    {"Dictionary", "", 1, 1, {"capacity", "", "", ""}},
+    {"Dictionary", "", 1, 1, {"comparer", "", "", ""}},
+    {"Dictionary", "", 2, 2, {"capacity", "comparer", "", ""}},
+    {"OwningDictionary", "", 1, 1, {"capacity", "", "", ""}},
+    {"OwningDictionary", "", 1, 1, {"comparer", "", "", ""}},
+    {"OwningDictionary", "", 2, 2, {"capacity", "comparer", "", ""}},
+    {"Set", "", 1, 1, {"capacity", "", "", ""}},
+    {"Set", "", 1, 1, {"comparer", "", "", ""}},
+    {"Set", "", 2, 2, {"capacity", "comparer", "", ""}},
+    {"OwningSet", "", 1, 1, {"capacity", "", "", ""}},
+    {"OwningSet", "", 1, 1, {"comparer", "", "", ""}},
+    {"OwningSet", "", 2, 2, {"capacity", "comparer", "", ""}},
+    // stdlib §2.16 / §6.3 / §6.4 / §6.7 / §7.2 / §8.2 — the remaining
+    // argument-taking reserved heads.
+    {"Shared", "", 1, 1, {"value", "", "", ""}},
+    {"Random", "", 1, 1, {"seed", "", "", ""}},
+    {"Semaphore", "", 1, 1, {"initialCount", "", "", ""}},
+    {"Semaphore", "", 2, 2, {"initialCount", "maxCount", "", ""}},
+    {"Channel", "", 1, 1, {"capacity", "", "", ""}},
+}};
+
+// fix #3425 — the built-in EXCEPTION constructors (spec §31.4). `Exception`
+// declares `(message)` and `(message, cause)`; `ArgumentException` and
+// `ArgumentOutOfRangeException` declare `(message, paramName)` instead
+// (stdlib §2.5); `TimeoutException` declares `(message, inner)` (stdlib §6.1).
+//
+// The one-argument `(message)` form is shared by the WHOLE family and is
+// answered generically in the lookup below from `isBuiltinExceptionName`, so
+// only the arity-2 forms — where the family DISAGREES — need rows here.
+constexpr std::array<BuiltinParamNameRow, 4> kBuiltinExceptionCtorParamNames = {{
+    {"Exception", "", 2, 2, {"message", "cause", "", ""}},
+    {"ArgumentException", "", 2, 2, {"message", "paramName", "", ""}},
+    {"ArgumentOutOfRangeException", "", 2, 2, {"message", "paramName", "", ""}},
+    {"TimeoutException", "", 2, 2, {"message", "inner", "", ""}},
+}};
+
+// fix #3425: the two record-shaped builtins whose `lowerNew` arm resolves each
+// argument to its FIELD SLOT BY NAME before lowering (#3098,
+// LlvmBackend_Exprs2.cpp). See the header.
+constexpr std::array<std::string_view, 2> kBuiltinCtorLoweredByNameHeads = {
+    "ExceptionInfo", "ReadOnlyStringSpan",
+};
 
 // The heads `kStringParamNames` / `kEncodingParamNames` answer for. See the
 // header for the two roles this predicate plays at the call site.
@@ -973,25 +1068,67 @@ std::string_view primitiveBuiltinSpelling(int primitive) {
     return "<unknown>";
 }  // per stdlib §2.13 rule 2 / §3.4, fix #3119
 
-// fix #3398 (§22.5, v0.283; stdlib §1 / §9.6 / §3.2): see the header.
-std::vector<std::string_view> builtinParamNames(std::string_view typeHead,
-                                                std::string_view member,
-                                                std::size_t arity) {
+namespace {
+
+// Collect every row of `tbl` whose declared shape admits `argCount`
+// arguments, in the table's declaration order. Shared by the member and
+// constructor lookups so the "required <= argCount <= total" admission rule
+// has one spelling. // per §22.5, fix #3424 / #3425
+template <typename Tbl>
+void collectRows(const Tbl& tbl, std::string_view head, std::string_view member,
+                 std::size_t argCount, std::vector<BuiltinFormals>& out) {
+    for (const auto& r : tbl) {
+        if (r.head != head || r.member != member) continue;
+        if (argCount < r.required || argCount > r.total) continue;
+        BuiltinFormals f;
+        f.names.assign(r.names.begin(),
+                       r.names.begin() + static_cast<std::ptrdiff_t>(r.total));
+        f.required = r.required;
+        out.push_back(std::move(f));
+    }
+}
+
+}  // namespace
+
+// fix #3398 (§22.5, v0.283; stdlib §1 / §9.6 / §3.2), widened and made
+// overload-aware by fix #3424: see the header.
+std::vector<BuiltinFormals> builtinParamNameCandidates(std::string_view typeHead,
+                                                       std::string_view member,
+                                                       std::size_t argCount) {
     // The static call spelling is `String.From(...)`; the instance receiver's
     // head is the `string` keyword. One table answers both.
     if (typeHead == "String") typeHead = "string";
-    auto scan = [&](const auto& tbl) -> std::vector<std::string_view> {
-        for (const auto& r : tbl)
-            if (r.head == typeHead && r.member == member && r.arity == arity)
-                return std::vector<std::string_view>(
-                    r.names.begin(),
-                    r.names.begin() + static_cast<std::ptrdiff_t>(arity));
-        return {};
-    };
-    if (typeHead == "string") return scan(kStringParamNames);
-    if (typeHead == "Encoding") return scan(kEncodingParamNames);
-    return {};
+    std::vector<BuiltinFormals> out;
+    if (typeHead == "string")
+        collectRows(kStringParamNames, typeHead, member, argCount, out);
+    else if (typeHead == "Encoding")
+        collectRows(kEncodingParamNames, typeHead, member, argCount, out);
+    return out;
 }  // per §22.5 / stdlib §1 / §9.6 / §3.2
+
+// fix #3425 (§22.5 / §17.7, v0.283): see the header.
+std::vector<BuiltinFormals> builtinCtorParamNameCandidates(
+    std::string_view typeHead, std::size_t argCount) {
+    std::vector<BuiltinFormals> out;
+    collectRows(kBuiltinCtorParamNames, typeHead, /*member=*/"", argCount, out);
+    collectRows(kBuiltinExceptionCtorParamNames, typeHead, /*member=*/"",
+                argCount, out);
+    // Spec §31.4: every standard exception type declares `constructor(message:
+    // string)`; the arity-2 forms disagree across the family and are the rows
+    // above. Answered from the hierarchy rather than one row per name so a new
+    // built-in exception cannot silently lose its named-argument surface.
+    if (argCount == 1 && isBuiltinExceptionName(typeHead)) {
+        BuiltinFormals f;
+        f.names.push_back("message");
+        f.required = 1;
+        out.push_back(std::move(f));
+    }
+    return out;
+}  // per §22.5 / §17.7 / §31.4 / stdlib §2.5 / §3.1 / §4 / §6 / §7.2
+
+bool isBuiltinCtorLoweredByName(std::string_view head) {
+    return contains(kBuiltinCtorLoweredByNameHeads, head);
+}  // per §22.5 / §17.7, fix #3425 (the #3098 `lowerNew` arm)
 
 bool isBuiltinNamedArgTableHead(std::string_view head) {
     return contains(kBuiltinNamedArgTableHeads, head);
