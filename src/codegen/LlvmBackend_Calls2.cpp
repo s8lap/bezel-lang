@@ -11079,8 +11079,17 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                             { needsInline = true; break; }
                 }
                 if (needsInline) {
-                    llvm::Value* r = emitInlineGenericMethod(ms, args);
-                    if (r != nullptr || diverged_) {
+                    // fix #3497 (§4.7 / §22.2, v0.283): ask whether the inline path
+                    // LOWERED the call, not whether it produced a value. `r == nullptr`
+                    // is also what a legitimately unit-valued inline returns (a §4.7
+                    // unit result has no value), and falling through on it emitted the
+                    // compiled call on top of the body just inlined here — one call
+                    // expression running the callee TWICE. Widening only: `r != nullptr`
+                    // implies `inlined`, so every previously-returning case still
+                    // returns, and a genuine decline still falls through untouched.
+                    bool inlined = false;
+                    llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined);
+                    if (inlined || diverged_) {
                         emitPendingCheck();
                         return r;
                     }
@@ -11482,6 +11491,13 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         // never a wrong-typed call to the template). The §14.1/#783 sema gate
         // already rejects shapes whose body could not be reconstructed (decl
         // null), so reaching here means the body IS available.
+        //
+        // #3497: this is why the fourth call site passes no `emitted` out-param
+        // — the unconditional return already makes the distinction moot here,
+        // and it is the ONLY one of the four that was never able to run the
+        // inlined body twice. Do not "restore symmetry" by adding a
+        // fall-through: it is this `return` that keeps the wrong-width call to
+        // the template unreachable.
         return r;
     }
 
@@ -11532,8 +11548,17 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         // "any at all", and this runs on every call with a live substitution.)
         const bool parentIsGeneric = sema::genericParamCount(ms->parent) != 0;
         if (parentIsGeneric) {
-            llvm::Value* r = emitInlineGenericMethod(ms, args);
-            if (r != nullptr || diverged_) {
+            // fix #3497 (§4.7 / §22.2, v0.283): ask whether the inline path
+            // LOWERED the call, not whether it produced a value. `r == nullptr`
+            // is also what a legitimately unit-valued inline returns (a §4.7
+            // unit result has no value), and falling through on it emitted the
+            // compiled call on top of the body just inlined here — one call
+            // expression running the callee TWICE. Widening only: `r != nullptr`
+            // implies `inlined`, so every previously-returning case still
+            // returns, and a genuine decline still falls through untouched.
+            bool inlined = false;
+            llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined);
+            if (inlined || diverged_) {
                 emitPendingCheck();
                 return r;
             }
@@ -11591,8 +11616,17 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         }
         if (typesMismatch) {
             // Inline the method body with the current generic substitution.
-            llvm::Value* r = emitInlineGenericMethod(ms, args);
-            if (r != nullptr || diverged_) {
+            // fix #3497 (§4.7 / §22.2, v0.283): ask whether the inline path
+            // LOWERED the call, not whether it produced a value. `r == nullptr`
+            // is also what a legitimately unit-valued inline returns (a §4.7
+            // unit result has no value), and falling through on it emitted the
+            // compiled call on top of the body just inlined here — one call
+            // expression running the callee TWICE. Widening only: `r != nullptr`
+            // implies `inlined`, so every previously-returning case still
+            // returns, and a genuine decline still falls through untouched.
+            bool inlined = false;
+            llvm::Value* r = emitInlineGenericMethod(ms, args, &inlined);
+            if (inlined || diverged_) {
                 emitPendingCheck();
                 return r;
             }
@@ -12566,7 +12600,13 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
 
 
 llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
-                                      std::vector<llvm::Value*>& args) {
+                                      std::vector<llvm::Value*>& args,
+                                      bool* emitted) {
+    // fix #3497: "did I lower the call here?" starts out NO and is answered at
+    // each emission arm below; see the declaration for why the answer cannot be
+    // read off the returned value. Assigned before every `return` so a caller
+    // never reads a stale `true` from its own initialisation.
+    if (emitted) *emitted = false;
     CallableInfo ci;
     if (!callableInfo(ms, ci)) return nullptr;
     // #1059: do NOT bail when `ms->decl` is an OperatorDecl rather than a
@@ -12657,8 +12697,23 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
 
     // Emit the body.
     llvm::Value* result = nullptr;
+    // fix #3497: set by whichever arm below emits the callee's body into the
+    // caller. Never inferred from `result`: a §4.7 unit body emits everything
+    // and yields no value.
+    bool bodyEmitted = false;
     if (ci.bodyKind == ast::MethodBodyKind::Expression && ci.exprBody) {
+        // fix #3497: #2963's discriminator, taken around the body's lowering.
+        // A value came back ⇒ the body lowered. No value but real work emitted
+        // ⇒ the body lowered and its result is unit — the shape that ran twice.
+        // Nothing emitted and no value ⇒ nothing lowered, and the caller's
+        // existing fall-through stays exactly as it was. `emittedSideEffect
+        // Since` resolves every uncertain case to `true`, which is the safe
+        // direction here for the same reason it is at `lowerCall`: it costs at
+        // most a call the caller would have emitted anyway, while the opposite
+        // error executes user code a second time.
+        const IrFootprint beforeBody = irFootprint();
         result = lowerExpr(*ci.exprBody);
+        bodyEmitted = result != nullptr || emittedSideEffectSince(beforeBody);
         // §8.6 / §29.2 / §4.3 (#1316): apply the SAME return-coercion the
         // non-generic return sites and buildSpecializedMethodFn use — a generic
         // expression-body method like `AsSeq<T>(a: Array<T>): IEnumerable<T>
@@ -12697,6 +12752,12 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
         // `ret` in the outer function. Instead, monomorphize: compile a
         // concrete version of the function with the active substitution.
         result = emitGenericSpecialization(ms, args, ci);
+        // fix #3497: exact for this arm without the footprint — emitGeneric
+        // Specialization returns the `CallInst` (void-typed for a unit method,
+        // hence non-null) on every path that emits a call, and nullptr only
+        // when `buildSpecializedMethodFn` failed or the arity disagreed, i.e.
+        // before any call was emitted.
+        bodyEmitted = result != nullptr;
     }
 
     // Restore state.
@@ -12711,6 +12772,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     diverged_ = savedDiverged;
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628 (phase a)
 
+    if (emitted) *emitted = bodyEmitted;
     return result;
 }
 

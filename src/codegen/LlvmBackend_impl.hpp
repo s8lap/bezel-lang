@@ -15305,8 +15305,30 @@ private:
     // active, binding `this` and the parameters to the actual arguments.
     // Used when the method function was compiled for a generic template (T→i32)
     // but the actual call uses concrete types (e.g. double for Box<double>).
+    //
+    // fix #3497 (§4.7 / §22.2 / §14.1, v0.283): `emitted` reports WHETHER this
+    // function lowered the call here, separately from WHAT it produced — the
+    // #2963 split, at this producer. A method declared without a return type
+    // returns unit (§4.7: "`()` … is the return type of methods declared
+    // without an explicit return type"), so an ARROW body whose expression is a
+    // call to another such method (§22.2: "When the body is a single
+    // expression, `=> expression` replaces the block") emits the WHOLE body and
+    // then has no value to hand back. Read off the return alone that is
+    // indistinguishable from "this path declined", and every caller that then
+    // fell through emitted the compiled call as well — running the callee's
+    // body a SECOND time.
+    //
+    // The sibling `emitVirtualGenericDispatch` answers the same question by
+    // returning its void `CallInst` as a non-null sentinel; that trick is not
+    // available here, because the expression arm's value comes from `lowerExpr`,
+    // which normalises a void result to a true `nullptr` (#3421) — there is no
+    // instruction left to hand back. So the answer is reported out-of-band, and
+    // it is computed from the fact the compiler ALREADY has: `IrFootprint` /
+    // `emittedSideEffectSince`, #2963's own discriminator. Pass `nullptr` (the
+    // default) at a caller that returns unconditionally.
     llvm::Value* emitInlineGenericMethod(sema::MethodSymbol* ms,
-                                          std::vector<llvm::Value*>& args);
+                                          std::vector<llvm::Value*>& args,
+                                          bool* emitted = nullptr);
 
     // CG42: null-conditional call `x?.M(args)` (§7.5) — the callee is a
     // null-conditional member access. If the receiver is null the call is

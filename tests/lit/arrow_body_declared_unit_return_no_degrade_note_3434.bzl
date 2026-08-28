@@ -43,12 +43,15 @@
 //   * `Bump()`               — ordinary method-symbol dispatch;
 //   * `Fwd<T>`               — the generic specialization's own arrow-body face.
 //
-// KNOWN, UNRELATED, FILED: the `C.Fwd<int>(c, 1)` call site emits the arrow
-// body's call BOTH inline at the call site AND through `bz$M.C$Fwd`, so `Bump`
-// runs twice per call (issue 3497). That is pre-existing, identical with and
-// without the `: ()` ascription, and invisible to this file, which asserts only
-// on diagnostics — but it is named here so the next reader does not take this
-// program's presence as a claim that the generic route is otherwise sound.
+// FIXED SINCE, by issue 3497: the `C.Fwd<int>(c, 1)` call site used to emit the
+// arrow body's call BOTH inline at the call site AND through `bz$M.C$Fwd`, so
+// `Bump` ran twice per call. That was pre-existing and identical with and
+// without the `: ()` ascription — unrelated to this file, which asserts only on
+// diagnostics, and invisible to it. It is named here because this file's `Fwd`
+// route is the exact program that carried it, and because the note this file
+// pins is what its own fix removed, leaving that issue the sole record. The
+// runtime oracle for the doubling now lives in
+// tests/codegen/generic_arrow_unit_body_runs_once_3497_test.cpp.
 //
 // The NEGATIVE control lives in this directory as
 // call_lowered_as_unit_declared_return_still_warns_2963.bzl (`: int`, which
