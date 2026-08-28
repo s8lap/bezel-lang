@@ -4503,9 +4503,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 ifaceCompareMs
                     ? ensureIfaceCmpThunk(elemTR->declaration, ifaceCompareMs)
                     : nullptr;
-            // Choose comparator: class IComparable → bz$classcmp$<Name>,
-            // interface IComparable → bz$ifacecmp$<Name>,
-            // string → bz$strcmp, int/other → bz$intcmp.
+            // Choose comparator: class IComparable → bz$classcmp$<M.Name>,
+            // interface IComparable → bz$ifacecmp$<M.Name>,
+            // string → bz$strcmp, int/other → bz$intcmp.  Both reference-type
+            // names are MODULE-QUALIFIED (`mangledTypeName`), per §2.8.3
+            // rule 3 — see buildObjectCompareToThunk for what the unqualified
+            // class name cost (#3512).
             bool isStringElem =
                 !classCompareMs && !ifaceCmpFn && (elemTy2 == ptrTy());
             llvm::Function* cmpFn = nullptr;

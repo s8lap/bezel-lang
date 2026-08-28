@@ -613,10 +613,34 @@ llvm::Function* Emitter::buildObjectCompareToThunk(const sema::TypeRef* ty) {
     sema::MethodSymbol* cmpMs = findMethodByName(ty->declaration, "CompareTo");
     if (!cmpMs || cmpMs->params.size() != 1) return nullptr;
 
-    // The name is #1195's verbatim, so a program that both sorts an
-    // `Array<Ord>` and iterates a `SortedDictionary<Ord, V>` emits ONE thunk.
+    // fix #3512 (spec §2.8.3 rule 3, v0.283): the cache key is the
+    // MODULE-QUALIFIED name, matching `ensureIfaceCmpThunk`'s interface arm
+    // above (`bz$ifacecmp$` + mangledTypeName) and every other `bz$`/`vt$`/
+    // `td$` symbol since #1488. It was #1195's UNQUALIFIED
+    // `ty->declaration->name` until #3512: rule 3 states that "Two modules each
+    // declaring a public type of the same name declare two unrelated types",
+    // and two such types collapsed to ONE `bz$classcmp$Ord` here — so the
+    // comparator built for whichever type reached this function FIRST was then
+    // handed the other type's instances. Measured on 06551dd: two modules each
+    // declaring `public class Ord: IComparable<Ord>` with OPPOSITE `CompareTo`
+    // both sorted ascending (`Array.Sort` and `SortedDictionary`
+    // iteration/`FirstKey`/`LastKey` alike), and with DIFFERING FIELD LAYOUTS
+    // (a leading `string` against a leading `int`) the shared thunk read one
+    // type's field at the other's offset and the program SEGV'd (rc=139).
+    //
+    // The `SortedDictionary` half is why this is not merely an ordering bug:
+    // `buildSortedObjectKeyIdentity` names its identity function after this one
+    // (`bz$sortedobjkey$eq$` + this name), so the collision decided MAP
+    // MEMBERSHIP too — the repro raised `ArgumentException` from an `Add` of a
+    // key that was not present, §4.17's duplicate-key tier fired on two
+    // distinct keys. Qualifying here fixes both, and the identity function
+    // inherits the qualified name for free.
+    //
+    // Sharing is preserved exactly where it was intended: one thunk per TYPE,
+    // so a program that both sorts an `Array<Ord>` and iterates a
+    // `SortedDictionary<Ord, V>` still emits ONE.
     std::string thunkName =
-        std::string("bz$classcmp$") + std::string(ty->declaration->name);
+        std::string("bz$classcmp$") + mangledTypeName(ty->declaration);
     if (llvm::Function* existing = module_->getFunction(thunkName))
         return existing;
 
