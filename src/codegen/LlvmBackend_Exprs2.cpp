@@ -3236,6 +3236,28 @@ void Emitter::storePrimaryCtorPositionalArgs(
                       genericSubst_ = std::move(posSubst);
                       genericSubstSemaTy_ = std::move(posSemaTy);
                       currentThis_ = savedThisForArg;
+                      // fix #3502 (§4.7 "The unit type" / §22.10 / §11.1,
+                      // v0.283): a unit-typed argument has NO lowered value —
+                      // `()` lowers to LLVM `void`, so `lowerExpr` returns null
+                      // — and this slot is a real FIELD with a real storage
+                      // type, so `continue`ing left the `()?` field at its
+                      // calloc zero, which IS `null`. §4.7 makes `()?` "an
+                      // optional with two values, `null` and `()`", so
+                      // `new B(C.Nothing())` and `new B(null)` both reading
+                      // absent is a silent wrong value, not a missing feature.
+                      // Routed through the SAME `unitValueForTarget` predicate
+                      // the call-argument / local-decl / assignment / return
+                      // positions use (#2915/#3095/#3421), with the target
+                      // supplied by `recordMemberTypeResolved` — the existing
+                      // authority for "the declared type of a storage member,
+                      // resolved through the active substitution", which is the
+                      // one already installed here (`posSubst`, the new type's
+                      // own). A no-op for every non-unit source and every
+                      // non-unit field, so the `continue` below still covers
+                      // the shapes it was written for.
+                      if (!v)
+                          v = unitValueForTarget(
+                              v, recordMemberTypeResolved(fs), argExpr);
                       if (!v) continue;
                   } else {
                       v = defaultV;
@@ -3350,6 +3372,19 @@ void Emitter::prePopulateBasePositionalFields(
         for (const auto& arg : td->primaryBaseCtorArgs) {
             if (!arg.value) { baseArgVals.clear(); break; }
             llvm::Value* v = lowerExpr(*arg.value);
+            // fix #3502 (§4.7 / §22.10 / §11.1, v0.283): the inheritance-clause
+            // face of the same gap — see the `storePrimaryCtorPositionalArgs`
+            // site above. A null `v` here used to ABANDON the whole
+            // pre-population (`clear(); break;`), so `class D(): B(C.Nothing())`
+            // left EVERY one of B's positional fields at its calloc zero.
+            // `baseArgVals.size()` is the index of the slot this argument is
+            // about to occupy — the store loop below pairs `baseArgVals[i]` with
+            // `basePosFields[i]` — so the rescue asks about the field this
+            // argument actually lands in, not an unrelated one.
+            if (!v && baseArgVals.size() < basePosFields.size())
+                v = unitValueForTarget(
+                    v, recordMemberTypeResolved(basePosFields[baseArgVals.size()]),
+                    arg.value.get());
             if (!v) { baseArgVals.clear(); break; }
             baseArgVals.push_back(v);
         }
@@ -3394,6 +3429,15 @@ void Emitter::prePopulateBasePositionalFields(
                 for (const auto& arg : chainCall->args) {
                     if (!arg.value) { baseArgVals.clear(); break; }
                     llvm::Value* v = lowerExpr(*arg.value);
+                    // fix #3502 (§4.7 / §22.10 / §11.1, v0.283): the explicit
+                    // `base(...)`-chain face of the same gap — same reasoning
+                    // and same pairing as the primaryBaseCtorArgs loop above.
+                    if (!v && baseArgVals.size() < basePosFields.size())
+                        v = unitValueForTarget(
+                            v,
+                            recordMemberTypeResolved(
+                                basePosFields[baseArgVals.size()]),
+                            arg.value.get());
                     if (!v) { baseArgVals.clear(); break; }
                     baseArgVals.push_back(v);
                 }
