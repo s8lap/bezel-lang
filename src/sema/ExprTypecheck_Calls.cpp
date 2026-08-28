@@ -11092,10 +11092,9 @@ void ExprTC::checkBuiltinNamedArgs(const ast::CallExpr& ce, Symbol* calleeSym) {
     // declared names. The four §22.5 violations the binder reports (unknown
     // name, bound twice, positional-after-named, required-not-supplied) are
     // exactly the ones reachable here, with exactly the user path's wording.
-    // The lookup returns CANDIDATE lists (one per declared overload at this
-    // argument count) and the call is admitted if it binds against any one of
-    // them; carrying the member side's four same-arity §9.6 pairs that way is
-    // #3424.
+    // fix #3424: the lookup is OVERLOAD-AWARE — where two overloads share an
+    // argument count and disagree on names (`string.Replace/2`), the call is
+    // admitted if it binds against EITHER, which is what #3398 had to reject.
     BuiltinBind bb;
     if (!bindBuiltinCandidates(cands, ce.args, ce.span.begin, desc, bb))
         return;  // the helper reported; no cascade

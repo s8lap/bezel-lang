@@ -449,15 +449,15 @@ std::string_view primitiveBuiltinSpelling(int primitive);
 // resolve against, and the stdlib's built-in overloads are distinguished at a
 // call site chiefly by argument count (`Remove(startIndex)` /
 // `Remove(startIndex, length)`). Where two overloads DO share an argument
-// count and disagree on names — `StringBuilder/1` (`capacity` vs `initial`),
+// count and disagree on names — `string.Replace/2` (`oldChar, newChar` vs
+// `oldValue, newValue`), `StringBuilder/1` (`capacity` vs `initial`),
 // `Dictionary/1` (`capacity` vs `comparer`) — the lookup returns BOTH
 // candidate lists and the caller accepts a call that binds against ANY ONE of
-// them, which is what admits a built-in constructor overload pair at all.
-// #3398 shipped a single-list lookup and had to OMIT such overloads entirely;
-// carrying the MEMBER side's four omitted §9.6 pairs the same way is #3424.
-// Keying off the overload the built-in TYPE dispatch picks is not available:
-// that dispatch lives in codegen's `lowerCallDispatch` / `lowerNew` arm chain,
-// which sema cannot consult.
+// them. #3398 shipped a single-list lookup and had to OMIT those overloads
+// entirely (a rejection where the names were perfectly well declared); this
+// is the fix that #3424 asked for. Keying off the overload the built-in TYPE
+// dispatch picks is not available: that dispatch lives in codegen's
+// `lowerCallDispatch` / `lowerNew` arm chain, which sema cannot consult.
 //
 // A row carries `required` — the count of LEADING parameters that declare no
 // default — so a §22.5 optional parameter (stdlib `TimeOnly(hour, minute,
@@ -486,7 +486,7 @@ struct BuiltinFormals {
 // names.size()`), in declaration order, or an EMPTY vector when the registry
 // carries no names for that (head, member) at that argument count. The head
 // `"String"` (the static call spelling) normalizes to `"string"`.
-// per §22.5 / stdlib §1 / §9.6 / §3.2, fix #3398 (candidate lists: #3425)
+// per §22.5 / stdlib §1 / §9.6 / §3.1 / §3.2, fix #3398 + #3424
 std::vector<BuiltinFormals> builtinParamNameCandidates(std::string_view typeHead,
                                                        std::string_view member,
                                                        std::size_t argCount);

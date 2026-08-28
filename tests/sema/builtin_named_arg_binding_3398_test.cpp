@@ -48,8 +48,22 @@
 //
 // Both are LOUD. The project's standing preference is that a loud rejection
 // beats a wrong value. Lifting limitation 2 (codegen consuming the binding)
-// is #3423; lifting limitation 1 (more rows, overload-aware lookup) is #3424;
-// the still-unfixed `new T(...)` twin is #3425.
+// is #3423, still open.
+//
+// UPDATED BY fix #3424 (§22.5, v0.283). Limitation 1 is now bounded rather
+// than absolute: `common::builtinParamNameCandidates` carries stdlib §3.1
+// `StringBuilder` as well, and the lookup is OVERLOAD-AWARE — it returns every
+// candidate name list declared at the call's argument count and the call is
+// admitted if it binds against ANY of them. So the two rows below that pinned
+// `sb.Append(zzz := …)` as "no names carried" and
+// `s.Replace(oldValue := …, newValue := …)` as "same-arity overloads disagree,
+// so reject" changed answers WITH the fix and are updated here in the same
+// commit (the fix-must-update-existing-tests discipline): the first now draws
+// the SHARED binder's unknown-name diagnostic, and the second COMPILES and
+// yields §9.6's value. A member on a head the registry still carries no rows
+// for (`Array<T>.IndexOf`) keeps limitation 1's rejection and is pinned below.
+// The `new T(...)` twin is fix #3425
+// (tests/sema/builtin_ctor_named_arg_binding_3425_test.cpp).
 //
 // FAIL-WITHOUT / PASS-WITH. Every `rejects_*` row below compiles clean on
 // `d05399c` (the pre-fix tree) — the diagnostic text it asserts does not exist
@@ -110,6 +124,11 @@ constexpr const char* kReorderDiag =
     "is not supported on a built-in member";
 constexpr const char* kNoNamesDiag =
     "named arguments are not supported on this built-in member";
+// fix #3424: the candidate-listing diagnostic, reported when a built-in member
+// has SEVERAL declared name lists at the call's argument count and the call
+// binds against none of them (the shared binder can only name one list).
+constexpr const char* kNoCandidateDiag =
+    "the named arguments match none of the declared overloads";
 
 // The SHARED §22.5 binder's own strings — the ones a user-declared callee
 // draws. Asserting these is what pins "same binder, not a second copy".
@@ -206,33 +225,100 @@ BEZEL_TEST(builtin_named_arg_3398,
 // Limitation 1: a built-in member the registry carries no names for.
 // ---------------------------------------------------------------------------
 
-// #3398: `StringBuilder` is outside the covered subset (stdlib §3.1), so a
-// named argument on it is rejected with the limitation named, rather than
-// bound positionally behind the caller's back. The diagnostic must say WHY
-// and what to do instead.
+// #3398 limitation 1, on a head the registry STILL carries no member rows for.
+// `Array<T>` is a reserved built-in name, so the check claims the call — and
+// with no names to match against, the name is rejected with the limitation
+// named rather than bound positionally behind the caller's back. The
+// diagnostic must say WHY and what to do instead.
+//
+// (This row was `sb.Append(zzz := …)` before fix #3424 widened the table to
+// stdlib §3.1; `StringBuilder` now HAS names, so that spelling draws the
+// shared binder's unknown-name diagnostic instead — pinned separately below.)
 BEZEL_TEST(builtin_named_arg_3398,
            rejects_named_arg_on_uncovered_builtin_member) {
     JitResult r = runAot(prog(
-        "    var sb := new StringBuilder(); "
-        "    sb.Append(zzz := \"ab\"); "
-        "    Console.WriteLine(sb.ToString()); "));
+        "    var a: Array<int> := [1, 2, 3]; "
+        "    Console.WriteLine(a.IndexOf(item := 2)); "));
     if (!hasError(r, kNoNamesDiag)) dumpDiagnostics(r);
     BEZEL_EXPECT_TRUE(hasError(r, kNoNamesDiag));
+    BEZEL_EXPECT_TRUE(hasError(r, "`Array.IndexOf`"));
     BEZEL_EXPECT_TRUE(hasError(r, "Pass the arguments positionally"));
     BEZEL_EXPECT_TRUE(hasError(r, "#3398"));
 }
 
-// #3398 / stdlib §9.6: `Replace/2` is deliberately OMITTED from the table —
-// §9.6 declares two arity-2 overloads that DISAGREE on parameter names
-// (`oldChar, newChar` and `oldValue, newValue`), and the (head, member, arity)
-// key cannot decide between them. The omission must reject, never guess.
+// fix #3424 / stdlib §3.1: `StringBuilder` is covered now, so an unknown name
+// on it draws the SHARED binder's diagnostic — the one a user-declared callee
+// draws — rather than limitation 1's "no names carried" message. This is the
+// row that proves the widening turned a not-supported rejection into a real
+// §22.5 name check.
 BEZEL_TEST(builtin_named_arg_3398,
-           rejects_named_arg_on_same_arity_name_disagreeing_overload) {
+           unknown_name_on_newly_covered_stringbuilder_draws_the_shared_diagnostic) {
+    JitResult r = runAot(prog(
+        "    using var sb := new StringBuilder(); "
+        "    sb.AppendLine(zzz := \"x\"); "));
+    if (!hasError(r, kUnknownNameDiag)) dumpDiagnostics(r);
+    BEZEL_EXPECT_TRUE(hasError(r, kUnknownNameDiag));
+    BEZEL_EXPECT_TRUE(hasError(r, "`StringBuilder.AppendLine`"));
+    BEZEL_EXPECT_TRUE(hasError(r, "`zzz`"));
+    BEZEL_EXPECT_FALSE(hasError(r, kNoNamesDiag));
+}
+
+// fix #3424 / stdlib §3.1: and the in-order named call on the newly covered
+// head COMPILES and computes the declared value. Rejected before the fix
+// (limitation 1), so this row is FAIL-WITHOUT for the widening.
+BEZEL_TEST(builtin_named_arg_3398,
+           accepts_in_order_named_args_on_stringbuilder_append) {
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+                        "    using var sb := new StringBuilder(); "
+                        "    sb.Append(value := \"ab\"); "
+                        "    Console.WriteLine(sb.ToString()); ")),
+                    std::string("ab"));
+}
+
+// fix #3424 / stdlib §9.6: `Replace/2` was deliberately OMITTED from #3398's
+// table — §9.6 declares two arity-2 overloads that DISAGREE on parameter names
+// (`oldChar, newChar` and `oldValue, newValue`) and the single-list lookup
+// could not decide between them, so a call naming EITHER pair was rejected.
+// The overload-aware lookup returns both candidate lists and admits a call
+// that binds against either, so this now compiles and computes §9.6's value.
+// (Was `rejects_named_arg_on_same_arity_name_disagreeing_overload`.)
+BEZEL_TEST(builtin_named_arg_3398,
+           accepts_named_args_on_same_arity_name_disagreeing_overload) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog(
+            "    var s := \"hello\"; "
+            "    Console.WriteLine(s.Replace(oldValue := \"l\", "
+            "newValue := \"L\")); ")),
+        std::string("heLLo"));
+}
+
+// fix #3424: …and the OTHER candidate of the same overload pair, whose
+// arguments are `char`s. Both candidates must be reachable, or the lookup has
+// merely swapped which single overload it knows about.
+BEZEL_TEST(builtin_named_arg_3398,
+           accepts_the_other_candidate_of_a_name_disagreeing_overload_pair) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(prog(
+            "    var s := \"hello\"; "
+            "    Console.WriteLine(s.Replace(oldChar := \'l\', "
+            "newChar := \'L\')); ")),
+        std::string("heLLo"));
+}
+
+// fix #3424: names taken from DIFFERENT candidates of the same overload pair
+// belong to no declared overload and must still be rejected — the candidate
+// rule is "binds against one list", never "every name appears in some list".
+// The diagnostic lists both declared spellings, because the shared binder can
+// only name one of them.
+BEZEL_TEST(builtin_named_arg_3398,
+           rejects_names_mixed_across_two_candidates_of_one_overload_pair) {
     JitResult r = runAot(prog(
         "    var s := \"hello\"; "
-        "    Console.WriteLine(s.Replace(oldValue := \"l\", newValue := \"L\")); "));
-    if (!hasError(r, kNoNamesDiag)) dumpDiagnostics(r);
-    BEZEL_EXPECT_TRUE(hasError(r, kNoNamesDiag));
+        "    Console.WriteLine(s.Replace(oldChar := \'l\', "
+        "newValue := \"L\")); "));
+    if (!hasError(r, kNoCandidateDiag)) dumpDiagnostics(r);
+    BEZEL_EXPECT_TRUE(hasError(r, kNoCandidateDiag));
+    BEZEL_EXPECT_TRUE(hasError(r, "(oldChar, newChar) | (oldValue, newValue)"));
 }
 
 // ---------------------------------------------------------------------------

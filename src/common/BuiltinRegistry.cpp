@@ -408,20 +408,20 @@ struct BuiltinParamNameRow {
 // table answers both spellings and the lookup normalizes `"String"` to
 // `"string"`.
 //
-// OMITTED, per the header's same-arity-disagreement rule: `Replace/2`
-// (`oldChar, newChar` | `oldValue, newValue`), `Repeat/2` (`c, count` |
-// `unit, count`), `Split/1` (`separator` | `separators`), `AsSpan/1`
-// (`start` | `r`). Widening the lookup to carry both candidate lists — which
-// this row shape now supports — is #3424. `Trim/0`, `ToUpper/0` and the other
-// nullary members carry no parameters and so cannot take a named argument at
-// all.
-constexpr std::array<BuiltinParamNameRow, 31> kStringParamNames = {{
+// The four overload pairs #3398 had to OMIT — `Replace/2`, `Repeat/2`,
+// `Split/1`, `AsSpan/1` — are present since #3424 as MULTIPLE candidate rows
+// at the same argument count. `Trim/0`, `ToUpper/0` and the other nullary
+// members carry no parameters and so cannot take a named argument at all.
+constexpr std::array<BuiltinParamNameRow, 39> kStringParamNames = {{
     // Construction (static)
     {"string", "From", 1, 1, {"value", "", "", ""}},
     {"string", "From", 3, 3, {"buffer", "start", "length", ""}},  // renamed v0.282 (§1)
     {"string", "FromCStringPointer", 1, 1, {"p", "", "", ""}},
     {"string", "FromWStringPointer", 1, 1, {"p", "", "", ""}},
     {"string", "Join", 2, 2, {"separator", "items", "", ""}},
+    // §9.6 declares two arity-2 `Repeat` overloads that disagree (#3424).
+    {"string", "Repeat", 2, 2, {"c", "count", "", ""}},
+    {"string", "Repeat", 2, 2, {"unit", "count", "", ""}},
     // Inspection (static)
     {"string", "IsNullOrEmpty", 1, 1, {"value", "", "", ""}},
     {"string", "IsNullOrWhiteSpace", 1, 1, {"value", "", "", ""}},
@@ -435,6 +435,9 @@ constexpr std::array<BuiltinParamNameRow, 31> kStringParamNames = {{
     // Substring / span views
     {"string", "Substring", 1, 1, {"startIndex", "", "", ""}},
     {"string", "Substring", 2, 2, {"startIndex", "length", "", ""}},
+    // §9.6 declares `AsSpan(start)` and `AsSpan(r: Range<int>)` (#3424).
+    {"string", "AsSpan", 1, 1, {"start", "", "", ""}},
+    {"string", "AsSpan", 1, 1, {"r", "", "", ""}},
     {"string", "AsSpan", 2, 2, {"start", "length", "", ""}},
     // Modification
     {"string", "Trim", 1, 1, {"chars", "", "", ""}},
@@ -447,6 +450,13 @@ constexpr std::array<BuiltinParamNameRow, 31> kStringParamNames = {{
     {"string", "Insert", 2, 2, {"startIndex", "value", "", ""}},
     {"string", "Remove", 1, 1, {"startIndex", "", "", ""}},
     {"string", "Remove", 2, 2, {"startIndex", "length", "", ""}},  // renamed v0.282 (§1)
+    // §9.6 declares two arity-2 `Replace` overloads that disagree (#3424).
+    {"string", "Replace", 2, 2, {"oldChar", "newChar", "", ""}},
+    {"string", "Replace", 2, 2, {"oldValue", "newValue", "", ""}},
+    // §9.6 declares `Split(separator: char)`, `Split(separator: string)` and
+    // `Split(separators: Array<char>)` — two candidate names at arity 1.
+    {"string", "Split", 1, 1, {"separator", "", "", ""}},
+    {"string", "Split", 1, 1, {"separators", "", "", ""}},
     // Comparison and equality
     {"string", "CompareTo", 1, 1, {"other", "", "", ""}},
     {"string", "Compare", 2, 2, {"a", "b", "", ""}},
@@ -465,6 +475,18 @@ constexpr std::array<BuiltinParamNameRow, 5> kEncodingParamNames = {{
     {"Encoding", "GetString", 1, 1, {"bytes", "", "", ""}},
     {"Encoding", "GetString", 3, 3, {"bytes", "start", "length", ""}},  // renamed v0.282 (§1)
     {"Encoding", "GetByteCount", 1, 1, {"s", "", "", ""}},
+}};
+
+// fix #3424 — stdlib §3.1 `StringBuilder` (v0.283). Every `Append` /
+// `AppendLine` overload declares its single parameter `value`, so one row per
+// argument count answers all of them.
+constexpr std::array<BuiltinParamNameRow, 6> kStringBuilderParamNames = {{
+    {"StringBuilder", "Append", 1, 1, {"value", "", "", ""}},
+    {"StringBuilder", "AppendLine", 1, 1, {"value", "", "", ""}},
+    {"StringBuilder", "AppendFormat", 2, 2, {"format", "args", "", ""}},
+    {"StringBuilder", "Insert", 2, 2, {"index", "value", "", ""}},
+    {"StringBuilder", "Remove", 2, 2, {"startIndex", "length", "", ""}},
+    {"StringBuilder", "Replace", 2, 2, {"oldValue", "newValue", "", ""}},
 }};
 
 // fix #3425 — the built-in CONSTRUCTOR rows (§17.7's closed constructor
@@ -554,10 +576,11 @@ constexpr std::array<std::string_view, 2> kBuiltinCtorLoweredByNameHeads = {
     "ExceptionInfo", "ReadOnlyStringSpan",
 };
 
-// The heads `kStringParamNames` / `kEncodingParamNames` answer for. See the
-// header for the two roles this predicate plays at the call site.
-constexpr std::array<std::string_view, 3> kBuiltinNamedArgTableHeads = {
-    "string", "String", "Encoding",
+// The heads `kStringParamNames` / `kEncodingParamNames` /
+// `kStringBuilderParamNames` answer for. See the header for the two roles this
+// predicate plays at the call site.
+constexpr std::array<std::string_view, 4> kBuiltinNamedArgTableHeads = {
+    "string", "String", "Encoding", "StringBuilder",
 };
 
 }  // namespace
@@ -1103,8 +1126,10 @@ std::vector<BuiltinFormals> builtinParamNameCandidates(std::string_view typeHead
         collectRows(kStringParamNames, typeHead, member, argCount, out);
     else if (typeHead == "Encoding")
         collectRows(kEncodingParamNames, typeHead, member, argCount, out);
+    else if (typeHead == "StringBuilder")
+        collectRows(kStringBuilderParamNames, typeHead, member, argCount, out);
     return out;
-}  // per §22.5 / stdlib §1 / §9.6 / §3.2
+}  // per §22.5 / stdlib §1 / §9.6 / §3.1 / §3.2
 
 // fix #3425 (§22.5 / §17.7, v0.283): see the header.
 std::vector<BuiltinFormals> builtinCtorParamNameCandidates(
