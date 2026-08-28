@@ -6152,13 +6152,32 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
                                                     currentFn_);
             builder_.CreateCondBr(isNull, contBB, dispBB);
             builder_.SetInsertPoint(dispBB);
+            // fix #3494 (§28.12 step 2's fault edge, v0.283): null the slot
+            // BEFORE the (possibly awaited) disposal, exactly as the `taskScope`
+            // arm above already does and for the same reason. A `DisposeAsync`
+            // that completes BY THROWING re-raises inside `emitAwaitSuspend`'s
+            // fault block, which runs `emitUnwindDisposals()` — the isUnwind
+            // pass over this very stack. With the slot still holding the object
+            // there, that pass disposed it AGAIN, through the SYNCHRONOUS
+            // fallback (this call passes a null `disposeAsyncFn` when isUnwind),
+            // so the destructor body ran on the fault edge — the body §28.12
+            // step 1 says `DisposeAsync` supersedes. The reclamation §28.12 step
+            // 2 does require on that edge is emitted by the `onFault` hook
+            // inside `emitAsyncDisposeAwaitAndFree`, so nulling here does not
+            // strand the object: it moves its reclamation from the wrong
+            // mechanism to the right one.
+            //
+            // Moving the store is safe on every other edge too: nothing between
+            // here and the call reads the slot, and the normal path's own
+            // reclamation uses the already-loaded `obj`, not a reload.
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
             // Pass the direct function pointer; null means sync fallback.
             // On the unwind path, always use sync fallback (pass null).
             emitAsyncDisposeAwaitAndFree(
                 obj, isUnwind ? nullptr : it->disposeAsyncFn,
-                isUnwind ? nullptr : it->asyncDisposeCls);
-            builder_.CreateStore(
-                llvm::ConstantPointerNull::get(ptrTy()), addr);
+                isUnwind ? nullptr : it->asyncDisposeCls,
+                isUnwind ? -1 : it->disposeAsyncVSlot);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;

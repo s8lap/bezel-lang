@@ -1426,6 +1426,17 @@ private:
         // disposerReclaimFns_ for §28.12 step 2's owned-field cascade + base
         // chain, which the async arm previously replaced with a bare `free`.
         const sema::TypeSymbol* asyncDisposeCls = nullptr;
+        // fix #3493 / §28.12 step 1 (v0.283): the VTABLE SLOT of the same
+        // `DisposeAsync` `disposeAsyncFn` was resolved from — `vtableSlot_`'s
+        // answer for that one MethodSymbol, not a second lookup — or -1 when
+        // the method is not `virtual`/`override`/`abstract` and therefore has
+        // no slot. Non-negative ⇒ the emit site dispatches through the object's
+        // vtable instead of calling `disposeAsyncFn` directly, so a derived
+        // runtime type behind a base-typed head runs its own `DisposeAsync`.
+        // -1 is not a degrade: §12.2 forbids hiding, so a non-virtual
+        // `DisposeAsync` cannot be redeclared in a subclass and the static
+        // resolution is already the only implementation reachable.
+        int disposeAsyncVSlot = -1;
         // stdlib §6.10 / §28.14 (v0.175, #808): an `await using var` bound to
         // a TaskScope. NORMAL exit: bz_task_scope_dispose_async (cancel the
         // scope's token, drain remaining children, swallow their faults;
@@ -10567,12 +10578,23 @@ private:
     // without this reclaim the source task leaks. False for every other row
     // (bound-owned-local / bound-owned-parameter sources are reclaimed by
     // emitUnwindDisposals / emitAsyncOwnedParamAutoDispose, respectively).
+    // fix #3494 / §28.12 step 2 (v0.283): `onFault` is emitted in the FAULT
+    // block — after the awaited task's exception object has been restored into
+    // `bz$exc` and the task reclaimed, and BEFORE `emitUnwindDisposals()` and
+    // the branch to `unwindBB()`. It is the awaiting site's own fault-edge
+    // obligation: code emitted after `emitAwaitSuspend` RETURNS lives on the
+    // `await.ok` edge only, so a site that must act on both edges (the
+    // `await using` physical reclamation §28.12 step 2 requires "when
+    // `DisposeAsync` completes by throwing") has no other place to put it.
+    // A parameter, not emitter state, so no nested emission can see a stale
+    // value (rules §13). Empty for every await that has no such obligation.
     llvm::Value* emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                   bool freeTaskAfter,
                                   bool takeResultAfter = false,
                                   bool markSpentAfter = false,
                                   bool deferTaskFree = false,
-                                  bool freeOnFault = false);
+                                  bool freeOnFault = false,
+                                  const std::function<void()>& onFault = {});
 
     // §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
     // stdlib §6.10 (v0.175, #808): emit the TaskScope disposal for one scope
@@ -10589,9 +10611,17 @@ private:
     // unwind path when asyncDispose is set. When `disposeAsyncFn` is null (sync
     // fallback: class not statically known, or not in async SM context), falls back
     // to emitDisposeAndReclaim (synchronous Dispose + free).
+    // fix #3493 / §28.12 step 1 (v0.283): `disposeAsyncVSlot` is the vtable slot
+    // of the SAME `DisposeAsync` `disposeAsyncFn` was resolved from, or -1 when
+    // that method is not virtual. When set, the call dispatches through the
+    // object's vtable, so a derived runtime type behind a base-typed
+    // `await using var` runs ITS OWN asynchronous cleanup ("whatever
+    // asynchronous cleanup THE CLASS defines"), as every other disposal path in
+    // the compiler already does.
     void emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
                                       llvm::Function* disposeAsyncFn,
-                                      const sema::TypeSymbol* cls = nullptr);
+                                      const sema::TypeSymbol* cls = nullptr,
+                                      int disposeAsyncVSlot = -1);
 
     // §30.7: emit an ASYNC ITERATOR method (declared `async`, contains `yield`,
     // returns IAsyncEnumerable<T> / IAsyncEnumerator<T>). Combines the iterator

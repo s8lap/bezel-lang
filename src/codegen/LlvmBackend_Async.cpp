@@ -3462,7 +3462,8 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                        bool freeTaskAfter, bool takeResultAfter,
                                        bool markSpentAfter,
                                        bool deferTaskFree,
-                                       bool freeOnFault) {
+                                       bool freeOnFault,
+                                       const std::function<void()>& onFault) {
     if (!task) return nullptr;
 
     // Store the awaited task into the frame's pending-task slot so the resumed
@@ -3673,6 +3674,29 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
                                          llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(markSpentFn, {awaitedTask});
         }
+        // fix #3494 / §28.12 step 2 (v0.283) — THE FAULT EDGE. Step 2 states,
+        // verbatim: "This includes the fault edge: when `DisposeAsync` completes
+        // by throwing, logical disposal is over — the runtime performs physical
+        // reclamation, then the exception propagates from the await."
+        //
+        // `onFault` is that "performs physical reclamation, THEN": the awaiting
+        // site's own fault-edge obligation, emitted BEFORE the general unwind
+        // pass and before the branch to `unwindBB()`. It exists because this
+        // block is where an awaited task's fault leaves the await — everything
+        // the awaiting site emitted AFTER `emitAwaitSuspend` returns lives on
+        // the `await.ok` edge and is unreachable from here. `await using`'s
+        // §28.12 step 2 reclamation was exactly such code, so a throwing
+        // `DisposeAsync` skipped it and the object was instead reclaimed by the
+        // unwind pass below — through the SYNCHRONOUS fallback, destructor body
+        // and all, which step 1 says `DisposeAsync` supersedes.
+        //
+        // A hook parameter rather than emitter state, deliberately: this is a
+        // property of ONE await, so there is no `clear()`/save-restore contract
+        // for a nested emission to get wrong (rules §13, issue 3505).
+        // Empty for every other await; `emitTaskScopeDispose`'s await does not
+        // use it (the runtime frees the scope on the fault edge and the slot is
+        // already nulled). // per §28.12 step 2, #3494
+        if (onFault) onFault();
         // §28.3 / CG21: dispose the using-vars unwound between here and the
         // handler (a caught-exception entry is skipped — it stays in flight), the
         // same as emitThrowValue's synchronous-throw path, then branch to the
@@ -4211,9 +4235,10 @@ void Emitter::emitFreeSpillArea(llvm::Value* self) {
 }
 
 
-// §28.12 / §30 (`await using` normal-exit path): call DisposeAsync() on `obj`
-// via `disposeAsyncFn` (the direct LLVM function pointer resolved at
-// registration time), await the returned Task (a proper suspend point), then
+// §28.12 / §30 (`await using`): call DisposeAsync() on `obj` — dispatched
+// through `disposeAsyncVSlot` when the method is virtual (fix #3493), else via
+// `disposeAsyncFn`, the direct LLVM function pointer resolved at registration
+// time — await the returned Task (a proper suspend point), then
 // run §28.12 step 2's PHYSICAL RECLAMATION on it — the class's
 // `bz$<C>$DisposeReclaim` (owned-field cascade + base chain, run-once guarded,
 // destructor body skipped per step 1) followed by emitReclaimBlock's block
@@ -4221,6 +4246,13 @@ void Emitter::emitFreeSpillArea(llvm::Value* self) {
 // that reclaim function, and a head with none degrades to the full synchronous
 // emitDisposeAndReclaim (see the tail). Before fix #3470 this was a bare
 // `free(obj)` and the owned subtree was stranded.
+//
+// The reclamation is emitted on BOTH edges of the await (fix #3494): §28.12
+// step 2's fault-edge sentence — "when `DisposeAsync` completes by throwing,
+// logical disposal is over — the runtime performs physical reclamation, then
+// the exception propagates from the await" — makes the throwing case part of
+// this function's contract, and the fault edge does not flow through the code
+// after `emitAwaitSuspend` returns. See the lambda below.
 //
 // When `disposeAsyncFn` is null (concrete class not statically known at
 // registration time — interface-typed local or class not yet emitted) OR the
@@ -4235,7 +4267,8 @@ void Emitter::emitFreeSpillArea(llvm::Value* self) {
 // DisposeAsync's function type is: ptr(ptr) — takes `this`, returns Task*.
 void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
                                            llvm::Function* disposeAsyncFn,
-                                           const sema::TypeSymbol* cls) {
+                                           const sema::TypeSymbol* cls,
+                                           int disposeAsyncVSlot) {
     bool inAsyncSM = (smKind_ == SuspendKind::Await ||
                       smKind_ == SuspendKind::AsyncYield) &&
                      smStateStruct_ && smSelf_ && asyncResumeFn_;
@@ -4256,24 +4289,6 @@ void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
         emitDisposeAndReclaim(obj);
         return;
     }
-
-    // Call DisposeAsync() directly through the resolved function pointer.
-    // DisposeAsync is an async method entry: returns a Task* immediately (the
-    // async body runs synchronously until the first genuine suspension); the
-    // result Task is completed either inline (already-done path) or via a
-    // continuation when the async body's own awaits complete.
-    // Function type: ptr DisposeAsync(ptr this).
-    auto* dispAsyncTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
-    llvm::Value* task = builder_.CreateCall(
-        dispAsyncTy, disposeAsyncFn, {obj}, "dispasync.task");
-
-    // Await the Task returned by DisposeAsync() — a proper suspend point
-    // inside the enclosing async method's Resume function. emitAwaitSuspend
-    // spills suspend-locals, registers the resume continuation on the task,
-    // and returns; the resume block reads the result and re-raises any fault.
-    // freeTaskAfter=true: the task is anonymous/single-use (no other owner).
-    // Result type is null (DisposeAsync returns Task, not Task<T>).
-    emitAwaitSuspend(task, /*resultTy=*/nullptr, /*freeTaskAfter=*/true);
 
     // fix #3470 (§28.12 step 2, v0.283): PHYSICAL RECLAMATION. Step 2 reads,
     // verbatim: "owned fields are disposed in reverse declaration order, the
@@ -4298,29 +4313,107 @@ void Emitter::emitAsyncDisposeAwaitAndFree(llvm::Value* obj,
     // the synchronous core runs, so the two paths cannot drift. `cls` is the
     // SAME resolution `disposeAsyncFn` came from (registerUsingDisposal's
     // `cls`), never a second classification of what is in the slot.
+    //
+    // fix #3494 (§28.12 step 2, v0.283): resolved and CLOSED OVER here, before
+    // the await, because step 2's "This includes the fault edge: when
+    // `DisposeAsync` completes by throwing, logical disposal is over — the
+    // runtime performs physical reclamation, then the exception propagates from
+    // the await" gives this sequence TWO emission points, not one. Everything
+    // emitted after `emitAwaitSuspend` returns lands on the `await.ok` edge
+    // alone; the fault edge leaves the await inside `emitAwaitSuspend`'s own
+    // `await.fault` block. ONE lambda, emitted on both edges, is what keeps the
+    // two from drifting — the same discipline `emitPhysicalReclamationSteps`
+    // applies to the synchronous/`await using` split one level down.
     llvm::Function* reclaimFn = nullptr;
     if (cls) {
         auto rit = disposerReclaimFns_.find(cls);
         if (rit != disposerReclaimFns_.end()) reclaimFn = rit->second;
     }
-    if (reclaimFn) {
-        builder_.CreateCall(reclaimFn, {obj});
-        emitReclaimBlock(obj);
-    } else {
-        // DEGRADE, in the recoverable direction. No reclaim function exists for
-        // this head: the class is IMPORTED (its `bz$<C>$DisposeReclaim` belongs
-        // to the defining module and is not part of the exported ABI) or
-        // GENERIC (its physical reclamation is per-instantiation). Fall back to
-        // the FULL synchronous reclamation, which is the same arm the
-        // `!disposeAsyncFn` sync fallback above already takes: the object's
-        // owned subtree and base chain are reclaimed correctly through the
-        // vtable's most-derived `Dispose`, at the cost of also running the
-        // destructor body §28.12 step 1 would have skipped. That is a defined
-        // synchronous-fallback shape the section already sanctions elsewhere,
-        // and it is strictly better than the alternative this replaces — which
-        // ran no cleanup at all and stranded the whole subtree.
-        emitDisposeAndReclaim(obj);
+    auto emitPhysicalReclamation = [&]() {
+        if (reclaimFn) {
+            builder_.CreateCall(reclaimFn, {obj});
+            emitReclaimBlock(obj);
+        } else {
+            // DEGRADE, in the recoverable direction. No reclaim function exists
+            // for this head: the class is IMPORTED (its `bz$<C>$DisposeReclaim`
+            // belongs to the defining module and is not part of the exported
+            // ABI) or GENERIC (its physical reclamation is per-instantiation).
+            // Fall back to the FULL synchronous reclamation, which is the same
+            // arm the `!disposeAsyncFn` sync fallback above already takes: the
+            // object's owned subtree and base chain are reclaimed correctly
+            // through the vtable's most-derived `Dispose`, at the cost of also
+            // running the destructor body §28.12 step 1 would have skipped.
+            // That is a defined synchronous-fallback shape the section already
+            // sanctions elsewhere, and it is strictly better than the
+            // alternative this replaces — which ran no cleanup at all and
+            // stranded the whole subtree.
+            emitDisposeAndReclaim(obj);
+        }
+    };
+
+    // Call DisposeAsync(). DisposeAsync is an async method entry: it returns a
+    // Task* immediately (the async body runs synchronously until the first
+    // genuine suspension); the result Task is completed either inline
+    // (already-done path) or via a continuation when the async body's own
+    // awaits complete. Function type: ptr DisposeAsync(ptr this).
+    //
+    // fix #3493 (§28.12 step 1, v0.283): DISPATCH, not a direct call, whenever
+    // `DisposeAsync` occupies a vtable slot. Step 1 says the awaited
+    // `DisposeAsync()` "performs whatever asynchronous cleanup THE CLASS
+    // defines", and for `await using var u: Base := new Der();` the class is
+    // `Der` — every other disposal path in the compiler already resolves the
+    // runtime class through the vtable, which is why the synchronous twin of
+    // that program is correct and only the `await` spelling was wrong.
+    //
+    // #3493 filed this as needing "a dispatch point that does not exist" in the
+    // fixed vtable layout. MEASURED, and that premise is refuted for this half:
+    // §12.2 forbids hiding, so a derived `DisposeAsync` can only exist as an
+    // `override` of a `virtual`/`abstract` base member — and `isVirtual` puts
+    // exactly those in `vtableSlot_`. So in every program where the defect can
+    // manifest through a class-typed head, the slot is already there and
+    // already filled with the most-derived body (verified in the emitted
+    // module: `vt$M.Base[6] = bz$M.Base$DisposeAsync`,
+    // `vt$M.Der[6] = bz$M.Der$DisposeAsync`). `disposeAsyncVSlot` is
+    // `vtableSlot_[dams]` for the SAME `dams` `disposeAsyncFn` was resolved
+    // from (registerUsingDisposal), never a second lookup, and is -1 when the
+    // method is non-virtual — where the static call is already exact, because
+    // no derived class can declare a `DisposeAsync` of its own.
+    auto* dispAsyncTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    llvm::Value* callee = disposeAsyncFn;
+    if (disposeAsyncVSlot >= 0) {
+        llvm::Value* vptr =
+            builder_.CreateLoad(ptrTy(), obj, "dispasync.vptr");
+        llvm::Value* slotPtr = builder_.CreateGEP(
+            ptrTy(), vptr,
+            {builder_.getInt32(static_cast<unsigned>(disposeAsyncVSlot))},
+            "dispasync.slot");
+        callee = builder_.CreateLoad(ptrTy(), slotPtr, "dispasync.fn");
     }
+    llvm::Value* task = builder_.CreateCall(
+        dispAsyncTy, callee, {obj}, "dispasync.task");
+
+    // Await the Task returned by DisposeAsync() — a proper suspend point
+    // inside the enclosing async method's Resume function. emitAwaitSuspend
+    // spills suspend-locals, registers the resume continuation on the task,
+    // and returns; the resume block reads the result and re-raises any fault.
+    // freeTaskAfter=true: the task is anonymous/single-use (no other owner).
+    // Result type is null (DisposeAsync returns Task, not Task<T>).
+    //
+    // fix #3494: the last argument is §28.12 step 2's FAULT EDGE — the same
+    // reclamation, emitted in `await.fault` before the unwind pass runs and
+    // before the exception propagates. Before this, the fault edge reached
+    // NONE of the code below, and the object was reclaimed instead by the
+    // enclosing unwind pass, which takes the SYNCHRONOUS fallback
+    // (`emitDisposals` passes a null `disposeAsyncFn` when `isUnwind`) and so
+    // ran the destructor body step 1 says `DisposeAsync` supersedes. The
+    // caller nulls the slot BEFORE this call precisely so that unwind pass
+    // now finds nothing left to dispose (the `taskScope` arm's precedent).
+    emitAwaitSuspend(task, /*resultTy=*/nullptr, /*freeTaskAfter=*/true,
+                     /*takeResultAfter=*/false, /*markSpentAfter=*/false,
+                     /*deferTaskFree=*/false, /*freeOnFault=*/false,
+                     /*onFault=*/emitPhysicalReclamation);
+
+    emitPhysicalReclamation();
 }
 
 

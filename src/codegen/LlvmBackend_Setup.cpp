@@ -15873,6 +15873,24 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                             // the incoming side alone reinstates a duplicate
                             // resolution at the retired location.
                             d.asyncDisposeCls = cls;
+                            // fix #3493 / §28.12 step 1 (v0.283): the SAME
+                            // `dams` this resolution already answered, asked of
+                            // the authority that already decides "does this
+                            // method dispatch through the vtable" —
+                            // `vtableSlot_`, populated by `buildVtable` in
+                            // `declareVtables()`, which runs before any body is
+                            // lowered. No second classification: `isVirtual`
+                            // decides membership, and this reads its result.
+                            //
+                            // Absent ⇒ non-virtual ⇒ §12.2's no-hiding rule
+                            // means no subclass can declare a `DisposeAsync` at
+                            // all, so `disposeAsyncFn` is already the only
+                            // implementation any runtime type in this slot can
+                            // have, and the direct call stays exact.
+                            auto vsIt = vtableSlot_.find(dams);
+                            if (vsIt != vtableSlot_.end())
+                                d.disposeAsyncVSlot =
+                                    static_cast<int>(vsIt->second);
                         }
                     }
                 }
