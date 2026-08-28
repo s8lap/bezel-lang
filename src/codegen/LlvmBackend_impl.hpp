@@ -4413,10 +4413,16 @@ private:
     //     only, so `[3]()` — a `[3 x void]` — passes straight through it and
     //     traps in `entryAlloca`/`bindParameters`; issue 3528, filed loud and
     //     deliberately not patched.
-    //   * `emitValueToString`'s unit arm materialises a VALUE
-    //     (`ConstantInt::get(unitPlaceholderTy(), 0)`), which is a different
-    //     operation from choosing a storage TYPE and is not this helper's
-    //     business.
+    //   * `emitValueToString`'s unit arm answers §8.5's `"()"` string, and its
+    //     caller only ROUTES a `Kind::Unit` operand there — a rendering
+    //     decision, not a storage-type one, so it is not this helper's
+    //     business.  (An earlier revision of this bullet said that arm
+    //     "materialises a VALUE (`ConstantInt::get(unitPlaceholderTy(), 0)`)".
+    //     It does not: the arm returns `lowerStringLiteral(...)`, and
+    //     `LlvmBackend_String.cpp` mentions `unitPlaceholderTy` only in a
+    //     comment.  The conclusion was right and the reason was wrong — which
+    //     is the third time this inventory has been corrected, so the reason
+    //     is now stated in terms of what the code returns.)
     //   * The five signature-building sites `lowerTypeRef`'s own comment lists
     //     as still calling the raw lowerings (extern/FFI parameter list, the
     //     static-auto-property global, the imported indexer's parameter and
