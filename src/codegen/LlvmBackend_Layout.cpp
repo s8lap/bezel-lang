@@ -1486,7 +1486,16 @@ llvm::Type* Emitter::storageType(const sema::Symbol* m) {
     // the layout gets the real field type from `fieldTypes_`.
     if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m))
         if (fs->posParam && fs->posParam->type)
-            return lowerType(fs->posParam->type.get());
+            // fix #3527 (§4.7 / §9.1, v0.283): `unitStorageTy`, like the body-
+            // field and auto-property arms below. #2827 added the `()`→one-byte
+            // substitution to those two and not to this one, so a §9.1
+            // POSITIONAL field of unit type stayed `void` and `recordStruct`
+            // laid the record out with a `void` MEMBER. `setupBoxDescriptors`
+            // mints a ToString thunk for every record in the module and that
+            // thunk LOADS the record value, so merely DECLARING `record R(A:
+            // int, U: ());` — with no value of it anywhere — killed `bezelc`
+            // with SIGILL and no diagnostic (measured rc=132 on ef339fa).
+            return unitStorageTy(lowerType(fs->posParam->type.get()));
     // §2.5 / §22.8 (issue #328 FINDING [7]): an IMPORTED instance field has no
     // ast::FieldDecl — its resolved type rides the importedMemberType side table
     // (ModuleLoader). Without consulting it, an imported field of a non-int type
@@ -1518,18 +1527,17 @@ llvm::Type* Emitter::storageType(const sema::Symbol* m) {
         // faithful. A `()?` target never reaches here (`isNullableValueTy`
         // claims `()?` first and returns the tagged `{i8, i8}` optional — a
         // real first-class type, no substitution needed).
-        llvm::Type* fty = lowerType(fd->type.get());
-        if (fty && fty->isVoidTy()) fty = unitPlaceholderTy();
-        return fty;
+        // fix #3527: asked through `unitStorageTy` rather than spelled inline,
+        // so this arm and the two beside it cannot drift again.
+        return unitStorageTy(lowerType(fd->type.get()));
     }
     if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl)) {
         // Same #2827 substitution as the field arm above — an auto-property
         // with `()?`-shaped backing storage is reduced by `lowerType` to its
         // declared type's LLVM type, which is `void` for `()`. Gated
         // identically.
-        llvm::Type* pty = lowerType(pd->type.get());
-        if (pty && pty->isVoidTy()) pty = unitPlaceholderTy();
-        return pty;
+        // fix #3527: same one spelling as the two arms above.
+        return unitStorageTy(lowerType(pd->type.get()));
     }
     return i32();
 }

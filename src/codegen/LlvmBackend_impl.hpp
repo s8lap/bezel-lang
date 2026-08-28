@@ -2955,7 +2955,7 @@ private:
     llvm::AllocaInst* entryAlloca(llvm::Type* ty) {
         llvm::BasicBlock& entry = currentFn_->getEntryBlock();
         llvm::IRBuilder<> tmp(&entry, entry.begin());
-        if (ty && ty->isVoidTy()) ty = unitPlaceholderTy();
+        ty = unitStorageTy(ty);  // fix #3527: one spelling, asked not re-derived
         return tmp.CreateAlloca(ty);
     }
 
@@ -4370,6 +4370,28 @@ private:
     // substitution — `lowerLocalDecl`'s #1619 guard, the parameter-signature
     // substitution (`lowerParamType`) and the `()?` payload slot all read it.
     llvm::Type* unitPlaceholderTy() { return llvm::Type::getInt8Ty(llvm_); }
+
+    // fix #3527 (§4.7 *The unit type*, v0.283): the ONE spelling of "the
+    // STORAGE form of a lowered type". `lowerType`/`lowerTypeRef` answer LLVM
+    // `void` for exactly one thing — the unit type's `Kind::Unit` arm; every
+    // other arm answers a sized type — and `void` is not a legal alloca,
+    // parameter, struct-member or array-element type. Asking `DataLayout` for
+    // its size or alignment executes an `llvm_unreachable`, which in a release
+    // LLVM is a `ud2`: `bezelc` dies of SIGILL with NO DIAGNOSTIC, the worst
+    // outcome available. §4.7 gives the unit type exactly one value, so it
+    // carries no information and one inert byte is a faithful slot.
+    //
+    // This existed as an INLINE two-line idiom at seven independent sites
+    // (`entryAlloca`, `lowerParamType`, `lowerParamTypeRef`, `storageType`'s
+    // body-field and auto-property arms, `emitValueToString`'s caller, the
+    // state-machine frame planner) and the eighth — `storageType`'s POSITIONAL
+    // RECORD FIELD arm — was simply missed, which is issue 3527: declaring
+    // `record R(A: int, U: ());` killed the compiler outright. Every one of
+    // those sites now asks here, so a missed arm is a missed CALL rather than a
+    // silently different spelling.
+    llvm::Type* unitStorageTy(llvm::Type* ty) {
+        return (ty && ty->isVoidTy()) ? unitPlaceholderTy() : ty;
+    }
     // A nullable VALUE type — a value primitive (isNullablePrimTy), an enum
     // (isNullableEnumTy), a record (isNullableRecordTy), a CHOICE
     // (isNullableChoiceTy, fix #2447), a value-builtin
@@ -4733,7 +4755,7 @@ private:
         llvm::Type* ty = lowerType(t);
         // `lowerType(nullptr)` also answers void, but that is "no type node"
         // (an unannotated parameter), which this substitution must not claim.
-        return (t && ty && ty->isVoidTy()) ? unitPlaceholderTy() : ty;
+        return t ? unitStorageTy(ty) : ty;
     }
     // The sema-TypeRef face of lowerParamType — used by the imported-signature
     // paths, which reconstruct parameters from `ParameterSymbol::resolvedDeclType`
@@ -4741,7 +4763,7 @@ private:
     // cross-module call is emitted against a mismatched signature.
     llvm::Type* lowerParamTypeRef(const sema::TypeRef* rt) {
         llvm::Type* ty = lowerTypeRef(rt);
-        return (rt && ty && ty->isVoidTy()) ? unitPlaceholderTy() : ty;
+        return rt ? unitStorageTy(ty) : ty;
     }
 
     // fix #568 / §14.1 / §7.1: coerce a ReturnStmt value `v` to the function's

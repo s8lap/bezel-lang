@@ -159,7 +159,7 @@ void Emitter::collectSuspendLocals(
         // can drift. The two MUST agree: the per-suspend spill stores
         // `alloca->getAllocatedType()` bytes into this field, and `entryAlloca`
         // already gives the unit local an `i8` alloca.
-        if (ty && ty->isVoidTy()) ty = unitPlaceholderTy();
+        ty = unitStorageTy(ty);  // fix #3527: the shared spelling
         if (frameCapturedLocals_.count(static_cast<const void*>(node))) {
             // fix #3484 follow-up (§27.5 / §30.1, v0.283): remember what the
             // field WOULD have been. #808 widens this one to ptr because
@@ -228,7 +228,7 @@ void Emitter::collectSuspendLocals(
                 // type from a different source (the annotation, else the
                 // iterable's element), so it needs the guard of its own; a
                 // `void` field here traps identically.
-                if (ty && ty->isVoidTy()) ty = unitPlaceholderTy();
+                ty = unitStorageTy(ty);  // fix #3527: the shared spelling
                 if (frameCapturedLocals_.count(static_cast<const void*>(fs)))
                     ty = ptrTy();
                 out.push_back({fs, ty});

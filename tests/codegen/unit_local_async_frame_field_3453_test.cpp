@@ -230,3 +230,34 @@ BEZEL_TEST(codegen_unit_local_async_frame_field_3453,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("()\n4\n"));
 }
+
+// ── T7 — the ASYNC ITERATOR venue (§30.7's `IAsyncEnumerable<T>`, whose bodies
+// §29.3 governs alongside the synchronous form). It reaches the frame planner
+// through a THIRD caller (`emitAsyncIteratorMethod`), whose own trap fired at a
+// different line — `getTypeAllocSize` inside the `GetAsyncEnumerator` clone —
+// which is why it is a row of its own rather than assumed covered by T1/T4.
+// MEASURED rc=132 on ef339fa; the sum pins that the frame round-trips.
+BEZEL_TEST(codegen_unit_local_async_frame_field_3453,
+           unit_local_in_async_iterator_body_spec_4_7_29_3_30_7) {
+    auto r = runAot(
+        "module M3453G; "
+        "class C "
+        "  public static async method Seq(): IAsyncEnumerable<int> "
+        "    var u: () := (); "
+        "    yield return 1; "
+        "    Console.WriteLine(u.ToString()); "
+        "    yield return 2; "
+        "  end Seq; "
+        "  public static async method Main(): Task<int> "
+        "    var n := 0; "
+        "    await for var x in C.Seq() do "
+        "      n := n + x; "
+        "    end for; "
+        "    Console.WriteLine(n.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("()\n3\n"));
+}
