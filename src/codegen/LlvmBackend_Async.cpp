@@ -3577,7 +3577,7 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
     // clobber the live alloca with the frame's stale (zero) value. (This is the
     // analogue of the yield handler's pre-yield spill, but here it must precede
     // the already-done fast path too.)
-    for (auto& [allocaSlot, fieldIdx] : smAllocaToField_) {
+    for (auto& [allocaSlot, fieldIdx] : smSpillsInFrameOrder()) {  // fix #3504
         llvm::Value* fptr =
             builder_.CreateStructGEP(smStateStruct_, smSelf_, fieldIdx);
         llvm::Value* curVal =
@@ -3613,7 +3613,7 @@ llvm::Value* Emitter::emitAwaitSuspend(llvm::Value* task, llvm::Type* resultTy,
     builder_.SetInsertPoint(resumeBB);
     // Restore all suspend-locals from the frame (they were spilled above; on the
     // fast path they are simply re-loaded with the same values).
-    for (auto& [allocaSlot, fieldIdx] : smAllocaToField_) {
+    for (auto& [allocaSlot, fieldIdx] : smSpillsInFrameOrder()) {  // fix #3504
         llvm::Value* fptr =
             builder_.CreateStructGEP(smStateStruct_, smSelf_, fieldIdx);
         llvm::Value* savedVal =

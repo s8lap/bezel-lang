@@ -642,6 +642,23 @@ void Emitter::clearSmFrame() {
 }
 
 
+// fix #3504 (§29.3 / §30.2, v0.283): see the declaration in
+// LlvmBackend_impl.hpp. Ordering the spill set on the frame field index is what
+// makes the emitted spill/restore group independent of where the allocas
+// happened to land in memory.
+std::vector<std::pair<llvm::AllocaInst*, unsigned>>
+Emitter::smSpillsInFrameOrder() const {
+    std::vector<std::pair<llvm::AllocaInst*, unsigned>> out(
+        smAllocaToField_.begin(), smAllocaToField_.end());
+    std::stable_sort(out.begin(), out.end(),
+                     [](const std::pair<llvm::AllocaInst*, unsigned>& a,
+                        const std::pair<llvm::AllocaInst*, unsigned>& b) {
+                         return a.second < b.second;
+                     });
+    return out;
+}
+
+
 void Emitter::collectYields(const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
                            std::vector<const ast::YieldStmt*>& out) {
     for (const auto& s : stmts) {

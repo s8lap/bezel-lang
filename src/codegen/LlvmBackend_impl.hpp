@@ -33,6 +33,7 @@
 #include "sema/TypeResolution.hpp"  // typeRefEqual — §2.8.3 rule 4 exact type identity
 #include "sema/Symbol.hpp"
 
+#include "llvm/ADT/MapVector.h"   // fix #3504: deterministic iteration for a pointer-keyed map
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -10791,6 +10792,24 @@ private:
     // a member of the enum — the gate is then closed by nulling smStateGEP_).
     void clearSmFrame();
 
+    // fix #3504 (§29.3 "Iterator methods" / §30.2 "`await`", v0.283): the
+    // suspend-local spill set, in FRAME FIELD order.
+    //
+    // Every site that emits a spill/restore group iterates smAllocaToField_, so
+    // that iteration order IS the emitted instruction order. Field index is the
+    // one key that is both unique to a slot and assigned deterministically (by
+    // buildStateMachineFrame, walking the body), so ordering on it makes
+    // `bezelc`'s output reproducible under any change to the compiler's own
+    // allocation order — and makes a spill group read in frame layout order,
+    // which is also how a reviewer wants to read it. The sort is STABLE over a
+    // MapVector, so even a field index that somehow served two slots would keep
+    // a deterministic order rather than depending on the sort's tie handling.
+    //
+    // Order within one group is semantically free: every member is stored before
+    // the suspend branch and loaded after the resume, so no two of them race.
+    // This is a determinism fix, not a correctness one.
+    std::vector<std::pair<llvm::AllocaInst*, unsigned>> smSpillsInFrameOrder() const;
+
     // fix #3505 (§29.3 "Iterator methods" / §30.1 "`async` methods" /
     // §30.6 "Async lambdas" / §30.7 "Async iterators", v0.283): THE
     // suspend/resume frame member list, and the single authority both halves of
@@ -10824,7 +10843,16 @@ private:
     using SmFrameBlockVec       = std::vector<llvm::BasicBlock*>;
     using SmFrameNodeFieldMap   = std::unordered_map<const ast::Node*, unsigned>;
     using SmFrameSymFieldMap    = std::unordered_map<const sema::Symbol*, unsigned>;
-    using SmFrameAllocaFieldMap = std::unordered_map<llvm::AllocaInst*, unsigned>;
+    // fix #3504 (§29.3 / §30.2, v0.283): a MapVector, NOT an unordered_map.
+    // The per-suspension spill/restore group is emitted by ITERATING this map,
+    // so its iteration order reaches the emitted IR — and iterating a
+    // POINTER-keyed unordered_map orders by whether the key addresses collide
+    // modulo the bucket count, which any change to the compiler's own
+    // allocation order can flip. Measured (issue 3504): adding one unrelated
+    // `std::unordered_set::insert` on the compiler side reordered a program's
+    // spill/restore pairs with no other change. MapVector iterates in INSERTION
+    // order, which is driven by the AST walk and therefore reproducible.
+    using SmFrameAllocaFieldMap = llvm::MapVector<llvm::AllocaInst*, unsigned>;
     using SmFrameAllocaSet      = std::unordered_set<llvm::AllocaInst*>;
 
 #define BEZEL_SM_FRAME_MEMBERS(X)                                              \
@@ -11059,7 +11087,7 @@ private:
     // (wires the source slot to the field) and the iterator Dispose body.
     std::unordered_map<const ast::Node*, unsigned> smForInSrcFields_;
     // Maps alloca slot → frame field index (spill at suspend, restore at state entry).
-    std::unordered_map<llvm::AllocaInst*, unsigned> smAllocaToField_;
+    SmFrameAllocaFieldMap smAllocaToField_;  // fix #3504
 
     // fix #3466 (§27.5 / §30.1, v0.283): the frame's paramCellFields, published
     // for the FUNCTION the state-machine body lowers into (`smParamCellFieldFn_`
@@ -11182,7 +11210,7 @@ private:
         unsigned             smNextSuspendState_;
         std::unordered_map<const ast::Node*, unsigned>     smLocalFields_;
         std::unordered_map<const ast::Node*, unsigned>     smForInSrcFields_;
-        std::unordered_map<llvm::AllocaInst*, unsigned>    smAllocaToField_;
+        SmFrameAllocaFieldMap                             smAllocaToField_;
         // --- iterator-specific frame state ---
         unsigned             iterCurrentValField_;
         llvm::Type*          iterElemTy_;

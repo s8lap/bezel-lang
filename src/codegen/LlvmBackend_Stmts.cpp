@@ -3313,7 +3313,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (smStateStruct_ && smSelf_ &&
             (smKind_ == SuspendKind::Yield || isAsyncYield)) {
             // Save all suspend-locals to the state frame before yielding.
-            for (auto& [allocaSlot, fieldIdx] : smAllocaToField_) {
+            for (auto& [allocaSlot, fieldIdx] : smSpillsInFrameOrder()) {  // fix #3504
                 llvm::Value* fptr = builder_.CreateStructGEP(
                     smStateStruct_, smSelf_, fieldIdx);
                 llvm::Value* curVal = builder_.CreateLoad(
@@ -3806,7 +3806,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             if (nextState < smStateBBs_.size()) {
                 builder_.SetInsertPoint(smStateBBs_[nextState]);
                 // Restore all iterator locals from the state struct.
-                for (auto& [allocaSlot, fieldIdx] : smAllocaToField_) {
+                for (auto& [allocaSlot, fieldIdx] : smSpillsInFrameOrder()) {  // fix #3504
                     llvm::Value* fptr = builder_.CreateStructGEP(
                         smStateStruct_, smSelf_, fieldIdx);
                     llvm::Value* savedVal = builder_.CreateLoad(
