@@ -8011,6 +8011,49 @@ private:
         return other;
     }
 
+    // fix #3538 (§8.1 / §8.3 / §8.6, v0.283): does the ARGUMENT's static type
+    // settle `valueReceiver.Equals(arg)` at False on its own?
+    //
+    // §8.1 declares exactly one universal `Equals(other: Object?)`, so a
+    // value-typed argument is BOXED before the comparison (§8.6), and §8.3's
+    // record and enum rows compare a value only against a value OF ITS OWN
+    // TYPE. A box of `int`, of `bool`, of `()`, of a DIFFERENT record / enum /
+    // choice, or a `string`, therefore cannot equal a box of `ts` whatever the
+    // bytes inside: the answer is known statically and no box need be minted to
+    // discover it. The caller still LOWERS the argument, for its §22.5 effects.
+    //
+    // Answers false — meaning "ask at run time" — for `Object`, an interface, a
+    // class, ANY nullable form, an inline array and an unresolved generic,
+    // because each of those CAN dynamically be a box of `ts`, and only the box's
+    // own §8.3 `Equals` can tell.
+    //
+    // This is a classification of the ARGUMENT, deliberately not a second
+    // spelling of "are these the same type": the receiver side is the caller's
+    // `ts`, and the one comparison performed here is `declaration != ts` on the
+    // TypeSymbol the resolver already computed.
+    bool equalsArgSettlesFalse(const sema::TypeRef* at,
+                               const sema::TypeSymbol* ts) {
+        if (!at || !ts || at->nullable) return false;
+        using K = sema::TypeRef::Kind;
+        if (at->kind == K::Unit) return true;                  // §4.7
+        if (at->kind == K::Primitive)                          // `string` too
+            return at->primitive != sema::PrimitiveType::Object;
+        if (at->kind == K::Named && at->declaration &&
+            at->declaration != ts) {
+            auto k = at->declaration->kind;
+            return k == ast::TypeDeclKind::Record ||
+                   k == ast::TypeDeclKind::Enum ||
+                   k == ast::TypeDeclKind::Choice;
+        }
+        return false;
+    }
+
+    // fix #3538: the run-time face of the same question — see the definition in
+    // LlvmBackend_Calls2.cpp.
+    llvm::Value* lowerValueSemUniversalEquals(const sema::TypeRef* recvTy,
+                                              llvm::Value* recv,
+                                              const ast::CallExpr& call);
+
     // fix #3095 (§4.7, v0.252): boxForTarget's `()?` sibling — a unit-typed
     // source expression lowers to no llvm::Value, and at a `()?` LOCATION the
     // PRESENT optional `{i8 1, i8 0}` must be synthesized for it (§4.7: `()?`

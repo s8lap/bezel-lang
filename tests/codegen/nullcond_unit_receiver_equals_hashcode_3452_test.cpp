@@ -201,16 +201,27 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
 // reserves that answer for a null receiver ("`x?.M` returns null if `x` is
 // null"), so a NON-NULL receiver answering `null` is unreadable by construction.
 //
-// MEASURED, `p?.Equals(true)` on `var p: Pt? := new Pt(1, 2)`:
+// MEASURED, on the RECORD receiver this row originally used
+// (`p?.Equals(true)` with `var p: Pt? := new Pt(1, 2)`):
 //   base (pre-#3452)          rc=1, "Basic Block ... does not have terminator!"
 //   block-closing only        rc=0, prints `A null`   <-- the fail-open
-//   this commit               rc=1, the located error asserted below
+//   #3452's follow-up         rc=1, the located error asserted below
 //
-// The live decline behind it is #3538 (`lowerValueSemMethodOn`'s record arm
-// declines when the `Equals` argument is not itself a record — the sibling the
-// `Object`-receiver path got `lowerUniversalEqualsArg` for in #3443). That is
-// owned elsewhere; this row's job is to pin that the decline stays fail-CLOSED
-// and cannot regress into `null` again.
+// ⚠ THE RECEIVER MOVED, AND THE ROW DID NOT WEAKEN (fix #3538). That record
+// decline was `lowerValueSemMethodOn`'s record arm refusing an `Equals`
+// argument that is not itself a record — and it was a DEFECT, not a rule:
+// §8.1 gives every value an `Equals(other: Object?)` and §8.6 boxes the
+// argument, so `p?.Equals(true)` is `False`, which is what it now answers
+// (measured: rc=0, prints `False`). Keeping this row on that program would
+// have pinned the defect, so it moves to a receiver whose decline #3538
+// deliberately does NOT remove: a CHOICE, whose arm still refuses a value
+// primitive because §8.6 forbids boxing an owning-classified choice (§35.4)
+// and settling that needs a §35.7 classification #3538 did not make — issue
+// 3545, with the measured table. Every assertion below is unchanged in kind;
+// only the receiver type in them differs.
+//
+// Deleting the row was the alternative and would have retired the guard the
+// previous commit added it for, one commit after adding it.
 //
 // The TEXT is asserted, not `hasErrors()` (which the IR-verifier abort also
 // satisfies) and not `!ran` alone (which the BASE also satisfies) — only the new
@@ -219,11 +230,14 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
            nullcond_declining_inner_lowering_fails_closed_spec_7_5) {
     auto r = runAot(
         "module M3452F; "
-        "record Pt(X: int, Y: int); "
+        "choice Sh "
+        "  Circle(R: int), "
+        "  Square(S: int); "
+        "end Sh; "
         "class C "
         "  public static method Main(): int "
-        "    var p: Pt? := new Pt(1, 2); "
-        "    var b := p?.Equals(true); "
+        "    var s: Sh? := Sh.Circle(1); "
+        "    var b := s?.Equals(7); "
         "    Console.WriteLine((if b = null then \"null\" else b!.ToString())); "
         "    return 0; "
         "  end Main; "
@@ -242,7 +256,7 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
     bool named = false;
     for (const auto& d : r.diagnostics.diagnostics())
         if (d.message.find("member `Equals`") != std::string::npos &&
-            d.message.find("`M3452F.Pt`") != std::string::npos)
+            d.message.find("`M3452F.Sh`") != std::string::npos)
             named = true;
     BEZEL_EXPECT_TRUE(named);
 }

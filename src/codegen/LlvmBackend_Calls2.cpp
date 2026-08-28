@@ -2825,6 +2825,58 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
 // unit-receiver arm (fix #3422), whose long derivation of WHY each answer is
 // what it is still stands at that call site; only the receiver evaluation
 // stayed behind, because the two callers own that step.
+// fix #3538 (§8.1 / §8.3 / §8.6, v0.283): answer `valueReceiver.Equals(arg)`
+// for the argument shapes whose STATIC type does not settle it — an `Object`, an
+// interface, a class, or any nullable form, each of which can dynamically BE a
+// box of the receiver's own type.
+//
+// Boxing both sides and dispatching is not a workaround, it is §8.1's own model:
+// the universal member's formal is `Object?`, §8.6 boxes a value operand at an
+// `Object` location, and the box's vtable `Equals` (`bz$boxeq$<T>`) ALREADY
+// implements §8.3's rule exactly — null `other` is false, a different box vtable
+// is false, the same vtable compares payloads — and is #2980-hardened against a
+// `%bz.string` operand reaching it. Re-deriving that decision inline here is the
+// second spelling this codebase's dominant defect class is made of; the
+// reference-semantics receiver reaches the same dispatch through the same
+// `lowerUniversalEqualsArg` (#3443), so the two spellings of §8.1's one member
+// cannot disagree.
+//
+// MEASURED before this existed, on b43196a: `p.Equals(o)` with `o: Object`
+// holding a box of a record EQUAL to `p` answered **False** — the old arm read
+// the record struct straight off the BOX POINTER (the vtable and refcount words
+// as `X`/`Y`), so it compared the receiver against the box header. A silent
+// wrong answer, and the reason this route exists rather than a decline.
+//
+// The RECEIVER's box is a pure temporary: minted here, only READ by `bz$boxeq`,
+// unreachable from anywhere else, so it is released immediately after the
+// comparison instead of leaked. The ARGUMENT's box is `lowerUniversalEqualsArg`'s
+// and keeps that helper's own #2952 / #3480 lifetime, unchanged.
+llvm::Value* Emitter::lowerValueSemUniversalEquals(const sema::TypeRef* recvTy,
+                                                   llvm::Value* recv,
+                                                   const ast::CallExpr& call) {
+    if (!recvTy || !recv || call.args.size() != 1 || !call.args[0].value)
+        return nullptr;
+    // §22.5 order: the receiver was evaluated by the caller; the argument is
+    // evaluated (and boxed) next. Minting the receiver's box afterwards copies
+    // an SSA value the argument's evaluation cannot have changed.
+    llvm::Value* other = lowerUniversalEqualsArg(*call.args[0].value);
+    if (!other || !other->getType()->isPointerTy()) return nullptr;
+    // `boxValue` publishes its mint in `lastBoxMint_` for #2865's reader; this
+    // box is claimed HERE, so the caller's view of that field is restored.
+    llvm::Value* savedMint = lastBoxMint_;
+    llvm::Value* boxedRecv = boxValue(recv, recvTy);
+    lastBoxMint_ = savedMint;
+    if (!boxedRecv || !boxedRecv->getType()->isPointerTy() ||
+        boxedRecv == recv)
+        return nullptr;   // no box descriptor for this value kind — fail closed
+    llvm::Value* r = lowerObjectEquals(boxedRecv, other);
+    if (!r) return nullptr;
+    auto* relFn = declareC("bz_box_release", llvm::Type::getVoidTy(llvm_),
+                           {ptrTy()});
+    builder_.CreateCall(relFn, {boxedRecv});   // null-safe (§28.9)
+    return r;
+}
+
 llvm::Value* Emitter::emitUnitUniversalAnswer(std::string_view member,
                                               const ast::CallExpr& call) {
     if (member == "ToString" && call.args.empty())
@@ -2994,10 +3046,71 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         // §8.3: enum GetHashCode → the underlying integer value (i32).
         if (isGetHashCode)
             return builder_.CreateZExtOrTrunc(recv, i32());
-        // §8.4/§10: enum Equals → integer comparison.
+        // §8.4/§10: enum Equals → integer comparison — but ONLY against another
+        // value of THIS enum.
+        //
+        // fix #3538 (§8.1 / §8.3 / §8.6, v0.283): this arm used to lower any
+        // argument and `ZExtOrTrunc` it into the enum's underlying width, which
+        // made §8.3's enum row ("underlying integer comparison") answer for
+        // operands that are not this enum at all. MEASURED on b43196a with
+        // `enum Color Red, Green, Blue; end Color;` and `c := Color.Green`:
+        //   c.Equals(1)         -> True    (an `int` is not a `Color`)
+        //   c.Equals(true)      -> True    (`i1 1` zero-extends to Green's 1)
+        //   c.Equals(Size.Med)  -> True    (a DIFFERENT enum, same ordinal)
+        //   c.Equals("s") / (o: Object) / (a record) -> `bezelc` rc=1,
+        //                        "ZExt only operates on integer" (malformed IR)
+        // Three silent wrong answers and three internal-consistency failures.
+        // §8.1's universal member is `Equals(other: Object?)`, so each of those
+        // arguments is a BOXED value at the call (§8.6) and §8.3's enum row
+        // compares it against a boxed `Color`: the answer is False, not the
+        // integer comparison of two unrelated bit patterns.
         if (isEquals && call.args[0].value) {
-            llvm::Value* other = lowerExpr(*call.args[0].value);
+            const ast::Expr& argE = *call.args[0].value;
+            const sema::TypeRef* at = ctx_.exprType(argE);
+            if (equalsArgSettlesFalse(at, ts)) {
+                lowerExpr(argE);          // §22.5: the argument still evaluates
+                return builder_.getFalse();
+            }
+            using K = sema::TypeRef::Kind;
+            // This enum itself, or a type parameter this instantiation has not
+            // resolved (whose value shape decides below, as it always did).
+            bool ownEnumOrUnresolved =
+                !at || (!at->nullable && at->kind == K::Named &&
+                        (at->declaration == ts || !at->declaration));
+            if (!ownEnumOrUnresolved)
+                return lowerValueSemUniversalEquals(recvTy, recv, call);
+            llvm::Value* other = lowerExpr(argE);
             if (!other) return nullptr;
+            // The `ZExtOrTrunc` below is valid only over integers; a reference
+            // reaching it is what emitted the malformed IR above. Reachable
+            // only for an UNRESOLVED type parameter (every settled argument
+            // shape was routed by one of the two tests above), and the answer
+            // is a DECLINE rather than the run-time route, because `argE` has
+            // already been lowered here and `lowerValueSemUniversalEquals`
+            // would lower it a second time — the #1075 double-evaluation
+            // hazard.
+            //
+            // It is a located ERROR and not a bare decline, because a decline
+            // here would be a loud-to-quiet inversion: the pre-#3538 code
+            // reached `CreateZExtOrTrunc(ptr, i32)` and `bezelc` exited 1 with
+            // "ZExt only operates on integer", so every program that gets here
+            // ALREADY fails to build. Returning null instead would degrade the
+            // `.` spelling to #3079's `Severity::Warning` note and a dropped
+            // statement — a program that compiles and answers nothing. Nothing
+            // that works today is newly rejected by this.
+            if (!other->getType()->isIntegerTy()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    "member `Equals` on a `" + spec85QualifiedTypeName(ts) +
+                    "` receiver was given an argument whose type this "
+                    "instantiation does not resolve to a value of that enum, "
+                    "and \xC2\xA7""8.3's enum equality is defined over the "
+                    "underlying integer only, so no comparison can be emitted; "
+                    "give the argument the enum type, or compare through an "
+                    "`Object`-typed operand (language spec \xC2\xA7""8.1 / "
+                    "\xC2\xA7""8.3 / \xC2\xA7""8.6)");
+                return llvm::PoisonValue::get(i1());
+            }
             return builder_.CreateICmpEQ(
                 recv, builder_.CreateZExtOrTrunc(other, recv->getType()));
         }
@@ -3056,8 +3169,49 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
     if (isToString)    return emitRecordToString(recv, ts);   // §8.5 / §9.1 / §9.2
     if (isGetHashCode) return emitRecordHashCode(recv, ts);   // §8.3 / §9.1 / §9.2
     if (isEquals && call.args[0].value) {
+        // fix #3538 (§8.1 / §8.3 / §8.6, v0.283): THREE argument shapes, not one.
+        //
+        // §8.1 gives every value an `Equals(other: Object?)`, so sema admits an
+        // argument of any type and §8.6 boxes a value-typed one. This arm
+        // recognised only "the lowered argument is a struct" and DECLINED
+        // otherwise — and a declining `Equals` makes the whole enclosing
+        // statement lower to nothing (the #3079 note, `Severity::Warning`), so
+        // `Console.WriteLine(p.Equals(7).ToString());` printed NOTHING AT ALL and
+        // the program still exited 0. MEASURED on b43196a, `record Pt(X: int,
+        // Y: int)` with `p := new Pt(1, 2)`:
+        //   p.Equals(7) / (true) / (3.5) / ('a') / (Color.Red)
+        //                                -> statement dropped, exit 0   (#3538)
+        //   p.Equals(new Other(1))       -> `bezelc` SEGV, rc=139, no diagnostic
+        //   p.Equals(o), o: Object holding a box of an EQUAL Pt
+        //                                -> False, and False is WRONG (§8.3)
+        //   p.Equals("s")                -> False, by loading the record struct
+        //                                   off the STRING pointer
+        // The first is the filed defect, the second a crash it hid, and the
+        // third the silent wrong answer that made the whole arm unsafe: the
+        // unconditional `CreateLoad(st, other)` below read whatever the pointer
+        // pointed at as this record's fields.
+        const ast::Expr& argE = *call.args[0].value;
+        const sema::TypeRef* at = ctx_.exprType(argE);
+        // (a) The argument's static type settles the answer at False on its own.
+        //     The argument is still lowered — §22.5 makes its effects part of
+        //     the call whatever the answer is.
+        if (equalsArgSettlesFalse(at, ts)) {
+            lowerExpr(argE);
+            return builder_.getFalse();
+        }
+        using K = sema::TypeRef::Kind;
+        // (b) This record itself, or a type parameter this instantiation has
+        //     not resolved — the latter keeps the pre-existing value-shape
+        //     handling below rather than gaining a new classification.
+        bool ownRecordOrUnresolved =
+            !at || (!at->nullable && at->kind == K::Named &&
+                    (at->declaration == ts || !at->declaration));
+        // (c) Anything else — `Object`, an interface, a class, `Pt?` — can
+        //     dynamically BE a box of this record, so only the run time can say.
+        if (!ownRecordOrUnresolved)
+            return lowerValueSemUniversalEquals(recvTy, recv, call);
         // §9.1 / §9.2: structural equality, same as the `=` operator (§8.3).
-        llvm::Value* other = lowerExpr(*call.args[0].value);
+        llvm::Value* other = lowerExpr(argE);
         if (!other) return nullptr;
         if (other->getType()->isPointerTy())
             other = builder_.CreateLoad(st, other);
@@ -13480,12 +13634,14 @@ llvm::Value* Emitter::lowerNullCondValueSemCall(
         // lowering has no answer to give; there is no correct value to invent,
         // and §7.5's `null` is already spoken for.
         //
-        // The live venue behind it is #3538 (`record.Equals(<a value argument
-        // that is not a record>)` — `lowerValueSemMethodOn`'s record arm
-        // declines on its `isStructTy()` guard, the sibling the `Object`-receiver
-        // path got `lowerUniversalEqualsArg` for in #3443 and this one never
-        // did). That defect is owned elsewhere; this block's job is only to stop
-        // it failing open.
+        // The live venue behind it WAS #3538 (`record.Equals(<a value argument
+        // that is not a record>)`); that arm now answers, so the surviving live
+        // decline is the CHOICE arm a few lines above it — `sh.Equals(7)` and
+        // friends, issue 3545, which #3538 deliberately did not extend to
+        // because §8.6 forbids boxing an owning-classified choice (§35.4).
+        // That defect is owned elsewhere; this block's job is only to stop it
+        // failing open, and T6 in the companion test file is the row that pins
+        // it against exactly that receiver.
         std::string recvName;
         if (innerTy.declaration)
             recvName = spec85QualifiedTypeName(innerTy.declaration);
@@ -13497,7 +13653,7 @@ llvm::Value* Emitter::lowerNullCondValueSemCall(
             " has no lowering for the argument or receiver shape given here, so "
             "no value can be produced; language spec \xC2\xA7""7.5 reserves the "
             "`null` result of `?.` for a null receiver, so the access cannot be "
-            "silently answered `null` instead (tracked #3538)");
+            "silently answered `null` instead (tracked #3545)");
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
         return nullptr;
