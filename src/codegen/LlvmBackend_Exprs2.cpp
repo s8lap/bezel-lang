@@ -1693,8 +1693,35 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // (#969) — the `do var g := () => x; end; return x;` read-after-
             // inner-scope case. So the free registered here fires at the
             // captured local's OWN scope end or not at all.
+            // fix #3498 (§27.5 / §28.9, v0.283): `declaredShallower` is the
+            // fourth admission, and it is not a new proof — it is the OBSERVATION
+            // THAT THIS GATE IS ANSWERING A QUESTION ITS OWN CONSUMER ANSWERS
+            // BETTER. The hazard the guarded-in-loop exclusion names, in its own
+            // words, is "a local declared in an OUTER scope … captured by an
+            // inner-LOOP lambda … freeing it at the lambda scope would corrupt
+            // later iterations". But for exactly that shape
+            // `consumeLastLambdaCapturedCells` never frees at the lambda scope:
+            // it either DEFERS the free into the owner's scope (#966 / #1017,
+            // when the captured local has a reads-through-cell disposal) or SKIPS
+            // it outright (#969). So the exclusion suppresses only frees that
+            // would have landed in the RIGHT place, and the shape it is actually
+            // protecting — a local declared at the SAME dispose depth as an
+            // in-loop capture site, whose one guarded cell really would be freed
+            // once per iteration — is untouched, because `declaredShallower` is
+            // false for it.
+            //
+            // `declScopeDepth_` is #969's OWN predicate, read here rather than
+            // respelled, and it is read at the same depth the consumer will read
+            // it at (both run inside this scope, one immediately after the
+            // other), so the two cannot disagree.
+            bool declaredShallower = false;
+            {
+                auto ddit = declScopeDepth_.find(static_cast<const void*>(decl));
+                declaredShallower = ddit != declScopeDepth_.end() &&
+                                    ddit->second < disposeStack_.size();
+            }
             bool guardedOk = !wasGuardedLocal || isPatternBinding ||
-                             loopStack_.empty();
+                             loopStack_.empty() || declaredShallower;
             if (guardedOk) {
                 LastCellEntry lce{newSlot, static_cast<const void*>(decl),
                                   inlineN};

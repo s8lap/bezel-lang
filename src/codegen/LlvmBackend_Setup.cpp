@@ -22484,6 +22484,56 @@ bool Emitter::isUserMethodClosureReturnCall(const ast::Expr* init) const {
 }
 
 
+// fix #3498 (§28.14 / §27.5 / §28.9, v0.283): see the declaration in
+// LlvmBackend_impl.hpp for the §28.14 argument and for why this is a strict
+// UNDER-approximation of lowerCall's `callBoundedClosureArgs` rather than a
+// second spelling of it.
+bool Emitter::isCallBoundedClosureArgPosition(const ast::CallExpr& call,
+                                              std::size_t ai) const {
+    if (!call.callee) return false;
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
+    if (!ms || ms->isOperator) return false;
+    // An IMPORTED callee's body is not compiled here; §28.14's verification did
+    // run in the exporter, but this pre-scan cannot see the declaration shape it
+    // would need, so it declines (a leak, the safe direction).
+    if (ctx_.isImported(ms)) return false;
+    // SEAM-ACCESSOR: the imported case is DECLINED on the line above, so
+    // this AST read is reached only for a locally-compiled callee whose
+    // MethodDecl is in this module — the shape #3152's audit sanctions. It
+    // cannot answer wrong for an imported symbol because it never runs for
+    // one, and declining there is the conservative direction (a leak, never
+    // an over-free).
+    auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return false;
+    // §28.14 *Call-bounded × deferred activation*, excluded three ways.
+    if (isAsyncMethod(ms)) return false;
+    if (md->bodyKind == ast::MethodBodyKind::Block && containsYield(md->stmts))
+        return false;
+    // NO declared return type: nothing can carry the callback out of the call at
+    // all. Strictly narrower than lowerCall's `declaredReturnOk`/`callResultOk`,
+    // which admit non-frame return heads too.
+    if (md->returnType) return false;
+    // POSITIONAL, exact arity — the only shape in which the SYNTACTIC index is
+    // the PARAMETER index. A named (`Identifier :=`) or defaulted call is not
+    // reordered here the way `buildOrderedArgs` reorders it at lowering time, so
+    // it is declined rather than guessed at.
+    if (call.args.size() != md->params.size()) return false;
+    if (ai >= md->params.size()) return false;
+    for (const auto& a : call.args)
+        if (!a.name.empty() || !a.modifier.empty() || a.isDiscard) return false;
+    const ast::Param& p = md->params[ai];
+    // No modifier — mirrors `callBoundedParams_`'s own enrolment one-for-one, so
+    // this admits only positions where the sink verification actually ran.
+    // `scoped` (§28.14 storage-bounded: the callee MAY store it) and `owned`
+    // (ownership transfers in) are thereby excluded.
+    if (!p.modifier.empty()) return false;
+    // Spelled as a function type IN SOURCE (#1921 / #2248: a bare `T` is
+    // `Kind::Named` at every instantiation, so it can never arm this).
+    if (!p.type || p.type->kind != ast::TypeKind::Function) return false;
+    return true;
+}
+
+
 // #429 (closure RETURN category) / §28.9 / §28.3: see the declaration in
 // LlvmBackend_impl.hpp. A returned IDENTIFIER names a closure-typed LOCAL
 // that owns a +1 in its slot when EITHER its initializer is a +1 closure
@@ -27434,6 +27484,36 @@ void Emitter::collectCellFreeEligible(
                 }
                 for (std::size_t ai = 0; ai < c->args.size(); ++ai) {
                     if (scopedCallArgHandled && ai == 0) continue;
+                    // fix #3498 (§28.14 the CALL-BOUNDED DEFAULT / §27.5 /
+                    // §28.9, v0.283): the THIRD non-escaping admission in this
+                    // arm, beside #2182's IIFE and #2334's stdlib `scoped`
+                    // register positions. A lambda LITERAL passed into a plain
+                    // (no-modifier) function-typed parameter is call-bounded:
+                    // §28.14 makes the callee's holding of it end with the call
+                    // and `MethodOwnership::callBoundedScan` verifies every sink
+                    // on every user body, so the closure cannot outlive THIS
+                    // frame and a local captured only by such lambdas is safe to
+                    // free at its own scope end — exactly the IIFE argument, for
+                    // a callee that is a named method rather than the lambda
+                    // itself. Without this the generic `expr(arg, false)`
+                    // recursion below classifies the lambda ESCAPING, the
+                    // capture lands in capturedByEscaping, and the cell is
+                    // reclaimed by nobody (8 B per call for a class capture,
+                    // 4 for an `int` — issue 3498).
+                    //
+                    // Admitting here is only HALF of what the shape needs: as
+                    // #2182 records for the IIFE, `lowerLambda`'s entries are
+                    // dropped unless the call site also calls
+                    // `consumeLastLambdaCapturedCells()`. That half is in
+                    // lowerCall, beside #1073's own call-bounded closure release.
+                    if (auto* argLam = dynamic_cast<const ast::LambdaExpr*>(
+                            c->args[ai].value.get())) {
+                        if (em.isCallBoundedClosureArgPosition(*c, ai)) {
+                            collectLambdaCaptures(argLam, em,
+                                                  /*isNonEscaping=*/true);
+                            continue;
+                        }
+                    }
                     expr(c->args[ai].value.get(), false);
                 }
                 return; }

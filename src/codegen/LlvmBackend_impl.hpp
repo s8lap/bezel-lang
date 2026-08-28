@@ -12247,6 +12247,37 @@ private:
     // at the call site). Cross-module imported methods are excluded (no local
     // mint). Parallel to isUserMethodStringReturnCall for strings.
     bool isUserMethodClosureReturnCall(const ast::Expr* init) const;
+    // fix #3498 (§28.14 / §27.5 / §28.9, v0.283): is syntactic argument `ai` of
+    // `call` a §28.14 CALL-BOUNDED function-typed parameter position — i.e. one
+    // where the callee provably holds no reference to the callback once the call
+    // returns, so a lambda LITERAL passed there does NOT outlive this frame?
+    //
+    // §28.14: "A function-typed parameter declared *without* `scoped` is
+    // call-bounded: the callee receives the callback for the duration of the
+    // call only … These obligations are compiler-verified for user-authored
+    // callees." `MethodOwnership::callBoundedScan` runs that verification on
+    // every user body and rejects every sink, so for this parameter shape the
+    // guarantee is real rather than assumed.
+    //
+    // The one §28.14 shape allowed to retain the callback past the call is
+    // *Call-bounded × deferred activation* — an `async` callee, an iterator, or
+    // a callee whose declared return ANNOUNCES a frame. This predicate excludes
+    // all three by requiring NO declared return type at all, which is strictly
+    // narrower than the `declaredReturnOk` / `callResultOk` clause pair that
+    // lowerCall's `callBoundedClosureArgs` uses for the same §28.14 judgement
+    // (LlvmBackend_Calls2.cpp). That containment is deliberate and is the
+    // soundness argument: every position this admits is ALSO one where #1073
+    // already releases the closure at the call, so the closure demonstrably does
+    // not outlive the frame. The predicate is not a competing spelling of that
+    // one — it is a strict under-approximation of it, stated as such, for the
+    // AST pre-scan which has no `args` vector to work from.
+    //
+    // Every clause is a SOURCE-WRITTEN declaration shape and fails closed, per
+    // the #1921 / #2248 lesson: a bare type parameter is `ast::TypeKind::Named`
+    // in the AST whatever it is substituted to, so no instantiation can talk
+    // this into arming.
+    bool isCallBoundedClosureArgPosition(const ast::CallExpr& call,
+                                         std::size_t ai) const;
     // #429 (closure RETURN category) / §28.9 / §28.3: true when the returned
     // expression is an identifier naming a closure-typed local whose slot
     // already owns a +1 — either initialized by a +1 closure producer (lambda /

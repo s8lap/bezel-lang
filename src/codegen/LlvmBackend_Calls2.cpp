@@ -10032,6 +10032,27 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
         // producer's evaluation and here, so it runs exactly once per evaluation
         // of the call and is mutually exclusive with the unwind cleanup above.
         for (llvm::Value* cl : callBoundedClosureArgs) emitClosureRelease(cl);
+        // fix #3498 (§28.14 / §27.5 / §28.9, v0.283): the CAPTURE-CELL half of
+        // the release above. #1073 drops the producer's +1 on the CLOSURE here
+        // because §28.14 makes the callee's hold end with the call; the cells
+        // the closure's env points AT are a separate allocation that nothing
+        // dropped. `collectCellFreeEligible` now classifies a lambda literal in
+        // this same call-bounded position as NON-escaping (LlvmBackend_Setup.cpp),
+        // so `lowerLambda` recorded those cells in `lastLambdaCapturedCells_` —
+        // but, exactly as #2182 found for the IIFE, the entries are dropped on
+        // the floor unless the CALL SITE consumes them: the five existing
+        // consumers are lowerLocalDecl, the IIFE arm and the three §28.14
+        // scoped-register special cases, and an ordinary call was none of them.
+        //
+        // The helper re-runs every per-cell soundness check on its own — the
+        // #966 / #1017 owner-disposal deferral and the #969 shallower-scope skip
+        // — so what is added here is the OPPORTUNITY to decide, not a decision.
+        // Gated on the same vector the release above uses, which is a strict
+        // SUPERSET of the positions the pre-scan admits, so the gate can never
+        // miss one; a diverging call skips it (a leak, the safe direction), and
+        // a second consume sees an emptied vector, so no cell can be registered
+        // twice.
+        if (!callBoundedClosureArgs.empty()) consumeLastLambdaCapturedCells();
         // fix #3195: the same NORMAL-return release for the scoped arm —
         // the producer's +1 on a closure passed to a `scoped` parameter
         // whose callee provably doesn't store it.
