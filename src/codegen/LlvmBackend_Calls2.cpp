@@ -12190,40 +12190,28 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // locals/params/fn context above is saved) so building a specialization is
     // transparent to the caller's state machine. Containers are moved out, which
     // both saves them O(1) AND hands the helper a clean (empty) slate.
-    SuspendKind savedSmKind = smKind_;
-    llvm::StructType* savedSmStateStruct = smStateStruct_;
-    llvm::Value* savedSmSelf = smSelf_;
-    llvm::Value* savedSmStateGEP = smStateGEP_;
-    llvm::BasicBlock* savedSmDoneBB = smDoneBB_;
-    unsigned savedSmNextState = smNextSuspendState_;
-    unsigned savedIterCurValField = iterCurrentValField_;
-    llvm::Type* savedIterElemTy = iterElemTy_;
-    unsigned savedAsyncOuterField = asyncOuterTaskField_;
-    unsigned savedAsyncPendingField = asyncPendingTaskField_;
-    unsigned savedAsyncSpillField = asyncSpillPtrField_;
-    llvm::Function* savedAsyncResumeFn = asyncResumeFn_;
-    llvm::Type* savedAsyncResultTy = asyncResultTy_;
-    const sema::TypeRef* savedAsyncResultSemaTy = asyncResultSemaType_;
-    // §30.5 / #1503: save/restore alongside its asyncResultTy_/
-    // asyncResultSemaType_ siblings — emitAsyncMethod (called below for a
-    // specialized async method) both sets and resets this field itself, but
-    // this wrapper may run mid-emission of an OUTER async state machine, so
-    // the outer's value must survive the nested specialization untouched.
-    llvm::Function* savedAsyncPatternAResultDisposer =
-        asyncPatternAResultDisposer_;
-    // §30.1 (#1521): same nested-emission hazard as asyncPatternAResultDisposer_
-    // above — emitAsyncMethod (called below for a specialized plain async method)
-    // both publishes and clears this field itself around its OWN emission, but a
-    // specialization built mid-emission of an OUTER async method's Resume body
-    // must not lose the outer's frame pointer across the nested call, nor must
-    // the nested emission see the OUTER frame while smStateStruct_/smSelf_ are
-    // reset to the specialization's own (different) frame — reset to null below
-    // alongside the other SM scalars.
-    const StateMachineFrame* savedAsyncOwnedParamFrame = asyncOwnedParamFrame_;
-    auto savedSmStateBBs = std::move(smStateBBs_);
-    auto savedSmLocalFields = std::move(smLocalFields_);
-    auto savedSmForInSrcFields = std::move(smForInSrcFields_);
-    auto savedSmAllocaToField = std::move(smAllocaToField_);
+    //
+    // fix #3505 (§29.3 / §30.1 / §30.7, v0.283): the save half is now ONE guard,
+    // generated from the same BEZEL_SM_FRAME_MEMBERS list `clearSmFrame()` is
+    // generated from — the emit*Method helpers below each open a
+    // StateMachineFrameScope, so on the way out they retract EVERY member on
+    // that list, and this site's hand-written save list covered only part of it.
+    // The five it missed (smForInSrcFields_, iterElemSemaTy_,
+    // iterElemIsOwnedClass_, iterCurrentValOwnedField_, iterIsOwningIter_) are
+    // the yield-specific half of an enclosing ITERATOR's frame, so a lazy
+    // specialization built from inside one silently disarmed its §29.1 owned-
+    // value disposal for every later `yield return`.
+    //
+    // The CLEAN SLATE the moves used to provide is kept explicitly below: the
+    // guard only saves, so the containers the helper must not inherit are
+    // cleared by name, exactly the four the moves used to empty. What is NOT on
+    // the frame list (smIterEnumFramesAtState_, smIterCleanupAtState_,
+    // asyncHandlerSpillSlots_) keeps its own move-out save.
+    SmFrameSaveScope smFrameSave(*this);
+    smStateBBs_.clear();
+    smLocalFields_.clear();
+    smForInSrcFields_.clear();
+    smAllocaToField_.clear();
     auto savedSmIterEnumFrames = std::move(smIterEnumFramesAtState_);
     // fix #1567: preserve the outer iterator's unified establishment-ordered
     // cleanup snapshot across a nested SM emission (parallel to the enum-frame
@@ -12495,26 +12483,8 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628
     emittingGenericTemplateBody_ = savedGenTemplate;  // #817
     // Restore the caller's state-machine context (#1060 / #1061).
-    smKind_ = savedSmKind;
-    smStateStruct_ = savedSmStateStruct;
-    smSelf_ = savedSmSelf;
-    smStateGEP_ = savedSmStateGEP;
-    smDoneBB_ = savedSmDoneBB;
-    smNextSuspendState_ = savedSmNextState;
-    iterCurrentValField_ = savedIterCurValField;
-    iterElemTy_ = savedIterElemTy;
-    asyncOuterTaskField_ = savedAsyncOuterField;
-    asyncPendingTaskField_ = savedAsyncPendingField;
-    asyncSpillPtrField_ = savedAsyncSpillField;
-    asyncResumeFn_ = savedAsyncResumeFn;
-    asyncResultTy_ = savedAsyncResultTy;
-    asyncResultSemaType_ = savedAsyncResultSemaTy;
-    asyncPatternAResultDisposer_ = savedAsyncPatternAResultDisposer;
-    asyncOwnedParamFrame_ = savedAsyncOwnedParamFrame;  // §30.1 (#1521)
-    smStateBBs_ = std::move(savedSmStateBBs);
-    smLocalFields_ = std::move(savedSmLocalFields);
-    smForInSrcFields_ = std::move(savedSmForInSrcFields);
-    smAllocaToField_ = std::move(savedSmAllocaToField);
+    // fix #3505: the frame itself is restored by smFrameSave's destructor when
+    // this function returns; only the members outside it are by hand.
     smIterEnumFramesAtState_ = std::move(savedSmIterEnumFrames);
     smIterCleanupAtState_ = std::move(savedSmIterCleanup);  // fix #1567
     asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpill);

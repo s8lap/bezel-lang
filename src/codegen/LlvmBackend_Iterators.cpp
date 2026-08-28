@@ -630,35 +630,15 @@ bool Emitter::containsYield(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
 // the constructor reset, LlvmBackend_Assign.cpp ~4602). Called by the
 // StateMachineFrameScope RAII guard at every exit from a state-machine emitter
 // (normal return and every diagnostic early-return path).
+// fix #3505 (§29.3 / §30.1 / §30.6 / §30.7, v0.283): the member list moved to
+// BEZEL_SM_FRAME_MEMBERS in LlvmBackend_impl.hpp, so that this retraction and
+// the SmFrameSaveScope that undoes it for an ENCLOSING body are generated from
+// ONE list. Five members used to be here and on no save list; read the macro's
+// comment for what that cost.
 void Emitter::clearSmFrame() {
-    smKind_                    = SuspendKind::Yield;
-    smStateStruct_             = nullptr;
-    smSelf_                    = nullptr;
-    smStateGEP_                = nullptr;
-    smStateBBs_.clear();
-    smDoneBB_                  = nullptr;
-    smNextSuspendState_        = 0;
-    smLocalFields_.clear();
-    smForInSrcFields_.clear();
-    smAllocaToField_.clear();
-    smParamCellField_.clear();          // fix #3466
-    smLocalPreBoxField_.clear();        // fix #3484 follow-up
-    smRestoredParamSlots_.clear();      // fix #3484 follow-up
-    smCellFrameFn_             = nullptr;
-    iterCurrentValField_       = 0;
-    iterElemTy_                = nullptr;
-    iterElemSemaTy_            = nullptr;
-    iterElemIsOwnedClass_      = false;
-    iterCurrentValOwnedField_  = 0;
-    iterIsOwningIter_          = false;    // fix #2621
-    asyncOuterTaskField_       = 0;
-    asyncPendingTaskField_     = 0;
-    asyncSpillPtrField_        = 0;
-    asyncResultTy_             = nullptr;
-    asyncResultSemaType_       = nullptr;
-    asyncPatternAResultDisposer_ = nullptr;
-    asyncOwnedParamFrame_      = nullptr;
-    asyncResumeFn_             = nullptr;
+#define BEZEL_SM_FRAME_CLEAR_ONE(TYPE, MEMBER, NEUTRAL) MEMBER = NEUTRAL;
+    BEZEL_SM_FRAME_MEMBERS(BEZEL_SM_FRAME_CLEAR_ONE)
+#undef BEZEL_SM_FRAME_CLEAR_ONE
 }
 
 
@@ -895,7 +875,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // fix #3500 (§27.5 / §28.9 / §29.3, v0.283): this emitter now CLEARS and
     // re-pins the §27.5 closure/capture-cell eligibility sets for `moveNextFn`
     // (see the block beside collectStringReleaseEligible below). It is reached
-    // mid-emission of an OUTER body by instantiateGenericSpecialization, so the
+    // mid-emission of an OUTER body by buildSpecializedMethodFn, so the
     // clear needs its save/restore half — see CaptureReclaimSetScope.
     CaptureReclaimSetScope captureReclaimScope(*this);
     smKind_ = SuspendKind::Yield;

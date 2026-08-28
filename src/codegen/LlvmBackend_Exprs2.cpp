@@ -2159,56 +2159,37 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // The non-async lambda body never touches these, so the save/restore is
     // scoped to the async branch.
     if (lam.isAsync) {
-        SuspendKind savedSmKind = smKind_;
-        llvm::StructType* savedSmStateStruct = smStateStruct_;
-        llvm::Value* savedSmSelf = smSelf_;
-        llvm::Value* savedSmStateGEP = smStateGEP_;
-        auto savedSmStateBBs = smStateBBs_;
-        llvm::BasicBlock* savedSmDoneBB = smDoneBB_;
-        unsigned savedSmNextState = smNextSuspendState_;
-        auto savedSmLocalFields = smLocalFields_;
-        auto savedSmAllocaToField = smAllocaToField_;
-        // fix #3484 (follow-up, 2): the cell-frame publication is per-FUNCTION
-        // state, and emitAsyncLambda's StateMachineFrameScope runs clearSmFrame
-        // on the way out — which wiped the ENCLOSING body's publication.
-        // Everything lowered in it AFTER this nested lambda then behaved as if no
-        // frame existed: boxedStorage declined the fall-back for a captured
-        // PARAMETER (whose pre-boxing alloca IS restored), and lowerLambda
-        // registered no field for a later capture. Measured: a conditional
-        // parameter capture, a nested `async lambda`, then a read after the
-        // await went from the correct `0 1 4 3` to SEGV @ 0 — a shape the
-        // pre-follow-up tree got right. Save and restore all four alongside
-        // smAllocaToField_, which is here for exactly the same reason.
-        auto savedSmParamCellField = smParamCellField_;
-        auto savedSmLocalPreBoxField = smLocalPreBoxField_;
-        auto savedSmRestoredParamSlots = smRestoredParamSlots_;
-        llvm::Function* savedSmCellFrameFn = smCellFrameFn_;
-        unsigned savedIterCurrentValField = iterCurrentValField_;
-        llvm::Type* savedIterElemTy = iterElemTy_;
-        unsigned savedAsyncOuterTaskField = asyncOuterTaskField_;
-        unsigned savedAsyncPendingTaskField = asyncPendingTaskField_;
-        unsigned savedAsyncSpillPtrField = asyncSpillPtrField_;
+        // fix #3505 (§29.3 / §30.1 / §30.6 / §30.7, v0.283): one guard for the
+        // WHOLE suspend/resume frame, in place of the 23 hand-written `savedX`
+        // locals this block carried. emitAsyncLambda's StateMachineFrameScope
+        // retracts every member `clearSmFrame()` lists; this restores every
+        // member `clearSmFrame()` lists, and both are generated from
+        // BEZEL_SM_FRAME_MEMBERS, so the two halves cannot drift apart. Five
+        // members the hand-written list omitted — smForInSrcFields_,
+        // iterElemSemaTy_, iterElemIsOwnedClass_, iterCurrentValOwnedField_,
+        // iterIsOwningIter_ — are now restored; the last three are what a sync
+        // OWNING iterator's later `yield return` reads to dispose the value the
+        // consumer abandoned (§29.1, #2621), so an `async lambda` declared in an
+        // iterator body used to cost every later yield that dispose.
+        // (#3484 follow-up's four cell-frame members and #1503's Pattern A
+        // disposer were on the old list and are on this one; nothing that was
+        // saved before has stopped being saved.)
+        SmFrameSaveScope smFrameSave(*this);
+        // NOT part of the retracted frame (clearSmFrame does not touch it), so
+        // it keeps its own save: emitAsyncLambda repopulates it for the lambda's
+        // own handler spills.
         auto savedAsyncHandlerSpillSlots = asyncHandlerSpillSlots_;
-        llvm::Function* savedAsyncResumeFn = asyncResumeFn_;
-        llvm::Type* savedAsyncResultTy = asyncResultTy_;
-        const sema::TypeRef* savedAsyncResultSemaType = asyncResultSemaType_;
-        // §30.5 / #1503: save/restore the Pattern A result-disposer field
-        // alongside its asyncResultTy_/asyncResultSemaType_ siblings — same
-        // nested-async-lambda-inside-an-enclosing-machine hazard.
-        llvm::Function* savedAsyncPatternAResultDisposer =
-            asyncPatternAResultDisposer_;
-        // §30.1 (#1521): save/restore + suppress the enclosing method's owned-
-        // param-auto-dispose frame across the nested lambda emission. emitAsyncLambda
-        // does not itself publish this field (a lambda's own `owned` params are not
-        // yet wired into this mechanism), so left alone it would still point at the
-        // OUTER method's StateMachineFrame while smStateStruct_/smSelf_ are swapped
-        // to the LAMBDA's own (differently laid out) frame — emitAsyncComplete calls
-        // inside the lambda's own Resume body would then GEP the outer frame's
-        // capture field indices into the lambda's struct type, a type/index
-        // mismatch. Null it for the duration of the nested call so the lambda's own
-        // completion sites see "no owned-param frame" (a correct no-op) and restore
-        // the outer pointer afterward for the enclosing method's own sites.
-        const StateMachineFrame* savedAsyncOwnedParamFrame = asyncOwnedParamFrame_;
+        // §30.1 (#1521): SUPPRESS the enclosing method's owned-param-auto-dispose
+        // frame across the nested lambda emission (the save itself is the scope's
+        // job now). emitAsyncLambda does not publish this field (a lambda's own
+        // `owned` params are not yet wired into this mechanism), so left alone it
+        // would still point at the OUTER method's StateMachineFrame while
+        // smStateStruct_/smSelf_ are swapped to the LAMBDA's own (differently
+        // laid out) frame — emitAsyncComplete calls inside the lambda's own
+        // Resume body would then GEP the outer frame's capture field indices into
+        // the lambda's struct type, a type/index mismatch. Null it for the
+        // duration of the nested call so the lambda's own completion sites see
+        // "no owned-param frame" (a correct no-op).
         asyncOwnedParamFrame_ = nullptr;
         // emitAsyncLambda recomputes closure-release AND capture-cell-free
         // eligibility for the LAMBDA's own body and keys them to the lambda resume
@@ -2289,30 +2270,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         dictLiteralFreeEligibleFn_ = savedDictLiteralFreeEligFn;           // #2143
         literalTreeAggregateEligible_ =
             std::move(savedLiteralTreeAggElig);                            // #2660
-        smKind_ = savedSmKind;
-        smStateStruct_ = savedSmStateStruct;
-        smSelf_ = savedSmSelf;
-        smStateGEP_ = savedSmStateGEP;
-        smStateBBs_ = std::move(savedSmStateBBs);
-        smDoneBB_ = savedSmDoneBB;
-        smNextSuspendState_ = savedSmNextState;
-        smLocalFields_ = std::move(savedSmLocalFields);
-        smAllocaToField_ = std::move(savedSmAllocaToField);
-        smParamCellField_ = std::move(savedSmParamCellField);          // #3484 f/u
-        smLocalPreBoxField_ = std::move(savedSmLocalPreBoxField);      // #3484 f/u
-        smRestoredParamSlots_ = std::move(savedSmRestoredParamSlots);  // #3484 f/u
-        smCellFrameFn_ = savedSmCellFrameFn;                           // #3484 f/u
-        iterCurrentValField_ = savedIterCurrentValField;
-        iterElemTy_ = savedIterElemTy;
-        asyncOuterTaskField_ = savedAsyncOuterTaskField;
-        asyncPendingTaskField_ = savedAsyncPendingTaskField;
-        asyncSpillPtrField_ = savedAsyncSpillPtrField;
+        // fix #3505: the whole sm*_/async*_ frame is put back by smFrameSave's
+        // destructor at the end of this block. Only the member that is NOT part
+        // of the retracted frame is restored by hand.
         asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpillSlots);
-        asyncResumeFn_ = savedAsyncResumeFn;
-        asyncResultTy_ = savedAsyncResultTy;
-        asyncResultSemaType_ = savedAsyncResultSemaType;
-        asyncPatternAResultDisposer_ = savedAsyncPatternAResultDisposer;
-        asyncOwnedParamFrame_ = savedAsyncOwnedParamFrame;  // §30.1 (#1521)
     } else {
     // fix #3237: a SYNC lambda body nested inside an async method also needs
     // the enclosing machine's sm*_/async*_ fields cleared — the sync lambda
@@ -2330,35 +2291,20 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // enclosing machine either — review verdict item 4) for the sync body so
     // the enclosing machine's state is fully out of scope during
     // lowerScopedBlock(lam.stmts) / lowerExpr(exprBody).
-    SuspendKind savedSmKindSync = smKind_;
-    llvm::StructType* savedSmStateStructSync = smStateStruct_;
-    llvm::Value* savedSmSelfSync = smSelf_;
-    llvm::Value* savedSmStateGEPSync = smStateGEP_;
-    auto savedSmStateBBsSync = smStateBBs_;
-    llvm::BasicBlock* savedSmDoneBBSync = smDoneBB_;
-    unsigned savedSmNextSuspendStateSync = smNextSuspendState_;
-    auto savedSmLocalFieldsSync = smLocalFields_;
-    auto savedSmAllocaToFieldSync = smAllocaToField_;
-    // fix #3484 (follow-up, 2): the sync-lambda twin of the save above. A nested
-    // SYNC lambda body does not open a StateMachineFrameScope, but it does lower
-    // with its own currentFn_, and any boxing inside it must not leave the
-    // enclosing state machine's publication altered.
-    auto savedSmParamCellFieldSync = smParamCellField_;
-    auto savedSmLocalPreBoxFieldSync = smLocalPreBoxField_;
-    auto savedSmRestoredParamSlotsSync = smRestoredParamSlots_;
-    llvm::Function* savedSmCellFrameFnSync = smCellFrameFn_;
-    unsigned savedIterCurrentValFieldSync = iterCurrentValField_;
-    llvm::Type* savedIterElemTySync = iterElemTy_;
-    unsigned savedAsyncOuterTaskFieldSync = asyncOuterTaskField_;
-    unsigned savedAsyncPendingTaskFieldSync = asyncPendingTaskField_;
-    unsigned savedAsyncSpillPtrFieldSync = asyncSpillPtrField_;
+    // fix #3505 (§29.3 / §30.1 / §30.6 / §30.7, v0.283): the sync twin of the
+    // async branch's guard — one scope for the whole retracted frame, in place
+    // of the hand-written `savedXSync` list. Nothing this branch saved before
+    // has stopped being saved; what it gains is the five members the two lists
+    // both omitted, which matters here because the sync body can itself contain
+    // a nested `async lambda` or a call that instantiates a generic state
+    // machine, either of which runs clearSmFrame while this body is mid-emission.
+    //
+    // Note the asymmetry with the async branch, which is deliberate: this branch
+    // CLEARS only a subset of the frame (below), because a sync lambda body must
+    // still see the enclosing machine's #3484 cell-frame publication when it
+    // boxes a capture. The scope only saves; it does not clear.
+    SmFrameSaveScope smFrameSaveSync(*this);
     auto savedAsyncHandlerSpillSlotsSync = asyncHandlerSpillSlots_;
-    llvm::Function* savedAsyncResumeFnSync = asyncResumeFn_;
-    llvm::Type* savedAsyncResultTySync = asyncResultTy_;
-    const sema::TypeRef* savedAsyncResultSemaTypeSync = asyncResultSemaType_;
-    llvm::Function* savedAsyncPatternAResultDisposerSync =
-        asyncPatternAResultDisposer_;
-    const StateMachineFrame* savedAsyncOwnedParamFrameSync = asyncOwnedParamFrame_;
     // fix #2747: the SYNC lambda body's `lowerReturnStmt` reads and RESETS the
     // outer `return await` Pattern A detection flags (`asyncChainedReturn_` /
     // `asyncBorrowedReturn_`) at lines 1928-1937 unconditionally — even when
@@ -2553,30 +2499,9 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     }
     // fix #3237: restore the enclosing machine's sm*_/async*_ after the sync
     // body emit (paired with the save/clear above the `if (lam.exprBody)`).
-    smKind_ = savedSmKindSync;
-    smStateStruct_ = savedSmStateStructSync;
-    smSelf_ = savedSmSelfSync;
-    smStateGEP_ = savedSmStateGEPSync;
-    smStateBBs_ = std::move(savedSmStateBBsSync);
-    smDoneBB_ = savedSmDoneBBSync;
-    smNextSuspendState_ = savedSmNextSuspendStateSync;
-    smLocalFields_ = std::move(savedSmLocalFieldsSync);
-    smAllocaToField_ = std::move(savedSmAllocaToFieldSync);
-    smParamCellField_ = std::move(savedSmParamCellFieldSync);          // #3484 f/u
-    smLocalPreBoxField_ = std::move(savedSmLocalPreBoxFieldSync);      // #3484 f/u
-    smRestoredParamSlots_ = std::move(savedSmRestoredParamSlotsSync);  // #3484 f/u
-    smCellFrameFn_ = savedSmCellFrameFnSync;                           // #3484 f/u
-    iterCurrentValField_ = savedIterCurrentValFieldSync;
-    iterElemTy_ = savedIterElemTySync;
-    asyncOuterTaskField_ = savedAsyncOuterTaskFieldSync;
-    asyncPendingTaskField_ = savedAsyncPendingTaskFieldSync;
-    asyncSpillPtrField_ = savedAsyncSpillPtrFieldSync;
+    // fix #3505: smFrameSaveSync's destructor puts the frame back at the end of
+    // this block; only the members outside the retracted frame are by hand.
     asyncHandlerSpillSlots_ = std::move(savedAsyncHandlerSpillSlotsSync);
-    asyncResumeFn_ = savedAsyncResumeFnSync;
-    asyncResultTy_ = savedAsyncResultTySync;
-    asyncResultSemaType_ = savedAsyncResultSemaTypeSync;
-    asyncPatternAResultDisposer_ = savedAsyncPatternAResultDisposerSync;
-    asyncOwnedParamFrame_ = savedAsyncOwnedParamFrameSync;
     asyncChainedReturn_ = savedAsyncChainedReturnSync;       // fix #2747
     asyncBorrowedReturn_ = savedAsyncBorrowedReturnSync;     // fix #2747
     }

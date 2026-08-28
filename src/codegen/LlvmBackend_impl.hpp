@@ -10791,6 +10791,75 @@ private:
     // a member of the enum — the gate is then closed by nulling smStateGEP_).
     void clearSmFrame();
 
+    // fix #3505 (§29.3 "Iterator methods" / §30.1 "`async` methods" /
+    // §30.6 "Async lambdas" / §30.7 "Async iterators", v0.283): THE
+    // suspend/resume frame member list, and the single authority both halves of
+    // the frame contract are generated from.
+    //
+    // A `clear()` on per-lowering state and a save/restore around a NESTED
+    // emission are two halves of ONE contract. `clearSmFrame()` was the first
+    // half; every venue that emits a state machine from the MIDDLE of another
+    // body (`lowerLambda`'s `async` branch → `emitAsyncLambda`, and
+    // `buildSpecializedMethodFn` → `emitAsyncMethod` /
+    // `emitIteratorMethod` / `emitAsyncIteratorMethod`) needs the second, and
+    // each had spelled it out by hand as a list of `savedX` locals. Five members
+    // — smForInSrcFields_, iterElemSemaTy_, iterElemIsOwnedClass_,
+    // iterCurrentValOwnedField_, iterIsOwningIter_ — were on the clear list and
+    // on none of the save lists, so a nested emission RETRACTED them for the
+    // enclosing body. Measured (issue 3505): a sync OWNING iterator whose body
+    // declares an `async lambda` between two `yield return new R(...)` loses
+    // §29.1's displaced-value dispose at every later yield — 3 disposals become
+    // 2 and LeakSanitizer reports the abandoned object.
+    //
+    // Generating both halves from ONE list is what makes the contract structural
+    // instead of a list somebody must remember to maintain: a member added here
+    // is cleared AND saved, and a member added to only one of them cannot exist.
+    // Anything that is NOT part of the retracted frame (asyncHandlerSpillSlots_,
+    // smIterEnumFramesAtState_, smIterCleanupAtState_, the §30.5 Pattern A
+    // return flags) is deliberately absent: those are saved where they are
+    // needed, by name, because they are not `clearSmFrame()`'s business.
+    //
+    // The aliases exist only so a member type containing a comma can be passed
+    // as a single macro argument.
+    using SmFrameBlockVec       = std::vector<llvm::BasicBlock*>;
+    using SmFrameNodeFieldMap   = std::unordered_map<const ast::Node*, unsigned>;
+    using SmFrameSymFieldMap    = std::unordered_map<const sema::Symbol*, unsigned>;
+    using SmFrameAllocaFieldMap = std::unordered_map<llvm::AllocaInst*, unsigned>;
+    using SmFrameAllocaSet      = std::unordered_set<llvm::AllocaInst*>;
+
+#define BEZEL_SM_FRAME_MEMBERS(X)                                              \
+    /* kind-agnostic frame scaffolding */                                      \
+    X(SuspendKind,            smKind_,                   SuspendKind::Yield)   \
+    X(llvm::StructType*,      smStateStruct_,            nullptr)              \
+    X(llvm::Value*,           smSelf_,                   nullptr)              \
+    X(llvm::Value*,           smStateGEP_,               nullptr)              \
+    X(SmFrameBlockVec,        smStateBBs_,               {})                   \
+    X(llvm::BasicBlock*,      smDoneBB_,                 nullptr)              \
+    X(unsigned,               smNextSuspendState_,       0)                    \
+    X(SmFrameNodeFieldMap,    smLocalFields_,            {})                   \
+    X(SmFrameNodeFieldMap,    smForInSrcFields_,         {}) /* §29.7 (#944) */ \
+    X(SmFrameAllocaFieldMap,  smAllocaToField_,          {})                   \
+    X(SmFrameSymFieldMap,     smParamCellField_,         {}) /* fix #3466 */   \
+    X(SmFrameNodeFieldMap,    smLocalPreBoxField_,       {}) /* #3484 f/u */   \
+    X(SmFrameAllocaSet,       smRestoredParamSlots_,     {}) /* #3484 f/u */   \
+    X(llvm::Function*,        smCellFrameFn_,            nullptr)              \
+    /* iterator-specific half */                                               \
+    X(unsigned,               iterCurrentValField_,      0)                    \
+    X(llvm::Type*,            iterElemTy_,               nullptr)              \
+    X(const sema::TypeRef*,   iterElemSemaTy_,           nullptr) /* #1102B */ \
+    X(bool,                   iterElemIsOwnedClass_,     false)   /* #1120 */  \
+    X(unsigned,               iterCurrentValOwnedField_, 0)       /* #1120 */  \
+    X(bool,                   iterIsOwningIter_,         false)   /* #2621 */  \
+    /* async-specific half */                                                  \
+    X(unsigned,               asyncOuterTaskField_,      0)                    \
+    X(unsigned,               asyncPendingTaskField_,    0)                    \
+    X(unsigned,               asyncSpillPtrField_,       0)                    \
+    X(llvm::Type*,            asyncResultTy_,            nullptr)              \
+    X(const sema::TypeRef*,   asyncResultSemaType_,      nullptr)              \
+    X(llvm::Function*,        asyncPatternAResultDisposer_, nullptr) /* #1503 */ \
+    X(const StateMachineFrame*, asyncOwnedParamFrame_,   nullptr)  /* #1521 */ \
+    X(llvm::Function*,        asyncResumeFn_,            nullptr)
+
     // fix #2895 (sequential analogue of NestedBodyScope, §29.3/§30.1/§30.7,
     // v0.240): RAII guard that retracts the suspend/resume frame at every
     // exit from a state-machine emitter (normal return AND any early-return
@@ -10814,6 +10883,46 @@ private:
         Emitter& e_;
     };
 
+    // fix #3505 (§29.3 / §30.1 / §30.6 / §30.7, v0.283): the SECOND half of the
+    // frame contract — save the whole suspend/resume frame on entry to a nested
+    // emission and put it back on EVERY exit, including an exception.
+    //
+    // Pairs with `StateMachineFrameScope`, which is the first half seen from the
+    // other side: the nested emitter retracts the frame it published, and this
+    // guard makes that retraction cost the ENCLOSING body nothing. Both are
+    // generated from `BEZEL_SM_FRAME_MEMBERS` above, so neither can drift from
+    // the other; that is the whole point, and it is why this is a scope rather
+    // than another hand-maintained list of `savedX` locals.
+    //
+    // SAVE ONLY. It does not clear: what a nested emission must not INHERIT is a
+    // separate decision each venue makes for itself (`lowerLambda`'s sync branch
+    // deliberately leaves the #3484 cell-frame publication visible to the nested
+    // body while `buildSpecializedMethodFn` deliberately resets the
+    // scalars, per #1062), and folding the two decisions together would silently
+    // change both.
+    struct SmFrameSaveScope {
+        explicit SmFrameSaveScope(Emitter& e)
+            : e_(e)
+#define BEZEL_SM_FRAME_SAVE_INIT(TYPE, MEMBER, NEUTRAL) , MEMBER(e.MEMBER)
+              BEZEL_SM_FRAME_MEMBERS(BEZEL_SM_FRAME_SAVE_INIT)
+#undef BEZEL_SM_FRAME_SAVE_INIT
+        {}
+        ~SmFrameSaveScope() {
+#define BEZEL_SM_FRAME_SAVE_RESTORE(TYPE, MEMBER, NEUTRAL) \
+            e_.MEMBER = std::move(MEMBER);
+            BEZEL_SM_FRAME_MEMBERS(BEZEL_SM_FRAME_SAVE_RESTORE)
+#undef BEZEL_SM_FRAME_SAVE_RESTORE
+        }
+        SmFrameSaveScope(const SmFrameSaveScope&) = delete;
+        SmFrameSaveScope& operator=(const SmFrameSaveScope&) = delete;
+
+    private:
+        Emitter& e_;
+#define BEZEL_SM_FRAME_SAVE_DECL(TYPE, MEMBER, NEUTRAL) TYPE MEMBER;
+        BEZEL_SM_FRAME_MEMBERS(BEZEL_SM_FRAME_SAVE_DECL)
+#undef BEZEL_SM_FRAME_SAVE_DECL
+    };
+
     // fix #3500 (§27.5 / §28.9 / §29.3, v0.283): save/restore the §27.5
     // closure-release and capture-cell eligibility sets across ONE nested body
     // emission. A `clear()` on per-lowering state and a save/restore around
@@ -10822,7 +10931,7 @@ private:
     //
     // WHY IT MATTERS HERE. `emitIteratorMethod` is not only reached from
     // `emitFunctionBody` (where the next method's own pre-scan re-pins
-    // everything, so clobbering is harmless): `instantiateGenericSpecialization`
+    // everything, so clobbering is harmless): `buildSpecializedMethodFn`
     // (LlvmBackend_Calls2.cpp) also calls it MID-EMISSION of an outer body, to
     // build a lazy monomorphization. That site saves and restores the string
     // sets (#2807 / #2817) and the closure-release set (#2854) precisely for
