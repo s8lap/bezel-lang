@@ -22,11 +22,19 @@
 //
 // The fix holds the fall-back slot in a TRACKING handle and declines any read
 // whose slot no longer resolves to an AllocaInst in the read's own function.
-// This program therefore compiles; it is NOT asserted to run. Its runtime
-// behaviour is the pre-#3484 one — the catch binding's holder gets no frame
-// field, so reading it after the in-arm suspension dereferences null — a
-// separate, pre-existing defect filed on its own. What is pinned here is only
-// that the compiler emits well-formed IR for it.
+// This program therefore compiles; it is NOT asserted to run. What is pinned
+// here is only that the compiler emits well-formed IR for it — the CHECK lines
+// below are negative assertions about diagnostics and are unaffected by what
+// the program does at runtime.
+//
+// ⚠ The paragraph that stood here described that runtime behaviour as "the
+// pre-#3484 one — the catch binding's holder gets no frame field, so reading it
+// after the in-arm suspension dereferences null". That is no longer true:
+// `fix #3503` gives the holder the handler spill area and refreshes it on
+// arm re-entry, so the separate defect this text pointed at is fixed. The
+// sentence is corrected rather than dropped because a reader arriving from
+// #3484 should see that the follow-up landed, not silently find the warning
+// gone.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
