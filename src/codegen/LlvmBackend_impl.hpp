@@ -10073,6 +10073,15 @@ private:
         // Absent when the source is a named local/param (disposed at its own
         // scope end via the using/local machinery, not loop-owned).
         std::unordered_map<const ast::Node*, unsigned> forInSrcFields;
+        // fix #3466 (§27.5 / §30.1, v0.283): for each PARAMETER a lambda in the
+        // body captures, a dedicated POINTER-width frame field holding that
+        // parameter's capture-CELL HOLDER across a suspension. It cannot share
+        // the parameter's ordinary capture field: that one carries the raw
+        // parameter VALUE, which the resume prologue restores unconditionally
+        // into the pre-boxing alloca on every activation and which boxLocalSlot
+        // still reads to seed the cell. These fields are appended AFTER
+        // `extraTrailing`, so no existing field index moves.
+        std::unordered_map<const sema::Symbol*, unsigned> paramCellFields;
     };
 
     // Pre-scan a method body to collect all LocalDecl/ForStmt nodes and their
@@ -10648,6 +10657,19 @@ private:
     std::unordered_map<const ast::Node*, unsigned> smForInSrcFields_;
     // Maps alloca slot → frame field index (spill at suspend, restore at state entry).
     std::unordered_map<llvm::AllocaInst*, unsigned> smAllocaToField_;
+
+    // fix #3466 (§27.5 / §30.1, v0.283): the frame's paramCellFields, published
+    // for the FUNCTION the state-machine body lowers into (`smParamCellFieldFn_`
+    // — the resume fn for async, MoveNext for an iterator). lowerLambda consults
+    // it when it boxes a captured PARAMETER and wires the fresh cell-HOLDER
+    // alloca into smAllocaToField_, so the existing per-suspend spill/restore
+    // carries the holder across the suspension. Without it the holder is a plain
+    // entry-block alloca that the resume prologue re-nulls on every activation:
+    // after a real suspension the body reads back null — a SIGSEGV where the
+    // parameter is read after the `await`, and a leak at the scope-end cell free
+    // (`free(null)`) where it is not.
+    std::unordered_map<const sema::Symbol*, unsigned> smParamCellField_;
+    llvm::Function* smParamCellFieldFn_ = nullptr;
 
     // fix #2891 (§31.2 "`try`/`catch`/`finally`" / §30.1 "`async` methods" /
     // §29.3 "Iterator methods" / §29.7, v0.240): the only legal way to read
@@ -13224,6 +13246,16 @@ private:
     // computeFrameCapturedLocals at each frame-building site (async method /
     // async lambda / iterator), consulted in collectSuspendLocals.
     std::unordered_set<const void*> frameCapturedLocals_;
+    // fix #3466 (§27.5 / §30.1, v0.283): the PARAMETER symbols captured by any
+    // lambda in the same frame body — the sibling of frameCapturedLocals_ above,
+    // filled by the SAME walk so the two cannot drift. A captured parameter's
+    // slot is rebound to a cell holder exactly as a captured local's is, but a
+    // parameter has no bodyLocals field to widen and inherit; it needs a frame
+    // field of its own (StateMachineFrame::paramCellFields).
+    std::unordered_set<const sema::Symbol*> frameCapturedParams_;
+    // Fills BOTH frameCapturedLocals_ and frameCapturedParams_ from one pass
+    // over every lambda in `body` (the name is historical: #808 needed only the
+    // locals half).
     void computeFrameCapturedLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 

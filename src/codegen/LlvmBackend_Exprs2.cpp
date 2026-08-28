@@ -1234,6 +1234,28 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 smAllocaToField_[newSlot] = fieldIdx;
             }
         }
+        // fix #3466 (§27.5 / §30.1, v0.283): the move above only ever fires when
+        // the ORIGINAL slot already had a frame field, which for a PARAMETER it
+        // never does — a parameter's cross-suspension restore is the resume
+        // prologue's unconditional copy from its capture field into the
+        // PRE-BOXING alloca, and that copy knows nothing about the cell holder
+        // this capture just rebound paramSlots_ to. So the holder was a bare
+        // entry-block alloca of the resume fn, re-nulled on every activation:
+        // after a real suspension the body read back null — SIGSEGV on a read of
+        // the parameter after the `await`, and a silent leak at the scope-end
+        // cell free (which then freed null) where there was no such read.
+        // buildStateMachineFrame reserves a dedicated ptr field per captured
+        // parameter; wire the holder to it so the per-suspend spill/restore
+        // (emitAwaitSuspend, the yield handler — both iterate smAllocaToField_)
+        // carries it. Guarded on `!count(newSlot)` so a SECOND lambda capturing
+        // the same parameter (which reaches boxLocalSlot's already-boxed path
+        // with newSlot == slot) cannot re-key an existing mapping.
+        if (currentFn_ == smParamCellFieldFn_ &&
+            !smAllocaToField_.count(newSlot)) {
+            auto pcit = smParamCellField_.find(sym);
+            if (pcit != smParamCellField_.end())
+                smAllocaToField_[newSlot] = pcit->second;
+        }
         ce.sym = sym;
         ce.decl = nullptr;
         // #429: record freshly-boxed param cells that are eligible for free

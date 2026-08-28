@@ -1395,6 +1395,17 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // Restore captured params (this + params) from the frame.
         emitFrameCaptureRestores(frame, self);
 
+        // fix #3466 (§27.5 / §30.1, v0.283): publish the per-parameter capture-
+        // CELL fields for the fn the body actually lowers into (the resume, not
+        // the entry). lowerLambda reads this when it boxes a captured parameter
+        // and maps the fresh cell-HOLDER alloca to its field, so the existing
+        // emitAwaitSuspend spill/restore carries the holder across every
+        // suspension lowered after the capture site. Keyed by function because
+        // paramSlots_/locals_ are rebuilt per emitted function and a nested
+        // emission must not inherit this frame's field indices.
+        smParamCellField_ = frame.paramCellFields;
+        smParamCellFieldFn_ = resumeFn;
+
         // fix #2807 / fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): CO-GATE the
         // parameter retain with the parameter release the pin above just turned
         // on. lowerStringLocalReassign (and the §4.6 `+=` branch's `isLocal`)
@@ -2628,6 +2639,13 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
 
         llvm::Value* self = resumeFn->getArg(1);
         emitFrameCaptureRestores(frame, self);
+
+        // fix #3466 (§27.5 / §30.1 / §30.7, v0.283): the async-ITERATOR spelling
+        // of the same publish — see the async-method site above. This body
+        // suspends on BOTH an `await` and a `yield return`, and both spill/restore
+        // loops iterate smAllocaToField_, so one registration covers both.
+        smParamCellField_ = frame.paramCellFields;
+        smParamCellFieldFn_ = resumeFn;
 
         // fix #2817 / fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): CO-GATE the
         // parameter retain with the parameter release the pin above just turned

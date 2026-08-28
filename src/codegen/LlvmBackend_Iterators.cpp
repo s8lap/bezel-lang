@@ -72,19 +72,31 @@ bool Emitter::forInBuiltinEnumeratorNeedsFrameSlot(const ast::ForStmt& fs) {
 // §27.5 / §30 (#808 exposure): see the header comment on frameCapturedLocals_.
 // One pass over every lambda in the frame body; each captured LocalSymbol's
 // decl node (a LocalDecl or the anchoring ForStmt) enters the set.
+//
+// fix #3466 (§27.5 / §30.1, v0.283): the SAME walk also records the captured
+// PARAMETER symbols. Both halves answer one question — "which of this frame
+// body's variables does a lambda box into a shared cell?" — and the answer
+// decides a frame-layout obligation for each storage class (a ptr-WIDE field
+// for a local, a ptr field of its OWN for a parameter). Deriving them from two
+// walks would be exactly the duplicated-classification-predicate shape that
+// keeps generating defects here, so they share one.
 void Emitter::computeFrameCapturedLocals(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     frameCapturedLocals_.clear();
+    frameCapturedParams_.clear();
     std::vector<const ast::LambdaExpr*> lambdas;
     collectAllLambdas(body, lambdas);
     for (const ast::LambdaExpr* lam : lambdas) {
         std::unordered_set<const sema::Symbol*> caps;
         collectCapturedSyms(*lam, caps);
         for (const sema::Symbol* s : caps) {
-            if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s))
+            if (auto* loc = dynamic_cast<const sema::LocalSymbol*>(s)) {
                 if (loc->decl)
                     frameCapturedLocals_.insert(
                         static_cast<const void*>(loc->decl));
+            } else if (dynamic_cast<const sema::ParameterSymbol*>(s)) {
+                frameCapturedParams_.insert(s);
+            }
         }
     }
 }
@@ -334,6 +346,26 @@ Emitter::StateMachineFrame Emitter::buildStateMachineFrame(
         (unsigned)(frame.localStart + frame.bodyLocals.size());
     for (llvm::Type* ty : extraTrailing) fields.push_back(ty);
 
+    // fix #3466 (§27.5 / §30.1, v0.283): one POINTER field per lambda-captured
+    // PARAMETER, holding that parameter's capture-CELL HOLDER across a
+    // suspension. Appended LAST — after `extraTrailing` — precisely so that no
+    // index any caller already computed from `captureStart` / `localStart` /
+    // `currentValField` (+1, +2 for the async trailing trio) moves. The frame is
+    // calloc'd at construction, so a field starts null, which is exactly the
+    // "cell not yet allocated" state boxLocalSlot's guard already tests for.
+    //
+    // Reserved from the frame LAYOUT, not from the capture set actually boxed:
+    // whether a given lambda reaches boxLocalSlot is decided later, during body
+    // lowering, and the struct body is finalized here. An unused field costs 8
+    // bytes in a frame that is already per-call heap-allocated.
+    for (auto* param : ms->params) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(param);
+        if (!ps) continue;
+        if (!frameCapturedParams_.count(ps)) continue;
+        frame.paramCellFields[ps] = (unsigned)fields.size();
+        fields.push_back(ptrTy());
+    }
+
     frame.structTy = llvm::StructType::create(llvm_, fields, structName);
     frame.vtableField = 0;
     frame.stateField = 1;
@@ -537,6 +569,8 @@ void Emitter::clearSmFrame() {
     smLocalFields_.clear();
     smForInSrcFields_.clear();
     smAllocaToField_.clear();
+    smParamCellField_.clear();          // fix #3466
+    smParamCellFieldFn_        = nullptr;
     iterCurrentValField_       = 0;
     iterElemTy_                = nullptr;
     iterElemSemaTy_            = nullptr;
@@ -1495,6 +1529,18 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
         // Restore captured params (this + params) from the frame.
         emitFrameCaptureRestores(frame, self);
+
+        // fix #3466 (§27.5 / §29.3 / §30.1, v0.283): publish the per-parameter
+        // capture-CELL fields for MoveNext — the fn the iterator body lowers
+        // into. A `yield` suspends exactly as an `await` does, and the same
+        // entry-block re-null applies (MoveNext opens with the state-dispatch
+        // switch, so the cell holder's null-init runs on every advance), so a
+        // parameter a lambda captures needs its holder carried by the frame here
+        // for the same reason. Measured on the pre-fix compiler: a `v := v + 5`
+        // between two `yield return`s did not reach the closure — 9 where 14 is
+        // §27.5's answer.
+        smParamCellField_ = frame.paramCellFields;
+        smParamCellFieldFn_ = moveNextFn;
 
         // fix #2817 / fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): CO-GATE the
         // parameter retain with the parameter release the pin above just turned
