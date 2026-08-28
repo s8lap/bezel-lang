@@ -39,13 +39,18 @@
 // later, so a write parked there is picked up rather than lost.
 //
 // ONLY THE EXPOSED READS ARE PATCHED. A read the capture site's `cell.done` join
-// DOMINATES can never see the null, and those are left bit-identical. That is
-// not an optimization: an unconditional guard perturbs register allocation
-// enough to change which stale stack slots still hold a heap pointer when
-// LeakSanitizer scans at exit, and five one-shot leak rows elsewhere were
-// passing on exactly that accident. Since dominance is a question about the
-// FINISHED CFG, `boxedStorage` records the read and `fixupCapturedCellHolderReads`
-// patches from `run()`.
+// DOMINATES can never see the null, and those are left bit-identical. That is not
+// an optimization: an unconditional guard perturbs register allocation enough to
+// change which stale stack slots still hold a heap pointer when LeakSanitizer
+// scans at exit, and a first draft that emitted it unconditionally turned five
+// one-shot leak rows elsewhere red. For two of them
+// (closure_literal_arg_leak_1073) the leak is MEASURED pre-existing and unchanged
+// in magnitude — 4000 B / 500 allocations at 500x amplification on both compilers
+// — so those were passing on the scan accident; the other three
+// (lambda_closure_return_mint_agreement_2691) were not amplified and nothing is
+// claimed about them beyond that the narrowed guard leaves them clean. Since
+// dominance is a question about the FINISHED CFG, `boxedStorage` records the read
+// and `fixupCapturedCellHolderReads` patches from `run()`.
 //
 // DIRECTION OF DANGER. Read-side only. It widens no free, shortens no lifetime
 // and adds no release: a null dereference becomes a load/store of storage that

@@ -3504,7 +3504,10 @@ llvm::AllocaInst* Emitter::localSlot(const ast::Expr& e) {
 // not-taken path never runs the allocation, so the holder is still the entry
 // block's null when a LATER read of the same variable loads it — and this
 // function handed that null straight back as the address to load from
-// (`SEGV on unknown address 0x0`, measured on four spellings of the shape,
+// (`SEGV on unknown address 0x0`, measured on six spellings — a `case` arm with
+// and without a `do … end`, an `if` body, an if-EXPRESSION arm, and a zero-trip
+// `while` with either an ordinary read or a `using var`'s scope-end DISPOSAL as
+// the surviving reader — over a captured parameter and a captured local alike,
 // purely synchronous, with no `await` and no unsafe construct in the program).
 //
 // WHICH HALF IS WRONG is decided by the design of the holder, not by taste: the

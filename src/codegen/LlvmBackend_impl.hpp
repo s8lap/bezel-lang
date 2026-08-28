@@ -822,16 +822,24 @@ private:
     // what keeps the emitted IR BIT-IDENTICAL for every program whose capture is
     // unconditional. An unconditional select there perturbs register allocation
     // enough to change which stale stack slots still hold a heap pointer when
-    // LeakSanitizer scans at exit, which flips one-shot leak rows that were
-    // passing on that accident (measured: five, in closure_literal_arg_leak_1073
-    // and lambda_closure_return_mint_agreement_2691, whose programs leak the
-    // same bytes before and after under 500x amplification).
+    // LeakSanitizer scans at exit: a draft that emitted it unconditionally turned
+    // five one-shot leak rows red. Two of them (closure_literal_arg_leak_1073)
+    // are MEASURED to leak the same bytes with and without this fix — 4000 B /
+    // 500 allocations at 500x amplification — so they were passing on that
+    // accident; the other three (lambda_closure_return_mint_agreement_2691) were
+    // not amplified and nothing beyond "the narrowed guard leaves them clean" is
+    // claimed for them.
     //
     // The blocks after which a holder is guaranteed non-null: boxLocalSlot's
     // `cell.done` join for a guarded boxing (both the first-capture and the
     // already-boxed re-guard), or the capture site's own block for a fresh one.
     // Module-lifetime and NOT part of the saved/restored nested-emission state —
     // the fixup runs once, over the whole module, after every body is complete.
+    // These BasicBlock* cannot dangle at that point: they are recorded only from
+    // inside a body being emitted, and the only Function::eraseFromParent calls
+    // in the backend (LlvmBackend_Setup.cpp, the exported property/indexer
+    // forwarders) drop a declaration created moments earlier whose body was never
+    // emitted, so no block of theirs ever reaches this map.
     std::unordered_map<llvm::AllocaInst*, std::vector<llvm::BasicBlock*>>
         cellHolderReadyBlocks_;
     struct PendingHolderRead {
