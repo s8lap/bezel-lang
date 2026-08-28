@@ -136,6 +136,30 @@ void Emitter::collectSuspendLocals(
         } else if (init) {
             if (auto* rt = ctx_.exprType(*init)) ty = lowerTypeRef(rt);
         }
+        // fix #3453 (§4.7 / §30.1 / §29.3, v0.283): a frame field is a STRUCT
+        // MEMBER, and `void` is not a legal one. `lowerTypeRef` answers `void`
+        // for exactly one thing — the unit type's `Kind::Unit` arm (§4.7, "the
+        // type with exactly one value"); every other arm answers a sized type.
+        // A `var u: () := ();` in an `async` body or an iterator body therefore
+        // planned a `void` field here, and the first `DataLayout` query over the
+        // finished struct (`getTypeAllocSize(stateStructTy)`, the frame's
+        // `calloc` size) executed LLVM's `llvm_unreachable` inside
+        // `StructLayout::StructLayout` — a `ud2` in a release LLVM, so `bezelc`
+        // died of SIGILL with NO DIAGNOSTIC OF ANY SEVERITY (measured rc=132 on
+        // ef339fa for a unit local in an async body, in an iterator body, in an
+        // async body containing a lambda, and for the §21.1 `const` spelling).
+        //
+        // §4.7 gives the unit type exactly one value, so it carries no
+        // information and one inert byte is a faithful slot. This is the SAME
+        // substitution `entryAlloca` makes structurally for the local's own
+        // alloca and `lowerParamType`/`lowerParamTypeRef` make at the signature
+        // — asked here rather than re-derived, and asked at the ONE place both
+        // state-machine frame builders (`buildStateMachineFrame` and
+        // `emitAsyncLambda`'s own layout) decide a local's slot type, so neither
+        // can drift. The two MUST agree: the per-suspend spill stores
+        // `alloca->getAllocatedType()` bytes into this field, and `entryAlloca`
+        // already gives the unit local an `i8` alloca.
+        if (ty && ty->isVoidTy()) ty = unitPlaceholderTy();
         if (frameCapturedLocals_.count(static_cast<const void*>(node))) {
             // fix #3484 follow-up (§27.5 / §30.1, v0.283): remember what the
             // field WOULD have been. #808 widens this one to ptr because
@@ -198,6 +222,13 @@ void Emitter::collectSuspendLocals(
                 // §27.5 / §30 (#808 exposure): a captured loop variable is
                 // cell-boxed too — its frame field must be ptr-typed (see the
                 // LocalDecl branch above).
+                // fix #3453 (§4.7 / §30.1, v0.283): the loop variable's twin
+                // of `frameSlotTy`'s void→placeholder swap above — same reason,
+                // same authority (`unitPlaceholderTy`). This arm derives its
+                // type from a different source (the annotation, else the
+                // iterable's element), so it needs the guard of its own; a
+                // `void` field here traps identically.
+                if (ty && ty->isVoidTy()) ty = unitPlaceholderTy();
                 if (frameCapturedLocals_.count(static_cast<const void*>(fs)))
                     ty = ptrTy();
                 out.push_back({fs, ty});
@@ -331,8 +362,20 @@ Emitter::StateMachineFrame Emitter::buildStateMachineFrame(
         if (!ps) continue;
         llvm::Type* pty = ptrTy();  // default ptr for class params
         if (ps->declType) {
+            // fix #3453 (§4.7 / §30.1, v0.283): `lowerParamTypeRef`, not the raw
+            // `lowerTypeRef`. Two reasons, and the second is the load-bearing
+            // one. (a) A capture field is a struct member, which `void` — the
+            // unit type's lowering (§4.7) — is not a legal type for; a `()`
+            // PARAMETER of an `async` method planned a `void` field and killed
+            // `bezelc` with SIGILL and no diagnostic at the frame's first
+            // `getTypeAllocSize` (measured rc=132 on ef339fa). (b) This field
+            // must hold exactly what the parameter's own slot holds:
+            // `emitFrameCaptureStores` does `CreateLoad(ty, paramSlots_[sym])`
+            // against this very type, and that slot was allocated from
+            // `lowerParamType`'s answer. Asking the SAME face the signature asks
+            // is what keeps the two from drifting apart again.
             if (auto* rt = ctx_.resolvedType(*ps->declType))
-                pty = lowerTypeRef(rt);
+                pty = lowerParamTypeRef(rt);
         }
         frame.captures.push_back({ps, pty});
     }
