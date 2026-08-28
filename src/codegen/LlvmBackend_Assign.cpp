@@ -12374,10 +12374,17 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         // same formal shape.
         if (v && v->getType()->isVoidTy() && params[idx].type) {
             sema::TypeRef* formal0 = ctx_.resolvedType(*params[idx].type);
+            // fix #3487: holder hoisted out of the inner `if` for the same
+            // reason as the `!v` rescue below — see the long comment there.
+            // This arm's escape is not reachable from any program found so
+            // far (every unit-valued argument measured lowers to a NULL `v`,
+            // taking the `!v` rescue, not a void-typed one), but the shape is
+            // identical and the two arms are 40 lines apart; leaving one
+            // spelled the defective way is how the next reader copies it.
+            sema::TypeRef concrHolder;
             if (formal0) {
                 if (formal0->kind == sema::TypeRef::Kind::Named &&
                     !formal0->declaration && formal0->nullable) {
-                    sema::TypeRef concrHolder;
                     if (nullableTypeParamConcrete(formal0, concrHolder))
                         formal0 = &concrHolder;
                 } else {
@@ -12416,12 +12423,27 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // (#885/#886) `GetVal<int>(null, 42)` path that depends on the
             // `T?` formal staying bare until `applyMethodGenericSubst` runs
             // is untouched.
+            // fix #3487: `concrHolder` is declared HERE, in the scope that
+            // outlives every dereference of `formal0` below, not inside the
+            // inner `if`. `nullableTypeParamConcrete` fills it by value and
+            // `formal0` is made to point AT it, so a holder scoped to the
+            // inner `if` is destroyed at that block's closing brace while
+            // `formal0` — declared one scope out — keeps pointing at the dead
+            // slot. `unitValueForTarget`/`isNullableUnitTy` then read it:
+            // MEASURED as `stack-use-after-scope` by a `bezelc` built with
+            // `-fsanitize=address -fsanitize-address-use-after-scope`, on
+            // `C.Take<()>(C.Nothing())` where `Take<T>(x: T?) where T: value`
+            // (§4.7 / §14.2, v0.283). Without ASan the read happened to land on
+            // unclobbered stack and the program printed the right answers,
+            // which is why it went unnoticed. `Emitter::unitValueForCtorParam`
+            // (LlvmBackend_Layout.cpp) is the local precedent for keeping the
+            // holder alive across the call.
+            sema::TypeRef concrHolder;
             if (formal0) {
                 if (formal0->kind == sema::TypeRef::Kind::Named &&
                     !formal0->declaration && formal0->nullable) {
                     // `T?` with an active `T → <concrete>` substitution:
                     // preserve nullability (resolveTypeParamRef strips it).
-                    sema::TypeRef concrHolder;
                     if (nullableTypeParamConcrete(formal0, concrHolder))
                         formal0 = &concrHolder;
                 } else {
