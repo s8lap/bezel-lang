@@ -1404,7 +1404,8 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // paramSlots_/locals_ are rebuilt per emitted function and a nested
         // emission must not inherit this frame's field indices.
         smParamCellField_ = frame.paramCellFields;
-        smParamCellFieldFn_ = resumeFn;
+        smLocalPreBoxField_ = frame.localPreBoxFields;
+        smCellFrameFn_ = resumeFn;
 
         // fix #2807 / fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): CO-GATE the
         // parameter retain with the parameter release the pin above just turned
@@ -1865,7 +1866,16 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             auto* slot = entryAlloca(fc.fieldTy);
             builder_.CreateStore(val, slot);
             if (fc.cellValTy) cellVars_[slot] = fc.cellValTy;
-            if (fc.paramSym) paramSlots_[fc.paramSym] = slot;
+            if (fc.paramSym) {
+                paramSlots_[fc.paramSym] = slot;
+                // fix #3484 follow-up: an async lambda restores its own params
+                // unconditionally here, exactly as emitFrameCaptureRestores does
+                // for a method, so this alloca is valid fall-back storage after a
+                // resume. Its captured LOCALS are NOT covered — this frame is
+                // hand-rolled and reserves no pre-box field — so boxedStorage
+                // declines those and leaves the pre-#3484 read in place.
+                smRestoredParamSlots_.insert(slot);
+            }
             if (fc.localDecl) locals_[fc.localDecl] = slot;
         }
         // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §30.6 (v0.240): the
@@ -2645,7 +2655,8 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // suspends on BOTH an `await` and a `yield return`, and both spill/restore
         // loops iterate smAllocaToField_, so one registration covers both.
         smParamCellField_ = frame.paramCellFields;
-        smParamCellFieldFn_ = resumeFn;
+        smLocalPreBoxField_ = frame.localPreBoxFields;
+        smCellFrameFn_ = resumeFn;
 
         // fix #2817 / fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): CO-GATE the
         // parameter retain with the parameter release the pin above just turned

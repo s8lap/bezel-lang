@@ -840,17 +840,43 @@ private:
     // in the backend (LlvmBackend_Setup.cpp, the exported property/indexer
     // forwarders) drop a declaration created moments earlier whose body was never
     // emitted, so no block of theirs ever reaches this map.
+    // Consulted SYNCHRONOUSLY by boxedStorage, which snapshots the entry into the
+    // pending read below. It is never read at module end, so a stale entry for a
+    // dead alloca can never be reached through a recycled address.
     std::unordered_map<llvm::AllocaInst*, std::vector<llvm::BasicBlock*>>
         cellHolderReadyBlocks_;
     struct PendingHolderRead {
-        // WeakTrackingVH, not a raw pointer: fixupSuspendDominance's
-        // DemoteRegToStack ERASES the instructions it demotes, and a resume
-        // function's holder load is a candidate. A demoted read is skipped —
-        // whether a state-machine holder survives a SUSPENSION is a frame-layout
-        // question (#3466), separate from the dominance one asked here.
+        // TRACKING HANDLES, not raw pointers. Two different passes invalidate
+        // these between the read's emission and the module-end fixup:
+        //   * fixupSuspendDominance's DemoteRegToStack ERASES the instructions it
+        //     demotes, and a resume function's holder load is a candidate;
+        //   * promoteDemotedSlotsToFrame (LlvmBackend_Async.cpp) does
+        //     replaceAllUsesWith + eraseFromParent on every
+        //     asyncHandlerSpillSlots_ entry — and lowerTry registers a CATCH-ARM
+        //     BINDING's own alloca there when the arm awaits, which is exactly
+        //     the alloca cellVarSyncSlot_ records as the fall-back slot.
+        // With a raw pointer the second one produced malformed IR ("Referring to
+        // an instruction in another function!") once LLVM recycled the freed
+        // AllocaInst's address into a different function — and a SAME-function
+        // recycle would have verified clean and silently addressed the wrong
+        // storage. A handle that no longer resolves to an AllocaInst in the
+        // read's own function makes the fixup skip that read, which restores the
+        // pre-#3484 dereference rather than emitting a wrong address.
         llvm::WeakTrackingVH load;
-        llvm::AllocaInst*    holder;
-        llvm::AllocaInst*    syncSlot;
+        llvm::WeakTrackingVH syncSlot;
+        // Snapshot of the holder's completion blocks AS OF THE READ. Taken here
+        // rather than looked up at module end so the raw-pointer map above is
+        // only ever indexed while its key alloca is live. A capture site lowered
+        // AFTER this read cannot contribute — which is the conservative
+        // direction: a read that a later capture's join would dominate is still
+        // exposed on the path that reaches the read first.
+        std::vector<llvm::BasicBlock*> readyBlocks;
+        // False when this read is inside a STATE MACHINE and the fall-back slot
+        // has no frame field, so it is NOT restored across a suspension. The
+        // fall-back would then address a fresh-stack alloca holding garbage — a
+        // silently wrong value where the unpatched read was a loud SIGSEGV. See
+        // fixupCapturedCellHolderReads.
+        bool syncSurvivesSuspend = true;
     };
     std::vector<PendingHolderRead> pendingHolderReads_;
     // Runs once from run(), before the module verifier.
@@ -10090,6 +10116,27 @@ private:
         // still reads to seed the cell. These fields are appended AFTER
         // `extraTrailing`, so no existing field index moves.
         std::unordered_map<const sema::Symbol*, unsigned> paramCellFields;
+        // fix #3484 follow-up (§27.5 / §30.1, v0.283): for each lambda-captured
+        // LOCAL, a field of the local's PRE-BOXING type, carrying the ORIGINAL
+        // alloca across a suspension.
+        //
+        // The local's own bodyLocals field is ptr-widened by #808 and is MOVED
+        // onto the cell holder when the capture is lowered (lowerLambda), which
+        // leaves the pre-boxing alloca with no field at all. That was harmless
+        // while nothing read it after a suspend — and stopped being harmless the
+        // moment #3484 made it the fall-back address for a null holder: on a path
+        // that skipped the capture site the resume read a fresh-stack alloca and
+        // produced a plausible wrong number instead of the old SIGSEGV.
+        //
+        // This is `paramCellFields`' twin, and the asymmetry between them is the
+        // point: a PARAMETER's pre-boxing alloca is restored by the resume
+        // prologue's unconditional copy from its capture field, so it needs no
+        // field of its own and the holder gets the new one; a LOCAL's is restored
+        // by nothing, so the holder keeps the existing field and the pre-boxing
+        // alloca gets the new one. Type is the local's PRECISE lowered type, not
+        // ptr: a record/value-struct local would overflow a ptr-width field
+        // exactly as #461 describes.
+        std::unordered_map<const ast::Node*, unsigned> localPreBoxFields;
     };
 
     // Pre-scan a method body to collect all LocalDecl/ForStmt nodes and their
@@ -10677,7 +10724,22 @@ private:
     // parameter is read after the `await`, and a leak at the scope-end cell free
     // (`free(null)`) where it is not.
     std::unordered_map<const sema::Symbol*, unsigned> smParamCellField_;
-    llvm::Function* smParamCellFieldFn_ = nullptr;
+    // fix #3484 follow-up: the LOCAL twin — see StateMachineFrame::
+    // localPreBoxFields. Keyed by the local's decl node (a LocalDecl /
+    // LocalConstDecl / anchoring ForStmt), exactly as frame.localFields is.
+    std::unordered_map<const ast::Node*, unsigned> smLocalPreBoxField_;
+    // The function BOTH maps above are published for. Named for the frame rather
+    // than for either map: they are two halves of one publication and must never
+    // be gated on different keys.
+    llvm::Function* smCellFrameFn_ = nullptr;
+    // fix #3484 follow-up: the PARAMETER pre-boxing allocas a state-machine body
+    // restores UNCONDITIONALLY in its prologue (emitFrameCaptureRestores, and
+    // emitAsyncLambda's capture restore). They carry no smAllocaToField_ entry
+    // and need none — the prologue copy is their restore — so boxedStorage must
+    // still treat them as valid fall-back storage across a suspension. Without
+    // this the parameter half of #3484 would be declined inside every async body
+    // and #3466's crash rows would regress to the SIGSEGV.
+    std::unordered_set<llvm::AllocaInst*> smRestoredParamSlots_;
 
     // fix #2891 (§31.2 "`try`/`catch`/`finally`" / §30.1 "`async` methods" /
     // §29.3 "Iterator methods" / §29.7, v0.240): the only legal way to read
@@ -13261,6 +13323,14 @@ private:
     // parameter has no bodyLocals field to widen and inherit; it needs a frame
     // field of its own (StateMachineFrame::paramCellFields).
     std::unordered_set<const sema::Symbol*> frameCapturedParams_;
+    // fix #3484 follow-up: for each lambda-captured LOCAL, the type its frame
+    // field WOULD have had before #808's ptr widening — i.e. the type the
+    // pre-boxing alloca actually holds. Filled by collectSuspendLocals (the one
+    // place that already computes it) and consumed by buildStateMachineFrame to
+    // size StateMachineFrame::localPreBoxFields. Cleared by
+    // computeFrameCapturedLocals, which every frame-building site calls
+    // immediately before collectSuspendLocals.
+    std::unordered_map<const ast::Node*, llvm::Type*> frameLocalPreBoxTy_;
     // Fills BOTH frameCapturedLocals_ and frameCapturedParams_ from one pass
     // over every lambda in `body` (the name is historical: #808 needed only the
     // locals half).

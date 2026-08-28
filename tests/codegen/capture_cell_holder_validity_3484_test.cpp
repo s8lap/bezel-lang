@@ -19,12 +19,14 @@
 //
 //     AddressSanitizer: SEGV on unknown address 0x000000000000
 //
-// Purely synchronous: no `await`, no generic, no unsafe construct. Measured on
-// six spellings below — a `case` arm with and without a `do … end`, an `if`
-// body, an if-EXPRESSION arm at root depth, and a `while` the compiler cannot
-// prove runs at least once — over a captured PARAMETER and a captured LOCAL, and
-// with the surviving reader being either an ordinary read or a `using var`'s own
-// scope-end DISPOSAL (which goes through the same funnel).
+// Measured on six spellings below — a `case` arm with and without a `do … end`,
+// an `if` body, an if-EXPRESSION arm at root depth, and a `while` the compiler
+// cannot prove runs at least once — over a captured PARAMETER and a captured
+// LOCAL, and with the surviving reader being either an ordinary read or a
+// `using var`'s own scope-end DISPOSAL (which goes through the same funnel).
+// The first seven need no `await`, no generic and no unsafe construct; the last
+// four put the same conditional capture inside an `async` body, where the
+// FALL-BACK SLOT has its own survival obligation — see the second section.
 //
 // WHICH HALF IS WRONG is decided by the design of the holder, not by taste. The
 // guarded strategy is what MAKES the holder nullable — that null is how the
@@ -66,21 +68,41 @@
 // this one's contract. The cross-SUSPENSION twin of the null holder is #3466,
 // covered by its own file.
 //
-// FAIL-WITHOUT / PASS-WITH, measured program-by-program on one build of each
-// compiler (`bezelc --sanitize=address`):
+// FAIL-WITHOUT / PASS-WITH, measured program-by-program on one build of each of
+// THREE compilers (`bezelc --sanitize=address` for the leak figures, plain builds
+// for the crash/value rows). `0c5ecd1` is the tree with no fix; `first draft` is
+// this fix as originally written — before the fall-back was required to survive a
+// suspension — and is shown because it FAILED SOFTLY where the base failed
+// loudly, which is the more dangerous direction and the reason those rows exist:
 //
-//   row                                          pre-fix          post-fix
-//   case arm, do-block capture, read after        SEGV @ 0         67200
-//   case arm, no do-block, read after             SEGV @ 0         67200
-//   if body capture, read after                   SEGV @ 0         67200
-//   if-EXPRESSION arms at root depth              SEGV @ 0         30000
-//   captured LOCAL behind an `if`, read after     SEGV @ 0         134400
-//   zero-trip loop, read after                    SEGV @ 0         30
-//   zero-trip loop, disposal is the only reader   SEGV @ 0         400
-//   control: same program with NO lambda          67200            67200
-//   control: capture behind an `if`, no read      22350            22350
+//   row                                     0c5ecd1     first draft   this fix
+//   case arm, do-block capture, read after  SEGV @ 0    67200         67200
+//   case arm, no do-block, read after       SEGV @ 0    67200         67200
+//   if body capture, read after             SEGV @ 0    67200         67200
+//   if-EXPRESSION arms at root depth        SEGV @ 0    30000         30000
+//   captured LOCAL behind an `if`           SEGV @ 0    134400        134400
+//   zero-trip loop, read after              SEGV @ 0    30            30
+//   zero-trip loop, disposal is only reader SEGV @ 0    400           400
+//   control: same program, NO lambda        67200       67200         67200
+//   control: capture, no later read         22350       22350         22350
+//   async cond. capture LOCAL, per n        SEGV @ 0    0 0 8 0 16 0  0 2 8 6 16 10
+//   control: same, NO lambda                0 2 8 ...   0 2 8 ...     0 2 8 6 16 10
+//   async cond. capture, REFERENCE local    SEGV @ 0    SEGV @ 0xc    7 0 7 0
+//   async cond. capture, `using var` freed  SEGV @ 0    SEGV          30
+//   nested `async lambda` between the two   SEGV @ 0    0 1 4 3       0 1 4 3
 //
-// per §27.5 (issue #3484)
+// The last row is a REGRESSION GUARD rather than a fix row: the first draft got
+// it right and an intermediate version of THIS fix broke it (SEGV @ 0), because
+// the nested lambda's frame teardown wiped the enclosing body's publication.
+//
+// The three async rows are what the first draft could not satisfy: it turned the
+// base's loud SEGV into a silent wrong number for a value local, into a
+// DIFFERENT and later fault for a reference local, and into a skipped disposal.
+// The catch-arm-binding-across-`await` face of the same defect is a compile-time
+// one (malformed IR) and is pinned by
+// tests/lit/catch_binding_capture_across_await_valid_ir_3484.bzl.
+//
+// per §27.5, §28.4, §30.1 (issue #3484)
 
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
@@ -377,4 +399,208 @@ BEZEL_TEST(capture_cell_holder_validity_3484,
         "  end Main; "
         "end C;"),
         "400\n");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// The FALL-BACK SLOT must itself survive a suspension
+//
+// Everything above is a synchronous frame, where the pre-boxing alloca lives as
+// long as the function and the fall-back is simply correct. Inside a STATE
+// MACHINE it is not automatic, and getting it wrong is worse than the crash this
+// fix removes: a fresh-stack alloca reads as a plausible number, so the program
+// returns a WRONG ANSWER instead of dying at address 0.
+//
+// A captured LOCAL is the exposed case. lowerLambda MOVES its #808-widened frame
+// field onto the cell holder, which leaves the pre-boxing alloca — the exact slot
+// this fix falls back to — with no field and therefore no restore. (A captured
+// PARAMETER is not exposed: the resume prologue restores its pre-boxing alloca
+// unconditionally from its capture field, which is why every #3466 row was green
+// while these were not.) The repair is the mirror of #3466's: there the HOLDER
+// got the new field, here the PRE-BOXING ALLOCA does.
+//
+// boxedStorage additionally DECLINES the fall-back outright when the slot has no
+// such restore — an async LAMBDA's own body local, a catch-arm binding promoted
+// into the spill area — so an unrepaired venue keeps the loud pre-#3484 SIGSEGV
+// instead of quietly reading the wrong storage.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// The headline row: an `int` LOCAL captured in a conditional block, read after an
+// `await`. Printed per `n` rather than aggregated, because the aggregate hides
+// which half is wrong. Step(n) = (n even ? 2n : 0) + 2n, so the six lines are
+// 0,2,8,6,16,10 — identical to the no-lambda control below, which is what makes
+// them the right numbers rather than merely numbers.
+//   0c5ecd1 (no #3484):  SEGV @ 0 after the first line
+//   #3484 as first written: 0,0,8,0,16,0 — every ODD n silently wrong
+// per §27.5, §30.1 (issue #3484)
+BEZEL_TEST(capture_cell_holder_validity_3484,
+           async_conditional_capture_local_read_after_await_spec_27_5_30_1) {
+    BEZEL_EXPECT_EQ(out(
+        "module M; import System; "
+        "class C "
+        "  public static async method Run(n: int): Task<int> "
+        "    var k := n * 2; "
+        "    var s := 0; "
+        "    if n mod 2 = 0 then "
+        "      var g := lambda(): int => k; "
+        "      s := g(); "
+        "    end if; "
+        "    await Task.Delay(1); "
+        "    return s + k; "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    for var i in 0..<6 do "
+        "      Console.WriteLine((await Run(i)).ToString()); "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"),
+        "0\n2\n8\n6\n16\n10\n");
+}
+
+// CONTROL — the identical program with the lambda deleted. Green on all three
+// compilers; it is where the six expected numbers come from.
+// per §27.5, §30.1 (issue #3484)
+BEZEL_TEST(capture_cell_holder_validity_3484,
+           control_async_conditional_no_lambda_spec_27_5_30_1) {
+    BEZEL_EXPECT_EQ(out(
+        "module M; import System; "
+        "class C "
+        "  public static async method Run(n: int): Task<int> "
+        "    var k := n * 2; "
+        "    var s := 0; "
+        "    if n mod 2 = 0 then "
+        "      s := k; "
+        "    end if; "
+        "    await Task.Delay(1); "
+        "    return s + k; "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    for var i in 0..<6 do "
+        "      Console.WriteLine((await Run(i)).ToString()); "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"),
+        "0\n2\n8\n6\n16\n10\n");
+}
+
+// The REFERENCE-typed twin. A garbage fall-back is not a wrong number here but a
+// wrong BASE ADDRESS that a field offset is then added to, so the failure moves
+// from `SEGV @ 0` to `SEGV @ 0xc` — a different, later fault that looks like an
+// unrelated bug. Step(n) = (n even ? 7 : 0).
+//   0c5ecd1:  prints 7, then SEGV @ 0
+//   #3484 as first written: prints 7, then SEGV @ 0xc
+// per §27.5, §30.1 (issue #3484)
+BEZEL_TEST(capture_cell_holder_validity_3484,
+           async_conditional_capture_reference_local_read_after_await_spec_27_5) {
+    BEZEL_EXPECT_EQ(out(
+        "module M; import System; "
+        "class Box "
+        "  public V: int := 0; "
+        "  public method Add(x: int) V := V + x; end Add; "
+        "end Box; "
+        "class Sink "
+        "  public method Take(h: () -> ()) h(); end Take; "
+        "end Sink; "
+        "class C "
+        "  public static async method Step(n: int): Task<int> "
+        "    using var box := new Box(); "
+        "    using var s := new Sink(); "
+        "    if n mod 2 = 0 then "
+        "      s.Take(lambda () => do box.Add(7); end); "
+        "    end if; "
+        "    await Task.Delay(1); "
+        "    return box.V; "
+        "  end Step; "
+        "  public static async method Main(): Task<int> "
+        "    for var i in 0..<4 do "
+        "      Console.WriteLine((await Step(i)).ToString()); "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"),
+        "7\n0\n7\n0\n");
+}
+
+// The DISPOSAL face, with a live oracle for it. The only surviving reader of the
+// captured `using var` on the skipped path is its own scope-end disposal, which
+// goes through boxedStorage like any other read — so a fall-back slot that does
+// not survive the suspension makes the disposal address the wrong storage and,
+// for a trivial-dispose class, silently not happen at all (measured as a leak
+// rather than a crash). A `destructor` bumping a static counter turns that into a
+// VALUE: `Probe.Live` must be 0 once all six activations have finished.
+// Printed as acc*10 + Live, so 3 disposals-observed*10 + 0 = 30.
+// per §27.5, §28.4, §30.1 (issue #3484)
+BEZEL_TEST(capture_cell_holder_validity_3484,
+           async_conditional_capture_using_var_still_disposed_spec_27_5_28_4) {
+    BEZEL_EXPECT_EQ(out(
+        "module M; import System; "
+        "class Probe "
+        "  public static Live: int := 0; "
+        "  public V: int := 0; "
+        "  public constructor() Probe.Live := Probe.Live + 1; end constructor; "
+        "  public method Touch() V := V + 1; end Touch; "
+        "  destructor Probe.Live := Probe.Live - 1; end destructor; "
+        "end Probe; "
+        "class Sink "
+        "  public method Take(h: () -> ()) h(); end Take; "
+        "end Sink; "
+        "class C "
+        "  public static async method Step(n: int): Task<int> "
+        "    var seen := 0; "
+        "    using var p := new Probe(); "
+        "    using var s := new Sink(); "
+        "    if n mod 2 = 0 then "
+        "      s.Take(lambda () => do p.Touch(); end); "
+        "      seen := 1; "
+        "    end if; "
+        "    await Task.Delay(1); "
+        "    return seen; "
+        "  end Step; "
+        "  public static async method Main(): Task<int> "
+        "    var acc := 0; "
+        "    for var i in 0..<6 do acc := acc + await Step(i); end; "
+        "    Console.WriteLine((acc * 10 + Probe.Live).ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;"),
+        "30\n");
+}
+
+// A nested `async lambda` BETWEEN the capture site and the read. Its own
+// StateMachineFrameScope runs clearSmFrame on the way out, which wiped the
+// ENCLOSING body's cell-frame publication — so everything lowered after it
+// behaved as though no frame existed, and the fall-back for the captured
+// PARAMETER (whose pre-boxing alloca IS restored by the resume prologue) was
+// wrongly declined. Measured while building this fix: the shape went from a
+// correct 0,1,4,3 to SEGV @ 0, a regression against the very tree the rest of
+// this file repairs. The publication is now saved and restored across a nested
+// lambda exactly as `smAllocaToField_` already was.
+// Step(v) = (v even ? v : 0) + v + 0, so 0,1,4,3.
+// per §27.5, §30.1, §30.6 (issue #3484)
+BEZEL_TEST(capture_cell_holder_validity_3484,
+           nested_async_lambda_between_capture_and_read_spec_27_5_30_6) {
+    BEZEL_EXPECT_EQ(out(
+        "module M; import System; "
+        "class C "
+        "  public static async method Step(v: int): Task<int> "
+        "    var s := 0; "
+        "    if v mod 2 = 0 then "
+        "      var g := lambda(): int => v; "
+        "      s := g(); "
+        "    end if; "
+        "    var h := async lambda(): Task<int> => do "
+        "      await Task.Delay(1); return 0; "
+        "    end; "
+        "    await Task.Delay(1); "
+        "    return s + v + (await h()); "
+        "  end Step; "
+        "  public static async method Main(): Task<int> "
+        "    for var i in 0..<4 do "
+        "      Console.WriteLine((await Step(i)).ToString()); "
+        "    end; "
+        "    return 0; "
+        "  end Main; "
+        "end C;"),
+        "0\n1\n4\n3\n");
 }

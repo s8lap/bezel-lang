@@ -1250,7 +1250,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // carries it. Guarded on `!count(newSlot)` so a SECOND lambda capturing
         // the same parameter (which reaches boxLocalSlot's already-boxed path
         // with newSlot == slot) cannot re-key an existing mapping.
-        if (currentFn_ == smParamCellFieldFn_ &&
+        if (currentFn_ == smCellFrameFn_ &&
             !smAllocaToField_.count(newSlot)) {
             auto pcit = smParamCellField_.find(sym);
             if (pcit != smParamCellField_.end())
@@ -1534,6 +1534,34 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 unsigned fieldIdx = smit->second;
                 smAllocaToField_.erase(smit);
                 smAllocaToField_[newSlot] = fieldIdx;
+                // fix #3484 follow-up (§27.5 / §30.1, v0.283): that MOVE leaves
+                // the PRE-BOXING alloca with no frame field, so it is not
+                // restored on a resume — it is a fresh-stack alloca holding
+                // whatever the new activation left there. Harmless while nothing
+                // read it after a suspend; not harmless once #3484 made it the
+                // fall-back address for a NULL holder, which is exactly the
+                // state a conditionally-executed capture site leaves behind. The
+                // shape then returned a plausible WRONG NUMBER (0 for every odd
+                // `n` where §27.5 requires 2n) in place of the old SIGSEGV —
+                // strictly worse, and invisible to every test in the tree.
+                //
+                // buildStateMachineFrame reserves a second field, of the local's
+                // pre-boxing type, for exactly this. Give the original slot that
+                // field so BOTH halves round-trip: the holder through the moved
+                // ptr field, the pre-boxing alloca through its own.
+                //
+                // This is the LOCAL half of the same "one slot, two meanings"
+                // problem the captured-PARAMETER branch above solves by giving
+                // the HOLDER the new field. The halves are mirrored, not
+                // identical, because only the parameter's pre-boxing alloca is
+                // already restored (by the resume prologue's unconditional copy
+                // from its capture field) — which is precisely why every #3466
+                // row passed while this one did not.
+                if (currentFn_ == smCellFrameFn_) {
+                    auto pit = smLocalPreBoxField_.find(decl);
+                    if (pit != smLocalPreBoxField_.end())
+                        smAllocaToField_[slot] = pit->second;
+                }
             }
         }
         ce.sym = nullptr;
@@ -2010,6 +2038,21 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         unsigned savedSmNextState = smNextSuspendState_;
         auto savedSmLocalFields = smLocalFields_;
         auto savedSmAllocaToField = smAllocaToField_;
+        // fix #3484 (follow-up, 2): the cell-frame publication is per-FUNCTION
+        // state, and emitAsyncLambda's StateMachineFrameScope runs clearSmFrame
+        // on the way out — which wiped the ENCLOSING body's publication.
+        // Everything lowered in it AFTER this nested lambda then behaved as if no
+        // frame existed: boxedStorage declined the fall-back for a captured
+        // PARAMETER (whose pre-boxing alloca IS restored), and lowerLambda
+        // registered no field for a later capture. Measured: a conditional
+        // parameter capture, a nested `async lambda`, then a read after the
+        // await went from the correct `0 1 4 3` to SEGV @ 0 — a shape the
+        // pre-follow-up tree got right. Save and restore all four alongside
+        // smAllocaToField_, which is here for exactly the same reason.
+        auto savedSmParamCellField = smParamCellField_;
+        auto savedSmLocalPreBoxField = smLocalPreBoxField_;
+        auto savedSmRestoredParamSlots = smRestoredParamSlots_;
+        llvm::Function* savedSmCellFrameFn = smCellFrameFn_;
         unsigned savedIterCurrentValField = iterCurrentValField_;
         llvm::Type* savedIterElemTy = iterElemTy_;
         unsigned savedAsyncOuterTaskField = asyncOuterTaskField_;
@@ -2125,6 +2168,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         smNextSuspendState_ = savedSmNextState;
         smLocalFields_ = std::move(savedSmLocalFields);
         smAllocaToField_ = std::move(savedSmAllocaToField);
+        smParamCellField_ = std::move(savedSmParamCellField);          // #3484 f/u
+        smLocalPreBoxField_ = std::move(savedSmLocalPreBoxField);      // #3484 f/u
+        smRestoredParamSlots_ = std::move(savedSmRestoredParamSlots);  // #3484 f/u
+        smCellFrameFn_ = savedSmCellFrameFn;                           // #3484 f/u
         iterCurrentValField_ = savedIterCurrentValField;
         iterElemTy_ = savedIterElemTy;
         asyncOuterTaskField_ = savedAsyncOuterTaskField;
@@ -2162,6 +2209,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     unsigned savedSmNextSuspendStateSync = smNextSuspendState_;
     auto savedSmLocalFieldsSync = smLocalFields_;
     auto savedSmAllocaToFieldSync = smAllocaToField_;
+    // fix #3484 (follow-up, 2): the sync-lambda twin of the save above. A nested
+    // SYNC lambda body does not open a StateMachineFrameScope, but it does lower
+    // with its own currentFn_, and any boxing inside it must not leave the
+    // enclosing state machine's publication altered.
+    auto savedSmParamCellFieldSync = smParamCellField_;
+    auto savedSmLocalPreBoxFieldSync = smLocalPreBoxField_;
+    auto savedSmRestoredParamSlotsSync = smRestoredParamSlots_;
+    llvm::Function* savedSmCellFrameFnSync = smCellFrameFn_;
     unsigned savedIterCurrentValFieldSync = iterCurrentValField_;
     llvm::Type* savedIterElemTySync = iterElemTy_;
     unsigned savedAsyncOuterTaskFieldSync = asyncOuterTaskField_;
@@ -2377,6 +2432,10 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     smNextSuspendState_ = savedSmNextSuspendStateSync;
     smLocalFields_ = std::move(savedSmLocalFieldsSync);
     smAllocaToField_ = std::move(savedSmAllocaToFieldSync);
+    smParamCellField_ = std::move(savedSmParamCellFieldSync);          // #3484 f/u
+    smLocalPreBoxField_ = std::move(savedSmLocalPreBoxFieldSync);      // #3484 f/u
+    smRestoredParamSlots_ = std::move(savedSmRestoredParamSlotsSync);  // #3484 f/u
+    smCellFrameFn_ = savedSmCellFrameFnSync;                           // #3484 f/u
     iterCurrentValField_ = savedIterCurrentValFieldSync;
     iterElemTy_ = savedIterElemTySync;
     asyncOuterTaskField_ = savedAsyncOuterTaskFieldSync;

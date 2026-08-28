@@ -84,6 +84,7 @@ void Emitter::computeFrameCapturedLocals(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     frameCapturedLocals_.clear();
     frameCapturedParams_.clear();
+    frameLocalPreBoxTy_.clear();   // fix #3484 follow-up; filled by collectSuspendLocals
     std::vector<const ast::LambdaExpr*> lambdas;
     collectAllLambdas(body, lambdas);
     for (const ast::LambdaExpr* lam : lambdas) {
@@ -135,8 +136,18 @@ void Emitter::collectSuspendLocals(
         } else if (init) {
             if (auto* rt = ctx_.exprType(*init)) ty = lowerTypeRef(rt);
         }
-        if (frameCapturedLocals_.count(static_cast<const void*>(node)))
+        if (frameCapturedLocals_.count(static_cast<const void*>(node))) {
+            // fix #3484 follow-up (§27.5 / §30.1, v0.283): remember what the
+            // field WOULD have been. #808 widens this one to ptr because
+            // lowerLambda MOVES it onto the cell holder; the pre-boxing alloca
+            // is then left with no field, and #3484 made that alloca the
+            // fall-back address a null holder reads. buildStateMachineFrame
+            // gives it a field of this exact type so the fall-back survives a
+            // suspension. Precise type, not ptr — a record/value-struct local
+            // spilled into a ptr-width field is the #461 overflow.
+            frameLocalPreBoxTy_[node] = ty;
             ty = ptrTy();
+        }
         return ty;
     };
     for (const auto& s : body) {
@@ -366,6 +377,20 @@ Emitter::StateMachineFrame Emitter::buildStateMachineFrame(
         fields.push_back(ptrTy());
     }
 
+    // fix #3484 follow-up (§27.5 / §30.1, v0.283): the LOCAL twin — one field per
+    // lambda-captured local, of the local's PRE-BOXING type, so the alloca
+    // #3484's fall-back addresses survives a suspension. Appended after the
+    // parameter fields for the same index-stability reason. Deduped because
+    // §29.7 (#944) pushes a for-in iterable node into bodyLocals TWICE.
+    for (auto& [node, ty] : frame.bodyLocals) {
+        (void)ty;
+        if (frame.localPreBoxFields.count(node)) continue;
+        auto pit = frameLocalPreBoxTy_.find(node);
+        if (pit == frameLocalPreBoxTy_.end()) continue;
+        frame.localPreBoxFields[node] = (unsigned)fields.size();
+        fields.push_back(pit->second);
+    }
+
     frame.structTy = llvm::StructType::create(llvm_, fields, structName);
     frame.vtableField = 0;
     frame.stateField = 1;
@@ -437,6 +462,10 @@ void Emitter::emitFrameCaptureRestores(const StateMachineFrame& frame,
             auto* slot = entryAlloca(ty);
             builder_.CreateStore(val, slot);
             paramSlots_[sym] = slot;
+            // fix #3484 follow-up: this store is the parameter's unconditional
+            // cross-suspension restore, which is what lets boxedStorage use this
+            // alloca as a fall-back address after a resume.
+            smRestoredParamSlots_.insert(slot);
             if (fc)
                 if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym))
                     if (ps->modifier == "owned" && ty->isPointerTy())
@@ -570,7 +599,9 @@ void Emitter::clearSmFrame() {
     smForInSrcFields_.clear();
     smAllocaToField_.clear();
     smParamCellField_.clear();          // fix #3466
-    smParamCellFieldFn_        = nullptr;
+    smLocalPreBoxField_.clear();        // fix #3484 follow-up
+    smRestoredParamSlots_.clear();      // fix #3484 follow-up
+    smCellFrameFn_             = nullptr;
     iterCurrentValField_       = 0;
     iterElemTy_                = nullptr;
     iterElemSemaTy_            = nullptr;
@@ -1540,7 +1571,8 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // between two `yield return`s did not reach the closure — 9 where 14 is
         // §27.5's answer.
         smParamCellField_ = frame.paramCellFields;
-        smParamCellFieldFn_ = moveNextFn;
+        smLocalPreBoxField_ = frame.localPreBoxFields;
+        smCellFrameFn_ = moveNextFn;
 
         // fix #2817 / fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): CO-GATE the
         // parameter retain with the parameter release the pin above just turned

@@ -76,7 +76,6 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
-using bezel::test::runAot;          // fix #3484: row B's oracle (see its header)
 using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
 
@@ -126,7 +125,16 @@ BEZEL_TEST(codegen_1073_closure_arg, lambda_literal_arg_released_spec_28_14) {
 // iteration count (2400 bytes over 50 allocations), so this is the unmistakable
 // fail-without signal; with the fix every iteration's temporary is reclaimed.
 //
-// ── ORACLE CHANGED BY fix #3484 (§27.5, v0.283): `runAotChecked` → `runAot`.
+// ── ORACLE NARROWED BY fix #3484 (§27.5, v0.283):
+// `runAotChecked` → `runAotCheckedLenient` (ASan on, LeakSanitizer off).
+//
+// An earlier revision of this fix dropped to plain `runAot`, which throws away
+// the generated-code AddressSanitizer as well — and only the LEAK half of the
+// oracle is what this program can no longer satisfy. That matters here more than
+// most places: the neighbouring defect class in this file's family (#2691) is a
+// heap-use-after-free, which ASan catches and `runAot` would not. #2214 added
+// `runAotCheckedLenient` for exactly this "the program incidentally leaks, but
+// the memory net must stay on" idiom, and this file already uses it three times.
 //
 // This program leaks EIGHT BYTES — the §27.5 capture cell holding the `Box`
 // reference — and always has. It is not #1073's leak (that one is the 50 closure
@@ -150,13 +158,13 @@ BEZEL_TEST(codegen_1073_closure_arg, lambda_literal_arg_released_spec_28_14) {
 // passed in as 0: "AddressSanitizer: SEGV on unknown address 0x000000000000 in
 // bz$M.C$Step". Post-fix that program returns 0 cleanly.
 //
-// So the row keeps its program and its VALUE assertion (50 `Add` calls did
-// happen), and gives up a leak assertion that was never true. #1073's own leak
-// contract stays pinned by row A above, which is still `runAotChecked` and still
-// green. The 8-byte cell is filed separately.
+// So the row keeps its program, its VALUE assertion (50 `Add` calls did happen)
+// and its use-after-free net, and gives up only the leak assertion that was never
+// true. #1073's own leak contract stays pinned by row A above, which is still
+// `runAotChecked` and still green. The 8-byte cell is filed separately (#3498).
 // ===========================================================================
 BEZEL_TEST(codegen_1073_closure_arg, lambda_literal_arg_in_loop_released_spec_28_14) {
-    auto r = runAot(
+    auto r = runAotCheckedLenient(
         "module M; "
         "class Box "
         "  public V: int := 0; "

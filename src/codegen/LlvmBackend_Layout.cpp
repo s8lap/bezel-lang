@@ -3540,8 +3540,29 @@ llvm::Value* Emitter::boxedStorage(llvm::AllocaInst* slot, llvm::Type*& elemTy) 
         // exactly as it was.
         auto syncIt = cellVarSyncSlot_.find(slot);
         if (syncIt != cellVarSyncSlot_.end() && syncIt->second) {
-            pendingHolderReads_.push_back(
-                {llvm::WeakTrackingVH(cell), slot, syncIt->second});
+            PendingHolderRead p;
+            p.load = llvm::WeakTrackingVH(cell);
+            p.syncSlot = llvm::WeakTrackingVH(syncIt->second);
+            // Snapshot now, while `slot` is certainly live — see the map's
+            // declaration comment.
+            auto rb = cellHolderReadyBlocks_.find(slot);
+            if (rb != cellHolderReadyBlocks_.end()) p.readyBlocks = rb->second;
+            // Inside a STATE MACHINE the fall-back slot is only usable if it
+            // round-trips the frame. A local's does once lowerLambda has given it
+            // its own field; a parameter's does via the resume prologue's
+            // unconditional restore, which is why parameters are admitted here
+            // whether or not they carry a field of their own. Anything else — an
+            // async LAMBDA's own body local (its frame is hand-rolled and
+            // reserves no such field, #3499's neighbourhood), a catch-arm binding
+            // promoted into the spill area — is NOT restored, and addressing it
+            // after a resume would turn a loud SIGSEGV into a quiet wrong value.
+            // Decline those: the read stays exactly as it was before #3484.
+            if (smStateStruct_ && smSelf_) {
+                p.syncSurvivesSuspend =
+                    smAllocaToField_.count(syncIt->second) != 0 ||
+                    smRestoredParamSlots_.count(syncIt->second) != 0;
+            }
+            pendingHolderReads_.push_back(std::move(p));
         }
         return cell;
     }
@@ -3575,14 +3596,27 @@ void Emitter::fixupCapturedCellHolderReads() {
     std::unordered_map<llvm::Function*, std::vector<const PendingHolderRead*>>
         byFn;
     for (const PendingHolderRead& p : pendingHolderReads_) {
-        // Null once the instruction has been erased — DemoteRegToStack in
-        // fixupSuspendDominance does that to a resume function's cross-suspend
-        // registers. Such a read is simply skipped: whether a state-machine
-        // holder is valid ACROSS a suspension is a frame-layout question (#3466),
-        // not the intra-function dominance one this pass answers.
+        // DECLINE 1 — the read itself is gone. fixupSuspendDominance's
+        // DemoteRegToStack erases the registers it demotes, and a resume
+        // function's holder load is a candidate.
         auto* ld = llvm::dyn_cast_or_null<llvm::Instruction>(
             static_cast<llvm::Value*>(p.load));
         if (!ld || !ld->getParent() || !ld->getFunction()) continue;
+        // DECLINE 2 — the fall-back slot is gone or is no longer an alloca of
+        // this function. promoteDemotedSlotsToFrame RAUWs and ERASES every
+        // asyncHandlerSpillSlots_ entry, and a catch-arm binding that awaits
+        // inside the arm is registered there — the same alloca cellVarSyncSlot_
+        // recorded. Reading a raw pointer here produced malformed IR once LLVM
+        // recycled the freed alloca into another function; a same-function
+        // recycle would have verified clean and addressed the wrong storage.
+        auto* sync = llvm::dyn_cast_or_null<llvm::AllocaInst>(
+            static_cast<llvm::Value*>(p.syncSlot));
+        if (!sync || sync->getFunction() != ld->getFunction()) continue;
+        // DECLINE 3 — inside a state machine, the fall-back slot is not restored
+        // across a suspension, so addressing it after a resume would read a
+        // fresh-stack alloca: a plausible WRONG VALUE in place of a loud SIGSEGV,
+        // which is strictly worse. Leave the read exactly as it was.
+        if (!p.syncSurvivesSuspend) continue;
         byFn[ld->getFunction()].push_back(&p);
     }
     for (auto& [fn, reads] : byFn) {
@@ -3591,23 +3625,22 @@ void Emitter::fixupCapturedCellHolderReads() {
         for (const PendingHolderRead* p : reads) {
             auto* ld = llvm::cast<llvm::Instruction>(
                 static_cast<llvm::Value*>(p->load));
+            auto* sync = llvm::cast<llvm::AllocaInst>(
+                static_cast<llvm::Value*>(p->syncSlot));
             // Dominated by any completion point of this holder's boxing ⇒ the
             // cell is allocated on every path that reaches this read. Leave the
-            // IR untouched.
+            // IR untouched — that bit-identity is what keeps a program with an
+            // unconditional capture out of this fix entirely.
             bool ready = false;
-            auto rb = cellHolderReadyBlocks_.find(p->holder);
-            if (rb != cellHolderReadyBlocks_.end()) {
-                for (llvm::BasicBlock* b : rb->second) {
-                    if (b->getParent() != fn) continue;
-                    if (dt.dominates(b, ld->getParent())) { ready = true; break; }
-                }
+            for (llvm::BasicBlock* b : p->readyBlocks) {
+                if (!b || b->getParent() != fn) continue;
+                if (dt.dominates(b, ld->getParent())) { ready = true; break; }
             }
             if (ready) continue;
             llvm::IRBuilder<> b(ld->getParent(), std::next(ld->getIterator()));
             llvm::Value* isNull = b.CreateICmpEQ(
                 ld, llvm::ConstantPointerNull::get(ptrTy()), "cell.unset");
-            llvm::Value* sel =
-                b.CreateSelect(isNull, p->syncSlot, ld, "cell.orslot");
+            llvm::Value* sel = b.CreateSelect(isNull, sync, ld, "cell.orslot");
             ld->replaceAllUsesWith(sel);
             // RAUW also rewrote the two uses INSIDE the guard it just built,
             // which would make the select its own operand. Point them back.
