@@ -2285,7 +2285,7 @@ private:
     // wrong-answer bug, not only a missing-rejection bug.
     //
     // The rule applied here is `bindArgsToParams`'s — the SAME binder, over a
-    // `FormalsView` of the parameter names `common::builtinParamNames`
+    // `FormalsView` of the parameter names `common::builtinParamNameCandidates`
     // carries — so the four §22.5 violations (unknown parameter name, a
     // parameter bound twice, a positional argument after a named one, a
     // required parameter left unsupplied) draw the same diagnostic strings a

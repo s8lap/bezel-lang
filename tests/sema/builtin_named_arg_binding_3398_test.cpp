@@ -27,7 +27,7 @@
 // built-in silently computed something else — a wrong-answer bug, not only a
 // missing-rejection bug.
 //
-// WHAT THE FIX DOES, and its two deliberate limits. `common::builtinParamNames`
+// WHAT THE FIX DOES, and its two deliberate limits. `common::builtinParamNameCandidates`
 // now carries the declared parameter names for the stdlib §9.6 `string` family
 // and the §3.2 `Encoding` family, and `ExprTC::checkBuiltinNamedArgs` feeds
 // them to the SAME `bindArgsToParams` the user path uses — so an unknown name,

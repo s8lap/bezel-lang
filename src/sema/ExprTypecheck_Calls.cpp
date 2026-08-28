@@ -10366,7 +10366,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // against — so a named argument on a built-in was discarded and bound
     // positionally, which made a reordered named call a silent wrong answer.
     // Runs the same `bindArgsToParams` the user path runs, over the parameter
-    // names `common::builtinParamNames` now carries. See the header.
+    // names `common::builtinParamNameCandidates` now carries. See the header.
     checkBuiltinNamedArgs(ce, calleeSym);
 
     // §7 / stdlib §4.x (#2582): the collection twin of #2315 — a builtin
