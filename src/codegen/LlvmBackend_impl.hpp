@@ -5746,12 +5746,17 @@ private:
     // six `multiple definition of bz$M.Outer1.Ord$ctor` / `…$Dispose` /
     // `…$init` / `vt$…` / `td$…` link errors on a two-library build that links
     // and runs cleanly with the dotted spelling absent. '+' cannot appear in a
-    // Bezel identifier or in a dotted module name (Appendix A.2/A.3), so it can
+    // Bezel identifier or in a dotted module name (Appendix A.1 Lexical:
+    // `Identifier ::= Letter IdentCont*`, `IdentCont ::= IdentStart | Digit`;
+    // A.2 carries only the dotted-module half), so it can
     // only ever mean "the enclosing-type path starts here", and it never
     // collides with the '$' this scheme already uses as its FIELD separator
     // (reusing '$' would have made `bz$<cls>$<member>` unparseable for the
     // tooling that splits on it). The §11.6 surface spelling stays dotted where
-    // it belongs — `TypeSymbol::qualifiedTypeName()` for diagnostics, and
+    // it belongs — `TypeSymbol::qualifiedTypeName()`, whose only two callers
+    // today are this fix's own population sites (an earlier revision of this
+    // comment called it the spelling "for diagnostics"; it has no diagnostic
+    // caller), and
     // `spec85QualifiedTypeName` below for observable §8.5 output; this is the
     // LINKER spelling and is deliberately not the same string, for the same
     // reason that helper is deliberately a separate function.
@@ -10864,11 +10869,26 @@ private:
     // body (`lowerLambda`'s `async` branch → `emitAsyncLambda`, and
     // `buildSpecializedMethodFn` → `emitAsyncMethod` /
     // `emitIteratorMethod` / `emitAsyncIteratorMethod`) needs the second, and
-    // each had spelled it out by hand as a list of `savedX` locals. Five members
-    // — smForInSrcFields_, iterElemSemaTy_, iterElemIsOwnedClass_,
-    // iterCurrentValOwnedField_, iterIsOwningIter_ — were on the clear list and
-    // on none of the save lists, so a nested emission RETRACTED them for the
-    // enclosing body. Measured (issue 3505): a sync OWNING iterator whose body
+    // each had spelled it out by hand as a list of `savedX` locals, and the two
+    // venues had DIFFERENT hand-written lists -- which is the whole reason a
+    // generated one is the fix rather than a tidy-up.
+    //
+    // At `lowerLambda` five members -- smForInSrcFields_, iterElemSemaTy_,
+    // iterElemIsOwnedClass_, iterCurrentValOwnedField_, iterIsOwningIter_ --
+    // were on the clear list and on none of the save list, so a nested emission
+    // RETRACTED them for the enclosing body.
+    //
+    // At `buildSpecializedMethodFn` the gap was DIFFERENT and WIDER: eight were
+    // missing, and smForInSrcFields_ was NOT among them -- that venue already
+    // saved it. The four extra are the #3484-follow-up cell-frame members
+    // (smParamCellField_, smLocalPreBoxField_, smRestoredParamSlots_,
+    // smCellFrameFn_). Generating both halves from one list therefore WIDENS
+    // that venue by those four; the direction is the one #3484-follow-up-2
+    // already chose at `lowerLambda`, and it was probed (generic call +
+    // conditional param capture + read after await) as identical stdout and
+    // identical leak profile on both compilers. Saying "the same five" at both
+    // venues -- as an earlier revision of this comment did -- hid a real
+    // behaviour widening behind a number that was right for only one of them. Measured (issue 3505): a sync OWNING iterator whose body
     // declares an `async lambda` between two `yield return new R(...)` loses
     // §29.1's displaced-value dispose at every later yield — 3 disposals become
     // 2 and LeakSanitizer reports the abandoned object.

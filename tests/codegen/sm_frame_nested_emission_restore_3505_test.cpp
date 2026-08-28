@@ -168,8 +168,11 @@ BEZEL_TEST(sm_frame_nested_emission_restore_3505,
 // THE SECOND VENUE. `buildSpecializedMethodFn` builds a lazy monomorphization
 // from the MIDDLE of another body, and the emit*Method helpers it calls each
 // open a StateMachineFrameScope — so a generic call inside an owning iterator
-// retracts the SAME five members, by a different route and with no lambda
-// anywhere. Its hand-written save list covered 16 of the 28. Same observable:
+// retracts frame members by a different route, with no lambda anywhere. Its
+// gap was NOT the same five: this venue already saved smForInSrcFields_, and
+// EIGHT were missing rather than five (the four extra are the #3484-follow-up
+// cell-frame members). Its hand-written save list covered 20 of the 28 — an
+// earlier revision of this comment said 16. Same observable:
 // the §29.1 displaced-value dispose stops being emitted for every later yield.
 //
 //   pre-fix : 21 + LeakSanitizer report      post-fix: 31, clean
