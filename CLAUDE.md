@@ -190,6 +190,20 @@ still on it proves less than its name suggests. **Write new tests on `runAot`
 only**, and port a JIT test whenever you touch one. The count above is the
 ratchet: it must only ever go down.
 
+**That ratchet is now executed, not just written down** (#3439).
+`scripts/check_deprecated_jit_oracle.py` measures all three numbers against
+`scripts/deprecated_jit_oracle.baseline` and `gate_full_cycle.sh` runs it —
+self-test first, then `--strict` — alongside the seam, vacuous-test and
+enumerable-grid ratchets. After **porting** a test, bank it with `--update`
+(which refuses to raise a count); `--list` shows every file still on the
+lenient oracle. The baseline is **exact, not a ceiling**: a count *below* it
+fails as stale headroom, because unbanked headroom is indistinguishable from a
+rise somebody already spent. ⚠ The reason this phase exists is worth keeping:
+the rule above, with its measured numbers, had been in this file for months and
+the count still rose 60→61 on 2026-08-23 and survived five days and two full
+gate cycles. **A prose ratchet is not a ratchet** — its three sibling checks
+were scripts with self-tests and this one was a paragraph.
+
 One machine-local, not-tracked step is required for ccache to cache the PCH'd
 compiles: `~/.config/ccache/ccache.conf` must contain
 `sloppiness = pch_defines,time_macros` (without it every PCH build is a cache

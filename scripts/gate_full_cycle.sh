@@ -572,6 +572,35 @@ if ! python3 scripts/check_enumerable_grid_spellings.py --strict \
 fi
 say "enumerable-grid phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_grid.log"))"
 
+# ── DEPRECATED-JIT-ORACLE PHASE (#3439) ────────────────────────────────────
+# `runJit`/`runJitChecked` skip the ownership and definite-assignment passes
+# and skip verifyModule, so a test on them proves less than its name suggests.
+# CLAUDE.md has said "the count must only ever go down" — with the measured
+# numbers beside it — for months, and on 2026-08-23 the count still rose 60→61
+# (an uncalled `runJitOnly` helper, #3439) and survived FIVE DAYS and two full
+# gate cycles. Nothing failed except that the rule lived in PROSE. Its three
+# sibling checks above are scripts with self-tests; this one was a paragraph.
+# That asymmetry is what this phase removes.
+say "jit-oracle phase: detector self-test + deprecation ratchet (#3439)"
+if ! python3 scripts/check_deprecated_jit_oracle.py --self-test \
+      > "$LOGDIR/${TAG}_jitoracle.log" 2>&1; then
+  say "CYCLE FAILURE: check_deprecated_jit_oracle SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_jitoracle.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_jitoracle.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_deprecated_jit_oracle.py --strict \
+      >> "$LOGDIR/${TAG}_jitoracle.log" 2>&1; then
+  say "CYCLE FAILURE: the deprecated JIT oracle count moved — a new test was"
+  say "  written on the LENIENT oracle, or a port was not banked with --update"
+  say "  (#3439). See $LOGDIR/${TAG}_jitoracle.log"
+  sed -n '/check_deprecated_jit_oracle:/,$p' "$LOGDIR/${TAG}_jitoracle.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "jit-oracle phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_jitoracle.log"))"
+
 # ── GATE SELF-TEST PHASE (#3415) ───────────────────────────────────────────
 # The fourth source-level check, and the one that guards the checkers rather
 # than the tree. `scripts/gate/tests/` holds the self-tests for the gate's own

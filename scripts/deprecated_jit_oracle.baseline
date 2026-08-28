@@ -1,0 +1,19 @@
+# deprecated_jit_oracle.baseline - the ratchet for the lenient JIT
+# test oracle (CLAUDE.md; the rise that motivated it is #3439).
+#
+# Regenerate with scripts/check_deprecated_jit_oracle.py --update after
+# PORTING a test from runJit to runAot.  --update refuses to raise a
+# count: landing a rise takes a deliberate hand-edit of this file.
+#
+# These are EXACT, not ceilings.  A count below its baseline fails as
+# STALE HEADROOM - a port that forgot to --update silently buys room
+# for the next regression.
+#
+# live_calls: `runJit(` in tests/**/*.cpp, excluding tests/support/.
+# bare_grep : `runJit(` anywhere under tests/, unfiltered (the control
+#             that distinguishes a real new call site from a recipe
+#             discrepancy - see the script header).
+# checked   : `runJitChecked(` under the live_calls filters.
+live_calls = 60
+bare_grep = 62
+checked = 3
