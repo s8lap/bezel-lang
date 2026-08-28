@@ -123,3 +123,37 @@ BEZEL_TEST(codegen_positional_record_unit_field_3527,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("1\nR(A: 1, U: ())\n"));
 }
+
+// ── T4 — BOTH-SIDES CONTROL. T1–T3 all fail at `r.ran` without the fix, so
+// nothing in this file would notice a harness break or a syntax slip that made
+// every row fail for an unrelated reason. This row is T2 with the unit component
+// replaced by an `int`: the same three-component positional record, the same
+// neighbour reads, the same three §8.5 renderings, and no unit type anywhere —
+// so it passes on BOTH sides of the fix. It also pins that this commit does not
+// change the layout or rendering of an ordinary positional record.
+BEZEL_TEST(codegen_positional_record_unit_field_3527,
+           control_int_component_record_unaffected_spec_9_1_8_5_8_6) {
+    auto r = runAot(
+        "module M3527D; "
+        "record R(A: int, U: int, B: string); "
+        "class C "
+        "  public static method Main(): int "
+        "    var r := new R(7, 0, \"s\"); "
+        "    Console.WriteLine(r.A.ToString()); "
+        "    Console.WriteLine(r.B); "
+        "    Console.WriteLine(r.U.ToString()); "
+        "    Console.WriteLine(r.ToString()); "
+        "    var o: Object := r; "
+        "    Console.WriteLine(o.ToString()); "
+        "    Console.WriteLine($\"interp {r}\"); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText,
+                    std::string("7\ns\n0\n"
+                                "R(A: 7, U: 0, B: s)\n"
+                                "R(A: 7, U: 0, B: s)\n"
+                                "interp R(A: 7, U: 0, B: s)\n"));
+}

@@ -896,7 +896,11 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // inferred `resolvedDeclType`, or the expected function type — so no
             // derivation path can reintroduce the trap. `()?` never needs it: it
             // is the tagged `{i8, i8}` optional (isNullableUnitTy). // per §4.7
-            if (ty && ty->isVoidTy()) ty = unitPlaceholderTy();
+            //
+            // fix #3527 follow-up: asked through `unitStorageTy` — the one
+            // spelling of this substitution — rather than repeated inline. The
+            // expression is character-for-character what stood here before.
+            ty = unitStorageTy(ty);
             userParamTys.push_back(ty);
             ++pi;
         }

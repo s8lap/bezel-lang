@@ -190,3 +190,84 @@ BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
     BEZEL_EXPECT_EQ(r.stdoutText,
                     std::string("A\nnull\nB\nside\nTrue\n"));
 }
+
+// ── T6 — HALF (b) MUST FAIL CLOSED. This is the row the first version of this
+// fix did not have, and its absence let a blocker through review.
+//
+// Closing `ncvs.do`/`ncvs.end` makes the IR well-formed, but on its own it turns
+// a compile ERROR into a compiling program with a WRONG VALUE: the caller's
+// fallback for a null result is `#3079`/`#2434`, both `Severity::Warning`, so the
+// build succeeds and the `?.` result comes back all-zero — i.e. `null`. §7.5
+// reserves that answer for a null receiver ("`x?.M` returns null if `x` is
+// null"), so a NON-NULL receiver answering `null` is unreadable by construction.
+//
+// MEASURED, `p?.Equals(true)` on `var p: Pt? := new Pt(1, 2)`:
+//   base (pre-#3452)          rc=1, "Basic Block ... does not have terminator!"
+//   block-closing only        rc=0, prints `A null`   <-- the fail-open
+//   this commit               rc=1, the located error asserted below
+//
+// The live decline behind it is #3538 (`lowerValueSemMethodOn`'s record arm
+// declines when the `Equals` argument is not itself a record — the sibling the
+// `Object`-receiver path got `lowerUniversalEqualsArg` for in #3443). That is
+// owned elsewhere; this row's job is to pin that the decline stays fail-CLOSED
+// and cannot regress into `null` again.
+//
+// The TEXT is asserted, not `hasErrors()` (which the IR-verifier abort also
+// satisfies) and not `!ran` alone (which the BASE also satisfies) — only the new
+// diagnostic distinguishes this commit from both other states.
+BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
+           nullcond_declining_inner_lowering_fails_closed_spec_7_5) {
+    auto r = runAot(
+        "module M3452F; "
+        "record Pt(X: int, Y: int); "
+        "class C "
+        "  public static method Main(): int "
+        "    var p: Pt? := new Pt(1, 2); "
+        "    var b := p?.Equals(true); "
+        "    Console.WriteLine((if b = null then \"null\" else b!.ToString())); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool located = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(
+                "reserves the `null` result of `?.` for a null receiver") !=
+            std::string::npos)
+            located = true;
+    BEZEL_EXPECT_TRUE(located);
+    // …and it must name the member and the receiver type, which is the whole
+    // point of replacing "IR verification failed" with a real diagnostic.
+    bool named = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("member `Equals`") != std::string::npos &&
+            d.message.find("`M3452F.Pt`") != std::string::npos)
+            named = true;
+    BEZEL_EXPECT_TRUE(named);
+}
+
+// ── T7 — BOTH-SIDES CONTROL. Every other row in this file fails 100% without
+// the fix, which is right for a crash/reject fix but leaves nothing that would
+// catch a harness break, a syntax slip in the shared `prog()` scaffold, or a
+// stdlib change — a file that is all-red on one side and all-green on the other
+// cannot distinguish "the fix works" from "the file stopped building". This row
+// uses an `int?` receiver, touches no unit-type code path, and passes on BOTH
+// sides of the fix by construction.
+BEZEL_TEST(codegen_nullcond_unit_receiver_equals_hashcode_3452,
+           control_nullcond_on_int_receiver_unaffected_spec_7_5_8_3) {
+    auto r = runAot(prog(
+        "    var p: int? := 5; "
+        "    var n: int? := null; "
+        "    var e := p?.Equals(5); "
+        "    var f := p?.Equals(6); "
+        "    var g := n?.Equals(5); "
+        "    Console.WriteLine((if e = null then \"null\" else e!.ToString())); "
+        "    Console.WriteLine((if f = null then \"null\" else f!.ToString())); "
+        "    Console.WriteLine((if g = null then \"null\" else g!.ToString())); "
+        "    var h := p?.GetHashCode(); "
+        "    Console.WriteLine((if h = null then \"null\" else (h! = 5).ToString())); "));
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("True\nFalse\nnull\nTrue\n"));
+}

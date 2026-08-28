@@ -13452,24 +13452,52 @@ llvm::Value* Emitter::lowerNullCondValueSemCall(
         ? emitValueToString(innerVal, &innerTy)
         : lowerValueSemMethodOn(&innerTy, innerVal, call, nm.member);
     if (!res) {
-        // fix #3452 (§7.5, v0.283): a declining inner lowering must still leave
-        // WELL-FORMED IR behind. `callBB` and `endBB` already exist and the
-        // entry block already branched to them, so a bare `return nullptr` here
-        // left two blocks with no terminator — `bezelc` exited 1 with
-        // "IR verification failed (malformed IR emitted)", an internal-
-        // consistency failure that names no construct in the user's program,
-        // rather than the located `#3079` note the caller emits for a dropped
-        // statement. Close `callBB` into `endBB` and leave the builder there, so
-        // whatever the caller emits next continues in a properly-reached block
-        // and the null result degrades to that ordinary diagnostic.
+        // fix #3452 follow-up (§7.5, v0.283): a declining inner lowering must
+        // leave WELL-FORMED IR behind **and must still fail the compile**.
         //
-        // The one venue MEASURED to reach this (a `()` receiver's
-        // `Equals`/`GetHashCode`) is answered by `lowerValueSemMethodOn`'s unit
-        // arm as of this commit, so this is now a backstop and not a live path;
-        // it is kept because the decline is `lowerValueSemMethodOn`'s to make —
-        // §9.2's ineligible body record is documented there as "fall through to
-        // ordinary dispatch" — and the next such decline must not be a verifier
-        // failure again.
+        // TWO HALVES, and the second is the one this follow-up adds. `callBB`
+        // and `endBB` already exist and the entry block already branched to
+        // them, so a bare `return nullptr` here left both blocks with no
+        // terminator: `bezelc` exited 1 with "IR verification failed (malformed
+        // IR emitted)", an internal-consistency failure that names no construct
+        // in the user's program. Closing `callBB` into `endBB` fixes the IR.
+        //
+        // ⚠ CLOSING THE BLOCKS ALONE CONVERTS A FAIL-CLOSED COMPILE ERROR INTO A
+        // FAIL-OPEN WRONG VALUE, and the first version of this fix did exactly
+        // that. The caller's fallback for a null result is `#3079` / `#2434`,
+        // both `Severity::Warning`, so the program COMPILED and the `?.` result
+        // came back all-zero — i.e. `null`. §7.5 reserves `null` for a NULL
+        // RECEIVER ("`x?.M` returns null if `x` is null"), so a non-null
+        // receiver answering `null` is unreadable by construction: the program
+        // cannot tell the two apart. MEASURED on the block-closing-only build,
+        // `p?.Equals(true)` with `var p: Pt? := new Pt(1, 2)` printed `A null`
+        // at exit 0, where the base compiler had refused to build at all.
+        //
+        // So: report an ERROR here. It is the diagnostic this site owed all
+        // along — located at the call, naming the member and the receiver type,
+        // which is precisely what "IR verification failed" could not do — and it
+        // keeps the decline fail-CLOSED. `res` is null exactly where the inner
+        // lowering has no answer to give; there is no correct value to invent,
+        // and §7.5's `null` is already spoken for.
+        //
+        // The live venue behind it is #3538 (`record.Equals(<a value argument
+        // that is not a record>)` — `lowerValueSemMethodOn`'s record arm
+        // declines on its `isStructTy()` guard, the sibling the `Object`-receiver
+        // path got `lowerUniversalEqualsArg` for in #3443 and this one never
+        // did). That defect is owned elsewhere; this block's job is only to stop
+        // it failing open.
+        std::string recvName;
+        if (innerTy.declaration)
+            recvName = spec85QualifiedTypeName(innerTy.declaration);
+        ctx_.diagnostics().report(
+            Severity::Error, call.span.begin,
+            "member `" + std::string(nm.member) + "` on a `?.` access to " +
+            (recvName.empty() ? std::string("this nullable value-typed receiver")
+                              : ("a nullable `" + recvName + "` receiver")) +
+            " has no lowering for the argument or receiver shape given here, so "
+            "no value can be produced; language spec \xC2\xA7""7.5 reserves the "
+            "`null` result of `?.` for a null receiver, so the access cannot be "
+            "silently answered `null` instead (tracked #3538)");
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
         return nullptr;

@@ -4381,14 +4381,50 @@ private:
     // outcome available. §4.7 gives the unit type exactly one value, so it
     // carries no information and one inert byte is a faithful slot.
     //
-    // This existed as an INLINE two-line idiom at seven independent sites
-    // (`entryAlloca`, `lowerParamType`, `lowerParamTypeRef`, `storageType`'s
-    // body-field and auto-property arms, `emitValueToString`'s caller, the
-    // state-machine frame planner) and the eighth — `storageType`'s POSITIONAL
-    // RECORD FIELD arm — was simply missed, which is issue 3527: declaring
-    // `record R(A: int, U: ());` killed the compiler outright. Every one of
-    // those sites now asks here, so a missed arm is a missed CALL rather than a
-    // silently different spelling.
+    // Before this helper the substitution existed as an INLINE idiom, repeated
+    // per site, and `storageType`'s POSITIONAL RECORD FIELD arm simply did not
+    // have it — issue 3527: declaring `record R(A: int, U: ());` killed the
+    // compiler outright, no value of the record required.
+    //
+    // ROUTED THROUGH HERE — ten call sites, named rather than counted by grep
+    // (a grep for this helper's name also matches its declaration and the prose
+    // that discusses it, so the enumeration is the inventory, not a number):
+    //   `entryAlloca`; `lowerParamType`; `lowerParamTypeRef`; `storageType`'s
+    //   three member arms (positional field, body `FieldDecl`, auto
+    //   `PropertyDecl`); `collectSuspendLocals`' local-slot and for-loop-variable
+    //   arms (the state-machine frame planner — added by issue 3453, which is
+    //   where the missing one actually was, not a pre-existing site);
+    //   `lowerLambda`'s parameter arm (#3095); `lowerLocalDecl`'s slot (#1619).
+    //   That last one spelled the placeholder `i8()` where every other site
+    //   spelled it `unitPlaceholderTy()` — the same type, two names, which is
+    //   precisely the drift this helper closes.
+    //
+    // NOT ROUTED, DELIBERATELY — do not read the list above as "every `void`
+    // in the compiler now comes here":
+    //   * `buildStateMachineFrame`'s `extraTrailing` (Iterators.cpp) takes
+    //     already-lowered types from its callers and does not substitute, so an
+    //     `IEnumerable<()>` / `IAsyncEnumerable<()>` element type still reaches
+    //     the struct raw and still SIGILLs on the declaration alone — issue 3537,
+    //     owned elsewhere. It is also why this file's for-loop-variable routing
+    //     is currently UNREACHABLE: every source of a `()` element dies at the
+    //     trailing field first.
+    //   * `lowerTypeRef`'s inline-array arm builds `ArrayType::get(elem, N)`
+    //     from a RAW element lowering. This helper tests the TOP-LEVEL type
+    //     only, so `[3]()` — a `[3 x void]` — passes straight through it and
+    //     traps in `entryAlloca`/`bindParameters`; issue 3528, filed loud and
+    //     deliberately not patched.
+    //   * `emitValueToString`'s unit arm materialises a VALUE
+    //     (`ConstantInt::get(unitPlaceholderTy(), 0)`), which is a different
+    //     operation from choosing a storage TYPE and is not this helper's
+    //     business.
+    //   * The five signature-building sites `lowerTypeRef`'s own comment lists
+    //     as still calling the raw lowerings (extern/FFI parameter list, the
+    //     static-auto-property global, the imported indexer's parameter and
+    //     `value` lists, and the function-VALUE call's parameter list, #3137).
+    //
+    // Keep this inventory honest when you add a call: an enumeration that
+    // claims completeness it does not have is worse than no enumeration, because
+    // the next reader stops looking.
     llvm::Type* unitStorageTy(llvm::Type* ty) {
         return (ty && ty->isVoidTy()) ? unitPlaceholderTy() : ty;
     }

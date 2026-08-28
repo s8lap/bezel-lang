@@ -13581,7 +13581,15 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // store — substitute a one-byte placeholder slot; its contents are never
     // meaningfully read (there is only one unit value, so nothing
     // distinguishes one placeholder byte pattern from another).
-    if (slotTy->isVoidTy()) slotTy = i8();
+    //
+    // fix #3527 follow-up: asked through `unitStorageTy` rather than spelled
+    // inline — and note this site spelled the placeholder `i8()` while every
+    // other spelled it `unitPlaceholderTy()`. Both are `getInt8Ty`, so the
+    // behaviour is identical, but two names for one decision is exactly the
+    // drift the shared helper exists to close. `unitStorageTy` also tolerates a
+    // null argument, which this line did not; `slotTy` is non-null here either
+    // way, so that is a strict widening of the guard.
+    slotTy = unitStorageTy(slotTy);
     // §29.3: in an iterator MoveNext body, map locals to state-struct fields
     // so they persist across yield returns.
     llvm::AllocaInst* slot = nullptr;

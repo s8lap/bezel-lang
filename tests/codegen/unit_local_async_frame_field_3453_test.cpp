@@ -261,3 +261,39 @@ BEZEL_TEST(codegen_unit_local_async_frame_field_3453,
     BEZEL_EXPECT_EQ(r.exitCode, 0);
     BEZEL_EXPECT_EQ(r.stdoutText, std::string("()\n3\n"));
 }
+
+// ── T8 — BOTH-SIDES CONTROL. T1–T7 all fail at `r.ran` without the fix, which
+// is correct for a compiler-crash fix but means the file is all-red on one side
+// and all-green on the other — a state that cannot distinguish "the fix works"
+// from "the file stopped building". This row is T2 with the unit local replaced
+// by an `int` one: same async shape, same neighbours, same suspension, no unit
+// type anywhere, so it passes on BOTH sides.
+BEZEL_TEST(codegen_unit_local_async_frame_field_3453,
+           control_int_local_in_async_body_unaffected_spec_30_1_30_2) {
+    auto r = runAot(
+        "module M3453H; "
+        "class C "
+        "  public static async method Inner(n: int): Task<int> "
+        "    return n * 2; "
+        "  end Inner; "
+        "  public static async method Work(): Task<int> "
+        "    var before := 11; "
+        "    var u: int := 0; "
+        "    var s := \"kept\"; "
+        "    var got := await Inner(5); "
+        "    Console.WriteLine(s); "
+        "    Console.WriteLine(before.ToString()); "
+        "    Console.WriteLine(got.ToString()); "
+        "    Console.WriteLine(u.ToString()); "
+        "    return before + got; "
+        "  end Work; "
+        "  public static async method Main(): Task<int> "
+        "    var v := await Work(); "
+        "    Console.WriteLine(v.ToString()); "
+        "    return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_EQ(r.stdoutText, std::string("kept\n11\n10\n0\n21\n"));
+}
