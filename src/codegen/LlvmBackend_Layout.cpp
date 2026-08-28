@@ -3494,15 +3494,125 @@ llvm::AllocaInst* Emitter::localSlot(const ast::Expr& e) {
 
 // §27.5: route a local/param access through its shared heap cell when the
 // variable has been boxed for capture; otherwise use the alloca directly.
+//
+// fix #3484 (§27.5, v0.283): the cell-holder alloca is NOT valid on every path
+// that reaches a read. boxLocalSlot's GUARDED strategy deliberately makes the
+// holder null-checkable — it null-initialises it in the entry block and
+// allocates the cell behind a `cell.isnull` branch emitted AT THE CAPTURE SITE.
+// When that capture site sits in a conditionally-executed block (a `case` arm,
+// an `if` body, an if-EXPRESSION arm, a loop that may run zero times), the
+// not-taken path never runs the allocation, so the holder is still the entry
+// block's null when a LATER read of the same variable loads it — and this
+// function handed that null straight back as the address to load from
+// (`SEGV on unknown address 0x0`, measured on four spellings of the shape,
+// purely synchronous, with no `await` and no unsafe construct in the program).
+//
+// WHICH HALF IS WRONG is decided by the design of the holder, not by taste: the
+// guarded strategy is what makes the holder nullable in the first place (that
+// null is how the runtime tells a first pass from a later one across a loop
+// back-edge), so the holder is CORRECT and the reads are the wrong half. Repair
+// them here, at the single funnel every boxed read and write already goes
+// through, rather than growing a second null-discipline at ~40 call sites.
+//
+// The repair is NOT emitted inline, because whether a given read is exposed
+// depends on the FINISHED CFG — a read the capture site's join block dominates
+// can never see the null — and at the moment a read is emitted the blocks and
+// edges above it do not all exist yet. So the read is recorded here and patched
+// once, from run(), by fixupCapturedCellHolderReads below. Emitting the guard
+// unconditionally would be both dead code on the dominated reads and an
+// observable perturbation: see cellHolderReadyBlocks_'s declaration comment for
+// the five one-shot LeakSanitizer rows that measured it.
 llvm::Value* Emitter::boxedStorage(llvm::AllocaInst* slot, llvm::Type*& elemTy) {
     auto it = cellVars_.find(slot);
     if (it != cellVars_.end()) {
         elemTy = it->second;
         // The alloca holds a pointer to the heap cell; the value lives there.
-        return builder_.CreateLoad(ptrTy(), slot, "cell");
+        llvm::Value* cell = builder_.CreateLoad(ptrTy(), slot, "cell");
+        // Only a GUARDED/fresh boxing of THIS emission records a sync slot, and
+        // it records it in the same breath as cellVars_[slot] (boxLocalSlot's
+        // tail), so a cellVars_ hit current enough for the load above makes the
+        // paired sync entry current too. A cell holder with no sync entry — an
+        // async-lambda capture restored from its env, a captured ref/out param
+        // aliasing the caller's storage — is not this defect's shape and is left
+        // exactly as it was.
+        auto syncIt = cellVarSyncSlot_.find(slot);
+        if (syncIt != cellVarSyncSlot_.end() && syncIt->second) {
+            pendingHolderReads_.push_back(
+                {llvm::WeakTrackingVH(cell), slot, syncIt->second});
+        }
+        return cell;
     }
     elemTy = slot->getAllocatedType();
     return slot;
+}
+
+
+// fix #3484 (§27.5, v0.283): give every EXPOSED capture-cell holder read a null
+// fallback, and leave every dominated one untouched. Run once from run(), after
+// every function body is complete, because the dominance question is about the
+// finished CFG (see boxedStorage).
+//
+// The fallback address is the PRE-BOXING alloca recorded in cellVarSyncSlot_ —
+// exactly the storage boxLocalSlot itself reads to seed the cell if the capture
+// site is reached later on. So the fallback is not an approximation:
+//   * holder null  ⇒ no closure over this variable exists yet, nothing else can
+//                    observe it, and the original slot IS its storage; reads see
+//                    the live value and writes land where a later `cell.alloc`
+//                    will seed itself from (its `preboxed` load);
+//   * holder set   ⇒ the select folds to the cell and §27.5 sharing is exactly
+//                    as before.
+//
+// DIRECTION OF DANGER: this widens no free and shortens no lifetime. It turns a
+// null dereference into a load/store of storage that lives as long as the frame;
+// a cell that is never allocated was already never freed (`free(null)` is a
+// no-op), so nothing here can double-free or free early.
+void Emitter::fixupCapturedCellHolderReads() {
+    if (pendingHolderReads_.empty()) return;
+    // Group by function so one DominatorTree serves every read in it.
+    std::unordered_map<llvm::Function*, std::vector<const PendingHolderRead*>>
+        byFn;
+    for (const PendingHolderRead& p : pendingHolderReads_) {
+        // Null once the instruction has been erased — DemoteRegToStack in
+        // fixupSuspendDominance does that to a resume function's cross-suspend
+        // registers. Such a read is simply skipped: whether a state-machine
+        // holder is valid ACROSS a suspension is a frame-layout question (#3466),
+        // not the intra-function dominance one this pass answers.
+        auto* ld = llvm::dyn_cast_or_null<llvm::Instruction>(
+            static_cast<llvm::Value*>(p.load));
+        if (!ld || !ld->getParent() || !ld->getFunction()) continue;
+        byFn[ld->getFunction()].push_back(&p);
+    }
+    for (auto& [fn, reads] : byFn) {
+        if (!fn || fn->isDeclaration()) continue;
+        llvm::DominatorTree dt(*fn);
+        for (const PendingHolderRead* p : reads) {
+            auto* ld = llvm::cast<llvm::Instruction>(
+                static_cast<llvm::Value*>(p->load));
+            // Dominated by any completion point of this holder's boxing ⇒ the
+            // cell is allocated on every path that reaches this read. Leave the
+            // IR untouched.
+            bool ready = false;
+            auto rb = cellHolderReadyBlocks_.find(p->holder);
+            if (rb != cellHolderReadyBlocks_.end()) {
+                for (llvm::BasicBlock* b : rb->second) {
+                    if (b->getParent() != fn) continue;
+                    if (dt.dominates(b, ld->getParent())) { ready = true; break; }
+                }
+            }
+            if (ready) continue;
+            llvm::IRBuilder<> b(ld->getParent(), std::next(ld->getIterator()));
+            llvm::Value* isNull = b.CreateICmpEQ(
+                ld, llvm::ConstantPointerNull::get(ptrTy()), "cell.unset");
+            llvm::Value* sel =
+                b.CreateSelect(isNull, p->syncSlot, ld, "cell.orslot");
+            ld->replaceAllUsesWith(sel);
+            // RAUW also rewrote the two uses INSIDE the guard it just built,
+            // which would make the select its own operand. Point them back.
+            llvm::cast<llvm::Instruction>(isNull)->setOperand(0, ld);
+            llvm::cast<llvm::Instruction>(sel)->setOperand(2, ld);
+        }
+    }
+    pendingHolderReads_.clear();
 }
 
 
@@ -3596,6 +3706,11 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
 
         // Done: cell ptr is in *newSlot.
         builder_.SetInsertPoint(doneBB);
+        // fix #3484: from this join on, the holder is non-null on every path
+        // through it — the guard above allocated it if it was not. Recorded so
+        // fixupCapturedCellHolderReads can leave every read this block dominates
+        // exactly as emitted.
+        cellHolderReadyBlocks_[newSlot].push_back(doneBB);
         return builder_.CreateLoad(ptrTy(), newSlot, "cell");
     }
     llvm::Type* valTy = slot->getAllocatedType();
@@ -3645,6 +3760,12 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
         newSlot = entryAlloca(ptrTy());
         builder_.CreateStore(cell, newSlot);
         cellVars_[newSlot] = valTy;
+        // fix #3484: the fresh path stores unconditionally, so the holder is
+        // non-null from here on through this block. (No cellVarSyncSlot_ entry
+        // is recorded on this path, so boxedStorage records no read for it
+        // either; the block is recorded for symmetry and for a slot that later
+        // reaches the already-boxed re-guard above.)
+        cellHolderReadyBlocks_[newSlot].push_back(builder_.GetInsertBlock());
         return cell;
     }
 
@@ -3692,6 +3813,13 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
     // Done: cell ptr is in *newSlot.
     builder_.SetInsertPoint(doneBB);
     llvm::Value* cellPtr = builder_.CreateLoad(ptrTy(), newSlot, "cell");
+
+    // fix #3484 (§27.5, v0.283): this join is where the holder becomes valid.
+    // Any read the block DOMINATES is safe as emitted; any read it does not —
+    // the whole point of the issue, a capture site inside a `case` arm / `if`
+    // body / if-expression arm / zero-trip loop — needs the null fallback
+    // fixupCapturedCellHolderReads adds.
+    cellHolderReadyBlocks_[newSlot].push_back(doneBB);
 
     cellVars_[newSlot] = valTy;
     // §27.5 / #673: record the original slot so writes to the cell also

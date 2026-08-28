@@ -43,6 +43,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/ValueHandle.h"   // fix #3484: WeakTrackingVH over pending reads
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -537,6 +538,11 @@ public:
         // emitModule directly and is more lenient than the AOT file-emission
         // path. The AOT boundary (emitObjectFile) runs the verifier independently
         // and returns false on failure, so the driver exits non-zero (#506).
+        // fix #3484 (§27.5, v0.283): every function body is complete, so the
+        // dominance question boxedStorage deferred can now be answered against
+        // the finished CFGs. Must run BEFORE the verifier — it is what makes the
+        // exposed capture-cell holder reads well-defined.
+        fixupCapturedCellHolderReads();
 #ifndef NDEBUG
         bool wantVerify = true;
 #else
@@ -799,6 +805,49 @@ private:
     // loop variables (their incBB manages the original slot directly).
     // Part of the saved/restored emitter state across nested-function emission.
     std::unordered_map<llvm::AllocaInst*, llvm::AllocaInst*> cellVarSyncSlot_;
+
+    // fix #3484 (§27.5, v0.283): the machinery that decides, per READ of a
+    // capture-cell holder, whether that read needs a null fallback.
+    //
+    // boxLocalSlot's GUARDED strategy null-initialises the holder in the entry
+    // block and allocates the cell behind a `cell.isnull` branch emitted AT THE
+    // CAPTURE SITE, so on any path that skipped the capture site the holder is
+    // still null when a later read loads it — a SEGV at address 0. Only SOME
+    // reads are exposed: a read the capture site's join block DOMINATES can
+    // never see the null. Deciding that needs the FINISHED CFG, so it cannot be
+    // decided at the moment the read is emitted (the blocks and edges above it
+    // do not all exist yet). Hence: record, patch once at the end.
+    //
+    // Keeping the guard off the dominated reads is not an optimization — it is
+    // what keeps the emitted IR BIT-IDENTICAL for every program whose capture is
+    // unconditional. An unconditional select there perturbs register allocation
+    // enough to change which stale stack slots still hold a heap pointer when
+    // LeakSanitizer scans at exit, which flips one-shot leak rows that were
+    // passing on that accident (measured: five, in closure_literal_arg_leak_1073
+    // and lambda_closure_return_mint_agreement_2691, whose programs leak the
+    // same bytes before and after under 500x amplification).
+    //
+    // The blocks after which a holder is guaranteed non-null: boxLocalSlot's
+    // `cell.done` join for a guarded boxing (both the first-capture and the
+    // already-boxed re-guard), or the capture site's own block for a fresh one.
+    // Module-lifetime and NOT part of the saved/restored nested-emission state —
+    // the fixup runs once, over the whole module, after every body is complete.
+    std::unordered_map<llvm::AllocaInst*, std::vector<llvm::BasicBlock*>>
+        cellHolderReadyBlocks_;
+    struct PendingHolderRead {
+        // WeakTrackingVH, not a raw pointer: fixupSuspendDominance's
+        // DemoteRegToStack ERASES the instructions it demotes, and a resume
+        // function's holder load is a candidate. A demoted read is skipped —
+        // whether a state-machine holder survives a SUSPENSION is a frame-layout
+        // question (#3466), separate from the dominance one asked here.
+        llvm::WeakTrackingVH load;
+        llvm::AllocaInst*    holder;
+        llvm::AllocaInst*    syncSlot;
+    };
+    std::vector<PendingHolderRead> pendingHolderReads_;
+    // Runs once from run(), before the module verifier.
+    void fixupCapturedCellHolderReads();
+
     // #429 / §27.5: cells registered by the most-recent lowerLambda call:
     // pairs of (newSlot, captured-decl-or-sym-key) for freshly-boxed,
     // non-for-var captures.  Consumed by lowerLocalDecl when the lambda is

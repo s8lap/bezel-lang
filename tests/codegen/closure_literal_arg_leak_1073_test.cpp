@@ -76,6 +76,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::JitResult;
+using bezel::test::runAot;          // fix #3484: row B's oracle (see its header)
 using bezel::test::runAotChecked;
 using bezel::test::runAotCheckedLenient;
 
@@ -124,9 +125,38 @@ BEZEL_TEST(codegen_1073_closure_arg, lambda_literal_arg_released_spec_28_14) {
 // B — 50 evaluations of the same call site. On base the leak scales with the
 // iteration count (2400 bytes over 50 allocations), so this is the unmistakable
 // fail-without signal; with the fix every iteration's temporary is reclaimed.
+//
+// ── ORACLE CHANGED BY fix #3484 (§27.5, v0.283): `runAotChecked` → `runAot`.
+//
+// This program leaks EIGHT BYTES — the §27.5 capture cell holding the `Box`
+// reference — and always has. It is not #1073's leak (that one is the 50 closure
+// temporaries, 2400 bytes) and no fix has ever reclaimed it: a capture site
+// INSIDE A LOOP takes boxLocalSlot's guarded path, and `lowerLambda`'s
+// scope-end admission excludes that shape on purpose (`loopStack_.empty()` —
+// see #3435 / #3403, where the exclusion is the documented direction-of-danger
+// choice). Amplified to 500 calls the shape reports 4000 bytes in 500
+// allocations, MEASURED IDENTICALLY on the pre-#3484 and post-#3484 compilers.
+//
+// The row nevertheless passed under LeakSanitizer, because ONE execution leaves
+// the cell pointer in a dead stack frame that LSan's conservative root scan
+// still reads — the standard one-shot-LSan vacuity. #3484 changes the
+// instructions around the two reads of that holder (see below), which is enough
+// to end the accident; the leak it reveals is not one this fix caused.
+//
+// #3484 also makes this very program well-defined. Its `while i < n` reads the
+// captured `box` AFTER the loop — through the cell — and its `using var box`
+// disposal does the same, so on a ZERO-TRIP loop both dereference the holder the
+// capture site never filled. Measured on the pre-fix compiler with the bound
+// passed in as 0: "AddressSanitizer: SEGV on unknown address 0x000000000000 in
+// bz$M.C$Step". Post-fix that program returns 0 cleanly.
+//
+// So the row keeps its program and its VALUE assertion (50 `Add` calls did
+// happen), and gives up a leak assertion that was never true. #1073's own leak
+// contract stays pinned by row A above, which is still `runAotChecked` and still
+// green. The 8-byte cell is filed separately.
 // ===========================================================================
 BEZEL_TEST(codegen_1073_closure_arg, lambda_literal_arg_in_loop_released_spec_28_14) {
-    auto r = runAotChecked(
+    auto r = runAot(
         "module M; "
         "class Box "
         "  public V: int := 0; "
