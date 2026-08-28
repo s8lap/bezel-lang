@@ -14532,6 +14532,53 @@ private:
         return true;
     }
 
+    // fix #3501 (§4.7 "The unit type" / §7.10 "Generics and nullability" /
+    // §14.1, v0.283): make the CALLEE's UNIT bindings visible to the §4.7
+    // argument rescue, without disturbing the substitution the argument
+    // EXPRESSIONS are lowered under.
+    //
+    // A constructor's argument expressions belong to the ENCLOSING scope, so
+    // `lowerNew` (#597) and `emitChainCall` deliberately lower them with the
+    // enclosing scope's substitution active, not the constructed class's. The
+    // §4.7 unit rescue runs in that same loop but asks a DIFFERENT question —
+    // "what type does the FORMAL have?" — and answers it through
+    // `resolveTypeParamRef` / `nullableTypeParamConcrete`, both of which read
+    // `genericSubstSemaTy_`. For a formal whose declared type is the callee
+    // class's own type parameter monomorphized to `()` or `()?` (§7.10 lists
+    // "the unit type" among the substitutions `where T: value` admits), the
+    // binding that answers is exactly the one that swap removed: the formal
+    // stayed a bare `Named T`, neither the `Kind::Unit` nor the
+    // `isNullableUnitTy` test matched, and codegen reported the #1386 ICE on a
+    // program §4.7 and §7.10 both make well-formed.
+    //
+    // Only `genericSubstSemaTy_` is touched — `genericSubst_` (param name →
+    // LLVM type) is not read by either resolver, and leaving it alone keeps
+    // `genericSubst_.empty()`, which several sites branch on (notably
+    // `emitChainCall`'s #617 base-substitution block), answering exactly as
+    // before.
+    //
+    // Two gates, both taken from #3137's method-level pre-pass
+    // (LlvmBackend_Calls2.cpp), which solves the same problem for an EXPLICIT
+    // call-site type argument:
+    //   * UNIT-SHAPED bindings only. Installing a non-unit binding here would
+    //     resolve a `T?` formal early and strip the nullability the
+    //     `GetVal<int>(null, 42)` path (#885/#886) depends on keeping until
+    //     `applyMethodGenericSubst` runs.
+    //   * Names the enclosing substitution does NOT already bind. An enclosing
+    //     generic scope that happens to spell its own parameter with the same
+    //     name owns that name for the argument expressions; overwriting it
+    //     would lower them under the wrong `T`. Such a case keeps today's
+    //     behaviour — the loud #1386 ICE, not a silently different value.
+    void carryCalleeUnitSubst(
+        const std::unordered_map<std::string_view, const sema::TypeRef*>&
+            calleeSema) {
+        for (const auto& [name, ty] : calleeSema) {
+            if (!ty || ty->kind != sema::TypeRef::Kind::Unit) continue;
+            if (genericSubstSemaTy_.count(name)) continue;
+            genericSubstSemaTy_[name] = ty;
+        }
+    }
+
     // fix #2743 / §14.1 / §7.1: is `t` a BARE GENERIC TYPE-PARAMETER reference
     // (`T`) — a single-part Named ref with no declaration that is not one of the
     // reserved builtin names? `nullableTypeParamConcrete` reports success for a

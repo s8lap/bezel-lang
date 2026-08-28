@@ -11521,12 +11521,39 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     // copy-OUT flushed after the chain target runs (see both consuming paths
     // below). §22.3 puts no restriction on ref/out params in a chain call.
     std::vector<AccessorRefArg> accessorRefArgs;
+    // fix #3501 (§4.7 "The unit type" / §7.10 / §14.1 / §22.7, v0.283): make the
+    // CHAIN TARGET's unit bindings visible to `unitValueForCtorParam` below.
+    // For `class D: B<()>` with `base(C.Nothing())` the target's formal is a
+    // bare `Named T`, and the substitution that binds it (`T -> ()`) is built
+    // only AFTER this loop, by the #617 block further down — so the §4.7 rescue
+    // saw an unresolvable formal and the #1386 ICE fired on a program §7.10
+    // makes well-formed ("`where T: value` restricts T to ... the unit type").
+    // `computeAncestorGenericSubst` is the shared #2840 authority for "the
+    // substitution a base instantiation is reached under" (the same helper the
+    // #2889 arm below, `emitImplicitBase` and `emitSpecializedImplicitBaseCtor`
+    // ask); it returns false rather than installing one it cannot resolve.
+    // Only the UNIT bindings are carried, and only onto names the active
+    // substitution does not already bind — see `carryCalleeUnitSubst`. Restored
+    // immediately after the loop so the #617 block below still sees exactly the
+    // `genericSubst_`/`genericSubstSemaTy_` it did before.
+    auto savedSemaForChainArgs = genericSubstSemaTy_;
+    if (!isThis && targetCls != cs->parent && !targetCls->genericParams.empty()) {
+        sema::TypeRef synthDerived;
+        synthDerived.kind = sema::TypeRef::Kind::Named;
+        synthDerived.declaration = const_cast<sema::TypeSymbol*>(cs->parent);
+        std::unordered_map<std::string_view, llvm::Type*> chainSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> chainSema;
+        if (computeAncestorGenericSubst(&synthDerived, targetCls, chainSubst,
+                                        chainSema))
+            carryCalleeUnitSubst(chainSema);
+    }
     for (std::size_t ai = 0; ai < call->args.size(); ++ai) {
         const auto& a = call->args[ai];
         if (!a.value) {
             // fix #2579: the call never runs — release any bracket pins
             // recorded by earlier args so their refcount isn't stranded.
             emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+            genericSubstSemaTy_ = std::move(savedSemaForChainArgs);  // #3501
             return;
         }
         // The formal modifier lives on the chain TARGET ctor's params.
@@ -11572,10 +11599,19 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                 Severity::Error, a.value->span.begin,
                 "internal: lowerExpr returned null for base-constructor "
                 "argument — #1386");
+            genericSubstSemaTy_ = std::move(savedSemaForChainArgs);  // #3501
             return;
         }
         args.push_back(v);
     }
+    // fix #3501: the carried unit bindings cover the ARGUMENT loop ONLY. The
+    // #617 block immediately below captures `genericSubstSemaTy_` into
+    // `savedSemaTyForBase` and rebuilds the base substitution from scratch, so
+    // it must see exactly the map it saw before. Every early `return` inside the
+    // loop restores it too: an emitter member left mutated on one exit edge is
+    // the asymmetry #3505 catalogues, and this one would leak a `T -> ()`
+    // binding into whatever the caller emits next.
+    genericSubstSemaTy_ = std::move(savedSemaForChainArgs);
     // §12 / §14 (issue #617): when the DERIVED class is non-generic but its
     // base is a CONCRETE generic instantiation (e.g. `class StringBox: Box<string>`
     // calling `base(s)`), genericSubst_ is empty and the template ctor

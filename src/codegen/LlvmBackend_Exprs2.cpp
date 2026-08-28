@@ -5927,6 +5927,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             auto ctorArgSemaSave  = genericSubstSemaTy_;
             genericSubst_       = savedSubst;
             genericSubstSemaTy_ = savedSemaTy;
+            // fix #3501 (§4.7 / §7.10 / §14.1, v0.283): keep the constructed
+            // class's UNIT bindings visible while its ctor arguments are
+            // lowered, so `buildOrderedArgs`'s §4.7 rescue can see that the
+            // formal `u: T` of `new B<()>(C.Nothing())` IS the unit type. See
+            // `carryCalleeUnitSubst`. Restored with the rest below.
+            carryCalleeUnitSubst(ctorArgSemaSave);
             if (sema::ConstructorSymbol* earlyCs = ctorForArgs(t, ne.args)) {
                 auto earlyIt = ctorFns_.find(earlyCs);
                 auto* earlyCd =
@@ -6874,6 +6880,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             auto ctorArgSemaTy = genericSubstSemaTy_;
             genericSubst_ = savedSubst;
             genericSubstSemaTy_ = savedSemaTy;
+            // fix #3501 (§4.7 / §7.10 / §14.1, v0.283): the twin of the
+            // pre-pass bracket above — the same carry, for the `new`-sites
+            // whose arguments this branch (re)lowers rather than reusing the
+            // prebuilt ones. See `carryCalleeUnitSubst`.
+            carryCalleeUnitSubst(ctorArgSemaTy);
             args.push_back(obj);
             // #429 (ARGUMENT-PASS category): collect per-param arg expressions
             // so we can release any +1 string producer after the ctor runs.
