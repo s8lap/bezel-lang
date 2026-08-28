@@ -302,10 +302,26 @@ BEZEL_TEST(nullable_value_tostring_receiver_3481,
 //
 // §7.4 rejects `.ToString()` on a nullable value that has NOT been narrowed, so
 // the only way a null value reaches this rendering is a guarded branch that does
-// not take it. This row proves the fix did not turn "render the payload" into an
-// unconditional payload read: the null local takes the `else` arm, the present
-// one takes the `then` arm and renders, and both are pinned in one program with
-// the values ordered so a swapped branch is visible.
+// not take it. The null local takes the `else` arm, the present one takes the
+// `then` arm and renders, and both are pinned in one program with the values
+// ordered so a swapped branch is visible.
+//
+// ⚠ This row does NOT catch an unconditional payload read — an earlier revision
+// of this comment said it did. MEASURED by per-fix review: a mutant with site 1
+// changed to `emitPrimitiveToString(nullablePrimValue(recv), ...)` — the exact
+// unconditional unwrap — passes all 26 rows. Nothing here catches it.
+//
+// That is a fact about the LANGUAGE, not a gap in this file: no null can reach
+// either site. Un-narrowed `.ToString()` is a §7.4 rejection; a narrowing
+// invalidated by reassignment is the same rejection; `v!.ToString()` on a
+// runtime null raises NullReferenceException (rc 70) BEFORE the site; and
+// `v?.ToString()` goes through `lowerNullCondValueSemCall`, a different path.
+//
+// So the delegation to `emitValueToString` with the NULLABLE TypeRef is chosen
+// for single-authority reasons (§8.5 has one renderer, not a fourth spelling),
+// NOT because a row pins the difference. The renderer's null handling is
+// confirmed by an independent route: `record Box(V: int?, W: string)` with a
+// null component prints `Box(V: null, W: k)` identically on both compilers.
 //
 // `C.Get()` returns `int?` from a method, so the null is not a literal the
 // front-end could fold — the tag is a genuine runtime value here.
@@ -436,7 +452,10 @@ BEZEL_TEST(nullable_value_tostring_receiver_3481, nullable_record_override_uncha
 
 // The NON-nullable spellings of the primitive rows, in one program. None of
 // them was ever broken; they reach the exact arm the site-1 fix now guards, so
-// this is the row that would catch a fix that unwrapped unconditionally.
+// this row pins that the guard did not disturb the path it wraps.
+//
+// ⚠ It does NOT catch an unconditional unwrap either — see T6's note. That
+// mutant passes every row in this file, because no null reaches the site.
 BEZEL_TEST(nullable_value_tostring_receiver_3481, non_nullable_primitives_unchanged) {
     auto r = runAot(plain(
         "  var i: int := 12345; var l: long := 9000000000; "
