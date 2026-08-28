@@ -14588,6 +14588,31 @@ private:
     // Unsupported types (record, decimal, enum, unresolved T): returns null.
     llvm::Function* buildSortedKeyComparator(const sema::TypeRef* keyTy);
 
+    // fix #3488 / stdlib §4.17 / spec §14.2: the same-ABI comparator thunk for a
+    // REFERENCE key/element (a class or an interface that satisfies
+    // `IComparable<Self>`) — it dispatches the type's own `CompareTo` rather
+    // than loading and ICmp'ing a scalar. This is the builder Array<T>.Sort()
+    // already used inline for `bz$classcmp$<C>` (#1195) and, via
+    // ensureIfaceCmpThunk, for `bz$ifacecmp$<I>` (#2768); it is factored out
+    // here so the sorted-collection family and Sort() share ONE thunk per type
+    // rather than two spellings of it. Null when the reference type has no
+    // dispatchable `CompareTo` (`Object`, or a class that declares none) — the
+    // §4.17 `where K: IComparable<K>` shape that nothing checks today (#3490).
+    llvm::Function* buildObjectCompareToThunk(const sema::TypeRef* ty);
+
+    // fix #3488 / stdlib §4.17 (v0.283): the (hash, eq) pair that makes
+    // `CompareTo`-equality the STORED IDENTITY of a reference key, for the one
+    // collection whose documented identity that is: "Two keys are the same key
+    // exactly when `CompareTo` returns `0`" (§4.17). The generic-key table's
+    // ordinary pair for such a key is §8.3's `Equals`/`GetHashCode` (#2773),
+    // which for a class is reference identity — right for `Dictionary` (§4.8),
+    // wrong for the sorted map. Returns false (leaving the outputs untouched)
+    // when the key is not a reference type or declares no dispatchable
+    // `CompareTo`, in which case the caller keeps the §8.3 pair unchanged.
+    bool buildSortedObjectKeyIdentity(const sema::TypeRef* keyTy,
+                                      llvm::Function*& hashOut,
+                                      llvm::Function*& eqOut);
+
     // §3: instance method calls on Array<T>, Dictionary<K,V>, etc.
     // Called from lowerCall before the normal method-symbol dispatch.
     llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call);

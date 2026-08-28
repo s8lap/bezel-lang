@@ -571,6 +571,169 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
     return fn;
 }
 
+// fix #3488 / stdlib §4.17 / spec §14.2 (v0.283): the `int cmp(const void* a,
+// const void* b)` thunk for a REFERENCE key/element, where `a`/`b` point at the
+// stored key BYTES — for a class or interface key those bytes are the reference
+// itself, so each argument is a `ptr*` and the thunk loads through it. The body
+// dispatches the type's own `IComparable<T>.CompareTo`, which is what stdlib
+// §4.17 names as the ordering authority: "Ordering is defined by `K`'s
+// `IComparable<K>.CompareTo`".
+//
+// ⚠ THIS IS NOT A NEW CAPABILITY. #3428's commit body and #3488/#3489 both state
+// that "there is no `CompareTo`-through-the-vtable comparator anywhere in the
+// compiler". That was measured wrong: `Array<T>.Sort()` has built exactly this
+// thunk since #1195 (`bz$classcmp$<C>`, class element) and #2768
+// (`bz$ifacecmp$<I>`, interface element, via ensureIfaceCmpThunk), with the
+// IDENTICAL `i32 (ptr, ptr)` slot-address ABI `buildSortedKeyComparator` needs.
+// What was missing was the wiring, not the comparator. This function is the
+// Sort() builder LIFTED OUT so that both callers share one thunk per type — per
+// the standing rule that a second spelling of an existing decision is the
+// dominant defect generator here, the Sort() arm now calls this rather than
+// carrying its own copy.
+//
+// Null for a reference type with no dispatchable `CompareTo`: `Object` (no
+// declaration to search), and a class or interface that declares none. §4.17
+// constrains `K: IComparable<K>`, but nothing checks that constraint for a
+// builtin generic (#3490), so this arm is reachable and its callers must treat
+// null as "not orderable" exactly as they already do for a record key.
+llvm::Function* Emitter::buildObjectCompareToThunk(const sema::TypeRef* ty) {
+    if (!ty || !hasObjectHeaderEquality(ty)) return nullptr;
+    // `Object` is Kind::Primitive here — it has no declaration to search for a
+    // `CompareTo`, and stdlib §2.1 declares none on it.
+    if (ty->kind != sema::TypeRef::Kind::Named || !ty->declaration) return nullptr;
+
+    if (ty->declaration->kind == ast::TypeDeclKind::Interface) {
+        // #2768's thunk, selected by the exact §14.2 rule-3 constraint
+        // (selfComparableIfaceCompareTo) and dispatched through the §13 itable.
+        if (sema::MethodSymbol* ifm = selfComparableIfaceCompareTo(ty))
+            return ensureIfaceCmpThunk(ty->declaration, ifm);
+        return nullptr;
+    }
+
+    sema::MethodSymbol* cmpMs = findMethodByName(ty->declaration, "CompareTo");
+    if (!cmpMs || cmpMs->params.size() != 1) return nullptr;
+
+    // The name is #1195's verbatim, so a program that both sorts an
+    // `Array<Ord>` and iterates a `SortedDictionary<Ord, V>` emits ONE thunk.
+    std::string thunkName =
+        std::string("bz$classcmp$") + std::string(ty->declaration->name);
+    if (llvm::Function* existing = module_->getFunction(thunkName))
+        return existing;
+
+    auto* thunkTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+    auto* fn = llvm::Function::Create(thunkTy, llvm::Function::InternalLinkage,
+                                      thunkName, module_.get());
+    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    // A LOCAL IRBuilder, not `builder_`: the thunk is emitted in the middle of
+    // another function's lowering, and touching `builder_`/`currentFn_` here
+    // would drag `propagateBB_`/`unwindTarget_` with it (the hazard
+    // rejectUnimplementedComparerCtor documents for the comparer trampolines).
+    llvm::IRBuilder<> thunkB(bb);
+    llvm::Value* aPtr = thunkB.CreateLoad(ptrTy(), &*fn->arg_begin());
+    llvm::Value* bPtr = thunkB.CreateLoad(ptrTy(), &*std::next(fn->arg_begin()));
+    auto* cmpToTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+    llvm::Value* result = nullptr;
+    auto vsIt = vtableSlot_.find(cmpMs);
+    if (vsIt != vtableSlot_.end()) {
+        // Virtual dispatch through the receiver's vtable (field 0), per §12.
+        llvm::Value* vtable = thunkB.CreateLoad(ptrTy(), aPtr);
+        llvm::Value* slotPtr =
+            thunkB.CreateGEP(ptrTy(), vtable, {thunkB.getInt32(vsIt->second)});
+        llvm::Value* fnPtr = thunkB.CreateLoad(ptrTy(), slotPtr);
+        result = thunkB.CreateCall(cmpToTy, fnPtr, {aPtr, bPtr});
+    } else {
+        auto fnIt = methodFns_.find(cmpMs);
+        // findMethodByName already demands `methodFns_.count(ms)`, so the miss
+        // arm is unreachable; keep it well-formed rather than trusting that.
+        if (fnIt == methodFns_.end()) {
+            fn->eraseFromParent();
+            return nullptr;
+        }
+        result = thunkB.CreateCall(fnIt->second->getFunctionType(),
+                                   fnIt->second, {aPtr, bPtr});
+    }
+    thunkB.CreateRet(result);
+    return fn;
+}
+
+// fix #3488 / stdlib §4.17 (v0.283): the stored-identity pair for a REFERENCE
+// key of a `SortedDictionary<K, V>`.
+//
+// §4.17 states the rule outright — "Two keys are the same key exactly when
+// `CompareTo` returns `0`" — and names the ordering authority in the same
+// paragraph: "Ordering is defined by `K`'s `IComparable<K>.CompareTo`". The
+// generic-key table's ordinary pair for a class/interface key is #2773's §8.3
+// `Equals`/`GetHashCode`, i.e. REFERENCE identity, so `Ord(5)` and a second
+// `Ord(5)` were stored as two distinct keys: `TryAdd` of the second returned
+// `true` and `Count` reached 2, where §4.17 makes them one key (and v0.282's
+// `Add` must raise `ArgumentException`).
+//
+// The equality half is exactly `CompareTo(a, b) == 0`, dispatched through the
+// same thunk that orders the collection, so membership and iteration order can
+// never disagree.
+//
+// ⚠ THE HASH HALF IS DELIBERATELY CONSTANT, AND THAT IS A RECORDED TRADE, NOT
+// AN OVERSIGHT. A hash table's contract is `eq(a, b) ⇒ hash(a) == hash(b)`.
+// For a reference key there is NO derivable hash consistent with
+// `CompareTo`-equality: two `CompareTo`-equal instances are distinct objects
+// with distinct §8.3 identity hashes, and `CompareTo` exposes no key material
+// to fold. So the only pair that satisfies the table's contract AND §4.17's
+// identity rule is (constant, `CompareTo == 0`). That is CORRECT — every key
+// lands in one probe cluster and `dict_find_gen`'s linear probe then decides
+// by `eq_fn`, which is precisely §4.17's rule — but it makes §4.17's
+// "Point operations … are **O(log n)**" clause O(n) for a reference key.
+// Satisfying that clause needs the comparator-keyed ordered backing §4.17's own
+// "owning sorted collections ride the self-hosted-collections work" note
+// defers, and #3489 specifies;
+// filed as a follow-up rather than attempted here. The alternative on offer was
+// leaving the collection SILENTLY wrong (unsorted iteration, a SEGV on
+// `FirstKey`, and duplicate keys) — a complexity clause is the cheaper thing to
+// owe.
+//
+// Scalar, string, record, enum and choice keys never reach here: they keep
+// their existing §8.3 pair, whose hash IS consistent with their value equality,
+// and their O(1) probe.
+bool Emitter::buildSortedObjectKeyIdentity(const sema::TypeRef* keyTy,
+                                           llvm::Function*& hashOut,
+                                           llvm::Function*& eqOut) {
+    llvm::Function* cmp = buildObjectCompareToThunk(keyTy);
+    // Null for `Object` and for a reference type that declares no `CompareTo`
+    // — §4.17 constrains `K: IComparable<K>`, but nothing checks that for a
+    // builtin generic (#3490), so such a key stays on today's §8.3 pair rather
+    // than acquiring a new rejection this lane did not measure.
+    if (!cmp) return false;
+
+    static const char* kHashName = "bz$sortedobjkey$hash";
+    llvm::Function* hashFn = module_->getFunction(kHashName);
+    if (!hashFn) {
+        auto* hty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+        hashFn = llvm::Function::Create(hty, llvm::Function::InternalLinkage,
+                                        kHashName, module_.get());
+        llvm::IRBuilder<> hb(llvm::BasicBlock::Create(llvm_, "entry", hashFn));
+        hb.CreateRet(hb.getInt64(0));
+    }
+
+    std::string eqName = std::string("bz$sortedobjkey$eq$") + cmp->getName().str();
+    llvm::Function* eqFn = module_->getFunction(eqName);
+    if (!eqFn) {
+        auto* ety = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()}, false);
+        eqFn = llvm::Function::Create(ety, llvm::Function::InternalLinkage,
+                                      eqName, module_.get());
+        llvm::IRBuilder<> eb(llvm::BasicBlock::Create(llvm_, "entry", eqFn));
+        // Both args are pointers to the stored key BYTES — for a reference key
+        // that is a `ptr*`, which is the comparator thunk's own ABI, so they
+        // forward unchanged.
+        llvm::Value* c = eb.CreateCall(cmp->getFunctionType(), cmp,
+                                       {&*eqFn->arg_begin(),
+                                        &*std::next(eqFn->arg_begin())});
+        eb.CreateRet(eb.CreateICmpEQ(c, llvm::ConstantInt::get(i32(), 0)));
+    }
+
+    hashOut = hashFn;
+    eqOut   = eqFn;
+    return true;
+}
+
 // fix #1426 / stdlib §4.17–§4.18: Build a comparison thunk for SortedDictionary
 // FirstKey/LastKey, SortedSet First/Last, and sorted-snapshot iteration.
 // Signature: int cmp(const void* a, const void* b)
@@ -593,6 +756,17 @@ llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
     else if (kllvm->isIntegerTy(1))   name += "i1";
     else if (kllvm->isFloatTy())      name += "f32";
     else if (kllvm->isDoubleTy())     name += "f64";
+    else if (hasObjectHeaderEquality(keyTy))
+        // fix #3488 / stdlib §4.17: a class/interface key lowers to `ptr`, so it
+        // used to take the `return nullptr` arm below — and EVERY consumer of
+        // this comparator then silently degraded: `SortedDictionary` iteration
+        // fell back to the unsorted insertion-order snapshot, and
+        // `FirstKey`/`LastKey` failed to lower at all, which lowerLocalDecl
+        // degraded (#2434) to a zero-initialised local whose first member read
+        // SEGV'd. Ordering for such a key is the type's own `CompareTo`
+        // (§4.17: "Ordering is defined by `K`'s `IComparable<K>.CompareTo`"),
+        // which buildObjectCompareToThunk dispatches at the same ABI.
+        return buildObjectCompareToThunk(keyTy);
     else return nullptr;  // unsupported (record, decimal, etc.)
 
     if (auto* existing = module_->getFunction(name)) return existing;

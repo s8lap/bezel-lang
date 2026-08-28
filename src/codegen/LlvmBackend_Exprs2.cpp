@@ -4712,6 +4712,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         genericBackingType(rt, 0, /*isSet=*/false, &ksz)) {
                     llvm::Function* hashT = buildValueHashTrampoline(keyTy);
                     llvm::Function* eqT   = buildValueEqTrampoline(keyTy);
+                    // fix #3488 / stdlib §4.17 (v0.283): a SORTED map's stored
+                    // identity is `CompareTo`-equality ("Two keys are the same
+                    // key exactly when `CompareTo` returns `0`"), not §8.3's
+                    // `Equals`/`GetHashCode`. For a scalar/string/record/enum
+                    // key the two coincide and nothing changes; for a REFERENCE
+                    // key they do not, and the §8.3 pair stored two
+                    // `CompareTo`-equal keys as distinct. Only
+                    // `SortedDictionary` is retargeted — `Dictionary` /
+                    // `OwningDictionary` keep §8.3 reference identity, which is
+                    // what §4.8 / §4.9 specify for them.
+                    if (colName == "SortedDictionary")
+                        buildSortedObjectKeyIdentity(keyTy, hashT, eqT);
                     auto* allocFn = declareC("bz_dict_alloc_generic", ptrTy(),
                                              {i64(), ptrTy(), ptrTy()});
                     return builder_.CreateCall(allocFn,

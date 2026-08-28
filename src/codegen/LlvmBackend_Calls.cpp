@@ -4516,48 +4516,21 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // via vtable (virtual/override) or direct compiled call otherwise.
                 // Each thunk arg is ptr* — a pointer to the class-pointer slot in
                 // the array buffer.  per §14.2 / #1195.
-                std::string thunkName = std::string("bz$classcmp$") +
-                                        std::string(elemTR->declaration->name);
-                cmpFn = module_->getFunction(thunkName);
-                if (!cmpFn) {
-                    auto* thunkTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
-                    cmpFn = llvm::Function::Create(thunkTy,
-                                                   llvm::Function::InternalLinkage,
-                                                   thunkName, module_.get());
-                    auto* bb = llvm::BasicBlock::Create(llvm_, "entry", cmpFn);
-                    llvm::IRBuilder<> thunkB(bb);
-                    llvm::Value* aSlot = &*cmpFn->arg_begin();
-                    llvm::Value* bSlot = &*std::next(cmpFn->arg_begin());
-                    // Load class pointers from element slots.
-                    llvm::Value* aPtr = thunkB.CreateLoad(ptrTy(), aSlot);
-                    llvm::Value* bPtr = thunkB.CreateLoad(ptrTy(), bSlot);
-                    // Dispatch a.CompareTo(b): vtable slot if virtual, else direct.
-                    auto* cmpToTy = llvm::FunctionType::get(
-                        i32(), {ptrTy(), ptrTy()}, false);
-                    llvm::Value* result = nullptr;
-                    auto vsIt = vtableSlot_.find(classCompareMs);
-                    if (vsIt != vtableSlot_.end()) {
-                        // Virtual dispatch: load vtable from receiver (field 0),
-                        // then load the function pointer from the slot.  §12.
-                        unsigned vtSlot = vsIt->second;
-                        llvm::Value* vtable = thunkB.CreateLoad(ptrTy(), aPtr);
-                        llvm::Value* slotPtr = thunkB.CreateGEP(
-                            ptrTy(), vtable, {thunkB.getInt32(vtSlot)});
-                        llvm::Value* fnPtr = thunkB.CreateLoad(ptrTy(), slotPtr);
-                        result = thunkB.CreateCall(cmpToTy, fnPtr, {aPtr, bPtr});
-                    } else {
-                        // Non-virtual: direct call to the compiled method body.
-                        auto fnIt = methodFns_.find(classCompareMs);
-                        if (fnIt != methodFns_.end()) {
-                            result = thunkB.CreateCall(
-                                fnIt->second->getFunctionType(),
-                                fnIt->second, {aPtr, bPtr});
-                        } else {
-                            result = llvm::ConstantInt::get(i32(), 0);
-                        }
-                    }
-                    thunkB.CreateRet(result);
-                }
+                //
+                // fix #3488: the body used to be built INLINE here, and was the
+                // only such builder in the compiler — which is why #3428 and
+                // #3488 both concluded there was no `CompareTo`-through-the-
+                // vtable comparator at all and deferred the sorted-collection
+                // work on that ground. It is now buildObjectCompareToThunk, so
+                // `Array<T>.Sort()` and `SortedDictionary<K, V>`'s ordered
+                // operations share ONE builder and one `bz$classcmp$<C>` per
+                // module instead of two spellings of the same dispatch.
+                cmpFn = buildObjectCompareToThunk(elemTR);
+                // Unreachable: `classCompareMs` came from the same
+                // findMethodByName probe the helper's class arm runs, so it
+                // builds. Guarded because a null here would be handed to
+                // bz_array_sort as the comparator and called through.
+                if (!cmpFn) return nullptr;
             } else if (isStringElem) {
                 // String comparator: load two ptr elements, call strcmp on their data.
                 auto* cmpName2 = "bz$strcmp";

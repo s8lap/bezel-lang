@@ -29804,6 +29804,13 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
         genericBackingType(dictTy, 0, /*isSet=*/false, &ksz);
         llvm::Function* hashT = buildValueHashTrampoline(keyTy);
         llvm::Function* eqT   = buildValueEqTrampoline(keyTy);
+        // fix #3488 / stdlib §4.17: the literal form allocates the same table
+        // as `lowerNew`, so it takes the same `CompareTo`-identity retarget for
+        // a SortedDictionary reference key. Keeping the two in step is the
+        // point: a literal-built and a `new`-built map of the same type must
+        // agree on what "the same key" means.
+        if (dictTy->headName() == "SortedDictionary")
+            buildSortedObjectKeyIdentity(keyTy, hashT, eqT);
         auto* allocFn = declareC("bz_dict_alloc_generic", ptrTy(),
                                  {i64(), ptrTy(), ptrTy()});
         dict = builder_.CreateCall(allocFn,
