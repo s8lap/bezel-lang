@@ -55,6 +55,13 @@
 // line between it and the use dips below its own brace depth — so the scan
 // cannot reach across a function boundary and report a neighbour's local.  It
 // is a ratchet on ONE known-bad shape, not a lifetime checker.
+//
+// The declaration matcher accepts `NAME;`, `NAME{...}` and `NAME = ...`.  It
+// was `;`-only when first written, which left the identical defect written as
+// `sema::TypeRef h{};` or `sema::TypeRef h = ...;` invisible to it — ordinary
+// modern C++, and an unstated hole in a ratchet's own LIMITS is the failure
+// this project keeps paying for.  Closing it cost nothing: 0 additional hits
+// across all of `src/`.
 
 #include <algorithm>
 #include <cctype>
@@ -132,7 +139,11 @@ bool matchValueHolderDecl(const std::string& s, std::string& nameOut) {
         if (i == begin) { at += kTy.size(); continue; }
         std::size_t j = i;
         while (j < s.size() && (s[j] == ' ' || s[j] == '\t')) ++j;
-        if (j < s.size() && s[j] == ';') {
+        // Accept `NAME;`, `NAME{...}` and `NAME = ...` — brace-init and
+        // copy-init declare a value holder exactly as `;` does, and a matcher
+        // that only knew `;` was evadable by writing the same defect as
+        // `sema::TypeRef h{};` (measured: 0 new hits across all of src/).
+        if (j < s.size() && (s[j] == ';' || s[j] == '{' || s[j] == '=')) {
             nameOut = s.substr(begin, i - begin);
             return true;
         }
