@@ -1690,6 +1690,18 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
     if (!lam.exprBody) {
         computeFrameCapturedLocals(lam.stmts);
         collectSuspendLocals(lam.stmts, bodyLocals);
+    } else {
+        // fix #3499 (§27.5 / §30.6, v0.283): an EXPRESSION-bodied async lambda
+        // runs neither walk, so all three sets would still describe the
+        // ENCLOSING frame body — and the field reservation below keys frame
+        // LAYOUT off them. A stale `frameCapturedParams_` entry cannot name one
+        // of this lambda's own parameters (the symbols differ), so the surviving
+        // hazard is a reserved-but-unused field rather than a mis-indexed one;
+        // clear them anyway, because a layout decision must not depend on what
+        // the previous frame happened to contain.
+        frameCapturedLocals_.clear();
+        frameCapturedParams_.clear();
+        frameLocalPreBoxTy_.clear();
     }
 
     std::vector<llvm::Type*> fields;
@@ -1706,6 +1718,57 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
     fields.push_back(ptrTy());          // outerTask
     fields.push_back(ptrTy());          // pendingTask
     fields.push_back(ptrTy());          // spill
+
+    // fix #3499 (§27.5 / §30.6 / §30.1, v0.283): this is the FOURTH
+    // state-machine frame venue and the only one that does not go through
+    // buildStateMachineFrame, so #3466's and #3484's capture-CELL fields were
+    // missing here. Reserve both, with exactly the shapes those two fixes
+    // established, and append them AFTER the three trailing async fields so no
+    // index computed above (OUTER_TASK_FIELD / PENDING_TASK_FIELD /
+    // SPILL_PTR_FIELD, LOCAL_START, CAPTURE_START) moves.
+    //
+    //  (a) one POINTER field per lambda-captured PARAMETER, for the cell HOLDER
+    //      a nested lambda's capture rebinds paramSlots_ to. Without it the
+    //      holder was a bare entry-block alloca of the resume fn, re-nulled on
+    //      every activation while the dispatch jumps past the capture site: the
+    //      write after the `await` landed in the pre-boxing alloca (#3484's
+    //      fall-back, admitted here because the restore loop below is
+    //      unconditional) while the closure kept reading the cell — 7 where
+    //      §27.5's "modifications ... are visible outside, and vice versa"
+    //      requires 107. Ptr width, never the parameter's own type (#461/#808:
+    //      an 8-byte cell pointer spilled into an i32 field overflows into its
+    //      neighbour). A NEW field, never the parameter's capture field: that
+    //      one carries the raw VALUE the restore loop copies back on every
+    //      activation and that boxLocalSlot reads to seed the cell.
+    //      `!fc.cellValTy` selects the plain by-value slots — a capture of an
+    //      OUTER param already arrives as a cell pointer and is restored from
+    //      its capture field unconditionally, so its holder needs nothing.
+    //
+    //  (b) one field per lambda-captured body LOCAL, of the local's PRE-BOXING
+    //      type, because lowerLambda MOVES that local's #808-widened field onto
+    //      the holder and leaves the pre-boxing alloca — #3484's fall-back
+    //      address — with no field at all. Precise type, not ptr: a 12-byte
+    //      record local spilled through a ptr-width field was measured leaking
+    //      raw stack into the program's answer (#3484 follow-up / #461).
+    std::unordered_map<const sema::Symbol*, unsigned> paramCellFields;
+    for (auto& fc : caps) {
+        if (!fc.paramSym || fc.cellValTy) continue;
+        if (!frameCapturedParams_.count(fc.paramSym)) continue;
+        if (paramCellFields.count(fc.paramSym)) continue;
+        paramCellFields[fc.paramSym] = (unsigned)fields.size();
+        fields.push_back(ptrTy());
+    }
+    std::unordered_map<const ast::Node*, unsigned> localPreBoxFields;
+    for (auto& [node, ty] : bodyLocals) {
+        (void)ty;
+        // Deduped because §29.7 (#944) pushes a for-in iterable node into
+        // bodyLocals TWICE — the same guard buildStateMachineFrame carries.
+        if (localPreBoxFields.count(node)) continue;
+        auto pit = frameLocalPreBoxTy_.find(node);
+        if (pit == frameLocalPreBoxTy_.end()) continue;
+        localPreBoxFields[node] = (unsigned)fields.size();
+        fields.push_back(pit->second);
+    }
 
     static std::atomic<unsigned> lamSmCounter{0};
     unsigned smId = lamSmCounter.fetch_add(1);
@@ -1843,6 +1906,11 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         // Reset it so only the lambda body's own suspend-locals are tracked.
         // (smLocalFields_ is overwritten wholesale by emitResumeDispatch below.)
         smAllocaToField_.clear();
+        // fix #3499 (§27.5 / §30.6, v0.283): same argument, same sentence — the
+        // enclosing resume's restored-parameter allocas are NOT this function's,
+        // and boxedStorage tests this set directly (it is not gated on
+        // smCellFrameFn_). Refilled for THIS resume by the restore loop below.
+        smRestoredParamSlots_.clear();
 
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
         builder_.SetInsertPoint(entry);
@@ -1878,6 +1946,22 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             }
             if (fc.localDecl) locals_[fc.localDecl] = slot;
         }
+        // fix #3499 (§27.5 / §30.6 / §30.1, v0.283): publish the capture-cell
+        // field maps for the fn the body actually lowers into (the resume, not
+        // the closure entry) — the async-lambda spelling of the publication
+        // emitAsyncMethod / emitIteratorMethod / emitAsyncIteratorMethod already
+        // do. lowerLambda reads these when it boxes a captured parameter or
+        // local and wires the holder (resp. the pre-boxing alloca) into
+        // smAllocaToField_, so the existing emitAwaitSuspend spill/restore
+        // carries it across every suspension lowered after the capture site.
+        // Keyed by function because paramSlots_/locals_ are rebuilt per emitted
+        // function and a nested emission must not inherit this frame's indices.
+        // All three are cleared by clearSmFrame and saved/restored around BOTH
+        // nested-lambda emissions in lowerLambda — the two halves of the one
+        // contract issue 3505 names (per §13 of the lane rules).
+        smParamCellField_ = paramCellFields;
+        smLocalPreBoxField_ = localPreBoxFields;
+        smCellFrameFn_ = resumeFn;
         // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §30.6 (v0.240): the
         // `var` STRING-local refcount analysis must describe the async LAMBDA's
         // RESUME fn too — the same re-establishment performed just above for the
