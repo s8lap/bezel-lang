@@ -3699,6 +3699,70 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     flushFinallysBefore(i);  // finally@depth i precedes scope i
                     for (const Disposal& d : disposeStack_[i]) {
                         if (d.caughtException || d.unwindOnly) continue;
+                        // fix #3500 (§27.5 / §28.9 / §29.3, v0.283): the §27.5
+                        // CLOSURE-release and CAPTURE-CELL frees are deliberately
+                        // NOT enrolled in this abandonment snapshot.
+                        //
+                        // The snapshot's exclusivity argument is "Dispose stamps
+                        // the DISPOSED sentinel, an exhausted iterator parks at
+                        // -1" — which covers abandonment vs. exhaustion but NOT a
+                        // body that THROWS after a yield. On that edge this stack
+                        // runs in addition to whatever the throw path already
+                        // did, and that is not a hypothesis: on ef339fa, with
+                        // none of this issue's changes present,
+                        //
+                        //     using var r := new R(); yield return r.V;
+                        //     if v > 2 then throw …; end if;
+                        //
+                        // is a heap-use-after-free and the same shape over a
+                        // `string` local is a SEGV. That pre-existing double-run
+                        // is filed separately; what matters here is that arming a
+                        // FREE on it would convert this issue's LEAK into a
+                        // use-after-free — measured, on exactly that shape, with
+                        // an earlier revision of this commit that did not have
+                        // these three lines.
+                        //
+                        // So the new reclaims arm only where the dispose stack is
+                        // run exactly once — MoveNext's own scope exit, i.e. the
+                        // run-to-exhaustion path this issue's repro takes — and
+                        // an ABANDONED or THROWING enumeration keeps the
+                        // pre-existing leak. No pre-existing entry is removed:
+                        // before this commit a sync iterator body could not
+                        // register ANY of these kinds at all (their eligibility
+                        // tokens never named `moveNextFn`), so this filter is a
+                        // no-op for every program that compiled before it.
+                        //
+                        // THE LIST MUST MATCH `consumeLastLambdaCapturedCells`
+                        // EXACTLY, and `inlineOwnedArrayCell` is the one that is
+                        // easy to miss: it is pushed BESIDE the `boxedCellFree`
+                        // that frees the cell (both the pattern-binding and the
+                        // ordinary branch), and it disposes the owned ELEMENTS
+                        // THROUGH that same cell — so replaying it after the
+                        // throw edge already ran it is a use-after-free on the
+                        // very same allocation. A captured move-only
+                        // `[2 owned]Cell` in an iterator that throws after a
+                        // yield was `heap-use-after-free ... in
+                        // bz$iter$Gen$CloneDispose` with a three-kind version of
+                        // this filter, and is clean with the fourth.
+                        //
+                        // THE LIST IS COMPLETE, enumerated from the REGISTRATION
+                        // SITES rather than from the kind list. Exactly three
+                        // places register a Disposal under a token this commit
+                        // re-establishes: `lowerLocalDecl`'s closure arm
+                        // (`closureRelease`); `consumeLastLambdaCapturedCells`
+                        // (`boxedCellFree`, `boxedCellFreeDeferred`,
+                        // `inlineOwnedArrayCell` — `skipCellFreeOnUnwind` is a
+                        // modifier on those same entries, not a kind of its
+                        // own); and #793's for-var cell free (`boxedCellFree`,
+                        // and gated on `!smStateStruct_`, so unreachable in a
+                        // MoveNext at all). The neighbouring plain
+                        // `inlineOwnedArray` is deliberately NOT in the list: it
+                        // is gated on `moveOnlyArrayTransferredFn_`, a token
+                        // this commit does not touch, so it is as inert in an
+                        // iterator body after this change as it was before.
+                        if (d.closureRelease || d.boxedCellFree ||
+                            d.boxedCellFreeDeferred || d.inlineOwnedArrayCell)
+                            continue;
                         if (d.iterEnumDispose) {
                             auto* alloca =
                                 llvm::dyn_cast_or_null<llvm::AllocaInst>(d.slot);

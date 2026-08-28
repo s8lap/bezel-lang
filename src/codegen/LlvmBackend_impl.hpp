@@ -10684,6 +10684,75 @@ private:
         Emitter& e_;
     };
 
+    // fix #3500 (§27.5 / §28.9 / §29.3, v0.283): save/restore the §27.5
+    // closure-release and capture-cell eligibility sets across ONE nested body
+    // emission. A `clear()` on per-lowering state and a save/restore around
+    // nested emission are two halves of ONE contract, and this family had only
+    // the first half.
+    //
+    // WHY IT MATTERS HERE. `emitIteratorMethod` is not only reached from
+    // `emitFunctionBody` (where the next method's own pre-scan re-pins
+    // everything, so clobbering is harmless): `instantiateGenericSpecialization`
+    // (LlvmBackend_Calls2.cpp) also calls it MID-EMISSION of an outer body, to
+    // build a lazy monomorphization. That site saves and restores the string
+    // sets (#2807 / #2817) and the closure-release set (#2854) precisely for
+    // this reason, but never grew a save for the capture-cell family — which is
+    // exactly the asymmetry issue 3505 catalogues, and which `emitAsyncMethod`
+    // already trips over today. Rather than extend that hole to the
+    // sync-iterator path, this scope makes the iterator emitter LEAVE THE SETS
+    // AS IT FOUND THEM, so a nested specialization cannot cost the outer body
+    // its own eligibility. (Direction if it were missing: the outer body's gates
+    // go false and its reclaims silently stop firing — a leak, not a UAF, and
+    // invisible to any test that does not nest a generic iterator inside a body
+    // that also captures.)
+    struct CaptureReclaimSetScope {
+        explicit CaptureReclaimSetScope(Emitter& e)
+            : e_(e),
+              closureReleaseEligible_(e.closureReleaseEligible_),
+              closureReleaseEligibleFn_(e.closureReleaseEligibleFn_),
+              boxCaptureLocals_(e.boxCaptureLocals_),
+              singleCaptureLocals_(e.singleCaptureLocals_),
+              assignedCaptureVars_(e.assignedCaptureVars_),
+              definitelyEscapingLambdas_(e.definitelyEscapingLambdas_),
+              boxCaptureLocalsFn_(e.boxCaptureLocalsFn_),
+              cellFreeEligible_(e.cellFreeEligible_),
+              unwindUnsafeCellFree_(e.unwindUnsafeCellFree_),
+              sharedCellEnvdtorFreeOwner_(e.sharedCellEnvdtorFreeOwner_),
+              cellFreeEligibleFn_(e.cellFreeEligibleFn_) {}
+        ~CaptureReclaimSetScope() {
+            e_.closureReleaseEligible_ = std::move(closureReleaseEligible_);
+            e_.closureReleaseEligibleFn_ = closureReleaseEligibleFn_;
+            e_.boxCaptureLocals_ = std::move(boxCaptureLocals_);
+            e_.singleCaptureLocals_ = std::move(singleCaptureLocals_);
+            e_.assignedCaptureVars_ = std::move(assignedCaptureVars_);
+            e_.definitelyEscapingLambdas_ =
+                std::move(definitelyEscapingLambdas_);
+            e_.boxCaptureLocalsFn_ = boxCaptureLocalsFn_;
+            e_.cellFreeEligible_ = std::move(cellFreeEligible_);
+            e_.unwindUnsafeCellFree_ = std::move(unwindUnsafeCellFree_);
+            e_.sharedCellEnvdtorFreeOwner_ =
+                std::move(sharedCellEnvdtorFreeOwner_);
+            e_.cellFreeEligibleFn_ = cellFreeEligibleFn_;
+        }
+        CaptureReclaimSetScope(const CaptureReclaimSetScope&) = delete;
+        CaptureReclaimSetScope& operator=(const CaptureReclaimSetScope&) =
+            delete;
+
+    private:
+        Emitter& e_;
+        std::unordered_set<const void*> closureReleaseEligible_;
+        llvm::Function* closureReleaseEligibleFn_;
+        std::unordered_set<const void*> boxCaptureLocals_;
+        std::unordered_set<const void*> singleCaptureLocals_;
+        std::unordered_set<const void*> assignedCaptureVars_;
+        std::unordered_set<const void*> definitelyEscapingLambdas_;
+        llvm::Function* boxCaptureLocalsFn_;
+        std::unordered_set<const void*> cellFreeEligible_;
+        std::unordered_set<const void*> unwindUnsafeCellFree_;
+        std::unordered_map<const void*, const void*> sharedCellEnvdtorFreeOwner_;
+        llvm::Function* cellFreeEligibleFn_;
+    };
+
     // §30.7: complete the in-flight async iterator's PER-ADVANCE Task<bool> with
     // `hasValue` (true = a value was yielded into current_val; false = exhausted).
     // Unlike emitAsyncComplete, it does NOT free the frame (the frame persists
