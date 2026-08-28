@@ -338,6 +338,44 @@ BEZEL_TEST(builtin_ctor_named_arg_3425,
         std::string("TypeName|Msg|Stack"));
 }
 
+// §22.5 *Evaluation order*, on the ONE built-in construction this fix leaves
+// admitting a reorder — which is exactly where an evaluation-order bug could
+// hide, because every other reordered built-in construction is now rejected.
+// §22.5 states it verbatim: "A call's **supplied** argument expressions are
+// evaluated in **call-site textual order** — left to right as written, for
+// positional and named arguments alike; naming an argument changes which
+// parameter it binds to, never when it runs (`M(b := Next(), a := Next())`
+// evaluates the `b` expression first)."
+//
+// The three arguments are side-effecting and distinguishable, so the two
+// orders are separately observable: the VALUE line reports the BINDING
+// (TypeName|Message|StackTrace = D, A, B) and the LOG line reports the
+// EVALUATION order (A, B, D — the order written). A `lowerNew` arm that
+// lowered in field order instead would print "DAB" and "DAB"; one that bound
+// by position would print "ABD" and "ABD". Only "DAB" then "ABD" is §22.5.
+BEZEL_TEST(builtin_ctor_named_arg_3425,
+           exceptioninfo_reordered_named_args_evaluate_in_textual_order) {
+    BEZEL_EXPECT_EQ(
+        runAotOut(
+            "module M; "
+            "class C "
+            "  public static method Tag(sb: StringBuilder, s: string): string "
+            "    sb.Append(s); "
+            "    return s; "
+            "  end Tag; "
+            "  public static method Main(): int "
+            "    using var sb := new StringBuilder(); "
+            "    var e := new ExceptionInfo(Message := Tag(sb, \"A\"), "
+            "                               StackTrace := Tag(sb, \"B\"), "
+            "                               TypeName := Tag(sb, \"D\")); "
+            "    Console.WriteLine(e.TypeName + e.Message + e.StackTrace); "
+            "    Console.WriteLine(sb.ToString()); "
+            "    return 0; "
+            "  end Main; "
+            "end C;"),
+        std::string("DAB\nABD"));
+}
+
 // …and an unknown name on that same exempt head is still rejected: the
 // exemption is from the REORDER limitation only, never from §22.5's rule that
 // a named argument names an existing parameter.
