@@ -1775,10 +1775,50 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // DEFINITELY escapes (definitelyEscapingLambdas_ — directly returned). The
         // scope-end boxedCellFree does not fire for an escaping closure, so the
         // sole env's envdtor is the cell's only free (no double-free); the defining
-        // scope is gone before the escaped closure dies (no UAF). Ordinary guarded
-        // and for-var cells remain excluded (shared/per-iteration holders); a
-        // case-arm binding is the scoped exception handled above.
-        if (!alreadyBoxed && (!wasGuardedLocal || isPatternBinding) && !isForVar &&
+        // scope is gone before the escaped closure dies (no UAF). For-var cells
+        // remain excluded (per-iteration holders); a case-arm binding is the
+        // scoped exception handled above.
+        //
+        // fix #3455 (§27.5 / §28.9, v0.283): `loopStack_.empty()` joins the
+        // guarded-boxing exclusion here, which makes this the THIRD and LAST of
+        // the four cell-reclaim arms in this function to state the SAME proof.
+        // The captured-PARAM twin of this branch already reads
+        // `(!wasGuardedParam || loopStack_.empty())` (#3403) and the captured-
+        // LOCAL scope-end branch above already reads
+        // `!wasGuardedLocal || isPatternBinding || loopStack_.empty()` (#3435);
+        // only this arm still spelled the exclusion as a flat `!wasGuardedLocal`,
+        // and a flat `!wasGuardedLocal` is not a statement about anything this
+        // branch needs. What makes a guarded cell unsafe to free from ONE
+        // envdtor is a BACKWARD EDGE above the capture site — one syntactic
+        // lambda node inside a loop makes N closures over ONE guarded cell, and
+        // N envdtors would free it N times. `loopStack_.empty()` IS that proof:
+        // with no enclosing loop the null-guarded allocation runs at most once
+        // per invocation, and `singleCaptureLocals_` then means exactly one
+        // closure holds it.
+        //
+        // WHY THE OLD SPELLING DECLINED A SHAPE IT WAS MEANT TO COVER.
+        // `wasGuardedLocal` reports boxLocalSlot's STRATEGY, which is chosen by
+        // "is there a StoreInst to this slot in the CURRENT basic block?" —
+        // a question about where the builder happens to be, not about this
+        // capture. lowerLambda boxes captured PARAMETERS before captured LOCALS,
+        // and a param that reaches boxLocalSlot's ALREADY-BOXED path emits the
+        // #2303 null-guard, which splits the block. So in
+        //
+        //     var g := lambda() => k;      /* k boxed here, fresh */
+        //     var t: int := g();
+        //     var f := lambda() => k + t;  /* k re-boxed: guard splits the block */
+        //     return f;                    /* ... so t is then GUARDED */
+        //
+        // `t` — captured by exactly ONE, definitely-escaping lambda, which is
+        // precisely the shape #694 exists to handle — was pushed onto the
+        // guarded path by `k`'s null-guard and declined. Measured 4 B/call
+        // (2000 B / 500 allocations at x500) on ef339fa, clean with this
+        // conjunct. Because captured locals are enumerated from an unordered_map,
+        // WHICH capture arrives second is iteration order, so the old spelling
+        // was also order-dependent.
+        if (!alreadyBoxed &&
+            (!wasGuardedLocal || isPatternBinding || loopStack_.empty()) &&
+            !isForVar &&
             currentFn_ == boxCaptureLocalsFn_ &&
             definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
             singleCaptureLocals_.count(static_cast<const void*>(decl)))
