@@ -3760,6 +3760,28 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // is gated on `moveOnlyArrayTransferredFn_`, a token
                         // this commit does not touch, so it is as inert in an
                         // iterator body after this change as it was before.
+                        //
+                        // ⚠ UPDATE — fix #3531 (§29.7 / §28.3, v0.283). The
+                        // THROW-EDGE DOUBLE-RUN described above IS NOW FIXED:
+                        // `propagateBB` (LlvmBackend_Disposal.cpp) marks a sync
+                        // iterator done (state = -1) when its body leaves
+                        // MoveNext by an exception, exactly as #623's
+                        // `finUnwindBB` already did for the `try`/`finally`
+                        // edge, so `Dispose` no longer replays this stack on
+                        // that edge at all. That removes THIS FILTER'S STATED
+                        // REASON, and issue 3541 tracks removing it.
+                        //
+                        // IT IS DELIBERATELY STILL HERE. Removing it also arms
+                        // these four frees on the ABANDONMENT path, and that
+                        // path is independently broken: a `using var` CAPTURED
+                        // BY A LAMBDA in a sync iterator, abandoned by `break`
+                        // with no throw anywhere in the program, is a
+                        // `heap-buffer-overflow` in `bz$iter$Gen$CloneDispose`
+                        // — measured identically on b43196a and on the #3531
+                        // tree, filed as issue 3539. Arming four more frees on
+                        // a path that already corrupts memory is the same
+                        // leak-to-use-after-free trade this filter exists to
+                        // avoid. 3539 first, then 3541.
                         if (d.closureRelease || d.boxedCellFree ||
                             d.boxedCellFreeDeferred || d.inlineOwnedArrayCell)
                             continue;

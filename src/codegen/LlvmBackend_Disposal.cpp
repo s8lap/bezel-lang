@@ -1790,6 +1790,129 @@ llvm::BasicBlock* Emitter::propagateBB() {
         propagateBB_ = llvm::BasicBlock::Create(llvm_, "propagate",
                                                 currentFn_);
         builder_.SetInsertPoint(propagateBB_);
+        // fix #3531 (§29.7 / §28.3 / §29.3, v0.283): a SYNC ITERATOR body that
+        // leaves `MoveNext` BY AN EXCEPTION must mark the state machine done
+        // (state = -1) before it returns, exactly as the `try`/`finally`
+        // unwind edge already does.
+        //
+        // This is not a new rule and not a new predicate — it is #623's rule,
+        // stated verbatim at its own site in LlvmBackend_Stmts.cpp
+        // (`finUnwindBB`): "if we are inside an iterator state machine, mark
+        // the iterator as done (state=-1) BEFORE running the finally body …
+        // when the consumer's for-loop cleanup subsequently calls Dispose,
+        // Dispose must see state=-1 and be a no-op — otherwise the finally
+        // would run a second time." That site is reached ONLY when the body
+        // has a `try`/`finally` around the throw; a body that throws with no
+        // enclosing `try` never passed through it, so the state stayed parked
+        // at the last yield and the consumer's `Dispose` replayed
+        // `smIterCleanupAtState_` — the very disposals §28.3's EDGE PARITY
+        // rule ("the exception edge performs the same implicit disposal as
+        // the normal edge, on the single establishment-ordered cleanup stack;
+        // the only difference is the lint") had just run on the way out.
+        // Measured on b43196a: `using var r := new R(); yield return r.V;
+        // if v > 2 then throw …; end if;` is a `heap-use-after-free … READ of
+        // size 8 … in bz$iter$Gen$CloneDispose`, and the same shape over a
+        // `string` local is a SEGV inside the allocator (a double free).
+        //
+        // THE THROW EDGE OWNS THEM, not `Dispose`. §28.3's edge parity makes
+        // MoveNext's own unwind the discharger of the body's establishment-
+        // ordered stack, and it has already run by the time control reaches
+        // this block (`emitUnwindDisposals` at the throw site / the pending
+        // check). §29.7 then says the abandonment replay is for a consumer
+        // that "stops iterating early", and that the state machine
+        // "Transitions to a completed state; subsequent `MoveNext()` returns
+        // `false`; second `Dispose()` is a no-op" — a body that threw HAS
+        // completed, so -1 is the state it owes, and the replay must not run.
+        // Choosing this direction is also the leak-safe one: the throw edge
+        // disposes, `Dispose` skips. The reverse (let `Dispose` own it) would
+        // need the throw edge to skip, which is unreachable-in-general
+        // because a manually-driven enumerator need never be disposed.
+        //
+        // WHY `propagateBB` AND NOT THE THROW SITES: `unwindBB()` is
+        // `unwindTarget_ ? unwindTarget_ : propagateBB()`, and every
+        // `unwindTarget_` chain inside MoveNext ends either at a `catch`
+        // (handled — the iterator keeps going, and stamping there would be
+        // wrong) or at a `finally` unwind (which stamps -1 itself and then
+        // re-propagates outward). So this block is the SINGLE edge on which
+        // an exception actually leaves the state machine, and it is created
+        // lazily — an iterator body with NO UNWIND EDGE AT ALL emits
+        // byte-identical IR (measured: a two-`yield` generator over `int`
+        // diffs 0 lines against b43196a). Where an unwind edge does exist the
+        // delta is exactly ONE instruction, this store, whether the edge comes
+        // from a `throw`, a call's pending check, an overflow check, a `new`
+        // that can fail, or the static-init guard — all of which end an
+        // activation the same way, and on all of which -1 is the state §29.7
+        // owes.
+        //
+        // `smStateGEPHere()` is the existing authority for "we are emitting
+        // inside the iterator's own MoveNext right now" (#2891): it is null
+        // in a nested lambda body, in the Dispose body that replays a
+        // `finally`, and in any plain method compiled after this one, so no
+        // cross-function store can be emitted. Scoped to `SuspendKind::Yield`
+        // because the async twins were MEASURED not to have this defect — the
+        // same program shape over `IAsyncEnumerable<int>` is clean on this tree
+        // AND on b43196a, because the async paths park their state through
+        // their own completion protocols rather than leaving it at the last
+        // yield. That measurement is pinned as
+        // `parity_async_iterator_throw_after_yield_unaffected_spec_29_7` in
+        // tests/codegen/iterator_throw_after_yield_double_run_3531_test.cpp, so
+        // widening this gate later is a decision with evidence attached rather
+        // than a guess.
+        // per §29.7, §28.3 rule 15, §29.3
+        if (smKind_ == SuspendKind::Yield) {
+            if (llvm::Value* smGEP = smStateGEPHere()) {
+                // THE STATE FIELD DOES DOUBLE DUTY, and the two duties part
+                // company on exactly this edge. It is (a) a DISCHARGE record —
+                // what the `smIterCleanupAtState_` switch and the -1/-2
+                // sentinels read — and (b) a POSITION, which §29.8's "the state
+                // machine disposes any `owned` parameter that has not been
+                // moved out of by the body" (extended to plain owned locals by
+                // #2306 under §29.7) reads through `disposeOwnedParams` /
+                // `disposeOwnedLocals` as `established <= state <
+                // transferred`. On the throw edge (a) is true and (b) is NOT:
+                // the body threw where it stood, and a local established before
+                // that point and transferred after it is STILL OWED. Stamping
+                // -1 alone answered (b) with "past everything" and skipped that
+                // disposal — a measured 3200 B / 200 objects over 200
+                // activations of
+                //
+                //     var a := new Box(1);
+                //     yield return new Box(2);
+                //     yield return C.Boom(v);   /* throws */
+                //     yield return a;
+                //
+                // on an `IOwningEnumerable<Box>` head. (The linear pre-pass
+                // `collectYieldStatesForOwnedLocals` aborts on statement FORMS
+                // it does not model, but a `yield return <call>` is a YieldStmt
+                // it tolerates — so a body can have both a fully populated
+                // `ownedLocalYieldStates` AND an unwind edge.)
+                //
+                // So spill the POSITION first, then stamp the DISCHARGE. Only
+                // the two positional visits prefer the spill; every other
+                // reader of the state field (resume dispatch, the -2
+                // idempotency guard, the cleanup switch) keeps seeing -1, which
+                // is what §29.7's "Transitions to a completed state" asks for.
+                //
+                // The spill is `select(state > 0, state, 0)`: 0 is the calloc
+                // default AND the correct answer for a body that threw before
+                // its first yield (nothing established yet), and the guard also
+                // makes this a no-op when #623's `finUnwindBB` already stamped
+                // -1 on the way through a `finally` — that path keeps its
+                // pre-existing behaviour rather than acquiring new.
+                if (llvm::Value* parkGEP = smParkedStateGEPHere()) {
+                    llvm::Value* cur = builder_.CreateLoad(
+                        builder_.getInt32Ty(), smGEP, "prop.curstate");
+                    llvm::Value* suspended = builder_.CreateICmpSGT(
+                        cur, builder_.getInt32(0), "prop.suspended");
+                    builder_.CreateStore(
+                        builder_.CreateSelect(suspended, cur,
+                                              builder_.getInt32(0),
+                                              "prop.park"),
+                        parkGEP);
+                }
+                builder_.CreateStore(builder_.getInt32(-1), smGEP);
+            }
+        }
         // per §33.3 / §22.13 (line 3845): propagateBB is the per-function
         // fallback when an exception reaches a frame with no enclosing handler
         // (unwindTarget_ unset). For an inner frame the exception is still live

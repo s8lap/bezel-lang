@@ -434,6 +434,15 @@ Emitter::StateMachineFrame Emitter::buildStateMachineFrame(
         fields.push_back(pit->second);
     }
 
+    // fix #3531 (§29.7 / §29.8 / §28.3, v0.283): the PARKED SUSPEND POSITION —
+    // one i32, appended LAST for the same index-stability reason as the two
+    // blocks above. Written only by a SYNC iterator's exception exit
+    // (propagateBB, LlvmBackend_Disposal.cpp) and read only by
+    // `disposeOwnedParams` / `disposeOwnedLocals`; every other frame kind
+    // carries it inert (4 bytes in a per-call heap frame, calloc-zeroed).
+    frame.parkedStateField = (unsigned)fields.size();
+    fields.push_back(i32());
+
     frame.structTy = llvm::StructType::create(llvm_, fields, structName);
     frame.vtableField = 0;
     frame.stateField = 1;
@@ -1716,6 +1725,15 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         llvm::Value* stateGEP =
             builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
 
+        // fix #3531 (§29.7 / §29.8 / §28.3, v0.283): publish the PARKED-POSITION
+        // GEP beside it, in the same entry block (so it dominates every unwind
+        // edge). propagateBB() spills the suspend position here before it stamps
+        // the done sentinel; `disposeOwnedParams` / `disposeOwnedLocals` read it
+        // back. Emitted for every sync iterator — the store is what is gated, not
+        // the GEP, and an unread GEP folds away.
+        smParkedStateGEP_ = builder_.CreateStructGEP(
+            stateStructTy, self, frame.parkedStateField, "mn.parkedstate");
+
         // Collect all yield stmts and assign state numbers.
         std::vector<const ast::YieldStmt*> yields;
         collectYields(*ci.stmts, yields);
@@ -1990,6 +2008,36 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             builder_.SetInsertPoint(proceed);
         }
 
+        // fix #3531 (§29.7 / §29.8 / §28.3, v0.283): the POSITIONAL state, used
+        // by `disposeOwnedParams` and `disposeOwnedLocals` ONLY. Those two ask
+        // "where was the body when it stopped", not "has the cleanup stack been
+        // discharged" — §29.8's "the state machine disposes any `owned`
+        // parameter that has not been moved out of by the body", keyed on
+        // `established <= state < transferred`. A body that left MoveNext by an
+        // exception spilled that position into `parkedStateField` and then
+        // stamped -1 (propagateBB, LlvmBackend_Disposal.cpp), so recover it
+        // here: a non-zero park is meaningful only alongside the done sentinel,
+        // and zero means "never parked", which is both the calloc default and
+        // the right answer for a body that threw before its first yield.
+        //
+        // Every OTHER reader keeps `disposeState` untouched — the cleanup
+        // switch below must see -1 and run nothing (that is this issue's fix),
+        // and the -2 idempotency guard above has already run.
+        llvm::Value* positionalState = disposeState;
+        {
+            llvm::Value* parkGEP = builder_.CreateStructGEP(
+                stateStructTy, self, frame.parkedStateField, "dsp.parkedstate");
+            llvm::Value* parked =
+                builder_.CreateLoad(i32(), parkGEP, "dsp.parked");
+            llvm::Value* isDone = builder_.CreateICmpEQ(
+                disposeState, builder_.getInt32(-1), "dsp.isdone");
+            llvm::Value* hasPark = builder_.CreateICmpNE(
+                parked, builder_.getInt32(0), "dsp.haspark");
+            positionalState = builder_.CreateSelect(
+                builder_.CreateAnd(isDone, hasPark, "dsp.usepark"),
+                parked, disposeState, "dsp.posstate");
+        }
+
         // Restore captures so finally bodies can access `this` / params.
         emitFrameCaptureRestores(frame, self);
 
@@ -2062,10 +2110,12 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 if (stateKeyedOwned && yieldState != 0) {
                     // State N means yield N has already transferred its parameter.
                     // State 0 still owns all captures; -1 means fully exhausted.
+                    // fix #3531: `positionalState`, not `disposeState` — see the
+                    // block that computes it. This is a POSITION test.
                     llvm::Value* notComplete = builder_.CreateICmpSGE(
-                        disposeState, builder_.getInt32(0), "itp.active");
+                        positionalState, builder_.getInt32(0), "itp.active");
                     llvm::Value* beforeMove = builder_.CreateICmpSLT(
-                        disposeState,
+                        positionalState,
                         builder_.getInt32((int)yieldState),
                         "itp.beforemove");
                     shouldDispose = builder_.CreateAnd(
@@ -2126,8 +2176,11 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                     obj, llvm::ConstantPointerNull::get(ptrTy()),
                     "itl.nonnull");
                 // Established: suspension state >= establishedAtState.
+                // fix #3531: `positionalState`, not `disposeState` — a body that
+                // left MoveNext by an exception parked its position rather than
+                // moving past it, and this local is still owed (§29.8 / §29.7).
                 llvm::Value* established = builder_.CreateICmpSGE(
-                    disposeState,
+                    positionalState,
                     builder_.getInt32((int)info.establishedAtState),
                     "itl.estab");
                 // Not transferred: state < transferredAtState. (If
@@ -2135,7 +2188,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                 // pre-pass already filtered such cases out — every registered
                 // local has transferredAtState > 0.)
                 llvm::Value* beforeMove = builder_.CreateICmpSLT(
-                    disposeState,
+                    positionalState,
                     builder_.getInt32((int)info.transferredAtState),
                     "itl.beforemove");
                 llvm::Value* shouldDispose = builder_.CreateAnd(

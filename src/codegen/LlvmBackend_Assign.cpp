@@ -4809,6 +4809,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
       smStateStruct_(e.smStateStruct_),
       smSelf_(e.smSelf_),
       smStateGEP_(e.smStateGEP_),
+      smParkedStateGEP_(e.smParkedStateGEP_),   // fix #3531
       smStateBBs_(std::move(e.smStateBBs_)),
       smDoneBB_(e.smDoneBB_),
       smNextSuspendState_(e.smNextSuspendState_),
@@ -4845,6 +4846,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     e.smStateStruct_             = nullptr;
     e.smSelf_                    = nullptr;
     e.smStateGEP_                = nullptr;
+    e.smParkedStateGEP_          = nullptr;   // fix #3531
     e.smStateBBs_.clear();
     e.smDoneBB_                  = nullptr;
     e.smNextSuspendState_        = 0;
@@ -4885,6 +4887,7 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
     e_.smStateStruct_             = smStateStruct_;
     e_.smSelf_                    = smSelf_;
     e_.smStateGEP_                = smStateGEP_;
+    e_.smParkedStateGEP_          = smParkedStateGEP_;  // fix #3531
     e_.smStateBBs_                = std::move(smStateBBs_);
     e_.smDoneBB_                  = smDoneBB_;
     e_.smNextSuspendState_        = smNextSuspendState_;

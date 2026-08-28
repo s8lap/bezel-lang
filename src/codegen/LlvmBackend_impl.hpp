@@ -10337,6 +10337,26 @@ private:
         // ptr: a record/value-struct local would overflow a ptr-width field
         // exactly as #461 describes.
         std::unordered_map<const ast::Node*, unsigned> localPreBoxFields;
+        // fix #3531 (§29.7 / §29.8 / §28.3, v0.283): the PARKED SUSPEND
+        // POSITION. `state` does double duty — it is a resume INDEX for the
+        // dispatch switch and the `smIterCleanupAtState_` switch, and it is a
+        // SENTINEL (-1 done, -2 disposed) — and the two meanings part company
+        // exactly on the throw edge, where the establishment-ordered cleanup
+        // stack HAS been discharged (§28.3 edge parity) but the frame's
+        // position has NOT moved past anything. §29.8's "the state machine
+        // disposes any `owned` parameter that has not been moved out of by the
+        // body" (extended to plain owned locals by #2306 under §29.7) is read
+        // POSITIONALLY by `disposeOwnedParams` / `disposeOwnedLocals`, so
+        // stamping -1 for the first fact silently answered the second one
+        // "past everything" and skipped a disposal that was still owed.
+        //
+        // So the throw edge spills the position here before stamping, and ONLY
+        // those two positional visits prefer it. Zero (the calloc default) means
+        // "no parked position", which is also the right answer for a body that
+        // threw before its first yield: nothing was established yet.
+        // Appended LAST, after `localPreBoxFields`, for #3466's index-stability
+        // reason — no index any caller already computed can move.
+        unsigned parkedStateField = 0;
     };
 
     // Pre-scan a method body to collect all LocalDecl/ForStmt nodes and their
@@ -10924,6 +10944,7 @@ private:
     X(llvm::StructType*,      smStateStruct_,            nullptr)              \
     X(llvm::Value*,           smSelf_,                   nullptr)              \
     X(llvm::Value*,           smStateGEP_,               nullptr)              \
+    X(llvm::Value*,           smParkedStateGEP_,         nullptr) /* #3531 */ \
     X(SmFrameBlockVec,        smStateBBs_,               {})                   \
     X(llvm::BasicBlock*,      smDoneBB_,                 nullptr)              \
     X(unsigned,               smNextSuspendState_,       0)                    \
@@ -11139,6 +11160,10 @@ private:
     llvm::StructType* smStateStruct_ = nullptr;
     llvm::Value* smSelf_ = nullptr;
     llvm::Value* smStateGEP_ = nullptr;
+    // fix #3531 (§29.7 / §29.8, v0.283): GEP to `frame.parkedStateField` in the
+    // function currently being emitted, published beside smStateGEP_ by the SYNC
+    // iterator's MoveNext prologue and read through smParkedStateGEPHere() only.
+    llvm::Value* smParkedStateGEP_ = nullptr;
     std::vector<llvm::BasicBlock*> smStateBBs_;
     llvm::BasicBlock* smDoneBB_ = nullptr;
     unsigned smNextSuspendState_ = 0;
@@ -11223,6 +11248,16 @@ private:
         return smStateGEP_;
     }
 
+    // fix #3531: smStateGEPHere()'s twin for the parked-position field. Same
+    // #2891 cross-function guard, for the same reason — the member outlives the
+    // emitter that published it.
+    llvm::Value* smParkedStateGEPHere() const {
+        if (!smParkedStateGEP_) return nullptr;
+        if (auto* inst = llvm::dyn_cast<llvm::Instruction>(smParkedStateGEP_))
+            if (inst->getFunction() != currentFn_) return nullptr;
+        return smParkedStateGEP_;
+    }
+
     // fix #2702 (§23.3/§23.4/§30.5/§28.4, v0.240): ONE place that saves,
     // neutralises and restores the emitter state a NESTED body emission must
     // not inherit. `ensurePropertyBlockGetter`, `ensureIndexerBlockGetter` and
@@ -11268,6 +11303,14 @@ private:
         llvm::StructType*    smStateStruct_;
         llvm::Value*         smSelf_;
         llvm::Value*         smStateGEP_;
+        // fix #3531: smStateGEP_'s partner. This scope is NOT generated
+        // from BEZEL_SM_FRAME_MEMBERS (#3505 converted clearSmFrame and
+        // SmFrameSaveScope, not this one), so the pair has to be kept by
+        // hand here — and it must be a PAIR: smStateGEPHere() and
+        // smParkedStateGEPHere() are read together on the same edge, so
+        // saving one without the other is the very asymmetry #3505 is
+        // about. Noted as a follow-up on issue 3505.
+        llvm::Value*         smParkedStateGEP_;
         std::vector<llvm::BasicBlock*> smStateBBs_;
         llvm::BasicBlock*    smDoneBB_;
         unsigned             smNextSuspendState_;
