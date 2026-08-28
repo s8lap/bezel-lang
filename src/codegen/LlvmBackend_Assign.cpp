@@ -8647,7 +8647,21 @@ llvm::Value* Emitter::wrapOwnedArrayAsIEnumerable(llvm::Value* arr,
     auto* mnFn = module_->getFunction(plainPrefix + "MoveNext");
     auto* curFn = module_->getFunction(plainPrefix + "Current");
     std::string vtName = prefix + "vtable";
-    auto* vtGV = module_->getGlobalVariable(vtName);
+    // fix #3477: `getNamedGlobal`, NOT `getGlobalVariable(vtName)`. The
+    // one-argument overload is `getGlobalVariable(Name, /*AllowInternal=*/false)`
+    // (llvm/IR/Module.h) and returns null for a global with LOCAL linkage --
+    // which every vtable below is. So this guard never fired: each wrap site
+    // minted a fresh vtable and LLVM uniqued the name (`...$vtable.1`),
+    // contradicting the comment above that the vtable is "created once per
+    // element type". `getNamedGlobal` is `getGlobalVariable(Name, true)` and is
+    // already this file's spelling for the same question (see the imported-
+    // indexer thunk's `vt$<Type>` lookup, which notes that "the module itself
+    // is the memo — no twelfth side table"). Sharing is sound because the
+    // vtable's contents are ONLY the self-pointer and functions that the
+    // `getFunction(name)` caches above ALREADY share under this same key, so
+    // the vtable inherits exactly the key those functions have (#3450 is the
+    // record of that key being sharpened, and this lookup rides it).
+    auto* vtGV = module_->getNamedGlobal(vtName);
     if (!vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
@@ -9011,7 +9025,9 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
     // Vtable: [0]=self, [1]=Dispose, [2]=MoveNext, [3]=TakeCurrent,
     // [4]=GetOwningEnumerator (fresh clone over the current remainder).
     std::string vtName = prefix + "vtable";
-    auto* vtGV = module_->getGlobalVariable(vtName);
+    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
+    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
+    auto* vtGV = module_->getNamedGlobal(vtName);
     if (!vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
@@ -9250,7 +9266,9 @@ llvm::Value* Emitter::wrapLinkedListAsIOwningEnumerator(
     // Vtable: [0]=self, [1]=Dispose, [2]=MoveNext, [3]=TakeCurrent,
     // [4]=GetOwningEnumerator (the same 5-slot §29.11 shape).
     std::string vtName = prefix + "vtable";
-    auto* vtGV = module_->getGlobalVariable(vtName);
+    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
+    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
+    auto* vtGV = module_->getNamedGlobal(vtName);
     if (!vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
@@ -9407,7 +9425,9 @@ Emitter::ArrEnumMachinery Emitter::ensureArrayEnumMachinery(llvm::Type* elemTy) 
 
     // Build the vtable (§29.11 #943: 5 slots — slot 4 = GetEnumerator/clone).
     std::string vtName = prefix + "vtable";
-    auto* vtGV = module_->getGlobalVariable(vtName);
+    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
+    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
+    auto* vtGV = module_->getNamedGlobal(vtName);
     if (!vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
@@ -9571,7 +9591,9 @@ Emitter::ArrEnumMachinery Emitter::ensureStackEnumMachinery(llvm::Type* elemTy) 
 
     // Build the vtable (same 5-slot §29.11 layout as the forward machinery).
     std::string vtName = prefix + "vtable";
-    auto* vtGV = module_->getGlobalVariable(vtName);
+    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
+    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
+    auto* vtGV = module_->getNamedGlobal(vtName);
     if (!vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
@@ -9769,7 +9791,9 @@ llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
     auto* mnFn = module_->getFunction(plainPrefix + "MoveNext");
     auto* curFn = module_->getFunction(plainPrefix + "Current");
     std::string vtName = prefix + "vtable";
-    auto* vtGV = module_->getGlobalVariable(vtName);
+    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
+    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
+    auto* vtGV = module_->getNamedGlobal(vtName);
     if (!vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
@@ -10125,7 +10149,9 @@ llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
     // [4]=GetEnumerator (the same 5-slot shape as every sync IEnumerable
     // producer, §29.11 #943).
     std::string vtName = prefix + "vtable";
-    auto* vtGV = module_->getGlobalVariable(vtName);
+    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
+    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
+    auto* vtGV = module_->getNamedGlobal(vtName);
     if (!vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
@@ -10306,7 +10332,9 @@ Emitter::LlEnumMachinery Emitter::ensureLinkedListEnumMachinery(llvm::Type* elem
     // vtable: [0]=self-ptr sentinel, [1]=Dispose, [2]=MoveNext, [3]=Current,
     // [4]=GetEnumerator (same 5-slot shape as the array wrapper, §29.11 #943).
     std::string vtName = prefix + "vtable";
-    auto* vtGV = module_->getGlobalVariable(vtName);
+    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
+    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
+    auto* vtGV = module_->getNamedGlobal(vtName);
     if (!vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
@@ -10481,7 +10509,9 @@ llvm::Value* Emitter::wrapOwnedLinkedListAsIEnumerable(
     auto* mnFn = module_->getFunction(plainPrefix + "MoveNext");
     auto* curFn = module_->getFunction(plainPrefix + "Current");
     std::string vtName = prefix + "vtable";
-    auto* vtGV = module_->getGlobalVariable(vtName);
+    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
+    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
+    auto* vtGV = module_->getNamedGlobal(vtName);
     if (!vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
@@ -10928,7 +10958,9 @@ llvm::Value* Emitter::wrapDictionaryEntryArrayAsIEnumerable(
     auto* mnFn = module_->getFunction(plainPrefix + "MoveNext");
     auto* curFn = module_->getFunction(plainPrefix + "Current");
     std::string vtName = prefix + "vtable";
-    auto* vtGV = module_->getGlobalVariable(vtName);
+    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
+    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
+    auto* vtGV = module_->getNamedGlobal(vtName);
     if (!vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
@@ -11560,7 +11592,9 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
 
     // 8. Build vtable global (§29.11 #943: 5 slots — slot 4 = GetEnumerator).
     std::string vtName = prefix + "vtable";
-    auto* vtGV = module_->getGlobalVariable(vtName);
+    // fix #3477: `getNamedGlobal` (AllowInternal), not the one-argument
+    // `getGlobalVariable` -- see wrapOwnedArrayAsIEnumerable for why.
+    auto* vtGV = module_->getNamedGlobal(vtName);
     if (!vtGV) {
         auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
         std::vector<llvm::Constant*> elems = {
