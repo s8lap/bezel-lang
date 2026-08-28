@@ -32,14 +32,28 @@
 // missing name in a positive list can be load-bearing: #3444 records the case
 // where adding one would SUPPRESS a diagnostic and let an unlowered path
 // through, converting a loud error into a silent miscompile. The direction here
-// is the opposite. This list has one effect and one only — it selects a
-// `checkAssignable` call, i.e. it ADDS a rejection; it enables no lowering and
-// suppresses no diagnostic, so the only risk it carries is over-rejection,
-// which the second half of this file measures. And the accepts it was leaking
-// are not benign: MEASURED on 0c5ecd1, each of the two programs above compiles
-// and then SEGVs at run time (`AddressSanitizer: SEGV on unknown address
-// 0x000000000000 … READ`, exit 139 without ASan) — the same failure mode #2582
-// records for the slots it closed, not a silent-but-harmless nullable.
+// is the opposite: this list selects a `checkAssignable` call, i.e. it ADDS a
+// rejection, so its dominant risk is over-rejection — which the second half of
+// this file measures at zero.
+//
+// ⚠ ONE QUALIFIER, found by per-fix review and recorded because an earlier
+// revision of this comment stated the stronger claim flatly. `checkAssignable`
+// is NOT side-effect-free: `ExprTypecheck.cpp:4095` calls `ctx_.setExprType(...)`
+// on the §27.6 property-getter-reference path (gated `to->kind == Function`).
+// So this list CAN reach a typing side effect. Measured, that direction is
+// strictly toward correctness — `SortedDictionary<int, () -> int>.Add(1, p.Q)`
+// with an `int` property `Q` went from rc 139 (a SEGV, storing an i32 into a
+// function slot) to the correct value, converging on the `Dictionary` twin
+// which was already right. No shape exists where "before" was correct and
+// "after" is not, because that branch requires `from->kind != Function`.
+// That arm is currently UNTESTED; it is a newly-reached path.
+//
+// And the accepts this list was leaking are not benign — but they are not
+// symmetric either. MEASURED on 0c5ecd1: the KEY program SEGVs at the `Add`
+// itself (`AddressSanitizer: SEGV on unknown address 0x0 … READ`, rc 139); the
+// VALUE program does NOT — it compiles, stores the null, returns `Count == 1`,
+// and is ASan-clean, faulting only on the first read-back. Saying both "SEGV at
+// run time" sends the next reader hunting a fault one of them never produces.
 //
 // WHY IT WAS MISSED. #2582's own comment in this file asserted, of the pos-1
 // gate, that "`SortedDictionary<K, V>` (§4.17 line 2999-3017) declares NO

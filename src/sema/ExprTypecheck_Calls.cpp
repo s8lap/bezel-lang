@@ -11375,11 +11375,17 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         // left the name out because §4.17 genuinely had no `Add` at the time
         // (its write surface was the indexer only), and #3372 added the sibling
         // `TryAdd` without revisiting `Add`; the gate never caught up with the
-        // stdlib revision. Unguarded, BOTH slots are memory-unsafe, not merely
-        // permissive: measured on 0c5ecd1, `sd.Add(k, 1)` with `k: string? :=
-        // null` and `sd2.Add(1, v)` with `v: string? := null` each compile and
-        // then SEGV at run time (ASan: READ of address 0x0) — the same failure
-        // mode #2582 records for the slots it closed.
+        // stdlib revision. Unguarded, both slots are memory-unsafe, but NOT
+        // symmetrically, and the distinction matters when reproducing them:
+        //   * KEY slot — `sd.Add(k, 1)` with `k: string? := null` compiles and
+        //     SEGVs AT THE `Add` ITSELF (ASan: READ of address 0x0, rc 139).
+        //   * VALUE slot — `sd2.Add(1, v)` with `v: string? := null` does NOT
+        //     fault there: it compiles, stores the null into a non-nullable V,
+        //     returns `Count == 1`, and is ASan-CLEAN. It SEGVs on the first
+        //     read-back (`sd2[1].Length` -> rc 139).
+        // An earlier revision of this comment said both "compile and then SEGV
+        // at run time", which is false for the value slot and would send the
+        // next reader hunting a fault that program does not produce.
         if (pos == 0 && (
             (m == "Add"    && (colName == "Set" || colName == "SortedSet" ||
                                colName == "LinkedList" ||
