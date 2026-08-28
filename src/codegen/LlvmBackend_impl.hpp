@@ -749,6 +749,16 @@ private:
     // in an earlier basic block) and wrongly reuse one stale cell. Keyed by the
     // AllocaInst (module-lifetime, unique across the compilation — no clearing).
     std::unordered_set<llvm::AllocaInst*> loopBodyDeclaredSlots_;
+    // fix #3503 (§31.2 / §27.5, v0.283): the AST decl nodes (`CatchArm::body`)
+    // that name a CATCH-ARM BINDING. lowerTry is the only place that knows —
+    // `arm.body` is an ordinary Stmt, so nothing downstream can tell it from a
+    // block — and lowerLambda needs the fact to treat such a binding the way it
+    // already treats a `case`-arm BindingPattern: RE-BOUND on every entry to its
+    // arm, so a guarded capture cell (allocated once, reused) must be refreshed
+    // from the binding slot at each capture, or a second entry reads the FIRST
+    // exception through the closure. Keyed by AST node (parse-lifetime, unique
+    // across the compilation — no clearing, no dangling).
+    std::unordered_set<const ast::Node*> catchArmBindingDecls_;
     // fix #2975 (§29.7 / §28.3 / §28.2, v0.240): the decl nodes whose
     // pure-`IEnumerable<T>`/`IOwningEnumerable<T>` local-decl coercion
     // (lowerLocalDecl) ACTUALLY built an iterator-format value — one whose

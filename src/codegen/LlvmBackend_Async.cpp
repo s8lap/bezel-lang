@@ -4058,10 +4058,56 @@ void Emitter::promoteDemotedSlotsToFrame(
     llvm::Function* fn, const std::vector<llvm::AllocaInst*>& demoted) {
     if (demoted.empty() || !smStateStruct_) return;
 
+    // (0) fix #3503 (§27.5 / §30.9 / §31.2, v0.283): ADMISSION. Step (3) below
+    // replaces each slot with a GEP computed in the block the dispatch switch is
+    // split into, which does NOT dominate the resume ENTRY block — so a slot
+    // with a use up there cannot be promoted as written. Every slot registered
+    // before this fix had none (its stores sit at the handler / def site), and
+    // one that arrived with one would have produced malformed IR.
+    //
+    // The one kind that DOES arrive with an entry-block use is the capture-CELL
+    // HOLDER a lambda capturing a catch-arm binding creates: boxLocalSlot's
+    // guarded strategy null-initialises the holder in the entry block, which is
+    // how the runtime tells a first pass from a later one. That store must go,
+    // and not merely to satisfy dominance — the calloc'd spill area already
+    // starts null on the FIRST entry, so keeping the store would re-null the
+    // holder on EVERY resume, which is exactly the null dereference this
+    // promotion is here to repair.
+    //
+    // Erase such a store; DECLINE any slot that still has an entry-block use
+    // afterwards, leaving it a plain stack slot. Declining preserves the
+    // pre-existing loud failure instead of emitting IR that verifies but
+    // addresses the wrong storage.
+    llvm::BasicBlock& entryBB0 = fn->getEntryBlock();
+    std::vector<llvm::AllocaInst*> admitted;
+    admitted.reserve(demoted.size());
+    for (llvm::AllocaInst* a : demoted) {
+        if (!a) continue;
+        std::vector<llvm::StoreInst*> zeroInit;
+        bool blocked = false;
+        for (llvm::User* u : a->users()) {
+            auto* inst = llvm::dyn_cast<llvm::Instruction>(u);
+            if (!inst || inst->getParent() != &entryBB0) continue;
+            auto* st = llvm::dyn_cast<llvm::StoreInst>(inst);
+            auto* cv = st ? llvm::dyn_cast<llvm::Constant>(st->getValueOperand())
+                          : nullptr;
+            if (st && st->getPointerOperand() == a && cv && cv->isNullValue()) {
+                zeroInit.push_back(st);
+                continue;
+            }
+            blocked = true;
+            break;
+        }
+        if (blocked) continue;
+        for (llvm::StoreInst* st : zeroInit) st->eraseFromParent();
+        admitted.push_back(a);
+    }
+    if (admitted.empty()) return;
+
     // (1) Spill struct layout: one field per demoted slot, in stable order.
     std::vector<llvm::Type*> spillFields;
-    spillFields.reserve(demoted.size());
-    for (llvm::AllocaInst* a : demoted)
+    spillFields.reserve(admitted.size());
+    for (llvm::AllocaInst* a : admitted)
         spillFields.push_back(a->getAllocatedType());
     auto* spillStructTy = llvm::StructType::create(
         llvm_, spillFields, fn->getName().str() + ".spill");
@@ -4120,8 +4166,8 @@ void Emitter::promoteDemotedSlotsToFrame(
     spillPtr->addIncoming(freshPtr, allocBB);
 
     // (3) Re-point each demoted alloca at its heap-spill GEP.
-    for (unsigned i = 0; i < demoted.size(); ++i) {
-        llvm::AllocaInst* a = demoted[i];
+    for (unsigned i = 0; i < admitted.size(); ++i) {
+        llvm::AllocaInst* a = admitted[i];
         llvm::Value* gep =
             cb.CreateStructGEP(spillStructTy, spillPtr, i,
                                a->getName().str() + ".spill");

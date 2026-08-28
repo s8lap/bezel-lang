@@ -4335,6 +4335,17 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 llvm::AllocaInst* slot = entryAlloca(ptrTy());
                 builder_.CreateStore(exc, slot);
                 locals_[arm.body.get()] = slot;
+                // fix #3503 (§31.2 / §27.5, v0.283): record that this decl node
+                // names a CATCH-ARM binding, i.e. a binding this store RE-BINDS
+                // on every entry to the arm. lowerLambda needs that fact for the
+                // same reason it needs it for a `case`-arm BindingPattern: a
+                // GUARDED capture cell is allocated once and then reused, so
+                // without a per-entry refresh a second entry to the arm reads
+                // the FIRST exception through the closure. This is the only
+                // place that knows, and it is recorded here rather than
+                // re-derived from the AST shape (`arm.body` is an ordinary Stmt
+                // — nothing distinguishes it downstream).
+                catchArmBindingDecls_.insert(arm.body.get());
                 // The binding is read in the arm body, possibly AFTER an in-arm
                 // await (§31.1: the borrow's lifetime is the whole arm body, which
                 // spans the suspend) — frame-back it so the caught object pointer

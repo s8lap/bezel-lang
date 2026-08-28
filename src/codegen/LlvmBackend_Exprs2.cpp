@@ -1511,13 +1511,61 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // entry; otherwise a case inside a loop would capture the first
         // iteration's payload forever. The holder remains live until the arm's
         // owner scope (or the escaping closure) releases it.
-        if (isPatternBinding && wasGuardedLocal) {
+        //
+        // fix #3503 (§31.2 / §27.5 / §28.9, v0.283): a CATCH-ARM binding is the
+        // same shape and was NOT covered — `arm.body` is an ordinary Stmt, so
+        // the `BindingPattern` test above cannot see it, and lowerTry records
+        // the fact instead. Measured on `ef339fa`, a `try/catch` inside a
+        // `while` whose arm captures the binding: heap-use-after-free in the
+        // closure on iteration 2, because the guarded cell still held iteration
+        // 1's exception object, which the arm's own disposal had already
+        // reclaimed. That is PRE-EXISTING and reproduces on a purely
+        // SYNCHRONOUS method; it becomes load-bearing here because the fix
+        // above makes the holder survive a resume, which would otherwise have
+        // turned the async spelling's SIGSEGV into exactly that use-after-free.
+        //
+        // Only the REFRESH is widened. The free-side admission (`guardedOk`
+        // below, which lets a case-arm binding's guarded cell be reclaimed at
+        // the arm scope even inside a loop) is deliberately NOT widened to catch
+        // arms: that is a release-direction change and needs its own evidence.
+        // The cost of leaving it is one leaked cell per method invocation, which
+        // is the behaviour every guarded in-loop capture already has (#3403).
+        if ((isPatternBinding || catchArmBindingDecls_.count(decl)) &&
+            wasGuardedLocal) {
             llvm::Value* current = builder_.CreateLoad(ce.valTy, slot,
                                                        "pattern.capture.value");
             builder_.CreateStore(current, ce.envValue);
         }
         locals_[decl] = newSlot;  // rebind to the ptr cell-holder
         rebindDisposalSlot(slot, newSlot);
+        // fix #3503 (§27.5 / §30.9 / §31.2 / §30.1, v0.283): a CATCH-ARM
+        // BINDING has no bodyLocals frame field for the move below to relocate —
+        // collectSuspendLocals never sees it, because lowerTry creates its slot
+        // directly. Its cross-suspension storage is the handler SPILL AREA
+        // instead: lowerTry registers the binding's own alloca in
+        // asyncHandlerSpillSlots_ when the arm contains an `await` (§31.1 — the
+        // borrow's lifetime is the whole arm body, which spans the suspend), and
+        // promoteDemotedSlotsToFrame moves it into the frame's calloc'd spill
+        // area. The cell HOLDER this capture just created was in NEITHER place:
+        // a bare entry-block alloca of the resume fn, whose `store ptr null`
+        // re-runs on every activation while the state dispatch jumps straight
+        // past the capture site — so a read of the binding after the in-arm
+        // `await` loaded null and dereferenced it (SIGSEGV @ 0, on every
+        // compiler back to before #3484; the #3484 fall-back deliberately
+        // declines this shape because the fall-back slot is the promoted binding
+        // alloca, which is erased during promotion).
+        //
+        // Give the holder the SAME home the binding itself has, rather than a
+        // fourth storage class: registration is keyed on the ORIGINAL slot's own
+        // membership, so this fires exactly where the existing authority already
+        // decided "this slot must survive a suspension and has no frame field".
+        // The spill area is calloc'd, so the holder starts null — the guard's
+        // first-pass state — and then PERSISTS, which is the repair.
+        if (newSlot != slot && smStateStruct_ && smSelf_ &&
+            std::find(asyncHandlerSpillSlots_.begin(),
+                      asyncHandlerSpillSlots_.end(),
+                      slot) != asyncHandlerSpillSlots_.end())
+            asyncHandlerSpillSlots_.push_back(newSlot);
         // §30 / #1377: when the enclosing function is an ASYNC STATE MACHINE and
         // this captured local is a suspend-local (tracked in smAllocaToField_ for
         // spill/restore across await yield points), update smAllocaToField_ to
