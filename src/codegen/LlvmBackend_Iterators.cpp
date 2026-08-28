@@ -945,7 +945,23 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             retName = retRef->importedName;
         if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0]) {
             elemSemaTy = retRef->genericArgs[0];
-            elemTy = lowerTypeRef(elemSemaTy);
+            // fix #3537 (§4.7 / §29.3, v0.283): the element type is a STORAGE
+            // position, not a return position — the SAME lowered type becomes
+            // `buildStateMachineFrame`'s `current_val` trailing FIELD, `Current`'s
+            // (vtable slot 3) return type, and the operand type of every
+            // load/store against that field. `lowerTypeRef` answers LLVM `void`
+            // for §4.7's unit type, so `IEnumerable<()>` reached the frame's
+            // field list raw and killed `bezelc` with SIGILL and no diagnostic on
+            // the DECLARATION alone (`StructLayout` under `getTypeAllocSize`;
+            // `llvm_unreachable` is a `ud2` in a release LLVM).
+            //
+            // Substituting HERE rather than inside `buildStateMachineFrame` over
+            // `extraTrailing` — the placement issue 3537 proposed — is deliberate:
+            // the trailing field is only the first of the positions this one type
+            // feeds, so a substitution confined to the field would have moved the
+            // trap to the `CreateStore(Constant::getNullValue(elemTy), …)` beside
+            // it rather than removed it. MEASURED.
+            elemTy = unitStorageTy(lowerTypeRef(elemSemaTy));
         }
     }
 

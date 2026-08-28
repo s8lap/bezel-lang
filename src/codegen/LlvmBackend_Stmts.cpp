@@ -7554,7 +7554,15 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     llvm::Value* enumObj = lowerExpr(*fs.iterable);
     if (!enumObj) return false;
 
-    llvm::Type* elemTy = lowerTypeRef(iterTy->genericArgs[0]);
+    // fix #3537 (§4.7 / §29.2, v0.283): the CONSUMER face of the element-type
+    // substitution `emitIteratorMethod` makes on the producer side. `elemTy` here
+    // types the `Current` (vtable slot 3) callee AND the store into the loop
+    // variable's slot; the producer emits slot 3 returning the one-byte
+    // placeholder for a `()` element, so reading `void` here built a
+    // `void (ptr)` callee type and then stored a void value — MEASURED SIGILL in
+    // `DataLayout::getABITypeAlign` under `CreateAlignedStore`. Both faces must
+    // substitute identically or producer and consumer disagree about slot 3.
+    llvm::Type* elemTy = unitStorageTy(lowerTypeRef(iterTy->genericArgs[0]));
 
     // Determine if the value is a bz_array_t (variable/param backed by Array)
     // or an iterator state machine (result of a call to an iterator method).
@@ -8755,7 +8763,11 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     // Element type T from the source's first generic arg (IAsyncEnumerable<T>).
     llvm::Type* elemTy = i32();
     if (!iterTy->genericArgs.empty() && iterTy->genericArgs[0])
-        elemTy = lowerTypeRef(iterTy->genericArgs[0]);
+        // fix #3537 (§4.7 / §30.7, v0.283): the `await for` face of the same
+        // producer/consumer agreement `lowerIEnumerableBuiltinFor` states — see
+        // that site. `emitAsyncIteratorMethod` emits slot 3 returning the
+        // one-byte placeholder for a `()` element.
+        elemTy = unitStorageTy(lowerTypeRef(iterTy->genericArgs[0]));
 
     // Evaluate the source to the enumerator pointer and store it in a slot.
     // #792 / §29.7/§30.7: the slot is frame-backed (asyncHandlerSpillSlots_) so it

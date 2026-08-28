@@ -4376,28 +4376,46 @@ private:
     // have it — issue 3527: declaring `record R(A: int, U: ());` killed the
     // compiler outright, no value of the record required.
     //
-    // ROUTED THROUGH HERE — ten call sites, named rather than counted by grep
-    // (a grep for this helper's name also matches its declaration and the prose
-    // that discusses it, so the enumeration is the inventory, not a number):
+    // ROUTED THROUGH HERE — named rather than counted by grep (a grep for this
+    // helper's name also matches its declaration and the prose that discusses
+    // it, so the enumeration IS the inventory and a number beside it is a
+    // fourth thing to get wrong.  It has been wrong three times: "8 call
+    // sites", then a "reproducible recipe" that miscounted twice, then "12"
+    // when the true count was 14.  Do not add the number back):
     //   `entryAlloca`; `lowerParamType`; `lowerParamTypeRef`; `storageType`'s
     //   three member arms (positional field, body `FieldDecl`, auto
     //   `PropertyDecl`); `collectSuspendLocals`' local-slot and for-loop-variable
     //   arms (the state-machine frame planner — added by issue 3453, which is
     //   where the missing one actually was, not a pre-existing site);
-    //   `lowerLambda`'s parameter arm (#3095); `lowerLocalDecl`'s slot (#1619).
-    //   That last one spelled the placeholder `i8()` where every other site
-    //   spelled it `unitPlaceholderTy()` — the same type, two names, which is
-    //   precisely the drift this helper closes.
+    //   `lowerLambda`'s parameter arm (#3095); `lowerLocalDecl`'s slot (#1619);
+    //   and the ITERATOR ELEMENT TYPE at all four of its faces (fix #3537) —
+    //   `emitIteratorMethod` and `emitAsyncIteratorMethod` producer-side,
+    //   `lowerIEnumerableBuiltinFor` and `lowerAwaitFor` consumer-side.
+    //   `lowerLocalDecl`'s slot spelled the placeholder `i8()` where every other
+    //   site spelled it `unitPlaceholderTy()` — the same type, two names, which
+    //   is precisely the drift this helper closes.
+    //
+    // The four #3537 sites are ONE decision at four faces, not four decisions:
+    // the element type becomes the frame's `current_val` field, `Current`'s
+    // (slot 3) return type, the operand of every load/store against that field,
+    // and the callee type the CONSUMER builds for slot 3. Routing only the
+    // trailing field moves the trap to the `CreateStore` beside it; routing only
+    // the producer leaves the consumer calling `void (ptr)` where the producer
+    // emitted `i8 (ptr)`. Both were measured while fixing it.
     //
     // NOT ROUTED, DELIBERATELY — do not read the list above as "every `void`
     // in the compiler now comes here":
-    //   * `buildStateMachineFrame`'s `extraTrailing` (Iterators.cpp) takes
-    //     already-lowered types from its callers and does not substitute, so an
-    //     `IEnumerable<()>` / `IAsyncEnumerable<()>` element type still reaches
-    //     the struct raw and still SIGILLs on the declaration alone — issue 3537,
-    //     owned elsewhere. It is also why this file's for-loop-variable routing
-    //     is currently UNREACHABLE: every source of a `()` element dies at the
-    //     trailing field first.
+    //   * `buildStateMachineFrame`'s `extraTrailing` (Iterators.cpp) still takes
+    //     already-lowered types from its callers and does not substitute. Both
+    //     of its live callers now hand it a substituted element type (above), so
+    //     no `void` reaches it today — but a NEW caller passing a raw
+    //     `lowerTypeRef` result would trap again, in `StructLayout`.
+    //   * `lowerIEnumerableFor`'s element type (Stmts.cpp) — the USER-CLASS
+    //     `IEnumerable` consumer — derives `elemTy` from the class's own declared
+    //     `Current` member rather than from the interface's generic argument, and
+    //     a hand-written `Current(): ()` really is a `void`-returning function, so
+    //     the producer/consumer agreement that justifies the four sites above
+    //     does not hold there. Left alone deliberately; issue 3544.
     //   * `lowerTypeRef`'s inline-array arm builds `ArrayType::get(elem, N)`
     //     from a RAW element lowering. This helper tests the TOP-LEVEL type
     //     only, so `[3]()` — a `[3 x void]` — passes straight through it and

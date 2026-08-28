@@ -2212,7 +2212,12 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         auto* retRef = ctx_.resolvedType(*ci.returnType);
         if (retRef && !retRef->genericArgs.empty() && retRef->genericArgs[0]) {
             elemSemaTy = retRef->genericArgs[0];
-            elemTy = lowerTypeRef(elemSemaTy);
+            // fix #3537 (§4.7 / §30.7, v0.283): the §30.7 twin of the §29.3
+            // substitution in `emitIteratorMethod` — see that site for the full
+            // derivation. An `IAsyncEnumerable<()>` reached this frame's
+            // `current_val` trailing field as LLVM `void` and SIGILL'd on the
+            // declaration alone, exactly as the synchronous form did.
+            elemTy = unitStorageTy(lowerTypeRef(elemSemaTy));
         }
         if (retRef) {
             std::string_view rn;
