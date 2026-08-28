@@ -346,6 +346,134 @@ BEZEL_TEST(catch_escape_closure, local_closure_capturing_binding_invoked_locally
 }
 
 // =====================================================================
+// POSITIVE 4 — fix #3520 (§31.1, v0.283): the closure ESCAPES by ASSIGNMENT to
+//              a local declared OUTSIDE the `try`, not by `return`.
+//
+// §31.1 "Exception ownership": the bound exception variable "is a **borrow** of
+// the in-flight exception; its source is the runtime, and its lifetime is the
+// arm body's", and the borrow "may not be ... captured by a closure that may
+// outlive the arm"; "Exception instances themselves cannot escape the arm that
+// caught them."
+//
+// The rejection for this channel was already WRITTEN (checkBorrowStoreEscape's
+// §31.1 `Dest::OuterLocal` branch) and structurally UNREACHABLE: resolving a
+// plain-local target into an outer-local escape compares declaring-block DEPTHS
+// (`localDepth_`), and `localDepth_` recorded only `LocalDecl` nodes. A catch
+// binding anchors on its arm's BODY node, so its depth was -1 and the resolution
+// bailed before the §31.1 branch could run. Measured on b43196a: this program
+// compiled with NO diagnostic and SIGSEGV'd on the later call, in the async
+// spelling AND in the purely synchronous one below.
+// =====================================================================
+
+// Direct: `f := lambda() => Use(ex);` where `f` is declared before the `try`.
+// The closure outlives the arm; the captured borrow dangles. (§31.1.)
+BEZEL_TEST(catch_escape_closure, assign_capturing_closure_to_outer_local_diagnosed_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var f: () -> int := lambda() => 0; "
+        "  try DoWork(); "
+        "  catch var ex: Exception => do "
+        "    f := lambda() => Use(ex); "
+        "  end; "
+        "  end; "
+        "  return f(); "
+        "end Handle;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "may not be captured by a closure assigned to `f`"));
+}
+
+// The ASYNC spelling the issue was filed with — the arm also `await`s. The
+// `await` is NOT what makes it an escape (the synchronous row above reproduces
+// identically); it is the same assignment through the same check, so both must
+// be rejected by the same rule. (§31.1.)
+BEZEL_TEST(catch_escape_closure, assign_capturing_closure_to_outer_local_async_arm_diagnosed_31_1) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  private method DoWork() end DoWork; "
+        "  private method Use(e: Exception): int return 0; end Use; "
+        "  public async method Handle(): Task<int> "
+        "    var f: () -> int := lambda() => 0; "
+        "    try DoWork(); "
+        "    catch var ex: Exception => do "
+        "      f := lambda() => Use(ex); "
+        "      await Task.Delay(1); "
+        "    end; "
+        "    end; "
+        "    return f(); "
+        "  end Handle; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "may not be captured by a closure assigned to `f`"));
+}
+
+// The same channel with NO closure at all: `holder := ex;` where `holder` is
+// declared before the `try`. §31.1: "Exception instances themselves cannot
+// escape the arm that caught them." Measured on b43196a this compiled clean and
+// SIGSEGV'd on the read after the `try`. The wording must NOT name a closure the
+// program does not contain, which is why the §31.1 outer-local branch splits on
+// the shape the way the non-catch branch beside it already does.
+BEZEL_TEST(catch_escape_closure, assign_binding_to_outer_local_diagnosed_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var holder: Exception? := null; "
+        "  try DoWork(); "
+        "  catch var ex: Exception => do "
+        "    holder := ex; "
+        "  end; "
+        "  end; "
+        "  return 0; "
+        "end Handle;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "may not be assigned to `holder`"));
+}
+
+// --- POSITIVE 4 negative controls (must NOT be rejected) ------------------
+
+// CONTROL (§31.1): the same assignment, but the holder `g` is declared INSIDE
+// the arm body. `g` dies with the arm, so the closure never outlives the borrow
+// and the program is legal. This is the over-rejection guard that separates
+// "assigned to a closure holder" from "assigned to a holder that OUTLIVES the
+// arm" — the depth comparison is doing real work, not rejecting every capture.
+BEZEL_TEST(catch_escape_closure, assign_capturing_closure_to_inner_local_clean_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var n: int := 0; "
+        "  try DoWork(); "
+        "  catch var ex: Exception => do "
+        "    var g: () -> int := lambda() => 0; "
+        "    g := lambda() => Use(ex); "
+        "    n := g(); "
+        "  end; "
+        "  end; "
+        "  return n; "
+        "end Handle;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// CONTROL (§31.1): the spec's own escape hatch — "copy the relevant data out of
+// it ... into separate owned values". A closure capturing an `int` copied out of
+// the exception carries no borrow of the instance, so assigning it to the outer
+// holder is legal and must stay accepted.
+BEZEL_TEST(catch_escape_closure, assign_closure_capturing_copied_value_to_outer_local_clean_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var f: () -> int := lambda() => 0; "
+        "  try DoWork(); "
+        "  catch var ex: Exception => do "
+        "    var k := ex.Message.Length; "
+        "    f := lambda() => k; "
+        "  end; "
+        "  end; "
+        "  return f(); "
+        "end Handle;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// =====================================================================
 // CROSS-CUTTING negative controls — the arm body that only reads / uses the
 // exception locally and lets it go is the idiomatic, legal shape (§31.1; the
 // `RecordError(ex)` pattern of Guide 02 §5).

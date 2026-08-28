@@ -4439,11 +4439,13 @@ void MethodOwnership::collectCaseArmBorrowSources(
     for (const auto& s : body) if (s) collectCaseArmBorrowSourcesStmt(*s);
 }
 
-// §28.3 / §28.9 (#861): record each LocalDecl's block-nesting depth. The method
-// body is depth 0; each nested do-end / if-branch / loop / try-arm body adds one.
+// §28.3 / §28.9 (#861): record each LocalDecl's block-nesting depth, and (fix
+// #3520, §31.1) each catch arm's BINDING depth. The method body is depth 0; each
+// nested do-end / if-branch / loop / try-arm body adds one.
 // Covers every scope-introducing statement form. A consistent over-count
 // (e.g. a catch arm whose body is itself a do-end) is harmless: only the
-// monotonic ordering along a single nesting path matters, and that is preserved. We do NOT recurse into lambda expression
+// monotonic ordering along a single nesting path matters, and that is
+// preserved. We do NOT recurse into lambda expression
 // bodies — locals declared inside a closure are closure-scoped, not method-scope
 // locals, and are never the target/source of this method's escape check.
 void MethodOwnership::collectLocalDepthsStmt(const ast::Stmt& s, int depth) {
@@ -4479,8 +4481,34 @@ void MethodOwnership::collectLocalDepthsStmt(const ast::Stmt& s, int depth) {
     if (auto* ts = dynamic_cast<const ast::TryStmt*>(&s)) {
         for (const auto& bs : ts->body)
             if (bs) collectLocalDepthsStmt(*bs, depth + 1);
-        for (const auto& arm : ts->catches)
-            if (arm.body) collectLocalDepthsStmt(*arm.body, depth + 1);
+        for (const auto& arm : ts->catches) {
+            if (!arm.body) continue;
+            // fix #3520 (§31.1 "Exception ownership", v0.283): record the catch
+            // ARM BINDING's own block depth. §31.1: the bound exception variable
+            // "is a **borrow** of the in-flight exception; its source is the
+            // runtime, and its lifetime is the arm body's" — so the binding lives
+            // at the arm body's depth, exactly like an owned local declared as the
+            // arm's first statement.
+            //
+            // Without this entry `depthOf(src->decl)` returned -1 for every catch
+            // binding, and `checkBorrowStoreEscape`'s outer-local resolution
+            // (`td >= 0 && sd >= 0 && td < sd`) bailed BEFORE reaching its own
+            // §31.1 `isCatchBorrow` branch. That made the "caught exception may
+            // not be captured by a closure assigned to <outer local>" rejection
+            // structurally unreachable: `f := lambda() => ex.Message.Length;`
+            // inside the arm, with `f` declared outside the `try`, compiled with
+            // no diagnostic and SIGSEGV'd on the later call — measured on b43196a
+            // in both the async and the purely synchronous spelling. §31.1 states
+            // the borrow "may not be ... captured by a closure that may outlive
+            // the arm" and that "Exception instances themselves cannot escape the
+            // arm that caught them", so the rejection is the spec's, not a new
+            // rule; only the depth that lets the existing check see it was
+            // missing. The binding is keyed on `arm.body` because that is the AST
+            // node its LocalSymbol anchors on (§31.2.1 arm patterns).
+            if (arm.hasBinding && !arm.varName.empty())
+                localDepth_[arm.body.get()] = depth + 1;
+            collectLocalDepthsStmt(*arm.body, depth + 1);
+        }
         for (const auto& bs : ts->finallyBody)
             if (bs) collectLocalDepthsStmt(*bs, depth + 1);
         return;
@@ -5013,7 +5041,7 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     // §3. Distinct message from the owned-local case so the §31.1 rule is
     // pointed to directly.
     if (isCatchBorrow(src)) {
-        if (dest == Dest::OuterLocal) {
+        if (dest == Dest::OuterLocal && outerLocalIsClosureCapture) {
             report(
                 Severity::Error, as.span.begin,
                 std::string("caught exception `") + std::string(src->name) +
@@ -5025,6 +5053,27 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
                 "` lives in an enclosing block that outlives the arm, so calling "
                 "the closure later would read a disposed exception (§31.1; copy "
                 "the data you need out of it into an owned value instead)");
+        } else if (dest == Dest::OuterLocal) {
+            // fix #3520 (§31.1, v0.283): the same channel reached by a PLAIN
+            // borrow store (`holder := ex;`) rather than a closure. Both are
+            // "Exception instances themselves cannot escape the arm that caught
+            // them" (§31.1), but the closure wording above would be a lie here —
+            // it names a closure the program does not contain. Both spellings
+            // were accepted before the arm became reachable, and both SIGSEGV;
+            // this one mirrors the shape split the non-catch branch below
+            // already makes. // per §31.1
+            report(
+                Severity::Error, as.span.begin,
+                std::string("caught exception `") + std::string(src->name) +
+                "` may not be assigned to `" +
+                std::string(targetLocal->name) +
+                "` — a caught exception is a borrow whose lifetime is the catch "
+                "arm body (the runtime disposes it after the arm completes), and "
+                "`" + std::string(targetLocal->name) +
+                "` lives in an enclosing block that outlives the arm, so a later "
+                "read would see a disposed exception (§31.1; copy the data you "
+                "need out of it — e.g. its message — into an owned value "
+                "instead)");
         } else if (dest == Dest::Field) {
             report(
                 Severity::Error, as.span.begin,
