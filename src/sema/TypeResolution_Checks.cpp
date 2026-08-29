@@ -219,6 +219,53 @@ void Resolver::checkBaseVisibility() {
     }
 }
 
+// fix #3574 (§11.6 "Nested types", v0.286): the ONE recursive
+// type-and-nested-types walk the module-level checks in this file share.
+//
+// §11.6, verbatim: "Nested types may themselves contain nested types." --
+// with no depth bound. Thirteen `Resolver::check*` passes here each carried a
+// hand-copy of a walk that visited a module child and then exactly ONE level
+// of its `NestedTypeSymbol` members, so every rule they enforce silently
+// stopped applying at nesting depth 2. Measured on 907ce0f: the §30.1
+// async-return rule fired 1 / 1 / 0 times over a depth-0 / 1 / 2 ladder of the
+// same class body, and §22.10's convenience-constructor rule escaping at
+// depth 2 reached issue 3535's wild-pointer dereference (SIGSEGV, exit 139)
+// on a program the compiler accepted with no diagnostic at all.
+//
+// Order is PRE-ORDER on purpose -- `fn(t)` before the nested members, in
+// member declaration order. On a program whose types nest no deeper than one
+// level that reproduces the old visit sequence exactly, so no diagnostic that
+// already fired changes position.
+//
+// The walk deliberately does NOT widen along the two other axes the old copies
+// also excluded: a module child that is not a `TypeSymbol` (an
+// `ExtensionSymbol` is visited only where a pass opts in, as
+// `checkReadonlyPropertyForms` below does) and a §21.10 method-local type
+// (which is not a `NestedTypeSymbol` member of any type and was never
+// reachable from this walk).
+static void visitTypeAndNested(TypeSymbol* t,
+                               const std::function<void(TypeSymbol*)>& fn) {
+    if (!t) return;
+    fn(t);
+    for (Symbol* m : t->members) {
+        if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m))
+            visitTypeAndNested(nt->type, fn);
+    }
+}
+
+// The module-level entry point: every top-level type and, transitively, every
+// type nested inside one. A caller that also needs a non-`TypeSymbol` module
+// child walks `children` itself and calls `visitTypeAndNested` on the
+// `TypeSymbol` arm, so its diagnostics stay interleaved in declaration order.
+void Resolver::forEachTypeAndNested(
+    const std::function<void(TypeSymbol*)>& fn) {
+    if (!ctx_.module()) return;
+    for (Symbol* child : ctx_.module()->children) {
+        if (auto* t = dynamic_cast<TypeSymbol*>(child))
+            visitTypeAndNested(t, fn);
+    }
+}
+
 // §13.3 (#956): every type appearing in a member's signature must be at least
 // as visible as the member; "a private member is unconstrained". A private
 // (nested) type is the least visible level, so a NON-private member whose
@@ -227,15 +274,10 @@ void Resolver::checkBaseVisibility() {
 // comparison across internal/protected/public is a follow-up. Builtins and
 // generic parameters (null declaration) are fully visible and never flagged.
 void Resolver::checkMemberSignatureVisibility() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypeMemberSignatureVisibility(t);
-        for (Symbol* m : t->members)
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m))
-                if (nt->type) checkTypeMemberSignatureVisibility(nt->type);
-    }
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested(
+        [&](TypeSymbol* t) { checkTypeMemberSignatureVisibility(t); });
 }
 
 void Resolver::checkTypeMemberSignatureVisibility(TypeSymbol* t) {
@@ -274,17 +316,9 @@ void Resolver::checkTypeMemberSignatureVisibility(TypeSymbol* t) {
 }
 
 void Resolver::checkStaticConstructorParams() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypeStaticCtorParams(t);
-        for (Symbol* m : t->members) {
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) checkTypeStaticCtorParams(nt->type);
-            }
-        }
-    }
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested([&](TypeSymbol* t) { checkTypeStaticCtorParams(t); });
 }
 
 void Resolver::checkTypeStaticCtorParams(TypeSymbol* t) {
@@ -302,17 +336,9 @@ void Resolver::checkTypeStaticCtorParams(TypeSymbol* t) {
 }
 
 void Resolver::checkConstructorChains() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypeConstructorChains(t);
-        for (Symbol* m : t->members) {
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) checkTypeConstructorChains(nt->type);
-            }
-        }
-    }
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested([&](TypeSymbol* t) { checkTypeConstructorChains(t); });
 }
 
 bool Resolver::isChainCall(const ast::Stmt* s, bool* isThis) {
@@ -413,17 +439,9 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
 }
 
 void Resolver::checkAsyncModifiers() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypeAsyncModifiers(t);
-        for (Symbol* m : t->members) {
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) checkTypeAsyncModifiers(nt->type);
-            }
-        }
-    }
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested([&](TypeSymbol* t) { checkTypeAsyncModifiers(t); });
 }
 
 namespace {
@@ -480,17 +498,9 @@ void Resolver::checkTypeAsyncModifiers(TypeSymbol* t) {
 }
 
 void Resolver::checkStaticNotVirtual() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypeStaticNotVirtual(t);
-        for (Symbol* m : t->members) {
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) checkTypeStaticNotVirtual(nt->type);
-            }
-        }
-    }
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested([&](TypeSymbol* t) { checkTypeStaticNotVirtual(t); });
 }
 
 void Resolver::checkTypeStaticNotVirtual(TypeSymbol* t) {
@@ -539,17 +549,9 @@ void Resolver::checkTypeStaticNotVirtual(TypeSymbol* t) {
 }
 
 void Resolver::checkMethodBodies() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypeMethodBodies(t);
-        for (Symbol* m : t->members) {
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) checkTypeMethodBodies(nt->type);
-            }
-        }
-    }
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested([&](TypeSymbol* t) { checkTypeMethodBodies(t); });
 }
 
 void Resolver::checkTypeMethodBodies(TypeSymbol* t) {
@@ -961,17 +963,9 @@ void Resolver::checkGenericConstraintConsistency() {
 }
 
 void Resolver::checkConstTypes() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypeConsts(t);
-        for (Symbol* m : t->members) {
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) checkTypeConsts(nt->type);
-            }
-        }
-    }
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested([&](TypeSymbol* t) { checkTypeConsts(t); });
 }
 
 void Resolver::checkTypeConsts(TypeSymbol* t) {
@@ -1079,17 +1073,10 @@ int Resolver::visRank(ast::Visibility v) {
 }
 
 void Resolver::checkAccessorVisibility() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypeAccessorVisibility(t);
-        for (Symbol* m : t->members) {
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) checkTypeAccessorVisibility(nt->type);
-            }
-        }
-    }
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested(
+        [&](TypeSymbol* t) { checkTypeAccessorVisibility(t); });
 }
 
 void Resolver::checkTypeAccessorVisibility(TypeSymbol* t) {
@@ -1743,17 +1730,9 @@ std::string_view Resolver::overloadModifier(std::string_view mod) {
 }
 
 void Resolver::checkOverloadSignatures() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypeOverloads(t);
-        for (Symbol* m : t->members) {
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) checkTypeOverloads(nt->type);
-            }
-        }
-    }
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested([&](TypeSymbol* t) { checkTypeOverloads(t); });
 }
 
 void Resolver::checkTypeOverloads(TypeSymbol* t) {
@@ -1820,20 +1799,11 @@ bool Resolver::signaturesIndistinguishable(const std::vector<Symbol*>& a,
 }
 
 void Resolver::checkClassModifierCombinations() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypeModifierCombinations(t);
-        // Nested types carry the same A.3 `Modifier*` production (§11.6 reuses
-        // the type-declaration productions), so they are checked identically —
-        // the walk mirrors checkStaticNotVirtual's.
-        for (Symbol* m : t->members) {
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) checkTypeModifierCombinations(nt->type);
-            }
-        }
-    }
+    // Nested types carry the same A.3 `Modifier*` production (§11.6 reuses the
+    // type-declaration productions), so they are checked identically — at every
+    // depth, per fix #3574's shared walk.
+    forEachTypeAndNested(
+        [&](TypeSymbol* t) { checkTypeModifierCombinations(t); });
 }
 
 void Resolver::checkTypeModifierCombinations(TypeSymbol* t) {
@@ -1987,6 +1957,11 @@ void Resolver::checkClosedHierarchyLeafVisibility() {
     // are rejected at the base's inheritance site, TypeResolution_Names.
     // cpp:717). Nested classes are included — a nested class can extend a
     // top-level `closed` root.
+    // NOT `forEachTypeAndNested` (fix #3574): this walk stops DESCENDING at a
+    // non-class nested type, so a class nested inside a nested record is
+    // deliberately outside the leaf set it builds here. Routing it through the
+    // shared walk would widen that set — a separate §11.7 question with its own
+    // repair (issue filed), not part of #3574's one-level-walk family.
     std::vector<TypeSymbol*> localClasses;
     std::function<void(TypeSymbol*)> collectNested = [&](TypeSymbol* parent) {
         for (Symbol* m : parent->members) {
@@ -4209,35 +4184,24 @@ static bool memberBlocksHiding(SemaContext& ctx, TypeSymbol* derived,
     return true;
 }
 
-// §12.2 / #1749: collect `t` (if it's a class) plus every class reachable
-// through its NestedTypeSymbol members, transitively — §11.6 states nested
-// types "may themselves contain nested types" with no depth bound, so a
-// class nested inside a nested class must be visited too, not just the
-// module's direct children and their immediate nested members (the shallow,
-// one-level pattern several sibling checks in this file use, e.g.
-// checkConstTypes above). isNestedWithin (used below by
-// memberBlocksHiding's `private` case) already assumes this transitive
-// reach; the outer walk driving checkHidingAndOverride was the one piece
-// that never visited nested classes at all.
-static void collectHidingCheckClasses(TypeSymbol* t,
-                                       std::vector<TypeSymbol*>& out) {
-    if (!t) return;
-    if (t->kind == ast::TypeDeclKind::Class) out.push_back(t);
-    for (Symbol* m : t->members) {
-        if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-            if (nt->type) collectHidingCheckClasses(nt->type, out);
-        }
-    }
-}
-
+// §12.2 / #1749: the hiding/override check runs over `t` (if it's a class)
+// plus every class reachable through its NestedTypeSymbol members,
+// transitively — §11.6 states nested types "may themselves contain nested
+// types" with no depth bound, so a class nested inside a nested class must be
+// visited too. isNestedWithin (used above by memberBlocksHiding's `private`
+// case) already assumes that transitive reach.
+//
+// fix #3574: the collector this used to call (`collectHidingCheckClasses`) was
+// a hand-copy of the same recursion; it now routes through the shared
+// `forEachTypeAndNested`. The pre-order visit sequence is identical — the old
+// copy also descended through nested types of EVERY kind and filtered only
+// what it PUSHED, which is what the lambda below does.
 void Resolver::checkHidingAndOverride() {
     if (!ctx_.module()) return;
     std::vector<TypeSymbol*> classes;
-    for (Symbol* child : ctx_.module()->children) {
-        if (auto* t = dynamic_cast<TypeSymbol*>(child)) {
-            collectHidingCheckClasses(t, classes);
-        }
-    }
+    forEachTypeAndNested([&](TypeSymbol* t) {
+        if (t->kind == ast::TypeDeclKind::Class) classes.push_back(t);
+    });
     for (TypeSymbol* t : classes) {
         // Gather base CLASS members by name (transitive). A name can map to
         // SEVERAL members — overloaded virtual methods (#1090) — so collect all
@@ -7737,6 +7701,11 @@ void Resolver::checkVarianceMarkerScopeForType(TypeSymbol& t) {
                 std::string(gps->variance) + "` (§11.8)");
         }
     }
+    // NOT `forEachTypeAndNested` (fix #3574): this recursion is INTERLEAVED
+    // with the per-member work above, so each nested type is visited between
+    // its siblings rather than after all of them. It already reaches every
+    // depth; routing it through the shared pre-order walk would only reorder
+    // the diagnostics.
     for (Symbol* m : t.members) {
         checkMethodGenericParamsNoVariance(m);
         if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
@@ -11410,17 +11379,9 @@ bool isUserClassTypeRef(const TypeRef* rt) {
 }  // namespace
 
 void Resolver::checkPureModifiers() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypePureModifiers(t);
-        for (Symbol* m : t->members) {
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) checkTypePureModifiers(nt->type);
-            }
-        }
-    }
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested([&](TypeSymbol* t) { checkTypePureModifiers(t); });
 }
 
 void Resolver::checkTypePureModifiers(TypeSymbol* t) {
@@ -11674,17 +11635,9 @@ void Resolver::checkTypePureModifiers(TypeSymbol* t) {
 // other pure checks, and any future chain-wide invariant can grow here
 // without re-threading the override walker.
 void Resolver::checkPureDispatch() {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* t = dynamic_cast<TypeSymbol*>(child);
-        if (!t) continue;
-        checkTypePureDispatch(t);
-        for (Symbol* m : t->members) {
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) checkTypePureDispatch(nt->type);
-            }
-        }
-    }
+    // fix #3574: routed through the ONE recursive nested-type walk
+    // (§11.6, v0.286) -- this rule applies at every nesting depth.
+    forEachTypeAndNested([&](TypeSymbol* t) { checkTypePureDispatch(t); });
 }
 
 void Resolver::checkTypePureDispatch(TypeSymbol* t) {
@@ -11717,12 +11670,11 @@ void Resolver::checkReadonlyPropertyForms() {
     if (!ctx_.module()) return;
     for (Symbol* child : ctx_.module()->children) {
         if (auto* t = dynamic_cast<TypeSymbol*>(child)) {
-            checkTypeReadonlyPropertyForms(t);
-            for (Symbol* m : t->members) {
-                if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                    if (nt->type) checkTypeReadonlyPropertyForms(nt->type);
-                }
-            }
+            // fix #3574: the shared recursive walk (§11.6, v0.286). Driven from
+            // inside this loop rather than via forEachTypeAndNested so the
+            // extension arm below stays interleaved in declaration order.
+            visitTypeAndNested(
+                t, [&](TypeSymbol* ty) { checkTypeReadonlyPropertyForms(ty); });
             continue;
         }
         // §23.2: extensions (`ExtensionSymbol`) live at module scope, not

@@ -13,6 +13,7 @@
 // namespace scope here would be a program-wide ODR clash. As a nested type it
 // cannot collide.
 
+#include <functional>
 #include <optional>
 #include <set>
 #include <string>
@@ -203,6 +204,13 @@ private:
     // deferred). Bases resolving to a built-in (null declaration) are
     // effectively public and skipped.
     static int effVisRank(ast::Visibility v);
+
+    // fix #3574 (§11.6 "Nested types", v0.286): the ONE recursive walk over
+    // every type this module declares — each top-level type and, transitively,
+    // every type nested inside one, pre-order in declaration order. Thirteen
+    // check* passes below hand-copied a one-level walk and so stopped enforcing
+    // their rule at nesting depth 2; they all route through this instead.
+    void forEachTypeAndNested(const std::function<void(TypeSymbol*)>& fn);
 
     void checkBaseVisibility();
     // §13.3 (#956): a member's signature types must be at least as visible as
