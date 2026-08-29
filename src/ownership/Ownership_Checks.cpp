@@ -4451,7 +4451,11 @@ void MethodOwnership::collectCaseArmBorrowSources(
 // §28.3 / §28.9 (#861): record each LocalDecl's block-nesting depth, and (fix
 // #3520, §31.1) each catch arm's BINDING depth. The method body is depth 0; each
 // nested do-end / if-branch / loop / try-arm body adds one.
-// Covers every scope-introducing statement form. A consistent over-count
+// Covers the scope-introducing statement forms: if / while / for / do-end /
+// try (body, catch arms, finally) and — since fix #3552 — the statement-`case`
+// arm bodies. (fix #3520 wrote "every scope-introducing statement form" here;
+// that was false as written, because `CaseStmt` is one and was not covered.)
+// A consistent over-count
 // (e.g. a catch arm whose body is itself a do-end) is harmless: only the
 // monotonic ordering along a single nesting path matters, and that is
 // preserved. We do NOT recurse into lambda expression
@@ -4520,6 +4524,39 @@ void MethodOwnership::collectLocalDepthsStmt(const ast::Stmt& s, int depth) {
         }
         for (const auto& bs : ts->finallyBody)
             if (bs) collectLocalDepthsStmt(*bs, depth + 1);
+        return;
+    }
+    // fix #3552 (§28.3 / §31.1, v0.286): the statement-position `case`. Each
+    // Block-form arm body is a scope-introducing block exactly like a
+    // `do`-`end`, so §28.3 "Borrow lifetime rules" applies across its boundary
+    // verbatim: "A borrow may not be assigned to a local whose scope strictly
+    // encloses the borrow's source's scope"; and §31.1's "Exception ownership"
+    // clause says the catch binding's "lifetime is the arm body's". A `case`
+    // arm body is such an enclosing scope, and the depth is how this pass
+    // decides "strictly encloses". Without this arm every local declared
+    // inside an arm — and
+    // every catch binding of a `try` nested in an arm — was absent from
+    // `localDepth_`, so `depthOf()` answered -1 and all four consumers'
+    // `td >= 0 && sd >= 0 && td < sd` guard returned BEFORE reaching their own
+    // rejection (checkBorrowStoreEscape §28.3/§31.1, checkCollectionBorrowStore-
+    // Escape and checkIndexerSetBorrowStoreEscape §28.11, and
+    // checkBareBorrowLoopCarriedEscape §28.3). Measured on fd39253: the §31.1
+    // closure-capture repro compiled clean and ASan reported a
+    // heap-use-after-free, while the byte-identical `do`-`end` spelling was
+    // rejected; the §28.3 owned-local repro compiled clean and leaked 40 bytes.
+    //
+    // Only `stmts` is walked. An Expression-form arm body holds no statement and
+    // therefore no LocalDecl (see the matching note on
+    // collectOwnedConsumingAwaits' CaseStmt arm), and a `when` guard is a
+    // boolean condition. The arm's own PATTERN BINDINGS are deliberately not
+    // given a depth here: §35.5 already resolves an arm binding's borrow source
+    // through `registerCaseArmBorrowSources`, a separate authority, and
+    // respelling that classification into `localDepth_` would be a second,
+    // drifting copy of a decision the compiler already makes.
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        for (const auto& arm : cs->arms)
+            for (const auto& bs : arm.stmts)
+                if (bs) collectLocalDepthsStmt(*bs, depth + 1);
         return;
     }
 }
@@ -11470,9 +11507,21 @@ void MethodOwnership::collectStmtsInsideTryStmt(const ast::Stmt& s,
         if (enclosingTry) stmtsInsideTryByStmt_[&s] = enclosingTry;
     }
     // Recurse into the control-flow forms that can lexically contain a try
-    // statement (mirrors collectLocalDepthsStmt's structure). `insideTry` stays
-    // sticky once set: a statement nested three ifs deep inside a try body is
-    // still inside that try.
+    // statement: if / while / for / do-end / try. `insideTry` stays sticky once
+    // set: a statement nested three ifs deep inside a try body is still inside
+    // that try.
+    //
+    // ⚠ `ast::CaseStmt` is NOT among them, so a `try` nested in a statement-
+    // `case` arm leaves its children unmarked. That is currently MOOT for this
+    // map's §28.8.1 consumer, which skips a whole `case` on purpose (see the
+    // long note at `firePendingInTryChecks`' CaseStmt early-return: the CFG
+    // appends a `case` as one opaque node, so judging its arms against the
+    // pre-`case` entry state would falsely reject). It is recorded rather than
+    // fixed because the two facts are independent: if a future consumer reads
+    // `stmtsInsideTry_` without that skip, this gap becomes live. This comment
+    // previously read "mirrors collectLocalDepthsStmt's structure"; fix #3552
+    // gave that walker a CaseStmt arm, which would have left the claim false.
+    // // per §28.8.1
     if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
         for (const auto& bs : ifs->ifBranch.body)
             if (bs) collectStmtsInsideTryStmt(*bs, insideTry, enclosingTry);
