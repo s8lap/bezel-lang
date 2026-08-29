@@ -2627,7 +2627,7 @@ llvm::Value* Emitter::emitCheckedArith(llvm::Intrinsic::ID id, llvm::Value* l,
 // ---------------------------------------------------------------------------
 
 const sema::TypeRef* Emitter::recordFieldType(const sema::FieldSymbol* fs) {
-    // fix #3615 (§9.1 / §9.2 / §2.8.2 / §4.6 / §28.9, v0.286): DELEGATE to the ONE
+    // fix #3615 (§9.1 / §9.2 / §19.3 / §2.8.2 / §2.8.3 rule 4, v0.286): DELEGATE to the ONE
     // both-sources storage-component accessor, `sema::storageComponentType`
     // (declared sema/Symbol.hpp, body SymbolCollection.cpp) — do not spell the
     // three-source lookup a second time here.
@@ -2645,16 +2645,33 @@ const sema::TypeRef* Emitter::recordFieldType(const sema::FieldSymbol* fs) {
     // reaches `ctx.importedMemberType(m)` unconditionally, which is what the
     // loader's own #2516 comment says the design relies on.
     //
-    // MEASURED (a two-module ASan/LSan probe, 200 iterations): a `record
-    // Pt(X: int, Name: string)` exported by Lib and produced through an
-    // imported factory leaked 8290 bytes in 400 allocations in the importer and
-    // 0 in the character-identical single-module twin — `isStringStorageMember`
-    // (LlvmBackend_impl.hpp) reads this function, so the §4.6 release at the
-    // record value's scope end never fired for the imported shape. #2874's
-    // comment predicted the two sides were "balanced by accident"; they are not,
-    // because the +1 is minted in the DEPENDENCY and only the consumer ever
-    // sees the value die. Both sides still flip together at this single point,
-    // which is why a leak becomes balanced rather than a UAF.
+    // MEASURED — the two live observables this closes are §19.3 record
+    // destructuring sub-patterns, whose lowering (LlvmBackend_Exprs2.cpp) asks
+    // `recordMemberType` for the slot's declared type. Over a `record
+    // Tag(Name: string, C: Color)` exported by a dependency, each against a
+    // character-identical single-module twin: a `string` sub-pattern compared the
+    // slot by POINTER instead of by content (a runtime-built "abc" took the `_`
+    // arm cross-module and the matching arm locally — exit 0, wrong value), and
+    // an enum-constant sub-pattern was a hard backend reject ("the `case`/`when`
+    // pattern `Blue` is not supported by the backend ... (§19.3)").
+    //
+    // ⚠ WHAT THIS DOES NOT CLOSE, measured on BOTH sides of this change: an
+    // imported record's `string` component produced by an imported factory still
+    // LEAKS at the consumer's scope end (8290 B in 400 allocations at 200
+    // iterations; the single-module twin is clean). `isStringStorageMember`
+    // (LlvmBackend_impl.hpp) does read this function, but that release is gated
+    // earlier by the `recordCallResultReleaseEligible_` pass, so a null field
+    // type was not what suppressed it. Filed separately with the repro; do not
+    // read this delegation as having fixed it.
+    //
+    // Related, and worth correcting where it stands: fix 2874's comment asserted
+    // that the store-side retain and the disposal-side release are "both skipped,
+    // so the string is balanced by accident". That does not hold for the
+    // cross-module shape — the `+1` is minted in the DEPENDENCY and only the
+    // consumer ever sees the value die, so skipping the consumer side leaks
+    // rather than balances. Its warning that flipping the predicate in only ONE
+    // place turns a leak into a UAF still stands for the shapes where both sides
+    // are in the same module, and this edit does flip both together.
     return sema::storageComponentType(fs, ctx_);
 }
 
