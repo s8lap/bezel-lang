@@ -7178,6 +7178,111 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return found;
         }
+        // fix #3510 / stdlib §4.8 / §4.9 / §4.17 (v0.285; the §1 *OrNull tier,
+        // v0.231): `.GetOrNull(k): V?` — `null` when the key is absent, otherwise
+        // the stored value under the family's read semantics (a copy for a
+        // value-typed V and `string`, a BORROW of the stored value for a
+        // class-typed V; ownership stays with the dictionary, so no disposal
+        // obligation attaches — the same posture as `GetOrAdd` below and as the
+        // indexer's get).
+        //
+        // Receiver coverage: this arm sits inside the `isDict` block, whose
+        // predicate is the #1414 stage-3 registry's `common::isDictionaryName`
+        // (Dictionary / OwningDictionary / SortedDictionary all share the
+        // bz_dict_t* representation), so one lowering serves all three families
+        // that declare the member. The sorted family is unaffected by ordering
+        // here: `GetOrNull` is a POINT lookup, which §4.17 specifies as O(log n)
+        // on the same table the ordered iteration snapshots separately.
+        //
+        // Lowering = TryGetValue's probe + decode, with the out-parameter write
+        // replaced by a `V?` value: the tagged `{i8 hasValue, V}` struct for a
+        // value-typed V, and a nullable pointer for a `string`/class V. When V is
+        // ITSELF nullable the result type coincides with V's own lowering
+        // (`?` is idempotent under substitution — spec §7.10; §4.8's own caveat
+        // that the result cannot then distinguish "absent" from "a present null"),
+        // so the decoded value IS the result and the miss path is its zero.
+        if (m == "GetOrNull" && call.args.size() == 1 && call.args[0].value) {
+            llvm::Value* k = lowerExpr(*call.args[0].value);
+            if (!k) return nullptr;
+            llvm::Type* valLlvm = valTy ? lowerTypeRef(valTy) : ptrTy();
+            if (!valLlvm) valLlvm = ptrTy();
+            // §28.11, #891: pre-null the slot so the miss path — where
+            // bz_dict_try_get_* does NOT write — reads null, not stack garbage.
+            auto* tmpSlot = entryAlloca(ptrTy());
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 tmpSlot);
+            llvm::Value* found;
+            if (keyTy) {
+                auto* fn = declareC("bz_dict_try_get_gen", i1(),
+                                    {ptrTy(), ptrTy(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, genKeyPtr(k), tmpSlot});
+            } else {
+                auto [kd, kl] = strDataLen(k);
+                auto* fn = declareC("bz_dict_try_get_str", i1(),
+                                    {ptrTy(), ptrTy(), i64(), ptrTy()});
+                found = builder_.CreateCall(fn, {recv, kd, kl, tmpSlot});
+            }
+            auto* hitBB = llvm::BasicBlock::Create(llvm_, "gon.hit", currentFn_);
+            auto* endBB = llvm::BasicBlock::Create(llvm_, "gon.end", currentFn_);
+            llvm::BasicBlock* preBB = builder_.GetInsertBlock();
+            builder_.CreateCondBr(found, hitBB, endBB);
+
+            builder_.SetInsertPoint(hitBB);
+            llvm::Value* valPtr = builder_.CreateLoad(ptrTy(), tmpSlot, "gon.slot");
+            llvm::Value* dv;
+            if (valLlvm->isStructTy()) {
+                // fix #685: a record / decimal / nullable-value V is heap-boxed
+                // by encodeValue; load it back out of the box (TryGetValue's
+                // decode, verbatim).
+                dv = builder_.CreateLoad(valLlvm, valPtr, "gon.rec");
+            } else if (!valLlvm->isPointerTy()) {
+                llvm::Value* asI64 = builder_.CreatePtrToInt(valPtr, i64());
+                dv = asI64;
+                if (valLlvm->isFloatingPointTy()) {
+                    if (valLlvm->isDoubleTy())
+                        dv = builder_.CreateBitCast(asI64, valLlvm);
+                    else
+                        dv = builder_.CreateBitCast(
+                            builder_.CreateTrunc(asI64, i32()), valLlvm);
+                } else if (!valLlvm->isIntegerTy(64)) {
+                    dv = builder_.CreateTrunc(asI64, valLlvm);
+                }
+            } else {
+                dv = valPtr;  // pointer value (string / class) — a borrow
+            }
+            llvm::BasicBlock* hitEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+
+            builder_.SetInsertPoint(endBB);
+            sema::TypeRef nullRT;
+            bool haveNullRT = false;
+            if (valTy) { nullRT = *valTy; nullRT.nullable = true; haveNullRT = true; }
+            llvm::StructType* nst =
+                (haveNullRT && isNullableValueTy(&nullRT))
+                    ? nullableValueStructTy(&nullRT) : nullptr;
+            if (nst && nst != valLlvm) {
+                // Value-typed V: build `{i8 hasValue, V}`.
+                auto* valPhi = builder_.CreatePHI(valLlvm, 2, "gon.val");
+                valPhi->addIncoming(dv, hitEnd);
+                valPhi->addIncoming(llvm::Constant::getNullValue(valLlvm), preBB);
+                auto* hvPhi =
+                    builder_.CreatePHI(nullablePrimHasValTy(), 2, "gon.hv");
+                hvPhi->addIncoming(
+                    llvm::ConstantInt::get(nullablePrimHasValTy(), 1), hitEnd);
+                hvPhi->addIncoming(
+                    llvm::ConstantInt::get(nullablePrimHasValTy(), 0), preBB);
+                llvm::Value* res = builder_.CreateInsertValue(
+                    llvm::UndefValue::get(nst), hvPhi, {0u});
+                return builder_.CreateInsertValue(res, valPhi, {1u});
+            }
+            // A `string`/class V (nullable pointer), or a V that is ITSELF
+            // nullable (its own lowering already carries the tag): the decoded
+            // value is the result and the miss path is its all-zero form.
+            auto* phi = builder_.CreatePHI(valLlvm, 2, "gon.res");
+            phi->addIncoming(dv, hitEnd);
+            phi->addIncoming(llvm::Constant::getNullValue(valLlvm), preBB);
+            return phi;
+        }
         // .GetOrAdd(k, factory): V  (stdlib §4.8 borrowing / §4.9 owning)
         //   Dictionary<K,V>:       factory is (K) -> V
         //   OwningDictionary<K,V>:  factory is (K) -> owned V, result is a BORROW

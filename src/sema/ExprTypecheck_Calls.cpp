@@ -5226,7 +5226,15 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "PopValue" || mm == "TryPopValue" ||
                                 mm == "TryAdd" || mm == "Take" || mm == "TryTake" ||
                                 mm == "Get" || mm == "TryGetValue" ||
-                                mm == "GetOrAdd" ||
+                                // fix #3510 / stdlib §4.9 (v0.285): `GetOrNull`
+                                // is declared on `OwningDictionary<K, V>` beside
+                                // `GetOrAdd` (the §1 *OrNull tier, v0.231). It
+                                // was absent from THIS surface list while the
+                                // member-access list below (`isDeclaredMethod`)
+                                // already carried it, so the call form was
+                                // rejected by a message that itself enumerates
+                                // `GetOrNull` as part of the surface.
+                                mm == "GetOrAdd" || mm == "GetOrNull" ||
                                 mm == "UnionWith" || mm == "IntersectWith" ||
                                 mm == "ExceptWith" || mm == "IsSubsetOf" ||
                                 mm == "IsSupersetOf" || mm == "Drain" ||
@@ -5346,6 +5354,10 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "Enqueue" || mm == "Dequeue" ||
                                 mm == "TryDequeue" || mm == "TryAdd" ||
                                 mm == "Get" || mm == "TryGetValue" || mm == "GetOrAdd" ||
+                                // fix #3510 / stdlib §4.8 / §4.17 (v0.285):
+                                // `GetOrNull(key: K): V?` is declared on both
+                                // `Dictionary<K, V>` and `SortedDictionary<K, V>`.
+                                mm == "GetOrNull" ||
                                 mm == "UnionWith" || mm == "IntersectWith" ||
                                 mm == "ExceptWith" || mm == "IsSubsetOf" ||
                                 mm == "IsSupersetOf" ||
@@ -6732,6 +6744,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  m == "TryAdd" ||
                                  m == "TryPopValue")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // fix #3510 / stdlib §4.8 / §4.9 (v0.285, the §1 *OrNull
+                        // tier added v0.231): `GetOrNull(key: K): V?` — null when
+                        // the key is absent, otherwise the value under the family's
+                        // read semantics (a copy for value-typed V and `string`, a
+                        // BORROW of the stored value for class-typed V, so no
+                        // disposal obligation attaches — exactly `GetOrAdd`'s
+                        // posture below). The result type is V made NULLABLE; the
+                        // §4.8/§4.9 prose is explicit that `?` is idempotent under
+                        // substitution (spec §7.10), so an already-nullable V is
+                        // unchanged by this.
+                        else if (m == "GetOrNull" && ce.args.size() == 1 &&
+                                 recvTy && recvTy->genericArgs.size() > 1 &&
+                                 recvTy->genericArgs[1]) {
+                            auto* vt = ctx_.makeTypeRef();
+                            *vt = *recvTy->genericArgs[1];
+                            vt->nullable = true;
+                            ctx_.setExprType(&ce, vt);
+                        }
                         // fix #643 / stdlib §4.9: PopValue(key): owned V — removes
                         // and returns the owned value; raises if absent.
                         else if (m == "PopValue" && recvTy &&
@@ -6839,6 +6869,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  m == "TryAdd" ||
                                  m == "TryGetValue")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
+                        // fix #3510 / stdlib §4.17 (v0.285): `GetOrNull(key: K):
+                        // V?`. It MUST be listed here, ahead of the catch-all
+                        // V-return arm at the end of this block — that arm would
+                        // otherwise type the call as the NON-nullable value type,
+                        // which is the same clobbering shape #3372 recorded for
+                        // `TryAdd` and #2546 for `GetEnumerator`.
+                        else if (m == "GetOrNull" && ce.args.size() == 1 &&
+                                 recvTy && recvTy->genericArgs.size() > 1 &&
+                                 recvTy->genericArgs[1]) {
+                            auto* vt = ctx_.makeTypeRef();
+                            *vt = *recvTy->genericArgs[1];
+                            vt->nullable = true;
+                            ctx_.setExprType(&ce, vt);
+                        }
                         // FirstKey / LastKey — return the key type K.
                         else if ((m == "FirstKey" || m == "LastKey") && recvTy &&
                                  !recvTy->genericArgs.empty() &&
