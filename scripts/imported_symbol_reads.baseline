@@ -4,8 +4,11 @@
 # so BOTH a rise and stale headroom fail - a landed family that forgot to
 # --update is a violation exactly like a regression, which is what stops a
 # later family from quietly handing back what an earlier one ratcheted away.
-# Raising a count is a deliberate act that needs --force and an explanation
-# in the commit message. See
+# Raising a count needs --force, and (#3590) --force alone is not enough
+# once the rise pushes a file above its ceiling in
+# scripts/imported_symbol_reads.grandfather (which only ever falls - see
+# that file's header) - the excess needs a `// SEAM-DEBT: #NNNN <reason>`
+# marker at each new site. See
 # docs/proposals/imported-symbol-audit-2026-08-13.md for the per-site triage.
 
 # class1: dynamic_cast<const ast::TypeDecl*>(<sym>->decl) - wrong-but-quiet

@@ -1,0 +1,41 @@
+# enumerable_grid_spellings.grandfather - the ceiling for #3590.
+#
+# THE CEILING ONLY EVER FALLS. `--update` MAY LOWER a per-file ceiling
+# (to min(existing, measured) - a drain becomes the new ceiling on the
+# very next --update) and MAY NEVER RAISE one; raising a ceiling stays a
+# deliberate, reviewed hand-edit to this file. A path whose tightened
+# ceiling reaches 0 is dropped entirely. See tighten_ceiling() /
+# check_debt_floor() in check_enumerable_grid_spellings.py, and #3590
+# (same rationale as scripts/imported_symbol_reads.grandfather).
+#
+# classH: one comparison chain naming >=2 of the eight iterator/enumerator
+#         interface heads - the enumerable-wrap grid's DECLARED-HEAD axis.
+#         Authority: common::isIterFormatEnumerableHead /
+#         isSyncIterFormatEnumerableHead / isIterableInterfaceHead.
+1    src/codegen/LlvmBackend_Async.cpp
+8    src/codegen/LlvmBackend_Calls2.cpp
+1    src/codegen/LlvmBackend_Exprs.cpp
+3    src/codegen/LlvmBackend_Iterators.cpp
+2    src/codegen/LlvmBackend_Setup.cpp
+1    src/codegen/LlvmBackend_Stmts.cpp
+2    src/codegen/LlvmBackend_impl.hpp
+1    src/common/OwnershipFacts.cpp
+5    src/ownership/Ownership.cpp
+2    src/sema/ExprTypecheck.cpp
+5    src/sema/ExprTypecheck_Calls.cpp
+1    src/sema/TypeResolution_Checks.cpp
+1    src/sema/TypeResolution_Names.cpp
+
+# classF: one comparison chain naming OwningBuffer together with Array or
+#         OwningArray - the grid's SOURCE-FAMILY axis for the §29.2
+#         array-enumerator wrap. Authority:
+#         common::isArrayEnumeratorWrapSourceName.
+1    src/codegen/LlvmBackend_Assign.cpp
+1    src/codegen/LlvmBackend_Calls2.cpp
+1    src/codegen/LlvmBackend_Calls3.cpp
+1    src/codegen/LlvmBackend_Exprs.cpp
+1    src/codegen/LlvmBackend_Exprs2.cpp
+2    src/ownership/Ownership_Checks.cpp
+2    src/sema/ExprTypecheck_Calls.cpp
+1    src/sema/ExprTypecheck_Exprs.cpp
+1    src/sema/TypeResolution_Names.cpp

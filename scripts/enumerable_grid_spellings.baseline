@@ -4,8 +4,11 @@
 # EQUAL the measured count, so BOTH a rise and stale headroom fail - a landed
 # family that forgot to --update is a violation exactly like a regression,
 # which is what stops a later family from quietly handing back what an
-# earlier one ratcheted away. Raising a count needs --force and an
-# explanation in the commit message.
+# earlier one ratcheted away. Raising a count needs --force, and (#3590)
+# --force alone is not enough once the rise pushes a file above its
+# ceiling in scripts/enumerable_grid_spellings.grandfather (which only
+# ever falls - see that file's header) - the excess needs a
+# `// GRID-DEBT: #NNNN <reason>` marker at each new site.
 
 # classH: one comparison chain naming >=2 of the eight iterator/enumerator
 #         interface heads - the enumerable-wrap grid's DECLARED-HEAD axis.

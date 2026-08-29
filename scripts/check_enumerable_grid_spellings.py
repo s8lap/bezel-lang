@@ -76,8 +76,36 @@ teaches people to route around it.
   question.
 
 WHEN A FAMILY LANDS. Counts go down; re-baseline with `--update`, which REFUSES
-to raise a count. Raising one is a deliberate act that needs `--force` and an
-explanation in the commit message.
+to raise a count. Raising one is a deliberate act that needs `--force`.
+
+⚠ `--force` ALONE IS NOT ENOUGH (#3590 - the twin of the identical gap in
+check_imported_symbol_reads.py, ported here because the fix is the same shape).
+A rise past what the tree already carried when this mechanism landed needs a
+per-site, CHECKABLE marker, not just a sentence in a commit body:
+
+    // GRID-DEBT: #NNNN <reason>
+
+placed like `GRID-AUTHORITY` (attaches to the next spelling within 8 lines).
+Unlike `GRID-AUTHORITY`, `GRID-DEBT` does NOT remove the site from the count -
+the spelling is still an offender, still baselined, still meant to be
+consolidated onto the shared classifier. It only justifies a rise ABOVE
+`scripts/enumerable_grid_spellings.grandfather`, a ceiling file recording the
+per-file count that already existed when #3590 landed - the tree's existing
+class-H / class-F sites need no marker, because they sit at or below their own
+file's ceiling. Every spelling a file carries above that ceiling must be
+covered by a `GRID-DEBT` marker naming a real issue, and coverage is
+recomputed from the LIVE TREE on every `--strict` run, not just at the moment
+`--force` was typed. See `check_debt_floor` below.
+
+⚠ THE CEILING ONLY EVER FALLS (#3590 review finding 1, ported from the
+identical fix in check_imported_symbol_reads.py). A file's ceiling is not
+frozen forever at #3590's launch value - that would protect nothing during a
+drain campaign, since a later lane could silently re-grow a drained file back
+toward its old high-water mark with a bare `--force` and no marker. EVERY
+successful `--update` TIGHTENS the ceiling to `min(existing, measured)`, per
+file - never raises one. Raising a ceiling stays a deliberate, reviewed
+hand-edit to `scripts/enumerable_grid_spellings.grandfather`. See
+`tighten_ceiling` / `write_grandfather` below.
 
 PER-SITE EXEMPTION. A site that IS the authority - the one function that owns
 the question - writes the marker at the site, with a reason:
@@ -101,6 +129,7 @@ import argparse, pathlib, re, sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BASELINE = ROOT / 'scripts' / 'enumerable_grid_spellings.baseline'
+GRANDFATHER = ROOT / 'scripts' / 'enumerable_grid_spellings.grandfather'
 SCAN_DIRS = ('src',)
 SUFFIXES = ('.cpp', '.hpp')
 
@@ -141,6 +170,17 @@ _ALT = '|'.join(sorted(ALL_NAMES, key=len, reverse=True))
 CMP = re.compile(r'(?:[=!]=\s*"(%s)")|(?:"(%s)"\s*[=!]=)' % (_ALT, _ALT))
 
 MARKER = re.compile(r'//\s*GRID-AUTHORITY:\s*\S')
+
+# GRID-DEBT (#3590). A SIBLING marker, not a replacement — see check_debt_floor
+# and the module docstring. GRID-AUTHORITY says "this spelling IS the
+# authority" and removes it from the count; GRID-DEBT says "this is a known
+# offender, deliberately left past its file's grandfathered ceiling" and does
+# NOT remove it from the count. The `#NNNN` must sit immediately after the
+# colon; a marker with a reason but no issue number is malformed (reported by
+# malformed_debt_marker_lines, always a violation) — a marker that cannot be
+# checked cannot justify a rise.
+GRID_DEBT = re.compile(r'//\s*GRID-DEBT:\s*(\S.*)$')
+GRID_DEBT_ISSUE = re.compile(r'^#(\d+)\b')
 
 # The authority predicates this ratchet points every offender at. If one is
 # deleted the ratchet would report a lovely green while the seam had no owner at
@@ -197,6 +237,46 @@ def marker_lines(raw):
     return [i + 1 for i, ln in enumerate(raw.split('\n')) if MARKER.search(ln)]
 
 
+def debt_marker_lines(raw):
+    """[(line, issue), ...] for WELL-FORMED GRID-DEBT markers (#3590)."""
+    out = []
+    for i, ln in enumerate(raw.split('\n')):
+        m = GRID_DEBT.search(ln)
+        if not m:
+            continue
+        im = GRID_DEBT_ISSUE.match(m.group(1).strip())
+        if im:
+            out.append((i + 1, int(im.group(1))))
+    return out
+
+
+def malformed_debt_marker_lines(raw):
+    """1-indexed line numbers carrying a GRID-DEBT marker with NO `#NNNN`
+    right after the colon. Always a violation - see malformed_debt_report."""
+    out = []
+    for i, ln in enumerate(raw.split('\n')):
+        m = GRID_DEBT.search(ln)
+        if m and not GRID_DEBT_ISSUE.match(m.group(1).strip()):
+            out.append(i + 1)
+    return out
+
+
+def _assign_statement_debt(markers, lit_lines):
+    """{line: issue} - maps each (marker_line, issue) to the next unused
+    literal-line at or after it, within 8 lines. Mirrors
+    `_exempt_statement_lines`' attachment exactly, but RECORDS an issue number
+    instead of removing the site from the count."""
+    out, used = {}, set()
+    for m, issue in markers:
+        for ln in lit_lines:
+            if ln in used or ln < m or ln > m + 8:
+                continue
+            out[ln] = issue
+            used.add(ln)
+            break
+    return out
+
+
 def _exempt_statement_lines(markers, lit_lines):
     """-> the set of statement first-literal lines a marker exempts.
 
@@ -245,7 +325,12 @@ def statements(text):
 
 
 def scan_text(raw, path):
-    """-> (classH_sites, classF_sites); site = (path, line, names)."""
+    """-> (classH_sites, classF_sites, malformed_debt).
+
+    A site is (path, line, names, debt) - `debt` is the GRID-DEBT issue number
+    covering that spelling, or None. `malformed_debt` is [(path, line), ...]
+    for every malformed GRID-DEBT marker in this file.
+    """
     text = strip_comments(raw)
     found = []
     for first, _last, chunk in statements(text):
@@ -254,7 +339,10 @@ def scan_text(raw, path):
             continue
         line = first + chunk.count('\n', 0, hits[0][0])
         found.append((line, set(n for _, n in hits)))
-    exempt = _exempt_statement_lines(marker_lines(raw), [ln for ln, _ in found])
+    lit_lines = [ln for ln, _ in found]
+    exempt = _exempt_statement_lines(marker_lines(raw), lit_lines)
+    debt = _assign_statement_debt(debt_marker_lines(raw), lit_lines)
+    malformed = [(path, ln) for ln in malformed_debt_marker_lines(raw)]
     h, f = [], []
     for line, names in found:
         if line in exempt:
@@ -266,29 +354,73 @@ def scan_text(raw, path):
         # is precisely the mistake that would make a later lane "consolidate" a
         # site it must not touch.
         if len(names & set(IFACE_HEADS)) >= 2:
-            h.append((path, line, sorted(names)))
+            h.append((path, line, sorted(names), debt.get(line)))
         if 'OwningBuffer' in names and (names & {'Array', 'OwningArray'}):
-            f.append((path, line, sorted(names)))
-    return h, f
+            f.append((path, line, sorted(names), debt.get(line)))
+    return h, f, malformed
 
 
 def scan(root):
-    h, f = [], []
+    h, f, malformed = [], [], []
     for d in SCAN_DIRS:
         for p in sorted((root / d).rglob('*')):
             if p.suffix not in SUFFIXES:
                 continue
-            a, b = scan_text(p.read_text(), str(p.relative_to(root)))
+            a, b, m = scan_text(p.read_text(), str(p.relative_to(root)))
             h += a
             f += b
-    return h, f
+            malformed += m
+    return h, f, malformed
 
 
 def counts(sites):
     out = {}
-    for path, _, _ in sites:
+    for path, _, _, _ in sites:
         out[path] = out.get(path, 0) + 1
     return out
+
+
+def debt_marked_paths(sites):
+    """{path: N} - how many of `sites` (class-H or class-F tuples) carry a
+    WELL-FORMED GRID-DEBT marker. Used by `check_debt_floor`."""
+    out = {}
+    for path, _, _, issue in sites:
+        if issue is not None:
+            out[path] = out.get(path, 0) + 1
+    return out
+
+
+def malformed_debt_report(malformed):
+    """-> violation strings for every malformed GRID-DEBT marker. Unconditional
+    - runs on every invocation, rise or not (#3590)."""
+    return ['%s:%d: GRID-DEBT marker has no `#NNNN` right after the colon - a '
+            'marker that cannot be checked cannot justify a rise (write e.g. '
+            '`// GRID-DEBT: #3600 <reason>`)' % (path, line)
+            for path, line in sorted(set(malformed))]
+
+
+def check_debt_floor(name, cur, floor, sites):
+    """-> violation strings. A rise above the GRANDFATHERED ceiling needs a
+    per-site GRID-DEBT marker; `--force` alone is not enough (#3590). See the
+    identical mechanism (and its rationale) in check_imported_symbol_reads.py.
+    """
+    bad = []
+    marked = debt_marked_paths(sites)
+    for path in sorted(cur):
+        have = cur[path]
+        ceiling = floor.get(path, 0)
+        if have <= ceiling:
+            continue
+        excess = have - ceiling
+        got = marked.get(path, 0)
+        if got < excess:
+            bad.append(
+                '%s: %s has %d spelling(s), %d above its grandfathered ceiling '
+                'of %d (scripts/enumerable_grid_spellings.grandfather) - %d of '
+                'the %d excess spelling(s) carry a `// GRID-DEBT: #NNNN <reason>` '
+                'marker, %d do not. --force does not substitute for the marker.'
+                % (name, path, have, excess, ceiling, got, excess, excess - got))
+    return bad
 
 
 def authority_report():
@@ -319,27 +451,30 @@ class BaselineConflict(Exception):
     pass
 
 
-def _parse_baseline(text):
+def _parse_counts_file(text, source_name):
+    """Parse a `# classH` / `# classF`-sectioned `<int> <path>` file. Shared by
+    the mutable baseline and the frozen grandfather ceiling (#3590); one parser
+    serves both, `source_name` is what a merge-conflict error names."""
     h, f, section = {}, {}, 'classH'
     for raw in text.splitlines():
         line = raw.strip()
-        # A merge-conflicted baseline used to reach int() and die with an
+        # A merge-conflicted file used to reach int() and die with an
         # unhandled ValueError - a traceback where the answer is one sentence.
         # It happens on EVERY multi-family merge, because two lanes that both
         # re-baselined always conflict here.
         if line.startswith(('<<<<<<<', '=======', '>>>>>>>')):
             raise BaselineConflict(
-                'scripts/enumerable_grid_spellings.baseline has unresolved merge '
-                'conflict markers.\n'
-                '  Resolve by taking the CURRENT branch\'s version (the ratchet is '
-                'a floor, so the lower\n'
-                '  counts are the right ones), then re-run with --update to make it '
-                'exact:\n'
+                '%s has unresolved merge conflict markers.\n'
+                '  Do NOT hand-merge the counts.\n'
+                '  For the mutable baseline (scripts/enumerable_grid_spellings.\n'
+                '  baseline): take the CURRENT branch\'s version (the ratchet is a\n'
+                '  floor, so the lower counts are right), then regenerate exactly:\n'
                 '      git checkout --ours scripts/enumerable_grid_spellings.baseline\n'
                 '      python3 scripts/check_enumerable_grid_spellings.py --update\n'
-                '  Do NOT hand-merge the counts: --update measures the merged tree, '
-                'which is the\n'
-                '  only source that can be right.')
+                '  For the frozen grandfather ceiling (scripts/enumerable_grid_\n'
+                '  spellings.grandfather): there is no --update for this file - it\n'
+                '  changes only by a deliberate, reviewed edit, so resolve it by hand.'
+                % source_name)
         if not line or line.startswith('#'):
             if line.startswith('# classF'):
                 section = 'classF'
@@ -354,7 +489,78 @@ def _parse_baseline(text):
 def read_baseline():
     if not BASELINE.exists():
         return {}, {}
-    return _parse_baseline(BASELINE.read_text())
+    return _parse_counts_file(BASELINE.read_text(),
+                               'scripts/enumerable_grid_spellings.baseline')
+
+
+def read_grandfather():
+    """The per-file ceiling (#3590): class-H/class-F counts already present in
+    the tree when the GRID-DEBT mechanism landed, TIGHTENED DOWNWARD by every
+    successful `--update` since (see `tighten_ceiling` / `write_grandfather`).
+    `--update` may LOWER a ceiling; it may never RAISE one. A missing file
+    reads as an ALL-ZERO ceiling (fail closed)."""
+    if not GRANDFATHER.exists():
+        return {}, {}
+    return _parse_counts_file(GRANDFATHER.read_text(),
+                               'scripts/enumerable_grid_spellings.grandfather')
+
+
+def tighten_ceiling(existing, cur):
+    """{path: N} - the new grandfather ceiling after a successful `--update`
+    (#3590 review finding 1, identical to the twin in
+    check_imported_symbol_reads.py). MONOTONE DOWNWARD ONLY:
+    `new[path] = min(existing.get(path, 0), cur.get(path, 0))`. Can never
+    raise a ceiling; a path whose tightened ceiling reaches 0 is dropped."""
+    out = {}
+    for path in set(existing) | set(cur):
+        new = min(existing.get(path, 0), cur.get(path, 0))
+        if new > 0:
+            out[path] = new
+    return out
+
+
+def write_grandfather(existingH, existingF, curH, curF):
+    """Persist the tightened ceiling (#3590 review finding 1) and report what
+    changed as [(cls, path, old, new), ...]. Called on EVERY successful
+    `--update`, alongside `write_baseline` - a drain must become the new
+    ceiling immediately, or the mechanism protects nothing during a drain
+    campaign. Can only ever lower a value already on disk; never raises one.
+    """
+    newH = tighten_ceiling(existingH, curH)
+    newF = tighten_ceiling(existingF, curF)
+    lines = [
+        '# enumerable_grid_spellings.grandfather - the ceiling for #3590.',
+        '#',
+        '# THE CEILING ONLY EVER FALLS. `--update` MAY LOWER a per-file ceiling',
+        '# (to min(existing, measured) - a drain becomes the new ceiling on the',
+        '# very next --update) and MAY NEVER RAISE one; raising a ceiling stays a',
+        '# deliberate, reviewed hand-edit to this file. A path whose tightened',
+        '# ceiling reaches 0 is dropped entirely. See tighten_ceiling() /',
+        '# check_debt_floor() in check_enumerable_grid_spellings.py, and #3590',
+        '# (same rationale as scripts/imported_symbol_reads.grandfather).',
+        '#',
+        '# classH: one comparison chain naming >=2 of the eight iterator/enumerator',
+        '#         interface heads - the enumerable-wrap grid\'s DECLARED-HEAD axis.',
+        '#         Authority: common::isIterFormatEnumerableHead /',
+        '#         isSyncIterFormatEnumerableHead / isIterableInterfaceHead.',
+    ]
+    lines += ['%-4d %s' % (n, p) for p, n in sorted(newH.items())]
+    lines += [
+        '',
+        '# classF: one comparison chain naming OwningBuffer together with Array or',
+        '#         OwningArray - the grid\'s SOURCE-FAMILY axis for the §29.2',
+        '#         array-enumerator wrap. Authority:',
+        '#         common::isArrayEnumeratorWrapSourceName.',
+    ]
+    lines += ['%-4d %s' % (n, p) for p, n in sorted(newF.items())]
+    GRANDFATHER.write_text('\n'.join(lines) + '\n')
+    changed = []
+    for cls, existing, new in (('classH', existingH, newH), ('classF', existingF, newF)):
+        for path in sorted(set(existing) | set(new)):
+            old_v, new_v = existing.get(path, 0), new.get(path, 0)
+            if new_v < old_v:
+                changed.append((cls, path, old_v, new_v))
+    return newH, newF, changed
 
 
 def write_baseline(h, f):
@@ -365,8 +571,11 @@ def write_baseline(h, f):
         '# EQUAL the measured count, so BOTH a rise and stale headroom fail - a landed',
         '# family that forgot to --update is a violation exactly like a regression,',
         '# which is what stops a later family from quietly handing back what an',
-        '# earlier one ratcheted away. Raising a count needs --force and an',
-        '# explanation in the commit message.',
+        '# earlier one ratcheted away. Raising a count needs --force, and (#3590)',
+        '# --force alone is not enough once the rise pushes a file above its',
+        '# ceiling in scripts/enumerable_grid_spellings.grandfather (which only',
+        '# ever falls - see that file\'s header) - the excess needs a',
+        '# `// GRID-DEBT: #NNNN <reason>` marker at each new site.',
         '',
         '# classH: one comparison chain naming >=2 of the eight iterator/enumerator',
         '#         interface heads - the enumerable-wrap grid\'s DECLARED-HEAD axis.',
@@ -535,6 +744,11 @@ FIXTURES = [
      '// GRID-AUTHORITY: only the next one\n'
      'bool a = n == "IEnumerable" || n == "IOwningEnumerable";\n'
      'bool b = m == "IEnumerable" || m == "IOwningEnumerable";\n', 1, 0),
+    # GRID-DEBT (#3590) is NOT GRID-AUTHORITY: it documents a deliberately-taken
+    # rise, it does not remove the spelling from the count.
+    ('debt_marker_still_counts.cpp',
+     '// GRID-DEBT: #3600 tracked, will consolidate with the next family\n'
+     'return n == "IEnumerable" || n == "IOwningEnumerable";\n', 1, 0),
 ]
 
 
@@ -561,17 +775,160 @@ def self_test_compare():
     return ok
 
 
+# GRID-DEBT marker parsing (#3590): parallel to the exempt_marker_* FIXTURES
+# above for GRID-AUTHORITY, but exercising `debt_marker_lines` /
+# `malformed_debt_marker_lines` / `_assign_statement_debt` directly.
+DEBT_FIXTURES = [
+    # (name, body, want debt_marker_lines() [(line, issue)], want malformed [line])
+    ('debt_marker_above.cpp',
+     '// GRID-DEBT: #3600 tracked, will consolidate later\n'
+     'return n == "IEnumerable" || n == "IOwningEnumerable";\n',
+     [(1, 3600)], []),
+    ('debt_marker_same_line.cpp',
+     'return n == "IEnumerable" || n == "IOwningEnumerable";'
+     '  // GRID-DEBT: #3601 tracked\n',
+     [(1, 3601)], []),
+    ('debt_marker_multiline_reason.cpp',
+     '// GRID-DEBT: #3602 this explanation deliberately wraps across two\n'
+     '// full lines of prose before the marked spelling follows\n'
+     'return n == "IEnumerable" || n == "IOwningEnumerable";\n',
+     [(1, 3602)], []),
+    # No `#NNNN` right after the colon - malformed, justifies NOTHING.
+    ('debt_marker_no_issue.cpp',
+     '// GRID-DEBT: needs consolidating eventually\n'
+     'return n == "IEnumerable" || n == "IOwningEnumerable";\n',
+     [], [1]),
+    ('debt_marker_issue_not_leading.cpp',
+     '// GRID-DEBT: relates to the #3419 umbrella, no local issue yet\n'
+     'return n == "IEnumerable" || n == "IOwningEnumerable";\n',
+     [], [1]),
+]
+
+
+def self_test_debt():
+    ok = True
+    for name, body, want_markers, want_malformed in DEBT_FIXTURES:
+        got_markers = debt_marker_lines(body)
+        got_malformed = malformed_debt_marker_lines(body)
+        good = (got_markers == want_markers and got_malformed == want_malformed)
+        ok = ok and good
+        print('  [%s] debt/%-30s markers=%s (want %s)  malformed=%s (want %s)'
+              % ('ok  ' if good else 'FAIL', name, got_markers, want_markers,
+                 got_malformed, want_malformed))
+    return ok
+
+
+# check_debt_floor (#3590): proves the NEW refusal actually fires on a known
+# positive AND does not fire when marker coverage is sufficient.
+DEBT_FLOOR_CASES = [
+    # (label, cur, floor, sites, want_violations)
+    ('at ceiling',      {'a.cpp': 3}, {'a.cpp': 3}, [], 0),
+    ('under ceiling',   {'a.cpp': 2}, {'a.cpp': 3}, [], 0),
+    ('excess, no marker',
+     {'a.cpp': 4}, {'a.cpp': 3}, [], 1),
+    ('excess, fully marked',
+     {'a.cpp': 4}, {'a.cpp': 3}, [('a.cpp', 10, ['x'], 9001)], 0),
+    ('excess, partially marked',
+     {'a.cpp': 5}, {'a.cpp': 3}, [('a.cpp', 10, ['x'], 9001)], 1),
+    ('new file, no ceiling on record',
+     {'b.cpp': 1}, {}, [], 1),
+    ('new file, marked',
+     {'b.cpp': 1}, {}, [('b.cpp', 5, ['y'], 9002)], 0),
+]
+
+
+def self_test_debt_floor():
+    ok = True
+    for label, cur, floor, sites, want in DEBT_FLOOR_CASES:
+        got = len(check_debt_floor('t', cur, floor, sites))
+        good = (got == want)
+        ok = ok and good
+        print('  [%s] debt-floor/%-28s violations=%d (want %d)'
+              % ('ok  ' if good else 'FAIL', label, got, want))
+    return ok
+
+
+# tighten_ceiling (#3590 review finding 1): the ceiling must only ever fall.
+# Identical shape to the twin in check_imported_symbol_reads.py.
+GRANDFATHER_TIGHTEN_CASES = [
+    # (label, existing_ceiling, measured, want_new_ceiling)
+    ('drain lowers the ceiling',
+     {'a.cpp': 28}, {'a.cpp': 20}, {'a.cpp': 20}),
+    ('unchanged stays unchanged',
+     {'a.cpp': 28}, {'a.cpp': 28}, {'a.cpp': 28}),
+    ('marked rise above ceiling does not raise it',
+     {'a.cpp': 20}, {'a.cpp': 25}, {'a.cpp': 20}),
+    ('new file gets no ceiling for free',
+     {}, {'b.cpp': 5}, {}),
+    ('fully drained file is dropped',
+     {'a.cpp': 28}, {}, {}),
+    ('cannot rise even when measured is higher and marked',
+     {'a.cpp': 20}, {'a.cpp': 30}, {'a.cpp': 20}),
+]
+
+
+def self_test_grandfather_tighten():
+    ok = True
+    for label, existing, cur, want in GRANDFATHER_TIGHTEN_CASES:
+        got = tighten_ceiling(existing, cur)
+        good = (got == want)
+        ok = ok and good
+        print('  [%s] tighten/%-40s got %s (want %s)'
+              % ('ok  ' if good else 'FAIL', label, got, want))
+    return ok
+
+
+def self_test_drain_protection():
+    """FAIL-WITHOUT/PASS-WITH for review finding 1 (#3590): a drain must
+    immediately become the new ceiling. Identical shape to the twin in
+    check_imported_symbol_reads.py."""
+    old_ceiling = {'a.cpp': 28}
+    drained = {'a.cpp': 20}
+    new_ceiling = tighten_ceiling(old_ceiling, drained)
+    step1_ok = (new_ceiling == {'a.cpp': 20})
+
+    regrown = {'a.cpp': 25}
+    violations_without_fix = len(check_debt_floor('t', regrown, old_ceiling, []))
+    violations_with_fix = len(check_debt_floor('t', regrown, new_ceiling, []))
+
+    good = (step1_ok and violations_without_fix == 0 and violations_with_fix == 1)
+    print('  [%s] drain-protection: tighten(28->20)=%s ceiling; regrow to 25 '
+          '(<=28) -> WITHOUT tightening: %d violation(s) (bug, want 0 to prove '
+          'it reproduces); WITH tightening: %d violation(s) (fix, want 1)'
+          % ('ok  ' if good else 'FAIL', step1_ok, violations_without_fix,
+             violations_with_fix))
+    return good
+
+
+def self_test_grandfather_missing_fails_closed():
+    """Finding 3 (#3590 review): a MISSING grandfather file fails CLOSED, not
+    open - see the twin in check_imported_symbol_reads.py for the full
+    rationale."""
+    cur = {'a.cpp': 5}
+    violations = check_debt_floor('t', cur, {}, [])
+    good = (len(violations) == 1)
+    print('  [%s] grandfather-missing fails CLOSED: violations=%d (want 1 - '
+          'the whole count, not silently accepted)'
+          % ('ok  ' if good else 'FAIL', len(violations)))
+    return good
+
+
 def self_test():
     ok = self_test_compare()
     for name, body, wantH, wantF in FIXTURES:
-        gotH, gotF = scan_text(body, name)
+        gotH, gotF, _malformed = scan_text(body, name)
         good = (len(gotH) == wantH and len(gotF) == wantF)
         ok = ok and good
         print('  [%s] %-38s expected (H=%d,F=%d), got (H=%d,F=%d)'
               % ('ok  ' if good else 'FAIL', name, wantH, wantF,
                  len(gotH), len(gotF)))
+    ok = self_test_debt() and ok
+    ok = self_test_debt_floor() and ok
+    ok = self_test_grandfather_tighten() and ok
+    ok = self_test_drain_protection() and ok
+    ok = self_test_grandfather_missing_fails_closed() and ok
     # A detector that cannot see the real tree is also broken.
-    h, f = scan(ROOT)
+    h, f, _malformed = scan(ROOT)
     if not h or not f:
         ok = False
         print('  [FAIL] whole-tree scan found %d class-H and %d class-F spelling(s)'
@@ -603,15 +960,26 @@ def main():
     if a.self_test:
         return self_test()
 
-    h, f = scan(ROOT)
+    h, f, malformed = scan(ROOT)
     curH, curF = counts(h), counts(f)
     baseH, baseF = read_baseline()
+    floorH, floorF = read_grandfather()
 
     if a.list:
-        for path, line, names in h:
-            print('classH  %s:%d  %s' % (path, line, ','.join(names)))
-        for path, line, names in f:
-            print('classF  %s:%d  %s' % (path, line, ','.join(names)))
+        for path, line, names, debt in h:
+            print('classH  %s:%d  %s%s' % (path, line, ','.join(names),
+                  '  [GRID-DEBT #%d]' % debt if debt else ''))
+        for path, line, names, debt in f:
+            print('classF  %s:%d  %s%s' % (path, line, ','.join(names),
+                  '  [GRID-DEBT #%d]' % debt if debt else ''))
+        for path, line in sorted(set(malformed)):
+            print('malformed-debt-marker  %s:%d' % (path, line))
+
+    # A rise above the grandfathered ceiling (#3590) needs a per-site GRID-DEBT
+    # marker; checked on EVERY run, not only when --force is passed.
+    debt_bad = (check_debt_floor('classH', curH, floorH, h) +
+                check_debt_floor('classF', curF, floorF, f) +
+                malformed_debt_report(malformed))
 
     if a.update:
         rises = ([v for v in compare('classH', curH, baseH, stale=False) if baseH] +
@@ -622,14 +990,35 @@ def main():
                 print('  ' + v)
             print('Use --force if the rise is deliberate, and say why in the commit.')
             return 1
+        # (#3590) --force gets past the "may only go DOWN" refusal above, but
+        # NOT past this one. The only way through is a real
+        # `// GRID-DEBT: #NNNN <reason>` marker at each new site.
+        if debt_bad:
+            print('REFUSING to update: new debt above the grandfathered ceiling '
+                  '(#3590) needs a per-site marker - --force alone is not enough.')
+            for v in debt_bad:
+                print('  ' + v)
+            print('Add `// GRID-DEBT: #NNNN <reason>` at each new site, naming a')
+            print('real issue that tracks the debt, or bring the count back down')
+            print('to scripts/enumerable_grid_spellings.grandfather\'s ceiling.')
+            return 1
         write_baseline(curH, curF)
+        # (#3590 review finding 1) Tighten the ceiling DOWNWARD to match, on
+        # EVERY successful update - see the identical rationale in
+        # check_imported_symbol_reads.py. Can only lower a value already on
+        # disk; never raises one.
+        _newH, _newF, ceiling_changed = write_grandfather(floorH, floorF, curH, curF)
         print('baseline updated: %d class-H spelling(s) in %d file(s), '
               '%d class-F in %d file(s)'
               % (sum(curH.values()), len(curH), sum(curF.values()), len(curF)))
+        if ceiling_changed:
+            print('grandfather ceiling tightened (%d file(s)):' % len(ceiling_changed))
+            for cls, path, old_v, new_v in ceiling_changed:
+                print('  %s: %s %d -> %d' % (cls, path, old_v, new_v))
         return 0
 
     auth_lines, auth_ok = authority_report()
-    bad = compare('classH', curH, baseH) + compare('classF', curF, baseF)
+    bad = compare('classH', curH, baseH) + compare('classF', curF, baseF) + debt_bad
     if not auth_ok:
         bad += [l.strip() for l in auth_lines if l.strip().startswith('AUTHORITY')]
     if bad:

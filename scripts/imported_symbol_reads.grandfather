@@ -1,0 +1,69 @@
+# imported_symbol_reads.grandfather - the ceiling for #3590.
+#
+# THE CEILING ONLY EVER FALLS. `--update` MAY LOWER a per-file ceiling
+# (to min(existing, measured) - a drain becomes the new ceiling on the
+# very next --update) and MAY NEVER RAISE one; raising a ceiling stays a
+# deliberate, reviewed hand-edit to this file - never automatic, never a
+# side effect of --update. A path whose tightened ceiling reaches 0 is
+# dropped entirely: nothing left to grandfather, so a future site there
+# is new debt like any file that never had headroom.
+#
+# WHY THE CEILING MOVES: a ceiling frozen forever at its #3590-launch
+# value would protect nothing during a drain campaign - a lane could take
+# a file from 28 to 20, and a LATER lane could silently re-add 8 reads
+# with a bare `--update --force` (no marker, no issue) as long as it
+# stayed under the original 28. That is exactly the 292 -> 311 regrowth
+# #3590 exists to stop, just restarting from a lower number. See
+# tighten_ceiling() / check_debt_floor() in check_imported_symbol_reads.py.
+#
+# class1: dynamic_cast<const ast::TypeDecl*>(<sym>->decl) - wrong-but-quiet
+#         for an imported symbol.
+1    src/codegen/LlvmBackend_Exprs2.cpp
+5    src/codegen/LlvmBackend_Setup.cpp
+1    src/codegen/LlvmBackend_impl.hpp
+4    src/module/ModuleMetadataBuilder.cpp
+1    src/ownership/Ownership_Checks.cpp
+1    src/sema/EnumValues.hpp
+6    src/sema/ExprTypecheck.cpp
+5    src/sema/ExprTypecheck_Calls.cpp
+7    src/sema/ExprTypecheck_Exprs.cpp
+4    src/sema/PureChecker.cpp
+5    src/sema/SymbolCollection.cpp
+9    src/sema/TypeResolution_Checks.cpp
+1    src/sema/TypeResolution_Names.cpp
+
+# class2: deliberately has NO grandfathered ceiling. The always-null cast
+#         (#3150) is dead code on every path, not a genuine imported-symbol
+#         seam, so there is no legitimate "debt" reading to grandfather -
+#         class-2 is zero-tolerance instead: class2_zero_tolerance() (#3590)
+#         refuses ANY class-2 site unconditionally, --force included.
+
+# class3: dynamic_cast<const ast::{Method,Property,Field,Constructor,
+#         Event,Const}Decl*>(<sym>->decl) - the MEMBER half of the seam
+#         (#3149).
+20   src/codegen/LlvmBackend_Assign.cpp
+28   src/codegen/LlvmBackend_Calls2.cpp
+3    src/codegen/LlvmBackend_Disposal.cpp
+8    src/codegen/LlvmBackend_Exprs.cpp
+7    src/codegen/LlvmBackend_Exprs2.cpp
+3    src/codegen/LlvmBackend_Layout.cpp
+8    src/codegen/LlvmBackend_Serialization.cpp
+58   src/codegen/LlvmBackend_Setup.cpp
+4    src/codegen/LlvmBackend_Stmts.cpp
+2    src/codegen/LlvmBackend_String.cpp
+21   src/codegen/LlvmBackend_impl.hpp
+2    src/common/OwnershipFacts.cpp
+4    src/module/ModuleLoader.cpp
+10   src/module/ModuleMetadataBuilder.cpp
+4    src/ownership/Ownership.cpp
+3    src/ownership/Ownership_Checks.cpp
+1    src/sema/DefiniteAssignment.cpp
+1    src/sema/EntryPoint.cpp
+13   src/sema/ExprTypecheck.cpp
+16   src/sema/ExprTypecheck_Calls.cpp
+18   src/sema/ExprTypecheck_Exprs.cpp
+11   src/sema/PureChecker.cpp
+5    src/sema/StaticInitCycles.cpp
+5    src/sema/SymbolCollection.cpp
+51   src/sema/TypeResolution_Checks.cpp
+5    src/sema/TypeResolution_Names.cpp
