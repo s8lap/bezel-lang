@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.285. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.286. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -152,7 +152,7 @@ visibility  static  (async|pure)  (abstract|virtual|override|sealed override)  (
 | Constructor | `public constructor(a: int)` + optional `base(a);`/`this(a);` chain + body + `end constructor;` | §22.7 |
 | Destructor | `destructor` … `end destructor;` — no visibility, no name, no parameters | §28.4 |
 | Operator | `public static pure method operator +(a: V, b: V): V => …;` closes `end operator +;` | §25.1 |
-| Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `override GetHashCode` beside them (a record; an enum or choice writes a plain `GetHashCode(): int`), and by itself strips the record of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. | §25.2, §9.2 |
+| Equality operator | Overloading `=`/`<>` with **both operands the declaring type** obliges `Equals(T)` **and** `override GetHashCode` beside them (a record; an enum or choice writes a plain `GetHashCode(): int`), and by itself strips the record of auto-`=`/`Equals`/`GetHashCode`/`ToString` — **write all four or none**. A **heterogeneous** `=` (`T = U`) obliges nothing and strips nothing. On a move-only choice, `=`/`<>` operands and the `Equals(T)` parameter bind BORROWS — both operands stay live (v0.286). | §25.2, §9.2 |
 | Invariant | `invariant(_bal + _limit >= 0m);` — class bodies only, no visibility, keeps its `;` | §22.16 |
 | Nested type | `public record Token(…);` inside a class body — visibility **required** | §11.6 |
 
