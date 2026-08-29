@@ -1,6 +1,6 @@
 # Bezel Guide 5: Collections, Queries, and Iteration
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.278.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.284.*
 
 The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5, auto-imported since v0.278 — no `import` needed). What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `move` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
 
@@ -251,7 +251,7 @@ var mean := hot.Average(lambda(r) => r.Celsius);  // as many passes as you like
 **Which operators are lazy, and what they retain** (stdlib §5):
 
 - The callback-taking lazy operators — `Where`, `Select`, `SelectMany`, `TakeWhile`, `SkipWhile`, `OrderBy`/`OrderByDescending`/`ThenBy`/`ThenByDescending`, `GroupBy`, `Zip` — **retain their callback in the query value until it is consumed**, and with it every borrow the callback captured.
-- The callback-free lazy operators (`Take`, `Skip`, `Reverse`, `Distinct`, `OfType`, `Concat`, `Union`, `Intersect`, `Except`) retain nothing.
+- The callback-free lazy operators (`Take`, `Skip`, `Reverse`, `Distinct`, `Concat`, `Union`, `Intersect`, `Except`) retain nothing.
 - The **eager** operators run during the call and retain nothing: the element accessors (`First`/`Last`/`Single`/`ElementAt`, with the `*OrNull` forms, and the predicate forms where they exist — `ElementAt`/`ElementAtOrNull` carry none), `Count`, `Any`, `All`, `Contains`, the aggregations (`Sum`, `Min`, `Max`, `Average`, `Aggregate`), and the materializers (`ToArray`, `ToDictionary`, `ToSet`).
 
 (On an `Array<T>` receiver, `Reverse()` resolves to the in-place instance method before extensions are consulted — the lazy operator applies only where the receiver has no instance `Reverse`; stdlib §5.)

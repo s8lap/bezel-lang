@@ -1,7 +1,6 @@
 public extension IEnumerable<T>
   // Filtering
   public method Where(predicate: (T) -> bool): IEnumerable<T>;
-  public method OfType<U>(): IEnumerable<U>;
 
   // Projection
   public method Select<U>(selector: (T) -> U): IEnumerable<U>;

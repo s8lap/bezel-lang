@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.282. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.284. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -659,11 +659,8 @@ public static class Math
   public static method Min<T>(a: T, b: T): T where T: IComparable<T>;     // NOT pure
   public static method Max<T>(a: T, b: T): T where T: IComparable<T>;     // NOT pure
   public static method Clamp<T>(value: T, low: T, high: T): T where T: IComparable<T>;
-  public static pure method Sqrt/Exp/Log/Log10/Log2/Sin/Cos/Tan/Asin/Acos/Atan/
-                            Sinh/Cosh/Tanh(x: double): double;
+  public static pure method Sqrt(x: double): double;
   public static pure method Pow(x: double, y: double): double;
-  public static pure method Log(x: double, base_: double): double;
-  public static pure method Atan2(y: double, x: double): double;
   public static method DivRem(a: int, b: int, out remainder: int): int;   // + long form; NOT pure
   public static pure method Floor/Ceiling/Truncate(x: double): double;
   public static pure method Round(x: double[, digits: int]): double;
@@ -1053,7 +1050,7 @@ The sorted collections take **no comparer parameter** — ordering is `K`/`T`'s 
 ```bezel
 public extension IEnumerable<T>
   // Filtering / projection (LAZY)
-  Where(predicate: (T) -> bool): IEnumerable<T>;      OfType<U>(): IEnumerable<U>;
+  Where(predicate: (T) -> bool): IEnumerable<T>;
   Select<U>(selector: (T) -> U): IEnumerable<U>;
   SelectMany<U>(selector: (T) -> IEnumerable<U>): IEnumerable<U>;
   // Quantifiers and element access (EAGER)
@@ -1351,7 +1348,7 @@ Every absence below was verified by a full-document search. Reaching for one of 
 
 **Query operators.** `ToList`, `ToLookup`, `Join`, `GroupJoin`, `Cast<T>`, `AsEnumerable`, `DefaultIfEmpty`, `Prepend`, `Append`, `Chunk`, `DistinctBy`, `UnionBy`/`IntersectBy`/`ExceptBy`, `MinBy`, `MaxBy`, `Order()`/`OrderDescending()`, `TakeLast`, `SkipLast`, `LongCount`, `Enumerable.Empty`/`Range`/`Repeat` (**there is no `Enumerable` class at all**), `SequenceEqual` over `IEnumerable<T>` (it exists only on the span types), `SelectMany` with a result selector, `Zip` without a combiner, `Where`/`Select` with an index. Replacements: `ToList` → `ToArray()`; `MinBy(f)` → `OrderBy(f).First()`; `Enumerable.Range` → the language's `1..n`, which is `IEnumerable<T>` (`(1..100).Sum()` works); `Append`/`Prepend` → `Concat` with a one-element `Array<T>`.
 
-**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) — it *does* have `TryAdd` since v0.282; `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`.
+**Collections.** `List<T>` (reserved name), `HashSet<T>` (→ `Set<T>`), `SortedList`, `PriorityQueue`, `Deque`, `ConcurrentDictionary`/`ConcurrentQueue`/`ConcurrentBag` (→ `Locked<T>` over a sendable collection, or `Channel<T>`), `ImmutableArray`/`ImmutableList`/`ImmutableDictionary` (→ `FrozenArray<T>`), `ReadOnlyDictionary`, `BitArray`, `Lookup`, `KeyValuePair` (→ `DictionaryEntry<K,V>`), `Tuple`/`ValueTuple` (**Bezel has no tuples** — use a record), `Nullable<T>` (→ `T?`), `IComparer<T>` (only `IEqualityComparer<T>` exists), `StringComparison`/`StringComparer`. Absent *members* on types that do exist: `Array<T>` has no `RemoveAll`, `FindIndex`, `FindAll`, `Find`, `Exists`, `BinarySearch`, `CopyTo`, `TrueForAll`, `GetRange`, `InsertRange`, `RemoveRange`, `ForEach`; `Dictionary` has no `GetValueOrDefault` (→ `GetOrNull`) — it *does* have `TryAdd` since v0.282; `Math` has no transcendental block since v0.284 (`Sin`/`Cos`/`Tan`/`Asin`/`Acos`/`Atan`/`Atan2`/`Sinh`/`Cosh`/`Tanh`/`Exp`/`Log`/`Log10`/`Log2`/`E` removed; `Sqrt`/`Pow`/rounding stay; the compiler still accepts them until #3559 lands) and no `Hypot`/`Cbrt`/`PI` (never documented; removed from the compiler with #3559); `IEnumerable<T>` has no `OfType<U>` since v0.284 (#3559); `Console` has no `Clear` since v0.284; `OwningArray<T>` declares no `ToArray`/`Sorted`/`Reversed`; `OwningLinkedList<T>` has no source constructor; `Stack`/`Queue` have no `Add`/`Remove`/`IsReadOnly`.
 
 **Text.** `string.Format`/`String.Format` (**use interpolation**), `String.Empty` (use `""`), `string.Concat`, `Split` with a remove-empty option, `Regex`, `ToTitleCase`, `Normalize`, the `StringBuilder.Length` setter, the `C` format specifier, any culture-aware formatting.
 

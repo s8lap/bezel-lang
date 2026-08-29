@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.283 — August 2026**
+**Companion to the Bezel Language Specification, v0.284 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -105,8 +105,6 @@ public static class Console
   public static readonly property Out: TextWriter;
   public static readonly property Error: TextWriter;
 
-  // Convenience
-  public static method Clear();
 end Console;
 ```
 
@@ -122,7 +120,6 @@ A static class of mathematical functions and constants. All trigonometric functi
 ```bezel
 public static class Math
   public static const Pi: double := 3.14159265358979323846;
-  public static const E: double := 2.71828182845904523536;
   public static const Tau: double := 6.28318530717958647692;
 
   public static pure method Abs(x: int): int;
@@ -143,22 +140,7 @@ public static class Math
                                                                             //   member declares no `out` (§22.15);
                                                                             //   the tuple shape 0062 sketched does
                                                                             //   not exist (no tuples).
-  public static pure method Exp(x: double): double;
-  public static pure method Log(x: double): double;       // natural log
-  public static pure method Log(x: double, base_: double): double;
-  public static pure method Log10(x: double): double;
-  public static pure method Log2(x: double): double;
 
-  public static pure method Sin(x: double): double;
-  public static pure method Cos(x: double): double;
-  public static pure method Tan(x: double): double;
-  public static pure method Asin(x: double): double;
-  public static pure method Acos(x: double): double;
-  public static pure method Atan(x: double): double;
-  public static pure method Atan2(y: double, x: double): double;
-  public static pure method Sinh(x: double): double;
-  public static pure method Cosh(x: double): double;
-  public static pure method Tanh(x: double): double;
 
   public static pure method Floor(x: double): double;
   public static pure method Ceiling(x: double): double;
@@ -2966,6 +2948,8 @@ The unsigned variants follow by casting through the matching unsigned type at th
 
 A tier below the byte accessors, for formats that pack fields at sub-byte positions — a protocol header whose flag, opcode, and code fields share a byte; a stream of variable-width codes. `BitReader` and `BitWriter` are records carrying a span plus a `(BitStart, BitLength)` window counted in **bits**; every read and write covers a run of 1 to 64 bits and needs no mask-and-shift ladder at the call site.
 
+> ⚠ **Implementation state (v0.284, [#3558](https://github.com/s8lap/bezel-lang/issues/3558)):** the bit tier's `TryWrite*` forms have no compiler support yet, while the byte tier's are fully implemented — the two Try-write families are in opposite implementation states. The design contract is shared (the byte tier's recorded write-side reason in §4.14 covers both).
+
 ```bezel
 public record BitReader(Source: ReadOnlySpan<byte>, BitStart: int, BitLength: int)
 
@@ -3505,13 +3489,12 @@ A bound lazy query is single-consumption with the normative consumption-point li
 
 **Ownership at class-typed substitutions (v0.194; noted v0.195; scoped v0.235, #1666).** Under the bare-type-parameter rule (language spec [§28.3](Bezel_Language_Spec.md#sec-bare-type-parameter-returns)), the element-access and no-selector aggregation results at a class or interface element type are **borrows of the element, sourced from the receiver** — `First`/`Last`/`Single`/`ElementAt` (with the `*OrNull` forms, and the predicate forms where they exist — `ElementAt`/`ElementAtOrNull` carry none), `Min()`/`Max()` and their no-selector `MinOrNull()`/`MaxOrNull()` forms ([§5.1](#sec-no-selector-aggregation-overloads)), and `Min<U>`/`Max<U>(selector)` (for the selector forms, borrows of the projected value — the same liveness follows transitively through the element): the caller takes no disposal obligation, and the result is usable while the element's backing is live — for a collection-backed sequence, while the collection's own source lives; over an **enumerator-owned-element source** — an iterator whose enumerator's own frame owns the yielded element, or an operator chain over one — the element does not survive the terminal's internal enumerator, so a later use of the result faults deterministically in checked mode (the K4.1 backstop, language spec [§28.2](Bezel_Language_Spec.md#sec-checked-disposal)). The frame owns the element in **either** of the two ways language spec [§29.2](Bezel_Language_Spec.md#sec-iterator-yield-ownership) admits, and the hazard is identical under both: **minting** it — a fresh producer or a `move` result, which the enumerator owns outright and disposes on the next advance (§29.2's first owned-class-typed bullet) — or **adopting** it into a frame-resident owned binding (an owned local, a `using var`, or an `owned` parameter, §29.4's list) and yielding an unmarked read of that binding, which is a borrow whose source the frame owns and which [§29.7](Bezel_Language_Spec.md#sec-disposal-of-partially-consumed-iterators)'s pass disposes when the enumerator is disposed (§29.2's borrowed-expression bullet). Adopt-then-yield is §29.2's *warning-free* producer spelling; that is a statement about the producer's diagnostics, not about the element's liveness at a consumer's terminal accessor; **materializing does not remedy this (v0.265, #2557)** — `ToArray()`/`ToSet()`/`ToDictionary(…)` at a class or interface element type return **borrowing** collections whose slots hold borrows of the enumerated elements (language spec [§28.11](Bezel_Language_Spec.md#sec-element-slot-policy)'s borrow-slot row; [§4.4](#sec-arrayt)), so a slot filled from an enumerator-owned yield dangles on return exactly as the accessor result does, and `ToArray()` stays the remedy only for [§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration)'s *re-enumeration* hazard, which is a different problem over a live backing. The remedies are: consume each element inside the loop body that borrows it (the borrow is valid until the next advance, language spec [§29.2](Bezel_Language_Spec.md#sec-iterator-yield-ownership)); or give the elements an owner that outlives the use — the producer declares an owning enumeration return type (`IOwningEnumerable<T>`, language spec [§29.3](Bezel_Language_Spec.md#sec-iterator-methods)) and the consumer takes each element through owning iteration ([§4.13](#sec-owning-enumeration-interfaces)), typically building them into an owning collection to which the accessor is then applied; where the source is an owning collection, `Drain()` is that path ([§4.5](#sec-ownedarrayt)). Where the producer is a **borrowing** minting iterator the consumer cannot change, no retention remedy exists at a class element type — the borrowing protocol has no transfer-out (language spec [§29.1](Bezel_Language_Spec.md#sec-current-semantics-on-borrowing-and-owning-enumerators)) — and the element must be used before the next advance. These accessors are compiler-known members: at class element types no in-language body over arbitrary `IEnumerable<T>` can produce the element borrow, because an iteration-variable borrow may not escape the loop (language spec §28.3/§29.2, v0.235). `Aggregate<TAccum>(seed, fold)` additionally carries **`seed`** as a source: at class `TAccum` the result is a borrow of {receiver, seed} — usable only while both are live, an empty source returning the seed itself (the one §5 classification v0.194 tightened). At value and runtime-managed substitutions no ownership attaches (§2.2's note, applied to this module). **(v0.243, #3047; predicate widened v0.268, [#3285](https://github.com/s8lap/bezel-lang/issues/3285))** The compiler **must warn** at the **no-selector forms of these accessors** when the receiver's traced provenance roots at a **directly-called same-compilation-unit iterator at least one of whose reachable yields is enumerator-owned in *either* arm — minted or adopted — or at a lazy chain over one**, the chain running **through** a materializer (`ToArray()`/`ToSet()`/`ToDictionary(…)`) or a `GroupBy` grouping at a class or interface element type, both of which are pass-through nodes of that trace and never roots — the element borrow is dead (or, under mixed yields, may be dead) on arrival; the member set, the predicate, the pass-through nodes, the exhaustive silent shapes, and the recorded liftables are normative at language spec [§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration), whose wording governs, this sentence being a summary of it. **The warn set remains a proper subset of the hazard class named above (v0.266; restated v0.268):** what left the residue at v0.268 is the **adopting** arm and the materializer/`GroupBy` chains; what stays in it is a cross-module iterator, an indirectly-called one, a receiver the trace cannot resolve, and a frame-owned element the yield reaches only through a field, an indexer, or an iteration variable — each an under-approximation and not a soundness claim, with the checked-mode backstop the guard throughout. In one direction the predicate also **over**-warns, and §29.11 states that too: an adopted binding the iterator transfers out of its frame after yielding is live at an exhausting accessor and dead at an abandoning one, and the receiver-keyed predicate does not distinguish them.
 
-**Callback retention (the callback-taking lazy operators store their callbacks).** A predicate/selector/key/combiner passed to a **lazy** operator that takes one — `Where`, `Select`, `SelectMany`, `TakeWhile`, `SkipWhile`, `OrderBy`, `OrderByDescending`, `ThenBy`, `ThenByDescending`, `GroupBy`, `Zip` — is **retained by the returned query value until enumeration**, not just for the duration of the call. These signatures are the normative instance of the language spec's deferred-activation frame-residence rule (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters) *Call-bounded × deferred activation*, v0.196): the callback resides in the returned **query value** — the deferred-activation frame — its captured borrows' sources are carried sources of that frame (spec [§28.3](Bezel_Language_Spec.md#sec-unbound-owned-temporaries)'s capture-set contribution, v0.196), and the retention ends at the query's [§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration) single-consumption point. A user-authored callback-taking iterator method follows the identical rule — a general language rule, not a stdlib certification. The callback-free lazy operators (`Take`, `Skip`, `Reverse`, `Distinct`, `OfType`, `Concat`, `Union`, `Intersect`, `Except`) hold no callback and carry no such obligation. The **eager** operators (`First(pred)`, `FirstOrNull(pred)`, `Last(pred)`, `LastOrNull(pred)`, `Single(pred)`, `SingleOrNull(pred)`, `Count(pred)`, `Any(pred)`, `All(pred)`, `Sum`, `Min`, `Max`, `Average`, `Aggregate`, `ToArray`, `ToDictionary`, `ToSet`) are **call-bounded** as their unmarked signatures state — they invoke the callback during the call and retain nothing.
+**Callback retention (the callback-taking lazy operators store their callbacks).** A predicate/selector/key/combiner passed to a **lazy** operator that takes one — `Where`, `Select`, `SelectMany`, `TakeWhile`, `SkipWhile`, `OrderBy`, `OrderByDescending`, `ThenBy`, `ThenByDescending`, `GroupBy`, `Zip` — is **retained by the returned query value until enumeration**, not just for the duration of the call. These signatures are the normative instance of the language spec's deferred-activation frame-residence rule (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters) *Call-bounded × deferred activation*, v0.196): the callback resides in the returned **query value** — the deferred-activation frame — its captured borrows' sources are carried sources of that frame (spec [§28.3](Bezel_Language_Spec.md#sec-unbound-owned-temporaries)'s capture-set contribution, v0.196), and the retention ends at the query's [§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration) single-consumption point. A user-authored callback-taking iterator method follows the identical rule — a general language rule, not a stdlib certification. The callback-free lazy operators (`Take`, `Skip`, `Reverse`, `Distinct`, `Concat`, `Union`, `Intersect`, `Except`) hold no callback and carry no such obligation. The **eager** operators (`First(pred)`, `FirstOrNull(pred)`, `Last(pred)`, `LastOrNull(pred)`, `Single(pred)`, `SingleOrNull(pred)`, `Count(pred)`, `Any(pred)`, `All(pred)`, `Sum`, `Min`, `Max`, `Average`, `Aggregate`, `ToArray`, `ToDictionary`, `ToSet`) are **call-bounded** as their unmarked signatures state — they invoke the callback during the call and retain nothing.
 
 ```bezel
 public extension IEnumerable<T>
   // Filtering
   public method Where(predicate: (T) -> bool): IEnumerable<T>;
-  public method OfType<U>(): IEnumerable<U>;
 
   // Projection
   public method Select<U>(selector: (T) -> U): IEnumerable<U>;
@@ -4694,6 +4677,8 @@ Semantics and obligations (normative statement: language spec §30.12):
 
 Compiler-known data-parallel combinators over a lazy, process-wide team of worker domains (normative checking and
 runtime semantics: language spec [§30.14 "Data-parallel combinators"](Bezel_Language_Spec.md#sec-data-parallel-combinators)).
+
+> ⚠ **Spec-ahead-of-implementation (v0.284, [#3557](https://github.com/s8lap/bezel-lang/issues/3557)):** this entire class is unimplemented — no sema arm, no codegen arm, no runtime team. The surface below is the normative contract the implementation will meet; the 2026-08 subtraction review kept it on its recorded design weight (rationale §12.9; proposal 0032 §5.3's worked program) with a re-ask docketed at v0.303.
 The `body`/`selector`/`combiner` parameters are **spawn positions**: capture-free (a non-capturing lambda or a static
 method reference), with element and result sendability compiler-checked at the call site — the same admission as
 `Domain.Spawn` entries ([§6.8](#sec-domain)). This surface is not writable in user Bezel (function values are never

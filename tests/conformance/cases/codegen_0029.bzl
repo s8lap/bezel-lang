@@ -1,6 +1,6 @@
 public extension IEnumerable<T>
   // Filtering / projection (LAZY)
-  Where(predicate: (T) -> bool): IEnumerable<T>;      OfType<U>(): IEnumerable<U>;
+  Where(predicate: (T) -> bool): IEnumerable<T>;
   Select<U>(selector: (T) -> U): IEnumerable<U>;
   SelectMany<U>(selector: (T) -> IEnumerable<U>): IEnumerable<U>;
   // Quantifiers and element access (EAGER)

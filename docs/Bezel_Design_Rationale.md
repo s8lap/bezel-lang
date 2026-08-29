@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.283 — August 2026**
+**Companion to the Bezel Language Specification, v0.284 — August 2026**
 
 The spec describes the language. This document explains the choices behind it — places where two reasonable designs were possible and one was picked, places where a familiar-looking rule has a less-stated rule behind it, and places where something widely done elsewhere was deliberately left out. The spec says what the language *is*; this document says *why*, and what the alternatives would have cost.
 
@@ -1987,6 +1987,8 @@ The rule costs nothing on programs that mean what they say and catches the most 
 The reasoning: `not` reads as a boolean operation. A reader seeing `not x` expects `x` to be (or to behave like) a `bool`. Overloading `not` on arbitrary types would invite confusion — three-valued logic, set-complement semantics, "negate" as in "produce additive inverse" all have superficial appeal, but each interpretation departs from the boolean reading in ways that are easy to misread. Domain-specific inversion is better expressed by a named method (e.g. `.Negate()`, `.Invert()`, `.Complement()`), which makes intent explicit at every call site.
 
 The bitwise complement operator `~` remains user-overloadable. Types that have a meaningful bit-pattern inversion or set-complement operation can overload `~`; types with logical-style negation should provide a named method.
+
+**The binary bitwise operators (`&`, `|`, `^`, `<<`, `>>`) stay user-overloadable, recorded here since v0.284 (the 2026-08 subtraction review).** No stdlib type overloads them and no client exists yet, but the keep is structural three ways: `~`'s own ground names the *set-complement* role, which is incoherent without union and intersection beside it; removal would touch the shared grammar productions (Appendix A's `OpToken`/`IfaceStaticOperator`) and permanently strand the compound-assignment desugar for `&=`/`|=`/`^=`/`<<=`/`>>=`; and proposal 0078's checked-enum ruling already forecloses the flags-*enum* client while leaving the flags-*record* shape (a `BitMask` with `CompareTo`-free set algebra) as the anticipated user — one lit guard (#2162) pins the enum-operator composition. Re-measured each subtraction pass.
 
 <a id="sec-no-implicit-conversion-operators"></a>
 ### 14.5 No implicit conversion operators

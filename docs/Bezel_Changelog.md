@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.283 — August 2026**
+**Companion to the Bezel Language Specification, v0.284 — August 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -8642,3 +8642,27 @@ Non-blocking, all applied: the standard library conditioned `OwningArray<T>.ToAr
 - **Kernel classification: no contact. Body-locality: not applicable. Conformance corpus: no contact. Guides: no contact. Code-generation reference: no contact, pin unmoved** (v0.282, 1 behind — no surface it transcribes changed).
 - **Gate round (adversarial critique, one pass).** Verdict on the first draft: **REFUTED IN PART** — four blocking findings, all applied; the decisions survived, one stated principle did not. The substantive one: the boundary rule's first draft grounded the `Task`/`Task<T>` split in arity-sensitive rules, misreading §30.5 — Pattern A/B keys on the result's *kind*, and a `Task<()>` would differ from `Task` by nothing — so the recorded rule is now **frequency-shaped** (dedicated type where the no-value case is pervasive; instantiation where it is the minority; satellites follow their family head), and the boundary row's reopening bar was rewritten, the first draft's bar having been met by current spec text on day one. Mechanical: the `deferred` row sat in the `rejected` group and two rows were mis-alphabetized; the new rationale section had been inserted under §4's anchor (the same anchor-hijack class the v0.282 gate caught — twice is a pattern worth a mechanical check); and the census figures conflated two counting units and two document scopes, restated above with both stated. Non-blocking, applied: `Task<()>` appears in *two* parser tests (the proposal's census corrected); the §5 follow-set gains `)`/`?`; the migration figure names the rationale's own sites.
 - **Standing note:** v0.283 is the due point of the first process-§10 subtraction review (clock started v0.263; `DangerousPointer` is routed to it). Per §10 it is its own pass with its own output, deliberately not attached to any revision — it has not run yet and is now due.
+
+---
+
+### v0.284 changelog (v0.283 → v0.284)
+
+**Proposal [0121](proposals/0121-subtraction-batch-2026-08.md) graduates: the first subtraction batch lands (owner-accepted 2026-08-27, with Option B ruled for `Parallel.Reduce`).** Three removals, two honesty markers, one recorded keep — the output of the 2026-08 subtraction review ([pass record](proposals/subtraction-review-2026-08.md)), every item verified adversarially before it was proposed.
+
+**Removed (all with compiler catch-up tracked at [#3559](https://github.com/s8lap/bezel-lang/issues/3559) — until it lands, the docs' silence on these names is an impl-ahead-of-spec delta, not an absence the compiler honors):**
+
+- **`Console.Clear()`** (stdlib §2.2) — zero hits repo-wide, zero record, zero implementation.
+- **LINQ `OfType<U>()`** (stdlib §5) — zero record, own-tests-only; its unrelated-`U` soundness defect ([#3410](https://github.com/s8lap/bezel-lang/issues/3410)) dies with the member. The two conformance signature-transcriptions (`codegen_0029`, `stdlib_0092`) hand-updated per #1380; Guide 05's operator enumeration and the code-generation reference trimmed.
+- **The `Math` transcendental block** (stdlib §2.1): `Sin`/`Cos`/`Tan`/`Asin`/`Acos`/`Atan`/`Atan2`/`Sinh`/`Cosh`/`Tanh`, `Exp`, `Log` (both), `Log10`, `Log2`, and the `E` constant — 18 names at zero usage member-by-member. `Sqrt`, `Pow`, `DivRem`, `Fmod`/`IEEERemainder`, and the rounding family stay. Proposal 0042 §305's enumeration of these names was a purity-annotation batch, not a keep-defense — quoted past, not around. The table-stakes counterargument was weighed and the reopening bar recorded (a real numeric program hitting the wall re-adds what it needs, with tests). **The G1 ghost ruling rides R3's acceptance:** `Math.Hypot`, `Math.Cbrt`, and `Math.PI` — implemented but never documented, with the code-generation reference asserting `Hypot` does not exist ([#3411](https://github.com/s8lap/bezel-lang/issues/3411)) — are removed from the compiler with the block (#3559), making that assertion true when the catch-up lands.
+
+**Option B for `Parallel` (the owner's ruling): nothing removed; the honesty arrives instead.** stdlib §6.12 now carries a spec-ahead-of-implementation marker citing its new tracker ([#3557](https://github.com/s8lap/bezel-lang/issues/3557)) — the entire class is unimplemented, kept on its recorded design weight (rationale §12.9's seed ruling; proposal 0032 §5.3's worked program), with the re-ask docketed at v0.303. The bit-tier `TryWrite*` forms get the same treatment ([#3558](https://github.com/s8lap/bezel-lang/issues/3558)): documented with zero compiler support while the byte tier is fully implemented — the two families' opposite states are now stated where they stand.
+
+**Recorded keep:** the binary bitwise operators (`&`, `|`, `^`, `<<`, `>>`) stay user-overloadable, and rationale §14.4 now says why — `~`'s own set-complement ground is incoherent without union/intersection beside it; removal would touch Appendix A's shared productions and strand the compound-assignment desugar; 0078 forecloses the flags-enum client, leaving the flags-record shape as the anticipated user. Zero clients today; re-measured each subtraction pass.
+
+**Verified keeps recorded at the review, unchanged here** (so this batch's silence is not endorsement-by-omission): the `TryWrite*` byte tier, `StringBuilder.AppendFormat`, `Interop.CodeAddress<F>`, `DangerousPointer` (expiry v0.303), `Convert` and the §2 `*OrNull` tier (re-asks docketed with measurements).
+
+**Migration.**
+
+- **Newly rejected (document level):** calls to the three removed surfaces — though the compiler accepts all of them until #3559 lands, so nothing changes for a program today; the deltas are filed, not asserted. **Newly accepted: nothing.**
+- **Doc-only this revision:** stdlib (three removals, two markers), rationale (§14.4 paragraph), code-generation reference (Math digest, LINQ digest, not-exists additions; pin → v0.284), Guide 05 (one enumeration line; pin → v0.284), `DECLINED.md` (three `retired` rows, one `rejected` row), two conformance transcriptions hand-edited (#1380). **Kernel classification: no contact. Body-locality: not applicable.**
+- **Proposal ledger:** 0121 → superseded; #3409 closes at this landing; #3410 routed to #3559 (defect dies with the arm); #3411 resolved by the G1 ruling (work in #3559).
