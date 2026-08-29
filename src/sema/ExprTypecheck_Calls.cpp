@@ -6269,9 +6269,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // §4.17 (#1354): SortedDictionary<K,V> conforms to
                     // IReadOnlyCollection<DictionaryEntry<K,V>>, so it uses
                     // the same LINQ element type as Dictionary<K,V>.
+                    // fix #3511 / stdlib §4.17 / §5 (v0.285): whether THIS block
+                    // typed the call. The `SortedDictionary` block far below ends
+                    // in a catch-all V-return arm; when this block has already
+                    // typed a §5 operator over the entry element type, that arm
+                    // CLOBBERS the lazy `IEnumerable<DictionaryEntry<K, V>>` back
+                    // to the bare value type, and the `for` over `sd.Take(1)` then
+                    // reports "this source is not iterable" (§21.4). Carrying the
+                    // fact out of the block that decides it — rather than adding a
+                    // third §5 operator-name list beside `typeLinqOperator`'s and
+                    // `isLinqOperator`'s — is the point: #3372's `TryAdd` and
+                    // #2546's `GetEnumerator` are the same clobber, each patched
+                    // by one more name, and `Dictionary<K, V>` never had the bug
+                    // only because its own block has no catch-all.
+                    bool dictEntryElemTyped = false;
                     if ((colName == "Dictionary" || colName == "SortedDictionary") &&
                         recvTy && recvTy->genericArgs.size() >= 2 &&
                         recvTy->genericArgs[0] && recvTy->genericArgs[1]) {
+                        const bool hadTypeBefore = (ctx_.exprType(ce) != nullptr);
                         // Build DictionaryEntry<K,V> (same synthetic repr as
                         // ExprTypecheck.cpp §4.8 for-in case).
                         static const char kDictEntryLINQName[] = "DictionaryEntry";
@@ -6286,6 +6301,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Bool));
                         else if (m == "Count")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
+                        // issue 3576 (noted at #3511, v0.285): the type set here
+                        // is right, but codegen has NO arm for an entry-struct
+                        // element type at these four terminals on any member of
+                        // the dictionary family — `d.First()` on a plain
+                        // `Dictionary` emits the `#2434` degradation note and
+                        // yields a zero-filled entry. Until that is closed, the
+                        // `dictEntryElemTyped` hand-off at the end of this block
+                        // deliberately EXCLUDES these four names so the sorted
+                        // family keeps its loud rejection rather than joining the
+                        // quiet path. See the comment at that assignment.
                         else if (m == "First" || m == "Last" || m == "Single" ||
                                  m == "ElementAt")
                             ctx_.setExprType(&ce, entryTy);
@@ -6303,6 +6328,45 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // Where/Skip/Take/TakeWhile/SkipWhile/Distinct/OrderBy/
                         // OrderByDescending/ThenBy/Concat/… → lazy IEnumerable<DictionaryEntry<K,V>>.
                         else typeLinqOperator(entryTy);
+                        // fix #3511: this block owns the answer for every name it
+                        // typed here (including the `typeLinqOperator` fallback,
+                        // whose own name set is the one authority for §5) —
+                        // EXCEPT the four §5 element-access terminals.
+                        //
+                        // Why those four are carved out (issue 3576). `First` /
+                        // `Last` / `Single` / `ElementAt` are typed by ONE
+                        // dedicated arm a few lines above (`setExprType(entryTy)`)
+                        // and are lowered by a DIFFERENT codegen path from
+                        // everything this fix enables — and that path has no arm
+                        // for an entry-struct element type on ANY member of the
+                        // dictionary family, `Dictionary` included. It emits the
+                        // `#2434` "degraded to a zero-initialized value" NOTE,
+                        // which is not an error, so the program compiles and
+                        // yields a zero-filled entry.
+                        //
+                        // Letting the guard cover them would therefore turn a
+                        // LOUD pre-fix rejection into a SILENT wrong answer:
+                        // measured, `var f := sd.First(); … f.Key` went from a
+                        // hard "no member `Key` on primitive type `int`" (the
+                        // catch-all had typed the call as V) to compiling and
+                        // printing `0:0` with exit 0. Excluding the four names
+                        // keeps that reject exactly as loud as it was, and costs
+                        // nothing this fix delivers: every operator #3511 is
+                        // about — the lazy chain through `typeLinqOperator`, the
+                        // `Any`/`All`/`Count` bool/int arms, and the
+                        // `ToArray`/`ToSet` materializers — is typed by a
+                        // different arm and lowered by a different path.
+                        //
+                        // The carve-out is deliberately spelled by NAME rather
+                        // than by "did the element-access arm fire", because the
+                        // four names ARE the arm's whole condition; there is no
+                        // separate fact to consult.
+                        const bool isEntryElementAccess =
+                            m == "First" || m == "Last" || m == "Single" ||
+                            m == "ElementAt";
+                        dictEntryElemTyped =
+                            !hadTypeBefore && (ctx_.exprType(ce) != nullptr) &&
+                            !isEntryElementAccess;
                     }
                     // §4.15 (#549): Array<T>.AsSpan() / AsSpan(start) /
                     // AsSpan(start,length) / AsSpan(range) → ArraySpan<T>.
@@ -6900,6 +6964,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         // one.
                         else if (m == "GetEnumerator") { /* handled by the
                             #2546 gate at line 5117; do not overwrite */ }
+                        // fix #3511 / stdlib §4.17 / §5 (v0.285): a §5 operator
+                        // the shared Dictionary/SortedDictionary entry block above
+                        // already typed (`sd.Take(1)` → lazy
+                        // `IEnumerable<DictionaryEntry<K, V>>`) must NOT fall into
+                        // the catch-all below — that is the clobber #3511 reports.
+                        //
+                        // `dictEntryElemTyped` is FALSE for `First`/`Last`/
+                        // `Single`/`ElementAt` by construction (issue 3576), so
+                        // those four still reach the catch-all and are still typed
+                        // as V — which is what makes `sd.First().Key` a loud
+                        // reject instead of a silent zero-filled entry. The
+                        // reasoning is recorded where the flag is assigned.
+                        else if (dictEntryElemTyped) { /* typed above; keep it */ }
                         // Indexer / Value return: V (second generic arg).
                         else if (recvTy && recvTy->genericArgs.size() > 1 &&
                                  recvTy->genericArgs[1])

@@ -1734,6 +1734,54 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
             llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
             llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
 
+            // fix #3511 / stdlib §4.17 (v0.285): this materializer is reached for
+            // EVERY bz_dict_t*-backed receiver, `SortedDictionary<K, V>` included
+            // — `isDictTypeName` is the #1414 registry's three-name set. The
+            // snapshot above is in STORAGE order, which is right for §4.8's
+            // insertion-ordered `Dictionary` and WRONG for §4.17's "iteration
+            // visits entries in ascending key order". Sort keys and values
+            // together here, exactly as `wrapSortedDictionaryAsIEnumerable`
+            // (LlvmBackend_Calls2.cpp) does for the for-in / GetEnumerator path,
+            // so the §5 chain over a sorted map yields the same sequence the bare
+            // `for var e in sd` does.
+            //
+            // Why it matters that this is a VALUE bug and not only a rejection:
+            // sema alone (the #3511 clobber fix) makes `sd.Take(1)` COMPILE, and
+            // without this arm it then silently yields whichever entry the hash
+            // table happens to store first — measured key 3 for a map built
+            // `Add(3,·); Add(1,·); Add(2,·)`, where §4.17 requires key 1. A loud
+            // reject would have become a quiet wrong answer.
+            if (builtinTypeName(recvTy) == "SortedDictionary") {
+                // Branch on `useGen` — the SAME flag that chose the snapshot
+                // above — AND require `lensArr`, which is non-null exactly when
+                // `isStringKey`. The sort must consume the arrays in the shape
+                // they were actually filled: `bz_dict_keys_str` is what populates
+                // `lensOutSlot`, and `bz_sort_kv_str` dereferences it. The two
+                // flags agree in every case reachable today, so the conjunction
+                // is belt-and-braces rather than a live distinction — it is
+                // deliberately STRICTER than the `wrapSortedDictionaryAsIEnumerable`
+                // spelling it mirrors (LlvmBackend_Calls2.cpp), which derives
+                // `useGen = !isStringKey` and passes `lensArr` unguarded.
+                if (!useGen && lensArr) {
+                    auto* sortFn = declareC(
+                        "bz_sort_kv_str", llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy(), i64()});
+                    builder_.CreateCall(sortFn, {keysArr, lensArr, valsArr, cnt});
+                } else if (useGen) {
+                    // A key type `buildSortedKeyComparator` cannot rank returns
+                    // null; leaving the snapshot unsorted then matches what the
+                    // for-in path already does for that same key type (#1426),
+                    // rather than inventing a second answer here.
+                    if (llvm::Function* cmpFn = buildSortedKeyComparator(keyTy)) {
+                        auto* sortFn = declareC(
+                            "bz_sort_kv_gen", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy(), i64(), ptrTy()});
+                        builder_.CreateCall(sortFn,
+                                            {keysArr, valsArr, cnt, cmpFn});
+                    }
+                }
+            }
+
             // Allocate the result bz_array_t.
             auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
             llvm::Value* arr = builder_.CreateCall(
