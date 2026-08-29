@@ -1,6 +1,6 @@
 # Bezel for Code Generation
 
-*Validated against v0.284. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
+*Validated against v0.285. Companion to the Bezel Language Specification — a writing reference, not a normative document.*
 
 A dense reference for writing correct Bezel without reading the spec. It covers the syntax surface, the ownership rules, the standard-library name index, the idioms that work, and the shapes that look right and are rejected.
 
@@ -1631,7 +1631,7 @@ public method Log(items: Array<string>);     Log(["a", "b", "c"]);
 var c := new Config(timeout := 30, retries := 3);             // named constructor arguments
 ```
 
-Also absent, with the landed spelling beside it: `goto`/`break 2`/labels on non-loop statements → labeled loops (`scan: for … break scan;`); `let`/`val`/`readonly var` → `const x := e;`; `defer`/`errdefer` → `using var`, `finally`, `ScopeGuard`; `do…while`/`repeat…until` → `while` with a leading flag; local functions → a lambda bound to a local; attributes `[Obsolete]` → the closed clause vocabulary (`serialized`, `equality skip`, `when true`); `#if`/`#region` → runtime branching; `import M.{X}`/`import M.*`/`public import` → plain `import M;` (+ `as`); tuples, anonymous types, comprehensions, a value-form `(try E catch …)`, block expressions → a `record` (possibly method-local), the lazy operators, the `try` statement, and the binding atom `(var x := e; body)`; `x not in c` → `not (x in c)`; `not is` → `is not`; `default(SomeChoice)` → construct a case, or use `C?`; implicit/explicit conversion **operators** → named `To…`/`From…` methods; `operator ==` on a class → `=` always calls `Equals` (records and enums may overload); member hiding, `protected internal`, `default interface methods`, `ref` returns, class deconstruction — all rejected.
+Also absent, with the landed spelling beside it: `goto`/`break 2`/labels on non-loop statements → labeled loops (`scan: for … break scan;`); `let`/`val`/`readonly var` → `const x := e;`; `defer`/`errdefer` → `using var`, `finally`, `ScopeGuard`; `do…while`/`repeat…until` → `while` with a leading flag; local functions → a lambda bound to a local; attributes `[Obsolete]` → the closed clause vocabulary (`serialized`, `equality skip`, `when true`); `#if`/`#region` → runtime branching; `import M.{X}`/`import M.*`/`public import` → plain `import M;` (+ `as`); tuples, anonymous types, comprehensions, a value-form `(try E catch …)`, block expressions → a `record` (possibly method-local), the lazy operators, the `try` statement, and the binding atom `(var x := e; body)`; `x not in c` → `not (x in c)`; `not is` → `is not`; `default(SomeChoice)` → construct a case, or use `C?`; implicit/explicit conversion **operators** → named `To…`/`From…` methods; `operator ==` on a class → `=` always calls `Equals` (records, enums, and choices may overload); member hiding, `protected internal`, `default interface methods`, `ref` returns, class deconstruction — all rejected.
 
 ### 7.2 Ownership shapes that look fine
 
