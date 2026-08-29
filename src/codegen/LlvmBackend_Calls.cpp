@@ -9973,18 +9973,6 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     builder_.CreateFCmpOEQ(arg, negInf));
                 return builder_.CreateNot(builder_.CreateOr(isNaN, isInf), "isfinite");
             }
-            if (m == "Cbrt") {
-                // Math.Cbrt(x): double — cube root via libc cbrt().
-                auto* dbl = llvm::Type::getDoubleTy(llvm_);
-                if (!arg->getType()->isDoubleTy())
-                    arg = builder_.CreateSIToFP(arg, dbl);
-                auto* cbrtFn = module_->getFunction("cbrt");
-                if (!cbrtFn) {
-                    auto* ft = llvm::FunctionType::get(dbl, {dbl}, false);
-                    cbrtFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, "cbrt", module_.get());
-                }
-                return builder_.CreateCall(cbrtFn, {arg}, "cbrt.result");
-            }
             if (m == "Sqrt" || m == "Floor" || m == "Ceiling" || m == "Round" || m == "Truncate") {
                 // Use llvm intrinsics for common math ops. §2.2: one-argument
                 // Round is BANKER'S ROUNDING (round half to even) — that is
@@ -10124,15 +10112,14 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return builder_.CreateFDiv(rounded, scale, "round.result");
             }
         }
-        // §2.2: Math.Pi, Math.E, Math.Tau — named constants. (`PI` is the legacy
-        // spelling kept for the existing intrinsic test; the spec name is `Pi`.)
+        // §2.2 (v0.285): Math.Pi, Math.Tau — the surviving named constants.
+        // fix #3559: `E` and the never-documented `PI` spelling were removed at
+        // v0.284 (G1 ruling, issue 3411) and are rejected in sema.
         if (call.args.empty()) {
             auto* dbl = llvm::Type::getDoubleTy(llvm_);
-            if (m == "Pi" || m == "PI") return llvm::ConstantFP::get(dbl, 3.14159265358979323846);
-            if (m == "E")  return llvm::ConstantFP::get(dbl, 2.71828182845904523536);
+            if (m == "Pi") return llvm::ConstantFP::get(dbl, 3.14159265358979323846);
             if (m == "Tau") return llvm::ConstantFP::get(dbl, 6.28318530717958647692);
         }
-        // Math.Log(x), Math.Log2(x), Math.Log10(x)
         // Math.Clamp(value, min, max): clamp value to [min, max].
         if (m == "Clamp" && call.args.size() == 3 &&
             call.args[0].value && call.args[1].value && call.args[2].value) {
@@ -10210,49 +10197,20 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     builder_.CreateFCmpOGT(clamped, hi), hi, clamped, "clamp.f.result");
             }
         }
-        if (call.args.size() == 1 && call.args[0].value && (m == "Log" || m == "Log2" || m == "Log10")) {
-            llvm::Value* arg = lowerExpr(*call.args[0].value);
-            if (!arg) return nullptr;
-            auto* dbl = llvm::Type::getDoubleTy(llvm_);
-            if (!arg->getType()->isDoubleTy()) arg = builder_.CreateSIToFP(arg, dbl);
-            const char* cname = m == "Log2" ? "log2" : m == "Log10" ? "log10" : "log";
-            auto* logFn = module_->getFunction(cname);
-            if (!logFn) {
-                auto* ft = llvm::FunctionType::get(dbl, {dbl}, false);
-                logFn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, cname, module_.get());
-            }
-            return builder_.CreateCall(logFn, {arg}, std::string(m) + ".result");
-        }
-        // §6.1/§6.3: Trig functions — 1-arg via libc.
-        if (call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* arg = lowerExpr(*call.args[0].value);
-            if (!arg) return nullptr;
-            auto* dbl = llvm::Type::getDoubleTy(llvm_);
-            if (!arg->getType()->isDoubleTy()) arg = builder_.CreateSIToFP(arg, dbl);
-            const char* fn1 = m == "Sin" ? "sin" : m == "Cos" ? "cos" :
-                m == "Tan" ? "tan" : m == "Asin" ? "asin" : m == "Acos" ? "acos" :
-                m == "Atan" ? "atan" : m == "Exp" ? "exp" :
-                m == "Sinh" ? "sinh" : m == "Cosh" ? "cosh" : m == "Tanh" ? "tanh" : nullptr;
-            if (fn1) {
-                auto* fn = module_->getFunction(fn1);
-                if (!fn) {
-                    auto* ft = llvm::FunctionType::get(dbl, {dbl}, false);
-                    fn = llvm::Function::Create(ft, llvm::Function::ExternalLinkage, fn1, module_.get());
-                }
-                return builder_.CreateCall(fn, {arg}, std::string(m) + ".result");
-            }
-        }
-        // §6.1: Math.Fmod, IEEERemainder, Atan2, Hypot — 2-arg via libc.
+        // fix #3559 (stdlib §2.2, v0.285): the libc-backed lowerings for
+        // `Log`/`Log2`/`Log10`, the trig/hyperbolic/`Exp` block, `Atan2` and
+        // `Hypot` were deleted here when v0.284 removed those members from the
+        // documents. `Fmod` and `IEEERemainder` are the two survivors of the
+        // 2-arg group, so it no longer needs a name-to-libc table.
         if (call.args.size() == 2 && call.args[0].value && call.args[1].value &&
-            (m == "Fmod" || m == "IEEERemainder" || m == "Atan2" || m == "Hypot")) {
+            (m == "Fmod" || m == "IEEERemainder")) {
             llvm::Value* a = lowerExpr(*call.args[0].value);
             llvm::Value* b = lowerExpr(*call.args[1].value);
             if (!a || !b) return nullptr;
             auto* dbl = llvm::Type::getDoubleTy(llvm_);
             if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
             if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
-            const char* fn2 = m == "Fmod" ? "fmod" : m == "IEEERemainder" ? "remainder" :
-                               m == "Atan2" ? "atan2" : "hypot";
+            const char* fn2 = m == "Fmod" ? "fmod" : "remainder";
             auto* fn = module_->getFunction(fn2);
             if (!fn) {
                 auto* ft = llvm::FunctionType::get(dbl, {dbl, dbl}, false);

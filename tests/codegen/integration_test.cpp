@@ -359,7 +359,10 @@ BEZEL_TEST(integration, math_pow_and_sqrt) {
     // Math.Pow and Math.Sqrt integration.
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C public static method Main(): int "
-        "  var area := Math.PI * Math.Pow(5.0, 2.0); "
+        /* fix #3559: `Math.PI` was the never-documented duplicate spelling
+           and was removed with the v0.284 block (G1, issue 3411); `Math.Pi`
+           is the documented constant (stdlib §2.2, v0.285) and stays. */
+        "  var area := Math.Pi * Math.Pow(5.0, 2.0); "
         "  return (if area > 78.0 then 1 else 0); "
         "end Main; end C;"), 1);
 }

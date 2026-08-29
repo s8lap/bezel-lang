@@ -229,32 +229,17 @@ BEZEL_TEST(codegen_stdlib_661_singleornull_pred, singleornull_pred_probe_071b_ca
 // #651 — GroupBy / OfType — stdlib §5
 // ===========================================================================
 
-// stdlib §5 OfType: OfType<int>() on an Array<int> returns all elements
-// (homogeneous source; element type matches the requested type).
-BEZEL_TEST(codegen_stdlib_651_groupby_oftype, oftype_same_type_returns_all) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "using var a := new Array<int>(); "
-        "a.Add(1); a.Add(2); a.Add(3); "
-        "using var b := a.OfType<int>().ToArray(); "
-        "return b.Count; ")), 3);
-}
-
-// stdlib §5 OfType: OfType<int>() on empty array returns empty.
-BEZEL_TEST(codegen_stdlib_651_groupby_oftype, oftype_empty_source_returns_empty) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "using var a := new Array<int>(); "
-        "using var b := a.OfType<int>().ToArray(); "
-        "return b.Count; ")), 0);
-}
-
-// stdlib §5 OfType: OfType chained with other operators.
-BEZEL_TEST(codegen_stdlib_651_groupby_oftype, oftype_chained_with_where) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "using var a := new Array<int>(); "
-        "a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
-        "using var b := a.OfType<int>().Where(lambda(x: int) => x > 2).ToArray(); "
-        "return b.Count; ")), 2);
-}
+// fix #3559 (stdlib §5, v0.285): the three `OfType<int>()` rows that stood
+// here were REMOVED with the member. v0.284 (proposal 0121 R2) withdrew
+// `OfType<U>()` from stdlib §5, so "returns all elements", "returns empty" and
+// "chains with Where" are no longer claims the standard library makes — the
+// operator does not exist to make them about. `GroupBy` below is unaffected;
+// it was the other half of #651 and stays.
+//
+// The rejection regression tests for the removal, including the identity cell
+// these three used (which the issue-3440 interim still ADMITTED, so it is one
+// of the rows that can only pass on a compiler carrying #3559), live in
+// `tests/sema/stdlib_v0284_removals_3559_test.cpp`.
 
 // stdlib §5 GroupBy: GroupBy on empty array → empty result.
 BEZEL_TEST(codegen_stdlib_651_groupby_oftype, groupby_empty_source_returns_empty) {

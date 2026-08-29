@@ -7645,8 +7645,12 @@ bool ExprTC::extWhereClauseProvablyViolated(
 // (the table the LINQ matching in ExprTypecheck_Calls.cpp / typeCall also
 // reaches for, e.g. the `isLinqOp` check at ~15702; kept independent here
 // rather than imported, because lookupExtensionMember runs in a different
-// translation unit and the cost of duplicating a 42-row table is one
-// comment).
+// translation unit and the cost of duplicating the table is one comment).
+// The size is stated qualitatively on purpose: the "42-row" figure this
+// comment carried was already wrong before #3559 removed the `OfType` row
+// (the initializer held 54), and a hardcoded count in a comment beside a
+// table that changes every time stdlib §5 does is a claim that goes stale
+// unread.
 struct StdlibLinqOverload {
     const char* name;
     int arity;  // one entry per overload of `name` — name + arity match a
@@ -7663,7 +7667,9 @@ struct StdlibLinqOverload {
 static const StdlibLinqOverload kStdlibLinqOverloads[] = {
     // Main `extension IEnumerable<T>` block (stdlib §5 line 3497)
     // Filtering
-    {"Where", 1, ""}, {"OfType", 0, ""},
+    // fix #3559: `OfType` was removed from stdlib §5 at v0.284, so it is no
+    // longer a row of the table this list mirrors.
+    {"Where", 1, ""},
     // Projection
     {"Select", 1, ""}, {"SelectMany", 1, ""},
     // Quantifiers

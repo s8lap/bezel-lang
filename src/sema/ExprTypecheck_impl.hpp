@@ -1236,47 +1236,15 @@ private:
     // interface)? BFS, cycle-guarded.
     static bool isSubtype(TypeSymbol* from, TypeSymbol* to);
 
-    // narrow issue 3440 (stdlib §5 `OfType<U>()`, spec §8.1 *Definition*,
-    // §12 *Inheritance and Dispatch*, §12.7, v0.283): is the CURRENT `OfType<U>()` lowering — an unconditional
-    // identity pass-through that relabels every element of an
-    // `IEnumerable<srcElem>` as `outElem` with no runtime test — CORRECT for
-    // this (srcElem, outElem) pair?
-    //
-    // It is correct exactly when the test it omits would have been statically
-    // TRUE for every element AND the two types share one runtime
-    // representation, so admitting the whole sequence unchanged is the right
-    // answer. Spec §8.1 draws that line: classes, interfaces, `string` and
-    // function types reach `Object` "via their reference-type heap
-    // representation", while "records, enums, primitives, inline arrays, and
-    // the unit type derive via boxing (§8.6)" — a boxing derivation is a
-    // representation change, so a pass-through across one is a type confusion,
-    // not an upcast.
-    //
-    // It is INTENDED as an under-approximation of the sound set: a pair it
-    // cannot prove sound is reported "not yet implemented" (the caller's
-    // diagnostic) rather than lowered. Returning FALSE therefore costs a
-    // rejection, never a miscompile.
-    //
-    // ⚠ The converse does NOT hold by construction, and must not be assumed:
-    // returning TRUE is a positive claim about representation, and the first
-    // landing of this predicate got one wrong — it admitted `Range<T>` at
-    // `U = Object` because a `builtinClassSym` carries `kind == Class` even for
-    // a value type, and that cell SIGSEGV'd. The accepted set is an enumerated
-    // list of three arms, each measured, not a derivation; treat a change to any
-    // of them as a soundness change and re-measure the whole accepted set.
-    //
-    // Two genuinely undecidable inputs (a null or `Error` type) return TRUE on
-    // purpose, so an already-broken program draws its own diagnostic instead of
-    // a cascade.
-    static bool ofTypeIdentityRelabelIsSound(const TypeRef* srcElem,
-                                             const TypeRef* outElem);
-
-    // narrow issue 3440: the shared "not yet implemented" diagnostic text both
-    // `OfType<U>()` typing arms raise when the predicate above returns false.
-    // ONE spelling, because two arms reach `OfType` and a message that drifted
-    // between them would make a half-fix read as a whole one.
-    static std::string ofTypeNotImplementedMessage(const TypeRef* srcElem,
-                                                   const TypeRef* outElem);
+    // fix #3559 (stdlib §5, v0.285): the shared REMOVED-at-v0.284 diagnostic
+    // text both `OfType<U>()` typing arms raise — unconditionally, since the
+    // member no longer exists. ONE spelling, because two arms reach `OfType`
+    // and a message that drifted between them would make a half-fix read as a
+    // whole one. (Issue 3440's interim soundness predicate
+    // `ofTypeIdentityRelabelIsSound` was deleted with the member: it decided
+    // WHICH pairs to admit, and no pair is admitted now.)
+    static std::string ofTypeRemovedMessage(const TypeRef* srcElem,
+                                            const TypeRef* outElem);
 
     // #2782 / #2787: does the INTERFACE `argTy` satisfy `where T:
     // IComparable<T>`? Delegates to sema::selfComparableIface — THE one

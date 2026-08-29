@@ -2427,9 +2427,9 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                  // fell through to the Array in-place handler (Count/Sum = 0;
                  // ToArray SIGABRT on the bz.range struct read as an array).
                  // fix #1220: string is IEnumerable<char> — admit Reverse on it.
-                 (m == "Reverse" && (lazyRecv || rangeRecv || strRecv)) ||
-                 // stdlib §5 (#651): OfType<U>() — lazy identity/type-filter.
-                 m == "OfType");
+                 // fix #3559: `OfType<U>()` was removed from stdlib §5 at
+                 // v0.284 and its always-true-predicate lowering deleted here.
+                 (m == "Reverse" && (lazyRecv || rangeRecv || strRecv)));
     if (!isOp) return nullptr;
 
     // stdlib §5 (#755) / #1914: `X.GroupBy(k).SelectMany(lambda(g) => g)` — the
@@ -2748,33 +2748,6 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     if (m == "Reverse" && call.args.empty()) {
         auto* revFn = declareC("bz_lazy_reverse", ptrTy(), {ptrTy()});
         return builder_.CreateCall(revFn, {src}, "linq.reverse");
-    }
-    // stdlib §5 (#651): OfType<U>() — type-filter lazy operator.
-    // For value-type sources (monomorphic): U must equal T (statically enforced
-    // by sema since Bezel has no runtime type tags for value types), so OfType
-    // is an identity — wrap source as a Where-all (predicate always true).
-    // The element size is unchanged (U == T).
-    if (m == "OfType" && call.args.empty()) {
-        // Build a Where with an always-true predicate trampoline.
-        // kind-0 trampoline: i32(ptr closure, ptr elem) returns 1 always.
-        llvm::FunctionType* fty = llvm::FunctionType::get(i32(),
-            {ptrTy(), ptrTy()}, false);
-        auto* alwaysTrueFn = llvm::Function::Create(fty,
-            llvm::Function::InternalLinkage, "bz$oftype$tramp", module_.get());
-        auto savedIP = builder_.saveIP();
-        llvm::Function* savedFn = currentFn_;
-        currentFn_ = alwaysTrueFn;
-        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", alwaysTrueFn);
-        builder_.SetInsertPoint(entry);
-        builder_.CreateRet(builder_.getInt32(1));
-        builder_.restoreIP(savedIP);
-        currentFn_ = savedFn;
-        // bz_lazy_where with nullptr closure and alwaysTrueFn → pass-through.
-        auto* whereFn = declareC("bz_lazy_where", ptrTy(), {ptrTy(), ptrTy(), ptrTy()});
-        return builder_.CreateCall(whereFn,
-            {src, llvm::ConstantPointerNull::get(llvm::PointerType::get(llvm_, 0)),
-             alwaysTrueFn},
-            "linq.oftype");
     }
     return nullptr;
 }
