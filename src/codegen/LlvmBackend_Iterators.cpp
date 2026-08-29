@@ -1213,26 +1213,42 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             std::pair<unsigned, unsigned>> lscanOut;
         collectYieldStatesForOwnedLocals(
             ctx_, *ci.stmts, lscanState, lscanOut, lscanOk);
+        ownedLocalYieldStates.clear();
         if (lscanOk && !lscanOut.empty()) {
-            bool allTransferred = true;
+            // fix #3554: the veto must be PROPORTIONAL to the ambiguity, and
+            // the TYPE GATE MUST RUN FIRST. collectYieldStatesForOwnedLocals
+            // registers EVERY plain non-`using`, non-autoDropAtScopeEnd local
+            // with no type gate — deliberately, because the gate belongs at
+            // emit time where `frame` and the disposer table exist. So an
+            // ordinary `var q := 8;` anywhere in the body lands in the map
+            // with transferredAtState == 0, and testing that FIRST made a
+            // local with no disposal obligation at all veto the state-keyed
+            // analysis for every OTHER local in the body (measured on the
+            // §29.8 throw-after-yield shape: `live=400 dead=200`, 3200 B in
+            // 200 objects leaked from `bz$iter$Gen$MoveNext`, purely from
+            // adding an unrelated `int` local). A local that is not a
+            // dispose-via-vtable-slot-2 class/interface instance carries NO
+            // obligation on this path, so skipping it cannot produce a double
+            // free — it is not evidence of ambiguity and must not veto.
+            bool ambiguous = false;
             for (auto& [ld, pr] : lscanOut) {
+                if (!unwindOwnedLocalClass(ld)) continue;
                 if (pr.second == 0) {
-                    allTransferred = false;
-                    break;
-                }
-                if (!unwindOwnedLocalClass(ld)) {
-                    // The local's type is not a class/interface instance that
-                    // admits dispose-via-vtable-slot-2 (it might be a
-                    // collection, a Task, a built-in handle, etc.) — those
-                    // have their own disposal paths and aren't this fix's
-                    // target.
-                    allTransferred = false;
+                    // The genuinely ambiguous case, kept deliberately: a local
+                    // that IS an owned class/interface instance yet was never
+                    // transferred at a `yield return L;`. Its discharge is at a
+                    // site the linear scan cannot statically place (§29.6
+                    // catch/finally bodies are not walked), so arming the
+                    // state-keyed dispose against it would risk a double free.
+                    // Keep the conservative whole-body bail-out (the #1897
+                    // bounded leak) for that shape only.
+                    ambiguous = true;
                     break;
                 }
             }
-            if (allTransferred) {
-                ownedLocalYieldStates.clear();
+            if (!ambiguous) {
                 for (auto& [ld, pr] : lscanOut) {
+                    if (!unwindOwnedLocalClass(ld)) continue;
                     LocalKeyedDisposal info;
                     info.establishedAtState = pr.first;
                     info.transferredAtState = pr.second;
@@ -1241,11 +1257,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                         info.frameField = fit->second;
                     ownedLocalYieldStates[ld] = info;
                 }
-            } else {
-                ownedLocalYieldStates.clear();
             }
-        } else {
-            ownedLocalYieldStates.clear();
         }
     }
 
