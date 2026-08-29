@@ -572,6 +572,37 @@ if ! python3 scripts/check_enumerable_grid_spellings.py --strict \
 fi
 say "enumerable-grid phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_grid.log"))"
 
+# ── LOCALDECL-ONLY WALKER PHASE (#3591) ────────────────────────────────────
+# §21.1's runtime `const` is `ast::LocalConstDecl`, a DIFFERENT AST node from
+# `ast::LocalDecl` with differently-named fields. A walker spelled
+# `dynamic_cast<const ast::LocalDecl*>(s)` therefore silently skips every
+# `const` local. That has been fixed SEVEN separate times one site at a time
+# (#2802, #3375, #3402, #3416, #3417, #3427, #3436), with symptoms from a
+# 420 B leak to a use-after-free — and until now it was the one duplicated-
+# classification family with no detector, while its three smaller siblings
+# above all had gate-enforced ones. Fixing instance N+1 by hand is not a
+# ratchet; this is.
+say "localdecl-only-walker phase: detector self-test + walker-family ratchet (#3591)"
+if ! python3 scripts/check_localdecl_only_walkers.py --self-test \
+      > "$LOGDIR/${TAG}_localdecl.log" 2>&1; then
+  say "CYCLE FAILURE: check_localdecl_only_walkers SELF-TEST failed — the"
+  say "  detector is broken, so its verdict means nothing. See $LOGDIR/${TAG}_localdecl.log"
+  sed -n '1,20p' "$LOGDIR/${TAG}_localdecl.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+if ! python3 scripts/check_localdecl_only_walkers.py --strict \
+      >> "$LOGDIR/${TAG}_localdecl.log" 2>&1; then
+  say "CYCLE FAILURE: the LocalDecl-only walker family GREW — a new"
+  say "  dynamic_cast<[const] ast::LocalDecl*> site with no sibling"
+  say "  LocalConstDecl handling silently skips every §21.1 const local (#3591)."
+  say "  See $LOGDIR/${TAG}_localdecl.log"
+  sed -n '/LOCALDECL-ONLY WALKER FAMILY/,$p' "$LOGDIR/${TAG}_localdecl.log" 2>/dev/null \
+    | head -40 | sed 's/^/  | /' | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+say "localdecl-only-walker phase: GREEN ($(tail -1 "$LOGDIR/${TAG}_localdecl.log"))"
+
 # ── DEPRECATED-JIT-ORACLE PHASE (#3439) ────────────────────────────────────
 # `runJit`/`runJitChecked` skip the ownership and definite-assignment passes
 # and skip verifyModule, so a test on them proves less than its name suggests.
