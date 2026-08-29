@@ -2623,7 +2623,8 @@ void MethodOwnership::checkCapturedOwnedConsumeInStmt(const ast::Stmt& s) {
     scanCapturedOwnedConsumeStmt(s, /*insideLambda=*/false);
 }
 
-void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
+void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e,
+                                                  bool catchBorrowLegOnly) {
     // Gather every lambda appearing in the returned expression. The
     // returned expression is most commonly the lambda itself
     // (`return () => r.V;`), but it may also wrap it (e.g. a conditional).
@@ -2702,6 +2703,14 @@ void MethodOwnership::checkClosureEscapesOnReturn(const ast::Expr& e) {
                     "instead)");
                 return;  // one diagnostic per return is enough
             }
+            // fix #3546 (§31.1, v0.283): the lambda-body driver runs this
+            // check as a SYNTACTIC pre-pass, where only the §31.1 leg above
+            // has its input available (a sema-set flag). The legs below read
+            // `states_` / `recordBorrowLocalSource_` / the method's parameter
+            // sets, which describe the METHOD's scope, not the lambda body's
+            // — running them from there would answer the wrong question. See
+            // the header. // per §31.1 v0.283
+            if (catchBorrowLegOnly) continue;
             // §27.5 / §28.6 (#1217): a `ref` or `out` parameter is a pointer
             // into the CALLER's stack frame (§22.3). The pointer is valid only
             // for the duration of this method call. A closure that captures a

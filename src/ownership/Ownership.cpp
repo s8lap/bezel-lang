@@ -1225,6 +1225,11 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
     // so the classifier was inert there. // per §28.3 SB01-B (v0.190)
     checkLambdaTaskFamilyBorrowReturns(
         body, returnType_ ? ctx_.resolvedType(*returnType_) : nullptr);
+    // fix #3546 (§31.1, v0.283): the same reachability gap for the §31.1
+    // caught-exception escape rule — a `return <closure capturing ex>` inside
+    // a `try`/`catch` nested in a lambda body is never reached by the
+    // dataflow's ReturnStmt arm. // per §31.1 v0.283
+    checkCatchBorrowClosureEscapesInLambdaBodies(body);
 }
 
 void MethodOwnership::runExprBodyOwningReturnCheck(
@@ -1363,6 +1368,8 @@ void MethodOwnership::runExprBodyOwningReturnCheck(
     // left un-inferred in this position. // per §28.3 SB01-B (v0.190)
     checkLambdaTaskFamilyBorrowReturnsExpr(
         exprBody, returnType_ ? ctx_.resolvedType(*returnType_) : nullptr);
+    // fix #3546 (§31.1, v0.283): same reachability gap, same position.
+    checkCatchBorrowClosureEscapesInLambdaBodiesExpr(exprBody);
     // §17.15 / K8.4 (v0.216, #2098): the `=>` sibling of finishBindAtom's
     // escape check. The full ownership dataflow does not run on expression
     // bodies, but checkBindAtomBodyEscape is deliberately self-contained
@@ -7345,6 +7352,126 @@ void MethodOwnership::collectReturnDirectLambdas(
 // return type the type-checker leaves un-inferred in these positions (funcReturn
 // is null off the typed-local path — see checkOneLambdaTaskFamilyBorrowReturn).
 // A nested lambda gets no expected type (nullptr), exactly as before.
+// fix #3546 (§31.1, v0.283): drive the §31.1 caught-exception leg of
+// `checkClosureEscapesOnReturn` over every `return` reachable inside a lambda
+// body. §31.1 "Exception ownership" says the bound exception variable "is a
+// **borrow** of the in-flight exception; its source is the runtime, and its
+// lifetime is the arm body's", that it may not be "captured by a closure that
+// may outlive the arm", and that "Exception instances themselves cannot escape
+// the arm that caught them". The rejection existed but was UNREACHABLE here:
+// the dataflow drives it from `visitStmt`'s `ReturnStmt` arm, and ownership's
+// statement walks never enter a lambda body (it lives inside a `LambdaExpr`,
+// an expression). A `try`/`catch` inside a lambda body could therefore return
+// a closure over its catch binding with no diagnostic — compile rc=0, SIGSEGV
+// at run — while the byte-identical method-level spelling was rejected.
+//
+// Shape mirrors `checkLambdaTaskFamilyBorrowReturns`: collect every lambda in
+// the body (`collectBodyLambdas` already descends into nested lambdas, so the
+// flat list covers all nesting), then walk each lambda's OWN returns without
+// crossing into a nested lambda — a nested lambda's returns are checked when
+// the flat list reaches it. Purely syntactic, like that pre-pass, so it is
+// independent of the enclosing method's dataflow.
+//
+// ⚠ DELIBERATELY CONSERVATIVE, and it costs a legal program. A `return`
+// inside a lambda leaves only THAT LAMBDA; whether the lambda itself outlives
+// the arm needs escape analysis this syntactic pre-pass does not have. So a
+// lambda that is built, invoked and dropped entirely INSIDE the arm is
+// rejected too:
+//
+//   catch var ex: Exception => do
+//     var mk := lambda(): () -> int => do return lambda() => Use(ex); end;
+//     var g := mk();
+//     total := g() + g();   /* memory-safe: ASan-clean, prints 8 */
+//   end;
+//
+// §31.1 says "captured by a closure that MAY outlive the arm", so
+// over-approximating "may" is a defensible reading of an undecided case — but
+// it IS a reading the spec did not choose for us, recorded here rather than
+// left silent. Issue 3569 tracks narrowing this to lambdas whose own value
+// escapes. // per §31.1 v0.283
+void MethodOwnership::checkCatchBorrowClosureEscapesInLambdaBodies(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    std::vector<const ast::LambdaExpr*> lambdas;
+    for (const auto& s : body)
+        if (s) collectBodyLambdas(*s, lambdas);
+    for (const ast::LambdaExpr* lam : lambdas)
+        checkCatchBorrowClosureEscapesInOneLambda(*lam);
+}
+
+// The `=> E` sibling — an expression-bodied method/accessor/initializer can
+// embed a lambda exactly as a block body can. // per §31.1 v0.283
+void MethodOwnership::checkCatchBorrowClosureEscapesInLambdaBodiesExpr(
+        const ast::Expr& e) {
+    std::vector<const ast::LambdaExpr*> lambdas;
+    collectBodyLambdasExpr(e, lambdas);
+    for (const ast::LambdaExpr* lam : lambdas)
+        checkCatchBorrowClosureEscapesInOneLambda(*lam);
+}
+
+void MethodOwnership::checkCatchBorrowClosureEscapesInOneLambda(
+        const ast::LambdaExpr& lam) {
+    // An expression-bodied lambda's `=> E` IS its returned value.
+    if (lam.exprBody) {
+        checkClosureEscapesOnReturn(*lam.exprBody,
+                                    /*catchBorrowLegOnly=*/true);
+        return;
+    }
+    for (const auto& s : lam.stmts)
+        if (s) scanCatchBorrowClosureReturns(*s);
+}
+
+// Mirrors `collectReturnDirectLambdas` node-for-node so this walk reaches
+// exactly the returns that traversal classifies — including a `try`/`catch`
+// arm body, which is the shape this fix exists for. // per §31.1 v0.283
+void MethodOwnership::scanCatchBorrowClosureReturns(const ast::Stmt& s) {
+    if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+        if (rs->value)
+            checkClosureEscapesOnReturn(*rs->value,
+                                        /*catchBorrowLegOnly=*/true);
+        return;
+    }
+    if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+        for (const auto& bs : ifs->ifBranch.body)
+            if (bs) scanCatchBorrowClosureReturns(*bs);
+        for (const auto& el : ifs->elifBranches)
+            for (const auto& bs : el.body)
+                if (bs) scanCatchBorrowClosureReturns(*bs);
+        for (const auto& bs : ifs->elseBody)
+            if (bs) scanCatchBorrowClosureReturns(*bs);
+        return;
+    }
+    if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+        for (const auto& bs : ws->body)
+            if (bs) scanCatchBorrowClosureReturns(*bs);
+        return;
+    }
+    if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+        for (const auto& bs : fs->body)
+            if (bs) scanCatchBorrowClosureReturns(*bs);
+        return;
+    }
+    if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+        for (const auto& bs : db->body)
+            if (bs) scanCatchBorrowClosureReturns(*bs);
+        return;
+    }
+    if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+        for (const auto& bs : trys->body)
+            if (bs) scanCatchBorrowClosureReturns(*bs);
+        for (const auto& arm : trys->catches)
+            if (arm.body) scanCatchBorrowClosureReturns(*arm.body);
+        for (const auto& bs : trys->finallyBody)
+            if (bs) scanCatchBorrowClosureReturns(*bs);
+        return;
+    }
+    if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+        for (const auto& arm : cs->arms)
+            for (const auto& bs : arm.stmts)
+                if (bs) scanCatchBorrowClosureReturns(*bs);
+        return;
+    }
+}
+
 void MethodOwnership::checkLambdaTaskFamilyBorrowReturnsExpr(
         const ast::Expr& e, const sema::TypeRef* topExpected) {
     std::vector<const ast::LambdaExpr*> lambdas;
@@ -9599,6 +9726,8 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
             mo.checkLambdaTaskFamilyBorrowReturnsExpr(
                 *od->exprBody,
                 od->returnType ? ctx.resolvedType(*od->returnType) : nullptr);
+            // fix #3546 (§31.1, v0.283): same reachability gap, same position.
+            mo.checkCatchBorrowClosureEscapesInLambdaBodiesExpr(*od->exprBody);
         }
     } else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
         // #1484 / §28.6: a field INITIALIZER (`f: T := E`) is an ownership-
@@ -9627,6 +9756,9 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
             mo.checkLambdaTaskFamilyBorrowReturnsExpr(
                 *fd->initializer,
                 fd->type ? ctx.resolvedType(*fd->type) : nullptr);
+            // fix #3546 (§31.1, v0.283): same reachability gap, same position.
+            mo.checkCatchBorrowClosureEscapesInLambdaBodiesExpr(
+                *fd->initializer);
         }
     } else if (auto* nt = dynamic_cast<const ast::NestedTypeMember*>(&m)) {
         if (nt->decl) {
@@ -9665,6 +9797,8 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
             mo.checkLambdaTaskFamilyBorrowReturnsExpr(
                 *pd->exprBody,
                 pd->type ? ctx.resolvedType(*pd->type) : nullptr);
+            // fix #3546 (§31.1, v0.283): same reachability gap, same position.
+            mo.checkCatchBorrowClosureEscapesInLambdaBodiesExpr(*pd->exprBody);
         } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
             for (const auto& acc : pd->accessors) {
                 MethodOwnership mo(ctx);
@@ -9695,6 +9829,14 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
                         acc.stmts,
                         (!acc.isSet && pd->type) ? ctx.resolvedType(*pd->type)
                                                  : nullptr);
+                // fix #3546 (§31.1, v0.283): same reachability gap, same
+                // position. Both accessor body shapes.
+                if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
+                    acc.exprBody)
+                    mo.checkCatchBorrowClosureEscapesInLambdaBodiesExpr(
+                        *acc.exprBody);
+                else if (acc.bodyKind == ast::PropertyAccessorBodyKind::Block)
+                    mo.checkCatchBorrowClosureEscapesInLambdaBodies(acc.stmts);
                 if (acc.isSet) continue;  // §28.6 getter-fresh-owned: getters only
                 if (acc.bodyKind == ast::PropertyAccessorBodyKind::Expression &&
                     acc.exprBody) {

@@ -506,3 +506,150 @@ BEZEL_TEST(catch_escape_local_use, no_binding_arm_clean_31_2_1) {
         "end Handle;"));
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// =====================================================================
+// POSITIVE 5 — fix #3546 (§31.1, v0.283): the `try`/`catch` sits INSIDE A
+//              LAMBDA BODY and the closure escapes the arm by `return`.
+//
+// §31.1 "Exception ownership": the bound exception variable "is a **borrow** of
+// the in-flight exception; its source is the runtime, and its lifetime is the
+// arm body's"; the borrow "may not be ... captured by a closure that may
+// outlive the arm"; "Exception instances themselves cannot escape the arm that
+// caught them."
+//
+// The rejection for the RETURN channel already existed and was UNREACHABLE
+// here: the dataflow drives `checkClosureEscapesOnReturn` from `visitStmt`'s
+// `ReturnStmt` arm, and ownership's statement walks never enter a lambda body
+// (a lambda body lives inside a `LambdaExpr`, an *expression*). Measured on
+// e57a1eb: the program below compiled with NO diagnostic (rc=0) and SIGSEGV'd
+// at run, while the byte-identical spelling with the `try` at method top level
+// (POSITIVE 3 above) was correctly rejected.
+// =====================================================================
+
+// The filed repro's shape: a lambda whose body is a `try`/`catch`, and whose
+// catch arm `return`s a closure capturing `ex`. The `return` leaves the LAMBDA,
+// which leaves the arm, so the closure outlives the exception. (§31.1.)
+BEZEL_TEST(catch_escape_closure, return_capturing_closure_from_lambda_body_diagnosed_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var mk := lambda(): () -> int => do "
+        "    try DoWork(); "
+        "    catch var ex: Exception => do "
+        "      return lambda() => Use(ex); "
+        "    end; "
+        "    end; "
+        "    return lambda() => 0; "
+        "  end; "
+        "  var g := mk(); "
+        "  return g(); "
+        "end Handle;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned closure captures the caught exception `ex`"));
+}
+
+// The same escape one level deeper — the `try` sits inside a `do ... end` block
+// inside the lambda body. The arm-body traversal must reach it through the
+// nested block exactly as the method-level walk does. (§31.1.)
+BEZEL_TEST(catch_escape_closure, return_capturing_closure_from_nested_block_in_lambda_body_diagnosed_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var mk := lambda(): () -> int => do "
+        "    do "
+        "      try DoWork(); "
+        "      catch var ex: Exception => do "
+        "        return lambda() => Use(ex); "
+        "      end; "
+        "      end; "
+        "    end; "
+        "    return lambda() => 0; "
+        "  end; "
+        "  var g := mk(); "
+        "  return g(); "
+        "end Handle;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned closure captures the caught exception `ex`"));
+}
+
+// --- POSITIVE 5 negative controls (must NOT be rejected) ------------------
+
+// CONTROL (§31.1): inside a lambda body, a closure that captures `ex` but is
+// INVOKED LOCALLY within the arm does not outlive the arm — the same boundary
+// the method-level control above guards. The new lambda-body traversal must not
+// widen the rejection to it.
+BEZEL_TEST(catch_escape_closure, lambda_body_local_closure_capturing_binding_invoked_locally_clean_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var mk := lambda(): int => do "
+        "    var n: int := 0; "
+        "    try DoWork(); "
+        "    catch var ex: Exception => do "
+        "      var f := lambda() => Use(ex); "
+        "      n := f(); "
+        "    end; "
+        "    end; "
+        "    return n; "
+        "  end; "
+        "  return mk(); "
+        "end Handle;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// CONTROL (§31.1): the spec's own remedy — copy the data out of the exception
+// ("copy the relevant data out of it (typically `ex.Message` ...) into separate
+// owned values") — and return a closure over the COPY. `k` is an `int`; nothing
+// borrows the exception, so returning the closure from the lambda body is legal.
+BEZEL_TEST(catch_escape_closure, lambda_body_return_closure_over_copied_value_clean_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var mk := lambda(): () -> int => do "
+        "    try DoWork(); "
+        "    catch var ex: Exception => do "
+        "      var k := ex.Message.Length; "
+        "      return lambda() => k; "
+        "    end; "
+        "    end; "
+        "    return lambda() => 0; "
+        "  end; "
+        "  var g := mk(); "
+        "  return g(); "
+        "end Handle;"));
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// KNOWN OVER-APPROXIMATION (issue 3569) — pinned here so the decision is a
+// recorded choice rather than a later surprise.
+//
+// The lambda-body driver added for issue 3546 is SYNTACTIC: it rejects a
+// returned closure over a catch binding anywhere in a lambda body. A `return`
+// inside a lambda leaves only THAT LAMBDA, and deciding whether the lambda
+// itself outlives the arm needs escape analysis the pre-pass does not have.
+// Here `mk` is built, invoked, and dropped entirely INSIDE the arm, so nothing
+// outlives the exception — the program is memory-safe (measured: exit 0,
+// prints 8, ASan-clean before the issue-3546 fix) and it is now REJECTED.
+//
+// §31.1's wording is "captured by a closure that **may** outlive the arm", so
+// over-approximating "may" is a defensible reading of a case the spec leaves
+// undecided; it is not a free one. Issue 3569 tracks narrowing the driver to
+// lambdas whose own value escapes. If that lands, THIS ROW FLIPS to
+// BEZEL_EXPECT_FALSE — it is the marker for that work, not a rule of §31.1.
+BEZEL_TEST(catch_escape_closure, lambda_confined_to_arm_over_rejected_known_3569_31_1) {
+    auto r = parseAndCheckOwnership(wrap(
+        "public method Handle(): int "
+        "  var total: int := 0; "
+        "  try DoWork(); "
+        "  catch var ex: Exception => do "
+        "    var mk := lambda(): () -> int => do "
+        "      return lambda() => Use(ex); "
+        "    end; "
+        "    var g := mk(); "
+        "    total := g() + g(); "
+        "  end; "
+        "  end; "
+        "  return total; "
+        "end Handle;"));
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "returned closure captures the caught exception `ex`"));
+}

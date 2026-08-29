@@ -379,6 +379,25 @@ public:
     void checkLambdaTaskFamilyBorrowReturnsExpr(
         const ast::Expr& e, const sema::TypeRef* topExpected = nullptr);
 
+    // fix #3546 (§31.1, v0.283): §31.1 states the catch-arm binding "may not
+    // be ... captured by a closure that may outlive the arm", and "Exception
+    // instances themselves cannot escape the arm that caught them". The RETURN
+    // channel of that rejection lives in `checkClosureEscapesOnReturn`, which
+    // the dataflow drives from `visitStmt`'s `ReturnStmt` arm — and ownership's
+    // statement walks deliberately never enter a lambda body (a lambda body
+    // lives inside a `LambdaExpr`, an *expression*). So a `return <closure
+    // capturing ex>` inside a `try`/`catch` that itself sits inside a lambda
+    // body was never classified: it compiled clean and segfaulted at runtime,
+    // while the byte-identical method-level spelling was rejected. These
+    // drivers reach exactly those returns and feed the SAME check — no second
+    // spelling of the rule, and no second spelling of "is this decl a catch-arm
+    // binding". Mirrors `checkLambdaTaskFamilyBorrowReturns{,Expr}`'s
+    // collect-every-lambda-then-walk-its-own-returns shape. // per §31.1 v0.283
+    void checkCatchBorrowClosureEscapesInLambdaBodies(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    void checkCatchBorrowClosureEscapesInLambdaBodiesExpr(const ast::Expr& e);
+    void checkCatchBorrowClosureEscapesInOneLambda(const ast::LambdaExpr& lam);
+
     // #2166 / §28.10 (v0.220): the `using var` borrow-pin classification
     // (`handleLocalDecl`'s `usingVarSourceIsBorrow` flag — see the #2128/#2137
     // derivation above) is set by the dataflow's `visitStmt` walk for every
@@ -1383,7 +1402,40 @@ private:
     // local's enclosing scope, and the returned closure outlives that
     // scope — a use-after-dispose. Walks the returned expression for any
     // LambdaExpr and diagnoses each offending capture.
-    void checkClosureEscapesOnReturn(const ast::Expr& e);
+    //
+    // `catchBorrowLegOnly` (issue 3546, §31.1, v0.283): run ONLY the §31.1
+    // caught-exception leg and skip the §27.5 ref/out, §9.7 borrow-bearing
+    // record/choice and §28.9 owned-local legs. Set by
+    // `checkCatchBorrowClosureEscapesInLambdaBodies` (declared in the public
+    // section above), whose syntactic pre-pass cannot supply those legs'
+    // inputs: `states_` and `recordBorrowLocalSource_` hold METHOD-scope
+    // locals only, never a lambda body's own, so those legs would silently
+    // answer about the wrong scope. `isCatchBorrow` needs no such input — it
+    // reads a sema-set flag (`sema::LocalSymbol::isCatchBinding`, issue 3521),
+    // so it classifies the captured identifier exactly from there.
+    //
+    // ⚠ That exactness is about CLASSIFYING the identifier, NOT about escape.
+    // A `return` inside a lambda leaves only THAT LAMBDA, and whether the
+    // lambda itself outlives the arm needs escape analysis this pre-pass does
+    // not have. The driver is therefore deliberately CONSERVATIVE: it rejects
+    // a returned closure over a catch binding anywhere in a lambda body,
+    // including the case where the lambda provably does not outlive the arm
+    // (`var mk := lambda(): () -> int => do return lambda() => Use(ex); end;
+    // var g := mk(); total := g();` — memory-safe, ASan-clean, and rejected).
+    // §31.1's own wording is "captured by a closure that MAY outlive the arm",
+    // so over-approximating "may" is a defensible reading, but it IS a choice
+    // the spec did not make for us and it costs a legal program. Issue 3569
+    // tracks narrowing it to lambdas whose own value escapes.
+    void checkClosureEscapesOnReturn(const ast::Expr& e,
+                                     bool catchBorrowLegOnly = false);
+
+    // Per-statement walker for `checkCatchBorrowClosureEscapesInOneLambda`:
+    // reaches every `return E;` in one lambda body without crossing a nested
+    // lambda (a nested lambda's returns belong to it and are reached when the
+    // flat collect list gets to it). Mirrors `collectReturnDirectLambdas`
+    // node-for-node.
+    void scanCatchBorrowClosureReturns(const ast::Stmt& s);
+
 
     // §28.3 (v0.184, #1958) "Captured owned bindings": inside a closure a
     // captured owned binding — an owned local or `owned` parameter of the
