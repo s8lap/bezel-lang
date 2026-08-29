@@ -115,7 +115,7 @@ The `Object` overloads invoke `ToString()`. For interpolated strings, the compil
 <a id="sec-math"></a>
 ### 2.2 `Math`
 
-A static class of mathematical functions and constants. All trigonometric functions take and return `double` (radians). Constants are `double`.
+A static class of mathematical functions and constants. Constants are `double`.
 
 ```bezel
 public static class Math
@@ -140,7 +140,6 @@ public static class Math
                                                                             //   member declares no `out` (§22.15);
                                                                             //   the tuple shape 0062 sketched does
                                                                             //   not exist (no tuples).
-
 
   public static pure method Floor(x: double): double;
   public static pure method Ceiling(x: double): double;
@@ -2434,7 +2433,6 @@ end IOwningAsyncEnumerator;
 
 A type may implement both `IEnumerable<T>` and `IOwningEnumerable<T>`. `OwningArray<T>` does so: default iteration via `IEnumerable<T>` yields borrows of T (the standard read-only-iteration semantics); drain iteration via `IOwningEnumerable<T>` yields owned T values that the consumer must discharge. The for-loop desugaring picks based on the static type of the source expression: `for var x in arr do` desugars via `IEnumerable<T>` (borrowing); `for var x in arr.Drain() do` desugars via `IOwningEnumerable<T>` (owning). Family-wide (v0.258): every owning collection's `Drain()` mints a **fresh drain-view frame** — a caller-owned enumerable over the collection, never the collection re-exposed (spec [§28.3](Bezel_Language_Spec.md#sec-producers)'s calls-mint rule; [§4.5](#sec-ownedarrayt) states the `OwningArray<T>` case) — so the frame's disposal at loop end never disposes the collection, and partial iteration leaves the undrained remainder in place. A drain view is **not single-pass**: it is an ordinary owned frame, not a spec-[§29.11](Bezel_Language_Spec.md#sec-multiple-enumeration) lazy query (the affine filing retired at v0.258), and each `GetOwningEnumerator()` call on a live view yields a fresh enumerator over the collection's *current* remainder — [§4.5](#sec-ownedarrayt)'s partial-iteration contract means a re-enumeration continues draining what remains, never replaying what already left.
 
-
 <a id="sec-owned-buffers-and-spans"></a>
 <a id="sec-ownedbuffert-spant-readonlyspant"></a>
 ### 4.14 `OwningBuffer<T>`, `Span<T>`, `ReadOnlySpan<T>`
@@ -3446,7 +3444,6 @@ first).
 
 ---
 
-
 <a id="sec-counterk"></a>
 ### 4.20 `Counter<K>` (v0.215)
 
@@ -4328,7 +4325,6 @@ await for var t in Task.WhenEach(move tasks) do         // t: owned OwningTask<R
 end;
 ```
 
-
 <a id="sec-domain"></a>
 ### 6.8 `Domain`
 
@@ -4523,7 +4519,6 @@ end Pool;
 
 Shutdown traces entirely from documented rules: `senders.Clear()` disposes every job-sender (§4.5) ⇒ each inbox closes (the closing rule above) ⇒ each worker's `ReceiveAll` yields the tail and completes normally ⇒ the worker's `using var c` disposes its context, cascading into its results-sender ⇒ after all N dispose, the results channel closes ⇒ the boss's `ReceiveAll` completes ⇒ the joins are awaited (§6.8).
 
-
 ---
 
 <a id="sec-taskscope"></a>
@@ -4679,6 +4674,7 @@ Compiler-known data-parallel combinators over a lazy, process-wide team of worke
 runtime semantics: language spec [§30.14 "Data-parallel combinators"](Bezel_Language_Spec.md#sec-data-parallel-combinators)).
 
 > ⚠ **Spec-ahead-of-implementation (v0.284, [#3557](https://github.com/s8lap/bezel-lang/issues/3557)):** this entire class is unimplemented — no sema arm, no codegen arm, no runtime team. The surface below is the normative contract the implementation will meet; the 2026-08 subtraction review kept it on its recorded design weight (rationale §12.9; proposal 0032 §5.3's worked program) with a re-ask docketed at v0.303.
+
 The `body`/`selector`/`combiner` parameters are **spawn positions**: capture-free (a non-capturing lambda or a static
 method reference), with element and result sendability compiler-checked at the call site — the same admission as
 `Domain.Spawn` entries ([§6.8](#sec-domain)). This surface is not writable in user Bezel (function values are never

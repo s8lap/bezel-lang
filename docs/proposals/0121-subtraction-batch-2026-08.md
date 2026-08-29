@@ -1,6 +1,6 @@
 # 0121 — Subtraction batch, 2026-08: four removals, one recorded keep, two ghost rulings
 
-**Status:** under-review — the output of the [2026-08 subtraction review](subtraction-review-2026-08.md) (process §10: the pass mints no removal; this proposal is its docket for the owner queue). Every claim below survived an adversarial verification lane that refuted three sibling candidates; the greps and record-searches are in the review record.
+**Status:** graduated-v0.284 — superseded — graduated v0.284 (owner-accepted 2026-08-27, in the owner's words: "I accept 0121 with Option B for Parallel.Reduce"). Landed with the v0.284 gate's corrections (the changelog records them: §-numbers, the honest 15-name count, the 0078 quotation, two further transcription cases). *(prior: under-review — the 2026-08 subtraction review's docket.)*
 **Tracking issue:** [#3409](https://github.com/s8lap/bezel-lang/issues/3409)
 **Target module(s):** stdlib §2.2 (`Console`), §5 (LINQ), §2.1 (`Math`), §6.12 (`Parallel`); rationale §14.4 (one paragraph); conformance corpus per item. **Grammar untouched by every item.**
 **Written against:** v0.283

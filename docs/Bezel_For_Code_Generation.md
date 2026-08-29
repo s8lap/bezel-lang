@@ -650,11 +650,10 @@ public static class Console
   public static method ReadKey(): char;                // EndOfStreamException at end of input
   public static method ReadKeyOrNull(): char?;
   public static readonly property In: TextReader;   Out: TextWriter;   Error: TextWriter;
-  public static method Clear();
 end
 
 public static class Math
-  public static const Pi: double;   E: double;   Tau: double;
+  public static const Pi: double;   Tau: double;
   public static pure method Abs(int|long|double|decimal) -> same;
   public static method Min<T>(a: T, b: T): T where T: IComparable<T>;     // NOT pure
   public static method Max<T>(a: T, b: T): T where T: IComparable<T>;     // NOT pure
@@ -1354,7 +1353,7 @@ Every absence below was verified by a full-document search. Reaching for one of 
 
 **Concurrency.** `Thread`, `ThreadPool`, `Monitor`, a `lock` statement (→ `Mutex`/`Locked<T>`), `Interlocked` (→ `Atomic<T>`), `ManualResetEvent`/`AutoResetEvent`/`CountdownEvent`/`Barrier`, `Task.Run` (→ `Domain.Spawn`), `Task.CompletedTask` (→ `Task.FromResult`), `Task.Yield`, `ConfigureAwait`, `Task.Wait`/`.Result` inside async code, `AggregateException` (first fault wins; **no aggregation**), `Parallel.For`.
 
-**Everything else.** `Object.MemberwiseClone` and any clone facility, `ICloneable`, member reflection (**declined, not deferred**), attributes, `Activator`, `Lazy<T>`, `WeakReference` (→ `Weak<T>`), `Option<T>` (→ `T?`), `Result.Unwrap`/`UnwrapOrElse`, `Math.Round(decimal)` (→ `Decimal.Round`), `Math.Cbrt`/`Hypot`/`BigMul`, `Random.Shared`, cryptographic randomness, a `Guid` constructor, `Environment.StackTrace`/`CurrentDirectory`/`TickCount`, `Convert` from any non-`string` source, `Encoding.GetEncoding(name)`/`Encoding.Default`, `OutOfMemoryException`, `InnerException` on user exception types, multidimensional arrays, `defer`/`errdefer` (→ `ScopeGuard`).
+**Everything else.** `Object.MemberwiseClone` and any clone facility, `ICloneable`, member reflection (**declined, not deferred**), attributes, `Activator`, `Lazy<T>`, `WeakReference` (→ `Weak<T>`), `Option<T>` (→ `T?`), `Result.Unwrap`/`UnwrapOrElse`, `Math.Round(decimal)` (→ `Decimal.Round`), `Math.Cbrt`/`Hypot`/`BigMul`, `Random.Shared`, cryptographic randomness, a `Guid` constructor, `Environment.StackTrace`/`CurrentDirectory`/`TickCount`, `Convert` from any non-`string` source, `Encoding.GetEncoding(name)`/`Encoding.Default`, `OutOfMemoryException`, `InnerException` on user exception types, multidimensional arrays, `defer`/`errdefer` (→ `ScopeGuard`). (the compiler still ships `Cbrt`/`Hypot`/`PI` until #3559 lands — impl-ahead, do not use)
 
 ### 5.12 The `pure` inventory
 

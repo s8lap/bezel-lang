@@ -1,6 +1,5 @@
 public static class Math
   public static const Pi: double := 3.14159265358979323846;
-  public static const E: double := 2.71828182845904523536;
   public static const Tau: double := 6.28318530717958647692;
 
   public static pure method Abs(x: int): int;
@@ -21,22 +20,7 @@ public static class Math
                                                                             //   member declares no `out` (§22.15);
                                                                             //   the tuple shape 0062 sketched does
                                                                             //   not exist (no tuples).
-  public static pure method Exp(x: double): double;
-  public static pure method Log(x: double): double;       // natural log
-  public static pure method Log(x: double, base_: double): double;
-  public static pure method Log10(x: double): double;
-  public static pure method Log2(x: double): double;
 
-  public static pure method Sin(x: double): double;
-  public static pure method Cos(x: double): double;
-  public static pure method Tan(x: double): double;
-  public static pure method Asin(x: double): double;
-  public static pure method Acos(x: double): double;
-  public static pure method Atan(x: double): double;
-  public static pure method Atan2(y: double, x: double): double;
-  public static pure method Sinh(x: double): double;
-  public static pure method Cosh(x: double): double;
-  public static pure method Tanh(x: double): double;
 
   public static pure method Floor(x: double): double;
   public static pure method Ceiling(x: double): double;
