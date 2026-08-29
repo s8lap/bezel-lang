@@ -3398,8 +3398,25 @@ void Emitter::prePopulateBasePositionalFields(
         }
     }
     // --- Case (b): explicit ctor with leading base(...) chain call ---
-    else if (cs && !cs->params.empty() && !ctorArgVals.empty() &&
-             cs->params.size() == ctorArgVals.size()) {
+    // fix #3523 (§22.10 / §22.8 step 0 / §12.8, v0.283): the guard used to
+    // require `!cs->params.empty()`, so a ZERO-parameter derived constructor
+    // never reached the scan below and its base's positional slots kept their
+    // calloc zero — `class D: B` with `constructor() base(7);` over
+    // `class B(n: int)` read 0, while the otherwise identical `class E: B`
+    // with `constructor(v: int) base(v);` read the right value. Nothing in
+    // §22.8 step 0 or §12.8 makes the base's slots depend on the DERIVED
+    // constructor's own arity. The clause's only purpose is to bind that
+    // constructor's parameters into `paramSlots_` so a chain argument that
+    // READS one can be lowered; a chain call whose arguments read nothing
+    // needs no bindings, which is exactly the zero-parameter case, and the
+    // binding loop below is `pi < cs->params.size()` so it runs zero times
+    // there. `emitChainCall` does not cover for it either: for a base with no
+    // explicit constructor it takes the `!isThis && !hasAnyConstructor`
+    // branch, which runs the base's field initializers and never lowers the
+    // chain arguments.
+    else if (cs && (cs->params.empty() ||
+                    (!ctorArgVals.empty() &&
+                     cs->params.size() == ctorArgVals.size()))) {
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (cd && !cd->body.empty()) {
             bool isThis = false;
