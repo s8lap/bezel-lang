@@ -7,6 +7,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/AwaitScan.hpp"  // fix #3587: the shared await-site walk
 #include "common/BuiltinRegistry.hpp"  // #1985: isBuiltinExceptionName
 #include "common/OwnershipFacts.hpp"  // #1801: bare-type-parameter source set
 
@@ -11383,76 +11384,17 @@ void MethodOwnership::checkAsyncSignatureBorrowBearing(
     }
 }
 
+// fix #3587 (CLAUDE.md §6 dedup) / #2251: thin wrapper over the ONE
+// both-sources await-site walk (src/common/AwaitScan.hpp). This used to be
+// its own hand-written dynamic_cast chain covering 16 of the 32 `ast::*Expr`
+// kinds, silently missing `ast::CaseExpr` (MEASURED live — a real hang, not
+// latent) and `ast::BindExpr` (latent behind sema's #2098 `inBindAtom_`
+// gate) — see AwaitScan.hpp's header for the full rationale.
 bool MethodOwnership::exprContainsAwait(const ast::Expr* e) const {
-    if (!e) return false;
-    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
-        if (ue->op == "await") return true;
-        return exprContainsAwait(ue->operand.get());
-    }
-    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e))
-        return exprContainsAwait(be->left.get()) ||
-               exprContainsAwait(be->right.get());
-    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e))
-        return exprContainsAwait(ma->target.get());
-    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e))
-        return exprContainsAwait(nm->target.get());
-    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
-        if (exprContainsAwait(ce->callee.get())) return true;
-        for (const auto& a : ce->args)
-            if (exprContainsAwait(a.value.get())) return true;
-        return false;
-    }
-    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
-        if (exprContainsAwait(nc->callee.get())) return true;
-        for (const auto& a : nc->args)
-            if (exprContainsAwait(a.value.get())) return true;
-        return false;
-    }
-    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
-        if (exprContainsAwait(ix->target.get())) return true;
-        for (const auto& a : ix->indices)
-            if (exprContainsAwait(a.value.get())) return true;
-        return false;
-    }
-    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e))
-        return exprContainsAwait(bg->operand.get());
-    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
-        for (const auto& a : ne->args)
-            if (exprContainsAwait(a.value.get())) return true;
-        return false;
-    }
-    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e))
-        return exprContainsAwait(cd->condition.get()) ||
-               exprContainsAwait(cd->thenValue.get()) ||
-               exprContainsAwait(cd->elseValue.get());
-    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
-        return exprContainsAwait(te->operand.get());
-    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e))
-        return exprContainsAwait(th->operand.get());
-    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
-        if (exprContainsAwait(we->source.get())) return true;
-        for (const auto& ia : we->assigns)
-            if (exprContainsAwait(ia.value.get())) return true;
-        return false;
-    }
-    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e))
-        return exprContainsAwait(re->lo.get()) ||
-               exprContainsAwait(re->hi.get()) ||
-               exprContainsAwait(re->step.get());
-    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
-        for (const auto& k : cl->keys)
-            if (exprContainsAwait(k.get())) return true;
-        for (const auto& v : cl->elements)
-            if (exprContainsAwait(v.get())) return true;
-        return false;
-    }
-    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
-        for (const auto& p : is->parts)
-            if (exprContainsAwait(p.expr.get())) return true;
-        return false;
-    }
-    // LambdaExpr: a separate async scope — not descended (§30.6).
-    return false;
+    bool found = false;
+    bezel::common::forEachAwaitSite(
+        e, [&](const ast::UnaryExpr*) { found = true; });
+    return found;
 }
 
 // ---------------------------------------------------------------------------

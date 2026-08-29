@@ -1,6 +1,7 @@
 #include "flow/CFG.hpp"
 
 #include "ast/Node.hpp"
+#include "common/AwaitScan.hpp"  // fix #3587: the shared await-site walk
 
 namespace bezel::flow {
 
@@ -36,111 +37,25 @@ namespace {
 
 // Async-readiness 3a: record every explicit `await` UnaryExpr (§30.2)
 // reachable from `e` into `block->awaitSites`, via `cfg.recordAwaitSite`.
+// Purely additive: only `awaitSites` is touched.
 //
-// The walk mirrors the sub-expression recursion shape used by the
-// definite-assignment analyzer (sema/DefiniteAssignment.cpp), descending
-// into every operand/argument/element. It deliberately does NOT descend
-// into a `LambdaExpr` body: a `LambdaExpr` is its own async scope (§30.6 —
-// an `async` lambda compiles to its own state machine), so an `await`
-// inside it is a suspend point of the lambda's CFG, not of the enclosing
-// method's. This matches how DefiniteAssignment treats lambda bodies as a
-// separate scope. Purely additive: only `awaitSites` is touched.
+// fix #3587 (CLAUDE.md §6 dedup) / #2251: thin wrapper over the ONE
+// both-sources await-site walk (src/common/AwaitScan.hpp). This used to be
+// its own hand-written dynamic_cast chain — the one of the four original
+// copies that already had the `BindExpr` arm (see AwaitScan.hpp's header for
+// the full rationale, including the LIVE `CaseExpr` gap this closes: MEASURED
+// hangs, not latent — the OLD comment below this file carried, asserting
+// "CaseExpr: no `await`-bearing child reachable ... in the enclosing method's
+// CFG," was wrong). The walk still mirrors the sub-expression recursion shape
+// used by the definite-assignment analyzer (sema/DefiniteAssignment.cpp) and
+// still deliberately does NOT descend into a `LambdaExpr` body — a
+// `LambdaExpr` is its own async scope (§30.6), so an `await` inside it is a
+// suspend point of the lambda's CFG, not of the enclosing method's.
 void recordAwaitsInExpr(CFG& cfg, CFGBlock* block, const ast::Expr* e) {
-    if (!e) return;
-    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(e)) {
-        if (ue->op == "await") {
-            // §30.2: this UnaryExpr is the suspend site.
-            cfg.recordAwaitSite(block, ue);
-        }
-        recordAwaitsInExpr(cfg, block, ue->operand.get());
-        return;
-    }
-    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, be->left.get());
-        recordAwaitsInExpr(cfg, block, be->right.get());
-        return;
-    }
-    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, ma->target.get());
-        return;
-    }
-    if (auto* nc = dynamic_cast<const ast::NullCondMemberExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, nc->target.get());
-        return;
-    }
-    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, ce->callee.get());
-        for (const auto& a : ce->args) recordAwaitsInExpr(cfg, block, a.value.get());
-        return;
-    }
-    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, nc->callee.get());
-        for (const auto& a : nc->args) recordAwaitsInExpr(cfg, block, a.value.get());
-        return;
-    }
-    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, ix->target.get());
-        for (const auto& a : ix->indices) recordAwaitsInExpr(cfg, block, a.value.get());
-        return;
-    }
-    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, bg->operand.get());
-        return;
-    }
-    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
-        for (const auto& a : ne->args) recordAwaitsInExpr(cfg, block, a.value.get());
-        return;
-    }
-    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, cd->condition.get());
-        recordAwaitsInExpr(cfg, block, cd->thenValue.get());
-        recordAwaitsInExpr(cfg, block, cd->elseValue.get());
-        return;
-    }
-    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, te->operand.get());
-        return;
-    }
-    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, th->operand.get());
-        return;
-    }
-    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, we->source.get());
-        for (const auto& ia : we->assigns) recordAwaitsInExpr(cfg, block, ia.value.get());
-        return;
-    }
-    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e)) {
-        recordAwaitsInExpr(cfg, block, re->lo.get());
-        recordAwaitsInExpr(cfg, block, re->hi.get());
-        recordAwaitsInExpr(cfg, block, re->step.get());
-        return;
-    }
-    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
-        for (const auto& k : cl->keys) recordAwaitsInExpr(cfg, block, k.get());
-        for (const auto& v : cl->elements) recordAwaitsInExpr(cfg, block, v.get());
-        return;
-    }
-    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
-        for (const auto& p : is->parts) recordAwaitsInExpr(cfg, block, p.expr.get());
-        return;
-    }
-    // §17.15 (v0.216, #2098): the binding atom — clause initializers and the
-    // body are synchronous sub-expressions of the enclosing statement.
-    // (Sema currently REJECTS `await` inside a binding atom in an async body
-    // — the targeted §17.15/§30.5 rejection, #2122 — so a recorded site here
-    // is defensive bookkeeping, kept so the CFG walk never silently
-    // under-counts if that rejection is later lifted.)
-    if (auto* bx = dynamic_cast<const ast::BindExpr*>(e)) {
-        for (const auto& cl : bx->clauses)
-            if (cl) recordAwaitsInExpr(cfg, block, cl->initializer.get());
-        recordAwaitsInExpr(cfg, block, bx->body.get());
-        return;
-    }
-    // LambdaExpr: not descended (separate async scope — see note above).
-    // Literals, identifiers, This/Base/TypeOf/NameOf/Default, UnitExpr,
-    // CaseExpr: no `await`-bearing child reachable along a synchronous
-    // sub-expression edge in the enclosing method's CFG.
+    bezel::common::forEachAwaitSite(e, [&](const ast::UnaryExpr* ue) {
+        // §30.2: this UnaryExpr is the suspend site.
+        cfg.recordAwaitSite(block, ue);
+    });
 }
 
 // Loop context: where `break` and `continue` should branch to. The CFG

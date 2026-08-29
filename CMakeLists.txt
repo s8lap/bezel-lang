@@ -230,6 +230,7 @@ target_compile_options(bezel_runtime PRIVATE -std=c++20 -pthread)
 target_link_libraries(bezel_runtime PRIVATE pthread)
 
 add_library(bezel_core STATIC
+    src/common/AwaitScan.cpp
     src/common/BuiltinRegistry.cpp
     src/common/OwnershipFacts.cpp
     src/support/Diagnostic.cpp

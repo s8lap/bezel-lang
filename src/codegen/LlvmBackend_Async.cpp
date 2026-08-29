@@ -2,6 +2,8 @@
 
 #include <set>
 
+#include "common/AwaitScan.hpp"
+
 namespace bezel::codegen {
 
 // ===========================================================================
@@ -52,76 +54,17 @@ namespace bezel::codegen {
 // (IAsyncEnumerable / `await for`), Task.FireAndForget, and `await using`.
 // ===========================================================================
 
+// fix #3587 (CLAUDE.md §6 dedup) / #2251: thin wrapper over the ONE
+// both-sources await-site walk (src/common/AwaitScan.hpp). This used to be
+// its own hand-written dynamic_cast chain covering 16 of the 32 `ast::*Expr`
+// kinds — see AwaitScan.hpp's header for the full rationale, the measured
+// per-copy counts, and the CaseExpr/BindExpr gaps this closes (CaseExpr was
+// LIVE: MEASURED hangs, not latent).
 bool Emitter::exprContainsAwait(const ast::Expr* e) {
-    if (!e) return false;
-    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
-        if (un->op == "await") return true;
-        return exprContainsAwait(un->operand.get());
-    }
-    if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(e))
-        return exprContainsAwait(bin->left.get()) ||
-               exprContainsAwait(bin->right.get());
-    if (auto* me = dynamic_cast<const ast::MemberAccessExpr*>(e))
-        return exprContainsAwait(me->target.get());
-    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e))
-        return exprContainsAwait(nm->target.get());
-    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
-        if (exprContainsAwait(ce->callee.get())) return true;
-        for (const auto& a : ce->args)
-            if (exprContainsAwait(a.value.get())) return true;
-        return false;
-    }
-    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
-        if (exprContainsAwait(nc->callee.get())) return true;
-        for (const auto& a : nc->args)
-            if (exprContainsAwait(a.value.get())) return true;
-        return false;
-    }
-    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
-        if (exprContainsAwait(ix->target.get())) return true;
-        for (const auto& a : ix->indices)
-            if (exprContainsAwait(a.value.get())) return true;
-        return false;
-    }
-    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e))
-        return exprContainsAwait(bg->operand.get());
-    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
-        for (const auto& a : ne->args)
-            if (exprContainsAwait(a.value.get())) return true;
-        return false;
-    }
-    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e))
-        return exprContainsAwait(cd->condition.get()) ||
-               exprContainsAwait(cd->thenValue.get()) ||
-               exprContainsAwait(cd->elseValue.get());
-    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
-        return exprContainsAwait(te->operand.get());
-    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e))
-        return exprContainsAwait(th->operand.get());
-    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
-        if (exprContainsAwait(we->source.get())) return true;
-        for (const auto& ia : we->assigns)
-            if (exprContainsAwait(ia.value.get())) return true;
-        return false;
-    }
-    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e))
-        return exprContainsAwait(re->lo.get()) ||
-               exprContainsAwait(re->hi.get()) ||
-               exprContainsAwait(re->step.get());
-    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
-        for (const auto& k : cl->keys)
-            if (exprContainsAwait(k.get())) return true;
-        for (const auto& v : cl->elements)
-            if (exprContainsAwait(v.get())) return true;
-        return false;
-    }
-    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
-        for (const auto& p : is->parts)
-            if (exprContainsAwait(p.expr.get())) return true;
-        return false;
-    }
-    // LambdaExpr is a separate async scope (§30.6) — not descended here.
-    return false;
+    bool found = false;
+    bezel::common::forEachAwaitSite(
+        e, [&](const ast::UnaryExpr*) { found = true; });
+    return found;
 }
 
 
@@ -141,6 +84,23 @@ bool Emitter::containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
         } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s.get())) {
             // §30.7: an `await for` itself contains an await (MoveNextAsync).
             if (fs->isAwait) return true;
+            // #2251 / #3587: `fs->iterable` (`for x in EXPR do`) is
+            // DELIBERATELY not scanned here. It undercounts a genuine
+            // `await` there (MEASURED live: a cross-thread hang, `timeout
+            // 10` -> exit 124) — but counting it is NOT a safe fix on its
+            // own: probing it (an async method awaiting the ITERABLE, e.g.
+            // `for x in (await GetArr()) do …`) with the count corrected
+            // turns the hang into a NONDETERMINISTIC segfault / silent-
+            // wrong-value race (5 runs: exit 139, 139, 139, 139, 0 — the
+            // exit-0 run's return value was 0, not the correct 6), because
+            // `lowerFor`/`lowerArrayFor` (LlvmBackend_Stmts.cpp — held by
+            // another lane this run) does not itself support a suspend
+            // inside the iterable position: the loop's iteration-state setup
+            // is not spill/dominance-safe across the state-machine's basic
+            // blocks. Fixing the count alone converts a loud, deterministic
+            // hang into a quiet, nondeterministic wrong answer — a strictly
+            // worse trade (CLAUDE.md §6c) — so it is intentionally left
+            // uncounted here pending a real lowering fix. See issue #3622.
             if (containsAwait(fs->body)) return true;
         } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
             if (exprContainsAwait(ws->condition.get())) return true;
@@ -155,6 +115,39 @@ bool Emitter::containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             if (ifs->hasElse && containsAwait(ifs->elseBody)) return true;
         } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
             if (containsAwait(db->body)) return true;
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            // fix #3587: mirror countAwaits' TryStmt arm below (§30.9/#441)
+            // — this bool sibling had NO TryStmt arm at all pre-fix, so any
+            // caller gating on `containsAwait` (e.g.
+            // `registerForLoopSpillSlots`, which decides whether a
+            // loop-carried local needs frame-heap-backed spill storage to
+            // survive a cross-thread suspend) would silently treat a
+            // try-body-only await as "no await here" and skip the spill
+            // registration — a stack-slot-across-suspend miscompile, not
+            // merely a hang.
+            if (containsAwait(ts->body)) return true;
+            for (const auto& arm : ts->catches) {
+                if (arm.guard && exprContainsAwait(arm.guard.get())) return true;
+                if (stmtContainsAwait(arm.body.get())) return true;
+            }
+            if (ts->hasFinally && containsAwait(ts->finallyBody)) return true;
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s.get())) {
+            // fix #2251 / #3587: statement-position `case` was ABSENT from
+            // this walker entirely (no arm at all) — MEASURED live (a real
+            // cross-thread hang) for an await in an arm's Statement-form
+            // body; see countAwaits' CaseStmt arm below for the counting
+            // twin and case_expr_await_uncounted_2251_test.cpp for the
+            // expression-position sibling this mirrors.
+            if (exprContainsAwait(cs->scrutinee.get())) return true;
+            for (const auto& arm : cs->arms) {
+                bool found = false;
+                bezel::common::forEachAwaitSiteInCaseArm(
+                    arm, [&](const ast::UnaryExpr*) { found = true; });
+                if (found) return true;
+                if (arm.bodyKind == ast::CaseArmBodyKind::Block &&
+                    containsAwait(arm.stmts))
+                    return true;
+            }
         }
     }
     return false;
@@ -166,72 +159,13 @@ bool Emitter::containsAwait(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
 static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts);
 static unsigned countAwaitsInStmt(const ast::Stmt* s);
 
+// fix #3587 / #2251: thin wrapper over the shared walk (AwaitScan.hpp) — see
+// Emitter::exprContainsAwait above for the rationale; same shape, counting
+// instead of short-circuiting.
 static unsigned countAwaitsInExpr(const ast::Expr* e) {
-    if (!e) return 0;
-    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(e)) {
-        unsigned n = countAwaitsInExpr(un->operand.get());
-        if (un->op == "await") n += 1;
-        return n;
-    }
-    if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(e))
-        return countAwaitsInExpr(bin->left.get()) +
-               countAwaitsInExpr(bin->right.get());
-    if (auto* me = dynamic_cast<const ast::MemberAccessExpr*>(e))
-        return countAwaitsInExpr(me->target.get());
-    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e))
-        return countAwaitsInExpr(nm->target.get());
-    if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
-        unsigned n = countAwaitsInExpr(ce->callee.get());
-        for (const auto& a : ce->args) n += countAwaitsInExpr(a.value.get());
-        return n;
-    }
-    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
-        unsigned n = countAwaitsInExpr(nc->callee.get());
-        for (const auto& a : nc->args) n += countAwaitsInExpr(a.value.get());
-        return n;
-    }
-    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
-        unsigned n = countAwaitsInExpr(ix->target.get());
-        for (const auto& a : ix->indices) n += countAwaitsInExpr(a.value.get());
-        return n;
-    }
-    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e))
-        return countAwaitsInExpr(bg->operand.get());
-    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
-        unsigned n = 0;
-        for (const auto& a : ne->args) n += countAwaitsInExpr(a.value.get());
-        return n;
-    }
-    if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e))
-        return countAwaitsInExpr(cd->condition.get()) +
-               countAwaitsInExpr(cd->thenValue.get()) +
-               countAwaitsInExpr(cd->elseValue.get());
-    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
-        return countAwaitsInExpr(te->operand.get());
-    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e))
-        return countAwaitsInExpr(th->operand.get());
-    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
-        unsigned n = countAwaitsInExpr(we->source.get());
-        for (const auto& ia : we->assigns) n += countAwaitsInExpr(ia.value.get());
-        return n;
-    }
-    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e))
-        return countAwaitsInExpr(re->lo.get()) +
-               countAwaitsInExpr(re->hi.get()) +
-               countAwaitsInExpr(re->step.get());
-    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
-        unsigned n = 0;
-        for (const auto& k : cl->keys) n += countAwaitsInExpr(k.get());
-        for (const auto& v : cl->elements) n += countAwaitsInExpr(v.get());
-        return n;
-    }
-    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
-        unsigned n = 0;
-        for (const auto& p : is->parts) n += countAwaitsInExpr(p.expr.get());
-        return n;
-    }
-    // LambdaExpr is a separate async scope (§30.6) — not descended here.
-    return 0;
+    unsigned n = 0;
+    bezel::common::forEachAwaitSite(e, [&](const ast::UnaryExpr*) { ++n; });
+    return n;
 }
 
 static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts) {
@@ -279,6 +213,11 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             // clause is lowered the same way (the token is evaluated and then
             // discarded), so it carries the same single suspend point.
             if (fs->isAwait) n += 1;
+            // #2251 / #3587: `fs->iterable` deliberately NOT counted — see
+            // the `containsAwait` bool sibling above for the full rationale
+            // (a naive count fix here is UNSAFE: it trades a deterministic
+            // hang for a nondeterministic segfault/wrong-value race, because
+            // the lowering does not support a suspend in iterable position).
             n += countAwaits(fs->body);
         }
         else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s.get())) {
@@ -329,6 +268,18 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
             // Counting it once would leave the unwind-path finally's await without
             // a resume state → #441 hang on the faulted-body path.
             if (ts->hasFinally) n += 2 * countAwaits(ts->finallyBody);
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s.get())) {
+            // fix #2251 / #3587: statement-position `case` — see the
+            // `containsAwait` bool sibling above for the full rationale
+            // (MEASURED live) and case_expr_await_uncounted_2251_test.cpp
+            // for the expression-position sibling this mirrors.
+            n += countAwaitsInExpr(cs->scrutinee.get());
+            for (const auto& arm : cs->arms) {
+                bezel::common::forEachAwaitSiteInCaseArm(
+                    arm, [&](const ast::UnaryExpr*) { ++n; });
+                if (arm.bodyKind == ast::CaseArmBodyKind::Block)
+                    n += countAwaits(arm.stmts);
+            }
         }
     }
     return n;
@@ -655,6 +606,22 @@ bool Emitter::awaitInFinallyPosition(
             if (ifs->hasElse && awaitInFinallyPosition(ifs->elseBody)) return true;
         } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
             if (awaitInFinallyPosition(db->body)) return true;
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s.get())) {
+            // fix #3587: a Block-form (`do … end`) arm body can nest a
+            // try/finally just like any other compound-statement position
+            // above — this recursive descent had no CaseStmt arm at all
+            // pre-fix, so a §30.7-forbidden `await` nested inside a
+            // statement-`case` arm's finally would have been silently
+            // ADMITTED instead of rejected (the async iterator's `finally`
+            // runs synchronously via Dispose, §29.7, so that await's
+            // continuation would be silently discarded at runtime — the
+            // exact hazard this function exists to reject at compile time).
+            // Widening-only: can only turn a prior silent accept into this
+            // function's existing loud rejection, never the reverse.
+            for (const auto& arm : cs->arms)
+                if (arm.bodyKind == ast::CaseArmBodyKind::Block &&
+                    awaitInFinallyPosition(arm.stmts))
+                    return true;
         }
     }
     return false;
@@ -724,6 +691,14 @@ bool Emitter::suspendInTryPosition(
             if (ifs->hasElse && suspendInTryPosition(ifs->elseBody)) return true;
         } else if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
             if (suspendInTryPosition(db->body)) return true;
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s.get())) {
+            // fix #3587: see the identical CaseStmt arm in
+            // awaitInFinallyPosition above — same widening-only rationale,
+            // for the §29.6 yield-in-forbidden-try-position sibling check.
+            for (const auto& arm : cs->arms)
+                if (arm.bodyKind == ast::CaseArmBodyKind::Block &&
+                    suspendInTryPosition(arm.stmts))
+                    return true;
         }
     }
     return false;
