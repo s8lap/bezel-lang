@@ -31,6 +31,7 @@
 #include "common/IntLiteral.hpp"       // #2936: the one integer-literal parser
 #include "sema/SemaContext.hpp"
 #include "sema/TypeResolution.hpp"  // typeRefEqual — §2.8.3 rule 4 exact type identity
+#include "sema/GenericParams.hpp"  // fix #3530: sema::genericParamNames (both-sources walk, #3143)
 #include "sema/Symbol.hpp"
 
 #include "llvm/ADT/MapVector.h"   // fix #3504: deterministic iteration for a pointer-keyed map
@@ -15122,6 +15123,30 @@ private:
     // dispatchable `CompareTo` (`Object`, or a class that declares none) — the
     // §4.17 `where K: IComparable<K>` shape that nothing checks today (#3490).
     llvm::Function* buildObjectCompareToThunk(const sema::TypeRef* ty);
+
+    // fix #3530 (§14.1 / §2.8.3 rule 4, v0.283): buildObjectCompareToThunk's
+    // per-instantiation cache, keyed on `descIdentityKey(declaration, instArgs)`
+    // — the STRUCTURAL identity — rather than on the emitted symbol name,
+    // because the readable per-instantiation mangle is cosmetic and two
+    // distinct instantiations can render alike. A non-generic class has empty
+    // `instArgs` and so keys on its declaration alone, preserving the
+    // pre-#3530 one-thunk-per-type sharing exactly.
+    std::map<std::string, llvm::Function*> classCmpThunks_;
+
+    // fix #3530 (§14.1, v0.283): the `CompareTo` body MONOMORPHIZED for one
+    // concrete instantiation of a generic class. `methodFns_[ms]` holds the
+    // UNSPECIALIZED TEMPLATE, whose `T`-typed fields sit at the i32-placeholder
+    // offsets — calling it from the comparator thunk compared the wrong bytes.
+    // `instArgs` are the caller's `substituteTypeRefLocal`-composed type
+    // arguments, the same values that keyed the thunk. Null when the shape is
+    // not one the thunk's `i32 (ptr, ptr)` ABI can carry, and for an INHERITED
+    // `CompareTo` (issue 3566 — `gpNames` are then the wrong parameter names);
+    // the caller then keeps the template call it made before this fix.
+    llvm::Function* specializedClassCompareToFn(
+        const sema::TypeRef* ty, sema::MethodSymbol* ms,
+        const std::vector<std::string_view>& gpNames,
+        const std::vector<const sema::TypeRef*>& instArgs,
+        llvm::Function* templateFn);
 
     // fix #3488 / stdlib §4.17 (v0.283): the (hash, eq) pair that makes
     // `CompareTo`-equality the STORED IDENTITY of a reference key, for the one

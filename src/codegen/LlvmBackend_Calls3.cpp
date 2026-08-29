@@ -646,14 +646,81 @@ llvm::Function* Emitter::buildObjectCompareToThunk(const sema::TypeRef* ty) {
     // Sharing is preserved exactly where it was intended: one thunk per TYPE,
     // so a program that both sorts an `Array<Ord>` and iterates a
     // `SortedDictionary<Ord, V>` still emits ONE.
+    //
+    // fix #3530 (§14.1 / §2.8.3 rules 3-4 / stdlib §4.4, v0.283): a CONSTRUCTED
+    // generic class needs BOTH halves of rule 3's identity for a constructed
+    // type — "a constructed generic type is identified by its generic's
+    // identity plus the identities of its arguments" — and #3512/#3529 supplied
+    // only the generic's half. `Array<Box<int>>` and `Array<Box<long>>` in one
+    // program both mangled to `bz$classcmp$M.Box` and shared ONE thunk.
+    // `gpNames.size() == genericArgs.size()` is the same concrete-instantiation
+    // test RecordSubstGuard applies (LlvmBackend_Layout.cpp); a NON-generic
+    // class fails it and keeps the pre-#3530 name byte-for-byte.
+    const std::vector<std::string_view> gpNames =
+        sema::genericParamNames(ty->declaration);
+    const bool genericInst =
+        !gpNames.empty() && gpNames.size() == ty->genericArgs.size();
+
+    // Each argument is composed through the ACTIVE OUTER substitution FIRST,
+    // via `substituteTypeRefLocal` — the SAME call the sibling generic-receiver
+    // site makes (LlvmBackend_Calls2.cpp, the #2192/#3020 arm), deliberately
+    // rather than a second spelling of it. Inside a specialization of an OUTER
+    // generic, `Array<Box<T>>`'s argument is still the bare parameter `T`, a
+    // TypeRef whose structural key ("UT<>;") is identical for EVERY binding, so
+    // keying on the raw argument would rebuild one level down exactly the
+    // collapse this fix removes — and in the REGRESSION direction, because
+    // pre-#3530 every binding ran the placeholder template while post-#3530 the
+    // first would mint a correct specialization that the rest silently inherit.
+    //
+    // ⚠ A SHALLOW resolution is not enough, which is why this is not
+    // `resolveTypeParamRef`: that helper returns its argument unchanged the
+    // moment `declaration` is non-null, so it answers the same TypeRef for
+    // `Box<Pair<T>>` at every binding of `T` (no recursion into a CONSTRUCTED
+    // argument's own arguments), and it drops the `?` that `appendDescKey`
+    // deliberately encodes, collapsing `Box<T?>` onto `Box<T>`.
+    // `substituteTypeRefLocal` does both — see its #2057 recursion arm and its
+    // "Preserve `T?` nullability of the placeholder occurrence" copy — and
+    // #2192/#3020 record that this exact collapse class ("collapsed every
+    // `A<U>` onto ONE shared (erased) descriptor") already shipped once.
+    //
+    // An EMPTY outer environment (the ordinary top-level case) makes this the
+    // identity, so a program with no enclosing generic is byte-identical.
+    std::vector<const sema::TypeRef*> instArgs;
+    if (genericInst) {
+        instArgs.reserve(ty->genericArgs.size());
+        for (const sema::TypeRef* a : ty->genericArgs)
+            instArgs.push_back(
+                substituteTypeRefLocal(a, genericSubstSemaTy_));
+    }
+
     std::string thunkName =
         std::string("bz$classcmp$") + mangledTypeName(ty->declaration);
-    if (llvm::Function* existing = module_->getFunction(thunkName))
-        return existing;
+    for (const sema::TypeRef* a : instArgs)
+        thunkName += "$" + descReadableMangle(a);
+
+    // The cache is keyed on the STRUCTURAL identity (`descIdentityKey` — the
+    // recursive encoding the per-monomorphization runtime descriptors and
+    // buildSpecializedMethodFn's #1947 key already share), NOT on the emitted
+    // name: `descReadableMangle` is explicitly cosmetic (it renders a type by
+    // its SIMPLE name and lets LLVM uniquify a clash), so two distinct
+    // instantiations can mangle alike — `Box<Outer1.Ord>` and `Box<Outer2.Ord>`,
+    // the §11.6 shape #3529 fixed for the enclosing-type path — and a
+    // name-keyed `getFunction` would then hand the second the first's thunk.
+    // For a non-generic class `instArgs` is empty, so the key is that class's
+    // declaration alone and the pre-#3530 sharing (one thunk per type across
+    // Sort/Sorted/SortedDictionary) is preserved exactly.
+    const std::string thunkKey = descIdentityKey(ty->declaration, instArgs);
+    if (auto cit = classCmpThunks_.find(thunkKey); cit != classCmpThunks_.end())
+        return cit->second;
 
     auto* thunkTy = llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
     auto* fn = llvm::Function::Create(thunkTy, llvm::Function::InternalLinkage,
                                       thunkName, module_.get());
+    // Publish BEFORE the body below can build a specialization: that emits a
+    // whole method body, which may itself sort an `Array<Self>` and re-enter
+    // here for the same type. (The pre-#3530 body emitted nothing, so the
+    // pre-#3530 `getFunction` check could sit after the Create.)
+    classCmpThunks_[thunkKey] = fn;
     auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
     // A LOCAL IRBuilder, not `builder_`: the thunk is emitted in the middle of
     // another function's lowering, and touching `builder_`/`currentFn_` here
@@ -677,14 +744,133 @@ llvm::Function* Emitter::buildObjectCompareToThunk(const sema::TypeRef* ty) {
         // findMethodByName already demands `methodFns_.count(ms)`, so the miss
         // arm is unreachable; keep it well-formed rather than trusting that.
         if (fnIt == methodFns_.end()) {
+            classCmpThunks_.erase(thunkKey);
             fn->eraseFromParent();
             return nullptr;
         }
-        result = thunkB.CreateCall(fnIt->second->getFunctionType(),
-                                   fnIt->second, {aPtr, bPtr});
+        // fix #3530 (§14.1 / stdlib §4.4, v0.283): for a GENERIC class,
+        // `methodFns_[cmpMs]` is the UNSPECIALIZED TEMPLATE — the body emitted
+        // with every type parameter at its placeholder lowering (`T` -> i32),
+        // which the emitter itself documents as "never the call target — every
+        // call binds the concrete substitution and routes to a specialization"
+        // (emittingGenericTemplateBody_, LlvmBackend_impl.hpp). Calling it here
+        // read every field of a `Box<long>` at the `Box<int>` OFFSETS: measured
+        // on e57a1eb, `class Box<T>` with `Lead: T; V: int` had the template
+        // load `V` at +0x10 (Lead as i32) where the instantiation's own
+        // `Box$CompareTo$spec` loads it at +0x18, so `CompareTo` compared the
+        // low half of `Lead` instead of `V` and `Array<Box<long>>.Sort()`
+        // returned the array in INSERTION order with nothing diagnosed —
+        // a stdlib §4.4 "in place" natural-order sort silently not performed.
+        // The VIRTUAL arm above was already correct (the per-instantiation
+        // `vt$<C>$specN` carries the specialized method), which is why only a
+        // non-virtual `CompareTo` was affected.
+        llvm::Function* target = nullptr;
+        if (genericInst)
+            target = specializedClassCompareToFn(ty, cmpMs, gpNames, instArgs,
+                                                 fnIt->second);
+        if (!target) target = fnIt->second;
+        result = thunkB.CreateCall(target->getFunctionType(), target,
+                                   {aPtr, bPtr});
     }
     thunkB.CreateRet(result);
     return fn;
+}
+
+
+// fix #3530 (§14.1 / §2.8.3 rule 4 monomorphization, v0.283): the
+// `CompareTo` body MONOMORPHIZED for one concrete instantiation of a generic
+// class, for buildObjectCompareToThunk to call in place of the placeholder
+// template. Null when the shape is not one this thunk's ABI can carry, in
+// which case the caller keeps the pre-#3530 template call — a fallback that is
+// no worse than the behaviour it replaces and cannot introduce a new mis-typed
+// call.
+//
+// The substitution install is the same param<->arg binding RecordSubstGuard and
+// the generic-class RECEIVER path (LlvmBackend_Layout.cpp's computed-accessor
+// prolog, #3143) perform, and it consumes the caller's ALREADY-COMPOSED
+// `instArgs` — the `substituteTypeRefLocal` results that also keyed the thunk's
+// name and cache entry — so the name, the cache key and the emitted body cannot
+// disagree about which instantiation this is. RecordSubstGuard itself is not
+// reused: it deliberately admits only Record and Choice declarations, and
+// widening its kind filter would change every one of its dozen existing call
+// sites that can be handed a class TypeRef.
+llvm::Function* Emitter::specializedClassCompareToFn(
+        const sema::TypeRef* ty, sema::MethodSymbol* ms,
+        const std::vector<std::string_view>& gpNames,
+        const std::vector<const sema::TypeRef*>& instArgs,
+        llvm::Function* templateFn) {
+    // ⚠ DECLINE AN INHERITED `CompareTo` (issue 3566). `findMethodByName` walks
+    // the base chain, so `ms` can belong to a BASE class whose body reads the
+    // BASE's type-parameter names — and `gpNames` are the DERIVED class's.
+    // For `class Base<U>` / `class Derived<T>: Base<T>`, installing
+    // {"T" -> long} leaves Base's `U` unbound, so the "specialization" lowers
+    // Base's `U`-typed fields at the i32 placeholder and comes out
+    // INSTRUCTION-IDENTICAL to the template — while `buildSpecializedMethodFn`
+    // clears `emittingGenericTemplateBody_`, disabling the template-only return
+    // backstop for a body that is still effectively a template. Declining here
+    // restores the pre-#3530 template call byte-for-byte for that shape, which
+    // is the honest answer until the fix issue 3566 proposes lands: compose the
+    // derived arguments through `TypeSymbol::baseTypeRefs` to the declaring
+    // base, the walk `instanceDescriptorFor` already performs.
+    if (!ms->parent || !ty->declaration || ms->parent != ty->declaration)
+        return nullptr;
+    // The thunk loads two `ptr`s and calls `i32 (ptr, ptr)`. Require the
+    // TEMPLATE to already have that signature before specializing: it is the
+    // signature `CompareTo(other: Self): int` produces for every instantiation
+    // (a class-typed parameter lowers to `ptr` in the template exactly as in
+    // the specialization), while a `CompareTo(other: T): int` — legal, but not
+    // the §14.2 `T: IComparable<T>` shape `Sort()` is admitted under — lowers
+    // its parameter to the i32 placeholder here and to the concrete width
+    // there. Checking the PARAMETER shapes on the template rather than on the
+    // built specialization declines them without emitting a body at all.
+    llvm::FunctionType* tft = templateFn ? templateFn->getFunctionType()
+                                         : nullptr;
+    if (!tft || tft->getNumParams() != 2 || tft->isVarArg() ||
+        !tft->getReturnType()->isIntegerTy(32) ||
+        !tft->getParamType(0)->isPointerTy() ||
+        !tft->getParamType(1)->isPointerTy())
+        return nullptr;
+    if (isStaticMethod(ms)) return nullptr;  // `this` is the thunk's first arg
+
+    CallableInfo ci;
+    if (!callableInfo(ms, ci)) return nullptr;  // abstract / no AST body
+
+    if (instArgs.size() != gpNames.size()) return nullptr;
+    auto savedSubst = genericSubst_;
+    auto savedSemaTy = genericSubstSemaTy_;
+    std::unordered_map<std::string_view, llvm::Type*> newSubst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> newSema;
+    // Both halves come from the caller's composed `instArgs`, in the lockstep
+    // order the sibling site uses (`newSubst[p] = lowerTypeRef(argSema);
+    // newSema[p] = argSema;`), so the LLVM and sema maps cannot desync — the
+    // desync #3020 records as corrupting the buildSpecializedMethodFn cache key.
+    for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
+        newSubst[gpNames[gi]] = lowerTypeRef(instArgs[gi]);
+        newSema[gpNames[gi]] = instArgs[gi];
+    }
+    genericSubst_ = std::move(newSubst);
+    genericSubstSemaTy_ = std::move(newSema);
+    // buildSpecializedMethodFn caches on (ms, subst, identity keys, paramTys),
+    // so an instantiation whose `CompareTo` was already specialized for an
+    // ordinary source-level call is REUSED rather than emitted twice; it also
+    // saves and restores the whole builder/state-machine context itself, which
+    // is what makes it safe to call from the middle of another body's lowering.
+    llvm::Function* specFn =
+        buildSpecializedMethodFn(ms, ci, {ptrTy(), ptrTy()});
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSemaTy);
+    if (!specFn) return nullptr;
+    // The RETURN type is the one shape the template pre-check cannot settle: it
+    // is re-derived from the declared return type UNDER the substitution, so a
+    // `CompareTo(): T` bound to `long` is `i32` on the template and `i64` here.
+    // Unlike the parameter checks above this one necessarily runs AFTER the body
+    // is built, so declining leaves an unused internal function in the module
+    // (harmless — nothing references it — but it is not the "no dead body" the
+    // parameter pre-check gives).
+    llvm::FunctionType* sft = specFn->getFunctionType();
+    if (sft->getNumParams() != 2 || !sft->getReturnType()->isIntegerTy(32))
+        return nullptr;
+    return specFn;
 }
 
 // fix #3488 / stdlib §4.17 (v0.283): the stored-identity pair for a REFERENCE
