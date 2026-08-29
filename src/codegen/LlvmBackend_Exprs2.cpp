@@ -3019,6 +3019,17 @@ namespace {
 // reads only the AST and has exactly one caller.
 bool ctorChainsViaThis(const sema::ConstructorSymbol* cs) {
     if (!cs || cs->isStatic) return false;
+    // The chain FORM of a constructor body has no symbol-side channel: nothing
+    // on `ConstructorSymbol` records "chains via `this(...)`" — only the body's
+    // first statement does, and an imported constructor has no body to read. So
+    // the cast below answers false for an import. That is inert today because
+    // both imported callers gate on `!hasAnyConstructor(t)` before reaching
+    // here, and an imported primary constructor plus a convenience constructor
+    // is non-functional end to end regardless (measured identical before and
+    // after fix #3583). If that is ever fixed by carrying the chain form across
+    // the wire, this read must be routed through the new channel rather than
+    // kept.
+    // SEAM-DEBT: #3625 no symbol-side channel for a constructor body's chain form
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd || cd->body.empty() || !cd->body[0]) return false;
     bool isThis = false;
