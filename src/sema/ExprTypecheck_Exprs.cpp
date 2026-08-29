@@ -110,11 +110,13 @@ bool isPromotablePrimitive(PrimitiveType p) {
 //   - an auto body that is virtual/abstract/override — the runtime accessor may
 //     be a user override with a computed body, so the access can dispatch to it.
 // Indexers are always Expression- or Block-bodied (never auto), so a user
-// indexer access always qualifies. Callers gate on a LOCAL PropertyDecl being
-// present (`ps->decl`): a builtin property (`.Length`/`.Count`, whose access is
-// typed by a dedicated path that sets no user PropertyDecl) and an imported
-// property (reconstructed without a decl, ModuleLoader §2.5) are conservatively
-// left alone — the common-auto-read exclusion the #1566 change reserved here.
+// indexer access always qualifies.
+//
+// ⚠ This overload answers from the AST ALONE and is therefore only half the
+// question — an IMPORTED property has no `ast::PropertyDecl` (§2.5) and lands on
+// the `!pd` arm. Nothing outside this file may call it; ask the SYMBOL overload
+// below, which is the one that consults both sources. It is left non-`static`
+// only because the symbol overload delegates to it.
 bool propertyAccessRunsUserCode(const ast::PropertyDecl* pd) {
     if (!pd) return false;
     switch (pd->bodyKind) {
@@ -129,6 +131,55 @@ bool propertyAccessRunsUserCode(const ast::PropertyDecl* pd) {
             return false;  // a non-virtual auto-property is a pure field access
     }
     return false;
+}
+
+// fix #3616 (§7.4 / §2.8.3 rule 4, v0.286): the ONE both-sources spelling of the
+// §7.4 accessor-call question, asked of the SYMBOL. Every call site takes this
+// overload; the AST-only one above is a detail of this one's local arm.
+//
+// WHY A SECOND OVERLOAD RATHER THAN A CONSERVATIVE DEFAULT AT EACH SITE. The
+// three §7.4 call sites had drifted into three different spellings of the
+// null-`pd` case — two dropped the invalidation silently (`if (auto* pd = …)`),
+// one answered `true` (`pd ? f(pd) : true`) with a comment explaining why
+// unknown must be conservative. The prior revision of the AST-only comment above
+// called leaving an imported property alone "conservative"; for an INVALIDATION
+// rule it is the opposite — the narrowing survives an accessor that may reach
+// the capturing closure and null the local, which §7.4 exists to forbid.
+// MEASURED: the character-identical `expr_body_property_getter_invalidates_capture`
+// program (tests/lit/sema/…_spec_7_4.bzl) is REJECTED when `Box` is local and
+// ACCEPTED when `Box` is imported — the §2.8.3 rule 4 divergence in as many words.
+//
+// But a blunt `return true` for every decl-less property would create the
+// divergence in the OTHER direction: its sibling lit test
+// (`auto_property_read_keeps_capture_narrowing_spec_7_4`) pins that a
+// non-virtual AUTO property read must NOT invalidate, and an imported one is
+// still a plain backing-field load. So the imported arm asks the existing
+// both-sources storage classification (`isAutoPropertyStorageSymbol`,
+// sema/Symbol.hpp — the #2478 wire bit, `bodyKind == Auto && !static &&
+// !abstract`) plus the wire-carried `modifiers`, and reproduces the AST answer
+// rather than approximating it.
+//
+// Residual, deliberate over-conservatism: a `static` imported auto-property
+// reads `true` here, because the #2478 wire bit is cleared for `static` and the
+// import carries nothing else that separates a static auto body from a static
+// expression body. That costs a narrowing optimization on a shape that must also
+// be inside a mutating-capture block to be observable; it is never unsound.
+bool propertyAccessRunsUserCode(const PropertySymbol* ps, const SemaContext& ctx) {
+    // Unknown symbol ⇒ conservative. No current site can reach this (each
+    // dynamic_casts first), and that is the point: the NEXT site cannot be
+    // written unsoundly by omission.
+    if (!ps) return true;
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+        return propertyAccessRunsUserCode(pd);
+    // IMPORTED (§2.5): no ast::PropertyDecl ever crosses the boundary.
+    // §23.4 — an indexer is never auto, so its accessor is always user code.
+    if (ps->isIndexer) return true;
+    for (std::string_view m : ps->modifiers)
+        if (m == "virtual" || m == "abstract" || m == "override") return true;
+    // A plain imported auto-property is a backing-field load, exactly as the
+    // local one is. Anything else — computed, static, or unclassified — runs
+    // user code as far as this rule is concerned.
+    return !isAutoPropertyStorageSymbol(ps, ctx);
 }
 
 // §18.5 / stdlib §2.18 (v0.172, #812/#1339): the FORMAT portion of an encoded
@@ -2677,8 +2728,29 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                         // type-parameter constraint is an
                                         // accessor call too — invalidate a
                                         // mutably-captured local's narrowing
-                                        // (#1566).
-                                        if (propertyAccessRunsUserCode(pd))
+                                        // (#1566). fix #3616: ask the symbol,
+                                        // not the decl. The ANSWER is unchanged
+                                        // here today — the `if (!pd ||
+                                        // !pd->type) continue` guard above means
+                                        // `pd` is non-null by the time this
+                                        // line runs, and an indexer is never
+                                        // auto — so this is a spelling change,
+                                        // made so all three §7.4 sites ask the
+                                        // one accessor and this one cannot
+                                        // become the next silent `if (auto* pd
+                                        // = …)`. That guard is separately
+                                        // suspect (`ps->decl` is null for every
+                                        // IMPORTED indexer, and the sibling
+                                        // IndexExpr site ~500 lines below falls
+                                        // back to `ctx_.importedMemberType(ps)`
+                                        // where this one gives up), but a
+                                        // repro distinguishing the imported
+                                        // from the local case could not be
+                                        // built — both fail identically at
+                                        // codegen on an unrelated #2491
+                                        // degrade — so it is recorded as an
+                                        // open observation, not fixed here.
+                                        if (propertyAccessRunsUserCode(ps, ctx_))
                                             invalidateCapturedNarrowings();
                                         return true;
                                     }
@@ -3239,12 +3311,16 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // captured local's narrowing exactly as a named-
                         // property access or a call does (#1566). Indexers
                         // are never auto, so any user indexer qualifies. An
-                        // imported indexer (no `pd` to ask
-                        // propertyAccessRunsUserCode about) is conservatively
-                        // treated as running user code too — the safe
-                        // default (it forgoes a narrowing optimization it
-                        // might have kept, never keeps one it shouldn't).
-                        if (pd ? propertyAccessRunsUserCode(pd) : true)
+                        // imported indexer (no `pd`) is conservatively treated
+                        // as running user code too — the safe default (it
+                        // forgoes a narrowing optimization it might have kept,
+                        // never keeps one it shouldn't). fix #3616: that
+                        // reasoning now lives ONCE, inside the symbol overload,
+                        // instead of in this site's own `pd ? … : true`; this
+                        // was the only one of the three sites that got it
+                        // right, and having it right here is why the other two
+                        // being wrong went unnoticed.
+                        if (propertyAccessRunsUserCode(ps, ctx_))
                             invalidateCapturedNarrowings();
                     } else if (anyIndexer && nargs > 0) {
                         // §23.4: the receiver declares indexer(s) but none has
@@ -3369,10 +3445,15 @@ void ExprTC::visitExpr(const ast::Expr& e) {
         // (propertyAccessRunsUserCode); indexers are handled at the IndexExpr
         // sites. A no-op unless the body has a lambda that mutates a captured
         // local.
+        // fix #3616: the inner `if (auto* pd = …)` this replaces dropped the
+        // invalidation for EVERY imported property (§2.5 leaves `ps->decl`
+        // null), so the same program was rejected with a local `Box` and
+        // accepted with an imported one — the §2.8.3 rule 4 divergence. The
+        // outer PropertySymbol gate stays: a builtin `.Length`/`.Count` access
+        // sets no PropertySymbol at all and is not this rule's business.
         if (auto* ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(e))) {
-            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
-                if (propertyAccessRunsUserCode(pd))
-                    invalidateCapturedNarrowings();
+            if (propertyAccessRunsUserCode(ps, ctx_))
+                invalidateCapturedNarrowings();
         }
         // §22.12 (cf. C# CS0176): a static member must be accessed through the
         // type name (`C._x`), not through an instance (`c._x`). The latter was
