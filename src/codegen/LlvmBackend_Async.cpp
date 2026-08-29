@@ -2741,6 +2741,47 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // the frame locals restored. // per §29.7, §30.7
         collectStringReleaseEligible(*ci.stmts);
         stringReleaseEligibleFn_ = resumeFn;
+        // narrow #3553 / #422 / §27.5 / §28.9 / §30.7: one more member of the
+        // "re-establish this pass for the resume fn" family the async-ITERATOR
+        // body was missing. A `var` CLOSURE local in the body — `var f :=
+        // lambda(x: int) => x + n;` — allocates a closure cell (+ its env block
+        // and capture cells) and must be released at scope end, exactly as in a
+        // synchronous method, in a sync ITERATOR's MoveNext
+        // (LlvmBackend_Iterators.cpp emitIteratorMethod) and in a plain async
+        // method's Resume (emitAsyncMethod above, which states the reason in
+        // full: "The async routing in emitFunctionBody returns BEFORE that
+        // pass's collectClosureReleaseEligible / eligible-fn setup runs, so
+        // without this the closure cell (+ its env block) leaks").
+        //
+        // emitAsyncIteratorMethod never ran either half, so
+        // `closureReleaseEligibleFn_` still held whatever function the PREVIOUS
+        // emission left behind; `currentFn_ == closureReleaseEligibleFn_` was
+        // false for this whole body and the release never registered in the
+        // resume's disposeStack_. Measured on `var f := lambda(x: int) => x + n;`
+        // in an `IAsyncEnumerable<int>` body driven 200 times: a DIRECT leak of
+        // 8000 B / 200 objects (the 40-byte cell) in `bz$asynciter$Gen$Resume`,
+        // plus the two INDIRECT leaks that hang off it (1600 B env blocks,
+        // 800 B capture cells) — 10400 B / 600 allocations. The no-lambda twin
+        // of the same iterator is clean, and so is the SYNC iterator twin.
+        //
+        // NARROW, not a complete fix: this releases the closure cell and the env
+        // block that hangs off it, taking that program from 10400 B / 600 to
+        // 800 B / 200 — the 4-byte CAPTURE cell still leaks, because
+        // emitAsyncIteratorMethod ALSO never establishes collectBoxCaptureLocals
+        // / collectDefinitelyEscapingLambdas / collectCellFreeEligible for
+        // resumeFn, which the sync iterator does. That surviving half is issue
+        // 3567 (family: 3498 / 3500 / 3518 / 3532). The split is in this order
+        // deliberately and not arbitrarily: bz_closure_release runs the envdtor,
+        // which reads captures THROUGH the capture cell, so the residue outlives
+        // its only reader — arming the cell free first would have been the
+        // dangerous order.
+        //
+        // Keyed to resumeFn because that is where the body lowers; the Dispose
+        // and MoveNextAsync bodies lower under a different currentFn_, so
+        // nothing arms in them — the same scoping the four re-establishments
+        // above already rely on. // per §27.5, §28.9
+        collectClosureReleaseEligible(*ci.stmts);
+        closureReleaseEligibleFn_ = resumeFn;
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
         builder_.SetInsertPoint(entry);
 
