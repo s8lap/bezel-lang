@@ -194,6 +194,13 @@ struct Loader {
     // cross-module reference between two loaded dependencies still binds).
     std::unordered_map<std::string, sema::TypeSymbol*>& localTypes;
 
+    // fix #3540 (§11.6 / §2.8.3 rule 3 / §2.8.2, v0.285): Named references
+    // whose `lookupNamed` came back null at conversion time, retried once by
+    // `resolvePendingNamed` after every type of the module — including every
+    // §11.6 NESTED type, which only comes into existence while pass 2 walks
+    // its enclosing type's member list — has been registered in `localTypes`.
+    std::vector<std::pair<sema::TypeRef*, std::string>> pendingNamed;
+
     sema::TypeRef* convert(const MetaType& mt) {
         auto* ref = ctx.makeImportedTypeRef();
         ref->nullable = mt.nullable;
@@ -258,6 +265,15 @@ struct Loader {
                     sema::SemaContext::isSynthesizedBuiltinInterfaceName(
                         mt.namedName))
                     ref->declaration = ctx.builtinInterfaceSym(mt.namedName);
+                // fix #3540 (§11.6 / §2.8.3 rule 3, v0.285): still unbound.
+                // It may simply be a name this loader can never resolve (a
+                // builtin like `Task` or `Array<T>` has no exported user type,
+                // which is what the `importedName` carriage above is for) — or
+                // it may be a type of THIS module that pass 2 has not created
+                // yet, which is the whole nested-type population. Record it and
+                // retry once at the end of pass 2; see `resolvePendingNamed`.
+                if (ref->declaration == nullptr && !mt.namedName.empty())
+                    pendingNamed.emplace_back(ref, mt.namedName);
                 for (const MetaType& ga : mt.genericArgs)
                     ref->genericArgs.push_back(convert(ga));
                 break;
@@ -335,6 +351,42 @@ struct Loader {
         // collectInstanceStorage misses the base-subobject prefix → wrong
         // field offsets (Sum() returns 400 instead of 300).
         return ctx.lookupImportedTypeByName(name);
+    }
+
+    // fix #3540 (§11.6 / §2.8.3 rule 3 / §2.8.2, v0.285): retry every Named
+    // reference `lookupNamed` could not bind while pass 2 was still running.
+    //
+    // `loadMetadataPass1` registers `md.types` — this module's TOP-LEVEL types
+    // — and nothing else. A §11.6 NESTED type's TypeSymbol is not created until
+    // pass 2 reaches its enclosing type's `MetaMemberKind::NestedType` member
+    // and calls `reconstructTypeSymbol`, so every signature converted BEFORE
+    // that point saw a null for it: a sibling nested type declared later in the
+    // same `Outer`, or any member of a top-level type that precedes `Outer` in
+    // `md.types`. `reconstructTypeSymbol` registers a nested type before
+    // walking its own members, which covers the self-reference of the issue's
+    // repro; this pass covers the rest, and makes the result independent of
+    // declaration order in the same way #1487 made the top-level pass
+    // order-independent.
+    //
+    // The retry can only ever turn a null into a symbol. A reference that stays
+    // unresolved keeps EXACTLY its pre-#3540 shape, `importedName` included, so
+    // the builtin population (`Task`, `Array<T>`, `IEnumerable<T>`, …) is
+    // untouched. On a successful retry `importedName` is cleared, so the
+    // TypeRef becomes indistinguishable from one `lookupNamed` bound eagerly —
+    // every reader that prefers `declaration` and falls back to `importedName`
+    // (`typeRefSigText`, `TypeRef::headName`, codegen's name probes) then sees
+    // one consistent state rather than a resolved symbol shadowed by a stale
+    // name.
+    void resolvePendingNamed() {
+        for (auto& entry : pendingNamed) {
+            sema::TypeRef* ref = entry.first;
+            if (ref->declaration != nullptr) continue;
+            if (sema::TypeSymbol* ts = lookupNamed(entry.second)) {
+                ref->declaration = ts;
+                ref->importedName = std::string_view{};
+            }
+        }
+        pendingNamed.clear();
     }
 
     std::vector<std::string_view> intern(const std::vector<std::string>& in) {
@@ -506,7 +558,23 @@ struct Loader {
         }
         if (node->kind == ast::TypeKind::Named && !mt.namedName.empty()) {
             node->name = std::make_unique<ast::QualifiedName>();
-            node->name->parts.push_back(ctx.internString(mt.namedName));
+            // fix #3540 (§11.6, v0.285): `namedName` is the QUALIFIED type
+            // name, so a nested type arrives in its §11.6 surface spelling
+            // ("Outer.Box" — "A nested type is referenced from outside as
+            // `Outer.Nested`"), which is a MULTI-part QualifiedName. Pushing it
+            // whole would make `parts[0]` the string "Outer.Box", an
+            // identifier no lookup can match. A top-level name has no '.' and
+            // so still produces exactly one part, unchanged.
+            std::size_t pos = 0;
+            for (;;) {
+                const std::size_t dot = mt.namedName.find('.', pos);
+                const std::size_t end =
+                    dot == std::string::npos ? mt.namedName.size() : dot;
+                node->name->parts.push_back(
+                    ctx.internString(mt.namedName.substr(pos, end - pos)));
+                if (dot == std::string::npos) break;
+                pos = dot + 1;
+            }
         }
         ctx.setResolvedType(node.get(), convert(mt));
         return node;
@@ -540,6 +608,37 @@ struct Loader {
         // The two sides must agree or a nested type's external declaration in
         // the importer names a symbol the exporter never defined.
         t->enclosingTypePath = parent.qualifiedTypeName();
+        // fix #3540 (§11.6 / §2.8.3 rule 3 / §2.8.2, v0.285): enter this nested
+        // type into `localTypes` so a member signature that names it resolves.
+        // Nothing ever did — `loadMetadataPass1` walks `md.types`, i.e. the
+        // TOP-LEVEL types only, and this symbol does not exist until now — so
+        // `lookupNamed` returned null for every `Outer.Box`-typed parameter of
+        // an imported member, the TypeRef kept `declaration == nullptr`, and
+        // codegen took the i32 default. The consumer could not be compiled at
+        // all: a `ptr` argument against an `i32` parameter, reported as
+        // "Call parameter type does not match function signature!" from the IR
+        // verifier rather than as any language rule.
+        //
+        // The key is the QUALIFIED name and must be. §2.8.3 rule 3 identifies a
+        // type by "its declaring module name, its qualified type name
+        // (including any enclosing-type path, §11.6), and its generic arity",
+        // and #3529 is the record of `Outer1.Ord` and `Outer2.Ord` being two
+        // unrelated types under that rule. Keying on the simple name would make
+        // one of them answer for the other — #3529's collision moved from the
+        // linker into the importer's type table, which is strictly worse than
+        // the null. `qualifiedTypeName()` is the one authority for the spelling
+        // and is exactly what `ModuleMetadataBuilder::convertType` now writes
+        // into `MetaType::namedName`; both sides call the same function, so the
+        // writer and the reader cannot drift.
+        //
+        // Registered HERE, before this type's own members are converted further
+        // down, so a nested type's members can name it — `Plus(other:
+        // Outer.Box)` on `Outer.Box` is the issue's repro. Anything converted
+        // earlier is picked up by `resolvePendingNamed` at the end of pass 2.
+        //
+        // A nested key always contains '.', which no top-level key can, so this
+        // cannot shadow a `md.types` entry registered by pass 1.
+        localTypes[t->qualifiedTypeName()] = t;
         // §9.2 (issue #501): propagate positional-record flag.
         t->hasPositionalFields = td.hasPositionalFields;
         // fix #2950 (§12 / §31.4 / §2.8.3 rule 4, v0.240): restore the built-in
@@ -1137,6 +1236,35 @@ struct Loader {
 // or ParameterSymbol — letting inlineCtorBody / implicitFieldAddr work with the
 // per-instantiation genericSubst_ active (§14.1 monomorphization).
 
+// fix #3540 (§11.6 / §2.8.3 rule 3, v0.285): the last component of a Named
+// MetaType's `namedName`, i.e. the type's SIMPLE identifier.
+//
+// `namedName` carries the QUALIFIED type name ("Outer.Box" for a §11.6 nested
+// type, identical to the simple name for a top-level one) because that is what
+// §2.8.3 rule 3 identifies a type by and what the loader's by-name resolution
+// needs to tell `Outer1.Box` from `Outer2.Box`. Three consumers want the simple
+// spelling instead, and they ask through this one helper so they cannot drift
+// from each other:
+//
+//   * `metaTypeToSourceText` renders SYNTHETIC stub source whose class header
+//     declares the SIMPLE name (`class Box<T>`) and which has no `Outer` in
+//     scope, so a qualified spelling would not resolve inside it;
+//   * `metaTypeSigText` is a signature key compared against `typeRefSigText`,
+//     which renders `declaration->name` — the simple name — so the two must
+//     produce the same text for the same type or ctor/dtor body attachment
+//     (§14/#705) silently stops matching;
+//   * `metaTypeReferencesNonSelfNamed` compares against that same synthetic
+//     header's `selfName`, which is `MetaTypeDecl::name`, again simple.
+//
+// Reading through it makes all three byte-identical to their pre-#3540
+// behaviour for every program, nested or not; only type RESOLUTION sees the
+// qualified form.
+static std::string metaNamedSimpleName(const MetaType& mt) {
+    const std::size_t dot = mt.namedName.rfind('.');
+    return dot == std::string::npos ? mt.namedName
+                                    : mt.namedName.substr(dot + 1);
+}
+
 // Render a MetaType as Bezel source text for use in a synthetic class source.
 static std::string metaTypeToSourceText(const MetaType& mt) {
     if (mt.kind == TypeKind::Primitive) {
@@ -1160,7 +1288,7 @@ static std::string metaTypeToSourceText(const MetaType& mt) {
         }
     }
     if (mt.kind == TypeKind::Named) {
-        std::string s = mt.namedName;
+        std::string s = metaNamedSimpleName(mt);  // fix #3540 — see the helper
         if (!mt.genericArgs.empty()) {
             s += "<";
             for (std::size_t i = 0; i < mt.genericArgs.size(); ++i) {
@@ -1204,7 +1332,7 @@ static std::string metaTypeSigText(const MetaType& mt) {
         }
     }
     if (mt.kind == TypeKind::Named) {
-        std::string s = mt.namedName;
+        std::string s = metaNamedSimpleName(mt);  // fix #3540 — see the helper
         if (!mt.genericArgs.empty()) {
             s += '<';
             for (std::size_t i = 0; i < mt.genericArgs.size(); ++i) {
@@ -1442,9 +1570,14 @@ static bool metaTypeReferencesNonSelfNamed(
                                                    inScopeGenericParams))
                     return true;
             }
-            if (mt.namedName.empty()) return false;
-            if (mt.namedName == selfName) return false;
-            if (inScopeGenericParams.count(mt.namedName)) return false;
+            // fix #3540 (§11.6, v0.285): compare the SIMPLE name — `selfName`
+            // is `MetaTypeDecl::name` and the synthetic source's class header
+            // declares that identifier, not a qualified path. See
+            // `metaNamedSimpleName`.
+            const std::string simpleName = metaNamedSimpleName(mt);
+            if (simpleName.empty()) return false;
+            if (simpleName == selfName) return false;
+            if (inScopeGenericParams.count(simpleName)) return false;
             return true;
         }
         case TypeKind::InlineArray:
@@ -3755,6 +3888,14 @@ static void loadMetadataPass2(
         loader.convertChoiceCases(td, *t);
         // (registration moved to pass 1 for order-independent by-name binding.)
     }
+
+    // fix #3540 (§11.6 / §2.8.3 rule 3, v0.285): every type of this module is
+    // now registered in `localTypes` — the top-level ones by pass 1, the §11.6
+    // nested ones by the member walk just above — so retry the Named references
+    // that could not bind while that walk was still in progress. Placed before
+    // pass 3, whose generic-body re-parse reads the member types this fills in.
+    // See `Loader::resolvePendingNamed`.
+    loader.resolvePendingNamed();
 
     // Pass 3 (§14/#662c, schema v5): for imported generic CLASSES, re-parse
     // exported ctor/dtor body text and attach ast::ConstructorDecl /

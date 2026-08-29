@@ -144,7 +144,28 @@ MetaType convertType(const sema::TypeRef* ref) {
             // §14: carry the referent's name (a generic-parameter use resolves
             // to a TypeSymbol named after the parameter, e.g. `T`).
             if (ref->declaration != nullptr) {
-                t.namedName = std::string(ref->declaration->name);
+                // fix #3540 (spec §11.6 / §2.8.3 rule 3 / §2.8.2, v0.285): the
+                // QUALIFIED type name, not the simple identifier. §2.8.3 rule 3
+                // identifies a type by "its **declaring module name, its
+                // qualified type name (including any enclosing-type path,
+                // [§11.6](#sec-nested-types)), and its generic arity**", and
+                // MetaType's own header already states that `namedName` "carries
+                // the referent's fully-qualified name by value". It carried the
+                // SIMPLE one, so a §11.6 nested type crossed the artifact
+                // boundary as "Box": the importer's `lookupNamed` — which only
+                // ever knew this module's TOP-LEVEL types — returned null, the
+                // parameter's TypeRef kept `declaration == nullptr`, and codegen
+                // lowered it to the i32 default (#495's fallback). The consumer
+                // then passed a `ptr` to an `i32` parameter and died in IR
+                // verification instead of reporting any language rule.
+                //
+                // `qualifiedTypeName()` is the single authority for this
+                // spelling (sema/Symbol.hpp), the same one `reconstructTypeSymbol`
+                // keys `localTypes` on, so the writer and the reader cannot
+                // drift. A TOP-LEVEL type has an empty enclosing path, so its
+                // `namedName` is byte-identical to the pre-#3540 spelling and
+                // the whole non-nested world is unchanged on the wire.
+                t.namedName = ref->declaration->qualifiedTypeName();
             } else if (ref->astNode && ref->astNode->name &&
                        !ref->astNode->name->parts.empty()) {
                 // §2.5 / §29.3 (issue #495): builtin types (IEnumerable<T>,

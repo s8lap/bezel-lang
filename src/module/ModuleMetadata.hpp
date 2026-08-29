@@ -249,7 +249,14 @@ inline constexpr std::uint32_t kSchemaVersion = 7;
 // a diagnostic naming the dependency; an old reader given a new artifact
 // silently ignores the 5th field (the existing reader's `hdr.size() < 4`
 // gate never looks past index 3).
-inline constexpr std::uint32_t kProducerContentRevision = 1;
+// fix #3540 (§11.6 / §2.8.3 rule 3, v0.285) bumped 1 -> 2: a `MetaType::Named`
+// for a §11.6 NESTED type now carries the QUALIFIED type name ("Outer.Box")
+// where it used to carry the simple one ("Box"). That is a change in WHAT THE
+// WRITER WRITES, which is exactly what this stamp exists to police — a v0.285
+// compiler reading a pre-#3540 artifact would look "Box" up in a table keyed by
+// "Outer.Box", miss, and fall back to the i32 lowering, i.e. reproduce the very
+// defect on a stale dependency instead of rejecting it.
+inline constexpr std::uint32_t kProducerContentRevision = 2;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
 
