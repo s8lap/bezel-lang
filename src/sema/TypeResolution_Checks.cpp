@@ -315,27 +315,63 @@ void Resolver::checkConstructorChains() {
     }
 }
 
-bool Resolver::isChainCall(const ast::Stmt* s) {
+bool Resolver::isChainCall(const ast::Stmt* s, bool* isThis) {
     auto* es = dynamic_cast<const ast::ExpressionStmt*>(s);
     if (!es || !es->expr) return false;
     auto* call = dynamic_cast<const ast::CallExpr*>(es->expr.get());
     if (!call || !call->callee) return false;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(
         call->callee.get());
-    return id && (id->name == "this" || id->name == "base");
+    if (!id) return false;
+    if (id->name == "this") {
+        if (isThis) *isThis = true;
+        return true;
+    }
+    if (id->name == "base") {
+        if (isThis) *isThis = false;
+        return true;
+    }
+    return false;
 }
 
 void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
+    // fix #3535 (§22.10 "Primary constructors" / §22.7 "Constructors",
+    // v0.283): "A class with a primary constructor may declare additional
+    // convenience constructors. Each must chain to another constructor via
+    // `this(...)`; only the primary may chain to `base(...)`." §22.7 states
+    // the same restriction from the constructor side. A class's primary
+    // constructor is carried on the TypeDecl, NOT as a ConstructorSymbol
+    // (see `checkNewConstraintSatisfied`), so in such a class EVERY declared
+    // instance constructor is a convenience constructor and owes a leading
+    // `this(...)`.
+    //
+    // This was not enforced anywhere, and the omission is memory-unsafe
+    // rather than merely permissive: the `new` site stores the call's
+    // arguments into the primary-constructor field slots by POSITION
+    // (`Emitter::storePrimaryCtorPositionalArgs`, LlvmBackend_Exprs2.cpp),
+    // pairing argument i with positional field i. When a convenience
+    // constructor does not chain, nothing ever re-stores those slots with
+    // the values the object should hold, so the blind pairing survives to
+    // the first field read. Measured on e57a1eb with
+    // `class B(n: int, s: string)` + a non-chaining `constructor(v: int,
+    // w: int)`: `new B(5, 9)` stored the integer 9 into the `s: string`
+    // slot and SIGSEGVed on `Show()`. `hasPositionalFields` is read off the
+    // TypeSymbol (#501) rather than the TypeDecl for the same reason #3141
+    // moved the codegen gate there.
+    const bool classHasPrimaryCtor =
+        t->kind == ast::TypeDeclKind::Class && t->hasPositionalFields;
     for (Symbol* m : t->members) {
         auto* cs = dynamic_cast<ConstructorSymbol*>(m);
         if (!cs) continue;
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (!cd) continue;
         int chainCount = 0;
+        bool misplacedChain = false;
         for (std::size_t i = 0; i < cd->body.size(); ++i) {
             if (!cd->body[i] || !isChainCall(cd->body[i].get())) continue;
             ++chainCount;
             if (i != 0) {
+                misplacedChain = true;
                 ctx_.diagnostics().report(
                     Severity::Error, cd->body[i]->span.begin,
                     "a `base(...)` / `this(...)` constructor chain "
@@ -349,6 +385,30 @@ void Resolver::checkTypeConstructorChains(TypeSymbol* t) {
                 "a constructor may contain at most one `base(...)` "
                 "or `this(...)` chain call (§12.8)");
         }
+        // §22.10 / §22.7: the convenience-constructor chaining rule. A
+        // static constructor has no chaining position (§22.7) and is
+        // exempt. A constructor whose chain call is already diagnosed as
+        // misplaced or duplicated is left alone — the §12.8 diagnostic
+        // above already names the defect, and a second one over the same
+        // statement would only add noise.
+        if (!classHasPrimaryCtor || cs->isStatic) continue;
+        if (misplacedChain || chainCount > 1) continue;
+        bool leadingIsThis = false;
+        const bool hasLeadingChain =
+            !cd->body.empty() && cd->body[0] &&
+            isChainCall(cd->body[0].get(), &leadingIsThis);
+        if (hasLeadingChain && leadingIsThis) continue;  // conforming
+        const SourceLocation where =
+            hasLeadingChain ? cd->body[0]->span.begin : cd->span.begin;
+        ctx_.diagnostics().report(
+            Severity::Error, where,
+            std::string("constructor of class `") + std::string(t->name) +
+            "`, which has a primary constructor, must chain to another "
+            "constructor via `this(...)`" +
+            (hasLeadingChain
+                 ? "; only the primary constructor may chain to `base(...)`"
+                 : "") +
+            " (§22.10)");
     }
 }
 

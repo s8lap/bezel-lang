@@ -121,8 +121,17 @@ BEZEL_TEST(own_owning_inline_array_field_trivial_dispose_2666,
         "class Res public constructor() end constructor; "
         "  destructor end destructor; "
         "end Res; "
+        /* fix #3535 (§22.10, v0.283): SlotHolder's `public constructor()`
+           was removed here. §22.10 requires every convenience constructor of
+           a primary-constructor class to chain via `this(...)`, and that rule
+           is now enforced, so the old non-chaining spelling is a compile
+           error. It was never load-bearing for this row: `new SlotHolder([...])`
+           binds its one argument to the PRIMARY constructor's `slots`
+           parameter, and the row's subject is the §28.9 classification of the
+           positional `[2 owned]Res?` field. Measured with and without the
+           line on the fix compiler: the §28.3 auto-drop warning on `b2` this
+           row asserts is byte-identical either way. */
         "class SlotHolder(slots: [2 owned]Res?) "
-        "  public constructor() end constructor; "
         "end SlotHolder; ",
         "var b2 := new SlotHolder([new Res(), new Res()]); return 0;"));
     BEZEL_EXPECT_TRUE(hasAutoDropWarning(r, "b2"));

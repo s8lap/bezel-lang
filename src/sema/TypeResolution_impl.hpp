@@ -223,7 +223,10 @@ private:
 
     // True if `s` is a constructor chain call: an expression statement
     // whose expression is a call on the bare identifier `this`/`base`.
-    static bool isChainCall(const ast::Stmt* s);
+    // When non-null, `*isThis` receives true for `this(...)` and false for
+    // `base(...)` (written only when the function returns true) — the
+    // §22.10 convenience-constructor rule below needs the two apart.
+    static bool isChainCall(const ast::Stmt* s, bool* isThis = nullptr);
 
     void checkTypeConstructorChains(TypeSymbol* t);
 
