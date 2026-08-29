@@ -143,3 +143,54 @@ scripted by `scripts/extract_diag_to_lit.py`.
   **canary** subset before the authoritative full pass — fail-fast only, never
   acceptance (#2100; knobs `GATE_CANARY=0`, `GATE_CANARY_BASE`,
   `GATE_CANARY_MAX_PCT`).
+
+### Behaviour differential — the oracle for a change that ships no test
+
+A pure refactor (a deduplication, a unification, a rename) is supposed to change
+nothing observable, so it can ship no regression test that FAILS WITHOUT and
+PASSES WITH — the discipline the rest of this file is built around has nothing
+to bite on. A green suite then only says *the behaviours the suite already pins
+did not move*; it says nothing about the ~2,800 programs in `tests/conformance/`
+and `tests/lit/` that no gtest asserts on individually.
+
+`scripts/behaviour_differential.sh` is the oracle for exactly that case. It
+compiles **and runs** both corpora under a BASELINE `bezelc` and a CANDIDATE
+`bezelc` and compares what a user of the language can observe — compile exit
+status, compiler diagnostics, run exit status, program stdout, program stderr —
+reporting each difference under a named class and exiting non-zero on any of
+them.
+
+```
+scripts/behaviour_differential.sh --self-test         # ~20s, no compiler needed
+scripts/behaviour_differential.sh \
+    --baseline  /path/to/main-build/bezelc \
+    --candidate ./build/bezelc
+```
+
+Why not `cmp` the object files: `bezelc` is not byte-reproducible against
+*itself*. Generated symbol names embed raw AST pointers (#3548), async/iterator
+spill order is pointer-hash dependent (#3504), and a one-`bool` change to
+`sizeof(sema::LocalSymbol)` reorders spill groups — identical instruction
+multiset, different bytes. Object `SAME` is conclusive; object `DIFF` is not.
+Running the program is immune to all three.
+
+Three things about it are worth knowing before you trust a green:
+
+- **It is fail-closed.** It refuses to report clean unless it measured that it
+  did work: the corpus must clear a size floor, every program must yield an
+  observation from both compilers, at least one must compile cleanly under both,
+  and `executed` must EQUAL `runnable under both` — every program that compiled
+  in executable mode under both compilers must actually have been run.
+- **It prints how much each observable channel carried.** Measured at 907ce0f:
+  of 467 programs that ran under both, only **24 printed anything** and only 5
+  wrote to stderr. A bare "467 executed, 0 stdout mismatches" overstates its
+  evidence by ~19x, so the report names the witness count per channel and marks
+  the thin ones. Read that table before reading the verdict. (The corpus gap
+  behind those two numbers is filed as issue 3607.)
+- **Every mismatch is re-observed on both sides before it is reported**, and
+  a side that disagrees with itself is filed under `nondeterministic` rather
+  than reported. A raw one-shot diff between two runs is not conclusive.
+
+The baseline binary must keep its own build tree: `bezelc` links the
+`libbezel_runtime.a` that tree built, so a preserved binary is not a preserved
+experiment. Build the baseline in a separate checkout and leave it there.
