@@ -1681,6 +1681,21 @@ private:
     // (a literal/arithmetic/const may; a variable or call result may not).
     std::optional<long long> foldIntConstExprTC(const ast::Expr& e);
 
+    // fix #3617 (§17.14 / §15.1 / §22.12 / §2.8.3 rule 4, v0.286): the ONE
+    // bare-identifier resolver the three ExprTC §17.14 constant folds share.
+    // Resolves `name` through `lookupName` (the lexical scope chain plus the
+    // enclosing type's member consts, including an IMPORTED base's) to a
+    // compile-time integer, consulting BOTH sources: the AST initializer when
+    // the symbol has one (`ast::LocalConstDecl` / `ast::ConstDecl`), and
+    // `ConstMemberSymbol::intValue` — fix #3230's wire-carried value — when it
+    // does not, which is every imported const (§2.5 reconstructs the symbol
+    // with no AST). `depth` is the recursion depth `foldIntConst` bounds.
+    //
+    // It exists because this was three hand-copied lambdas and only ONE of them
+    // (foldIntConstExprTC's) carried #3230's imported arm; see the definition
+    // for what the other two silently answered.
+    std::optional<long long> foldConstIdentTC(std::string_view name, int depth);
+
     // §17.14 (v0.184, #1688): does `e` contain a `/` or `mod` node whose RHS
     // folds to a compile-time zero, using the SAME identifier resolution as
     // foldIntConstExprTC (lexical-scope `lookupName`, not a type's member-

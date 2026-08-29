@@ -9308,30 +9308,65 @@ void ExprTC::checkCasePatternConstantRanges(
     for (const auto& arm : arms) checkPatternConsts(arm.pattern.get());
 }
 
+// fix #3617 (§17.14 / §15.1 / §22.12 / §2.8.3 rule 4, v0.286): see the contract
+// in ExprTypecheck_impl.hpp. This body is #3230's — the ONE of the three ExprTC
+// copies that had the imported arm. The other two (`localConstDivByZeroTC`,
+// `foldLocalConstArraySize`) were character-identical lambdas MINUS the final
+// `ConstMemberSymbol::intValue` fallback, so a bare identifier naming an
+// imported const answered `std::nullopt` there and the fold silently gave up.
+//
+// #3230 fixed four copies of this resolver, in three files, and did not know
+// these two existed; the family is six, not four. Making the ExprTC three ONE
+// function is what stops the seventh being written wrong. The remaining three
+// (`TypeResolution_Checks.cpp`, `TypeResolution_Names.cpp` x2) sit on a
+// different class with a different `lookupName` and are left to their own
+// change (issue filed) — they already carry #3230's arm, so all six now AGREE;
+// the residue is duplication, not divergence.
+//
+// MEASURED, both against a character-identical single-module twin, with `K`/`Z`
+// consts on a base class the importer inherits:
+//   * `const q: int := 10 / Z;` — LOCAL: rejected, "const `q` initializer
+//     contains a division or modulo by zero (§17.14)". IMPORTED base: ACCEPTED,
+//     and the program throws System.DivideByZeroException at run time (exit 70).
+//     A compile error demoted to a runtime fault by a module boundary.
+//   * `const n: int := K; var a: [n]int := [7, 8, 9];` — LOCAL: compiles.
+//     IMPORTED base: `arraySizeValue` stayed -1 and codegen emitted MALFORMED IR
+//     ("Invalid indices for GEP pointer type!", IR verification failed).
+std::optional<long long> ExprTC::foldConstIdentTC(std::string_view name,
+                                                  int depth) {
+    Symbol* s = lookupName(name);
+    if (!s) return std::nullopt;
+    const ast::Expr* val = nullptr;
+    if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
+        val = lc->value.get();
+    else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
+        val = cd->value.get();
+    if (val)
+        return foldIntConst(
+            *val,
+            [this](std::string_view n, int d) { return foldConstIdentTC(n, d); },
+            depth + 1);
+    // fix #3230 (§17.14 / §5.1 / §22.12; family M11 of umbrella #3152):
+    // an IMPORTED class member const has no AST ConstDecl — the symbol
+    // is reconstructed from dependency metadata, fix #328 — so the
+    // AST path above returns nullopt and `case`-pattern out-of-range
+    // gates (#1153), the §5.1 narrowing range check (#2986 admission),
+    // and any other imported-class-const-driven constant expression
+    // silently no-op. Fall back to the typed value the loader
+    // populated (parseImportedConstIntText in ModuleLoader.cpp);
+    // std::nullopt for non-integer-family or non-foldable consts, which
+    // keep the pre-fix behavior unchanged. // per §17.14
+    if (auto* cms = dynamic_cast<ConstMemberSymbol*>(s))
+        if (cms->intValue) return *cms->intValue;
+    return std::nullopt;
+}
+
 std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
+    // fix #3617: the resolver is `foldConstIdentTC` now — this lambda was its
+    // original home and the only #3230-correct copy of three.
     std::function<std::optional<long long>(std::string_view, int)> resolve =
-        [&](std::string_view name, int d) -> std::optional<long long> {
-        Symbol* s = lookupName(name);
-        if (!s) return std::nullopt;
-        const ast::Expr* val = nullptr;
-        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
-            val = lc->value.get();
-        else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
-            val = cd->value.get();
-        if (val) return foldIntConst(*val, resolve, d + 1);
-        // fix #3230 (§17.14 / §5.1 / §22.12; family M11 of umbrella #3152):
-        // an IMPORTED class member const has no AST ConstDecl — the symbol
-        // is reconstructed from dependency metadata, fix #328 — so the
-        // AST path above returns nullopt and `case`-pattern out-of-range
-        // gates (#1153), the §5.1 narrowing range check (#2986 admission),
-        // and any other imported-class-const-driven constant expression
-        // silently no-op. Fall back to the typed value the loader
-        // populated (parseImportedConstIntText in ModuleLoader.cpp);
-        // std::nullopt for non-integer-family or non-foldable consts, which
-        // keep the pre-fix behavior unchanged. // per §17.14
-        if (auto* cms = dynamic_cast<ConstMemberSymbol*>(s))
-            if (cms->intValue) return *cms->intValue;
-        return std::nullopt;
+        [this](std::string_view name, int d) -> std::optional<long long> {
+        return foldConstIdentTC(name, d);
     };
     // fix #2986 (§17.14 / §5.1 / §22.12, v0.240): admit a qualified class
     // const `C.GK` as a compile-time integer constant so it can drive §5.1
@@ -9382,17 +9417,13 @@ std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
 // unfoldable initializer can be diagnosed specifically as a division/modulo
 // by zero rather than silently accepted as "not a foldable constant".
 bool ExprTC::localConstDivByZeroTC(const ast::Expr& e) {
+    // fix #3617: was a third copy of the resolver, missing #3230's imported arm
+    // — so `10 / Z` with an IMPORTED `Z := 0` folded to nullopt, no `/`-by-zero
+    // node was found, and the const initializer was silently accepted. See
+    // foldConstIdentTC for the measured local-vs-imported divergence.
     std::function<std::optional<long long>(std::string_view, int)> resolve =
-        [&](std::string_view name, int d) -> std::optional<long long> {
-        Symbol* s = lookupName(name);
-        if (!s) return std::nullopt;
-        const ast::Expr* val = nullptr;
-        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
-            val = lc->value.get();
-        else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
-            val = cd->value.get();
-        if (!val) return std::nullopt;
-        return foldIntConst(*val, resolve, d + 1);
+        [this](std::string_view name, int d) -> std::optional<long long> {
+        return foldConstIdentTC(name, d);
     };
     return containsConstDivByZero(e, resolve);
 }
@@ -9466,17 +9497,16 @@ void ExprTC::foldLocalConstArraySize(TypeRef* declType) {
     // Resolve a bare identifier to an in-scope `const`'s int value. lookupName
     // walks the lexical scope chain (local consts) and the enclosing type
     // (member consts); either decl form carries the initializer expression.
+    //
+    // fix #3617: was a fourth copy of the resolver, missing #3230's imported
+    // arm. The comment above said "either decl form carries the initializer
+    // expression" — true, and precisely why an IMPORTED const, which has NO
+    // decl form, was invisible: `const n: int := K;` over an imported `K` left
+    // `arraySizeValue` at -1 and codegen emitted malformed IR. See
+    // foldConstIdentTC for the measurement.
     std::function<std::optional<long long>(std::string_view, int)> resolve =
-        [&](std::string_view name, int d) -> std::optional<long long> {
-        Symbol* s = lookupName(name);
-        if (!s) return std::nullopt;
-        const ast::Expr* val = nullptr;
-        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s->decl))
-            val = lc->value.get();
-        else if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
-            val = cd->value.get();
-        if (!val) return std::nullopt;
-        return foldIntConst(*val, resolve, d + 1);
+        [this](std::string_view name, int d) -> std::optional<long long> {
+        return foldConstIdentTC(name, d);
     };
     if (auto v = foldIntConst(*declType->arraySize, resolve, 0)) {
         // §15.1 (#953): N must be greater than zero. A local-`const`-sized
