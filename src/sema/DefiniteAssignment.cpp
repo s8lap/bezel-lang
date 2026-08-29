@@ -1289,6 +1289,9 @@ private:
                 gateObservation(id->span.begin, "reference to `this`");
                 return;
             }
+            // fix #3583 (§22.8 step 0 / §22.10): the bare spelling of a
+            // primary-constructor parameter in the chaining position.
+            gateChainPositionPrimaryParamRead(*id, id->span.begin);
             checkRead(*id);
             return;
         }
@@ -1798,6 +1801,57 @@ private:
         }
     }
 
+    // fix #3583 (§22.8 step 0 / §22.10 / §22.7 rule 1, v0.286): a read of a
+    // §22.10 PRIMARY-CONSTRUCTOR PARAMETER in the chaining position.
+    //
+    // §22.7 rule 1's gate above deliberately excludes a field read — "a field
+    // or auto-property read is backing storage … its own §7.9/§28.8.1 DA rules
+    // apply" — and a primary-constructor parameter resolves to a (compiler-
+    // generated) FieldSymbol, so it fell into that exclusion and nothing
+    // checked it. But its §7.9 rule is not the one that applies here: §22.8
+    // puts the capture of those parameters at **step 0 of the chained-to
+    // primary**, and says in as many words that a chaining constructor does not
+    // run it:
+    //
+    //   "A constructor that chains via `this(...)` **skips steps 0 and 2** …
+    //    (Step 0 is vacuous for such a constructor anyway: … primary-parameter
+    //    capture happens inside the chained-to primary.)"
+    //
+    // Step 1 (the chain call, arguments included) is evaluated BEFORE that
+    // step 0, so on every ordering the slot read here is unwritten. §22.10's
+    // scope list agrees from the other side: the parameters are in scope
+    // "Inside field initializers", "Inside the inheritance clause's base call"
+    // and "Inside the body of any method, property, constructor, or destructor"
+    // — and §12.8 puts the chaining position outside the body ("it is
+    // syntactically distinct from the body's statements").
+    //
+    // This was memory-unsafe rather than merely undefined: with §22.8 step 0
+    // ALSO running at the `new` site under a blind argument-i/field-i pairing,
+    // the slot held whatever the convenience constructor's i-th argument was,
+    // and `class B(n: int, s: string)` + `constructor(v: int, w: int)
+    // this(v, s);` + `new B(5, 9)` loaded the integer 9 as a string pointer and
+    // SIGSEGVed (issue 3562). Removing that store — which #3583 does, because
+    // §22.8 forbids it — would have turned the crash into a quiet read of the
+    // calloc zero. It is rejected instead, which is the outcome issues 3562 and
+    // 3585 both recommend. (issue 3585 asks the spec to state the rule
+    // explicitly; this implements the reading its own Recommendation gives, and
+    // is recorded there.)
+    void gateChainPositionPrimaryParamRead(const ast::Expr& e,
+                                           const SourceLocation& loc) {
+        if (!ctorMode_ || !inChainingPosition_) return;
+        auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(e));
+        if (!fs || !fs->posParam) return;
+        if (!fs->parent || fs->parent->kind != ast::TypeDeclKind::Class) return;
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("cannot read primary-constructor parameter `") +
+            std::string(fs->name) +
+            "` in the chaining position — the primary-constructor parameters "
+            "are captured as step 0 of the chained-to primary constructor, "
+            "which runs after the `this(...)` arguments are evaluated, so the "
+            "parameter has no value here (§22.8 step 0, §22.10)");
+    }
+
     // §22.7 rule 2: a dispatching call on `this` to a `virtual`/`override`/
     // `abstract` member from a non-sealed (or abstract) constructor body is a
     // compile error — during construction the runtime type may be a derived
@@ -1963,6 +2017,11 @@ private:
                                     "property `" + std::string(ma.member) + "`");
             }
         }
+        // fix #3583 (§22.8 step 0 / §22.10): the `this.p` spelling of a
+        // primary-constructor parameter in the chaining position. §22.10's
+        // capture rule makes the parameter a compiler-generated field, so both
+        // spellings reach the same unwritten slot.
+        gateChainPositionPrimaryParamRead(ma, ma.span.begin);
         // Field / auto-property / method-group / unresolved: not an
         // observation; do not recurse into the `this`/`base` receiver.
         return true;

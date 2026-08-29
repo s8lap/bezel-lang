@@ -11220,15 +11220,9 @@ llvm::Function* Emitter::declareImportedInit(const sema::TypeSymbol* ts) {
 
 
 const ast::CallExpr* Emitter::chainCallOf(const ast::Stmt& s, bool& isThis) {
-    auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s);
-    if (!es || !es->expr) return nullptr;
-    auto* call = dynamic_cast<const ast::CallExpr*>(es->expr.get());
-    if (!call || !call->callee) return nullptr;
-    auto* id = dynamic_cast<const ast::IdentifierExpr*>(call->callee.get());
-    if (!id) return nullptr;
-    if (id->name == "this") { isThis = true; return call; }
-    if (id->name == "base") { isThis = false; return call; }
-    return nullptr;
+    // fix #3583 (§12.8, v0.286): forwards to `ast::chainCallOfStmt`, the ONE
+    // chain-call recognizer. This body was one of three byte-identical copies.
+    return ast::chainCallOfStmt(s, isThis);
 }
 
 
@@ -11439,55 +11433,57 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             // without this nothing initialized the primary-ctor class — its
             // positional params and field initializers all stayed calloc-zero.
             llvm::StructType* st = classStruct(targetCls);
+            // fix #3583 (§22.8 step 0 / §22.10 / §22.5, v0.286): §22.8 step 0
+            // has ONE implementation now. This arm used to carry a second,
+            // weaker copy of `storePrimaryCtorPositionalArgs`'s loop, gated on
+            // `allPositional && n == posFields.size()`, so it paid none of the
+            // machinery the `new`-site copy had accumulated:
+            //   - the §22.5 BINDING sema publishes (#3196) — a chain call
+            //     written with named arguments (`this(s := w, n := v)`) failed
+            //     the `allPositional` gate and stored NOTHING, leaving the whole
+            //     object calloc-zero;
+            //   - the §22.5 DEFAULT of a primary parameter (#3202 local /
+            //     #3213 imported) — a chain call omitting a trailing defaulted
+            //     parameter (`this(v)` against `B(n: int, s: string := "d")`)
+            //     failed the exact-arity gate and likewise stored NOTHING;
+            //   - the §4.7 unit rescue (#3502) and the #597 / #2367 evaluation
+            //     brackets.
+            // Those two holes were invisible while the `new` site was ALSO
+            // running step 0 for a convenience-bound call and covering for
+            // them — with a blind argument-i/field-i pairing against a
+            // parameter list it does not describe, which is issue 3562's wild
+            // pointer. Closing the hole at the `new` site (LlvmBackend_Exprs2.cpp)
+            // and completing this one are the same fix; neither lands alone.
+            //
+            // `currentThis_` is both the object and the enclosing `this`, and
+            // the active `genericSubst_` is already this class's own, so the
+            // helper's #597 / #2367 save-install-restore brackets are no-ops
+            // here — the chain arguments are expressions of the convenience
+            // constructor's own body, evaluated in the frame they were written
+            // in.
+            storePrimaryCtorPositionalArgs(
+                targetCls, currentThis_, st, call->args,
+                ctx_.positionalBinding(*call), genericSubst_,
+                genericSubstSemaTy_, currentThis_);
+            // fix #3583 (§22.10 "When a class with a primary constructor has a
+            // base class, the base call appears in the inheritance clause"):
+            // the §22.10 inheritance-clause base call is evaluated against the
+            // object's own positional slots, so it must run AFTER the step 0
+            // above and BEFORE the base's own construction sequence. The `new`
+            // site runs it for a primary-bound call and now skips it for a
+            // convenience-bound one, which is this arm.
+            //
+            // Gated on the SAME symbol-side flag the store above gates itself
+            // on, and for the same reason: only a class with a primary
+            // constructor can HAVE a §22.10 inheritance-clause base call. Left
+            // ungated it would also fire on the error-recovery shape that
+            // reaches this branch — a `this(...)` naming no constructor arity in
+            // a class with no primary constructor — where the recursion would
+            // reach a grandparent's positional slots the old code never touched.
             if (targetCls->kind == ast::TypeDeclKind::Class &&
-                targetCls->hasPositionalFields) {
-                // fix #3141 (family F3 of umbrella #3152, §22.8 step 0): the
-                // primary-constructor parameter list is the indexed symbol-side
-                // view. It is the same list `td->positionalFields` names (a
-                // local positional FieldSymbol's `posParam` points into it),
-                // read so the argument-i-to-field-i pairing survives an import,
-                // and so this no longer re-scans `members` per argument. The
-                // flag gates the build so the vector is not materialized for a
-                // class with no primary constructor.
-                const std::vector<const sema::Symbol*> posFields =
-                    sema::recordPositionalFieldSymbols(targetCls);
-                bool allPositional = true;
-                for (const auto& a : call->args)
-                    if (!a.name.empty()) { allPositional = false; break; }
-                if (allPositional && n == posFields.size() &&
-                    !posFields.empty()) {
-                    for (std::size_t pi = 0; pi < posFields.size(); ++pi) {
-                        {  // scope for the per-field bindings below
-                            auto* fs = const_cast<sema::FieldSymbol*>(
-                                static_cast<const sema::FieldSymbol*>(
-                                    posFields[pi]));
-                            auto pit = fieldIndex_.find(fs);
-                            if (pit == fieldIndex_.end()) continue;
-                            if (!call->args[pi].value) continue;
-                            llvm::Value* v = lowerExpr(*call->args[pi].value);
-                            if (!v) continue;
-                            v = coerceNumericToType(
-                                v, st->getElementType(pit->second),
-                                isUnsignedTargetExpr(*call->args[pi].value));
-                            // #1605 / §4.6 / §28.9: same STRING positional-ctor-
-                            // param field gap as the `new C(args)` site
-                            // (LlvmBackend_Exprs2.cpp) — this `this(args)`
-                            // delegation to the primary ctor stores straight into
-                            // the same disposed FieldSymbol, so it needs the same
-                            // independent +1 (retain unless the arg is a fresh
-                            // +1 producer, transferred instead). Field is
-                            // calloc-zeroed — no old value to release here.
-                            if (v->getType()->isPointerTy() &&
-                                isStringStorageMember(fs) &&
-                                !isPlusOneStringProducer(call->args[pi].value.get()))
-                                emitStringRetain(v);
-                            builder_.CreateStore(
-                                v, builder_.CreateStructGEP(st, currentThis_,
-                                                            pit->second));
-                        }
-                    }
-                }
-            }
+                targetCls->hasPositionalFields)
+                prePopulateBasePositionalFields(targetCls, currentThis_, {},
+                                                nullptr);
             emitImplicitBase(targetCls, currentThis_);
             emitOwnFieldInit(targetCls, currentThis_, st);
         }

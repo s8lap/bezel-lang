@@ -2030,6 +2030,12 @@ private:
                                const std::vector<ast::CallArgument>& args,
                                SourceLocation loc,
                                const std::string& calleeDesc, bool emit);
+    // fix #3583 (§22.8 step 0 / §22.10 / §22.5, v0.286): publish the §22.5
+    // binding of a convenience constructor's `this(...)` chain arguments to
+    // its class's PRIMARY constructor parameter list, so codegen's single
+    // §22.8-step-0 body serves the chain site as well as the `new` site. See
+    // the definition in ExprTypecheck_Calls.cpp.
+    void publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd);
     BindResult bindArgsToParams(const std::vector<ast::Param>& params,
                                const std::vector<ast::CallArgument>& args,
                                SourceLocation loc,

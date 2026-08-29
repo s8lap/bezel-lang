@@ -11684,6 +11684,11 @@ void ExprTC::visitMember(const ast::Member& m) {
         // verifies the expressions only.
         runMethodBody(cd->params, &cd->body, nullptr,
                       paramSymbolsOf(m), &cd->contractClauses);
+        // fix #3583 (§22.8 step 0 / §22.10 / §22.5, v0.286): after the body
+        // walk (so the chain arguments are typed), publish the §22.5 binding
+        // of a `this(...)` chain to this class's PRIMARY constructor, which is
+        // where §22.8 puts step 0 for such a constructor.
+        publishPrimaryCtorChainBinding(*cd);
         returnCtx_ = saveRet;
         inStaticMember_ = saveStatic;
         inConstructor_ = saveCtor;

@@ -225,15 +225,32 @@ public:
     // this one lives ONLY on the call site — a `new` for an imported type
     // occurs in the IMPORTER, never in the dependency's re-parsed body — so
     // `ModuleLoader`'s body-reconstruction remap does not need to copy it.
+    //
+    // fix #3583 (§22.8 step 0 / §22.10, v0.286): the key is the CALL SITE, and
+    // a `new T(...)` is not the only one. §22.8 says step 0 runs inside the
+    // chained-to primary constructor, so the OTHER site that fills these slots
+    // is a convenience constructor's `this(...)` chain call — an
+    // `ast::CallExpr`, not an `ast::NewExpr`. The map is keyed on
+    // `const ast::Expr*` so both sites publish to and read from ONE table with
+    // ONE binder body (`bindArgsToParams` over `FormalsView::of(fields)`),
+    // rather than the chain site growing a second, weaker pairing rule of its
+    // own. The `NewExpr` overloads below are kept so the existing call sites
+    // are unchanged.
+    void setPositionalBinding(const ast::Expr* site, std::vector<int> binding) {
+        newExprPositionalBindings_[site] = std::move(binding);
+    }
+    const std::vector<int>* positionalBinding(const ast::Expr& site) const {
+        auto it = newExprPositionalBindings_.find(&site);
+        return it == newExprPositionalBindings_.end() ? nullptr
+                                                      : &it->second;
+    }
     void setNewExprPositionalBinding(const ast::NewExpr* ne,
                                      std::vector<int> binding) {
-        newExprPositionalBindings_[ne] = std::move(binding);
+        setPositionalBinding(ne, std::move(binding));
     }
     const std::vector<int>* newExprPositionalBinding(
         const ast::NewExpr& ne) const {
-        auto it = newExprPositionalBindings_.find(&ne);
-        return it == newExprPositionalBindings_.end() ? nullptr
-                                                      : &it->second;
+        return positionalBinding(ne);
     }
     // §14.1/#783: iterate all AST-type→TypeRef and expr→TypeRef entries. Used by
     // ModuleLoader to COPY a re-parsed generic method body's resolved/expr types
@@ -804,7 +821,10 @@ private:
     // for the rationale and lifetime story. Local-only — never copied by
     // ModuleLoader's body-reconstruction remap (the `new` site lives in the
     // importer, not in a dependency's re-parsed body).
-    std::unordered_map<const ast::NewExpr*, std::vector<int>>
+    // fix #3583: keyed on `const ast::Expr*` — the `new` site's `NewExpr` AND
+    // a convenience constructor's `this(...)` chain `CallExpr` (§22.8 step 0
+    // has two call sites, one binder).
+    std::unordered_map<const ast::Expr*, std::vector<int>>
         newExprPositionalBindings_;
     // Cache for the common primitive TypeRefs. Key is `(p << 1) | nullable`.
     std::unordered_map<std::uint32_t, TypeRef*> primitiveCache_;

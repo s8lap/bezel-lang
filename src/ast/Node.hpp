@@ -1448,4 +1448,31 @@ struct SourceFile : Node {
     std::vector<std::unique_ptr<TopDecl>> topDecls;
 };
 
+// §12.8 / §22.7 / §22.10 (v0.286, fix #3583): the ONE spelling of "is this
+// statement a constructor CHAIN CALL, and is it `this(...)` or `base(...)`?".
+// §12.8 puts the chain call in the leading statement position, and four places
+// have to recognise it — the resolver's §22.10 convenience-constructor check,
+// definite assignment's §22.7 chaining-position gate, the emitter's chain
+// lowering, and (new here) the §22.5 binding publication for a `this(...)`
+// chain to a primary constructor. Each carried its own copy of the same
+// six-line dynamic_cast walk, which is the duplicated-classification shape.
+// `Emitter::chainCallOf`, `Emitter`'s `ctorChainsViaThis` and
+// `ExprTC::publishPrimaryCtorChainBinding` read this one;
+// `Resolver::isChainCall` and `DefiniteAssignment::getChainingCall` still hold
+// their own and are filed to converge here (they were left alone only to keep
+// this fix's cherry-pick footprint off files other lanes are rewriting).
+// Returns the chain `CallExpr` and sets `isThis`, or null when `s` is not a
+// chain call.
+inline const CallExpr* chainCallOfStmt(const Stmt& s, bool& isThis) {
+    auto* es = dynamic_cast<const ExpressionStmt*>(&s);
+    if (!es || !es->expr) return nullptr;
+    auto* call = dynamic_cast<const CallExpr*>(es->expr.get());
+    if (!call || !call->callee) return nullptr;
+    auto* id = dynamic_cast<const IdentifierExpr*>(call->callee.get());
+    if (!id) return nullptr;
+    if (id->name == "this") { isThis = true; return call; }
+    if (id->name == "base") { isThis = false; return call; }
+    return nullptr;
+}
+
 } // namespace bezel::ast

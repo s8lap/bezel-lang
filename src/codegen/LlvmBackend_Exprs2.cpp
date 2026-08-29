@@ -3007,13 +3007,34 @@ llvm::Value* Emitter::lowerWith(const ast::WithExpr& we) {
 //   Recurse into the base class so that multi-level chains (B: A(x), A: Root(x))
 //   are handled correctly.
 
+namespace {
+
+// fix #3583 (§22.8 / §22.10 / §12.8, v0.286): §22.8's own predicate — "a
+// constructor that chains via `this(...)` **skips steps 0 and 2**". The `new`
+// site asks it to decide whether to run step 0 there or leave it to the
+// chained-to primary, which is where §22.8 puts it for such a constructor. A
+// null `cs` (no explicit constructor bound — the call goes straight to the
+// primary) answers false, because the primary constructor is precisely the one
+// that does NOT skip step 0. File-local rather than an `Emitter` member: it
+// reads only the AST and has exactly one caller.
+bool ctorChainsViaThis(const sema::ConstructorSymbol* cs) {
+    if (!cs || cs->isStatic) return false;
+    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+    if (!cd || cd->body.empty() || !cd->body[0]) return false;
+    bool isThis = false;
+    return ast::chainCallOfStmt(*cd->body[0], isThis) && isThis;
+}
+
+}  // namespace
+
 // §22.8 step 0 / §22.10 (fix #3162) — see LlvmBackend_impl.hpp for the
 // contract and for why this is a method rather than two copies.
 void Emitter::storePrimaryCtorPositionalArgs(
         const sema::TypeSymbol* t,
         llvm::Value* obj,
         llvm::StructType* st,
-        const ast::NewExpr& ne,
+        const std::vector<ast::CallArgument>& args,
+        const std::vector<int>* binding,
         const std::unordered_map<std::string_view, llvm::Type*>& outerSubst,
         const std::unordered_map<std::string_view, const sema::TypeRef*>&
             outerSemaTy,
@@ -3079,12 +3100,12 @@ void Emitter::storePrimaryCtorPositionalArgs(
       // removed `anyNamed` decline, so the silent-zero-fallback it's
       // guarding against is not reachable today from a semantically-
       // accepted `new` site — keeping the guard preserves that posture.
-      const std::vector<int>* bindingPtr = ctx_.newExprPositionalBinding(ne);
+      const std::vector<int>* bindingPtr = binding;
       if (!bindingPtr) {
           bool allPositional = true;
-          for (const auto& a : ne.args)
+          for (const auto& a : args)
               if (!a.name.empty()) { allPositional = false; break; }
-          if (!allPositional || ne.args.size() > posFields.size())
+          if (!allPositional || args.size() > posFields.size())
               return;  // named-without-binding or oversupplied — every
                        // field stays calloc-zero, the pre-#3196 posture.
       }
@@ -3112,7 +3133,7 @@ void Emitter::storePrimaryCtorPositionalArgs(
     if (bindingPtr) {
         argIdx = (pi < bindingPtr->size()) ? (*bindingPtr)[pi] : -1;
     } else {
-        argIdx = (pi < ne.args.size()) ? static_cast<int>(pi) : -1;
+        argIdx = (pi < args.size()) ? static_cast<int>(pi) : -1;
     }
                   // The argument expression to lower: supplied (by the §22.5
                   // binding) when the slot has a bound arg, the parameter's
@@ -3126,9 +3147,9 @@ void Emitter::storePrimaryCtorPositionalArgs(
                   const ast::Expr* argExpr = nullptr;
                   llvm::Value* defaultV = nullptr;
                   if (argIdx >= 0 &&
-                      static_cast<std::size_t>(argIdx) < ne.args.size() &&
-                      ne.args[argIdx].value) {
-                      argExpr = ne.args[argIdx].value.get();
+                      static_cast<std::size_t>(argIdx) < args.size() &&
+                      args[argIdx].value) {
+                      argExpr = args[argIdx].value.get();
                   } else if (fs->posParam &&
                              (fs->posParam->defaultValue ||
                               !fs->posParam->defaultText.empty())) {
@@ -5857,8 +5878,9 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // match a deferred local shape is not this fix's business, and keeping
         // the guard leaves every imported shape that works today bit-identical.)
         if (!hasAnyConstructor(t))
-            storePrimaryCtorPositionalArgs(t, obj, st, ne, savedSubst,
-                                           savedSemaTy, currentThis_);
+            storePrimaryCtorPositionalArgs(
+                t, obj, st, ne.args, ctx_.positionalBinding(ne), savedSubst,
+                savedSemaTy, currentThis_);
         llvm::Function* initFn = declareImportedInit(t);
         builder_.CreateCall(initFn, {obj});
     } else if (importedGenericNoBody || importedGenericWithBody) {
@@ -5904,8 +5926,9 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // the guard is the same shape, the same asymmetry, and the same
         // reason as the non-generic imported arm one section up.
         if (!hasAnyConstructor(t))
-            storePrimaryCtorPositionalArgs(t, obj, st, ne, savedSubst,
-                                           savedSemaTy, currentThis_);
+            storePrimaryCtorPositionalArgs(
+                t, obj, st, ne.args, ctx_.positionalBinding(ne), savedSubst,
+                savedSemaTy, currentThis_);
         emitInstanceInit(t, obj, st);
     } else if (!ctx_.isImported(t)) {
         // §22.10 / §22.8 (#478): a class with primary-constructor parameters
@@ -5930,8 +5953,43 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // arguments into their field slots before emitInstanceInit runs the
         // field initializers, which may read them. The IMPORTED arm above
         // calls the same helper before `bz$<Type>$init`.
-        storePrimaryCtorPositionalArgs(t, obj, st, ne, savedSubst, savedSemaTy,
-                                       savedThisForInit);
+        //
+        // fix #3583 (§22.8 / §22.10, v0.286): ...but NOT when this `new` binds
+        // to an explicit §22.10 convenience constructor. §22.8:
+        //
+        //   "A constructor that chains via `this(...)` **skips steps 0 and 2**:
+        //    its effective sequence is the chained `this(...)` call, then its
+        //    own body. (Step 0 is vacuous for such a constructor anyway: only
+        //    non-primary constructors may chain via `this(...)` (§22.7,
+        //    §22.10), and primary-parameter capture happens inside the
+        //    chained-to primary.)"
+        //
+        // The arguments of such a call bind to the CONVENIENCE constructor's
+        // parameter list, which this helper does not describe: it pairs
+        // argument i with positional field i (or with the §22.5 binding sema
+        // published for the PRIMARY's parameter list, which is not the list
+        // these arguments were bound against). Running it here therefore stored
+        // a `string` argument into an `int` slot and vice versa — measured on
+        // 907ce0f, `class B(n: int, s: string)` + `constructor(w: string,
+        // v: int) this(s := w, n := v);` + `new B("hi", 3)` printed `4423024`
+        // and then SIGSEGVed (issue 3562). The store is not merely wrong, it is
+        // redundant: the chained-to primary's step 0 — `emitChainCall`'s
+        // `this(...)`-to-primary arm, which since this fix calls THIS SAME
+        // HELPER — writes every one of those slots before anything reads them.
+        //
+        // The predicate is §22.8's own: does the constructor this call binds to
+        // chain via `this(...)`? In a class with a primary constructor
+        // `Resolver::checkTypeConstructorChains` (fix #3535) makes every
+        // accepted explicit constructor do exactly that, so this coincides with
+        // the cheaper `!ctorForArgs(t, ne.args)` on every well-formed program;
+        // spelling it as the spec does keeps it right for a class whose
+        // constructor does NOT chain (a non-primary class, where the helper
+        // already returns early on `!hasPositionalFields`).
+        const bool boundCtorChainsThis = ctorChainsViaThis(ctorForArgs(t, ne.args));
+        if (!boundCtorChainsThis)
+            storePrimaryCtorPositionalArgs(
+                t, obj, st, ne.args, ctx_.positionalBinding(ne), savedSubst,
+                savedSemaTy, savedThisForInit);
         // §11.1 / #873: pre-populate base classes' positional-param field slots
         // BEFORE emitInstanceInit so that base field initializers (e.g.
         // `_field := v`) can read the value passed via the base(v) chain call
@@ -6020,9 +6078,26 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // (a ref/out param's arg is the caller's storage
                         // ADDRESS), so the pre-pass must bind ref/out params
                         // through refParams_, not paramSlots_.
-                        prePopulateBasePositionalFields(t, obj, paramVals,
-                                                        earlyCs,
-                                                        /*ctorArgsByRefAbi=*/true);
+                        //
+                        // fix #3583 (§22.8 / §22.10, v0.286): skipped for a
+                        // `this(...)`-chaining constructor, for the same reason
+                        // step 0 is. The §22.10 inheritance-clause base call
+                        // (`class B(n: int, s: string): A(n)`) is evaluated
+                        // against the object's OWN positional slots — case (a)
+                        // of `prePopulateBasePositionalFields` — so running it
+                        // here would read slots the chained-to primary has not
+                        // written yet, and store the calloc zero into the base.
+                        // The chain arm now runs it immediately after its step 0
+                        // (LlvmBackend_Setup.cpp), where the slots hold their
+                        // §22.8-ordered values. This is the third consumer of
+                        // the blind store issue 3583 records; without moving it,
+                        // `class A(p: int)` + `class B(n: int, s: string): A(n)`
+                        // + `constructor(v: int) this(v, "conv");` printed
+                        // `8 / conv / 0` instead of `8 / conv / 8`.
+                        if (!boundCtorChainsThis)
+                            prePopulateBasePositionalFields(
+                                t, obj, paramVals, earlyCs,
+                                /*ctorArgsByRefAbi=*/true);
                     } else {
                         // fix #2319: the call never runs, so no §22.3 write-back
                         // is owed — release the pinned receiver/index values.
@@ -6030,12 +6105,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     }
                 }
             }
-            if (prebuiltCtorArgs.empty()) {
+            if (prebuiltCtorArgs.empty() && !boundCtorChainsThis) {
                 // No explicit ctor (primary-ctor class with primaryBaseCtorArgs
                 // or no chain at all): still pre-populate from primaryBaseCtorArgs.
                 // (a): primaryBaseCtorArgs expressions reference primary-ctor
                 // FieldSymbols on `t` → evaluated via implicitFieldAddr(GEP obj),
                 // so currentThis_ = obj is already correct here.
+                // fix #3583: `!boundCtorChainsThis` covers the recovery path
+                // where the bound convenience constructor was found but its
+                // arguments did not build (`ok == false` above) — the chain arm
+                // still owns the base pre-population for it.
                 prePopulateBasePositionalFields(t, obj, {}, nullptr);
             }
             genericSubst_       = std::move(ctorArgSubstSave);

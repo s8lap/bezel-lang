@@ -16158,12 +16158,31 @@ private:
     //   argument expression belongs to the caller's scope, not to `t` (#597).
     // `thisForArgs` — the ENCLOSING `this`, for the same reason (#2367).
     // No-op unless `t` is a class with a non-empty primary-constructor
-    // parameter list and the call is all-positional with matching arity.
+    // parameter list and either sema published a §22.5 binding for the call
+    // site or the call is all-positional and not over-supplied.
+    //
+    // fix #3583 (§22.8 step 0 / §22.10 / §22.5, v0.286): the parameters are an
+    // ARGUMENT LIST and its published §22.5 BINDING, not an `ast::NewExpr`,
+    // because §22.8 gives step 0 two call sites and only one of them is a
+    // `new`. A constructor that chains via `this(...)` "skips steps 0 and 2 …
+    // primary-parameter capture happens inside the chained-to primary", so the
+    // OTHER site is `emitChainCall`'s `this(...)`-to-primary arm. That arm used
+    // to carry its own weaker copy of this loop — no §22.5 binding, no §22.5
+    // default, no §4.7 unit rescue — gated on `allPositional && n ==
+    // posFields.size()`, so a chain call written with named arguments or
+    // omitting a trailing defaulted parameter stored NOTHING and the object
+    // kept its calloc zero. Passing the list makes both sites one body.
+    //
+    // `args`    — the call site's arguments (`ne.args`, or the chain call's).
+    // `binding` — the §22.5 per-slot binding sema published for that call site
+    //   (`SemaContext::positionalBinding`), or null for a site sema has not
+    //   bound, which keeps the legacy all-positional/short-arity fallback.
     void storePrimaryCtorPositionalArgs(
         const sema::TypeSymbol* t,
         llvm::Value* obj,
         llvm::StructType* st,
-        const ast::NewExpr& ne,
+        const std::vector<ast::CallArgument>& args,
+        const std::vector<int>* binding,
         const std::unordered_map<std::string_view, llvm::Type*>& outerSubst,
         const std::unordered_map<std::string_view, const sema::TypeRef*>&
             outerSemaTy,

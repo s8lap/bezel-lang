@@ -10784,6 +10784,72 @@ ExprTC::BindResult ExprTC::bindArgsToParams(
     return res;
 }
 
+// fix #3583 (§22.8 step 0 / §22.10 / §22.5, v0.286): publish the §22.5 argument
+// BINDING for a convenience constructor's `this(...)` chain call to its class's
+// PRIMARY constructor, on the same `SemaContext` side table
+// `checkPositionalNewArgsFromSymbols` uses for a `new T(...)`.
+//
+// §22.8 gives step 0 — "primary-constructor parameters … are captured into
+// their compiler-generated private fields" — exactly two lowering sites: the
+// `new` site for a call that reaches the primary directly, and the chained-to
+// primary itself for a call that reaches it through a `this(...)` chain ("a
+// constructor that chains via `this(...)` skips steps 0 and 2 … primary-
+// parameter capture happens inside the chained-to primary"). Codegen's `new`
+// site reads this table (#3196) so a NAMED call (`new PBox(W := 4, V := 3)`)
+// and a call omitting a DEFAULTED parameter both store the slots §22.5 bound;
+// the chain site had no binding to read, so it carried a second, weaker pairing
+// of its own that gave up entirely on either spelling and left the object
+// calloc-zero. Publishing here lets both sites run ONE body with ONE §22.5
+// binder — which is the whole point of #3196 — instead of two.
+//
+// `emit=true`, and that is deliberate. Sema does not §22.5-check a `this(...)`
+// chain to a primary constructor at all today — the primary has no
+// `ConstructorSymbol` for the ordinary path to check against — so an
+// over-supplied or under-supplied chain call reached codegen and produced a
+// silently wrong object. Since this fix makes the chain site the ONLY §22.8
+// step-0 site for a convenience-bound construction, a call the binder cannot
+// bind would leave the object calloc-zero with no diagnostic anywhere, which
+// is the quiet outcome §22.5 has a rejection for everywhere else. The
+// diagnostics are not new text: they are the same five strings
+// `bindArgsToParams` already emits for a `new T(...)`, a method call and an
+// imported callee — the point of #3178's `FormalsView` is that one binder
+// serves every formal source. Measured before this: `this(x, "a", 99)` against
+// `class B(n: int, s: string)` compiled clean and ran. What is still NOT
+// checked here is §5.1 assignability of each bound argument to its slot's type
+// (`this("bad", 1)` still reaches a wild store); that is a separate family and
+// is filed rather than smuggled in.
+void ExprTC::publishPrimaryCtorChainBinding(const ast::ConstructorDecl& cd) {
+    if (cd.isStatic || !currentType_) return;
+    if (currentType_->kind != ast::TypeDeclKind::Class ||
+        !currentType_->hasPositionalFields)
+        return;
+    if (cd.body.empty() || !cd.body[0]) return;
+    bool isThis = false;
+    const ast::CallExpr* chain = ast::chainCallOfStmt(*cd.body[0], isThis);
+    if (!chain || !isThis) return;
+    // The chain may target an explicit SIBLING constructor rather than the
+    // primary. Codegen takes its primary-constructor branch exactly when
+    // `ctorByArity` finds no other non-static constructor of the call's arity
+    // (LlvmBackend_Setup.cpp's `emitChainCall`), so the same question is asked
+    // here — publishing a PRIMARY-parameter binding for a call that binds to a
+    // sibling's parameter list would be the very mispairing this fix removes.
+    const std::size_t n = chain->args.size();
+    for (Symbol* m : currentType_->members) {
+        auto* other = dynamic_cast<ConstructorSymbol*>(m);
+        if (!other || other->isStatic || other->decl == &cd) continue;
+        if (other->params.size() == n) return;
+    }
+    const std::vector<const Symbol*> fields =
+        recordPositionalFieldSymbols(currentType_);
+    if (fields.empty()) return;
+    const std::string desc =
+        std::string("`this(...)` chain to the primary constructor of `") +
+        std::string(currentType_->name) + "`";
+    BindResult b = bindArgsToParams(sema::FormalsView::of(fields), chain->args,
+                                    chain->span.begin, desc, /*emit=*/true);
+    if (b.ok) ctx_.setPositionalBinding(chain, b.paramToArg);
+}
+
 // §7 / stdlib §9.6 (#2315): see the header comment for the full rationale.
 // A primitive `string` instance-method call has no MethodSymbol, so the
 // ordinary per-argument assignability check (checkCallArity →
