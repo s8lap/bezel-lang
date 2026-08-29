@@ -44,7 +44,6 @@
 8    src/codegen/LlvmBackend_Serialization.cpp
 58   src/codegen/LlvmBackend_Setup.cpp
 4    src/codegen/LlvmBackend_Stmts.cpp
-2    src/codegen/LlvmBackend_String.cpp
 21   src/codegen/LlvmBackend_impl.hpp
 2    src/common/OwnershipFacts.cpp
 4    src/module/ModuleLoader.cpp
@@ -53,7 +52,7 @@
 3    src/ownership/Ownership_Checks.cpp
 1    src/sema/DefiniteAssignment.cpp
 1    src/sema/EntryPoint.cpp
-13   src/sema/ExprTypecheck.cpp
+11   src/sema/ExprTypecheck.cpp
 16   src/sema/ExprTypecheck_Calls.cpp
 18   src/sema/ExprTypecheck_Exprs.cpp
 11   src/sema/PureChecker.cpp
