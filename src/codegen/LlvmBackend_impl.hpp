@@ -8098,6 +8098,30 @@ private:
         return false;
     }
 
+    // fix #3556 (§8.1 / §8.3 / §8.6, v0.286): the complement of
+    // `equalsArgSettlesFalse` above — does the ARGUMENT's static type identify
+    // it as either THIS record/enum's own type, or an unresolved generic
+    // parameter whose value shape this instantiation has not settled (whose
+    // handling stays the pre-existing value-shape path, per the fix #3538
+    // commit this predicate was extracted from)? Both the enum `Equals` arm
+    // and the record `Equals` arm (LlvmBackend_Calls2.cpp) asked exactly this
+    // — byte-identical apart from the local variable's name — and #3556
+    // records that as the exact "will drift silently" shape this codebase
+    // keeps paying for: hoisted here so there is one spelling, not two.
+    //
+    // `!at` (an unresolved argument type) and an unresolved bare `Kind::Named`
+    // type parameter (`!at->declaration`) both answer true, matching the two
+    // inline copies this replaces: neither copy distinguished those cases from
+    // "is `ts` itself", so this hoist changes nothing about which programs
+    // take the structural-equality path below vs. the run-time
+    // `lowerValueSemUniversalEquals` path.
+    bool equalsArgIsOwnTypeOrUnresolved(const sema::TypeRef* at,
+                                        const sema::TypeSymbol* ts) {
+        using K = sema::TypeRef::Kind;
+        return !at || (!at->nullable && at->kind == K::Named &&
+                       (at->declaration == ts || !at->declaration));
+    }
+
     // fix #3538: the run-time face of the same question — see the definition in
     // LlvmBackend_Calls2.cpp.
     llvm::Value* lowerValueSemUniversalEquals(const sema::TypeRef* recvTy,

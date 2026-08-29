@@ -3071,13 +3071,12 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
                 lowerExpr(argE);          // §22.5: the argument still evaluates
                 return builder_.getFalse();
             }
-            using K = sema::TypeRef::Kind;
             // This enum itself, or a type parameter this instantiation has not
             // resolved (whose value shape decides below, as it always did).
-            bool ownEnumOrUnresolved =
-                !at || (!at->nullable && at->kind == K::Named &&
-                        (at->declaration == ts || !at->declaration));
-            if (!ownEnumOrUnresolved)
+            // fix #3556: the ONE both-arms `equalsArgIsOwnTypeOrUnresolved`
+            // predicate (LlvmBackend_impl.hpp), replacing the inline copy that
+            // used to live here byte-identical to the record arm below.
+            if (!equalsArgIsOwnTypeOrUnresolved(at, ts))
                 return lowerValueSemUniversalEquals(recvTy, recv, call);
             llvm::Value* other = lowerExpr(argE);
             if (!other) return nullptr;
@@ -3199,16 +3198,15 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
             lowerExpr(argE);
             return builder_.getFalse();
         }
-        using K = sema::TypeRef::Kind;
         // (b) This record itself, or a type parameter this instantiation has
         //     not resolved — the latter keeps the pre-existing value-shape
         //     handling below rather than gaining a new classification.
-        bool ownRecordOrUnresolved =
-            !at || (!at->nullable && at->kind == K::Named &&
-                    (at->declaration == ts || !at->declaration));
+        // fix #3556: the ONE both-arms `equalsArgIsOwnTypeOrUnresolved`
+        // predicate (LlvmBackend_impl.hpp), replacing the inline copy that
+        // used to live here byte-identical to the enum arm above.
         // (c) Anything else — `Object`, an interface, a class, `Pt?` — can
         //     dynamically BE a box of this record, so only the run time can say.
-        if (!ownRecordOrUnresolved)
+        if (!equalsArgIsOwnTypeOrUnresolved(at, ts))
             return lowerValueSemUniversalEquals(recvTy, recv, call);
         // §9.1 / §9.2: structural equality, same as the `=` operator (§8.3).
         llvm::Value* other = lowerExpr(argE);
