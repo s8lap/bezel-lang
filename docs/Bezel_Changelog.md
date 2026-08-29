@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.284 — August 2026**
+**Companion to the Bezel Language Specification, v0.285 — August 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -8668,3 +8668,11 @@ Non-blocking, all applied: the standard library conditioned `OwningArray<T>.ToAr
 - **Newly rejected (document level):** calls to the three removed surfaces — though the compiler accepts all of them until #3559 lands, so nothing changes for a program today; the deltas are filed, not asserted. **Newly accepted: nothing.**
 - **Doc-only this revision:** stdlib (three removals, two markers), rationale (§14.4 paragraph), code-generation reference (Math digest, LINQ digest, not-exists additions; pin → v0.284), Guide 05 (one enumeration line; pin → v0.284), `DECLINED.md` (three `retired` rows, one `rejected` row), two conformance transcriptions hand-edited (#1380). **Kernel classification: no contact. Body-locality: not applicable.**
 - **Proposal ledger:** 0121 → superseded; #3409 closes at this landing; #3410 routed to #3559 (defect dies with the arm); #3411 resolved by the G1 ruling (work in #3559).
+
+---
+
+### v0.285 changelog (v0.284 → v0.285)
+
+**Ruling: §35.2's boxable-classifications clause scopes replacement, not declarability ([#3335](https://github.com/s8lap/bezel-lang/issues/3335) — reading (1)).** v0.276's composition gate had surfaced a three-way tension: §35.7 offers every non-auto-hashable choice the §25.2 operator rescue, §25.2 obliges `Equals(T)`/`GetHashCode` to take it, and §35.2's carry-over sentence — "for the boxable classifications" — could be read as denying those members to owning and borrow-bearing choices, making an owning choice that overloads `=` unrescuable. The ruling adopts the reading the issue itself identified as the likely intent: the clause is about **taking over `Object`'s virtuals**, which only a boxable value can be dispatched through; it says nothing about *declaring* the plain members, which dispatch statically on a choice anyway. One sentence lands in §35.2 stating it: the members are declarable on every classification, replace nothing where no box exists, and §25.2's obligation is dischargeable everywhere. The alternatives' costs were as the issue recorded — reading (2) would have needed three scope edits and a compiler guard for an unrescuable form with no diagnostic; the affected population was verified zero at v0.276 (no choice anywhere declares an equality operator), so this ruling changes no program's verdict and closes the question before evidence pressure could make it expensive. Gate: clarification-scale ruling, single-sentence edit against the issue's own worked analysis; the v0.276 gate record and the issue carry the adversarial half (both readings argued, population measured); no further critique round was run — recorded here per the honest-gate convention.
+
+**Migration.** Newly rejected: nothing. Newly accepted: nothing today (no declarer exists); the sentence forecloses a future over-rejection. **Impl note:** [#3333](https://github.com/s8lap/bezel-lang/issues/3333)'s co-declaration implementation needs **no classification guard** — the obligation is uniform. Kernel: no contact. Body-locality: not applicable. Doc-only: one spec sentence. Guides/CG/corpus: no contact (population zero).
