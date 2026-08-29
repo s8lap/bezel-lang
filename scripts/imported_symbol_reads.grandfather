@@ -61,7 +61,7 @@
 11   src/sema/ExprTypecheck.cpp
 16   src/sema/ExprTypecheck_Calls.cpp
 18   src/sema/ExprTypecheck_Exprs.cpp
-11   src/sema/PureChecker.cpp
+8    src/sema/PureChecker.cpp
 5    src/sema/StaticInitCycles.cpp
 5    src/sema/SymbolCollection.cpp
 51   src/sema/TypeResolution_Checks.cpp

@@ -586,10 +586,42 @@ struct MemberSymbol : Symbol {
     ast::Visibility visibility = ast::Visibility::None;
     std::vector<std::string_view> modifiers;
     TypeSymbol* parent = nullptr;
-    // §22.15 / §22.16 / #2054: explicit purity and declaration-derived
-    // contract records reconstructed from an imported artifact. Local members
-    // continue to read their AST declarations during the ordinary passes.
+    // §22.15 (v0.286, fix #3609): this member's declared purity, on BOTH
+    // sides. `SymbolCollection::collectMember` fills it for a LOCAL declaration
+    // and `ModuleLoader::applyBehavior` from `MetaMember::isPure` for an
+    // imported one, by the SAME rule the exporter used to write the wire
+    // (`ModuleMetadataBuilder::convertMember`): the `pure` modifier, overridden
+    // by `ast::OperatorDecl::isPure` for an operator and
+    // `ast::ConstructorDecl::isPure` for a constructor, neither of which the
+    // parser copies into a modifier list. ASK `memberIsPure` BELOW rather than
+    // reading this directly: not every `MemberSymbol` is built by
+    // `collectMember` (the builtin-interface shims in SemaContext.hpp and a
+    // record's synthesized positional fields are not), and for those this field
+    // keeps its `false` default while the accessor's decl and modifier arms
+    // still answer.
+    //
+    // ⚠ It was an IMPORT-ONLY channel until #3609, and `applyBehavior` still
+    // FORGES a `pure` entry in `modifiers` for an imported member so the
+    // `hasMod(sym, "pure")` sweeps in TypeResolution_Checks.cpp keep seeing it
+    // (fix #2054 added both halves in one commit). That forgery is load-bearing
+    // — §22.15 dispatch rule 1 at TypeResolution_Checks.cpp:4462 reads an
+    // imported base member's purity through it — so it stays until those sites
+    // are routed through `memberIsPure` too.
     bool isPure = false;
+    // §22.16 / #2054: this member's declaration-derived contract records,
+    // reconstructed from an imported artifact (ModuleLoader.cpp:736, :4312).
+    //
+    // ⚠ NOTHING READS THIS YET, and that is deliberate rather than an
+    // oversight — see issue 3611. §22.16's clauses are enforced CALLEE-side
+    // (measured: a cross-module `requires` violation raises
+    // ContractViolationException from the exporter's own compiled prologue), so
+    // an importer needs no records to enforce a direct call. What it WOULD need
+    // them for is the half of §22.16 that is unimplemented on both sides of the
+    // seam: clauses are "inherited, never restated" by an override, and an
+    // override of an IMPORTED base method has no other channel to the base's
+    // clauses. `TypeSymbol::invariantContracts` is the same channel one level up
+    // and already has that reader (ModuleMetadataBuilder.cpp:858-864). Kept, not
+    // deleted, so implementing 3611 does not have to re-derive the carriage.
     std::vector<ContractRecord> contractRecords;
     // fix #3140 (§9.8, family F2 of umbrella #3152): this storage member's
     // `serialized` clause — `skip`, `optional`, and the `"<name>"` wire rename.
@@ -1257,9 +1289,10 @@ bool isInstanceFieldStorageSymbol(const Symbol* m);
 // The three sources are not redundant — each is the ONLY one populated on some
 // path:
 //
-//   * `isPure` is an IMPORTED-ONLY channel — `SymbolCollection` never sets it
-//     (it does not even copy `cd->modifiers` onto a `ConstructorSymbol`), so it
-//     is `false` for every LOCAL constructor;
+//   * `isPure` was an IMPORTED-ONLY channel when this predicate was written;
+//     since #3609 `SymbolCollection` fills it locally too, from
+//     `ConstructorDecl::isPure` (it still does not copy `cd->modifiers` onto a
+//     `ConstructorSymbol`, so the modifier arm remains empty for locals);
 //   * `decl` is null for every constructor of a non-generic IMPORTED CLASS —
 //     `ModuleLoader` re-parses ctor body text only for a generic type or a
 //     record (ModuleLoader.cpp, the `parseAndAttachCtorBody` caller);
@@ -1276,6 +1309,43 @@ bool isInstanceFieldStorageSymbol(const Symbol* m);
 // (measured on `ec6a02f`). §22.15: "A pure constructor's `base(…)`/`this(…)`
 // chain target must itself be pure."
 bool constructorIsPure(const ConstructorSymbol* cs);
+
+// §22.15 (v0.286, fix #3609): is this member declared `pure`? THE predicate
+// for every member kind; `constructorIsPure` above is its constructor-typed
+// alias, kept because #3174's contract is recorded against that name.
+//
+// It consults the same three sources in the same order, generalised off
+// constructors: `MemberSymbol::isPure` (now filled on BOTH sides — see the
+// field), then the AST node when there is one (`ast::OperatorDecl::isPure` for
+// an operator, `ast::ConstructorDecl::isPure` for a constructor — the two
+// spellings of `pure` the parser does NOT put in a modifier list), then the
+// `pure` modifier. The set matters even though the field now subsumes most of
+// it: `decl` is the only source for a local operator or constructor built
+// before the symbol's `isPure` is assigned, and the modifier arm is what every
+// pre-#3609 call site did and is kept verbatim so no admitted program changes
+// verdict.
+//
+// WHAT IT REPLACED. Five sites in PureChecker.cpp each asked a DIFFERENT SUBSET
+// of those sources — `callTargetIsPure`'s method arm (all three), the `in`/
+// `Contains` receiver scan (field + modifier, its own comment claiming it was
+// the "same predicate"), `checkOneMember`'s method arm (decl + modifier),
+// its property arm (modifier + accessor-level `pure get`), and the pure-ctor
+// field-initializer gate (decl only). None disagreed in a reachable shape,
+// because `ModuleLoader::applyBehavior` forges the `pure` modifier for every
+// imported member; the drift risk was the point, not a measured miscompile.
+bool memberIsPure(const MemberSymbol* m);
+
+// §22.15 "Purity attaches to the getter" (v0.286, fix #3609): is THIS
+// property's GETTER pure? A strictly wider question than `memberIsPure(ps)`,
+// because `pure get` is an accessor-level marker riding
+// `ast::PropertyAccessor::isPure` — a channel the property's own modifier list
+// does not carry, and one `MetaMember` has no slot for either (the exporter
+// writes `MetaMember::isPure` from the PROPERTY's modifiers,
+// ModuleMetadataBuilder.cpp), so this arm answers for local declarations only
+// and an imported `pure get` property reads as not-pure. That asymmetry is a
+// real seam gap, filed as issue 3618; it is inert today because
+// `callTargetIsPure` admits every property read unconditionally.
+bool propertyGetterIsPure(const PropertySymbol* ps);
 
 // §9.3 (v0.158, #1383): true when a positional or combined-form record
 // synthesizes equality — i.e. every positional field's type (and every body

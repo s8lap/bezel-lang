@@ -78,6 +78,8 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
                             std::string_view enclosingTypePath = {});
 Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
                       SemaContext& ctx);
+Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
+                          SemaContext& ctx);
 
 // A.3 GenericParam: register one symbol per declared parameter in the
 // given scope.
@@ -161,8 +163,8 @@ std::vector<Symbol*> collectParams(const std::vector<ast::Param>& params,
     return out;
 }
 
-Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
-                      SemaContext& ctx) {
+Symbol* collectMemberImpl(const ast::Member& m, TypeSymbol& parent,
+                          SemaContext& ctx) {
     // Each member has its own scope (parameters, locals live inside).
     const ScopeId scope = ctx.newScope();
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(&m)) {
@@ -306,6 +308,70 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
     // Unknown Member kind — return null so the caller can skip without
     // diagnosing (parser would already have errored if it built one).
     return nullptr;
+}
+
+// fix #3609 (§22.15 / §2.8.2, v0.286): fill the SYMBOL-side purity channel for
+// a LOCAL declaration, so `MemberSymbol::isPure` means the same thing on both
+// sides of the artifact boundary instead of meaning "imported AND pure".
+//
+// THE RULE IS THE EXPORTER'S, VERBATIM. `ModuleMetadataBuilder::convertMember`
+// writes the wire as `out.isPure = hasModifier(m.modifiers, "pure")`, then its
+// operator arm overrides with `od->isPure` and its constructor arm with
+// `cd->isPure` — the two forms whose `pure` the parser consumes into a
+// dedicated AST bool instead of leaving in the modifier list
+// (Parser_Decls.cpp, parseOperatorDeclBody / the ctor arm). Mirroring it
+// exactly is what makes the channel a channel: a member exported by this
+// compiler and re-imported reads back the value it had here. (The exporter is
+// deliberately left reading the declaration rather than this field: it is
+// SERIALISING a declaration, not answering §22.15, and it must keep working for
+// the member symbols that are not built by `collectMember` — see the note on
+// the wrapper below. That also keeps the emitted artifact bytes provably
+// unchanged by this fix.)
+//
+// It admits nothing new on its own. Every reader of the field ORs it with the
+// modifier scan it duplicates (`memberIsPure` below, and the two PureChecker
+// sites that predate it), so a local member that now answers `true` through
+// `isPure` already answered `true` through `modifiers` or through its decl.
+static bool declaredPure(const MemberSymbol& m) {
+    // An operator's and a constructor's `pure` exist ONLY on the AST node:
+    // neither `ast::OperatorDecl` nor `ast::ConstructorDecl` keeps the modifier
+    // list the parser scanned for it (Parser_Decls.cpp), so the modifier arm
+    // below cannot answer for either form. This function runs on a LOCAL
+    // declaration only — `ModuleLoader::applyBehavior` fills the same field
+    // from the wire for an import — so a null cast here is the expected shape,
+    // not a silent import miss.
+    // SEAM-ACCESSOR: the operator arm of the local member-purity channel.
+    if (const auto* od = dynamic_cast<const ast::OperatorDecl*>(m.decl))
+        return od->isPure;
+    // SEAM-ACCESSOR: the constructor arm of the local member-purity channel.
+    if (const auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m.decl))
+        return cd->isPure;
+    for (std::string_view mod : m.modifiers)
+        if (mod == "pure") return true;
+    return false;
+}
+
+Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
+                      SemaContext& ctx) {
+    Symbol* sym = collectMemberImpl(m, parent, ctx);
+    // One place, every member kind — the arms of `collectMemberImpl` each
+    // `return` early, so filling the field per-arm is how the next kind gets
+    // forgotten. §22.15 rejects `pure` on a field, event, destructor, const and
+    // enum constant, so for those kinds this is `false` in every well-formed
+    // program; it is still assigned uniformly, because the wire assigns it
+    // uniformly and a channel that agrees only on the reachable kinds is the
+    // shape this fix exists to remove.
+    //
+    // ⚠ NOT every `MemberSymbol` is built here, and `memberIsPure` keeps its
+    // modifier and decl arms precisely so this field is never the ONLY source.
+    // The builtin-interface shims (SemaContext.hpp) and a record's synthesized
+    // positional fields (collectTypeDecl below) construct symbols directly and
+    // leave it `false`; none of them can carry `pure` — they have no modifier
+    // list to put it in and no `ast::OperatorDecl`/`ast::ConstructorDecl` — so
+    // the predicate still answers correctly for them.
+    if (auto* mem = dynamic_cast<MemberSymbol*>(sym))
+        mem->isPure = declaredPure(*mem);
+    return sym;
 }
 
 TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
@@ -976,21 +1042,57 @@ bool isInstanceFieldStorageSymbol(const Symbol* m) {
     return true;
 }
 
-// §22.15 (v0.254, fix #3174): see the contract in sema/Symbol.hpp. Symbol-side
+// §22.15 (v0.286, fix #3609): see the contract in sema/Symbol.hpp. Symbol-side
 // first, AST second, modifier third — the order is immaterial (nothing sets two
-// of them to different answers) but the SET matters: each of the three is the
-// only populated source on some path.
-bool constructorIsPure(const ConstructorSymbol* cs) {
-    if (!cs) return false;
-    if (cs->isPure) return true;
-    // SEAM-ACCESSOR: the AST arm of the both-sources ctor-purity predicate. This
-    // read is *supposed* to answer null for an import — that is what the
-    // `cs->isPure` arm above is for — so it is a sanctioned decl read, not an
-    // unconverted one.
-    if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
+// of them to different answers) but the SET matters: each is the only populated
+// source on some path.
+//
+// This is #3174's `constructorIsPure` generalised off `ConstructorSymbol`. The
+// only structural change is that BOTH decl arms are tried, since a
+// `MemberSymbol` may be either kind; a `MethodSymbol` never carries an
+// `ast::ConstructorDecl` and a `ConstructorSymbol` never an
+// `ast::OperatorDecl`, so neither arm can fire on a symbol the other arm
+// serves, and no call site's answer moves.
+bool memberIsPure(const MemberSymbol* m) {
+    if (!m) return false;
+    if (m->isPure) return true;
+    // The AST arms. Both are *supposed* to answer null for an import — that is
+    // what the `m->isPure` arm above is for — so they are sanctioned decl
+    // reads, not unconverted ones.
+    // SEAM-ACCESSOR: the operator arm of the both-sources purity predicate.
+    if (auto* od = dynamic_cast<const ast::OperatorDecl*>(m->decl))
+        if (od->isPure) return true;
+    // SEAM-ACCESSOR: the constructor arm of the both-sources purity predicate.
+    if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(m->decl))
         if (cd->isPure) return true;
-    for (std::string_view mod : cs->modifiers)
+    for (std::string_view mod : m->modifiers)
         if (mod == "pure") return true;
+    return false;
+}
+
+// §22.15 (v0.254, fix #3174; generalised by #3609): the constructor-typed
+// alias. Kept as its own name because #3174's recorded contract, its call
+// sites, and the chain-purity comment in PureChecker.cpp all name it.
+bool constructorIsPure(const ConstructorSymbol* cs) {
+    return memberIsPure(cs);
+}
+
+// §22.15 "Purity attaches to the getter" (v0.286, fix #3609): see the contract
+// in sema/Symbol.hpp. Strictly wider than `memberIsPure` — the accessor-level
+// `pure get` marker is a channel the property's modifier list does not carry.
+bool propertyGetterIsPure(const PropertySymbol* ps) {
+    if (!ps) return false;
+    if (memberIsPure(ps)) return true;
+    // Unlike the arms in `memberIsPure` this one has NO symbol-side counterpart
+    // to fall back on — `MetaMember` carries no per-accessor purity slot — so
+    // for an imported property it answers a silent "no". That is a real seam
+    // gap (issue 3618) rather than a sanctioned import-answers-elsewhere read;
+    // it is exempted anyway because dropping the arm would be strictly worse —
+    // it is what makes a `pure get` body get walked at all.
+    // SEAM-ACCESSOR: the accessor-level arm of the getter-purity predicate.
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+        for (const auto& a : pd->accessors)
+            if (a.isPure && !a.isSet) return true;
     return false;
 }
 

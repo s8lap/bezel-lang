@@ -249,14 +249,13 @@ bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
     // pure-CLASSIFICATION (auto-getters, record-synthesized members) lands
     // in a later slice.
     if (!calleeSym) return false;  // conservatively reject unknown
-    if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
-        if (ms->isPure) return true;
-        if (auto* op = dynamic_cast<const ast::OperatorDecl*>(ms->decl))
-            if (op->isPure) return true;
-        for (auto mod : ms->modifiers)
-            if (mod == "pure") return true;
-        return false;
-    }
+    // fix #3609 (§22.15, v0.286): through the one predicate. This arm was the
+    // WIDEST of the five spellings of "is this member pure" — symbol field, the
+    // `ast::OperatorDecl` bool, and the modifier scan — so `memberIsPure` is it
+    // verbatim plus a `ConstructorDecl` arm that a `MethodSymbol` can never
+    // reach. No admitted program changes verdict here.
+    if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym))
+        return memberIsPure(ms);
     // fix #3174 (§22.15, v0.254): through the one predicate. This site was
     // already both-sources; it is routed here so the chain-purity site below
     // cannot drift away from it again.
@@ -619,11 +618,13 @@ bool PureBodyWalker::inOperatorCalleeIsPure(const ast::BinaryExpr& be) const {
             auto* ms = dynamic_cast<MethodSymbol*>(m);
             if (!ms) continue;
             if (ms->name != "Contains") continue;
-            // Same predicate as callTargetIsPure's MethodSymbol arm.
-            if (ms->isPure) return true;
-            for (std::string_view mod : ms->modifiers)
-                if (mod == "pure") return true;
-            return false;
+            // fix #3609 (§22.15, v0.286): the same predicate as
+            // callTargetIsPure's MethodSymbol arm — now literally the same
+            // function, which is what the comment here used to claim. It had
+            // dropped the `ast::OperatorDecl` arm; that is unreachable behind
+            // the `name != "Contains"` filter (an operator symbol is named for
+            // its token), so restoring it admits nothing new.
+            return memberIsPure(ms);
         }
     }
     // No matching Contains found, or non-Named receiver. Conservatively
@@ -1258,11 +1259,12 @@ void checkOneMember(SemaContext& ctx, MemberSymbol& member) {
     bool isCtor = false;
     std::string label;
     if (auto* ms = dynamic_cast<MethodSymbol*>(&member)) {
-        if (auto* op = dynamic_cast<const ast::OperatorDecl*>(ms->decl))
-            isPure = op->isPure;
-        if (!isPure)
-            for (auto mod : ms->modifiers)
-                if (mod == "pure") { isPure = true; break; }
+        // fix #3609 (§22.15, v0.286): through the one predicate. This arm read
+        // the `ast::OperatorDecl` bool and the modifiers but NOT the symbol
+        // field; `checkPureBodies` walks only this module's own types and
+        // extension blocks, so the field was structurally always false here and
+        // adding it changes nothing.
+        isPure = memberIsPure(ms);
         if (ms->isOperator)
             label = std::string("operator `") + std::string(ms->operatorToken) +
                     "`";
@@ -1325,16 +1327,13 @@ void checkOneMember(SemaContext& ctx, MemberSymbol& member) {
         // Property-level pure applies to the getter. For Slice 2, walk
         // the getter body (expression-bodied / block-getter) — auto-
         // properties have no authored body.
-        bool pure = false;
-        for (auto mod : ps->modifiers)
-            if (mod == "pure") { pure = true; break; }
-        // Accessor-level `pure get`.
+        // fix #3609 (§22.15, v0.286): through the one predicate — the
+        // GETTER-level one, which keeps this arm's accessor-level `pure get`
+        // source. Routing a property through the member-level `memberIsPure`
+        // alone would stop walking a `pure get` body, turning a §22.15
+        // diagnostic into silence.
         const auto* pd = dynamic_cast<const ast::PropertyDecl*>(member.decl);
-        if (pd) {
-            for (const auto& a : pd->accessors)
-                if (a.isPure && !a.isSet) { pure = true; break; }
-        }
-        if (!pure) return;
+        if (!propertyGetterIsPure(ps)) return;
         label = std::string("property `") + std::string(ps->name) + "`";
         PureBodyWalker w(ctx, member, label, /*isConstructor=*/false);
         if (pd) {
@@ -1442,9 +1441,13 @@ bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
         for (Symbol* m : t->members) {
             auto* cs = dynamic_cast<ConstructorSymbol*>(m);
             if (!cs) continue;
-            const auto* cd =
-                dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-            if (cd && cd->isPure) {
+            // fix #3609 (§22.15, v0.286): through the one predicate. This gate
+            // read `ast::ConstructorDecl::isPure` alone — the NARROWEST of the
+            // five spellings — so a ctor whose purity arrived on any other
+            // channel left the class's field initializers unwalked. `t` is a
+            // local type here, so the widening is inert today; it is the
+            // divergence that mattered.
+            if (constructorIsPure(cs)) {
                 hasPureCtor = true;
                 pureCtorMember = cs;
                 break;
