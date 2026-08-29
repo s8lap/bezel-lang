@@ -1,0 +1,32 @@
+# localdecl_only_walkers.baseline - the ratchet for #3591.
+# Regenerate with scripts/check_localdecl_only_walkers.py --update after a
+# bare site is fixed or exempted. The gate requires this file to EQUAL the
+# measured count, so BOTH a rise and stale headroom fail - a landed fix that
+# forgot to --update is a violation exactly like a regression, which is what
+# stops a later change from quietly handing back what an earlier one
+# ratcheted away. Raising a count needs --force, and once the rise pushes a
+# file above its ceiling in scripts/localdecl_only_walkers.grandfather
+# (which only ever falls - see that file's header), the excess needs a
+# `// LOCALDECL-DEBT: #NNNN <reason>` marker at each new site.
+#
+# One row per file: the number of BARE dynamic_cast<[const] ast::
+# LocalDecl*> sites - see check_localdecl_only_walkers.py's module
+# docstring for the scope-based classifier and
+# docs/proposals/duplication-census-2026-08-30.md hotspot 8 / issue #3591
+# for the six prior instances of this exact defect shape.
+
+1    src/codegen/LlvmBackend_Assign.cpp
+3    src/codegen/LlvmBackend_Async.cpp
+3    src/codegen/LlvmBackend_Calls2.cpp
+1    src/codegen/LlvmBackend_Disposal.cpp
+1    src/codegen/LlvmBackend_Exprs.cpp
+2    src/codegen/LlvmBackend_Exprs2.cpp
+3    src/codegen/LlvmBackend_Iterators.cpp
+12   src/codegen/LlvmBackend_Setup.cpp
+1    src/codegen/LlvmBackend_Stmts.cpp
+1    src/codegen/LlvmBackend_String.cpp
+1    src/driver/ScopedAwaitBind.cpp
+9    src/ownership/Ownership.cpp
+18   src/ownership/Ownership_Checks.cpp
+1    src/sema/ExprTypecheck_Calls.cpp
+1    src/sema/TypeResolution_Checks.cpp

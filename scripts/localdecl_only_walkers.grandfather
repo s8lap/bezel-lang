@@ -1,0 +1,30 @@
+# localdecl_only_walkers.grandfather - the ceiling for #3591.
+#
+# THE CEILING ONLY EVER FALLS. `--update` MAY LOWER a per-file ceiling
+# (to min(existing, measured) - a drain becomes the new ceiling on the
+# very next --update) and MAY NEVER RAISE one; raising a ceiling stays a
+# deliberate, reviewed hand-edit to this file. A path whose tightened
+# ceiling reaches 0 is dropped entirely. See tighten_ceiling() /
+# check_debt_floor() in check_localdecl_only_walkers.py (same
+# rationale/mechanism as scripts/imported_symbol_reads.grandfather and
+# scripts/enumerable_grid_spellings.grandfather, #3590).
+#
+# One row per file: the number of BARE dynamic_cast<[const] ast::
+# LocalDecl*> sites (no LocalConstDecl handling found in the cast's
+# own enclosing function/lambda scope).
+
+1    src/codegen/LlvmBackend_Assign.cpp
+3    src/codegen/LlvmBackend_Async.cpp
+3    src/codegen/LlvmBackend_Calls2.cpp
+1    src/codegen/LlvmBackend_Disposal.cpp
+1    src/codegen/LlvmBackend_Exprs.cpp
+2    src/codegen/LlvmBackend_Exprs2.cpp
+3    src/codegen/LlvmBackend_Iterators.cpp
+12   src/codegen/LlvmBackend_Setup.cpp
+1    src/codegen/LlvmBackend_Stmts.cpp
+1    src/codegen/LlvmBackend_String.cpp
+1    src/driver/ScopedAwaitBind.cpp
+9    src/ownership/Ownership.cpp
+18   src/ownership/Ownership_Checks.cpp
+1    src/sema/ExprTypecheck_Calls.cpp
+1    src/sema/TypeResolution_Checks.cpp
