@@ -208,7 +208,24 @@ function(bezel_add_test_binary group)
         # bezelc_version_test.cpp) needs to exec the driver binary to check
         # the output. Same generator expression as the lit track uses; not on
         # a separate target so a test-only build misses nothing.
-        BEZELC_PATH="$<TARGET_FILE:bezelc>")
+        BEZELC_PATH="$<TARGET_FILE:bezelc>"
+        # The ABSOLUTE path to src/runtime, for native_test_harness.hpp's
+        # runtimeSourceDir(). It used to derive that path from the header's own
+        # __FILE__, which is only absolute when the compiler is invoked with an
+        # absolute -I -- and a path-REWRITING compiler wrapper breaks exactly
+        # that assumption. ccache's `base_dir` rewrites every absolute path
+        # under it into one relative to the compiler's cwd (the CMake build
+        # dir) and passes the REWRITTEN argv to the real compiler, so __FILE__
+        # became `../../../../../home/.../tests/native_test_harness.hpp`. That
+        # resolves from the build dir and nowhere else; gate.sh runs the test
+        # binaries from the WORKTREE ROOT (`cd $(git rev-parse --show-toplevel)`,
+        # gate.sh:71), where it does not resolve at all -- so
+        # runtimeSourceFiles() came back empty, asanRuntimeObject() returned "",
+        # and the ASan leg of 123 test files silently degraded (a handful FAILED
+        # loudly; the rest treat "" as "toolchain missing -> SKIP" and passed
+        # VACUOUSLY). A -D value is not a path argument, so no wrapper rewrites
+        # it; this is the only channel that is absolute by construction.
+        BEZEL_RUNTIME_SRC_DIR="${CMAKE_SOURCE_DIR}/src/runtime")
     # Force all bezel_runtime object files in, then export-dynamic so a
     # process-symbol-table lookup resolves bz_array_*, bz_dict_*, etc.
     target_link_options(${tgt} PRIVATE

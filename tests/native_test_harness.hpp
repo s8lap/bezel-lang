@@ -37,9 +37,43 @@ namespace bezel::native_test {
 
 namespace fs = std::filesystem;
 
-// Absolute path to repo-root/src/runtime, derived from this header's __FILE__
-// (tests/native_test_harness.hpp → repo root).
+// Absolute path to repo-root/src/runtime.
+//
+// It MUST be absolute: it is the input to sanitizerRuntimeMaster(), whose whole
+// output (the ASan-instrumented runtime object ~123 test files link against) is
+// "" — i.e. SKIP — when the directory does not resolve. A relative answer makes
+// that outcome depend on the CWD of whatever runs the test binary, and the two
+// callers disagree: run_parallel.sh inherits its caller's cwd, and gate.sh runs
+// from the WORKTREE ROOT (`cd $(git rev-parse --show-toplevel)`, gate.sh:71).
+//
+// Primary channel: BEZEL_RUNTIME_SRC_DIR, an absolute -D from
+// tests/CMakeLists.txt. A -D value is not a path argument, so a path-REWRITING
+// compiler wrapper leaves it alone.
+//
+// The ⚠ fallback is the ORIGINAL derivation, from this header's own __FILE__,
+// and it is the reason the primary channel exists: __FILE__ is absolute only
+// when the compiler was invoked with an absolute -I. ccache's `base_dir`
+// rewrites every absolute path under it to one relative to the compiler's cwd
+// AND PASSES THE REWRITTEN ARGV TO THE REAL COMPILER, so with
+// `base_dir = /home/stepan` this expanded to
+// `../../../../../home/.../tests/native_test_harness.hpp` — resolvable from the
+// CMake build dir and nowhere else. Measured 2026-08-30: identical binary,
+// identical tree; run from <build>/tests the ASan rows of
+// ownedarray_forin_using_var_1287 / owning_array_drain_getowningenum_2218 /
+// owning_enumerator_pending_value_1794 / channel_recv_all_1724 are 4/5/3/8
+// PASS (20 rows), and run from the worktree root they are 3/2/0/7 — 8 rows
+// FAIL. The fallback is kept so a TU compiled outside CMake still works, but it
+// is now second, and it is pinned by
+// tests/support/runtime_source_dir_absolute_test.cpp.
 inline fs::path runtimeSourceDir() {
+#ifdef BEZEL_RUNTIME_SRC_DIR
+    {
+        std::error_code ec;
+        fs::path fromBuild(BEZEL_RUNTIME_SRC_DIR);
+        if (fromBuild.is_absolute() && fs::is_directory(fromBuild, ec) && !ec)
+            return fromBuild.lexically_normal();
+    }
+#endif
     fs::path here(__FILE__);              // tests/native_test_harness.hpp
     return here.parent_path()             // tests/
                .parent_path()             // repo root
