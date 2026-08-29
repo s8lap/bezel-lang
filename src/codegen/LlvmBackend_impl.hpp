@@ -8563,6 +8563,42 @@ private:
     llvm::Value* wrapDictionaryAsIEnumerable(
         llvm::Value* dict, const sema::TypeRef* iEnumTy);
 
+    // fix #3519 (§29.2, v0.283; stdlib §4.8): the CAPABILITY gate on the
+    // Dictionary arm of the §29.2 wrap grid — true only for the entry shapes
+    // the snapshot+materialise path is PROVEN to carry end to end, which is
+    // `DictionaryEntry<K, V>` with both K and V a NON-NULLABLE PRIMITIVE (the
+    // scalars, `string`, and `Object`). It is not a taste judgement: for a
+    // class-, record- or enum-valued dictionary the materialised entry reaches
+    // the consumer but `x.Value.<member>` fails to lower on the wrapped face
+    // (the #2961 internal, store dropped -> a WRONG ANSWER), and
+    // `freeDictSourceNow`'s `bz_dict_free(d, null)` never disposes or releases
+    // the values -> a leak. Those shapes therefore stay on the historical
+    // fall-through, where they keep failing LOUDLY exactly as they did before
+    // #3519. Converting a SIGSEGV into a silent wrong answer would be the
+    // worse outcome, so the arm claims only what it can carry. See issues
+    // 3563 and 3568.
+    //
+    // ⚠ TWO CLASSIFICATIONS THIS GATE DOES **NOT** MAKE, spelled out because an
+    // earlier revision of this comment asserted both and the code made
+    // neither — the repo's dominant defect generator:
+    //   * There is no `Kind::Nullable`. `Kind` is {Error, Primitive, Named,
+    //     Unit, InlineArray, Function} and `nullable` is a separate `bool` on
+    //     the same TypeRef, so `int?` is `Kind::Primitive` and the kind test
+    //     alone ADMITS it. The gate consults `->nullable` explicitly; without
+    //     that, `Dictionary<int, int?>` leaked 3200 B in 400 allocations at
+    //     200 iterations (issue 3568's leak through a second door).
+    //   * `Object` is NOT declined. `PrimitiveType::Object` is a PrimitiveType,
+    //     so `Dictionary<int, Object>` passes — deliberately, and measured
+    //     clean.
+    //
+    // ONE spelling, read by BOTH faces (the return/argument coercion in
+    // `wrapAsIEnumerableForTarget` and the local-decl mint in
+    // `LlvmBackend_Setup.cpp`) — the #3419 grid's whole lesson is that a
+    // decision spelled twice drifts. It reads the SAME `TypeRef` fields
+    // `wrapDictionaryAsIEnumerable` itself decodes, so the gate cannot admit a
+    // shape the helper then mis-materialises.
+    static bool dictEntryWrapShapeSupported(const sema::TypeRef* iEnumTy);
+
     // fix #2522 (stdlib §4.8/§4.12; language spec §29.1, v0.236): the
     // string-keyed sibling of wrapOwnedArrayAsIEnumerable, used by
     // wrapDictionaryAsIEnumerable when the rebuilt DictionaryEntry<K,V>

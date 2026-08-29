@@ -7867,6 +7867,72 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
             return drainLazyPipelineToOwnedIEnumerable(lazy, targetTy);
         }
     }
+    // fix #3519 (§29.2 / §28.9 / §28.3, v0.283; stdlib §4.8 / §4.17): the
+    // Dictionary family's arm of the §29.2 wrap grid — MISSING ENTIRELY until
+    // this commit. A `Dictionary<K,V>` coerced to
+    // `IEnumerable<DictionaryEntry<K,V>>` fell off the end of this function to
+    // the bare `return v` and handed the caller the raw `bz_dict_t*`. §29.2's
+    // desugaring then reads that value's first word as a vtable and calls slot
+    // 4 (`GetEnumerator`): measured as a deterministic SIGSEGV (rc 139) with
+    // ASan reporting a wild jump ("PC is at a non-executable region"), at BOTH
+    // faces this function serves — the RETURN coercion and the ARGUMENT
+    // coercion — while iterating the same dictionary in place is clean. The
+    // tell in the object file is that the failing program emits no
+    // `bz$...enum...$vtable` pair at all, because no wrap was ever minted.
+    //
+    // This is #3419's duplicated-arm shape once more, and specifically the
+    // half of it where an OWNERSHIP axis was widened without the WRAP axis:
+    // `returnSourceIsCalleeOwnedCollection` has named `Dictionary` /
+    // `OwningDictionary` / `SortedDictionary` since #2299 (it must, or the
+    // source would be double-freed), so `srcOwnedByCallee` arrives here TRUE
+    // for exactly the shape this function had no arm for.
+    //
+    // NO NEW PREDICATE AND NO NEW WRAP HELPER. `isDictTypeName` is the
+    // emitter's existing face of `common::isDictionaryName` — the same
+    // authority the indexer, `.Count` and for-in lowering already read — and
+    // the wrap authority already exists and is already exercised by the
+    // explicit `.GetEnumerator()` face (`LlvmBackend_Calls2.cpp` ~6766):
+    // `wrapDictionaryAsIEnumerable` snapshots the live keys+values, decodes
+    // one `{K, V}` entry struct per pair (rebuilding ref-counted string keys)
+    // and returns an OWNING array enumerator over that snapshot — routing the
+    // string-key shape through `wrapDictionaryEntryArrayAsIEnumerable` so the
+    // rebuilt keys are released. `wrapSortedDictionaryAsIEnumerable` is its
+    // ordered sibling; a `SortedDictionary` must take it, because the plain
+    // snapshot is in hash order and stdlib §4.17's ascending-key iteration
+    // would be silently broken by it — the same contract reason `SortedSet` is
+    // excluded from the array arm above.
+    //
+    // OWNERSHIP. The snapshot is INDEPENDENT of the source dictionary (a fresh
+    // `bz_array_t`, rebuilt keys, copied value words), so the wrapper's slot-1
+    // Dispose reclaims exactly the snapshot and never the source — which is
+    // why a callee-OWNED source must be freed here and now, exactly as the
+    // dict-backed `Set` arm above does (#2299's `freeDictSourceNow`).
+    // Scope-end disposal is NOT an option: it would race the caller's
+    // iteration of the returned wrapper. §28.3 suppresses the returned local's
+    // own reclaim, so this free is exactly-once. `bz_dict_free(d, null)`
+    // releases the table without touching the values, which is what keeps the
+    // snapshot's borrowed value words live for the caller's iteration.
+    if (isDictTypeName(actualTy)) {
+        // fix #3519, NARROWED on review: only the entry shapes this path
+        // carries end to end. A non-primitive K or V falls through to the
+        // historical `return v`, where it keeps failing LOUDLY (the SIGSEGV it
+        // produced before #3519) instead of being turned into a wrong answer.
+        if (!dictEntryWrapShapeSupported(targetTy)) return v;
+        llvm::Value* wrap =
+            (builtinTypeName(actualTy) == "SortedDictionary")
+                ? wrapSortedDictionaryAsIEnumerable(v, targetTy)
+                : wrapDictionaryAsIEnumerable(v, targetTy);
+        // A malformed entry TypeRef (no `DictionaryEntry<K,V>` args) makes the
+        // helpers decline; fall through to the historical pass-through rather
+        // than claim a frame that was never minted (#3419: a claim wider than
+        // the mint double-frees).
+        if (wrap) {
+            if (outWrapMade) *outWrapMade = true;
+            if (srcOwnedByCallee) freeDictSourceNow(v);
+            return wrap;
+        }
+        return v;
+    }
     // fix #2298 / §28.9: LinkedList<T> widened to `IEnumerable<T>` here uses
     // the plain borrow wrap (slot-1 Dispose = `free(self)`, the wrapper frame
     // only) for the BORROWED source — the source's binder still disposes its
@@ -10562,6 +10628,44 @@ llvm::Value* Emitter::wrapOwnedLinkedListAsIEnumerable(
 // pointer pass-through). Iteration order is insertion order (the order
 // bz_dict_keys_*/bz_dict_values_* return), matching §4.8's contract and
 // lowerDictEntryFor's foreach behaviour.
+// fix #3519 (§29.2, v0.283; stdlib §4.8 / §4.17): see the declaration in
+// LlvmBackend_impl.hpp for why this gate exists. It drills the SAME path
+// `wrapDictionaryAsIEnumerable` drills — iEnumTy -> DictionaryEntry<K,V> ->
+// {K, V} — and admits only a NON-NULLABLE PRIMITIVE K and V
+// (`sema::TypeRef::Kind::Primitive` is the classification the front end
+// already computed, not a new one). Records, classes and enums are
+// `Kind::Named` and are declined, because the two defects recorded on the
+// declaration make the wrap produce a wrong answer or a leak for them.
+//
+// `Object` IS admitted: `PrimitiveType::Object` is a PrimitiveType ("§4 Object
+// class — treated as a primitive lookup key", `sema/TypeRef.hpp:30`), so
+// `Dictionary<int, Object>` passes this gate. That is deliberate and measured
+// clean (`iters=1`, rc 0, LSan clean) — an `Object`-valued entry carries a
+// borrowed reference the table does not own, so the null value disposer is
+// sound for it exactly as it is for `string`.
+bool Emitter::dictEntryWrapShapeSupported(const sema::TypeRef* iEnumTy) {
+    if (!iEnumTy || iEnumTy->genericArgs.empty() || !iEnumTy->genericArgs[0])
+        return false;
+    const sema::TypeRef* entryTy = iEnumTy->genericArgs[0];
+    if (entryTy->genericArgs.size() < 2 || !entryTy->genericArgs[0] ||
+        !entryTy->genericArgs[1])
+        return false;
+    // NULLABILITY IS A SEPARATE AXIS, NOT A `Kind`. `sema::TypeRef::Kind` is
+    // {Error, Primitive, Named, Unit, InlineArray, Function} — there is no
+    // `Nullable` member; `nullable` is a `bool` on the SAME TypeRef
+    // (`sema/TypeRef.hpp:43`, and Kind::Primitive's own comment reads
+    // "PrimitiveType + nullable"). So a `V?` over a primitive is still
+    // `Kind::Primitive` and the kind test alone ADMITS it — measured, a
+    // `Dictionary<int, int?>` iterated 200x leaked 3200 B in 400 allocations
+    // under LSan, which is issue 3568's null-value-disposer leak reached
+    // through a second door: `bz_dict_free(d, null)` never releases the boxed
+    // nullable payloads. Declined explicitly here.
+    return entryTy->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
+           entryTy->genericArgs[1]->kind == sema::TypeRef::Kind::Primitive &&
+           !entryTy->genericArgs[0]->nullable &&
+           !entryTy->genericArgs[1]->nullable;
+}
+
 llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
         llvm::Value* dict, const sema::TypeRef* iEnumTy) {
     if (!dict || !iEnumTy) return nullptr;

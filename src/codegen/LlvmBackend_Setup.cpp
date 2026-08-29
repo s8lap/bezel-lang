@@ -13352,6 +13352,40 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 v = drainLazyPipelineToOwnedIEnumerable(lazy, declTR);
                 if (dynamic_cast<const ast::NewExpr*>(init) != nullptr)
                     freeDictSourceNow(srcSet);
+            } else if (initTR && isDictTypeName(initTR) &&
+                       dictEntryWrapShapeSupported(declTR)) {
+                // fix #3519 (§29.2 / §28.9 / §28.3, v0.283; stdlib §4.8 /
+                // §4.17): the local-decl face of the SAME missing arm this
+                // commit adds to `wrapAsIEnumerableForTarget`. `var e:
+                // IEnumerable<DictionaryEntry<int,int>> := d;` stored the raw
+                // `bz_dict_t*` in the slot and the following for-in
+                // vtable-dispatched on it — measured SIGSEGV (rc 139), the
+                // identical symptom the RETURN face shows, so the two faces
+                // are widened together per #3419 rather than one at a time
+                // (widening one and leaving the other is #3392's shape).
+                // Reuses the existing `wrapDictionaryAsIEnumerable` /
+                // `wrapSortedDictionaryAsIEnumerable` authorities and the
+                // existing `isDictTypeName` classifier — no new predicate.
+                //
+                // The snapshot is INDEPENDENT of the source dictionary, so the
+                // source is freed here only for the unbound-`new` shape, on
+                // exactly the alias-rejection gate the Array / Set /
+                // LinkedList arms use: a producer-init IDENTIFIER source is
+                // still owned by that identifier and freeing it here would
+                // DOUBLE-FREE at its own scope end, while a `new` at this site
+                // is bound to no other name by construction. The wrapper frame
+                // + snapshot are claimed by the coercion's own self-report
+                // (`v != preIterWrap`), so no claim-side edit is needed.
+                llvm::Value* srcDict = v;
+                llvm::Value* wrap =
+                    (builtinTypeName(initTR) == "SortedDictionary")
+                        ? wrapSortedDictionaryAsIEnumerable(srcDict, declTR)
+                        : wrapDictionaryAsIEnumerable(srcDict, declTR);
+                if (wrap) {
+                    v = wrap;
+                    if (dynamic_cast<const ast::NewExpr*>(init) != nullptr)
+                        freeDictSourceNow(srcDict);
+                }
             } else if (initTR && isLinkedListTypeName(initTR)) {
                 // #1177: (Owned)LinkedList<T> is node-based (bz_llist) — wrap
                 // with the node-walking enumerator, mirroring buildOrderedArgs.
