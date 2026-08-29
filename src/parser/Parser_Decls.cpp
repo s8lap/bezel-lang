@@ -1,68 +1,11 @@
 #include "parser/Parser.hpp"
+#include "parser/Parser_impl.hpp"
 
 #include <algorithm>
 #include <string>
 #include <string_view>
 
 namespace bezel {
-
-namespace {
-
-// §3.4: the lowercase primitive-type aliases. These are unconditionally
-// reserved keywords (Appendix B.1) but they ARE valid type-name first
-// components — `int`, `string`, etc. The PascalCase forms (`Object`, `String`,
-// `Array`) are ordinary identifiers and need no special handling here.
-bool isPrimitiveTypeKeyword(std::string_view text) {
-    return text == "bool"   || text == "byte"  || text == "sbyte" ||
-           text == "short"  || text == "ushort" || text == "int"  ||
-           text == "uint"   || text == "long"  || text == "ulong" ||
-           text == "float"  || text == "double" || text == "decimal" ||
-           text == "char"   || text == "string";
-}
-
-} // namespace
-
-namespace {
-
-// Higher precedence = tighter binding. The numeric scale is internal — we
-// just need an ordering consistent with §17.1's precedence table. Returns 0
-// for tokens that aren't binary operators recognised yet (deferred ops:
-// `in`/`is`/`as` keyword relationals, `is not` two-token relational,
-// conditional `expr if cond else expr`, assignments — assignments live in
-// AssignmentStmt at statement level).
-int binaryPrecedence(const Token& tok) {
-    if (tok.kind == TokenKind::Punctuator) {
-        const std::string_view t = tok.text;
-        if (t == "*" || t == "/")  return 14; // §17.1 L3 multiplicative
-        if (t == "+" || t == "-")  return 13; // §17.1 L4 additive
-        if (t == "<<" || t == ">>") return 12; // §17.1 L5 shift
-        if (t == ".." || t == "..<") return 11; // §17.1 L6 range
-        if (t == "&")              return 10; // §17.1 L7 bitwise AND
-        if (t == "^")              return 9;  // §17.1 L8 bitwise XOR
-        if (t == "|")              return 8;  // §17.1 L9 bitwise OR
-        if (t == "<" || t == ">" || t == "<=" || t == ">=") return 7;
-        if (t == "=" || t == "<>") return 6;  // §17.1 L11 equality
-        if (t == "??")             return 5;  // §17.1 L12 null-coalescing
-    }
-    if (tok.kind == TokenKind::Keyword) {
-        const std::string_view t = tok.text;
-        if (t == "mod") return 14; // multiplicative (keyword-spelled)
-        // §17.1 L10 relational, keyword-spelled. `is not` is also relational
-        // and handled below as a two-token sequence starting at `is`.
-        if (t == "in" || t == "is" || t == "as") return 7;
-        if (t == "and") return 4;  // §17.1 L13 logical AND
-        if (t == "or")  return 3;  // §17.1 L14 logical OR
-    }
-    return 0;
-}
-
-// `??` (and only `??` at slice-14 scope) is right-associative per §17.1's
-// note on level 12.
-bool isRightAssociative(std::string_view op) {
-    return op == "??";
-}
-
-} // namespace
 
 // Issue #135: span-stamping wrappers. Each captures the location of the
 // first token of the construct, delegates to the *Impl that builds the

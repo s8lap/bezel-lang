@@ -1,4 +1,5 @@
 #include "parser/Parser.hpp"
+#include "parser/Parser_impl.hpp"
 
 #include <algorithm>
 #include <string>
@@ -8,18 +9,6 @@
 namespace bezel {
 
 namespace {
-
-// §3.4: the lowercase primitive-type aliases. These are unconditionally
-// reserved keywords (Appendix B.1) but they ARE valid type-name first
-// components — `int`, `string`, etc. The PascalCase forms (`Object`, `String`,
-// `Array`) are ordinary identifiers and need no special handling here.
-bool isPrimitiveTypeKeyword(std::string_view text) {
-    return text == "bool"   || text == "byte"  || text == "sbyte" ||
-           text == "short"  || text == "ushort" || text == "int"  ||
-           text == "uint"   || text == "long"  || text == "ulong" ||
-           text == "float"  || text == "double" || text == "decimal" ||
-           text == "char"   || text == "string";
-}
 
 // Best-effort recognizer for the §18.5 hole-delimitation sharp edge (#2102):
 // an unparenthesized generic-argument list at the top level of a hole —
