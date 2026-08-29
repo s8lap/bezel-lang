@@ -2627,45 +2627,50 @@ llvm::Value* Emitter::emitCheckedArith(llvm::Intrinsic::ID id, llvm::Value* l,
 // ---------------------------------------------------------------------------
 
 const sema::TypeRef* Emitter::recordFieldType(const sema::FieldSymbol* fs) {
-    // §9.1: a positional field carries its type on the originating Param;
-    // a body field on its FieldDecl.
-    if (fs->posParam && fs->posParam->type)
-        return ctx_.resolvedType(*fs->posParam->type);
-    if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
-        if (fd->type)
-            return ctx_.resolvedType(*fd->type);
-    // fix #2874 (§2.8.2 / §22.8 / §4.6 / §28.9, v0.240): an IMPORTED instance
-    // field's type rides ctx_.importedMemberType(fs) (the loader synthesizes a
-    // null-type posParam only for §9.1 positional-vs-body discrimination, not
-    // the type itself; the type itself is never recoverable from posParam for
-    // a #2516 imported positional field, and fs->decl is null for every
-    // imported member). Without this fallback isStringStorageMember /
-    // isClosureStorageMember / boxStorageFields_-membership all returned false
-    // for EVERY imported generic's instance field — a string field's §4.6
-    // retain is skipped at STORE time (no producer-side release to balance a
-    // missing consumer-side one) AND the §4.6 release is skipped at the
-    // matching DISPOSAL time (no consumer-side release to balance a missing
-    // producer-side one). Today both sides are skipped, so the string is
-    // balanced by accident; flipping the predicate in only ONE place would
-    // convert a leak into a UAF. The two sides read this predicate through
-    // isStringStorageMember / emitStringRetain / bz_string_release at the
-    // SAME site, so a single edit here is the single point of fix.
-    if (!fs->posParam && !fs->decl) {
-        if (const sema::TypeRef* rt = ctx_.importedMemberType(fs))
-            return rt;
-    }
-    return nullptr;
+    // fix #3615 (§9.1 / §9.2 / §2.8.2 / §4.6 / §28.9, v0.286): DELEGATE to the ONE
+    // both-sources storage-component accessor, `sema::storageComponentType`
+    // (declared sema/Symbol.hpp, body SymbolCollection.cpp) — do not spell the
+    // three-source lookup a second time here.
+    //
+    // This function used to be that second spelling, and it had drifted in the
+    // one way that matters: its imported fallback was gated on
+    // `if (!fs->posParam && !fs->decl)`. Fix #2874's own comment on that gate
+    // NAMED the case the gate excludes — "the loader synthesizes a null-type
+    // posParam only for §9.1 positional-vs-body discrimination, not the type
+    // itself; the type itself is never recoverable from posParam for a #2516
+    // imported positional field". A #2516 imported positional field therefore
+    // has a NON-NULL synthetic `posParam` (ModuleLoader.cpp `if (mm.isPositional)`),
+    // so `!fs->posParam` is false and the fallback #2874 added never ran for
+    // exactly the field kind its comment describes. `storageComponentType`
+    // reaches `ctx.importedMemberType(m)` unconditionally, which is what the
+    // loader's own #2516 comment says the design relies on.
+    //
+    // MEASURED (a two-module ASan/LSan probe, 200 iterations): a `record
+    // Pt(X: int, Name: string)` exported by Lib and produced through an
+    // imported factory leaked 8290 bytes in 400 allocations in the importer and
+    // 0 in the character-identical single-module twin — `isStringStorageMember`
+    // (LlvmBackend_impl.hpp) reads this function, so the §4.6 release at the
+    // record value's scope end never fired for the imported shape. #2874's
+    // comment predicted the two sides were "balanced by accident"; they are not,
+    // because the +1 is minted in the DEPENDENCY and only the consumer ever
+    // sees the value die. Both sides still flip together at this single point,
+    // which is why a leak becomes balanced rather than a UAF.
+    return sema::storageComponentType(fs, ctx_);
 }
 
 const sema::TypeRef* Emitter::recordMemberType(const sema::Symbol* m) {
-    // §9.1: FieldSymbol storage (positional Param or body FieldDecl).
+    // fix #3615: same delegation. The old body's §9.2 property arm read the type
+    // off `dynamic_cast<const ast::PropertyDecl*>(m->decl)` with NO imported
+    // fallback at all, so every imported auto-property answered null here.
+    // `storageComponentType`'s PropertySymbol arm has the same two AST steps
+    // plus `ctx.importedMemberType(m)`. The dispatch is equivalent on the local
+    // side: SymbolCollection.cpp:236 makes a `PropertySymbol` for every
+    // `ast::PropertyDecl` and nothing else is ever given one, so
+    // "decl is a PropertyDecl" and "symbol is a PropertySymbol with an AST
+    // decl" name the same set.
     if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m))
         return recordFieldType(fs);
-    // §9.2: body auto-property storage — type on the PropertyDecl.
-    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
-        if (pd->type)
-            return ctx_.resolvedType(*pd->type);
-    return nullptr;
+    return sema::storageComponentType(m, ctx_);
 }
 
 // stdlib §3.1 / §8.5: `StringBuilder.ToString()` — concatenate the parts array
