@@ -1949,6 +1949,21 @@ std::unique_ptr<ast::Expr> Parser::qualifiedNameToExpr(
 // Slice 39: statement-position `case`.
 
 std::unique_ptr<ast::Expr> Parser::parsePostfix(std::unique_ptr<ast::Expr> head) {
+    // fix #3582: `parsePrimaryExpression` returns a NULL expression at exactly
+    // the two points where it has ALREADY reported a located error — the
+    // generic "expected expression" and §17.13's bare `_` — and that null is
+    // the parser's established "no expression here" signal: the
+    // expression-statement fallthrough in Parser_Stmts.cpp reads it to hand
+    // the offending token back to the statement-list loop, which advances past
+    // it (Parser_Decls.cpp's `advance(); // crude recovery`). A suffix chain
+    // has nothing to attach to, and every arm below reads `head->span.begin`
+    // and moves `head` into a suffix node, so the null must be propagated, not
+    // dereferenced. Before this the `.` / `?.` / `!` arms dereferenced it and
+    // the compiler SEGV'd with no diagnostic. The token is deliberately NOT
+    // consumed here: the diagnostic is already on the record and
+    // resynchronisation belongs to the statement-list loop, whose null-return
+    // contract guarantees forward progress.
+    if (!head) return nullptr;
     // §A.5 / §17.1 level 1 postfix chain: `.member`, `(args)`, `?.member`,
     // `?(args)`, `[indices]`, `!` (postfix null-forgiving). All bind to the
     // expression on the left.

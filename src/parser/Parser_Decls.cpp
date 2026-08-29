@@ -1,6 +1,7 @@
 #include "parser/Parser.hpp"
 
 #include <algorithm>
+#include <string>
 #include <string_view>
 
 namespace bezel {
@@ -1028,6 +1029,50 @@ std::unique_ptr<ast::Type> Parser::parseType() {
         if (!consumeClosingAngle()) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected '>' to close generic arguments");
+        }
+        // fix #3582 (A.5 / §11.6, v0.286): `Outer<int>.Tag` — a nested
+        // type reached through an EXPLICITLY-ARGUED enclosing generic — is
+        // not a Type. A.5 attaches the argument list to the END of the whole
+        // dotted name (`TypeNoNullable ::= QualifiedName GenericArgs?`, over
+        // `QualifiedName ::= Identifier ("." Identifier)*`), §11.6 spells the
+        // reference `Outer.Nested`, and §2.7's leftmost-first chain resolves
+        // each later segment against the type the first segment named — so no
+        // argument list may sit on an enclosing segment. It has to be
+        // diagnosed HERE because parseType otherwise just stops, leaving the
+        // `.` to desynchronise the enclosing construct: `new Outer<int>.Tag(n)`
+        // fell out as "expected '(' to begin constructor argument list", and a
+        // local's type ascription left `.Tag` to start a statement, reaching
+        // parsePostfix with a null head (the SEGV this issue was filed for).
+        // Recovery parses the spelling the rule names, so one rejected
+        // spelling yields one error instead of a cascade — the same
+        // parse-it-as-the-remedy discipline the retired-spelling diagnostics use.
+        if (type->name && !type->name->parts.empty() &&
+            !type->genericArgs.empty() && isPunctuator(".") &&
+            peekNext().kind == TokenKind::Identifier) {
+            const SourceLocation dotLoc = current_.location;
+            std::string outer;
+            for (std::string_view part : type->name->parts) {
+                if (!outer.empty()) outer += '.';
+                outer.append(part);
+            }
+            std::string remedy = outer;
+            while (isPunctuator(".") &&
+                   peekNext().kind == TokenKind::Identifier) {
+                advance();  // past `.`
+                remedy += '.';
+                remedy.append(current_.text);
+                type->name->parts.push_back(current_.text);
+                advance();  // past the segment identifier
+            }
+            diagnostics_.report(
+                Severity::Error, dotLoc,
+                "a generic argument list attaches to the end of a qualified "
+                "type name (A.5 `TypeNoNullable ::= QualifiedName "
+                "GenericArgs?`), so it may not sit on an enclosing segment: `" +
+                    outer + "<...>." + remedy.substr(outer.size() + 1) +
+                    "` is not a type \xe2\x80\x94 write `" + remedy +
+                    "` to name the nested type (\xc2\xa7""11.6, v0.286)");
+            type->genericArgs.clear();
         }
     }
     if (isPunctuator("?")) {
