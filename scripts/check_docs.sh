@@ -569,6 +569,76 @@ else:
         print(f"SETS: clean ({_total} enumeration(s) of the {SET_MARK} across "
               f"{len(set_sites)} document(s); all agree on {len(_norm)} members)")
 
+
+# ---- 3f. REGISTER: the §14.2 conditionally-admitted register polices itself --
+# Added post-v0.285 (#3332, the 0116 §5.2 follow-through). The register is a
+# record, not an enforcement: nothing stopped a new "admitted only where"
+# passage from never adding its row, and nothing flagged a row whose member the
+# stdlib no longer declares -- the failure that made Array.Sort()'s v0.274
+# deletion invisible for a revision. Two directions, keyed on the TERM OF ART
+# ("conditionally-admitted member", any case/hyphenation), never on paraphrased
+# English (the SETS tuning lesson):
+#   A. every positive use of the term in spec/stdlib names a register member
+#      within its paragraph (negated uses -- "not a ...", "neither is a ..." --
+#      are the recorded exemption shape and are skipped);
+#   B. every register row's members are (i) declared in the stdlib and
+#      (ii) claimed conditional by a positive term-use near one of its names.
+REG_TERM = re.compile(r'conditionall?y[-\s/]+admitted\s+member', re.I)  # [-\s/]+ spans fence-comment line wraps ('...LY\n// ADMITTED')
+_regsec = re.search(r'<a id="sec-conditionally-admitted-members"></a>(.*?)\n### ',
+                    text['spec'], re.S)
+if not _regsec:
+    print('REGISTER: cannot find spec section sec-conditionally-admitted-members '
+          '-- the check has lost its anchor')
+    fail = 1
+else:
+    _rows = []
+    for _r in re.finditer(r'\n\| (`[^|]+`) \|', _regsec.group(1)):
+        _names = re.findall(r'`([A-Za-z_][A-Za-z0-9_<>, ]*?)\.?([A-Za-z_][A-Za-z0-9_]*)(?:\(\))?`', _r.group(1))
+        _mem = [n[1] for n in _names if n[1] not in ('T', 'E', 'U', 'F')]
+        if _mem:
+            _rows.append((_r.group(1)[:60], set(_mem)))
+    _bad = []
+    if not _rows:
+        _bad.append('  no rows parsed from the register table')
+    # direction A: positive term uses name a register member nearby
+    _all_members = set().union(*[m for _, m in _rows]) if _rows else set()
+    _pos_sites = []
+    for _k in ('spec', 'stdlib'):
+        for _m in REG_TERM.finditer(text[_k]):
+            _pre = text[_k][max(0, _m.start()-60):_m.start()].lower()
+            if re.search(r'(?:not|never|neither\s+is)\s+a\s+(?:\*\*)?$|is one$', _pre):
+                continue
+            _ln = text[_k][:_m.start()].count('\n') + 1
+            _para = text[_k][max(0, _m.start()-1500):_m.start()+1500]
+            _named = {n for n in _all_members if n in _para}
+            if _m.start() >= (_regsec.start() if _k == 'spec' else 10**12) and \
+               _m.start() <= (_regsec.end() if _k == 'spec' else -1):
+                continue  # the register section itself
+            if not _named:
+                _bad.append(f'  [A] [{_k}] line {_ln}: the term appears with no '
+                            'register member named in its paragraph -- add the row '
+                            'or the exemption phrasing')
+            else:
+                _pos_sites.append((_k, _named))
+    # direction B: every row declared + claimed
+    for _label, _mem in _rows:
+        _decl = any(re.search(r'method\s+' + re.escape(n) + r'\s*[(<]', text['stdlib'])
+                    for n in _mem)
+        if not _decl:
+            _bad.append(f'  [B-i] register row {_label}...: no stdlib declaration '
+                        'found for any of its members -- stale row (the v0.274 class)')
+        _claimed = any(_mem & _named for _k, _named in _pos_sites)
+        if not _claimed:
+            _bad.append(f'  [B-ii] register row {_label}...: no stdlib/spec passage '
+                        'claims these members conditionally admitted')
+    if _bad:
+        print(f'REGISTER: {len(_bad)} violation(s):')
+        print('\n'.join(_bad))
+        fail = 1
+    else:
+        print(f'REGISTER: clean ({len(_rows)} register rows; {len(_pos_sites)} '
+              'positive term-sites, all mapped; negated exemptions skipped)')
+
 sys.exit(1 if fail else 0)
 PY
 STRUCT=$?
