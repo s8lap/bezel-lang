@@ -10414,6 +10414,43 @@ private:
     // built from a `[...]` LITERAL and held across an await round-trips too.
     void mapSuspendLocalSlot(const ast::Node* declNode, llvm::AllocaInst* slot);
 
+    // fix #3468 / §29.2 / §29.7 (v0.286): the ONE classification of a builtin-
+    // enumerable `for-in` SOURCE — the two questions `lowerIEnumerableBuiltinFor`
+    // asks of `fs.iterable` before it emits anything:
+    //
+    //   (1) is the source's static type in the six-head iteration-interface
+    //       family this desugaring handles at all (`inFamily`, and if so at
+    //       which `head`, with `iterTy` the resolved TypeRef whose
+    //       `genericArgs[0]` is the element type), and
+    //   (2) does the runtime value follow the `bz_array_t*` ARRAY protocol or is
+    //       it a vtable-backed iterator-format enumerator (`isArrayBacked`)?
+    //
+    // Both were answered TWICE — once here in the lowering and once in
+    // `forInBuiltinEnumeratorNeedsFrameSlot`, whose own header comment below
+    // declares itself that lowering's mirror. The mirror had drifted in four
+    // independent ways (no owning head, no imported-name fallback, no
+    // field/property arm, no member-access / indexer arms), and every divergence
+    // is an abandoned-iterator LEAK: the frame field is reserved by the
+    // predicate and wired by the lowering, so a predicate NARROWER than the
+    // lowering leaves the enumerator round-tripping only through the alloca
+    // spill area, which the state machine's `Dispose` cannot reach (issue 3468 —
+    // measured 25600 B / 800 allocations at the property-read shape). Answering
+    // once makes divergence #5 impossible rather than merely absent.
+    //
+    // PURE INSPECTION: it reads `ctx_` (exprType / exprSymbol / resolvedType)
+    // and emits no IR, so it is safe both at frame-layout time
+    // (`collectSuspendLocals`, before any lowering) and at lowering time.
+    struct BuiltinForInSource {
+        bool inFamily = false;          // head is in the six-name family AND
+                                        // an element type is available
+        std::string_view head;          // the resolved head name (AST or
+                                        // importedName); empty when !inFamily
+        sema::TypeRef* iterTy = nullptr;  // the iterable expression's type
+        bool isArrayBacked = true;      // false ⇒ vtable-backed iterator-format
+                                        // enumerator (Dispose at vtable slot 1)
+    };
+    BuiltinForInSource classifyBuiltinForInSource(const ast::ForStmt& fs);
+
     // §29.7 (#944): true when `fs` is a for-in whose lowering creates an
     // implicit iterator-format enumerator (Dispose at vtable slot 1) — i.e. the
     // builtin-enumerable vtable path of lowerIEnumerableBuiltinFor (a CallExpr /
@@ -10425,8 +10462,11 @@ private:
     // suspended inside the loop, §29.7) — keyed on `fs.iterable.get()`. This
     // predicate is the single source of truth shared by collectSuspendLocals
     // (which reserves the field) and lowerIEnumerableBuiltinFor (which wires the
-    // enumerator slot to it and registers the suspension disposal). It mirrors the
-    // `isArrayBacked == false` decision in lowerIEnumerableBuiltinFor exactly.
+    // enumerator slot to it and registers the suspension disposal).
+    //
+    // fix #3468: it no longer "mirrors" the `isArrayBacked == false` decision in
+    // lowerIEnumerableBuiltinFor — it IS that decision, read from the shared
+    // `classifyBuiltinForInSource` above. A mirror is a thing that drifts.
     bool forInBuiltinEnumeratorNeedsFrameSlot(const ast::ForStmt& fs);
 
     // Build the kind-agnostic frame layout for a state machine: compute the

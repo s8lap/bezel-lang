@@ -17,9 +17,8 @@
 1    src/codegen/LlvmBackend_Async.cpp
 8    src/codegen/LlvmBackend_Calls2.cpp
 1    src/codegen/LlvmBackend_Exprs.cpp
-3    src/codegen/LlvmBackend_Iterators.cpp
+2    src/codegen/LlvmBackend_Iterators.cpp
 2    src/codegen/LlvmBackend_Setup.cpp
-1    src/codegen/LlvmBackend_Stmts.cpp
 2    src/codegen/LlvmBackend_impl.hpp
 1    src/common/OwnershipFacts.cpp
 5    src/ownership/Ownership.cpp

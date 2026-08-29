@@ -133,6 +133,42 @@ BEZEL_TEST(builtin_registry_snapshot, sync_iter_format_enumerable_head_set) {
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isIterFormatEnumerableHead(n));
 }
 
+// --- isBuiltinForInEnumerableHead (#3468, §29.2, stdlib §4.12–§4.13): the
+//     family gate of the builtin `for-in` desugaring. NOT a migration snapshot
+//     — the table is new with #3468, which retired the two hand-written copies
+//     of it (the lowering and its self-declared "mirror", which had drifted).
+//     The pins that carry the load are the ASYMMETRIES: it is a strict SUPERSET
+//     of the sync iterator-format pair (the four richer read/collection
+//     interfaces reach the same desugaring but keep the ARRAY protocol), and it
+//     excludes the ASYNC heads (they take `await for`) and every ENUMERATOR
+//     head (an enumerator is not an enumerable).
+BEZEL_TEST(builtin_registry_snapshot, builtin_for_in_enumerable_head_set) {
+    static constexpr std::array<std::string_view, 6> kSnapshot = {
+        "IEnumerable", "IOwningEnumerable",
+        "IReadOnlyCollection", "IReadOnlyList", "ICollection", "IList",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isBuiltinForInEnumerableHead(n));
+    for (std::string_view n : {"IAsyncEnumerable", "IOwningAsyncEnumerable",
+                               "IEnumerator", "IOwningEnumerator",
+                               "IAsyncEnumerator", "IOwningAsyncEnumerator",
+                               "IOwningCollection", "IOwningList",
+                               "IGrouping", "Array", "OwningArray",
+                               "LinkedList", "Set", ""})
+        BEZEL_EXPECT_FALSE(isBuiltinForInEnumerableHead(n));
+    // Strict superset of the sync iterator-format pair: those two are the ones
+    // whose runtime value is a vtable-backed enumerator; the other four in this
+    // set reach the same handler and stay on the array protocol.
+    for (std::string_view n : {"IEnumerable", "IOwningEnumerable"}) {
+        BEZEL_EXPECT_TRUE(isSyncIterFormatEnumerableHead(n));
+        BEZEL_EXPECT_TRUE(isBuiltinForInEnumerableHead(n));
+    }
+    for (std::string_view n : {"IReadOnlyCollection", "IReadOnlyList",
+                               "ICollection", "IList"}) {
+        BEZEL_EXPECT_TRUE(isBuiltinForInEnumerableHead(n));
+        BEZEL_EXPECT_FALSE(isSyncIterFormatEnumerableHead(n));
+    }
+}
+
 // --- isArrayEnumeratorWrapSourceName (#3419, §29.2, stdlib §4.4–§4.5/§4.11/
 //     §4.14): the grid's SOURCE-FAMILY axis. The negatives are the whole point
 //     of the predicate existing separately from isArrayBackedCollectionName:

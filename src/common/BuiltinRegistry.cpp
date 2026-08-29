@@ -107,6 +107,23 @@ constexpr std::array<std::string_view, 2> kSyncIterFormatEnumerableHeads = {
     "IEnumerable", "IOwningEnumerable",
 };
 
+// fix #3468 / §29.2 / stdlib §4.12–§4.13 / §4.5 / §4.14: the SIX iteration-
+// interface heads the §29.2 builtin `for-in` desugaring
+// (`Emitter::lowerIEnumerableBuiltinFor`) handles — the two iterator-format
+// enumerable heads plus the four richer read/collection interfaces whose
+// runtime value is still one of the iteration representations. A source typed
+// at any OTHER head is not this desugaring's business (a user class routes to
+// `lowerIEnumerableFor`, a concrete collection to `lowerArrayFor` and friends).
+//
+// This list was spelled by hand in exactly two places — the lowering and the
+// frame-slot predicate that DECLARES ITSELF ITS MIRROR — and the mirror had
+// drifted in four independent ways (issue 3468). Both now read
+// `classifyBuiltinForInSource`, which reads this table.
+constexpr std::array<std::string_view, 6> kBuiltinForInEnumerableHeads = {
+    "IEnumerable", "IOwningEnumerable",
+    "IReadOnlyCollection", "IReadOnlyList", "ICollection", "IList",
+};
+
 // #3419 / §29.2 / stdlib §4.4–§4.5 / §4.11 / §4.14: the SOURCE-FAMILY axis —
 // the collection heads that take the ARRAY-ENUMERATOR wrap. Deliberately NOT
 // `kArrayBackedCollections`: see the header for why `Set`/`OwningSet` (hash
@@ -629,6 +646,12 @@ bool isIterFormatEnumerableHead(std::string_view head) {
 // The synchronous half of the above. // per §29.2, #3419
 bool isSyncIterFormatEnumerableHead(std::string_view head) {
     return contains(kSyncIterFormatEnumerableHeads, head);
+}
+
+// fix #3468 / §29.2: the iteration-interface heads the builtin for-in
+// desugaring handles. // per §29.2, #3468
+bool isBuiltinForInEnumerableHead(std::string_view head) {
+    return contains(kBuiltinForInEnumerableHeads, head);
 }
 
 // #3419 / §29.2 / stdlib §4.4–§4.5 / §4.11 / §4.14: the array-enumerator wrap

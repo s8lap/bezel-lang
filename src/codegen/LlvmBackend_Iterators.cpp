@@ -16,57 +16,30 @@ namespace bezel::codegen {
 // ===========================================================================
 
 bool Emitter::forInBuiltinEnumeratorNeedsFrameSlot(const ast::ForStmt& fs) {
-    // §29.7 (#944): mirror lowerIEnumerableBuiltinFor's family check + the
-    // `isArrayBacked == false` decision so collectSuspendLocals reserves a frame
-    // field for EXACTLY the for-ins whose lowering creates an iterator-format
-    // enumerator (Dispose at vtable slot 1). Any divergence would leave the
-    // wired-in enumerator slot pointing at a missing / mismatched field.
-    if (!fs.iterable) return false;
-    auto* iterTy = ctx_.exprType(*fs.iterable);
-    if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return false;
-    if (iterTy->declaration) return false;  // user class → lowerIEnumerableFor
-    std::string_view n;
-    if (iterTy->astNode && iterTy->astNode->name &&
-        !iterTy->astNode->name->parts.empty()) {
-        n = iterTy->headName();
-    } else if (!iterTy->importedName.empty()) {
-        n = iterTy->importedName;
-    } else {
-        return false;
-    }
-    if (n != "IEnumerable" && n != "IReadOnlyCollection" && n != "IReadOnlyList" &&
-        n != "ICollection" && n != "IList" && n != "IOwningEnumerable")
-        return false;
-    if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
-
-    // isArrayBacked == false ⇒ vtable-backed enumerator (the slot-1-Dispose
-    // enumerator). Matches lowerIEnumerableBuiltinFor's protocol heuristic.
-    if (dynamic_cast<const ast::CallExpr*>(fs.iterable.get())) return true;
-    if (dynamic_cast<const ast::NewExpr*>(fs.iterable.get())) return true;
-    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(fs.iterable.get())) {
-        sema::Symbol* sym = ctx_.exprSymbol(*id);
-        auto checkNamed = [&](sema::TypeRef* rt) {
-            return rt && rt->kind == sema::TypeRef::Kind::Named && rt->declaration;
-        };
-        auto checkPureIEnumerable = [&](sema::TypeRef* rt) -> bool {
-            if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
-            if (rt->declaration) return false;
-            if (!rt->astNode || !rt->astNode->name ||
-                rt->astNode->name->parts.empty())
-                return false;
-            return rt->headName() == "IEnumerable";
-        };
-        if (auto* par = dynamic_cast<sema::ParameterSymbol*>(sym)) {
-            if (par->declType) {
-                auto* rt = ctx_.resolvedType(*par->declType);
-                if (checkNamed(rt) || checkPureIEnumerable(rt)) return true;
-            }
-        } else if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
-            if (checkNamed(loc->declType) || checkPureIEnumerable(loc->declType))
-                return true;
-        }
-    }
-    return false;
+    // §29.7 (#944): collectSuspendLocals must reserve a frame field for EXACTLY
+    // the for-ins whose lowering creates an iterator-format enumerator (Dispose
+    // at vtable slot 1), so the enclosing iterator's Dispose can reach and
+    // dispose it when the loop is abandoned while suspended inside its body.
+    //
+    // fix #3468 (§29.2 / §29.7, v0.286): this used to be a hand-written MIRROR
+    // of `lowerIEnumerableBuiltinFor`'s family check and `isArrayBacked == false`
+    // decision, and its own header comment said so — "Any divergence would leave
+    // the wired-in enumerator slot pointing at a missing / mismatched field."
+    // It had diverged in FOUR independent ways: no `IOwningEnumerable` head in
+    // its `checkPureIEnumerable`, no `importedName` fallback there (so every
+    // cross-module TypeRef answered false), no `FieldSymbol`/`PropertySymbol`
+    // bare-identifier arm (#1642), and no `MemberAccessExpr` (#1642) /
+    // `IndexExpr` (#3356) arms at all. Each gap is a real abandoned-iterator
+    // LEAK, because the lowering wires the enumerator to a field this predicate
+    // never reserved and so falls back to the alloca spill area, which Dispose
+    // does not read: measured 25600 B / 800 allocations over 400 abandonments at
+    // the property-read shape (issue 3468).
+    //
+    // The repair is not to close the four gaps — that produces a fifth
+    // divergence later. Both sites now ask ONE function, so "the mirror has
+    // drifted" is no longer a state the compiler can be in.
+    BuiltinForInSource k = classifyBuiltinForInSource(fs);
+    return k.inFamily && !k.isArrayBacked;
 }
 
 // §27.5 / §30 (#808 exposure): see the header comment on frameCapturedLocals_.

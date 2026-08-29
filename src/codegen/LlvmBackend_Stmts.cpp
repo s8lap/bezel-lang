@@ -3795,12 +3795,79 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 act.kind = IterCleanup::Kind::EnumFrame;
                                 act.frameField = fit->second;
                                 actions.push_back(act);
+                                continue;  // tracked by field, not by node
                             }
-                            continue;
+                            // fix #3468 (§29.7 / §29.2 / stdlib §4.12–§4.13,
+                            // v0.286): an iterEnumDispose with NO frame field
+                            // used to `continue` here, on the claim that it
+                            // "cannot be live across this yield". That claim is
+                            // false, and the counterexample is the ordinary one:
+                            // a NAMED local/param bound to an iterator-format
+                            // enumerable (`var seq: IEnumerable<T> := coll;`)
+                            // inside an iterator body. Its scope-end disposal is
+                            // an iterEnumDispose too — the value is a
+                            // vtable-backed enumerator whose Dispose is at slot
+                            // 1, not a class-table object — but it is a NODE-
+                            // keyed local, not one of the for-in's implicit
+                            // enumerator/source resources, so it is absent from
+                            // smIterEnumFrameSlot_ and was dropped SILENTLY:
+                            // measured 12800 B / 400 abandonments, and unchanged
+                            // by `using var` (issue 3468's second, independent
+                            // leak).
+                            //
+                            // disposeOwnedLocals (#2306) does not cover it and
+                            // must not: it is keyed on the owned-CLASS pre-pass
+                            // and dispatches emitDisposeAndReclaim (the class
+                            // dispatch table), which is the wrong vtable for an
+                            // iterator-format value.
+                            //
+                            // So fall through to the node-keyed path below,
+                            // which preserves d.iterEnumDispose and therefore
+                            // replays the SAME slot-1 disposal the normal exit
+                            // paths emit. Exactly once, by the same argument
+                            // every other entry in this stack relies on: Dispose
+                            // stamps the DISPOSED sentinel (-2) before running
+                            // the stack, so no MoveNext can resume past this
+                            // yield and reach the loop's own disposal;
+                            // exhaustion parks -1 and the throw edge parks -1
+                            // (#3531), and neither state has a case in the
+                            // switch. An entry that reaches here was previously
+                            // DROPPED, never emitted, so this can only add a
+                            // missing disposal — it cannot duplicate one.
                         }
                         const ast::Node* node = nullptr;
                         for (const auto& [n, s] : locals_)
                             if (s == d.slot) { node = n; break; }
+                        // ⚠ fix #3468, NARROW EXCLUSION: a LAMBDA-CAPTURED
+                        // iterator-format local keeps its pre-existing leak
+                        // rather than gaining a wild dispatch. §27.5 (#808)
+                        // rebinds a captured local's frame field to a shared
+                        // CELL POINTER (boxLocalSlot), and the Dispose
+                        // function's restore loop copies that field verbatim
+                        // into `locals_[node]` — so the slot this path would
+                        // dispose holds the CELL, not the object, and the
+                        // slot-1 dispatch loads a "vtable" out of the cell
+                        // header. MEASURED on this tree: an `IEnumerable<T>`
+                        // local captured by a lambda, in an iterator abandoned
+                        // by `break`, is 38400 B / 1600 allocations LEAKED
+                        // without the arm above and an ASan SEGV with it.
+                        // Trading a leak for a wild jump is strictly worse —
+                        // #1462 did exactly that on this seam and was reverted
+                        // — so the capture case is excluded here and filed
+                        // separately. It is the same hazard issue 3539 already
+                        // records for an ordinary captured `using var` on this
+                        // path (heap-buffer-overflow in CloneDispose), and the
+                        // repair belongs in the RESTORE (teach it to unbox),
+                        // not in arming more frees over a boxed slot.
+                        //
+                        // Scoped to `d.iterEnumDispose` so the pre-existing
+                        // behaviour of every other Disposal kind here is
+                        // byte-for-byte unchanged: this guard can only decline
+                        // an entry THIS COMMIT would have newly added.
+                        if (node && d.iterEnumDispose &&
+                            frameCapturedLocals_.count(
+                                static_cast<const void*>(node)))
+                            continue;
                         if (node) {
                             IterCleanup act;
                             act.kind = IterCleanup::Kind::Disposal;
@@ -7545,17 +7612,29 @@ bool Emitter::lowerDictDrainFor(const ast::ForStmt& fs) {
 }
 
 
-bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
-    if (!fs.iterable) return false;
+// fix #3468 / §29.2 / §29.7 / stdlib §4.12–§4.13 (v0.286): the ONE
+// classification of a builtin-enumerable `for-in` source — see the header
+// comment on `BuiltinForInSource` for why answering it twice was a leak
+// generator. Extracted VERBATIM from `lowerIEnumerableBuiltinFor`, which is the
+// authority of the pair: every arm below, and every comment on it, is that
+// function's own text. `forInBuiltinEnumeratorNeedsFrameSlot` — the drifted
+// copy — now reads this instead of re-deriving it.
+//
+// Pure inspection: no IR is emitted, so `collectSuspendLocals` may call it at
+// frame-layout time, before any lowering has run.
+Emitter::BuiltinForInSource
+Emitter::classifyBuiltinForInSource(const ast::ForStmt& fs) {
+    BuiltinForInSource k;
+    if (!fs.iterable) return k;
     auto* iterTy = ctx_.exprType(*fs.iterable);
-    if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return false;
+    if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return k;
     // §2.5 / §29.3 (issue #495): for a LOCALLY-declared iterable the name
     // comes from astNode; for an IMPORTED-type iterable (cross-module call
     // returning IEnumerable<T>) astNode is null and the name is in importedName
     // (set by ModuleLoader from the metadata namedName field).  Declaration must
     // be null in both cases — a non-null declaration means a user class whose
     // GetEnumerator is handled by lowerIEnumerableFor.
-    if (iterTy->declaration) return false;
+    if (iterTy->declaration) return k;
     std::string_view n;
     if (iterTy->astNode && iterTy->astNode->name &&
         !iterTy->astNode->name->parts.empty()) {
@@ -7563,28 +7642,18 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     } else if (!iterTy->importedName.empty()) {
         n = iterTy->importedName;
     } else {
-        return false;
+        return k;
     }
     // Only handle the iteration-interface family.
-    if (n != "IEnumerable" && n != "IReadOnlyCollection" && n != "IReadOnlyList" &&
-        n != "ICollection" && n != "IList" &&
-        n != "IOwningEnumerable")
-        return false;
+    // fix #3468 (§29.2, v0.286): the six-name list is now a TABLE in the builtin
+    // registry, not a comparison chain spelled here and again in the frame-slot
+    // predicate — the shape umbrella #3419's grid ratchet exists to retire.
+    if (!common::isBuiltinForInEnumerableHead(n)) return k;
     // Must have a generic arg to determine element type.
-    if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
-
-    llvm::Value* enumObj = lowerExpr(*fs.iterable);
-    if (!enumObj) return false;
-
-    // fix #3537 (§4.7 / §29.2, v0.283): the CONSUMER face of the element-type
-    // substitution `emitIteratorMethod` makes on the producer side. `elemTy` here
-    // types the `Current` (vtable slot 3) callee AND the store into the loop
-    // variable's slot; the producer emits slot 3 returning the one-byte
-    // placeholder for a `()` element, so reading `void` here built a
-    // `void (ptr)` callee type and then stored a void value — MEASURED SIGILL in
-    // `DataLayout::getABITypeAlign` under `CreateAlignedStore`. Both faces must
-    // substitute identically or producer and consumer disagree about slot 3.
-    llvm::Type* elemTy = unitStorageTy(lowerTypeRef(iterTy->genericArgs[0]));
+    if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return k;
+    k.inFamily = true;
+    k.head = n;
+    k.iterTy = iterTy;
 
     // Determine if the value is a bz_array_t (variable/param backed by Array)
     // or an iterator state machine (result of a call to an iterator method).
@@ -7725,6 +7794,33 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         if (common::isSyncIterFormatEnumerableHead(n))
             isArrayBacked = false;
     }
+    k.isArrayBacked = isArrayBacked;
+    return k;
+}
+
+bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
+    // fix #3468 (§29.2 / §29.7, v0.286): the family gate and the array-vs-vtable
+    // protocol decision both come from the shared classifier above, so
+    // `forInBuiltinEnumeratorNeedsFrameSlot` (which reserves the §29.7 frame
+    // field this function wires) cannot disagree with what is lowered here.
+    BuiltinForInSource k = classifyBuiltinForInSource(fs);
+    if (!k.inFamily) return false;
+    std::string_view n = k.head;
+    sema::TypeRef* iterTy = k.iterTy;
+
+    llvm::Value* enumObj = lowerExpr(*fs.iterable);
+    if (!enumObj) return false;
+
+    // fix #3537 (§4.7 / §29.2, v0.283): the CONSUMER face of the element-type
+    // substitution `emitIteratorMethod` makes on the producer side. `elemTy` here
+    // types the `Current` (vtable slot 3) callee AND the store into the loop
+    // variable's slot; the producer emits slot 3 returning the one-byte
+    // placeholder for a `()` element, so reading `void` here built a
+    // `void (ptr)` callee type and then stored a void value — MEASURED SIGILL in
+    // `DataLayout::getABITypeAlign` under `CreateAlignedStore`. Both faces must
+    // substitute identically or producer and consumer disagree about slot 3.
+    llvm::Type* elemTy = unitStorageTy(lowerTypeRef(iterTy->genericArgs[0]));
+    bool isArrayBacked = k.isArrayBacked;
 
     if (isArrayBacked) {
         // Use direct bz_array_t protocol.

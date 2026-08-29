@@ -103,6 +103,24 @@ bool isIterFormatEnumerableHead(std::string_view head);
 // with a synchronous enumerator. // per §29.2 / stdlib §4.12–§4.13, #3419
 bool isSyncIterFormatEnumerableHead(std::string_view head);
 
+// fix #3468 / §29.2 / stdlib §4.12–§4.13 / §4.5 / §4.14: the SIX iteration-
+// interface heads the §29.2 builtin `for-in` desugaring handles —
+// `IEnumerable<T>` and `IOwningEnumerable<T>` (the iterator-format enumerables)
+// plus `IReadOnlyCollection<T>`, `IReadOnlyList<T>`, `ICollection<T>` and
+// `IList<T>` (the richer read/collection interfaces, which keep the
+// indexer-based array protocol). A source typed at any other head belongs to a
+// different for-handler.
+//
+// This is the FAMILY GATE, not the protocol decision: whether such a source is
+// array-backed or vtable-backed is `Emitter::classifyBuiltinForInSource`'s
+// second half. Both questions used to be answered TWICE — once in
+// `lowerIEnumerableBuiltinFor` and once in
+// `forInBuiltinEnumeratorNeedsFrameSlot`, whose own header comment declares
+// itself that lowering's mirror — and the mirror had drifted in four
+// independent ways, leaking an abandoned iterator's enumerator and source
+// frames at three measured source shapes (issue 3468). // per §29.2, #3468
+bool isBuiltinForInEnumerableHead(std::string_view head);
+
 // #3419 / §29.2 / stdlib §4.4–§4.5 / §4.11 / §4.14: the SOURCE-FAMILY axis of
 // the enumerable-wrap grid — the collection heads whose backing is the dense
 // `bz_array_t*` element array AND which therefore take the ARRAY-ENUMERATOR
