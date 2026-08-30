@@ -103,6 +103,22 @@ private:
     // is rejected. Returns true iff admitted.
     bool callTargetIsPure(Symbol* calleeSym);
 
+    // narrow #3610 (§22.15 rule 6, v0.286): rule 6's admitted call forms name
+    // "method, **operator**, accessor read, or constructor" — the operator
+    // form was the one this walker never asked about. A §25 user-declared
+    // overload is a call to a `MethodSymbol`, and `ExprTC::typeBinary` /
+    // `typeUnary` ALREADY record that symbol on the operator node
+    // (`setExprSymbol(&be, opm)` — ExprTypecheck_Exprs.cpp:4688, :4809, :5894),
+    // so the question is answerable from a fact the compiler already computes.
+    // Routed through `callTargetIsPure`, the one authority fix #3609 left
+    // behind, rather than a sixth spelling of "is this member pure".
+    //
+    // `opSym` is null for every BUILT-IN operator on primitives, enums, and
+    // `string` (`findBinaryOperator`/`findUnaryOperator` resolve no symbol
+    // there) — rule 3 material, not a call, and deliberately untouched.
+    void checkOperatorOverloadPurity(Symbol* opSym, std::string_view opTok,
+                                     SourceLocation loc);
+
     // §22.15 "Members classified by rule" (#2061, item 2): a record's
     // synthesized Equals/GetHashCode/ToString are pure-classified iff every
     // field's equality dispatch target is pure (auto-hashable form).
@@ -270,6 +286,50 @@ bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {
     // "Intrinsic purity (the stdlib contract)" trusts stdlib markers, and
     // Slice 4 covers the stdlib annotation wave.
     return true;
+}
+
+// narrow #3610 (§22.15 rule 6, v0.286): the operator arm of rule 6.
+//
+// WHAT WAS MISSING. Rule 6 admits "a call — method, **operator**, accessor
+// read, or constructor in the admitted positions — … iff the member declared
+// on the receiver's static type … is `pure`-declared or pure-classified".
+// `checkExpr`'s BinaryExpr arm implemented rule 3 (built-in operators on
+// primitives, enums and `string`) by walking the operands, and the only
+// operator it ever classified was `in` — which is not an overload at all but
+// the §17.5 `Contains` call. A §25 user-declared `operator -` therefore ran
+// inside a pure body, locally and across the artifact boundary alike.
+//
+// WHY THIS IS NOT A SIXTH PREDICATE. The overload is already resolved and
+// already recorded: `ExprTC::typeBinary` calls `ctx_.setExprSymbol(&be, opm)`
+// for a named-type overload and for a `where T: I<T>` constraint static
+// operator, and `ExprTC::typeUnary` does the same for `&ue`. Nothing else
+// ever puts a symbol on a BinaryExpr/UnaryExpr node, so "the node carries a
+// MethodSymbol" IS "this operator is a user-declared overload". The purity
+// question then goes to `callTargetIsPure`, unchanged.
+//
+// NARROW, DELIBERATELY. This covers the operator EXPRESSION forms only.
+// The STATEMENT forms — `a += b` and `t++` through a §25 overload — record no
+// symbol anywhere (their overload is re-looked-up by hand at five separate
+// sites), so closing them needs the resolution recorded first: #3628.
+// Rule 6's "accessor read" arm stays as it was — `callTargetIsPure` still
+// admits every `PropertySymbol` unconditionally — because an accessor-level
+// `pure get` has no `MetaMember` slot (#3618), so tightening it today would
+// reject a cross-module property read whose local twin compiles: #3630.
+void PureBodyWalker::checkOperatorOverloadPurity(Symbol* opSym,
+                                                 std::string_view opTok,
+                                                 SourceLocation loc) {
+    auto* ms = dynamic_cast<MethodSymbol*>(opSym);
+    if (!ms) return;   // rule 3: a built-in operator resolves no symbol.
+    if (callTargetIsPure(ms)) return;
+    std::string owner = ms->parent ? std::string(ms->parent->name)
+                                   : std::string("<type>");
+    reportPureViolation(
+        loc, std::string("call to `operator ") + std::string(opTok) + "`",
+        std::string("\xC2\xA7""25's `") + std::string(opTok) +
+        "` on this operand type is the call `" + owner + "::operator " +
+        std::string(opTok) + "`, and \xC2\xA7""22.15's calls-to-pure-members rule "
+        "admits an operator call only when the resolved overload is "
+        "pure-declared \xE2\x80\x94 declare it `pure`, or use a `pure` overload");
 }
 
 // §22.15 "Members classified by rule" (#2061, item 2): a record's
@@ -1127,6 +1187,13 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
                     "(\xC2\xA7""22.15, #3279, stdlib \xC2\xA7""9.8)");
             }
         }
+        // narrow #3610 (§22.15 rule 6, v0.286): every OTHER binary operator
+        // token may be a §25 user-declared overload — including the §25.2
+        // equality forms `=` / `<>` — and an overload is a call. `in` is
+        // excluded because it is not an overload (§17.5 `Contains`, handled
+        // above); `and` / `or` never resolve one.
+        checkOperatorOverloadPurity(ctx_.exprSymbol(*be), be->op,
+                                    be->span.begin);
         checkExpr(be->left.get());
         checkExpr(be->right.get());
         return;
@@ -1140,6 +1207,11 @@ void PureBodyWalker::checkExpr(const ast::Expr* e) {
                 ue->span.begin, "`await`",
                 "interleaves with the domain's continuation queue");
         }
+        // narrow #3610 (§22.15 rule 6, v0.286): the unary half. `typeUnary`
+        // records a resolved §25 unary overload on the node exactly as the
+        // binary path does; `await` is rejected above and resolves none.
+        checkOperatorOverloadPurity(ctx_.exprSymbol(*ue), ue->op,
+                                    ue->span.begin);
         checkExpr(ue->operand.get());
         return;
     }
