@@ -222,7 +222,10 @@ const char* kEightLocalsAcrossAnAwait =
 BEZEL_TEST(spill_order_deterministic_3504, await_spill_group_is_in_frame_order) {
     std::string ir = compileAndCaptureIR(kEightLocalsAcrossAnAwait);
     BEZEL_EXPECT_TRUE(!ir.empty());
-    std::string body = sliceFunctionBody(ir, "bz$async$Step$Resume");
+    // fix #3536: the async Resume mangling now includes the owning class
+    // (`mangledTypeName(ms->parent)`, "M.C" for `module M; class C ...`) so
+    // two same-named async methods on different classes no longer collide.
+    std::string body = sliceFunctionBody(ir, "bz$async$M.C$Step$Resume");
     BEZEL_EXPECT_TRUE(!body.empty());
     auto runs = frameGepRuns(body, "%async.Step", 8);
     // Two groups: the spill before the fast/slow branch and the restore at the

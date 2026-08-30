@@ -1166,7 +1166,21 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     const unsigned SPILL_PTR_FIELD = CURRENT_VAL_FIELD + 2;          // #747
 
     bool isInstance = !isStaticMethod(ms);
-    std::string prefix = std::string("bz$iter$") + std::string(ms->name) + "$";
+    // fix #3536: qualify with the owning class (the same `mangledTypeName`
+    // convention as the ordinary per-class member spellings, e.g.
+    // LlvmBackend_Setup.cpp's `"bz$" + mangledTypeName(ts) + "$Dispose"`).
+    // Unqualified, two classes each declaring a same-named iterator method
+    // computed the SAME prefix; every mint here is unguarded
+    // (`llvm::Function::Create` / `new llvm::GlobalVariable` with no
+    // existence check first), so LLVM's own name-uniquing silently handed
+    // the second class a private `.1`..`.7` copy of the machinery — correct
+    // today only because nothing consults the collided key. The moment a
+    // cache guard is added at this site (the ordinary shape `fix #3477`
+    // already applied to eleven sibling mints in LlvmBackend_Assign.cpp),
+    // the second class would silently reuse the first class's MoveNext /
+    // Current / Dispose over its own, differently-shaped frame.
+    std::string prefix = std::string("bz$iter$") + mangledTypeName(ms->parent) +
+                         "$" + std::string(ms->name) + "$";
 
     // §29.7 (#2306): finish the local pre-pass now that `frame` is built.
     // Run the linear scan (it was declared above but its frame-field slot

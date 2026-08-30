@@ -1055,7 +1055,10 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     asyncOwnedParamFrame_ = &frame;
 
     bool isInstance = !isStaticMethod(ms);
-    std::string prefix = std::string("bz$async$") + std::string(ms->name) + "$";
+    // fix #3536: qualify with the owning class — see the identical rationale
+    // at the sync-iterator mint (LlvmBackend_Iterators.cpp, `emitIteratorMethod`).
+    std::string prefix = std::string("bz$async$") + mangledTypeName(ms->parent) +
+                         "$" + std::string(ms->name) + "$";
 
     // --- Resume(ptr completedTask, ptr frame) -> void ---
     // The bz_task_then continuation ABI is void(void* task, void* state); the
@@ -2243,7 +2246,10 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     asyncSpillPtrField_ = SPILL_PTR_FIELD;
 
     bool isInstance = !isStaticMethod(ms);
-    std::string prefix = std::string("bz$asynciter$") + std::string(ms->name) + "$";
+    // fix #3536: qualify with the owning class — see the identical rationale
+    // at the sync-iterator mint (LlvmBackend_Iterators.cpp, `emitIteratorMethod`).
+    std::string prefix = std::string("bz$asynciter$") + mangledTypeName(ms->parent) +
+                         "$" + std::string(ms->name) + "$";
 
     // §29.7 (#2574): the LOCAL counterpart of the async iterator's owned-
     // parameter scan. Restricted to IOwningAsyncEnumerable iterators — a bare-
