@@ -51,17 +51,29 @@
 //
 // T2 — the two identically-shaped `isDeclaredParam`/`scanRefConstraint`
 // copies in `ExprTC::typeCall`'s §28.2 `T.Dispose()` gate
-// (ExprTypecheck_Calls.cpp). MEASURED: `class Holder<T> end Holder;`,
-// extended by `extension Holder<T> where T: class { method Clear(owned x: T)
-//   x.Dispose(); end; }`: "no member `Dispose` on unconstrained type
-// parameter `T`" — on BOTH local and imported `Holder` before the fix (this
-// one is not import-sensitive by itself: `where T: class` on the extension is
-// invisible to `scanRefConstraint` regardless of import status), because it
-// sits on the same class-1-shaped `dynamic_cast<const ast::TypeDecl*>
-// (currentType_->decl)` line the audit tracks and blocks the family from
-// round-tripping even where `isInScopeTypeParam` alone is fixed. Fixed
-// identically (a third `currentExtension_` arm on both `scanRefConstraint`'s
-// scan list and `isDeclaredParam`).
+// (ExprTypecheck_Calls.cpp), fixed with a third `currentExtension_` arm on
+// both `scanRefConstraint`'s scan list and `isDeclaredParam`. MEASURED, two
+// DIFFERENT shapes because the bug's local and imported halves manifest
+// differently here (unlike T1, where both halves are diagnostic-observable
+// the same way):
+//   local, `class Holder<T> end Holder;` extended by `extension Holder<T>
+//   where T: class { method Clear(owned x: T) x.Dispose(); end; }` — an
+//   OVER-REJECTION: `isDeclaredParam` was already true pre-fix (via the
+//   `currentType_`/`Holder` name-coincidence `isInScopeTypeParam`'s comment
+//   describes), so `scanRefConstraint` missing the extension's OWN
+//   `where T: class` produced a wrong, loud reject: "no member `Dispose` on
+//   unconstrained type parameter `T`".
+//   imported, same `Holder`/extension shape — pre-fix `isDeclaredParam` was
+//   ALSO false here (the `currentType_` coincidence cannot fire across a
+//   module boundary, same root cause as T1), so the diagnostic branch
+//   (which requires `isDeclaredParam`) never ran at all: a SILENT DEFERRAL,
+//   not a correct accept — confirmed zero diagnostics with the `where`
+//   clause EITHER present or absent, since presence/absence only feeds
+//   `scanRefConstraint`, downstream of the `isDeclaredParam` gate that was
+//   already false. Fixed, this becomes reachable and CORRECT either way:
+//   ref-constrained now silently admits (matching T2a's fixed local
+//   behavior); UNCONSTRAINED now loudly and correctly rejects — the
+//   diagnostically-observable half of the imported repro this file pins.
 //
 // WHY THE SEMA-ONLY HARNESS. Both repros are extension MEMBER BODIES, which
 // `ExprTC::visitTopDecl`'s `ExtensionDecl` arm typechecks unconditionally via
@@ -219,7 +231,11 @@ const char* kLibT2_3643 =
     "public class Holder<T> "
     "end Holder; ";
 
-const char* kExtT2Body_3643 =
+// T2a's body: the extension's `where T: class` bound (declared on the
+// EXTENSION, not on `Holder`) SHOULD entitle `T.Dispose()` (§28.2: "every
+// class implicitly implements IDisposable ... a class, interface, or
+// class-type constraint makes the call legal").
+const char* kExtT2ConstrainedBody_3643 =
     "extension Holder<T> where T: class "
     "  public method Clear(owned x: T): int "
     "    x.Dispose(); "
@@ -227,34 +243,73 @@ const char* kExtT2Body_3643 =
     "  end Clear; "
     "end; ";
 
-std::string appT2_3643() {
-    return std::string("module App; import Lib; ") + kExtT2Body_3643;
-}
+// T2b's body: NO `where` clause at all — `T` is a genuine, declared extension
+// type parameter, but carries no reference-type bound, so §28.2/§14.2
+// correctly reject `T.Dispose()` ("add a `where T: <constraint>` that
+// provides this member").
+const char* kExtT2UnconstrainedBody_3643 =
+    "extension Holder<T> "
+    "  public method Clear(owned x: T): int "
+    "    x.Dispose(); "
+    "    return 7; "
+    "  end Clear; "
+    "end; ";
 
-std::string localT2_3643() {
+std::string localT2Constrained_3643() {
     return std::string("module App; class Holder<T> end Holder; ") +
-           kExtT2Body_3643;
+           kExtT2ConstrainedBody_3643;
 }
 
-// #3643 T2, THE DEFECT. Pre-fix: "no member `Dispose` on unconstrained type
-// parameter `T`" on BOTH sides identically (not import-sensitive by itself —
-// `where T: class` lives on the EXTENSION, which `scanRefConstraint` never
-// scanned, regardless of import status) — but it sits on the same
-// class-1-shaped cast the audit tracks, and blocks this family from
-// round-tripping even with T1 alone fixed.
-BEZEL_TEST(xmod_extension_type_param_scope_3643,
-           imported_extension_ref_constrained_param_admits_dispose_spec_28_2) {
-    ModuleMetadata dep = buildMeta3643(kLibT2_3643);
-    auto r = run3643(&dep, appT2_3643());
-    BEZEL_EXPECT_TRUE(r->parsed);
-    BEZEL_EXPECT_TRUE(!sawDiag3643(*r, kNoDispose3643));
+std::string appT2Unconstrained_3643() {
+    return std::string("module App; import Lib; ") +
+           kExtT2UnconstrainedBody_3643;
 }
 
+// #3643 T2a, THE OVER-REJECTION DEFECT (local half — the fix's effect IS
+// diagnostically observable here). Pre-fix: `scanRefConstraint` never scanned
+// the EXTENSION's own `where T: class` (only `currentMethodDecl_`'s and
+// `currentType_`'s, i.e. `Holder`'s own declared constraints, which are
+// empty), so a legally ref-constrained `T` was wrongly rejected: "no member
+// `Dispose` on unconstrained type parameter `T`". `isDeclaredParam` itself
+// was ALREADY true pre-fix here (via the `currentType_`-`Holder` coincidence
+// `isInScopeTypeParam`'s comment describes — `Holder`'s own declared `T`
+// happens to match), which is exactly why this diagnostic fired at all
+// instead of the code silently falling through, and why this row can pin the
+// defect via diagnostic ABSENCE while T2b (below) needs diagnostic PRESENCE.
 BEZEL_TEST(xmod_extension_type_param_scope_3643,
            local_extension_ref_constrained_param_admits_dispose_spec_28_2) {
-    auto r = run3643(nullptr, localT2_3643());
+    auto r = run3643(nullptr, localT2Constrained_3643());
     BEZEL_EXPECT_TRUE(r->parsed);
     BEZEL_EXPECT_TRUE(!sawDiag3643(*r, kNoDispose3643));
+}
+
+// #3643 T2b, THE SILENT-DEFERRAL DEFECT (imported half). Unlike T2a, an
+// IMPORTED `Holder`'s `currentType_->decl` is unconditionally null, so
+// pre-fix `isDeclaredParam` was ALSO false here regardless of the extension's
+// `where` clause — the diagnostic-reporting branch requires `isDeclaredParam`
+// to be true, so pre-fix this shape produced ZERO diagnostics at ANY
+// severity (verified directly against this exact input, both with and
+// without the `where T: class` clause): not a correct accept, but every
+// check in `ExprTC::typeCall`'s Dispose gate silently deferring past this
+// site entirely.
+//
+// That means T2a's OWN imported/constrained twin (`extension Holder<T>
+// where T: class`, same as T2a but over an imported `Holder`) is NOT
+// diagnostically distinguishable pre- vs. post-fix — both produce zero
+// diagnostics here, since post-fix it is admitted silently (correctly,
+// confirmed by direct inspection of `refConstrained`/`isObjectMember` during
+// development) and pre-fix it was silently deferred (unverified). So this
+// row drops the `where` clause instead: `T` is then a genuine but
+// UNCONSTRAINED extension parameter, and post-fix the new
+// `currentExtension_` arm correctly recognizes it as declared and PRODUCES
+// the loud, correct §14.2 reject — exactly the diagnostic T2a's local twin
+// pins for the ref-constrained case, now reachable on the imported side too.
+BEZEL_TEST(xmod_extension_type_param_scope_3643,
+           imported_extension_unconstrained_param_rejects_dispose_spec_14_2) {
+    ModuleMetadata dep = buildMeta3643(kLibT2_3643);
+    auto r = run3643(&dep, appT2Unconstrained_3643());
+    BEZEL_EXPECT_TRUE(r->parsed);
+    BEZEL_EXPECT_TRUE(sawDiag3643(*r, kNoDispose3643));
 }
 
 }  // namespace
