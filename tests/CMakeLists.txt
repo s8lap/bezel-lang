@@ -225,7 +225,16 @@ function(bezel_add_test_binary group)
         # loudly; the rest treat "" as "toolchain missing -> SKIP" and passed
         # VACUOUSLY). A -D value is not a path argument, so no wrapper rewrites
         # it; this is the only channel that is absolute by construction.
-        BEZEL_RUNTIME_SRC_DIR="${CMAKE_SOURCE_DIR}/src/runtime")
+        BEZEL_RUNTIME_SRC_DIR="${CMAKE_SOURCE_DIR}/src/runtime"
+        # fix #3627: the SAME defect class, one directory over. Four source-
+        # scanning ratchet tests each derived the repo root from their own
+        # __FILE__ (tests/support/repo_root.hpp); under the same ccache
+        # base_dir rewrite this becomes unresolvable-from-the-worktree-root,
+        # and (worse than the runtime case) a directory walk over an
+        # unresolvable root silently visits zero files instead of erroring,
+        # so a "zero hits expected" ratchet passes having scanned nothing.
+        # Same fix: an absolute -D no path-rewriting wrapper touches.
+        BEZEL_REPO_ROOT_DIR="${CMAKE_SOURCE_DIR}")
     # Force all bezel_runtime object files in, then export-dynamic so a
     # process-symbol-table lookup resolves bz_array_*, bz_dict_*, etc.
     target_link_options(${tgt} PRIVATE

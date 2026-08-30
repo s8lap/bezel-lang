@@ -39,6 +39,7 @@
 #include <string>
 #include <vector>
 
+#include "support/repo_root.hpp"
 #include "test_harness.hpp"
 
 namespace {
@@ -100,18 +101,6 @@ const Entry kAstKeyedTables[] = {
      "store to the legacy all-positional pairing, not to a crash."},
 };
 
-// Locate the repo root from this translation unit's own path:
-// <root>/tests/module/<this file>.
-std::string repoRoot() {
-    std::string p = __FILE__;
-    for (int up = 0; up < 3; ++up) {
-        std::size_t slash = p.find_last_of('/');
-        if (slash == std::string::npos) return {};
-        p.resize(slash);
-    }
-    return p;
-}
-
 // Every member name declared as `std::unordered_map<const ast::…> name_;`,
 // in declaration order. Scans forward from each match to the terminating `;`
 // so a declaration wrapped across lines is handled.
@@ -144,7 +133,7 @@ std::vector<std::string> scanAstKeyedTableNames(const std::string& src) {
 
 BEZEL_TEST(semacontext_ast_side_table_snapshot,
            every_ast_keyed_table_has_a_recorded_reconstruction_disposition) {
-    const std::string root = repoRoot();
+    const std::string root = ::bezel::test::repoRoot();
     BEZEL_EXPECT_TRUE(!root.empty());
     const std::string header = root + "/src/sema/SemaContext.hpp";
 

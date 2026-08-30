@@ -27,22 +27,12 @@
 #include <iostream>
 #include <vector>
 
+#include "support/repo_root.hpp"
 #include "test_harness.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
-
-// <root>/tests/support/<this file>  ->  <root>
-std::string repoRoot() {
-    std::string p = __FILE__;
-    for (int up = 0; up < 3; ++up) {
-        const std::size_t slash = p.find_last_of('/');
-        if (slash == std::string::npos) return {};
-        p.resize(slash);
-    }
-    return p;
-}
 
 bool isCommentLine(const std::string& line) {
     const std::size_t i = line.find_first_not_of(" \t");
@@ -68,7 +58,15 @@ const char* const kBannedLiterals[] = {
     "\"/var/tmp/bezel-scratch\" /",
 };
 
-void scan(const std::string& dir, std::vector<Hit>& hits) {
+// fix #3627: filesScanned counts every file actually examined (not just the
+// hit count). A fs::recursive_directory_iterator over an unresolvable `dir`
+// silently produces zero entries — no exception, no `ec` the caller reads —
+// so a walk over a WRONG root looked identical to a walk that found a clean
+// tree: both report 0 hits. filesScanned makes that distinguishable: "0 hits
+// over ~1,760 files scanned" is the tree being clean; "0 hits over 0 files
+// scanned" is the walk never having happened.
+void scan(const std::string& dir, std::vector<Hit>& hits,
+          std::size_t& filesScanned) {
     std::error_code ec;
     for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end;
          it.increment(ec)) {
@@ -82,6 +80,7 @@ void scan(const std::string& dir, std::vector<Hit>& hits) {
 
         std::ifstream in(p);
         if (!in) continue;
+        ++filesScanned;
         std::string line;
         int n = 0;
         while (std::getline(in, line)) {
@@ -103,12 +102,20 @@ void scan(const std::string& dir, std::vector<Hit>& hits) {
 // artifacts go in ./scratch/ or /var/tmp/bezel-scratch — never /tmp, which is
 // tmpfs (RAM)"), not a language rule, so it cites the operating doc.
 BEZEL_TEST(scratch_path_hygiene, no_test_source_hardcodes_a_scratch_root) {
-    const std::string root = repoRoot();
+    const std::string root = ::bezel::test::repoRoot();
     BEZEL_EXPECT_TRUE(!root.empty());
     if (root.empty()) return;
 
     std::vector<Hit> hits;
-    scan(root + "/tests", hits);
+    std::size_t filesScanned = 0;
+    scan(root + "/tests", hits, filesScanned);
+
+    // fix #3627: the scan must actually have run — a walk over an
+    // unresolvable root visits zero files and would otherwise report the
+    // SAME "0 hits" as a genuinely clean tree. tests/ holds ~2,057 eligible
+    // files at time of writing; 500 is a floor with generous headroom for
+    // growth or churn, not a tight bound.
+    BEZEL_EXPECT_TRUE(filesScanned > 500);
 
     // Print every offender before asserting: the count alone would send the
     // reader hunting, and the fix is per-file.

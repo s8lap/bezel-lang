@@ -81,6 +81,7 @@
 #include <string>
 #include <vector>
 
+#include "support/repo_root.hpp"
 #include "test_harness.hpp"
 
 namespace {
@@ -290,18 +291,6 @@ const Entry kWarningDegrades[] = {
 // at all, it declines the site — so the count stays 9.
 constexpr std::size_t kUnsafePointerCount = 9;
 
-// Locate the repo root from this translation unit's own path:
-// <root>/tests/support/<this file>.
-std::string repoRoot() {
-    std::string p = __FILE__;
-    for (int up = 0; up < 3; ++up) {
-        std::size_t slash = p.find_last_of('/');
-        if (slash == std::string::npos) return {};
-        p.resize(slash);
-    }
-    return p;
-}
-
 struct Site {
     std::string file;      // relative to the repo root
     int line = 0;
@@ -397,7 +386,7 @@ std::vector<Site> scanSrcTree(const std::string& root) {
 
 BEZEL_TEST(internal_degrade_disposition_snapshot_2924,
            every_warning_severity_degrade_has_a_recorded_safety_disposition) {
-    const std::string root = repoRoot();
+    const std::string root = ::bezel::test::repoRoot();
     BEZEL_EXPECT_TRUE(!root.empty());
 
     const std::vector<Site> sites = scanSrcTree(root);

@@ -73,22 +73,12 @@
 #include <string>
 #include <vector>
 
+#include "support/repo_root.hpp"
 #include "test_harness.hpp"
 
 namespace {
 
 namespace fs = std::filesystem;
-
-// <root>/tests/support/<this file>  ->  <root>
-std::string repoRoot() {
-    std::string p = __FILE__;
-    for (int up = 0; up < 3; ++up) {
-        const std::size_t slash = p.find_last_of('/');
-        if (slash == std::string::npos) return {};
-        p.resize(slash);
-    }
-    return p;
-}
 
 bool isIdentChar(char c) {
     return std::isalnum(static_cast<unsigned char>(c)) != 0 || c == '_';
@@ -311,7 +301,7 @@ void scanFile(const fs::path& p, const std::string& rel,
 // "Constraints", v0.283.
 BEZEL_TEST(typeref_holder_scope_escape_3487,
            no_stack_typeref_holder_escapes_into_an_outer_scoped_pointer) {
-    const std::string root = repoRoot();
+    const std::string root = ::bezel::test::repoRoot();
     BEZEL_EXPECT_TRUE(!root.empty());
     if (root.empty()) return;
 
