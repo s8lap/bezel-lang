@@ -768,3 +768,62 @@ BEZEL_TEST(builtin_registry_snapshot, keyword_alias_builtin_set) {
                                "int32", "object", "Int", "Char", ""})
         BEZEL_EXPECT_FALSE(isKeywordAliasBuiltinName(n));
 }
+
+// --- isStringLinqOperatorMemberName (#3589, §5/§9.6): the string-receiver
+//     LINQ exemption gate. NOT a migration snapshot in the usual sense — the
+//     table collapses two hand-spellings a #3589 measurement found were
+//     byte-identical (the `.` member-access gate and its `?.` mirror), so
+//     this pins the union those two already agreed on. The negatives matter
+//     more than usual here: `ElementAtOrNull`/`MinOrNull`/`MaxOrNull`/
+//     `Contains`/`OfType` are real (or, for `OfType`, formerly real) stdlib
+//     §5/§5.1 names that stay OUT of this particular table — issue #3444
+//     tracks whether the first three should be added, but only after their
+//     string/IEnumerable<char> lowering is exercised end-to-end, which this
+//     fix does not do.
+BEZEL_TEST(builtin_registry_snapshot, string_linq_operator_member_name_set) {
+    static constexpr std::array<std::string_view, 38> kSnapshot = {
+        "Where", "Select", "SelectMany", "Skip", "Take", "TakeWhile",
+        "SkipWhile", "Distinct", "OrderBy", "OrderByDescending", "ThenBy",
+        "ThenByDescending", "Concat", "Zip", "Union", "Intersect", "Except",
+        "Reverse", "Any", "All", "Count", "Sum", "Min", "Max", "Average",
+        "First", "Last", "Single", "ElementAt", "FirstOrNull", "LastOrNull",
+        "SingleOrNull", "ToArray", "ToSet", "ToDictionary", "GroupBy",
+        "Aggregate", "ForEach",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isStringLinqOperatorMemberName(n));
+    // Real stdlib §5/§5.1 names deliberately absent from THIS table (#3444's
+    // still-open widening question), plus the retired `OfType` and a
+    // near-neighbour typo.
+    for (std::string_view n : {"ElementAtOrNull", "MinOrNull", "MaxOrNull",
+                               "Contains", "OfType", "ToList", "Sorted",
+                               "Reversed", ""})
+        BEZEL_EXPECT_FALSE(isStringLinqOperatorMemberName(n));
+}
+
+// --- isBuiltinCollectionLinqOperatorName (#3589, §5): the builtin non-owning-
+//     collection-family bare-reference / member-access LINQ exemption gate.
+//     Collapses four hand-spellings this fix found were meant to be one
+//     question (three byte-identical, the fourth missing only `ToArray`,
+//     masked by that family's own separate `isDeclaredMethod` admitting it —
+//     see the header comment for the full #3589 reasoning). `Reverse`/
+//     `Count`/`Contains` stay OUT on purpose: each builtin family pre-empts
+//     them through its own dedicated handler before this gate runs.
+BEZEL_TEST(builtin_registry_snapshot,
+           builtin_collection_linq_operator_name_set) {
+    static constexpr std::array<std::string_view, 38> kSnapshot = {
+        "Where", "OfType", "Select", "SelectMany", "Any", "All", "First",
+        "FirstOrNull", "Last", "LastOrNull", "Single", "SingleOrNull",
+        "ElementAt", "Sum", "Min", "Max", "MinOrNull", "MaxOrNull",
+        "Average", "Aggregate", "OrderBy", "OrderByDescending", "Distinct",
+        "Union", "Intersect", "Except", "Take", "TakeWhile", "Skip",
+        "SkipWhile", "Concat", "Zip", "GroupBy", "ToArray", "ToDictionary",
+        "ToSet", "ThenBy", "ThenByDescending",
+    };
+    for (auto n : kSnapshot)
+        BEZEL_EXPECT_TRUE(isBuiltinCollectionLinqOperatorName(n));
+    // Pre-empted-elsewhere exclusions (see header) plus fictitious names.
+    for (std::string_view n : {"Reverse", "Count", "Contains", "ElementAtOrNull",
+                               "ToList", "Append", "SequenceEqual", "Join",
+                               "AsReadOnly", "ForEach", ""})
+        BEZEL_EXPECT_FALSE(isBuiltinCollectionLinqOperatorName(n));
+}

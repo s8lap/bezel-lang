@@ -548,4 +548,67 @@ bool isBuiltinCtorLoweredByName(std::string_view head);
 // per §22.5, fix #3398
 bool isBuiltinNamedArgTableHead(std::string_view head);
 
+// fix #3589 (stdlib §5 / §9.6, v0.286): is `n` one of the member names the
+// STRING-receiver gate exempts from its "not yet supported in codegen"
+// catch-all, so `typeCall()` can resolve the call via the `IEnumerable<char>`
+// LINQ extension path (fix #1220, §9.6 — string is IEnumerable<char>)?
+//
+// This answers a DIFFERENT question from `isBuiltinCollectionLinqOperatorName`
+// below, not merely a copy of it: this table folds in `Reverse` (string
+// declares no native in-place `Reverse`, unlike `Array<T>`/§4.4, so the lazy
+// §5 operator is the only `Reverse` a string receiver can mean) and `Count`
+// (string has no dedicated `.Count` property handler pre-empting this gate
+// the way Array/Dictionary/… do, per ExprTypecheck_Calls.cpp's #3589 site
+// comments) — both DELIBERATELY excluded from the collection-family table
+// because a dedicated mechanism intercepts them there first. It also carries
+// `ForEach`, which stdlib §5 does not declare (`docs/Bezel_Standard_Library.md`
+// §5's `IEnumerable<T>` extension has no `ForEach` row) but which has a real,
+// separately-gated LOWERING (`LlvmBackend_Calls.cpp`'s `isArrTerminal` /
+// `LlvmBackend_Calls3.cpp`'s "per §5 LINQ: .ForEach" arm) that this fix does
+// not touch — removing the name here would only change which diagnostic a
+// currently-broken call gets, not fix it; the lowering defect (an LLVM IR
+// verifier failure on the void-returning closure call, reproduced on both a
+// `string` and an `Array<int>` receiver) is filed separately (issue 3636).
+//
+// Collapses two byte-identical 38-name hand-spellings (the `.` member-access
+// gate and its `?.` mirror) that a #3589 measurement found duplicated the
+// entire list verbatim. per §5 / §9.6, fix #3589
+bool isStringLinqOperatorMemberName(std::string_view n);
+
+// fix #3589 (stdlib §5, v0.286): is `n` one of stdlib §5's LINQ extension
+// operator names, admitted so a BARE reference (`var f := a.Where;`, no call)
+// or a member-access on a builtin non-owning-collection-family receiver
+// (`Array`/`OwningArray`, `Stack`/`OwningStack`/`Queue`/`OwningQueue`,
+// `Dictionary`/`OwningDictionary`/`SortedDictionary`,
+// `Set`/`OwningSet`/`SortedSet`/`LinkedList`/`OwningLinkedList`) is recognised
+// as a REAL member (issue #2470/#2492: "not yet supported" rather than a false
+// "no member") rather than routed to the collection-specific "no member"
+// reject. Each receiver family co-declares its OWN `isDeclaredMethod` set
+// alongside this table for its native (§4.x) surface — deliberately NOT
+// folded in here, because that surface differs per family while the §5
+// question does not.
+//
+// Carries `OfType` even though stdlib §5 no longer declares it (removed
+// v0.284, fix #3559): fix #3559's own commit records that the four call-site
+// membership lists (this table's four pre-unification copies) are
+// "deliberately LEFT" because they decide WHICH diagnostic a bare `OfType`
+// reference gets — the specific v0.284-removal wording, not a generic
+// "no member" message that would send a reader hunting for a typo that is
+// not there. Excludes `Reverse`, `Count`, and `Contains` on purpose: each of
+// these families pre-empts them through its own dedicated handler before this
+// gate is consulted (a bare `a.Reverse` on `Array<T>` hits the native
+// imperative `Reverse()`, `.Count` hits a dedicated property handler, and
+// `Contains` is every family's own native §4.x method) — admitting them here
+// too would be harmless-redundant at best and is left out to keep this table
+// answering exactly one question.
+//
+// Collapses four hand-spellings this fix's #3589 measurement found were
+// meant to be identical (three were already byte-identical 38-name copies;
+// the fourth — the `Array`/`OwningArray` site — was missing `ToArray` only
+// because that family's own `isDeclaredMethod` already admits it separately,
+// masking the gap; unifying on the union changes no observable accept/reject
+// decision anywhere, confirmed by `scripts/behaviour_differential.sh`).
+// per §5, fix #3589
+bool isBuiltinCollectionLinqOperatorName(std::string_view n);
+
 }  // namespace bezel::common

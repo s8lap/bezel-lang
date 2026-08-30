@@ -5259,7 +5259,40 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 // generously; the materializer copy-forms
                                 // (ToArray/ToSet/ToDictionary) are rejected above for
                                 // owning receivers but kept here so this check does
-                                // not double-report them.
+                                // not double-report them. `Reversed`/`Sorted` are
+                                // NOT §5 — they are Array<T>'s own native copy-form
+                                // methods (stdlib §4.4) — kept in this union for the
+                                // same "valid to call at all" reason. `OfType` is
+                                // kept though retired from stdlib §5 (fix #3559):
+                                // that fix's commit records the membership lists are
+                                // deliberately left so a bare/call reference gets
+                                // the specific removal diagnostic rather than a
+                                // generic "no member" one. `ForEach` is kept though
+                                // undeclared in stdlib §5: it has a real (if
+                                // currently broken — issue 3636) codegen lowering,
+                                // so removing it here would silently swap one
+                                // diagnostic for another rather than fix anything.
+                                //
+                                // fix #3589: `Append`/`SequenceEqual`/`Join`/
+                                // `AsReadOnly`/`ToList` were REMOVED from this list.
+                                // None is declared on Array/OwningArray (or any
+                                // other receiver this predicate governs) by stdlib
+                                // §4/§5 — each is a real member of a DIFFERENT type
+                                // (`StringBuilder.Append`, `ArraySpan<T>.
+                                // SequenceEqual`/`.AsReadOnly`, `TaskScope.Join`/
+                                // `string.Join`, and `ToList` does not exist at all,
+                                // per `Bezel_Standard_Library.md` §5's own "There is
+                                // no ToList()" note) — confirmed by grepping every
+                                // codegen dispatch arm for each name: none fires for
+                                // an Array/Dictionary/Stack/Queue/Set/LinkedList
+                                // receiver, so admitting them here only routed a
+                                // certain-to-fail call to a worse, generic "#2457 no
+                                // dispatch arm" diagnostic instead of this
+                                // predicate's own precise "no member ... (§22.5 /
+                                // §4.x)" one. `grep -rn '\.NAME(' tests/` (excluding
+                                // the real-receiver uses above) found zero instance
+                                // calls of any of the five on a governed receiver in
+                                // the whole suite.
                                 mm == "Where" || mm == "Select" ||
                                 mm == "SelectMany" || mm == "Skip" ||
                                 mm == "Take" ||
@@ -5273,13 +5306,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "MaxOrNull" || mm == "FirstOrNull" ||
                                 mm == "LastOrNull" || mm == "Single" ||
                                 mm == "SingleOrNull" || mm == "ElementAt" ||
-                                mm == "Concat" || mm == "Append" || mm == "Union" ||
+                                mm == "Concat" || mm == "Union" ||
                                 mm == "Intersect" || mm == "Except" || mm == "Zip" ||
-                                mm == "SequenceEqual" || mm == "OfType" ||
-                                mm == "Reversed" || mm == "Sorted" || mm == "Join" ||
-                                mm == "ForEach" || mm == "AsReadOnly" ||
+                                mm == "OfType" ||
+                                mm == "Reversed" || mm == "Sorted" ||
+                                mm == "ForEach" ||
                                 mm == "ToArray" || mm == "ToSet" ||
-                                mm == "ToDictionary" || mm == "ToList";
+                                mm == "ToDictionary";
                         };
                         if (!allowedOwningMethod(m)) {
                             ctx_.diagnostics().report(
@@ -5387,7 +5420,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "GetEnumerator" ||
                                 mm == "GetAsyncEnumerator" ||
                                 mm == "MoveNext" || mm == "MoveNextAsync" ||
-                                // borrowing LINQ operators (§5).
+                                // borrowing LINQ operators (§5). See the
+                                // allowedOwningMethod copy above for why
+                                // `Reversed`/`Sorted`/`OfType`/`ForEach` stay
+                                // and `Append`/`SequenceEqual`/`Join`/
+                                // `AsReadOnly`/`ToList` were removed
+                                // (fix #3589) — same reasoning, same receiver
+                                // family union.
                                 mm == "Where" || mm == "Select" ||
                                 mm == "SelectMany" || mm == "Skip" ||
                                 mm == "Take" ||
@@ -5401,13 +5440,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 mm == "MaxOrNull" || mm == "FirstOrNull" ||
                                 mm == "LastOrNull" || mm == "Single" ||
                                 mm == "SingleOrNull" || mm == "ElementAt" ||
-                                mm == "Concat" || mm == "Append" || mm == "Union" ||
+                                mm == "Concat" || mm == "Union" ||
                                 mm == "Intersect" || mm == "Except" || mm == "Zip" ||
-                                mm == "SequenceEqual" || mm == "OfType" ||
-                                mm == "Reversed" || mm == "Sorted" || mm == "Join" ||
-                                mm == "ForEach" || mm == "AsReadOnly" ||
+                                mm == "OfType" ||
+                                mm == "Reversed" || mm == "Sorted" ||
+                                mm == "ForEach" ||
                                 mm == "ToArray" || mm == "ToSet" ||
-                                mm == "ToDictionary" || mm == "ToList";
+                                mm == "ToDictionary";
                         };
                         if (!allowedNonOwningMethod(m)) {
                             ctx_.diagnostics().report(
@@ -16785,26 +16824,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // emit the catch-all diagnostic here — typeCall() will type
                     // the call expression with char as the element type. Only
                     // emit the error for truly unrecognised (non-LINQ) members.
+                    //
+                    // fix #3589: was a hand-spelled 38-name chain, byte-identical
+                    // to the `?.` mirror ~4000 lines below (isStringLinqOp) —
+                    // now the shared common::isStringLinqOperatorMemberName
+                    // table both sites read. See its header comment for why this
+                    // table's contents differ from the builtin-collection-family
+                    // isLinqOperator table (a different question, not a copy).
                     bool isLinqOp =
-                        ma.member == "Where"     || ma.member == "Select"    ||
-                        ma.member == "SelectMany" || ma.member == "Skip"      ||
-                        ma.member == "Take"       || ma.member == "TakeWhile" ||
-                        ma.member == "SkipWhile"  || ma.member == "Distinct"  ||
-                        ma.member == "OrderBy"    || ma.member == "OrderByDescending" ||
-                        ma.member == "ThenBy"     || ma.member == "ThenByDescending"  ||
-                        ma.member == "Concat"     || ma.member == "Zip"       ||
-                        ma.member == "Union"      || ma.member == "Intersect" ||
-                        ma.member == "Except"     || ma.member == "Reverse"   ||
-                        ma.member == "Any"        || ma.member == "All"       ||
-                        ma.member == "Count"      || ma.member == "Sum"       ||
-                        ma.member == "Min"        || ma.member == "Max"       ||
-                        ma.member == "Average"    || ma.member == "First"     ||
-                        ma.member == "Last"       || ma.member == "Single"    ||
-                        ma.member == "ElementAt"  || ma.member == "FirstOrNull"  ||
-                        ma.member == "LastOrNull"  || ma.member == "SingleOrNull" ||
-                        ma.member == "ToArray"    || ma.member == "ToSet"     ||
-                        ma.member == "ToDictionary" || ma.member == "GroupBy" ||
-                        ma.member == "Aggregate"  || ma.member == "ForEach";
+                        common::isStringLinqOperatorMemberName(ma.member);
                     if (!isLinqOp) {
                         // Emit a diagnostic for unrecognized string members.
                         //
@@ -17032,26 +17060,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // call-site validator (~line 3814/3937) -- out of
                         // scope here, which is the bare-reference form
                         // only.
+                        // fix #3589: was missing `ToArray` relative to the
+                        // other three copies of this list (masked here only
+                        // because `Array`/`OwningArray`'s own isDeclaredMethod
+                        // above already admits `ToArray` natively — see the
+                        // #3589 commit's §6b exclusion diff). Now the shared
+                        // common::isBuiltinCollectionLinqOperatorName table
+                        // all four copies read.
                         bool isLinqOperator =
-                            mbr == "Where" || mbr == "OfType" ||
-                            mbr == "Select" || mbr == "SelectMany" ||
-                            mbr == "Any" || mbr == "All" ||
-                            mbr == "First" || mbr == "FirstOrNull" ||
-                            mbr == "Last" || mbr == "LastOrNull" ||
-                            mbr == "Single" || mbr == "SingleOrNull" ||
-                            mbr == "ElementAt" || mbr == "Sum" ||
-                            mbr == "Min" || mbr == "Max" ||
-                            mbr == "MinOrNull" || mbr == "MaxOrNull" ||
-                            mbr == "Average" || mbr == "Aggregate" ||
-                            mbr == "OrderBy" || mbr == "OrderByDescending" ||
-                            mbr == "Distinct" || mbr == "Union" ||
-                            mbr == "Intersect" || mbr == "Except" ||
-                            mbr == "Take" || mbr == "TakeWhile" ||
-                            mbr == "Skip" || mbr == "SkipWhile" ||
-                            mbr == "Concat" || mbr == "Zip" ||
-                            mbr == "GroupBy" || mbr == "ToDictionary" ||
-                            mbr == "ToSet" || mbr == "ThenBy" ||
-                            mbr == "ThenByDescending";
+                            common::isBuiltinCollectionLinqOperatorName(mbr);
                         bool isCallForm = &ma == calleeOfCallCtx_;
                         // #2470 (stdlib §4.4/§4.5; language spec §27.6): a
                         // BARE reference to a name in `isDeclaredMethod` has
@@ -17341,27 +17358,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // in the older #920/#1112 allowedNonOwningMethod/
                         // allowedOwningMethod call-site lists, ~line 3789/
                         // 3912, out of scope for this fix).
+                        // fix #3589: was a hand-spelled copy of the shared
+                        // §5 LINQ-operator-name question — now
+                        // common::isBuiltinCollectionLinqOperatorName.
                         bool isLinqOperator =
-                            mbr == "Where" || mbr == "OfType" ||
-                            mbr == "Select" || mbr == "SelectMany" ||
-                            mbr == "Any" || mbr == "All" ||
-                            mbr == "First" || mbr == "FirstOrNull" ||
-                            mbr == "Last" || mbr == "LastOrNull" ||
-                            mbr == "Single" || mbr == "SingleOrNull" ||
-                            mbr == "ElementAt" || mbr == "Sum" ||
-                            mbr == "Min" || mbr == "Max" ||
-                            mbr == "MinOrNull" || mbr == "MaxOrNull" ||
-                            mbr == "Average" || mbr == "Aggregate" ||
-                            mbr == "OrderBy" || mbr == "OrderByDescending" ||
-                            mbr == "Distinct" || mbr == "Union" ||
-                            mbr == "Intersect" || mbr == "Except" ||
-                            mbr == "Take" || mbr == "TakeWhile" ||
-                            mbr == "Skip" || mbr == "SkipWhile" ||
-                            mbr == "Concat" || mbr == "Zip" ||
-                            mbr == "GroupBy" || mbr == "ToArray" ||
-                            mbr == "ToDictionary" ||
-                            mbr == "ToSet" || mbr == "ThenBy" ||
-                            mbr == "ThenByDescending";
+                            common::isBuiltinCollectionLinqOperatorName(mbr);
                         bool isCallForm = &ma == calleeOfCallCtx_;
                         // #2470 (stdlib §4.11; language spec §27.6): the same
                         // no-MethodSymbol-behind-a-bare-reference gap slice
@@ -17788,32 +17789,13 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             // #2521 distinct diagnostic above — that
                             // block returns before this one runs).
                             mbr == "GetEnumerator";
-                        // stdlib §5 IEnumerable<T> LINQ extension
-                        // operators. Mirrors the #2536 block's identical
-                        // list verbatim (the same #2484 transcription
-                        // with MinOrNull/MaxOrNull included).
+                        // stdlib §5 IEnumerable<T> LINQ extension operators.
+                        // fix #3589: was a hand-spelled copy (this comment
+                        // used to say it "mirrors the #2536 block's identical
+                        // list verbatim" — now it just reads the same shared
+                        // table that block reads).
                         bool isLinqOperator =
-                            mbr == "Where" || mbr == "OfType" ||
-                            mbr == "Select" || mbr == "SelectMany" ||
-                            mbr == "Any" || mbr == "All" ||
-                            mbr == "First" || mbr == "FirstOrNull" ||
-                            mbr == "Last" || mbr == "LastOrNull" ||
-                            mbr == "Single" || mbr == "SingleOrNull" ||
-                            mbr == "ElementAt" || mbr == "Sum" ||
-                            mbr == "Min" || mbr == "Max" ||
-                            mbr == "MinOrNull" || mbr == "MaxOrNull" ||
-                            mbr == "Average" || mbr == "Aggregate" ||
-                            mbr == "OrderBy" ||
-                            mbr == "OrderByDescending" ||
-                            mbr == "Distinct" || mbr == "Union" ||
-                            mbr == "Intersect" || mbr == "Except" ||
-                            mbr == "Take" || mbr == "TakeWhile" ||
-                            mbr == "Skip" || mbr == "SkipWhile" ||
-                            mbr == "Concat" || mbr == "Zip" ||
-                            mbr == "GroupBy" || mbr == "ToArray" ||
-                            mbr == "ToDictionary" ||
-                            mbr == "ToSet" || mbr == "ThenBy" ||
-                            mbr == "ThenByDescending";
+                            common::isBuiltinCollectionLinqOperatorName(mbr);
                         if (!isCallForm &&
                             (isUniversalObjectMember || isDeclaredMethod ||
                              isLinqOperator)) {
@@ -17945,28 +17927,11 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             // extension machinery (language spec §26.5)
                             // dispatches structurally, exactly like the
                             // Stack/Queue block above).
+                            // fix #3589: was the fourth hand-spelled copy of
+                            // this same list — now the shared table.
                             bool isLinqOperator =
-                                mbr == "Where" || mbr == "OfType" ||
-                                mbr == "Select" || mbr == "SelectMany" ||
-                                mbr == "Any" || mbr == "All" ||
-                                mbr == "First" || mbr == "FirstOrNull" ||
-                                mbr == "Last" || mbr == "LastOrNull" ||
-                                mbr == "Single" || mbr == "SingleOrNull" ||
-                                mbr == "ElementAt" || mbr == "Sum" ||
-                                mbr == "Min" || mbr == "Max" ||
-                                mbr == "MinOrNull" || mbr == "MaxOrNull" ||
-                                mbr == "Average" || mbr == "Aggregate" ||
-                                mbr == "OrderBy" ||
-                                mbr == "OrderByDescending" ||
-                                mbr == "Distinct" || mbr == "Union" ||
-                                mbr == "Intersect" || mbr == "Except" ||
-                                mbr == "Take" || mbr == "TakeWhile" ||
-                                mbr == "Skip" || mbr == "SkipWhile" ||
-                                mbr == "Concat" || mbr == "Zip" ||
-                                mbr == "GroupBy" || mbr == "ToArray" ||
-                                mbr == "ToDictionary" ||
-                                mbr == "ToSet" || mbr == "ThenBy" ||
-                                mbr == "ThenByDescending";
+                                common::isBuiltinCollectionLinqOperatorName(
+                                    mbr);
                             // Known property names — handled by dedicated
                             // property handlers above (~10908 Keys/Values,
                             // ~10947 Count) for the families in their
@@ -20413,26 +20378,12 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
                 // missing-LINQ-member on a non-typed call would land in
                 // codegen's fallthrough and produce the same junk the .form
                 // did before #1220 — out of scope here.
+                //
+                // fix #3589: was byte-identical to the `.` form's isLinqOp
+                // ~4000 lines above — both now read the one shared
+                // common::isStringLinqOperatorMemberName table.
                 bool isStringLinqOp =
-                    mbr == "Where"     || mbr == "Select"    ||
-                    mbr == "SelectMany" || mbr == "Skip"      ||
-                    mbr == "Take"       || mbr == "TakeWhile" ||
-                    mbr == "SkipWhile"  || mbr == "Distinct"  ||
-                    mbr == "OrderBy"    || mbr == "OrderByDescending" ||
-                    mbr == "ThenBy"     || mbr == "ThenByDescending"  ||
-                    mbr == "Concat"     || mbr == "Zip"       ||
-                    mbr == "Union"      || mbr == "Intersect" ||
-                    mbr == "Except"     || mbr == "Reverse"   ||
-                    mbr == "Any"        || mbr == "All"       ||
-                    mbr == "Count"      || mbr == "Sum"       ||
-                    mbr == "Min"        || mbr == "Max"       ||
-                    mbr == "Average"    || mbr == "First"     ||
-                    mbr == "Last"       || mbr == "Single"    ||
-                    mbr == "ElementAt"  || mbr == "FirstOrNull"  ||
-                    mbr == "LastOrNull"  || mbr == "SingleOrNull" ||
-                    mbr == "ToArray"    || mbr == "ToSet"     ||
-                    mbr == "ToDictionary" || mbr == "GroupBy" ||
-                    mbr == "Aggregate"  || mbr == "ForEach";
+                    common::isStringLinqOperatorMemberName(mbr);
                 if (!isStringLinqOp) {
                     ctx_.diagnostics().report(
                         Severity::Error, nmLoc,

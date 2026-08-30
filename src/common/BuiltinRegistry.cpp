@@ -600,6 +600,43 @@ constexpr std::array<std::string_view, 4> kBuiltinNamedArgTableHeads = {
     "string", "String", "Encoding", "StringBuilder",
 };
 
+// fix #3589 (stdlib §5 / §9.6): see the header — the string-receiver LINQ
+// exemption gate. 38 names; two independent hand-spellings (the `.` and `?.`
+// member-access gates) were found byte-identical, confirming they answer the
+// one question.
+constexpr std::array<std::string_view, 38> kStringLinqOperatorMemberNames = {
+    "Where",     "Select",     "SelectMany", "Skip",
+    "Take",      "TakeWhile",  "SkipWhile",  "Distinct",
+    "OrderBy",   "OrderByDescending",        "ThenBy",
+    "ThenByDescending",         "Concat",     "Zip",
+    "Union",     "Intersect",  "Except",     "Reverse",
+    "Any",       "All",        "Count",      "Sum",
+    "Min",       "Max",        "Average",    "First",
+    "Last",      "Single",     "ElementAt",  "FirstOrNull",
+    "LastOrNull", "SingleOrNull",            "ToArray",
+    "ToSet",     "ToDictionary",             "GroupBy",
+    "Aggregate", "ForEach",
+};
+
+// fix #3589 (stdlib §5): see the header — the builtin-collection-family
+// bare-reference / member-access LINQ exemption gate. 38 names — the union of
+// four hand-spellings that a #3589 measurement found were meant to be
+// identical (three were already byte-identical; the fourth, the
+// `Array`/`OwningArray` copy, was missing `ToArray` only because that
+// family's `isDeclaredMethod` set admits it separately — see the header).
+constexpr std::array<std::string_view, 38> kBuiltinCollectionLinqOperatorNames = {
+    "Where",     "OfType",     "Select",     "SelectMany",
+    "Any",       "All",        "First",      "FirstOrNull",
+    "Last",      "LastOrNull", "Single",     "SingleOrNull",
+    "ElementAt", "Sum",        "Min",        "Max",
+    "MinOrNull", "MaxOrNull",  "Average",    "Aggregate",
+    "OrderBy",   "OrderByDescending",        "Distinct",
+    "Union",     "Intersect",  "Except",     "Take",
+    "TakeWhile", "Skip",       "SkipWhile",  "Concat",
+    "Zip",       "GroupBy",    "ToArray",    "ToDictionary",
+    "ToSet",     "ThenBy",     "ThenByDescending",
+};
+
 }  // namespace
 
 bool isOwningPrefixedName(std::string_view head) {
@@ -1181,5 +1218,13 @@ bool isBuiltinCtorLoweredByName(std::string_view head) {
 bool isBuiltinNamedArgTableHead(std::string_view head) {
     return contains(kBuiltinNamedArgTableHeads, head);
 }  // per §22.5, fix #3398
+
+bool isStringLinqOperatorMemberName(std::string_view n) {
+    return contains(kStringLinqOperatorMemberNames, n);
+}  // per §5 / §9.6, fix #3589
+
+bool isBuiltinCollectionLinqOperatorName(std::string_view n) {
+    return contains(kBuiltinCollectionLinqOperatorNames, n);
+}  // per §5, fix #3589
 
 }  // namespace bezel::common
