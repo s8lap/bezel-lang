@@ -6,6 +6,7 @@
 #include "sema/ConstFold.hpp"
 #include "sema/EnumValues.hpp"  // enumHasZeroConstant — §17.11 default(E) (#3044)
 #include "sema/GenericParams.hpp"  // detail::astGenericParams — §14.6 in-scope name set (#3271)
+#include "sema/NestedTypeWalk.hpp"  // fix #3597: promoted so PureChecker.cpp can share it too
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation
 #include "sema/TypeResolution.hpp"
 
@@ -219,51 +220,19 @@ void Resolver::checkBaseVisibility() {
     }
 }
 
-// fix #3574 (§11.6 "Nested types", v0.286): the ONE recursive
-// type-and-nested-types walk the module-level checks in this file share.
-//
-// §11.6, verbatim: "Nested types may themselves contain nested types." --
-// with no depth bound. Thirteen `Resolver::check*` passes here each carried a
-// hand-copy of a walk that visited a module child and then exactly ONE level
-// of its `NestedTypeSymbol` members, so every rule they enforce silently
-// stopped applying at nesting depth 2. Measured on 907ce0f: the §30.1
-// async-return rule fired 1 / 1 / 0 times over a depth-0 / 1 / 2 ladder of the
-// same class body, and §22.10's convenience-constructor rule escaping at
-// depth 2 reached issue 3535's wild-pointer dereference (SIGSEGV, exit 139)
-// on a program the compiler accepted with no diagnostic at all.
-//
-// Order is PRE-ORDER on purpose -- `fn(t)` before the nested members, in
-// member declaration order. On a program whose types nest no deeper than one
-// level that reproduces the old visit sequence exactly, so no diagnostic that
-// already fired changes position.
-//
-// The walk deliberately does NOT widen along the two other axes the old copies
-// also excluded: a module child that is not a `TypeSymbol` (an
-// `ExtensionSymbol` is visited only where a pass opts in, as
-// `checkReadonlyPropertyForms` below does) and a §21.10 method-local type
-// (which is not a `NestedTypeSymbol` member of any type and was never
-// reachable from this walk).
-static void visitTypeAndNested(TypeSymbol* t,
-                               const std::function<void(TypeSymbol*)>& fn) {
-    if (!t) return;
-    fn(t);
-    for (Symbol* m : t->members) {
-        if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m))
-            visitTypeAndNested(nt->type, fn);
-    }
-}
-
-// The module-level entry point: every top-level type and, transitively, every
-// type nested inside one. A caller that also needs a non-`TypeSymbol` module
-// child walks `children` itself and calls `visitTypeAndNested` on the
-// `TypeSymbol` arm, so its diagnostics stay interleaved in declaration order.
+// fix #3574 (§11.6 "Nested types", v0.286), fix #3597: the ONE recursive
+// type-and-nested-types walk the module-level checks in this file share --
+// `visitTypeAndNested` / `forEachTypeAndNested` (free functions) now live in
+// sema/NestedTypeWalk.hpp, promoted out of this TU so PureChecker.cpp (a
+// different translation unit with no `Resolver` instance) can share the
+// identical walk rather than carrying a sixteenth hand-copy. See that
+// header for the full rationale and the measured 907ce0f depth-0/1/2 ladder.
+// `Resolver::forEachTypeAndNested` stays as a thin member wrapper so the
+// thirteen `check*` passes below don't need to thread `ctx_.module()`
+// themselves.
 void Resolver::forEachTypeAndNested(
     const std::function<void(TypeSymbol*)>& fn) {
-    if (!ctx_.module()) return;
-    for (Symbol* child : ctx_.module()->children) {
-        if (auto* t = dynamic_cast<TypeSymbol*>(child))
-            visitTypeAndNested(t, fn);
-    }
+    bezel::sema::forEachTypeAndNested(ctx_.module(), fn);
 }
 
 // §13.3 (#956): every type appearing in a member's signature must be at least

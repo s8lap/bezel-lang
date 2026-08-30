@@ -5,6 +5,7 @@
 
 #include "common/BuiltinRegistry.hpp"
 #include "common/OwnershipFacts.hpp"  // fix #3588: the ONE §28.9 trivial-dispose walk
+#include "sema/NestedTypeWalk.hpp"  // fix #3597: the shared §11.6 nested-type walk
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 #include "support/Diagnostic.hpp"
@@ -1408,76 +1409,95 @@ static void checkClassInvariants(SemaContext& ctx, const TypeSymbol& t) {
     }
 }
 
+// fix #3597 (§22.15 "Pure-body rules" / §22.16 "Contract clauses" / §11.6
+// "Nested types", v0.286): ALL of the per-type work `checkPureBodies` used
+// to run inline for a module-level type, now ONE function so the shared
+// recursive nested-type walker (fix #3574's `forEachTypeAndNested`,
+// promoted to sema/NestedTypeWalk.hpp for exactly this caller) can drive it
+// at every nesting depth instead of the one-level hand-copy this replaces.
+// That one-level copy escaped along TWO independent axes measured on
+// d8e07d7: §22.15's pure-body rule (the member loop below) never reached a
+// type nested two levels deep (1/1/0 over a depth-0/1/2 ladder), and the
+// pure-constructor field-initializer rule (the walk at the end of this
+// function) was never applied to a nested type's OWN field initializers AT
+// ALL -- it ran only for the outer `t` the old loop iterated, so a nested
+// class with a `pure constructor` escaped it already at depth 1 (1/0 over
+// depth 0/1).
+//
+// Diagnostic-order note: the old code interleaved a nested type's
+// diagnostics with its outer type's remaining sibling members (nested type N
+// declared between members A and B emitted A's diagnostic, then N's, then
+// B's). This walker is PRE-ORDER over TYPES, not members: it runs this
+// entire function for `t` (invariants, every member, then the field-init
+// walk) before descending into any of `t`'s nested types, so a nested type's
+// diagnostics now follow ALL of its outer type's own-member diagnostics
+// rather than appearing at the nested type's declaration position among
+// them. Measured over the in-tree lit corpus: no existing CHECK/CHECK-NEXT
+// sequence assumes the old interleaving (the one lit pin that exercises
+// invariant-plus-member-body diagnostics together,
+// invariant_member_not_evaluated_2941.bzl, already uses CHECK-DAG "so the
+// order of diagnostic emission doesn't matter"), and no gtest indexes
+// `diagnostics()` by position.
+static void checkOneType(SemaContext& ctx, TypeSymbol& t) {
+    // §22.16 (v0.240, #2941): purity-check every source-defined invariant
+    // member BEFORE the member-purity walk, so an invariant diagnostic is
+    // reported ahead of any body diagnostic (matching the clause-before-body
+    // ordering at the checkOneMember call site).
+    checkClassInvariants(ctx, t);
+    for (Symbol* m : t.members) {
+        auto* mem = dynamic_cast<MemberSymbol*>(m);
+        if (!mem) continue;
+        checkOneMember(ctx, *mem);
+    }
+    // §22.15 "Pure constructors" (v0.202, #2052): the birth-store rule
+    // extends to the class's field initializers — they execute as part
+    // of construction, so a class with a pure constructor must have
+    // field initializers satisfying the pure-body rules. Walk every
+    // field initializer under a synthesized pure-ctor context.
+    bool hasPureCtor = false;
+    MemberSymbol* pureCtorMember = nullptr;
+    for (Symbol* m : t.members) {
+        auto* cs = dynamic_cast<ConstructorSymbol*>(m);
+        if (!cs) continue;
+        // fix #3609 (§22.15, v0.286): through the one predicate. This gate
+        // read `ast::ConstructorDecl::isPure` alone — the NARROWEST of the
+        // five spellings — so a ctor whose purity arrived on any other
+        // channel left the class's field initializers unwalked. `t` is a
+        // local type here, so the widening is inert today; it is the
+        // divergence that mattered.
+        if (constructorIsPure(cs)) {
+            hasPureCtor = true;
+            pureCtorMember = cs;
+            break;
+        }
+    }
+    if (hasPureCtor && pureCtorMember) {
+        const std::string label =
+            std::string("field initializer of class `") +
+            std::string(t.name) +
+            "` (pure constructor birth-store rule)";
+        for (Symbol* m : t.members) {
+            auto* fs = dynamic_cast<FieldSymbol*>(m);
+            if (!fs) continue;
+            const auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+            if (!fd || !fd->initializer) continue;
+            PureBodyWalker w(ctx, *pureCtorMember, label,
+                             /*isConstructor=*/true);
+            w.checkExpr(fd->initializer.get());
+        }
+    }
+}
+
 }  // namespace
 
 bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
     (void)src;
     if (!ctx.module()) return !ctx.diagnostics().hasErrors();
-    // Walk every type's members (top-level + nested).
-    std::vector<TypeSymbol*> types;
-    for (Symbol* child : ctx.module()->children) {
-        if (auto* t = dynamic_cast<TypeSymbol*>(child)) types.push_back(t);
-    }
-    for (TypeSymbol* t : types) {
-        // §22.16 (v0.240, #2941): purity-check every source-defined
-        // invariant member BEFORE the member-purity walk, so an invariant
-        // diagnostic is reported ahead of any body diagnostic (matching the
-        // clause-before-body ordering at the checkOneMember call site).
-        checkClassInvariants(ctx, *t);
-        for (Symbol* m : t->members) {
-            auto* mem = dynamic_cast<MemberSymbol*>(m);
-            if (!mem) continue;
-            checkOneMember(ctx, *mem);
-            // Recurse into nested types' members.
-            if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
-                if (nt->type) {
-                    checkClassInvariants(ctx, *nt->type);
-                    for (Symbol* nm : nt->type->members) {
-                        auto* nmem = dynamic_cast<MemberSymbol*>(nm);
-                        if (nmem) checkOneMember(ctx, *nmem);
-                    }
-                }
-            }
-        }
-        // §22.15 "Pure constructors" (v0.202, #2052): the birth-store rule
-        // extends to the class's field initializers — they execute as part
-        // of construction, so a class with a pure constructor must have
-        // field initializers satisfying the pure-body rules. Walk every
-        // field initializer under a synthesized pure-ctor context.
-        bool hasPureCtor = false;
-        MemberSymbol* pureCtorMember = nullptr;
-        for (Symbol* m : t->members) {
-            auto* cs = dynamic_cast<ConstructorSymbol*>(m);
-            if (!cs) continue;
-            // fix #3609 (§22.15, v0.286): through the one predicate. This gate
-            // read `ast::ConstructorDecl::isPure` alone — the NARROWEST of the
-            // five spellings — so a ctor whose purity arrived on any other
-            // channel left the class's field initializers unwalked. `t` is a
-            // local type here, so the widening is inert today; it is the
-            // divergence that mattered.
-            if (constructorIsPure(cs)) {
-                hasPureCtor = true;
-                pureCtorMember = cs;
-                break;
-            }
-        }
-        if (hasPureCtor && pureCtorMember) {
-            const std::string label =
-                std::string("field initializer of class `") +
-                std::string(t->name) +
-                "` (pure constructor birth-store rule)";
-            for (Symbol* m : t->members) {
-                auto* fs = dynamic_cast<FieldSymbol*>(m);
-                if (!fs) continue;
-                const auto* fd =
-                    dynamic_cast<const ast::FieldDecl*>(fs->decl);
-                if (!fd || !fd->initializer) continue;
-                PureBodyWalker w(ctx, *pureCtorMember, label,
-                                 /*isConstructor=*/true);
-                w.checkExpr(fd->initializer.get());
-            }
-        }
-    }
+    // fix #3597 (§11.6, v0.286): every type this module declares, at every
+    // nesting depth -- the shared recursive walker (fix #3574,
+    // sema/NestedTypeWalk.hpp) replaces the old one-level hand-copy.
+    forEachTypeAndNested(ctx.module(),
+                         [&](TypeSymbol* t) { checkOneType(ctx, *t); });
     // §22.15 (fix #3175, v0.254): extension blocks (`extension T`) live at
     // module scope as `ExtensionSymbol`s, NOT inside a `TypeSymbol`'s members
     // (§A.3, SymbolCollection.cpp:439; Symbol.hpp:793). A `pure` extension
