@@ -74,10 +74,22 @@ using TypeParamResolver =
 // `decl`'s class chain make it NON-trivial-dispose — a destructor, or a
 // non-static `owned` field (declared, or a captured `owned` primary-
 // constructor parameter, §22.10), anywhere from `decl` up through its base
-// classes?  The inverse of the spec's trivial-dispose classification: "A
-// class whose `Dispose()` is provably a no-op — it has no destructor, no
-// `owned` fields, … and its base class (if any, other than `Object`) is
-// itself trivial-dispose — is a trivial-dispose class."
+// classes?  The inverse of the spec's trivial-dispose classification.
+//
+// ⚠ THE QUOTE THAT USED TO STAND HERE IS FROM A PRE-v0.286 REVISION and is
+// left un-rewritten on purpose (issue 3632).  It read "…it has no destructor,
+// no `owned` fields, … and its base class (if any, other than `Object`) is
+// itself trivial-dispose".  §28.9 at v0.286 reads "no `owned` fields OF
+// NON-TRIVIAL-DISPOSE TYPE", and spells the consequence out: "an `owned` field
+// whose declared type is itself trivial-dispose does not disqualify the
+// holder".  This function does NOT implement that recursive clause — the
+// `isOwned && !isStatic` arm below never reads the field's type — so updating
+// the quotation to v0.286's words would make this comment describe a rule the
+// code does not follow, which is the defect class this file's own history is
+// about.  Measured over-rejection, safe direction, filed with the widening's
+// hazards (the coinductive walk, §3.6 rule 2's per-instantiation reading, and
+// the codegen cascade that must be confirmed BEFORE sema is widened) as
+// issue 3632.
 //
 // Relocated here VERBATIM from `ExprTC::isNonTrivialDisposeClass` (#2654) so
 // the sema consumers (§22.5 default-value check, §21.9 bare-discard) and the
@@ -94,12 +106,45 @@ using TypeParamResolver =
 // wire; the exporter runs this same predicate.  Callers that previously kept
 // their own inline-array walk (`MethodOwnership::classChainHasOwningInlineArrayField`
 // at the §28.3 gate in Ownership.cpp, #2654) consult this predicate only and
-// delete the local companion.  A FOURTH independent copy of this
-// classification lives at `PureChecker.cpp`'s `isTrivialDisposeClass`
-// (§22.15) and a fifth at `ExprTypecheck.cpp`'s §21.9 inline walk in
-// `visitStmt`'s ExpressionStmt arm — both were updated in lockstep with this
-// predicate's owning-inline-array extension so the four walks cannot drift on
-// the inline-array arm.
+// delete the local companion.
+//
+// fix #3588 (§28.9 / §22.15 / §21.9, v0.286): THIS IS NOW THE ONLY BODY OF
+// THAT CLASSIFICATION IN THE TREE.  Two hand-maintained copies were collapsed
+// onto it — `PureBodyWalker::isTrivialDisposeClass` (§22.15's throw carve-out,
+// which is this predicate INVERTED) and the inline walk in
+// `ExprTypecheck.cpp`'s §21.9 ExpressionStmt arm.  Measured at 11920b8 by a
+// normalizing diff (comments and whitespace stripped, namespace qualifiers
+// folded): the §22.15 copy differed from this one ONLY in spelling
+// (per-level `return false` where this accumulates into `reject`), and the
+// §21.9 copy ONLY in gating its carried-verdict arm — which is now the
+// `ImportedDisposeVerdict` parameter below.  Not one classification arm
+// disagreed.
+//
+// The paragraph that used to stand here said the copies were "updated in
+// lockstep ... so the four walks cannot drift"; `PureChecker.cpp`'s said they
+// were "kept in sync with the predicate's shape by construction".  Neither was
+// true as written: they were kept in sync BY HAND, three times over, which is
+// why #2666 had to edit all three and #3191 had to edit two of them, in
+// separate commits.  It is true by construction now.
+//
+// `MethodOwnership::rhsIsDisposableClassType` (Ownership.cpp) is deliberately
+// NOT one of these and was NOT collapsed: it answers a coarser, differently
+// scoped question for the §28.10 vacuous-pin lint — it matches INTERFACES, it
+// does not walk base chains, it has no inline-array arm, no primary-ctor-
+// parameter arm and no `static owned` exclusion, and it pairs with a builtin
+// head-name table this predicate does not consult.  It disagrees with this one
+// in BOTH directions on real inputs; its own comment is the record of why.
+// See #3588 for the full per-copy exclusion diff.
+//
+// ONE ARM of this predicate is still spelled twice: the captured `owned`
+// primary-ctor parameter test (§22.10) is character-identical to codegen's
+// `Emitter::isCapturedOwnedPrimaryParam` (LlvmBackend_impl.hpp), whose own
+// comment says the two "must agree" because a captured slot is
+// non-trivial-dispose exactly when its generated Dispose has a slot to walk
+// (#3205's measured leak).  #3588 did NOT collapse that pair, because moving
+// the codegen predicate here would cross this file's own MECHANISM/EXPRESSION-
+// SHAPE boundary (lines 22-25) and that is a decision to argue, not to take in
+// passing.  Filed with the shape and the boundary question as issue 3634.
 //
 // Cycle-guarded (mirrors the #1624 precedent) so a malformed base-type graph
 // that survives error recovery cannot hang the compiler.
@@ -110,7 +155,39 @@ using TypeParamResolver =
 // read of its argument — the paragraph above says so — so this only makes the
 // existing contract expressible in the type. Every pre-existing caller passes a
 // non-const `TypeSymbol*`, which converts implicitly.
-bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl);
+//
+// fix #3588 (§28.9 / §21.9 / §3.6, v0.286): the carried-verdict knob, and the
+// ONE substantive difference among the copies this predicate absorbed.
+//
+//   Consult (the default; what every caller but one wants) — an IMPORTED
+//     class's carried §3.6 verdict (`TypeSymbol::importedNonTrivialDispose`,
+//     put on the wire by #3191) disqualifies, checked per level.  This is the
+//     answer §2.8.2 requires: the property is part of the public contract, and
+//     "an interface that omitted them would force the consumer to either
+//     reject imported types at those rules or guess."
+//
+//   Ignore — the carried verdict is NOT read; only the structural member scan
+//     decides.  Exactly one caller asks for this: §21.9's bare-discard check,
+//     on its CALL arm only.  `Cell.MakeIt(i);` over an imported non-trivial-
+//     dispose class is reclaimed through `disposeOwnedValue` per #3189's
+//     design intent, so firing §21.9's hard error there aborts a build that
+//     must run — a regression measurable on
+//     `xmod_owned_return_channel_3189.t2_imported_bare_discard_reclaimed_21_9`
+//     (imported count reads 7, expected 0).  Its NEW arm passes `Consult` and
+//     keeps #3191's rejection.  See fix #3191's follow-up (0bb85f1) for the
+//     full argument; the call site carries it too.
+//
+// `Consult` is the DEFAULT deliberately: it is the MORE-REJECTING answer, and
+// the two wrong answers are not symmetric.  A wrong "non-trivial" runs a
+// `Dispose()` that is provably a no-op; a wrong "trivial" leaks (or, at the
+// §21.9 site, silently drops a resource the single-module twin rejects).  A
+// caller that does not think about this knob therefore gets the safe
+// direction.
+enum class ImportedDisposeVerdict { Consult, Ignore };
+
+bool isNonTrivialDisposeClass(
+    const sema::TypeSymbol* decl,
+    ImportedDisposeVerdict importedVerdict = ImportedDisposeVerdict::Consult);
 
 // Shared shape-recognition: if the callee of `call` resolves to a user
 // `ast::MethodDecl` (a MethodSymbol whose `decl` is a MethodDecl), return it;

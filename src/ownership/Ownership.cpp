@@ -5551,6 +5551,50 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     // #2654 disproved that by relocating the body to `common::` as a free
     // function, so the reason recorded here is now the real one — the two
     // predicates answer different questions. Per #2666 / #2671 note 1.)
+    //
+    // fix #3588 (§28.10 / §28.9, v0.286) RE-EXAMINED AND KEPT SEPARATE. That
+    // change collapsed the three genuine copies of §28.9's classification onto
+    // `common::isNonTrivialDisposeClass` and deliberately left this one where
+    // it is. Read side by side, the two answer differently on five axes — and
+    // in BOTH directions, so no argument to the shared predicate recovers
+    // this one:
+    //   1. BASE CHAIN. This scans `rt->declaration->members` and stops; the
+    //      shared predicate walks up the base classes. A derived class whose
+    //      destructor or `owned` field is on the BASE -> false here, true
+    //      there.
+    //   2. OWNING INLINE ARRAY (`[N owned]T?` / `[N owned]T`, §15.1.1). No arm
+    //      here; §28.9's third disqualifier there (#2666) -> false / true.
+    //   3. CAPTURED `owned` PRIMARY-CTOR PARAMETER (§22.10). The loop below
+    //      reads `fs->modifiers`, and a positional field's `FieldSymbol` never
+    //      has that vector populated (`SymbolCollection.cpp:441-455` sets
+    //      `posParam` and leaves `modifiers` empty) — the modifier lives at
+    //      `fs->posParam->modifier`, which only the shared predicate reads.
+    //      -> false / true.
+    //   4. `static owned` FIELD. The loop below does not exclude `static`;
+    //      the shared predicate does, because §22.12 rule 4 / §22.13 dispose
+    //      a static at process exit, not with the instance. -> TRUE here,
+    //      false there. (Code-level; §22.12 rule 2 makes the declaration hard
+    //      to reach for a user class type — measured: `public static owned r:
+    //      R? := null;` is rejected outright — so treat this axis as a latent
+    //      difference, not a live one.)
+    //   5. IMPORTED CARRIED VERDICT. This never reads
+    //      `importedNonTrivialDispose`; the shared predicate consults it per
+    //      level (#3191). An imported destructor-bearing class -> false here,
+    //      true there.
+    // And the two are not even total over the same domain: Path 2 below
+    // answers for a declaration-less builtin head from
+    // `isDisposableBuiltinHeadName`, where the shared predicate — which takes
+    // a `TypeSymbol*` — has no argument to be called with at all.
+    //
+    // (The "it also matches INTERFACES" line above is about the KIND GATE, not
+    // about an answer: an interface can declare neither a destructor nor a
+    // field — measured, both are parse errors in an interface body — so Path 1
+    // returns false for an interface either way. Kept because the gate is
+    // deliberate, corrected here so it is not read as a sixth axis.)
+    //
+    // Collapsing these would move the §28.10 vacuity lint on every reachable
+    // axis, in the direction that recommends a `const` remedy which leaks
+    // (#2812's measured shape). // per §28.10, fix #3588
     if (rt->declaration) {
         if (rt->declaration->kind != ast::TypeDeclKind::Class &&
             rt->declaration->kind != ast::TypeDeclKind::Interface)

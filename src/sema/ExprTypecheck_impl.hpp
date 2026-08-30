@@ -677,13 +677,15 @@ private:
     bool isEventSubscribeDrop(const ast::Expr* e);
 
     // §28.9 / §22.5 (issue #1684): does `decl`'s class chain make it
-    // non-trivial-dispose — a destructor, or a non-static `owned` field
-    // (declared, or a captured `owned` primary-constructor parameter,
-    // §22.10), anywhere from `decl` up through its base classes? Mirrors the
-    // walk visitStmt's ExpressionStmt arm performs inline for the §21.9
-    // bare-discard check (this file); duplicated rather than shared because
-    // that walk is not exposed as a callable predicate, but both apply the
-    // same §28.9 test.
+    // non-trivial-dispose — a destructor, an owning inline array (§15.1.1),
+    // or a non-static `owned` field (declared, or a captured `owned`
+    // primary-constructor parameter, §22.10), anywhere from `decl` up through
+    // its base classes? A thin wrapper over `common::isNonTrivialDisposeClass`
+    // since #2654. The paragraph that used to stand here said the §21.9
+    // bare-discard walk in `visitStmt`'s ExpressionStmt arm was "duplicated
+    // rather than shared because that walk is not exposed as a callable
+    // predicate" — that walk is gone, collapsed onto the same shared predicate
+    // by fix #3588, so there is one body and this claim no longer holds.
     bool isNonTrivialDisposeClass(TypeSymbol* decl) const;
 
     // §22.5 v0.184 (issue #1684): is `e` a fresh owned-producing expression —

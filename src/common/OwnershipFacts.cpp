@@ -28,7 +28,8 @@ namespace bezel::common {
 // line of classification logic changed, so every existing sema consumer keeps
 // byte-identical behaviour and the ownership pass's §28.3 auto-drop gate now
 // shares this single copy.
-bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl) {
+bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl,
+                              ImportedDisposeVerdict importedVerdict) {
     bool reject = false;
     std::unordered_set<const sema::TypeSymbol*> visitedBase;
     const std::size_t kMaxWalk = 4096;  // defensive; base chains are shallow
@@ -68,7 +69,13 @@ bool isNonTrivialDisposeClass(const sema::TypeSymbol* decl) {
         // "genuinely trivial" are the same read, and both must fall through to
         // the member scan, which still decides correctly for a local type and
         // degrades to exactly the pre-fix answer for a stale imported one.
-        if (cur->importedNonTrivialDispose) {
+        //
+        // fix #3588 (§28.9 / §21.9, v0.286): `importedVerdict` gates ONLY this
+        // arm — the structural member scan below runs either way, so a LOCAL
+        // non-trivial-dispose class is classified identically for every
+        // caller. See the header for which caller asks for `Ignore` and why.
+        if (importedVerdict == ImportedDisposeVerdict::Consult &&
+            cur->importedNonTrivialDispose) {
             reject = true;
             break;
         }

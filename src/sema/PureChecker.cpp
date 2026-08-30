@@ -1,10 +1,10 @@
 #include "sema/PureChecker.hpp"
 
 #include <string>
-#include <unordered_set>
 #include <vector>
 
 #include "common/BuiltinRegistry.hpp"
+#include "common/OwnershipFacts.hpp"  // fix #3588: the ONE §28.9 trivial-dispose walk
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
 #include "support/Diagnostic.hpp"
@@ -94,9 +94,11 @@ private:
     // is pure AND E is trivial-dispose. Returns true iff admitted.
     bool throwCarveOutAdmits(const ast::NewExpr& ne);
 
-    // §22.15 trivial-dispose (inverse of ExprTC::isNonTrivialDisposeClass):
-    // a class is trivial-dispose iff it has no destructor and no non-static
-    // owned field, anywhere in its base chain.
+    // §22.15 trivial-dispose — the exact inverse of
+    // `common::isNonTrivialDisposeClass`, which is what it now calls (#3588).
+    // A class is trivial-dispose iff it has no destructor, no owning inline
+    // array (§15.1.1), no captured `owned` primary-ctor parameter (§22.10) and
+    // no non-static `owned` field, anywhere in its base chain.
     bool isTrivialDisposeClass(TypeSymbol* decl) const;
 
     // §22.15 rule 6: a call to a member not pure-declared / pure-classified
@@ -170,92 +172,26 @@ private:
 };
 
 bool PureBodyWalker::isTrivialDisposeClass(TypeSymbol* decl) const {
-    // Cycle-guarded walk up the base chain (mirrors ExprTC's predicate).
-    std::unordered_set<const TypeSymbol*> visited;
-    const std::size_t kMaxWalk = 4096;
-    std::size_t walked = 0;
-    for (TypeSymbol* cur = decl; cur;) {
-        if (++walked > kMaxWalk) break;
-        if (!visited.insert(cur).second) break;
-        // fix #3223 (§22.15 / §28.9 / §2.8.2, v0.254 — sister to #3191): an
-        // IMPORTED class's carried §3.6 verdict, consulted BEFORE the member
-        // scan below — because for an imported class that scan cannot succeed.
-        // A class's destructor is deliberately not part of the exported member
-        // list (§13.3 — `Dispose()` is the public surface, and there is no
-        // `MetaMemberKind::Destructor`), and `ModuleLoader` builds a
-        // `DestructorSymbol` on exactly one path — the generic body re-parse.
-        // So EVERY non-generic imported class scanned as "no destructor" and
-        // this function answered trivial-dispose for all of them, whatever
-        // they declared. `TypeSymbol::importedNonTrivialDispose` carries the
-        // exporter's verdict (`MetaTypeDecl::nonTrivialDispose`, set by
-        // #3191), so the structural walk has an answer on the imported side
-        // rather than a default. Per level, not once at `decl`, so a LOCAL
-        // `class Derived: Res` over an imported `Res` is decided when the
-        // walk REACHES `Res`. A `false` verdict never short-circuits — absent
-        // (a pre-#3191 artifact) and genuinely-trivial read alike, and both
-        // must fall through to the member scan, which keeps the local-class
-        // answer correct for both fresh and stale imports.
-        //
-        // This is the FOURTH independent copy of §28.9's classification
-        // (alongside `common::isNonTrivialDisposeClass`, `Ownership.cpp`'s
-        // §28.3 gate, and `ExprTypecheck.cpp`'s §21.9 walk). #2666 brings
-        // all four into line on the inline-array arm (§28.9 v0.237's third
-        // disqualifier); the duplicated walks remain here, kept in sync
-        // with the predicate's shape by construction.
-        if (cur->importedNonTrivialDispose) return false;
-        for (Symbol* m : cur->members) {
-            if (dynamic_cast<DestructorSymbol*>(m)) return false;
-            auto* fs = dynamic_cast<FieldSymbol*>(m);
-            if (!fs) continue;
-            // fix #2666 (§28.9 v0.237 / §15.1.1): an owning-inline-array
-            // field — `[N owned]T?` / `[N owned]T`, `TypeKind::InlineArray`
-            // with `arrayOwned` set — disqualifies trivial-dispose per the
-            // spec's third arm. Read from the AST directly (a primary-ctor
-            // parameter's TYPE is `fs->posParam->type`; a body field's TYPE
-            // is `fs->decl` cast to FieldDecl). Walks BEFORE the posParam
-            // arm so a primary-ctor parameter whose type is `[N owned]T?`
-            // is caught; the `modifier == "owned"` arm below covers an
-            // `owned` primary-ctor parameter that is not also owning-inline-
-            // array. Mirrors `common::isNonTrivialDisposeClass` so the
-            // §22.15 throw-carve-out (this walker) and the §28.3 auto-drop
-            // (the shared predicate, #2654) cannot drift on the inline-array
-            // arm — the duplicated-predicate defect class.
-            const ast::Type* fieldAstTy = nullptr;
-            if (fs->posParam) {
-                fieldAstTy = fs->posParam->type.get();
-            } else if (auto* fd =
-                           dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
-                fieldAstTy = fd->type.get();
-            }
-            if (fieldAstTy &&
-                fieldAstTy->kind == ast::TypeKind::InlineArray &&
-                fieldAstTy->arrayOwned) {
-                return false;
-            }
-            if (fs->posParam) {
-                if (fs->parent &&
-                    fs->parent->kind == ast::TypeDeclKind::Class &&
-                    fs->posParam->modifier == "owned" &&
-                    !fs->posParamInitRef)
-                    return false;
-                continue;
-            }
-            bool isStatic = false, isOwned = false;
-            for (auto mod : fs->modifiers) {
-                if (mod == "static") isStatic = true;
-                if (mod == "owned") isOwned = true;
-            }
-            if (isOwned && !isStatic) return false;
-        }
-        TypeSymbol* nextBase = nullptr;
-        for (TypeSymbol* b : cur->baseTypes)
-            if (b && b->kind == ast::TypeDeclKind::Class) {
-                nextBase = b;
-                break;
-            }
-        cur = nextBase;
-    }
-    return true;
+    // fix #3588 (§22.15 / §28.9 / §2.8.2, v0.286): ONE body, in `common/`.
+    //
+    // What stood here was a second, hand-maintained copy of
+    // `common::isNonTrivialDisposeClass` written inverted — same cycle guard,
+    // same 4096-iteration cap, same member scan (destructor / owning inline
+    // array §15.1.1 / captured `owned` primary-ctor parameter §22.10 /
+    // non-static `owned` field), same base-chain step, same carried-verdict
+    // short-circuit. A normalizing diff of the two bodies at 11920b8 found NO
+    // classification arm that differed: every hunk was `return false` where the
+    // shared predicate writes `reject = true; break;`. The comment that used to
+    // stand on that copy claimed it was "kept in sync with the predicate's
+    // shape by construction" — it was kept in sync by hand, and the two edits
+    // that had to touch it (#2666's inline-array arm, #3223's carried verdict)
+    // are the record of that. Delegation makes the claim true.
+    //
+    // §22.15's throw carve-out wants the CARRIED imported verdict — that is
+    // fix #3223's whole subject (an imported destructor-bearing exception type
+    // must not be admitted at `throw new E()`), and it is the shared
+    // predicate's default.
+    return !common::isNonTrivialDisposeClass(decl);
 }
 
 bool PureBodyWalker::callTargetIsPure(Symbol* calleeSym) {

@@ -13122,191 +13122,79 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                            t->kind == TypeRef::Kind::Named && t->declaration &&
                            t->declaration->kind == ast::TypeDeclKind::Class &&
                            !t->declaration->isValueBuiltin) {
-                    // §21.9 / §31.2.1 (#1624 precedent) — TERMINATION: the
-                    // base-type graph can contain cycles that survive into
-                    // sema via error recovery (an erroneous `class A: B;
-                    // class B: A` is reported by the §12 cycle check but its
-                    // TypeSymbol baseTypes still link A↔B, so this walk reaches
-                    // it during the §21.9 bare-discard non-trivial-dispose
-                    // classification). Without a guard, a cyclic base chain
-                    // whose members set no `reject` (no destructor / no owned
-                    // field in the cycle — a trivial-dispose cycle reached via
-                    // `ownedProduced`) loops forever, hanging/crashing the
-                    // compiler on valid input. Mirror catchArmNcb's #1624 fix:
-                    // a visited-set (by TypeSymbol pointer) gates the walk, and
-                    // a hard iteration cap is defense-in-depth so a malformed
-                    // deep/diamond graph can never make this unbounded.
-                    std::unordered_set<const TypeSymbol*> visitedBase;
-                    const std::size_t kMaxWalk = 4096;  // defensive; base chains are shallow
-                    std::size_t walked = 0;
-                    for (TypeSymbol* cur = t->declaration; cur && !reject;) {
-                        if (++walked > kMaxWalk) break;              // §21.9 walk must terminate
-                        if (!visitedBase.insert(cur).second) break;  // cycle guard (#1624)
-                        // fix #3191 (§3.6 / §28.9 / §2.8.2, family M2 of #3152):
-                        // an IMPORTED class's carried §3.6 trivial-dispose
-                        // verdict, consulted PER LEVEL before the member scan —
-                        // because for an imported class that scan cannot
-                        // succeed. The destructor is not an exported member
-                        // (§13.3: `Dispose()` is the public surface, and there
-                        // is no `MetaMemberKind::Destructor`), so this walk found
-                        // no `DestructorSymbol` on ANY non-generic imported class
-                        // and this diagnostic could not fire across a module
-                        // boundary. MEASURED at cf84884: `new Derived(1);` over a
-                        // local `class Derived: Res` with an imported `Res`
-                        // declaring a destructor is a hard error in the
-                        // character-identical single-module twin and compiled
-                        // SILENTLY two modules out.
-                        //
-                        // ⚠ THIS IS A FOURTH INDEPENDENT COPY of §28.9's
-                        // classification (`common::isNonTrivialDisposeClass`,
-                        // `Ownership.cpp`'s §28.3 gate, `PureChecker.cpp`'s
-                        // `isTrivialDisposeClass`, and this one). Fixing the
-                        // shared copy alone did NOT make this diagnostic fire —
-                        // verified by measurement, not assumed — which is the
-                        // duplicated-predicate defect class in miniature.
-                        // #2666 brings all four into line on the owning-
-                        // inline-array arm (§28.9 v0.237's third
-                        // disqualifier); collapsing them onto the shared
-                        // predicate is filed separately and the walks
-                        // remain here, in sync with the predicate's shape
-                        // by construction.
-                        //
-                        // Per level, not once at the head, so a LOCAL class
-                        // deriving from an imported base is decided when the walk
-                        // REACHES that base. A false verdict never
-                        // short-circuits: absent (a pre-#3191 artifact) and
-                        // genuinely-trivial read alike and both fall through to
-                        // the member scan, which keeps `trivialDisposeProducer`
-                        // meaning exactly what #2655's stamp below says it means.
-                        //
-                        // fix #3191 follow-up (§21.9, v0.254 — same family M2):
-                        // GATE the reject fire on the source expression being a
-                        // NEW (not a CALL). The CALL path (`Cell.MakeIt(i);`
-                        // where `Cell` is the imported non-trivial-dispose
-                        // producer) is reclaimed by `disposeOwnedValue` per
-                        // #3189's design intent — the §21.9 hard error does NOT
-                        // fire on those, see the long ⚠ comment at the call
-                        // site — so the imported-carrier verdict is read for
-                        // NEW only. The NEW path (`new ImportedCell();`, or
-                        // `new Derived();` over a local `Derived: Res` with
-                        // `Res` imported declaring a destructor — #3191's
-                        // measured shape) is the §21.9 hard-error target and
-                        // fires the wire-side verdict on every level of the
-                        // walk. Without this gate, #3191's wire-side carrier
-                        // breaks the §21.9 reclaim path: a regression
-                        // measurable on
-                        // `xmod_owned_return_channel_3189.t2_imported_bare_discard`
-                        // (count reads 7, expected 0). With it, both #3189's
-                        // reclaim and #3191's NEW-rejection are preserved on
-                        // their respective cases. The CALL gate is the
-                        // boundary; the carrier stays on the wire for the NEW
-                        // arm and for any other consumer that wants it.
-                        if (cur->importedNonTrivialDispose &&
-                            dynamic_cast<const ast::NewExpr*>(es->expr.get())) {
-                            reject = true;
-                            break;
-                        }
-                        for (Symbol* m : cur->members) {
-                            if (dynamic_cast<DestructorSymbol*>(m)) {
-                                reject = true;
-                                break;
-                            }
-                            // §21.9 / §3.6 / #1594: non-trivial-dispose is not
-                            // just "has a user destructor" — a class carrying
-                            // ANY `owned` storage member is non-trivial-dispose
-                            // too (§28.9's derived-property computation), since
-                            // its generated Dispose() must run to release that
-                            // member. Without this, a class whose only
-                            // disposal obligation is an `owned` field (declared,
-                            // or a captured `owned` primary-ctor parameter,
-                            // §22.10 v0.180) was misclassified trivial-dispose:
-                            // the bare-statement codegen path
-                            // (LlvmBackend_Stmts.cpp ExpressionStmt) never calls
-                            // Dispose() for a bare-statement discard, so the
-                            // owned member genuinely leaked with zero
-                            // diagnostics. Mirrors codegen's
-                            // isCapturedOwnedPrimaryParam (LlvmBackend_impl.hpp)
-                            // for the posParam case; sema has no access to that
-                            // codegen predicate, so the equivalent check is
-                            // reproduced here directly on the FieldSymbol.
-                            //
-                            // fix #3205 (§22.10 v0.254): the posParam arm
-                            // gates on `!posParamInitRef` only, dropping the
-                            // pre-fix `posParamBodyRef` requirement, so an
-                            // `owned` primary-ctor parameter REFERENCED
-                            // NOWHERE is captured-and-disposed (no silent leak)
-                            // and the class is non-trivial-dispose. See the
-                            // codegen predicate's comment for the four-case
-                            // truth table and the spec enumeration gap.
-                            auto* fs = dynamic_cast<FieldSymbol*>(m);
-                            if (!fs) continue;
-                            // fix #2666 (§28.9 v0.237 / §15.1.1): an
-                            // owning-inline-array field — `[N owned]T?` /
-                            // `[N owned]T`, `TypeKind::InlineArray` with
-                            // `arrayOwned` set — disqualifies
-                            // trivial-dispose per the spec's third arm.
-                            // Walks BEFORE the posParam arm so a
-                            // primary-ctor parameter whose type is `[N
-                            // owned]T?` is caught too. Mirrors
-                            // `common::isNonTrivialDisposeClass` /
-                            // `PureChecker::isTrivialDisposeClass` so the
-                            // §21.9 reject here, the §28.3 auto-drop, and
-                            // the §22.15 throw carve-out cannot drift on
-                            // the inline-array arm. See those walkers'
-                            // comments for the rationale and the
-                            // #2666/#2654+#3191+#3205 sibling structure.
-                            const ast::Type* fieldAstTy = nullptr;
-                            if (fs->posParam) {
-                                fieldAstTy = fs->posParam->type.get();
-                            } else if (auto* fd =
-                                           dynamic_cast<const ast::FieldDecl*>(
-                                               fs->decl)) {
-                                fieldAstTy = fd->type.get();
-                            }
-                            if (fieldAstTy &&
-                                fieldAstTy->kind ==
-                                    ast::TypeKind::InlineArray &&
-                                fieldAstTy->arrayOwned) {
-                                reject = true;
-                                break;
-                            }
-                            if (fs->posParam) {
-                                if (fs->parent &&
-                                    fs->parent->kind ==
-                                        ast::TypeDeclKind::Class &&
-                                    fs->posParam->modifier == "owned" &&
-                                    !fs->posParamInitRef) {
-                                    reject = true;
-                                    break;
-                                }
-                                continue;
-                            }
-                            // A `static owned` field (§22.12 rule 4) is
-                            // disposed at process-exit order (§22.13), not by
-                            // this instance's Dispose() — exclude it, or a
-                            // class whose only `owned` member is static would
-                            // be wrongly classified non-trivial-dispose here.
-                            bool isStatic = false, isOwned = false;
-                            for (auto mod : fs->modifiers) {
-                                if (mod == "static") isStatic = true;
-                                if (mod == "owned") isOwned = true;
-                            }
-                            if (isOwned && !isStatic) { reject = true; break; }
-                        }
-                        TypeSymbol* nextBase = nullptr;
-                        for (TypeSymbol* b : cur->baseTypes)
-                            if (b && b->kind == ast::TypeDeclKind::Class) {
-                                nextBase = b;
-                                break;
-                            }
-                        cur = nextBase;
+                    // fix #3588 (§28.9 / §21.9 / §3.6 / §2.8.2, v0.286):
+                    // §28.9's trivial-dispose classification, through the ONE
+                    // shared predicate.
+                    //
+                    // What stood here was an inline THIRD copy of
+                    // `common::isNonTrivialDisposeClass`'s body — the #1624
+                    // cycle guard, the 4096-iteration cap, the member scan
+                    // (destructor / owning inline array §15.1.1 / captured
+                    // `owned` primary-ctor parameter §22.10 / non-static
+                    // `owned` field), the base-chain step, all of it. Measured
+                    // at 11920b8 by a normalizing diff of the two bodies: they
+                    // differed in exactly ONE place, the argument below.
+                    // Everything else was character-identical, and each arm's
+                    // rationale (with its fix number) now lives ONCE, beside
+                    // the predicate. This copy is the one whose own comment
+                    // recorded that fixing the shared predicate alone did not
+                    // make this diagnostic fire — #3191 had to edit here too,
+                    // in the same commit. There is now no "here" to miss.
+                    //
+                    // ⚠ THE ARGUMENT IS THE WHOLE DIFFERENCE. Read this before
+                    // changing it. §21.9's walk serves BOTH the NEW and the
+                    // CALL arm, and the two want OPPOSITE answers on an
+                    // IMPORTED non-trivial-dispose producer:
+                    //
+                    //   NEW  — `new ImportedCell();`, or `new Derived();` over
+                    //     a local `class Derived: Res` with `Res` imported and
+                    //     declaring a destructor (#3191's MEASURED shape at
+                    //     cf84884: a hard error in the character-identical
+                    //     single-module twin, COMPILED SILENTLY two modules
+                    //     out). Must REJECT — that is what #3191 put the §3.6
+                    //     verdict on the wire for, and what makes the two
+                    //     builds agree per §2.8.3 rule 4.   -> Consult.
+                    //
+                    //   CALL — `Cell.MakeIt(i);` over the same imported class.
+                    //     Must NOT reject: it is reclaimed through
+                    //     `disposeOwnedValue` per #3189's documented design
+                    //     intent (see the long ⚠ note at the flag below), and
+                    //     firing the hard error there aborts a build that must
+                    //     run — a regression measurable on
+                    //     `xmod_owned_return_channel_3189
+                    //     .t2_imported_bare_discard_reclaimed_21_9`, where the
+                    //     imported disposal count reads 7 against an expected
+                    //     0 because the call is rejected and the destructor
+                    //     never runs.   -> Ignore.
+                    //
+                    // ONLY the carried verdict is gated. The structural member
+                    // scan runs on both arms, so a LOCAL non-trivial-dispose
+                    // class reached through a CALL is rejected exactly as
+                    // before this change.
+                    // // per §21.9, §28.9, §3.6, fix #3191 follow-up (0bb85f1)
+                    const bool producerIsNew =
+                        dynamic_cast<const ast::NewExpr*>(es->expr.get()) !=
+                        nullptr;
+                    if (common::isNonTrivialDisposeClass(
+                            t->declaration,
+                            producerIsNew
+                                ? common::ImportedDisposeVerdict::Consult
+                                : common::ImportedDisposeVerdict::Ignore)) {
+                        // An OR into `reject`, never an assignment: `reject`
+                        // may ALREADY be true here from
+                        // `subDrop || externOwnedBare` (#2680), in which case
+                        // the pre-#3588 loop's `cur && !reject` condition
+                        // stopped it before its first iteration and
+                        // `trivialDisposeProducer` stayed false. Writing the
+                        // predicate's result into `reject` would clear that
+                        // and turn a §21.9 hard error into a silent free.
+                        reject = true;
                     }
-                    // fix #2655 / §28.3 / §28.9 (v0.237): the walk above just
-                    // ran to completion on a Named, non-nullable, non-value-
+                    // fix #2655 / §28.3 / §28.9 (v0.237): the classification
+                    // above just ran on a Named, non-nullable, non-value-
                     // builtin CLASS and found no destructor and no instance
                     // `owned` member — i.e. this producer's type is
-                    // TRIVIAL-DISPOSE (§28.9's derived-property computation, as
-                    // this section computes it).
+                    // TRIVIAL-DISPOSE (§28.9's derived-property computation).
                     trivialDisposeProducer = !reject;
                 }
                 if (reject) {
