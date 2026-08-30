@@ -5197,12 +5197,9 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                 // use-site error as a non-auto-hashable body record (§9.3
                 // "use-site-error discipline"). For LOCAL records the flag lives
                 // on the ast::TypeDecl; for IMPORTED records (no ast node) it
-                // lives on TypeSymbol itself (issue #501 fix).
-                bool positional = ts->hasPositionalFields;
-                if (!positional) {
-                    if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
-                        positional = td->hasPositionalFields;
-                }
+                // lives on TypeSymbol itself (issue #501 fix). fix #3600: the
+                // shared both-sources accessor.
+                bool positional = recordIsPositional(ts);
                 bool isEq = positional
                                 ? isPositionalRecordEqualityBearing(ts, ctx_)
                                 : false;

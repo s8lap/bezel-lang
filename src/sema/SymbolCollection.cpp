@@ -1558,11 +1558,8 @@ static bool isAdmissibleComponentType(const TypeRef* ty, const SemaContext& ctx,
                 // "hashable"; widening to "hashable" is deferred (DECLINED.md
                 // row 320) because it would smuggle reference equality
                 // through user-equality records carrying a class-typed field.
-                if (decl->hasPositionalFields)
+                if (recordIsPositional(decl))
                     return isPositionalRecordEqualityBearing(decl, ctx);
-                if (auto* td = dynamic_cast<const ast::TypeDecl*>(decl->decl))
-                    if (td->hasPositionalFields)
-                        return isPositionalRecordEqualityBearing(decl, ctx);
                 return isAutoEqualityBearingBodyRecord(decl, ctx);
             }
             // §9.2 v0.210 (#2083): a CHOICE component is admissible iff it is
@@ -1580,6 +1577,16 @@ static bool isAdmissibleComponentType(const TypeRef* ty, const SemaContext& ctx,
         }
     }
     return true;
+}
+
+// Declared in Symbol.hpp — see the doc comment there for the both-sources
+// contract (#3600).
+bool recordIsPositional(const TypeSymbol* rec) {
+    if (!rec) return false;
+    if (rec->hasPositionalFields) return true;
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(rec->decl))
+        return td->hasPositionalFields;
+    return false;
 }
 
 // §9.2: auto-equality eligibility for a body record. The spec's membership
@@ -1618,9 +1625,7 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
     if (!rec || rec->kind != ast::TypeDeclKind::Record) return false;
     // §9.3: a record with positional fields is positional / combined form; it
     // gets the §9.1 positional synthesis, not this body-record path.
-    if (rec->hasPositionalFields) return false;
-    if (auto* td = dynamic_cast<const ast::TypeDecl*>(rec->decl))
-        if (td->hasPositionalFields) return false;
+    if (recordIsPositional(rec)) return false;
 
     for (const Symbol* m : rec->members) {
         // An auto-property is the participating storage — eligible only when its
@@ -2017,13 +2022,9 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx) {
         // enforced).
         // §9.3 (v0.158, #1383): positional/combined records must pass the
         // admissibility check; the blind `return true` was the pre-#1383 bug.
-        if (ts->hasPositionalFields)
+        if (recordIsPositional(ts))
             return isPositionalRecordEqualityBearing(ts, ctx) ||
                    recordHasUserDeclaredEquality(ts);
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl))
-            if (td->hasPositionalFields)
-                return isPositionalRecordEqualityBearing(ts, ctx) ||
-                       recordHasUserDeclaredEquality(ts);
         return isAutoEqualityBearingBodyRecord(ts, ctx) ||
                recordHasUserDeclaredEquality(ts);
     }

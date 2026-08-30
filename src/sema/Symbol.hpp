@@ -1347,6 +1347,26 @@ bool memberIsPure(const MemberSymbol* m);
 // `callTargetIsPure` admits every property read unconditionally.
 bool propertyGetterIsPure(const PropertySymbol* ps);
 
+// §9.1 / §9.2 (issue #501, #3600): is `rec` a POSITIONAL (or combined-form)
+// record — the §9.1 package that always synthesizes value semantics?
+//
+// BOTH sources are load-bearing. `ModuleLoader` sets
+// `TypeSymbol::hasPositionalFields` for an IMPORTED record and never assigns
+// `TypeSymbol::decl`, so an `ast::TypeDecl*` cast of `rec->decl` is null for
+// every imported type; a LOCAL record has the flag mirrored onto the symbol
+// at collection time too (`SymbolCollection.cpp`), so the symbol-side check
+// alone already answers correctly for both — the AST fallback exists only as
+// a defensive second source. The canonical statement of why reading only the
+// AST half is a live defect (a MEASURED cross-module `ToString` miscompile,
+// f1175c6) lives on codegen's own copy, `Emitter::recordIsPositional`
+// (`LlvmBackend_impl.hpp`) — that copy predates this one and is not yet
+// routed through it (#3600 tracks finishing that).
+//
+// This is the ONE sema-side spelling; #3600 found ~9 independent, correct-
+// today re-derivations of exactly this both-sources shape scattered across
+// sema. Route new callers through this rather than re-deriving it again.
+bool recordIsPositional(const TypeSymbol* rec);
+
 // §9.3 (v0.158, #1383): true when a positional or combined-form record
 // synthesizes equality — i.e. every positional field's type (and every body
 // auto-property's type for the combined form) is an admissible component type
