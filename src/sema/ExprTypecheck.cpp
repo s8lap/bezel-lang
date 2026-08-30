@@ -2578,8 +2578,22 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
     //      type parameter `T` is a type test against the substituted type
     //      argument, per instantiation. A generic parameter is not in the value
     //      scope (lookupName does not find it), so recognize it directly from
-    //      the enclosing method's / type's declared parameters (the same lookup
-    //      the `new T()` and type-argument-inference paths use).
+    //      the enclosing method's / type's / (fix #3617-family drain, R10)
+    //      extension's declared parameters (the same lookup the `new T()` and
+    //      type-argument-inference paths use).
+    //
+    // The extension arm was missing — the identical gap as `isInScopeTypeParam`
+    // (§11.8, this file): inside an extension body `currentType_` names the
+    // EXTENDED type, whose own `td->genericParams` only coincidentally answers
+    // for the EXTENSION's own block-level parameter (§26.4) when an author
+    // reuses the same letter, and never answers at all when the extended type
+    // is imported (`currentType_->decl` is unconditionally null for an
+    // imported type — see `isInScopeTypeParam`'s comment for the measurement).
+    // A `case`/`when` pattern matching a generic extension method's own type
+    // parameter by bare name (`case x (T) ...`) is the reachable shape this
+    // gap silently mis-rejected as "neither a type test, constant, nor
+    // enum-constant pattern" for an imported extended type while accepting it
+    // for a same-named local one.
     if (currentMethodDecl_)
         for (const auto& gp : currentMethodDecl_->genericParams)
             if (gp.name == last) return;
@@ -2587,6 +2601,12 @@ void ExprTC::checkTopLevelNamedPattern(const ast::NamedPattern* np,
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
             for (const auto& gp : td->genericParams)
                 if (gp.name == last) return;
+    if (currentExtension_ && currentExtension_->decl)
+        if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                currentExtension_->decl))
+            if (ed->targetType &&
+                isExtensionTargetTypeParam(*ed->targetType, last))
+                return;
 
     // (3) Named-`const` pattern: `last` is a `const` member anywhere (mirrors
     //     codegen's constValueForPatternName ConstMemberSymbol search — module
@@ -8247,7 +8267,53 @@ std::string ExprTC::extensionNameBlockedNote(const TypeRef* receiver,
 }
 
 // §11.8 (v0.176, #807): is `name` a declared generic type parameter of the
-// enclosing method (checked first — more specific) or the enclosing type?
+// enclosing method (checked first — more specific), the enclosing type, or
+// (fix #3617-family drain, R10) the enclosing EXTENSION block?
+//
+// The third arm was missing. §26.4: an extension's head introduces a FRESH
+// block-level type parameter for each bare identifier in the extended type's
+// argument position — `extension Box<T>` binds a `T` belonging to the
+// EXTENSION, not to `Box`'s own declaration, even when the two happen to
+// share a spelling; ExtensionDecl carries no `genericParams` field of its own
+// (the parameter binds via the head's argument positions, per
+// `isExtensionTargetTypeParam`'s own comment, #3083). Inside an extension
+// body `currentType_` is set to the EXTENDED type (visitTopDecl's
+// ExtensionDecl arm, so `this`/bare-member lookups resolve against it) — so
+// the `currentType_` arm above answers this function's question only by
+// NAME-COINCIDENCE: it asks whether the extended type's OWN class-level
+// parameter list contains `name`, which matches the extension's true answer
+// only when an author reuses the same letter (`extension Box<T>` over
+// `class Box<T>`), and is a false negative whenever they do not — or whenever
+// the extended type is IMPORTED, since `TypeSymbol::decl` is null for every
+// extended-type import: `ModuleLoader.cpp`'s Pass-3 generic-body reparse
+// attaches a decl to individual MEMBER symbols only (`t->members[i]->decl`),
+// never to the TYPE's own `decl` (no `t->decl = …` assignment exists in that
+// file), so `currentType_->decl` is unconditionally null whenever
+// `currentType_` names an imported type.
+//
+// MEASURED (both compiled with this arm ABSENT, a single-module twin vs. an
+// imported `interface IZero<T> { static method Zero(): owned T; }` +
+// `class Box<T>`, extended by `extension Box<T> where T: IZero<T> ...
+// return T.Zero(); ...`): LOCAL (Box declared in the same module, its own
+// `T` coincidentally matching) — `T` IS recognized here (via the coincidence
+// above) and typechecking proceeds to fail on a DIFFERENT, unrelated gap
+// (`forEachConstraintBound` missing the identical arm — sibling fix in this
+// commit). IMPORTED Box (same extension source otherwise): `T` is NOT
+// recognized at all — "unresolved identifier `T`" — because the coincidence
+// this function relied on cannot fire across a module boundary. Adding the
+// extension arm makes both sides reach the identical point, regardless of
+// import — the residual `forEachConstraintBound` gap then reproduces
+// IDENTICALLY on both sides too (see that function's own comment).
+//
+// The correct source for "is `name` the extension block's own parameter" is
+// `currentExtension_`, which is a LOCAL declaration on every path — an
+// extension contributes only its exported MEMBERS to an importer (an
+// ExtensionSymbol's own body is never reconstructed for one) — exactly the
+// reasoning `isEnclosingTypeParamName` (§31.2.1, #3083, a few hundred lines
+// below) already applies for the throw/catch-arm question this function does
+// not cover. That function is this one's up-to-date twin; feeding this one
+// through the SAME `isExtensionTargetTypeParam` helper, rather than
+// re-deriving a fourth copy, is what keeps them from drifting again.
 bool ExprTC::isInScopeTypeParam(std::string_view name) const {
     if (currentMethodDecl_) {
         for (const auto& gp : currentMethodDecl_->genericParams)
@@ -8257,6 +8323,14 @@ bool ExprTC::isInScopeTypeParam(std::string_view name) const {
         if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl)) {
             for (const auto& gp : td->genericParams)
                 if (gp.name == name) return true;
+        }
+    }
+    if (currentExtension_ && currentExtension_->decl) {
+        if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                currentExtension_->decl)) {
+            if (ed->targetType &&
+                isExtensionTargetTypeParam(*ed->targetType, name))
+                return true;
         }
     }
     return false;
@@ -8276,7 +8350,33 @@ GenericParamSymbol* ExprTC::typeParamMarker(std::string_view name) {
 
 // §11.8: walk the `type`-kind constraint bounds declared for `paramName` —
 // the enclosing method's `where` clauses first (more specific), then the
-// enclosing type's — calling `fn` with each resolved bound until it accepts.
+// enclosing type's, then (fix #3617-family drain, R10) the enclosing
+// EXTENSION's — calling `fn` with each resolved bound until it accepts.
+//
+// The extension arm was missing here, on both `isDeclaredParam` and
+// `forItems`'s `scan`, matching `isInScopeTypeParam`'s identical gap a few
+// hundred lines up (see its comment for why `currentType_`'s own arm is only
+// a name-coincidence substitute for `currentExtension_` inside an extension
+// body, and why that makes an IMPORTED extended type diverge from a local
+// one). `typeParamHasExceptionBound` already scans `extDecl->genericConstraints`
+// as a third source; this function needed the same third source and,
+// because it also gates entry with `isDeclaredParam` (unlike
+// `typeParamHasExceptionBound`, which has no such gate), the extension's own
+// `isExtensionTargetTypeParam`-recognized parameter too.
+//
+// MEASURED: `extension Box<T> where T: IZero<T> { method Reset(): owned T
+// return T.Zero(); end; }` over `interface IZero<T> { static method Zero():
+// owned T; }` — with `isInScopeTypeParam`'s extension arm added (this
+// commit) but NOT this one: `T` is now recognized as a type parameter on
+// BOTH a local and an imported `Box`, but `T.Zero()` still fails on both
+// identically with "type parameter `T` has no static member `Zero`" (the
+// where-clause naming `IZero<T>` lives on the EXTENSION, which neither
+// `isDeclaredParam` nor `forItems` consulted) — i.e. this gap is NOT
+// import-sensitive by itself, but it sits on the same `dynamic_cast<const
+// ast::TypeDecl*>(currentType_->decl)` line the class-1 ratchet counts, and
+// is the reason `isInScopeTypeParam`'s own fix alone does not make the
+// T1/T2 repro pair fully round-trip. With BOTH arms added, `T.Zero()`
+// resolves and returns identically local vs. imported.
 bool ExprTC::forEachConstraintBound(
     std::string_view paramName, const std::function<bool(TypeRef*)>& fn) {
     // §14.2 type-parameter bounds: a constraint bound may itself be another type
@@ -8290,6 +8390,10 @@ bool ExprTC::forEachConstraintBound(
         (currentType_ && currentType_->decl)
             ? dynamic_cast<const ast::TypeDecl*>(currentType_->decl)
             : nullptr;
+    const ast::ExtensionDecl* extDecl =
+        (currentExtension_ && currentExtension_->decl)
+            ? dynamic_cast<const ast::ExtensionDecl*>(currentExtension_->decl)
+            : nullptr;
     auto isDeclaredParam = [&](std::string_view nm) -> bool {
         if (currentMethodDecl_)
             for (const auto& gp : currentMethodDecl_->genericParams)
@@ -8297,12 +8401,16 @@ bool ExprTC::forEachConstraintBound(
         if (typeDecl)
             for (const auto& gp : typeDecl->genericParams)
                 if (gp.name == nm) return true;
+        if (extDecl && extDecl->targetType &&
+            isExtensionTargetTypeParam(*extDecl->targetType, nm))
+            return true;
         return false;
     };
-    // Visit every constraint item declared for `nm` — the method's clause first
-    // (most specific), then the enclosing type's — applying `g`; stop when it
-    // returns true. (A constraint clause only references params declared in the
-    // same clause, so scanning both lists never cross-attributes a bound.)
+    // Visit every constraint item declared for `nm` — the method's clause
+    // first (most specific), then the enclosing type's, then the enclosing
+    // extension's — applying `g`; stop when it returns true. (A constraint
+    // clause only references params declared in the same clause, so scanning
+    // all three lists never cross-attributes a bound.)
     auto forItems =
         [&](std::string_view nm,
             const std::function<bool(const ast::ConstraintItem&)>& g) -> bool {
@@ -8318,6 +8426,7 @@ bool ExprTC::forEachConstraintBound(
         if (currentMethodDecl_ && scan(currentMethodDecl_->genericConstraints))
             return true;
         if (typeDecl && scan(typeDecl->genericConstraints)) return true;
+        if (extDecl && scan(extDecl->genericConstraints)) return true;
         return false;
     };
     std::unordered_set<std::string_view> visited;
@@ -8560,8 +8669,17 @@ bool ExprTC::isExceptionDerivedClass(const TypeRef* ty) {
 // a free parameter). The rule mirrors Resolver::bindExtensionTargetTypeParams
 // (TypeResolution_Names.cpp) exactly so the §31.1/§31.2.1 check recognizes
 // the same set of names the resolver binds into the extension's scope.
-static bool isExtensionTargetTypeParam(const ast::Type& target,
-                                       std::string_view name) {
+//
+// fix #3617-family drain (R10): promoted from a file-static free function to
+// an ExprTC member (declaration moved to ExprTypecheck_impl.hpp) so
+// `ExprTypecheck_Calls.cpp`'s two same-shaped `isDeclaredParam` copies
+// (§28.2's `T.Dispose()` gate) can call it too, instead of gaining a THIRD
+// hand-rolled walk of `ast::Type::genericArgs` the next time this question
+// comes up outside this file — exactly the duplication this run's audit
+// tracks. Body unchanged from `isEnclosingTypeParamName`'s original #3083
+// helper.
+bool ExprTC::isExtensionTargetTypeParam(const ast::Type& target,
+                                        std::string_view name) const {
     for (const auto& ga : target.genericArgs) {
         if (!ga) continue;
         if (ga->kind != ast::TypeKind::Named || !ga->name ||

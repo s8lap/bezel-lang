@@ -345,8 +345,18 @@ private:
     // resolveMemberAccess (and codegen) can identify the receiver kind.
     std::unordered_map<std::string_view, GenericParamSymbol*> typeParamMarkers_;
     // §11.8: is `name` a declared generic type parameter of the enclosing
-    // method or type?
+    // method, type, or (fix #3617-family drain, R10) extension block?
     bool isInScopeTypeParam(std::string_view name) const;
+    // §26.4 / #3083: does `target`'s argument list bind `name` as a
+    // block-level extension type parameter (a bare single-segment
+    // non-nullable identifier in one of `target`'s generic-argument
+    // positions, at any nesting depth)? Promoted from an ExprTypecheck.cpp
+    // file-static (fix #3617-family drain, R10) to a member so
+    // ExprTypecheck_Calls.cpp's copies of the same "is this name an in-scope
+    // type parameter" question can share it instead of re-deriving a second
+    // walk of `ast::Type::genericArgs`.
+    bool isExtensionTargetTypeParam(const ast::Type& target,
+                                    std::string_view name) const;
     // §11.8: the cached marker symbol for an in-scope type-parameter name.
     GenericParamSymbol* typeParamMarker(std::string_view name);
     // §11.8: search the enclosing method's constraints (then the enclosing

@@ -4011,6 +4011,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             }
                             return false;
                         };
+                        // fix #3617-family drain (R10): a THIRD source, the
+                        // enclosing EXTENSION's own `where` clause, was
+                        // missing — the identical gap as `isInScopeTypeParam`
+                        // (ExprTypecheck.cpp, §11.8): a generic extension's
+                        // block-level parameter (§26.4) has its constraints
+                        // on the EXTENSION declaration, not on `currentType_`
+                        // (the extended type, which `currentType_->decl` only
+                        // reads correctly by coincidence — see that
+                        // function's comment for the measured local/imported
+                        // divergence this produces).
                         bool refConstrained = false;
                         if (currentMethodDecl_)
                             refConstrained = scanRefConstraint(
@@ -4021,9 +4031,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     currentType_->decl))
                                 refConstrained =
                                     scanRefConstraint(td->genericConstraints);
+                        if (!refConstrained && currentExtension_ &&
+                            currentExtension_->decl)
+                            if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                                    currentExtension_->decl))
+                                refConstrained = scanRefConstraint(
+                                    ed->genericConstraints);
                         if (refConstrained) isObjectMember = true;
                     }
                     if (!isObjectMember) {
+                        // fix #3617-family drain (R10): same missing
+                        // extension arm as `scanRefConstraint` just above,
+                        // now for "is `paramName` declared at all" rather
+                        // than "is it ref-constrained" — reuses
+                        // `isExtensionTargetTypeParam` (promoted to an ExprTC
+                        // member for exactly this cross-file reuse) instead
+                        // of a fourth hand-rolled walk.
                         bool isDeclaredParam = false;
                         if (currentMethodDecl_) {
                             for (const auto& gp :
@@ -4041,6 +4064,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     if (gp.name == paramName) {
                                         isDeclaredParam = true; break;
                                     }
+                            }
+                        }
+                        if (!isDeclaredParam && currentExtension_ &&
+                                currentExtension_->decl) {
+                            if (auto* ed = dynamic_cast<const ast::ExtensionDecl*>(
+                                    currentExtension_->decl)) {
+                                if (ed->targetType &&
+                                    isExtensionTargetTypeParam(
+                                        *ed->targetType, paramName))
+                                    isDeclaredParam = true;
                             }
                         }
                         if (isDeclaredParam) {
@@ -18408,6 +18441,33 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // whether THIS block fires; a genuine type parameter
                     // still reaches it and is typed exactly as before.
                     std::string_view paramName = recvTy->headName();
+                    // NOT extended with a `currentExtension_` arm during the
+                    // #3617-family class-1 drain (R10), unlike its two
+                    // siblings a few hundred lines up (the `Dispose`
+                    // ref-constraint gate) and in ExprTypecheck.cpp
+                    // (`isInScopeTypeParam`, `forEachConstraintBound`).
+                    // MEASURED (not just reasoned): `extension Box<T> {
+                    // method Describe(): string return this.v.ToString();
+                    // end; }` over `class Box<T> { public v: T; }` reaches
+                    // this block for a LOCAL Box (this file's own debug
+                    // instrumentation, since removed, confirmed
+                    // `isDeclaredParam=1` via the `currentType_` coincidence
+                    // documented on `isInScopeTypeParam`) but NEVER reaches
+                    // it at all for an IMPORTED Box — `recvTy->declaration`
+                    // is non-null there, so the outer `!recvTy->declaration`
+                    // guard above is false and this whole block is skipped.
+                    // That resolution happens in TypeResolution (not owned by
+                    // this drain this cycle), so whether an extension arm
+                    // here would ever fire for an import is not something
+                    // this file can currently exercise; both sides that DO
+                    // reach here (local only, in every construction tried)
+                    // already share method/type recognition identically, so
+                    // no measured local-vs-import DIVERGENCE exists to fix.
+                    // Left as-is rather than adding an unmeasured arm; if a
+                    // reachable import-side gap surfaces here later, see
+                    // `isInScopeTypeParam`'s comment for the fix shape
+                    // (`isExtensionTargetTypeParam`, already an ExprTC
+                    // member for exactly this reuse).
                     bool isDeclaredParam = false;
                     if (currentMethodDecl_) {
                         for (const auto& gp : currentMethodDecl_->genericParams)
