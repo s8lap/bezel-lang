@@ -176,6 +176,36 @@ public:
         return exprSymbols_;
     }
 
+    // fix #3628 (§22.15 rule 6 / §25.1 / §17.6, v0.286): the STATEMENT
+    // operator forms — compound assignment (`a += b`) and increment/decrement
+    // (`t++`) — each invoke a §25 overload exactly as the expression forms do
+    // (`setExprSymbol` above, added by narrow #3610), but neither
+    // `ExprTypecheck.cpp` site that resolves the overload records it anywhere:
+    // the compound-assignment result-type check and the IncrementStmt
+    // overload-existence check each look the `MethodSymbol` up by hand and
+    // let it fall out of scope once their own local question is answered.
+    // `PureBodyWalker`'s rule-6 arm can only ask `callTargetIsPure` about a
+    // fact it can read, so this table publishes the SAME resolution those two
+    // sites already compute — keyed on the `AssignmentStmt` / `IncrementStmt`
+    // node (both derive from `ast::Stmt`, so one table serves both; no
+    // per-statement-kind duplication).
+    //
+    // Unlike `patternSymbols_`/`lambdaParams_`, this table needs NO entry in
+    // ModuleLoader's body-reconstruction remap loops: it is read only by
+    // `checkPureBodies`, which — like `typecheckExpressions` — runs once per
+    // compiled `SourceFile` on the driver's own `SemaContext` and never on a
+    // ModuleLoader-reparsed imported generic body (`checkPureBodies` has
+    // exactly one caller, `Driver.cpp`). Same reasoning fix #3583 gives for
+    // `newExprPositionalBindings_`: the statement lives only at the call
+    // site, in the importer's own AST.
+    void setStmtOperatorSymbol(const ast::Stmt* s, Symbol* sym) {
+        stmtOperatorSymbols_[s] = sym;
+    }
+    Symbol* stmtOperatorSymbol(const ast::Stmt& s) const {
+        auto it = stmtOperatorSymbols_.find(&s);
+        return it == stmtOperatorSymbols_.end() ? nullptr : it->second;
+    }
+
     // §19.3 (v0.226, #1853): per-Pattern resolved symbol. A bare-name
     // NamedPattern that resolves to a LOCAL `const` carries no Expr node for
     // exprSymbol() to key on (a Pattern is not an Expr), so codegen's const
@@ -826,6 +856,10 @@ private:
     // has two call sites, one binder).
     std::unordered_map<const ast::Expr*, std::vector<int>>
         newExprPositionalBindings_;
+    // fix #3628 (§22.15 rule 6 / §25.1 / §17.6, v0.286): resolved §25
+    // operator for a STATEMENT operator form (`a += b`, `t++`). See
+    // `setStmtOperatorSymbol`/`stmtOperatorSymbol` above.
+    std::unordered_map<const ast::Stmt*, Symbol*> stmtOperatorSymbols_;
     // Cache for the common primitive TypeRefs. Key is `(p << 1) | nullable`.
     std::unordered_map<std::uint32_t, TypeRef*> primitiveCache_;
     // §2.5 imports (issue #328 inc 3): owned imported symbols + their TypeRefs,

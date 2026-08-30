@@ -801,10 +801,37 @@ void PureBodyWalker::checkOneStmt(const ast::Stmt* s) {
                 "an `owned` marker on the RHS is a transfer (disposal-"
                 "running)");
         }
+        // fix #3628 (§22.15 rule 6 / §25.1, v0.286): §25.1, verbatim — "the
+        // compound forms desugar mechanically to read-modify-write using the
+        // underlying binary operator's overload." `t += b` therefore IS the
+        // call `T::operator +`, and rule 6 governs it exactly as it governs
+        // the spelled-out `t := t + b` (narrow #3610). `ExprTypecheck.cpp`'s
+        // compound-assignment existence checks already resolve that overload
+        // (including through inheritance and either operand's declaring
+        // type, §25.2) and publish it via `setStmtOperatorSymbol` — read here
+        // rather than re-resolved, so this is not a sixth predicate. Null for
+        // every compound form that resolves no user overload: `:=`, `??=`,
+        // a primitive/primitive pair, and an event `+=`/`-=` (§24.4 — not a
+        // real compound assignment, resolves no 2-param `operator`).
+        if (Symbol* opSym = ctx_.stmtOperatorSymbol(*as)) {
+            std::string_view underlying = as->op;
+            if (!underlying.empty() && underlying.back() == '=')
+                underlying.remove_suffix(1);  // "+=" -> "+", "mod=" -> "mod"
+            checkOperatorOverloadPurity(opSym, underlying, as->span.begin);
+        }
         return;
     }
     if (auto* is = dynamic_cast<const ast::IncrementStmt*>(s)) {
         checkAssignmentTarget(*is->target);
+        // fix #3628 (§22.15 rule 6 / §17.6, v0.286): §17.6, verbatim — "the
+        // statement `x++` is equivalent to `x := T.operator++(x)`" — a call,
+        // exactly as rule 6 governs the binary/unary EXPRESSION operator
+        // forms (narrow #3610). `ExprTypecheck.cpp`'s IncrementStmt overload-
+        // existence check already resolves the `operator ++`/`operator --`
+        // and publishes it via `setStmtOperatorSymbol`; null when the target
+        // is a built-in numeric (§17.6 category (2) — no overload resolved).
+        if (Symbol* opSym = ctx_.stmtOperatorSymbol(*is))
+            checkOperatorOverloadPurity(opSym, is->op, is->span.begin);
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {

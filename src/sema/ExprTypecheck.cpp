@@ -14032,6 +14032,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // left unchecked, conservatively, as before.
                 std::string binOp(as->op.substr(0, as->op.size() - 1));
                 bool hasApplicableOp = false;
+                // fix #3628 (§22.15 rule 6, v0.286): the matched overload,
+                // published below once the loop settles on it — see the
+                // Named-target branch's comment for why this is the
+                // authoritative resolution to publish (it is the SAME §25.2
+                // both-operand + inherited search codegen's
+                // `findCompoundOperatorOverload` repeats).
+                MethodSymbol* matchedOp = nullptr;
                 for (MethodSymbol* m : collectInheritedOperators(
                          rTy->declaration, binOp, 2)) {
                     auto paramTy = [&](Symbol* paramSym) -> TypeRef* {
@@ -14057,9 +14064,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         (p1->nullable || !rTy->nullable);
                     if (leftOk && rightOk) {
                         hasApplicableOp = true;
+                        matchedOp = m;
                         break;
                     }
                 }
+                if (matchedOp) ctx_.setStmtOperatorSymbol(as, matchedOp);
                 if (!hasApplicableOp) {
                     const char* kindWord = "";
                     switch (rTy->declaration->kind) {
@@ -14153,21 +14162,36 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                       pt->declaration)) &&
                            (pt->nullable || !operandTy->nullable);
                 };
-                auto typeDeclaresApplicable = [&](TypeSymbol* decl) -> bool {
-                    if (!decl) return false;
+                // fix #3628 (§22.15 rule 6, v0.286): returns the matched
+                // MethodSymbol (was previously bool-only) so it can be
+                // PUBLISHED — this is §25.2's full "union of the operator
+                // overloads declared on the static types of both operands,
+                // including inherited" search, the same one codegen's
+                // `findCompoundOperatorOverload` (LlvmBackend_Layout.cpp)
+                // repeats to pick the operator it actually calls at runtime.
+                // `PureBodyWalker` reads the published symbol via
+                // `ctx_.stmtOperatorSymbol` instead of re-resolving — a
+                // narrower direct-members-only rescan (as the pre-existing
+                // result-type check just above uses) would silently miss an
+                // INHERITED operator and leave rule 6 unenforced for it.
+                auto typeDeclaresApplicable =
+                    [&](TypeSymbol* decl) -> MethodSymbol* {
+                    if (!decl) return nullptr;
                     for (MethodSymbol* m :
                          collectInheritedOperators(decl, binOp, 2)) {
                         if (m->params.size() < 2) continue;
                         if (operandMatchesParam(tTy, m->params[0]) &&
                             operandMatchesParam(rTy, m->params[1]))
-                            return true;
+                            return m;
                     }
-                    return false;
+                    return nullptr;
                 };
-                bool hasApplicableOp =
-                    typeDeclaresApplicable(tTy->declaration) ||
-                    (rTy->kind == TypeRef::Kind::Named && rTy->declaration &&
-                     typeDeclaresApplicable(rTy->declaration));
+                MethodSymbol* matchedOp = typeDeclaresApplicable(tTy->declaration);
+                if (!matchedOp && rTy->kind == TypeRef::Kind::Named &&
+                    rTy->declaration)
+                    matchedOp = typeDeclaresApplicable(rTy->declaration);
+                bool hasApplicableOp = matchedOp != nullptr;
+                if (matchedOp) ctx_.setStmtOperatorSymbol(as, matchedOp);
                 if (!hasApplicableOp) {
                     const char* kindWord = "";
                     switch (tTy->declaration->kind) {
@@ -15439,6 +15463,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 ms->operatorToken == is->op &&
                                 ms->params.size() == 1) {
                                 hasOverload = true;
+                                // fix #3628 (§22.15 rule 6 / §17.6, v0.286):
+                                // this is the SAME resolution codegen's own
+                                // IncrementStmt lowering repeats
+                                // (LlvmBackend_Stmts.cpp's `opMethod` scan —
+                                // direct members only, no inherited chain, so
+                                // this walk and that one always agree).
+                                // Publish it so `PureBodyWalker` can ask
+                                // `callTargetIsPure` about a fact this site
+                                // already computed, instead of re-resolving.
+                                ctx_.setStmtOperatorSymbol(is, ms);
                                 break;
                             }
                         }
