@@ -1446,112 +1446,83 @@ void Resolver::checkOutNullPostcond(const std::vector<ast::Param>& params,
     }
 }
 
+// fix #3619 (§17.14 / §3619, v0.286): the ONE Resolver-side identifier
+// resolver for a compile-time integer constant — see the declaration in
+// TypeResolution_impl.hpp. A bare name is a `const` whose initializer is
+// itself an int-const expression. Member consts live on the enclosing type
+// (tracked by currentOuterType_) and its class base chain; module/enclosing-
+// scope consts are reached through the lexical `scope`. (Local consts are
+// not yet registered at type-resolution time — see resolveTypesInBody — so a
+// local-const size is not foldable here; the ExprTypecheck pass folds those,
+// where locals are in scope.) Before this fix, `foldIntConstExpr` and
+// `findConstShiftDomainFaultInScope` each spelled this closure inline,
+// verbatim identical to each other.
+std::optional<long long> Resolver::resolveConstIdentInScope(
+    std::string_view name, int d, Scope* scope) {
+    auto resolve = [this, scope](std::string_view n, int dd) {
+        return resolveConstIdentInScope(n, dd, scope);
+    };
+    for (TypeSymbol* ts = currentOuterType_; ts;) {
+        for (Symbol* m : ts->members)
+            if (auto* cms = dynamic_cast<ConstMemberSymbol*>(m))
+                if (cms->name == name) {
+                    // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
+                    // umbrella #3152): an IMPORTED class-level const has
+                    // no AST ConstDecl (the symbol is reconstructed from
+                    // dependency metadata, fix #328's reconstruction), so
+                    // the AST path's `cd->value` is unevaluable and the
+                    // fold would silently return nullopt — leaving
+                    // `arraySizeValue` at -1, the §5.1 narrowing
+                    // unchecked, and the case-pattern range ungated. Fall
+                    // back to the typed value the loader populated
+                    // (parseImportedConstIntText in ModuleLoader.cpp).
+                    // The `if (cd) /` `if (cd->value)` pair is wrapped
+                    // here in braces (not as a chained `else if`) so the
+                    // `else` binds to the OUTER `if (auto* cd = ...)`,
+                    // not to `if (cd->value)` — otherwise the imported
+                    // case (`cd == nullptr`) would fall off the chain
+                    // with no diagnostic and no fold. // per §17.14
+                    if (auto* cd = dynamic_cast<const ast::ConstDecl*>(
+                            cms->decl)) {
+                        if (cd->value)
+                            return foldIntConst(*cd->value, resolve, d + 1);
+                    } else if (cms->intValue) {
+                        return *cms->intValue;
+                    }
+                }
+        TypeSymbol* nb = nullptr;
+        for (TypeSymbol* base : ts->baseTypes)
+            if (base && base->kind == ast::TypeDeclKind::Class) {
+                nb = base;
+                break;
+            }
+        ts = nb;
+    }
+    if (Symbol* s = lookupName(name, scope))
+        if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
+            if (cd->value)
+                return foldIntConst(*cd->value, resolve, d + 1);
+    return std::nullopt;
+}
+
 std::optional<long long> Resolver::foldIntConstExpr(const ast::Expr& e,
                                                     Scope* scope, int depth) {
-    // Identifier resolution for the shared folder: a bare name is a `const`
-    // whose initializer is itself an int-const expression. Member consts live
-    // on the enclosing type (tracked by currentOuterType_) and its class base
-    // chain; module/enclosing-scope consts are reached through the lexical
-    // `scope`. (Local consts are not yet registered at type-resolution time —
-    // see resolveTypesInBody — so a local-const size is not foldable here; the
-    // ExprTypecheck pass folds those, where locals are in scope.)
     std::function<std::optional<long long>(std::string_view, int)> resolve =
-        [&](std::string_view name, int d) -> std::optional<long long> {
-        for (TypeSymbol* ts = currentOuterType_; ts;) {
-            for (Symbol* m : ts->members)
-                if (auto* cms = dynamic_cast<ConstMemberSymbol*>(m))
-                    if (cms->name == name) {
-                        // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
-                        // umbrella #3152): an IMPORTED class-level const has
-                        // no AST ConstDecl (the symbol is reconstructed from
-                        // dependency metadata, fix #328's reconstruction), so
-                        // the AST path's `cd->value` is unevaluable and the
-                        // fold would silently return nullopt — leaving
-                        // `arraySizeValue` at -1, the §5.1 narrowing
-                        // unchecked, and the case-pattern range ungated. Fall
-                        // back to the typed value the loader populated
-                        // (parseImportedConstIntText in ModuleLoader.cpp).
-                        // The `if (cd) /` `if (cd->value)` pair is wrapped
-                        // here in braces (not as a chained `else if`) so the
-                        // `else` binds to the OUTER `if (auto* cd = ...)`,
-                        // not to `if (cd->value)` — otherwise the imported
-                        // case (`cd == nullptr`) would fall off the chain
-                        // with no diagnostic and no fold. // per §17.14
-                        if (auto* cd = dynamic_cast<const ast::ConstDecl*>(
-                                cms->decl)) {
-                            if (cd->value)
-                                return foldIntConst(*cd->value, resolve, d + 1);
-                        } else if (cms->intValue) {
-                            return *cms->intValue;
-                        }
-                    }
-            TypeSymbol* nb = nullptr;
-            for (TypeSymbol* base : ts->baseTypes)
-                if (base && base->kind == ast::TypeDeclKind::Class) {
-                    nb = base;
-                    break;
-                }
-            ts = nb;
-        }
-        if (Symbol* s = lookupName(name, scope))
-            if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
-                if (cd->value)
-                    return foldIntConst(*cd->value, resolve, d + 1);
-        return std::nullopt;
-    };
+        [this, scope](std::string_view name, int d) {
+            return resolveConstIdentInScope(name, d, scope);
+        };
     return foldIntConst(e, resolve, depth);
 }
 
-// §6.5 / §17.14 (v0.242, #3045) — see the declaration. The resolver closure is
-// a verbatim copy of foldIntConstExpr's (each of this file's folding entry
-// points carries its own, matching the file's existing style) so the probe and
-// the fold agree on every const value they can see.
+// §6.5 / §17.14 (v0.242, #3045) — see the declaration. Shares
+// `resolveConstIdentInScope` with `foldIntConstExpr` (fix #3619) so the
+// probe and the fold agree on every const value they can see.
 ConstShiftDomainFault Resolver::findConstShiftDomainFaultInScope(
     const ast::Expr& e, Scope* scope) {
     std::function<std::optional<long long>(std::string_view, int)> resolve =
-        [&](std::string_view name, int d) -> std::optional<long long> {
-        for (TypeSymbol* ts = currentOuterType_; ts;) {
-            for (Symbol* m : ts->members)
-                if (auto* cms = dynamic_cast<ConstMemberSymbol*>(m))
-                    if (cms->name == name) {
-                        // fix #3230 (§17.14 / §15.1 / §22.12; family M11 of
-                        // umbrella #3152): an IMPORTED class-level const has
-                        // no AST ConstDecl (the symbol is reconstructed from
-                        // dependency metadata, fix #328's reconstruction), so
-                        // the AST path's `cd->value` is unevaluable and the
-                        // fold would silently return nullopt — leaving
-                        // `arraySizeValue` at -1, the §5.1 narrowing
-                        // unchecked, and the case-pattern range ungated. Fall
-                        // back to the typed value the loader populated
-                        // (parseImportedConstIntText in ModuleLoader.cpp).
-                        // The `if (cd) /` `if (cd->value)` pair is wrapped
-                        // here in braces (not as a chained `else if`) so the
-                        // `else` binds to the OUTER `if (auto* cd = ...)`,
-                        // not to `if (cd->value)` — otherwise the imported
-                        // case (`cd == nullptr`) would fall off the chain
-                        // with no diagnostic and no fold. // per §17.14
-                        if (auto* cd = dynamic_cast<const ast::ConstDecl*>(
-                                cms->decl)) {
-                            if (cd->value)
-                                return foldIntConst(*cd->value, resolve, d + 1);
-                        } else if (cms->intValue) {
-                            return *cms->intValue;
-                        }
-                    }
-            TypeSymbol* nb = nullptr;
-            for (TypeSymbol* base : ts->baseTypes)
-                if (base && base->kind == ast::TypeDeclKind::Class) {
-                    nb = base;
-                    break;
-                }
-            ts = nb;
-        }
-        if (Symbol* s = lookupName(name, scope))
-            if (auto* cd = dynamic_cast<const ast::ConstDecl*>(s->decl))
-                if (cd->value)
-                    return foldIntConst(*cd->value, resolve, d + 1);
-        return std::nullopt;
-    };
+        [this, scope](std::string_view name, int d) {
+            return resolveConstIdentInScope(name, d, scope);
+        };
     return findConstShiftDomainFault(e, resolve);
 }
 

@@ -817,6 +817,27 @@ private:
                               const ast::Type* returnType, Scope* scope,
                               SourceLocation loc);
 
+    // §17.14 / #3230 (family M11 of umbrella #3152) / #3619: the ONE
+    // Resolver-side "what is this identifier's compile-time integer constant
+    // value" resolver — walks `currentOuterType_`'s own const members and its
+    // class base chain, then falls back to the lexical `scope`. Before #3619
+    // `foldIntConstExpr` and `findConstShiftDomainFaultInScope` each spelled
+    // this identifier-resolution closure inline, verbatim identical to each
+    // other (the latter's own comment already said so); both now build their
+    // `foldIntConst`/`findConstShiftDomainFault` resolver from this one
+    // function so the two walks are guaranteed to keep agreeing. This is a
+    // DIFFERENT resolution shape from `ExprTC::foldConstIdentTC` (lexical
+    // scope only, via `lookupName`, no `currentOuterType_`/base-chain walk —
+    // locals are not yet registered at type-resolution time) and from
+    // `checkTypeConsts`'s own closure in TypeResolution_Checks.cpp (siblings
+    // of ONE type's `members` only, no base-chain, no lexical scope) — #3619
+    // declined to force those into this one, since collapsing them would
+    // either narrow this walk or widen the sibling-only one. `d` is the
+    // fold-depth `foldIntConst` threads through for the cyclic-reference
+    // guard.
+    std::optional<long long> resolveConstIdentInScope(std::string_view name,
+                                                       int d, Scope* scope);
+
     // §15.1 (issue #734): fold an inline-array size `N` to a compile-time
     // integer. N must be a compile-time integer expression: integer literals,
     // `const` declarations whose value is itself an int-const expression, and
@@ -828,11 +849,11 @@ private:
                                               int depth);
 
     // §6.5 / §17.14 (v0.242, #3045): the fault probe paired with
-    // `foldIntConstExpr` — same identifier resolution, so both walks see the
-    // same const values. Called when the fold returns nullopt, to tell "a
-    // constant shift count outside the §6.5 domain" (an evaluation fault,
-    // a compile error at the constant expression) apart from "not a foldable
-    // constant expression".
+    // `foldIntConstExpr` — same identifier resolution (`resolveConstIdentInScope`),
+    // so both walks see the same const values. Called when the fold returns
+    // nullopt, to tell "a constant shift count outside the §6.5 domain" (an
+    // evaluation fault, a compile error at the constant expression) apart
+    // from "not a foldable constant expression".
     ConstShiftDomainFault findConstShiftDomainFaultInScope(const ast::Expr& e,
                                                            Scope* scope);
 
